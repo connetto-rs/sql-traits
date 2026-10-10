@@ -747,6 +747,78 @@ pub enum Error {
         /// Name of the relation that named no schema.
         relation_name: String,
     },
+    #[error(
+        "Temporary {object_kind} `{relation_name}` cannot be created in non-temporary schema `{schema_name}`."
+    )]
+    /// Error indicating that a temporary relation is qualified with a schema
+    /// other than `pg_temp`.
+    ///
+    /// PostgreSQL keeps temporary relations only in the session's temporary
+    /// schema. This also covers a view the statement wrote without `TEMP`
+    /// whose definition reads a temporary relation, which PostgreSQL makes
+    /// temporary and then cannot place in the schema the statement named.
+    TemporaryRelationInPermanentSchema {
+        /// Kind of relation the statement creates.
+        object_kind: ObjectKind,
+        /// Name of the relation the statement creates.
+        relation_name: String,
+        /// The non-temporary schema the statement named.
+        schema_name: String,
+    },
+    #[error("Materialized view `{view_name}` cannot be declared `TEMP`.")]
+    /// Error indicating that the input writes `CREATE TEMP MATERIALIZED
+    /// VIEW`, which the parser accepts and PostgreSQL rejects as a syntax
+    /// error. A materialized view becomes temporary only by being created in
+    /// `pg_temp`.
+    TemporaryMaterializedView {
+        /// Name the statement wrote.
+        view_name: String,
+    },
+    #[error("Materialized view `{view_name}` cannot read temporary relation `{relation_name}`.")]
+    /// Error indicating that a materialized view's definition reads a
+    /// temporary table or view, which PostgreSQL refuses.
+    MaterializedViewReadsTemporaryRelation {
+        /// Name of the materialized view the statement creates.
+        view_name: String,
+        /// Name the definition wrote for the temporary relation.
+        relation_name: String,
+    },
+    #[error(
+        "Foreign key of table `{host_table}` cannot reference `{referenced_table}`: constraints on temporary tables may reference only temporary tables, and constraints on permanent tables only permanent ones."
+    )]
+    /// Error indicating that a foreign key joins a temporary table and a
+    /// permanent one, in either direction, which PostgreSQL refuses.
+    ForeignKeyCrossesTemporaryStorage {
+        /// Table declaring the foreign key.
+        host_table: String,
+        /// Table the foreign key references.
+        referenced_table: String,
+        /// Whether the declaring table is the temporary one.
+        host_is_temporary: bool,
+    },
+    #[error(
+        "Permanent table `{table_name}` cannot inherit from temporary relation `{parent_name}`."
+    )]
+    /// Error indicating that a permanent table names a temporary parent in
+    /// `INHERITS` or `PARTITION OF`, which PostgreSQL refuses.
+    PermanentRelationInheritsTemporary {
+        /// Table the statement creates.
+        table_name: String,
+        /// Temporary parent it names.
+        parent_name: String,
+    },
+    #[error(
+        "Temporary table `{table_name}` cannot be created as a partition of permanent relation `{parent_name}`."
+    )]
+    /// Error indicating that a temporary table is declared `PARTITION OF` a
+    /// permanent one, which PostgreSQL refuses. A temporary table may still
+    /// inherit from a permanent one through `INHERITS`.
+    TemporaryPartitionOfPermanent {
+        /// Table the statement creates.
+        table_name: String,
+        /// Permanent parent it names.
+        parent_name: String,
+    },
     #[error("No schema has been selected to create collation `{collation_name}` in.")]
     /// Error indicating that a `CREATE COLLATION` statement names no creatable
     /// schema.

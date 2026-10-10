@@ -13,7 +13,10 @@ use crate::{
         ColumnLike, DatabaseLike, DocumentationMetadata, ForeignKeyLike, GrantLike, Metadata,
         PolicyLike, TableGrantLike, TriggerLike, check_constraint::CheckConstraintLike,
     },
-    utils::identifier_resolution::{identifiers_match, normalize_identifier},
+    utils::{
+        identifier_resolution::{identifiers_match, normalize_identifier},
+        object_name::is_temporary_schema,
+    },
 };
 
 /// How a partitioned table routes a row to one of its partitions.
@@ -314,6 +317,37 @@ pub trait TableLike:
     fn stored_table_schema(&self) -> Option<Cow<'_, str>> {
         self.table_schema()
             .map(|schema| normalize_identifier(schema, self.table_schema_is_quoted()))
+    }
+
+    /// Returns whether this table lives in the session's temporary schema.
+    ///
+    /// PostgreSQL keeps every temporary relation in `pg_temp`, whether the
+    /// statement wrote `TEMP`, qualified the name with `pg_temp`, or created
+    /// it while the search path began there. The model records each of those
+    /// in `pg_temp`, so this reads the stored schema.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id INT); CREATE TEMP TABLE docs (id INT, draft TEXT);",
+    /// )?;
+    /// let lookup = |target| db.table_by_target(target, IdentifierCase::AsWritten);
+    /// let permanent = lookup(TargetName::new("docs", false))?.unwrap();
+    /// let temporary = lookup(TargetName::new("docs", false).with_schema("pg_temp", false))?.unwrap();
+    /// assert!(!permanent.is_temporary());
+    /// assert!(temporary.is_temporary());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_temporary(&self) -> bool {
+        self.table_schema()
+            .is_some_and(|schema| is_temporary_schema(schema, self.table_schema_is_quoted()))
     }
 
     /// Returns the table ID according to its position in the database's table

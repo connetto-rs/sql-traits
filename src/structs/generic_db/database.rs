@@ -10,9 +10,10 @@ use crate::{
     structs::{GenericDB, IdentifierCase, SchemaProfile, TargetName, generic_db::RelationSlot},
     traits::{DatabaseLike, TableLike},
     utils::object_name::{
-        RelationKey, function_has_stored_identity, render_table_candidate, render_view_candidate,
-        resolve_one_function, resolve_one_relation, resolve_target_from_candidates,
-        stored_function_key, stored_identity_key, stored_table_key, stored_view_key,
+        RelationKey, function_has_stored_identity, relation_search_path, render_table_candidate,
+        render_view_candidate, resolve_one_function, resolve_one_relation,
+        resolve_target_from_candidates, stored_function_key, stored_identity_key, stored_table_key,
+        stored_view_key,
     },
 };
 
@@ -508,7 +509,8 @@ impl<P: SchemaProfile> GenericDB<P> {
     }
 
     /// Resolves a written target to one relation of a kind, walking the search
-    /// path for an unqualified name.
+    /// path for an unqualified name, with the temporary schema first unless
+    /// the path names it.
     fn resolve_relation_on_path<'db, R>(
         &'db self,
         target: &TargetName<'_>,
@@ -521,8 +523,9 @@ impl<P: SchemaProfile> GenericDB<P> {
             return resolve_one_relation(target, &candidates_of(self, &probe), render);
         }
 
-        for (entry_schema, entry_quoted) in &self.search_path {
-            let probe = IndexProbe::new(target, case, Some((entry_schema, *entry_quoted)));
+        let path = || self.search_path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted));
+        for (entry_schema, entry_quoted) in relation_search_path(path) {
+            let probe = IndexProbe::new(target, case, Some((entry_schema, entry_quoted)));
             if self.probed_name_is_taken(&probe) {
                 // Reported under the written name: the entry qualifier is
                 // resolution machinery, not something the statement spelled.

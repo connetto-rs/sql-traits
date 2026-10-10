@@ -55,10 +55,10 @@ use crate::{
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
         object_name::{
-            Qualifier, RelationKey, object_name_identifiers, object_name_last_part,
-            overqualified_object_name, qualifier_of, require_local_object_name,
-            require_static_object_name, resolve_table_object_name_in_iter,
-            resolve_table_object_name_on_search_path_in_iter,
+            Qualifier, RelationKey, TEMPORARY_SCHEMA, is_temporary_schema, object_name_identifiers,
+            object_name_last_part, overqualified_object_name, qualifier_of, relation_search_path,
+            require_local_object_name, require_static_object_name,
+            resolve_table_object_name_in_iter, resolve_table_object_name_on_search_path_in_iter,
             resolve_target_on_search_path_in_iter, resolve_view_on_search_path_in_iter,
             stored_table_key, table_matches_key, table_matches_object_name, target_name_of_idents,
             target_name_of_object_name, view_matches_key,
@@ -1322,56 +1322,73 @@ impl ParserDBBuilder {
         )
     }
 
-    /// Resolves a table the input has created so far, honouring the search
-    /// path the input has set, so every statement reaching for a bare name
-    /// answers alike.
+    /// Resolves a table the input has created so far through the session's
+    /// path, the first schema holding the name under any relation kind ending
+    /// the walk, so every statement reaching for a bare name answers alike.
     fn resolve_table_object_name(
         &self,
         object_name: &ObjectName,
     ) -> Result<Option<&CreateTable>, LookupError> {
+        let case = self.identifier_case();
         resolve_table_object_name_on_search_path_in_iter(
             self.tables().iter().map(|(table, _)| table.as_ref()),
             object_name,
-            self.search_path(),
-            self.identifier_case(),
+            || self.search_path(),
+            case,
+            |key| self.relation_key_is_held(key, case),
         )
     }
 
-    /// Resolves a plain view the input has created so far, honouring the
-    /// search path, so every statement reaching for a bare name answers the
-    /// same way a table lookup does.
+    /// Resolves a plain view the input has created so far, walking the path
+    /// the way [`Self::resolve_table_object_name`] does.
     fn resolve_view_object_name(
         &self,
         object_name: &ObjectName,
     ) -> Result<Option<&View>, LookupError> {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
+        let case = self.identifier_case();
         resolve_view_on_search_path_in_iter(
             self.views().iter().map(|(view, _)| view.as_ref()),
             &target_name_of_idents(schema_ident, name_ident),
-            self.search_path(),
-            self.identifier_case(),
-            // Ingestion resolves within one kind: the shared pool of names is
-            // asked separately, by the creation checks.
-            |_| false,
+            || self.search_path(),
+            case,
+            |key| self.relation_key_is_held(key, case),
         )
     }
 
-    /// Resolves a materialized view the input has created so far, honouring
-    /// the search path.
+    /// Resolves a materialized view the input has created so far, walking the
+    /// path the way [`Self::resolve_table_object_name`] does.
     fn resolve_materialized_view_object_name(
         &self,
         object_name: &ObjectName,
     ) -> Result<Option<&MaterializedView>, LookupError> {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
+        let case = self.identifier_case();
         resolve_view_on_search_path_in_iter(
             self.materialized_views().iter().map(|(view, _)| view.as_ref()),
             &target_name_of_idents(schema_ident, name_ident),
-            self.search_path(),
-            self.identifier_case(),
-            // Ingestion resolves within one kind: the shared pool of names is
-            // asked separately, by the creation checks.
-            |_| false,
+            || self.search_path(),
+            case,
+            |key| self.relation_key_is_held(key, case),
         )
+    }
+
+    /// The kind holding the relation name a statement writes and the schema
+    /// holding it, a bare name reaching the first schema on the session's
+    /// relation path that holds it under any kind, an index included.
+    fn relation_reached<'name>(
+        &'name self,
+        name: &'name ObjectName,
+    ) -> Option<(ObjectKind, (&'name str, bool))> {
+        let ident = object_name_last_identifier(name)?;
+        let holder = |schema: (&'name str, bool)| {
+            relation_name_holder(self, ident, Some(schema)).map(|kind| (kind, schema))
+        };
+        match qualifier_of(name) {
+            Qualifier::Named(schema, quoted) => holder((schema, quoted)),
+            Qualifier::RunTime => None,
+            Qualifier::Absent => relation_search_path(|| self.search_path()).find_map(holder),
+        }
     }
 
     /// Whether any table, view or materialized view is stored under `key`.
@@ -1419,6 +1436,38 @@ impl ParserDBBuilder {
         )
     }
 
+    /// The position of the index a written name reaches through the shared
+    /// relation pool, refusing a name another kind holds there.
+    fn index_position(&self, name: &ObjectName) -> Result<Option<usize>, crate::errors::Error> {
+        let Some((index_name, index_quoted)) = object_name_last_part(name) else {
+            return Ok(None);
+        };
+        let case = self.identifier_case();
+        match self.relation_reached(name) {
+            None => Ok(None),
+            Some((ObjectKind::Index, schema)) => {
+                Ok(self.indices().iter().position(|(index, _)| {
+                    index.attribute().name.as_ref().and_then(object_name_last_part).is_some_and(
+                        |(stored, quoted)| {
+                            case.identifiers_match(stored, quoted, index_name, index_quoted)
+                        },
+                    ) && schema_qualifiers_match(
+                        table_schema_qualifier(TableAttribute::table(index.as_ref())),
+                        Some(schema),
+                        case,
+                    )
+                }))
+            }
+            Some((actual_kind, _)) => {
+                Err(crate::errors::Error::RelationKindMismatch {
+                    object_name: name.to_string(),
+                    expected_kind: ObjectKind::Index,
+                    actual_kind,
+                })
+            }
+        }
+    }
+
     /// The table, view or materialized view a reference reaches through the
     /// session's path, the first schema holding the name under any kind ending
     /// the walk.
@@ -1427,44 +1476,47 @@ impl ParserDBBuilder {
         let target = target_name_of_idents(schema_ident, name_ident);
         let case = self.identifier_case();
         let claimed = |key: &RelationKey| self.relation_key_is_held(key, case);
+        let path = || self.search_path();
         if let Some(table) = resolve_target_on_search_path_in_iter(
             self.tables().iter().map(|(table, _)| table.as_ref()),
             &target,
-            self.search_path(),
+            path,
             case,
             claimed,
         )
         .ok()?
         {
-            return Some(BoundRelation { qualifier: stored_qualifier(&table.name) });
+            return Some(BoundRelation {
+                qualifier: stored_qualifier(&table.name),
+                temporary: table.is_temporary(),
+            });
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
             self.views().iter().map(|(view, _)| view.as_ref()),
             &target,
-            self.search_path(),
+            path,
             case,
             claimed,
         )
         .ok()?
         {
-            return Some(BoundRelation { qualifier: stored_view_qualifier(view) });
+            return Some(BoundRelation {
+                qualifier: stored_view_qualifier(view),
+                temporary: view.is_temporary(),
+            });
         }
         resolve_view_on_search_path_in_iter(
             self.materialized_views().iter().map(|(view, _)| view.as_ref()),
             &target,
-            self.search_path(),
+            path,
             case,
             claimed,
         )
         .ok()?
-        .map(|view| BoundRelation { qualifier: stored_view_qualifier(view) })
+        .map(|view| {
+            BoundRelation { qualifier: stored_view_qualifier(view), temporary: view.is_temporary() }
+        })
     }
-}
-
-/// The relation a reference reached when the statement holding it ran.
-struct BoundRelation {
-    /// Qualifier that relation is stored under.
-    qualifier: Option<Ident>,
 }
 
 /// A type alias for the result of processing check constraints.
@@ -2654,14 +2706,16 @@ fn declared_schema<'builder>(
         .find(|schema| identifiers_match(schema.name(), schema.is_quoted(), name, quoted))
 }
 
-/// Returns whether a schema by this name is one a table may be created in.
+/// Returns whether a schema by this name is one a relation may be created in.
 ///
 /// The default schema is exempt from being declared, since no dump emits a
 /// statement creating it, which is the same allowance
 /// [`ParserDB::resolve_table_object_name_on_search_path`] makes when resolving
-/// a name against it.
+/// a name against it. So is the session's temporary schema, which always
+/// exists and which no statement can create.
 fn schema_is_declared(builder: &ParserDBBuilder, name: &str, quoted: bool) -> bool {
     identifiers_match(name, quoted, "public", false)
+        || is_temporary_schema(name, quoted)
         || declared_schema(builder, name, quoted).is_some()
 }
 
@@ -2749,50 +2803,48 @@ fn refuse_no_inherit_check_on_partitioned(
     Ok(())
 }
 
-/// Records a permanent table created without a schema in the one the search
-/// path selects.
-///
-/// PostgreSQL creates in the first schema on the path that exists, so the walk
-/// passes an entry naming nothing and takes the next. An entry naming the
-/// default schema leaves the name bare, since this model already spells a table
-/// there without the prefix, which is why a bare name and a `public` one
-/// already collide.
-///
-/// A temporary table is left alone. The server puts one in a schema private to
-/// the session rather than on the path, so reading it as the path's would claim
-/// it collides with the permanent table of that name, which is the one thing a
-/// temporary table is guaranteed not to do.
-///
-/// # Errors
-///
-/// Returns
-/// [`SchemaNotFoundForRelation`](crate::errors::Error::SchemaNotFoundForRelation)
-/// when the path names only schemas the input never creates, the refusal a
-/// schema written out in full already gets, and
-/// [`NoSchemaSelectedForRelation`](crate::errors::Error::NoSchemaSelectedForRelation)
-/// when `SET search_path TO ''` left it naming none at all. A real server
-/// refuses both with one complaint, that no schema has been selected to create
-/// in, and each of these carries whichever name it can.
-fn qualify_on_search_path(
+/// Qualifies the name of a relation being created with the schema it lands in,
+/// answering whether that is the temporary schema.
+fn place_relation(
     builder: &ParserDBBuilder,
-    create_table: &mut CreateTable,
-) -> Result<(), crate::errors::Error> {
-    // A node carrying no name part names nothing the path could place, and a
-    // caller assembling statements by hand rather than parsing them can hand
-    // one over.
-    if create_table.name.0.is_empty()
-        || create_table.temporary
-        || create_table.table_schema().is_some()
-    {
-        return Ok(());
+    name: &mut ObjectName,
+    temporary: bool,
+    object_kind: ObjectKind,
+) -> Result<bool, crate::errors::Error> {
+    // A hand-assembled node may carry no name part, which names nothing to
+    // place.
+    let Some((relation_name, _)) = object_name_last_part(name) else {
+        return Ok(temporary);
+    };
+    match qualifier_of(name) {
+        Qualifier::Named(schema, quoted) if is_temporary_schema(schema, quoted) => {}
+        Qualifier::Named(schema, quoted) => {
+            validate_relation_schema(builder, Some((schema, quoted)), object_kind, relation_name)?;
+            if temporary {
+                return Err(crate::errors::Error::TemporaryRelationInPermanentSchema {
+                    object_kind,
+                    relation_name: relation_name.to_string(),
+                    schema_name: schema.to_string(),
+                });
+            }
+            return Ok(false);
+        }
+        Qualifier::RunTime => return Ok(temporary),
+        Qualifier::Absent if temporary => {}
+        Qualifier::Absent => {
+            let qualifier = search_path_qualifier(builder, object_kind, relation_name)?;
+            let Some(qualifier) = qualifier else {
+                return Ok(false);
+            };
+            if !is_temporary_schema(&qualifier.value, qualifier.quote_style.is_some()) {
+                bind_reference(name, Some(qualifier));
+                return Ok(false);
+            }
+        }
     }
-
-    if let Some(qualifier) =
-        search_path_qualifier(builder, crate::errors::ObjectKind::Table, create_table.table_name())?
-    {
-        create_table.name.0.insert(0, ObjectNamePart::Identifier(qualifier));
-    }
-    Ok(())
+    // One spelling, so every comparison rule reaches it.
+    bind_reference(name, Some(Ident::new(TEMPORARY_SCHEMA)));
+    Ok(true)
 }
 
 /// Replaces a reference's qualifier, keeping the identifier it names as
@@ -2825,10 +2877,19 @@ fn stored_view_qualifier<V: ViewLike>(view: &V) -> Option<Ident> {
     })
 }
 
+/// The relation a reference reached when the statement holding it ran.
+struct BoundRelation {
+    /// Qualifier that relation is stored under.
+    qualifier: Option<Ident>,
+    /// Whether it lives in the session's temporary schema.
+    temporary: bool,
+}
+
 /// Binds every foreign key target in `node` to the table it reaches now, the
 /// node itself included, leaving one reaching nothing for the key check to
 /// refuse.
 fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
+    let case = builder.identifier_case();
     let qualifiers: Vec<Option<Option<Ident>>> = foreign_keys_of(node)
         .map(|foreign_key| {
             resolve_table_object_name_on_search_path_in_iter(
@@ -2838,8 +2899,9 @@ fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
                     .map(|(table, _)| table.as_ref())
                     .chain(core::iter::once(&*node)),
                 &foreign_key.foreign_table,
-                builder.search_path(),
-                builder.identifier_case(),
+                || builder.search_path(),
+                case,
+                |key| builder.relation_key_is_held(key, case),
             )
             .ok()
             .flatten()
@@ -2860,7 +2922,8 @@ fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
 /// PostgreSQL creates in the first schema on the path that exists, so the walk
 /// passes an entry naming nothing and takes the next. An entry spelled empty
 /// names no schema, so it is passed over like one naming a schema the input
-/// never creates.
+/// never creates. The temporary schema always exists, so an entry naming it
+/// selects it.
 ///
 /// # Errors
 ///
@@ -2878,6 +2941,9 @@ fn search_path_qualifier(
     for (entry, quoted) in builder.search_path().filter(|(entry, _)| !entry.is_empty()) {
         if identifiers_match(entry, quoted, "public", false) {
             return Ok(None);
+        }
+        if is_temporary_schema(entry, quoted) {
+            return Ok(Some(Ident::new(TEMPORARY_SCHEMA)));
         }
 
         if let Some(schema) = declared_schema(builder, entry, quoted) {
@@ -3883,9 +3949,10 @@ impl ParserDB {
     /// Resolves a table from an SQL object name, trying each schema on the
     /// database's search path for an unqualified name.
     ///
-    /// The path is walked in order and the first schema holding a match wins.
-    /// A table stored without a schema is found where `public` sits on the
-    /// path.
+    /// The path is walked in order and the first schema holding a match wins,
+    /// with the temporary schema `pg_temp` searched first unless the path
+    /// names it. A table stored without a schema is found where `public` sits
+    /// on the path.
     ///
     /// # Errors
     ///
@@ -4459,6 +4526,7 @@ impl ParserDB {
         // `public`, so a bare `parent` reaches `public.parent` as it does in
         // the database. The table being created is chained in so a
         // table may reference itself.
+        let case = builder.identifier_case();
         let referenced_table = resolve_table_object_name_on_search_path_in_iter(
             builder
                 .tables()
@@ -4466,8 +4534,9 @@ impl ParserDB {
                 .map(|(t, _)| t.as_ref())
                 .chain(core::iter::once(create_table.as_ref())),
             &fk.foreign_table,
-            builder.search_path(),
-            builder.identifier_case(),
+            || builder.search_path(),
+            case,
+            |key| builder.relation_key_is_held(key, case),
         )?;
         let Some(referenced_table) = referenced_table else {
             // A view holding the name is a different complaint: the relation
@@ -4485,6 +4554,13 @@ impl ParserDB {
                 host_table: create_table.name.to_string(),
             });
         };
+        if referenced_table.is_temporary() != create_table.is_temporary() {
+            return Err(crate::errors::Error::ForeignKeyCrossesTemporaryStorage {
+                host_table: create_table.name.to_string(),
+                referenced_table: referenced_table_name,
+                host_is_temporary: create_table.is_temporary(),
+            });
+        }
 
         for ref_col_ident in &fk.referred_columns {
             let column_exists = referenced_table.columns.iter().any(|col| {
@@ -6142,35 +6218,18 @@ impl ParserDB {
                     ..
                 } => {
                     for name in names {
-                        let index_name = last_str(&name);
-
-                        // Find the index
-                        let index_exists = builder.indices_mut().iter().any(|(idx, _)| {
-                            idx.attribute().name.as_ref().is_some_and(|n| last_str(n) == index_name)
-                        });
-
-                        if !index_exists {
+                        let Some(position) = builder.index_position(&name)? else {
                             if if_exists {
                                 continue;
                             }
                             return Err(crate::errors::Error::DropIndexNotFound {
-                                index_name: index_name.to_string(),
+                                index_name: last_str(&name).to_string(),
                             });
-                        }
+                        };
 
-                        // Remove from builder's indices list
-                        builder.indices_mut().retain(|(idx, _)| {
-                            idx.attribute().name.as_ref().is_none_or(|n| last_str(n) != index_name)
-                        });
-
-                        // Remove from table metadata
+                        let (removed, _) = builder.indices_mut().remove(position);
                         for (_, table_meta) in builder.tables_mut() {
-                            table_meta.retain_indices(|idx| {
-                                idx.attribute()
-                                    .name
-                                    .as_ref()
-                                    .is_none_or(|n| last_str(n) != index_name)
-                            });
+                            table_meta.retain_indices(|index| !Arc::ptr_eq(index, &removed));
                         }
                     }
                 }
@@ -6178,14 +6237,7 @@ impl ParserDB {
                     name,
                     operation: AlterIndexOperation::RenameIndex { index_name: new_name },
                 } => {
-                    let case = builder.identifier_case();
-                    let Some(position) = builder.indices().iter().position(|(index, _)| {
-                        index
-                            .attribute()
-                            .name
-                            .as_ref()
-                            .is_some_and(|stored| object_names_match(stored, &name, case))
-                    }) else {
+                    let Some(position) = builder.index_position(&name)? else {
                         return Err(crate::errors::Error::AlterIndexNotFound {
                             index_name: last_str(&name).to_string(),
                         });
@@ -6912,10 +6964,14 @@ impl ParserDB {
                         crate::errors::ObjectKind::Table,
                         builder.catalog_name(),
                     )?;
-                    // Where the table lands is decided before the name is read,
-                    // so `IF NOT EXISTS` compares the schema it truly creates
-                    // in rather than the one the statement spelled.
-                    qualify_on_search_path(&builder, &mut create_table)?;
+                    // Placed first, so `IF NOT EXISTS` checks the schema it
+                    // truly creates in.
+                    create_table.temporary = place_relation(
+                        &builder,
+                        &mut create_table.name,
+                        create_table.temporary,
+                        ObjectKind::Table,
+                    )?;
 
                     // `IF NOT EXISTS` skips the statement whole when anything
                     // in the relation pool of the schema already holds the
@@ -7159,6 +7215,7 @@ impl ParserDB {
                         &tables,
                         &path,
                         builder.identifier_case(),
+                        |key| builder.relation_key_is_held(key, builder.identifier_case()),
                     )?;
                     builder.bind_access_targets(&mut grant.objects);
 
@@ -7186,6 +7243,7 @@ impl ParserDB {
                         &tables,
                         &path,
                         builder.identifier_case(),
+                        |key| builder.relation_key_is_held(key, builder.identifier_case()),
                     )?;
                     builder.bind_access_targets(&mut revoke.objects);
 

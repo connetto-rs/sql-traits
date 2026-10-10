@@ -515,9 +515,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// Resolves a name a statement wrote into the table it denotes, comparing
     /// identifiers as `case` says the engine does.
     ///
-    /// An unqualified name resolves through the first schema on
-    /// [`Self::search_path`] holding it, and a table stored without a schema
-    /// resides in the default schema `public`. What `case` decides is the
+    /// An unqualified name resolves through the first schema holding it, with
+    /// the temporary schema `pg_temp` searched before [`Self::search_path`]
+    /// unless the path names it, and a table stored without a schema resides
+    /// in the default schema `public`. What `case` decides is the
     /// comparison of each part, both the name and any qualifier, and of the
     /// schemas on the search path:
     /// [`IdentifierCase::AsWritten`] lets quoting decide, which is
@@ -546,13 +547,15 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// CREATE SCHEMA app;
     /// SET search_path TO app;
     /// CREATE TABLE app.docs (id INT);
+    /// CREATE TEMP TABLE notes (id INT);
     /// ",
     /// )?;
+    /// let resolve =
+    ///     |name| db.resolve_target_table(TargetName::new(name, false), IdentifierCase::AsWritten);
     /// // The search path carries the bare name into `app`.
-    /// let table = db
-    ///     .resolve_target_table(TargetName::new("docs", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// assert_eq!(table.table_schema(), Some("app"));
+    /// assert_eq!(resolve("docs")?.unwrap().table_schema(), Some("app"));
+    /// // The temporary schema is searched first.
+    /// assert!(resolve("notes")?.unwrap().is_temporary());
     /// # Ok(())
     /// # }
     /// ```
@@ -565,7 +568,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         resolve_target_on_search_path_in_iter(
             self.tables(),
             &target,
-            self.search_path(),
+            || self.search_path(),
             case,
             |key| relation_name_is_claimed(self, key, case),
         )
@@ -588,7 +591,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         resolve_view_on_search_path_in_iter(
             self.views(),
             &target,
-            self.search_path(),
+            || self.search_path(),
             case,
             |key| relation_name_is_claimed(self, key, case),
         )
@@ -611,7 +614,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         resolve_view_on_search_path_in_iter(
             self.materialized_views(),
             &target,
-            self.search_path(),
+            || self.search_path(),
             case,
             |key| relation_name_is_claimed(self, key, case),
         )

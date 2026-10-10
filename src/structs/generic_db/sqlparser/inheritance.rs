@@ -988,19 +988,37 @@ fn parent_owning(
 }
 
 /// Binds every parent a table being created names to the table it reaches
-/// through the session's path, refusing an absent one.
+/// through the session's path, refusing an absent one and one PostgreSQL will
+/// not link across temporary and permanent storage.
 fn bind_parents(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
     child_name: &str,
 ) -> Result<(), Error> {
-    for parent_name in parent_names_mut(create_table) {
+    let child_temporary = create_table.is_temporary();
+    let parents =
+        create_table.inherits.iter_mut().flatten().map(|name| (ParentKind::Inherits, name)).chain(
+            create_table.partition_of.iter_mut().map(|name| (ParentKind::PartitionOf, name)),
+        );
+    for (kind, parent_name) in parents {
         let Some(parent) = builder.resolve_table_object_name(parent_name)? else {
             return Err(Error::ParentTableNotFound {
                 parent_table: parent_name.to_string(),
                 child_table: child_name.to_string(),
             });
         };
+        if parent.is_temporary() && !child_temporary {
+            return Err(Error::PermanentRelationInheritsTemporary {
+                table_name: child_name.to_string(),
+                parent_name: parent_name.to_string(),
+            });
+        }
+        if !parent.is_temporary() && child_temporary && kind == ParentKind::PartitionOf {
+            return Err(Error::TemporaryPartitionOfPermanent {
+                table_name: child_name.to_string(),
+                parent_name: parent_name.to_string(),
+            });
+        }
         let qualifier = super::stored_qualifier(&parent.name);
         super::bind_reference(parent_name, qualifier);
     }
