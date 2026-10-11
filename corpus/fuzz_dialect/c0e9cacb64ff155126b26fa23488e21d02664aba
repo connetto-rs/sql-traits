@@ -1,4 +1,0 @@
-CREATE TABLE orde(
-   id SERIAL  ,amont DECIMAL(97, 2) CHECK (0),
-   stnt DECIMAL CHECK (amou)
-);

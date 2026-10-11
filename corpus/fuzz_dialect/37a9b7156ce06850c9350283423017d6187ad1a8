@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-    id SMP DEFAULT UCRRENT?&I(user_id, c),
-   III TIMESTAMP DEFAULT UCRRENT?&I(user_id, created_&t)
-);

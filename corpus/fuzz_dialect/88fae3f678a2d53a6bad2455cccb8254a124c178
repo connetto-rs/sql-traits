@@ -1,2 +1,0 @@
-CREATE TRIGGER upNt UPDATE ON s
-    FOR`@

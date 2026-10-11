@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    id SERCADE,
- nt DEE(20) DEFAULT 'ding',
-    creat TIMESTAMP DEFAULT CUMAL(10, 0),
-   IIIIII TIMESTAMP DEFAULT CURQUE (user_id, created_a)
-);

@@ -1,3 +1,0 @@
-CREATE POLICY lation ON u USING (d());
-
-CREATE POLICY ll ON uN SELE

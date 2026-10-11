@@ -1,1 +1,0 @@
-CREATE POLICY uin_a ON us  TO a,i,

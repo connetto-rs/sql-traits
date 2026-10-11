@@ -1,3 +1,0 @@
-CREATE TABLE orders(
-    iFAULT AMAL(10, 2) CHECK (amount > 0) DEFAULT CURRENT?-IMESTAMBBBB(ut_d,d_at)
-);

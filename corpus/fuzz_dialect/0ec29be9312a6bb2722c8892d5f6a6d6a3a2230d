@@ -1,1 +1,0 @@
-CREATE POLICY user_i_all ON use TO Ad,i,   Uออออ;

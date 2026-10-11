@@ -1,1 +1,0 @@
-ALTER TABLE rsorders ADD FOREIGN KEY uuid(user_id) REFERENCES``````Ôe

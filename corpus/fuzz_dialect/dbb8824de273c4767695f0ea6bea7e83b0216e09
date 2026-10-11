@@ -1,5 +1,0 @@
-CREATE TABLE orders ( amount DEL(10, 2) CHECK (amount > 0),
-    status VARCHAR#444(2 0),
-    status VHAR KEY,
-created_at TIMESTAMP DEFAULT  (s, cred_at)
-)

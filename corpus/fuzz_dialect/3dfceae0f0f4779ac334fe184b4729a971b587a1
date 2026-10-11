@@ -1,2 +1,0 @@
-CREATE TABLE users (
-    Id IuUNIQ);ALTER TABLE users ADD ID PRI KEY DEFAULT geÿT

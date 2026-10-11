@@ -1,6 +1,0 @@
-CREATE TABLE geo_data (
-    id UUAD PRIMARY KEY DEFAULT _en_ran|||||t|||||||ID PRIMARY KEY DEFAULT user|||J|||UAD PRIMARY KEY DEFAULT _en_ran|||||||||||||t|||||||ID PRIMARY KEY DEFAULT user|||||||t|||||||ID PRIMARY KEY DEFAULT _en_an|||en_random_uuid(),
-    point POINT,
-    data J NULL,
-    tags TEXT[] DEFAULT+'{}'||||||||J||||||VEnullifCNOR
-);

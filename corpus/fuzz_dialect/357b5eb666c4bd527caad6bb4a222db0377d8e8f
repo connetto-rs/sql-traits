@@ -1,4 +1,0 @@
-CREATE TABLE oders (
-     amount DECIMAL(14, 2) CHECK (amount),T CURRENT_@TIMTAMP,
-    UNIQUE (user, created_at)
-);

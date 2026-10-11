@@ -1,2 +1,0 @@
-CREATE POLICY uon ON u
- USING (s (ue<<

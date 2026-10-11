@@ -1,1 +1,0 @@
-CREATE POLICY un ON u   USING (us/a==L======;

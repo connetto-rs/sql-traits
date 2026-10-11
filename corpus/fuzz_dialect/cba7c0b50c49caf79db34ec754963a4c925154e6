@@ -1,1 +1,0 @@
-ALTER TABLE ordes ADD  KEY (_/isa_lt DESC);ÿ ATN

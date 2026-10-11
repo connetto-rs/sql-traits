@@ -1,3 +1,0 @@
-CREATE FUNCTION calculateapo_ttl(ordeICRDcurrentme,TUPLE (T, stCASC, id 
-t)
-);

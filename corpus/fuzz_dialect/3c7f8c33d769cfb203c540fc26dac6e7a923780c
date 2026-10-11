@@ -1,3 +1,0 @@
-CREATE POLICY uson ON user  ;
-
-CREATE POLICY n_all ON ING

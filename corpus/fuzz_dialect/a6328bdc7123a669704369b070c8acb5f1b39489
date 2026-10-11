@@ -1,6 +1,0 @@
-CREATE TABLE dreors (
-    id SP DEFAULT CURRERRENT_TI<->CUTI<->
-AMPNT_TI<->CUTI<->
-AMP,
-    UNIQUE (ed_at)
-)¾

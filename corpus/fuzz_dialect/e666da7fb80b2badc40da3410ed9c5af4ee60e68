@@ -1,1 +1,0 @@
-CREATE INDEX e ON es(st) WHERE ##   USING (  TIBg;

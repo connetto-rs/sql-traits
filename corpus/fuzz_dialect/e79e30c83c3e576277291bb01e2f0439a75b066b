@@ -1,2 +1,0 @@
-CREATE POLICY zs_ ON sL
-    USING (u~$ll+llB!~~

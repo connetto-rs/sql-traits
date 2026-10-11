@@ -1,2 +1,0 @@
-CREATE TABLE ords ( d SP KEY,
-    u2 DECIMAL(5, 22222222(

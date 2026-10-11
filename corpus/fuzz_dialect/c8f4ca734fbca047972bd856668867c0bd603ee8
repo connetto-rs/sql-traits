@@ -1,4 +1,0 @@
-CREATE TABLE orders (  id SERCADE,
-  o#unt DEEMMAL(10, 2) CHECK (amount > 0),
-    stamESTA NULL REFERENCES usersBBBBPNIQUE (user_d, created_at)
-);

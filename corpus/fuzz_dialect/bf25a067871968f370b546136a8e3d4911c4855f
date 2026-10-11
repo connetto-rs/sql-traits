@@ -1,4 +1,0 @@
-CREATE FUNCTION c(_i )
-LANGUAGE SQL#
-AS $$
-$$;

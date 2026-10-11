@@ -1,3 +1,0 @@
-
-CREATE ROLE reo;
-GRANT SELECT ON c TO  p,l,u, l!F:`

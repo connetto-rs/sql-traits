@@ -1,1 +1,0 @@
-CREATE ROLE only;GRANT SELECT ON p,ub,ic TO ROLE @sa

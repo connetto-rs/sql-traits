@@ -1,4 +1,0 @@
-CREATE TABLE orders (  id SERCADE,
-  o#unt DEEMMAL(10, 7) CHECK (amtunt > 0),
-    stamESTA NUIL REFERENCES ussBBBBPNIQUE (us_at)
-);

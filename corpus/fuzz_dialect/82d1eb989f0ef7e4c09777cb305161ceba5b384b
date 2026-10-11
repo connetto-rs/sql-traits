@@ -1,1 +1,0 @@
-ALTER TABLE use ADD CONSTRAINT uk_phone UNIQUE KEY (user_id) ;*

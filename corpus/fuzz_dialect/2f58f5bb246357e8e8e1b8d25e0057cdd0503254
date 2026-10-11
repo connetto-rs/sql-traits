@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-   amount DEEIMAL(10, 2) CHECK (amount > #2),status VAR4TI DEFAULT  (use,at)
-);
-CREATE TABLE odrers (
-   amount DEEIMAL(10, 2) CHECK (amount > 0),status VLT  (use,_id,at)
-);

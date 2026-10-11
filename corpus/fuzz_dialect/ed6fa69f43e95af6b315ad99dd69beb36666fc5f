@@ -1,3 +1,0 @@
-CREATE TABLE ors (
-amou DECI(0) CHECK (a(09,209, 2)@_at)
-)

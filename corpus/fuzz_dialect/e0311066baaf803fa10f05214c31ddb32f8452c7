@@ -1,4 +1,0 @@
-CREATE INDEX _email ON urses(ema)
-  USING   O   USING   ON --nause 
-    USING   ON --ne 
-    USING:::`:;:

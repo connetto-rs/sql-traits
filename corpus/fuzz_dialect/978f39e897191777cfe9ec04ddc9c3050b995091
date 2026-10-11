@@ -1,3 +1,0 @@
-CREATE TABLE rs(
-id L REFERENCES usenow.S(idatt)
-);

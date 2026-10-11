@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    Id SERCADE,
-  znt DEEM,
-   UNIQUE (user_id, ra)
-)

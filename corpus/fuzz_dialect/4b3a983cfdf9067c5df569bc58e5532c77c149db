@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-   id TEGER NOT NULL REFERENCES users(id@) ON DELETE CASCADE,
-   ER N NULL REFERENCES users(ated_at)
-);

@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-    id SIMARY KEY,UNIQUE (userd, creaBBBBuer_id, ca)
-.);

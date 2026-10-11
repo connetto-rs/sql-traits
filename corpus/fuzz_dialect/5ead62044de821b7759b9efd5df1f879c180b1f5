@@ -1,2 +1,0 @@
-CREATE TABLE geo_d(ta EXT[] DEFAULT+'{}' [:en] ?R
-);

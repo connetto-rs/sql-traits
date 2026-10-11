@@ -1,2 +1,0 @@
-CREATE ROLE rAEE,only;
-GRANT SELECT ON SCHEMA pub TO  p,l,u,bÙ,

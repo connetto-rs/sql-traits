@@ -1,2 +1,0 @@
-CREATE POLICY usln ON serr
-WITH CHECK (g)3____[

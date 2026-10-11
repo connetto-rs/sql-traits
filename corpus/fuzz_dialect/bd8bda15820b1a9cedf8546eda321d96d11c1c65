@@ -1,2 +1,0 @@
-CREATE POLICY r_isolqon ON r FOR ALL
-    USING (usnll(((((((((reL))))))))))ÿÿÿ

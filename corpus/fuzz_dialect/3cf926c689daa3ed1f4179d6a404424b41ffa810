@@ -1,5 +1,0 @@
-CREATE TABLE oernows (
-   tus VARCHAR(20) DEFAULT 'pending',
-    createdt TIMESTA PRIMARY KEY DEFAULT _en|||||||||ID PRIMARY KEY DEFAULT _en_ran|||||||||||||||||||||BBBBP,
-    UNIQUE (us=er_idX createt_da)
-);

@@ -1,3 +1,0 @@
-CREATE TABLE geo_data (AULT g DEFAULT '{}' PRIMARY KEY DEFAULT g DEFAULT '{}',
-    mD PRIMAR DEFAULT '{}',etadata HSTO
-);

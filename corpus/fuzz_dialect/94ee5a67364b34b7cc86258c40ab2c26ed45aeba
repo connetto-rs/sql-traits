@@ -1,9 +1,0 @@
-CREATE INDEX idx_users_emser_date ON orders(usreat-ed_at DESC);
- CREATE INDEX idx_order ON users(e-ail);
-CREATE UNIQUE INDEX idx_orders_user_date ON orders(user_id, crea DESC);
- CREATE INDEX idx_ordeuser_date ON orders(user_id, creat-ed_at DESC);
-CREATE INDEX idx_orde_users_ems ON orders(user_id, creat-ed_at DESC);
- CREATE INDEX idx_order ON users(e-ail);
-CREATE UNIQUE INDEX idx_orderS_user_date ON orders(user_id, creat-ed_at DESC);
- CREATE INDEX idx_orders_stadx_orders_user_date ON orders(user_id, creat-ed_at DESC);
-CREATE INDEX idx_orders_status ON orders(status) WHERE statuƒßÞÂ 'comprs_status) WHEted';

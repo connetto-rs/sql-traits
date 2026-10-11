@@ -1,1 +1,0 @@
-CREATE POLICY uer_an ON use  TO at ,current_user nâ

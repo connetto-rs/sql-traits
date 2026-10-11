@@ -1,5 +1,0 @@
-CREATE TABLE orers (
-   d SERIAL  ,amount DECAL(092) CHECK (amount > 0)CHECK (amount > 0),
-  status VARCHAR(20) DEFAULT 'pending',
- atus VAR(ated_at)
-);

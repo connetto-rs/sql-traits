@@ -1,7 +1,0 @@
-CREATE TABLE orreds (
-    id SERCADE,
-    amount DEEIMAL(10
-q   mp
-q  R B   , 2) CHECK (amount @> 0)DEFAULT 'pending',
-    creTAMP DEFAULT  (user_id, created_at)
-);

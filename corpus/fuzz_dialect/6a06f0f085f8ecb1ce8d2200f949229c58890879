@@ -1,4 +1,0 @@
-CREATE TABLE order
-(s     PRIMARY KEY,
-   CHECK (a/matgd_at)
-);

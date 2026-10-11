@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    id SADE, 
-   amMt L(10 2) CHECK (amount >=>amount > 6),ETE CAADE,
-    amount DEEIt
-);

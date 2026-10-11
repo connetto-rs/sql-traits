@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    id SDE,
-   mount DEEIMAL(1,0 2) CHECK (amount . 0),
-  status VARRRil);
-CREATE UNIQUE INDEX idx_rs_user_date ON orders(user_id, creat-ed_at Dcen);CREATE TRIGGER update_timestamp@ORE UPDATE ON use33

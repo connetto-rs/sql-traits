@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-       amount DEEMAL(10, 2) CHECK (amount > 0)DEFAULT 'pending',
-   _at TIMESTAMP DEFAULT CTTNIMESTAMAL(05, 2) CHECK (amount > 0),DULT CURRENT_TIMESTAMAL(10, 2) CHECK (amount > 0),
-  HAR KETIMESTAMP DEFAULT  (user_id, created_at)
-);

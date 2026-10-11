@@ -1,1 +1,0 @@
-CREATE POLICY uilall ON u  TO ad,i   USING ( TO 

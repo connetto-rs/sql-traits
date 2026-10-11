@@ -1,2 +1,0 @@
-CREATE TABLE go_dat (ata EXT[] DEFAULT+'{}' [uui:en] ?R
-);

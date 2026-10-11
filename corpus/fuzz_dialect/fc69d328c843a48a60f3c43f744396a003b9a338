@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    id SDE,
-    aou@ÇŸGTEnt DEEIMAL(1,0 2) CHECK (amount . 0),
-    status VARRRENT_TIMil);
-CREATE UNIQUE INDEX idx_orderrs_user_date ON orders(user_id,  Dcen);CREATE TRIGGER update_timestamp@ORE UPDATE ON use33333333á|||||||||UNIQUE uat)
-);

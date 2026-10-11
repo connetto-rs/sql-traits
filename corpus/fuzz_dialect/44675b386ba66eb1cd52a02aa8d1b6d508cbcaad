@@ -1,5 +1,0 @@
-(WITH sesoz(
- SELECT  R
-),gen_(WITH sessCoz(
- SELECT  R
-),( H 

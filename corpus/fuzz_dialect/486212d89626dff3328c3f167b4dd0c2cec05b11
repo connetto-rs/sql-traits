@@ -1,8 +1,0 @@
-CREATE TABLE geo_data (
-    id UUMARY KEY DEFAULT geom_uuil(),
-    point POINT,
-    data JSONB NOT NULL,
-    taEFAULT gen_randomndom_uuiOINT,
-    data JSONB NOT NULL,
-    point POINT,
-    data JSONB NOT DEFIA

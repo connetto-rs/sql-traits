@@ -1,4 +1,0 @@
-CREATE TABLE ord(
-    id SEEL(10  2) CHECK (a>= TE >amou> 0),
-  tNOTETE CASCst
-);

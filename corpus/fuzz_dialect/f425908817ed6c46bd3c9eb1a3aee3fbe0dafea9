@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    id SDE,
-   mount DEEIMA CHECK (amount . 0),
-  max  ENT_TIMil);
-CREATE UNIQUE INDEX idx_orderrs_user_date ON orders(user,id, creatmed_cen);

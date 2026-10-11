@@ -1,5 +1,0 @@
-CREATE INDEX mdemail ON users(email)
-  USING   ON --n-e 
-    USING   O 
-    USING L
-    USING Eÿÿ

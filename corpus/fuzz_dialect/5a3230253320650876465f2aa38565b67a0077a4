@@ -1,4 +1,0 @@
-CREATE ROLE aedR admin W PASSWORD 'ret';
-CREATE ROLE redR admin WaCASC, stCASBB,
-CASC, sBbBB,
-TR E

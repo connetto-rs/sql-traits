@@ -1,5 +1,0 @@
-CREATE TABLE rrs (
-    id SERIAL PRIMARY KEY,
-   nt DE CHECK (a-ou),at TIMESTAMP DEFAULT @@@@@@@*@BBB:=BBBBP,
-    UNIQUE (userlen_id, cE)
-);

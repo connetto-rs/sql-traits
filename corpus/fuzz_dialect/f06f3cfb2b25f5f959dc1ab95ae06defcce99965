@@ -1,5 +1,0 @@
-CREATE TABLE rrs (
-    id SEPRIMARY KEY,
-   nt DE CHECK (a-ou),at TIMEP DEFAULT @@@@B@@*@BBB:=BBBBP,
-    UNIQUE (userlen_id, cE)
-);

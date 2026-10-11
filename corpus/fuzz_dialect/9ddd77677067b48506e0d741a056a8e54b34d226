@@ -1,3 +1,0 @@
-CREATE TABLE ord(
- u DECIMAL(1822 )CHECK (@@@:d_at ), CHECK (@@(@@@:d_at ), CHECK (@@@local@:d@::time with time zone@@:d_at ), CHECK (@@(@@@:d_at ), CHECK (@V@:d_a
-)

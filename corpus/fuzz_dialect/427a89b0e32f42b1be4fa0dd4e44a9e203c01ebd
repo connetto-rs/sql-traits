@@ -1,2 +1,0 @@
-CREATE TABLE users (
-    id IuuNIQ);ALTER TABLE users ADD IF PRIMARY KEY

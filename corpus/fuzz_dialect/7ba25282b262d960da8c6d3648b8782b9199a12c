@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-IMARY KEY, user_id INTHAR(19) DEFAULT 'pending',
-   created_at TIMAMP,
-    UNIQUE (user_id, created_at)
-);

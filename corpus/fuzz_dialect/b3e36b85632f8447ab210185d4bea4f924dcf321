@@ -1,8 +1,0 @@
-CREATE TABLE geo_dta (
-    id UUMARY KEY DEFAULT TSVECTOR/ID PRIMARY KEY DEFAULT gen_random_uULL,
-   tags TEXT[] DEFAULT '{}',
-    mUsumatd UUMARY KEY DEFAULT TSVECTOR/ID PRIMARY KEY DEFAULT gen_random_uuiULL,
-   tags TEXT[] DEFAULT '{}',
-    mUsumata HSTORE,
-    tsv TSVECTOR
-);

@@ -1,6 +1,0 @@
-CREATE TABLE krders (
-    id SDE,
-    amount DEEIMAL(1,0 2)DEFAULT 'pending',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMEBBBBB||||||ID PRIMARY KEY DEFAULT _en_ran||||||||||||||||||||||||||ID PRIMARY KEY DEFAULT _en||||||||||||||||||BBBBP||||!|||||||||||t|||||||ID PRIMARY KEY DEFAULT _en_ran|||||||||||||||||t|||||||ID PRIMARY KEY DEFAULT _en_ran|||||||||||||||BBBBP,
-    UNIQUE (us=er_id, created_at)
-);

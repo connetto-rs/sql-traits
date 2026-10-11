@@ -1,1 +1,0 @@
-CREATE POLICY uer ON us  USING (usl<==

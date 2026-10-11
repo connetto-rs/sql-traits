@@ -1,6 +1,0 @@
-CREATE TABLE os (
-    id SDE,
-    amount DEEIMAL(1,0 2) CHECK (amount > 0),
-    status VARCHAA PRIMARY KEY DEFAULT _en_ran||||||||||||||||ID PRIMARY KEY DEFAULT _en_ran|J||||||ID PRIMARY KEY DEFAULT _en_ran||||||||||||||P,
-    UNIQUE (ws=er_idr	ated_at)
-);

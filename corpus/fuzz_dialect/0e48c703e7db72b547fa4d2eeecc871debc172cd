@@ -1,2 +1,0 @@
-CREATE POLICY n ON resus
- USING (u~sel-ln<=>

@@ -1,4 +1,0 @@
-CREATE INDEX mil ON users(eml)
-
-    USING  ulL
-    USInG  uLE

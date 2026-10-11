@@ -1,2 +1,0 @@
-CREATE POLICY laIon ON 
- LL USING (useSA #-O

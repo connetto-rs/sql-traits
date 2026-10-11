@@ -1,2 +1,0 @@
-CREATE POLICY ul ON user TO ad,in
-USING N]`N

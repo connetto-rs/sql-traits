@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-mount DEEIMAL(10, 2) CHECK (amount > 0),
-  status VARCHAR(20) DEFAULT 'penduuidv7ing',
-     status VARCHIMARY KEY,
-    user_id INOT NULL REFERENCES users(idd, cveated_at)
-);

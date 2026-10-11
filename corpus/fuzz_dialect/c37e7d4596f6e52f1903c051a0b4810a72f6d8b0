@@ -1,4 +1,0 @@
-CREATE FUNCTION n(oTEG)
-LANGUAGE QAS 
-$$`EA
-$$

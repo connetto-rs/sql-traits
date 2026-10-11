@@ -1,3 +1,0 @@
-CREATE TABLE De(s VRSTAY KEY,
-   CHECK (amoudat)
-);

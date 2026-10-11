@@ -1,4 +1,0 @@
-CREATE TABLE ordesr (d SADE,
-    amount DECIMAL(1, 2) CHECK (amount #> 0),
-  FA  UNIQE (usecreated_at)
-);

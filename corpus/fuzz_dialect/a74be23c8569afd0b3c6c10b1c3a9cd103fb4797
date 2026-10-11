@@ -1,3 +1,0 @@
-CREATE POLICY user_isolIon ON sus  
-  
-   USING (usel|>>gIN (A |>>geoe .Aal( TABLE |>>E;

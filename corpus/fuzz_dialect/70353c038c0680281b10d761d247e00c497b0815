@@ -1,2 +1,0 @@
-CREATE TRIGGER sIK@ UPDATE ON us
-    EXEC loti;Ž

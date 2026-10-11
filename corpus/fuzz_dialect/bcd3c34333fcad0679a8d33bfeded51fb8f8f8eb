@@ -1,5 +1,0 @@
-CREATE TABLE rders (
-    id Y,
-   nt DE CHECK (a-oun),
-    status@ VAAR(20) DEFAULT n'pending'DEFAULT @}@@@@
-);

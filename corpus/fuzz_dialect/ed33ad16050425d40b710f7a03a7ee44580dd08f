@@ -1,5 +1,0 @@
-CREATE TABLE ordernows (
-    id SDE,
-    aVR CHAR(04) DEFAULT 'png',
-    created_at TIMESTA PRIMARY KEY DEFAULT _e||t|||||||ID PRIMARY KEY DEFAULT _enn_ran||||||||||||||||t|||||||ID PRIMARY KEY DEFAULT _en_rUE (us=ecreated_at)
-);

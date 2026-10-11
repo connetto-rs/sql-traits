@@ -1,1 +1,0 @@
-CREATE POLICY usr_isn ON u USING (uslln(|&> 

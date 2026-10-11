@@ -1,3 +1,0 @@
-CREATE POLICY user_tion ON users       WITH CHECK (usrent_usum_id());
-CREATE POLICY admiisoln ON users
-     WITH CHECK (u?ser/id_id)UWING (true);

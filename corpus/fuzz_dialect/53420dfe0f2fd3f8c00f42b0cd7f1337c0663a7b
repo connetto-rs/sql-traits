@@ -1,1 +1,0 @@
-CREATE POLICY user_isation ON esu  USING (usell = ct_~~lt_usz~~llll

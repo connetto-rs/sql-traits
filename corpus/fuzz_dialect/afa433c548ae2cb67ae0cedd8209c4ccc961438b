@@ -1,3 +1,0 @@
-CREATE POLICY user_isolRtIon ON sus
-    FOR ALL
-   USING (usel|>>gIN (A |>>geoelA .( TABLE |>>gINA TR;IGGE;

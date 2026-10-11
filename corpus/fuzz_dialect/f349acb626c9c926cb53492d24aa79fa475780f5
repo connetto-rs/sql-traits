@@ -1,2 +1,0 @@
-CREATE TABLE gea@(
- itaID KEY DEFAULT _randLT '{}');

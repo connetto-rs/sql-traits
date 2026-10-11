@@ -1,3 +1,0 @@
-CREATE INDEX id ON rders(u_ DESC);
-CREATE INDEX _user_date ON ders(user DESC);
-CREATE INsta 

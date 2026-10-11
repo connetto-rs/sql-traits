@@ -1,2 +1,0 @@
-CREATE POLICY olikn ON ALL
-  USING (um_us|e~=adm u;

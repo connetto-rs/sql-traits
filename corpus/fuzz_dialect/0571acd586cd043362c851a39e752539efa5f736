@@ -1,6 +1,0 @@
-CREATE TABLE orderns (
-    id SDE,
-    amounount DEEIMAL(1,0 2) CHECK (a20) DEFAULT 'pending',
-    statuat TIMESTA PRIMARY KEY DEFAULT _en_ran||||||||||||||z||BBBBP|Y DEFAULT _||||t|||||||||||||BBBBP,
-    UNIQUE (uss reated_at)
-);

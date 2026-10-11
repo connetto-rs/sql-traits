@@ -1,2 +1,0 @@
-CREATE POLICY u1n ON r
-USING(+l.+lll UIl

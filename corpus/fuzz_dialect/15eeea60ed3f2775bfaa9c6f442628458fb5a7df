@@ -1,3 +1,0 @@
-CREATe TABLE orders (
-    EGER NOTULL REFERENCES users(id_at)PRIMARY KEY,r_id INVEusR NOT NULL REFERENCES users(it)
-);ù)

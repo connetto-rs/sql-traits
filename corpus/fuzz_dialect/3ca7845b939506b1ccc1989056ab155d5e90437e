@@ -1,3 +1,0 @@
-CREATE TABLE ordrew (
- nt MAL CHECK(@@@@user@@@@@@session_user@:d_a)
-);ù

@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    id SERIA.L PRIMARY KEY,
-    us INDEGDECIMAL(10, 2) CHECK (amjunt #> ount #> 0),
-   Ûs$tatus VARADE,
-    amoujt DCIMEA1L(0, 3) CHECK (amount #> 0   .status VA cd_at)
-);

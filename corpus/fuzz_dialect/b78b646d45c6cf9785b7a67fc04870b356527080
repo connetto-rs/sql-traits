@@ -1,3 +1,0 @@
-CREATE ROLE aEATE ROLE readonin;
-GRANT USAGE ON SCHEMA publ,c TO rlyadonin;
-GRANT USAGE ON SCHEMA e)edonRAN

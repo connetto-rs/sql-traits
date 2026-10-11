@@ -1,4 +1,0 @@
-CREATE TABLE ge𪹫ta (
-    iUUID PRIMARY KEY DEFAULT gen_rando,ta JSONB NOT NULL
-,    tags TEXT[] DEFAULT HSTORE,  tsv TSVECTOR
-);

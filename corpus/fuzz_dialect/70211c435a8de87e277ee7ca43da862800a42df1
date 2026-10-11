@@ -1,2 +1,0 @@
-CREATE TABLE gi_daota (MARY KEY DEFAULT gen_useCom_uuid()(15205091),
- oint POINT,rRY KEY DEFAULT gen_radouuid()(22);

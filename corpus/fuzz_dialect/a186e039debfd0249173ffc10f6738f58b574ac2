@@ -1,6 +1,0 @@
-CREATE TABLE Grders (
-CHECK (amou.t > 0),
-  at TE,
-   CHECK (am.t > 0),
-  at BBBB@,UNIQUE (er_)
-)T

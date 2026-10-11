@@ -1,7 +1,0 @@
-CREATE TABLE orders (
-  t EL(10  2) CHECK (amount >amoun:t > 0),
- st CA2A,
-  amount Ddevs (
-1) CHECK (amount > 0),
-MESTAB  st
-);

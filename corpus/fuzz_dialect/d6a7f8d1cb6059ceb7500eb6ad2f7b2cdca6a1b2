@@ -1,4 +1,0 @@
-CREATE TABLE ders (
-B PRIMARY KEY,
-  T NUL REFERENCES u.ser
-);

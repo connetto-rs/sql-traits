@@ -1,5 +1,0 @@
-CREATE TABLE geo_eo_data (MARY KEandomRIMARY KEY DEFAULT genWrad()(25638),
-    Y KEY DEFAULT gen_2andom_uuid()(0951586),
-    point POINT,
-  UIDdata H0TSVmRIMARY KEY DEFAULT gdom_uuid()(22220000325638)  R
-);

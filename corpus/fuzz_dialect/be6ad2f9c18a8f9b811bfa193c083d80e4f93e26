@@ -1,2 +1,0 @@
-CREATE POLICY n ON yeus
-  USING(u~se-n!~*

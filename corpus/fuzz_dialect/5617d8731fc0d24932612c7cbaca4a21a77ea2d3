@@ -1,1 +1,0 @@
-ALTER TABLE  users  ADD CONSTRAINT NSCHECK (@@H:d_at )¬ CHèBL

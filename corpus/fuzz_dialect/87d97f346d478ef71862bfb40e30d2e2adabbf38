@@ -1,3 +1,0 @@
-CREATE INDEX email ON users(emai)
---- 
-    USING  l USING  ulse`

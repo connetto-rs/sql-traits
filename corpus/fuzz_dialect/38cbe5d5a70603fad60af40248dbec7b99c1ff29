@@ -1,3 +1,0 @@
-CREATE TABLE ores (
-   at TIMESTAMP DEFAULT RRE(ut)
-)
