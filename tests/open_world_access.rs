@@ -141,11 +141,11 @@ fn a_path_resolved_grant_target_is_not_reported() {
     db.validate_access_targets().expect("nothing is dangling");
 }
 
-/// The validator walks the final path, agreeing with `TableGrantLike::tables`:
-/// a grant stranded by a later path change is reported, because the accessors
-/// cannot resolve it either.
+/// A grant keeps the table it reached when it was made, as PostgreSQL keeps
+/// it, so a later path change neither strands it for the accessors nor for
+/// the validator.
 #[test]
-fn a_grant_stranded_by_a_later_path_change_is_reported() {
+fn a_grant_keeps_its_table_across_a_later_path_change() {
     let sql = "CREATE SCHEMA app;
          CREATE SCHEMA zzz;
          SET search_path TO app;
@@ -157,15 +157,9 @@ fn a_grant_stranded_by_a_later_path_change_is_reported() {
 
     let db = open_world().parse::<PostgreSqlDialect>(sql).expect("schema parses");
     let grant = db.table_grants().next().expect("the grant is recorded");
-    assert_eq!(grant.tables(&db).count(), 0, "the accessors cannot resolve it either");
-
-    let unresolved: Vec<_> =
-        db.unresolved_access_references().expect("targets are well formed").collect();
-    assert!(
-        matches!(unresolved[..], [UnresolvedAccessReference::GrantTable(table)]
-            if table.to_string() == "docs"),
-        "got {unresolved:?}"
-    );
+    let tables: Vec<_> = grant.tables(&db).collect();
+    assert!(matches!(tables[..], [table] if table.table_schema() == Some("app")));
+    assert_eq!(db.unresolved_access_references().expect("targets are well formed").count(), 0);
 }
 
 #[test]

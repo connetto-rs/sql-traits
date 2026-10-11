@@ -127,7 +127,8 @@ pub trait ForeignKeyLike:
     where
         Self: 'db;
 
-    /// Returns the referenced table that the foreign key points to.
+    /// Returns the referenced table, the one the `REFERENCES` clause reached
+    /// when the foreign key was declared.
     ///
     /// # Arguments
     ///
@@ -169,12 +170,14 @@ pub trait ForeignKeyLike:
         database: &'db Self::DB,
     ) -> Result<&'db <Self::DB as DatabaseLike>::Table, LookupError>;
 
-    /// Returns the table name the foreign key wrote in its `REFERENCES`
-    /// clause, exactly as written.
+    /// Returns the table name the `REFERENCES` clause names, as ingestion
+    /// bound it.
     ///
-    /// Unlike [`Self::referenced_table`] this applies no resolution and cannot
-    /// fail, so a caller with its own resolution rules (a search path, a
-    /// default schema) can read the target and resolve it itself.
+    /// The name carries the qualifier of the table it reached when the key was
+    /// declared, or none for a table in the default schema, and keeps the
+    /// quoting written on the table name. Unlike [`Self::referenced_table`]
+    /// this applies no resolution and cannot fail, so a caller with its own
+    /// resolution rules can read the target and resolve it itself.
     ///
     /// # Example
     ///
@@ -206,7 +209,7 @@ pub trait ForeignKeyLike:
     /// # }
     /// ```
     ///
-    /// An unqualified reference reads back with no qualifier:
+    /// A reference to the default schema reads back with no qualifier:
     ///
     /// ```rust
     /// # fn main() -> Result<(), sql_traits::errors::Error> {

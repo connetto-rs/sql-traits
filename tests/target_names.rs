@@ -1,11 +1,11 @@
-//! Tests that an object's target reads back exactly as the SQL wrote it.
+//! Tests that an object's target reads back as the name ingestion bound.
 //!
-//! A policy, a trigger, a foreign key and a grant all name a table, and until
-//! now the only way to ask which one was to resolve it. Resolution can refuse,
-//! and it applies this crate's rules rather than the caller's, so a caller that
-//! honours a search path of its own had no route to the name at all and was
-//! forced onto the concrete parser node. These tests pin the unresolved
-//! reading, including the case where resolution fails.
+//! A policy, a trigger, a foreign key and a grant all name a table. Reading
+//! that name applies no resolution and cannot fail, so a caller honouring
+//! rules of its own can resolve it itself. The name carries the qualifier of
+//! the table it reached when the object was created and the quoting the SQL
+//! wrote on the table name. These tests pin that reading, including the case
+//! where resolution fails.
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
@@ -15,13 +15,12 @@ fn parse(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")
 }
 
-/// The scenario from the finding that opened this work, now expressible: the
-/// only `docs` table lives in schema `app`, the schema puts `app` on the search
-/// path, and the policy names `docs` unqualified. The target resolves, and the
-/// reader still hands back the name exactly as the policy wrote it, which is
-/// what a caller applying its own rules needs.
+/// The only `docs` table lives in schema `app`, the schema puts `app` on the
+/// search path, and the policy names `docs` unqualified. The reader hands back
+/// the name qualified with the schema the path reached, which is the table
+/// the policy stays on.
 #[test]
-fn policy_target_reads_back_unqualified_while_resolving_through_the_search_path() {
+fn policy_target_reads_back_bound_to_the_schema_the_search_path_reached() {
     let db = parse(
         "CREATE SCHEMA app;
          SET search_path TO app;
@@ -33,22 +32,18 @@ fn policy_target_reads_back_unqualified_while_resolving_through_the_search_path(
     let target = policy.target_table_name();
     assert_eq!(target.name(), "docs");
     assert!(!target.name_is_quoted());
-    assert_eq!(target.schema(), None, "the policy wrote no qualifier");
-    assert_eq!(target.to_string(), "docs");
+    assert_eq!(target.schema(), Some("app"), "the search path reached app");
+    assert_eq!(target.to_string(), "app.docs");
 
-    // The catalog resolves the very name the policy wrote, without the caller
-    // reassembling the parts or reaching for the concrete parser node.
+    // The bound name resolves in the catalog without the caller reassembling
+    // the parts or reaching for the concrete parser node.
     let resolved = db
         .resolve_target_table(target, IdentifierCase::AsWritten)
         .expect("the name is unambiguous");
-    assert_eq!(
-        resolved.expect("the search path finds it").table_schema(),
-        Some("app"),
-        "the generic resolution walks the search path"
-    );
+    assert_eq!(resolved.expect("the qualified name finds it").table_schema(), Some("app"));
 
-    let table = policy.table(&db).expect("the search path resolves the target");
-    assert_eq!(table.table_schema(), Some("app"), "and it resolves into the schema on the path");
+    let table = policy.table(&db).expect("the bound target resolves");
+    assert_eq!(table.table_schema(), Some("app"));
 }
 
 /// Without the schema on the path, the same policy names a table that cannot
@@ -321,8 +316,8 @@ fn a_generic_catalog_resolves_every_policy_target() {
         [
             // Written qualified and quoted, and the quoting survives the round trip.
             ("app.\"Notes\"".to_string(), Some("app".to_string())),
-            // Written unqualified, carried into `app` by the search path.
-            ("docs".to_string(), Some("app".to_string())),
+            // Written unqualified, bound into `app` by the search path.
+            ("app.docs".to_string(), Some("app".to_string())),
         ]
     );
 }

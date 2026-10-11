@@ -8,7 +8,7 @@ use crate::{
     traits::{DatabaseLike, DocumentationMetadata, Metadata, PolicyLike},
     utils::{
         identifier_resolution::is_public_pseudo_role,
-        object_name::{resolve_required_table, target_name_of_object_name},
+        object_name::{resolve_required_bound_table, target_name_of_object_name},
     },
 };
 
@@ -44,7 +44,7 @@ impl PolicyLike for CreatePolicy {
     where
         Self: 'db,
     {
-        resolve_required_table(&self.table_name, database)
+        resolve_required_bound_table(&self.table_name, database)
     }
 
     fn target_table_name(&self) -> TargetName<'_> {

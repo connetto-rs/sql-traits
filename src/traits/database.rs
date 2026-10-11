@@ -525,8 +525,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// is SQLite's, and [`IdentifierCase::Exact`] folds neither, which is
     /// MySQL with `lower_case_table_names = 0`.
     ///
-    /// This is the counterpart of the readers that hand back a target as
-    /// written, such as [`PolicyLike::target_table_name`]. Unlike
+    /// This is how PostgreSQL reads a name a query writes now. Unlike
     /// [`Self::table_by_target`], this walks the search path, and either
     /// reports an ambiguous name rather than picking a winner: two tables
     /// differing only in case are one name under folding.
@@ -547,13 +546,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// CREATE SCHEMA app;
     /// SET search_path TO app;
     /// CREATE TABLE app.docs (id INT);
-    /// CREATE POLICY docs_policy ON docs USING (true);
     /// ",
     /// )?;
-    /// let policy = db.policies().next().unwrap();
-    /// // The policy wrote no qualifier, and the search path carries it into `app`.
-    /// let table =
-    ///     db.resolve_target_table(policy.target_table_name(), IdentifierCase::AsWritten)?.unwrap();
+    /// // The search path carries the bare name into `app`.
+    /// let table = db
+    ///     .resolve_target_table(TargetName::new("docs", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
     /// assert_eq!(table.table_schema(), Some("app"));
     /// # Ok(())
     /// # }

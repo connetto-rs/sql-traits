@@ -36,13 +36,13 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::IdentifierCase,
+    structs::{IdentifierCase, TargetName},
     traits::{ColumnLike, DQLLike, DatabaseLike, TableLike, ViewLike},
     utils::{
         identifier_resolution::identifiers_match,
         object_name::{
-            object_name_last_part, qualifier_of, render_table_candidate, resolve_object_name,
-            target_name_from_object_name,
+            object_name_last_part, qualifier_of, render_table_candidate, resolve_bound_table,
+            resolve_object_name, target_name_from_object_name,
         },
     },
 };
@@ -126,6 +126,43 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
             frame = entry.parent;
         }
         false
+    }
+
+    /// The base table a written relation name denotes here.
+    ///
+    /// A query handed in by a caller resolves through the session's search
+    /// path. A stored view's definition was bound when the view was created,
+    /// so inside one the name is read as written instead, which keeps it on
+    /// the relation it reached then.
+    fn table(&self, name: &ObjectName) -> Result<Option<&'db DB::Table>, LookupError> {
+        if self.views.is_some() {
+            resolve_bound_table(name, self.database)
+        } else {
+            resolve_object_name(name, self.database)
+        }
+    }
+
+    /// The plain view a written name denotes here, read the way
+    /// [`Self::table`] reads a table.
+    fn view(&self, target: TargetName<'_>) -> Result<Option<&'db DB::View>, LookupError> {
+        if self.views.is_some() {
+            self.database.view_by_target(target, IdentifierCase::AsWritten)
+        } else {
+            self.database.resolve_target_view(target, IdentifierCase::AsWritten)
+        }
+    }
+
+    /// The materialized view a written name denotes here, read the way
+    /// [`Self::table`] reads a table.
+    fn materialized_view(
+        &self,
+        target: TargetName<'_>,
+    ) -> Result<Option<&'db DB::MaterializedView>, LookupError> {
+        if self.views.is_some() {
+            self.database.materialized_view_by_target(target, IdentifierCase::AsWritten)
+        } else {
+            self.database.resolve_target_materialized_view(target, IdentifierCase::AsWritten)
+        }
     }
 }
 
@@ -3481,13 +3518,9 @@ where
     let Some(target) = target_name_from_object_name(name.get()) else {
         return Ok(opaque_factor(OpaqueIdentity::Known { key, schema }));
     };
-    let (view, row_preserving) = if let Some(view) =
-        deriving.database.resolve_target_view(target.clone(), IdentifierCase::AsWritten)?
-    {
+    let (view, row_preserving) = if let Some(view) = deriving.view(target.clone())? {
         (DerivingView::Plain(view), true)
-    } else if let Some(view) =
-        deriving.database.resolve_target_materialized_view(target, IdentifierCase::AsWritten)?
-    {
+    } else if let Some(view) = deriving.materialized_view(target)? {
         (DerivingView::Materialized(view), false)
     } else {
         return Ok(opaque_factor(OpaqueIdentity::Known { key, schema }));
@@ -3834,7 +3867,7 @@ where
         });
     }
     let database = deriving.database;
-    let Some(table) = resolve_object_name(name.get(), database)? else {
+    let Some(table) = deriving.table(name.get())? else {
         return collect_view_factor(name, alias, key, schema, deriving, profile);
     };
     let Some(output_columns) = aliased_output_columns(table, alias, database, profile)? else {

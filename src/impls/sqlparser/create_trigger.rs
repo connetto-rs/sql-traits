@@ -10,7 +10,9 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         last_str,
-        object_name::{object_name_last_part, resolve_required_table, target_name_of_object_name},
+        object_name::{
+            object_name_last_part, resolve_required_bound_table, target_name_of_object_name,
+        },
     },
 };
 
@@ -34,7 +36,7 @@ impl TriggerLike for CreateTrigger {
     where
         Self: 'db,
     {
-        resolve_required_table(&self.table_name, database)
+        resolve_required_bound_table(&self.table_name, database)
     }
 
     #[inline]

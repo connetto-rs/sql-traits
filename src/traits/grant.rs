@@ -143,7 +143,11 @@ pub trait GrantLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// ```
     fn applies_to_public(&self) -> bool;
 
-    /// Returns the table names the grant wrote, exactly as written.
+    /// Returns the table names the grant lists, as ingestion bound them.
+    ///
+    /// Each carries the qualifier of the relation it reached when the grant was
+    /// made, or none for one in the default schema, and keeps the quoting
+    /// written on the relation name.
     ///
     /// A grant states its target in one of two ways, and only one of this
     /// reader and [`Self::target_schema_names`] ever yields: either the grant

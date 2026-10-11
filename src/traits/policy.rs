@@ -49,11 +49,8 @@ pub trait PolicyLike:
     /// ```
     fn name(&self) -> &str;
 
-    /// Returns the table the policy is defined on.
-    ///
-    /// The target is resolved by identifier, honouring both the schema
-    /// qualifier and the quoting of the name as written in the policy
-    /// definition.
+    /// Returns the table the policy is defined on, the one its target reached
+    /// when the policy was created.
     ///
     /// # Errors
     ///
@@ -114,13 +111,13 @@ pub trait PolicyLike:
     where
         Self: 'db;
 
-    /// Returns the table name the policy wrote as its target, exactly as
-    /// written.
+    /// Returns the table name the policy targets, as ingestion bound it.
     ///
-    /// Unlike [`Self::table`] this applies no resolution and cannot fail, so a
-    /// caller with its own resolution rules can read the target and resolve it
-    /// itself. To resolve it the way PostgreSQL does, hand it to
-    /// [`DatabaseLike::resolve_target_table`].
+    /// The name carries the qualifier of the table it reached when the policy
+    /// was created, or none for a table in the default schema, and keeps the
+    /// quoting written on the table name. Unlike [`Self::table`] this applies
+    /// no resolution and cannot fail, so a caller with its own resolution
+    /// rules can read the target and resolve it itself.
     ///
     /// # Example
     ///
@@ -137,11 +134,10 @@ pub trait PolicyLike:
     /// ",
     /// )?;
     /// let policy = db.policies().next().unwrap();
-    /// // The policy wrote no qualifier, and that is what reads back, even
-    /// // though the target resolves into `app` through the search path.
+    /// // The search path carried the bare name into `app` when the policy was made.
     /// let target = policy.target_table_name();
     /// assert_eq!(target.name(), "docs");
-    /// assert_eq!(target.schema(), None);
+    /// assert_eq!(target.schema(), Some("app"));
     /// assert_eq!(policy.table(&db)?.table_schema(), Some("app"));
     /// # Ok(())
     /// # }

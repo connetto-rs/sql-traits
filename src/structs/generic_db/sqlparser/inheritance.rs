@@ -235,7 +235,7 @@ pub(super) fn receives_column_constraint(
 ) -> bool {
     parents_with_kind(child).any(|(kind, name)| {
         option_passes_down(kind, &option.option)
-            && builder.resolve_table_object_name(name).ok().flatten().is_some_and(|parent| {
+            && builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
                 parent.columns.iter().any(|declared| {
                     same_column(&declared.name, written_on)
                         && declared.options.iter().any(|held| is_copy_of_option(option, held))
@@ -257,7 +257,7 @@ pub(super) fn requires_a_value(
     column: &str,
 ) -> bool {
     parents_with_kind(child).any(|(_, name)| {
-        builder.resolve_table_object_name(name).ok().flatten().is_some_and(|parent| {
+        builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
             parent.columns.iter().any(|declared| {
                 super::identifiers_match(
                     declared.name.value.as_str(),
@@ -538,7 +538,7 @@ pub(super) fn receives_constraint(
     held: &TableConstraint,
 ) -> bool {
     parents_with_kind(child).any(|(kind, name)| {
-        builder.resolve_table_object_name(name).ok().flatten().is_some_and(|parent| {
+        builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
             parent
                 .constraints
                 .iter()
@@ -817,6 +817,8 @@ pub(super) fn apply_parents(
     collations: &[super::CreatedCollationMetadata],
     catalog: &super::PostgresCatalog,
 ) -> Result<Inherited, Error> {
+    let child_name = create_table.name.to_string();
+    bind_parents(builder, create_table, &child_name)?;
     let parents: Vec<(ParentKind, ObjectName)> =
         parents_with_kind(create_table).map(|(kind, name)| (kind, name.clone())).collect();
     if parents.is_empty() {
@@ -829,7 +831,7 @@ pub(super) fn apply_parents(
         .filter(|column| super::stored_column_collation_name(column).is_some())
         .map(|column| column.name.clone())
         .collect();
-    let child_name = create_table.name.to_string();
+
     let local: Vec<Ident> = create_table.columns.iter().map(|column| column.name.clone()).collect();
     // The child is not in the stores yet, so the names it introduces itself
     // have to be spoken for before a generated one is built beside them.
@@ -980,18 +982,38 @@ fn parent_owning(
 ) -> Option<String> {
     parents
         .iter()
-        .filter_map(|(_, name)| builder.resolve_table_object_name(name).ok().flatten())
+        .filter_map(|(_, name)| builder.resolve_bound_table_name(name).ok().flatten())
         .find(|parent| parent.columns.iter().any(|held| same_column(&held.name, column)))
         .map(|parent| parent.name.to_string())
 }
 
-/// Resolves one parent name, refusing a table the input never created.
+/// Binds every parent a table being created names to the table it reaches
+/// through the session's path, refusing an absent one.
+fn bind_parents(
+    builder: &ParserDBBuilder,
+    create_table: &mut CreateTable,
+    child_name: &str,
+) -> Result<(), Error> {
+    for parent_name in parent_names_mut(create_table) {
+        let Some(parent) = builder.resolve_table_object_name(parent_name)? else {
+            return Err(Error::ParentTableNotFound {
+                parent_table: parent_name.to_string(),
+                child_table: child_name.to_string(),
+            });
+        };
+        let qualifier = super::stored_qualifier(&parent.name);
+        super::bind_reference(parent_name, qualifier);
+    }
+    Ok(())
+}
+
+/// Resolves one parent name the child already bound.
 fn resolve_parent<'builder>(
     builder: &'builder ParserDBBuilder,
     parent_name: &ObjectName,
     child_name: &str,
 ) -> Result<&'builder CreateTable, Error> {
-    builder.resolve_table_object_name(parent_name)?.ok_or_else(|| {
+    builder.resolve_bound_table_name(parent_name)?.ok_or_else(|| {
         Error::ParentTableNotFound {
             parent_table: parent_name.to_string(),
             child_table: child_name.to_string(),
@@ -1007,6 +1029,6 @@ pub(super) fn is_inherited_column(
     column: &Ident,
 ) -> bool {
     parent_names(table)
-        .filter_map(|name| builder.resolve_table_object_name(name).ok().flatten())
+        .filter_map(|name| builder.resolve_bound_table_name(name).ok().flatten())
         .any(|parent| parent.columns.iter().any(|held| same_column(&held.name, column)))
 }

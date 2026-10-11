@@ -21,12 +21,13 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     AlterTableOperation, CreateView, Ident, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, Visit, Visitor,
+    RenameTableNameKind, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use super::{
-    ParserDBBuilder, SchemaQualifier, object_name_last_identifier, relation_name_holder,
-    require_named_in_catalog, search_path_qualifier, validate_relation_schema,
+    ParserDBBuilder, SchemaQualifier, bind_reference, object_name_last_identifier,
+    relation_name_holder, require_named_in_catalog, search_path_qualifier,
+    validate_relation_schema,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -35,8 +36,8 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         object_name::{
-            RelationKey, object_name_last_part, qualifier_of, stored_table_key, stored_view_key,
-            target_key, target_name_from_object_name,
+            RelationKey, object_name_last_part, qualifier_of, stored_view_key, target_key,
+            target_name_from_object_name,
         },
     },
 };
@@ -73,6 +74,8 @@ pub(super) fn create_view(
     if !node.materialized && node.if_not_exists {
         return Err(Error::ViewIfNotExistsUnsupported { view_name: rendered_name(&node.name) });
     }
+
+    bind_definition(&builder, &mut node.query);
 
     // Where the view lands is decided before the name is read, so the
     // name-pool checks compare the schema it truly creates in rather than the
@@ -490,115 +493,157 @@ pub(super) fn view_owner_names(builder: &ParserDBBuilder) -> Vec<String> {
         .collect()
 }
 
-/// Collects the relations a query reads and the names it binds itself.
+/// The `WITH` names visible where a walk over a query stands, scoped as
+/// PostgreSQL scopes them.
 ///
-/// A `WITH` item's name is not a stored relation, and a reference to it reads
-/// that item rather than anything in the schema, so a definition writing
-/// `WITH t AS (...) SELECT ... FROM t` does not read a table called `t`.
-/// PostgreSQL agrees: dropping such a table is allowed and the view keeps
-/// working.
+/// An item's body sees the items before it, or every item under `WITH
+/// RECURSIVE`, and the rest of the query sees them all, so a body naming its
+/// own item reads the outer relation unless the `WITH` is recursive.
+#[derive(Default)]
+struct WithScopes {
+    frames: Vec<WithFrame>,
+}
+
+/// The items one `WITH` clause binds.
+struct WithFrame {
+    /// The query carrying the clause, compared by address.
+    owner: *const Query,
+    /// Each item's body, compared by address.
+    bodies: Vec<*const Query>,
+    /// Each item's name.
+    names: Vec<Ident>,
+    /// Whether the clause is `WITH RECURSIVE`.
+    recursive: bool,
+    /// How many items, from the first, the walk currently sees.
+    visible: usize,
+}
+
+impl WithScopes {
+    fn enter(&mut self, query: &Query) {
+        if let Some(frame) = self.frames.last_mut()
+            && let Some(position) = frame.bodies.iter().position(|body| core::ptr::eq(*body, query))
+        {
+            frame.visible = if frame.recursive { frame.names.len() } else { position };
+        }
+        if let Some(with) = &query.with {
+            self.frames.push(WithFrame {
+                owner: query,
+                bodies: with.cte_tables.iter().map(|cte| &raw const *cte.query).collect(),
+                names: with.cte_tables.iter().map(|cte| cte.alias.name.clone()).collect(),
+                recursive: with.recursive,
+                visible: 0,
+            });
+        }
+    }
+
+    fn leave(&mut self, query: &Query) {
+        if self.frames.last().is_some_and(|frame| core::ptr::eq(frame.owner, query)) {
+            self.frames.pop();
+        }
+        if let Some(frame) = self.frames.last_mut()
+            && !frame.recursive
+            && let Some(position) = frame.bodies.iter().position(|body| core::ptr::eq(*body, query))
+        {
+            frame.visible = position + 1;
+        }
+    }
+
+    /// Whether `name` reads a visible `WITH` item rather than a stored
+    /// relation.
+    fn reads_item(&self, name: &ObjectName) -> bool {
+        let [ObjectNamePart::Identifier(written)] = name.0.as_slice() else {
+            return false;
+        };
+        self.frames.iter().any(|frame| {
+            frame.names[..frame.visible].iter().any(|item| {
+                identifiers_match(
+                    item.value.as_str(),
+                    item.quote_style.is_some(),
+                    written.value.as_str(),
+                    written.quote_style.is_some(),
+                )
+            })
+        })
+    }
+}
+
+/// Binds every stored relation a definition reads.
+struct DefinitionBinder<'builder> {
+    builder: &'builder ParserDBBuilder,
+    scopes: WithScopes,
+}
+
+impl VisitorMut for DefinitionBinder<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        self.scopes.enter(query);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        self.scopes.leave(query);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Table { name, args: None, .. } = factor
+            && !self.scopes.reads_item(name)
+            && let Some(bound) = self.builder.bound_relation(name)
+        {
+            bind_reference(name, bound.qualifier);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Binds every stored relation a view definition reads to the relation it
+/// reaches now.
+fn bind_definition(builder: &ParserDBBuilder, query: &mut Query) {
+    let mut binder = DefinitionBinder { builder, scopes: WithScopes::default() };
+    let walk = query.visit(&mut binder);
+    debug_assert!(walk.is_continue(), "the binder never breaks");
+}
+
+/// Collects the identity of every stored relation a bound definition reads.
 struct RelationsRead {
-    /// Every name used in a relation position.
-    referenced: Vec<ObjectName>,
-    /// Every name a `WITH` clause binds, at any depth.
-    bound: Vec<Ident>,
+    scopes: WithScopes,
+    read: Vec<RelationKey>,
 }
 
 impl Visitor for RelationsRead {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-        if let Some(with) = &query.with {
-            self.bound.extend(with.cte_tables.iter().map(|cte| cte.alias.name.clone()));
-        }
+        self.scopes.enter(query);
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
-        self.referenced.push(relation.clone());
+    fn post_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        self.scopes.leave(query);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Table { name, args: None, .. } = factor
+            && !self.scopes.reads_item(name)
+            && let Some(target) = target_name_from_object_name(name)
+        {
+            self.read.push(target_key(&target, IdentifierCase::AsWritten));
+        }
         ControlFlow::Continue(())
     }
 }
 
 /// The normalized identity of every relation a view's definition reads.
 ///
-/// A bare name the definition binds as a `WITH` item is left out, since a
-/// reference to it reads that item. The names are collected across the whole
-/// definition rather than per scope, so a bare name matching a `WITH` item
-/// bound in a sibling scope is also left out. That errs towards missing a
-/// dependency rather than inventing one, which is the safe direction: a
-/// dependency this misses leaves a drop accepted that PostgreSQL would refuse,
-/// where the opposite would refuse a drop PostgreSQL accepts.
-///
-/// A bare name resolves against the schema the view itself sits in and then
-/// the default schema, which is the path the view's own creation walked: a
-/// view created bare while the path selected `s` landed in `s`, and a bare
-/// name in its definition reached `s` first too. The candidate that some
-/// stored relation answers is the one taken, so a definition reading the
-/// default schema because its own held nothing resolves there instead.
-fn relations_read_by<V: ViewLike>(builder: &ParserDBBuilder, view: &V) -> Vec<RelationKey> {
-    let mut visitor = RelationsRead { referenced: Vec::new(), bound: Vec::new() };
+/// Ingestion bound each name to the relation it reached, so a bare one means
+/// the default schema.
+fn relations_read_by<V: ViewLike>(view: &V) -> Vec<RelationKey> {
+    let mut visitor = RelationsRead { scopes: WithScopes::default(), read: Vec::new() };
     let walk = view.definition().visit(&mut visitor);
     debug_assert!(walk.is_continue(), "the visitor never breaks");
-
-    let own_schema = view.view_schema().map(|schema| {
-        crate::utils::identifier_resolution::normalize_identifier(
-            schema,
-            view.view_schema_is_quoted(),
-        )
-        .into_owned()
-    });
-
-    visitor
-        .referenced
-        .iter()
-        .filter(|name| {
-            // Only a one-part name can be a `WITH` item's.
-            name.0.len() != 1
-                || !object_name_last_identifier(name).is_some_and(|referenced| {
-                    visitor.bound.iter().any(|bound| {
-                        crate::utils::identifier_resolution::identifiers_match(
-                            bound.value.as_str(),
-                            bound.quote_style.is_some(),
-                            referenced.value.as_str(),
-                            referenced.quote_style.is_some(),
-                        )
-                    })
-                })
-        })
-        .filter_map(|name| {
-            let target = target_name_from_object_name(name)?;
-            let written = target_key(&target, IdentifierCase::AsWritten);
-            if target.schema().is_some() {
-                return Some(written);
-            }
-            // `target_key` already read a bare name as the default schema's,
-            // so that spelling is the second candidate.
-            let in_own_schema = own_schema
-                .as_ref()
-                .map(|schema| RelationKey { schema: schema.clone(), name: written.name.clone() });
-            match in_own_schema {
-                Some(candidate) if relation_key_is_held(builder, &candidate) => Some(candidate),
-                _ => Some(written),
-            }
-        })
-        .collect()
-}
-
-/// Whether any stored relation answers `key`.
-fn relation_key_is_held(builder: &ParserDBBuilder, key: &RelationKey) -> bool {
-    builder
-        .tables()
-        .iter()
-        .any(|(table, _)| stored_table_key(table.as_ref(), IdentifierCase::AsWritten) == *key)
-        || builder
-            .views()
-            .iter()
-            .any(|(view, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == *key)
-        || builder
-            .materialized_views()
-            .iter()
-            .any(|(view, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == *key)
+    visitor.read
 }
 
 /// Every view reading the relation `key` names, and every view reading one of
@@ -622,14 +667,14 @@ pub(super) fn dependent_views(
             (
                 ObjectKind::View,
                 stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
-                relations_read_by(builder, view.as_ref()),
+                relations_read_by(view.as_ref()),
             )
         })
         .chain(builder.materialized_views().iter().map(|(view, _)| {
             (
                 ObjectKind::MaterializedView,
                 stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
-                relations_read_by(builder, view.as_ref()),
+                relations_read_by(view.as_ref()),
             )
         }))
         .collect();

@@ -446,6 +446,19 @@ pub(crate) fn table_matches_key<T: TableLike>(
     key.name == stored_name_key(table, case) && key.schema == stored_schema_key(table, case)
 }
 
+/// Returns whether a stored view answers a key normalized under `case`,
+/// normalizing only the stored side.
+pub(crate) fn view_matches_key<V: ViewLike>(
+    view: &V,
+    key: &RelationKey,
+    case: IdentifierCase,
+) -> bool {
+    key.name == case.compared_form(view.view_name(), view.view_name_is_quoted())
+        && view.view_schema().map_or(key.schema == "public", |schema| {
+            key.schema == case.compared_form(schema, view.view_schema_is_quoted())
+        })
+}
+
 /// Reference matcher used by tests: compares a table against a written target
 /// without precomputing a key.
 #[cfg(test)]
@@ -779,6 +792,45 @@ pub(crate) fn resolve_required_table<'db, DB: DatabaseLike>(
     database: &'db DB,
 ) -> Result<&'db DB::Table, LookupError> {
     resolve_object_name(object_name, database)?
+        .ok_or_else(|| LookupError::TableNotFound { object_name: object_name.to_string() })
+}
+
+/// Resolves a reference a stored object carries to the base table it names.
+///
+/// Ingestion rewrites every stored reference to the qualifier of the relation
+/// it reached when the object was created, leaving it bare only for a
+/// relation stored bare. So the name is read as written, with no search path,
+/// and a later path does not move it, exactly as PostgreSQL keeps the object
+/// it bound.
+///
+/// # Errors
+///
+/// Returns an error when the object name is malformed for table lookup, or when
+/// the lookup is ambiguous.
+pub(crate) fn resolve_bound_table<'db, DB: DatabaseLike>(
+    object_name: &ObjectName,
+    database: &'db DB,
+) -> Result<Option<&'db DB::Table>, LookupError> {
+    let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
+    database.table_by_target(
+        target_name_of_idents(schema_ident, table_ident),
+        IdentifierCase::AsWritten,
+    )
+}
+
+/// Resolves a reference a stored object carries to the base table it cannot
+/// exist without, as [`resolve_bound_table`] does.
+///
+/// # Errors
+///
+/// Returns [`LookupError::TableNotFound`] when no table matches, and an error
+/// when the object name is malformed for table lookup or the lookup is
+/// ambiguous.
+pub(crate) fn resolve_required_bound_table<'db, DB: DatabaseLike>(
+    object_name: &ObjectName,
+    database: &'db DB,
+) -> Result<&'db DB::Table, LookupError> {
+    resolve_bound_table(object_name, database)?
         .ok_or_else(|| LookupError::TableNotFound { object_name: object_name.to_string() })
 }
 

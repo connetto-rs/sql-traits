@@ -55,11 +55,13 @@ use crate::{
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
         object_name::{
-            Qualifier, object_name_identifiers, object_name_last_part, overqualified_object_name,
-            qualifier_of, require_local_object_name, require_static_object_name,
-            resolve_table_object_name_in_iter, resolve_table_object_name_on_search_path_in_iter,
-            resolve_view_on_search_path_in_iter, stored_table_key, table_matches_object_name,
-            target_name_of_idents, target_name_of_object_name,
+            Qualifier, RelationKey, object_name_identifiers, object_name_last_part,
+            overqualified_object_name, qualifier_of, require_local_object_name,
+            require_static_object_name, resolve_table_object_name_in_iter,
+            resolve_table_object_name_on_search_path_in_iter,
+            resolve_target_on_search_path_in_iter, resolve_view_on_search_path_in_iter,
+            stored_table_key, table_matches_key, table_matches_object_name, target_name_of_idents,
+            target_name_of_object_name, view_matches_key,
         },
     },
 };
@@ -1371,6 +1373,98 @@ impl ParserDBBuilder {
             |_| false,
         )
     }
+
+    /// Whether any table, view or materialized view is stored under `key`.
+    fn relation_key_is_held(&self, key: &RelationKey, case: IdentifierCase) -> bool {
+        self.tables().iter().any(|(table, _)| table_matches_key(table.as_ref(), key, case))
+            || self.views().iter().any(|(view, _)| view_matches_key(view.as_ref(), key, case))
+            || self
+                .materialized_views()
+                .iter()
+                .any(|(view, _)| view_matches_key(view.as_ref(), key, case))
+    }
+
+    /// Binds every relation a grant or revoke names to the one it reaches
+    /// through the session's path, leaving a name reaching none as written.
+    fn bind_access_targets(&self, objects: &mut Option<GrantObjects>) {
+        let Some(GrantObjects::Tables(names)) = objects else {
+            return;
+        };
+        for name in names {
+            if let Some(bound) = self.bound_relation(name) {
+                bind_reference(name, bound.qualifier);
+            }
+        }
+    }
+
+    /// Binds a reference to the table it reaches through the session's path,
+    /// leaving one that reaches none as written.
+    fn bind_table_reference(&self, reference: &mut ObjectName) {
+        if let Ok(Some(table)) = self.resolve_table_object_name(reference) {
+            let qualifier = stored_qualifier(&table.name);
+            bind_reference(reference, qualifier);
+        }
+    }
+
+    /// Resolves a reference a stored node carries, which ingestion bound, so
+    /// a bare one means the default schema and no path is walked.
+    fn resolve_bound_table_name(
+        &self,
+        object_name: &ObjectName,
+    ) -> Result<Option<&CreateTable>, LookupError> {
+        resolve_table_object_name_in_iter(
+            self.tables().iter().map(|(table, _)| table.as_ref()),
+            object_name,
+            self.identifier_case(),
+        )
+    }
+
+    /// The table, view or materialized view a reference reaches through the
+    /// session's path, the first schema holding the name under any kind ending
+    /// the walk.
+    fn bound_relation(&self, reference: &ObjectName) -> Option<BoundRelation> {
+        let (schema_ident, name_ident) = object_name_identifiers(reference).ok()?;
+        let target = target_name_of_idents(schema_ident, name_ident);
+        let case = self.identifier_case();
+        let claimed = |key: &RelationKey| self.relation_key_is_held(key, case);
+        if let Some(table) = resolve_target_on_search_path_in_iter(
+            self.tables().iter().map(|(table, _)| table.as_ref()),
+            &target,
+            self.search_path(),
+            case,
+            claimed,
+        )
+        .ok()?
+        {
+            return Some(BoundRelation { qualifier: stored_qualifier(&table.name) });
+        }
+        if let Some(view) = resolve_view_on_search_path_in_iter(
+            self.views().iter().map(|(view, _)| view.as_ref()),
+            &target,
+            self.search_path(),
+            case,
+            claimed,
+        )
+        .ok()?
+        {
+            return Some(BoundRelation { qualifier: stored_view_qualifier(view) });
+        }
+        resolve_view_on_search_path_in_iter(
+            self.materialized_views().iter().map(|(view, _)| view.as_ref()),
+            &target,
+            self.search_path(),
+            case,
+            claimed,
+        )
+        .ok()?
+        .map(|view| BoundRelation { qualifier: stored_view_qualifier(view) })
+    }
+}
+
+/// The relation a reference reached when the statement holding it ran.
+struct BoundRelation {
+    /// Qualifier that relation is stored under.
+    qualifier: Option<Ident>,
 }
 
 /// A type alias for the result of processing check constraints.
@@ -2701,6 +2795,64 @@ fn qualify_on_search_path(
     Ok(())
 }
 
+/// Replaces a reference's qualifier, keeping the identifier it names as
+/// written.
+fn bind_reference(reference: &mut ObjectName, qualifier: Option<Ident>) {
+    let Some(name) = reference.0.pop() else {
+        return;
+    };
+    reference.0.clear();
+    reference.0.extend(qualifier.map(ObjectNamePart::Identifier));
+    reference.0.push(name);
+}
+
+/// The qualifier a relation name is stored under, if any.
+fn stored_qualifier(name: &ObjectName) -> Option<Ident> {
+    match name.0.as_slice() {
+        [.., ObjectNamePart::Identifier(schema), _] => Some(schema.clone()),
+        _ => None,
+    }
+}
+
+/// The qualifier a view is stored under, if any.
+fn stored_view_qualifier<V: ViewLike>(view: &V) -> Option<Ident> {
+    view.view_schema().map(|schema| {
+        if view.view_schema_is_quoted() {
+            Ident::with_quote('"', schema)
+        } else {
+            Ident::new(schema)
+        }
+    })
+}
+
+/// Binds every foreign key target in `node` to the table it reaches now, the
+/// node itself included, leaving one reaching nothing for the key check to
+/// refuse.
+fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
+    let qualifiers: Vec<Option<Option<Ident>>> = foreign_keys_of(node)
+        .map(|foreign_key| {
+            resolve_table_object_name_on_search_path_in_iter(
+                builder
+                    .tables()
+                    .iter()
+                    .map(|(table, _)| table.as_ref())
+                    .chain(core::iter::once(&*node)),
+                &foreign_key.foreign_table,
+                builder.search_path(),
+                builder.identifier_case(),
+            )
+            .ok()
+            .flatten()
+            .map(|table| stored_qualifier(&table.name))
+        })
+        .collect();
+    for (foreign_key, qualifier) in foreign_keys_of_mut(node).zip(qualifiers) {
+        if let Some(qualifier) = qualifier {
+            bind_reference(&mut foreign_key.foreign_table, qualifier);
+        }
+    }
+}
+
 /// The schema qualifier the search path selects for a relation name written
 /// without one, or [`None`] when the path selects the default schema, which
 /// this model leaves unwritten.
@@ -3760,14 +3912,14 @@ impl ParserDB {
     /// Returns an error when the object name is malformed for relation lookup,
     /// or when lookup is ambiguous.
     fn resolve_grant_view(&self, object_name: &ObjectName) -> Result<Option<()>, LookupError> {
+        use crate::traits::DatabaseLike as _;
+
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let target = target_name_of_idents(schema_ident, name_ident);
-        if self.resolve_target_view_on_path(&target, IdentifierCase::AsWritten)?.is_some() {
+        if self.view_by_target(target.clone(), IdentifierCase::AsWritten)?.is_some() {
             return Ok(Some(()));
         }
-        Ok(self
-            .resolve_target_materialized_view_on_path(&target, IdentifierCase::AsWritten)?
-            .map(|_| ()))
+        Ok(self.materialized_view_by_target(target, IdentifierCase::AsWritten)?.map(|_| ()))
     }
 
     /// Reports the roles and table targets that this database's access control
@@ -3778,13 +3930,12 @@ impl ParserDB {
     /// too.
     ///
     /// An [`AccessResolution::ClosedWorld`] parse rejects such a reference on
-    /// the spot, so one surfaces here either because the database was parsed
-    /// under [`AccessResolution::OpenWorld`], or because a later statement
-    /// moved an object out from under a grant that names it. The walk is
-    /// order-insensitive, running against the fully ingested database, so a
-    /// grant preceding the `CREATE ROLE` it names resolves. An unqualified
-    /// table target resolves through the database's search path, the final
-    /// one the input set, which is the same walk the reading accessors apply.
+    /// the spot, so one surfaces here because the database was parsed under
+    /// [`AccessResolution::OpenWorld`]. The walk is order-insensitive, running
+    /// against the fully ingested database, so a grant preceding the `CREATE
+    /// ROLE` it names resolves. A table target is read as ingestion bound it,
+    /// which is how the reading accessors read it, so one the grant reached
+    /// keeps resolving whatever the input does to the search path afterwards.
     /// Each distinct reference is reported once, in a deterministic order.
     ///
     /// # Errors
@@ -3846,7 +3997,7 @@ impl ParserDB {
                 for table_obj in tables {
                     // A view is as legal a target as a table, so only a name
                     // no relation holds is unresolved.
-                    if self.resolve_table_object_name_on_search_path(table_obj)?.is_none()
+                    if self.resolve_table_object_name(table_obj)?.is_none()
                         && self.resolve_grant_view(table_obj)?.is_none()
                     {
                         unresolved.insert(UnresolvedAccessReference::GrantTable(table_obj));
@@ -4664,12 +4815,15 @@ impl ParserDB {
         builder: ParserDBBuilder,
         table_name: &ObjectName,
         scope: AlterTableScope,
-        constraint: TableConstraint,
+        mut constraint: TableConstraint,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
+        if let TableConstraint::ForeignKey(foreign_key) = &mut constraint {
+            builder.bind_table_reference(&mut foreign_key.foreign_table);
+        }
 
         let mut builder = Self::alter_table_constraints(builder, &stored, |_, constraints| {
             constraints.push(constraint.clone());
@@ -6064,7 +6218,7 @@ impl ParserDB {
                         table_metadata.replace_index(&stored, &renamed);
                     }
                 }
-                Statement::CreateTrigger(create_trigger) => {
+                Statement::CreateTrigger(mut create_trigger) => {
                     require_named(&create_trigger.name, crate::errors::ObjectKind::Trigger)?;
                     let table_name = last_str(&create_trigger.table_name);
                     let table_exists =
@@ -6117,6 +6271,11 @@ impl ParserDB {
                         }
                     }
 
+                    builder.bind_table_reference(&mut create_trigger.table_name);
+                    if let Some(referenced) = &mut create_trigger.referenced_table_name {
+                        builder.bind_table_reference(referenced);
+                    }
+
                     // A trigger name is unique per table, so the same name on
                     // another table is fine and the match takes both. A
                     // `CREATE OR REPLACE` replaces the stored node rather than
@@ -6135,7 +6294,7 @@ impl ParserDB {
                         (Some(_), false) => {
                             return Err(crate::errors::Error::TriggerAlreadyExists {
                                 trigger_name: last_str(&create_trigger.name).to_string(),
-                                table_name: table_name.to_string(),
+                                table_name: last_str(&create_trigger.table_name).to_string(),
                             });
                         }
                         (Some(position), true) => {
@@ -6146,7 +6305,10 @@ impl ParserDB {
 
                     builder = builder.add_trigger(Arc::new(create_trigger), ());
                 }
-                Statement::DropTrigger(drop_trigger) => {
+                Statement::DropTrigger(mut drop_trigger) => {
+                    if let Some(table_name) = &mut drop_trigger.table_name {
+                        builder.bind_table_reference(table_name);
+                    }
                     let trigger_name = last_str(&drop_trigger.trigger_name);
 
                     // A trigger belongs to the table it was created on, so the
@@ -6174,7 +6336,8 @@ impl ParserDB {
 
                     builder.triggers_mut().remove(position);
                 }
-                Statement::DropPolicy(drop_policy) => {
+                Statement::DropPolicy(mut drop_policy) => {
+                    builder.bind_table_reference(&mut drop_policy.table_name);
                     let Some(index) = builder.policies().iter().position(|(policy, _)| {
                         idents_match(&policy.name, &drop_policy.name)
                             && target_tables_match(
@@ -6360,10 +6523,11 @@ impl ParserDB {
                         });
                     }
                 }
-                Statement::CreateIndex(create_index) => {
+                Statement::CreateIndex(mut create_index) => {
                     if let Some(index_name) = create_index.name.as_ref() {
                         require_named(index_name, crate::errors::ObjectKind::Index)?;
                     }
+                    builder.bind_table_reference(&mut create_index.table_name);
                     let if_not_exists = create_index.if_not_exists;
                     let (index, metadata) = Self::process_create_index(create_index, &builder)?;
                     let resolved_table = index.table();
@@ -6787,6 +6951,7 @@ impl ParserDB {
                     )?;
                     refuse_no_inherit_check_on_partitioned(&create_table)?;
                     record_implied_not_null(&mut create_table);
+                    bind_foreign_key_targets(&builder, &mut create_table);
                     let mut metadata = TableMetadata::default();
                     metadata.set_inherited_column_names(inherited.columns);
                     metadata.set_inherited_constraints(inherited.constraints);
@@ -6802,7 +6967,7 @@ impl ParserDB {
                 Statement::CreateView(create_view) => {
                     builder = views::create_view(builder, create_view)?;
                 }
-                Statement::CreatePolicy(policy) => {
+                Statement::CreatePolicy(mut policy) => {
                     require_named(&policy.table_name, crate::errors::ObjectKind::Table)?;
                     if access_resolution == AccessResolution::ClosedWorld {
                         validate_policy_roles(
@@ -6833,6 +6998,7 @@ impl ParserDB {
                             policy_name: policy.name.value.clone(),
                         });
                     }
+                    builder.bind_table_reference(&mut policy.table_name);
 
                     // A policy name is unique per table, whatever command the
                     // policy is declared `FOR`. Matched the way `DROP POLICY`
@@ -6967,7 +7133,7 @@ impl ParserDB {
                         builder = builder.add_schema(Arc::new(schema), ());
                     }
                 }
-                Statement::Grant(grant) => {
+                Statement::Grant(mut grant) => {
                     // Every name the statement carries first, including the
                     // schemas of a blanket grant, since a grant recorded
                     // against a name nothing can read covers nothing and says
@@ -6994,11 +7160,12 @@ impl ParserDB {
                         &path,
                         builder.identifier_case(),
                     )?;
+                    builder.bind_access_targets(&mut grant.objects);
 
                     builder = builder.add_table_grant(Arc::new(grant.clone()), ());
                     builder = builder.add_column_grant(Arc::new(grant), ());
                 }
-                Statement::Revoke(revoke) => {
+                Statement::Revoke(mut revoke) => {
                     require_static_access_names(revoke.objects.as_ref())?;
                     // A revoke naming no recorded grant is a no-op, as it is in
                     // the database.
@@ -7020,6 +7187,7 @@ impl ParserDB {
                         &path,
                         builder.identifier_case(),
                     )?;
+                    builder.bind_access_targets(&mut revoke.objects);
 
                     let unsupported =
                         apply_revoke_to_grant_store(builder.table_grants_mut(), &revoke).or_else(
@@ -7199,7 +7367,8 @@ impl ParserDB {
                         | AlterFunctionOperation::DependsOnExtension { .. } => {}
                     }
                 }
-                Statement::AlterPolicy(AlterPolicy { name, table_name, operation }) => {
+                Statement::AlterPolicy(AlterPolicy { name, mut table_name, operation }) => {
+                    builder.bind_table_reference(&mut table_name);
                     let Some(index) = builder.policies().iter().position(|(policy, _)| {
                         idents_match(&policy.name, &name)
                             && target_tables_match(

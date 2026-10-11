@@ -24,7 +24,7 @@ use crate::{
             SessionPrincipal, identifiers_match, is_public_pseudo_role, session_principal,
         },
         object_name::{
-            object_name_identifiers, object_name_last_part, resolve_object_name,
+            object_name_identifiers, object_name_last_part, resolve_bound_table,
             resolve_table_object_name_on_search_path_in_iter, table_matches_object_name,
             target_name_from_object_name,
         },
@@ -656,8 +656,8 @@ impl GrantLike for Grant {
     }
 }
 
-/// Resolves each table a grant names through the database's search path, the
-/// same way the read did, so a bare name reaches the same table here as there.
+/// Resolves each table a grant names as ingestion bound it, so a name keeps
+/// reaching the table it reached when the grant was made.
 fn granted_tables<'a>(
     grant: &'a Grant,
     database: &'a ParserDB,
@@ -666,7 +666,7 @@ fn granted_tables<'a>(
         Some(GrantObjects::Tables(names)) => {
             names
                 .iter()
-                .filter_map(|name| resolve_object_name(name, database).ok().flatten())
+                .filter_map(|name| resolve_bound_table(name, database).ok().flatten())
                 .collect()
         }
         Some(GrantObjects::AllTablesInSchema { schemas }) => {
@@ -726,22 +726,22 @@ fn granted_relations<'a>(
     }
 }
 
-/// Resolves one written name to whichever relation kind holds it.
+/// Resolves one bound name to whichever relation kind holds it.
 fn resolve_relation_name<'a>(
     name: &ObjectName,
     database: &'a ParserDB,
 ) -> Option<GrantRelation<'a, ParserDB>> {
-    if let Some(table) = resolve_object_name(name, database).ok().flatten() {
+    if let Some(table) = resolve_bound_table(name, database).ok().flatten() {
         return Some(GrantRelation::Table(table));
     }
     let target = target_name_from_object_name(name)?;
     if let Some(view) =
-        database.resolve_target_view(target.clone(), IdentifierCase::AsWritten).ok().flatten()
+        database.view_by_target(target.clone(), IdentifierCase::AsWritten).ok().flatten()
     {
         return Some(GrantRelation::View(view));
     }
     database
-        .resolve_target_materialized_view(target, IdentifierCase::AsWritten)
+        .materialized_view_by_target(target, IdentifierCase::AsWritten)
         .ok()
         .flatten()
         .map(GrantRelation::MaterializedView)

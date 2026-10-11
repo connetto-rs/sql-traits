@@ -9,7 +9,7 @@ use crate::{
     errors::LookupError,
     structs::{ParserDB, TableAttribute, TargetName},
     traits::{ForeignKeyLike, Metadata, database::DatabaseLike, table::TableLike},
-    utils::object_name::{resolve_required_table, target_name_of_object_name},
+    utils::object_name::{resolve_required_bound_table, target_name_of_object_name},
 };
 
 impl Metadata for TableAttribute<CreateTable, ForeignKeyConstraint> {
@@ -35,15 +35,14 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
         self.table()
     }
 
-    /// Resolves through the same path the read resolved against, so the
-    /// accessor never answers with a different table than the one the read
-    /// accepted. Matching on the name alone, ignoring the schema, was the
-    /// previous behaviour and picked whichever same-named table came first.
+    /// Reads the target as ingestion bound it, the table the name reached
+    /// when the key was declared, so neither a later search path nor a later
+    /// temporary table of the same name moves it.
     fn referenced_table<'db>(
         &self,
         database: &'db Self::DB,
     ) -> Result<&'db <Self::DB as DatabaseLike>::Table, LookupError> {
-        resolve_required_table(&self.attribute().foreign_table, database)
+        resolve_required_bound_table(&self.attribute().foreign_table, database)
     }
 
     #[inline]

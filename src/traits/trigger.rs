@@ -66,11 +66,8 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// ```
     fn name(&self) -> &str;
 
-    /// Returns the table the trigger is associated with.
-    ///
-    /// The target is resolved by identifier, honouring both the schema
-    /// qualifier and the quoting of the name as written in the trigger
-    /// definition.
+    /// Returns the table the trigger is associated with, the one its target
+    /// reached when the trigger was created.
     ///
     /// # Arguments
     ///
@@ -142,11 +139,12 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     where
         Self: 'db;
 
-    /// Returns the table name the trigger wrote as its target, exactly as
-    /// written.
+    /// Returns the table name the trigger targets, as ingestion bound it.
     ///
-    /// Unlike [`Self::table`] this applies no resolution and cannot fail, so a
-    /// caller with its own resolution rules (a search path, a default schema)
+    /// The name carries the qualifier of the table it reached when the trigger
+    /// was created, or none for a table in the default schema, and keeps the
+    /// quoting written on the table name. Unlike [`Self::table`] this applies
+    /// no resolution and cannot fail, so a caller with its own resolution rules
     /// can read the target and resolve it itself.
     ///
     /// # Example
@@ -177,7 +175,7 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// # }
     /// ```
     ///
-    /// An unqualified target reads back with no qualifier:
+    /// A target in the default schema reads back with no qualifier:
     ///
     /// ```rust
     /// # fn main() -> Result<(), sql_traits::errors::Error> {
