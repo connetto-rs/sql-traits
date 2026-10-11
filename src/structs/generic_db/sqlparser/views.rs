@@ -11,6 +11,10 @@
 //! recorded and the replacing shapes can both be read. A materialized view has
 //! no replace form at all, and a plain view has no `IF NOT EXISTS` form, both
 //! of which the parser accepts and the server rejects outright.
+//!
+//! A view whose definition reads a temporary relation is temporary whatever
+//! the statement wrote, and lands in `pg_temp`. A materialized view may not
+//! read one at all.
 
 use alloc::{
     string::{String, ToString},
@@ -25,9 +29,8 @@ use sqlparser::ast::{
 };
 
 use super::{
-    ParserDBBuilder, SchemaQualifier, bind_reference, object_name_last_identifier,
-    relation_name_holder, require_named_in_catalog, search_path_qualifier,
-    validate_relation_schema,
+    ParserDBBuilder, SchemaQualifier, bind_reference, object_name_last_identifier, place_relation,
+    relation_name_holder, require_named_in_catalog,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -36,8 +39,7 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         object_name::{
-            RelationKey, object_name_last_part, qualifier_of, stored_view_key, target_key,
-            target_name_from_object_name,
+            RelationKey, qualifier_of, stored_view_key, target_key, target_name_from_object_name,
         },
     },
 };
@@ -56,9 +58,11 @@ fn view_schema_qualifier(name: &ObjectName) -> SchemaQualifier<'_> {
 ///
 /// # Errors
 ///
-/// Refuses the two spellings the parser accepts and PostgreSQL does not, a
-/// name another relation in the schema already holds, a schema the input never
-/// creates, and a replacement that renames or drops an output column.
+/// Refuses the spellings the parser accepts and PostgreSQL does not, a name
+/// another relation in the schema already holds, a schema the input never
+/// creates, a temporary view outside the temporary schema, a materialized view
+/// reading a temporary relation, and a replacement that renames or drops an
+/// output column.
 pub(super) fn create_view(
     mut builder: ParserDBBuilder,
     mut node: CreateView,
@@ -71,40 +75,35 @@ pub(super) fn create_view(
             view_name: rendered_name(&node.name),
         });
     }
+    if node.materialized && node.temporary {
+        return Err(Error::TemporaryMaterializedView { view_name: rendered_name(&node.name) });
+    }
     if !node.materialized && node.if_not_exists {
         return Err(Error::ViewIfNotExistsUnsupported { view_name: rendered_name(&node.name) });
     }
 
-    bind_definition(&builder, &mut node.query);
-
-    // Where the view lands is decided before the name is read, so the
-    // name-pool checks compare the schema it truly creates in rather than the
-    // one the statement spelled. A temporary view goes to a schema private to
-    // the session, which the path never names.
-    if !node.temporary
-        && view_schema_qualifier(&node.name).is_none()
-        && let Some(qualifier) =
-            search_path_qualifier(&builder, kind, name_of(&node.name).unwrap_or_default())?
+    // A view reading a temporary relation is temporary whatever it wrote.
+    let temporary_read = bind_definition(&builder, &mut node.query);
+    let promoted = temporary_read.is_some();
+    if node.materialized
+        && let Some(relation_name) = temporary_read
     {
-        node.name.0.insert(0, ObjectNamePart::Identifier(qualifier));
+        return Err(Error::MaterializedViewReadsTemporaryRelation {
+            view_name: rendered_name(&node.name),
+            relation_name,
+        });
     }
-    validate_relation_schema(
-        &builder,
-        view_schema_qualifier(&node.name),
-        kind,
-        name_of(&node.name).unwrap_or_default(),
-    )?;
+    node.temporary = place_relation(&builder, &mut node.name, node.temporary || promoted, kind)?;
 
     let schema = view_schema_qualifier(&node.name);
     let Some(name_ident) = object_name_last_identifier(&node.name) else {
         return Err(Error::UnnamedObject { object_kind: kind });
     };
 
-    // A replacement takes the recorded definition's place, so it is checked
-    // against that definition and then removed before the name-pool check,
-    // which would otherwise see the view being replaced as a collision.
+    // Removed before the name-pool check, which would see the replaced view as
+    // a collision.
     if node.or_replace
-        && let Some(position) = plain_view_position(&builder, &node.name)
+        && let Some(position) = stored_view_position(&builder, &node.name)
     {
         let (existing, metadata) = builder.views_mut().remove(position);
         check_replacement_columns(existing.as_ref(), &node)?;
@@ -202,9 +201,12 @@ fn plain_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<u
         .position(|(view, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == key)
 }
 
-/// The last part of a view name, without its quoting.
-fn name_of(name: &ObjectName) -> Option<&str> {
-    object_name_last_part(name).map(|(value, _)| value)
+/// The position of the plain view stored under exactly `name`, a bare name
+/// meaning the default schema.
+fn stored_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<usize> {
+    let case = builder.identifier_case();
+    let key = target_key(&target_name_from_object_name(name)?, case);
+    builder.views().iter().position(|(view, _)| stored_view_key(view.as_ref(), case) == key)
 }
 
 /// Drops the views a `DROP VIEW` or `DROP MATERIALIZED VIEW` names.
@@ -230,10 +232,9 @@ pub(super) fn drop_views(
 ) -> Result<ParserDBBuilder, Error> {
     let expected_kind = if materialized { ObjectKind::MaterializedView } else { ObjectKind::View };
     for name in names {
-        let schema = view_schema_qualifier(name);
-        let Some(name_ident) = object_name_last_identifier(name) else {
+        if object_name_last_identifier(name).is_none() {
             return Err(Error::UnnamedObject { object_kind: expected_kind });
-        };
+        }
 
         let position = if materialized {
             materialized_view_position(&builder, name)
@@ -274,7 +275,7 @@ pub(super) fn drop_views(
         // Nothing of the asked-for kind holds the name. Another relation kind
         // holding it is the wrong-spelling case PostgreSQL names, and a name
         // nothing holds is absent.
-        match relation_name_holder(&builder, name_ident, schema) {
+        match builder.relation_reached(name).map(|(kind, _)| kind) {
             Some(actual_kind) => {
                 return Err(Error::RelationKindMismatch {
                     object_name: rendered_name(name),
@@ -317,18 +318,15 @@ pub(super) fn refuse_dropping_view_as_table(
     builder: &ParserDBBuilder,
     name: &ObjectName,
 ) -> Result<(), Error> {
-    let Some(name_ident) = object_name_last_identifier(name) else {
-        return Ok(());
-    };
-    match super::view_name_holder(builder, name_ident, view_schema_qualifier(name)) {
-        Some(actual_kind) => {
+    match builder.relation_reached(name) {
+        Some((actual_kind @ (ObjectKind::View | ObjectKind::MaterializedView), _)) => {
             Err(Error::RelationKindMismatch {
                 object_name: rendered_name(name),
                 expected_kind: ObjectKind::Table,
                 actual_kind,
             })
         }
-        None => Ok(()),
+        _ => Ok(()),
     }
 }
 
@@ -567,10 +565,12 @@ impl WithScopes {
     }
 }
 
-/// Binds every stored relation a definition reads.
+/// Binds every stored relation a definition reads, remembering the first
+/// temporary one.
 struct DefinitionBinder<'builder> {
     builder: &'builder ParserDBBuilder,
     scopes: WithScopes,
+    temporary_read: Option<String>,
 }
 
 impl VisitorMut for DefinitionBinder<'_> {
@@ -591,6 +591,9 @@ impl VisitorMut for DefinitionBinder<'_> {
             && !self.scopes.reads_item(name)
             && let Some(bound) = self.builder.bound_relation(name)
         {
+            if bound.temporary && self.temporary_read.is_none() {
+                self.temporary_read = Some(name.to_string());
+            }
             bind_reference(name, bound.qualifier);
         }
         ControlFlow::Continue(())
@@ -598,11 +601,13 @@ impl VisitorMut for DefinitionBinder<'_> {
 }
 
 /// Binds every stored relation a view definition reads to the relation it
-/// reaches now.
-fn bind_definition(builder: &ParserDBBuilder, query: &mut Query) {
-    let mut binder = DefinitionBinder { builder, scopes: WithScopes::default() };
+/// reaches now, answering the name of the first temporary one.
+fn bind_definition(builder: &ParserDBBuilder, query: &mut Query) -> Option<String> {
+    let mut binder =
+        DefinitionBinder { builder, scopes: WithScopes::default(), temporary_read: None };
     let walk = query.visit(&mut binder);
     debug_assert!(walk.is_continue(), "the binder never breaks");
+    binder.temporary_read
 }
 
 /// Collects the identity of every stored relation a bound definition reads.

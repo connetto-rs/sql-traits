@@ -23,6 +23,33 @@ use crate::{
     utils::identifier_resolution::{identifiers_match, normalize_identifier},
 };
 
+/// The name PostgreSQL gives the schema holding a session's temporary
+/// relations.
+pub(crate) const TEMPORARY_SCHEMA: &str = "pg_temp";
+
+/// Whether a schema name denotes the session's temporary schema.
+///
+/// Unquoted `PG_TEMP` folds onto it, while quoted `"PG_TEMP"` names an
+/// ordinary schema of that exact spelling.
+pub(crate) fn is_temporary_schema(name: &str, quoted: bool) -> bool {
+    identifiers_match(name, quoted, TEMPORARY_SCHEMA, false)
+}
+
+/// The schemas a relation lookup walks for an unqualified name.
+///
+/// PostgreSQL searches the temporary schema before the path unless the path
+/// names it, in which case it is searched where the path puts it. Functions
+/// never search it, so only relation lookups take this walk.
+pub(crate) fn relation_search_path<'path, I>(
+    search_path: impl Fn() -> I,
+) -> impl Iterator<Item = (&'path str, bool)>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
+    let named = search_path().any(|(schema, quoted)| is_temporary_schema(schema, quoted));
+    (!named).then_some((TEMPORARY_SCHEMA, false)).into_iter().chain(search_path())
+}
+
 /// Reports a name a statement builds while it runs, which no static reader can
 /// resolve.
 pub(crate) fn run_time_object_name(object_name: &ObjectName) -> LookupError {
@@ -565,24 +592,28 @@ pub(crate) fn resolve_table_object_name_in_iter<'a, T: TableLike>(
 /// kind, trying each schema on `search_path` in turn for an unqualified name.
 ///
 /// The path is walked in order and the first schema holding a match wins,
-/// which is what the database does. A relation stored without a schema resides
-/// in the default schema, so it is found where `public` sits on the path
-/// rather than ahead of it.
+/// which is what the database does. The temporary schema comes first unless
+/// the path names it, as [`relation_search_path`] spells out. A relation
+/// stored without a schema resides in the default schema, so it is found
+/// where `public` sits on the path rather than ahead of it.
 ///
 /// # Errors
 ///
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one relation in the schema that wins, reported under the name the
 /// statement wrote.
-fn resolve_relation_on_search_path<'a, 'path, R>(
+fn resolve_relation_on_search_path<'a, 'path, R, I>(
     relations: impl Iterator<Item = &'a R>,
     target: &TargetName<'_>,
-    search_path: impl Iterator<Item = (&'path str, bool)>,
+    search_path: impl Fn() -> I,
     case: IdentifierCase,
     key_of: impl Fn(&R, IdentifierCase) -> RelationKey,
     claimed: impl Fn(&RelationKey) -> bool,
     render: impl Fn(&R) -> String,
-) -> Result<Option<&'a R>, LookupError> {
+) -> Result<Option<&'a R>, LookupError>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
     if target.schema().is_some() {
         let key = target_key(target, case);
         let candidates: Vec<&R> =
@@ -596,7 +627,7 @@ fn resolve_relation_on_search_path<'a, 'path, R>(
         schema: String::new(),
         name: case.compared_form(target.name(), target.name_is_quoted()).into_owned(),
     };
-    for (entry_schema, entry_quoted) in search_path {
+    for (entry_schema, entry_quoted) in relation_search_path(search_path) {
         key.schema.clear();
         key.schema.push_str(&case.compared_form(entry_schema, entry_quoted));
         let candidates: Vec<&'a R> = indexed
@@ -640,13 +671,16 @@ pub(crate) fn relation_name_is_claimed<DB: DatabaseLike>(
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one table in the schema that wins, reported under the name the
 /// statement wrote.
-pub(crate) fn resolve_target_on_search_path_in_iter<'a, 'path, T: TableLike>(
+pub(crate) fn resolve_target_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
     tables: impl Iterator<Item = &'a T>,
     target: &TargetName<'_>,
-    search_path: impl Iterator<Item = (&'path str, bool)>,
+    search_path: impl Fn() -> I,
     case: IdentifierCase,
     claimed: impl Fn(&RelationKey) -> bool,
-) -> Result<Option<&'a T>, LookupError> {
+) -> Result<Option<&'a T>, LookupError>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
     resolve_relation_on_search_path(
         tables,
         target,
@@ -669,13 +703,16 @@ pub(crate) fn resolve_target_on_search_path_in_iter<'a, 'path, T: TableLike>(
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one view in the schema that wins, reported under the name the
 /// statement wrote.
-pub(crate) fn resolve_view_on_search_path_in_iter<'a, 'path, V: ViewLike>(
+pub(crate) fn resolve_view_on_search_path_in_iter<'a, 'path, V: ViewLike, I>(
     views: impl Iterator<Item = &'a V>,
     target: &TargetName<'_>,
-    search_path: impl Iterator<Item = (&'path str, bool)>,
+    search_path: impl Fn() -> I,
     case: IdentifierCase,
     claimed: impl Fn(&RelationKey) -> bool,
-) -> Result<Option<&'a V>, LookupError> {
+) -> Result<Option<&'a V>, LookupError>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
     resolve_relation_on_search_path(
         views,
         target,
@@ -728,26 +765,30 @@ pub(crate) fn resolve_function_in_iter<'a, F: FunctionLike>(
 /// Resolves a table from a one-part or two-part object name, honouring
 /// `search_path` for an unqualified name.
 ///
+/// `claimed` carries the same meaning it has for
+/// [`resolve_target_on_search_path_in_iter`].
+///
 /// # Errors
 ///
 /// Returns an error when the object name is malformed for table lookup, or when
 /// the lookup is ambiguous.
-pub(crate) fn resolve_table_object_name_on_search_path_in_iter<'a, 'path, T: TableLike>(
+pub(crate) fn resolve_table_object_name_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
     tables: impl Iterator<Item = &'a T>,
     object_name: &ObjectName,
-    search_path: impl Iterator<Item = (&'path str, bool)>,
+    search_path: impl Fn() -> I,
     case: IdentifierCase,
-) -> Result<Option<&'a T>, LookupError> {
+    claimed: impl Fn(&RelationKey) -> bool,
+) -> Result<Option<&'a T>, LookupError>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
     resolve_target_on_search_path_in_iter(
         tables,
         &target_name_of_idents(schema_ident, table_ident),
         search_path,
         case,
-        // Only tables are in hand here, so a view holding the name does not
-        // end the walk, which is the creation-time namespace question this
-        // crate answers separately.
-        |_| false,
+        claimed,
     )
 }
 
@@ -800,8 +841,8 @@ pub(crate) fn resolve_required_table<'db, DB: DatabaseLike>(
 /// Ingestion rewrites every stored reference to the qualifier of the relation
 /// it reached when the object was created, leaving it bare only for a
 /// relation stored bare. So the name is read as written, with no search path,
-/// and a later path does not move it, exactly as PostgreSQL keeps the object
-/// it bound.
+/// and neither a later path nor a later temporary relation of the same name
+/// reaches it, exactly as PostgreSQL keeps the object it bound.
 ///
 /// # Errors
 ///
@@ -1106,8 +1147,9 @@ mod tests {
         let scoped = resolve_table_object_name_on_search_path_in_iter(
             tables.iter(),
             &obj(&[("s", false), ("scoped", false)]),
-            default_path(),
+            default_path,
             IdentifierCase::AsWritten,
+            |_| false,
         )
         .expect("resolves")
         .expect("matches");
@@ -1117,8 +1159,9 @@ mod tests {
         let only_pub = resolve_table_object_name_on_search_path_in_iter(
             tables.iter(),
             &obj(&[("only_pub", false)]),
-            default_path(),
+            default_path,
             IdentifierCase::AsWritten,
+            |_| false,
         )
         .expect("resolves")
         .expect("matches");
@@ -1130,8 +1173,9 @@ mod tests {
             resolve_table_object_name_on_search_path_in_iter(
                 tables.iter(),
                 &obj(&[("things", false)]),
-                default_path(),
+                default_path,
                 IdentifierCase::AsWritten,
+                |_| false,
             ),
             Err(LookupError::AmbiguousTableLookup { ref object_name, .. }) if object_name == "things"
         ));
@@ -1140,8 +1184,9 @@ mod tests {
         let on_s_first = resolve_table_object_name_on_search_path_in_iter(
             tables.iter(),
             &obj(&[("users", false)]),
-            [("s", false), ("public", false)].into_iter(),
+            || [("s", false), ("public", false)].into_iter(),
             IdentifierCase::AsWritten,
+            |_| false,
         )
         .expect("resolves")
         .expect("matches");
@@ -1150,8 +1195,9 @@ mod tests {
         let on_public_first = resolve_table_object_name_on_search_path_in_iter(
             tables.iter(),
             &obj(&[("users", false)]),
-            [("public", false), ("s", false)].into_iter(),
+            || [("public", false), ("s", false)].into_iter(),
             IdentifierCase::AsWritten,
+            |_| false,
         )
         .expect("resolves")
         .expect("matches");
@@ -1162,8 +1208,9 @@ mod tests {
             resolve_table_object_name_on_search_path_in_iter(
                 tables.iter(),
                 &obj(&[("only_pub", false)]),
-                core::iter::once(("s", false)),
+                || core::iter::once(("s", false)),
                 IdentifierCase::AsWritten,
+                |_| false,
             )
             .unwrap()
             .is_none()
@@ -1174,8 +1221,9 @@ mod tests {
             resolve_table_object_name_on_search_path_in_iter(
                 tables.iter(),
                 &obj(&[("absent", false)]),
-                default_path(),
+                default_path,
                 IdentifierCase::AsWritten,
+                |_| false,
             )
             .unwrap()
             .is_none()
@@ -1220,7 +1268,7 @@ mod tests {
         let resolved = resolve_view_on_search_path_in_iter(
             db.views(),
             &TargetName::new("v", false),
-            [("s", false)].into_iter(),
+            || [("s", false)].into_iter(),
             IdentifierCase::AsWritten,
             |key| relation_name_is_claimed(&db, key, IdentifierCase::AsWritten),
         )

@@ -275,7 +275,7 @@ fn a_bare_create_and_a_written_one_collide() {
     );
 }
 
-/// A temporary table lives in a schema private to the session, so the path does
+/// A temporary table lives in the session's temporary schema, so the path does
 /// not place it and it cannot collide with the permanent table of that name.
 #[test]
 fn a_temporary_table_is_left_off_the_path() {
@@ -288,9 +288,12 @@ fn a_temporary_table_is_left_off_the_path() {
         ));
 
         assert!(
-            db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-                .expect("unambiguous lookup")
-                .is_some(),
+            db.table_by_target(
+                TargetName::new("docs", false).with_schema("pg_temp", false),
+                IdentifierCase::AsWritten
+            )
+            .expect("unambiguous lookup")
+            .is_some(),
             "{temporary} was placed on the path"
         );
         let permanent = db

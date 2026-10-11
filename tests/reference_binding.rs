@@ -2,8 +2,9 @@
 //!
 //! PostgreSQL binds a foreign key, a trigger, a policy, a grant, an index and a
 //! view definition to the object the name reached at creation, so a later `SET
-//! search_path` changes nothing about what they refer to. Every rule asserted
-//! here was measured against PostgreSQL 18.4 in Docker.
+//! search_path`, or a later temporary relation of the same name, which every
+//! bare lookup reaches first, changes nothing about what they refer to. Every
+//! rule asserted here was measured against PostgreSQL 18.4 in Docker.
 #![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{errors::Error, prelude::*};
@@ -182,4 +183,96 @@ fn a_recursive_with_body_reads_its_own_name() {
         .expect("unambiguous lookup")
         .expect("the view is stored");
     assert!(!stored.definition().to_string().contains("app.t"));
+}
+
+#[test]
+fn references_to_a_permanent_table_ignore_a_later_temporary_one() {
+    let db = db(&format!(
+        "{FUNCTION}
+         CREATE ROLE reader;
+         CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE TABLE c (tid INT REFERENCES t (id));
+         CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION touch();
+         CREATE POLICY pol ON t USING (true);
+         GRANT SELECT ON t TO reader;
+         CREATE INDEX i ON t (id);
+         CREATE VIEW v AS SELECT id FROM t;
+         CREATE TEMP TABLE t (id INT PRIMARY KEY, note TEXT);"
+    ));
+
+    let child = table(&db, None, "c");
+    let key = child.foreign_keys(&db).expect("in this database").next().expect("one key");
+    assert!(!key.referenced_table(&db).expect("resolves").is_temporary());
+
+    let trigger = db.triggers().next().expect("the trigger exists");
+    assert!(!trigger.table(&db).expect("resolves").is_temporary());
+
+    let policy = db.policies().next().expect("the policy exists");
+    assert!(!policy.table(&db).expect("resolves").is_temporary());
+
+    let grant = db.table_grants().next().expect("the grant exists");
+    let granted: Vec<_> = grant.tables(&db).collect();
+    assert!(matches!(granted[..], [table] if !table.is_temporary()));
+
+    let index = db.indexes().next().expect("the index exists");
+    assert!(!IndexLike::table(index, &db).is_temporary());
+
+    assert!(!row_source(&db, "SELECT id FROM v").is_temporary());
+}
+
+#[test]
+fn references_reaching_a_temporary_table_bind_to_it() {
+    let db = db(&format!(
+        "{FUNCTION}
+         CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE TEMP TABLE t (id INT PRIMARY KEY, note TEXT);
+         CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION touch();
+         CREATE POLICY pol ON t USING (true);
+         CREATE INDEX i ON t (id);
+         CREATE VIEW v AS SELECT id FROM t;"
+    ));
+    assert!(db.triggers().next().expect("trigger").table(&db).expect("resolves").is_temporary());
+    assert!(db.policies().next().expect("policy").table(&db).expect("resolves").is_temporary());
+    assert!(IndexLike::table(db.indexes().next().expect("index"), &db).is_temporary());
+    assert!(row_source(&db, "SELECT id FROM pg_temp.v").is_temporary());
+}
+
+#[test]
+fn a_dropped_trigger_is_the_one_on_the_temporary_table() {
+    let db = db(&format!(
+        "{FUNCTION}
+         CREATE TABLE t (id INT);
+         CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION touch();
+         CREATE TEMP TABLE t (id INT);
+         CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION touch();
+         DROP TRIGGER trg ON t;"
+    ));
+    let remaining: Vec<_> = db.triggers().collect();
+    assert_eq!(remaining.len(), 1);
+    assert!(!remaining[0].table(&db).expect("resolves").is_temporary());
+}
+
+#[test]
+fn a_dropped_policy_is_the_one_on_the_temporary_table() {
+    let db = db("CREATE TABLE t (id INT);
+         CREATE POLICY pol ON t USING (true);
+         CREATE TEMP TABLE t (id INT);
+         CREATE POLICY pol ON t USING (true);
+         DROP POLICY pol ON t;");
+    let remaining: Vec<_> = db.policies().collect();
+    assert_eq!(remaining.len(), 1);
+    assert!(!remaining[0].table(&db).expect("resolves").is_temporary());
+}
+
+#[test]
+fn a_temporary_table_read_by_a_temporary_view_needs_cascade() {
+    assert!(matches!(
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (id INT);
+             CREATE TEMP TABLE t (id INT);
+             CREATE VIEW v AS SELECT id FROM t;
+             DROP TABLE t;"
+        ),
+        Err(Error::RelationHasDependents { .. })
+    ));
 }

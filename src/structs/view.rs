@@ -15,7 +15,7 @@ use alloc::{
 
 use sqlparser::ast::{CreateView, Query};
 
-use crate::utils::object_name::{Qualifier, object_name_last_part, qualifier_of};
+use crate::utils::object_name::{Qualifier, TEMPORARY_SCHEMA, object_name_last_part, qualifier_of};
 
 /// The parts of a `CREATE VIEW` a schema records, shared by both view kinds.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,8 +37,31 @@ pub struct ViewDeclaration {
 impl ViewDeclaration {
     /// Reads the parts a schema records out of a parsed `CREATE VIEW`.
     ///
-    /// Answers [`None`] for a declaration carrying no usable name, which the
-    /// caller refuses before it reaches here.
+    /// A `TEMP` declaration written without a schema is recorded in
+    /// `pg_temp`, where PostgreSQL puts it, so an ordinary declaration and a
+    /// temporary one never read the same. Answers [`None`] for a declaration
+    /// carrying no usable name, which the caller refuses before it reaches
+    /// here.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::{prelude::*, structs::View};
+    /// use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
+    ///
+    /// let declaration = |sql: &str| {
+    ///     let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+    ///     let Some(Statement::CreateView(node)) = statements.pop() else {
+    ///         panic!("expected a view declaration")
+    ///     };
+    ///     View::from_node(&node)
+    /// };
+    /// let ordinary = declaration("CREATE VIEW v AS SELECT 1 AS result").unwrap();
+    /// let temporary = declaration("CREATE TEMP VIEW v AS SELECT 1 AS result").unwrap();
+    /// assert_ne!(ordinary, temporary);
+    /// assert_eq!(temporary.declaration().schema(), Some("pg_temp"));
+    /// assert!(temporary.is_temporary());
+    /// ```
     #[must_use]
     pub fn from_node(node: &CreateView) -> Option<Self> {
         let (name, name_is_quoted) = object_name_last_part(&node.name)?;
@@ -46,6 +69,7 @@ impl ViewDeclaration {
         // recorded at all rather than being recorded unqualified.
         let schema = match qualifier_of(&node.name) {
             Qualifier::Named(schema, quoted) => Some((schema, quoted)),
+            Qualifier::Absent if node.temporary => Some((TEMPORARY_SCHEMA, false)),
             Qualifier::Absent => None,
             Qualifier::RunTime => return None,
         };

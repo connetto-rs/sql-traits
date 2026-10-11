@@ -8,7 +8,7 @@ use sqlparser::ast::Query;
 use crate::{
     structs::TargetName,
     traits::{DatabaseLike, Metadata},
-    utils::identifier_resolution::normalize_identifier,
+    utils::{identifier_resolution::normalize_identifier, object_name::is_temporary_schema},
 };
 
 /// A trait for types that can be treated as SQL views.
@@ -88,12 +88,11 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
         normalize_identifier(self.view_name(), self.view_name_is_quoted())
     }
 
-    /// Returns the schema the view was declared in, if one was written.
+    /// Returns the schema the view is stored in, or `None` for one stored in
+    /// the default schema without a qualifier.
     ///
-    /// A view created without a qualifier lands in the first schema of the
-    /// search path in force at the time, exactly as a table does, so a `None`
-    /// here means the declaration named no schema rather than that the view
-    /// belongs to none.
+    /// Ingestion records where the view landed: the schema the search path
+    /// selected for a bare name, and `pg_temp` for a temporary view.
     fn view_schema(&self) -> Option<&str>;
 
     /// Returns whether the schema identifier of this view was quoted in SQL.
@@ -109,6 +108,45 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     #[inline]
     fn stored_view_schema(&self) -> Option<Cow<'_, str>> {
         self.view_schema().map(|schema| normalize_identifier(schema, self.view_schema_is_quoted()))
+    }
+
+    /// Returns whether this view lives in the session's temporary schema.
+    ///
+    /// PostgreSQL makes a view temporary when the statement writes `TEMP`,
+    /// when it names `pg_temp`, when the search path begins there, and when
+    /// the definition reads a temporary relation even though the statement
+    /// wrote nothing of the kind. The model records each of those in
+    /// `pg_temp`, so this reads the stored schema.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TEMP TABLE staging (id INT);
+    ///      CREATE VIEW declared AS SELECT 1 AS id;
+    ///      CREATE VIEW promoted AS SELECT id FROM staging;",
+    /// )?;
+    /// let declared = db
+    ///     .resolve_target_view(TargetName::new("declared", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// let promoted = db
+    ///     .resolve_target_view(TargetName::new("promoted", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// assert!(!declared.is_temporary());
+    /// // Reading a temporary table made the view temporary.
+    /// assert!(promoted.is_temporary());
+    /// assert_eq!(promoted.view_schema(), Some("pg_temp"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_temporary(&self) -> bool {
+        self.view_schema()
+            .is_some_and(|schema| is_temporary_schema(schema, self.view_schema_is_quoted()))
     }
 
     /// Returns the view name exactly as declared, including its optional

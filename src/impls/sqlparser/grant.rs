@@ -24,7 +24,7 @@ use crate::{
             SessionPrincipal, identifiers_match, is_public_pseudo_role, session_principal,
         },
         object_name::{
-            object_name_identifiers, object_name_last_part, resolve_bound_table,
+            RelationKey, object_name_identifiers, object_name_last_part, resolve_bound_table,
             resolve_table_object_name_on_search_path_in_iter, table_matches_object_name,
             target_name_from_object_name,
         },
@@ -294,8 +294,9 @@ fn action_columns(action: &Action) -> Option<&[Ident]> {
 /// one that lacks it, so this walks them in order and reports the same way.
 /// `ALL TABLES IN SCHEMA` carries no per-table column list to check and the
 /// database accepts a column list beside it, so that form is left alone. A
-/// one-part or two-part name resolves through `search_path`, and a shape the
-/// strict splitter rejects keeps the lenient last-two-parts matching.
+/// one-part or two-part name resolves through `search_path`, ending at the
+/// first schema `claimed` answers for, and a shape the strict splitter rejects
+/// keeps the lenient last-two-parts matching.
 ///
 /// # Errors
 ///
@@ -309,6 +310,7 @@ pub(crate) fn validate_granted_columns(
     database_tables: &[&CreateTable],
     search_path: &[(&str, bool)],
     case: IdentifierCase,
+    claimed: impl Fn(&RelationKey) -> bool,
 ) -> Result<(), crate::errors::Error> {
     let Privileges::Actions(actions) = privileges else {
         return Ok(());
@@ -322,8 +324,9 @@ pub(crate) fn validate_granted_columns(
             resolve_table_object_name_on_search_path_in_iter(
                 database_tables.iter().copied(),
                 name,
-                search_path.iter().copied(),
+                || search_path.iter().copied(),
                 case,
+                &claimed,
             )
             .map_err(crate::errors::Error::IdentifierLookupError)?
         } else {
