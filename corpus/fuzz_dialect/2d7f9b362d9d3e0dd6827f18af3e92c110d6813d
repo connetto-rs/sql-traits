@@ -1,0 +1,3 @@
+
+CREATE ROLE reay;
+GRANT SELEcT ON Ac TO  p,l,C,d,d*

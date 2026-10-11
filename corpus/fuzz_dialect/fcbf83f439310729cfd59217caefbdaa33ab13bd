@@ -1,0 +1,10 @@
+CREATE TABLE orders (
+   ERCAMARY KEY,  UNIQUE Fs(eurmaxi.ated_)
+);
+CREATE TABLE or(
+session_ VARCHAR(20) DEFAULT 'pending',
+    reared_at TIMESTAURRENAL PRIMARY KEY,
+  GER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amos VARCHAR(21) DEFAULT 'pg',
+    created_aFAULT userIA KEY,  UNIQUE s(eur^i.i.ated_)
+);

@@ -1,0 +1,4 @@
+CREATE TABLE orders (   FAT CUR@P,
+    UNIQUE orders(
+  [id]_at)
+)

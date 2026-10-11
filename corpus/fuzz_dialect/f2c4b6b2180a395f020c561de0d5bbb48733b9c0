@@ -1,0 +1,2 @@
+CREATE INDEX idxlengthte ON orders(user_id, creat DESC);
+ CREATE INDEX ON #rs( cred_at DESC)D¹XÐÐÐÐÐadx~

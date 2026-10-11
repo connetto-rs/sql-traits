@@ -1,0 +1,6 @@
+CREATE tABLE o (
+AMt EL(11  2) CHECK (amount >amount > 0),
+    statNOT NULL REFERENCES useCASCADE,
+    amount DEIM@L(0 0s),
+MESTABBBBBBB t
+);

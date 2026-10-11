@@ -1,0 +1,3 @@
+CREATE ROLE a;
+GRANT SELECT ON Aublic TO readonly;
+GRANT ALL PRIVILEGES ON TABLE useso TO @@@N @ @>@P@C@@@( @ @>@P@C@@((@D@(@DA@-@@@@N@ @CRE

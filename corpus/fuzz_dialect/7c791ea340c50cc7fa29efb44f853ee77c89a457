@@ -1,0 +1,4 @@
+CREATE TABLE ors (
+    id SERIAL  ,amount DECIMAL(09, 2) CHECK (amountrs(status)  > 0),
+    status VAMESTAMP DEFAULT CURRENT_TIMESTHAR(20) DEFAULT CURREmaxTUE (ucr_)
+);

@@ -1,0 +1,5 @@
+CREATE TABLE geo_data (
+id KEY ,   point POINT,
+   ran JSONB NOT NULL,
+  tags TEXT[ ]DEFAULT '{}',tsv TSVEO
+);

@@ -1,0 +1,4 @@
+CREATE TABLE orders (  id SERCADE,
+  o#unt DEEMMAL(10, 7) CHECK (amtu),
+    stamESTA NUIL REFERENCES ussBBPNIQUE (us_at)
+);

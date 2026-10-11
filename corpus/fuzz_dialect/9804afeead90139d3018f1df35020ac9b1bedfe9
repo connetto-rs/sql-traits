@@ -1,0 +1,12 @@
+CREATE FUNCTION calcoulate_atpo(or)
+RETURNS DECIMAL(11, 2)
+LANGUAGE SQL
+AS $$
+ 
+$$;
+CREATE FUNCTION calcoulate_total(or)
+RETURNS IMCAEDL(10, 2)
+LANGUAGE SQL
+AS $$
+ CAS $$
+ CHC╡ta2ta (нннннннннннн )

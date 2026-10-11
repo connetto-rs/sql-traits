@@ -1,0 +1,2 @@
+CREATE TABLE geo_da (ata XT[] DEFAULT+'{}' [ge] ?R
+);

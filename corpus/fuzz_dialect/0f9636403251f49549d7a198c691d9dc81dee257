@@ -1,0 +1,3 @@
+CREATE POLICY n ON user
+USING (ul.llrlil.rr.t._())
+ ;

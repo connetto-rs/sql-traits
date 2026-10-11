@@ -1,0 +1,2 @@
+CREATE INDEX email ON users(use#);
+CREATE INDEX idx_ordtus ON or(Latus) WHERE at FESCT

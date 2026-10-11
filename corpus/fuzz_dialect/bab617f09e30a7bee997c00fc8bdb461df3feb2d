@@ -1,0 +1,3 @@
+CREATE TABLE ers (
+ROT NULL REFERENCES 
+  TU(uid, crt_);

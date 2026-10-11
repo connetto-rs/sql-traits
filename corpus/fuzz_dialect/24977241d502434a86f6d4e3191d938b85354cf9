@@ -1,0 +1,2 @@
+CREATE FUNCTION caa0
+(l)SET l=r

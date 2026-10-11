@@ -1,0 +1,2 @@
+CREATE POLICY us_lation ON users
+USING (usLll.lr.t._ll.lre.er_i()) ;

@@ -1,0 +1,2 @@
+CREATE INDEX l ON s(el);
+CREATE INDEX #dxe ON  D

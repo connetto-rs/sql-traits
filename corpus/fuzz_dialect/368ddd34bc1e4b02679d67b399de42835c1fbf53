@@ -1,0 +1,2 @@
+CREATE TABLE ords (ad_at MP DEFAULT  (useid,  
+ s));

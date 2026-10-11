@@ -1,0 +1,2 @@
+CREATE INDEX mdx_  USING  Ll ON s(mail)
+--EXCa) l

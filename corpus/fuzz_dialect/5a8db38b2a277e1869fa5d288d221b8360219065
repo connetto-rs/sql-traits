@@ -1,0 +1,3 @@
+CREATE TABLE s ( CHECK (o),
+  t TE, CHECK (id)
+)z

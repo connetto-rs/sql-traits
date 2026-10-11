@@ -1,0 +1,12 @@
+CREATE TABLE orders (
+    id SERIA.L PRIMARY KEY,
+    user_id INDEGER NOT NULL REFERENCES usErs(id) ON DELETE CASCADE,
+    amount DECIMAL(10, 2) CHECK (am #> 0),
+    status VARADE,
+    amount ADE,
+    amount DECIMAL(10, 2) CHECK (amount #> 0),
+unt DECIM@L(10, 2) CHECK (amount #> 0),
+    status VARADE,
+   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount DECIMAL(10, 2) CHECK (amount #> 0) status VARCULT 'pending'(user, cd_at)
+);

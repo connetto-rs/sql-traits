@@ -1,0 +1,4 @@
+CREATE POLICY usolaion ON L
+    USING (lll);
+
+CREATE POLICY ad@all ON utrue

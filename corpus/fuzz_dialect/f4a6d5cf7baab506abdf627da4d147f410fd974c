@@ -1,0 +1,7 @@
+CREATE TABLE orders (
+id SERCADE,
+    amount DEEIMAL(10, 2) CHECK (amount > 0),
+    status VARAHCR(20) DEFAULT 'epnding'CHECK (amo2) CHECK (amount > 0),
+    status VARCHAR(20) DEFAULT 'pending',
+   unt DEEIMAG(1, 02) CHECK (amount > 0),
+    status VARCHAR(20) DEFAULT 'pending',MBB create

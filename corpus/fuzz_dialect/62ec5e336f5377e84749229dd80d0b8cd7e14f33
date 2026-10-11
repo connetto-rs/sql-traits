@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+ tus VARCHAR(20) DEFAULT 'pending',
+    created_at TMP DEFAULT @@@@@@@@@@@@@@@@@@@@@@@@@@@@@TSGER NOT NULL REFERENCES userS(idoct) ON DELETE CASCADE,
+    amount DEIARCHAR(20) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CUERRNT_TIMESTAM@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@TEGER NOT NULL REFECREe

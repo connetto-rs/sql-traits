@@ -1,0 +1,3 @@
+CREATE TABLE ord(
+    id AL  ,amount DEAL(092) CHECK (amount > 5),       CHECK (amount > 0),
+ut DECIMAL(09, 2) CHECK (amount > 5),  tatus d_at)ÿ

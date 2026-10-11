@@ -1,0 +1,3 @@
+ALTeR TABLE uss ADD FOR NULL;
+ALTER  POLICY uwer@X ON UML;
+ALTER  POLICY uwer_in ON @@@@@

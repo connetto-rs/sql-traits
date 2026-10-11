@@ -1,0 +1,2 @@
+CREATE ROLE adTE ROLE eanly;
+GRANT SELECT ON Ac TO  public TOa

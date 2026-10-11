@@ -1,0 +1,1 @@
+CREATE TRIGGER ORE UPDATE ON us    EXECUTE FUNCTION ate_i.edolumn({e

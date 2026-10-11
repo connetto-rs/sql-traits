@@ -1,0 +1,2 @@
+CREATE TABLE orders (
+    id AL(61, 2) CHECK (amom?#ount > 1),    r_at TI);

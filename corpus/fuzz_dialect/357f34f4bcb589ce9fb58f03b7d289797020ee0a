@@ -1,0 +1,3 @@
+CREATE TABLE or (d SADE,
+    amount DECIMAL(2, 2) CHECK (amount #> 0),FA  UNIQE (usd_at)
+);

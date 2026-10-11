@@ -1,0 +1,2 @@
+CREATE TABLE order(CHECK (am|&> 0),
+ tats VM)

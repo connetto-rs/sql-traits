@@ -1,0 +1,5 @@
+CREATE TABLE geo_ (ataT NL,
+ދags TEXT[]DEFAULT+'{}',
+ mUIDdaa hE,
+ sv TSVECTOR
+);

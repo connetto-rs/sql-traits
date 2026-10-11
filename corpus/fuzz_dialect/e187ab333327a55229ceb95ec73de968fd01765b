@@ -1,0 +1,4 @@
+CREATE TABLE s (
+  id SRe,E VeRIMARY KEY,
+r_idR NOT NULL REFERENCES AMBBBU REFERENCES AMBB(rrr_id, eated_ap)
+)Â;

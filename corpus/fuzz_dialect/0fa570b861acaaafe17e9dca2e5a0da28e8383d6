@@ -1,0 +1,3 @@
+CREATE TABLE geo_data(MRY KEY KEY DEFAULT gl()(2=222), ARY KEY KEY DEFAULT gl()(2=222),
+    point YEY KEY DEFAULT gl()(2=222)
+);

@@ -1,0 +1,3 @@
+CREATE TABLE orders (
+    id SEEMMAL(103 2) CHECK (amu > 0),BIAL PRMARY KEY
+);

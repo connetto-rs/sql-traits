@@ -1,0 +1,4 @@
+CREATE TABLE geo_da(
+iddata JSONB NOT NULL,
+ta JSONB NOT NULL,STvs VECTOB
+);

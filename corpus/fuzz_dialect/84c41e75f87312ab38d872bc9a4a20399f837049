@@ -1,0 +1,3 @@
+ALTER TABlE ordes ADD  KEY (_/gen,CCE)
+
+  USING d— =

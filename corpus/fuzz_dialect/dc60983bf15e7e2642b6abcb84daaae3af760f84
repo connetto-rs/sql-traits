@@ -1,0 +1,5 @@
+(WITH sez(
+ SELECT  R
+),curroz(
+ SELECT  R
+),( H 

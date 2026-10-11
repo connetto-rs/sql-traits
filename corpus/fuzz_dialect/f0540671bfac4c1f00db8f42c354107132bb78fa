@@ -1,0 +1,5 @@
+CREATE TABLE oders (      UNIQUE a(uset > 1),
+ 
+    UNIQUE (securret > 0),
+     UNIQUE (idcurrd- d_at)
+);

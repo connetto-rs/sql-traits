@@ -1,0 +1,3 @@
+ALTeR TABLE us ADD FOR NULL;
+ALTER  POLICY uweron ON UML;
+ALTER  POLICY uwer_in ON @@@@@@@@

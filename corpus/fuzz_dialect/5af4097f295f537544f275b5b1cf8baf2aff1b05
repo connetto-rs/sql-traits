@@ -1,0 +1,4 @@
+CREATE TABLE orders$(
+    id SL  ,amount DEAL(09, 2) CHECK (amount >unt > 0),
+unt DACLEIM(02,9 ) CHECK (amount >-$5),    status d_at)ÿÿ,       CHtatus d_ÿ 5),       CHECK (amount > 0),
+unt DACLEIM(02,9 ) CHECK (amount >-$5),    status d_at)ÿÿ,    CHtatus d_ÿÿÿ

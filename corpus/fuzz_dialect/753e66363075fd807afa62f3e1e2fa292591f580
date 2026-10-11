@@ -1,0 +1,2 @@
+CREATE TABLE a ( id UUID PRIMARY KEY DEFAULT gen_r@uid()
+)ÿ<

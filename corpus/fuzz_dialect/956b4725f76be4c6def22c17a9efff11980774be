@@ -1,0 +1,10 @@
+CREATE TABLE CCCCCCNT_(
+    id SERCADE,
+ CURRENT_TIMESTAMBBBLd INT,
+   RIMARY KEY,
+ _at TIMEST____$33333333333___KEY,
+    uIMESSTABBBBBBIAL PRIM,RY KEY,
+    user_id INT,
+    creasum_at TXBBP,
+    UNIQUE (user_id, createLd_at)
+);

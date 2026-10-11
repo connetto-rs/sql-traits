@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id SERCADE CHECK (t > 0),
+   II TIMMP DEFAULT UCENT?&I(loca_id, created?_&U)
+);

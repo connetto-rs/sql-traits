@@ -1,0 +1,3 @@
+CREATE TABLE d(
+ unt yyy2 CHECK (+@ß)
+)

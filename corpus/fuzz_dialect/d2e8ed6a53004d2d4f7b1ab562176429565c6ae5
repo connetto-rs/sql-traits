@@ -1,0 +1,2 @@
+CREATE TABLE d (CHECK (amC.AK.R.S > 0),
+at T);

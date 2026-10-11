@@ -1,0 +1,3 @@
+CREATE TABLE orders (
+  UNIQUE 
+TQUE(sidr IN(TABLE ord)

@@ -1,0 +1,2 @@
+CREATE POLICY tin_all ON us
+    TO ad,i,st , n USING; 

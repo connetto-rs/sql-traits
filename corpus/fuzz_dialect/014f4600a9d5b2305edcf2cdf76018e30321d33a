@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+  d S REFERENCES nullEGER NOT NULL REFERENCES users(id
+),  
+ INDEX i REFERENCES unEGER NOT NTE )
+)+

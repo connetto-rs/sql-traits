@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+  id SERIA.L PRIMARY KEY,
+  DELETE CASCADE,
+    amount DECIMAL(08, 2) CHECK (llllllllEl~*YlE ~~*YlllllllllleatE ~~*YllllqsqOLllll@llllll~*YlllE ~~*YllllllllllllllllleatE ~~*YllllqsqOLllll@llllll~*Yll ~~*YlllllllllleatE ~~*Y% Sucreated_at)
+);

@@ -1,0 +1,2 @@
+CREATE INDEX id ON rde(u_ DESC);
+CREATE INDEX _user_date ON ders(us DESC)INsta 

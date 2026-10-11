@@ -1,0 +1,3 @@
+CREATE INDEX is_email ON users(email);
+CREATE UNIQUE INDEX e ON ors(usrd, creat-ed_at Dgen);
+CREATE INDEX idtus ON orde(status) WHERE st

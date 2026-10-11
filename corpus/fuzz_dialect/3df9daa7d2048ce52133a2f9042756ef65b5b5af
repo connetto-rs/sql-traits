@@ -1,0 +1,3 @@
+;
+GRANT USAGE ON SCHEMA pub TO donin;
+GRANT USAGE ON SCHEMA p TO nly:

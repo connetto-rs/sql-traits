@@ -1,0 +1,1 @@
+CREATE TRIGGER E UPDATE ON user.Eu);
