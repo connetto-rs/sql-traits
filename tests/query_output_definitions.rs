@@ -1,0 +1,160 @@
+//! Integration tests for the ordered output definitions of a recorded query.
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests fail by panicking on unexpected outputs"
+)]
+
+use sql_traits::prelude::*;
+use sqlparser::{
+    ast::{Expr, Ident, Query, SelectItem, SetExpr, Statement},
+    dialect::PostgreSqlDialect,
+    parser::Parser,
+};
+
+const SCHEMA: &str = "
+    CREATE TABLE halves(h halfvec(3));
+    CREATE TABLE items(id INT PRIMARY KEY, h halfvec(3), v vector(3));
+    CREATE TABLE a(id INT, x INT);
+    CREATE TABLE b(id INT);
+";
+
+fn database() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses")
+}
+
+fn query(sql: &str) -> Query {
+    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+        .unwrap_or_else(|error| panic!("statement `{sql}` parses: {error}"));
+    match statements.pop().expect("one statement") {
+        Statement::Query(query) => *query,
+        other => panic!("expected a query, got {other:?}"),
+    }
+}
+
+fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
+    match definition {
+        ColumnDefinition::Base { table, column } => {
+            format!("{}.{}", table.table_name(), column.column_name())
+        }
+        ColumnDefinition::Expression { expression, .. } => format!("expression {expression}"),
+        ColumnDefinition::SetOperation { operator, left, right } => {
+            format!(
+                "{operator}({}, {})",
+                describe(&left.definition()),
+                describe(&right.definition())
+            )
+        }
+        ColumnDefinition::RecursiveUnion { anchor, recursive } => {
+            format!(
+                "recursive({}, {})",
+                describe(&anchor.definition()),
+                describe(&recursive.definition())
+            )
+        }
+        ColumnDefinition::Opaque => "opaque".to_owned(),
+    }
+}
+
+fn outputs_of(sql: &str, pick: fn(&Query) -> &Query) -> Vec<String> {
+    let database = database();
+    let query = query(sql);
+    let scope = ColumnScope::from_query(&query, &database).expect("scope builds");
+    let outputs =
+        scope.scope_for_query(pick(&query)).expect("query is recorded").output_definitions();
+    let entries = outputs.len();
+    let described = outputs
+        .map(|output| {
+            match output {
+                QueryOutput::Column(definition) => describe(&definition),
+                QueryOutput::Unexpanded => "unexpanded".to_owned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(described.len(), entries, "`{sql}` reports its entry count");
+    described
+}
+
+fn outputs(sql: &str) -> Vec<String> {
+    outputs_of(sql, |query| query)
+}
+
+fn first_subquery(query: &Query) -> &Query {
+    let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a SELECT body") };
+    let (SelectItem::UnnamedExpr(expression) | SelectItem::ExprWithAlias { expr: expression, .. }) =
+        &select.projection[0]
+    else {
+        panic!("expected an expression projection")
+    };
+    let Expr::BinaryOp { left, .. } = expression else { panic!("expected a distance operator") };
+    let Expr::Subquery(subquery) = left.as_ref() else { panic!("expected a scalar subquery") };
+    subquery
+}
+
+#[test]
+fn a_scalar_subquery_wildcard_exposes_the_stored_column() {
+    let sql = "SELECT (SELECT * FROM halves LIMIT 1) <-> '[1,2,3]'::vector(3) AS distance";
+    assert_eq!(outputs_of(sql, first_subquery), ["halves.h"]);
+    let sql = "SELECT (SELECT * FROM halves LIMIT 1) <-> v FROM items";
+    assert_eq!(outputs_of(sql, first_subquery), ["halves.h"]);
+}
+
+#[test]
+fn outputs_follow_the_select_list_with_wildcards_expanded_in_place() {
+    assert_eq!(
+        outputs("SELECT x, *, b.*, id * 2 AS doubled FROM a JOIN b ON a.id = b.id"),
+        ["a.x", "a.id", "a.x", "b.id", "b.id", "expression id * 2"]
+    );
+    assert_eq!(outputs("WITH c AS (SELECT id FROM a) SELECT * FROM c"), ["a.id"]);
+    assert_eq!(outputs("SELECT d.* FROM (SELECT x AS y FROM a) AS d"), ["a.x"]);
+}
+
+#[test]
+fn expression_outputs_keep_their_defining_scope() {
+    let database = database();
+    let query = query("SELECT id + x FROM a");
+    let scope = ColumnScope::from_query(&query, &database).expect("scope builds");
+    let mut outputs =
+        scope.scope_for_query(&query).expect("query is recorded").output_definitions();
+    let Some(QueryOutput::Column(ColumnDefinition::Expression { scope: defining, .. })) =
+        outputs.next()
+    else {
+        panic!("expected an expression output")
+    };
+    let id = defining
+        .resolve_column_definition(&Expr::Identifier(Ident::new("id")))
+        .expect("lookup succeeds")
+        .expect("id resolves");
+    assert_eq!(describe(&id), "a.id");
+    assert!(outputs.next().is_none());
+}
+
+#[test]
+fn an_unenumerable_wildcard_stays_one_entry_of_unknown_width() {
+    assert_eq!(
+        outputs("SELECT b.id, *, b.id AS again FROM b, generate_series(1, 2) AS g"),
+        ["b.id", "unexpanded", "b.id"]
+    );
+}
+
+#[test]
+fn set_operations_pair_positions_only_when_every_width_is_known() {
+    assert_eq!(outputs("SELECT id FROM a UNION ALL SELECT id FROM b"), ["UNION(a.id, b.id)"]);
+    assert_eq!(
+        outputs("SELECT id FROM b UNION SELECT * FROM generate_series(1, 2) AS g"),
+        ["opaque"]
+    );
+    assert_eq!(
+        outputs("SELECT * FROM generate_series(1, 2) AS g UNION SELECT id FROM b"),
+        ["unexpanded"]
+    );
+    assert_eq!(outputs("VALUES (1, 2), (3, 4)"), ["opaque", "opaque"]);
+}
+
+#[test]
+fn recursive_queries_expose_their_anchor_and_recursive_definitions() {
+    let sql =
+        "WITH RECURSIVE r(n) AS (SELECT id FROM b UNION ALL SELECT n + 1 FROM r) SELECT * FROM r";
+    let [output] = outputs(sql).try_into().expect("one output");
+    assert!(output.starts_with("recursive(b.id, "), "{output}");
+}
