@@ -42,7 +42,8 @@ fn resolve_in_db(db: &ParserDB, query: &str, reference: &str) -> Option<String> 
     let Statement::Query(query) = statements.pop().expect("one statement") else {
         panic!("expected a query");
     };
-    let scope = ColumnScope::from_query(&query, db).expect("the scope builds");
+    let scope =
+        ColumnScope::from_query(&query, db, IdentifierCase::AsWritten).expect("the scope builds");
     let mut wrapped = Parser::parse_sql(&GenericDialect {}, &format!("SELECT {reference}"))
         .expect("the reference parses");
     let Statement::Query(wrapped) = wrapped.pop().expect("one statement") else {

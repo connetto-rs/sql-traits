@@ -38,12 +38,9 @@ use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
     traits::{ColumnLike, DQLLike, DatabaseLike, TableLike, ViewLike},
-    utils::{
-        identifier_resolution::identifiers_match,
-        object_name::{
-            object_name_last_part, qualifier_of, render_table_candidate, resolve_bound_table,
-            resolve_object_name, target_name_from_object_name,
-        },
+    utils::object_name::{
+        object_name_last_part, qualifier_of, render_table_candidate, resolve_bound_table,
+        resolve_object_name, target_name_from_object_name,
     },
 };
 
@@ -81,6 +78,17 @@ impl<DB: DatabaseLike> DerivingView<'_, DB> {
     }
 }
 
+impl<'db, DB: DatabaseLike> DerivingView<'db, DB> {
+    /// The view's own declared name and quoting, read the way a base
+    /// table's `table_name` is.
+    fn view_identity(self) -> (&'db str, bool) {
+        match self {
+            Self::Plain(view) => (view.view_name(), view.view_name_is_quoted()),
+            Self::Materialized(view) => (view.view_name(), view.view_name_is_quoted()),
+        }
+    }
+}
+
 /// One view on the chain a derivation is currently inside, linked to the one
 /// that reached it.
 ///
@@ -101,6 +109,12 @@ struct DerivingFrame<'s, 'db, DB: DatabaseLike> {
 struct Deriving<'s, 'db, DB: DatabaseLike> {
     /// The database every relation name resolves against.
     database: &'db DB,
+    /// The comparison a written relation or column name is read under. It
+    /// only applies outside a view. A stored view's own definition is read
+    /// as written, following [`IdentifierCase::AsWritten`] regardless of
+    /// this value, since it is a PostgreSQL-bound reference rather than text
+    /// the caller wrote.
+    case: IdentifierCase,
     /// The innermost view being derived right now, if any.
     views: Option<&'s DerivingFrame<'s, 'db, DB>>,
 }
@@ -108,9 +122,10 @@ struct Deriving<'s, 'db, DB: DatabaseLike> {
 impl<DB: DatabaseLike> Copy for Deriving<'_, '_, DB> {}
 
 impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
-    /// A derivation of `database` that is inside no view.
-    fn of(database: &'db DB) -> Self {
-        Self { database, views: None }
+    /// A derivation of `database` that is inside no view, comparing written
+    /// names under `case`.
+    fn of(database: &'db DB, case: IdentifierCase) -> Self {
+        Self { database, case, views: None }
     }
 
     /// Whether a reference to `view` would close a cycle.
@@ -138,7 +153,7 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
         if self.views.is_some() {
             resolve_bound_table(name, self.database)
         } else {
-            resolve_object_name(name, self.database)
+            resolve_object_name(name, self.database, self.case)
         }
     }
 
@@ -148,7 +163,7 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
         if self.views.is_some() {
             self.database.view_by_target(target, IdentifierCase::AsWritten)
         } else {
-            self.database.resolve_target_view(target, IdentifierCase::AsWritten)
+            self.database.resolve_target_view(target, self.case)
         }
     }
 
@@ -161,7 +176,7 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
         if self.views.is_some() {
             self.database.materialized_view_by_target(target, IdentifierCase::AsWritten)
         } else {
-            self.database.resolve_target_materialized_view(target, IdentifierCase::AsWritten)
+            self.database.resolve_target_materialized_view(target, self.case)
         }
     }
 }
@@ -185,6 +200,10 @@ struct FromTableRef<'query, 'db, DB: DatabaseLike, D: Copy> {
     key: RelationKey<'query, 'db>,
     schema_key: Option<RelationKey<'query, 'db>>,
     table: &'db DB::Table,
+    /// Whether the `FROM` item carries an explicit `AS` alias, so a resolved
+    /// reference through it exposes the alias rather than the table's own
+    /// declared name.
+    has_alias: bool,
     nullable: bool,
     entry_index: usize,
     output_columns: BaseColumns<D>,
@@ -259,6 +278,11 @@ impl<DB: DatabaseLike, D: Copy> Clone for DerivedShape<'_, '_, DB, D> {
 
 struct DerivedRelationRef<'query, 'db, DB: DatabaseLike, D: Copy> {
     key: Option<RelationKey<'query, 'db>>,
+    /// The identity a resolved reference through this relation exposes. It
+    /// is the alias when one was given, or the view's or CTE's own declared
+    /// name when it was referenced bare, which can differ in case from `key`
+    /// under a folding engine. `None` for an anonymous derived subquery.
+    identity: Option<RelationKey<'query, 'db>>,
     shape: DerivedShape<'query, 'db, DB, D>,
     nullable: bool,
     entry_index: usize,
@@ -296,6 +320,7 @@ struct CteDependencyVisitor<'a> {
     candidates: &'a [Cte],
     shadowed: Vec<Vec<Ident>>,
     dependencies: Vec<bool>,
+    case: IdentifierCase,
 }
 
 impl Visitor for CteDependencyVisitor<'_> {
@@ -321,12 +346,12 @@ impl Visitor for CteDependencyVisitor<'_> {
             return ControlFlow::Continue(());
         };
         if self.shadowed.iter().rev().flatten().any(|ident| {
-            identifiers_match(&ident.value, ident.quote_style.is_some(), value, quoted)
+            self.case.identifiers_match(&ident.value, ident.quote_style.is_some(), value, quoted)
         }) {
             return ControlFlow::Continue(());
         }
         if let Some(position) = self.candidates.iter().position(|cte| {
-            identifiers_match(
+            self.case.identifiers_match(
                 &cte.alias.name.value,
                 cte.alias.name.quote_style.is_some(),
                 value,
@@ -339,11 +364,12 @@ impl Visitor for CteDependencyVisitor<'_> {
     }
 }
 
-fn cte_dependencies(cte: &Cte, candidates: &[Cte]) -> Vec<bool> {
+fn cte_dependencies(cte: &Cte, candidates: &[Cte], case: IdentifierCase) -> Vec<bool> {
     let mut visitor = CteDependencyVisitor {
         candidates,
         shadowed: Vec::new(),
         dependencies: vec![false; candidates.len()],
+        case,
     };
     let _: ControlFlow<()> = cte.query.visit(&mut visitor);
     visitor.dependencies
@@ -368,9 +394,9 @@ fn cte_reaches(adjacency: &[Vec<bool>], from: usize, target: usize) -> bool {
     false
 }
 
-fn mutually_recursive_ctes(with: &With) -> Vec<bool> {
+fn mutually_recursive_ctes(with: &With, case: IdentifierCase) -> Vec<bool> {
     let adjacency: Vec<Vec<bool>> =
-        with.cte_tables.iter().map(|cte| cte_dependencies(cte, &with.cte_tables)).collect();
+        with.cte_tables.iter().map(|cte| cte_dependencies(cte, &with.cte_tables, case)).collect();
     adjacency
         .iter()
         .enumerate()
@@ -412,10 +438,13 @@ struct FromScope<'query, 'db, DB: DatabaseLike, D: Copy> {
     opaque: Vec<OpaqueRelation<'query, 'db>>,
     from_entry_count: usize,
     unqualified_poison: bool,
+    /// The comparison a written column, relation or output name is read
+    /// under, fixed for the whole scope at the moment it is built.
+    case: IdentifierCase,
 }
 
 impl<DB: DatabaseLike, D: Copy> FromScope<'_, '_, DB, D> {
-    fn new() -> Self {
+    fn new(case: IdentifierCase) -> Self {
         Self {
             bases: Vec::new(),
             derived: Vec::new(),
@@ -424,6 +453,7 @@ impl<DB: DatabaseLike, D: Copy> FromScope<'_, '_, DB, D> {
             opaque: Vec::new(),
             from_entry_count: 0,
             unqualified_poison: false,
+            case,
         }
     }
 
@@ -508,7 +538,7 @@ where
         _select: AstRef<'query, 'db, Select>,
         _parent: Self::Cursor,
     ) -> Self::Scope {
-        FromScope::new()
+        FromScope::new(IdentifierCase::AsWritten)
     }
 
     fn scope<'scope>(
@@ -619,7 +649,7 @@ fn collect_source_from_clause<'query, 'db, DB: DatabaseLike>(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
-    let deriving = Deriving::of(database);
+    let deriving = Deriving::of(database, IdentifierCase::AsWritten);
     let mut profile = SourceDerivation;
     let parent = ();
     let cte_scope = match &query.with {
@@ -704,38 +734,32 @@ where
             }
             let (left_nullable, right_nullable) = nullable_sides(&join.get().join_operator);
             let data = profile.scope_mut(&mut scope);
-            if left_nullable {
-                for base in &mut data.bases[entry_bases..bases_before] {
-                    base.nullable = true;
-                }
-                for relation in &mut data.derived[entry_derived..derived_before] {
-                    relation.nullable = true;
-                }
-            }
-            if right_nullable {
-                for base in &mut data.bases[bases_before..] {
-                    base.nullable = true;
-                }
-                for relation in &mut data.derived[derived_before..] {
-                    relation.nullable = true;
-                }
-            }
+            mark_nullable_sides(
+                data,
+                left_nullable,
+                right_nullable,
+                entry_bases..bases_before,
+                entry_derived..derived_before,
+                bases_before,
+                derived_before,
+            );
             let mut merged = Vec::new();
             if let Some(names) = merge_names(
                 &join.get().join_operator,
                 accumulated.as_deref(),
                 right_names.as_deref(),
+                data.case,
             ) {
                 let boundary = data.from_entry_count;
                 for (name, quoted) in &names {
-                    merge_name(&mut data.merged, name.clone(), *quoted, boundary);
+                    merge_name(&mut data.merged, name.clone(), *quoted, boundary, data.case);
                 }
                 merged = names;
             } else {
                 data.unqualified_poison = true;
             }
-            plan = merge_plans(plan, right_entries, &merged);
-            accumulated = merge_output_names(accumulated, right_names, &merged);
+            plan = merge_plans(plan, right_entries, &merged, data.case);
+            accumulated = merge_output_names(accumulated, right_names, &merged, data.case);
         }
         profile.scope_mut(&mut scope).wildcard_plans.push(plan.unwrap_or_default());
     }
@@ -780,6 +804,37 @@ fn nullable_sides(operator: &JoinOperator) -> (bool, bool) {
     }
 }
 
+/// Marks the bases and derived relations a join's nullable sides collected,
+/// per [`nullable_sides`]. `left_bases`/`left_derived` are the ranges
+/// collected before the join, and `bases_before`/`derived_before` the
+/// starting index of what it itself collected.
+fn mark_nullable_sides<DB: DatabaseLike, D: Copy>(
+    data: &mut FromScope<'_, '_, DB, D>,
+    left_nullable: bool,
+    right_nullable: bool,
+    left_bases: core::ops::Range<usize>,
+    left_derived: core::ops::Range<usize>,
+    bases_before: usize,
+    derived_before: usize,
+) {
+    if left_nullable {
+        for base in &mut data.bases[left_bases] {
+            base.nullable = true;
+        }
+        for relation in &mut data.derived[left_derived] {
+            relation.nullable = true;
+        }
+    }
+    if right_nullable {
+        for base in &mut data.bases[bases_before..] {
+            base.nullable = true;
+        }
+        for relation in &mut data.derived[derived_before..] {
+            relation.nullable = true;
+        }
+    }
+}
+
 /// The column names a join merges: a `USING` list directly, a `NATURAL`
 /// join as the intersection of the two sides' output names, each name once.
 /// A `NATURAL` join whose sides' columns cannot be enumerated reports `None`
@@ -789,6 +844,7 @@ fn merge_names(
     operator: &JoinOperator,
     left: Option<&[(String, bool)]>,
     right: Option<&[(String, bool)]>,
+    case: IdentifierCase,
 ) -> Option<Vec<(String, bool)>> {
     let mut merged: Vec<(String, bool)> = Vec::new();
     match join_constraint(operator) {
@@ -796,7 +852,7 @@ fn merge_names(
         Some(JoinConstraint::Using(names)) => {
             for name in names {
                 if let Some((value, quoted)) = object_name_last_part(name) {
-                    push_unseen(&mut merged, value, quoted);
+                    push_unseen(&mut merged, value, quoted, case);
                 }
             }
         }
@@ -806,9 +862,9 @@ fn merge_names(
             };
             for (name, quoted) in left_names {
                 if right_names.iter().any(|(other, other_quoted)| {
-                    identifiers_match(other, *other_quoted, name, *quoted)
+                    case.identifiers_match(other, *other_quoted, name, *quoted)
                 }) {
-                    push_unseen(&mut merged, name, *quoted);
+                    push_unseen(&mut merged, name, *quoted, case);
                 }
             }
         }
@@ -817,8 +873,8 @@ fn merge_names(
 }
 
 /// Appends an identifier unless the list already carries it.
-fn push_unseen(names: &mut Vec<(String, bool)>, value: &str, quoted: bool) {
-    if !names.iter().any(|(name, known)| identifiers_match(name, *known, value, quoted)) {
+fn push_unseen(names: &mut Vec<(String, bool)>, value: &str, quoted: bool, case: IdentifierCase) {
+    if !names.iter().any(|(name, known)| case.identifiers_match(name, *known, value, quoted)) {
         names.push((value.to_string(), quoted));
     }
 }
@@ -833,6 +889,7 @@ fn merge_plans(
     left: Option<Vec<WildcardEntry>>,
     right: Option<Vec<WildcardEntry>>,
     merged: &[(String, bool)],
+    case: IdentifierCase,
 ) -> Option<Vec<WildcardEntry>> {
     let (left, right) = (left?, right?);
     let mut next: Vec<WildcardEntry> = merged
@@ -842,7 +899,7 @@ fn merge_plans(
     let remerged = |entry: &WildcardEntry| {
         matches!(entry, WildcardEntry::Merged { name, quoted }
         if merged.iter().any(|(merged, merged_quoted)| {
-            identifiers_match(merged, *merged_quoted, name, *quoted)
+            case.identifiers_match(merged, *merged_quoted, name, *quoted)
         }))
     };
     next.extend(left.into_iter().filter(|entry| !remerged(entry)));
@@ -859,11 +916,12 @@ fn merge_output_names(
     left: Option<Vec<(String, bool)>>,
     right: Option<Vec<(String, bool)>>,
     merged: &[(String, bool)],
+    case: IdentifierCase,
 ) -> Option<Vec<(String, bool)>> {
     let (left, right) = (left?, right?);
     let unmerged = |entry: &&(String, bool)| {
         !merged.iter().any(|(merged, merged_quoted)| {
-            identifiers_match(merged, *merged_quoted, &entry.0, entry.1)
+            case.identifiers_match(merged, *merged_quoted, &entry.0, entry.1)
         })
     };
     let mut names: Vec<(String, bool)> = merged.to_vec();
@@ -895,10 +953,16 @@ fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
 
 /// Records a merged name, moving its subsumption boundary to the latest
 /// merge of that name.
-fn merge_name(merged: &mut Vec<MergedName>, name: String, quoted: bool, subsumed: usize) {
+fn merge_name(
+    merged: &mut Vec<MergedName>,
+    name: String,
+    quoted: bool,
+    subsumed: usize,
+    case: IdentifierCase,
+) {
     match merged
         .iter_mut()
-        .find(|merged| identifiers_match(&merged.name, merged.quoted, &name, quoted))
+        .find(|merged| case.identifiers_match(&merged.name, merged.quoted, &name, quoted))
     {
         Some(existing) => existing.subsumed = subsumed,
         None => merged.push(MergedName { name, quoted, subsumed }),
@@ -906,18 +970,29 @@ fn merge_name(merged: &mut Vec<MergedName>, name: String, quoted: bool, subsumed
 }
 
 /// The subsumption boundary for this identifier if it is merged.
-fn merged_boundary(merged: &[MergedName], name: &str, quoted: bool) -> Option<usize> {
+fn merged_boundary(
+    merged: &[MergedName],
+    name: &str,
+    quoted: bool,
+    case: IdentifierCase,
+) -> Option<usize> {
     merged
         .iter()
-        .find(|merged| identifiers_match(&merged.name, merged.quoted, name, quoted))
+        .find(|merged| case.identifiers_match(&merged.name, merged.quoted, name, quoted))
         .map(|merged| merged.subsumed)
 }
 
 /// Whether a relation's own copy of this column name is absorbed into a
 /// merged join column: true when the relation was collected before that
 /// name's merge.
-fn subsumed_exposure(merged: &[MergedName], entry_index: usize, name: &str, quoted: bool) -> bool {
-    merged_boundary(merged, name, quoted).is_some_and(|boundary| entry_index < boundary)
+fn subsumed_exposure(
+    merged: &[MergedName],
+    entry_index: usize,
+    name: &str,
+    quoted: bool,
+    case: IdentifierCase,
+) -> bool {
+    merged_boundary(merged, name, quoted, case).is_some_and(|boundary| entry_index < boundary)
 }
 
 /// Derives the shapes of a `WITH` clause's CTEs in order. A recursive list
@@ -940,7 +1015,7 @@ where
     tests::record_cte_shape_derivation();
     let base = shapes.len();
     let mutually_recursive = if with.get().recursive {
-        mutually_recursive_ctes(with.get())
+        mutually_recursive_ctes(with.get(), deriving.case)
     } else {
         vec![false; with.get().cte_tables.len()]
     };
@@ -1325,6 +1400,7 @@ fn push_wildcard_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
                             base.entry_index,
                             &column.name,
                             column.quoted,
+                            scope.case,
                         )
                     }));
                 }
@@ -1341,6 +1417,7 @@ fn push_wildcard_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
                                     relation.entry_index,
                                     &column.name,
                                     column.quoted,
+                                    scope.case,
                                 )
                             })
                             .cloned(),
@@ -1395,9 +1472,10 @@ fn projection_output_name<DB: DatabaseLike, D: Copy>(
     bases: &[FromTableRef<'_, '_, DB, D>],
     output_names: Option<&OutputNameSource<'_, '_, '_, DB, D>>,
     ordinal: usize,
+    case: IdentifierCase,
 ) -> Option<(String, bool)> {
     projected_column_name(expr)
-        .or_else(|| three_part_output_name(expr, bases))
+        .or_else(|| three_part_output_name(expr, bases, case))
         .or_else(|| output_names.and_then(|names| names.get(ordinal)))
 }
 
@@ -2785,6 +2863,7 @@ where
                         &data.bases,
                         output_names,
                         columns.len(),
+                        data.case,
                     ),
                     derived_projection_source(expression.get(), data, opaque)?,
                 )
@@ -2838,7 +2917,7 @@ where
             }
             let Some(expansion) = ({
                 let data = profile.scope(scope);
-                expand_qualified_wildcard(&data.bases, &data.derived, object_name)
+                expand_qualified_wildcard(&data.bases, &data.derived, object_name, data.case)
             }) else {
                 return Ok(false);
             };
@@ -2931,6 +3010,7 @@ fn projected_column_name(expr: &Expr) -> Option<(String, bool)> {
 fn three_part_output_name<DB: DatabaseLike, D: Copy>(
     expr: &Expr,
     bases: &[FromTableRef<'_, '_, DB, D>],
+    case: IdentifierCase,
 ) -> Option<(String, bool)> {
     let Expr::CompoundIdentifier(parts) = expr else {
         return None;
@@ -2940,14 +3020,13 @@ fn three_part_output_name<DB: DatabaseLike, D: Copy>(
     }
     let base = base_for_qualified_name(
         bases,
-        parts[0].value.as_str(),
-        parts[0].quote_style.is_some(),
-        parts[1].value.as_str(),
-        parts[1].quote_style.is_some(),
+        (parts[0].value.as_str(), parts[0].quote_style.is_some()),
+        (parts[1].value.as_str(), parts[1].quote_style.is_some()),
         false,
         usize::MAX,
+        case,
     )?;
-    base_exposes_column(base, &parts[2])
+    base_exposes_column(base, &parts[2], case)
         .then(|| (parts[2].value.clone(), parts[2].quote_style.is_some()))
 }
 
@@ -2982,27 +3061,34 @@ fn resolve_wildcard_target<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     derived: &'scope [DerivedRelationRef<'query, 'db, DB, D>],
     qualifier: &ObjectName,
     require_row_identity: bool,
+    case: IdentifierCase,
 ) -> Option<WildcardTarget<'scope, 'query, 'db, DB, D>> {
     let (value, quoted) = object_name_last_part(qualifier)?;
     match qualifier.0.len() {
         1 => {
-            base_for_qualifier(bases, value, quoted, require_row_identity, usize::MAX)
+            base_for_qualifier(bases, value, quoted, require_row_identity, usize::MAX, case)
                 .map(WildcardTarget::Base)
                 .or_else(|| {
-                    derived_for_qualifier(derived, value, quoted, require_row_identity, usize::MAX)
-                        .map(WildcardTarget::Derived)
+                    derived_for_qualifier(
+                        derived,
+                        value,
+                        quoted,
+                        require_row_identity,
+                        usize::MAX,
+                        case,
+                    )
+                    .map(WildcardTarget::Derived)
                 })
         }
         2 => {
             let (schema, schema_quoted) = qualifier_of(qualifier).named()?;
             base_for_qualified_name(
                 bases,
-                schema,
-                schema_quoted,
-                value,
-                quoted,
+                (schema, schema_quoted),
+                (value, quoted),
                 require_row_identity,
                 usize::MAX,
+                case,
             )
             .map(WildcardTarget::Base)
         }
@@ -3014,8 +3100,9 @@ fn expand_qualified_wildcard<'query, 'db, DB: DatabaseLike, D: Copy>(
     bases: &[FromTableRef<'query, 'db, DB, D>],
     derived: &[DerivedRelationRef<'query, 'db, DB, D>],
     qualifier: &ObjectName,
+    case: IdentifierCase,
 ) -> Option<Vec<DerivedColumn<'query, 'db, DB, D>>> {
-    match resolve_wildcard_target(bases, derived, qualifier, false)? {
+    match resolve_wildcard_target(bases, derived, qualifier, false, case)? {
         WildcardTarget::Base(base) => Some(base_columns(base)),
         WildcardTarget::Derived(relation) => Some(relation.shape.columns.clone()),
     }
@@ -3042,6 +3129,7 @@ fn apply_alias_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
 fn find_cte<'query, 'db, 'scope, DB: DatabaseLike, D: Copy>(
     name: &ObjectName,
     cte_scope: &'scope [CteShape<'query, 'db, DB, D>],
+    case: IdentifierCase,
 ) -> Option<&'scope CteShape<'query, 'db, DB, D>> {
     if name.0.len() != 1 {
         return None;
@@ -3050,15 +3138,16 @@ fn find_cte<'query, 'db, 'scope, DB: DatabaseLike, D: Copy>(
     cte_scope
         .iter()
         .rev()
-        .find(|cte| identifiers_match(cte.name.value.get(), cte.name.quoted, value, quoted))
+        .find(|cte| case.identifiers_match(cte.name.value.get(), cte.name.quoted, value, quoted))
 }
 
 fn base_exposes_column<DB: DatabaseLike, D: Copy>(
     base: &FromTableRef<'_, '_, DB, D>,
     column: &Ident,
+    case: IdentifierCase,
 ) -> bool {
     base.output_columns.iter().any(|candidate| {
-        identifiers_match(
+        case.identifiers_match(
             &candidate.name,
             candidate.quoted,
             column.value.as_str(),
@@ -3070,9 +3159,10 @@ fn base_exposes_column<DB: DatabaseLike, D: Copy>(
 fn find_base_column<'scope, DB: DatabaseLike, D: Copy>(
     base: &'scope FromTableRef<'_, '_, DB, D>,
     column: &Ident,
+    case: IdentifierCase,
 ) -> Option<&'scope BaseColumnRef<D>> {
     base.output_columns.iter().find(|candidate| {
-        identifiers_match(
+        case.identifiers_match(
             &candidate.name,
             candidate.quoted,
             column.value.as_str(),
@@ -3081,8 +3171,8 @@ fn find_base_column<'scope, DB: DatabaseLike, D: Copy>(
     })
 }
 
-fn key_matches(key: RelationKey<'_, '_>, value: &str, quoted: bool) -> bool {
-    identifiers_match(key.value.get(), key.quoted, value, quoted)
+fn key_matches(key: RelationKey<'_, '_>, value: &str, quoted: bool, case: IdentifierCase) -> bool {
+    case.identifiers_match(key.value.get(), key.quoted, value, quoted)
 }
 
 fn base_for_qualifier<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
@@ -3091,22 +3181,22 @@ fn base_for_qualifier<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     quoted: bool,
     require_row_identity: bool,
     visible_entries: usize,
+    case: IdentifierCase,
 ) -> Option<&'scope FromTableRef<'query, 'db, DB, D>> {
     bases
         .iter()
         .filter(|base| base.entry_index < visible_entries)
         .filter(|base| !require_row_identity || !base.nullable)
-        .find(|base| key_matches(base.key, value, quoted))
+        .find(|base| key_matches(base.key, value, quoted, case))
 }
 
 fn base_for_qualified_name<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     bases: &'scope [FromTableRef<'query, 'db, DB, D>],
-    schema: &str,
-    schema_quoted: bool,
-    table_part: &str,
-    table_quoted: bool,
+    schema: (&str, bool),
+    table_part: (&str, bool),
     require_row_identity: bool,
     visible_entries: usize,
+    case: IdentifierCase,
 ) -> Option<&'scope FromTableRef<'query, 'db, DB, D>> {
     bases
         .iter()
@@ -3114,8 +3204,8 @@ fn base_for_qualified_name<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
         .filter(|base| !require_row_identity || !base.nullable)
         .find(|base| {
             base.schema_key.is_some_and(|stored| {
-                key_matches(stored, schema, schema_quoted)
-                    && key_matches(base.key, table_part, table_quoted)
+                key_matches(stored, schema.0, schema.1, case)
+                    && key_matches(base.key, table_part.0, table_part.1, case)
             })
         })
 }
@@ -3126,11 +3216,12 @@ fn derived_for_qualifier<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     quoted: bool,
     require_row_identity: bool,
     visible_entries: usize,
+    case: IdentifierCase,
 ) -> Option<&'scope DerivedRelationRef<'query, 'db, DB, D>> {
     derived
         .iter()
         .filter(|relation| relation.entry_index < visible_entries)
-        .find(|relation| relation.key.is_some_and(|key| key_matches(key, value, quoted)))
+        .find(|relation| relation.key.is_some_and(|key| key_matches(key, value, quoted, case)))
         .filter(|relation| {
             !require_row_identity || (relation.shape.row_preserving && !relation.nullable)
         })
@@ -3144,9 +3235,10 @@ enum DerivedMatch<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> {
 fn find_derived_column<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     columns: &'scope [DerivedColumn<'query, 'db, DB, D>],
     column: &Ident,
+    case: IdentifierCase,
 ) -> Option<DerivedMatch<'scope, 'query, 'db, DB, D>> {
     let mut matches = columns.iter().filter(|candidate| {
-        identifiers_match(
+        case.identifiers_match(
             &candidate.name,
             candidate.quoted,
             column.value.as_str(),
@@ -3188,9 +3280,20 @@ fn relation_key_display<DB: DatabaseLike, D: Copy>(
     }
 }
 
-struct ResolvedColumn<'db, DB: DatabaseLike, D: Copy> {
+struct ResolvedColumn<'scope, 'db, DB: DatabaseLike, D: Copy> {
     source: Option<&'db DB::Table>,
     definition: D,
+    /// The relation alias or CTE name a qualifier matched, or the stored
+    /// table's own declared name when the reference reached it unaliased.
+    /// `None` when no single relation stands behind the match, as for an
+    /// unqualified reference through a `USING`/`NATURAL` merge, or an
+    /// anonymous derived relation.
+    relation: Option<(&'scope str, bool)>,
+    /// The name this reference is exposed under at the binding it matched.
+    /// This is a `SELECT` list alias, a `WITH` column list alias, or the
+    /// stored column name, and is `None` only alongside an opaque or
+    /// ambiguous match, where no single declared name answers for it.
+    exposed: Option<(&'scope str, bool)>,
 }
 
 enum LookupOutcome<T> {
@@ -3199,84 +3302,118 @@ enum LookupOutcome<T> {
     Stop,
 }
 
-fn visible_merged_boundary(
-    merged: &[MergedName],
+/// The matched merge record for a column name, if it is merged and visible.
+fn visible_merged_name<'scope>(
+    merged: &'scope [MergedName],
     column: &Ident,
     visible_entries: usize,
-) -> Option<usize> {
-    merged
-        .iter()
-        .filter(|merged| merged.subsumed <= visible_entries)
-        .rev()
-        .find(|merged| {
-            identifiers_match(
-                &merged.name,
-                merged.quoted,
-                column.value.as_str(),
-                column.quote_style.is_some(),
-            )
-        })
-        .map(|merged| merged.subsumed)
+    case: IdentifierCase,
+) -> Option<&'scope MergedName> {
+    merged.iter().filter(|merged| merged.subsumed <= visible_entries).rev().find(|merged| {
+        case.identifiers_match(
+            &merged.name,
+            merged.quoted,
+            column.value.as_str(),
+            column.quote_style.is_some(),
+        )
+    })
 }
 
 fn opaque_qualifier_matches_key(
     key: RelationKey<'_, '_>,
     schema: Option<RelationKey<'_, '_>>,
     qualifier: &[Ident],
+    case: IdentifierCase,
 ) -> bool {
     match qualifier {
-        [table] => key_matches(key, table.value.as_str(), table.quote_style.is_some()),
+        [table] => key_matches(key, table.value.as_str(), table.quote_style.is_some(), case),
         [schema_part, table] => {
             schema.is_some_and(|schema| {
-                key_matches(schema, schema_part.value.as_str(), schema_part.quote_style.is_some())
-            }) && key_matches(key, table.value.as_str(), table.quote_style.is_some())
+                key_matches(
+                    schema,
+                    schema_part.value.as_str(),
+                    schema_part.quote_style.is_some(),
+                    case,
+                )
+            }) && key_matches(key, table.value.as_str(), table.quote_style.is_some(), case)
         }
         _ => false,
     }
 }
 
-fn opaque_qualifier_matches(identity: &OpaqueIdentity<'_, '_>, qualifier: &[Ident]) -> bool {
+fn opaque_qualifier_matches(
+    identity: &OpaqueIdentity<'_, '_>,
+    qualifier: &[Ident],
+    case: IdentifierCase,
+) -> bool {
     match identity {
         OpaqueIdentity::Known { key, schema } => {
-            opaque_qualifier_matches_key(*key, *schema, qualifier)
+            opaque_qualifier_matches_key(*key, *schema, qualifier, case)
         }
         OpaqueIdentity::Multiple(qualifiers) => {
             qualifiers.iter().any(|candidate| {
-                opaque_qualifier_matches_key(candidate.key, candidate.schema, qualifier)
+                opaque_qualifier_matches_key(candidate.key, candidate.schema, qualifier, case)
             })
         }
         OpaqueIdentity::Anonymous => false,
     }
 }
 
-fn unqualified_definition_local<'db, DB: DatabaseLike, D: Copy>(
-    scope: &FromScope<'_, 'db, DB, D>,
+/// The identity a resolved reference exposes for a base relation. It is the
+/// declared alias when the `FROM` item carries one, or the table's own
+/// declared name otherwise, so an unaliased reference exposes the name
+/// PostgreSQL stores it under rather than whatever case the caller wrote.
+fn base_relation_identity<'scope, DB: DatabaseLike, D: Copy>(
+    base: &'scope FromTableRef<'_, '_, DB, D>,
+) -> (&'scope str, bool) {
+    if base.has_alias {
+        (base.key.value.get(), base.key.quoted)
+    } else {
+        (base.table.table_name(), base.table.table_name_is_quoted())
+    }
+}
+
+fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
+    scope: &'scope FromScope<'_, 'db, DB, D>,
     visible_entries: usize,
     opaque: D,
     column: &Ident,
     require_row_identity: bool,
-) -> Result<LookupOutcome<ResolvedColumn<'db, DB, D>>, LookupError> {
+    case: IdentifierCase,
+) -> Result<LookupOutcome<ResolvedColumn<'scope, 'db, DB, D>>, LookupError> {
     if scope.unqualified_poison
         || scope.opaque.iter().any(|entry| entry.entry_index < visible_entries)
     {
-        return Ok(LookupOutcome::Found(ResolvedColumn { source: None, definition: opaque }));
+        return Ok(LookupOutcome::Found(ResolvedColumn {
+            source: None,
+            definition: opaque,
+            relation: None,
+            exposed: None,
+        }));
     }
     let mut definitions = Vec::new();
     let mut candidates = Vec::new();
-    let boundary = visible_merged_boundary(&scope.merged, column, visible_entries);
-    if boundary.is_some() {
-        definitions.push(ResolvedColumn { source: None, definition: opaque });
+    let merged_match = visible_merged_name(&scope.merged, column, visible_entries, case);
+    if let Some(merged) = merged_match {
+        definitions.push(ResolvedColumn {
+            source: None,
+            definition: opaque,
+            relation: None,
+            exposed: Some((merged.name.as_str(), merged.quoted)),
+        });
     }
-    let start = boundary.unwrap_or(0);
+    let start = merged_match.map_or(0, |merged| merged.subsumed);
     for base in scope
         .bases
         .iter()
         .filter(|base| base.entry_index >= start && base.entry_index < visible_entries)
     {
-        if let Some(base_column) = find_base_column(base, column) {
+        if let Some(base_column) = find_base_column(base, column, case) {
             definitions.push(ResolvedColumn {
                 source: (!require_row_identity || !base.nullable).then_some(base.table),
                 definition: base_column.definition,
+                relation: Some(base_relation_identity(base)),
+                exposed: Some((base_column.name.as_str(), base_column.quoted)),
             });
             candidates.push(render_table_candidate(base.table));
         }
@@ -3286,19 +3423,31 @@ fn unqualified_definition_local<'db, DB: DatabaseLike, D: Copy>(
         .iter()
         .filter(|relation| relation.entry_index >= start && relation.entry_index < visible_entries)
     {
-        match find_derived_column(&relation.shape.columns, column) {
+        match find_derived_column(&relation.shape.columns, column, case) {
             Some(DerivedMatch::Column(found)) => {
                 definitions.push(ResolvedColumn {
                     source: (!require_row_identity || !relation.nullable)
                         .then_some(found.source)
                         .flatten(),
                     definition: found.definition,
+                    relation: relation.identity.as_ref().map(|key| (key.value.get(), key.quoted)),
+                    exposed: Some((found.name.as_str(), found.quoted)),
                 });
                 candidates.push(relation_key_display(relation));
             }
             Some(DerivedMatch::Ambiguous) => {
-                definitions.push(ResolvedColumn { source: None, definition: opaque });
-                definitions.push(ResolvedColumn { source: None, definition: opaque });
+                definitions.push(ResolvedColumn {
+                    source: None,
+                    definition: opaque,
+                    relation: None,
+                    exposed: None,
+                });
+                definitions.push(ResolvedColumn {
+                    source: None,
+                    definition: opaque,
+                    relation: None,
+                    exposed: None,
+                });
                 candidates.push(relation_key_display(relation));
             }
             None => {}
@@ -3315,13 +3464,82 @@ fn unqualified_definition_local<'db, DB: DatabaseLike, D: Copy>(
     }
 }
 
-fn resolve_definition_local<'db, DB: DatabaseLike, D: Copy>(
-    scope: &FromScope<'_, 'db, DB, D>,
+fn resolve_two_part_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
+    scope: &'scope FromScope<'_, 'db, DB, D>,
+    visible_entries: usize,
+    opaque: D,
+    parts: &[Ident],
+    require_row_identity: bool,
+    case: IdentifierCase,
+) -> Result<LookupOutcome<ResolvedColumn<'scope, 'db, DB, D>>, LookupError> {
+    let column = &parts[1];
+    let qualifier = &parts[0];
+    let value = qualifier.value.as_str();
+    let quoted = qualifier.quote_style.is_some();
+    if let Some(base) =
+        base_for_qualifier(&scope.bases, value, quoted, require_row_identity, visible_entries, case)
+    {
+        return Ok(match find_base_column(base, column, case) {
+            Some(column) => {
+                LookupOutcome::Found(ResolvedColumn {
+                    source: Some(base.table),
+                    definition: column.definition,
+                    relation: Some(base_relation_identity(base)),
+                    exposed: Some((column.name.as_str(), column.quoted)),
+                })
+            }
+            None => LookupOutcome::Stop,
+        });
+    }
+    if let Some(relation) = derived_for_qualifier(
+        &scope.derived,
+        value,
+        quoted,
+        require_row_identity,
+        visible_entries,
+        case,
+    ) {
+        return match find_derived_column(&relation.shape.columns, column, case) {
+            Some(DerivedMatch::Column(column)) => {
+                Ok(LookupOutcome::Found(ResolvedColumn {
+                    source: column.source,
+                    definition: column.definition,
+                    relation: relation.identity.as_ref().map(|key| (key.value.get(), key.quoted)),
+                    exposed: Some((column.name.as_str(), column.quoted)),
+                }))
+            }
+            Some(DerivedMatch::Ambiguous) => {
+                Err(LookupError::AmbiguousTableLookup {
+                    object_name: column.value.clone(),
+                    candidates: vec![relation_key_display(relation)],
+                })
+            }
+            None => Ok(LookupOutcome::Stop),
+        };
+    }
+    if scope.opaque.iter().any(|entry| {
+        entry.entry_index < visible_entries
+            && opaque_qualifier_matches(&entry.identity, &parts[..1], case)
+    }) {
+        Ok(LookupOutcome::Found(ResolvedColumn {
+            source: None,
+            definition: opaque,
+            relation: None,
+            exposed: None,
+        }))
+    } else {
+        Ok(LookupOutcome::SearchParent)
+    }
+}
+
+fn resolve_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
+    scope: &'scope FromScope<'_, 'db, DB, D>,
     visible_entries: usize,
     opaque: D,
     expression: &Expr,
     require_row_identity: bool,
-) -> Result<LookupOutcome<ResolvedColumn<'db, DB, D>>, LookupError> {
+    case: IdentifierCase,
+) -> Result<LookupOutcome<ResolvedColumn<'scope, 'db, DB, D>>, LookupError> {
     match expression {
         Expr::Identifier(column) => {
             unqualified_definition_local(
@@ -3330,77 +3548,35 @@ fn resolve_definition_local<'db, DB: DatabaseLike, D: Copy>(
                 opaque,
                 column,
                 require_row_identity,
+                case,
             )
         }
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let column = &parts[1];
-            let qualifier = &parts[0];
-            let value = qualifier.value.as_str();
-            let quoted = qualifier.quote_style.is_some();
-            if let Some(base) = base_for_qualifier(
-                &scope.bases,
-                value,
-                quoted,
-                require_row_identity,
+            resolve_two_part_definition(
+                scope,
                 visible_entries,
-            ) {
-                return Ok(match find_base_column(base, column) {
-                    Some(column) => {
-                        LookupOutcome::Found(ResolvedColumn {
-                            source: Some(base.table),
-                            definition: column.definition,
-                        })
-                    }
-                    None => LookupOutcome::Stop,
-                });
-            }
-            if let Some(relation) = derived_for_qualifier(
-                &scope.derived,
-                value,
-                quoted,
+                opaque,
+                parts,
                 require_row_identity,
-                visible_entries,
-            ) {
-                return match find_derived_column(&relation.shape.columns, column) {
-                    Some(DerivedMatch::Column(column)) => {
-                        Ok(LookupOutcome::Found(ResolvedColumn {
-                            source: column.source,
-                            definition: column.definition,
-                        }))
-                    }
-                    Some(DerivedMatch::Ambiguous) => {
-                        Err(LookupError::AmbiguousTableLookup {
-                            object_name: column.value.clone(),
-                            candidates: vec![relation_key_display(relation)],
-                        })
-                    }
-                    None => Ok(LookupOutcome::Stop),
-                };
-            }
-            if scope.opaque.iter().any(|entry| {
-                entry.entry_index < visible_entries
-                    && opaque_qualifier_matches(&entry.identity, &parts[..1])
-            }) {
-                Ok(LookupOutcome::Found(ResolvedColumn { source: None, definition: opaque }))
-            } else {
-                Ok(LookupOutcome::SearchParent)
-            }
+                case,
+            )
         }
         Expr::CompoundIdentifier(parts) if parts.len() == 3 => {
             if let Some(base) = base_for_qualified_name(
                 &scope.bases,
-                parts[0].value.as_str(),
-                parts[0].quote_style.is_some(),
-                parts[1].value.as_str(),
-                parts[1].quote_style.is_some(),
+                (parts[0].value.as_str(), parts[0].quote_style.is_some()),
+                (parts[1].value.as_str(), parts[1].quote_style.is_some()),
                 require_row_identity,
                 visible_entries,
+                case,
             ) {
-                return Ok(match find_base_column(base, &parts[2]) {
+                return Ok(match find_base_column(base, &parts[2], case) {
                     Some(column) => {
                         LookupOutcome::Found(ResolvedColumn {
                             source: Some(base.table),
                             definition: column.definition,
+                            relation: Some(base_relation_identity(base)),
+                            exposed: Some((column.name.as_str(), column.quoted)),
                         })
                     }
                     None => LookupOutcome::Stop,
@@ -3408,9 +3584,14 @@ fn resolve_definition_local<'db, DB: DatabaseLike, D: Copy>(
             }
             if scope.opaque.iter().any(|entry| {
                 entry.entry_index < visible_entries
-                    && opaque_qualifier_matches(&entry.identity, &parts[..2])
+                    && opaque_qualifier_matches(&entry.identity, &parts[..2], case)
             }) {
-                Ok(LookupOutcome::Found(ResolvedColumn { source: None, definition: opaque }))
+                Ok(LookupOutcome::Found(ResolvedColumn {
+                    source: None,
+                    definition: opaque,
+                    relation: None,
+                    exposed: None,
+                }))
             } else {
                 Ok(LookupOutcome::SearchParent)
             }
@@ -3441,6 +3622,7 @@ fn column_source<'db, DB: DatabaseLike, D: Copy>(
         opaque,
         expression,
         require_row_identity,
+        scope.case,
     )? {
         LookupOutcome::Found(column) => Ok(column.source),
         LookupOutcome::SearchParent | LookupOutcome::Stop => Ok(None),
@@ -3534,9 +3716,17 @@ where
         return Ok(opaque_factor(OpaqueIdentity::Known { key, schema }));
     };
     let names = derived_column_names(&shape.columns);
+    let identity = Some(alias.map_or_else(
+        || {
+            let (view_name, view_quoted) = view.view_identity();
+            RelationKey { value: AstRef::Database(view_name), quoted: view_quoted }
+        },
+        alias_key,
+    ));
     Ok(FactorContribution {
         relation: RelationContribution::Derived(DerivedRelationRef {
             key: Some(key),
+            identity,
             shape,
             nullable: false,
             entry_index: 0,
@@ -3566,7 +3756,11 @@ where
         DerivingView::Materialized(view) => (view.definition(), view.declared_column_names()),
     };
     let frame = DerivingFrame { view, parent: deriving.views };
-    let inner = Deriving { database: deriving.database, views: Some(&frame) };
+    let inner = Deriving {
+        database: deriving.database,
+        case: IdentifierCase::AsWritten,
+        views: Some(&frame),
+    };
     let output_names = (!declared.is_empty()).then_some(OutputNameSource::Declared(declared));
     let parent = profile.no_parent();
     let Some(mut shape) = derive_query_shape(
@@ -3847,7 +4041,7 @@ where
     if has_arguments {
         return Ok(opaque_factor(OpaqueIdentity::Known { key, schema: None }));
     }
-    if let Some(cte) = find_cte(name.get(), cte_scope) {
+    if let Some(cte) = find_cte(name.get(), cte_scope, deriving.case) {
         let shape = match (cte.shape.clone(), alias) {
             (Some(shape), Some(table_alias)) => apply_alias_columns(Some(shape), table_alias.get()),
             (shape, _) => shape,
@@ -3859,6 +4053,7 @@ where
         return Ok(FactorContribution {
             relation: RelationContribution::Derived(DerivedRelationRef {
                 key: Some(key),
+                identity: Some(alias.map_or(cte.name, alias_key)),
                 shape,
                 nullable: false,
                 entry_index: 0,
@@ -3879,6 +4074,7 @@ where
             key,
             schema_key: alias.is_none().then(|| stored_schema_key::<DB>(table)),
             table,
+            has_alias: alias.is_some(),
             nullable: false,
             entry_index: 0,
             output_columns,
@@ -3923,9 +4119,11 @@ where
                 return Ok(opaque_factor(opaque_identity_from_alias(alias)));
             };
             let names = derived_column_names(&shape.columns);
+            let key = alias.map(alias_key);
             Ok(FactorContribution {
                 relation: RelationContribution::Derived(DerivedRelationRef {
-                    key: alias.map(alias_key),
+                    key,
+                    identity: key,
                     shape,
                     nullable: false,
                     entry_index: 0,
@@ -3960,9 +4158,10 @@ where
 pub(crate) fn build_definition_graph<'query, 'db, DB: DatabaseLike>(
     query: &'query Query,
     database: &'db DB,
+    case: IdentifierCase,
 ) -> Result<(definition_graph::DefinitionGraph<'query, 'db, DB>, ScopeCursor), LookupError> {
-    let deriving = Deriving::of(database);
-    let mut profile = DefinitionDerivation::new();
+    let deriving = Deriving::of(database, case);
+    let mut profile = DefinitionDerivation::new(case);
     let parent = profile.no_parent();
     let root =
         index_nested_query_scopes(AstRef::Query(query), &[], deriving, parent, &mut profile)?;
@@ -4034,6 +4233,7 @@ impl<DB: DatabaseLike> DQLLike<DB> for Query {
                                 &scope.derived,
                                 object_name,
                                 true,
+                                scope.case,
                             ) {
                                 Some(WildcardTarget::Base(base)) => Some(base.table),
                                 Some(WildcardTarget::Derived(relation)) => {
@@ -4087,7 +4287,7 @@ mod tests {
     use crate::{
         errors::LookupError,
         prelude::ParserDB,
-        structs::{ColumnDefinition, ColumnScope},
+        structs::{ColumnDefinition, ColumnScope, IdentifierCase},
         traits::{DQLLike, TableLike},
     };
 
@@ -4206,7 +4406,8 @@ mod tests {
                  SELECT f((SELECT id FROM users)).field.*, id AS x FROM users\
              ) AS d",
         );
-        let scope = ColumnScope::from_query(&query, &database).expect("scope builds");
+        let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
+            .expect("scope builds");
         let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select body") };
         let SelectItem::UnnamedExpr(reference) = &select.projection[0] else {
             panic!("expected an expression projection")
@@ -4221,8 +4422,12 @@ mod tests {
     fn private_fallback_helpers_reject_unrepresentable_names() {
         let key = RelationKey { value: AstRef::Query("table"), quoted: false };
         let qualifier = [Ident::new("catalog"), Ident::new("schema"), Ident::new("table")];
-        assert!(!opaque_qualifier_matches_key(key, None, &qualifier));
-        assert!(!opaque_qualifier_matches(&OpaqueIdentity::Anonymous, &qualifier));
+        assert!(!opaque_qualifier_matches_key(key, None, &qualifier, IdentifierCase::AsWritten));
+        assert!(!opaque_qualifier_matches(
+            &OpaqueIdentity::Anonymous,
+            &qualifier,
+            IdentifierCase::AsWritten
+        ));
 
         let ast = AstRef::Query("value");
         assert_eq!(ast.clone().get(), "value");
@@ -4231,12 +4436,13 @@ mod tests {
             .with
             .expect("with clause")
             .cte_tables[0];
-        assert_eq!(cte_dependencies(cte, &[]), Vec::<bool>::new());
+        assert_eq!(cte_dependencies(cte, &[], IdentifierCase::AsWritten), Vec::<bool>::new());
         let empty = sqlparser::ast::ObjectName(Vec::new());
         let mut visitor = super::CteDependencyVisitor {
             candidates: &[],
             shadowed: Vec::new(),
             dependencies: Vec::new(),
+            case: IdentifierCase::AsWritten,
         };
         assert!(matches!(
             sqlparser::ast::Visitor::pre_visit_relation(&mut visitor, &empty),

@@ -36,7 +36,7 @@ fn query(sql: &str) -> Query {
 /// from the same query, rendering the resolved table's name.
 fn resolve_projection(sql: &str, db: &ParserDB) -> Result<Option<String>, LookupError> {
     let query = query(sql);
-    let scope = ColumnScope::from_query(&query, db)?;
+    let scope = ColumnScope::from_query(&query, db, IdentifierCase::AsWritten)?;
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected a plain SELECT body")
     };
@@ -388,7 +388,8 @@ fn recursive_arm_qualifies_through_the_cte_alias() {
     let mut arm = (*cte.query).clone();
     arm.with = full.with.clone();
     arm.body = right.clone();
-    let scope = ColumnScope::from_query(&arm, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&arm, &db, IdentifierCase::AsWritten).expect("scope builds");
     let resolved =
         scope.resolve_column(&reference("cg.id")).expect("resolves").expect("cg.id resolves");
     assert_eq!(resolved.table_name(), "groups");
@@ -604,7 +605,8 @@ fn schema_qualified_from_qualifies_by_table_name() {
     let three_part = resolve_projection("SELECT s.a.payload FROM s.a", &db).expect("resolves");
     assert_eq!(three_part.as_deref(), Some("a"));
     let three_part_query = query("SELECT s.a.payload FROM s.a");
-    let scope = ColumnScope::from_query(&three_part_query, &db).expect("scope");
+    let scope =
+        ColumnScope::from_query(&three_part_query, &db, IdentifierCase::AsWritten).expect("scope");
     assert_eq!(
         scope
             .resolve_column(&reference("s.a.payload"))
@@ -628,7 +630,7 @@ fn schema_qualified_from_qualifies_by_table_name() {
 fn malformed_from_name_fails_construction() {
     let db = schema_db();
     let query = query("SELECT a.payload FROM a.b.c");
-    let result = ColumnScope::from_query(&query, &db);
+    let result = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten);
     assert!(matches!(result, Err(LookupError::InvalidObjectName { .. })), "got {:?}", result.err());
 }
 
@@ -637,7 +639,8 @@ fn malformed_from_name_fails_construction() {
 fn set_operation_body_answers_nothing() {
     let db = schema_db();
     let query = query("SELECT payload FROM a UNION SELECT payload FROM b");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     assert_eq!(scope.resolve_column(&reference("payload")).expect("resolves"), None);
     assert_eq!(scope.resolve_column(&reference("a.payload")).expect("resolves"), None);
 }
@@ -665,7 +668,7 @@ fn single_table_scope_resolves_the_defined_tables_columns() {
         .table_by_target(TargetName::new("a", false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("table a exists");
-    let scope = ColumnScope::for_table(table, &db);
+    let scope = ColumnScope::for_table(table, &db, IdentifierCase::AsWritten);
     assert_eq!(
         scope
             .resolve_column(&reference("payload"))
@@ -692,7 +695,7 @@ fn single_table_scope_qualifier_is_quote_aware() {
         .table_by_target(TargetName::new("Mix", true), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("quoted table is found");
-    let scope = ColumnScope::for_table(table, &db);
+    let scope = ColumnScope::for_table(table, &db, IdentifierCase::AsWritten);
     assert_eq!(
         scope
             .resolve_column(&reference("\"Mix\".v"))
@@ -711,7 +714,8 @@ fn single_table_scope_qualifier_is_quote_aware() {
 fn scope_resolves_references_from_outside_the_query() {
     let db = schema_db();
     let query = query("SELECT 1 FROM a JOIN b ON a.id = b.id");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     assert_eq!(
         scope.resolve_column(&reference("a.payload")).expect("resolves").map(TableLike::table_name),
         Some("a")
@@ -872,7 +876,8 @@ fn three_part_reference_on_null_extended_side_refuses_identity() {
     let db = ParserDB::parse::<GenericDialect>("CREATE TABLE a(id INT); CREATE TABLE b(id INT);")
         .expect("schema parses");
     let query = query("SELECT public.b.id FROM a LEFT JOIN b ON true");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     assert_eq!(
         scope
             .resolve_column(&reference("public.b.id"))
@@ -889,7 +894,8 @@ fn three_part_reference_on_null_extended_side_refuses_identity() {
 fn null_extended_derived_relation_still_answers_types() {
     let db = schema_db();
     let query = query("SELECT s.payload FROM b LEFT JOIN (SELECT payload FROM a) s ON true");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected a plain SELECT body")
     };
@@ -1312,4 +1318,271 @@ fn bare_name_through_a_null_extended_derived_relation() {
     let sql = "SELECT y FROM a LEFT JOIN (SELECT y FROM b) s ON true";
     assert_eq!(resolve_projection(sql, &db).expect("resolves").as_deref(), Some("b"));
     assert_eq!(query(sql).projection_source_table(&db).expect("identity succeeds"), None);
+}
+
+/// Resolves the query's single projected expression against a scope built
+/// from the same query under `case`, rendering the resolved table's name.
+fn resolve_projection_with_case(
+    sql: &str,
+    db: &ParserDB,
+    case: IdentifierCase,
+) -> Result<Option<String>, LookupError> {
+    let query = query(sql);
+    let scope = ColumnScope::from_query(&query, db, case)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected a plain SELECT body")
+    };
+    let SelectItem::UnnamedExpr(expr) = &select.projection.first().expect("one projection") else {
+        panic!("expected an expression projection")
+    };
+    Ok(scope.resolve_column(expr)?.map(|table| table.table_name().to_string()))
+}
+
+/// Resolves the query's single projected expression's binding against a
+/// scope built from the same query under `case`, rendering the owned
+/// relation and exposed names.
+#[expect(clippy::type_complexity, reason = "an owned mirror of ColumnBinding's two fields")]
+fn resolve_binding(
+    sql: &str,
+    db: &ParserDB,
+    case: IdentifierCase,
+) -> Result<Option<(Option<(String, bool)>, Option<(String, bool)>)>, LookupError> {
+    let query = query(sql);
+    let scope = ColumnScope::from_query(&query, db, case)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected a plain SELECT body")
+    };
+    let SelectItem::UnnamedExpr(expr) = &select.projection.first().expect("one projection") else {
+        panic!("expected an expression projection")
+    };
+    Ok(scope.resolve_column_binding(expr)?.map(|(_, binding)| {
+        (
+            binding.relation().map(|(name, quoted)| (name.to_string(), quoted)),
+            binding.exposed().map(|(name, quoted)| (name.to_string(), quoted)),
+        )
+    }))
+}
+
+// `IdentifierCase` selects the lexical comparison `ColumnScope` applies to
+// every `FROM`/column lookup. SQLite folds every identifier for ASCII
+// whether or not it was quoted, MySQL's `lower_case_table_names = 0` folds
+// neither side, and PostgreSQL's own `AsWritten` rule used everywhere else
+// in this file folds only the unquoted side. These cases exercise the
+// folding on every path `ColumnScope` reaches it through: a bare column, a
+// table alias, a `NATURAL` join's computed intersection, a qualified
+// wildcard, and a `WITH` reference.
+
+#[test]
+fn folded_case_matches_a_quoted_column_as_written_would_refuse() {
+    let db = ParserDB::parse::<GenericDialect>("CREATE TABLE a(id INT);").expect("schema parses");
+    assert_eq!(
+        resolve_projection_with_case("SELECT \"ID\" FROM a", &db, IdentifierCase::AsWritten)
+            .expect("resolves"),
+        None
+    );
+    assert_eq!(
+        resolve_projection_with_case("SELECT \"ID\" FROM a", &db, IdentifierCase::Folded)
+            .expect("resolves")
+            .as_deref(),
+        Some("a")
+    );
+}
+
+#[test]
+fn exact_case_refuses_an_unquoted_match_as_written_folds() {
+    let db = ParserDB::parse::<GenericDialect>("CREATE TABLE a(id INT);").expect("schema parses");
+    assert_eq!(
+        resolve_projection_with_case("SELECT ID FROM a", &db, IdentifierCase::AsWritten)
+            .expect("resolves")
+            .as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        resolve_projection_with_case("SELECT ID FROM a", &db, IdentifierCase::Exact)
+            .expect("resolves"),
+        None
+    );
+}
+
+#[test]
+fn folded_case_matches_a_table_alias_through_a_differently_cased_qualifier() {
+    let db = ParserDB::parse::<GenericDialect>("CREATE TABLE a(id INT);").expect("schema parses");
+    let query = query("SELECT id FROM a AS \"MiXeD\"");
+    let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded).expect("scope builds");
+    assert_eq!(
+        scope.resolve_column(&reference("mixed.id")).expect("resolves").map(TableLike::table_name),
+        Some("a")
+    );
+    assert_eq!(
+        scope
+            .resolve_column(&reference("\"MIXED\".id"))
+            .expect("resolves")
+            .map(TableLike::table_name),
+        Some("a")
+    );
+}
+
+#[test]
+fn folded_case_computes_a_natural_join_intersection_by_folded_name() {
+    let db = ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE a(\"ID\" INT, x INT); CREATE TABLE b(id INT, y INT);",
+    )
+    .expect("schema parses");
+    let query = query("SELECT * FROM a NATURAL JOIN b");
+    let as_written =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
+    assert_eq!(
+        as_written.resolve_column(&reference("x")).expect("resolves").map(TableLike::table_name),
+        Some("a")
+    );
+    let folded =
+        ColumnScope::from_query(&query, &db, IdentifierCase::Folded).expect("scope builds");
+    assert_eq!(folded.resolve_column(&reference("id")).expect("resolves"), None);
+}
+
+#[test]
+fn folded_case_expands_a_qualified_wildcard_through_a_differently_cased_alias() {
+    let db = ParserDB::parse::<GenericDialect>("CREATE TABLE a(id INT);").expect("schema parses");
+    let sql = "WITH v AS (SELECT \"T\".* FROM a AS t) SELECT v.id FROM v";
+    assert_eq!(
+        resolve_projection_with_case(sql, &db, IdentifierCase::AsWritten).expect("resolves"),
+        None
+    );
+    assert_eq!(
+        resolve_projection_with_case(sql, &db, IdentifierCase::Folded)
+            .expect("resolves")
+            .as_deref(),
+        Some("a")
+    );
+}
+
+#[test]
+fn folded_case_matches_a_cte_reference_regardless_of_case() {
+    let db = ParserDB::parse::<GenericDialect>("CREATE TABLE a(id INT);").expect("schema parses");
+    let sql = "WITH \"V\" AS (SELECT id FROM a) SELECT v.id FROM v";
+    assert_eq!(
+        resolve_projection_with_case(sql, &db, IdentifierCase::AsWritten).expect("resolves"),
+        None
+    );
+    assert_eq!(
+        resolve_projection_with_case(sql, &db, IdentifierCase::Folded)
+            .expect("resolves")
+            .as_deref(),
+        Some("a")
+    );
+}
+
+// `ColumnScope::resolve_column_binding` returns, alongside the usual
+// `ColumnDefinition`, the relation alias or declared name a reference's
+// qualifier matched and the name it is exposed under at that binding.
+
+#[test]
+fn binding_reports_the_tables_own_name_when_unaliased() {
+    let db = schema_db();
+    let (relation, exposed) =
+        resolve_binding("SELECT payload FROM a", &db, IdentifierCase::AsWritten)
+            .expect("resolves")
+            .expect("found");
+    assert_eq!(relation, Some(("a".to_string(), false)));
+    assert_eq!(exposed, Some(("payload".to_string(), false)));
+}
+
+#[test]
+fn binding_reports_the_alias_when_the_base_table_is_aliased() {
+    let db = schema_db();
+    let sql = "SELECT \"Mixed\".payload FROM a AS \"Mixed\"";
+    let (relation, exposed) =
+        resolve_binding(sql, &db, IdentifierCase::AsWritten).expect("resolves").expect("found");
+    assert_eq!(relation, Some(("Mixed".to_string(), true)));
+    assert_eq!(exposed, Some(("payload".to_string(), false)));
+}
+
+#[test]
+fn binding_reports_no_relation_for_an_anonymous_derived_relation() {
+    let db = schema_db();
+    let sql = "SELECT x FROM (SELECT payload AS x FROM a)";
+    let (relation, exposed) =
+        resolve_binding(sql, &db, IdentifierCase::AsWritten).expect("resolves").expect("found");
+    assert_eq!(relation, None);
+    assert_eq!(exposed, Some(("x".to_string(), false)));
+}
+
+#[test]
+fn binding_reports_the_alias_for_an_aliased_derived_relation() {
+    let db = schema_db();
+    let sql = "SELECT \"S\".x FROM (SELECT payload AS x FROM a) AS \"S\"";
+    let (relation, exposed) =
+        resolve_binding(sql, &db, IdentifierCase::AsWritten).expect("resolves").expect("found");
+    assert_eq!(relation, Some(("S".to_string(), true)));
+    assert_eq!(exposed, Some(("x".to_string(), false)));
+}
+
+#[test]
+fn folded_case_binding_reports_the_ctes_own_declared_name_not_the_reference_spelling() {
+    let db = schema_db();
+    let sql = "WITH \"MiXeD\" AS (SELECT payload AS x FROM a) SELECT \"mixed\".x FROM \"mixed\"";
+    let (relation, exposed) =
+        resolve_binding(sql, &db, IdentifierCase::Folded).expect("resolves").expect("found");
+    assert_eq!(relation, Some(("MiXeD".to_string(), true)));
+    assert_eq!(exposed, Some(("x".to_string(), false)));
+}
+
+#[test]
+fn binding_reports_the_with_column_list_alias_as_the_exposed_name() {
+    let db = schema_db();
+    let sql = "WITH v(renamed) AS (SELECT payload FROM a) SELECT v.renamed FROM v";
+    let (relation, exposed) =
+        resolve_binding(sql, &db, IdentifierCase::AsWritten).expect("resolves").expect("found");
+    assert_eq!(relation, Some(("v".to_string(), false)));
+    assert_eq!(exposed, Some(("renamed".to_string(), false)));
+}
+
+#[test]
+fn binding_reports_nothing_for_an_opaque_match() {
+    let db = schema_db();
+    let sql = "SELECT n FROM generate_series(1, 3) AS g(n)";
+    let (relation, exposed) = resolve_binding(sql, &db, IdentifierCase::AsWritten)
+        .expect("resolves")
+        .expect("found as opaque");
+    assert_eq!(relation, None);
+    assert_eq!(exposed, None);
+}
+
+#[test]
+fn binding_reports_no_relation_for_a_using_merged_column() {
+    let db = ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE a(id INT, x INT); CREATE TABLE b(id INT, y INT);",
+    )
+    .expect("schema parses");
+    let sql = "SELECT id FROM a JOIN b USING (id)";
+    let (relation, exposed) = resolve_binding(sql, &db, IdentifierCase::AsWritten)
+        .expect("resolves")
+        .expect("found as merged");
+    assert_eq!(relation, None);
+    assert_eq!(exposed, Some(("id".to_string(), false)));
+}
+
+#[test]
+fn binding_still_errors_on_an_ambiguous_match() {
+    let db = schema_db();
+    let query = query("SELECT id FROM a JOIN b ON a.id = b.id");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
+    assert!(matches!(
+        scope.resolve_column_binding(&reference("id")),
+        Err(LookupError::AmbiguousTableLookup { .. })
+    ));
+}
+
+#[test]
+fn folded_case_binding_reports_the_views_own_declared_name_not_the_reference_spelling() {
+    let db = ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE t(a INT); CREATE VIEW \"MyView\" AS SELECT a FROM t;",
+    )
+    .expect("schema parses");
+    let sql = "SELECT \"myview\".a FROM \"myview\"";
+    let (relation, exposed) =
+        resolve_binding(sql, &db, IdentifierCase::Folded).expect("resolves").expect("found");
+    assert_eq!(relation, Some(("MyView".to_string(), true)));
+    assert_eq!(exposed, Some(("a".to_string(), false)));
 }

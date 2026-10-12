@@ -806,14 +806,12 @@ where
 pub(crate) fn resolve_object_name<'db, DB: DatabaseLike>(
     object_name: &ObjectName,
     database: &'db DB,
+    case: IdentifierCase,
 ) -> Result<Option<&'db DB::Table>, LookupError> {
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
     // Through the trait method, so a catalog overriding it answers every
     // accessor the same way it answers a direct lookup.
-    database.resolve_target_table(
-        target_name_of_idents(schema_ident, table_ident),
-        IdentifierCase::AsWritten,
-    )
+    database.resolve_target_table(target_name_of_idents(schema_ident, table_ident), case)
 }
 
 /// Resolves an object name that is required to denote an existing base table of
@@ -831,8 +829,9 @@ pub(crate) fn resolve_object_name<'db, DB: DatabaseLike>(
 pub(crate) fn resolve_required_table<'db, DB: DatabaseLike>(
     object_name: &ObjectName,
     database: &'db DB,
+    case: IdentifierCase,
 ) -> Result<&'db DB::Table, LookupError> {
-    resolve_object_name(object_name, database)?
+    resolve_object_name(object_name, database, case)?
         .ok_or_else(|| LookupError::TableNotFound { object_name: object_name.to_string() })
 }
 
@@ -1233,11 +1232,16 @@ mod tests {
     #[test]
     fn resolve_object_name_db_entry_point() {
         let db = ParserDB::parse::<GenericDialect>("CREATE TABLE users (id INT);").expect("parses");
-        let resolved = resolve_object_name(&obj(&[("users", false)]), &db)
-            .expect("resolves")
-            .expect("matches");
+        let resolved =
+            resolve_object_name(&obj(&[("users", false)]), &db, IdentifierCase::AsWritten)
+                .expect("resolves")
+                .expect("matches");
         assert_eq!(resolved.table_name(), "users");
-        assert!(resolve_object_name(&obj(&[("absent", false)]), &db).unwrap().is_none());
+        assert!(
+            resolve_object_name(&obj(&[("absent", false)]), &db, IdentifierCase::AsWritten)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

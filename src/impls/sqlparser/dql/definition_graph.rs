@@ -9,7 +9,9 @@ use super::{
 };
 use crate::{
     errors::LookupError,
-    structs::{ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope},
+    structs::{
+        ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, IdentifierCase,
+    },
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 
@@ -133,6 +135,7 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     scopes: Vec<ScopeNode<'query, 'db, DB>>,
     select_index: Vec<SelectIndex>,
     queries: Vec<QueryNode<'query, 'db>>,
+    case: IdentifierCase,
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
@@ -165,11 +168,11 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         }
     }
 
-    fn resolve_definition_id(
-        &self,
+    fn resolve_definition_id<'scope>(
+        &'scope self,
         mut cursor: ScopeCursor,
         reference: &Expr,
-    ) -> Result<Option<DefinitionId>, LookupError> {
+    ) -> Result<Option<ResolvedColumn<'scope, 'db, DB, DefinitionId>>, LookupError> {
         loop {
             match resolve_definition_local(
                 &self.scopes[cursor.scope.0].data,
@@ -177,10 +180,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                 DefinitionId(0),
                 reference,
                 false,
+                self.scopes[cursor.scope.0].data.case,
             )? {
-                LookupOutcome::Found(ResolvedColumn { definition, .. }) => {
-                    return Ok(Some(definition));
-                }
+                LookupOutcome::Found(resolved) => return Ok(Some(resolved)),
                 LookupOutcome::Stop => return Ok(None),
                 LookupOutcome::SearchParent => {
                     let Some(parent) = self.scopes[cursor.scope.0].parent else {
@@ -197,7 +199,24 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         cursor: ScopeCursor,
         reference: &Expr,
     ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
-        Ok(self.resolve_definition_id(cursor, reference)?.map(|id| self.definition(id)))
+        Ok(self
+            .resolve_definition_id(cursor, reference)?
+            .map(|resolved| self.definition(resolved.definition)))
+    }
+
+    pub(crate) fn resolve_binding<'scope>(
+        &'scope self,
+        cursor: ScopeCursor,
+        reference: &Expr,
+    ) -> Result<
+        Option<(ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>)>,
+        LookupError,
+    > {
+        Ok(self.resolve_definition_id(cursor, reference)?.map(|resolved| {
+            let definition = self.definition(resolved.definition);
+            let binding = ColumnBinding::new(resolved.relation, resolved.exposed);
+            (definition, binding)
+        }))
     }
 
     pub(crate) fn resolve_source(
@@ -211,6 +230,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             DefinitionId(0),
             reference,
             false,
+            self.scopes[cursor.scope.0].data.case,
         )? {
             LookupOutcome::Found(column) => Ok(column.source),
             LookupOutcome::SearchParent | LookupOutcome::Stop => Ok(None),
@@ -264,13 +284,14 @@ pub(super) struct DefinitionDerivation<'query, 'db, DB: DatabaseLike> {
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(case: IdentifierCase) -> Self {
         Self {
             graph: DefinitionGraph {
                 definitions: alloc::vec![DefinitionNode::Opaque],
                 scopes: Vec::new(),
                 select_index: Vec::new(),
                 queries: Vec::new(),
+                case,
             },
             marker: PhantomData,
         }
@@ -297,7 +318,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             select: None,
             parent: None,
             owner: None,
-            data: FromScope::new(),
+            data: FromScope::new(self.graph.case),
             outputs: Vec::new(),
         });
         self.finish(scope)
@@ -329,7 +350,10 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             select: Some(select),
             parent,
             owner,
-            data: FromScope::new(),
+            data: FromScope::new(match select {
+                AstRef::Query(_) => self.graph.case,
+                AstRef::Database(_) => IdentifierCase::AsWritten,
+            }),
             outputs: Vec::new(),
         });
         self.graph.select_index.push(SelectIndex { address: select_address(select.get()), scope });
@@ -403,7 +427,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             return Ok(DefinitionId(0));
         };
         match self.graph.resolve_definition_id(scope, expression.get()) {
-            Ok(Some(definition)) => Ok(definition),
+            Ok(Some(resolved)) => Ok(resolved.definition),
             Ok(None) => Ok(self.push_definition(DefinitionNode::Expression { expression, scope })),
             Err(LookupError::AmbiguousTableLookup { .. }) => Ok(DefinitionId(0)),
             Err(error) => Err(error),
@@ -435,14 +459,15 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
 pub(crate) fn table_graph<'db, DB: DatabaseLike>(
     table: &'db DB::Table,
     database: &'db DB,
+    case: IdentifierCase,
 ) -> (DefinitionGraph<'db, 'db, DB>, ScopeCursor) {
-    let mut profile = DefinitionDerivation::new();
+    let mut profile = DefinitionDerivation::new(case);
     let scope = ScopeId(0);
     profile.graph.scopes.push(ScopeNode {
         select: None,
         parent: None,
         owner: None,
-        data: FromScope::new(),
+        data: FromScope::new(case),
         outputs: Vec::new(),
     });
     let mut output_columns = Vec::new();
@@ -469,6 +494,7 @@ pub(crate) fn table_graph<'db, DB: DatabaseLike>(
         },
         schema_key,
         table,
+        has_alias: false,
         nullable: false,
         entry_index: 0,
         output_columns,

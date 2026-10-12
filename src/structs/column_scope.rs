@@ -10,6 +10,7 @@ use crate::{
         build_definition_graph,
         definition_graph::{DefinitionGraph, DefinitionId, QueryId, ScopeCursor, table_graph},
     },
+    structs::IdentifierCase,
     traits::DatabaseLike,
 };
 
@@ -61,6 +62,81 @@ pub enum QueryOutput<'scope, 'query, 'db, DB: DatabaseLike> {
     Unexpanded,
 }
 
+/// The relation and exposed column names matched by a resolved reference.
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnBinding<'scope> {
+    relation: Option<(&'scope str, bool)>,
+    exposed: Option<(&'scope str, bool)>,
+}
+
+impl<'scope> ColumnBinding<'scope> {
+    pub(crate) fn new(
+        relation: Option<(&'scope str, bool)>,
+        exposed: Option<(&'scope str, bool)>,
+    ) -> Self {
+        Self { relation, exposed }
+    }
+
+    /// Returns the relation name, or `None` for a merged, anonymous or opaque
+    /// binding.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, Ident, Statement},
+    ///     dialect::SQLiteDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs(id INT);")?;
+    /// let Statement::Query(query) =
+    ///     Parser::parse_sql(&SQLiteDialect {}, "SELECT [D].[ID] FROM docs AS [d]")?.remove(0)
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let reference =
+    ///     Expr::CompoundIdentifier(vec![Ident::with_quote('[', "D"), Ident::with_quote('[', "ID")]);
+    /// let (_, binding) = scope.resolve_column_binding(&reference)?.expect("column resolves");
+    /// assert_eq!(binding.relation(), Some(("d", true)));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    #[must_use]
+    pub fn relation(&self) -> Option<(&'scope str, bool)> {
+        self.relation
+    }
+
+    /// Returns the exposed column name, or `None` for an opaque binding.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, Ident, Statement},
+    ///     dialect::SQLiteDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs(id INT);")?;
+    /// let sql = "WITH c([VaLuE]) AS (SELECT id FROM docs) SELECT [VALUE] FROM c";
+    /// let Statement::Query(query) = Parser::parse_sql(&SQLiteDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let reference = Expr::Identifier(Ident::with_quote('[', "VALUE"));
+    /// let (_, binding) = scope.resolve_column_binding(&reference)?.expect("column resolves");
+    /// assert_eq!(binding.exposed(), Some(("VaLuE", true)));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    #[must_use]
+    pub fn exposed(&self) -> Option<(&'scope str, bool)> {
+        self.exposed
+    }
+}
+
 /// A borrowed handle to one immutable definition node.
 ///
 /// ```compile_fail
@@ -94,7 +170,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionRef<'scope, 'query, 
     /// let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let reference = Expr::CompoundIdentifier(vec![Ident::new("u"), Ident::new("id")]);
     /// let Some(ColumnDefinition::SetOperation { left, right, .. }) =
     ///     scope.resolve_column_definition(&reference)?
@@ -164,7 +240,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
     /// let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let output = Expr::CompoundIdentifier(vec![Ident::new("d"), Ident::new("doubled")]);
     /// let Some(ColumnDefinition::Expression { scope: defining, .. }) =
     ///     scope.resolve_column_definition(&output)?
@@ -186,6 +262,58 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
         reference: &Expr,
     ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
         self.graph.resolve_definition(self.cursor, reference)
+    }
+
+    /// Resolves a column's definition and binding through this scope and its
+    /// parents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] for an ambiguous
+    /// reference and relation-name lookup errors from modeled definitions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, Ident, Statement},
+    ///     dialect::GenericDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>("CREATE TABLE a(id INT);")?;
+    /// let sql = "SELECT d.doubled FROM (SELECT id * 2 AS doubled FROM a) AS d";
+    /// let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
+    /// let output = Expr::CompoundIdentifier(vec![Ident::new("d"), Ident::new("doubled")]);
+    /// let Some((ColumnDefinition::Expression { scope: defining, .. }, outer_binding)) =
+    ///     scope.resolve_column_binding(&output)?
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(outer_binding.relation(), Some(("d", false)));
+    /// assert_eq!(outer_binding.exposed(), Some(("doubled", false)));
+    /// let Some((ColumnDefinition::Base { table, column }, inner_binding)) =
+    ///     defining.resolve_column_binding(&Expr::Identifier(Ident::new("id")))?
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!((table.table_name(), column.column_name()), ("a", "id"));
+    /// assert_eq!(inner_binding.relation(), Some(("a", false)));
+    /// assert_eq!(inner_binding.exposed(), Some(("id", false)));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn resolve_column_binding(
+        &self,
+        reference: &Expr,
+    ) -> Result<
+        Option<(ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>)>,
+        LookupError,
+    > {
+        self.graph.resolve_binding(self.cursor, reference)
     }
 
     /// Resolves a whole `GROUP BY` key of this scope's `SELECT` under
@@ -214,7 +342,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
     /// };
     /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
     /// let GroupByExpr::Expressions(keys, _) = &select.group_by else { unreachable!() };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let select_scope = scope.scope_for_select(select).expect("the root scope is recorded");
     /// for (key, expected) in keys.iter().zip(["x", "id"]) {
     ///     let Some(ColumnDefinition::Base { column, .. }) =
@@ -261,7 +389,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
     /// };
     /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
     /// let Some(Distinct::On(keys)) = &select.distinct else { unreachable!() };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let select_scope = scope.scope_for_select(select).expect("the root scope is recorded");
     /// let Some(ColumnDefinition::Base { column, .. }) =
     ///     select_scope.resolve_distinct_on_definition(&keys[0])?
@@ -296,7 +424,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
     /// let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let output = Expr::CompoundIdentifier(vec![Ident::new("d"), Ident::new("x")]);
     /// let Some(ColumnDefinition::Expression { expression: Expr::Subquery(nested), scope: defining }) =
     ///     scope.resolve_column_definition(&output)?
@@ -380,7 +508,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     /// let SelectItem::UnnamedExpr(Expr::Subquery(nested)) = &select.projection[0] else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let outputs = scope.scope_for_query(nested).expect("the nested query is recorded");
     /// let names = outputs
     ///     .output_definitions()
@@ -397,7 +525,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let outputs = scope.scope_for_query(&query).expect("the root query is recorded");
     /// let mut entries = outputs.output_definitions();
     /// assert_eq!(entries.len(), 2);
@@ -439,7 +567,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     /// else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let order = scope.scope_for_query(&query).expect("the root query is recorded");
     /// let Some(ColumnDefinition::Base { column, .. }) =
     ///     order.resolve_order_by_definition(&keys[0].expr)?
@@ -481,8 +609,7 @@ pub struct ColumnScope<'query, 'db, DB: DatabaseLike> {
 }
 
 impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
-    /// Builds the column scope of a query's outer body and records the scope of
-    /// every `Select` in the query.
+    /// Builds query scopes with `case` and reads stored definitions as written.
     ///
     /// # Errors
     ///
@@ -506,7 +633,7 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let Some(ColumnDefinition::Base { table, column }) =
     ///     scope.resolve_column_definition(&Expr::Identifier(Ident::new("id")))?
     /// else {
@@ -515,8 +642,12 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// assert_eq!((table.table_name(), column.column_name()), ("a", "id"));
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
-    pub fn from_query(query: &'query Query, database: &'db DB) -> Result<Self, LookupError> {
-        let (graph, root) = build_definition_graph(query, database)?;
+    pub fn from_query(
+        query: &'query Query,
+        database: &'db DB,
+        case: IdentifierCase,
+    ) -> Result<Self, LookupError> {
+        let (graph, root) = build_definition_graph(query, database, case)?;
         Ok(Self { graph, root })
     }
 
@@ -544,7 +675,7 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let qualified = Expr::CompoundIdentifier(vec![Ident::new("a"), Ident::new("id")]);
     /// assert_eq!(scope.resolve_column(&qualified)?.map(TableLike::table_name), Some("a"));
     /// assert!(scope.resolve_column(&Expr::Identifier(Ident::new("id"))).is_err());
@@ -577,7 +708,7 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let reference = Expr::CompoundIdentifier(vec![Ident::new("c"), Ident::new("id")]);
     /// let Some(ColumnDefinition::Base { table, column }) =
     ///     scope.resolve_column_definition(&reference)?
@@ -592,6 +723,72 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
         reference: &Expr,
     ) -> Result<Option<ColumnDefinition<'_, 'query, 'db, DB>>, LookupError> {
         self.graph.resolve_definition(self.root, reference)
+    }
+
+    /// Resolves a column's definition and matched relation and exposed names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when more than one
+    /// relation exposes the reference and relation-name lookup errors from
+    /// modeled definitions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, Ident, Statement},
+    ///     dialect::SQLiteDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>("CREATE TABLE docs (id INT);")?;
+    /// let sql = "SELECT [MIXED].[ID] AS result FROM docs AS [MiXeD]";
+    /// let Statement::Query(query) = Parser::parse_sql(&SQLiteDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let reference = Expr::CompoundIdentifier(vec![
+    ///     Ident::with_quote('[', "MIXED"),
+    ///     Ident::with_quote('[', "ID"),
+    /// ]);
+    /// let Some((ColumnDefinition::Base { column, .. }, binding)) =
+    ///     scope.resolve_column_binding(&reference)?
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(column.column_name(), "id");
+    /// assert_eq!(binding.relation(), Some(("MiXeD", true)));
+    /// assert_eq!(binding.exposed(), Some(("id", false)));
+    ///
+    /// let cte_sql = "WITH [MiXeD]([VaLuE]) AS (SELECT id FROM docs) \
+    ///                SELECT [MIXED].[VALUE] AS result FROM [mixed]";
+    /// let Statement::Query(cte_query) = Parser::parse_sql(&SQLiteDialect {}, cte_sql)?.remove(0)
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let cte_scope = ColumnScope::from_query(&cte_query, &db, IdentifierCase::Folded)?;
+    /// let cte_reference = Expr::CompoundIdentifier(vec![
+    ///     Ident::with_quote('[', "MIXED"),
+    ///     Ident::with_quote('[', "VALUE"),
+    /// ]);
+    /// let Some((ColumnDefinition::Base { column, .. }, cte_binding)) =
+    ///     cte_scope.resolve_column_binding(&cte_reference)?
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(column.column_name(), "id");
+    /// assert_eq!(cte_binding.relation(), Some(("MiXeD", true)));
+    /// assert_eq!(cte_binding.exposed(), Some(("VaLuE", true)));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn resolve_column_binding(
+        &self,
+        reference: &Expr,
+    ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
+    {
+        self.graph.resolve_binding(self.root, reference)
     }
 
     /// Returns the recorded scope for this exact `Select` of the query.
@@ -611,7 +808,7 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let SetExpr::SetOperation { left, right, .. } = query.body.as_ref() else { unreachable!() };
     /// for (operand, expected) in [(left, "a"), (right, "b")] {
     ///     let SetExpr::Select(select) = operand.as_ref() else { unreachable!() };
@@ -654,7 +851,7 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
-    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
     /// let Some(Expr::BinaryOp { right, .. }) = &select.selection else { unreachable!() };
     /// let Expr::Subquery(nested) = right.as_ref() else { unreachable!() };
@@ -689,7 +886,7 @@ impl<'db, DB: DatabaseLike> ColumnScope<'db, 'db, DB> {
     /// let table = db
     ///     .table_by_target(TargetName::new("a", false), IdentifierCase::AsWritten)?
     ///     .expect("table a exists");
-    /// let scope = ColumnScope::for_table(table, &db);
+    /// let scope = ColumnScope::for_table(table, &db, IdentifierCase::AsWritten);
     /// let Some(ColumnDefinition::Base { column, .. }) =
     ///     scope.resolve_column_definition(&Expr::Identifier(Ident::new("id")))?
     /// else {
@@ -700,8 +897,8 @@ impl<'db, DB: DatabaseLike> ColumnScope<'db, 'db, DB> {
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
     #[must_use]
-    pub fn for_table(table: &'db DB::Table, database: &'db DB) -> Self {
-        let (graph, root) = table_graph(table, database);
+    pub fn for_table(table: &'db DB::Table, database: &'db DB, case: IdentifierCase) -> Self {
+        let (graph, root) = table_graph(table, database, case);
         Self { graph, root }
     }
 }
