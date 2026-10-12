@@ -50,6 +50,17 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
     Opaque,
 }
 
+/// One entry of a query's ordered output list.
+#[derive(Debug)]
+pub enum QueryOutput<'scope, 'query, 'db, DB: DatabaseLike> {
+    /// One output column and the definition that determines its type.
+    Column(ColumnDefinition<'scope, 'query, 'db, DB>),
+    /// A wildcard whose columns cannot be enumerated, such as one over an
+    /// opaque relation or one reshaped by `EXCLUDE`, `REPLACE` or `RENAME`.
+    /// It stands for an unknown number of columns, possibly none.
+    Unexpanded,
+}
+
 /// A borrowed handle to one immutable definition node.
 ///
 /// ```compile_fail
@@ -331,14 +342,76 @@ impl<DB: DatabaseLike> fmt::Debug for ColumnDefinitionScope<'_, '_, '_, DB> {
     }
 }
 
-/// A borrowed resolver for one query's `ORDER BY` keys under PostgreSQL's
-/// rules.
+/// A borrowed view of one query's outputs and of its `ORDER BY` keys under
+/// PostgreSQL's rules.
 pub struct ColumnQueryScope<'scope, 'query, 'db, DB: DatabaseLike> {
     graph: &'scope DefinitionGraph<'query, 'db, DB>,
     query: QueryId,
 }
 
 impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db, DB> {
+    /// Returns the query's outputs in select-list order, with every enumerable
+    /// wildcard expanded in place.
+    ///
+    /// The iterator's length counts entries, and an
+    /// [`QueryOutput::Unexpanded`] entry stands for an unknown number of
+    /// columns. The SQL column count, and the ordinal of every entry after an
+    /// unexpanded one, are therefore known only when no entry is unexpanded.
+    /// A set operation pairs its operands' columns only when both widths are
+    /// known, and otherwise answers [`ColumnDefinition::Opaque`] for every
+    /// column of its left operand.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, SelectItem, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE a(id INT, x INT);")?;
+    /// let sql = "SELECT (SELECT * FROM a LIMIT 1) FROM a";
+    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// let SelectItem::UnnamedExpr(Expr::Subquery(nested)) = &select.projection[0] else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let outputs = scope.scope_for_query(nested).expect("the nested query is recorded");
+    /// let names = outputs
+    ///     .output_definitions()
+    ///     .map(|output| {
+    ///         let QueryOutput::Column(ColumnDefinition::Base { column, .. }) = output else {
+    ///             unreachable!()
+    ///         };
+    ///         column.column_name()
+    ///     })
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(names, ["id", "x"]);
+    ///
+    /// let sql = "SELECT a.id, * FROM a, generate_series(1, 2) AS g";
+    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db)?;
+    /// let outputs = scope.scope_for_query(&query).expect("the root query is recorded");
+    /// let mut entries = outputs.output_definitions();
+    /// assert_eq!(entries.len(), 2);
+    /// assert!(matches!(entries.next(), Some(QueryOutput::Column(ColumnDefinition::Base { .. }))));
+    /// assert!(matches!(entries.next(), Some(QueryOutput::Unexpanded)));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn output_definitions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = QueryOutput<'scope, 'query, 'db, DB>> + use<'scope, 'query, 'db, DB>
+    {
+        self.graph.query_outputs(self.query)
+    }
+
     /// Resolves a whole `ORDER BY` key, preferring a select-list output name
     /// over an input column and seeing only output names after a set operation.
     ///
@@ -562,8 +635,8 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
         self.graph.scope_for_select(None, select)
     }
 
-    /// Returns the recorded `ORDER BY` scope for this exact query or one nested
-    /// in it.
+    /// Returns the recorded output scope for this exact query or one nested in
+    /// it.
     ///
     /// # Examples
     ///

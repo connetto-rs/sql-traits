@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     errors::LookupError,
-    structs::ColumnDefinition,
+    structs::{ColumnDefinition, QueryOutput},
     traits::DatabaseLike,
     utils::{identifier_resolution::identifiers_match, object_name::object_name_last_part},
 };
@@ -545,6 +545,24 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     pub(crate) fn query_id(&self, query: &Query) -> Option<QueryId> {
         let address = query_address(innermost_query(query));
         self.queries.binary_search_by_key(&address, |node| node.address).ok().map(QueryId)
+    }
+
+    pub(crate) fn query_outputs<'scope>(
+        &'scope self,
+        query: QueryId,
+    ) -> impl ExactSizeIterator<Item = QueryOutput<'scope, 'query, 'db, DB>> {
+        let entries = match &self.queries[query.0].outputs {
+            QueryOutputs::Select(scope) => self.scopes[scope.0].outputs.as_slice(),
+            QueryOutputs::Merged(entries) => entries.as_slice(),
+        };
+        entries.iter().map(|entry| {
+            match entry {
+                OutputEntry::Column(column) => {
+                    QueryOutput::Column(self.definition(column.definition))
+                }
+                OutputEntry::Unexpanded => QueryOutput::Unexpanded,
+            }
+        })
     }
 
     pub(crate) fn resolve_order_by<'scope>(
