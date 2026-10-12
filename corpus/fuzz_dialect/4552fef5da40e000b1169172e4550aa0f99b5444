@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id SDE,
+   tus RRRENT_@TIl);
+CREATE UNIQUE INDEX idx_ordate ON orders(user,id, ceat-ed_at Dcen);

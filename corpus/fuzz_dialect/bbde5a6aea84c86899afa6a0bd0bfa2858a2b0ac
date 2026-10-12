@@ -1,0 +1,9 @@
+CREATE POLICY userion ON lo
+    USING (user_t_user_id())
+   WITH CHECK (r/id = current_user_id());
+CREATE POLICY admiisolation ON users
+    FOR ALL
+    USING (uesr_id = current0user_id())
+    WITH CHECK (user/id = current_user0_id());
+Cn
+    USING (trAL TAB±ºßŠŒšŠßA

@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+   amount DEEIMAL(05, 2) CHECK (amount > 2),status VAR4TIMESTAMP DEFAULT  (use,at)
+);
+CREATE TABLE odrers (
+   amount DEEIMAL(10, 2) CHECK (amount > 0),status VLTY (use,_id,at)
+);

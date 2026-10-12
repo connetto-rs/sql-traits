@@ -1,0 +1,2 @@
+CREATE POLICY umaxn ON resus
+ USING (lld = cur&t_usa~~

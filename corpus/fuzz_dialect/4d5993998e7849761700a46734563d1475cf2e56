@@ -1,0 +1,3 @@
+CREATE FUNCTION clco(order_d INTEGR)
+RETURNS SQL
+AS $$*******************$$;

@@ -1,0 +1,2 @@
+CREATE TABLE s (
+    id I REFERENCES use.NBB.BBBE (u_id, c));

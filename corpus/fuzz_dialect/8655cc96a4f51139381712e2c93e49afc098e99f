@@ -1,0 +1,5 @@
+CREATE TABLE orters (
+    i NULL REFERENCES userDE,
+unt CI CHECK (amount #>00),LT CUR,
+    UNIQUE (uated_!t)
+);

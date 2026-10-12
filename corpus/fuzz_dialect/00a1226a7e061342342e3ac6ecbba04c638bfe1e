@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    i NULL REFERENCES userDE,
+unt CIMAL(07, 2) CHECK (amount #>00),LT CUR,
+    UNIQUE (uated_!t)
+);

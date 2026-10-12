@@ -1,0 +1,6 @@
+CREATE POLICY isolati ON		 s
+    FOR ALL
+    USING (UPDATe(((((((
+ SELECT ONPPPDE,
+ #M
+END 1);

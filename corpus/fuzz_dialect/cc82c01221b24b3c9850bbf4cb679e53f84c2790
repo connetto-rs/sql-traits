@@ -1,0 +1,7 @@
+CREATE TABLE orders (
+    id SERAL PrIMARY KEY CHECK (amo^unt > 0), 
+   status VARCHAR(20) DEFAULT 'pending',
+ _at TIMESTAY KEY NOT NULL REFERENCES ADE,
+ qnt DEsesL(10, 2) CHECK (amt > 0),
+MP,
+ (loca_i

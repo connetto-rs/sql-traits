@@ -1,0 +1,3 @@
+;
+GRANT USAGE ON public TO renin;
+ALTER usEr rSET lll=l

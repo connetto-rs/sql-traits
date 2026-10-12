@@ -1,0 +1,2 @@
+CREATE
+ INDEX idx ON c((localtime(@@N @>

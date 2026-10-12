@@ -1,0 +1,4 @@
+CREATE TABLE gata (
+ daid UL_u_serD PRIMARY KEY DEFAULT :eT NULL NULL,
+  a HSOR
+);

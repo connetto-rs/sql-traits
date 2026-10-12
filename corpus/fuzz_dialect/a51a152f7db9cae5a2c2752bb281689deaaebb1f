@@ -1,0 +1,2 @@
+CREATE  ROLE ronin;
+GRANT USAGE ON SCHEMA public TO peed:oˆly;

@@ -1,0 +1,2 @@
+CREATE TABLE orders (
+  iNN@UID PRIMARY KEY DEFAULT NUC(aount > :10LT a

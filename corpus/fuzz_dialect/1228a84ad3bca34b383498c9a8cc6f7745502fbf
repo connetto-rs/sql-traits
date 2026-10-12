@@ -1,0 +1,2 @@
+CREATE ROLE E ROLE in;
+GRANT USAGE ON SCHEMA pu,l,cpub,c TO red

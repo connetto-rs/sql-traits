@@ -1,0 +1,5 @@
+CREATE TABLE rs (
+    iBBBABBLI PY KEY,
+    user_id INT,
+ UNIQUE (user_id,ed_at)
+);

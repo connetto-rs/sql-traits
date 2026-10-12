@@ -1,0 +1,2 @@
+CREATE INDEX iate ON orders(us,	crdd, crowESC);
+CREATE INDEX idx_orders_s ON s(stus) WH!= ;

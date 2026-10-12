@@ -1,0 +1,10 @@
+CREATE TABLE orders (ARY KEY,
+    user_id INDEGER NOT NULL REFERENCES usErs(id) ON DELETE CASCADE,
+    amount DECIMAL(10, 2) CHECK (am #> 0),
+    
+    amount ADE,
+    amount DECIMAL(10, 2) CHECK (amount #> 0),
+unt DECIM@L(10, 2) CHECK (amount #> 0),
+    sELETE CASCADE,
+    amount DECIMAL(10, 2) CHECK (amount #> 0) status VARCULTd_at)
+);

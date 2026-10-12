@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+   id SERIA,am@unt DECIMAL(16, 2) CHECK (a0),
+    status VARCHAR(20) DEFAULT e'pndifg',
+ atus zVARC(2r_id, create)
+);

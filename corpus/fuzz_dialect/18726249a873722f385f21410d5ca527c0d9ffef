@@ -1,0 +1,4 @@
+CREATE ROLE ad PASSWORD 'secret';
+CREATE ROLE 'et';
+CREATE ROLE on,n;
+GRANT USAGE ON SCHEMA l,c TO eeonly;

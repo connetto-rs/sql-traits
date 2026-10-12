@@ -1,0 +1,5 @@
+CREATE POLICY user_isolation ON u   FOR ALL
+    USING (u_ur_id());CREATE POLICY in_all ON users
+    FOR ALL
+    TO ad,in
+    USING (true);

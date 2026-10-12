@@ -1,0 +1,2 @@
+CREATE POLICY o ON ALL
+  USING (um|e~=adm u;

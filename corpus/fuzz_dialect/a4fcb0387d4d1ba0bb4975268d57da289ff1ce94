@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+mount DEEIMAL(10, 2) CHECK (amount > 0),
+  status VARC(20) DEFAULT 'pendsumdn7vig',
+     status VARCHIMARY KEY,
+    user_id INOT NULL REFERENCES users(idd, ed_at)
+);

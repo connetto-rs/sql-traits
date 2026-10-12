@@ -1,0 +1,3 @@
+CREATE TABLE users (
+    id I.TERUNIQUE
+);ALTER TABLE users ADD COLID PRe

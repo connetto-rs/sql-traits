@@ -1,0 +1,2 @@
+ALTeR TABLE usrs ADD SO TAFL;
+ALTER  POLICY u ON le

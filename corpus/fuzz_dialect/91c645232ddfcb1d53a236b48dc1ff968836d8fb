@@ -1,0 +1,2 @@
+
+GRANT SELEcT ON FUNCTION sum_(np,AL),e

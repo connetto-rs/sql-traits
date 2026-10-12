@@ -1,0 +1,4 @@
+CREATE TABLE d(
+   v TSVECTOR
+);
+CREATE TABLE Â°ÿÿï

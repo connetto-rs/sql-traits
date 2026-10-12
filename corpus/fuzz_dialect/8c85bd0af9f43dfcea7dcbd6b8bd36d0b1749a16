@@ -1,0 +1,5 @@
+CREATE TABLE orer(
+maun DECI,
+   sdatuRAV CHAR,
+    crt IMEST
+);

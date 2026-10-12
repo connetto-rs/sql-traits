@@ -1,0 +1,8 @@
+CREATe TABLE ordeps (
+    id SEENTEG NULL REFERENCES users(id) ON DELETE CASCADE,
+ amount DECIMAL(042) CHECK (amo@@@^@ated_at)
+);
+CREATE TABLE orders (
+ 
+ amount DECIMAL(20, 2) CHECK (at)
+);ù)

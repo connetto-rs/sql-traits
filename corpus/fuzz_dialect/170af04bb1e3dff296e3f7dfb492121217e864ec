@@ -1,0 +1,2 @@
+CREATE FUNCTION calco(ordm)RETURNS DSQL
+AS $$,' $$,'lN'«

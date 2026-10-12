@@ -1,0 +1,2 @@
+CREATE ROLE ad0minH LOGIN ;CREATE POLICY _all ON us   TO ad,i,s,L
+  

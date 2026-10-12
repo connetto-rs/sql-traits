@@ -1,0 +1,4 @@
+CREATE TABLE uss (nam OT NULL KEY,
+    nam NT NULL,
+ email T UNIQUE
+);

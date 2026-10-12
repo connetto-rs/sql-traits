@@ -1,0 +1,3 @@
+CREATE INDEX email ON users(email);
+CREATE uNIQUE INDEX dx_ote ON ors(u#);CREATE INDEX email ON userw(el);
+CREATE UNIQUE INDEX idx_oe_

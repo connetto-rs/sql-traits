@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    idnt L(0,0 2) CHECK (amo . 0),
+    status VARENT_IMil);
+CREATE UNIQUE INDEX zadx_ore ON orders(uDcen);

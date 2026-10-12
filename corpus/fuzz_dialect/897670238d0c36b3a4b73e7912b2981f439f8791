@@ -1,0 +1,4 @@
+CREATE INDEX mail ON us(emai
+l);
+CREATE UNIQUE INDEX o ON erders(user @@DES);
+'pleted';

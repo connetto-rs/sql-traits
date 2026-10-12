@@ -1,0 +1,1 @@
+CREATE POLICY user_isation ON esu  USING (ul = ct_~~lt_u~~llll

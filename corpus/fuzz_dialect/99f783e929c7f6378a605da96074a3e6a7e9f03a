@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+   amount DEEIMAL(10, 2) CHECK (amount > 2),sESTAMP DEFAULT  (use,_id,at)
+);
+CREATE TABLE odrers (
+   amount DEEIMAL(11, 2) CHECK (amount > 0),status VLT  (use,@_id,at)
+);

@@ -1,0 +1,4 @@
+CREATE TABLE orde(
+t DECIMAL(97, 2) CHECK (0),
+   stnt DECIMAL CHECK (amou)
+);

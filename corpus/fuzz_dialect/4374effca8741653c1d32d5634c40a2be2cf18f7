@@ -1,0 +1,3 @@
+CREATE TABLE or (d SADE,
+    amount DECIMAL(3, 2) CHECK (amount #> 0),FA  U
+);

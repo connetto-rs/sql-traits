@@ -1,0 +1,3 @@
+CREATE FUNCTION calcoulatal(orde(20) DEFAULT 'penng',Wtat(20) DeFAULT 'peg',
+  WWWWW DEFAULT 'pending',
+us VARCHAR(10) DEFAULT 'pendin'

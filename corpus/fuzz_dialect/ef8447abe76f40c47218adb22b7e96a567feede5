@@ -1,0 +1,2 @@
+CREATE TABLE ers (
+    id  DECIMA CHECK (ertnou(sstu)  > 5),tus VAR);

@@ -1,0 +1,4 @@
+CREATE TABLE ord(
+  E SLd(10  2) CHECK (a>= 0),
+  tNOTETE CAst
+);

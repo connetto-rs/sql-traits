@@ -1,0 +1,4 @@
+CREATE TABLE ord(
+    id SEEL(10  2) CHECK (a>= 0),
+  tNOTETE CAst
+);

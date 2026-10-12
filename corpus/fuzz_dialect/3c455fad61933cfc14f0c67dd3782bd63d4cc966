@@ -1,0 +1,2 @@
+CREATE TABLE ord (T N REFERENCES user CHECK (a~unt -> 1),
+TABB   st);

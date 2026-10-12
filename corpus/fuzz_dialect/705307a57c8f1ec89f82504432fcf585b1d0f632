@@ -1,0 +1,3 @@
+
+CREATE ROLE r;
+GRANT SELECT TO  p,l,u, l!F:`

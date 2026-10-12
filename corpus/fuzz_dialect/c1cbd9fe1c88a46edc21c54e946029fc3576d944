@@ -1,0 +1,2 @@
+ALTER TABLE ers DROP COLUMN NULL;
+ALTER TABLE orders ADD FOREIGN KEY uuid(ur_id) REFERENCES```0`uuidvrs(ie);

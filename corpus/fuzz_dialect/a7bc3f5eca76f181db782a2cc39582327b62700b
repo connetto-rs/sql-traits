@@ -1,0 +1,2 @@
+CREATE ROLE a user C;
+GRANT SELECT ON user FO,RO,i 

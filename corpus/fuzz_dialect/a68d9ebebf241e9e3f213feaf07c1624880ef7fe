@@ -1,0 +1,1 @@
+CREATE POLICY unio ON usr USING (uL|ll==(true=(true);
