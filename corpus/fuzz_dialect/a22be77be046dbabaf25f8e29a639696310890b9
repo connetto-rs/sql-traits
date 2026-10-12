@@ -1,2 +1,0 @@
-SELECT AL.AL.*,
-L.L.AL.*,L.Nu.AL.*,3L

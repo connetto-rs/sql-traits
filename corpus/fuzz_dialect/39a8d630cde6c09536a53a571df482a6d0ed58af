@@ -1,8 +1,0 @@
-CREATE ROLE eedonlya;
-GRANT USAGE ON SCHEMA publ, publ,c TO redoyadofin;
-GRANT USAGE ON SCHEMA publ, publ,c TO reelyadoonlya;
-GRANT USAGE ON SCHEMA publ, publ,c TO redoyadonin;
-GRANT USAGE ON SCHEMA publ, publ,c TO reedoonlyadonin;
-GRANT USAGE ON SCHEMA publ, publ,c TO rejadonin;
-GRANT USAGE ON SCHEMA publ, puнннннннннннннннннннlyadonin;
-GR

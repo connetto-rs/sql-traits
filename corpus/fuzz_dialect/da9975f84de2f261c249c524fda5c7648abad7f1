@@ -1,2 +1,0 @@
-CREATE TABLE order(CHECK (am|&> 0),
- tatus VM)

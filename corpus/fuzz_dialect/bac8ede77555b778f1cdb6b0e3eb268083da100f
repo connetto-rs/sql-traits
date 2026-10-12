@@ -1,6 +1,0 @@
-((WITH sesz(
- SELECT  R
-),gen_r(SELECT  R
-),cen_ra(WITH sessCoz(
- SELECT  R
-),(

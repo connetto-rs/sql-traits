@@ -1,6 +1,0 @@
-CREATE TABLE gedata (
-  idUU   ID PRIMARY KEY DEFAULT :en_rNULL,
-  dcta HSTORETOR
-);
-CREATE TABLE getata (T NULL,
-  dcta HS);

@@ -1,6 +1,0 @@
-CREATE TABLE geo_data (
-  RY KEY DEFAULT[] DEFAULT EY DEFAULT[] DEFAULT '{%',
-    mUIDdlocaltimestamp KEY DEFAULT[] DEFAULT '{%',
-now    Y DEFAULT[] DEFAULT '{%',data HSTOSTORE,
-  CREATE TRIGGER
-);

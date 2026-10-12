@@ -1,4 +1,0 @@
-CREATE TABLE s (
-  id SRRE,ee VIMARY KEY,
-r_idR NOT NULL REFERENCES AMBBBU REFERENCES AMBB(rrr_id, created_ap)
-)Â;

@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-    id SERAL PRIMARY KEY,     UNIQUE ot_(u&er_t)
-);

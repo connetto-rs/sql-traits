@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    id SEXRIA  ,amount D CHECK (amount > 0),
-   CHECK (amount < 1),
-    status d_at)ÿÿ
-);

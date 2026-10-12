@@ -1,5 +1,0 @@
-CREATE TABLE orde (
-    idPIMr_id@@@JJJ INTH@ DEFAULT 'pending',
-    created_at TMEMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (user _id, created_at)
-)

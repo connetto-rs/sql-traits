@@ -1,2 +1,0 @@
-CREATE POLICY usion ON userslc   USING (use.t._())
-    WITH CHECK (use~/N;

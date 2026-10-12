@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    id#unt DEEMMAMP DEFAULT CURREN,
-    UNIQUE a(uuu > 1),
-    
-    UNIQUE (userdcurred- ed_at)
-);

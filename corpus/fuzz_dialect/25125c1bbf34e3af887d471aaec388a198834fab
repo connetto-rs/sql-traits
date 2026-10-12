@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-    i uk_phone UNIQUE  CONSTRAINT uk_phone UNIQUE  CONSTRAINT _ene UNIQUE  CONSTRAINT _ephno UNIQUE (`;
-ALrsRTrEd

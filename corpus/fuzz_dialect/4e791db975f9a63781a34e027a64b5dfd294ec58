@@ -1,1 +1,0 @@
-CREATE POLICY usrn ON u USING (uslln(|&> 

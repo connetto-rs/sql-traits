@@ -1,8 +1,0 @@
-CREATE TABLE orders (
-    id SDE,
-    amounIEDAMt EL(72  2) CHECK (amount >amount > 0),
-  tNOT NUCASCADE,
-    amount DEEIMAL(1sum2) CHECK ( @0),
-MES DEEIMAL(1sum2) CHECK (amount!> @0),
-MESTA  st
-);

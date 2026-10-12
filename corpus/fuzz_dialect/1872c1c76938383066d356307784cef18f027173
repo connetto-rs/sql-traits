@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    id SERIAL  ,amount DECIMAL(09, 2) CHECK (amount >#0),
-    stnt DECIMAL(09, 2) CHECK (amounnt >0) DEFAULT uuid'pending',
- atuLT CURRNUE (user_id, creat)
-);

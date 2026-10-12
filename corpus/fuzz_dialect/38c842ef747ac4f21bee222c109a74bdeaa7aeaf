@@ -1,7 +1,0 @@
-CREATE TABLE ta (Y$ Km_uuid(),
-    pont PT,
-SONB NOT NULL,
-    tags Tddddddddd,
-    AUIDdata HSTORE,
-  s TSVECTOR
-);

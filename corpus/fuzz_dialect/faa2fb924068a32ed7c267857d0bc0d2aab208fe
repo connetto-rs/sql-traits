@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    idRIMARY KEY DEFAULT _en_rt|+||||(UPDATE((
-((((SELECT--+q
- --+@ˆ,UPD|||||||||||||||||d_at)
-);

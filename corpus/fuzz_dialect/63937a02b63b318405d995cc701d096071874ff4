@@ -1,2 +1,0 @@
-CREATE TABLE geo_data (
-    i UUMARY KEY DEFAULT TRY KEY DEFAULT ge(*));

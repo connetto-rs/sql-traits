@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-  NOT NULL REFERENCES users(id2) CHECK (a^ crea)
-);

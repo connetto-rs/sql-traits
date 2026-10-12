@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-  id SERADE,IEDAMt EL(11  2) CHECK (amount >amount > 0),
-    statNOT NULL REFERENCES useSCADE,
-    amount DEIMAL(0 0s),
-MESTABBBB t
-);

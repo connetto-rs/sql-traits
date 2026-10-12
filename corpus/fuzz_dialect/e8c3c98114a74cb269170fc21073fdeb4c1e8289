@@ -1,1 +1,0 @@
-ALTER  TABLE users ADD CONSTRAINT uk_ FOREIGN KEY (er_id) REFERENCES usersÿÿ

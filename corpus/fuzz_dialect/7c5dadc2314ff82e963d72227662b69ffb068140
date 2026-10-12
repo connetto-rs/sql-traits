@@ -1,4 +1,0 @@
-CREATE TABLE rders (
-    id RIES ,amount DECIMAL(09, 2) CHECK (amount > 0),
-   CHECK (amount > 1),
-us d_at)ÿÿ`O

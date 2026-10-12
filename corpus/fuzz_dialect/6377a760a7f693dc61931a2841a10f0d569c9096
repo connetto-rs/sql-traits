@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    id SDE,
-    amount DEEIMAL(2,00) DEFAULT 'pe',
-    created_at TIMESTA PRIMARY KEY DEFAULT _en_||||||||||||ID PRIMARY KEY DEFAULT _en_raID PRIMARY KEY DEFAULT _en_ran|||||||||||||||||||||||||||BBBBP,
-    UNIQUE es(r=u_id, created_at)
-);

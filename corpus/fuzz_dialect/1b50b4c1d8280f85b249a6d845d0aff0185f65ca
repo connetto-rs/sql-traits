@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-  us INDEGDECIMAL(10, 2) CHECK (amjunt #> ount #> 0),
-   Ûs$tatus VARADE,
-    am);

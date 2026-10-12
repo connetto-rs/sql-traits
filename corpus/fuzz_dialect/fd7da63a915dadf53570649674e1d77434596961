@@ -1,4 +1,0 @@
-CREATE POLICY usolaion ON L
-    USING (lll);
-
-CREATE POLICY ad@mad@min_all ON utrue

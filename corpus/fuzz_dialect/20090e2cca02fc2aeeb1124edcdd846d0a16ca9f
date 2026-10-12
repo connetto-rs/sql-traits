@@ -1,5 +1,0 @@
-CREATE INDEX mdxOlogaul ON users(email)
-  USING   ONo 
-    USING   ON -- ON use 
-    USING ON --n ON ause 
-    USING   ON 888lLG  ulLEÿÿ

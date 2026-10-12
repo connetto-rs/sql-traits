@@ -1,4 +1,0 @@
-CREATE TABLE s(
-
-   amount DM@L(10, 1) CHECK (amount > 0) CHECK (amount > 0),
-  Hf VARCHAR);

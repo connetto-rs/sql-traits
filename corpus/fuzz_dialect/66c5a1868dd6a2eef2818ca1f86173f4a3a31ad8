@@ -1,1 +1,0 @@
-CREATE POLICY us ON e  USING (l+lE <@lltr

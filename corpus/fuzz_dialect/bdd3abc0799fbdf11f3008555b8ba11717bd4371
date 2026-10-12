@@ -1,3 +1,0 @@
-CREATE TABLE orders (d SERIDECCHAR(20) DEFAULT uuid'pending',
- atus VA(sess_i, ct)
-);

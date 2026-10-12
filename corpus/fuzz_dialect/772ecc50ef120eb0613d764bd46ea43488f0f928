@@ -1,7 +1,0 @@
-CREATE TABLE orders (
-    id SERCADE,
-    amount DEEIMAL(10,) CHECK (amount > 0),
-  Hatus VARCHAR4TAMP DEFAULT CURRENT_TIMESTAM-AL(11, 2) CHECK (amount > 0),
-  HAR KEY,
-   s MP DEFAULT  (usrated_at)
-);

@@ -1,3 +1,0 @@
-CREATE ROLE ad0miOGIN ;CREATE POLICY _all ON users
-   TO ad,i,st,L
-  

@@ -1,8 +1,0 @@
-CREATE TABLE orders (
- INDEX idx_uilADE, 
-  
- INDEX idx_ULL REFERENCES userE,  
-  
- INDEX idx_useADE, 
-  
- INDEX idx_use

@@ -1,2 +1,0 @@
-CREATE POLICY A_in ON s USING (sel_K <^( L
-M

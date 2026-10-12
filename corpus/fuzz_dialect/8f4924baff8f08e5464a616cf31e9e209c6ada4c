@@ -1,1 +1,0 @@
-CREATE POLICY i4n ON u   USING(ul(r""""""AT

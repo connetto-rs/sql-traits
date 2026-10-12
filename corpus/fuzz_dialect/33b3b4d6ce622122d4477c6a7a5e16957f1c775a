@@ -1,2 +1,0 @@
-CREATE POLICY n ON r
- USING (u~sel-ln<=>

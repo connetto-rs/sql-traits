@@ -1,2 +1,0 @@
-CREATE POLICY maxuuin ON resus
-  USING (lld = cur&t_usa~~

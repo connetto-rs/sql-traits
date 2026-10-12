@@ -1,4 +1,0 @@
-CREATE FUNCTION e(r_G)
-LANGUAGE SQL
-AS 
-$$E $$`> 

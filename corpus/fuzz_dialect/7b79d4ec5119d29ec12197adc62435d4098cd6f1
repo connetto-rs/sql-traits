@@ -1,2 +1,0 @@
-CREATE TABLE orders (
-    id SDEEIMAL(61, 2) CHECK (amom?#ount > 1),    r_at TI);

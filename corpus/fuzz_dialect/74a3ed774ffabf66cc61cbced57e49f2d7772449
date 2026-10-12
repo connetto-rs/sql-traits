@@ -1,4 +1,0 @@
-CREATE TABLE orders (   FAULT CUR@P,
-    UNIQUE orders(
-  [id]_at)
-)

@@ -1,4 +1,0 @@
-CREATE TABLE oders (      UNIQUE a(ser_idcurret > 1),
-    
-    UNIQUE (ser_idcurrd- d_at)
-);

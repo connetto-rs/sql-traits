@@ -1,4 +1,0 @@
-CREATE TABLE gedta (
-  idUU   ID PRIMARY KEY DEFAULT :en_rT NULL,
-  data HSTRETOR
-);

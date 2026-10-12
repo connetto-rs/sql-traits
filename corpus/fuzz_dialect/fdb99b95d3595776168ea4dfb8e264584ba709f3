@@ -1,2 +1,0 @@
-CREATE TABLE orderw (amou DECIMAL(1822 ), CHECK (@@@:FFFFFFFF), CHECK (@@@:d_at)
-)

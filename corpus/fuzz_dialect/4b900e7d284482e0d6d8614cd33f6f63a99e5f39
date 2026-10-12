@@ -1,3 +1,0 @@
-CREATE TABLE orders( 
-  unt IMA(38, 2) CHECK (al ~~*Yeated_at)
-);

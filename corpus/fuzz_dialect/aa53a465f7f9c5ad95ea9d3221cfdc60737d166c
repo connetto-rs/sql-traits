@@ -1,2 +1,0 @@
-CREATE POLICY lmin_all ON us
-    TO ad,i,sd,i,st , n USING;t ,

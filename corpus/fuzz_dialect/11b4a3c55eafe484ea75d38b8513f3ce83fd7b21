@@ -1,3 +1,0 @@
-CREATE INDEX ilx_ual ON users(email);
-CREATE UNIQUE INDEX idx_date ON orders(uDESC#);
-CREATE INDEX ius ON orders(sus);

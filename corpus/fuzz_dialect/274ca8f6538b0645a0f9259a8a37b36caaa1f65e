@@ -1,4 +1,0 @@
-CREATE TABLE orders (
- uuidv7 Y KEY,
-    us_id INTNULL REFERENCES AMBBBBBQUE (ur_seid,d_at)
-);

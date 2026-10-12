@@ -1,1 +1,0 @@
-ALTER TABLE userrs ADD FOREIGN KEY (userid);

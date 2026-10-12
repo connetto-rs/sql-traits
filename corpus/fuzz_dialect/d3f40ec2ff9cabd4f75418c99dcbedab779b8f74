@@ -1,2 +1,0 @@
-CREATE TRIGGER upe    UPDATE ON userV
- EXECUTE FUNCTION upte#();

@@ -1,2 +1,0 @@
-CREATE TABLE ds (CHECK (amC.AK.R.S > 0),
-at T);

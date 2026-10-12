@@ -1,5 +1,0 @@
-CREATE TABLE geo_data (
-   id  KEY DEFAULT om_uuid(),
-   IMARY KEY DEFAULT gen_uid(),
-    point POI
-);

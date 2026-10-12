@@ -1,2 +1,0 @@
-CREATE FUNCTION te_(ore#_)
-RETURN  SQS AS $

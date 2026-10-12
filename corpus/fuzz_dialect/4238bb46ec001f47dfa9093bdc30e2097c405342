@@ -1,3 +1,0 @@
-CREATE TABLE odelen(      UNIQUE a(ser_idcurret > 2),
-     UNIQUE (ser_idcurrd- d_at)
-);

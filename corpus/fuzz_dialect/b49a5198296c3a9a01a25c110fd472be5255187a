@@ -1,1 +1,0 @@
-ALTER TABLE userrs ADD FOREIGN KEY s(uer_id) REFERENCES usr

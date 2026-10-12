@@ -1,1 +1,0 @@
-CREATE POLICY us_at ON AL    USING (localtimestamp(tIon ON Rl

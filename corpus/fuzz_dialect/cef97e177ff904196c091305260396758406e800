@@ -1,3 +1,0 @@
-CREATE TABLE oew (
- amount DECIMAL CHECK (@@c@@:dt)
-);ù

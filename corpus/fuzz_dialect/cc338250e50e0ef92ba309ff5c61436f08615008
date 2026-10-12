@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-   amount DEEIMAL(2) CHECK (amount > #2),staP DEFAULT  (use,at)
-);
-CREATE TABLE odrers (
-   amount DEEIMAL(10, 2) CHECK (cmount > 0),status VLT  (use,_id,at)
-);

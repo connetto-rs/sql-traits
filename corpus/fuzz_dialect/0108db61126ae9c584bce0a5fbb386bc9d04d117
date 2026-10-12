@@ -1,2 +1,0 @@
-CREATE POLICY usIon ON r USING (usllrd ?(true);
-1

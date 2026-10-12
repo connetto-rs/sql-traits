@@ -1,4 +1,0 @@
-CREATE TABLE a (
-    id UUID PRIMARY KEY DEFAULT genARY KEY DEFAULT gen&_rmLT '{}',
- v TSVECTOR
-);

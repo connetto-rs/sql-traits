@@ -1,5 +1,0 @@
-CREATE TABLE geo_data (
- daidUIRY KEY DEFAULT :eT NULL NULL,
-  UUIRY T NULL NULL,
- ta HST
-);
