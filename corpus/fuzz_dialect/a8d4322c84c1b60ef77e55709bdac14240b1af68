@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+    il SEAL ,  u$er_ad INT,
+d INT,
+ mes TIBBBBBP,
+    UNIQUE (usei)
+);

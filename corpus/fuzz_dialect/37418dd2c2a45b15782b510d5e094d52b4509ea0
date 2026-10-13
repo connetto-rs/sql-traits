@@ -1,0 +1,4 @@
+CREATE TABLE o (
+i  dESRIAL  ,amount DE CHECK (amount@> 0),
+   t DE
+);

@@ -1,0 +1,6 @@
+ALTER TABLE users ADD COLUMNu NOT NULL;
+ALTEr TABLE users ADD CONSTRAINT uk_phone UNIQUE (phone);
+ALTER TABLE users ADD CONSTRAINT uk_phone UNIQUE (phone);
+ALTER TABLE orders ADD Nserhone VAR;
+ALTER TABLE users ADD CONSTRAINT uk_phone UNIQUE (phone);
+ALTER TABLE orders ADD F``````ÔDROP

@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id SEIMAL(09, 2) CHECK (mo&nt > 0),
+    rtnoweed_qt TIMMP DEFAULT CURRET<MBBBBB?BBB (at)
+);

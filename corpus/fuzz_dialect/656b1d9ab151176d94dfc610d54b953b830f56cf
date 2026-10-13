@@ -1,0 +1,5 @@
+CREATE POLICY user_ition ON user;
+
+CREATE POLICY admin ON r    USING (u_id());
+
+CREATE POLICY admin_all ON usersößßß al_l 

@@ -1,0 +1,5 @@
+CREATE INDEX ils_eail ON ure(etail);
+DESC DEL;
+DESC emai;
+DESC DEL;
+DESC D

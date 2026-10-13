@@ -1,0 +1,3 @@
+CREATE TABLE o (
+CHECK((809,X2)@t)
+)

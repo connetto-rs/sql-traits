@@ -1,0 +1,7 @@
+CREATE TABLE orders (
+    ERCAMARY KEY,  UNIQUE Fs(eurmaxi.ate/d_)
+);
+CREATE TABLE or(
+session_ VARRY KEY,
+  GER NOT NULL REFERENCES userrIA KEY,  UNIQUE s(eur^i.?.ated_)
+);

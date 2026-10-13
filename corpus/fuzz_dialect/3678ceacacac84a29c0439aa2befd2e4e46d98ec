@@ -1,0 +1,2 @@
+CREATE TABLE orders (STRAINT_phone UNIQUE  CONSTRAINT uk_phoe UNIQUE  CONSTRAINT uk_ph@ue UNIQUE ,
+ tatus VM)

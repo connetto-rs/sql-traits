@@ -1,0 +1,4 @@
+CREATE TABLE users (
+    id Iu DEFAULT gen_rd()KEY,
+ naAeCm RUffffIQUE
+);ALTER TABLE users ADD COLI P

@@ -1,0 +1,2 @@
+CREATE POLICY us ON resus
+  USING (Nq''''+A+++Nq''''

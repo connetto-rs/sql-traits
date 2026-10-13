@@ -1,0 +1,6 @@
+CREATE TABLE gedata (
+  idUU  EY DEFAULT :en_NULL,
+  dcta HSTORETOR
+);
+CREATE TABLE getata (T NULL,
+  dcta HS);

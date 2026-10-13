@@ -1,0 +1,4 @@
+CREATE FUNCTION ca(r#I)
+LANGUAGE SQL
+AS 
+S $$$$;

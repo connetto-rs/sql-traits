@@ -1,0 +1,3 @@
+CREATE TaBLE ord(
+ amou DECIMAL(1822 ), CHECK (@@@:d_at ), CHECK (@@(@@@:d_:@:_at ), CHECK (@@@:@geond_at ), CHECK (@@AD@@:a_att ), CHECK (@@(@P@:d_ad@22 ), CHECK (@@@:d_at ), CHECK (@@.@@@:@:d__ ), CHECK (@@@:d_at ), CHECK (@@(@@@:@:d__at ), CHECK (@@(@P@:d_22 ), CHECK (@@@:d_at ), CHECK (@@(@@@:@:d__ ), CHECK (@@d@_:at ), CHECK (@@(@@@:@:d__at ), CHECK (@@(@P@:d_at ), CHECK (@@@:@geond_at ), CHECK (@@A@@@:a_att ), CHECK (@@(@P@:at ), CHECK (@@(@P@:d_at ), CHECK (@@@:nd_at ), CHECK (@@A@@@:a_at)
+)

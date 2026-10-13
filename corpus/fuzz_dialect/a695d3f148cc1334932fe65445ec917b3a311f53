@@ -1,0 +1,8 @@
+CALL
+eutu@;CALL
+uuu;CALL
+e;
+CREATE ROLE re, p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TOonly;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  l,C,d,d,d,d, p,l¬C,d,d,A,2

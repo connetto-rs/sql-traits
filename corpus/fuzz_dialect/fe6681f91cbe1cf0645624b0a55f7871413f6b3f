@@ -1,0 +1,2 @@
+CREATE INDEX useil ON users(il);
+CREATE UNIQUE INDEX id ON orders(st!atus) WHERE s != 'ed';

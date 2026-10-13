@@ -1,0 +1,3 @@
+CREATE TABLE oders (
+amount DECIMAL(14, 2) CHECK (amount),T URRENT_@AMPQUE (usreated_at)
+)

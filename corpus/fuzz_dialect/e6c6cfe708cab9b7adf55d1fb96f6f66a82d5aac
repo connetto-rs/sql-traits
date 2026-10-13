@@ -1,0 +1,2 @@
+CREATE TABLE t ( d INT2);
+CREATE TABLE t ( id INT2);

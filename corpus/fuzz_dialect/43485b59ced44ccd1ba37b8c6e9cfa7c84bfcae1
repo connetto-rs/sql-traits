@@ -1,0 +1,2 @@
+CREATE POLICY uss ON re
+USING (u>>ud>>>>);

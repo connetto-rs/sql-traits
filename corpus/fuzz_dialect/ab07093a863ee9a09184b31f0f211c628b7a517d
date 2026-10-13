@@ -1,0 +1,6 @@
+CREATE TABLE orders$(
+    id SERIA  ,amount DECIMAL(09, 2) CHECK (amount > 0),
+   CHECK (amount > amount > 0),
+   CHECK (amount > 0),
+unt DECI@
+);ÿÿ

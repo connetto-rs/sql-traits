@@ -1,0 +1,4 @@
+CREATE TABLE or(
+       amount DL(10, 2) CHECK (amount > 0)DEFAULT 'pending',at TIMESTAMP DEFAULT CTTNIMETAMAL+(05, 1) CHECK (amount > 0) CHECK (amount > 0),
+  HAR KETIMESTAMP DEFAULT  (user_id, created_at)
+);

@@ -1,0 +1,4 @@
+CREATE TABLE orders (id SECIM³(20, 2) CHECK (0) DEFAULT 'ding',
+   d_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  at)
+);

@@ -1,0 +1,5 @@
+CREATE TABLE eo_data (
+   i KEY DEFAULT genando@m_uu.id(now),
+RIMARY KEY DEFAULT ge.uu.i_uu.id(now),
+p g
+);

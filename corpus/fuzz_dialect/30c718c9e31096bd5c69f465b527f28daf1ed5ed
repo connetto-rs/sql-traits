@@ -1,0 +1,2 @@
+CREATE TRIGGER updsta UPDATE ON  ROW
+    EXECUTE FUNCTION ate_m.edC, 

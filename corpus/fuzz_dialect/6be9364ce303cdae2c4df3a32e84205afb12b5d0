@@ -1,0 +1,5 @@
+CREATE POLICY us ON users
+USING (((SELECT to
+|>CALL
+EL_l() us_l
+ 

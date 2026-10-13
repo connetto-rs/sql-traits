@@ -1,0 +1,2 @@
+CREATE INDEX ils_il ON e(etB,C, l);
+DELETE CAu

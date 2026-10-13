@@ -1,0 +1,4 @@
+CREATE ROLE nin;
+GRANT USAGE ON SCHEMA publ,c TO ren;
+GRANT USAGE ON SCHEMA publ,c TO #rlyadonin;
+GRANT USAGE ON SCHEMA ubl,c TO re×š›y;

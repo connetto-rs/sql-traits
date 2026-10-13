@@ -1,0 +1,4 @@
+CREATE TABLE ers (
+ user_id IN,
+    UNIQUE (user_id, create#at)
+);

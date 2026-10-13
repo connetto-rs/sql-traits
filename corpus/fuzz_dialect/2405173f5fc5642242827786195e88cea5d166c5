@@ -1,0 +1,3 @@
+CREATE TABLE orders (
+ at TIMEQTAMP DEFAULT(Pd,reatedd, creat)
+);

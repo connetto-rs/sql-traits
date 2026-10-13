@@ -1,0 +1,2 @@
+CREATE TABLE orders ( UNIQUE (user [cee:]_at)
+);

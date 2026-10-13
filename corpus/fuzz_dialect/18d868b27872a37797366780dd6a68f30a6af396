@@ -1,0 +1,5 @@
+CREATE TABLE ers (
+  current_timBBBAL PRIMARY KEY,id INT,
+ LT CURRBBBBB,
+    UNIQUE (u)
+)

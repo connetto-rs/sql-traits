@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+s VARCHAR(20) DEFAULT 'pending',
+  _at TIMESTA PRIMARY KEY DEFAULT _en_ran||||||||||||||IMESTA PRIMARY KEY DEFAULT _|||||||||||||||||||||||||ID PRIMARY KEY DEFAULT _e|||ID PRIMARY KEY DEFAULT _|||||BBBBP,
+    UNIQUE (us=er_idr	ated_at)
+);

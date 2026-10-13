@@ -1,0 +1,5 @@
+CREATE
+ INDEX id ON ord((
+SELECT((
+SELECT(SELECT (((
+SELECT (

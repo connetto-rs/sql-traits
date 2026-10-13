@@ -1,0 +1,3 @@
+
+CREATE ROLE ry;
+GRANT SELECT ON SCHEMA blic TO  p,l,u,  p,lÿu(

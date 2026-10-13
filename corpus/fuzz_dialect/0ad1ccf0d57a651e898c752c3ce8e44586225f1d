@@ -1,0 +1,2 @@
+CREATE ROLE a LOGin;
+GRANT USAGE ON SCHEMA pub,c TO reed

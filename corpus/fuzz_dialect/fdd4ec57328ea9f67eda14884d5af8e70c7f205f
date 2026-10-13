@@ -1,0 +1,3 @@
+ALTER TABLE sers ADD CONSTRAINT uk_phone UNIQUE p(#one);
+ALTER TABLE oers ADD CONSTRAINT ukhone UNIQUE p(hone);
+ALTERerE hmi
