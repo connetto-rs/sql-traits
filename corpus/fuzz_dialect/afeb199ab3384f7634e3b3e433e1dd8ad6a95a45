@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    id SAL PRIMARY KEY,
-    _id INTDM,max
-   _L(, 0),
-    sus VAM REFERENCES u
-);

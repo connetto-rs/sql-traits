@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-    id S  ,amount L(9, 2) CHECK (amount > 1>id),
-    status d_at)ÿÿÿÿÿÿ;

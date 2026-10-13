@@ -1,1 +1,0 @@
-ALTER TABLE rrs ADD  KEY (a_,id)=

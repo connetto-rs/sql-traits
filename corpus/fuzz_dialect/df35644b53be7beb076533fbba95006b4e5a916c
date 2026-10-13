@@ -1,1 +1,0 @@
-CREATE TRIGGER uE UPDATE OF ur,N,@s,

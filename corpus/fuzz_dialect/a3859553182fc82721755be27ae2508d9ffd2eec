@@ -1,8 +1,0 @@
-CREATE FUNCTION calcoulal(INTEGER)
-RETURNS DECIMAL(10, 2)
-LANGUAGE SQL
-AS $$
-  HEBE o//*%%%%%%%  %DE  
-  ,am  
-*/_i
-$$;

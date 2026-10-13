@@ -1,2 +1,0 @@
-CREATE
- INDEX id.x ON o((localtime(@@N @>

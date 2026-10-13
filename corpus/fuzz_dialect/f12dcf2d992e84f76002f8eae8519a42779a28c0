@@ -1,2 +1,0 @@
-CREATE POLICY _atio ON users
-  USING (llntTE(~=

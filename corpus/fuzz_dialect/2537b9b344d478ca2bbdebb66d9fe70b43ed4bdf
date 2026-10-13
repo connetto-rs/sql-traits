@@ -1,3 +1,0 @@
-CREATE TABLE orrs (
- OT NULL REFERENCES use ON DELETE 
-   amAL(

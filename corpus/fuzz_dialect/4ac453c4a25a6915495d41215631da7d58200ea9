@@ -1,3 +1,0 @@
-CREATE TABLE geo_daGIN PASSWORD 'et/*!*';
-CREATE ROLE r PASSWORD 'secret';
-CREATE ROLE rea

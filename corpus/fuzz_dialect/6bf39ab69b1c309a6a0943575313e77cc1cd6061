@@ -1,3 +1,0 @@
-CREATE TABLE weo_data(M ARY KEY KEY DEFAULT gl()(2=222),
-    point Y DEFAULT random_uuid()
-);

@@ -1,1 +1,0 @@
-CREATE POLICY unio ON user USING (uL|ll==(true=(true);

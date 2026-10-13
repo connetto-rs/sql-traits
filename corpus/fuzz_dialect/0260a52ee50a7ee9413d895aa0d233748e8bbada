@@ -1,4 +1,0 @@
-CREATE TABLE eo_data (
-   i KEY DEFAULT gnaenr_do(now),MRY KEY DEFAULT ge._rIMARY.id(now),
-    p CeECOR
-);

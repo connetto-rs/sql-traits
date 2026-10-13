@@ -1,2 +1,0 @@
-CREATE TABLE ords (ad_at MP DEFAULT  (ueid,  
- s));

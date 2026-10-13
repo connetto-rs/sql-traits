@@ -1,4 +1,0 @@
-
-CREATE TABLE ors (
-CHECK((809,X2)@t)
-)

@@ -1,3 +1,0 @@
- CREATE ROLE donin;
-GRANT USAGE TO reonn;
-SET L=_-R

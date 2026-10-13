@@ -1,5 +1,0 @@
-CREATE TABLE oat(J Dd,
- JSONB NO,
-  ata HSTORE,
-   adata HSTORE,
-    tsv TSVECO);

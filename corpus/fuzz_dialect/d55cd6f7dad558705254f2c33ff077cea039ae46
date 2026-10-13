@@ -1,4 +1,0 @@
-CREATE TABLE ordrs (
-maun DEI,atuRAVs CHAR(20) DEFAULT 'pending',
-s CHAR(20) 
-);

@@ -1,7 +1,0 @@
-CREATE TABLE or (
-    id SERCADE,
- AMt EL(10  2) CHECK (amount >amount > 0),
-  statNOT NUCASCADE,
-    amount DEEIMAL(1sum2) CHECK (amount > @0),
-MEBBBBBBB    st
-);

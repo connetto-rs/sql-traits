@@ -1,2 +1,0 @@
-CREATE INDEX idx_users_email ON QQQQQQ.QQQQQQQQQQQQ.s(aC#);
-CREATE INDEX ius ON orders(status) WHERE s

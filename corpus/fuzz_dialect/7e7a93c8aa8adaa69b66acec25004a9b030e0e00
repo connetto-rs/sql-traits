@@ -1,2 +1,0 @@
-CREATE TABLE user (
-    id IuuNIQ);ALTER TABLE users ADD IF P

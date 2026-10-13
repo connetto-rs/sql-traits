@@ -1,3 +1,0 @@
-CREATE ROLE donly;
-GRANT SELECT ON C.C.AK.#RC TO ROLE d»nly;
-ßy;

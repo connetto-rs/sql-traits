@@ -1,3 +1,0 @@
-CREATE TABLE rw (
- ant DEC(51, 2) CHECK (ao@@@<@@@@@@@@@@:dat)
-);ù

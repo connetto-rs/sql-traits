@@ -1,2 +1,0 @@
-CREATE TABLE ord (T NULL REFERENCES user CHECK (a~unt -> 0),
-TABB   st);

@@ -1,6 +1,0 @@
-CREATE TABLE ge(   id UUI DEFAULT gen_rd(),
- NB tON NULL,
-   s TEXT[]DEFAULT '{}',
- ta HT NULL,
-    tsv PSVECQOR
-);

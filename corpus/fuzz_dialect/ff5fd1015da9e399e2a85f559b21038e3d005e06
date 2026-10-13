@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-maun DECI,
-   statuRAV CHAR,
-    crt IMEST
-);

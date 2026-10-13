@@ -1,3 +1,0 @@
-CREATE FUNCTION calco(order_d INTEGR)
-RETURNS SQL
-AS $$*******************$$;

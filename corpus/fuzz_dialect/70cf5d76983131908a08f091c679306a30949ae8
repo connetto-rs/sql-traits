@@ -1,3 +1,0 @@
-CREATE POLICY _ison ON ers     USING (lll@ = _u());
-
-CREATE POLICY adr

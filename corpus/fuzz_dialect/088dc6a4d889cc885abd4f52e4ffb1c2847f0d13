@@ -1,2 +1,0 @@
-CREATE TABLE orders (
-    id SIMARY KEY,UNIQUE (userd, creaBr_id, c);

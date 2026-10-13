@@ -1,5 +1,0 @@
-CREATE INDEX idx_usersl ON usrs(emai
-l);
-CREATE UNIQUE INDEX idx_orde ON users
-  (use@@DESC);
-CREATE INDEX ON orders(stat);

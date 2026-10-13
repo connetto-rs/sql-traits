@@ -1,7 +1,0 @@
-CREATE TABLE orders (
-    iRY KEY,
- er_id GE,
-    amon DECI,
-T BzBBLP,
- I UQNUE(r_id, at)
-);

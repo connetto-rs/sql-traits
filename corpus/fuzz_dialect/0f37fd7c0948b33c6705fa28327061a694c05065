@@ -1,5 +1,0 @@
-CREATE TABLE geo_data (
-  RY uui DEFAULT[] DEFAULT EY DEFAULT[] DEFAULT '{%',
-    mUIDdlocaltimestamp KEY DEFAULT[] DEFAULT '{%',
-now    Y DEFAULT[] DEFAULT '{%',dDEFAULREATE TRIGGER
-);

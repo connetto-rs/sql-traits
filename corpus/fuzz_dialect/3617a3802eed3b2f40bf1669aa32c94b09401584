@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-    idnt DEEIMAL(0,0 2) CHECK (amo . 0),
-    status VARRRENT_IMil);
-CREATE UNIQUE INDEX zadx_ore ON orders(uDcen);

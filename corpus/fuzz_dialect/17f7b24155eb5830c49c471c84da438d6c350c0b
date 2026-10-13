@@ -1,3 +1,0 @@
-CREATe TABLE orerw (
- amount DIL(ECAM18,) CHECK (am) CHECK (amo@@@)
-)

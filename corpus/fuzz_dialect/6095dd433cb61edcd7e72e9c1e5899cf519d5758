@@ -1,2 +1,0 @@
-CREATE TABLE geo (
-    id UUID KEY DEFAULT _en_|"LL" KEY)

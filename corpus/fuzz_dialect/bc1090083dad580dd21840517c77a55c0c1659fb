@@ -1,1 +1,0 @@
-ALTER TABLE des ADD FOREIGN KEY (lid) REFERENCES usrs(id);

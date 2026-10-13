@@ -1,4 +1,0 @@
-CREATE TABLE users (
-    id Iu DEFAULT gen_r@+uid()KEY,
- naVAeCm RUffffIQUE
-);ALTER TABLE users ADD COLI P

@@ -1,2 +1,0 @@
-CREATE POLICY umaxin ON resus
- USING (lld = cur&t_usa~~

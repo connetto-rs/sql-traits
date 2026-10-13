@@ -1,1 +1,0 @@
-CREATE POLICY usi ON user WITH CHECK (um

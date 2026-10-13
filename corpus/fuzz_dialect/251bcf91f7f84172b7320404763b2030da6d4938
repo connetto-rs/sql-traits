@@ -1,5 +1,0 @@
-CREATE TABLE eo_data (
-   i KEY DEFAULT genando@m_uu.id(now),
-RIMARY KEY DEFAULT ge._r@m_uu.id(now),
-p geECOR
-);

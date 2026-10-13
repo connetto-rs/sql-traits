@@ -1,2 +1,0 @@
-CREATE TABLE i_dota (MARY KEY DEFAULT gen_useCom_uuid()(15205091),
- oint POINT,rRKY EY DEFAULT gen_radouuid()(22);

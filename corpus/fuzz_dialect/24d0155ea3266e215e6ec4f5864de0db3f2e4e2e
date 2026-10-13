@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-   amount DEEIMAL(0ocaltimesta09, 2) CHECK (amount >^ 0),   ted_at TIMESTAMP DEFAULT  (use,_id,at)
-);

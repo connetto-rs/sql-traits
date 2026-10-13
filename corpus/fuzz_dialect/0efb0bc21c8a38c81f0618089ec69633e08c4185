@@ -1,6 +1,0 @@
-CREATE TABLE geo_data ( id UUID PRIMARY KEY DEFAULT gen_NT,
-    data JSONB NOT NULL,
-    tags TEXT[] DEFAULT '{}',
-  ta HSTORE,
-    tsv TSVECTOR
-);

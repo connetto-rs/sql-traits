@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-  IEDAMt EL(10  2) CHECK (amount >amount > 0),
-    statNOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    amount DEEIMAL(0 0s),
-MSTAMBBBBBBBB t
-);

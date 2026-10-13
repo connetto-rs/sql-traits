@@ -1,5 +1,0 @@
-CREATE TABLE orters (
-    i NULL REFERENCES userDE,
-unt CI CHECK (amo #>00),L$T CUR,
-    UNIQUE (uated_!t)
-);

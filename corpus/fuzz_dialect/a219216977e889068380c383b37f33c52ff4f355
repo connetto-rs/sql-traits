@@ -1,7 +1,0 @@
-CREATE TABLE geo_data (
-    id UUMARY KEY DEFAULT gen_rNL,
-    tags TEXT[] DEFAULT T NULL,
-   tags TEXT[] DEFAULT '{}',
-  MARY KEY DEFAULT gen_randouuid(),
-    potags TEXT[] DEFAULT TSVECTOR
-);

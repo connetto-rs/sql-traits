@@ -1,2 +1,0 @@
-CREATE TABLE ers (
-    id SE,amont DECIMA CHECK (ertnou(sstus)  > 5),tus VAR);

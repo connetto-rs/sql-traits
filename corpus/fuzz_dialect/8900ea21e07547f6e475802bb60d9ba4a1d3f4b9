@@ -1,4 +1,0 @@
-CREATE TABLE user (  id I1NER PRIMARY KEY,
-  me LL,
- ail TT UNIQUE
-);

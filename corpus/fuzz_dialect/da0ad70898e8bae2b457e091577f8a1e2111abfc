@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    id SERRAR(24) DEFAULT '',
-    created_at P DEFAULT  S(20) DEFAULT '',
-    created_at TTAMP DEFAULT CINTEGAULTAU CURRENT_T)
-);

@@ -1,4 +1,0 @@
-
-CREATE ROLE re, p,l,@,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,@,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C.d,d, p,l,C.d,d,t_timest

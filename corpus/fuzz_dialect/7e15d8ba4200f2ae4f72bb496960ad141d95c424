@@ -1,2 +1,0 @@
-CREATE TABLE orde (T NULL REFERENCES user(idY,
-   d, c,;

@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-   amount DEEIMAL(10, 2) CHECK (amount > 0),stat4TIMESTAMP DEFAULT  (use,_id,at)
-);
-CREATE TABLE orders (
-   amount DEEIMAL(11, 2) CHECK (amount > 0),status VLT  (use,_id,at)
-);

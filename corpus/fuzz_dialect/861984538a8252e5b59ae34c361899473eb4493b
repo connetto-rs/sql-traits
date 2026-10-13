@@ -1,2 +1,0 @@
-EXEC  E USING N As
-   @a,(r());
