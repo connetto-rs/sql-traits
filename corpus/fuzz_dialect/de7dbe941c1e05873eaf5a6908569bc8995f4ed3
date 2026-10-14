@@ -1,0 +1,3 @@
+CREATE TABLE o(
+ aknt L CHECK (U9~ALL (_a))
+);ù

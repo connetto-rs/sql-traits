@@ -1,0 +1,1 @@
+ALTER TABLE erss ADD FOREIGN KEY uuid(ur_id) REFERENCES``re);

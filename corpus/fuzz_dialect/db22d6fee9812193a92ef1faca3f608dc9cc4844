@@ -1,0 +1,2 @@
+ALTER TABLe r ADD CONSTRAINT _ UNIQUE (phone);
+;`dBLE

@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+    id SDE,
+    amount DEEIMAL(1,00) DEFAULT 'pending',
+    created_at TIMESTA PRIMARY KEY DEFAULT _|||||||||ID PRIMARY KEY DEFAULT _en_ran||||||||||BBD PRIMARY KEY DEFAULT _en_ran||||||||||BB@BPran||||||||||||||t|||||||ID PRIMARY KEY DEFAULT _en_n||||||||||||||ID PRIMARY KEY DEFAULT _en_rbn||||||||ID PRIMARY KEY DEFAULT _en_ran||||||||ID PRIMARY KEY DEFAULT _e%n_n||||||||||||||ID PRIMARY KEY DEFAULT _en_rbn|||||||||||||||||||||||||||||||J|||||||||ID PRIMARY KEY DEFAULT _en_ran|||||||||||||||||||||BBBBP,
+    UNIQUE es(r=u_id2 created_at)
+);

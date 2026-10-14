@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+  Id SERCADE,
+  znt DEEM,  UNIQUE (usid, ra)
+)

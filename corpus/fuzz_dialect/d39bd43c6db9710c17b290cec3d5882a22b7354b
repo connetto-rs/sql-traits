@@ -1,0 +1,2 @@
+CREATE TABLE ords (PIMtABLE orde
+ CHECK (amount&> 0))

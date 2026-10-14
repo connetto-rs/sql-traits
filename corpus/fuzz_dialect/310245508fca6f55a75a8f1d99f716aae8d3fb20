@@ -1,0 +1,1 @@
+CREATE POLICY usn ON esu  USING (ul = ct_~~lt_u~~l

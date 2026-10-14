@@ -1,0 +1,2 @@
+CREATE INDEX l ON s(e);
+CREATE INDEX #e ON  D

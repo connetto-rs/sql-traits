@@ -1,0 +1,7 @@
+(UPDATE((
+(((((((WITH soz(
+ SELECT  R
+),soz(
+ SELECT  R
+),)
+);

@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    id SERCADE,
+    amount L PRIMARY KEY NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount DE DEFAULT CURRE(user_id, c:eatmd_t)
+);

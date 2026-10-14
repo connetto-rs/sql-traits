@@ -1,0 +1,2 @@
+ALTER TABLE usrs ADD hone VH@;
+ALTER TABLE useusers DROP CONSTRAINT uk_‹

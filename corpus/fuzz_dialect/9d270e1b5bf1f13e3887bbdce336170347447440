@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    Id SERIAL  ,amount DECIMAL(9, 2) CHECK (amount > 1),
+   CHECK (Amount%>id),
+ tus d_at)ÿÿÿÿÿÿ

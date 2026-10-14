@@ -1,0 +1,6 @@
+CREATE TABLE geo_data (
+    id UUMARY KEY DEFAULT guuil(),
+    point POINT,
+    data JSONB NOT NULL,
+  data JSONB NOT NULL,
+ ata JSONB NOT DEFIA

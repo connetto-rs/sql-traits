@@ -1,0 +1,3 @@
+CREATE TABLE geo_dta (
+    id UUUID PRIMARY KEY DEFAULT _en|||x||||point||J|?||||_en_ran|||||||point||||ID ||an||||nowx||||point||||ID |ran|||||||x||||point||||ID ||J||O|||OR
+);

@@ -1,0 +1,4 @@
+CREATE FUNCTION c()
+AS
+L
+  ,

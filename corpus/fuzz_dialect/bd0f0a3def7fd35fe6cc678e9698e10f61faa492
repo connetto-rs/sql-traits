@@ -1,0 +1,2 @@
+CREATE INDEX date ON o(s,CASC,t, sB,C,ASC, tBBB,xsBBBB,
+S

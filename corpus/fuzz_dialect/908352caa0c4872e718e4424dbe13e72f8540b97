@@ -1,0 +1,5 @@
+CREATE ROLE donly;
+GRANT SELECT ON ALL TABLES IN SCHEMA lCREK,KElRNC,lCREC,l,lCREC,KEC,lC,nowlocK,ic TO ROLE donly;
+ß
+    ß
+    Uly;

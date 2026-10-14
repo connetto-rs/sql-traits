@@ -1,0 +1,6 @@
+CREATE TABLE ers (
+  L PRI,
+  UNIQUE (user#idnowr KEY,
+ ad INT,BBP,
+   UN (uidno)
+)

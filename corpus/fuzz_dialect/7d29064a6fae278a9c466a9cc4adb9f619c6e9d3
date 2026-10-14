@@ -1,0 +1,6 @@
+CREATE TABLE geo_data (
+    i MARY KEY DEFAULT gen_rNL,
+    tags TEXT[] DEFAULT T NULL,
+   tags TEX[] DEFAULT '{}',
+  MARY KEYEXT[] DEFAULT TTOR
+);

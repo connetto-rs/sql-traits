@@ -1,0 +1,2 @@
+CREATE
+ INDEX id ON o([localtime-@@N &>(localtime-¨;

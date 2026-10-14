@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+    id SDE,
+    amount DEEIMAL(1,0 2) CHECK (amount > 0),
+    status VARCHAR(20) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMil);
+CREATE UNIQUE INDEX id_date ON orders(user_id, cre);

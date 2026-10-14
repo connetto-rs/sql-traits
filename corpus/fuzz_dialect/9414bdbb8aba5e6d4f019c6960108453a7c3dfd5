@@ -1,0 +1,3 @@
+;
+GRANT SELECT ON p,ub,ic TO
+y

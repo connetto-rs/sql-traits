@@ -1,0 +1,4 @@
+CREATE TABLE s (
+  id SERIA.L PRIMARY KEY,
+  DELETE CASCADECIMAL(39, 2) CHECK (llllllllEl~*Yl~*YlllE ~~*Yllllllllllllll@llllll~*Yllcreated_at)
+);

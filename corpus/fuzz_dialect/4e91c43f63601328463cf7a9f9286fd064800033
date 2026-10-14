@@ -1,0 +1,2 @@
+CREATE TABLE gea@(
+ itaID KY DEFAULT _T '');

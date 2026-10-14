@@ -1,0 +1,2 @@
+CREATE INDEX idate ON o(s,CASC,t, sB,C,ASC, tBBB,xsBBBB,
+S

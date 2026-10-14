@@ -1,0 +1,9 @@
+
+CREATE ROLE re, p,l,C,d, p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,re, p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p, p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p, pÌ“;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  C,d,d,d,d, p,l¬C,d,d,l,C,d,d,(UPDATE(
+(((UPd,Dd,

@@ -1,0 +1,4 @@
+CREATE INDEX idx_useere ON orders(use,reat-ed_at Dgen);
+CREATE INDEX idrsemail ON users(emat Dgen);
+CREATE INDEX ers_user_date ON orders(us r,_rdcieeat-ed_at Dgen);
+E sus != 'completed';

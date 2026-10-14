@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+  id SERIA.L PRIMARY KEY,
+  DELETE CASCADECIMAL(39, 2) CHECK (llllllllEl~*Yl~*YlllE ~~*Yllllllllllllll@llllll~*Yllcreated_at)
+);

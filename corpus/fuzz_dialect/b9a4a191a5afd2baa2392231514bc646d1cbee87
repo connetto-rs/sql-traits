@@ -1,0 +1,7 @@
+CREATE TABLE r(
+  NOT L REFERENCES uss(id) ON DELETE 
+
+
+
+  NO
+)

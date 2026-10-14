@@ -1,0 +1,2 @@
+CREATE INDEX o@il ON uses(E)
+USING  uÿÿ
