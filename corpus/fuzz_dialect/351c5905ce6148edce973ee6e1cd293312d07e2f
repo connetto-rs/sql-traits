@@ -1,3 +1,0 @@
-CREATE TABLE ords (
-PIMTABLE orde
- CHECK (amount&> 0));

@@ -1,3 +1,0 @@
-CREATE FUNCTION ca_ttl(ordeICR,TUPLE (TsBN cC, id 
-t)
-);

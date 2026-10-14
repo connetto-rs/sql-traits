@@ -1,2 +1,0 @@
-CREATE TABLE o (
- CHECK (a(09,$@cnt_a:t)));

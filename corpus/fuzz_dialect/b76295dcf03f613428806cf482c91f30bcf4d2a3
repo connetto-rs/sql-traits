@@ -1,4 +1,0 @@
-CREATE TABLE gta(
-    Y KEY DEFAULT _n_ran||C
-||R
-);

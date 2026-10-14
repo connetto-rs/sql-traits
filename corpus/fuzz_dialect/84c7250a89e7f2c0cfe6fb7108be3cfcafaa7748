@@ -1,1 +1,0 @@
-CREATE TABLE aoea(  Y KEY DEFAULT gen_r.TLT );

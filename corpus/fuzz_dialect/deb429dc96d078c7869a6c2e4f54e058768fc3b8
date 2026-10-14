@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    id P,
-    UNIQUE (TIME/CC::BBBBBBBP ,
-   UN::BBBBBBBBP,
-    UNIQUE (user_id- ed_at)t)
-);

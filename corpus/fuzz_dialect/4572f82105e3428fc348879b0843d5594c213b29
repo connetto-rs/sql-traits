@@ -1,1 +1,0 @@
-CREATE POLICY r_l ON use TO Ad,i,   Uออ

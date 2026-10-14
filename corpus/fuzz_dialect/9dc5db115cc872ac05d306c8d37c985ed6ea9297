@@ -1,2 +1,0 @@
-CREATE ROLE E ROLE only;
-GRANT SELECT ON pubc TO  p,l,u,p,,,A

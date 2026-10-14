@@ -1,4 +1,0 @@
-CREATE TABLE o_data (
-t     POI,  tags TEXT[]DEFAULT+'{}',
-AUIDS TEXT[] DEFAULT+'{',
-    AUIDdv TSS);

@@ -1,1 +1,0 @@
-CREATE TABLE ss (  id IN@LL,mail TEXT UNIQUE)

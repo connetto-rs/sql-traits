@@ -1,5 +1,0 @@
-CREATE POLICY uaTion ON users
-USING (ur.t.((((SELECT to
-|>CALL
-EL_l())
-  er;

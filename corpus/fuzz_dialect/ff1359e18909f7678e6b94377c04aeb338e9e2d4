@@ -1,3 +1,0 @@
-CREATE POLICY use@r_at#Ion ON resus
-USING(   ||/L
-  

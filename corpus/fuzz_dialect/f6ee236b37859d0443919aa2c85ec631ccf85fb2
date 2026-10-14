@@ -1,8 +1,0 @@
-CREATE TABLE orders (
-    ERCAMARY KEY,  UNIQUE Fs(eurmaxi.ated_)
-);
-CREATE TABLE or(
-session_ VARC,
-    reared_at TIMESTAURRENAL PRIMARY KEY,
-  GER NOT NULL REFERENCES userrIA KEY,  UNIQUE s(eur^i.i.ated_)
-);

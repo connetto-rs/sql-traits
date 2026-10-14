@@ -1,3 +1,0 @@
-CREATE FUNCTION calculao_ttl(ordeentme,TUPLE (T, stCASC, id 
-t)
-);

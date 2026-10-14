@@ -1,2 +1,0 @@
-CREATE POLICY us_on ON res
-USING(lG(true?-

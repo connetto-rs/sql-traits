@@ -1,6 +1,0 @@
-CREATE TABLE orders$(
-    id SERIA  ,amount DECIMAL(09, 2) CHECK (amount > 0),
-   CHECK (amount > amount > 0),
-   CHECK (amount > 1),
-unt DECI@AL(29, 2) CHECK (amount > 0),   atus d_at)ÿÿl
-);ÿÿ

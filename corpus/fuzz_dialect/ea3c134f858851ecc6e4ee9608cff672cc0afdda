@@ -1,4 +1,0 @@
-CREATE TABLE order
-(s    MARY KEY,
-   CHECK (a/gd_at)
-);

@@ -1,2 +1,0 @@
-CREATE POLICY latmin_all ON us
-    TO ad,i,sd,i,sad,i,sd,i,st  ,

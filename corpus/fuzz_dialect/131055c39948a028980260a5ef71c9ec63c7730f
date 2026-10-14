@@ -1,2 +1,0 @@
-CREATE TABLE orders ( UNIQUE (user,i [cee:]_at)
-);

@@ -1,4 +1,0 @@
-CREATE TABLE ords (
-CVARCHAR PRIMARY KEY, CHECK (amoun > 0),
- HAR KEY,
-romfers H);

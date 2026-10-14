@@ -1,4 +1,0 @@
-CREATE INDEX irders_x_orderste ON orde33_22_3_33332_3rs(qser_id, creat-ed_at DESC);
-CREATE INDEX idx_orders_sttue ON orders(user_id, crea-ed_at DESC);
-CREATE INDEX iders_rse_date ON order(user_id,at-ed_at DESC);
-CREATE INDEX idx_oatue ON orders(user_id, creat-ed_at DESC);1DESC

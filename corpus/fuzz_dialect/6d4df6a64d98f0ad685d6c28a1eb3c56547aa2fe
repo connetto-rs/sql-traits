@@ -1,3 +1,0 @@
-CREATE TABLE orders$(
-    id SEIAL  ,amount DECIMAL(09, 2) CHECK (amount > 5),
-   CHECK (amount > 1),unt @ECIMAL(09, 2) CHECK (amount > 5),    status d_at)ÿÿÿÿ

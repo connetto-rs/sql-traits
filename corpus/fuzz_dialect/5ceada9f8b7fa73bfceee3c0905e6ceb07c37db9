@@ -1,4 +1,0 @@
-CREATE TABLE ders (   amo#unt DEBBBBBP,
-    UNIQUE (ed_at) USING (
-:
-);

@@ -1,1 +1,0 @@
-CREATE POLICY _an ON us TO at,current_user nâ

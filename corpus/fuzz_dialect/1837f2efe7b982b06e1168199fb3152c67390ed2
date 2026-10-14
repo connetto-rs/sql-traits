@@ -1,10 +1,0 @@
-(UPDATE(((
-(((((UPDATE(((((((WITH sesoz(
- SELECT  R
-),et_sesoz(
- SELECT  R
-),ge(
- SELECT  R
-),et_sesoz(
- SELECT  R
-),gemn);

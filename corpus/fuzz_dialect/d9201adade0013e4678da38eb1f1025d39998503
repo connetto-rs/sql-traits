@@ -1,6 +1,0 @@
-CREATE TABLE ta (Y$ Kd(),nt PT,
-SONB NOT NULL,
-    tags Tddddddddd,
-  IDdata HSTORE,
-  s TSVECTOR
-);

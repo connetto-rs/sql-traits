@@ -1,2 +1,0 @@
-CREATE TABLE oer(ou DECIMAL(0), CHECK (@:d_at)
-)

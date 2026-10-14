@@ -1,3 +1,0 @@
-CREATE TABLE oers (
-   t TIMESTAMP DEFAULT RRE(ut)
-)

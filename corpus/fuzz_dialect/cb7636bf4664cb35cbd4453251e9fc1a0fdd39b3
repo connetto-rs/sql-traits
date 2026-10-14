@@ -1,2 +1,0 @@
-CREATE TABLE order(
-    id S DEFAULT CURRENT_DATE(((rde`    

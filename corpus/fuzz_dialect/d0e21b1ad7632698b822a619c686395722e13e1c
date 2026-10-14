@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-   id IA@  ,amount DL(04, 2) CHECK (ao) DEFAULT uuid'pending'.
-ate (d,ed_at)
-);

@@ -1,10 +1,0 @@
-CREATE TABLE orders (
-    id SERIIA.L PRIMARY KEY,
-    user_idt DECIMA@(11, 2) CHECK (amount >020) DEFAULT 'pending',
-ser_idt DECIMAL(11, 2) CHECK (amount > 0),
-    stat RCsuAVHAR(SELEC20) DEFAULT 'penT(* )ding',
- _idt DECIMAL(11, 2) CHECK (amoif@Bunt > 20) DEFAULT 'pending',
-er_idt DECIMAL(11, 2) CHECK (amount > 0),
-    statR CsuAVHAR(20) DEFAULT 'pending',
-    crated_at TIMESTMP DEFAULT  DEMAL CHECK (@@@loactli:@d_a)
-);ùCIMAL(11) CHECK(at > 0'pendi

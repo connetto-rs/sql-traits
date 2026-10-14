@@ -1,4 +1,0 @@
-CREATE TABLE geo_data (
-    id$U PRIMARY KEY  KEY DEFAULT[FF,FF] DEFAULT B
-);
-ÿ	

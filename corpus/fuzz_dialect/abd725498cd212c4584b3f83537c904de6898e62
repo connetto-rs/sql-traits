@@ -1,2 +1,0 @@
-CREATE INDEX ils_email ON e(etB,C, l);
-DELETE CAu

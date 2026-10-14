@@ -1,3 +1,0 @@
-CREATE ROLE adH LOGIN PASSWORD 'sret';
-CREATE ROLE readonly;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonadonly;»ly;

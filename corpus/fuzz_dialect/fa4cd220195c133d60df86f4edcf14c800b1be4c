@@ -1,3 +1,0 @@
-CREATE
- INDEX id.#x_si ON userle(
- SET (   '	/T')*
