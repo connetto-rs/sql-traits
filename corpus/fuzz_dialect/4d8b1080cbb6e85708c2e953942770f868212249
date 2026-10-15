@@ -1,3 +1,0 @@
-CREATE TABLE or(
- nt MAL CHECK(@@localtime@@session_user@:d_a)
-);ù:

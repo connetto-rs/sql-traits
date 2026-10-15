@@ -1,4 +1,0 @@
-CREATE TABLE os (
-    id SADE,
-    amount DEEIMAL(09, 1) CHECK (amount  >0) CHECK (amount  >0),
- H VARCHAR);

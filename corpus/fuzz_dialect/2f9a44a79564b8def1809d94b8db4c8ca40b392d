@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    mount DEEIMAL(1,00) DEFAULT 'pending',
-    created_at TIMESTA PRIMARY KEY DEFAULT _en_||||||||||||||||||||||||||||||ID PRIMARY KEY DEFAULT _enran|||||||||||||||||||||||BBBBPran|||||D PRIMARY KEY DEFAULT _en_rbn||||||||||||||||||||||||||||||||||J|||||||||ID PRIMARY KEY DEFAULT _en_ran||||||||||||x|||||BBBBP,
-    UNIQUE es(r=u_id, created_at)
-);

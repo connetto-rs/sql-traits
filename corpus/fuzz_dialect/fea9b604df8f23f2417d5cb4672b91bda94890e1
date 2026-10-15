@@ -1,3 +1,0 @@
-CREATE TABLE orders (d SR(20) DEFAULT uuid'pending',
- aRus VA(ses)
-);

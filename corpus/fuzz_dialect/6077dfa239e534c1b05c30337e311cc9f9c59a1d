@@ -1,3 +1,0 @@
-CREATE TABLE s (
-  DELETD L(16, 2) CHECK (gen_l_*A NOTNULL @@@ated_at)
-);

@@ -1,1 +1,0 @@
-CREATE INDEX idx_ ON us(SET (

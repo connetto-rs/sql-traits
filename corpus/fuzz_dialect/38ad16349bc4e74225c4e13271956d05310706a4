@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-  userT NULL REFERENCES userS(idoct) ON UPDATE(((( CASCADE,
-nt DEE,

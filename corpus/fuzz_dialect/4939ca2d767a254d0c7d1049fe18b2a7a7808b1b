@@ -1,2 +1,0 @@
-CREATE POLICY us_in ON r   FOR
- SELECT ` TABO

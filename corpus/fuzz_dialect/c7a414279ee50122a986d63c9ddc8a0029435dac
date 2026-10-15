@@ -1,5 +1,0 @@
-CREATE TABLE orde(
- id SERCAE,
- BBBAL PRIMARY KEY,
-   uR NOLL REFERENCES u.ser
-);

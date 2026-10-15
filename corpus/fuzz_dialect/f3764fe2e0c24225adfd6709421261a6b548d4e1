@@ -1,3 +1,0 @@
-CREATE ROLE ad LOGIN PASSWORD 'secRet';
-CREATE ROLE readonin;
-GRANT USAGE ON SCHEMA public TO reeÂdl

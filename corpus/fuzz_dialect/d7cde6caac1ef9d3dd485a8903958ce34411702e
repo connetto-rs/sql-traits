@@ -1,2 +1,0 @@
-ALTER TABLE users ADD hone VARCH@;
-ALTER TABLE users DROP CONSTRAINT uk_‹

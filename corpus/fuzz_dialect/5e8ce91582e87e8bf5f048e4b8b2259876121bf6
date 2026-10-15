@@ -1,3 +1,0 @@
-CREATE POLICY Ion ON oQL
-AS $$
-$$ `  S

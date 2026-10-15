@@ -1,6 +1,0 @@
-CREATE FUNCTION cate(oid INTEGER)
-RETURNS DECIL(05, 2)
-AS $$
- **********|'/************************.*****$*j**
-  TE$$;
-

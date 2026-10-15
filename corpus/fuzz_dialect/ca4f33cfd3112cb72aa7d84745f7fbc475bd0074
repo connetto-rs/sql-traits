@@ -1,2 +1,0 @@
-CREATE TABLE orders (
-  UNIQUE (sidr IN(TABLE ord)

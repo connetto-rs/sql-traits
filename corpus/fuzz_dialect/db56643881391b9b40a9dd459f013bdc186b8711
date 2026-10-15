@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-   idA RSLI1E  ,amount DECIMAL(09, 2) CHECK (amount > 0),
-    stnt DECMMAL(09, 2) CHECK (amount > 0),
-    status VARCHAR(20) DEFAULT e'pnding',mount DECIMAL(09, 2) CHECK (amount > 0),I UQNUE (userreated_at)
-);

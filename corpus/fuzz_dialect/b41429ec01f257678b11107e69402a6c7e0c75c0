@@ -1,2 +1,0 @@
-ALTeR TABLE usrs ADD CONSTRAINT uk_phone UNIQUE (phone);
-ALTER TABLE orders ADD CONSTRAINT ö0u0

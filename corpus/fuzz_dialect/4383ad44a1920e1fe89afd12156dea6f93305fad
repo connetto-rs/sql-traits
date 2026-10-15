@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-   os VA REFERENCES uGP DEFAULT CU_TBB=BBBHP,
-    UNIQUE (us, c:eated_at)
-);

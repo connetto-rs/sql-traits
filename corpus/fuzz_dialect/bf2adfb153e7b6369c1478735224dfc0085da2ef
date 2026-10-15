@@ -1,4 +1,0 @@
-CREATE TABLE de(
-B PKEY,
-  T NUL REFERENCES u.ser
-);

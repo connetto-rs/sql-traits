@@ -1,1 +1,0 @@
-ALTER TABLE ordes ADD  KEY (a_lt DESC)aio,p=

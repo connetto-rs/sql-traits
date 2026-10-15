@@ -1,3 +1,0 @@
-CREATE POLICY er_ ON us  
-  
-   USING (usel|>>gIN (A |>>geol( TABLE |>>EN 

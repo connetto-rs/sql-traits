@@ -1,1 +1,0 @@
-ALTER TABLE ue ADD CONSTRAINT uk_h UNIQUE KEY (useb_id) ;*

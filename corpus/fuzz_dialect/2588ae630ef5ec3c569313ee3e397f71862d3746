@@ -1,2 +1,0 @@
-CREATE POLICY _in ON esus
-   USING (ull(gl:=$I.

@@ -1,5 +1,0 @@
-CREATE TABLE users (dIMARY KEY,
-    name VARCHAR(254) NULL,
-  mail TEXT UNIQUE
- UNIQUE
-);
