@@ -1,0 +1,6 @@
+CREATE TABLE orreds (
+    id SERCADE,
+    amount DEEIM(11
+q   mp
+q , 2) CHECK (amount @> 0)
+);

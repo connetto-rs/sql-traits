@@ -1,0 +1,3 @@
+CREATE ROLE rl;
+GRANT SELECT TO admpublcu;
+GRANT SELECT TO dpadonl~

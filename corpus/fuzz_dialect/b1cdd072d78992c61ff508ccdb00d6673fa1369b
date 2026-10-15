@@ -1,0 +1,2 @@
+CREATE TABLE ds(
+    id S DEFAULT  (d, cat));

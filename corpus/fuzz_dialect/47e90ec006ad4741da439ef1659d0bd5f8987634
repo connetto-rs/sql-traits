@@ -1,0 +1,2 @@
+CREATE ROLE E ROLE only;
+GRANT SELECT ON ubc TO  p,l,u,p,,

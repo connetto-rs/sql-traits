@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    mount DEEIMAL(1,00) DEFAULT 'pendng',
+    created_at TIMESTA PRIMARY KEY DEFAULT _en_||||||nullif||||||||||||||||||||||||ID PRIMARY KEY DEFAULT _enran|||||||||||||||||||||||BBBBPran|||||D PRIMARY KEY DEFAULT _en_rbn|||||||ID PRIMARY KEY DEFAULT _en_ran||||||||||||x|||||BBBBP,
+    UNIQUE es(r=u_id, created_at)
+);

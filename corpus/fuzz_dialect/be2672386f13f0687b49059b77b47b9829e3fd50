@@ -1,0 +1,2 @@
+CREATE TABLE user(d uuidRI KEY UNIQUE
+);

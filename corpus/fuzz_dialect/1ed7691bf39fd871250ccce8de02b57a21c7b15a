@@ -1,0 +1,1 @@
+ALTER TABLE uses ADD FOREIGN KEY s(er_id) REFERENCES usr

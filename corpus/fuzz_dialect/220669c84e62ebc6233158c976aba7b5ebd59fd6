@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+  iIN NULL REFERENCES usenow.S(id) ON DELETE CASCADE,
+  CHECK (unt > 0),
+    st VARCHERRNBBB#
+);

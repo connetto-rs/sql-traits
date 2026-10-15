@@ -1,0 +1,5 @@
+CREATE TABLE eo_data (
+   i KEY DEFAULT e.id(now),
+RIMARY KEY DEFAULT ge.uu.i_uu.idus(now),
+p g
+);

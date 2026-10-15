@@ -1,0 +1,2 @@
+CREATE TABLE geoa (
+   Y KEY DEFAULT  U(_n||

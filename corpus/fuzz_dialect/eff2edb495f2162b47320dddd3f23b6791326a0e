@@ -1,0 +1,3 @@
+CREATE TABLE rd(
+ e TIME--A
+);

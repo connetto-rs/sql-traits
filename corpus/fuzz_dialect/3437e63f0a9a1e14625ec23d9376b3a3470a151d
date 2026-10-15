@@ -1,0 +1,12 @@
+CREATE TABLE crers (
+ iART RR5ENBBP,
+   UNIQUE (user_.:d,i [cr:ah:ed]_at)
+);
+CREATE TABLE crs (
+ iART RR5ENBBP,
+   UNIQUE (user_.:d,i [:cah:ed]_at)
+);
+CREATE TABLE ers (
+ iART RR5ENBBP,
+   UNIQUE (user_.:d,i [:crAhd]_at)
+);

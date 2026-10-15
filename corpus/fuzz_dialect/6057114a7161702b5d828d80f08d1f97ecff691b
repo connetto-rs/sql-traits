@@ -1,0 +1,2 @@
+CREATE
+INDEX i ON op(n @>(N0@> D

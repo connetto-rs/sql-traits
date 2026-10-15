@@ -1,0 +1,3 @@
+CREATE TABLE geo_d(
+ daid URY KEY DEFAULT :eT NULL NULL,  ta HST
+)

@@ -1,0 +1,1 @@
+CREATE INDEX idxl ON users(email);CREATE UNIQUE INDEX i ON oreCRErs(sta) WHERE su

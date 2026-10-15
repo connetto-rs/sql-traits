@@ -1,0 +1,4 @@
+CREATE ROLE d;
+GRANT SELECT ON ALwbglic TO readonlonly;
+GRANT SELECT ON ALLblic TO dly;
+GRANT SELECT ON A TO rÿÿM

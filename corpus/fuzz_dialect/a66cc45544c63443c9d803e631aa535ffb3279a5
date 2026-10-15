@@ -1,0 +1,4 @@
+CREATE TABLE ors (
+  d SERCADE,
+  znt DEEM,UNIQUE (usid, ra)
+)

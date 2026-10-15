@@ -1,0 +1,2 @@
+CREATE INDEX mdl ON e(mail)--O
+USING  Eÿ

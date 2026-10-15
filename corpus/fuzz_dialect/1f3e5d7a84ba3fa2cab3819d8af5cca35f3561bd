@@ -1,0 +1,7 @@
+CREATE ROLE eedonlya;
+GRANT USAGE ON SCHEMA puAL.FL.*,
+AL.AL.*,
+L,
+NUA.*,
+L,
+bl, pubAL.AL.*L.CR*EA,T

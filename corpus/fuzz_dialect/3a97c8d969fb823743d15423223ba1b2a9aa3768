@@ -1,0 +1,63 @@
+CREATE TABLE ge(a J[] DEFAULT
++''/
+{}: _AULTEFAULT
++''/
+{}: _AULT
++''/
+{}+''/
+{}: _usu
++''/
+{}: _ususelTOCEFAULT
++''/
+{}: _AULTEFAULT
++''/
+{}: _AULT
++''/
+{}+''/
+{}: _usu
++''/
+{}: _ususelTOCTFA: _usu
++''/
+{}: _ususelTOFAULT
++''/
+{}: _AULTEFA
++''/
+{}: _ususelTOCEFAULT
++''/
+{}: _AULTEFAULT
++''/
+{}: _AULT
++''/
+{}+''/
+{}: _usu
++''/
+{}: _usselTOCTFA: _usu
++''/
+{}: _ususelTOCTFAULT
++''/
+{}: _AULTEFAULT
++''/
+{}: _AULT
++''/
+{}:TFA: _usu
++''/
+{}: _ususelTOCTFAULT
++''/
+{}: _AULTEFAULT
++''/
+{}: _AULT
++''/
+{}: _usuULT
++''/
+{}: _AULT
++''/
+{}:TFA: _usu
++''/
+{}: _ususelTOCTFAULT
++''/
+{}: _AULTEFAULT
++''/
+{}: _AULT
++''/
+{}: _usuO
+);

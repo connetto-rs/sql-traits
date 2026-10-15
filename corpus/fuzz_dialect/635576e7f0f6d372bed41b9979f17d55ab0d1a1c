@@ -1,0 +1,3 @@
+CREATE ROLE do;
+GRANT USAGE ON SCHEMA publ, publ,c TO rin;
+GRANT USAGE ON SCHEMA publ, ubl,c R

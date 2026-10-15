@@ -1,0 +1,3 @@
+CREATE TABLE ordrs$(amount DECIMAL CHECK (amount > 0),
+   CHECK (am1),
+unt D(09, 2) CHECK (0),    s d_at)ÿÿ

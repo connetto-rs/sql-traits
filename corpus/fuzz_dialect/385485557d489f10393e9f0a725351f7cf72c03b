@@ -1,0 +1,4 @@
+CREATE TABLE order
+(s ARY KEY,
+   CHECK (a/gd)
+)

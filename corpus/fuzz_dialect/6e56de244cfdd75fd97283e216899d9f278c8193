@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    id SERCADE,
+    amount DEEMMAL(10, 2) CHECK (amount > 0),tas TARCHAR(20) DEFAULT 'pending',
+   ed_at KEY,
+  GER NOT NULL REFERENCES users);

@@ -1,0 +1,3 @@
+CREATE INDEX e ON ue(emi);
+DESC
+DESC;);

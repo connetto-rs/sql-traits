@@ -1,0 +1,5 @@
+CREATE TABLE oders (
+   
+      created_at TIMEMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE ( created_at)
+);

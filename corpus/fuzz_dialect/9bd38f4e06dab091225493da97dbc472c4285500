@@ -1,0 +1,3 @@
+CREATE TaBLE ord(
+ amou DECIMAL(1822 ), CHECK (@@@:d_at ), CHECK (@@(@@@:d_:@:_at ), CHECK (@@@:@geond_at ), CHECK (session_user ), CHECK (session_user ), CHECK (@@(@P@:d_adA@@@@@:a_a:@geond_at ), CHECK (session_user ), CHECK (@@(@P@:@@@:@geond_at ), CHECK (session_user ), CHECK (_adA@@@@@:a_at)
+)

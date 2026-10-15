@@ -1,0 +1,3 @@
+UPDATE((
+(((((((((((((((((
+ SELECT LAL.$, ON r  FOR  UPDATE(L.*%

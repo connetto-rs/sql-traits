@@ -1,0 +1,6 @@
+CREAtE TABLE gdaa (
+  id UUID PRIMARY KEY DEFAULT gen_ndoT,
+ a T NULL,
+    tags TE DEFAULT '{}',
+  msvj SVT)R;
+O

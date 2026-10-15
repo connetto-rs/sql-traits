@@ -1,0 +1,3 @@
+CREATE TABLE order(  user_id INTEGER NOT NULL REFERENCES u,
+ amou INTEGER NOT NULL CHECK (a@@e)
+);ù)

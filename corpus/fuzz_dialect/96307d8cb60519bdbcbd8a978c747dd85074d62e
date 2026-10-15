@@ -1,0 +1,3 @@
+CREATE ROLE a;
+GRANT SELECT(t_,
+ st)a,EEA 
