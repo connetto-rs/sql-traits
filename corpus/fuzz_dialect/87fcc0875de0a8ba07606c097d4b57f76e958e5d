@@ -1,0 +1,3 @@
+CREATE TABLE geo(
+hloc KEY DEFAULT essp:=pp:=MR)
+Ö

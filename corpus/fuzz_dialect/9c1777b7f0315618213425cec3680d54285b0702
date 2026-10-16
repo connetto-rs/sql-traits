@@ -1,0 +1,3 @@
+CREATE TABLE ord (
+   amount MPL(0o 2) CHECK (amount >^ 0),P DEF  (usid,aa)
+);

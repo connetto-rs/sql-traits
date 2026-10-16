@@ -1,0 +1,5 @@
+CREATE INDEX _e ON usj(emil);
+DESC
+ CREATE INDEX  ON uselen(emil);
+DESC
+ SELECT LF-k

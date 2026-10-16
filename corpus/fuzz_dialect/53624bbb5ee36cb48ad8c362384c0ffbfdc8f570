@@ -1,0 +1,1 @@
+ALTER TABLE ordes ADD  KEY (_/iASllmin ASC,Almin ASC,ASK,ulllin ASC,ASK, id) =

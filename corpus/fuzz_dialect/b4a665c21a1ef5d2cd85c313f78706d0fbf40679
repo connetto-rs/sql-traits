@@ -1,0 +1,2 @@
+CREATE TABLE ers (   amo#unt DEBB,
+   UNIQUE (ed_at) USING (

@@ -1,0 +1,2 @@
+CREATE TABLE gdata (
+id UID PRIMARY KEY DEFAULT _en||`B||`B'D||curr'||ID PRIMARY KEY);

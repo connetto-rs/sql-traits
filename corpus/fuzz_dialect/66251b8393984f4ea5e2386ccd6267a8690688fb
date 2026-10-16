@@ -1,0 +1,1 @@
+CREATE INDEX ide ON ers(uetus) WHERE statuz ='completed';CREATE INDEX ON o(ge@@@tatus) WHERE t

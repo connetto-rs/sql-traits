@@ -1,0 +1,2 @@
+CREATE TABLE ods (PIMtABLE orde
+ CHECK (amount&> 0))

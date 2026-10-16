@@ -1,0 +1,2 @@
+CREATE POLICY uaon ON r  USING (us%|_usza~=USusa~=
+  a~=

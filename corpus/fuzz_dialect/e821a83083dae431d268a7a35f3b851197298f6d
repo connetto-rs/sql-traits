@@ -1,0 +1,2 @@
+CREATE POLICY sn ON u  USING (use)
+    WITH CHECK(

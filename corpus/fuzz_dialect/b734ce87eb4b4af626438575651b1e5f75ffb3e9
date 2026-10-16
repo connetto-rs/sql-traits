@@ -1,0 +1,3 @@
+CREATE INDEX _@m ON sers(email)
+ 
+USING u  USING luLï

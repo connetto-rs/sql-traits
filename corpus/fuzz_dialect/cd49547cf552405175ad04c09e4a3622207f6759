@@ -1,0 +1,4 @@
+CREATE TABLE Orders (
+    id SDE,
+   tus RRENT_@TIl);
+CREATE UNIQUE INDEX idor ON orders(user,id, c-ed_at Dcen);

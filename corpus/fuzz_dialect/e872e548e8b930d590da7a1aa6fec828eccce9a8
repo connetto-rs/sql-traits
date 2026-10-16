@@ -1,0 +1,2 @@
+CREATE TABLE or (
+   UNIQUE(_at)   USING;

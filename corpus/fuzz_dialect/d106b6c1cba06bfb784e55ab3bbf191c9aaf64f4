@@ -1,0 +1,7 @@
+CREATE TABLE orders (
+    ididt DECIMA@(11, 2) CHECK (amount >020) DEFAULT 'pending',
+ser_idt DECIMAL(11, 2) CHECK (amount > 0),
+    s DECIMAL(1, 2) CHECK (amoif@Bunt > 20) DEFAULT 'pending',
+er_idt DECIMAL(11, 2) CHECK (amount > 0),
+at TIMESTMP DEFAULT  DEMAL CHECK (@@@loactli:@d_a)
+);ùCIMndi

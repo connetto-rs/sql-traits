@@ -1,0 +1,5 @@
+CREATE TABLE orde(
+ id SERCAE,
+ B PRIARY KEY,
+   uR NOLL REFERENCES u.ser
+);

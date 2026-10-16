@@ -1,0 +1,4 @@
+CREATE TABLE or
+(s ARY KEY,
+   CHECK(a/d)
+)

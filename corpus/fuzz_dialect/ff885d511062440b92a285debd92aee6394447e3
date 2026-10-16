@@ -1,0 +1,2 @@
+CREATE ROLE adE ROLE read;
+GRANT SELECT (O)

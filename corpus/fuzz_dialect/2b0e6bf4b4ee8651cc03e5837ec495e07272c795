@@ -1,0 +1,2 @@
+CREATE POLICY ulan ON s
+  USING (u$ll+l.+l@

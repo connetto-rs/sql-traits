@@ -1,0 +1,3 @@
+
+GRANT SELECT ON @Lc TO rea2ovlonly;
+GRANT SELECT ON ALL

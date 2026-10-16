@@ -1,0 +1,2 @@
+CREATE TABLE egen(
+CHECK (unt > :05L

@@ -1,0 +1,3 @@
+CREATE TABLE rs (
+    rua nVARCHAR(20) DEFAULT CNT_MBB&<(ur_id,_at)
+);

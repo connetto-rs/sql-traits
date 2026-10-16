@@ -1,0 +1,2 @@
+CREATE POLICY @on ON oQL
+AS S

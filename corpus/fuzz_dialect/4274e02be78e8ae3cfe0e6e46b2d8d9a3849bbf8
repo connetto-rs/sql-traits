@@ -1,0 +1,1 @@
+UPDATE((UPDATE O SET  s =ON(s) WHERE(_st)

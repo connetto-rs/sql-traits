@@ -1,0 +1,4 @@
+CREATE TABLE orders (   
+ i dSERIAL  REFERENCES use CHECK (amo@@@@@@$EFEcul$@
+)smo@@@$EFEcul$@ed_at)
+);ù

@@ -1,0 +1,2 @@
+ALTER TABLE us ADD CO NODL;
+ALTER  TABLE ord ADD I u(id);

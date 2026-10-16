@@ -1,0 +1,4 @@
+CREATE TABLE ata (
+    iUUID Y KEY  NULL,
+   vags T DEFAULT+ESR
+);

@@ -1,0 +1,4 @@
+CREATE TABLE orders ( 
+    o VARCHAR KEY,
+  FAULT CUBB0UE (uceratedat)
+);

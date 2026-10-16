@@ -1,0 +1,6 @@
+CREATE TABLE geo_data (
+    id UUID PRIMARY KEY NULL,
+  dser UUID PRIMARY KEY DEFAULT :eeeeNOT NULL,
+aif UUID PRIMARY KEY DEFAULT :en_ra_grder NULL,
+  daid UUID PRIMARY KEY DEFAULT :eoctn_, meta H
+);
