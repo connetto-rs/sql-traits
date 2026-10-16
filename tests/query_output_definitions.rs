@@ -59,7 +59,8 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
 fn outputs_of(sql: &str, pick: fn(&Query) -> &Query) -> Vec<String> {
     let database = database();
     let query = query(sql);
-    let scope = ColumnScope::from_query(&query, &database).expect("scope builds");
+    let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
+        .expect("scope builds");
     let outputs =
         scope.scope_for_query(pick(&query)).expect("query is recorded").output_definitions();
     let entries = outputs.len();
@@ -113,7 +114,8 @@ fn outputs_follow_the_select_list_with_wildcards_expanded_in_place() {
 fn expression_outputs_keep_their_defining_scope() {
     let database = database();
     let query = query("SELECT id + x FROM a");
-    let scope = ColumnScope::from_query(&query, &database).expect("scope builds");
+    let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
+        .expect("scope builds");
     let mut outputs =
         scope.scope_for_query(&query).expect("query is recorded").output_definitions();
     let Some(QueryOutput::Column(ColumnDefinition::Expression { scope: defining, .. })) =
@@ -157,4 +159,40 @@ fn recursive_queries_expose_their_anchor_and_recursive_definitions() {
         "WITH RECURSIVE r(n) AS (SELECT id FROM b UNION ALL SELECT n + 1 FROM r) SELECT * FROM r";
     let [output] = outputs(sql).try_into().expect("one output");
     assert!(output.starts_with("recursive(b.id, "), "{output}");
+}
+
+#[test]
+fn folded_wildcards_preserve_order_and_expression_scopes() {
+    use sqlparser::dialect::SQLiteDialect;
+
+    let database =
+        ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs(id INT);").expect("schema parses");
+    let Statement::Query(query) = Parser::parse_sql(
+        &SQLiteDialect {},
+        "SELECT [D].*, [D].[VALUE] + 1 FROM (SELECT [ID] AS [VaLuE] FROM [DOCS]) AS [d]",
+    )
+    .expect("query parses")
+    .remove(0) else {
+        panic!("expected a query")
+    };
+    let scope =
+        ColumnScope::from_query(&query, &database, IdentifierCase::Folded).expect("scope builds");
+    let mut outputs =
+        scope.scope_for_query(&query).expect("query is recorded").output_definitions();
+    let Some(QueryOutput::Column(first)) = outputs.next() else {
+        panic!("expected the expanded column")
+    };
+    assert_eq!(describe(&first), "docs.id");
+    let Some(QueryOutput::Column(ColumnDefinition::Expression { expression, scope: defining })) =
+        outputs.next()
+    else {
+        panic!("expected an expression output")
+    };
+    let Expr::BinaryOp { left, .. } = expression else { panic!("expected a binary expression") };
+    let (definition, binding) =
+        defining.resolve_column_binding(left).expect("lookup succeeds").expect("column resolves");
+    assert_eq!(describe(&definition), "docs.id");
+    assert_eq!(binding.relation(), Some(("d", true)));
+    assert_eq!(binding.exposed(), Some(("VaLuE", true)));
+    assert!(outputs.next().is_none());
 }

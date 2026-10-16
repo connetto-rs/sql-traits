@@ -90,7 +90,8 @@ fn select_key(
 ) -> Result<String, LookupError> {
     let database = database();
     let query = query(sql);
-    let scope = ColumnScope::from_query(&query, &database).expect("scope builds");
+    let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
+        .expect("scope builds");
     let select = body_select(pick(&query));
     resolve(&scope.scope_for_select(select).expect("select is recorded"), select)
 }
@@ -137,7 +138,8 @@ fn describe(definition: Option<&ColumnDefinition<'_, '_, '_, ParserDB>>) -> Stri
 fn order_by_in(sql: &str, pick: fn(&Query) -> &Query) -> Result<String, LookupError> {
     let database = database();
     let query = query(sql);
-    let scope = ColumnScope::from_query(&query, &database).expect("scope builds");
+    let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
+        .expect("scope builds");
     let target = pick(&query);
     let order = scope.scope_for_query(target).expect("query is recorded");
     order

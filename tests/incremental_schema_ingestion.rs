@@ -25,7 +25,8 @@ fn inspect_definition<R>(
     else {
         panic!("expected a query")
     };
-    let scope = ColumnScope::from_query(&query, database).expect("query scope builds");
+    let scope = ColumnScope::from_query(&query, database, IdentifierCase::AsWritten)
+        .expect("query scope builds");
     let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
     let SelectItem::UnnamedExpr(reference) = &select.projection[0] else {
         panic!("expected an expression")

@@ -14,6 +14,7 @@ use sqlparser::ast::{Delete, Insert, ObjectName, Query, Update, Visit, visit_rel
 
 use crate::{
     errors::LookupError,
+    structs::IdentifierCase,
     traits::{DataStatementLike, DatabaseLike},
     utils::object_name::resolve_object_name,
 };
@@ -54,7 +55,8 @@ impl<'db, DB: DatabaseLike> ReferencedTables<'db, DB> {
         object_name: &ObjectName,
         database: &'db DB,
     ) -> Result<(), LookupError> {
-        if let Some(table) = resolve_object_name(object_name, database)? {
+        if let Some(table) = resolve_object_name(object_name, database, IdentifierCase::AsWritten)?
+        {
             self.add(table, database);
         }
         Ok(())
@@ -69,7 +71,7 @@ fn collect_referenced_tables<'db, N: Visit, DB: DatabaseLike>(
     accumulator: &mut ReferencedTables<'db, DB>,
 ) -> Result<(), LookupError> {
     let flow = visit_relations(node, |object_name: &ObjectName| {
-        match resolve_object_name(object_name, database) {
+        match resolve_object_name(object_name, database, IdentifierCase::AsWritten) {
             Ok(Some(table)) => {
                 accumulator.add(table, database);
                 ControlFlow::Continue(())

@@ -17,9 +17,9 @@ use super::{
 };
 use crate::{
     errors::LookupError,
-    structs::{ColumnDefinition, QueryOutput},
+    structs::{ColumnDefinition, IdentifierCase, QueryOutput},
     traits::DatabaseLike,
-    utils::{identifier_resolution::identifiers_match, object_name::object_name_last_part},
+    utils::object_name::object_name_last_part,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,12 +101,16 @@ fn innermost_query(mut query: &Query) -> &Query {
     query
 }
 
-fn match_output(entries: &[OutputEntry<'_, '_>], key: &Ident) -> Result<OutputMatch, LookupError> {
+fn match_output(
+    entries: &[OutputEntry<'_, '_>],
+    key: &Ident,
+    case: IdentifierCase,
+) -> Result<OutputMatch, LookupError> {
     let named = |column: &&OutputColumn<'_, '_>| {
         matches!(
             &column.name,
             OutputName::Known { name, quoted }
-                if identifiers_match(name, *quoted, &key.value, key.quote_style.is_some())
+                if case.identifiers_match(name, *quoted, &key.value, key.quote_style.is_some())
         )
     };
     let columns = || {
@@ -389,7 +393,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                     SelectItemQualifiedWildcardKind::ObjectName(object_name),
                     options,
                 ) if !wildcard_reshapes_output(options) => {
-                    expand_qualified_wildcard(&data.bases, &data.derived, object_name)
+                    expand_qualified_wildcard(&data.bases, &data.derived, object_name, data.case)
                 }
                 _ => None,
             };
@@ -534,8 +538,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         &'scope self,
         entries: &[OutputEntry<'query, 'db>],
         key: &Ident,
+        case: IdentifierCase,
     ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
-        Ok(match match_output(entries, key)? {
+        Ok(match match_output(entries, key, case)? {
             OutputMatch::Found(definition) => Some(self.definition(definition)),
             OutputMatch::Uncertain => Some(ColumnDefinition::Opaque),
             OutputMatch::Absent => None,
@@ -576,7 +581,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             }
             QueryOutputs::Merged(entries) => {
                 match unwrap_nested(key) {
-                    Expr::Identifier(name) => self.output_definition(entries, name),
+                    Expr::Identifier(name) => self.output_definition(entries, name, self.case),
                     _ => Ok(None),
                 }
             }
@@ -590,8 +595,11 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
         let key = unwrap_nested(key);
         if let Expr::Identifier(name) = key
-            && let Some(definition) =
-                self.output_definition(&self.scopes[cursor.scope.0].outputs, name)?
+            && let Some(definition) = self.output_definition(
+                &self.scopes[cursor.scope.0].outputs,
+                name,
+                self.scopes[cursor.scope.0].data.case,
+            )?
         {
             return Ok(Some(definition));
         }
@@ -611,14 +619,17 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                 DefinitionId(0),
                 key,
                 false,
+                self.scopes[cursor.scope.0].data.case,
             )? {
                 LookupOutcome::Found(ResolvedColumn { definition, .. }) => {
                     return Ok(Some(self.definition(definition)));
                 }
                 LookupOutcome::Stop | LookupOutcome::SearchParent => {
-                    if let Some(definition) =
-                        self.output_definition(&self.scopes[cursor.scope.0].outputs, name)?
-                    {
+                    if let Some(definition) = self.output_definition(
+                        &self.scopes[cursor.scope.0].outputs,
+                        name,
+                        self.scopes[cursor.scope.0].data.case,
+                    )? {
                         return Ok(Some(definition));
                     }
                 }

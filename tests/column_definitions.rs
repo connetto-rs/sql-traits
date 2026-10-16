@@ -54,7 +54,7 @@ fn scope_with_independent_lifetimes<'query, 'database>(
     query: &'query Query,
     database: &'database ParserDB,
 ) -> ColumnScope<'query, 'database, ParserDB> {
-    ColumnScope::from_query(query, database).expect("scope builds")
+    ColumnScope::from_query(query, database, IdentifierCase::AsWritten).expect("scope builds")
 }
 
 fn assert_copy<T: Copy>(_: T) {}
@@ -71,7 +71,8 @@ fn recursive_cte_exposes_the_anchor_and_recursive_definitions() {
             JOIN tree t ON c.parent_id = t.id\
          ) SELECT t.depth FROM tree t",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected a plain SELECT body")
     };
@@ -116,7 +117,8 @@ fn recursive_ctes_with_non_enumerable_arms_remain_opaque() {
          ) SELECT c.x FROM c",
     ] {
         let query = query(sql);
-        let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
         assert!(matches!(
             scope.resolve_column_definition(&reference("c.x")).expect("definition resolves"),
             Some(ColumnDefinition::Opaque)
@@ -133,7 +135,8 @@ fn nested_set_operations_preserve_every_definition() {
             UNION ALL (SELECT 2 INTERSECT SELECT 3)\
          ) SELECT v.n FROM v",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected a plain SELECT body")
     };
@@ -168,7 +171,8 @@ fn nested_set_operations_preserve_every_definition() {
 fn base_definition_carries_the_table_and_original_column() {
     let db = schema_db();
     let query = query("WITH v AS (SELECT payload AS copy FROM b) SELECT v.copy FROM v");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("expected a plain SELECT body")
     };
@@ -217,7 +221,7 @@ fn table_scope_returns_base_definitions() {
             .table_by_target(target, IdentifierCase::AsWritten)
             .expect("unambiguous lookup")
             .expect("table exists");
-        let scope = ColumnScope::for_table(table, &db);
+        let scope = ColumnScope::for_table(table, &db, IdentifierCase::AsWritten);
         for reference_sql in references {
             let Some(ColumnDefinition::Base { table: resolved_table, column }) = scope
                 .resolve_column_definition(&reference(reference_sql))
@@ -252,7 +256,8 @@ fn computed_definitions_cross_every_derived_relation_kind() {
         "SELECT doubled FROM doubled_snapshot",
     ] {
         let query = query(sql);
-        let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected a plain SELECT body")
         };
@@ -272,7 +277,8 @@ fn expression_definition_resolves_its_base_inputs() {
     let db = ParserDB::parse::<GenericDialect>("CREATE TABLE invoices(amount NUMERIC);")
         .expect("schema parses");
     let query = query("SELECT v.doubled FROM (SELECT amount * 2 AS doubled FROM invoices) v");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) =
         scope.resolve_column_definition(&reference("v.doubled")).expect("definition resolves")
     else {
@@ -292,7 +298,8 @@ fn expression_definition_resolves_its_base_inputs() {
 fn opaque_relations_are_distinct_from_missing_columns() {
     let db = schema_db();
     let opaque = query("SELECT g.value FROM generate_series(1, 10) g");
-    let opaque_scope = ColumnScope::from_query(&opaque, &db).expect("scope builds");
+    let opaque_scope =
+        ColumnScope::from_query(&opaque, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::Select(select) = opaque.body.as_ref() else {
         panic!("expected a plain SELECT body")
     };
@@ -305,7 +312,8 @@ fn opaque_relations_are_distinct_from_missing_columns() {
     ));
 
     let missing = query("SELECT no.value FROM b");
-    let missing_scope = ColumnScope::from_query(&missing, &db).expect("scope builds");
+    let missing_scope =
+        ColumnScope::from_query(&missing, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::Select(select) = missing.body.as_ref() else {
         panic!("expected a plain SELECT body")
     };
@@ -320,7 +328,8 @@ fn opaque_relations_are_distinct_from_missing_columns() {
 fn assert_opaque_resolution(from_clause: &str, reference_sql: &str, expected: bool) {
     let db = schema_db();
     let query = query(&format!("SELECT {reference_sql} FROM {from_clause}"));
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let definition =
         scope.resolve_column_definition(&reference(reference_sql)).expect("definition resolves");
     match definition {
@@ -361,7 +370,8 @@ fn opaque_alias_shadows_the_parent_scope() {
              FROM a AS u\
          ) AS d(outer_payload, nested_payload)",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) = scope
         .resolve_column_definition(&reference("d.nested_payload"))
         .expect("output definition resolves")
@@ -404,7 +414,8 @@ fn unaliased_nested_join_preserves_outer_correlation() {
              FROM a\
          ) AS d(nested_payload)",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) = scope
         .resolve_column_definition(&reference("d.nested_payload"))
         .expect("output definition resolves")
@@ -467,7 +478,8 @@ fn non_enumerable_set_bodies_remain_opaque() {
     let db =
         ParserDB::parse::<GenericDialect>("CREATE VIEW v(x) AS VALUES (1);").expect("view parses");
     let query = query("SELECT v.x FROM v");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     assert!(matches!(
         scope.resolve_column_definition(&reference("v.x")).expect("definition resolves"),
         Some(ColumnDefinition::Opaque)
@@ -487,7 +499,8 @@ fn projection_shapes_do_not_invent_row_identity() {
         query("SELECT stack(2, 1, 2) AS (x, y) FROM a"),
     ] {
         assert!(query.projection_source_table(&db).expect("source resolves").is_none());
-        let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
         assert!(
             scope
                 .resolve_column_definition(&reference("x"))
@@ -509,7 +522,8 @@ fn expression_input_table(
     input_reference: &str,
 ) -> Option<String> {
     let query = query(sql);
-    let scope = ColumnScope::from_query(&query, db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { scope: defining_scope, .. }) = scope
         .resolve_column_definition(&reference(output_reference))
         .expect("output definition resolves")
@@ -623,7 +637,8 @@ fn outer_join_nullability_keeps_column_definitions() {
          (SELECT id FROM a) AS d \
          RIGHT JOIN b ON true",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Base { table, .. }) =
         scope.resolve_column_definition(&reference("d.id")).expect("definition resolves")
     else {
@@ -718,7 +733,8 @@ fn scalar_subquery_ctes_index_their_definitions_and_body() {
              ) AS x\
          ) AS d",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) =
         scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
     else {
@@ -808,7 +824,8 @@ fn indexed_nested_input_table(
     nested_select: for<'expression> fn(&'expression Expr) -> &'expression sqlparser::ast::Select,
 ) -> Option<String> {
     let query = query(sql);
-    let scope = ColumnScope::from_query(&query, db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) = scope
         .resolve_column_definition(&reference(output_reference))
         .expect("output definition resolves")
@@ -874,7 +891,8 @@ fn assert_expression_nested_selects_indexed(
     resolve_input: bool,
 ) {
     let db = schema_db();
-    let scope = ColumnScope::from_query(query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) =
         scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
     else {
@@ -949,7 +967,8 @@ fn assert_expression_children_indexed(query: Query) {
 
 fn assert_injected_container_children_indexed(query: &Query, query_count: usize) {
     let db = schema_db();
-    let scope = ColumnScope::from_query(query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { scope: defining_scope, .. }) =
         scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
     else {
@@ -1476,7 +1495,8 @@ fn hive_clause_children_follow_the_sqlparser_visitor() {
         assert_eq!(injector.query_count, expected_queries);
 
         let db = schema_db();
-        let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
         let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) =
             scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
         else {
@@ -1558,7 +1578,8 @@ fn set_operation_arms_have_distinct_nested_scopes() {
         "SELECT d.x FROM \
          (SELECT (SELECT payload FROM a UNION ALL SELECT payload FROM b) AS x) AS d",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) =
         scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
     else {
@@ -1665,7 +1686,8 @@ fn stored_view_query_containers_use_database_ast_references() {
     )
     .expect("schema parses");
     let query = query("SELECT nested_containers.x FROM nested_containers");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { scope: defining_scope, .. }) = scope
         .resolve_column_definition(&reference("nested_containers.x"))
         .expect("output definition resolves")
@@ -1696,7 +1718,8 @@ fn stored_view_table_functions_use_database_ast_references() {
     )
     .expect("schema parses");
     let query = query("SELECT table_function_view.value FROM table_function_view");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     assert!(matches!(
         scope
             .resolve_column_definition(&reference("table_function_view.value"))
@@ -1712,7 +1735,8 @@ fn nested_scope_index_recurses_through_nested_queries() {
         "SELECT d.x FROM \
          (SELECT (SELECT (SELECT a.payload FROM a)) AS x) AS d",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) =
         scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
     else {
@@ -1745,7 +1769,8 @@ fn nested_scope_index_includes_selection_expressions() {
              WHERE EXISTS (SELECT 1 FROM b WHERE b.id = a.id)\
          ) AS d",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { scope: defining_scope, .. }) =
         scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
     else {
@@ -1808,7 +1833,8 @@ fn alias_lists_and_quoted_names_preserve_expression_scopes() {
 fn expression_scopes_report_local_ambiguity() {
     let db = schema_db();
     let ambiguous_bare = query("SELECT d.x FROM (SELECT payload || '' AS x FROM a, b) AS d");
-    let scope = ColumnScope::from_query(&ambiguous_bare, &db).expect("scope builds");
+    let scope = ColumnScope::from_query(&ambiguous_bare, &db, IdentifierCase::AsWritten)
+        .expect("scope builds");
     let Some(ColumnDefinition::Expression { scope: defining_scope, .. }) =
         scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
     else {
@@ -1823,7 +1849,8 @@ fn expression_scopes_report_local_ambiguity() {
         "SELECT d.payload FROM \
          (SELECT a.payload, b.payload FROM a, b) AS d",
     );
-    let scope = ColumnScope::from_query(&ambiguous_qualified, &db).expect("scope builds");
+    let scope = ColumnScope::from_query(&ambiguous_qualified, &db, IdentifierCase::AsWritten)
+        .expect("scope builds");
     assert!(matches!(
         scope.resolve_column_definition(&reference("d.payload")),
         Err(LookupError::AmbiguousTableLookup { .. })
@@ -1834,7 +1861,8 @@ fn expression_scopes_report_local_ambiguity() {
 fn expression_without_relations_has_an_empty_scope() {
     let db = schema_db();
     let query = query("SELECT d.x FROM (SELECT 1 + 2 AS x) AS d");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Expression { expression, scope: defining_scope }) =
         scope.resolve_column_definition(&reference("d.x")).expect("output definition resolves")
     else {
@@ -1857,7 +1885,8 @@ fn wildcard_definitions_retain_exact_base_columns() {
         ("SELECT d.payload FROM (SELECT a.* FROM a, b) AS d", "a"),
     ] {
         let query = query(sql);
-        let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
         let Some(ColumnDefinition::Base { table, column }) =
             scope.resolve_column_definition(&reference("d.payload")).expect("definition resolves")
         else {
@@ -1872,7 +1901,8 @@ fn wildcard_definitions_retain_exact_base_columns() {
 fn merged_wildcard_columns_are_opaque() {
     let db = schema_db();
     let query = query("SELECT d.id FROM (SELECT * FROM a JOIN b USING (id)) AS d");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     assert!(matches!(
         scope.resolve_column_definition(&reference("d.id")).expect("definition resolves"),
         Some(ColumnDefinition::Opaque)
@@ -1883,7 +1913,8 @@ fn merged_wildcard_columns_are_opaque() {
 fn three_part_references_return_exact_base_definitions() {
     let db = schema_db();
     let unquoted = query("SELECT public.a.payload FROM a");
-    let scope = ColumnScope::from_query(&unquoted, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&unquoted, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::Base { table, column }) = scope
         .resolve_column_definition(&reference("public.a.payload"))
         .expect("definition resolves")
@@ -1898,7 +1929,8 @@ fn three_part_references_return_exact_base_definitions() {
     )
     .expect("quoted schema parses");
     let quoted = query("SELECT \"S\".\"T\".\"C\" FROM \"S\".\"T\"");
-    let scope = ColumnScope::from_query(&quoted, &quoted_db).expect("scope builds");
+    let scope = ColumnScope::from_query(&quoted, &quoted_db, IdentifierCase::AsWritten)
+        .expect("scope builds");
     let Some(ColumnDefinition::Base { table, column }) = scope
         .resolve_column_definition(&reference("\"S\".\"T\".\"C\""))
         .expect("definition resolves")
@@ -1919,7 +1951,8 @@ fn set_operations_preserve_mixed_base_and_expression_children() {
              SELECT payload || '' FROM a\
          ) AS d",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::SetOperation { left, right, .. }) =
         scope.resolve_column_definition(&reference("d.payload")).expect("definition resolves")
     else {
@@ -1948,7 +1981,8 @@ fn alias_lists_relabel_set_operation_definitions() {
              SELECT payload FROM b\
          ) AS d(x)",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let Some(ColumnDefinition::SetOperation { left, right, .. }) =
         scope.resolve_column_definition(&reference("d.x")).expect("definition resolves")
     else {
@@ -1973,7 +2007,8 @@ fn mutually_recursive_ctes_remain_opaque() {
              y(v) AS (SELECT x.v FROM x) \
          SELECT x.v FROM x",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     assert!(matches!(
         scope.resolve_column_definition(&reference("x.v")).expect("definition resolves"),
         Some(ColumnDefinition::Opaque)
@@ -1996,7 +2031,8 @@ fn wide_wildcard_chains_become_opaque_at_the_width_limit() {
     }
     sql.push_str(" SELECT c13.value FROM c13");
     let query = query(&sql);
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     assert!(matches!(
         scope.resolve_column_definition(&reference("c13.value")).expect("definition resolves"),
         Some(ColumnDefinition::Opaque)
@@ -2016,7 +2052,8 @@ fn definition_kind(scope: ColumnDefinitionScope<'_, '_, '_, ParserDB>, sql: &str
 fn query_root_set_operands_resolve_in_their_own_scopes() {
     let db = schema_db();
     let query = query("SELECT id FROM a UNION ALL SELECT id FROM b");
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::SetOperation { left, right, .. } = query.body.as_ref() else {
         panic!("expected a set operation body")
     };
@@ -2037,7 +2074,8 @@ fn query_root_nested_scopes_keep_local_precedence_and_outer_correlation() {
          UNION ALL \
          (SELECT id FROM b WHERE id IN (SELECT id FROM a WHERE a.payload = b.payload))",
     );
-    let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::SetOperation { left, right, .. } = query.body.as_ref() else {
         panic!("expected a set operation body")
     };
@@ -2123,7 +2161,8 @@ fn query_scope_indexes_every_select_of_the_input() {
         "SELECT id FROM a WHERE id IN (SELECT id FROM b UNION SELECT id FROM a)",
     ] {
         let query = query(sql);
-        let scope = ColumnScope::from_query(&query, &db).expect("scope builds");
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
         for select in input_selects(&query) {
             if scope.scope_for_select(select).is_none() {
                 missing.push(format!("`{select}` in `{sql}`"));
@@ -2141,7 +2180,8 @@ fn lateral_views_and_connect_by_scopes_stay_opaque_for_unmodeled_columns() {
         &HiveDialect {},
         "SELECT x.v FROM (SELECT col AS v FROM t LATERAL VIEW explode(arr) e AS col) AS x",
     );
-    let scope = ColumnScope::from_query(&lateral, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&lateral, &db, IdentifierCase::AsWritten).expect("scope builds");
     let SetExpr::Select(outer) = lateral.body.as_ref() else { panic!("expected a SELECT body") };
     let sqlparser::ast::TableFactor::Derived { subquery, .. } = &outer.from[0].relation else {
         panic!("expected a derived table")
@@ -2156,7 +2196,8 @@ fn lateral_views_and_connect_by_scopes_stay_opaque_for_unmodeled_columns() {
     assert!(root.projection_source_table(&db).expect("source resolves").is_none());
 
     let hierarchy = query("SELECT id FROM t START WITH id = 1 CONNECT BY PRIOR id = id");
-    let scope = ColumnScope::from_query(&hierarchy, &db).expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&hierarchy, &db, IdentifierCase::AsWritten).expect("scope builds");
     let root = scope.scope_for_select(select_body(&hierarchy)).expect("root scope is indexed");
     for (sql, expected) in [("level", "opaque"), ("t.id", "base t")] {
         assert_eq!(definition_kind(root, sql), expected, "`{sql}`");
