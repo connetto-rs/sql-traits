@@ -1,1 +1,0 @@
-CREATE POLICY usr ON u  USING (ll:l.llll.e

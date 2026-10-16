@@ -1,2 +1,0 @@
-CREATE TABLE oqds(
-    id S DEFAULT  (d, cat));

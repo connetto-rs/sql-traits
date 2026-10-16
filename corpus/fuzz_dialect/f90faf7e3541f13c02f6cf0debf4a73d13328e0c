@@ -1,4 +1,0 @@
-CREATE INDEX mdemail ON uses(eml)
-  USING   ON --n-e 
-    USING   O    USING L
-    USING Eÿÿ

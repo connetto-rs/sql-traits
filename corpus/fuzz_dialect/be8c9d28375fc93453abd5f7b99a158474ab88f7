@@ -1,2 +1,0 @@
-CREATE POLICY lmall ON us
-    TO ad,i,sd,i,st , n USING;t ,

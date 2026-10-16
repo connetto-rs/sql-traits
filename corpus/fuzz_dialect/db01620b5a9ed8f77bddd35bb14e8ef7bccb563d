@@ -1,1 +1,0 @@
-CREATE POLICY i@n ON re USING(llA=:--G

@@ -1,2 +1,0 @@
-CREATE ROLE adEATE ROLE nly;
-GRANT SELECT ON ALL TABLES IN SCHEMA pu TO current_only;»ly;

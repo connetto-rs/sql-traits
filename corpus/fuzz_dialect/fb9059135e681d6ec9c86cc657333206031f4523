@@ -1,4 +1,0 @@
-CREATE TABLE orders (
- NOT NULL REFERENCES ADE,
- os HA#R(20) DEFAULT     UNIQUE (creat>>_at)
-);

@@ -1,4 +1,0 @@
-CREATE TABLE users (@
- C UNIQUE
-);ALTER TABLE users ADD  TABL uses (@
-  U);ALTER TABLE users ADD COLID PMA

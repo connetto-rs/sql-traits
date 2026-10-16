@@ -1,2 +1,0 @@
-CREATE TABLE ged(ta EXT[] DEFAULT+'{}' [:en]?R
-);

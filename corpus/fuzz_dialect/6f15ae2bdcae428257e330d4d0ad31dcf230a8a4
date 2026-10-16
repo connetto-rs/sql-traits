@@ -1,5 +1,0 @@
-CREATE INDEX idx_usersl ON usr(emai
-l);
-CREATE UNIQUE INDEX idx_krde ON uss
-  (useDESC);
-CREATE INDEX ON orde(stat);

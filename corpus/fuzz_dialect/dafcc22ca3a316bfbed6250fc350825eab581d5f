@@ -1,6 +1,0 @@
-CREATE TABLE ambnnuid (
-    id UUID PRIMARY KEY DEFAULT NNNNNNNID PRIMARY KEY DEFAULt NlengthNNKNNNNN@@@@@@user@@:d__@length@:d_id NULL REFERENCES AMBNNUID PRIMARY KEY DEFAULT NNNNNNom_~uTVECTOR
-@@@@@@:d_@@@@:d@:d@@@@@@@@@@@:dsum_@@@@:d_@@@@@@@:d_@@@@:d@:d@@@@@:d_@@@@@@@@@:d_@length@:d_@@@@@@@@@:dr_id NULL REFERENCES AMBNNUID PRIMARY KEY DEFAULT NNNNNNom_~uTVECTOR
-@@@@@@@@user@@:d_@@@@@@@@@@@:dsum_@@@@:d_@@@@@@@@:d_@length@:d_@@@@@@@@@@@@@@@@@@:dr_id NULL REFERENCES AMBNNUID PRIMARY KEY DEFAULT NNNNNNom_~uTVECTOR
-@@@@@@:d_@@@@:d@:d@@@@@:d_@@@@@@@@@:d_@length@:d_@@@@@@@@@@@@@@@@@@:dr_id NULL REFERENCES AMBNNUID PRIMARY KEY DEFAULT NNNN@@@@@@@:dr_id NULL REFERENCES AMBNNAID PRIMARY KEY DEFAULT NNNNNNom_~uTVECTOR
-);

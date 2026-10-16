@@ -1,3 +1,0 @@
-CREATE TABLE o_da (
-    id    i PRIMARY KEY DEFAULT '{}' PRIMARY KEY DEFAULT '{}',
- ta HSTOR);

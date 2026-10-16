@@ -1,4 +1,0 @@
-CREATE TABLE geo_data (
-    id UUID PRIMARY KEY DEFAULT :edx_e NULL,
-  dai UUID PRIMARY KEY DEFAULT :eT NULL
-);

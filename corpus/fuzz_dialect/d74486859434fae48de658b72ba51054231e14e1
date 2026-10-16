@@ -1,3 +1,0 @@
-CREATE TABLE s (
- CHECK (a()@:a)
-);ù

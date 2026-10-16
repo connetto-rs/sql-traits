@@ -1,5 +1,0 @@
-CREATE TABLE geo_data (
-    id$UUID PRIY KEY  KEY DEFAULT[] DEFAULT '{%',
-    Y DEFAULT[] DEFAULT '{%',
-  CREATE TRIGGER
-);

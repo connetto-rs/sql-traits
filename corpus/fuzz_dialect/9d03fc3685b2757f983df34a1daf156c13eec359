@@ -1,3 +1,0 @@
-CREATE ROLE rmaxonlonly;
-GRANT SELECT ON ALL TO read;
-GRANT SELECT ON ALL TA->l„

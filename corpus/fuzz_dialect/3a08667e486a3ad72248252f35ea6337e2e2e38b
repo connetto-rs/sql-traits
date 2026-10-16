@@ -1,2 +1,0 @@
- SELECT $ON res$@
-    FOR  UPDATE(L

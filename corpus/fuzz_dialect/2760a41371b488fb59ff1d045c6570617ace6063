@@ -1,3 +1,0 @@
-CREATE ROLE adO ROLE realy;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
-DROP ROLE sôyRo

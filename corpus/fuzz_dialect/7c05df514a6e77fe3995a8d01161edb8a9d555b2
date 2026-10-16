@@ -1,3 +1,0 @@
-CREATE ROLE ATE ROLE readonly;
-GRANT ALL PRIVILEGES ON BLEic TO ru,adonl~;
-&

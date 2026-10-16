@@ -1,1 +1,0 @@
-CREATE POLICY sa ON re USING (l=:--d

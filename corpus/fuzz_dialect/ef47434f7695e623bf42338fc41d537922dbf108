@@ -1,3 +1,0 @@
-CREATE INDEX o--
- USING  il ON s(email)
----

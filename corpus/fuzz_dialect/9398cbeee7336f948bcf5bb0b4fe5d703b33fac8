@@ -1,3 +1,0 @@
-CREATE TABLE rs (
-    rua nVARCHAR(20) DEFAULT CNT_MBB&<JBBBBBBP,UNIQUE (ur_id,_at)
-);

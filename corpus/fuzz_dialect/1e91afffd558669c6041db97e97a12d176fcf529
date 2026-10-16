@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    amount DEEIML(09, 2) CHECK (amount > 0),atu----',
-    AMP DEFAULT CMAMAL(10, 2) CHECK (amount > 0)CHECK (amount > 0),
-  S usrs(idd created_at)
-);

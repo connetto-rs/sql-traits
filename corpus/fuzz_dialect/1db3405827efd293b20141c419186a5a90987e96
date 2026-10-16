@@ -1,2 +1,0 @@
-CREATE TABLE ods (Y KEY,
-     CHECK (amo > 0),tu VM);

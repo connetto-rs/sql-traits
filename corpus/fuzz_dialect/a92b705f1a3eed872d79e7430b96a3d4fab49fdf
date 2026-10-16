@@ -1,3 +1,0 @@
-CREATE TABLE ors (
- am DECI(@5, 2) CHECK (a^@d)
-);ù

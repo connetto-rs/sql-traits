@@ -1,1 +1,0 @@
-CREATE POLICY uon ON usersl   WITH CHECK (use~/N;

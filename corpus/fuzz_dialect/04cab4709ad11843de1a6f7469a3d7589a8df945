@@ -1,4 +1,0 @@
-CREATE TABLE eo_da(
-iddata JSONB NOT NULL,
-ta JSONB NOT NULL,STvs VECTOB
-);

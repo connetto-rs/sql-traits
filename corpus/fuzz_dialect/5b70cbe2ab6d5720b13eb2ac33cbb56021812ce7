@@ -1,5 +1,0 @@
-CREATE POLICY u ON users
-USING (((SELECT to
-|>CALL
-pL_l() us_l
- 

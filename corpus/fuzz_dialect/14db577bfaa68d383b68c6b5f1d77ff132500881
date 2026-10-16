@@ -1,4 +1,0 @@
-CREATE TABLE orders$(
-    id SERIAL  ,amount D CHECK (amount > 0),
-   CHECK (amount > 1),
-unt @ECIMAL(09,) CHECK (amount > 5), status at)ÿÿÿÿÿÿÿÿ

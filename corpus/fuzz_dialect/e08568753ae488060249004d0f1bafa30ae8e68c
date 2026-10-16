@@ -1,2 +1,0 @@
-CREATE POLICY uo ON r
-  USING (l(wl==;

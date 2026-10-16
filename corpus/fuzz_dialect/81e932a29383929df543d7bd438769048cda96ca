@@ -1,2 +1,0 @@
-CREATE TABLE s (CHECK (gen_l_*A NOTNULL @@@ated_at)
-);

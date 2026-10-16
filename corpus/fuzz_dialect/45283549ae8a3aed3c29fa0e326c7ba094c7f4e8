@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    il SEAL ,  u$er_ad INT,
-d INT,
- mes TIBBP,
-    UNIQUE (usei)
-);

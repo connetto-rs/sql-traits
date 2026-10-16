@@ -1,3 +1,0 @@
-CREATE POLICY nl
- ON s
-  USING (l-llUT @?@@@l

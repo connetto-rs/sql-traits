@@ -1,2 +1,0 @@
-CREATE POLICY Ustion ON res
-USING (uG (l(s) WHERE lue);
