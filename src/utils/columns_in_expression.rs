@@ -382,6 +382,7 @@ mod tests {
             expr: Box::new(Expr::Identifier(Ident::new("a"))),
             list: vec![Expr::Identifier(Ident::new("b"))],
             negated: false,
+            global: false,
         };
 
         let result: Vec<<ParserDB as DatabaseLike>::Column> =

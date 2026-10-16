@@ -18,6 +18,7 @@ use crate::utils::object_name::object_name_part_value;
 /// or column list is dropped the same way. The pinned `GEOGRAPHY(Point, 4326)`
 /// and `GEOMETRY(Point, 4326)` spellings are the exception and keep theirs. An
 /// element type is kept, so an array recurses into what it holds.
+/// MySQL's `ZEROFILL` padding reports its normalized inner type.
 ///
 /// # Examples
 ///
@@ -269,10 +270,8 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
         DataType::AnyType => "ANY TYPE".into(),
         // The declaration named no type at all.
         DataType::Unspecified => "UNSPECIFIED".into(),
-        // `ClickHouse` storage decorations rather than types of their own, so
-        // they report what they wrap. Nullability is exposed separately by
-        // `ColumnLike::is_nullable`.
-        DataType::Nullable(inner) | DataType::LowCardinality(inner) => {
+        // Storage and display decorations report the type they wrap.
+        DataType::Nullable(inner) | DataType::LowCardinality(inner) | DataType::Zerofill(inner) => {
             normalize_sqlparser_type(inner)
         }
         // Collation decides how values compare, not what type they are.
@@ -822,6 +821,28 @@ mod tests {
         assert_eq!(normalize_sqlparser_type(&DataType::UBigInt), "BIGINT");
         assert_eq!(normalize_sqlparser_type(&DataType::UHugeInt), "HUGEINT");
         assert_eq!(normalize_sqlparser_type(&DataType::HugeInt), "HUGEINT");
+    }
+
+    #[test]
+    fn test_normalize_sqlparser_type_zerofill() {
+        use sqlparser::ast::ExactNumberInfo;
+
+        assert_eq!(
+            normalize_sqlparser_type(&DataType::Zerofill(Box::new(DataType::Int(Some(5))))),
+            "INT"
+        );
+        assert_eq!(
+            normalize_sqlparser_type(&DataType::Zerofill(Box::new(DataType::BigIntUnsigned(
+                Some(20)
+            )))),
+            "BIGINT"
+        );
+        assert_eq!(
+            normalize_sqlparser_type(&DataType::Zerofill(Box::new(DataType::Decimal(
+                ExactNumberInfo::PrecisionAndScale(10, 2)
+            )))),
+            "DECIMAL"
+        );
     }
 
     /// A cast target that names the integer family and nothing narrower folds
