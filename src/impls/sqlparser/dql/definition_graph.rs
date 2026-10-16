@@ -1,19 +1,24 @@
 use alloc::{borrow::ToOwned, vec::Vec};
 use core::{marker::PhantomData, slice};
 
-use sqlparser::ast::{Expr, Select, SetOperator};
+use sqlparser::ast::{Expr, ObjectName, Select, SetOperator};
 
 use super::{
     BaseColumnRef, DerivationProfile, FromScope, LookupOutcome, RelationKey, ResolvedColumn,
-    resolve_definition_local,
+    resolve_definition_local, resolve_relation_local,
 };
 use crate::{
     errors::LookupError,
     structs::{
-        ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, IdentifierCase,
+        ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope,
+        IdentifierCase, RelationBinding,
     },
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
+
+/// A resolved column's definition and the names it matched.
+pub(crate) type Bound<'scope, 'query, 'db, DB> =
+    (ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>);
 
 mod output_columns;
 
@@ -204,19 +209,37 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             .map(|resolved| self.definition(resolved.definition)))
     }
 
+    fn bound<'scope>(
+        &'scope self,
+        resolved: &ResolvedColumn<'scope, 'db, DB, DefinitionId>,
+    ) -> Bound<'scope, 'query, 'db, DB> {
+        (
+            self.definition(resolved.definition),
+            ColumnBinding::new(resolved.relation, resolved.exposed),
+        )
+    }
+
     pub(crate) fn resolve_binding<'scope>(
         &'scope self,
         cursor: ScopeCursor,
         reference: &Expr,
-    ) -> Result<
-        Option<(ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>)>,
-        LookupError,
-    > {
-        Ok(self.resolve_definition_id(cursor, reference)?.map(|resolved| {
-            let definition = self.definition(resolved.definition);
-            let binding = ColumnBinding::new(resolved.relation, resolved.exposed);
-            (definition, binding)
-        }))
+    ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
+        Ok(self.resolve_definition_id(cursor, reference)?.map(|resolved| self.bound(&resolved)))
+    }
+
+    pub(crate) fn resolve_relation<'scope>(
+        &'scope self,
+        mut cursor: ScopeCursor,
+        qualifier: &ObjectName,
+    ) -> Option<RelationBinding<'scope>> {
+        loop {
+            let scope = &self.scopes[cursor.scope.0];
+            match resolve_relation_local(&scope.data, cursor.visible_entries, qualifier) {
+                LookupOutcome::Found(relation) => return Some(RelationBinding::new(relation)),
+                LookupOutcome::Stop => return None,
+                LookupOutcome::SearchParent => cursor = scope.parent?,
+            }
+        }
     }
 
     pub(crate) fn resolve_source(

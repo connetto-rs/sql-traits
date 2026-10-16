@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use sqlparser::ast::{Expr, Query, Select, SetOperator};
+use sqlparser::ast::{Expr, ObjectName, Query, Select, SetOperator};
 
 use crate::{
     errors::LookupError,
@@ -62,7 +62,8 @@ pub enum QueryOutput<'scope, 'query, 'db, DB: DatabaseLike> {
     Unexpanded,
 }
 
-/// The relation and exposed column names matched by a resolved reference.
+/// The relation and exposed column names matched by a resolved reference or
+/// clause key.
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnBinding<'scope> {
     relation: Option<(&'scope str, bool)>,
@@ -78,7 +79,7 @@ impl<'scope> ColumnBinding<'scope> {
     }
 
     /// Returns the relation name, or `None` for a merged, anonymous or opaque
-    /// binding.
+    /// binding and for a clause key matching a select-list output name.
     ///
     /// # Examples
     ///
@@ -108,7 +109,8 @@ impl<'scope> ColumnBinding<'scope> {
         self.relation
     }
 
-    /// Returns the exposed column name, or `None` for an opaque binding.
+    /// Returns the exposed column name, or the select-list output name a
+    /// clause key matched, or `None` for an opaque binding.
     ///
     /// # Examples
     ///
@@ -134,6 +136,58 @@ impl<'scope> ColumnBinding<'scope> {
     #[must_use]
     pub fn exposed(&self) -> Option<(&'scope str, bool)> {
         self.exposed
+    }
+}
+
+/// The relation a qualifier with no column, such as a qualified wildcard's,
+/// matched.
+#[derive(Debug, Clone, Copy)]
+pub struct RelationBinding<'scope> {
+    relation: Option<(&'scope str, bool)>,
+}
+
+impl<'scope> RelationBinding<'scope> {
+    pub(crate) fn new(relation: Option<(&'scope str, bool)>) -> Self {
+        Self { relation }
+    }
+
+    /// Returns the alias, or the declared name of a relation referenced
+    /// without one, or `None` for an opaque relation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{ObjectName, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement},
+    ///     dialect::SQLiteDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs(id INT);")?;
+    /// let sql = "SELECT [MIXED].*, [G].* FROM docs AS [MiXeD], generate_series(1, 2) AS [g]";
+    /// let Statement::Query(query) = Parser::parse_sql(&SQLiteDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// let qualifiers = select.projection.iter().map(|item| {
+    ///     let SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _) =
+    ///         item
+    ///     else {
+    ///         unreachable!()
+    ///     };
+    ///     name
+    /// });
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let relations = qualifiers
+    ///     .map(|name| scope.resolve_relation_binding(name).map(|binding| binding.relation()))
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(relations, [Some(Some(("MiXeD", true))), Some(None)]);
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    #[must_use]
+    pub fn relation(&self) -> Option<(&'scope str, bool)> {
+        self.relation
     }
 }
 
@@ -360,6 +414,52 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
         &self,
         key: &Expr,
     ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
+        Ok(self.graph.resolve_input_first(self.cursor, key)?.map(|(definition, _)| definition))
+    }
+
+    /// Resolves a whole `GROUP BY` key like
+    /// [`Self::resolve_group_by_definition`], with the names it matched.
+    ///
+    /// A key naming a select-list output reports that output's name as its
+    /// exposed name and no relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] for an ambiguous reference
+    /// or output name and relation-name lookup errors from modeled definitions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{GroupByExpr, SetExpr, Statement},
+    ///     dialect::SQLiteDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs(id INT, x INT);")?;
+    /// let sql = "SELECT id AS [VaLuE], id AS [X] FROM docs AS [D] GROUP BY [VALUE], x";
+    /// let Statement::Query(query) = Parser::parse_sql(&SQLiteDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// let GroupByExpr::Expressions(keys, _) = &select.group_by else { unreachable!() };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let select_scope = scope.scope_for_select(select).expect("the root scope is recorded");
+    /// let (_, output) = select_scope.resolve_group_by_binding(&keys[0])?.expect("key resolves");
+    /// assert_eq!((output.relation(), output.exposed()), (None, Some(("VaLuE", true))));
+    /// let (_, input) = select_scope.resolve_group_by_binding(&keys[1])?.expect("key resolves");
+    /// assert_eq!((input.relation(), input.exposed()), (Some(("D", true)), Some(("x", false))));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn resolve_group_by_binding(
+        &self,
+        key: &Expr,
+    ) -> Result<
+        Option<(ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>)>,
+        LookupError,
+    > {
         self.graph.resolve_input_first(self.cursor, key)
     }
 
@@ -404,7 +504,102 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
         &self,
         key: &Expr,
     ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
+        Ok(self.graph.resolve_output_first(self.cursor, key)?.map(|(definition, _)| definition))
+    }
+
+    /// Resolves a whole `DISTINCT ON` key like
+    /// [`Self::resolve_distinct_on_definition`], with the names it matched.
+    ///
+    /// A key naming a select-list output reports that output's name as its
+    /// exposed name and no relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] for an ambiguous reference
+    /// or output name and relation-name lookup errors from modeled definitions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Distinct, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE docs(id INT, x INT);")?;
+    /// let sql = "SELECT DISTINCT ON (VALUE, docs.x) id AS \"VaLuE\" FROM docs";
+    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// let Some(Distinct::On(keys)) = &select.distinct else { unreachable!() };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let select_scope = scope.scope_for_select(select).expect("the root scope is recorded");
+    /// let (_, output) = select_scope.resolve_distinct_on_binding(&keys[0])?.expect("key resolves");
+    /// assert_eq!((output.relation(), output.exposed()), (None, Some(("VaLuE", true))));
+    /// let (_, input) = select_scope.resolve_distinct_on_binding(&keys[1])?.expect("key resolves");
+    /// assert_eq!((input.relation(), input.exposed()), (Some(("docs", false)), Some(("x", false))));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn resolve_distinct_on_binding(
+        &self,
+        key: &Expr,
+    ) -> Result<
+        Option<(ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>)>,
+        LookupError,
+    > {
         self.graph.resolve_output_first(self.cursor, key)
+    }
+
+    /// Resolves a relation qualifier with no column, such as a qualified
+    /// wildcard's, through this scope and its enclosing scopes.
+    ///
+    /// Answers `None` when no visible relation matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{
+    ///         Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement,
+    ///     },
+    ///     dialect::SQLiteDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs(id INT);")?;
+    /// let sql = "SELECT (SELECT count([O].*) FROM docs AS i) FROM docs AS [o]";
+    /// let Statement::Query(query) = Parser::parse_sql(&SQLiteDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// let SelectItem::UnnamedExpr(Expr::Subquery(nested)) = &select.projection[0] else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(nested) = nested.body.as_ref() else { unreachable!() };
+    /// let SelectItem::UnnamedExpr(Expr::Function(count)) = &nested.projection[0] else {
+    ///     unreachable!()
+    /// };
+    /// let FunctionArguments::List(arguments) = &count.args else { unreachable!() };
+    /// let FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(qualifier)) = &arguments.args[0]
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let nested_scope = scope.scope_for_select(nested).expect("the subquery scope is recorded");
+    /// let binding = nested_scope.resolve_relation_binding(qualifier).expect("relation resolves");
+    /// assert_eq!(binding.relation(), Some(("o", true)));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    #[must_use]
+    pub fn resolve_relation_binding(
+        &self,
+        qualifier: &ObjectName,
+    ) -> Option<RelationBinding<'scope>> {
+        self.graph.resolve_relation(self.cursor, qualifier)
     }
 
     /// Returns the recorded scope for this exact nested `Select`.
@@ -583,6 +778,52 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
         &self,
         key: &Expr,
     ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
+        Ok(self.graph.resolve_order_by(self.query, key)?.map(|(definition, _)| definition))
+    }
+
+    /// Resolves a whole `ORDER BY` key like
+    /// [`Self::resolve_order_by_definition`], with the names it matched.
+    ///
+    /// A key naming a select-list output reports that output's name as its
+    /// exposed name and no relation. After a set operation that name is the
+    /// leading operand's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] for an ambiguous reference
+    /// or output name and relation-name lookup errors from modeled definitions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Statement, dialect::SQLiteDialect, parser::Parser};
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs(id INT);")?;
+    /// let sql = "SELECT id AS [VaLuE] FROM docs ORDER BY [VALUE], docs.[ID]";
+    /// let Statement::Query(query) = Parser::parse_sql(&SQLiteDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let Some(sqlparser::ast::OrderByKind::Expressions(keys)) =
+    ///     query.order_by.as_ref().map(|order| &order.kind)
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let order = scope.scope_for_query(&query).expect("the root query is recorded");
+    /// let (_, output) = order.resolve_order_by_binding(&keys[0].expr)?.expect("key resolves");
+    /// assert_eq!((output.relation(), output.exposed()), (None, Some(("VaLuE", true))));
+    /// let (_, input) = order.resolve_order_by_binding(&keys[1].expr)?.expect("key resolves");
+    /// assert_eq!((input.relation(), input.exposed()), (Some(("docs", false)), Some(("id", false))));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn resolve_order_by_binding(
+        &self,
+        key: &Expr,
+    ) -> Result<
+        Option<(ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>)>,
+        LookupError,
+    > {
         self.graph.resolve_order_by(self.query, key)
     }
 }
@@ -789,6 +1030,51 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
     {
         self.graph.resolve_binding(self.root, reference)
+    }
+
+    /// Resolves a relation qualifier with no column, such as a qualified
+    /// wildcard's, against the query's own `FROM` relations.
+    ///
+    /// Answers `None` when no relation matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement},
+    ///     dialect::SQLiteDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs(id INT);")?;
+    /// let sql = "SELECT [MIXED].*, [DOCS].* FROM docs AS [MiXeD], docs";
+    /// let Statement::Query(query) = Parser::parse_sql(&SQLiteDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let relations =
+    ///     select
+    ///         .projection
+    ///         .iter()
+    ///         .map(|item| {
+    ///             let SelectItem::QualifiedWildcard(
+    ///                 SelectItemQualifiedWildcardKind::ObjectName(name),
+    ///                 _,
+    ///             ) = item
+    ///             else {
+    ///                 unreachable!()
+    ///             };
+    ///             scope.resolve_relation_binding(name).and_then(|binding| binding.relation())
+    ///         })
+    ///         .collect::<Vec<_>>();
+    /// assert_eq!(relations, [Some(("MiXeD", true)), Some(("docs", false))]);
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    #[must_use]
+    pub fn resolve_relation_binding(&self, qualifier: &ObjectName) -> Option<RelationBinding<'_>> {
+        self.graph.resolve_relation(self.root, qualifier)
     }
 
     /// Returns the recorded scope for this exact `Select` of the query.

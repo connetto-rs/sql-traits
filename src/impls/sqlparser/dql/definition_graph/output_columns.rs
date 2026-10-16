@@ -9,15 +9,15 @@ use sqlparser::ast::{
 
 use super::{
     super::{
-        DerivationProfile, LookupOutcome, ResolvedColumn, expand_qualified_wildcard,
-        push_wildcard_columns, resolve_definition_local, wildcard_reshapes_output,
+        DerivationProfile, LookupOutcome, expand_qualified_wildcard, push_wildcard_columns,
+        resolve_definition_local, wildcard_reshapes_output,
     },
-    AstRef, DefinitionDerivation, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
+    AstRef, Bound, DefinitionDerivation, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
     select_address,
 };
 use crate::{
     errors::LookupError,
-    structs::{ColumnDefinition, IdentifierCase, QueryOutput},
+    structs::{ColumnBinding, ColumnDefinition, IdentifierCase, QueryOutput},
     traits::DatabaseLike,
     utils::object_name::object_name_last_part,
 };
@@ -77,8 +77,8 @@ pub(super) struct QueryNode<'query, 'db> {
     outputs: QueryOutputs<'query, 'db>,
 }
 
-enum OutputMatch {
-    Found(DefinitionId),
+enum OutputMatch<'entries> {
+    Found { definition: DefinitionId, name: &'entries str, quoted: bool },
     Uncertain,
     Absent,
 }
@@ -101,27 +101,30 @@ fn innermost_query(mut query: &Query) -> &Query {
     query
 }
 
-fn match_output(
-    entries: &[OutputEntry<'_, '_>],
+fn match_output<'entries>(
+    entries: &'entries [OutputEntry<'_, '_>],
     key: &Ident,
     case: IdentifierCase,
-) -> Result<OutputMatch, LookupError> {
-    let named = |column: &&OutputColumn<'_, '_>| {
-        matches!(
-            &column.name,
-            OutputName::Known { name, quoted }
-                if case.identifiers_match(name, *quoted, &key.value, key.quote_style.is_some())
-        )
-    };
-    let columns = || {
+) -> Result<OutputMatch<'entries>, LookupError> {
+    let matches = || {
         entries.iter().filter_map(|entry| {
             match entry {
-                OutputEntry::Column(column) => Some(column),
-                OutputEntry::Unexpanded => None,
+                OutputEntry::Column(
+                    column @ OutputColumn { name: OutputName::Known { name, quoted }, .. },
+                ) if case.identifiers_match(
+                    name,
+                    *quoted,
+                    &key.value,
+                    key.quote_style.is_some(),
+                ) =>
+                {
+                    Some((column, name.as_str(), *quoted))
+                }
+                _ => None,
             }
         })
     };
-    let Some(first) = columns().find(named) else {
+    let Some((first, name, quoted)) = matches().next() else {
         let uncertain = entries.iter().any(|entry| {
             !matches!(
                 entry,
@@ -130,12 +133,11 @@ fn match_output(
         });
         return Ok(if uncertain { OutputMatch::Uncertain } else { OutputMatch::Absent });
     };
-    if columns().filter(named).all(|column| first.same_value(column)) {
-        return Ok(OutputMatch::Found(first.definition));
+    if matches().all(|(column, ..)| first.same_value(column)) {
+        return Ok(OutputMatch::Found { definition: first.definition, name, quoted });
     }
-    let mut candidates = columns()
-        .filter(named)
-        .map(|column| {
+    let mut candidates = matches()
+        .map(|(column, ..)| {
             column
                 .expression
                 .map_or_else(|| key.value.clone(), |expression| format!("{}", expression.get()))
@@ -534,15 +536,19 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         ScopeCursor { scope, visible_entries: self.scopes[scope.0].data.from_entry_count }
     }
 
-    fn output_definition<'scope>(
+    fn output_binding<'scope>(
         &'scope self,
-        entries: &[OutputEntry<'query, 'db>],
+        entries: &'scope [OutputEntry<'query, 'db>],
         key: &Ident,
         case: IdentifierCase,
-    ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
+    ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
         Ok(match match_output(entries, key, case)? {
-            OutputMatch::Found(definition) => Some(self.definition(definition)),
-            OutputMatch::Uncertain => Some(ColumnDefinition::Opaque),
+            OutputMatch::Found { definition, name, quoted } => {
+                Some((self.definition(definition), ColumnBinding::new(None, Some((name, quoted)))))
+            }
+            OutputMatch::Uncertain => {
+                Some((ColumnDefinition::Opaque, ColumnBinding::new(None, None)))
+            }
             OutputMatch::Absent => None,
         })
     }
@@ -574,14 +580,14 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         &'scope self,
         query: QueryId,
         key: &Expr,
-    ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
+    ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
         match &self.queries[query.0].outputs {
             QueryOutputs::Select(scope) => {
                 self.resolve_output_first(self.select_cursor(*scope), key)
             }
             QueryOutputs::Merged(entries) => {
                 match unwrap_nested(key) {
-                    Expr::Identifier(name) => self.output_definition(entries, name, self.case),
+                    Expr::Identifier(name) => self.output_binding(entries, name, self.case),
                     _ => Ok(None),
                 }
             }
@@ -592,49 +598,43 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         &'scope self,
         cursor: ScopeCursor,
         key: &Expr,
-    ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
+    ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
         let key = unwrap_nested(key);
+        let scope = &self.scopes[cursor.scope.0];
         if let Expr::Identifier(name) = key
-            && let Some(definition) = self.output_definition(
-                &self.scopes[cursor.scope.0].outputs,
-                name,
-                self.scopes[cursor.scope.0].data.case,
-            )?
+            && let Some(bound) = self.output_binding(&scope.outputs, name, scope.data.case)?
         {
-            return Ok(Some(definition));
+            return Ok(Some(bound));
         }
-        self.resolve_definition(cursor, key)
+        self.resolve_binding(cursor, key)
     }
 
     pub(crate) fn resolve_input_first<'scope>(
         &'scope self,
         cursor: ScopeCursor,
         key: &Expr,
-    ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
+    ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
         let key = unwrap_nested(key);
+        let scope = &self.scopes[cursor.scope.0];
         if let Expr::Identifier(name) = key {
             match resolve_definition_local(
-                &self.scopes[cursor.scope.0].data,
+                &scope.data,
                 cursor.visible_entries,
                 DefinitionId(0),
                 key,
                 false,
-                self.scopes[cursor.scope.0].data.case,
+                scope.data.case,
             )? {
-                LookupOutcome::Found(ResolvedColumn { definition, .. }) => {
-                    return Ok(Some(self.definition(definition)));
-                }
+                LookupOutcome::Found(resolved) => return Ok(Some(self.bound(&resolved))),
                 LookupOutcome::Stop | LookupOutcome::SearchParent => {
-                    if let Some(definition) = self.output_definition(
-                        &self.scopes[cursor.scope.0].outputs,
-                        name,
-                        self.scopes[cursor.scope.0].data.case,
-                    )? {
-                        return Ok(Some(definition));
+                    if let Some(bound) =
+                        self.output_binding(&scope.outputs, name, scope.data.case)?
+                    {
+                        return Ok(Some(bound));
                     }
                 }
             }
         }
-        self.resolve_definition(cursor, key)
+        self.resolve_binding(cursor, key)
     }
 }
