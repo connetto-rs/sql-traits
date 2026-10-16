@@ -39,8 +39,8 @@ use crate::{
     structs::{IdentifierCase, TargetName},
     traits::{ColumnLike, DQLLike, DatabaseLike, TableLike, ViewLike},
     utils::object_name::{
-        object_name_last_part, qualifier_of, render_table_candidate, resolve_bound_table,
-        resolve_object_name, target_name_from_object_name,
+        object_name_last_part, render_table_candidate, resolve_bound_table, resolve_object_name,
+        target_name_from_object_name,
     },
 };
 
@@ -3050,10 +3050,69 @@ fn base_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
         .collect()
 }
 
-/// The relation a qualified wildcard prefix names.
-enum WildcardTarget<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> {
+/// The relation a qualifier names.
+enum QualifiedRelation<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> {
     Base(&'scope FromTableRef<'query, 'db, DB, D>),
     Derived(&'scope DerivedRelationRef<'query, 'db, DB, D>),
+}
+
+/// One written identifier and whether it was quoted.
+type NamePart<'name> = (&'name str, bool);
+
+fn ident_part(ident: &Ident) -> NamePart<'_> {
+    (ident.value.as_str(), ident.quote_style.is_some())
+}
+
+/// The optional schema and the relation a one- or two-part name writes.
+fn object_name_qualifier(name: &ObjectName) -> Option<(Option<NamePart<'_>>, NamePart<'_>)> {
+    match name.0.as_slice() {
+        [table] => Some((None, ident_part(table.as_ident()?))),
+        [schema, table] => {
+            Some((Some(ident_part(schema.as_ident()?)), ident_part(table.as_ident()?)))
+        }
+        _ => None,
+    }
+}
+
+/// Finds the visible relation a qualifier names, reading a bare name against
+/// base relations before derived ones and a schema-qualified name against
+/// base relations only.
+fn qualified_relation<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
+    bases: &'scope [FromTableRef<'query, 'db, DB, D>],
+    derived: &'scope [DerivedRelationRef<'query, 'db, DB, D>],
+    (schema, (value, quoted)): (Option<NamePart<'_>>, NamePart<'_>),
+    require_row_identity: bool,
+    visible_entries: usize,
+    case: IdentifierCase,
+) -> Option<QualifiedRelation<'scope, 'query, 'db, DB, D>> {
+    match schema {
+        None => {
+            base_for_qualifier(bases, value, quoted, require_row_identity, visible_entries, case)
+                .map(QualifiedRelation::Base)
+                .or_else(|| {
+                    derived_for_qualifier(
+                        derived,
+                        value,
+                        quoted,
+                        require_row_identity,
+                        visible_entries,
+                        case,
+                    )
+                    .map(QualifiedRelation::Derived)
+                })
+        }
+        Some(schema) => {
+            base_for_qualified_name(
+                bases,
+                schema,
+                (value, quoted),
+                require_row_identity,
+                visible_entries,
+                case,
+            )
+            .map(QualifiedRelation::Base)
+        }
+    }
 }
 
 fn resolve_wildcard_target<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
@@ -3062,38 +3121,15 @@ fn resolve_wildcard_target<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     qualifier: &ObjectName,
     require_row_identity: bool,
     case: IdentifierCase,
-) -> Option<WildcardTarget<'scope, 'query, 'db, DB, D>> {
-    let (value, quoted) = object_name_last_part(qualifier)?;
-    match qualifier.0.len() {
-        1 => {
-            base_for_qualifier(bases, value, quoted, require_row_identity, usize::MAX, case)
-                .map(WildcardTarget::Base)
-                .or_else(|| {
-                    derived_for_qualifier(
-                        derived,
-                        value,
-                        quoted,
-                        require_row_identity,
-                        usize::MAX,
-                        case,
-                    )
-                    .map(WildcardTarget::Derived)
-                })
-        }
-        2 => {
-            let (schema, schema_quoted) = qualifier_of(qualifier).named()?;
-            base_for_qualified_name(
-                bases,
-                (schema, schema_quoted),
-                (value, quoted),
-                require_row_identity,
-                usize::MAX,
-                case,
-            )
-            .map(WildcardTarget::Base)
-        }
-        _ => None,
-    }
+) -> Option<QualifiedRelation<'scope, 'query, 'db, DB, D>> {
+    qualified_relation(
+        bases,
+        derived,
+        object_name_qualifier(qualifier)?,
+        require_row_identity,
+        usize::MAX,
+        case,
+    )
 }
 
 fn expand_qualified_wildcard<'query, 'db, DB: DatabaseLike, D: Copy>(
@@ -3103,8 +3139,8 @@ fn expand_qualified_wildcard<'query, 'db, DB: DatabaseLike, D: Copy>(
     case: IdentifierCase,
 ) -> Option<Vec<DerivedColumn<'query, 'db, DB, D>>> {
     match resolve_wildcard_target(bases, derived, qualifier, false, case)? {
-        WildcardTarget::Base(base) => Some(base_columns(base)),
-        WildcardTarget::Derived(relation) => Some(relation.shape.columns.clone()),
+        QualifiedRelation::Base(base) => Some(base_columns(base)),
+        QualifiedRelation::Derived(relation) => Some(relation.shape.columns.clone()),
     }
 }
 
@@ -3322,28 +3358,18 @@ fn visible_merged_name<'scope>(
 fn opaque_qualifier_matches_key(
     key: RelationKey<'_, '_>,
     schema: Option<RelationKey<'_, '_>>,
-    qualifier: &[Ident],
+    (schema_part, (table, quoted)): (Option<NamePart<'_>>, NamePart<'_>),
     case: IdentifierCase,
 ) -> bool {
-    match qualifier {
-        [table] => key_matches(key, table.value.as_str(), table.quote_style.is_some(), case),
-        [schema_part, table] => {
-            schema.is_some_and(|schema| {
-                key_matches(
-                    schema,
-                    schema_part.value.as_str(),
-                    schema_part.quote_style.is_some(),
-                    case,
-                )
-            }) && key_matches(key, table.value.as_str(), table.quote_style.is_some(), case)
-        }
-        _ => false,
-    }
+    key_matches(key, table, quoted, case)
+        && schema_part.is_none_or(|(value, quoted)| {
+            schema.is_some_and(|schema| key_matches(schema, value, quoted, case))
+        })
 }
 
 fn opaque_qualifier_matches(
     identity: &OpaqueIdentity<'_, '_>,
-    qualifier: &[Ident],
+    qualifier: (Option<NamePart<'_>>, NamePart<'_>),
     case: IdentifierCase,
 ) -> bool {
     match identity {
@@ -3464,71 +3490,129 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
     }
 }
 
-fn resolve_two_part_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
-    scope: &'scope FromScope<'_, 'db, DB, D>,
+/// What a relation qualifier reaches in one scope.
+enum QualifierMatch<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> {
+    Relation(QualifiedRelation<'scope, 'query, 'db, DB, D>),
+    Opaque,
+}
+
+fn qualifier_local<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
+    scope: &'scope FromScope<'query, 'db, DB, D>,
     visible_entries: usize,
-    opaque: D,
-    parts: &[Ident],
+    qualifier: (Option<NamePart<'_>>, NamePart<'_>),
     require_row_identity: bool,
     case: IdentifierCase,
-) -> Result<LookupOutcome<ResolvedColumn<'scope, 'db, DB, D>>, LookupError> {
-    let column = &parts[1];
-    let qualifier = &parts[0];
-    let value = qualifier.value.as_str();
-    let quoted = qualifier.quote_style.is_some();
-    if let Some(base) =
-        base_for_qualifier(&scope.bases, value, quoted, require_row_identity, visible_entries, case)
-    {
-        return Ok(match find_base_column(base, column, case) {
-            Some(column) => {
-                LookupOutcome::Found(ResolvedColumn {
-                    source: Some(base.table),
-                    definition: column.definition,
-                    relation: Some(base_relation_identity(base)),
-                    exposed: Some((column.name.as_str(), column.quoted)),
-                })
-            }
-            None => LookupOutcome::Stop,
-        });
-    }
-    if let Some(relation) = derived_for_qualifier(
+) -> Option<QualifierMatch<'scope, 'query, 'db, DB, D>> {
+    if let Some(relation) = qualified_relation(
+        &scope.bases,
         &scope.derived,
-        value,
-        quoted,
+        qualifier,
         require_row_identity,
         visible_entries,
         case,
     ) {
-        return match find_derived_column(&relation.shape.columns, column, case) {
-            Some(DerivedMatch::Column(column)) => {
-                Ok(LookupOutcome::Found(ResolvedColumn {
-                    source: column.source,
-                    definition: column.definition,
-                    relation: relation.identity.as_ref().map(|key| (key.value.get(), key.quoted)),
-                    exposed: Some((column.name.as_str(), column.quoted)),
-                }))
-            }
-            Some(DerivedMatch::Ambiguous) => {
-                Err(LookupError::AmbiguousTableLookup {
-                    object_name: column.value.clone(),
-                    candidates: vec![relation_key_display(relation)],
-                })
-            }
-            None => Ok(LookupOutcome::Stop),
-        };
+        return Some(QualifierMatch::Relation(relation));
     }
-    if scope.opaque.iter().any(|entry| {
-        entry.entry_index < visible_entries
-            && opaque_qualifier_matches(&entry.identity, &parts[..1], case)
-    }) {
-        Ok(LookupOutcome::Found(ResolvedColumn {
-            source: None,
-            definition: opaque,
-            relation: None,
-            exposed: None,
-        }))
-    } else {
-        Ok(LookupOutcome::SearchParent)
+    scope
+        .opaque
+        .iter()
+        .any(|entry| {
+            entry.entry_index < visible_entries
+                && opaque_qualifier_matches(&entry.identity, qualifier, case)
+        })
+        .then_some(QualifierMatch::Opaque)
+}
+
+/// The identity a reference through a qualified relation exposes.
+fn qualified_relation_identity<'scope, DB: DatabaseLike, D: Copy>(
+    relation: &QualifiedRelation<'scope, '_, '_, DB, D>,
+) -> Option<(&'scope str, bool)> {
+    match relation {
+        QualifiedRelation::Base(base) => Some(base_relation_identity(base)),
+        QualifiedRelation::Derived(relation) => {
+            relation.identity.as_ref().map(|key| (key.value.get(), key.quoted))
+        }
+    }
+}
+
+/// Resolves a relation qualifier with no column in one scope, answering the
+/// identity it matched, or `None` for an opaque relation.
+fn resolve_relation_local<'scope, DB: DatabaseLike, D: Copy>(
+    scope: &'scope FromScope<'_, '_, DB, D>,
+    visible_entries: usize,
+    qualifier: &ObjectName,
+) -> LookupOutcome<Option<(&'scope str, bool)>> {
+    let Some(qualifier) = object_name_qualifier(qualifier) else {
+        return LookupOutcome::Stop;
+    };
+    match qualifier_local(scope, visible_entries, qualifier, false, scope.case) {
+        Some(QualifierMatch::Relation(relation)) => {
+            LookupOutcome::Found(qualified_relation_identity(&relation))
+        }
+        Some(QualifierMatch::Opaque) => LookupOutcome::Found(None),
+        None => LookupOutcome::SearchParent,
+    }
+}
+
+fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
+    scope: &'scope FromScope<'_, 'db, DB, D>,
+    visible_entries: usize,
+    opaque: D,
+    qualifier: (Option<NamePart<'_>>, NamePart<'_>),
+    column: &Ident,
+    require_row_identity: bool,
+    case: IdentifierCase,
+) -> Result<LookupOutcome<ResolvedColumn<'scope, 'db, DB, D>>, LookupError> {
+    let Some(matched) =
+        qualifier_local(scope, visible_entries, qualifier, require_row_identity, case)
+    else {
+        return Ok(LookupOutcome::SearchParent);
+    };
+    let relation = match matched {
+        QualifierMatch::Relation(relation) => relation,
+        QualifierMatch::Opaque => {
+            return Ok(LookupOutcome::Found(ResolvedColumn {
+                source: None,
+                definition: opaque,
+                relation: None,
+                exposed: None,
+            }));
+        }
+    };
+    let identity = qualified_relation_identity(&relation);
+    match relation {
+        QualifiedRelation::Base(base) => {
+            Ok(match find_base_column(base, column, case) {
+                Some(column) => {
+                    LookupOutcome::Found(ResolvedColumn {
+                        source: Some(base.table),
+                        definition: column.definition,
+                        relation: identity,
+                        exposed: Some((column.name.as_str(), column.quoted)),
+                    })
+                }
+                None => LookupOutcome::Stop,
+            })
+        }
+        QualifiedRelation::Derived(relation) => {
+            match find_derived_column(&relation.shape.columns, column, case) {
+                Some(DerivedMatch::Column(column)) => {
+                    Ok(LookupOutcome::Found(ResolvedColumn {
+                        source: column.source,
+                        definition: column.definition,
+                        relation: identity,
+                        exposed: Some((column.name.as_str(), column.quoted)),
+                    }))
+                }
+                Some(DerivedMatch::Ambiguous) => {
+                    Err(LookupError::AmbiguousTableLookup {
+                        object_name: column.value.clone(),
+                        candidates: vec![relation_key_display(relation)],
+                    })
+                }
+                None => Ok(LookupOutcome::Stop),
+            }
+        }
     }
 }
 
@@ -3551,50 +3635,21 @@ fn resolve_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
                 case,
             )
         }
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            resolve_two_part_definition(
+        Expr::CompoundIdentifier(parts) => {
+            let (qualifier, column) = match parts.as_slice() {
+                [table, column] => ((None, ident_part(table)), column),
+                [schema, table, column] => ((Some(ident_part(schema)), ident_part(table)), column),
+                _ => return Ok(LookupOutcome::Stop),
+            };
+            resolve_qualified_definition(
                 scope,
                 visible_entries,
                 opaque,
-                parts,
+                qualifier,
+                column,
                 require_row_identity,
                 case,
             )
-        }
-        Expr::CompoundIdentifier(parts) if parts.len() == 3 => {
-            if let Some(base) = base_for_qualified_name(
-                &scope.bases,
-                (parts[0].value.as_str(), parts[0].quote_style.is_some()),
-                (parts[1].value.as_str(), parts[1].quote_style.is_some()),
-                require_row_identity,
-                visible_entries,
-                case,
-            ) {
-                return Ok(match find_base_column(base, &parts[2], case) {
-                    Some(column) => {
-                        LookupOutcome::Found(ResolvedColumn {
-                            source: Some(base.table),
-                            definition: column.definition,
-                            relation: Some(base_relation_identity(base)),
-                            exposed: Some((column.name.as_str(), column.quoted)),
-                        })
-                    }
-                    None => LookupOutcome::Stop,
-                });
-            }
-            if scope.opaque.iter().any(|entry| {
-                entry.entry_index < visible_entries
-                    && opaque_qualifier_matches(&entry.identity, &parts[..2], case)
-            }) {
-                Ok(LookupOutcome::Found(ResolvedColumn {
-                    source: None,
-                    definition: opaque,
-                    relation: None,
-                    exposed: None,
-                }))
-            } else {
-                Ok(LookupOutcome::SearchParent)
-            }
         }
         _ => Ok(LookupOutcome::Stop),
     }
@@ -4235,8 +4290,8 @@ impl<DB: DatabaseLike> DQLLike<DB> for Query {
                                 true,
                                 scope.case,
                             ) {
-                                Some(WildcardTarget::Base(base)) => Some(base.table),
-                                Some(WildcardTarget::Derived(relation)) => {
+                                Some(QualifiedRelation::Base(base)) => Some(base.table),
+                                Some(QualifiedRelation::Derived(relation)) => {
                                     single_source_relation(relation, database)
                                 }
                                 None => None,
@@ -4282,7 +4337,8 @@ mod tests {
 
     use super::{
         AstRef, DerivationProfile, OpaqueIdentity, RelationKey, SourceDerivation, cte_dependencies,
-        opaque_qualifier_matches, opaque_qualifier_matches_key, set_expr_ref,
+        object_name_qualifier, opaque_qualifier_matches, opaque_qualifier_matches_key,
+        set_expr_ref,
     };
     use crate::{
         errors::LookupError,
@@ -4421,11 +4477,17 @@ mod tests {
     #[test]
     fn private_fallback_helpers_reject_unrepresentable_names() {
         let key = RelationKey { value: AstRef::Query("table"), quoted: false };
-        let qualifier = [Ident::new("catalog"), Ident::new("schema"), Ident::new("table")];
-        assert!(!opaque_qualifier_matches_key(key, None, &qualifier, IdentifierCase::AsWritten));
+        let three_parts = sqlparser::ast::ObjectName::from(vec![
+            Ident::new("catalog"),
+            Ident::new("schema"),
+            Ident::new("table"),
+        ]);
+        assert!(object_name_qualifier(&three_parts).is_none());
+        let qualifier = (Some(("schema", false)), ("table", false));
+        assert!(!opaque_qualifier_matches_key(key, None, qualifier, IdentifierCase::AsWritten));
         assert!(!opaque_qualifier_matches(
             &OpaqueIdentity::Anonymous,
-            &qualifier,
+            qualifier,
             IdentifierCase::AsWritten
         ));
 

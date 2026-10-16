@@ -16,7 +16,7 @@ mod view;
 
 pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
-    ColumnScope, QueryOutput,
+    ColumnScope, QueryOutput, RelationBinding,
 };
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use identifier_case::IdentifierCase;
