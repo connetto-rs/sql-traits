@@ -5,7 +5,7 @@
 //! or once per key column. Both answer the same ordinals, so this file counts
 //! allocations instead: past width one, where the key needs no storage of its
 //! own, a wider key must not cost more.
-#![cfg(not(tarpaulin))]
+#![cfg(not(coverage))]
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};

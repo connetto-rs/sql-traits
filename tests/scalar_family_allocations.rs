@@ -1,5 +1,5 @@
 //! Pins scalar family allocation behavior outside coverage instrumentation.
-#![cfg(not(tarpaulin))]
+#![cfg(not(coverage))]
 
 use core::{hint::black_box, sync::atomic::Ordering};
 

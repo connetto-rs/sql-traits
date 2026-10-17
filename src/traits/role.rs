@@ -392,8 +392,8 @@ mod tests {
         let role = db.role("test_role").expect("Role not found");
 
         // Use reference to role and explicitly route every call through
-        // `impl RoleLike for &T` so the blanket forwarding bodies (lines
-        // 292–344) are exercised under tarpaulin.
+        // `impl RoleLike for &T` so coverage credits the blanket forwarding
+        // bodies (lines 292–344).
         let role_ref: &<ParserDB as DatabaseLike>::Role = role;
 
         assert_eq!(<&_ as RoleLike>::name(&role_ref), "test_role");
