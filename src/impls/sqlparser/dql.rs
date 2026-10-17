@@ -849,7 +849,7 @@ fn merge_names(
     let mut merged: Vec<(String, bool)> = Vec::new();
     match join_constraint(operator) {
         None | Some(JoinConstraint::On(_) | JoinConstraint::None) => {}
-        Some(JoinConstraint::Using(names)) => {
+        Some(JoinConstraint::Using(names) | JoinConstraint::UsingAlias(names, _)) => {
             for name in names {
                 if let Some((value, quoted)) = object_name_last_part(name) {
                     push_unseen(&mut merged, value, quoted, case);
@@ -2469,7 +2469,10 @@ where
     fn join_constraint(&mut self, constraint: &'source JoinConstraint) -> Result<(), LookupError> {
         match constraint {
             JoinConstraint::On(expression) => self.expression(expression),
-            JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
+            JoinConstraint::Using(_)
+            | JoinConstraint::UsingAlias(..)
+            | JoinConstraint::Natural
+            | JoinConstraint::None => Ok(()),
         }
     }
 
