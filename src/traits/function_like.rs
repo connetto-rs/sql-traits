@@ -557,8 +557,7 @@ mod tests {
     use crate::{errors::Error, prelude::*, traits::DatabaseLike};
 
     /// Exercises both default-method bodies (`name_is_quoted`,
-    /// `normalized_return_type_name`) directly so they're credited
-    /// under tarpaulin.
+    /// `normalized_return_type_name`) directly so coverage credits them.
     #[test]
     fn test_default_methods_on_function() {
         let sql = r"

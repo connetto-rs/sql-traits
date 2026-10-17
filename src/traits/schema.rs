@@ -501,7 +501,7 @@ mod tests {
                     .unwrap();
             let schema = db.schema("my_schema").expect("schema");
 
-            // Explicitly invoke through the &T blanket impl so tarpaulin
+            // Explicitly invoke through the &T blanket impl so coverage
             // credits the forwarding bodies in `impl SchemaLike for &S`.
             let s_ref: &<ParserDB as DatabaseLike>::Schema = schema;
             assert_eq!(<&_ as SchemaLike>::name(&s_ref), "my_schema");
