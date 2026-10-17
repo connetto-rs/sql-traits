@@ -4,7 +4,7 @@
 //! `PostgresCatalog::postgres_18()`, whatever the dialect, so building it sits
 //! on the path of every parse. These tests count allocations, since the cost of
 //! that construction is the property they pin.
-#![cfg(not(tarpaulin))]
+#![cfg(not(coverage))]
 
 use sql_traits::prelude::*;
 

@@ -135,19 +135,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-    # Pinned deliberately: coverage generation fails on this runner with newer
-    # toolchains, and this is the last build the job completed on.
+    # Nightly, because doctest coverage is measured with `--doc`.
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@nightly
       with:
-        toolchain: nightly-2026-08-05
         components: llvm-tools-preview
-    - name: Install tarpaulin
-      uses: taiki-e/install-action@cargo-tarpaulin
-    - name: Generate coverage
-      run: cargo tarpaulin --engine=llvm --out xml --workspace --run-types AllTargets --run-types Doctests --features git,serde
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Measure all targets
+      run: cargo llvm-cov --workspace --all-targets --features git,serde --no-report
+    - name: Measure doctests and write the report
+      run: cargo llvm-cov --workspace --doc --features git,serde --no-clean --lcov --output-path target/coverage.lcov
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
+        files: target/coverage.lcov
         fail_ci_if_error: false

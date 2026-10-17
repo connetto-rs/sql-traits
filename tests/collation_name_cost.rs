@@ -7,7 +7,7 @@
 //! value copies the identifier and the qualifier on every read. These tests
 //! count allocations instead of asserting a signature, since the cost is the
 //! reason the accessor lends.
-#![cfg(not(tarpaulin))]
+#![cfg(not(coverage))]
 #![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{

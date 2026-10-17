@@ -738,9 +738,8 @@ mod tests {
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let grant = db.table_grants().next().expect("Grant not found");
 
-        // Explicitly route through `impl <Trait> for &T` so the blanket
-        // forwarding bodies (lines 208–243, 351–367) are exercised under
-        // tarpaulin.
+        // Explicitly route through `impl <Trait> for &T` so coverage credits
+        // the blanket forwarding bodies (lines 208–243, 351–367).
         let grant_ref: &<ParserDB as DatabaseLike>::TableGrant = grant;
 
         let privileges: Vec<_> = <&_ as GrantLike>::privileges(&grant_ref, &db).collect();
@@ -774,7 +773,7 @@ mod tests {
 
     /// Exercises the `impl ColumnGrantLike for &T` blanket forwarding —
     /// the trait's three methods (`columns`, `table`, plus inherited
-    /// `GrantLike`) all need explicit route-through for tarpaulin.
+    /// `GrantLike`) all need explicit route-through for coverage.
     #[test]
     fn test_column_grant_ref_implementation() {
         let sql = r"

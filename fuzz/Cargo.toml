@@ -19,7 +19,7 @@ test = false
 doc = false
 bench = false
 
-# Own workspace, so workspace-wide runs such as tarpaulin never start the fuzzer.
+# Own workspace, so workspace-wide runs such as coverage never start the fuzzer.
 [workspace]
 
 [profile.release]
