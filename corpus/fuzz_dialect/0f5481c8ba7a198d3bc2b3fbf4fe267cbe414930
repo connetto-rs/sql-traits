@@ -1,5 +1,0 @@
-CREATE TABLE gata (
-    id    iEY DEFAULT g DEFAULT '{}' PRIMARY KEY DEFAULT g DEFAULT '{}',
-    metadata HdBUUID PRIMARY KEY DEFAULT g DEFAULT -'{}' PRIMARY KEY DEFAULT g DEFAULT '{}',
-    metadatay H
-);

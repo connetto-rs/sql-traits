@@ -1,6 +1,0 @@
-(UPDATE(((
-(((WITH sesoz(
- SELECT  R
-),et_esoz(
- SELECT  R
-),g);

@@ -1,4 +1,0 @@
-CREATE FUNCTION e(r_G)
-LANGUAGE SL
-AS 
-$$E $$`> 

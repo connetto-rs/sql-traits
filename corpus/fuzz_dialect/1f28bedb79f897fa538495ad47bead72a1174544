@@ -1,1 +1,0 @@
-CREATE POLICY usen ON AL   USING (UN( >= 4,l

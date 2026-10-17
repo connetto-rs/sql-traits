@@ -1,3 +1,0 @@
-CREATE TABLE ers (
-ROT NULL REFERENCES 
-  TU(uid,t_);

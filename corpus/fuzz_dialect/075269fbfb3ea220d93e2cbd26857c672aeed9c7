@@ -1,2 +1,0 @@
-CREATE POLICY us_isolat ON ALL
-    USING (uu+@localtimestamp(on ON (Rl

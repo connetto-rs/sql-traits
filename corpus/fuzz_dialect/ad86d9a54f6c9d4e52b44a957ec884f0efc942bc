@@ -1,2 +1,0 @@
-CREATE TABLE users (
-  id IuNIQ);ALTER TABLE users ADD IF PARY KEY

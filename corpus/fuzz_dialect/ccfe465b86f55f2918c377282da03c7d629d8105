@@ -1,2 +1,0 @@
-CREATE TABLE ordeUPA (
- d SEL(2) CHECK (NOT( NOT( doublE

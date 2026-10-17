@@ -1,2 +1,0 @@
-CREATE POLICY on ON L
- USING (A (uA@> 0,///l

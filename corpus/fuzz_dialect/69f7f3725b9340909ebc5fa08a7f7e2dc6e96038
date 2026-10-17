@@ -1,1 +1,0 @@
-CREATE POLICY ll ON use  TO ad,i,p{

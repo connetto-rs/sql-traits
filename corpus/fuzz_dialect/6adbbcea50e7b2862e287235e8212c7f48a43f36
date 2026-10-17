@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-    id SDRNT_TIMil);
-CREATE UNIQUE INDEX idx_orderrs_user_date ON orders(user,nullifed_aRREN?_TIMil);
-CREATE UNIQUE INDEX idx_orderrs_user_date ON orders(user,id, c-ed_at Dcen);

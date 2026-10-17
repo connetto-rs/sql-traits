@@ -1,4 +1,0 @@
-CREATE TABLE oders (
-    amount DECIMAL(14, 2) CHECK (amount),T URRENT_@TIMTAMP,
-    UNIQUE (user, create@(@P@:d_at ), CHECK (@@(@@@:@:d__at ), CHECK (@@(@P@:d_at ), CHECK (@@@:@geond_at ), CHECK (@@A@@@:a_att ), CHECK (@@(@P:@_at ), CHECK (@Aeond_at ), CHECK (@@A@@@:a_att ), CHECK (@@(@P@:at ), CHECK (@@(@P@:d_at ), CHECK (@@@eond ), CHECK (@@A@@@:a_att ), CHECK (@@(@P@:d_a@t ), CHECK (@@(@P@:d_at ), CHECK (A@@:@_geond_at ), CHECK (@@A@@@:a_att ), CHECK (@@(@P@:d), CHECK (@@(@@@:@:d__ ), CHECK (@@@:d_at )d_at)
-);

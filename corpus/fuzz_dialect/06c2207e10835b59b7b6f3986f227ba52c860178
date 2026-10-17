@@ -1,4 +1,0 @@
-
-CREATE ROLE re, p,l,C,d,ly;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C.l,C,d,ly;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C.d,d,p,l¬C,d,

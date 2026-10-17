@@ -1,3 +1,0 @@
-CREATE TABLE orders (
- d SEL  ,amount DEC,
-    stnt DECIMAL(09, 2) CHECK (amount -> 0), staT CURRENT_TIB);

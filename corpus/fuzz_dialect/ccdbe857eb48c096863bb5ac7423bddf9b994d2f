@@ -1,2 +1,0 @@
-CREATE TABLE ord (T N REFERENCES ser CHECK (a~unt),
-TABB   st);

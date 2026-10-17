@@ -1,3 +1,0 @@
-CREATE FUNCTION calculaol(ordeentmC,TUPLE (T, stCASC, id 
-)
-);

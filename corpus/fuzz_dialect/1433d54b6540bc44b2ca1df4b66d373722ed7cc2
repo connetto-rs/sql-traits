@@ -1,1 +1,0 @@
-CREATE POLICY rla ON u USING (usllll (true) (true);#

@@ -1,2 +1,0 @@
-CREATE ROLE min ROLE reaCEM;
-GRANT SELECT ON  public TO readon WITH

@@ -1,5 +1,0 @@
-CREATE TABLE geo_data (
-    id UY KEY DEFAULT gen_rant_uu,
- ags0 TEXT[] DEFAULT '{}',gs TEXT[] DEFAULT '{}' KEY DEFAULT gom_uid(),
-s TEXT[] DEFAULT TSVECTOR
-);

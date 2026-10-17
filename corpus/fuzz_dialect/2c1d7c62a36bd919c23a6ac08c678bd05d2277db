@@ -1,2 +1,0 @@
-CREATE POLICY usolion ON users
- USING (us::li:: u

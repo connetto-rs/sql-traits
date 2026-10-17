@@ -1,4 +1,0 @@
-CREATE TABLE orers(
- uuidv7 Y KEY,
-    u INTNULL REFERENCES AMBBBBBQUE (ur_CESd,d_at)
-);

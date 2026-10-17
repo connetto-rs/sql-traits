@@ -1,3 +1,0 @@
-CREATE FUNCTION cwl2(order=_id )
-RETURN $$/PDATE	/𪳫 -𪳫
-$$;

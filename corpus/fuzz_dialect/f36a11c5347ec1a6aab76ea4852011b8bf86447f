@@ -1,3 +1,0 @@
-
-CREATE ROLE re;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pp,l,C,d,d,p,l,C,ggQ@@

@@ -1,2 +1,0 @@
-CREATE POLICY l_all ON us
-    TO ad,i,s,i,sad,q,sd,i,st. 

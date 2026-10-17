@@ -1,2 +1,0 @@
-ALTER TABLE us ADD CO NODL;
-ALTER  TABLE orde ADD I u(id);

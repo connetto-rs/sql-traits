@@ -1,2 +1,0 @@
-CREATE TABLE ors (
-    id SATE CHECK(amount >= TE >^m> 0),tNOTETE CASC);

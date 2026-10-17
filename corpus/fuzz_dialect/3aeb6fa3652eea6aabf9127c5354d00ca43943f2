@@ -1,4 +1,0 @@
-CREATE TABLE users (d INER PRIMARY KEY,
-  name VARCHAR(254) NULL,
-  mail TEXT UNIQUE
-);

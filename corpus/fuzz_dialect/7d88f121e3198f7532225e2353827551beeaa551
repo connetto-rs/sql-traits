@@ -1,3 +1,0 @@
-CREATE TABLE ord$(
-knt AL CHECK (uqi0>=ALL (_a))
-);ù
