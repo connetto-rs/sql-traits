@@ -733,6 +733,7 @@ where
                 index_join_expression_queries(join, cte_scope, deriving, local_parent, profile)?;
             }
             let (left_nullable, right_nullable) = nullable_sides(&join.get().join_operator);
+            let opaque = profile.opaque_definition();
             let data = profile.scope_mut(&mut scope);
             mark_nullable_sides(
                 data,
@@ -757,6 +758,10 @@ where
                 merged = names;
             } else {
                 data.unqualified_poison = true;
+            }
+            if let Some(alias) = join.try_map(|join| using_alias(&join.join_operator)) {
+                let entry_index = data.from_entry_count - 1;
+                data.derived.push(using_alias_relation(alias, &merged, opaque, entry_index));
             }
             plan = merge_plans(plan, right_entries, &merged, data.case);
             accumulated = merge_output_names(accumulated, right_names, &merged, data.case);
@@ -948,6 +953,48 @@ fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
         | JoinOperator::LeftAnti(constraint)
         | JoinOperator::RightAnti(constraint) => Some(constraint),
         _ => None,
+    }
+}
+
+/// The name a `USING (...) AS alias` constraint gives its join's merged
+/// columns.
+fn using_alias(operator: &JoinOperator) -> Option<&Ident> {
+    match join_constraint(operator)? {
+        JoinConstraint::UsingAlias(_, alias) => Some(alias),
+        _ => None,
+    }
+}
+
+/// The relation a `USING (...) AS alias` join names. It exposes only the
+/// merged columns, each coalesced from both sides and therefore sourceless,
+/// and shares the joined relation's entry index so it is visible exactly
+/// where the join is. Naming the merged columns leaves the join's rows as
+/// they are, so the relation is row-preserving.
+fn using_alias_relation<'query, 'db, DB: DatabaseLike, D: Copy>(
+    alias: AstRef<'query, 'db, Ident>,
+    merged: &[(String, bool)],
+    opaque: D,
+    entry_index: usize,
+) -> DerivedRelationRef<'query, 'db, DB, D> {
+    let key = ident_key(alias);
+    let columns = merged
+        .iter()
+        .map(|(name, quoted)| {
+            DerivedColumn {
+                name: name.clone(),
+                quoted: *quoted,
+                source: None,
+                definition: opaque,
+                marker: core::marker::PhantomData,
+            }
+        })
+        .collect();
+    DerivedRelationRef {
+        key: Some(key),
+        identity: Some(key),
+        shape: DerivedShape { columns, row_preserving: true },
+        nullable: false,
+        entry_index,
     }
 }
 
@@ -3850,9 +3897,13 @@ fn derived_column_names<DB: DatabaseLike, D: Copy>(
 }
 
 fn alias_key<'query, 'db>(alias: AstRef<'query, 'db, TableAlias>) -> RelationKey<'query, 'db> {
+    ident_key(alias.map(|alias| &alias.name))
+}
+
+fn ident_key<'query, 'db>(ident: AstRef<'query, 'db, Ident>) -> RelationKey<'query, 'db> {
     RelationKey {
-        value: alias.map(|alias| alias.name.value.as_str()),
-        quoted: alias.get().name.quote_style.is_some(),
+        value: ident.map(|ident| ident.value.as_str()),
+        quoted: ident.get().quote_style.is_some(),
     }
 }
 
@@ -4045,6 +4096,13 @@ fn collect_nested_factor_qualifiers<'query, 'db>(
                     first,
                     additional,
                 );
+                if let Some(alias) = join.try_map(|join| using_alias(&join.join_operator)) {
+                    push_opaque_qualifier(
+                        first,
+                        additional,
+                        OpaqueQualifier { key: ident_key(alias), schema: None },
+                    );
+                }
             }
         }
         TableFactor::Derived { .. }
@@ -4333,7 +4391,7 @@ impl<DB: DatabaseLike> DQLLike<DB> for Query {
 #[cfg(test)]
 mod tests {
     use sqlparser::{
-        ast::{Ident, SelectItem, SetExpr, Statement, Table},
+        ast::{Expr, Ident, ObjectName, SelectItem, SetExpr, Statement, Table},
         dialect::{BigQueryDialect, Dialect, GenericDialect},
         parser::Parser,
     };
@@ -4347,7 +4405,7 @@ mod tests {
         errors::LookupError,
         prelude::ParserDB,
         structs::{ColumnDefinition, ColumnScope, IdentifierCase},
-        traits::{DQLLike, TableLike},
+        traits::{ColumnLike, DQLLike, TableLike},
     };
 
     std::thread_local! {
@@ -4862,6 +4920,122 @@ mod tests {
             source_name("SELECT total FROM users JOIN orders USING (id)", &db),
             Some("orders".to_string())
         );
+    }
+
+    fn compound(parts: &[&str]) -> Expr {
+        Expr::CompoundIdentifier(parts.iter().copied().map(Ident::new).collect())
+    }
+
+    fn definition_of(scope: &ColumnScope<'_, '_, ParserDB>, parts: &[&str]) -> Option<String> {
+        let definition =
+            scope.resolve_column_definition(&compound(parts)).expect("lookup succeeds");
+        definition.map(|definition| {
+            match definition {
+                ColumnDefinition::Base { table, column } => {
+                    format!("{}.{}", table.table_name(), column.column_name())
+                }
+                ColumnDefinition::Opaque => "opaque".to_string(),
+                _ => "other".to_string(),
+            }
+        })
+    }
+
+    // Measured on PostgreSQL 18.4: `USING (...) AS j` names only the merged
+    // columns, so `j.id` reads the coalesced column and `j.total` does not
+    // exist, while the joined tables keep their own names.
+    #[test]
+    fn using_alias_names_only_the_merged_columns() {
+        let db = schema_db();
+        let sql = "SELECT j.id FROM users JOIN orders USING (id) AS j";
+        let query = query_of(sql);
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
+        let (definition, binding) = scope
+            .resolve_column_binding(&compound(&["j", "id"]))
+            .expect("lookup succeeds")
+            .expect("j.id resolves");
+        assert!(matches!(definition, ColumnDefinition::Opaque));
+        assert_eq!(binding.relation(), Some(("j", false)));
+        assert_eq!(binding.exposed(), Some(("id", false)));
+        assert_eq!(definition_of(&scope, &["j", "total"]), None);
+        assert_eq!(definition_of(&scope, &["orders", "total"]).as_deref(), Some("orders.total"));
+        assert_eq!(
+            scope
+                .resolve_relation_binding(&ObjectName::from(vec![Ident::new("j")]))
+                .and_then(|binding| binding.relation()),
+            Some(("j", false))
+        );
+        assert!(matches!(
+            scope
+                .resolve_column_definition(&Expr::Identifier(Ident::new("id")))
+                .expect("the merged column is not ambiguous"),
+            Some(ColumnDefinition::Opaque)
+        ));
+        assert_eq!(source_name(sql, &db), None);
+        assert_eq!(
+            source_name("SELECT orders.total FROM users JOIN orders USING (id) AS j", &db),
+            Some("orders".to_string())
+        );
+    }
+
+    // Measured on PostgreSQL 18.4: an inner `USING (...) AS j` hides an outer
+    // relation named `j`, so `j.name` inside it is an error instead of the
+    // outer table's column.
+    #[test]
+    fn using_alias_shadows_an_outer_relation() {
+        let db = schema_db();
+        let query = query_of(
+            "SELECT (SELECT j.name FROM users JOIN orders USING (id) AS j) FROM users AS j",
+        );
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
+        let SetExpr::Select(outer) = query.body.as_ref() else { panic!("expected a select body") };
+        let SelectItem::UnnamedExpr(Expr::Subquery(inner)) = &outer.projection[0] else {
+            panic!("expected a scalar subquery")
+        };
+        let SetExpr::Select(inner) = inner.body.as_ref() else { panic!("expected a select body") };
+        let inner_scope = scope.scope_for_select(inner).expect("the subquery is indexed");
+        assert!(
+            inner_scope
+                .resolve_column_definition(&compound(&["j", "name"]))
+                .expect("lookup succeeds")
+                .is_none()
+        );
+    }
+
+    // Measured on PostgreSQL 18.4: `j.*` expands to the merged columns alone,
+    // while `*` lists the join output as it does without the alias.
+    #[test]
+    fn using_alias_wildcard_expands_to_the_merged_columns() {
+        let db = schema_db();
+        let query = query_of(
+            "WITH c AS (SELECT j.* FROM users JOIN orders USING (id) AS j), \
+                  s AS (SELECT * FROM users JOIN orders USING (id) AS j) \
+             SELECT c.id FROM c, s",
+        );
+        let scope =
+            ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
+        assert_eq!(definition_of(&scope, &["c", "id"]).as_deref(), Some("opaque"));
+        assert_eq!(definition_of(&scope, &["c", "total"]), None);
+        assert_eq!(definition_of(&scope, &["s", "total"]).as_deref(), Some("orders.total"));
+    }
+
+    // Measured on PostgreSQL 18.4: a parenthesized join keeps its `USING`
+    // alias visible outside the parentheses unless they carry an alias.
+    #[test]
+    fn nested_join_exposes_its_using_alias() {
+        let db = schema_db();
+        let nested =
+            query_of("SELECT 1 FROM users AS u0 JOIN (users JOIN orders USING (id) AS j) ON true");
+        let scope =
+            ColumnScope::from_query(&nested, &db, IdentifierCase::AsWritten).expect("scope builds");
+        assert_eq!(definition_of(&scope, &["j", "id"]).as_deref(), Some("opaque"));
+        let aliased = query_of(
+            "SELECT 1 FROM users AS u0 JOIN (users JOIN orders USING (id) AS j) AS x ON true",
+        );
+        let scope = ColumnScope::from_query(&aliased, &db, IdentifierCase::AsWritten)
+            .expect("scope builds");
+        assert_eq!(definition_of(&scope, &["j", "id"]), None);
     }
 
     // Measured on PostgreSQL 18.4: a three-part reference resolves when the
