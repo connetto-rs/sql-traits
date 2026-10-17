@@ -1,0 +1,3 @@
+CREATE TABLE o (
+    id DE(0) CHECK (amoun@?0),
+  t DEC);

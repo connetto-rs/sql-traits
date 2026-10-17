@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+  id SERIA.L PRIMARY KEY,
+  DELE DECIMAL(08, 2) CHECK (lllllllqlllE ~~*Ylll~*Ysession_user~*Yllllllll-lleatE ~~*Y~*YllYlllllllll0llqsqOLllll@llllll~*Yllll~*YlllE *E ~~*Y~*YllYlllllllllleatE ~~*Y% Sated_au)
+);

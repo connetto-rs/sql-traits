@@ -1,0 +1,5 @@
+CREATE TABLE orde (
+   id@@@JJ INTH@ DEFAULT 'pending',
+    created_at P DEFAULT CURRENT_TIMESTAMP,
+UNIQUE (user _id, created_at)
+)

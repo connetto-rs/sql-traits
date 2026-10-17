@@ -1,0 +1,6 @@
+CREATE TABLE s (
+    UNIQUE curr(us.d,i: [d]_at)
+);
+CREATE TABLE s (
+    UNIQUE current_usere(_rus.d,i: at)
+)

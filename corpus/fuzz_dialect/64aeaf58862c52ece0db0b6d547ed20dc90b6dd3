@@ -1,0 +1,2 @@
+CREATE INDEX iuserl ON e(etB,C, l);
+DELETE u

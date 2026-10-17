@@ -1,0 +1,4 @@
+CREATE TABLE oratrs (
+     B sNOTULL REFERENCES E CHECK (a~mou -> 0),
+MESTBBB #st
+);

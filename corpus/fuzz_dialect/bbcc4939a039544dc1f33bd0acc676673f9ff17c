@@ -1,0 +1,3 @@
+CREATe TABLE orerw (
+ t DIL(M1) CHECK (am) CHECK (mo@@@)
+)

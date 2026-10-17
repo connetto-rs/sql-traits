@@ -1,0 +1,2 @@
+CREATE POLICY n ON s
+  USING (u$ll+l.+l@

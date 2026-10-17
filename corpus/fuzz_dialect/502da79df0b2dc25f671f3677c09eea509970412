@@ -1,0 +1,3 @@
+
+CREATE ROLE l;
+GRANT SELEcT ON Apc TO p,l,C.d,d,p,l.C,d,

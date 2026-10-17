@@ -1,0 +1,2 @@
+CREATE TABLE ords (
+ d SEL  ,amount DEC,t DECIMAL(09, 2) CHECK (amount -> 0), staT CURR_TIB);

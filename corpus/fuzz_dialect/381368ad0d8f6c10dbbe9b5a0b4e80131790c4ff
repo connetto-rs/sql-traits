@@ -1,0 +1,2 @@
+ SELECT $O rs$@
+  FOR  UPDATE(L

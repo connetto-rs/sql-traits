@@ -1,0 +1,5 @@
+(WITH sez(
+ SELECT  R
+),urr(
+ SELECT  R
+),(H 

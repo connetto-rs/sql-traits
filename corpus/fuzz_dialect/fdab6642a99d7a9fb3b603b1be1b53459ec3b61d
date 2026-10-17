@@ -1,0 +1,2 @@
+CREATE INDEX ON orders(us,d, c);
+CREATE INDEX ON s(stus) WH!= ;

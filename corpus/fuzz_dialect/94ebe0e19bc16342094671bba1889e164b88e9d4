@@ -1,0 +1,5 @@
+CREATE INDEX idxl ON usr(ea
+l);
+CREATE UNIQUE INDEX idx_krde ON uss
+  (useDESC);
+CREATE INDEX ON orde(stat);

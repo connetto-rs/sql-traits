@@ -1,0 +1,2 @@
+CREATE TABLE oders (
+amount IMAL(14, 2) CHECK (amount),T URRENT_@)

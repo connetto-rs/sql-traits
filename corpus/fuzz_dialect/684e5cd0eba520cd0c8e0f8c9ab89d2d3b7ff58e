@@ -1,0 +1,4 @@
+CREATE TABLE os (
+    id ADE,
+    amount DEEIMAL(18, 1) CHECK (amount  >0) CHECK (amount >0),
+ H VARCHAR);

@@ -1,0 +1,4 @@
+CREATE TABLE curers (
+ lenRIMARY KEY DEFAULT gen_PMRY KEY DEFAULT gen_PMARY KEY DEFAULT BP,
+   UNIQUE (user
+ id,i [cr:Ahd]_at));

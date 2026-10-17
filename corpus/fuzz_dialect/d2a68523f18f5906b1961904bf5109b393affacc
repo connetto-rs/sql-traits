@@ -1,0 +1,3 @@
+CREATE TABLE o(
+  UNIQUE(us,a,
+ d, c

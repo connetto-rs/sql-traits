@@ -1,0 +1,8 @@
+CREATE INDEX idx_users_email ON users(email);
+CREATE UNIQUE INDEX idx_orders_user_date ON orders(usC);
+ CREATE INDEX idx_order ON users(email);
+CREATE UNIQUE INDEX idd_user_date ON orders(user_iESC);
+ CREATE INDEX i ON users(e-ail);
+CREATE UNIQUE INDEX idx_orers_email ON users(email);
+CREATE UNIQUE INDEX idx_orders_user_dser_date ON orders(user_id, creat DESC);
+ CREATE INDEX idx_order ON users(email) IND ON orCREA

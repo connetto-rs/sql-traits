@@ -1,0 +1,4 @@
+ CREATE ROLE enin;
+GRANT USAGE ON S TO n;
+SET L=
+H,HHR

@@ -1,0 +1,2 @@
+CREATE TABLE g_daGIN PASSWORD 'et/*!*';
+CREATE ROLE r ROLE ra

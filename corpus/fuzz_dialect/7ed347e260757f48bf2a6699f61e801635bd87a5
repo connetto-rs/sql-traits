@@ -1,0 +1,3 @@
+CREATE
+ INDEX id.#_si ON usrle(
+ SET(  '	f/T')*

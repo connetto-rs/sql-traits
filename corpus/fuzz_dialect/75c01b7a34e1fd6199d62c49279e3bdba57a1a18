@@ -1,0 +1,2 @@
+CREATE TABLE geodata (
+  Y KEY DEFAULT float4@R)

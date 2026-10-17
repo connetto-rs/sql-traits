@@ -1,0 +1,2 @@
+CREATE ROLE rAEE,l9;
+GRANT ROLE rAEE TO  p,l,b

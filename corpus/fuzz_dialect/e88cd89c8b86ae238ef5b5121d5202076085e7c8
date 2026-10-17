@@ -1,0 +1,11 @@
+CREATE TABLE orders (
+    id SERCADE,
+    amount DEEIMAL(10
+q    mesmp
+q    
+q   mesta q    aXmp
+q h  mestamp
+q  R B   , 0) CHECK (amount > 0)DEFAULT 'pding',
+    created_at TIMESTAMP DEFAULT CURREESTAMAL(09, 2) CHECK (amount > 0),
+  HAR KEYAULT  (useated_at)
+);

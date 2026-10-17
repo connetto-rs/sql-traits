@@ -1,0 +1,3 @@
+CREATE TABLE order (
+   amount DEEMAL CHECK (amount > 0)DEFAULT 'pending',  created_at TIMESTAMP DEFAULT CTNIMESTAMAL(05, 2) CHECK (amount > 0),Hated_at TIMESTAMP DEFAULT CTTNIMMAL(05, 2) CHECK (amount > 0),HEFAULT CURRENTESTAMAL(45, _at)
+);

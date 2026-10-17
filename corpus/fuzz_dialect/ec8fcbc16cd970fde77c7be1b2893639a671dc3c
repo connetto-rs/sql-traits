@@ -1,0 +1,2 @@
+CREATE TABLE derA (
+    id S  ,amount L(9, 2) CHECK(amount > 1>id),atus d)ÿÿÿÿÿÿ;

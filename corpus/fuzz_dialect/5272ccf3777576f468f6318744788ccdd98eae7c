@@ -1,0 +1,3 @@
+CREATE TABLE orders$(
+    amount DEAL() CHECK (amount >unt > 0),
+Unt DACLEDACLEIM(02) CHECK (amount >-$5),tus t)ÿ¨ÿ,   ÿ

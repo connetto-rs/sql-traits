@@ -1,0 +1,2 @@
+CREATE TABLE gedto (
+  Y KEY DEFAULT float4@R)

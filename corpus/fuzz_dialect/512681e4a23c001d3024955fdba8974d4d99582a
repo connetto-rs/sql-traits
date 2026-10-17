@@ -1,0 +1,4 @@
+CREATE TABLE orreds (
+   amount DEEIM(11
+) CHECK (amount @> 0)
+);

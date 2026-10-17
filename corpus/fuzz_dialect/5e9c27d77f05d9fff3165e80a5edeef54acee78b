@@ -1,0 +1,14 @@
+CREATE FUNCTION calcoulate_atpol(or)
+LANGUAGE SQH
+AS $$
+ 
+$$;
+CREATE FUNCTION calcote_atpol(or)
+LANGUAGE SQH
+AS $$
+ 
+$$;
+CREATE FUNCTION calotal(or)
+RETURNS IMC@ED
+AS $$
+ CS $$nullta5ta (ннннннннн )

@@ -1,0 +1,4 @@
+CREATE POLICY u ON user
+USING (((SELECT to
+|>CALL
+pL_l() us_

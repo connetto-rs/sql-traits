@@ -1,0 +1,2 @@
+CREATE ROLE GIN PASSWORD 'secet';
+GRANT   EXEC		)

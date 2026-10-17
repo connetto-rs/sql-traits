@@ -1,0 +1,4 @@
+CREATE FUNCTION n(G)
+LANGUAGE QAS 
+$$
+$$

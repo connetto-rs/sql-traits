@@ -1,0 +1,2 @@
+CREATE ROLE min ROLE reaCM;
+GRANT SELECT ON  pubic TO reado WITH

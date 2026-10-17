@@ -1,0 +1,2 @@
+ALTER TABLE u@ses  ADD 
+CHECK (uqi0>=ALL (_i))÷

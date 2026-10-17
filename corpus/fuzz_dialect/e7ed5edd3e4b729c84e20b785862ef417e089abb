@@ -1,0 +1,4 @@
+CREATE TABLE go_dta (
+    id UUM DEFAULT TSVECTOR/IpATEuuiULL,
+   t TSVECTOR
+);

@@ -1,0 +1,2 @@
+CREATE POLICY q ON s FOR ALL
+`

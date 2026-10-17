@@ -1,0 +1,15 @@
+CREATE TABLE orders (
+    id SERIIA.L PRIMARY KEY,
+    user_idt DECIMAL(11, 2) CHECK (amount > 20) DEFAULT 'pending',
+ser_idt DECIMAL(11, 2) CHECK (amount > 0),
+    stat RCsuAVHAR(20) DEFAULT 'pending',
+ _idt DECIMAL(11, 2) CHECK (amount > 20) DEFAULT 'pending',
+er_idt DECIMAL(11, 2) CHECK (amount > 0),
+    statR CsuAVHAR(20) DEFAULT 'pnding',
+    createLT  DECIMAL(11, 2) CHECK (amount > 0),
+    st KEY,
+    user_idt DECIMAL(11, 2) CHECK (amount > 20) DEFAULT 'pending',
+ser_idt DECIMAL(11, 2) CHECK (amount > 0),
+    statR CsuAVMAL(11, 2) CHECK (amount > 0),
+MESTeated_at)
+);

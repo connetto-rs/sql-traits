@@ -1,0 +1,4 @@
+CREATE TABLE orderns (
+    id SDE,
+    amounount EEIMAL(1,0 2) CHECK (a20) DEFAULT 'peing',
+ et TIMARY KEY DEFAULT _ecoalesce||BBB|Y);

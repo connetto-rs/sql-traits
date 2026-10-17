@@ -1,0 +1,15 @@
+CREATE INDEX xlcnp_mdaumail ON users(email)
+  USING   O   USING   ON --n ON ON ause 
+    USING   ON --nN sel ail)
+  USING   O   USING   ON --n ON ON ause 
+    USING   ON --nN sel ON usersON usEX xamlcn_dumail ON useemail)
+  USING   O   USING   ON --n ON ON ause 
+    USING ON --nN sel ail)
+  USING   O   USING   ON --n ON ON ause 
+    USING   ON --nN sel ON useriOsl)
+  USING   O   USING   ON --n ON ON 
+  USING   O   USING   ON --n ON ON aus 
+    USING  ulL
+locK-ers(email)users(email)
+  USING   O   NG   O   USING   ON --n ON ON ING  ulL
+locK--C

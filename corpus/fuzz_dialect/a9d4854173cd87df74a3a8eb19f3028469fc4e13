@@ -1,0 +1,1 @@
+UPDATE O SET  s =O WHERE(at)

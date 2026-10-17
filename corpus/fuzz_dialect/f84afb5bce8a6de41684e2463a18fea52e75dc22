@@ -1,0 +1,4 @@
+CREATE TABLE orde (
+   id NU REFERENCES users(id@) ON DELETE CASCADE,
+   R N NULL REFERENCES users(ated_at)
+);

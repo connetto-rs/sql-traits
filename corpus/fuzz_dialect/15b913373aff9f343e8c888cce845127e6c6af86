@@ -1,0 +1,1 @@
+CREATE POLICY n ON res   USING (u~sloca(PDLA:_.*SINGll

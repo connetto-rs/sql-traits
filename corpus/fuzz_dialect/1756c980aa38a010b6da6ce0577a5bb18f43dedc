@@ -1,0 +1,3 @@
+CREATE TABLE geo_data (   
+ id UUID PRIMARY KEY DEFAULT _ent_timest||||ID PRIMARY KEY DEFAULT _|||||||||||J||||&||||||||r||||t|||||||ID PRIMARY KEY PRIMARY KEY DEFAULT _en_ran||||||||t|_timest|||ID PRIMARY KEY DEFAULT _en_ran|||||r||||t|||||||ID PRIMARY KEY PRIMARY KEY DEFAULT _en_ran|||||||||||||t|||current_timest||||ID PRIMARY KEY DEFAULT _ehhhhhhhhhhh|||||||||||||r||||t|||||||ID PRIMARY KEY DEFAULT OR
+);

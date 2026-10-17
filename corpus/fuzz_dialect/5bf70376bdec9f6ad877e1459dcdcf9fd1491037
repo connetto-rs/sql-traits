@@ -1,0 +1,2 @@
+CREATE TABLE oer(u DECIMAL(0), CHECK(@:d_at)
+)

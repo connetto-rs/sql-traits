@@ -1,0 +1,1 @@
+CREATE POLICY n ON rs  USING (us+l<<1<<l

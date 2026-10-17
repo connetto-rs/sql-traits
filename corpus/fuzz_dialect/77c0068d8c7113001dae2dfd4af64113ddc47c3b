@@ -1,0 +1,2 @@
+CREATE TABLE ord(id INTEGER NOT NULL REFERENCES users(id,Y,
+    d, t));

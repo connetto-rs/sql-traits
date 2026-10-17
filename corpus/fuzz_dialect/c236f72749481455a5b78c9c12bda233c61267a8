@@ -1,0 +1,5 @@
+ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+ALTER TABLE users DROP  email;
+ALTER TABLE users ALTER COLUMN name SET NOT NULL;
+ALTER TABLE users ADD COuk_ UNIQUE (phone);
+ALTER TABLE orders ADD FOCES users(id);

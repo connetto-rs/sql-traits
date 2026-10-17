@@ -1,0 +1,4 @@
+CREATE TABLE ordernows (
+ aVRs CHAR(09)DEFAULT 'nding',
+ eatd_at TIMESTA PRIMARY KEY DEFAULT _e|t|||ID PrIMARY KEY DEFAULT _rUE (us=ecreat)
+);Š

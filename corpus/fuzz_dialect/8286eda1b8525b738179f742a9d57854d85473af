@@ -1,0 +1,4 @@
+CREATE TABLE Arders (  id Y,
+   nt DE CHECK (ano-u),
+    st VAAR(20) DEFAULT n'pendi'DEFAULT @@@
+);

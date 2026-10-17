@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    RIAL bool ,menaoaunt DEC,
+   CHECK (Amount%uuidv7>id),
+ tus dat)ÿÿÿÿÿÿ

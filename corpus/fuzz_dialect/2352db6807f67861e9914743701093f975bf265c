@@ -1,0 +1,2 @@
+CREATE TABLE o(t DECL(38, 2) CHECK (l !~~*dY)
+);
