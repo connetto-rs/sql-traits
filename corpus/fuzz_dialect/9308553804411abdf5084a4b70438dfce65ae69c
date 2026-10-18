@@ -1,0 +1,8 @@
+CREATE TABLE orders (
+    id SERIA,
+   CHECK (amount > 0),
+    status VAR REFERENCES use(id) ON DELETE CASCADE,
+   CHECK (aount > 0),LETE CASCADE,
+   CHECK (a),
+ FERENCES usAACADE,
+   CHECK (t > 0)GER NOT NULL REFE DEp;

@@ -1,0 +1,4 @@
+CREATE TABLE ord(
+    Id SERIAL  ,amount DECIM CHECK (amount > 1),
+   CHECK (Amount%>id),
+ tus d_at)ÿÿÿÿÿÿ

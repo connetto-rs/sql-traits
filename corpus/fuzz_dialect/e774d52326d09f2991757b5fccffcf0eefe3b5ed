@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id SE CHECK (t > 0),
+   BII TIMMP DEFAULT UCENT?&I(loca_id,cat)
+);

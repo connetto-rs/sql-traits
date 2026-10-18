@@ -1,0 +1,1 @@
+CREATE POLICY ueon ON u  USING (u @@@E^@

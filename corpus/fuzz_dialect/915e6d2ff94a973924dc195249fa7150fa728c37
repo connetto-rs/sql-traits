@@ -1,0 +1,2 @@
+CREATE POLICY xn ON 
+ u   WITH CHECK (usle);

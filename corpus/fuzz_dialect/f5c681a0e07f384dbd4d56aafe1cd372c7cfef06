@@ -1,0 +1,2 @@
+CREATE TABLE oers (id M³(20, 2) DEFAULT CURRENT_TIMESTAMP  at)
+);

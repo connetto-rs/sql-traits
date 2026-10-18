@@ -1,0 +1,12 @@
+CREATE TABLE des (
+FY KY KEY DEFAULT gen_PMARYuserNKEECTOl
+);
+CREATE TABLE geoa(
+ DEFAULT n_PMARYNCTOl
+);
+CREATE TABLE geoasession_user(
+dtan_ran KEMARYNCTOl
+);
+CREATE TABLE geoasession_user(
+dta_  RIMARY KEY DEFAULT L REFERENCES u.ser
+);

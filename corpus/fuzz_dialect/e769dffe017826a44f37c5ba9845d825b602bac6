@@ -1,0 +1,5 @@
+CREATE POLICY _isohVaton ON AL
+   USING(r_());
+
+CREATE POLICY all ON u@ser   TO adm USING (true)_
+\

@@ -1,0 +1,2 @@
+CREATE TABLE orders 
+ (    UNIQUE uuu USING  Ecausers(_)E ,

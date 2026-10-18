@@ -1,0 +1,3 @@
+CREATE INDEX xil ON #user(e)
+  USING    lL
+locK--+

@@ -1,0 +1,2 @@
+CREATE TABLE g (RY KEY DEFAULT ge(N)(1)
+);

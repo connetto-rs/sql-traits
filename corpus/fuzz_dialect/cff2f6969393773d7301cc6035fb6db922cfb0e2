@@ -1,0 +1,3 @@
+CREATE TABLE or(
+   iO NULL REFERENCES rs(ib) ON	DELETE§§,
+)

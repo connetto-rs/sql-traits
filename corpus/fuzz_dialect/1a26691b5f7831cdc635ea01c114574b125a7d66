@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id SERIL  ,amoun VARCHAR(40) DEFAULT 'pending',
+ atus VARCHAR(20) 
+);

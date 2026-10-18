@@ -1,0 +1,5 @@
+CREATE TABLE oernows (
+   tus VARCHAR(20) DEFAULT 'pending',
+dt TIESTA PRIMARY KEY DEFAULT _en|ID PRIMARY KEY DEFAULT _en_|||||BBBBP,
+    UNIQUE (us=erX createt_da)
+);

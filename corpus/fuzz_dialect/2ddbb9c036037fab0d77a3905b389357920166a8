@@ -1,0 +1,2 @@
+CREATE TABLE oe( UNIQUE(e:d,i [te]_at)
+);

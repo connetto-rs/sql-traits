@@ -1,0 +1,2 @@
+ DELETE BA;
+CREATE TABLE se( i INT8)

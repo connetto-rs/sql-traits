@@ -1,0 +1,2 @@
+CREATE INDEX ON ers(a);
+CREATE TABLE g

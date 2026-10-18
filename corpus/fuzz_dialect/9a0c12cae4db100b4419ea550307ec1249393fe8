@@ -1,0 +1,7 @@
+CREATE TABLE users (
+    id IRY KEY,
+    nR PRI KEY,
+  R varchar KEY,
+A   n KEY,
+  aemVC RurrenUE
+);ALTER TABLE users ADD COLIY KE;

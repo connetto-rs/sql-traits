@@ -1,0 +1,3 @@
+CREATE TABLE ord(cHECK ((status) > 4),
+ status VART
+);

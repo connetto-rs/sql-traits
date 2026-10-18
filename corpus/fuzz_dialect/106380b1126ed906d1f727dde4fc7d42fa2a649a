@@ -1,0 +1,3 @@
+GRANT SELECT ON ALwbglic TO readonloly;
+GRANT SELECT ON ALLblic TO dly;
+GRANT SELECT ON A TO rÿÿM

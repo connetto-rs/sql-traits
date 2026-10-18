@@ -1,0 +1,5 @@
+CREAtE TABLE rder(
+ OT ULL REFERENCES ue
+    ON DELETE 
+    
+ dK

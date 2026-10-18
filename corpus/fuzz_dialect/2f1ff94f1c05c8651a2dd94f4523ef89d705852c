@@ -1,0 +1,2 @@
+CREATE POLICY us_lat ON urs
+USING (usLll.lr.t._ll.l.eri()) ;
