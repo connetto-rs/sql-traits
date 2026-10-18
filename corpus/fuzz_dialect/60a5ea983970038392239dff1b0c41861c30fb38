@@ -1,4 +1,0 @@
- CREATE ROLE enin;
-GRANT USAGE ON SCHEMbc TO n;
-SET L=
- H,HHR

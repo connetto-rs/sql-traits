@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-    id SERCADE,
-    amount L(10,) CHECK (amount > 0),
-  Hatus VARCP DEFAULT CURRIMESTAM?AL(05, 2) CHECK (amount > 0),
-  HAR KEP DEFAULT  (user_id, created_at)
-);

@@ -1,3 +1,0 @@
-CREATE POLICY szol ON u
-  TO	ad,iad,i,	
-ad,iÿÿÿ

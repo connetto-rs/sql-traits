@@ -1,3 +1,0 @@
-CREATE ROLE
-CREATE ROLE rea;
-GRANT USAGE ON SCHEMA pbl,c,c TO reenly;

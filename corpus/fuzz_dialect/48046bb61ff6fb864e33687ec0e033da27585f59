@@ -1,4 +1,0 @@
-CREATE ROLE GIN PASSWORD 'secet';
-GRANT SELECT ON ALLic TO radonly;
-
-GRANT   EXEC		)

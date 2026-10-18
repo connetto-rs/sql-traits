@@ -1,5 +1,0 @@
-CREATE INDEX mdxOlogaul ON uuids(email)
-  USING   ONo 
-    USING   ON -- ON use 
-    USING ON --n ON ause 
-    USING   ON 88LG  ulLEÿÿ

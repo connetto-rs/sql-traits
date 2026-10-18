@@ -1,6 +1,0 @@
-CREATE TABLE rs (
-
- N PRIARY KEY,
-   NOTREFERENCES use,
-mos VARCHAR(20) DEFAULT     UN	
-);

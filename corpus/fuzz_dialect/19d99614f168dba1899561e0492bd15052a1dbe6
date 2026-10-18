@@ -1,4 +1,0 @@
-CREATE INDEX r1_email ON users(ema.il);
-CREATE UNIQUE INDEX idx ON orde(user_id, crea-te_dAt DESC);
-CREATE INDEX idx_orderrders_user_date ON orders(user_creat-ed_at DESC);
-CREATE INDEX idx_orders_status ON orders(stqtus) WHERE statþs;

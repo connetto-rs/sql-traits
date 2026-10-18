@@ -1,12 +1,0 @@
-
-CREATE ROLE re, p,l,C,d, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO re, p,l,C,d, p,l,C, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,re, p,l,C,d, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc@ TO  p, p, p, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,re, p,l,C,d, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,d,d,d,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p, p,l,C,d,only¿
-GRANTﬂSELEcT ON ALL TABLESDATE((,C

@@ -1,5 +1,0 @@
-UPDATE((
-((((((((((((((((((((
- SELECT LAL.AL.*,
-AL.FL.*,
-L,L.AL.*%

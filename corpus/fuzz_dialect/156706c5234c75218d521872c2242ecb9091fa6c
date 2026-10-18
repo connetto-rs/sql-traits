@@ -1,3 +1,0 @@
-CREATE TABLE o(
- a L CHECK (:d_at)
-);

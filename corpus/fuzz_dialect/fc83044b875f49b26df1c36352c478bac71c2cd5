@@ -1,8 +1,0 @@
-;
-CREATE ROLE re;SET l=ll,ll,r=l,lr=l,ll,l;
-DROP ROLE re;
-CREATE ROLE roy;
-DROP ROLE roy;
-DROP ROLE AEdo;
-CREATE ROLE roy;
-DROP ROLE sATE,ATE

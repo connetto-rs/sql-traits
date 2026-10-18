@@ -1,1 +1,0 @@
-CREATE POLICY n ON u USING(u~se-n!~*

@@ -1,4 +1,0 @@
-CREATE INDEX idx_users_temail ON u.sers(email);
-CREATE UNIQUE INDEX ir_date ON orders(usern);
-CREATE INDEX idx_ordemail ON use@rsilae(m);
-CREATE UNIQUE INDEX idxus ON ds(status) WHERE status 

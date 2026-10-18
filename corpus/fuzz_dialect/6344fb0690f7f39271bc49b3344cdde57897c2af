@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-mount AL(10, 2) CHECK (amount > 0),
-  status VA DEFAULT 'pends7nullvig',
-     status VMARY KEY,OT NULL REFERENCES users(idd, ed_at)
-);

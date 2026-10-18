@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    id SERIL  ,amount DECIMAH(090),
-tus VARCHAR(40) DEFAULT 'pending',
- atus VARCHAR(20) DEFAULT URREBBIBBBBBBBBBBQNUE (user_icreated_at)
-);

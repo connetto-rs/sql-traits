@@ -1,2 +1,0 @@
-CREATE INDEX iate ON orders(us,	crdd, c);
-CREATE INDEX ON s(stus) WH!= ;

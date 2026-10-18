@@ -1,4 +1,0 @@
-CREATE TABLE ordr(
-maunatu CHAR(20) DEFAULT 'pending',
-s CHAR(20) 
-);

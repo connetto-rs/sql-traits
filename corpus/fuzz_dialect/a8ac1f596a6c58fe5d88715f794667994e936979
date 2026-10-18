@@ -1,2 +1,0 @@
-CREATE TABLE ow(t DIM, CHECK(am@@:a)
-);

@@ -1,3 +1,0 @@
-CREATE POLICY xn ON 
- u  USING (u)
- WITH CHECK (usle);

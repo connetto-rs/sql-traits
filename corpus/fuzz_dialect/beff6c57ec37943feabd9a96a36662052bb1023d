@@ -1,7 +1,0 @@
-CREATE TABLE orders (
-
-    amount DEEIMAL(10,) CHECK (amount > 0),
-  Hatus VARCHAR44444STAMP DEFAULT CURRIMESTAM?AL(11, 2) CHECK (amount > 0),
-  HAR KEY,
-   s VARCSTAMP DEFAULT  (userated_at)
-);

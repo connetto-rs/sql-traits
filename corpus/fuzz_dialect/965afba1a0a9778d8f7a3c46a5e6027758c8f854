@@ -1,2 +1,0 @@
-CREATE INDEX m_  USING  Ll ON s(mail)
---EXCa) l

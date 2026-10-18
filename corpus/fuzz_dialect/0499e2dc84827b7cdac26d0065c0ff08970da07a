@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-  userT NULL REFERENCES userS(idoct) ON DELETE CASCADE,
-nt DEC CHECK (aot?$ -> 0),
- id INTEG REFERENCES u(idnow) ON UPDATE((UP(q(pATHDELETE CASoLEr

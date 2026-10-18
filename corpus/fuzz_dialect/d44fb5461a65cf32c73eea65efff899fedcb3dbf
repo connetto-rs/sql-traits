@@ -1,2 +1,0 @@
-CREATE TABLE s (CHECK(gl_*A NOTNULL )
-);

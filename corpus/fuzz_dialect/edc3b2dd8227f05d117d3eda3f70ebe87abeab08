@@ -1,3 +1,0 @@
-CREATE ROLE rmanl;
-GRANT read;
-A AN

@@ -1,3 +1,0 @@
-CREATE TABLE orers (d SR(20) DEFAULT uuid'pending',
- as A(ses)
-);

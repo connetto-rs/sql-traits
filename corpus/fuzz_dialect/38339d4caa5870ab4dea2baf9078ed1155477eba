@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-    RIAL boolean ,amount DECIMAL(9,  0),
-   CHECK (AmountA>id),
- tus d_at)ÿÿÿÿÿÿ

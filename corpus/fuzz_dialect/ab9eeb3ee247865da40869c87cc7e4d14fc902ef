@@ -1,1 +1,0 @@
-CREATE POLICY n ON res   USING (u~s(PDLA:ALAoct_.*SINGll

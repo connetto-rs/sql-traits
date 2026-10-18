@@ -1,2 +1,0 @@
-CREATE TABLE at (ata EXT[] DEFAULT+'{}' [uui:en] ?R
-);

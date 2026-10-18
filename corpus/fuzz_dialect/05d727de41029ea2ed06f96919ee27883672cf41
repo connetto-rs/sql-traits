@@ -1,4 +1,0 @@
-CREATE FUNCTION n(oG)
-LANGUAGE QAS 
-$$
-$$

@@ -1,1 +1,0 @@
-CREATE POLICY rn ON r USING (All:""""ž

@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-  id ECIMAL(08) CHECK (llllllllllll~*Yllll~*YllSucreated_at)
-);

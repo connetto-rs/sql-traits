@@ -1,4 +1,0 @@
-CREATE TABLE ders (
-   tuat nVARCHAR(20) DEFAULT Q);CREATE TABLE dlength (
-   tuat nVARCHAR(20) DEFAULT CURRQ);
-

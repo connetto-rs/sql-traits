@@ -1,2 +1,0 @@
-CREATE TABLE users (
-  id I);ALTER TABLE users ADD ID P©ARY KEY 

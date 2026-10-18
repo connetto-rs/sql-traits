@@ -1,5 +1,0 @@
-CREATE TABLE oratrs (
-     B sNOTULL REFERENCES E,
- amount DEEIMAL(0sum2) CHECK (a~mou -> 0),
-MESTBBB #st
-);

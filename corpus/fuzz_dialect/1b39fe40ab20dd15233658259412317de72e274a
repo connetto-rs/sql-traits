@@ -1,8 +1,0 @@
-CREATE TABLE order (
-    
-LE orders (
-  id SERIAL P KE
-NULL REE ECNRE   crea
- s  t atsAuV RCCgnAR   UNIAL PRIMARY KEY,
-  uer_   t)
-);

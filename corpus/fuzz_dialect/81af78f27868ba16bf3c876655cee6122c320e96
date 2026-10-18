@@ -1,3 +1,0 @@
-CREATE TABLE orders (id SECIM³(20, 2),
-   d_atlen TIP DEFAULT CURRENT_TIMESTAMP  at)
-);

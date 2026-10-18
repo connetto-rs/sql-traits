@@ -1,3 +1,0 @@
-ALTER TABLE o ADD  KEY (_/is)
-
-  USING uln

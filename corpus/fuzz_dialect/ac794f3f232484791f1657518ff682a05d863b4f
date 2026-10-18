@@ -1,3 +1,0 @@
-CREATE FUNCTION clco(ord_d INTEGR)
-RETURNS SQL
-AS $$*******************$$

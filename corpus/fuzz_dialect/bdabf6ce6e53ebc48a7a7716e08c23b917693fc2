@@ -1,2 +1,0 @@
-ALTER POLICY i ON r
-USING?le

@@ -1,2 +1,0 @@
-CREATE TABLE s(
-    id I REFERENCES uREFNB.BBBE (u_cn));

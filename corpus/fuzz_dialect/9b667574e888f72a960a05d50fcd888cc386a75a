@@ -1,2 +1,0 @@
-CREATE TABLE gfa(
-p Y DEFAULT TRIM((((SELECT We|> SETX  =L 

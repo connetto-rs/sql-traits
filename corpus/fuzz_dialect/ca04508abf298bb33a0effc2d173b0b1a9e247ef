@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    id SERRAR(24) DEFAULT '',
-    creed_at P DEFAULT  S(20) DEFAULT '',
-at TTAMP DEFAULT CINTGUEALTAU CURRT)
-);

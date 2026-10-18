@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-   amount DL(10, 2) CHECK (amount > 0),status VAR4TIMESTAMA CHECK (amount > 0),   ted_a TIMESTAMP DEFAULT  (ue,_id,at)
-);

@@ -1,3 +1,0 @@
-CREATE TABLE o (
-CHECK((89,X2)@t)
-)

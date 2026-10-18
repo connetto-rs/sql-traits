@@ -1,4 +1,0 @@
-CREATE TABLE geo_data (
-    fd UUMARY KEY DEFAULT gen_randod(*),t P.IL,
-  tag HSTE,tsv VECTOR
-);

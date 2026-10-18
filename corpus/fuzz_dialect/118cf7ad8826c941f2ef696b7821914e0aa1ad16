@@ -1,2 +1,0 @@
-CREATE TABLE at (ta EXT[] DEFAULT+'{}' [uui:en] ?R
-);

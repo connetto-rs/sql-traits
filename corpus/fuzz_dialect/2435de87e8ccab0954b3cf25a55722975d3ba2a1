@@ -1,2 +1,0 @@
-CREATE POLICY si ON r   USING(mjn:
-[34

@@ -1,3 +1,0 @@
-CREATE ROLE donly;
-GRANT SELECT ON SCHEMA @p,i TO  donly;
-;

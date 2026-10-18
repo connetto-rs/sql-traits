@@ -1,2 +1,0 @@
-CREATE ROLE @only;
-GRANT SELECT ON SCHEMA p,ub,ic TO ROLE currenOLEier

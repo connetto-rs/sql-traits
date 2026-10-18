@@ -1,4 +1,0 @@
-CREATE TABLE rs (
-    id SERCAAL(11, 2) CHECK (amount > 0)DEFAULT 'peng',
- cr_at TIMMP DEFAULT CTIMESTAMAL(10, *) CHECK (amount > 0),DEFAULT CURRENT_TIME(TABLE@10,ed_at)
-);

@@ -1,5 +1,0 @@
-CREATE INDEX idx_users_email ON users(email);
-CREATE UNIQUE INDEX idx_s_user_date ON opders(user_id, createmail);
-CREATE UNIQUE INDEX dx_orers_email ON users(email);
-CREATE UNIQUE INDEX idx_orders_uorder ON users(email);
-CREATE UNIQUE INDEX iE TABLE orÿ_

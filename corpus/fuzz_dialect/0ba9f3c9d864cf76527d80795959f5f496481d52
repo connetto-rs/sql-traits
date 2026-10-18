@@ -1,2 +1,0 @@
-CREATE TABLE oers (#
-   L REFERENCES uses(id,  d,c
