@@ -1,0 +1,7 @@
+CREATE TABLE orde (
+    id SADE,
+   CHECK (amou.t > 0),
+  at T,
+   CHECK (am.t > 0), a BBP,
+    UNIQUE (u, ct)
+);

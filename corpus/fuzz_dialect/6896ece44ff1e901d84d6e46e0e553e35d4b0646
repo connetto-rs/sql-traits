@@ -1,0 +1,5 @@
+CREATE INDEX mail ON uses(emai)
+  USING   O   USING use 
+  USING   O  USING   ON --n ause 
+   USING  ulL
+    USINGÿÿ

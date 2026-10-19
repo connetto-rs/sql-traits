@@ -1,0 +1,4 @@
+;
+CREATE ROLE o;
+CREATE ROLE oy;
+DROP ROLE sA

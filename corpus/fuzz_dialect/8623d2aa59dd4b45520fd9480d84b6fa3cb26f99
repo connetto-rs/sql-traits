@@ -1,0 +1,1 @@
+CREATE INDEX ON ud(em)USING A`T

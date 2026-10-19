@@ -1,0 +1,2 @@
+CREATE POLICY ion ON res
+USING (u(l(s) WHERE lue);

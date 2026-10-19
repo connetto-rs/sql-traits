@@ -1,0 +1,2 @@
+CREATE POLICY uwon ON user
+USING (a<=+te<=l/A

@@ -1,0 +1,4 @@
+CREATE TABLE orders ( am@unt DECIMAL(16, 2) CHECK (a0),
+   us VARCHAR(20) DEFAULT e'pndig',
+ atus zVARC(2r_id, create)
+);

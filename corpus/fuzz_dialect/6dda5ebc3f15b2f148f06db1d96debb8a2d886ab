@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+   amount DEEIMAL(10, 2) CHECK (amount > 02) CHECK (amount > 0),   ted_at TIMESTAEFAULT  (qse,_id,at)
+);
+CREATE TABLE odrers (
+   amount DEtEEIMAL(10, 2) CHECK (amount > 02) CHECK (amount > 0), AMP DEFAULT  (qse,_id,at)
+);

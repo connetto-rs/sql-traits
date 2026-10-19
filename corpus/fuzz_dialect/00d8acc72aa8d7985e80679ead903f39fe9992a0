@@ -1,0 +1,2 @@
+ALTER  FUNCTION a.t$
+SET l=g A

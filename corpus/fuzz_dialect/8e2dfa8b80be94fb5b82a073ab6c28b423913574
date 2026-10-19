@@ -1,0 +1,9 @@
+CREATE INDEX _date ON orders(user_id, creat-ed_at DESC);
+ CREATE INDEX iddatorders_stadx_orders_user_date ON orders(user_ DESC);
+CREATE INDEX i_user_date ON orders(user_id, creat-ed_at DESC);
+CREATE INDEX idx_orde_udx_orde_users_emser_date ON orders(user_id, creat-ed_at DESC);
+ CREATE INDEX idx_idx_orders_stadx_orders_user_date ON orders(user_ DESC);
+CREATE INDEX idx_oers_emser_dr_date ON orders(user_id, creat-ed_at DESC);
+ CREATE INDEX idx_order_user_date ON orders(user_id, creat-''''''''''''''''''''''''''''''''ed_at DESC);
+ CREATE INDEX idx_orders_s_user_date ON orders(user_id, creat-ed_at DESC);
+CREATE INDEX idx_orde_users_emsetatus ON orders(status) WHERE statuƒßÞÂ 'complete';

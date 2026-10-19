@@ -1,0 +1,3 @@
+ALTER TABlE orde ADD  KEY (_/gen,C)
+ USING   ON---.4 (_/gen,C!
+ USING now USING uC

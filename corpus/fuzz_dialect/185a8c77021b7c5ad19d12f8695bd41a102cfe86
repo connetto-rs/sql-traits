@@ -1,0 +1,14 @@
+CREATE TABLE ord (
+ INDEX idx, 
+  
+ INDEX L REFERENCES userE,  
+  
+ INDEX _useAdx_lAD2E, 
+  
+ INDEX L REFERENCES userE,  
+  
+ INDEX idx_useADE, 
+  
+ INDEX DE, 
+  
+ INDEX i

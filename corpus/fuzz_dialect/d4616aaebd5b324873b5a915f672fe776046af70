@@ -1,0 +1,3 @@
+CREATE TABLE orders (ENCES As REFERENCES ADE,
+ os HA#R(20) DEFAULT     UNQUE (creat>>_at)
+);

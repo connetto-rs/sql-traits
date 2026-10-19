@@ -1,0 +1,2 @@
+CREATE ROLE min ROLE reaCM;
+GRANT SELECT ON  ic TO reado WITH

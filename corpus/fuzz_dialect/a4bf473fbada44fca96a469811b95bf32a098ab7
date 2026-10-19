@@ -1,0 +1,4 @@
+CREATE TABLE oders (
+ _at TIMEMP DEFAULT CURRENT_TIMESTAMP,UIN 
+   QUE ( reated_at)
+);

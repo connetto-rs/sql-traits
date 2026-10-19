@@ -1,0 +1,4 @@
+CREATE INDEX locse ON users(email)
+  USING n--aus 
+    USING   ON --n Oema ause 
+   USING   ON      USING  u   USING  ulL ulLEÿÿ

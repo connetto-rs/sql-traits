@@ -1,0 +1,4 @@
+CREATE TABLE rs (
+    id SERCAAL(1, 2) CHECK (am)DEFAULT 'peng',
+ cr_at TIMMP DEFAULT CTIMESTAMAL(10, *) CHECK (aunt > 0),DEFAULT CE(TABLE@10,ed_at)
+);

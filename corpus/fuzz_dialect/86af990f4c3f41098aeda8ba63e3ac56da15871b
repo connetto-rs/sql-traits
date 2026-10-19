@@ -1,0 +1,1 @@
+(UPDATE O SET  s =ON(s) WHERE(s)  `

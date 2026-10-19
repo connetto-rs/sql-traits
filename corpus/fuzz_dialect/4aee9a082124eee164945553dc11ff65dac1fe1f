@@ -1,0 +1,8 @@
+CREATE ROLE eedonlya;
+GRANT USAGE ON SCHEMA publ, pHH,Han,HHd,minH,HHHH,H,H,HHd,minH,Han,H,HHHH,useruuidv4HH,HHHH,HHHH,HHH,c TO rejadonin;
+GRANT USAGE ON Sn,HHHH,HNan,HHHHH,HHHHd,Hsum,HH,HHHH,HiNanHH,HHubl,c TO redoyadonin;
+GRANT USAGE ON SCHEMA publ, publ,c TO reenlyadonin;
+GRANT USAGE ON SCHEMA publ, publ,c TO rejadonin;
+GRANT USAGE ON SHHHHH,HHHHH,HHHH,HH,HHH,HiNan,HHHH,HHubl,c TO redoyadonin;
+GRANT USAGE ON SCHEMA publ, publ,c TO reedoonlaydonrejadonin;
+GRANT USAGE ON SHHHHH,HHHHH,HHHH,HH,HHHH,HiNan,HHHH,HHubl,c´

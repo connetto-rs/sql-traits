@@ -1,0 +1,2 @@
+CREATE TABLE r (
+T NL REFERENCES use.BBB.B@);

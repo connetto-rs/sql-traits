@@ -1,0 +1,3 @@
+CREATE TABLE a (
+ R KEY DEFAULT @@@@>=@@@)
+--xd

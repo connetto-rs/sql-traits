@@ -1,0 +1,2 @@
+CREATE TABLE ge(UUID PRARY KEY, point PO_uuid(),
+    point T[] DEFAULT+ T);

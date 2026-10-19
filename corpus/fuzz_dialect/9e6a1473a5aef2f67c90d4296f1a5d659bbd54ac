@@ -1,0 +1,5 @@
+CREATE ROLE a;
+GRANT SELECT ON Aublic TO reonly;
+GRANT ALL ON TABLE users TO admin;
+GRANT USAGE ON A  TO r;
+GRANT USAGE ON SCEbcic TO rg;

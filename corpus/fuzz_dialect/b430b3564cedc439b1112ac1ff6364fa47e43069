@@ -1,0 +1,4 @@
+CREATE TABLE o(
+    id EK(20)DEFAULT x'pen',
+a U
+);

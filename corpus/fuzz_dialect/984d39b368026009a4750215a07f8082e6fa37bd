@@ -1,0 +1,3 @@
+CREATe TABLE or(
+    EGER NOTULL REFERENCES users(id_at)PRIMARY KEY,r_id ILL REFERENCES users(it)
+);ù)

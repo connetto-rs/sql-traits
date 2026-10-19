@@ -1,0 +1,9 @@
+CREATE TABLE ers (
+   E SRSRCADE,
+   CHECK(amou.t > 0),  at TE,
+   CHECK (amo.t > 0),
+ at BBCADE,
+   CHECK (amou.t > p),
+  at E,
+   CHECK (amou.cret)
+)z

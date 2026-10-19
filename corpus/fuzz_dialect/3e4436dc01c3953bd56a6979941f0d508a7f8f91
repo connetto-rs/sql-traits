@@ -1,0 +1,2 @@
+CREATE TABLE orers (d SERCADE,BIAL PRIM,RY KEY,   user_id INT,s BBBBBBP,  UNIQUE (user_id, creat)
+);

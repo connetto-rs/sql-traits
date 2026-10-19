@@ -1,0 +1,4 @@
+
+ SELECT
+A |>WHERE(((
+ SELECT W |>WHERE oTE(

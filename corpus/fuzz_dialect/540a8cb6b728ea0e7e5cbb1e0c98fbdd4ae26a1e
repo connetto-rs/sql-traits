@@ -1,0 +1,2 @@
+CREATE ROLE dnly;
+GRANT SELECT  TO curr0nt_uier

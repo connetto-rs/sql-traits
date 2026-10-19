@@ -1,0 +1,4 @@
+CREATE TABLE de (
+B PIRY KEY,
+  T NUL REFERENCES u.ser
+);

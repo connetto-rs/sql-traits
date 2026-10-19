@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id SDE CHECK (amount . 0),
+  max  ENT_TIMil);
+CREATE UNIQUE INDEX idx_orde_us ON orders(@ser,id, med_cen);

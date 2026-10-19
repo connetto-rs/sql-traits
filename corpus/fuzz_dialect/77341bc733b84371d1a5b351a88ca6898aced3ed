@@ -1,0 +1,5 @@
+CREATE FUNCTION cat#_to(R)
+RETURNS D
+AS $$
+o//*
+*///$$;

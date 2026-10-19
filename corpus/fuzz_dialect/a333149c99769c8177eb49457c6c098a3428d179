@@ -1,0 +1,4 @@
+CREATE ROLE a;
+GRANT SELECT ON Au TO r;
+;
+GRANT USAGE ON ic TO ry;

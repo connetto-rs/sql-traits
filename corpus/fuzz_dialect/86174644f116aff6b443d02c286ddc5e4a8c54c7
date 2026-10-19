@@ -1,0 +1,2 @@
+CREATE TABLe orders (  id RIAL ,amount DL(9, 2) CHECK (amount > :0), sttn DECIMA@L(09, 2) CHECK (amount > 1), s VA
+);

@@ -1,0 +1,11 @@
+CREATE TABLE ta (
+    id U,UID PRIMd(),
+    p
+SCe_,t PT,
+   BNOT NULL,
+  ags TEXT[] DEFAULT '{}',
+  taOT LL,
+      metadata HSTORE,
+   OT NULL,
+    tsv TSVECOR
+);

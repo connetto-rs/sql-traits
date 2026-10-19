@@ -1,0 +1,2 @@
+CREATE TABLE rw (
+ a DECIMAL(122 ), CHECK (@@@:d_at ), CHECK (@@@:d_at))

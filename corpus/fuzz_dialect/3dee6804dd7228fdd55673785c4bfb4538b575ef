@@ -1,0 +1,2 @@
+CREATE TABLE r (
+mo DECI(10, 2) CHECK (:a@:a@localtime!));

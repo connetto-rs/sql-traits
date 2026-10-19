@@ -1,0 +1,2 @@
+CREATE POLICY usean ON resus
+  USING (+Nq''''+A++len (++Nq''''+A+++++++Nq''''+++++Nq''''++SIN+Nq''''+A+++++Nq''''+++++++Nq''''+++Nq''''+++

@@ -1,0 +1,9 @@
+CREATE TABLE des (
+FADEFAULT gen_PMARYNKEECTOl
+);
+CREATE TABLE geoa(
+ Y KEY,FAULT gen
+);
+CREATE TABLE geoasession_user(
+ULT L REFERENCES u.seuserr
+)½

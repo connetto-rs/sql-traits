@@ -1,0 +1,2 @@
+CREATE TABLE ord 
+ ( UNIQUE @u USING  uEcaur(ed_));

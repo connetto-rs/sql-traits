@@ -1,0 +1,2 @@
+CREATE TABLE gfa(
+p Y DEFAULT T(U(_((TRIM@U&'' 

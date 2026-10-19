@@ -1,0 +1,2 @@
+SELECT $O res$2 FOR UPDATE
+OF ((ECT-z

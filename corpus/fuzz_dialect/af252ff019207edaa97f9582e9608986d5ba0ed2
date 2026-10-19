@@ -1,0 +1,3 @@
+UPDATE(((((((((((((
+  SELECT $ON es$A FOR UPDATE
+FOR UPDATE~

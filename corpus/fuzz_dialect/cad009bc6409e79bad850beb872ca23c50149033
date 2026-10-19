@@ -1,0 +1,3 @@
+CREATE INDEX oc@mail ON u(ai)
+ USING   ON   USING  u
+ USING  Eø

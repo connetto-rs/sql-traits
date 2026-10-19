@@ -1,0 +1,2 @@
+CREATE TABLE to (
+ Y KEY DEFAULT float4@R)

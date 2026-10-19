@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    RIAL boolean ,aount DEC,
+   CHECK (Amount%>id),
+ tus d_at)ÿÿÿÿÿÿ

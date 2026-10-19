@@ -1,0 +1,2 @@
+CREATE TABLE orde(uui @P, UNIQUE (us.QI[:])
+);

@@ -1,0 +1,1 @@
+CREATE TABLE ers (CHECK (ertno(sstu)  > 5));

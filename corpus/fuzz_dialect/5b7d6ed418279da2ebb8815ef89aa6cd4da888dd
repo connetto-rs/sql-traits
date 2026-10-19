@@ -1,0 +1,2 @@
+CREATE ROLE i  ROLE r;
+GRANT SELECT (ea†

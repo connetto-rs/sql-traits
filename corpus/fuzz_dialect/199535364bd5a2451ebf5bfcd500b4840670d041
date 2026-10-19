@@ -1,0 +1,5 @@
+CREATE TABLE ge (
+id KEY ,   point POINT,
+   ran JSONB NULL,
+  tags TEXT[ ]DEFAULT '{}',tsv TSVEO
+);

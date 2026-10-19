@@ -1,0 +1,4 @@
+CREATE POLICY use ON use  WITH CHECK (d());dmall ON u@
+  #O 
+  
+ÿ

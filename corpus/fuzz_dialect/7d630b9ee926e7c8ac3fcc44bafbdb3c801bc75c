@@ -1,0 +1,2 @@
+CREATE TABLE g(
+     INDEX  USING A

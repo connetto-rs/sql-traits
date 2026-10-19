@@ -1,0 +1,6 @@
+ DELETE A.BT
+ FROMst$;
+ DELETE C
+ FROMst$;
+ DELETE CA
+ FROMt

@@ -1,0 +1,2 @@
+CREATE TABLE g (R KEY DEFAULT ge(N)(1)
+);

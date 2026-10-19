@@ -1,0 +1,2 @@
+CREATE TABLE o ( CHECK(a(09,2).@_at)
+)

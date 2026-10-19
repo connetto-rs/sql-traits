@@ -1,0 +1,3 @@
+CREATE TABLE or (d SADE,
+    amount IMAL(3, 2) CHECK (amount #> 0),F  U
+);

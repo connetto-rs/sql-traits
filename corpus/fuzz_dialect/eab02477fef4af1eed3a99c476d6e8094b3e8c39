@@ -1,0 +1,2 @@
+CREATE INDEX i ON QQQQQQ.QQQQQQQ.s(aC#);
+CREATE INDEX us ON orders(stas) WHERE s

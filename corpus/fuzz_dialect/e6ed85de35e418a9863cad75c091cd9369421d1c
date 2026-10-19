@@ -1,0 +1,2 @@
+CREATE POLICY uson ON user  ;
+CREATE POLICY n ON ING

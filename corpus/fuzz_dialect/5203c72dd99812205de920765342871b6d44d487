@@ -1,0 +1,4 @@
+CREATE TABLE user (  id I1N PRIMARY KEY,
+  me LL,
+ail TEXT UNIQUE
+);

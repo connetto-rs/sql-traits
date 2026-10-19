@@ -1,0 +1,6 @@
+CREATE FUNCTION ucte_total(oC,AWC,TUPLE (TtusBbBBtud(),CASus, tCaCASC,ASC, usBbBB,
+Btud(),CASus, tCaCASC,ASC, usBbBB,
+aCADEL,  DELETd(),C,ASC, usBbBB,
+aCASC, stDC,AASCAd 
+t)
+);

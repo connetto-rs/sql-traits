@@ -1,0 +1,4 @@
+CREATE TABLE users (
+  R varchar KEY,
+A   n KEY
+);ALTER TABLE users ADD COL KEMAR;

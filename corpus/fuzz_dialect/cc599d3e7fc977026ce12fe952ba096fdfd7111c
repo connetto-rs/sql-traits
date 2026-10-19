@@ -1,0 +1,2 @@
+CREATE TABLE rde(uui @P, UNIQUE (us.QI[:])
+);
