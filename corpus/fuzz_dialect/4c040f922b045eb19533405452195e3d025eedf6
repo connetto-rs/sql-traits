@@ -1,3 +1,0 @@
-CREATE TABLE orders (
-    id _TIMil);
-CREATE UNIQUE INDEX orde ON orders(user,id, c-ed_en);

@@ -1,1 +1,0 @@
-ALTER TABLE des ADD  KEY (_,is,id)=

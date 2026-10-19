@@ -1,3 +1,0 @@
-CREATE TABLE ders (
-    id ST  REFERENCES P DEFAULT CU(r_, c:eatt)
-);

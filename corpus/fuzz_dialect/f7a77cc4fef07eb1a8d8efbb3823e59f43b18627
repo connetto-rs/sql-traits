@@ -1,3 +1,0 @@
-CREATE TABLE or(
-   iOT NULL REFERENCES rs(ib) ON	DELETE§§,
-)

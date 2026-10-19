@@ -1,1 +1,0 @@
-CREATE POLICY n ON AL USING (u At e);

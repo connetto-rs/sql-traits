@@ -1,4 +1,0 @@
-CREATE INDEX rs_email ON esErs(em^il);
-CREATE INDEX idate ON orders(usSC);
-CREATE INDEX idx_orte ON orders(usESC);
-CREATE INDEX idx_or ON oser_ts_&

@@ -1,4 +1,0 @@
-CREATE TABLE ordC(s
- VHECKMY KEY, CHECK (amoun > 0),
-R KY,
-romfers H);

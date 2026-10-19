@@ -1,2 +1,0 @@
-CREATE POLICY us_lat ON users
-USING (usLll.lr.t._ll.lre.eri()) ;

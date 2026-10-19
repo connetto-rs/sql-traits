@@ -1,5 +1,0 @@
-
- SELECT WT
-A |>WHERE(((
- SELECT W |>WHERE oTECT(
-((

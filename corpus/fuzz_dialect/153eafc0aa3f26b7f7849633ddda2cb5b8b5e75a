@@ -1,2 +1,0 @@
-CREATE TABLE oe( UNIQUE(e:d,i [crte]_at)
-);

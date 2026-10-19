@@ -1,3 +1,0 @@
-CREATE ROLE rl;
-GRANT SELECT TO admcu;
-GRANT SELECT TO dpadonl~

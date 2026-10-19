@@ -1,4 +1,0 @@
-CREATE ROLE aEATE ROLE donin;
-GRANT USAGE ON SCHEMA publ,c TO reeonin;
-GRANT USAGE ON SCHEMA pu,c TO rlyadonin;
-GRANT USAGE ON SCHEMA publ)

@@ -1,1 +1,0 @@
-CREATE INDEX email ON users(use#) WHERE at T

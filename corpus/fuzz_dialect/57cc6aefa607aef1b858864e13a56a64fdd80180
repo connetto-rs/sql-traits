@@ -1,2 +1,0 @@
-CREATE POLICY useoh ON s
-     USING (u|=#lll.'l'(

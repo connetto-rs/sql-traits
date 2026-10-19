@@ -1,3 +1,0 @@
-CREATE TABLE orders (d_at TIA PRIMARY KEY DEFAULT _enRIMARY KEY DEFAULT nraBP,
-    UNIQUE es(r=u_ioreated)
-);

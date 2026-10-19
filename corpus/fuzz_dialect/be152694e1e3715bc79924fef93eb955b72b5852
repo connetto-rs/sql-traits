@@ -1,2 +1,0 @@
-CREATE POLICY se ON s USING (usll.+us
- e

@@ -1,2 +1,0 @@
-CREATE TABLE g(
- id UUID KEY DEFAULT _en|"LL" KEY)

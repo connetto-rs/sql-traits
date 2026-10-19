@@ -1,5 +1,0 @@
-CREATE INDEX ils_eail ON ure(eta);
-DESC DEL;
-DESC emai;
-DESC DEL;
-DESC D

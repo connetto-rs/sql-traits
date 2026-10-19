@@ -1,3 +1,0 @@
-CREATE POLICY er_ ON user TO	ad,i,
-	d,y,
-	ae,i,

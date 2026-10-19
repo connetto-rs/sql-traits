@@ -1,2 +1,0 @@
-CREATE POLICY usean ON ress
-  USING (+Nq''''+NG++Nq''''+A_+++Nq''''+

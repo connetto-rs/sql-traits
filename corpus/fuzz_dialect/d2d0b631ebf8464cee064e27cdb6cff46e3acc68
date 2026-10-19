@@ -1,3 +1,0 @@
-CREATE FUNCTION clco(oR)
-RETURNS SQL
-AS $$*****************$$

@@ -1,4 +1,0 @@
-
-CREATE TABLE ors (
- am D(2) CHECK ((a09, 2)@@ DEI(2))
-);

@@ -1,3 +1,0 @@
-CREATE TABLE ata (
-    iUUID Y KEY  NULL,s T DEFAULT+R
-);

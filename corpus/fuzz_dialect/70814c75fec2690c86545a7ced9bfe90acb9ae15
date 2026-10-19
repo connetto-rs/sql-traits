@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-maun DECI,
-   statuRAVs CHAR(20) DEFAULT 'pending',
-    crt IMEST
-);

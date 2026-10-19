@@ -1,3 +1,0 @@
-CREATE TABLE rs (
-    r nVARCHAR(41) DEFAULT _MBB&<(ur_id,_at)
-);

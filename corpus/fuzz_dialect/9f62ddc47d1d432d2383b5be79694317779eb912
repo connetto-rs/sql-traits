@@ -1,3 +1,0 @@
-CREATE FUNCTION a#_a(o)
-AS $$ /*/
-$$;

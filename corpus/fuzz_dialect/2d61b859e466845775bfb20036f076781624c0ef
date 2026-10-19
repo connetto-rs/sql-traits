@@ -1,2 +1,0 @@
-CREATE TABLE ord(aou DECIMAL(1822 ), CHECK (@@@:d_at ),CHECK (@@@:d_at ), CHECK (@@(@P@:a_at)
-)

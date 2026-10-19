@@ -1,3 +1,0 @@
-CREATE TABLE orders (t EL(1  20) CHECK (amount >amount > 0),
- amount DEEIML(1sum2) CHECK (amount >  TABLE 0),lengthMBB st
-);

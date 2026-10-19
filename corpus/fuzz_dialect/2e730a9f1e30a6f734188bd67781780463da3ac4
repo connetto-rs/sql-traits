@@ -1,5 +1,0 @@
-
-CREATE ROLE re, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA c TO  only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  l,C,d,d,d,d, t,l¬CREATE TRIC|

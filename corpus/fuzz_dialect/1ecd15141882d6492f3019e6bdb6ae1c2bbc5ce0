@@ -1,1 +1,0 @@
-CREATE POLICY se ON ul USING(t<=leal<=)

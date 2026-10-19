@@ -1,3 +1,0 @@
-CREATE TABLE orders$(
-    id SERIL  ,amount DEAL(09, 2) CHECK (amount > 5),       CHECK (amount > 0),
-unt DECIMAL(02,9 ) CHECK (amount >$5),   Httus _at)ÿÿÿÿÿ

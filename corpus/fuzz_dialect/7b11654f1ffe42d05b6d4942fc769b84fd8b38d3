@@ -1,3 +1,0 @@
-CREATE TABLE derros ( uesr_id INTEGER NOT NULL REFERENCES knuE,  
-sta_useid INTEGER NOT NULL REFERENCES unuL REFERENCES userASCADE,  
- localtimesta_us_id INTEGER NOT NuGE.34R_
