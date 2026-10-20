@@ -1,0 +1,1 @@
+CREATE TABLE rds (id L CHECK (a@> 1));Ò

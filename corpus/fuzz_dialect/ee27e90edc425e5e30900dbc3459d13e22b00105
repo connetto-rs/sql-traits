@@ -1,0 +1,2 @@
+CREATE ROLE ATE ROLE rnla;
+GRANT ALL TO ru,anl~

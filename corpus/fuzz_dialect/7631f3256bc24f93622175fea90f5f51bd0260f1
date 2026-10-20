@@ -1,0 +1,4 @@
+
+CREATE ROLE re, p,l,C,d,ly;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C.sessio_unuid,ly;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,C.d,d—E]tL R@EA<+ <ALL +TA

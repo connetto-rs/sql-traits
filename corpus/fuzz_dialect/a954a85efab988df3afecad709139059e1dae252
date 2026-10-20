@@ -1,0 +1,3 @@
+ DELETE CO sdonly;
+GRANT ALL PRIVILEGES ON FUNCTION l._e.t._li
+GR

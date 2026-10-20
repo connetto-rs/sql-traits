@@ -1,0 +1,4 @@
+CREATE TABLE a (
+t OI,  tags TEXT[]DEFAULT+'{}',
+AUIDS TEXT[] DEFAULT+'{',
+    AUIDdv TS);

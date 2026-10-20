@@ -1,0 +1,2 @@
+CREATE TABLE n(
+CHECK (unt > :0L

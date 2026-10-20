@@ -1,0 +1,2 @@
+CREATE TABLE d(
+CHECK (m.u> 0))

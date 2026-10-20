@@ -1,0 +1,4 @@
+CREATE TABLE ata (
+    ULT KEY DEFAULT _R
+||user||R
+);

@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    ERCAMARY KEY);
+CREATE TABLE or(
+sessioN_ RRY KEY,
+  GER T NULL REFERENCES user);

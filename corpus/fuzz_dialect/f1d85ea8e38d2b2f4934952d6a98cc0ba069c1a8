@@ -1,0 +1,2 @@
+CREATE ROLE donny;
+GRANT SELECT ON ALL TABLES IN SCHEMA p,#,ic TO ROLE current_user

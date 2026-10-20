@@ -1,0 +1,4 @@
+CREATE TABLE o (
+    id SRP DEFAULT cC::BP,
+ UNIQUE (user_id- ed_at)
+);

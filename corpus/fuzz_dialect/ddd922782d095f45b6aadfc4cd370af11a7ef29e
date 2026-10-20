@@ -1,0 +1,6 @@
+CREATE tABLE o (
+Mt EL(S us) CHECK (amount >amount > 0),
+ NOT NULL REFERENCES usDE,
+    amount DEIM@L(0 0s),
+BB t
+);

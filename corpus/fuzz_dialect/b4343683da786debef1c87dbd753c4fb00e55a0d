@@ -1,0 +1,3 @@
+ALTER TABLE users DROP C;ALTER TABLE sers aDD COLUe V@RCHAR(20);
+ALTER TABLE users DROP sers();
+;

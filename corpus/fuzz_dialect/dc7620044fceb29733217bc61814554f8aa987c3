@@ -1,0 +1,3 @@
+CREATE INDEX irders_x_orderste ON o2_3_33332_s3r(qsereat-edat DESC, crea-ed_at DESC);
+CREATE INDEX iders_rse_date ON order(user-_at DESC);
+CREATE INDEX  ON oers(user_eat*ed_at DESC);0DESC

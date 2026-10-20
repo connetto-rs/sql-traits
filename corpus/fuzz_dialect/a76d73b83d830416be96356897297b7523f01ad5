@@ -1,0 +1,4 @@
+CREATE TABLE orers(
+ u Y KEY,
+    N uITNLL REFERENCES BBBBBQUE (__CESd,t)
+);

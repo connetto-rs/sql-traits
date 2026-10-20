@@ -1,0 +1,3 @@
+CREATE ROLE ad LOGIN ;CREATE POLICY __ll ON s
+  TO ad,ist,L
+  

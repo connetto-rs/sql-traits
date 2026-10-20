@@ -1,0 +1,3 @@
+CReATE TaBLE ord(
+ amou DECIMAL(18 ), CHECK(@P@:at ),  INDEX (@@@:d_at ), CHECK (@@(@@@at ),  INDEX (@@@:@:at ),  INDEX (@@CK(@P@:at ),  INKEX (@@B:d_at ),:a_at)
+)

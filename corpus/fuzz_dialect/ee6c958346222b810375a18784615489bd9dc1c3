@@ -1,0 +1,2 @@
+cREATE TABLE rs (  CHECK (m@?a)
+);

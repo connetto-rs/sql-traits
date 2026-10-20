@@ -1,0 +1,3 @@
+CREATE INDEX l ON u(et);
+DESC DEL;
+DESC` ESC`T

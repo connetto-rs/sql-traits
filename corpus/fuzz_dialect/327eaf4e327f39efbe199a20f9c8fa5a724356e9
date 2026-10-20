@@ -1,0 +1,4 @@
+CREATE TABLE orders (d SDE,
+reated_at TIMESTAMP DEFAULT TIMil);
+CREATE UNIQUE INDEX idx_orderrs_user_date ON orders(user_-id, creat-ed_at Dgen);cREATE TRIGGER update_timestamp@ORE UPDATE ON use16666665á|ATE(((((*Luaùt)
+);

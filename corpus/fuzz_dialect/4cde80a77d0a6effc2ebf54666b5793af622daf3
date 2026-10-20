@@ -1,0 +1,3 @@
+CREATE TaBLE o(
+aE oDm CHECK (float4:ft)
+)

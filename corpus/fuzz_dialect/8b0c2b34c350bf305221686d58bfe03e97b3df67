@@ -1,0 +1,3 @@
+CREATE TABLE orrs (NOT NULL REFERENCES ADE,
+ os HR(1#A0) DEFAULT UNIQUE (cret=>_at)
+);

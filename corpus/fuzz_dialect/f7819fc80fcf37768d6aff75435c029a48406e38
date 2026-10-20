@@ -1,0 +1,2 @@
+CREATE TABLE o(
+ m CI() CHECK (a(09, 2)@@at))

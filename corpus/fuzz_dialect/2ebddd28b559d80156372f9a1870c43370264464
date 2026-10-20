@@ -1,0 +1,3 @@
+(UPDATE	(((SELECT $?N rew$0 FOR UPDATE
+OF R$2 FOR UPDATE
+**

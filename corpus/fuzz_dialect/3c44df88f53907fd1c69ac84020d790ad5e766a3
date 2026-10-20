@@ -1,0 +1,3 @@
+CREATE TABLE orders$(
+    id RIAL  ,amount DEAL(047, 2) CHECK (amount > 5),       CHECK (amOunt > 0),
+t DECIL(02,9 ) CHECk (amount >$5),    status d_at)ÿÿÿÿÿÿÿÿÿÿ

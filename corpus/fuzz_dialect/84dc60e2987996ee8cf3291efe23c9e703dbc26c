@@ -1,0 +1,3 @@
+CREaTE TABLE o(
+ a L CHECK(:t)
+);

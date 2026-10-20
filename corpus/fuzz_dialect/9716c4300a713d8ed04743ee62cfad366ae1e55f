@@ -1,0 +1,3 @@
+CREATE TABLE ord(
+ u DECIM.L(2 ), CHECK (@@@:d_@:d_at), CHECK (@@(@@@:d_at:d@::at ), CHECK (@@@local@:d@::td_a644 ), CHECK (@l@:d@::td_a644 ), CHECK (@@@:d_at), CHECK (@@(@@@:d_aad_at:d@::at ), CHECK (@@@local@:d@::td_a644 ), CHECK (@l@:d@::td_a644 ), CHECK (@@@:d_t:d@::at ), CHECK (@@@local@:d@::td_a644 ), CHECK (@l@:d@::td_a644 ), CHECK (@@@:d_at), CHECK (@@(@@local@:d@::td_a881 ), CHECK (@l@:d@::td_a644 ), CHECK (@@@:d_at), CHECK (@@(@@@:d_atl@:d@::ta)
+)

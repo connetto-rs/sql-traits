@@ -1,0 +1,2 @@
+SELECT $O re2 FOR UPDATE
+OF ((T-z
