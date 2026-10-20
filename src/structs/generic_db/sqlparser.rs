@@ -74,6 +74,7 @@ mod parse_options;
 mod postgres_18_collations;
 mod postgres_catalog;
 mod transactions;
+mod view_rewrites;
 mod views;
 
 pub use parse_options::{AccessResolution, ParseOptions};
@@ -2174,6 +2175,23 @@ fn tables_declaring_column(
         .collect()
 }
 
+/// The rename of column `from` of a table, as the stored view definitions
+/// reading the table name it, or `None` when the table declares no such
+/// column.
+fn column_rename(
+    node: &CreateTable,
+    from: &NamedColumn,
+    to: &Ident,
+) -> Option<view_rewrites::Rename> {
+    let ordinal = node.columns.iter().position(|column| from.matches(&column.name))?;
+    Some(view_rewrites::Rename::Column {
+        key: stored_table_key(node, IdentifierCase::AsWritten),
+        ordinal,
+        to: to.clone(),
+        columns: node.columns.iter().map(|column| column.name.clone()).collect(),
+    })
+}
+
 fn rename_column_idents(idents: &mut [Ident], from: &NamedColumn, to: &Ident) {
     for ident in idents {
         if from.matches(ident) {
@@ -4269,7 +4287,8 @@ impl ParserDB {
         Ok((index_arc, metadata))
     }
 
-    /// Renames a table and carries every reference to it along.
+    /// Renames a table and carries every reference to it along, the stored
+    /// view definitions reading it included.
     ///
     /// The rename happens before the referencing tables are rebuilt, because
     /// rebuilding a table resolves its foreign key targets against the stores
@@ -4289,7 +4308,9 @@ impl ParserDB {
             });
         };
         let renamed = StoredTable::of(resolved_table);
+        let key = stored_table_key(resolved_table, IdentifierCase::AsWritten);
         let target = RenameTarget::new(new_name, &resolved_table.name)?;
+        let readers = view_rewrites::readers(&builder, &[&key]);
 
         // Collected before the rename, while the old name is still the key.
         // A self-reference is not in here: the renamed node rewrites its own.
@@ -4321,6 +4342,16 @@ impl ParserDB {
         }
 
         builder.rewrite_table_references(&renamed, &target);
+
+        if let Some(readers) = readers
+            && let Some(to) = object_name_last_identifier(&target.name)
+        {
+            view_rewrites::follow_renames(
+                &mut builder,
+                readers,
+                &[view_rewrites::Rename::Relation { key, to: to.clone() }],
+            );
+        }
 
         Ok(builder)
     }
@@ -5604,7 +5635,8 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// Renames a column and carries every mention of it along.
+    /// Renames a column and carries every mention of it along, the stored
+    /// view definitions reading it included.
     ///
     /// The mentions outside the table's own node are rewritten first, so that
     /// the indexes detached and rebuilt with the node already carry the new
@@ -5661,6 +5693,18 @@ impl ParserDB {
         // child holds its own copy of an inherited column.
         let inheritors = inheritance::descendants(&builder, &stored);
 
+        // Read every table taking the new name before any of them changes.
+        let mut renames = Vec::with_capacity(inheritors.len() + 1);
+        for table in core::iter::once(&stored).chain(&inheritors) {
+            renames.extend(column_rename(
+                Self::stored_node(&builder, table)?,
+                &from,
+                new_column_name,
+            ));
+        }
+        let keys: Vec<&RelationKey> = renames.iter().map(view_rewrites::Rename::key).collect();
+        let readers = view_rewrites::readers(&builder, &keys);
+
         builder.rewrite_column_references(&stored, &declaring, &from, new_column_name);
         builder = Self::replace_table_node_with_collations(
             builder,
@@ -5694,6 +5738,10 @@ impl ParserDB {
                 },
             )?;
             inheritance::rename_inherited(&mut builder, child, &from.name, new_column_name);
+        }
+
+        if let Some(readers) = readers {
+            view_rewrites::follow_renames(&mut builder, readers, &renames);
         }
 
         Ok(builder)

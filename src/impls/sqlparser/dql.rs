@@ -207,6 +207,8 @@ struct FromTableRef<'query, 'db, DB: DatabaseLike, D: Copy> {
     nullable: bool,
     entry_index: usize,
     output_columns: BaseColumns<D>,
+    /// The address of the `FROM` item, see [`factor_address`].
+    factor: usize,
 }
 
 /// One output column of a derivable relation.
@@ -286,6 +288,41 @@ struct DerivedRelationRef<'query, 'db, DB: DatabaseLike, D: Copy> {
     shape: DerivedShape<'query, 'db, DB, D>,
     nullable: bool,
     entry_index: usize,
+    /// The address of the `FROM` item, see [`factor_address`], or zero for
+    /// the relation a `USING (...) AS alias` join names, which no item is.
+    factor: usize,
+}
+
+/// Where a `FROM` item sits in memory, which identifies it among the items
+/// of the query being resolved while that query is borrowed.
+fn factor_address(factor: &TableFactor) -> usize {
+    core::ptr::from_ref(factor).addr()
+}
+
+/// Where a join sits in memory, on the terms of [`factor_address`].
+fn join_address(join: &Join) -> usize {
+    core::ptr::from_ref(join).addr()
+}
+
+/// What a resolved column reference or clause key reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColumnOrigin {
+    /// Output column `ordinal` of the `FROM` item at address `factor`,
+    /// counted before any alias column list renames it.
+    Entry {
+        /// The address of the `FROM` item, see [`factor_address`].
+        factor: usize,
+        /// The position of the column among the item's output columns.
+        ordinal: usize,
+    },
+    /// A column a `USING` or `NATURAL` join merged, reached unqualified or
+    /// through the join's alias.
+    Merged,
+    /// A select-list output a clause key named.
+    Output,
+    /// Nothing certain, because an opaque relation could have answered or the
+    /// reference was ambiguous.
+    Unknown,
 }
 
 struct CteShape<'query, 'db, DB: DatabaseLike, D: Copy> {
@@ -423,11 +460,17 @@ struct MergedName {
 /// One output position of a `FROM` item's join chain as a `*` projection
 /// sees it: a base relation (index into `FromScope::bases`), a derived
 /// relation (index into `FromScope::derived`), or a column merged by a
-/// `USING` or `NATURAL` join, whose coalesced value has no single source.
+/// `USING` or `NATURAL` join, whose coalesced value has no single definition.
 enum WildcardEntry {
     Base(usize),
     Derived(usize),
-    Merged { name: String, quoted: bool },
+    Merged {
+        name: String,
+        quoted: bool,
+        /// The name of the relation the value is read from, as a qualifier
+        /// spells it, when one side of the join provides it.
+        provider: Option<(String, bool)>,
+    },
 }
 
 struct FromScope<'query, 'db, DB: DatabaseLike, D: Copy> {
@@ -435,6 +478,9 @@ struct FromScope<'query, 'db, DB: DatabaseLike, D: Copy> {
     derived: Vec<DerivedRelationRef<'query, 'db, DB, D>>,
     merged: Vec<MergedName>,
     wildcard_plans: Vec<Vec<WildcardEntry>>,
+    /// The names each `NATURAL` join merged, by the join's address, for the
+    /// joins whose sides' columns could be enumerated.
+    natural_merges: Vec<(usize, Vec<(String, bool)>)>,
     opaque: Vec<OpaqueRelation<'query, 'db>>,
     from_entry_count: usize,
     unqualified_poison: bool,
@@ -450,6 +496,7 @@ impl<DB: DatabaseLike, D: Copy> FromScope<'_, '_, DB, D> {
             derived: Vec::new(),
             merged: Vec::new(),
             wildcard_plans: Vec::new(),
+            natural_merges: Vec::new(),
             opaque: Vec::new(),
             from_entry_count: 0,
             unqualified_poison: false,
@@ -751,11 +798,7 @@ where
                 right_names.as_deref(),
                 data.case,
             ) {
-                let boundary = data.from_entry_count;
-                for (name, quoted) in &names {
-                    merge_name(&mut data.merged, name.clone(), *quoted, boundary, data.case);
-                }
-                merged = names;
+                merged = record_merge(data, join.get(), names);
             } else {
                 data.unqualified_poison = true;
             }
@@ -763,7 +806,7 @@ where
                 let entry_index = data.from_entry_count - 1;
                 data.derived.push(using_alias_relation(alias, &merged, opaque, entry_index));
             }
-            plan = merge_plans(plan, right_entries, &merged, data.case);
+            plan = merge_plans(plan, right_entries, &merged, &join.get().join_operator, data);
             accumulated = merge_output_names(accumulated, right_names, &merged, data.case);
         }
         profile.scope_mut(&mut scope).wildcard_plans.push(plan.unwrap_or_default());
@@ -890,19 +933,36 @@ fn push_unseen(names: &mut Vec<(String, bool)>, value: &str, quoted: bool, case:
 /// relation's. A re-merge of a name therefore drops the older merged entry
 /// and re-prepends it at the latest join's position. A poisoned side poisons
 /// the item's whole plan.
-fn merge_plans(
+///
+/// A merged column of a join other than `FULL` takes its value from one side,
+/// the joined relation for `RIGHT` and the accumulated one otherwise, and
+/// remembers the name that side's column is reached by.
+fn merge_plans<DB: DatabaseLike, D: Copy>(
     left: Option<Vec<WildcardEntry>>,
     right: Option<Vec<WildcardEntry>>,
     merged: &[(String, bool)],
-    case: IdentifierCase,
+    operator: &JoinOperator,
+    data: &FromScope<'_, '_, DB, D>,
 ) -> Option<Vec<WildcardEntry>> {
     let (left, right) = (left?, right?);
+    let case = data.case;
+    let source = match operator {
+        JoinOperator::FullOuter(_) => None,
+        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => Some(&right),
+        _ => Some(&left),
+    };
     let mut next: Vec<WildcardEntry> = merged
         .iter()
-        .map(|(name, quoted)| WildcardEntry::Merged { name: name.clone(), quoted: *quoted })
+        .map(|(name, quoted)| {
+            WildcardEntry::Merged {
+                name: name.clone(),
+                quoted: *quoted,
+                provider: source.and_then(|entries| merged_provider(entries, data, name, *quoted)),
+            }
+        })
         .collect();
     let remerged = |entry: &WildcardEntry| {
-        matches!(entry, WildcardEntry::Merged { name, quoted }
+        matches!(entry, WildcardEntry::Merged { name, quoted, .. }
         if merged.iter().any(|(merged, merged_quoted)| {
             case.identifiers_match(merged, *merged_quoted, name, *quoted)
         }))
@@ -910,6 +970,44 @@ fn merge_plans(
     next.extend(left.into_iter().filter(|entry| !remerged(entry)));
     next.extend(right.into_iter().filter(|entry| !remerged(entry)));
     Some(next)
+}
+
+/// The name the relation one side of a join reads column `name` from is
+/// reached by, if a single named relation provides it.
+fn merged_provider<DB: DatabaseLike, D: Copy>(
+    entries: &[WildcardEntry],
+    data: &FromScope<'_, '_, DB, D>,
+    name: &str,
+    quoted: bool,
+) -> Option<(String, bool)> {
+    let case = data.case;
+    entries.iter().find_map(|entry| {
+        match entry {
+            WildcardEntry::Base(index) => {
+                let base = &data.bases[*index];
+                base.output_columns
+                    .iter()
+                    .any(|column| case.identifiers_match(&column.name, column.quoted, name, quoted))
+                    .then(|| (base.key.value.get().to_owned(), base.key.quoted))
+            }
+            WildcardEntry::Derived(index) => {
+                let relation = &data.derived[*index];
+                relation
+                    .shape
+                    .columns
+                    .iter()
+                    .any(|column| case.identifiers_match(&column.name, column.quoted, name, quoted))
+                    .then_some(relation.key)
+                    .flatten()
+                    .map(|key| (key.value.get().to_owned(), key.quoted))
+            }
+            WildcardEntry::Merged { name: merged, quoted: merged_quoted, provider } => {
+                case.identifiers_match(merged, *merged_quoted, name, quoted)
+                    .then(|| provider.clone())
+                    .flatten()
+            }
+        }
+    })
 }
 
 /// The accumulated output names after one join: the merged names first, then
@@ -936,7 +1034,7 @@ fn merge_output_names(
 }
 
 /// The constraint carried by a join operator, if it carries one.
-fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
+pub(crate) fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
     match operator {
         JoinOperator::Join(constraint)
         | JoinOperator::Inner(constraint)
@@ -995,7 +1093,25 @@ fn using_alias_relation<'query, 'db, DB: DatabaseLike, D: Copy>(
         shape: DerivedShape { columns, row_preserving: true },
         nullable: false,
         entry_index,
+        factor: 0,
     }
+}
+
+/// Records the names a join merged, remembering the ones a `NATURAL` join
+/// merged so the join can be spelled out, and hands them back.
+fn record_merge<DB: DatabaseLike, D: Copy>(
+    data: &mut FromScope<'_, '_, DB, D>,
+    join: &Join,
+    names: Vec<(String, bool)>,
+) -> Vec<(String, bool)> {
+    let boundary = data.from_entry_count;
+    for (name, quoted) in &names {
+        merge_name(&mut data.merged, name.clone(), *quoted, boundary, data.case);
+    }
+    if matches!(join_constraint(&join.join_operator), Some(JoinConstraint::Natural)) {
+        data.natural_merges.push((join_address(join), names.clone()));
+    }
+    names
 }
 
 /// Records a merged name, moving its subsumption boundary to the latest
@@ -1470,7 +1586,7 @@ fn push_wildcard_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
                             .cloned(),
                     );
                 }
-                WildcardEntry::Merged { name, quoted } => {
+                WildcardEntry::Merged { name, quoted, .. } => {
                     columns.push(DerivedColumn {
                         name: name.clone(),
                         quoted: *quoted,
@@ -3242,12 +3358,14 @@ fn base_exposes_column<DB: DatabaseLike, D: Copy>(
     })
 }
 
+/// The column of a base relation a name reaches, with its position among the
+/// relation's output columns.
 fn find_base_column<'scope, DB: DatabaseLike, D: Copy>(
     base: &'scope FromTableRef<'_, '_, DB, D>,
     column: &Ident,
     case: IdentifierCase,
-) -> Option<&'scope BaseColumnRef<D>> {
-    base.output_columns.iter().find(|candidate| {
+) -> Option<(usize, &'scope BaseColumnRef<D>)> {
+    base.output_columns.iter().enumerate().find(|(_, candidate)| {
         case.identifiers_match(
             &candidate.name,
             candidate.quoted,
@@ -3314,7 +3432,8 @@ fn derived_for_qualifier<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
 }
 
 enum DerivedMatch<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> {
-    Column(&'scope DerivedColumn<'query, 'db, DB, D>),
+    /// The one column the name reaches, with its position in the shape.
+    Column(usize, &'scope DerivedColumn<'query, 'db, DB, D>),
     Ambiguous,
 }
 
@@ -3323,7 +3442,7 @@ fn find_derived_column<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     column: &Ident,
     case: IdentifierCase,
 ) -> Option<DerivedMatch<'scope, 'query, 'db, DB, D>> {
-    let mut matches = columns.iter().filter(|candidate| {
+    let mut matches = columns.iter().enumerate().filter(|(_, candidate)| {
         case.identifiers_match(
             &candidate.name,
             candidate.quoted,
@@ -3331,11 +3450,25 @@ fn find_derived_column<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
             column.quote_style.is_some(),
         )
     });
-    let first = matches.next()?;
+    let (position, first) = matches.next()?;
     if matches.next().is_some() {
         return Some(DerivedMatch::Ambiguous);
     }
-    Some(DerivedMatch::Column(first))
+    Some(DerivedMatch::Column(position, first))
+}
+
+/// The origin of a column a derived relation answered, which is its `FROM`
+/// item, or a merge when the relation is the one a `USING (...) AS alias`
+/// join names.
+fn derived_origin<DB: DatabaseLike, D: Copy>(
+    relation: &DerivedRelationRef<'_, '_, DB, D>,
+    ordinal: usize,
+) -> ColumnOrigin {
+    if relation.factor == 0 {
+        ColumnOrigin::Merged
+    } else {
+        ColumnOrigin::Entry { factor: relation.factor, ordinal }
+    }
 }
 
 fn single_source_relation<'db, DB: DatabaseLike, D: Copy>(
@@ -3380,6 +3513,8 @@ struct ResolvedColumn<'scope, 'db, DB: DatabaseLike, D: Copy> {
     /// stored column name, and is `None` only alongside an opaque or
     /// ambiguous match, where no single declared name answers for it.
     exposed: Option<(&'scope str, bool)>,
+    /// The `FROM` item and column the reference reached.
+    origin: ColumnOrigin,
 }
 
 enum LookupOutcome<T> {
@@ -3465,6 +3600,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
             definition: opaque,
             relation: None,
             exposed: None,
+            origin: ColumnOrigin::Unknown,
         }));
     }
     let mut definitions = Vec::new();
@@ -3476,6 +3612,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
             definition: opaque,
             relation: None,
             exposed: Some((merged.name.as_str(), merged.quoted)),
+            origin: ColumnOrigin::Merged,
         });
     }
     let start = merged_match.map_or(0, |merged| merged.subsumed);
@@ -3484,12 +3621,13 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
         .iter()
         .filter(|base| base.entry_index >= start && base.entry_index < visible_entries)
     {
-        if let Some(base_column) = find_base_column(base, column, case) {
+        if let Some((ordinal, base_column)) = find_base_column(base, column, case) {
             definitions.push(ResolvedColumn {
                 source: (!require_row_identity || !base.nullable).then_some(base.table),
                 definition: base_column.definition,
                 relation: Some(base_relation_identity(base)),
                 exposed: Some((base_column.name.as_str(), base_column.quoted)),
+                origin: ColumnOrigin::Entry { factor: base.factor, ordinal },
             });
             candidates.push(render_table_candidate(base.table));
         }
@@ -3500,7 +3638,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
         .filter(|relation| relation.entry_index >= start && relation.entry_index < visible_entries)
     {
         match find_derived_column(&relation.shape.columns, column, case) {
-            Some(DerivedMatch::Column(found)) => {
+            Some(DerivedMatch::Column(ordinal, found)) => {
                 definitions.push(ResolvedColumn {
                     source: (!require_row_identity || !relation.nullable)
                         .then_some(found.source)
@@ -3508,6 +3646,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
                     definition: found.definition,
                     relation: relation.identity.as_ref().map(|key| (key.value.get(), key.quoted)),
                     exposed: Some((found.name.as_str(), found.quoted)),
+                    origin: derived_origin(relation, ordinal),
                 });
                 candidates.push(relation_key_display(relation));
             }
@@ -3517,12 +3656,14 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
                     definition: opaque,
                     relation: None,
                     exposed: None,
+                    origin: ColumnOrigin::Unknown,
                 });
                 definitions.push(ResolvedColumn {
                     source: None,
                     definition: opaque,
                     relation: None,
                     exposed: None,
+                    origin: ColumnOrigin::Unknown,
                 });
                 candidates.push(relation_key_display(relation));
             }
@@ -3626,6 +3767,7 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
                 definition: opaque,
                 relation: None,
                 exposed: None,
+                origin: ColumnOrigin::Unknown,
             }));
         }
     };
@@ -3633,12 +3775,13 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
     match relation {
         QualifiedRelation::Base(base) => {
             Ok(match find_base_column(base, column, case) {
-                Some(column) => {
+                Some((ordinal, column)) => {
                     LookupOutcome::Found(ResolvedColumn {
                         source: Some(base.table),
                         definition: column.definition,
                         relation: identity,
                         exposed: Some((column.name.as_str(), column.quoted)),
+                        origin: ColumnOrigin::Entry { factor: base.factor, ordinal },
                     })
                 }
                 None => LookupOutcome::Stop,
@@ -3646,12 +3789,13 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
         }
         QualifiedRelation::Derived(relation) => {
             match find_derived_column(&relation.shape.columns, column, case) {
-                Some(DerivedMatch::Column(column)) => {
+                Some(DerivedMatch::Column(ordinal, column)) => {
                     Ok(LookupOutcome::Found(ResolvedColumn {
                         source: column.source,
                         definition: column.definition,
                         relation: identity,
                         exposed: Some((column.name.as_str(), column.quoted)),
+                        origin: derived_origin(relation, ordinal),
                     }))
                 }
                 Some(DerivedMatch::Ambiguous) => {
@@ -3795,6 +3939,7 @@ fn collect_view_factor<'query, 'db, DB, P>(
     alias: Option<AstRef<'query, 'db, TableAlias>>,
     key: RelationKey<'query, 'db>,
     schema: Option<RelationKey<'query, 'db>>,
+    factor: usize,
     deriving: Deriving<'_, 'db, DB>,
     profile: &mut P,
 ) -> Result<FactorContribution<'query, 'db, DB, P::Definition>, LookupError>
@@ -3835,6 +3980,7 @@ where
             shape,
             nullable: false,
             entry_index: 0,
+            factor,
         }),
         names: Some(names),
     })
@@ -4154,6 +4300,7 @@ where
         return Ok(opaque_factor(OpaqueIdentity::Anonymous));
     };
     let schema = alias.is_none().then(|| object_name_schema(name)).flatten();
+    let address = factor_address(factor.get());
     if has_arguments {
         return Ok(opaque_factor(OpaqueIdentity::Known { key, schema: None }));
     }
@@ -4173,13 +4320,14 @@ where
                 shape,
                 nullable: false,
                 entry_index: 0,
+                factor: address,
             }),
             names: Some(names),
         });
     }
     let database = deriving.database;
     let Some(table) = deriving.table(name.get())? else {
-        return collect_view_factor(name, alias, key, schema, deriving, profile);
+        return collect_view_factor(name, alias, key, schema, address, deriving, profile);
     };
     let Some(output_columns) = aliased_output_columns(table, alias, database, profile)? else {
         return Ok(opaque_factor(OpaqueIdentity::Known { key, schema }));
@@ -4194,6 +4342,7 @@ where
             nullable: false,
             entry_index: 0,
             output_columns,
+            factor: address,
         }),
         names: Some(names),
     })
@@ -4243,6 +4392,7 @@ where
                     shape,
                     nullable: false,
                     entry_index: 0,
+                    factor: factor_address(factor.get()),
                 }),
                 names: Some(names),
             })
@@ -4269,6 +4419,22 @@ where
         TableFactor::NestedJoin { .. } => Ok(opaque_factor(nested_join_identity(factor))),
         _ => Ok(opaque_factor(opaque_identity_from_alias(factor_alias(factor)))),
     }
+}
+
+/// The names `query` outputs, in order, named the way PostgreSQL names an
+/// unaliased select-list item, or `None` when some output cannot be named,
+/// as for a wildcard over an opaque relation.
+///
+/// # Errors
+///
+/// Returns the relation-name lookup errors resolving the query runs into.
+pub(crate) fn query_output_names<DB: DatabaseLike>(
+    query: &Query,
+    database: &DB,
+    case: IdentifierCase,
+) -> Result<Option<Vec<(String, bool)>>, LookupError> {
+    let (graph, _) = build_definition_graph(query, database, case)?;
+    Ok(graph.query_id(query).and_then(|query| graph.query_output_names(query)))
 }
 
 pub(crate) fn build_definition_graph<'query, 'db, DB: DatabaseLike>(

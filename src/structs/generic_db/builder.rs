@@ -14,9 +14,10 @@ use crate::{
         SchemaProfile,
         generic_db::{Identified, RelationSlot, Stored},
     },
-    traits::{FunctionLike, PolicyLike, RoleLike, SchemaLike, TableLike, TriggerLike},
+    traits::{FunctionLike, PolicyLike, RoleLike, SchemaLike, TableLike, TriggerLike, ViewLike},
     utils::object_name::{
-        RelationKey, render_table_candidate, stored_function_key, stored_table_key, stored_view_key,
+        RelationKey, render_table_candidate, stored_function_key, stored_table_key,
+        stored_view_key, table_matches_key, view_matches_key,
     },
 };
 
@@ -59,6 +60,20 @@ fn creates_implicit_public_ambiguity<T: TableLike>(
     table_names_match(left, right, case)
         && ((left.table_schema().is_none() && table_schema_is_public(right, case))
             || (right.table_schema().is_none() && table_schema_is_public(left, case)))
+}
+
+/// The stored views one of `keys` names, each keyed as written.
+fn views_named_by<V: ViewLike>(
+    views: &[Identified<V, RelationIdentity>],
+    keys: &[RelationKey],
+) -> Vec<Identified<V, RelationIdentity>> {
+    views
+        .iter()
+        .filter(|(view, _, _)| {
+            keys.iter().any(|key| view_matches_key(view.as_ref(), key, IdentifierCase::AsWritten))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Builder for constructing a `GenericDB` instance.
@@ -144,6 +159,58 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     /// consuming the current builder.
     pub(crate) fn snapshot_with(&self, ingestion: P::Ingestion) -> GenericDB<P> {
         self.clone().into_database(ingestion)
+    }
+
+    /// Returns a database holding only the tables, views and materialized
+    /// views `keys` names, and their columns, `column_table` naming each
+    /// column's table.
+    pub(crate) fn relations_database(
+        &self,
+        keys: &[RelationKey],
+        column_table: impl Fn(&P::Column) -> &P::Table,
+    ) -> GenericDB<P> {
+        let case = IdentifierCase::AsWritten;
+        let tables: Vec<_> = self
+            .tables
+            .iter()
+            .filter(|(table, _, _)| {
+                keys.iter().any(|key| table_matches_key(table.as_ref(), key, case))
+            })
+            .cloned()
+            .collect();
+        let columns = self
+            .columns
+            .iter()
+            .filter(|(column, _, _)| {
+                let owner = column_table(column);
+                tables.iter().any(|(table, _, _)| core::ptr::eq(table.as_ref(), owner))
+            })
+            .cloned()
+            .collect();
+        Self {
+            dialect: self.dialect.clone(),
+            catalog_name: self.catalog_name.clone(),
+            timezone: self.timezone.clone(),
+            views: views_named_by(&self.views, keys),
+            materialized_views: views_named_by(&self.materialized_views, keys),
+            tables,
+            columns,
+            indices: Vec::new(),
+            unique_indices: Vec::new(),
+            foreign_keys: Vec::new(),
+            functions: Vec::new(),
+            triggers: Vec::new(),
+            policies: Vec::new(),
+            check_constraints: Vec::new(),
+            roles: Vec::new(),
+            schemas: self.schemas.clone(),
+            table_grants: Vec::new(),
+            column_grants: Vec::new(),
+            search_path: self.search_path.clone(),
+            identifier_case: self.identifier_case,
+            identities: self.identities,
+        }
+        .into_database(P::default_ingestion(&self.dialect))
     }
 
     /// Returns a mutable reference to the tables list.

@@ -7,7 +7,7 @@ use sqlparser::ast::{Expr, ObjectName, Query, Select, SetOperator};
 use crate::{
     errors::LookupError,
     impls::dql::{
-        build_definition_graph,
+        ColumnOrigin, build_definition_graph,
         definition_graph::{DefinitionGraph, DefinitionId, QueryId, ScopeCursor, table_graph},
     },
     structs::IdentifierCase,
@@ -68,14 +68,21 @@ pub enum QueryOutput<'scope, 'query, 'db, DB: DatabaseLike> {
 pub struct ColumnBinding<'scope> {
     relation: Option<(&'scope str, bool)>,
     exposed: Option<(&'scope str, bool)>,
+    origin: ColumnOrigin,
 }
 
 impl<'scope> ColumnBinding<'scope> {
     pub(crate) fn new(
         relation: Option<(&'scope str, bool)>,
         exposed: Option<(&'scope str, bool)>,
+        origin: ColumnOrigin,
     ) -> Self {
-        Self { relation, exposed }
+        Self { relation, exposed, origin }
+    }
+
+    /// The `FROM` item and column the binding reached.
+    pub(crate) fn origin(&self) -> ColumnOrigin {
+        self.origin
     }
 
     /// Returns the relation name, or `None` for a merged, anonymous or opaque

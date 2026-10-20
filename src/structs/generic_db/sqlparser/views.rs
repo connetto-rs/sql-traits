@@ -17,6 +17,7 @@
 //! read one at all.
 
 use alloc::{
+    format,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -24,17 +25,19 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, CreateView, Ident, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    AlterTableOperation, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Owner, Query,
+    RenameTableNameKind, SelectItem, SetExpr, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use super::{
     ParserDBBuilder, SchemaQualifier, bind_reference, object_name_last_identifier, place_relation,
     relation_name_holder, require_named_in_catalog,
+    view_rewrites::{self, Rename},
 };
 use crate::{
-    errors::{Error, ObjectKind},
-    structs::{IdentifierCase, MaterializedView, View, metadata::ViewMetadata},
+    errors::{Error, LookupError, ObjectKind},
+    impls::dql::query_output_names,
+    structs::{IdentifierCase, MaterializedView, View, ViewDeclaration, metadata::ViewMetadata},
     traits::ViewLike,
     utils::{
         identifier_resolution::identifiers_match,
@@ -85,6 +88,7 @@ pub(super) fn create_view(
     // A view reading a temporary relation is temporary whatever it wrote.
     let temporary_read = bind_definition(&builder, &mut node.query);
     let promoted = temporary_read.is_some();
+    view_rewrites::spell_out(&builder, &mut node.query);
     if node.materialized
         && let Some(relation_name) = temporary_read
     {
@@ -339,7 +343,8 @@ fn rendered_name(name: &ObjectName) -> String {
 ///
 /// PostgreSQL accepts `ALTER TABLE` against a view for the actions a view
 /// supports and refuses the rest naming the action. Of those the parser can
-/// read, this handles renaming and changing the owner.
+/// read, this handles renaming the view or one of its columns and changing
+/// the owner.
 ///
 /// Only called when [`holds_view`] answered, so the name is known to be a
 /// view's.
@@ -347,8 +352,9 @@ fn rendered_name(name: &ObjectName) -> String {
 /// # Errors
 ///
 /// Returns [`Error::AlterActionUnsupportedOnRelation`] for an action a view
-/// does not support and [`Error::RelationNameAlreadyTaken`] when a rename asks
-/// for a name another relation in the schema holds.
+/// does not support, [`Error::RelationNameAlreadyTaken`] when a rename asks
+/// for a name another relation in the schema holds, and the errors of
+/// [`rename_view_column`].
 pub(super) fn alter_view(
     builder: ParserDBBuilder,
     name: &ObjectName,
@@ -360,6 +366,9 @@ pub(super) fn alter_view(
             let (RenameTableNameKind::As(new_name) | RenameTableNameKind::To(new_name)) =
                 table_name;
             rename_view(builder, name, kind, new_name)
+        }
+        AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+            rename_view_column(builder, name, kind, old_column_name, new_column_name)
         }
         AlterTableOperation::OwnerTo { new_owner } => {
             Ok(set_view_owner(builder, name, kind, new_owner))
@@ -389,7 +398,8 @@ pub(super) fn holds_view(builder: &ParserDBBuilder, name: &ObjectName) -> Option
         .map(|_| ObjectKind::MaterializedView)
 }
 
-/// Renames a stored view, refusing a name another relation already holds.
+/// Renames a stored view, refusing a name another relation already holds,
+/// and carries every view reading it along.
 ///
 /// The new name is checked against the pool in the schema the view actually
 /// sits in, which for a view the search path placed is not the schema the
@@ -412,12 +422,22 @@ fn rename_view(
         return Ok(builder);
     };
 
-    let (current_name, current_quoted, schema) = if kind == ObjectKind::MaterializedView {
+    let (current_name, current_quoted, schema, key) = if kind == ObjectKind::MaterializedView {
         let view = builder.materialized_views()[position].0.as_ref();
-        (view.view_name().to_string(), view.view_name_is_quoted(), stored_schema_of(view))
+        (
+            view.view_name().to_string(),
+            view.view_name_is_quoted(),
+            stored_schema_of(view),
+            stored_view_key(view, IdentifierCase::AsWritten),
+        )
     } else {
         let view = builder.views()[position].0.as_ref();
-        (view.view_name().to_string(), view.view_name_is_quoted(), stored_schema_of(view))
+        (
+            view.view_name().to_string(),
+            view.view_name_is_quoted(),
+            stored_schema_of(view),
+            stored_view_key(view, IdentifierCase::AsWritten),
+        )
     };
 
     // A rename to the name it already answers to changes nothing, and asking
@@ -439,6 +459,7 @@ fn rename_view(
         });
     }
 
+    let readers = view_rewrites::readers(&builder, &[&key]);
     let renamed = (new_ident.value.clone(), new_ident.quote_style.is_some());
     if kind == ObjectKind::MaterializedView {
         let (view, _, _) = &mut builder.materialized_views_mut()[position];
@@ -447,7 +468,163 @@ fn rename_view(
         let (view, _, _) = &mut builder.views_mut()[position];
         Arc::make_mut(view).declaration_mut().set_name(renamed.0, renamed.1);
     }
+    if let Some(readers) = readers {
+        view_rewrites::follow_renames(
+            &mut builder,
+            readers,
+            &[Rename::Relation { key, to: new_ident.clone() }],
+        );
+    }
     Ok(builder)
+}
+
+/// Renames one output column of a stored view, as `ALTER TABLE ... RENAME
+/// COLUMN` does against a view, and carries every view reading it along.
+///
+/// PostgreSQL keeps the column where it is and changes only the name it is
+/// exposed under, in the declaration's column list when it wrote that name,
+/// and otherwise as the alias of the select-list item producing it.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ColumnNotFound`] when the view exposes no column of
+/// the old name, [`Error::UnsupportedAlterTableOperation`] when the model
+/// cannot name every column the view exposes and the declaration's own list
+/// does not name the old one, and [`Error::ColumnAlreadyExists`] when the view
+/// already exposes a column of the new name.
+fn rename_view_column(
+    mut builder: ParserDBBuilder,
+    name: &ObjectName,
+    kind: ObjectKind,
+    old_name: &Ident,
+    new_name: &Ident,
+) -> Result<ParserDBBuilder, Error> {
+    let position = if kind == ObjectKind::MaterializedView {
+        materialized_view_position(&builder, name)
+    } else {
+        plain_view_position(&builder, name)
+    };
+    let Some(position) = position else {
+        return Ok(builder);
+    };
+    let (declaration, key) = if kind == ObjectKind::MaterializedView {
+        let view = builder.materialized_views()[position].0.as_ref();
+        (view.declaration(), stored_view_key(view, IdentifierCase::AsWritten))
+    } else {
+        let view = builder.views()[position].0.as_ref();
+        (view.declaration(), stored_view_key(view, IdentifierCase::AsWritten))
+    };
+    let view_name = declaration.name().to_string();
+
+    let read = view_rewrites::catalog(&builder, core::iter::once(declaration.query()));
+    let derived = query_output_names(declaration.query(), &read, IdentifierCase::AsWritten)?;
+    let enumerable = derived.is_some();
+    let mut names = derived.unwrap_or_default();
+    let declared = declaration.columns();
+    if names.len() < declared.len() {
+        names.resize(declared.len(), (String::new(), false));
+    }
+    for (name, written) in names.iter_mut().zip(declared) {
+        name.clone_from(written);
+    }
+    let same = |(name, quoted): &(String, bool), ident: &Ident| {
+        identifiers_match(name, *quoted, &ident.value, ident.quote_style.is_some())
+    };
+    let Some(ordinal) = names.iter().position(|name| same(name, old_name)) else {
+        if !enumerable {
+            return Err(Error::UnsupportedAlterTableOperation {
+                table_name: view_name,
+                operation: format!("RENAME COLUMN {old_name} TO {new_name}"),
+            });
+        }
+        return Err(LookupError::ColumnNotFound {
+            table_name: view_name,
+            column_name: old_name.value.clone(),
+        }
+        .into());
+    };
+    if !same(&names[ordinal], new_name) && names.iter().any(|name| same(name, new_name)) {
+        return Err(Error::ColumnAlreadyExists {
+            table_name: view_name,
+            column_name: new_name.value.clone(),
+        });
+    }
+    let columns: Vec<Ident> = names
+        .iter()
+        .map(|(name, quoted)| {
+            if *quoted { Ident::with_quote('"', name.as_str()) } else { Ident::new(name.as_str()) }
+        })
+        .collect();
+    let readers = view_rewrites::readers(&builder, &[&key]);
+
+    let declaration = if kind == ObjectKind::MaterializedView {
+        Arc::make_mut(&mut builder.materialized_views_mut()[position].0).declaration_mut()
+    } else {
+        Arc::make_mut(&mut builder.views_mut()[position].0).declaration_mut()
+    };
+    rename_output(declaration, ordinal, new_name, names);
+
+    if let Some(readers) = readers {
+        view_rewrites::follow_renames(
+            &mut builder,
+            readers,
+            &[Rename::Column { key, ordinal, to: new_name.clone(), columns }],
+        );
+    }
+    Ok(builder)
+}
+
+/// Exposes output column `ordinal` of a view under `new_name`, in the
+/// declaration's column list when it reaches that far, in the select-list
+/// item's alias otherwise, and in `names` when no single item produces the
+/// column.
+fn rename_output(
+    declaration: &mut ViewDeclaration,
+    ordinal: usize,
+    new_name: &Ident,
+    mut names: Vec<(String, bool)>,
+) {
+    let renamed = (new_name.value.clone(), new_name.quote_style.is_some());
+    if let Some(declared) = declaration.columns_mut().get_mut(ordinal) {
+        *declared = renamed;
+        return;
+    }
+    if let Some(item) = output_item(&mut declaration.query_mut().body, ordinal) {
+        match item {
+            SelectItem::UnnamedExpr(expression) => {
+                let expr = core::mem::replace(expression, Expr::Identifier(Ident::new("")));
+                *item = SelectItem::ExprWithAlias { expr, alias: new_name.clone() };
+                return;
+            }
+            SelectItem::ExprWithAlias { alias, .. } => {
+                *alias = new_name.clone();
+                return;
+            }
+            _ => {}
+        }
+    }
+    names[ordinal] = renamed;
+    *declaration.columns_mut() = names;
+}
+
+/// The select-list item producing output column `ordinal` of a query body,
+/// which the leftmost `SELECT` names, or `None` when a wildcard before it
+/// leaves the position unknown.
+fn output_item(body: &mut SetExpr, ordinal: usize) -> Option<&mut SelectItem> {
+    match body {
+        SetExpr::Select(select) => {
+            let before = select.projection.get(..ordinal)?;
+            if before.iter().any(|item| {
+                matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))
+            }) {
+                return None;
+            }
+            select.projection.get_mut(ordinal)
+        }
+        SetExpr::SetOperation { left, .. } => output_item(left, ordinal),
+        SetExpr::Query(query) => output_item(&mut query.body, ordinal),
+        _ => None,
+    }
 }
 
 /// The schema a stored view sits in, with its quote state.
@@ -498,7 +675,7 @@ pub(super) fn view_owner_names(builder: &ParserDBBuilder) -> Vec<String> {
 /// RECURSIVE`, and the rest of the query sees them all, so a body naming its
 /// own item reads the outer relation unless the `WITH` is recursive.
 #[derive(Default)]
-struct WithScopes {
+pub(super) struct WithScopes {
     frames: Vec<WithFrame>,
 }
 
@@ -517,7 +694,7 @@ struct WithFrame {
 }
 
 impl WithScopes {
-    fn enter(&mut self, query: &Query) {
+    pub(super) fn enter(&mut self, query: &Query) {
         if let Some(frame) = self.frames.last_mut()
             && let Some(position) = frame.bodies.iter().position(|body| core::ptr::eq(*body, query))
         {
@@ -534,7 +711,7 @@ impl WithScopes {
         }
     }
 
-    fn leave(&mut self, query: &Query) {
+    pub(super) fn leave(&mut self, query: &Query) {
         if self.frames.last().is_some_and(|frame| core::ptr::eq(frame.owner, query)) {
             self.frames.pop();
         }
@@ -548,7 +725,7 @@ impl WithScopes {
 
     /// Whether `name` reads a visible `WITH` item rather than a stored
     /// relation.
-    fn reads_item(&self, name: &ObjectName) -> bool {
+    pub(super) fn reads_item(&self, name: &ObjectName) -> bool {
         let [ObjectNamePart::Identifier(written)] = name.0.as_slice() else {
             return false;
         };
@@ -645,8 +822,13 @@ impl Visitor for RelationsRead {
 /// Ingestion bound each name to the relation it reached, so a bare one means
 /// the default schema.
 fn relations_read_by<V: ViewLike>(view: &V) -> Vec<RelationKey> {
+    relations_read_in(view.definition())
+}
+
+/// The normalized identity of every relation a bound definition reads.
+pub(super) fn relations_read_in(definition: &Query) -> Vec<RelationKey> {
     let mut visitor = RelationsRead { scopes: WithScopes::default(), read: Vec::new() };
-    let walk = view.definition().visit(&mut visitor);
+    let walk = definition.visit(&mut visitor);
     debug_assert!(walk.is_continue(), "the visitor never breaks");
     visitor.read
 }
