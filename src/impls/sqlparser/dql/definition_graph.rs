@@ -21,6 +21,7 @@ pub(crate) type Bound<'scope, 'query, 'db, DB> =
     (ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>);
 
 mod output_columns;
+pub(crate) mod reference_sites;
 
 pub(crate) use output_columns::QueryId;
 use output_columns::{OutputEntry, QueryNode};
@@ -215,7 +216,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     ) -> Bound<'scope, 'query, 'db, DB> {
         (
             self.definition(resolved.definition),
-            ColumnBinding::new(resolved.relation, resolved.exposed),
+            ColumnBinding::new(resolved.relation, resolved.exposed, resolved.origin),
         )
     }
 
@@ -521,6 +522,7 @@ pub(crate) fn table_graph<'db, DB: DatabaseLike>(
         nullable: false,
         entry_index: 0,
         output_columns,
+        factor: 0,
     });
     profile.graph.scopes[scope.0].data.from_entry_count = 1;
     profile.finish(scope)

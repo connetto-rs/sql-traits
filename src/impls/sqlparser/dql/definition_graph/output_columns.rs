@@ -9,8 +9,8 @@ use sqlparser::ast::{
 
 use super::{
     super::{
-        DerivationProfile, LookupOutcome, expand_qualified_wildcard, push_wildcard_columns,
-        resolve_definition_local, wildcard_reshapes_output,
+        ColumnOrigin, DerivationProfile, LookupOutcome, expand_qualified_wildcard,
+        push_wildcard_columns, resolve_definition_local, wildcard_reshapes_output,
     },
     AstRef, Bound, DefinitionDerivation, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
     select_address,
@@ -87,7 +87,7 @@ fn query_address(query: &Query) -> usize {
     core::ptr::from_ref(query).addr()
 }
 
-fn unwrap_nested(mut expression: &Expr) -> &Expr {
+pub(super) fn unwrap_nested(mut expression: &Expr) -> &Expr {
     while let Expr::Nested(inner) = expression {
         expression = inner;
     }
@@ -523,7 +523,7 @@ impl<DB: DatabaseLike> Visitor for QueryCollector<'_, '_, '_, DB> {
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
-    fn select_scope(&self, select: &Select) -> Option<ScopeId> {
+    pub(super) fn select_scope(&self, select: &Select) -> Option<ScopeId> {
         let address = select_address(select);
         let end = self.select_index.partition_point(|entry| entry.address <= address);
         self.select_index[..end]
@@ -532,7 +532,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             .map(|entry| entry.scope)
     }
 
-    fn select_cursor(&self, scope: ScopeId) -> ScopeCursor {
+    pub(super) fn select_cursor(&self, scope: ScopeId) -> ScopeCursor {
         ScopeCursor { scope, visible_entries: self.scopes[scope.0].data.from_entry_count }
     }
 
@@ -544,10 +544,16 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
         Ok(match match_output(entries, key, case)? {
             OutputMatch::Found { definition, name, quoted } => {
-                Some((self.definition(definition), ColumnBinding::new(None, Some((name, quoted)))))
+                Some((
+                    self.definition(definition),
+                    ColumnBinding::new(None, Some((name, quoted)), ColumnOrigin::Output),
+                ))
             }
             OutputMatch::Uncertain => {
-                Some((ColumnDefinition::Opaque, ColumnBinding::new(None, None)))
+                Some((
+                    ColumnDefinition::Opaque,
+                    ColumnBinding::new(None, None, ColumnOrigin::Unknown),
+                ))
             }
             OutputMatch::Absent => None,
         })
@@ -574,6 +580,28 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                 OutputEntry::Unexpanded => QueryOutput::Unexpanded,
             }
         })
+    }
+
+    /// The names `query` outputs, in order, each with its quote state, named
+    /// the way PostgreSQL names an unaliased select-list item, or `None` when
+    /// some output cannot be named.
+    pub(crate) fn query_output_names(&self, query: QueryId) -> Option<Vec<(String, bool)>> {
+        let entries = match &self.queries[query.0].outputs {
+            QueryOutputs::Select(scope) => self.scopes[scope.0].outputs.as_slice(),
+            QueryOutputs::Merged(entries) => entries.as_slice(),
+        };
+        entries
+            .iter()
+            .map(|entry| {
+                match entry {
+                    OutputEntry::Column(OutputColumn {
+                        name: OutputName::Known { name, quoted },
+                        ..
+                    }) => Some((name.clone(), *quoted)),
+                    OutputEntry::Column(_) | OutputEntry::Unexpanded => None,
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn resolve_order_by<'scope>(

@@ -133,6 +133,18 @@ impl ViewDeclaration {
         self.name = name;
         self.name_is_quoted = quoted;
     }
+
+    /// Returns the query the view is defined by, so a statement that rewrites
+    /// it leaves the view reading what it read.
+    pub(crate) fn query_mut(&mut self) -> &mut Query {
+        &mut self.query
+    }
+
+    /// Returns the column names the declaration wrote, for a statement that
+    /// renames one, on the terms of [`Self::query_mut`].
+    pub(crate) fn columns_mut(&mut self) -> &mut Vec<(String, bool)> {
+        &mut self.columns
+    }
 }
 
 /// A view whose definition runs on every read.
