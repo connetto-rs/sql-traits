@@ -351,6 +351,14 @@ fn mysql_definitions_commit_the_open_transaction() {
         outcome::<MySqlDialect>("BEGIN; SAVEPOINT s; BEGIN; RELEASE SAVEPOINT s;"),
         "savepoint not found"
     );
+    assert_eq!(
+        outcome::<MySqlDialect>(
+            "CREATE TABLE t (id INT); BEGIN; SAVEPOINT s; CREATE INDEX i ON t (id); \
+             RELEASE SAVEPOINT s;"
+        ),
+        "savepoint not found",
+        "an index definition commits like a table definition"
+    );
 }
 
 #[test]
@@ -435,6 +443,7 @@ fn oracle_definitions_erase_savepoints() {
         outcome::<OracleDialect>("SAVEPOINT \"Other\"; ROLLBACK TO SAVEPOINT Other;"),
         "savepoint not found"
     );
+    assert_eq!(outcome::<OracleDialect>("BEGIN;"), "unsupported", "Oracle has no `BEGIN`");
 }
 
 #[test]
