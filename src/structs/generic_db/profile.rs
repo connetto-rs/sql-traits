@@ -31,6 +31,10 @@ pub type Meta<K> = <K as Metadata>::Meta;
 /// it describes storage, and no public signature names it.
 pub(crate) type Stored<K> = (Arc<K>, Meta<K>);
 
+/// One schema object of a kind that keeps an identity, paired with its
+/// metadata and that identity.
+pub(crate) type Identified<K, I> = (Arc<K>, Meta<K>, I);
+
 /// The concrete types a [`GenericDB`] stores for each kind of schema object.
 ///
 /// One implementation exists per source representation. The parser's is

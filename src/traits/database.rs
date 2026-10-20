@@ -1,7 +1,7 @@
 //! Submodule providing a trait for describing SQL Database-like entities.
 
 use alloc::{string::ToString, vec::Vec};
-use core::{borrow::Borrow, fmt::Debug};
+use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use geometric_traits::{
     impls::CSR2D,
@@ -67,6 +67,11 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// SQL Server's `UNIQUEIDENTIFIER` never leak into the generic column
     /// trait. See [`DialectLike`].
     type Dialect: DialectLike<DB = Self>;
+    /// Identity of a table, view or materialized view, which the relation
+    /// keeps for as long as it exists, through its renames and rebuilds.
+    type RelationId: Copy + Eq + Ord + Hash + Debug + Send + Sync;
+    /// Identity of a table column, on the terms of [`Self::RelationId`].
+    type ColumnId: Copy + Eq + Ord + Hash + Debug + Send + Sync;
 
     /// Returns the SQL dialect this database is expressed in.
     fn dialect(&self) -> &Self::Dialect;
@@ -851,6 +856,152 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// ```
     fn table_by_id(&self, table_id: usize) -> Option<&Self::Table> {
         self.tables().nth(table_id)
+    }
+
+    /// Returns the identity of a table this database holds, or `None` for a
+    /// table it does not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (id INT); DROP TABLE t; CREATE TABLE t (id INT);",
+    /// )?;
+    /// let table = db
+    ///     .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?
+    ///     .expect("the table exists");
+    /// let identity = db.table_identity(table).expect("the table is held here");
+    /// assert_eq!(db.table_by_identity(identity), Some(table));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn table_identity(&self, table: &Self::Table) -> Option<Self::RelationId>;
+
+    /// Returns the identity of a plain view this database holds, or `None`
+    /// for a view it does not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (id INT); CREATE VIEW v AS SELECT id FROM t;
+    ///      ALTER TABLE v RENAME TO w;",
+    /// )?;
+    /// let view = db.views().next().expect("one view");
+    /// let identity = db.view_identity(view).expect("the view is held here");
+    /// assert_eq!(db.view_by_identity(identity).map(ViewLike::view_name), Some("w"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn view_identity(&self, view: &Self::View) -> Option<Self::RelationId>;
+
+    /// Returns the identity of a materialized view this database holds, or
+    /// `None` for one it does not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (id INT); CREATE MATERIALIZED VIEW m AS SELECT id FROM t;",
+    /// )?;
+    /// let view = db.materialized_views().next().expect("one materialized view");
+    /// let identity = db.materialized_view_identity(view).expect("the view is held here");
+    /// assert_eq!(db.materialized_view_by_identity(identity), Some(view));
+    /// assert_eq!(db.view_by_identity(identity), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn materialized_view_identity(&self, view: &Self::MaterializedView)
+    -> Option<Self::RelationId>;
+
+    /// Returns the identity of a table column this database holds, or `None`
+    /// for a column it does not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (a INT); ALTER TABLE t RENAME COLUMN a TO b;",
+    /// )?;
+    /// let table = db.tables().next().expect("one table");
+    /// let column = table.columns(&db)?.next().expect("one column");
+    /// let identity = db.column_identity(column).expect("the column is held here");
+    /// assert_eq!(db.column_by_identity(identity).map(ColumnLike::column_name), Some("b"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn column_identity(&self, column: &Self::Column) -> Option<Self::ColumnId>;
+
+    /// Returns the table holding `identity`, or `None` when no table here
+    /// holds it, because it was dropped, never created, or names a view.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+    ///
+    /// let ingestor = ParserDBIngestor::new::<PostgreSqlDialect>("catalog".to_owned());
+    /// let mut ingestor = Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE t (id INT);")?
+    ///     .into_iter()
+    ///     .try_fold(ingestor, ParserDBIngestor::apply_statement)?;
+    /// let before = ingestor.snapshot();
+    /// let identity = before
+    ///     .table_identity(before.tables().next().expect("one table"))
+    ///     .expect("the table is held here");
+    /// for statement in Parser::parse_sql(&PostgreSqlDialect {}, "ALTER TABLE t RENAME TO u;")? {
+    ///     ingestor = ingestor.apply_statement(statement)?;
+    /// }
+    /// let after = ingestor.finish();
+    /// assert_eq!(after.table_by_identity(identity).map(TableLike::table_name), Some("u"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn table_by_identity(&self, identity: Self::RelationId) -> Option<&Self::Table> {
+        self.tables().find(|table| self.table_identity(table) == Some(identity))
+    }
+
+    /// Returns the plain view holding `identity`, or `None` when no plain
+    /// view here holds it.
+    fn view_by_identity(&self, identity: Self::RelationId) -> Option<&Self::View> {
+        self.views().find(|view| self.view_identity(view) == Some(identity))
+    }
+
+    /// Returns the materialized view holding `identity`, or `None` when no
+    /// materialized view here holds it.
+    fn materialized_view_by_identity(
+        &self,
+        identity: Self::RelationId,
+    ) -> Option<&Self::MaterializedView> {
+        self.materialized_views()
+            .find(|view| self.materialized_view_identity(view) == Some(identity))
+    }
+
+    /// Returns the table column holding `identity` with whatever name
+    /// renames gave it, or `None` when no column here holds it, because it
+    /// or its table was dropped.
+    fn column_by_identity(&self, identity: Self::ColumnId) -> Option<&Self::Column> {
+        self.tables()
+            .filter_map(|table| table.columns(self).ok())
+            .flatten()
+            .find(|column| self.column_identity(column) == Some(identity))
     }
 
     /// Returns the function stored under exactly this identity.

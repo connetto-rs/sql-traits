@@ -13,7 +13,7 @@ use alloc::{
 use core::fmt::Debug;
 
 pub use builder::GenericDBBuilder;
-pub(crate) use profile::Stored;
+pub(crate) use profile::{Identified, Stored};
 pub use profile::{Meta, SchemaProfile};
 pub use sqlparser::{
     AccessResolution, ParseOptions, ParserDB, ParserDBBuilder, ParserDBIngestor, ParserIngestion,
@@ -22,7 +22,7 @@ pub use sqlparser::{
 };
 
 use crate::{
-    structs::IdentifierCase,
+    structs::{ColumnIdentity, IdentifierCase, IdentityCounter, RelationIdentity},
     traits::{PolicyLike, RoleLike, SchemaLike, TableLike, TriggerLike},
     utils::{
         identifier_resolution::stored_identifier_matches_lookup,
@@ -56,11 +56,11 @@ pub struct GenericDB<P: SchemaProfile> {
     /// Timezone of the database.
     timezone: Option<String>,
     /// List of tables in the database.
-    tables: Vec<Stored<P::Table>>,
+    tables: Vec<Identified<P::Table, RelationIdentity>>,
     /// List of plain views in the database.
-    views: Vec<Stored<P::View>>,
+    views: Vec<Identified<P::View, RelationIdentity>>,
     /// List of materialized views in the database.
-    materialized_views: Vec<Stored<P::MaterializedView>>,
+    materialized_views: Vec<Identified<P::MaterializedView, RelationIdentity>>,
     /// Relations by normalized `(schema, name)`, values their storage slots.
     ///
     /// PostgreSQL keeps tables, views and materialized views in one pool of
@@ -74,7 +74,14 @@ pub struct GenericDB<P: SchemaProfile> {
     /// stores nothing here.
     folded_relation_index: BTreeMap<RelationKey, Vec<RelationKey>>,
     /// List of columns in the database.
-    columns: Vec<Stored<P::Column>>,
+    columns: Vec<Identified<P::Column, ColumnIdentity>>,
+    /// Every relation identity held, ascending, with the slot holding it.
+    relation_identities: Vec<(RelationIdentity, RelationSlot)>,
+    /// Every column identity held, ascending, with the column's position.
+    column_identities: Vec<(ColumnIdentity, usize)>,
+    /// Where the next identity is drawn from, carried so a reopened
+    /// ingestion never hands out one this database has already used.
+    identities: IdentityCounter,
     /// List of indices in the database.
     indices: Vec<Stored<P::Index>>,
     /// List of unique indices in the database.
@@ -126,6 +133,8 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("views", &self.views.len())
             .field("materialized_views", &self.materialized_views.len())
             .field("columns", &self.columns.len())
+            .field("relation_identities", &self.relation_identities.len())
+            .field("column_identities", &self.column_identities.len())
             .field("indices", &self.indices.len())
             .field("unique_indices", &self.unique_indices.len())
             .field("foreign_keys", &self.foreign_keys.len())
@@ -144,6 +153,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("function_index", &self.function_index.len())
             .field("folded_relation_index", &self.folded_relation_index.len())
             .field("folded_function_index", &self.folded_function_index.len())
+            .field("identities", &self.identities)
             .finish()
     }
 }
@@ -158,6 +168,9 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             views: self.views.clone(),
             materialized_views: self.materialized_views.clone(),
             columns: self.columns.clone(),
+            relation_identities: self.relation_identities.clone(),
+            column_identities: self.column_identities.clone(),
+            identities: self.identities,
             indices: self.indices.clone(),
             unique_indices: self.unique_indices.clone(),
             foreign_keys: self.foreign_keys.clone(),
@@ -218,7 +231,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                     table.table_schema().map(alloc::string::ToString::to_string),
                     table.table_name().to_string(),
                 ),
-                |(t, _)| {
+                |(t, _, _)| {
                     (
                         t.table_schema().map(alloc::string::ToString::to_string),
                         t.table_name().to_string(),
@@ -250,7 +263,7 @@ impl<P: SchemaProfile> GenericDB<P> {
     /// ```
     pub fn view_metadata(&self, view: &P::View) -> Option<&Meta<P::View>> {
         self.views
-            .binary_search_by(|(candidate, _)| {
+            .binary_search_by(|(candidate, _, _)| {
                 stored_view_key(candidate.as_ref(), IdentifierCase::AsWritten)
                     .cmp(&stored_view_key(view, IdentifierCase::AsWritten))
             })
@@ -282,7 +295,7 @@ impl<P: SchemaProfile> GenericDB<P> {
         view: &P::MaterializedView,
     ) -> Option<&Meta<P::MaterializedView>> {
         self.materialized_views
-            .binary_search_by(|(candidate, _)| {
+            .binary_search_by(|(candidate, _, _)| {
                 stored_view_key(candidate.as_ref(), IdentifierCase::AsWritten)
                     .cmp(&stored_view_key(view, IdentifierCase::AsWritten))
             })
@@ -310,7 +323,7 @@ impl<P: SchemaProfile> GenericDB<P> {
     /// ```
     pub fn column_metadata(&self, column: &P::Column) -> Option<&Meta<P::Column>> {
         self.columns
-            .binary_search_by(|(c, _)| c.as_ref().cmp(column))
+            .binary_search_by(|(c, _, _)| c.as_ref().cmp(column))
             .ok()
             .map(|index| &self.columns[index].1)
     }
@@ -645,7 +658,7 @@ impl<P: SchemaProfile> GenericDB<P> {
     /// # }
     /// ```
     pub fn tables_metadata(&self) -> impl Iterator<Item = (&P::Table, &Meta<P::Table>)> {
-        self.tables.iter().map(|(t, m)| (t.as_ref(), m))
+        self.tables.iter().map(|(t, m, _)| (t.as_ref(), m))
     }
 
     /// Iterates mutably over the table and metadata
@@ -671,7 +684,7 @@ impl<P: SchemaProfile> GenericDB<P> {
     pub fn tables_metadata_mut(
         &mut self,
     ) -> impl Iterator<Item = (&P::Table, &mut Meta<P::Table>)> {
-        self.tables.iter_mut().map(|(t, m)| ((*t).as_ref(), m))
+        self.tables.iter_mut().map(|(t, m, _)| ((*t).as_ref(), m))
     }
 
     /// Returns a reference to the metadata of the specified table grant, if it

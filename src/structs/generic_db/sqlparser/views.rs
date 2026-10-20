@@ -105,12 +105,12 @@ pub(super) fn create_view(
     if node.or_replace
         && let Some(position) = stored_view_position(&builder, &node.name)
     {
-        let (existing, metadata) = builder.views_mut().remove(position);
+        let (existing, metadata, identity) = builder.views_mut().remove(position);
         check_replacement_columns(existing.as_ref(), &node)?;
         let Some(view) = View::from_node(&node) else {
             return Err(Error::UnnamedObject { object_kind: kind });
         };
-        return Ok(builder.add_view(Arc::new(view), metadata));
+        return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
     }
 
     let holder = relation_name_holder(&builder, name_ident, schema);
@@ -198,7 +198,7 @@ fn plain_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<u
     builder
         .views()
         .iter()
-        .position(|(view, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == key)
+        .position(|(view, _, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == key)
 }
 
 /// The position of the plain view stored under exactly `name`, a bare name
@@ -206,7 +206,7 @@ fn plain_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<u
 fn stored_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<usize> {
     let case = builder.identifier_case();
     let key = target_key(&target_name_from_object_name(name)?, case);
-    builder.views().iter().position(|(view, _)| stored_view_key(view.as_ref(), case) == key)
+    builder.views().iter().position(|(view, _, _)| stored_view_key(view.as_ref(), case) == key)
 }
 
 /// Drops the views a `DROP VIEW` or `DROP MATERIALIZED VIEW` names.
@@ -305,7 +305,7 @@ fn materialized_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> O
     builder
         .materialized_views()
         .iter()
-        .position(|(view, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == key)
+        .position(|(view, _, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == key)
 }
 
 /// Refuses a `DROP TABLE` naming a view, as PostgreSQL does.
@@ -441,10 +441,10 @@ fn rename_view(
 
     let renamed = (new_ident.value.clone(), new_ident.quote_style.is_some());
     if kind == ObjectKind::MaterializedView {
-        let (view, _) = &mut builder.materialized_views_mut()[position];
+        let (view, _, _) = &mut builder.materialized_views_mut()[position];
         Arc::make_mut(view).declaration_mut().set_name(renamed.0, renamed.1);
     } else {
-        let (view, _) = &mut builder.views_mut()[position];
+        let (view, _, _) = &mut builder.views_mut()[position];
         Arc::make_mut(view).declaration_mut().set_name(renamed.0, renamed.1);
     }
     Ok(builder)
@@ -485,8 +485,8 @@ pub(super) fn view_owner_names(builder: &ParserDBBuilder) -> Vec<String> {
     builder
         .views()
         .iter()
-        .map(|(_, metadata)| metadata)
-        .chain(builder.materialized_views().iter().map(|(_, metadata)| metadata))
+        .map(|(_, metadata, _)| metadata)
+        .chain(builder.materialized_views().iter().map(|(_, metadata, _)| metadata))
         .filter_map(|metadata| metadata.owner().map(ToString::to_string))
         .collect()
 }
@@ -668,14 +668,14 @@ pub(super) fn dependent_views(
     let reads: Vec<(ObjectKind, RelationKey, Vec<RelationKey>)> = builder
         .views()
         .iter()
-        .map(|(view, _)| {
+        .map(|(view, _, _)| {
             (
                 ObjectKind::View,
                 stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
                 relations_read_by(view.as_ref()),
             )
         })
-        .chain(builder.materialized_views().iter().map(|(view, _)| {
+        .chain(builder.materialized_views().iter().map(|(view, _, _)| {
             (
                 ObjectKind::MaterializedView,
                 stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
@@ -729,13 +729,13 @@ pub(super) fn refuse_dependent_views(
 /// Removes the views a `CASCADE` takes along with the relation `key` names.
 pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &RelationKey) {
     let doomed = dependent_views(builder, key);
-    builder.views_mut().retain(|(view, _)| {
+    builder.views_mut().retain(|(view, _, _)| {
         !doomed.iter().any(|(kind, dead)| {
             *kind == ObjectKind::View
                 && *dead == stored_view_key(view.as_ref(), IdentifierCase::AsWritten)
         })
     });
-    builder.materialized_views_mut().retain(|(view, _)| {
+    builder.materialized_views_mut().retain(|(view, _, _)| {
         !doomed.iter().any(|(kind, dead)| {
             *kind == ObjectKind::MaterializedView
                 && *dead == stored_view_key(view.as_ref(), IdentifierCase::AsWritten)

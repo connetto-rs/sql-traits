@@ -7,7 +7,10 @@ use alloc::{
 
 use crate::{
     errors::LookupError,
-    structs::{GenericDB, IdentifierCase, SchemaProfile, TargetName, generic_db::RelationSlot},
+    structs::{
+        ColumnIdentity, GenericDB, IdentifierCase, RelationIdentity, SchemaProfile, TargetName,
+        generic_db::RelationSlot,
+    },
     traits::{DatabaseLike, TableLike},
     utils::object_name::{
         RelationKey, function_has_stored_identity, relation_search_path, render_table_candidate,
@@ -34,6 +37,8 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type ColumnGrant = P::ColumnGrant;
     type Schema = P::Schema;
     type Dialect = P::Dialect;
+    type RelationId = RelationIdentity;
+    type ColumnId = ColumnIdentity;
 
     #[inline]
     fn dialect(&self) -> &Self::Dialect {
@@ -69,19 +74,86 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     }
 
     fn views(&self) -> impl Iterator<Item = &Self::View> {
-        self.views.iter().map(|(view, _)| view.as_ref())
+        self.views.iter().map(|(view, _, _)| view.as_ref())
     }
 
     fn materialized_views(&self) -> impl Iterator<Item = &Self::MaterializedView> {
-        self.materialized_views.iter().map(|(view, _)| view.as_ref())
+        self.materialized_views.iter().map(|(view, _, _)| view.as_ref())
     }
 
     fn table_id(&self, table: &Self::Table) -> Option<usize> {
         self.tables
-            .binary_search_by_key(&(table.table_schema(), table.table_name()), |(t, _)| {
+            .binary_search_by_key(&(table.table_schema(), table.table_name()), |(t, _, _)| {
                 (t.table_schema(), t.table_name())
             })
             .ok()
+    }
+
+    fn table_identity(&self, table: &Self::Table) -> Option<Self::RelationId> {
+        self.table_id(table).map(|position| self.tables[position].2)
+    }
+
+    fn view_identity(&self, view: &Self::View) -> Option<Self::RelationId> {
+        let key = stored_view_key(view, IdentifierCase::AsWritten);
+        self.views
+            .binary_search_by(|(candidate, _, _)| {
+                stored_view_key(candidate.as_ref(), IdentifierCase::AsWritten).cmp(&key)
+            })
+            .ok()
+            .map(|position| self.views[position].2)
+    }
+
+    fn materialized_view_identity(
+        &self,
+        view: &Self::MaterializedView,
+    ) -> Option<Self::RelationId> {
+        let key = stored_view_key(view, IdentifierCase::AsWritten);
+        self.materialized_views
+            .binary_search_by(|(candidate, _, _)| {
+                stored_view_key(candidate.as_ref(), IdentifierCase::AsWritten).cmp(&key)
+            })
+            .ok()
+            .map(|position| self.materialized_views[position].2)
+    }
+
+    fn column_identity(&self, column: &Self::Column) -> Option<Self::ColumnId> {
+        self.columns
+            .binary_search_by(|(candidate, _, _)| candidate.as_ref().cmp(column))
+            .ok()
+            .map(|position| self.columns[position].2)
+    }
+
+    fn table_by_identity(&self, identity: Self::RelationId) -> Option<&Self::Table> {
+        match self.relation_slot(identity)? {
+            RelationSlot::Table(position) => Some(self.tables[position].0.as_ref()),
+            RelationSlot::View(_) | RelationSlot::MaterializedView(_) => None,
+        }
+    }
+
+    fn view_by_identity(&self, identity: Self::RelationId) -> Option<&Self::View> {
+        match self.relation_slot(identity)? {
+            RelationSlot::View(position) => Some(self.views[position].0.as_ref()),
+            RelationSlot::Table(_) | RelationSlot::MaterializedView(_) => None,
+        }
+    }
+
+    fn materialized_view_by_identity(
+        &self,
+        identity: Self::RelationId,
+    ) -> Option<&Self::MaterializedView> {
+        match self.relation_slot(identity)? {
+            RelationSlot::MaterializedView(position) => {
+                Some(self.materialized_views[position].0.as_ref())
+            }
+            RelationSlot::Table(_) | RelationSlot::View(_) => None,
+        }
+    }
+
+    fn column_by_identity(&self, identity: Self::ColumnId) -> Option<&Self::Column> {
+        self.column_identities
+            .binary_search_by_key(&identity, |(held, _)| *held)
+            .ok()
+            .map(|index| self.columns[self.column_identities[index].1].0.as_ref())
     }
 
     fn resolve_target_table(
@@ -148,12 +220,12 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     }
 
     fn table_by_id(&self, table_id: usize) -> Option<&Self::Table> {
-        self.tables.get(table_id).map(|(table, _)| table.as_ref())
+        self.tables.get(table_id).map(|(table, _, _)| table.as_ref())
     }
 
     #[inline]
     fn tables(&self) -> impl Iterator<Item = &Self::Table> {
-        self.tables.iter().map(|(table, _)| table.as_ref())
+        self.tables.iter().map(|(table, _, _)| table.as_ref())
     }
 
     #[inline]
@@ -312,7 +384,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                     RelationSlot::View(_) | RelationSlot::MaterializedView(_) => None,
                 }
             })
-            .map(|(table, _)| table.as_ref())
+            .map(|(table, _, _)| table.as_ref())
             .filter(|table| probe.accepts(|| stored_table_key(*table, IdentifierCase::Exact)))
             .collect()
     }
@@ -326,7 +398,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                     RelationSlot::Table(_) | RelationSlot::MaterializedView(_) => None,
                 }
             })
-            .map(|(view, _)| view.as_ref())
+            .map(|(view, _, _)| view.as_ref())
             .filter(|view| probe.accepts(|| stored_view_key(*view, IdentifierCase::Exact)))
             .collect()
     }
@@ -345,7 +417,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                     RelationSlot::Table(_) | RelationSlot::View(_) => None,
                 }
             })
-            .map(|(view, _)| view.as_ref())
+            .map(|(view, _, _)| view.as_ref())
             .filter(|view| probe.accepts(|| stored_view_key(*view, IdentifierCase::Exact)))
             .collect()
     }
@@ -359,17 +431,17 @@ impl<P: SchemaProfile> GenericDB<P> {
         self.probed_relation_slots(probe).any(|slot| {
             match slot {
                 RelationSlot::Table(position) => {
-                    self.tables.get(*position).is_some_and(|(table, _)| {
+                    self.tables.get(*position).is_some_and(|(table, _, _)| {
                         probe.accepts(|| stored_table_key(table.as_ref(), IdentifierCase::Exact))
                     })
                 }
                 RelationSlot::View(position) => {
-                    self.views.get(*position).is_some_and(|(view, _)| {
+                    self.views.get(*position).is_some_and(|(view, _, _)| {
                         probe.accepts(|| stored_view_key(view.as_ref(), IdentifierCase::Exact))
                     })
                 }
                 RelationSlot::MaterializedView(position) => {
-                    self.materialized_views.get(*position).is_some_and(|(view, _)| {
+                    self.materialized_views.get(*position).is_some_and(|(view, _, _)| {
                         probe.accepts(|| stored_view_key(view.as_ref(), IdentifierCase::Exact))
                     })
                 }
@@ -441,7 +513,15 @@ impl<P: SchemaProfile> GenericDB<P> {
                     RelationSlot::View(_) | RelationSlot::MaterializedView(_) => None,
                 }
             })
-            .map(|(table, _)| table.as_ref())
+            .map(|(table, _, _)| table.as_ref())
+    }
+
+    /// The slot of the relation holding `identity`, of whichever kind.
+    fn relation_slot(&self, identity: RelationIdentity) -> Option<RelationSlot> {
+        self.relation_identities
+            .binary_search_by_key(&identity, |(held, _)| *held)
+            .ok()
+            .map(|index| self.relation_identities[index].1)
     }
 
     /// Resolves a written target against the index, ignoring any search path.
