@@ -10,8 +10,9 @@ use alloc::{
 use crate::{
     errors::LookupError,
     structs::{
-        GenericDB, IdentifierCase, Meta, SchemaProfile,
-        generic_db::{RelationSlot, Stored},
+        ColumnIdentity, GenericDB, IdentifierCase, IdentityCounter, Meta, RelationIdentity,
+        SchemaProfile,
+        generic_db::{Identified, RelationSlot, Stored},
     },
     traits::{FunctionLike, PolicyLike, RoleLike, SchemaLike, TableLike, TriggerLike},
     utils::object_name::{
@@ -69,13 +70,13 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     /// Timezone of the database.
     timezone: Option<String>,
     /// List of tables in the database.
-    tables: Vec<Stored<P::Table>>,
+    tables: Vec<Identified<P::Table, RelationIdentity>>,
     /// List of plain views in the database.
-    views: Vec<Stored<P::View>>,
+    views: Vec<Identified<P::View, RelationIdentity>>,
     /// List of materialized views in the database.
-    materialized_views: Vec<Stored<P::MaterializedView>>,
+    materialized_views: Vec<Identified<P::MaterializedView, RelationIdentity>>,
     /// List of columns in the database.
-    columns: Vec<Stored<P::Column>>,
+    columns: Vec<Identified<P::Column, ColumnIdentity>>,
     /// List of indices in the database.
     indices: Vec<Stored<P::Index>>,
     /// List of unique indices in the database.
@@ -106,6 +107,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     /// Comparison deciding whether a creation takes a name something already
     /// holds, which each engine answers its own way.
     identifier_case: IdentifierCase,
+    /// Where the next identity is drawn from.
+    identities: IdentityCounter,
 }
 
 impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
@@ -131,6 +134,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             column_grants: self.column_grants.clone(),
             search_path: self.search_path.clone(),
             identifier_case: self.identifier_case,
+            identities: self.identities,
         }
     }
 }
@@ -143,28 +147,49 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     }
 
     /// Returns a mutable reference to the tables list.
-    pub(crate) fn tables_mut(&mut self) -> &mut Vec<Stored<P::Table>> {
+    pub(crate) fn tables_mut(&mut self) -> &mut Vec<Identified<P::Table, RelationIdentity>> {
         &mut self.tables
     }
 
     /// Returns a mutable reference to the plain views list.
-    pub(crate) fn views_mut(&mut self) -> &mut Vec<Stored<P::View>> {
+    pub(crate) fn views_mut(&mut self) -> &mut Vec<Identified<P::View, RelationIdentity>> {
         &mut self.views
     }
 
     /// Returns the plain views recorded so far, with their metadata.
-    pub(crate) fn views(&self) -> &[Stored<P::View>] {
+    pub(crate) fn views(&self) -> &[Identified<P::View, RelationIdentity>] {
         &self.views
     }
 
     /// Returns a mutable reference to the materialized views list.
-    pub(crate) fn materialized_views_mut(&mut self) -> &mut Vec<Stored<P::MaterializedView>> {
+    pub(crate) fn materialized_views_mut(
+        &mut self,
+    ) -> &mut Vec<Identified<P::MaterializedView, RelationIdentity>> {
         &mut self.materialized_views
     }
 
     /// Returns the materialized views recorded so far, with their metadata.
-    pub(crate) fn materialized_views(&self) -> &[Stored<P::MaterializedView>] {
+    pub(crate) fn materialized_views(
+        &self,
+    ) -> &[Identified<P::MaterializedView, RelationIdentity>] {
         &self.materialized_views
+    }
+
+    /// Returns `saved` as the builder a rollback leaves, keeping this
+    /// builder's identity counter so no identity is handed out twice.
+    pub(crate) fn rolled_back_to(&self, mut saved: Self) -> Self {
+        saved.identities = self.identities;
+        saved
+    }
+
+    /// Hands out a relation identity no object of this ingestion has held.
+    pub(crate) fn draw_relation_identity(&mut self) -> RelationIdentity {
+        self.identities.relation()
+    }
+
+    /// Hands out a column identity no object of this ingestion has held.
+    pub(crate) fn draw_column_identity(&mut self) -> ColumnIdentity {
+        self.identities.column()
     }
 
     /// Returns the schemas an unqualified name resolves against, in order,
@@ -255,12 +280,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     }
 
     /// Returns a slice of column Arc references with their metadata.
-    pub(crate) fn columns(&self) -> &[Stored<P::Column>] {
+    pub(crate) fn columns(&self) -> &[Identified<P::Column, ColumnIdentity>] {
         &self.columns
     }
 
     /// Returns a mutable reference to the columns list.
-    pub(crate) fn columns_mut(&mut self) -> &mut Vec<Stored<P::Column>> {
+    pub(crate) fn columns_mut(&mut self) -> &mut Vec<Identified<P::Column, ColumnIdentity>> {
         &mut self.columns
     }
 
@@ -333,6 +358,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             column_grants: Vec::new(),
             search_path: Self::default_search_path(),
             identifier_case: IdentifierCase::AsWritten,
+            identities: IdentityCounter::default(),
         }
     }
 }
@@ -354,7 +380,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
 
     fn ensure_table_lookup_invariants(&self, table: &P::Table) -> Result<(), LookupError> {
         let case = self.identifier_case;
-        for (existing, _) in self.tables() {
+        for (existing, _, _) in self.tables() {
             let existing = existing.as_ref();
             if tables_share_identity(existing, table, case)
                 || creates_implicit_public_ambiguity(existing, table, case)
@@ -377,7 +403,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self
     }
 
-    /// Adds a table with its metadata to the builder.
+    /// Adds a table with its metadata to the builder, under an identity no
+    /// object of this builder has held.
     ///
     /// # Errors
     ///
@@ -388,8 +415,20 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         table: Arc<P::Table>,
         metadata: Meta<P::Table>,
     ) -> Result<Self, LookupError> {
+        let identity = self.draw_relation_identity();
+        self.add_table_with_identity(table, metadata, identity)
+    }
+
+    /// Adds a table under the identity it already holds, for a statement that
+    /// replaces the table's node.
+    pub(crate) fn add_table_with_identity(
+        mut self,
+        table: Arc<P::Table>,
+        metadata: Meta<P::Table>,
+        identity: RelationIdentity,
+    ) -> Result<Self, LookupError> {
         self.ensure_table_lookup_invariants(table.as_ref())?;
-        self.tables.push((table, metadata));
+        self.tables.push((table, metadata, identity));
         Ok(self)
     }
 
@@ -408,11 +447,25 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             .try_fold(self, |builder, (table, metadata)| builder.add_table(table, metadata))
     }
 
-    /// Adds a column with its metadata to the builder.
+    /// Adds a column with its metadata to the builder, under an identity no
+    /// object of this builder has held.
     #[must_use]
     #[inline]
     pub fn add_column(mut self, column: Arc<P::Column>, metadata: Meta<P::Column>) -> Self {
-        self.columns.push((column, metadata));
+        let identity = self.draw_column_identity();
+        self.add_column_with_identity(column, metadata, identity)
+    }
+
+    /// Adds a column under the identity it already holds, for a statement
+    /// that replaces its table's node.
+    #[must_use]
+    pub(crate) fn add_column_with_identity(
+        mut self,
+        column: Arc<P::Column>,
+        metadata: Meta<P::Column>,
+        identity: ColumnIdentity,
+    ) -> Self {
+        self.columns.push((column, metadata, identity));
         self
     }
 
@@ -420,11 +473,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     #[must_use]
     #[inline]
     pub fn add_columns(
-        mut self,
+        self,
         columns: impl IntoIterator<Item = (Arc<P::Column>, Meta<P::Column>)>,
     ) -> Self {
-        self.columns.extend(columns);
-        self
+        columns
+            .into_iter()
+            .fold(self, |builder, (column, metadata)| builder.add_column(column, metadata))
     }
 
     /// Adds an index with its metadata to the builder.
@@ -544,9 +598,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.functions.iter().map(|(func_arc, _)| func_arc.clone()).collect()
     }
 
-    /// Returns a slice of table Arc references with their metadata.
+    /// Returns a slice of table Arc references with their metadata and
+    /// identities.
     #[must_use]
-    pub fn tables(&self) -> &[Stored<P::Table>] {
+    pub fn tables(&self) -> &[Identified<P::Table, RelationIdentity>] {
         &self.tables
     }
 
@@ -651,26 +706,37 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self
     }
 
-    /// Adds a plain view with its metadata to the builder.
+    /// Adds a plain view with its metadata to the builder, under an identity
+    /// no object of this builder has held.
     #[must_use]
     #[inline]
     pub fn add_view(mut self, view: Arc<P::View>, metadata: Meta<P::View>) -> Self {
-        self.views.push((view, metadata));
+        let identity = self.draw_relation_identity();
+        self.add_view_with_identity(view, metadata, identity)
+    }
+
+    /// Adds a plain view under the identity it already holds, for a statement
+    /// that replaces the view.
+    #[must_use]
+    pub(crate) fn add_view_with_identity(
+        mut self,
+        view: Arc<P::View>,
+        metadata: Meta<P::View>,
+        identity: RelationIdentity,
+    ) -> Self {
+        self.views.push((view, metadata, identity));
         self
     }
 
     /// Adds multiple plain views with their metadata to the builder.
     #[must_use]
     #[inline]
-    pub fn add_views(
-        mut self,
-        views: impl IntoIterator<Item = (Arc<P::View>, Meta<P::View>)>,
-    ) -> Self {
-        self.views.extend(views);
-        self
+    pub fn add_views(self, views: impl IntoIterator<Item = (Arc<P::View>, Meta<P::View>)>) -> Self {
+        views.into_iter().fold(self, |builder, (view, metadata)| builder.add_view(view, metadata))
     }
 
-    /// Adds a materialized view with its metadata to the builder.
+    /// Adds a materialized view with its metadata to the builder, under an
+    /// identity no object of this builder has held.
     #[must_use]
     #[inline]
     pub fn add_materialized_view(
@@ -678,7 +744,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         view: Arc<P::MaterializedView>,
         metadata: Meta<P::MaterializedView>,
     ) -> Self {
-        self.materialized_views.push((view, metadata));
+        let identity = self.draw_relation_identity();
+        self.materialized_views.push((view, metadata, identity));
         self
     }
 
@@ -686,18 +753,19 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     #[must_use]
     #[inline]
     pub fn add_materialized_views(
-        mut self,
+        self,
         views: impl IntoIterator<Item = (Arc<P::MaterializedView>, Meta<P::MaterializedView>)>,
     ) -> Self {
-        self.materialized_views.extend(views);
-        self
+        views
+            .into_iter()
+            .fold(self, |builder, (view, metadata)| builder.add_materialized_view(view, metadata))
     }
 
     /// Reopens a built database for further ingestion, handing its
     /// continuation state back beside the builder.
     ///
-    /// The inverse of [`Self::into_database`]: the relation index is dropped
-    /// and rebuilt when the builder finishes again.
+    /// The relation and identity indexes are dropped and rebuilt when the
+    /// builder finishes again, while the identity counter carries on.
     pub(crate) fn from_database(database: GenericDB<P>) -> (Self, P::Ingestion) {
         let GenericDB {
             dialect,
@@ -709,6 +777,9 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             relation_index: _,
             folded_relation_index: _,
             columns,
+            relation_identities: _,
+            column_identities: _,
+            identities,
             indices,
             unique_indices,
             foreign_keys,
@@ -747,6 +818,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             column_grants,
             search_path,
             identifier_case,
+            identities,
         };
         (builder, ingestion)
     }
@@ -756,14 +828,14 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     pub(crate) fn into_database(mut self, ingestion: P::Ingestion) -> GenericDB<P> {
         let catalog_name = self.catalog_name;
 
-        self.tables.sort_unstable_by_key(|(table, _)| {
+        self.tables.sort_unstable_by_key(|(table, _, _)| {
             (
                 table.table_schema().map(alloc::string::ToString::to_string),
                 table.table_name().to_string(),
             )
         });
 
-        self.columns.sort_unstable_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
+        self.columns.sort_unstable_by(|(a, _, _), (b, _, _)| a.as_ref().cmp(b.as_ref()));
         self.indices.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         self.unique_indices.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         self.foreign_keys.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
@@ -778,11 +850,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.roles
             .sort_unstable_by(|(left, _), (right, _)| left.stored_name().cmp(&right.stored_name()));
         self.schemas.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
-        self.views.sort_unstable_by(|(a, _), (b, _)| {
+        self.views.sort_unstable_by(|(a, _, _), (b, _, _)| {
             stored_view_key(a.as_ref(), IdentifierCase::AsWritten)
                 .cmp(&stored_view_key(b.as_ref(), IdentifierCase::AsWritten))
         });
-        self.materialized_views.sort_unstable_by(|(a, _), (b, _)| {
+        self.materialized_views.sort_unstable_by(|(a, _, _), (b, _, _)| {
             stored_view_key(a.as_ref(), IdentifierCase::AsWritten)
                 .cmp(&stored_view_key(b.as_ref(), IdentifierCase::AsWritten))
         });
@@ -792,24 +864,38 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         // index answers all three. Slots of a kind stay ascending because each
         // kind is walked in storage order.
         let mut relation_index: BTreeMap<_, Vec<RelationSlot>> = BTreeMap::new();
-        for (position, (table, _)) in self.tables.iter().enumerate() {
+        let mut relation_identities = Vec::with_capacity(
+            self.tables.len() + self.views.len() + self.materialized_views.len(),
+        );
+        for (position, (table, _, identity)) in self.tables.iter().enumerate() {
             relation_index
                 .entry(stored_table_key(table.as_ref(), IdentifierCase::AsWritten))
                 .or_default()
                 .push(RelationSlot::Table(position));
+            relation_identities.push((*identity, RelationSlot::Table(position)));
         }
-        for (position, (view, _)) in self.views.iter().enumerate() {
+        for (position, (view, _, identity)) in self.views.iter().enumerate() {
             relation_index
                 .entry(stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
                 .or_default()
                 .push(RelationSlot::View(position));
+            relation_identities.push((*identity, RelationSlot::View(position)));
         }
-        for (position, (view, _)) in self.materialized_views.iter().enumerate() {
+        for (position, (view, _, identity)) in self.materialized_views.iter().enumerate() {
             relation_index
                 .entry(stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
                 .or_default()
                 .push(RelationSlot::MaterializedView(position));
+            relation_identities.push((*identity, RelationSlot::MaterializedView(position)));
         }
+        relation_identities.sort_unstable_by_key(|(identity, _)| *identity);
+        let mut column_identities: Vec<_> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(position, (_, _, identity))| (*identity, position))
+            .collect();
+        column_identities.sort_unstable_by_key(|(identity, _)| *identity);
 
         // Functions keep their own pool of names, and a name carrying several
         // argument lists holds several slots, ascending in storage order.
@@ -834,6 +920,9 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             relation_index,
             folded_relation_index,
             columns: self.columns,
+            relation_identities,
+            column_identities,
+            identities: self.identities,
             indices: self.indices,
             unique_indices: self.unique_indices,
             foreign_keys: self.foreign_keys,

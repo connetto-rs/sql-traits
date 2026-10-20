@@ -41,8 +41,8 @@ use crate::{
     errors::{LookupError, ObjectKind},
     impls::SqlparserDialect,
     structs::{
-        ColumnMetadata, GenericDB, IdentifierCase, MaterializedView, Schema, SchemaProfile,
-        TableAttribute, TableMetadata, View,
+        ColumnIdentity, ColumnMetadata, GenericDB, IdentifierCase, MaterializedView,
+        RelationIdentity, Schema, SchemaProfile, TableAttribute, TableMetadata, View,
         metadata::{
             CheckMetadata, FunctionMetadata, IndexMetadata, PolicyMetadata, UniqueIndexMetadata,
         },
@@ -207,12 +207,16 @@ impl CollationResolution<'_> {
     }
 }
 
+/// What a column's earlier declaration leaves to the declaration replacing it.
 #[derive(Debug, Clone)]
 struct PreservedColumnMetadata {
     column_name: String,
     column_name_quoted: bool,
     collation: Option<ObjectName>,
     metadata: ColumnMetadata,
+    /// The identity of the column this one continues, or `None` for one
+    /// copied from another table, which is a column of its own.
+    identity: Option<ColumnIdentity>,
 }
 
 fn qualify_created_collation_name(
@@ -524,16 +528,37 @@ fn preserved_column_metadata_for_table(
     builder
         .columns()
         .iter()
-        .filter(|(column, _)| TableAttribute::table(column) == table)
-        .map(|(column, metadata)| {
+        .filter(|(column, _, _)| TableAttribute::table(column) == table)
+        .map(|(column, metadata, identity)| {
             PreservedColumnMetadata {
                 column_name: column.column_name().to_string(),
                 column_name_quoted: column.column_name_is_quoted(),
                 collation: stored_column_collation_name(column.attribute()).cloned(),
                 metadata: metadata.clone(),
+                identity: Some(*identity),
             }
         })
         .collect()
+}
+
+/// The identity the column a replacing declaration names already holds,
+/// matched by name alone since a rename has already been applied to
+/// `preserved`, or `None` for a column the replaced declaration did not have.
+fn preserved_column_identity(
+    column: &ColumnDef,
+    preserved: &[PreservedColumnMetadata],
+) -> Option<ColumnIdentity> {
+    preserved
+        .iter()
+        .find(|metadata| {
+            identifiers_match(
+                &metadata.column_name,
+                metadata.column_name_quoted,
+                column.name.value.as_str(),
+                column.name.quote_style.is_some(),
+            )
+        })
+        .and_then(|metadata| metadata.identity)
 }
 
 fn preserved_column_metadata_for_column(
@@ -855,7 +880,7 @@ fn existing_child_column_collation_conflict(
     inherited_def: &ColumnDef,
     inherited_metadata: &ColumnMetadata,
 ) -> Option<crate::errors::Error> {
-    let (child_column, child_metadata) = builder.columns().iter().find(|(column, _)| {
+    let (child_column, child_metadata, _) = builder.columns().iter().find(|(column, _, _)| {
         child.matches(TableAttribute::table(column), builder.identifier_case())
             && added.matches(&column.attribute().name)
     })?;
@@ -939,7 +964,7 @@ impl ParserDBBuilder {
             // and is NOT from the same table (self-referential FKs are OK to
             // drop)
             let Some(referenced_table) = resolve_table_object_name_in_iter(
-                self.tables().iter().map(|(table, _)| table.as_ref()),
+                self.tables().iter().map(|(table, _, _)| table.as_ref()),
                 &fk.attribute().foreign_table,
                 self.identifier_case(),
             )
@@ -948,7 +973,7 @@ impl ParserDBBuilder {
                 continue;
             };
             let Some(host_table) = resolve_table_object_name_in_iter(
-                self.tables().iter().map(|(table, _)| table.as_ref()),
+                self.tables().iter().map(|(table, _, _)| table.as_ref()),
                 &fk.table().name,
                 self.identifier_case(),
             )
@@ -1013,8 +1038,8 @@ impl ParserDBBuilder {
             )
         };
 
-        self.tables_mut().retain(|(table, _)| !is_target(table));
-        self.columns_mut().retain(|(column, _)| !is_target(TableAttribute::table(column)));
+        self.tables_mut().retain(|(table, _, _)| !is_target(table));
+        self.columns_mut().retain(|(column, _, _)| !is_target(TableAttribute::table(column)));
         self.indices_mut().retain(|(index, _)| !is_target(TableAttribute::table(index)));
         self.unique_indices_mut().retain(|(index, _)| !is_target(TableAttribute::table(index)));
         self.foreign_keys_mut().retain(|(key, ())| !is_target(TableAttribute::table(key)));
@@ -1114,7 +1139,7 @@ impl ParserDBBuilder {
         column: &NamedColumn,
     ) -> bool {
         let case = self.identifier_case();
-        self.tables().iter().any(|(host, _)| {
+        self.tables().iter().any(|(host, _, _)| {
             !table.matches(host.as_ref(), case) && refers_to_column(host.as_ref(), table, column)
         }) || self.policies().iter().any(|(policy, _)| {
             table.named_by(&policy.table_name)
@@ -1171,7 +1196,7 @@ impl ParserDBBuilder {
 
         self.tables()
             .iter()
-            .map(|(host, _)| host.as_ref())
+            .map(|(host, _, _)| host.as_ref())
             .filter(|host| !table.matches(host, case) && refers_to_column(host, table, column))
             .map(StoredTable::of)
             .collect()
@@ -1261,7 +1286,7 @@ impl ParserDBBuilder {
             true
         });
 
-        self.columns_mut().retain(|(column, _)| !belongs_to(TableAttribute::table(column)));
+        self.columns_mut().retain(|(column, _, _)| !belongs_to(TableAttribute::table(column)));
         self.unique_indices_mut().retain(|(index, _)| !belongs_to(TableAttribute::table(index)));
         self.foreign_keys_mut().retain(|(fk, ())| !belongs_to(TableAttribute::table(fk)));
         self.check_constraints_mut().retain(|(check, _)| !belongs_to(TableAttribute::table(check)));
@@ -1284,7 +1309,7 @@ impl ParserDBBuilder {
             || self
                 .tables()
                 .iter()
-                .any(|(_, metadata)| metadata.owner() == Some(stored_name.as_str()))
+                .any(|(_, metadata, _)| metadata.owner() == Some(stored_name.as_str()))
             || self
                 .functions()
                 .iter()
@@ -1314,11 +1339,11 @@ impl ParserDBBuilder {
                 identifiers_match(stored_schema, stored_quoted, schema_name, schema_quoted)
             })
         };
-        self.tables().iter().any(|(table, _)| {
+        self.tables().iter().any(|(table, _, _)| {
             in_schema(table.table_schema().map(|schema| (schema, table.table_schema_is_quoted())))
-        }) || self.views().iter().any(|(view, _)| {
+        }) || self.views().iter().any(|(view, _, _)| {
             in_schema(view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())))
-        }) || self.materialized_views().iter().any(|(view, _)| {
+        }) || self.materialized_views().iter().any(|(view, _, _)| {
             in_schema(view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())))
         })
     }
@@ -1339,7 +1364,7 @@ impl ParserDBBuilder {
     ) -> Result<Option<&CreateTable>, LookupError> {
         let case = self.identifier_case();
         resolve_table_object_name_on_search_path_in_iter(
-            self.tables().iter().map(|(table, _)| table.as_ref()),
+            self.tables().iter().map(|(table, _, _)| table.as_ref()),
             object_name,
             || self.search_path(),
             case,
@@ -1356,7 +1381,7 @@ impl ParserDBBuilder {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let case = self.identifier_case();
         resolve_view_on_search_path_in_iter(
-            self.views().iter().map(|(view, _)| view.as_ref()),
+            self.views().iter().map(|(view, _, _)| view.as_ref()),
             &target_name_of_idents(schema_ident, name_ident),
             || self.search_path(),
             case,
@@ -1373,7 +1398,7 @@ impl ParserDBBuilder {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let case = self.identifier_case();
         resolve_view_on_search_path_in_iter(
-            self.materialized_views().iter().map(|(view, _)| view.as_ref()),
+            self.materialized_views().iter().map(|(view, _, _)| view.as_ref()),
             &target_name_of_idents(schema_ident, name_ident),
             || self.search_path(),
             case,
@@ -1401,12 +1426,12 @@ impl ParserDBBuilder {
 
     /// Whether any table, view or materialized view is stored under `key`.
     fn relation_key_is_held(&self, key: &RelationKey, case: IdentifierCase) -> bool {
-        self.tables().iter().any(|(table, _)| table_matches_key(table.as_ref(), key, case))
-            || self.views().iter().any(|(view, _)| view_matches_key(view.as_ref(), key, case))
+        self.tables().iter().any(|(table, _, _)| table_matches_key(table.as_ref(), key, case))
+            || self.views().iter().any(|(view, _, _)| view_matches_key(view.as_ref(), key, case))
             || self
                 .materialized_views()
                 .iter()
-                .any(|(view, _)| view_matches_key(view.as_ref(), key, case))
+                .any(|(view, _, _)| view_matches_key(view.as_ref(), key, case))
     }
 
     /// Binds every relation a grant or revoke names to the one it reaches
@@ -1438,7 +1463,7 @@ impl ParserDBBuilder {
         object_name: &ObjectName,
     ) -> Result<Option<&CreateTable>, LookupError> {
         resolve_table_object_name_in_iter(
-            self.tables().iter().map(|(table, _)| table.as_ref()),
+            self.tables().iter().map(|(table, _, _)| table.as_ref()),
             object_name,
             self.identifier_case(),
         )
@@ -1486,7 +1511,7 @@ impl ParserDBBuilder {
         let claimed = |key: &RelationKey| self.relation_key_is_held(key, case);
         let path = || self.search_path();
         if let Some(table) = resolve_target_on_search_path_in_iter(
-            self.tables().iter().map(|(table, _)| table.as_ref()),
+            self.tables().iter().map(|(table, _, _)| table.as_ref()),
             &target,
             path,
             case,
@@ -1500,7 +1525,7 @@ impl ParserDBBuilder {
             });
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
-            self.views().iter().map(|(view, _)| view.as_ref()),
+            self.views().iter().map(|(view, _, _)| view.as_ref()),
             &target,
             path,
             case,
@@ -1514,7 +1539,7 @@ impl ParserDBBuilder {
             });
         }
         resolve_view_on_search_path_in_iter(
-            self.materialized_views().iter().map(|(view, _)| view.as_ref()),
+            self.materialized_views().iter().map(|(view, _, _)| view.as_ref()),
             &target,
             path,
             case,
@@ -2143,7 +2168,7 @@ fn tables_declaring_column(
     builder
         .tables()
         .iter()
-        .map(|(table, _)| table.as_ref())
+        .map(|(table, _, _)| table.as_ref())
         .filter(|table| !altered.matches(table, case) && column.declared_by(table))
         .map(StoredTable::of)
         .collect()
@@ -2904,7 +2929,7 @@ fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
                 builder
                     .tables()
                     .iter()
-                    .map(|(table, _)| table.as_ref())
+                    .map(|(table, _, _)| table.as_ref())
                     .chain(core::iter::once(&*node)),
                 &foreign_key.foreign_table,
                 || builder.search_path(),
@@ -3123,13 +3148,14 @@ fn view_name_holder(
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
     let case = builder.identifier_case();
-    if builder.views().iter().any(|(view, _)| view_holds_name(view.as_ref(), name, schema, case)) {
+    if builder.views().iter().any(|(view, _, _)| view_holds_name(view.as_ref(), name, schema, case))
+    {
         return Some(ObjectKind::View);
     }
     builder
         .materialized_views()
         .iter()
-        .any(|(view, _)| view_holds_name(view.as_ref(), name, schema, case))
+        .any(|(view, _, _)| view_holds_name(view.as_ref(), name, schema, case))
         .then_some(ObjectKind::MaterializedView)
 }
 
@@ -3163,7 +3189,7 @@ fn relation_name_holder(
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
     let case = builder.identifier_case();
-    let table = builder.tables().iter().any(|(table, _)| {
+    let table = builder.tables().iter().any(|(table, _, _)| {
         case.identifiers_match(
             table.table_name(),
             table.table_name_is_quoted(),
@@ -3508,7 +3534,7 @@ fn rename_role_references(builder: &mut ParserDBBuilder, previous: &Ident, repla
     let previous_name = stored_role_name(previous);
     let replacement_name = stored_role_name(replacement);
 
-    for (_, metadata) in builder.tables_mut() {
+    for (_, metadata, _) in builder.tables_mut() {
         if metadata.owner() == Some(previous_name.as_str()) {
             metadata.set_owner(Some(replacement_name.clone()));
         }
@@ -3521,12 +3547,12 @@ fn rename_role_references(builder: &mut ParserDBBuilder, previous: &Ident, repla
     // A view's owner is as much a reference to the role as a table's, so a
     // rename has to reach it too, otherwise the view keeps naming a role that
     // no longer exists and a later `DROP ROLE` sees nothing depending on it.
-    for (_, metadata) in builder.views_mut() {
+    for (_, metadata, _) in builder.views_mut() {
         if metadata.owner() == Some(previous_name.as_str()) {
             metadata.set_owner(Some(replacement_name.clone()));
         }
     }
-    for (_, metadata) in builder.materialized_views_mut() {
+    for (_, metadata, _) in builder.materialized_views_mut() {
         if metadata.owner() == Some(previous_name.as_str()) {
             metadata.set_owner(Some(replacement_name.clone()));
         }
@@ -4270,7 +4296,7 @@ impl ParserDB {
         let hosts: Vec<StoredTable> = builder
             .tables()
             .iter()
-            .map(|(table, _)| table.as_ref())
+            .map(|(table, _, _)| table.as_ref())
             .filter(|table| {
                 !renamed.matches(table, builder.identifier_case())
                     && (table_references(table, &renamed)
@@ -4326,14 +4352,14 @@ impl ParserDB {
         let Some(position) = builder
             .tables()
             .iter()
-            .position(|(table, _)| stored.matches(table.as_ref(), builder.identifier_case()))
+            .position(|(table, _, _)| stored.matches(table.as_ref(), builder.identifier_case()))
         else {
             return Err(ObjectKind::Table.not_in_database(&stored.name).into());
         };
         let empty_catalog = PostgresCatalog::empty();
         let catalog = catalog.unwrap_or(&empty_catalog);
 
-        let (previous_node, previous_metadata) = builder.tables_mut().remove(position);
+        let (previous_node, previous_metadata, identity) = builder.tables_mut().remove(position);
         let mut replacement = (*previous_node).clone();
         edit(&previous_node, &mut replacement)?;
         record_implied_not_null(&mut replacement);
@@ -4384,8 +4410,9 @@ impl ParserDB {
             collations,
             catalog,
             &preserved_collations,
+            Some(identity),
         )?;
-        builder.tables_mut().sort_by(|(a, _), (b, _)| {
+        builder.tables_mut().sort_by(|(a, _, _), (b, _, _)| {
             (a.table_schema(), a.table_name()).cmp(&(b.table_schema(), b.table_name()))
         });
 
@@ -4529,7 +4556,7 @@ impl ParserDB {
             builder
                 .tables()
                 .iter()
-                .map(|(t, _)| t.as_ref())
+                .map(|(t, _, _)| t.as_ref())
                 .chain(core::iter::once(create_table.as_ref())),
             &fk.foreign_table,
             || builder.search_path(),
@@ -4754,7 +4781,10 @@ impl ParserDB {
     /// options and table constraints imply.
     ///
     /// `table_metadata` carries the state the node does not express: row level
-    /// security flags and `CREATE INDEX` indexes.
+    /// security flags and `CREATE INDEX` indexes. `identity` is the one a
+    /// replaced node held, which the replacement keeps along with the
+    /// identity of every column `preserved` names, or `None` for a table the
+    /// statement creates.
     fn ingest_table_node_with_collations(
         mut builder: ParserDBBuilder,
         create_table: Arc<CreateTable>,
@@ -4762,11 +4792,13 @@ impl ParserDB {
         collations: &[CreatedCollationMetadata],
         catalog: &PostgresCatalog,
         preserved: &[PreservedColumnMetadata],
+        identity: Option<RelationIdentity>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         validate_table_schema(&builder, &create_table)?;
         validate_distinct_columns(&create_table, builder.identifier_case())?;
         validate_relation_names(&builder, &create_table)?;
 
+        let identity = identity.unwrap_or_else(|| builder.draw_relation_identity());
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
         let validate_missing = should_validate_missing_collations(*builder.dialect());
@@ -4786,7 +4818,9 @@ impl ParserDB {
                 preserved,
                 validate_missing,
             )?;
-            builder = builder.add_column(column.clone(), metadata);
+            let column_identity = preserved_column_identity(column.attribute(), preserved)
+                .unwrap_or_else(|| builder.draw_column_identity());
+            builder = builder.add_column_with_identity(column.clone(), metadata, column_identity);
         }
 
         builder = Self::process_table_constraints(
@@ -4796,7 +4830,7 @@ impl ParserDB {
             builder,
         )?;
 
-        Ok(builder.add_table(create_table, table_metadata)?)
+        Ok(builder.add_table_with_identity(create_table, table_metadata, identity)?)
     }
 
     /// Applies `edit` to the constraint list of the table an `ALTER TABLE`
@@ -5232,7 +5266,7 @@ impl ParserDB {
         let resolved_schema_quoted = resolved_table.table_schema_is_quoted();
 
         let case = builder.identifier_case();
-        let Some(entry) = builder.tables_mut().iter_mut().find(|(table, _)| {
+        let Some(entry) = builder.tables_mut().iter_mut().find(|(table, _, _)| {
             table_matches_resolved_identity(
                 table.as_ref(),
                 &resolved_table_name,
@@ -5327,7 +5361,7 @@ impl ParserDB {
         builder
             .tables()
             .iter()
-            .map(|(table, _)| table.as_ref())
+            .map(|(table, _, _)| table.as_ref())
             .find(|table| stored.matches(table, builder.identifier_case()))
             .ok_or_else(|| ObjectKind::Table.not_in_database(&stored.name).into())
     }
@@ -5615,7 +5649,7 @@ impl ParserDB {
         let hosts: Vec<StoredTable> = builder
             .tables()
             .iter()
-            .map(|(table, _)| table.as_ref())
+            .map(|(table, _, _)| table.as_ref())
             .filter(|host| {
                 !stored.matches(host, builder.identifier_case())
                     && refers_to_column(host, &stored, &from)
@@ -6227,7 +6261,7 @@ impl ParserDB {
                         };
 
                         let (removed, _) = builder.indices_mut().remove(position);
-                        for (_, table_meta) in builder.tables_mut() {
+                        for (_, table_meta, _) in builder.tables_mut() {
                             table_meta.retain_indices(|index| !Arc::ptr_eq(index, &removed));
                         }
                     }
@@ -6265,7 +6299,7 @@ impl ParserDB {
                     // metadata of the table the index is on, so both take the
                     // replacement.
                     builder.indices_mut()[position] = (renamed.clone(), metadata);
-                    for (_, table_metadata) in builder.tables_mut() {
+                    for (_, table_metadata, _) in builder.tables_mut() {
                         table_metadata.replace_index(&stored, &renamed);
                     }
                 }
@@ -6527,7 +6561,7 @@ impl ParserDB {
                             let tables_to_remove: Vec<_> = builder
                                 .tables()
                                 .iter()
-                                .filter(|(t, _)| {
+                                .filter(|(t, _, _)| {
                                     t.table_schema().is_some_and(|table_schema| {
                                         identifiers_match(
                                             table_schema,
@@ -6537,7 +6571,7 @@ impl ParserDB {
                                         )
                                     })
                                 })
-                                .map(|(t, _)| {
+                                .map(|(t, _, _)| {
                                     (
                                         t.table_name().to_string(),
                                         t.table_name_is_quoted(),
@@ -6610,7 +6644,7 @@ impl ParserDB {
                     }
 
                     let case = builder.identifier_case();
-                    if let Some(entry) = builder.tables_mut().iter_mut().find(|(table, _)| {
+                    if let Some(entry) = builder.tables_mut().iter_mut().find(|(table, _, _)| {
                         table_matches_resolved_identity(
                             table.as_ref(),
                             &resolved_table_name,
@@ -7017,6 +7051,7 @@ impl ParserDB {
                         &collation_metadata,
                         &active_postgres_catalog,
                         &inherited.column_metadata,
+                        None,
                     )?;
                 }
                 Statement::CreateView(create_view) => {
@@ -7206,7 +7241,7 @@ impl ParserDB {
                     // resolved, since a dump omits roles and never the table
                     // it grants on.
                     let tables: Vec<&CreateTable> =
-                        builder.tables().iter().map(|(table, _)| table.as_ref()).collect();
+                        builder.tables().iter().map(|(table, _, _)| table.as_ref()).collect();
                     let path: Vec<(&str, bool)> = builder.search_path().collect();
                     crate::impls::validate_granted_columns(
                         &grant.privileges,
@@ -7234,7 +7269,7 @@ impl ParserDB {
                     }
 
                     let tables: Vec<&CreateTable> =
-                        builder.tables().iter().map(|(table, _)| table.as_ref()).collect();
+                        builder.tables().iter().map(|(table, _, _)| table.as_ref()).collect();
                     let path: Vec<(&str, bool)> = builder.search_path().collect();
                     crate::impls::validate_granted_columns(
                         &revoke.privileges,

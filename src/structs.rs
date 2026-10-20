@@ -9,6 +9,7 @@ pub use generic_db::{
     SqlparserProfile, UnresolvedAccessReference,
 };
 mod identifier_case;
+mod identity;
 pub mod metadata;
 mod schema;
 mod target_name;
@@ -20,6 +21,8 @@ pub use column_scope::{
 };
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use identifier_case::IdentifierCase;
+pub(crate) use identity::IdentityCounter;
+pub use identity::{ColumnIdentity, RelationIdentity};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
 pub use schema::Schema;
 pub use target_name::TargetName;

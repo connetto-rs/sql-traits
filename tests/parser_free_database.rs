@@ -54,6 +54,14 @@ struct MemoryCatalog {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryDialect;
 
+/// The collection a relation of [`MemoryCatalog`] sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum MemoryRelationKind {
+    Table,
+    View,
+    MaterializedView,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryTable {
     schema: Option<String>,
@@ -208,6 +216,10 @@ impl DatabaseLike for MemoryCatalog {
     type ColumnGrant = MemoryColumnGrant;
     type Schema = MemorySchema;
     type Dialect = MemoryDialect;
+    /// Which collection holds the relation, and its position there, stable
+    /// because nothing in this catalog renames or drops.
+    type RelationId = (MemoryRelationKind, usize);
+    type ColumnId = usize;
 
     fn dialect(&self) -> &Self::Dialect {
         &self.dialect
@@ -258,6 +270,31 @@ impl DatabaseLike for MemoryCatalog {
 
     fn table_id(&self, table: &Self::Table) -> Option<usize> {
         self.tables.iter().position(|candidate| candidate == table)
+    }
+
+    fn table_identity(&self, table: &Self::Table) -> Option<Self::RelationId> {
+        self.table_id(table).map(|position| (MemoryRelationKind::Table, position))
+    }
+
+    fn view_identity(&self, view: &Self::View) -> Option<Self::RelationId> {
+        self.views
+            .iter()
+            .position(|candidate| candidate == view)
+            .map(|position| (MemoryRelationKind::View, position))
+    }
+
+    fn materialized_view_identity(
+        &self,
+        view: &Self::MaterializedView,
+    ) -> Option<Self::RelationId> {
+        self.materialized_views
+            .iter()
+            .position(|candidate| candidate == view)
+            .map(|position| (MemoryRelationKind::MaterializedView, position))
+    }
+
+    fn column_identity(&self, column: &Self::Column) -> Option<Self::ColumnId> {
+        self.columns.iter().position(|candidate| candidate == column)
     }
 
     fn policies(&self) -> impl Iterator<Item = &Self::Policy> {
@@ -1473,6 +1510,42 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
     let first_column = docs.columns(&catalog)?.next().expect("a column");
     assert_eq!(catalog.dialect().is_bool(&catalog, first_column), TypeMatch::No);
     assert_eq!(first_column.fixed_binary_length(&catalog), None);
+
+    Ok(())
+}
+
+/// The inherited identity lookups find each relation in its own kind only,
+/// and a column through the table that holds it.
+#[test]
+fn the_inherited_identity_lookups_answer_each_kind() -> Result<(), LookupError> {
+    let mut catalog = catalog();
+    catalog.views.push(view(Some("app"), "recent", false));
+    catalog.materialized_views.push(view(Some("app"), "recent", true));
+
+    let docs = catalog
+        .table_by_target(
+            TargetName::new("docs", false).with_schema("app", false),
+            IdentifierCase::AsWritten,
+        )?
+        .expect("the qualified lookup finds it");
+    let table = catalog.table_identity(docs).expect("the catalog holds the table");
+    assert_eq!(catalog.table_by_identity(table), Some(docs));
+    assert_eq!(catalog.view_by_identity(table), None);
+
+    let recent = catalog.views().next().expect("a view");
+    let view = catalog.view_identity(recent).expect("the catalog holds the view");
+    assert_eq!(catalog.view_by_identity(view), Some(recent));
+    assert_eq!(catalog.materialized_view_by_identity(view), None);
+    let snapshot = catalog.materialized_views().next().expect("a materialized view");
+    let materialized =
+        catalog.materialized_view_identity(snapshot).expect("the catalog holds the view");
+    assert_eq!(catalog.materialized_view_by_identity(materialized), Some(snapshot));
+    assert_eq!(catalog.table_by_identity(materialized), None);
+
+    let body = docs.columns(&catalog)?.nth(1).expect("a second column");
+    let identity = catalog.column_identity(body).expect("the catalog holds the column");
+    assert_eq!(catalog.column_by_identity(identity), Some(body));
+    assert_eq!(catalog.column_identity(&column(Some("app"), "docs", "absent")), None);
 
     Ok(())
 }

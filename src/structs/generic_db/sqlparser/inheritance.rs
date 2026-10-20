@@ -93,7 +93,7 @@ pub(super) fn descendants(builder: &ParserDBBuilder, parent: &StoredTable) -> Ve
     let mut frontier: Vec<StoredTable> = alloc::vec![parent.clone()];
 
     while let Some(current) = frontier.pop() {
-        for (table, _) in builder.tables() {
+        for (table, _, _) in builder.tables() {
             if !names_parent(table, &current) {
                 continue;
             }
@@ -122,7 +122,7 @@ pub(super) fn direct_children(
     builder
         .tables()
         .iter()
-        .filter_map(|(table, _)| {
+        .filter_map(|(table, _, _)| {
             parents_with_kind(table)
                 .find(|(_, name)| parent.named_by(name))
                 .map(|(kind, _)| (kind, StoredTable::of(table)))
@@ -133,8 +133,8 @@ pub(super) fn direct_children(
 /// Marks a column a table has just received from a parent as inherited.
 pub(super) fn mark_inherited(builder: &mut ParserDBBuilder, table: &StoredTable, column: &str) {
     let case = builder.identifier_case();
-    if let Some((_, metadata)) =
-        builder.tables_mut().iter_mut().find(|(stored, _)| table.matches(stored, case))
+    if let Some((_, metadata, _)) =
+        builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
     {
         let mut names = metadata.inherited_column_names().to_vec();
         names.push(column.to_string());
@@ -146,8 +146,8 @@ pub(super) fn mark_inherited(builder: &mut ParserDBBuilder, table: &StoredTable,
 /// `ONLY` drop on the parent leaves behind.
 pub(super) fn unmark_inherited(builder: &mut ParserDBBuilder, table: &StoredTable, column: &str) {
     let case = builder.identifier_case();
-    if let Some((_, metadata)) =
-        builder.tables_mut().iter_mut().find(|(stored, _)| table.matches(stored, case))
+    if let Some((_, metadata, _)) =
+        builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
     {
         let names: Vec<String> = metadata
             .inherited_column_names()
@@ -167,8 +167,8 @@ pub(super) fn rename_inherited(
     to: &Ident,
 ) {
     let case = builder.identifier_case();
-    if let Some((_, metadata)) =
-        builder.tables_mut().iter_mut().find(|(stored, _)| table.matches(stored, case))
+    if let Some((_, metadata, _)) =
+        builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
     {
         let names = metadata
             .inherited_column_names()
@@ -554,8 +554,8 @@ pub(super) fn mark_inherited_constraint(
     constraint: &TableConstraint,
 ) {
     let case = builder.identifier_case();
-    if let Some((_, metadata)) =
-        builder.tables_mut().iter_mut().find(|(stored, _)| table.matches(stored, case))
+    if let Some((_, metadata, _)) =
+        builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
     {
         let mut held = metadata.inherited_constraints().to_vec();
         held.push(constraint.to_string());
@@ -571,8 +571,8 @@ pub(super) fn unmark_inherited_constraint(
     constraint: &TableConstraint,
 ) {
     let case = builder.identifier_case();
-    if let Some((_, metadata)) =
-        builder.tables_mut().iter_mut().find(|(stored, _)| table.matches(stored, case))
+    if let Some((_, metadata, _)) =
+        builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
     {
         let rendered = constraint.to_string();
         let held: Vec<String> = metadata
@@ -596,8 +596,8 @@ pub(super) fn records_inherited_constraint(
     builder
         .tables()
         .iter()
-        .find(|(stored, _)| table.matches(stored, builder.identifier_case()))
-        .is_some_and(|(_, metadata)| metadata.inherited_constraints().contains(&rendered))
+        .find(|(stored, _, _)| table.matches(stored, builder.identifier_case()))
+        .is_some_and(|(_, metadata, _)| metadata.inherited_constraints().contains(&rendered))
 }
 
 /// Carries the record of which constraints a table received across a rebuild
@@ -639,15 +639,16 @@ fn inherited_column_metadata(
     builder
         .columns()
         .iter()
-        .find(|(stored, _)| {
+        .find(|(stored, _, _)| {
             stored.table() == parent && same_column(&stored.attribute().name, &source.name)
         })
-        .map(|(_, metadata)| {
+        .map(|(_, metadata, _)| {
             super::PreservedColumnMetadata {
                 column_name: copy.name.value.clone(),
                 column_name_quoted: copy.name.quote_style.is_some(),
                 collation: super::stored_column_collation_name(copy).cloned(),
                 metadata: metadata.clone(),
+                identity: None,
             }
         })
 }

@@ -66,6 +66,12 @@ impl Catalog {
         )?;
         Ok(Self { builder, postgres, collations })
     }
+
+    /// Returns `saved` as the catalog a rollback leaves, still drawing
+    /// identities after every one this catalog handed out.
+    fn rolled_back_to(self, saved: Self) -> Self {
+        Self { builder: self.builder.rolled_back_to(saved.builder), ..saved }
+    }
 }
 
 /// An open transaction.
@@ -134,7 +140,10 @@ pub(super) fn apply(
 /// The catalog an ingestion ending now leaves behind. A session that ends
 /// inside a transaction rolls it back.
 pub(super) fn finish(catalog: Catalog, transaction: Option<Transaction>) -> Catalog {
-    transaction.and_then(|open| open.start).unwrap_or(catalog)
+    match transaction.and_then(|open| open.start) {
+        Some(start) => catalog.rolled_back_to(start),
+        None => catalog,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -438,7 +447,7 @@ impl Rules {
                     return refuse_outside(outside, statement).map(|()| catalog);
                 };
                 if let Some(start) = open.start {
-                    catalog = start;
+                    catalog = catalog.rolled_back_to(start);
                 }
                 if chain {
                     *transaction = Some(self.open(&catalog, false));
@@ -487,7 +496,7 @@ impl Rules {
                     open.savepoints.pop().and_then(|savepoint| savepoint.saved)
                 };
                 if let Some(saved) = returned {
-                    catalog = saved;
+                    catalog = catalog.rolled_back_to(saved);
                 }
             }
         }
