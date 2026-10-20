@@ -1192,6 +1192,52 @@ pub enum Error {
         /// Kind of object the statement tried to create.
         object_kind: ObjectKind,
     },
+    #[error("`{statement}` is transaction control the engine behind this dialect does not have.")]
+    /// A transaction control statement names a feature the engine lacks, such
+    /// as a savepoint in DuckDB or any transaction in Spark.
+    UnsupportedTransactionControl {
+        /// The statement as written.
+        statement: String,
+    },
+    #[error("`{statement}` can only be used inside a transaction.")]
+    /// A statement that ends or marks a transaction ran with none open, in an
+    /// engine that refuses it there.
+    NoOpenTransaction {
+        /// The statement as written.
+        statement: String,
+    },
+    #[error("`{statement}` cannot open a transaction inside another one.")]
+    /// A statement opening a transaction ran inside one, in an engine that
+    /// does not nest transactions.
+    TransactionAlreadyOpen {
+        /// The statement as written.
+        statement: String,
+    },
+    #[error("Savepoint `{savepoint_name}` does not exist.")]
+    /// A release of, or rollback to, a savepoint the open transaction does not
+    /// hold.
+    SavepointNotFound {
+        /// Name of the savepoint as written.
+        savepoint_name: String,
+    },
+    #[error(
+        "`{statement}` defines a schema object inside a transaction, which this engine refuses."
+    )]
+    /// A schema definition ran inside a transaction, in an engine that only
+    /// runs definitions outside one.
+    DefinitionInTransaction {
+        /// The statement as written.
+        statement: String,
+    },
+    #[error(
+        "`{statement}` follows a schema definition inside its transaction, where only the end of the transaction may."
+    )]
+    /// A statement other than the end of the transaction followed a schema
+    /// definition, in an engine that requires the definition to come last.
+    StatementAfterDefinition {
+        /// The statement as written.
+        statement: String,
+    },
 }
 
 impl From<ParserError> for Error {

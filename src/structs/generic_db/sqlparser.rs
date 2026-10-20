@@ -73,6 +73,7 @@ mod like;
 mod parse_options;
 mod postgres_18_collations;
 mod postgres_catalog;
+mod transactions;
 mod views;
 
 pub use parse_options::{AccessResolution, ParseOptions};
@@ -158,9 +159,16 @@ impl core::fmt::Debug for ParserIngestion {
 }
 
 /// A statement-by-statement builder that produces queryable schema snapshots.
+///
+/// Transaction control is performed the way the engine behind the dialect
+/// performs it. A `ROLLBACK` or `ROLLBACK TO SAVEPOINT` undoes the catalog
+/// changes it covers, a snapshot taken inside a transaction shows the changes
+/// made so far, and [`Self::finish`] rolls back a transaction still open, as
+/// the end of a session does.
 pub struct ParserDBIngestor {
-    builder: ParserDBBuilder,
-    ingestion: Arc<ParserIngestion>,
+    catalog: transactions::Catalog,
+    access_resolution: AccessResolution,
+    transaction: Option<transactions::Transaction>,
 }
 
 #[derive(Clone, Copy)]
@@ -3724,16 +3732,10 @@ impl ParserDBIngestor {
         options: ParseOptions,
     ) -> Self {
         let (access_resolution, postgres_catalog, identifier_case) = options.into_parts();
-        let active_postgres_catalog =
-            Arc::new(if matches!(dialect, SqlparserDialect::PostgreSql) {
-                postgres_catalog
-            } else {
-                PostgresCatalog::empty()
-            });
-        let ingestion = Arc::new(ParserIngestion {
-            access_resolution,
-            active_postgres_catalog,
-            collation_metadata: Vec::new(),
+        let postgres = Arc::new(if matches!(dialect, SqlparserDialect::PostgreSql) {
+            postgres_catalog
+        } else {
+            PostgresCatalog::empty()
         });
         let mut builder: ParserDBBuilder = super::GenericDBBuilder::new(catalog_name, dialect)
             .with_identifier_case(identifier_case);
@@ -3828,51 +3830,47 @@ impl ParserDBIngestor {
             builder = builder.add_function(Arc::new(create_function), FunctionMetadata::default());
         }
 
-        Self { builder, ingestion }
+        Self {
+            catalog: transactions::Catalog { builder, postgres, collations: Vec::new() },
+            access_resolution,
+            transaction: None,
+        }
     }
 
     fn apply_statements(
         self,
         statements: impl IntoIterator<Item = Statement>,
     ) -> Result<Self, crate::errors::Error> {
-        let Self { builder, ingestion } = self;
-        let ParserIngestion { access_resolution, active_postgres_catalog, collation_metadata } =
-            Arc::try_unwrap(ingestion).unwrap_or_else(|shared| (*shared).clone());
-        let mut statements = statements.into_iter();
-        let (builder, active_postgres_catalog, collation_metadata) = ParserDB::apply_statements(
-            builder,
-            active_postgres_catalog,
-            collation_metadata,
-            access_resolution,
-            &mut statements,
-        )?;
-        let ingestion = Arc::new(ParserIngestion {
-            access_resolution,
-            active_postgres_catalog,
-            collation_metadata,
-        });
-        Ok(Self { builder, ingestion })
+        let Self { mut catalog, access_resolution, mut transaction } = self;
+        for statement in statements {
+            catalog = transactions::apply(catalog, &mut transaction, access_resolution, statement)?;
+        }
+        Ok(Self { catalog, access_resolution, transaction })
     }
 
     /// Applies one statement to the current schema.
     ///
     /// # Errors
     ///
-    /// Returns an error when the statement is invalid for the current schema.
+    /// Returns an error when the statement is invalid for the current schema,
+    /// or is transaction control the engine behind the dialect refuses in the
+    /// current transaction state.
     pub fn apply_statement(self, statement: Statement) -> Result<Self, crate::errors::Error> {
         self.apply_statements(core::iter::once(statement))
     }
 
-    /// Returns a queryable snapshot without consuming the builder.
+    /// Returns a queryable snapshot without consuming the builder. Inside a
+    /// transaction it shows the changes the transaction has made so far.
     #[must_use]
     pub fn snapshot(&self) -> ParserDB {
-        self.builder.snapshot_with(Arc::clone(&self.ingestion))
+        self.catalog.snapshot(self.access_resolution)
     }
 
-    /// Returns the final queryable schema.
+    /// Returns the final queryable schema, rolling back a transaction still
+    /// open.
     #[must_use]
     pub fn finish(self) -> ParserDB {
-        self.builder.into_database(self.ingestion)
+        transactions::finish(self.catalog, self.transaction).into_database(self.access_resolution)
     }
 }
 
@@ -3910,8 +3908,8 @@ impl ParserDB {
     /// ```
     #[must_use]
     pub fn into_ingestor(self) -> ParserDBIngestor {
-        let (builder, ingestion) = ParserDBBuilder::from_database(self);
-        ParserDBIngestor { builder, ingestion }
+        let (catalog, access_resolution) = transactions::Catalog::from_database(self);
+        ParserDBIngestor { catalog, access_resolution, transaction: None }
     }
 
     /// Resolves a schema using a parsed SQL identifier.
@@ -5912,8 +5910,9 @@ impl ParserDB {
     /// name.
     ///
     /// A statement the model tracks nothing for is discarded rather than
-    /// refused, so a script carrying `VACUUM` or `START TRANSACTION` builds the
-    /// schema its other statements describe.
+    /// refused, so a script carrying `VACUUM` builds the schema its other
+    /// statements describe. Transaction control is performed as
+    /// [`ParserDBIngestor`] describes, so a rolled back change leaves no trace.
     ///
     /// # Arguments
     ///
