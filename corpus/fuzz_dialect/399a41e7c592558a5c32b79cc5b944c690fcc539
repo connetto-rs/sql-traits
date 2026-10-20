@@ -1,2 +1,0 @@
-CREATE TABLE ord(
-  id MAY KEY,UNIQUE (ser,c, c);

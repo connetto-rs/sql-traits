@@ -1,5 +1,0 @@
-CREATE INDEX idx_users_emser_date ON orders(ud, creat-ed_at DESC);
- CREATE INDEX idx_orde_date ON ordes(user_id, creat-ed_at DESC);
- CREATE INDEX idx_ordedate ON orders(user_id, reat-ed_at: DESC);
- CREATE INDEX ie ON orders#(user_id, creat-ed_at DESC);
-CREATE INDEX idx_orders_status ON orders(status) WHERE statuƒßÞÂ 'cÞÂWHEted';

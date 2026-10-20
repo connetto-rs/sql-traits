@@ -1,1 +1,0 @@
-CREATE TABLE o(d INT NULL REFERENCES use(d,    d, ct));

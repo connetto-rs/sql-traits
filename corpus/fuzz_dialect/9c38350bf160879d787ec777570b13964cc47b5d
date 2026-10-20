@@ -1,1 +1,0 @@
-CREATE TABLE ovdes (CHECK(amount #> 0),_ aaES);

@@ -1,2 +1,0 @@
-CREATE FUNCTION calculaol(tmC,TUPLE (T, sC, i)
-);

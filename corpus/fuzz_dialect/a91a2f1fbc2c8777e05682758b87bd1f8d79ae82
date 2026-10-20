@@ -1,3 +1,0 @@
-CREATE TABLE o (
- CHECK (a(09, @@9, 2)/@t)
-);

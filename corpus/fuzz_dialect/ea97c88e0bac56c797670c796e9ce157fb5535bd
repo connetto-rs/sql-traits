@@ -1,6 +1,0 @@
-CREATE POLICY use ON use  WITH CHECK (d());
-
-CREATE POLICY admall ON u@
-  #O 
-  
-ÿ

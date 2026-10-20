@@ -1,2 +1,0 @@
-CREATE POLICY n ON ess
- USING (ull(gl:=$I.

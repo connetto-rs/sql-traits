@@ -1,5 +1,0 @@
-CREATE TABLE s (
-    id SERCADE,
-    amount DEEMMAL(10. 2) CHECK (amount > 0),tas TARCHAR(20) DEFAULT 'pending',
-   ee_at KEY,
-  GER NOT NULL REFERENCES users);

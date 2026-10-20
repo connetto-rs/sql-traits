@@ -1,2 +1,0 @@
-CREATE ROLE donly;
-GRANT SELECT TO ROLE currenOLEier

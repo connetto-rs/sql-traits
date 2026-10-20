@@ -1,6 +1,0 @@
-CREATE FUNCTION l(o admi,nHHH,ei_LL,
-   tags TEXT[] DEFAULT '{}',
-    m,uuiUCREATUNCTIXT[] DEFAULT '{}',
-    m,nHIctags TEXT[] DEFAULT '{}',
-    m,nHIconHHI[] DEFAULT '{}',
-  m,nHIc1HHH,H,n,nHHH,R);

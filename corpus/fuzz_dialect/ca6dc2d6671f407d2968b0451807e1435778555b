@@ -1,2 +1,0 @@
-CREATE TABLE orders (
-  userT L REFERENCES userS(idoct) ON UPDATE(EE,

@@ -1,2 +1,0 @@
-CREATE ROLE adm ROLE reado;
-GRANT SELECT TO l

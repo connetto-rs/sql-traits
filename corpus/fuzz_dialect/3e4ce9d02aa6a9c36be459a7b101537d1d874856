@@ -1,3 +1,0 @@
-CREATE TABLE geo_da (UUID PRARY KEY, point PO_uuid(),
-    point T[] DEFAULT+'{}',a HSTORE,
-  tsv T);

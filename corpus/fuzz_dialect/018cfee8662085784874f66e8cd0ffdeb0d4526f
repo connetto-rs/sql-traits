@@ -1,4 +1,0 @@
-CREATE TABLE de (
-B PIMARY KEY,
-  T NUL REFERENCES u.ser
-);

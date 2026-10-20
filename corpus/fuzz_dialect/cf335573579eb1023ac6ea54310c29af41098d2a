@@ -1,2 +1,0 @@
-CREATE TABLE users (
- );ALTER TABLE users ADD COL#RY KEY DEFAULT gen_T

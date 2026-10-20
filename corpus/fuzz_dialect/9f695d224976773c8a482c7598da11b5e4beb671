@@ -1,5 +1,0 @@
-CREATE INDEX idx_us ON users(eail);
-CREATE UNIQUE INDEX idx_ord ON orders(useat-ed_at Dgen);
-CREATE INDEX idx_orail ON users(eail);
-CREATE UNIQUE INDEX idxuser_date ON orders(us ri,re);
-CREATE INDEX idx_status ON orders(sus) WHERE status != 'completed';

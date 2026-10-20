@@ -1,3 +1,0 @@
-CREATE TABLE users ( m R KEY,
-    nR PRIMY KEY,
-   D n KEY,Cm RUNIQUE);ALTER TABLE users ADD LID P

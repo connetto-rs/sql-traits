@@ -1,4 +1,0 @@
-CREATE POLICY uaTion ON us
-USING (ur.(((SELECT to
-|>CALL
-EL_l())(p:=$ÿ

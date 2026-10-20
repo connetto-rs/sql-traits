@@ -1,4 +1,0 @@
-CREATE POLICY usolaion ON L
- ;
-
-CREATE POLICY d@all ON utrue

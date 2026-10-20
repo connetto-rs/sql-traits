@@ -1,3 +1,0 @@
-CREATE POLICY n ON us
-  USING (usl&l-l*l
-  # n

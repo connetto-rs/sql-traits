@@ -1,1 +1,0 @@
-CREATE INDEX mil ON usr(eml) USING  u   USInG  u

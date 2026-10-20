@@ -1,2 +1,0 @@
-CREATE ROLE donly;
-GRANT SELECT ON C.C.AK.RC.C.AKRSC.Aub,i TO donl

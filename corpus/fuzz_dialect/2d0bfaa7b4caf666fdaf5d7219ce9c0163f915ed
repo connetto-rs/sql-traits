@@ -1,3 +1,0 @@
-CREATE ROLE ad LOGIN ;CREATE POLICY _all ON urs
-  TO ad,i,st,L
-  

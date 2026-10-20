@@ -1,3 +1,0 @@
-CREATE TaBLE ord(
- amou DECIM CHECK (float8:a_&at ), CHECK (@@(@@@:d_aat)
-)

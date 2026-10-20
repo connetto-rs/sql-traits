@@ -1,2 +1,0 @@
-CREATE ROLE dnly;
-GRANT SELECT ON ALL TABLES IN SCHEMA p,ub,i TO curr0nt_uier

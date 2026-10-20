@@ -1,1 +1,0 @@
-ALTER TABLE u ADD CONSTRAINT cCHECK (@@;H:d_t)

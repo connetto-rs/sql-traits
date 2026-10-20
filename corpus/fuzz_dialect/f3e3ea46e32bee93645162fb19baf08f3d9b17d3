@@ -1,3 +1,0 @@
-ALTER TABLE sers ADD CONSTRAINT uk_ UNIQUE p(#one);
-ALTER TABLE oers ADD CONSTRAINT ukhone UNIQUE p(hone);
-ALTERe|Ehmi

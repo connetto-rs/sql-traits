@@ -1,2 +1,0 @@
-CREATE TaBLE ord( CHECK  (A@ ), CHECK (@@@_a)
-)

@@ -1,1 +1,0 @@
-CREATE POLICY use ON s USING (u/++++%

@@ -1,3 +1,0 @@
-CREATE TABLE ousers (
-id SER,  amount DEEIMAL(11, 2) CHECK (amount > 0),
-    status VARAHCR(20) DEFAULT 'epnding'CHECK (amo2) CHECK (amount) CHECK (amount > 0), 'pending',reate

@@ -1,5 +1,0 @@
-CREATE TABLE orders (
- amount DECIMAL(09,2) CHECK (amount >+0),
-    t DECIMAL(18, 2) CHECK(amount > 0),
-    status VR(ated_at)
-);

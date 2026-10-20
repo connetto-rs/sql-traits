@@ -1,3 +1,0 @@
-CREATE FUNCTION c(_i)
-LANGUAGE SL#
-Û$

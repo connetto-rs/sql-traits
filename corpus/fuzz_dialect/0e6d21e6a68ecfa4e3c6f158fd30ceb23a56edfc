@@ -1,3 +1,0 @@
-CREATE ROLE donLy;
-GRANT SELECT ON ALL TABLES IN SCHEMA @p,ub,lC7,ic TO ROLE donlyﬂ
-   Uly;

@@ -1,5 +1,0 @@
-CREATE TABLE rs (
-    iBBBABBLI Y KEY,
-    user_id INT,
- UNIQUE (user_id,ed_at)
-);

@@ -1,2 +1,0 @@
-CREATE POLICY usn ON r
-WITH CHECK(g)2___

@@ -1,6 +1,0 @@
-CREATE ROLE eedonlyadonin;
-GRANT USAGE ON SCHEMA publ, publ,c TO ren;
-GRANT USAGE ON SCHEMA publ, publ,c TO rdoonlin;
-GRANT USAGE ON SCHEMA publ, publocal,c TO redoyadonin;
-GRANT USAGE ON SCHEMA publ, publ,c TTO 
-GR

@@ -1,1 +1,0 @@
-CREATE POLICY qsn ON re USING (lk++++@@GER NOT

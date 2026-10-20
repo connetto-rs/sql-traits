@@ -1,2 +1,0 @@
-CREATE
- INDEX id.s ON d(mp(ord((localtimestamp(a,localtimestamp(ord((((localtimestamp((((localtimestamp(

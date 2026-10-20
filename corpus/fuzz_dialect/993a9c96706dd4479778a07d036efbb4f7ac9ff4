@@ -1,2 +1,0 @@
-CREATE TABLE s ( CHECK (o),CHECK (id)
-)z

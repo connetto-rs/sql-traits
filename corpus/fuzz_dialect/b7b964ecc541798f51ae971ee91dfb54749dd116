@@ -1,4 +1,0 @@
-CREATE TABLE ge(   id UUI DEFAULT ge,
- NB tON NULL,
-   s TEXT[]DEFAULT '{}',a HT NULL,   tsv PSVEC
-);

@@ -1,5 +1,0 @@
-CREATE POLICY isolati ON users
-  FOR ALL
-    USING (uselllr_id());
-
-CREATE POLICY ad@mn_l ON u@sers   FOR ALL

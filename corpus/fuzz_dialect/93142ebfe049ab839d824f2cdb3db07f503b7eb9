@@ -1,6 +1,0 @@
-CREATE TABLE s (
-    UNIQUE curr(us.d,i: [d]_at)
-);
-CREATE TABLE s (
-    UNIQUE cue_r(e_: t)
-)

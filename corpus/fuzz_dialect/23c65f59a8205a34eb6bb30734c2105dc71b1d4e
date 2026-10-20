@@ -1,1 +1,0 @@
-ALTER TABLE u ADD CONSTRAINT NcCHECK (@@;H:d_at)

@@ -1,2 +1,0 @@
-CREATE TABLE orders 
- ( UNIQUE @u USING  uEcaur(ed_));

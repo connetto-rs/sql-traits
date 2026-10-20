@@ -1,9 +1,0 @@
-CREATE TABLE CCCCNT_(
-    id SERCADE,
- CURRENT_TIMESTAMBBBLd INT,
-   RIMARY KEY,IMARY KEY,
- _at TIM3___KEY,
-    uIMBBBBIAL PRIM,RY KEY,
-    easum_at TXBBP,
-    UNIQUE (user_id, createLd_at)
-);

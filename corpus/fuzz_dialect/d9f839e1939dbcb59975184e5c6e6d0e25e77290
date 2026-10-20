@@ -1,2 +1,0 @@
-CREATE TABLE ode (
-CHECK (m.t > 0));

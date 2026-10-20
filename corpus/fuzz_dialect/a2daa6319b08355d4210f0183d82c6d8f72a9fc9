@@ -1,3 +1,0 @@
-CREATE POLICY useon ON use  WITH CHECK (us());
-
-CREATE POLICY ll ON u@eÿV G (tru

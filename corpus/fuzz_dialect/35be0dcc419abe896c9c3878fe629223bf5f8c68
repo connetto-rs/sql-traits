@@ -1,2 +1,0 @@
-CREATE POLICY ion ON res
-USING (uG (l(s) WHERE lue);

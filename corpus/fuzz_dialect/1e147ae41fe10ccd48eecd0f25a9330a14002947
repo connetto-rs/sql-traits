@@ -1,5 +1,0 @@
-CREATE TABLE ord(
- u DECIMAL(1822 )CHECK (@@@:d_ ), CHECK (@2 ), CHECK (@@@:d_at), CHECK (@@(@@@:d_at ))
-AS
-L
-  , )

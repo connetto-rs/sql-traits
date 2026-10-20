@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-t EL(10  2) CHECK (amount >a0),
-DELETE CASCADE,
-    amount D);

@@ -1,1 +1,0 @@
-CREATE POLICY sen ON r USING (l!~*LE!~*

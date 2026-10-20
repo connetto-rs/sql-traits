@@ -1,3 +1,0 @@
-CREATE TABLE or(
-CHECK(m@null@t)
-);

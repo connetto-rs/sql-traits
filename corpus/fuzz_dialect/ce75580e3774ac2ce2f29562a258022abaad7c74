@@ -1,2 +1,0 @@
-CREATE POLICY latminl ON us
-    TO ad,i,sd,i,sad,i,i,sd,i,sd,st.  ,

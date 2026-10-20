@@ -1,3 +1,0 @@
-CREATE TABLE ge
-( t  id   PRIMARY KEY DEFAULT :rT NULL,
- xdata h);

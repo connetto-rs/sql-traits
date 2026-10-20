@@ -1,3 +1,0 @@
-CREATE INDEX i_e ON us(e);
-DESC
-DESC#DON

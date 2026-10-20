@@ -1,1 +1,0 @@
-CREATE POLICY ur ON us   USING (user= ALL( U

@@ -1,1 +1,0 @@
-CREATE POLICY lz ON us USING (St._se_(H<^C

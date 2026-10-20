@@ -1,3 +1,0 @@
-CREATE TaBLE ord(
- amou DECI CHECK (@@@:d_ad_at ), CHECK (session_user ), CHECK (@@:d_g@@)
-)

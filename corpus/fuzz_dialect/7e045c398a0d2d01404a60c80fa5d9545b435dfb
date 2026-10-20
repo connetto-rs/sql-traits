@@ -1,4 +1,0 @@
-CREATE TABLE orders$(
-d RIAL  ,amount DECIMAL(09, 2) CHECK (amount > 0),
-   CHECK (amount > 1),
-unt DECIMAL(09, 2) CHECK (amount > 0),    status d_at)ÿÿÿÿÿÿÿÿ

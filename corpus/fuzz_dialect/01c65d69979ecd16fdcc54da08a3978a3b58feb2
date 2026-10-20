@@ -1,1 +1,0 @@
-CREATE POLICY user_ ON e    USING (ue.t.szeid()

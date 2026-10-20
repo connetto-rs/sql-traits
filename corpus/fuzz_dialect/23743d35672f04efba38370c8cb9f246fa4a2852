@@ -1,1 +1,0 @@
-CREATE TABLE ers (CHECK (ertno(sstu)  > 5),tus VAR);

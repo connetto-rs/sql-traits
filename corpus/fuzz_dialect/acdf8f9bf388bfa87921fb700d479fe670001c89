@@ -1,1 +1,0 @@
-ALTER TABLE ords ADD FOREIGN KEY (loc,_,c,_,il) REFERENCES BKEY (loc,_,c,_,il) REFERENLE oridREF
