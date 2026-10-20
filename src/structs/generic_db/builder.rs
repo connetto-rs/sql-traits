@@ -108,10 +108,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     identifier_case: IdentifierCase,
 }
 
-impl<P: SchemaProfile> GenericDBBuilder<P> {
-    /// Returns a database carrying the given ingestion state, without
-    /// consuming the current builder.
-    pub(crate) fn snapshot_with(&self, ingestion: P::Ingestion) -> GenericDB<P> {
+impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
+    fn clone(&self) -> Self {
         Self {
             dialect: self.dialect.clone(),
             catalog_name: self.catalog_name.clone(),
@@ -134,7 +132,14 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             search_path: self.search_path.clone(),
             identifier_case: self.identifier_case,
         }
-        .into_database(ingestion)
+    }
+}
+
+impl<P: SchemaProfile> GenericDBBuilder<P> {
+    /// Returns a database carrying the given ingestion state, without
+    /// consuming the current builder.
+    pub(crate) fn snapshot_with(&self, ingestion: P::Ingestion) -> GenericDB<P> {
+        self.clone().into_database(ingestion)
     }
 
     /// Returns a mutable reference to the tables list.
