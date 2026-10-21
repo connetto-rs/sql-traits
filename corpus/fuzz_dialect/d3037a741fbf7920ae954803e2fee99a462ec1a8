@@ -1,0 +1,5 @@
+
+ SELECT Soctet_ctet_
+INTO-N
+-^N
++INTO-N,ELECTN

@@ -1,0 +1,2 @@
+ SELECT $N res$@ FOR UPDATE
+FOR PTADU

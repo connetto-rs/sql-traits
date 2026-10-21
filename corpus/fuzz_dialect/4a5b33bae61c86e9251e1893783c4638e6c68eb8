@@ -1,0 +1,2 @@
+CREATE ROLE TE ROLE oKi;
+GRANT USAGE ON ACu,l,pul,c TO re

@@ -1,0 +1,5 @@
+CREATE ROLE ad LOGIN PASSWORD 'secret';
+CREATE ROLE reGIN PASSWORD'secret';
+CREATE ROLE readoninTE ROLE reN PASSWORD 'secret';
+CREATE ROLE reado;
+GRANT USAGE ON SCHEMA rubl,c,c TO reey;

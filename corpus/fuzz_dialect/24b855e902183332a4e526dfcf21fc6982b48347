@@ -1,0 +1,3 @@
+CREATE TABLE o (
+ CHECK (@@c XOR @@@d_:@@@d_a)
+)

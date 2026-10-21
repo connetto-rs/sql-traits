@@ -1,0 +1,3 @@
+CReATE TaBLE ord(
+ amou DECIMAL(18 ), CHECK(@P@:at ),  INDEX (@@@:d_at ), CHECK (@@(@@@at ),  INDEX (@@@:t_at ), CHECK (@@(@@@18 ), CHECK(@P@:at ),  INDEX (@@@:d_at ), CHECK (@@(@@@at ),  INDEX (@@@:t_at ), CHECK (@@(@@@geond_&at ), CHECK (@@A@@@:a_at ),  INDEX (@@at ),  INDEX (@@CK(@P@:a), CHEC@:@:dA@geond_at ), CHECK (@@A@:a_at ),  INDEX (@@at ),  INDEX (@@CK(@P@:at ),  INDEX (@@@:d_at ), CHECK (@@(@@@at ),  INDEX (@@@:t_at ), CHEC@:@:dA@@@:a_at)
+)

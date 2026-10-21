@@ -1,0 +1,9 @@
+CREATE TABLE ot(
+ t P DEFAULT CBB$(P,HH,HAL.*,
+L,
+H,HHH,HAL.HAL.*,
+L,
+mHHH,HHH,HAL.HAL.*,L,
+
+mNUat)
+);

@@ -1,0 +1,3 @@
+CREATE FUNCTION acu#ova(o)
+AS $$E/*
+$$;

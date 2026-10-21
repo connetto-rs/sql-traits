@@ -1,0 +1,1 @@
+CREATE TABLE ta (idUID P KEY DEFAULT bytea:ECN||:E);

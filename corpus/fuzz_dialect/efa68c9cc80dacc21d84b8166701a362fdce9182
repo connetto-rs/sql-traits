@@ -1,0 +1,5 @@
+(UPDATE(((TE((( SELECT
+e|>DROP 
+e|>DROP T
+e|> SELECT
+e|>CALL Dta( )Do_OP

@@ -1,0 +1,2 @@
+CREATE FUNCTION calcuaol(TUPLE (T, sC, i)
+);

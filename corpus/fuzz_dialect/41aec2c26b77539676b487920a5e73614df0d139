@@ -1,0 +1,2 @@
+CREATE TABLE i(Y KEY DEFAULT gen_om_(id()(N050),
+ o)(22)

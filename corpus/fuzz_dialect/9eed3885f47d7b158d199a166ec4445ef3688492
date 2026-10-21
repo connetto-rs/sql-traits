@@ -1,0 +1,8 @@
+CREATE TABLE orders (
+    id SEcoalesceRCADE,
+    amounIEDAMt EL(72  2) CHECK (amount >amount > 0),
+  tNOT NUCASCAE,
+    amount D(u) CHECK (amount > @0),
+MES DEEIMAL(1sum2) CHECK (amount > A0),
+MEBBBB    st
+);

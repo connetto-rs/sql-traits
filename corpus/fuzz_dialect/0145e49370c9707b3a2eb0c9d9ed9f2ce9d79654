@@ -1,0 +1,4 @@
+
+CREATE ROLE p,lATE ROLE p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,user p,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,user p,l,user pB

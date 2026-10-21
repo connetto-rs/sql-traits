@@ -1,0 +1,4 @@
+CREATE TABLE gdata (
+    id KEY DEFAULT gen_rant_uu,
+s0 TEXT[] DEFAULT '{}',gs TEXT[] DEFAULT '{}' KEY DEFAULT gomid(),
+s TEXT[]);

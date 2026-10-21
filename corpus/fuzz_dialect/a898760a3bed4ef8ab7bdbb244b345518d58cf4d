@@ -1,0 +1,2 @@
+CREATE TABLE ord$(nk
+ A CHECK (u0>=ALL (_a)));

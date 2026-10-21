@@ -1,0 +1,8 @@
+CREATE TABLE CCCCNT_(
+    id SERCADENE,BBLd INT,
+   RIMARY KEY,IMARY KEY,
+ _at TIM1__EY,
+    uIMBBBBIAL PRIM,RY KEY,
+    easum_at TXBBP,
+    UNIQUE (us_at)
+);

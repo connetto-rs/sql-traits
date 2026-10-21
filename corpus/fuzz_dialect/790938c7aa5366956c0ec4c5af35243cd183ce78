@@ -1,0 +1,4 @@
+CREATE TABLE e (
+   id NU REFERENCES uers(i@) ON DELETE CASCADE,
+   R N NULL REFERENCES users(ated_at)
+);

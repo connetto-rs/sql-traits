@@ -1,0 +1,2 @@
+CREATE TABLE oders (
+amount L(2) CHECK (amount),T URRENT_@)

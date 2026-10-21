@@ -1,0 +1,3 @@
+
+CREATE ROLE rey;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO session_user,lÿÿÿÿÿÿ,

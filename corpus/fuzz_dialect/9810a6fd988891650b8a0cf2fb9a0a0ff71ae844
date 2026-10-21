@@ -1,0 +1,1 @@
+CREATE POLICY uu_ ON e USING (u.t.zeid()

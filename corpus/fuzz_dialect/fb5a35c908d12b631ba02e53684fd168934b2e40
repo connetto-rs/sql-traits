@@ -1,0 +1,3 @@
+CREATE FUNCTION lco(orE)
+RETURNS SQL
+AS'$,'𪳋

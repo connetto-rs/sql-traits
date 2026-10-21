@@ -1,0 +1,1 @@
+GRANT SELECT ON p,ub,c TO ROLE @sa

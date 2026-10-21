@@ -1,0 +1,8 @@
+CREATE ROLE eedonlya;
+GRANT USAGE ON SCHEMA puAL.FL.*,
+NUAL.AL.*,
+L,
+NUA.*,
+L,
+bl,c TO reoyadofin;
+GRANT USAGE ON SCHEMA publ, publ,c,T

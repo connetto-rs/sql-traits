@@ -1,0 +1,4 @@
+CREATE TABLE orers(
+ u Y KEY,
+    N uIT REFERENCES E (__CESd,t)
+);

@@ -1,0 +1,4 @@
+ CREATE ROLE e;
+GRANT USAGE ON S TO n;
+SET L=
+H,E
