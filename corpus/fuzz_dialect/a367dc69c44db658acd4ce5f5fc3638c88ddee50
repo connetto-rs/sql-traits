@@ -1,3 +1,0 @@
-CREATE POLICY user_ition ON user;
-
-CREATE POLICY admin ON r    USING (u_id());CREATE POLICY admin_all ON userﬂﬂﬂ al_l 

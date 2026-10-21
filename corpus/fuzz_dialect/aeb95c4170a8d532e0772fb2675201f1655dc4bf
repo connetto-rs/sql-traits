@@ -1,3 +1,0 @@
-CREATE ROLE donly;
-GRANT SELECT ON AL#t,tELt,tBB,
-B@

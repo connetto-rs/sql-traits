@@ -1,7 +1,0 @@
-CREATE FUNCTION c(N)
-RETURNS DESQL
-AS $$
- VQ*
-AQ*
-AS7
-$$;

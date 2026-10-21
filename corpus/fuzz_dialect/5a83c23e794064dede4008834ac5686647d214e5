@@ -1,2 +1,0 @@
-CREATE TABLE i(MARY KEY DEFAULT gen_om_(id()(N050),
- o)(22);

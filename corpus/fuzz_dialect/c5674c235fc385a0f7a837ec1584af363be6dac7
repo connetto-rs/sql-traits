@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    ERCAMARY KEY);
-CREATE TABLE or(
-session_ RRY KEY,
-  GER NOT NULL REFERENCES user);

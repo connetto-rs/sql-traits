@@ -1,2 +1,0 @@
-SELECT $ON res$2 FOR UPDATE
-FOR P

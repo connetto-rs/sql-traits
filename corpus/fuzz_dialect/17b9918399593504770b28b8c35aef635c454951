@@ -1,5 +1,0 @@
-CREATE INDEX idte ON orers(sss_id, DELETE CASC, stDELETE CASC, stB
-uB,aCASC,ASC, sBB,
-ZCASC,BBaCASC,ASC, sBB,
-SC, sL, B,
-aSC,ASC,a

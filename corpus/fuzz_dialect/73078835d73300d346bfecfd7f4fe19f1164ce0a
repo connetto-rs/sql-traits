@@ -1,3 +1,0 @@
-CREATE TABLE rers (d SR(20) DEFAULT uuid'pe',
- as A(ses)
-);

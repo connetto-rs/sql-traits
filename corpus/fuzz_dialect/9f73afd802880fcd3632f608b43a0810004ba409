@@ -1,4 +1,0 @@
-CREATE TABLE or(
-    id L  ,amount DEIMAL(9, 2) CHECK (amount > 1),
-   CHECK (Amount%>id),
- tus d_at)ÿÿÿÿÿÿ

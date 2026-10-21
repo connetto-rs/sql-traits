@@ -1,8 +1,0 @@
-CREATE TABLE orders (
-    id SERIA,
-   CHECK (amoun > 0),
-    status VAR REFERENCES use(id) ON DELETE CASCADE,
-   CHECK (aount > 0),LETE CASCADE,
-   CHECK (a),
- FERENCES uE,
-   CHECK (t > 0)

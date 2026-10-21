@@ -1,1 +1,0 @@
-CREATE POLICY ul ON @s TO ad,session_user Ù#

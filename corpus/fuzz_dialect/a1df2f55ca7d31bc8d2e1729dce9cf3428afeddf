@@ -1,4 +1,0 @@
-CREATE TABLE data (
-   id UUID PRIMARY KEY DEFAULT[] DEFAULT '{}',
-   v TEA
-);

@@ -1,4 +1,0 @@
-CREATE POLICY u ON user
-USING (((SELECT to
-|>CALL
-pLl() us_

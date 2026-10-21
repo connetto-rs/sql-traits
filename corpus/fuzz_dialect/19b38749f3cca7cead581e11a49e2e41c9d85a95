@@ -1,3 +1,0 @@
-CREATE TABLE ers 
- ( id SP,
-  UNIQUE u USING  uEsers(e~_));

@@ -1,3 +1,0 @@
-CREATE TABLE rs (
-amo DECI() CHECK (:a@:a@localtime)
-);

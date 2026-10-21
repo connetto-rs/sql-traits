@@ -1,2 +1,0 @@
-CREATE TABLE rds (id L CHECK (a@> 0),
- t D);Ò

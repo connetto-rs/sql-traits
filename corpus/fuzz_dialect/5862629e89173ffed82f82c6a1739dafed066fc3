@@ -1,2 +1,0 @@
-CREATE TABLE n(
-CHECK (unt > :05L

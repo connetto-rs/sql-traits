@@ -1,1 +1,0 @@
-CREATE INDEX o@l ON uses(E)USING  u

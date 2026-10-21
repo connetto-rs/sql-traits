@@ -1,2 +1,0 @@
-CREATE TaBLE ord(CHECK (@@@:dt ), CHECK (session_user ), CHECK (@:@:d_ ), CHECK (@@@)
-)
