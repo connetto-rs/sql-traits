@@ -16,6 +16,7 @@ pub struct ColumnMetadata {
     postgres_deterministic: Option<bool>,
     postgres_collation: Option<ResolvedCollation>,
     mysql_padding: Option<MySqlCollationPadding>,
+    documentation: Option<String>,
 }
 
 impl ColumnMetadata {
@@ -30,6 +31,13 @@ impl ColumnMetadata {
     #[must_use]
     pub fn with_mysql_padding(mut self, padding: Option<MySqlCollationPadding>) -> Self {
         self.mysql_padding = padding;
+        self
+    }
+
+    /// Stores the comment block written above the column.
+    #[must_use]
+    pub fn with_documentation(mut self, documentation: Option<String>) -> Self {
+        self.documentation = documentation;
         self
     }
 
@@ -66,5 +74,11 @@ impl ColumnMetadata {
     #[must_use]
     pub fn mysql_padding(&self) -> Option<MySqlCollationPadding> {
         self.mysql_padding
+    }
+
+    /// Returns the comment block written above the column.
+    #[must_use]
+    pub fn documentation(&self) -> Option<&str> {
+        self.documentation.as_deref()
     }
 }

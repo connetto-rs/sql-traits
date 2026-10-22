@@ -4,21 +4,16 @@
 use alloc::{string::ToString, vec::Vec};
 
 use ::sqlparser::ast::{CreateTable, Expr, ObjectNamePart};
-use sql_docs::docs::TableDoc;
 
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, TableMetadata},
-    traits::{DatabaseLike, DocumentationMetadata, Metadata, PartitionStrategy, TableLike},
+    traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
     utils::{last_str, object_name::qualifier_of},
 };
 
 impl Metadata for CreateTable {
     type Meta = TableMetadata<CreateTable>;
-}
-
-impl DocumentationMetadata for CreateTable {
-    type Documentation = TableDoc;
 }
 
 /// Resolves the metadata `database` holds for `table`.
@@ -82,7 +77,7 @@ impl TableLike for CreateTable {
     where
         Self: 'db,
     {
-        Ok(table_metadata(self, database)?.table_doc().and_then(|d| d.doc()))
+        Ok(table_metadata(self, database)?.documentation())
     }
 
     #[inline]

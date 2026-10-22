@@ -7,7 +7,7 @@ use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Owner};
 use crate::{
     errors::LookupError,
     structs::TargetName,
-    traits::{DatabaseLike, DocumentationMetadata, Metadata},
+    traits::{DatabaseLike, Metadata},
 };
 
 /// A trait for types that can be treated as SQL policies.
@@ -20,7 +20,6 @@ pub trait PolicyLike:
     + Ord
     + Eq
     + Metadata
-    + DocumentationMetadata
     + Borrow<<<Self as PolicyLike>::DB as DatabaseLike>::Policy>
 {
     /// The database type the policy belongs to.

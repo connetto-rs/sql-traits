@@ -25,13 +25,14 @@ use core::ops::ControlFlow;
 use sqlparser::ast::{
     AccessExpr, CaseWhen, ConnectByKind, Cte, DictionaryField, Distinct, Expr, ExprWithAlias,
     Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, GroupByExpr,
-    Ident, Join, JoinConstraint, JoinOperator, JsonPathElem, LimitClause, MapEntry, Measure,
-    NamedWindowExpr, ObjectName, OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource,
-    Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
-    SetQuantifier, Subscript, SymbolDefinition, TableAlias, TableAliasColumnDef, TableFactor,
-    TableFunctionArgs, TableSample, TableSampleKind, TableVersion, TableWithJoins, TopQuantity,
-    Values, Visit, Visitor, WildcardAdditionalOptions, WindowFrameBound, WindowSpec, WindowType,
-    With, XmlNamespaceDefinition, XmlPassingClause, XmlTableColumn, XmlTableColumnOption,
+    Ident, InTarget, Join, JoinConstraint, JoinOperator, JsonPathElem, LimitClause, MapEntry,
+    Measure, NamedWindowExpr, ObjectName, OrderBy, OrderByExpr, OrderByKind, PipeOperator,
+    PivotValueSource, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    SetOperator, SetQuantifier, Subscript, SymbolDefinition, TableAlias, TableAliasColumnDef,
+    TableFactor, TableFunctionArgs, TableSample, TableSampleKind, TableVersion, TableWithJoins,
+    TopQuantity, Values, Visit, Visitor, WildcardAdditionalOptions, WindowFrameBound, WindowSpec,
+    WindowType, With, XmlNamespaceDefinition, XmlPassingClause, XmlTableColumn,
+    XmlTableColumnOption,
 };
 
 use crate::{
@@ -2896,7 +2897,7 @@ where
 
     fn expression(&mut self, expression: &'source Expr) -> Result<(), LookupError> {
         match expression {
-            Expr::InSubquery { expr, subquery, .. } => {
+            Expr::In { expr, target: InTarget::Subquery(subquery), .. } => {
                 self.expression(expr)?;
                 self.query(subquery)
             }
@@ -2943,7 +2944,9 @@ where
             | Expr::BinaryOp { left, right, .. }
             | Expr::AnyOp { left, right, .. }
             | Expr::AllOp { left, right, .. } => self.expression_pair(left, right),
-            Expr::InUnnest { expr, array_expr, .. } => self.expression_pair(expr, array_expr),
+            Expr::In { expr, target: InTarget::Unnest(array_expr), .. } => {
+                self.expression_pair(expr, array_expr)
+            }
             Expr::Like { expr, pattern, .. }
             | Expr::ILike { expr, pattern, .. }
             | Expr::SimilarTo { expr, pattern, .. }
@@ -2951,7 +2954,9 @@ where
             Expr::AtTimeZone { timestamp, time_zone } => self.expression_pair(timestamp, time_zone),
             Expr::Position { expr, r#in } => self.expression_pair(expr, r#in),
             Expr::MemberOf(member) => self.expression_pair(&member.value, &member.array),
-            Expr::InList { expr, list, .. } => self.expression_with_many(expr, list),
+            Expr::In { expr, target: InTarget::List(list), .. } => {
+                self.expression_with_many(expr, list)
+            }
             Expr::Between { expr, low, high, .. } => self.expression_triple(expr, low, high),
             Expr::Convert { expr, styles, .. } => self.expression_with_many(expr, styles),
             Expr::Substring { expr, substring_from, substring_for, .. } => {

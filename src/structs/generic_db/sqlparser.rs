@@ -1,7 +1,7 @@
 //! Implementations for [`ParserDB`] - a database schema parsed from SQL text.
 
 use alloc::{
-    borrow::{Cow, ToOwned},
+    borrow::Cow,
     boxed::Box,
     collections::BTreeSet,
     string::{String, ToString},
@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "git")]
 use git2::Repository;
-use sql_docs::SqlDoc;
 #[cfg(feature = "std")]
 use sqlparser::parser::ParserError;
 use sqlparser::{
@@ -33,7 +32,6 @@ use sqlparser::{
         ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut, visit_relations,
     },
     dialect::Dialect,
-    parser::Parser,
     tokenizer::Span,
 };
 
@@ -69,15 +67,19 @@ use crate::{
 mod column_copy;
 mod functions_in_expression;
 mod inheritance;
+mod leading_comments;
 mod like;
 mod parse_options;
+mod parsed_source;
 mod postgres_18_collations;
 mod postgres_catalog;
 mod transactions;
 mod view_rewrites;
 mod views;
 
+use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
+use parsed_source::{ParsedSource, StatementSource};
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};
 
 /// The object kinds a schema parsed from SQL text holds, each an `sqlparser`
@@ -125,6 +127,11 @@ pub type ParserDBBuilder = super::GenericDBBuilder<SqlparserProfile>;
 struct CreatedCollationMetadata {
     name: ObjectName,
     postgres_deterministic: Option<bool>,
+}
+
+enum TableOrigin {
+    Declaration(TableDocumentation),
+    Replacement(RelationIdentity),
 }
 
 /// The continuation state the parser carries inside every built database so
@@ -3881,15 +3888,28 @@ impl ParserDBIngestor {
         }
     }
 
-    fn apply_statements(
+    fn apply_statements<'source>(
         self,
-        statements: impl IntoIterator<Item = Statement>,
+        statements: impl IntoIterator<Item = (Statement, Option<StatementSource<'source>>)>,
     ) -> Result<Self, crate::errors::Error> {
         let Self { mut catalog, access_resolution, mut transaction } = self;
-        for statement in statements {
-            catalog = transactions::apply(catalog, &mut transaction, access_resolution, statement)?;
+        for (statement, source) in statements {
+            catalog = transactions::apply(
+                catalog,
+                &mut transaction,
+                access_resolution,
+                statement,
+                source,
+            )?;
         }
         Ok(Self { catalog, access_resolution, transaction })
+    }
+
+    fn apply_parsed(self, source: ParsedSource) -> Result<Self, crate::errors::Error> {
+        let ParsedSource { statements, comments } = source;
+        self.apply_statements(statements.into_iter().map(|(statement, start)| {
+            (statement, Some(StatementSource { comments: &comments, start }))
+        }))
     }
 
     /// Applies one statement to the current schema.
@@ -3900,7 +3920,7 @@ impl ParserDBIngestor {
     /// or is transaction control the engine behind the dialect refuses in the
     /// current transaction state.
     pub fn apply_statement(self, statement: Statement) -> Result<Self, crate::errors::Error> {
-        self.apply_statements(core::iter::once(statement))
+        self.apply_statements(core::iter::once((statement, None)))
     }
 
     /// Returns a queryable snapshot without consuming the builder. Inside a
@@ -4390,7 +4410,8 @@ impl ParserDB {
         let empty_catalog = PostgresCatalog::empty();
         let catalog = catalog.unwrap_or(&empty_catalog);
 
-        let (previous_node, previous_metadata, identity) = builder.tables_mut().remove(position);
+        let (previous_node, mut previous_metadata, identity) =
+            builder.tables_mut().remove(position);
         let mut replacement = (*previous_node).clone();
         edit(&previous_node, &mut replacement)?;
         record_implied_not_null(&mut replacement);
@@ -4399,6 +4420,7 @@ impl ParserDB {
         metadata.set_rls_enabled(previous_metadata.rls_enabled());
         metadata.set_rls_forced(previous_metadata.rls_forced());
         metadata.set_owner(previous_metadata.owner().map(str::to_string));
+        metadata.set_documentation(previous_metadata.take_documentation());
         // Which columns came from a parent is not spelled by the node, so it
         // has to survive the rebuild the way the other unspelled settings do.
         metadata.set_inherited_column_names(previous_metadata.inherited_column_names().to_vec());
@@ -4441,7 +4463,7 @@ impl ParserDB {
             collations,
             catalog,
             &preserved_collations,
-            Some(identity),
+            TableOrigin::Replacement(identity),
         )?;
         builder.tables_mut().sort_by(|(a, _, _), (b, _, _)| {
             (a.table_schema(), a.table_name()).cmp(&(b.table_schema(), b.table_name()))
@@ -4808,14 +4830,7 @@ impl ParserDB {
         Ok(())
     }
 
-    /// Ingests a table node, deriving its columns and everything its column
-    /// options and table constraints imply.
-    ///
-    /// `table_metadata` carries the state the node does not express: row level
-    /// security flags and `CREATE INDEX` indexes. `identity` is the one a
-    /// replaced node held, which the replacement keeps along with the
-    /// identity of every column `preserved` names, or `None` for a table the
-    /// statement creates.
+    /// Ingests a table with preserved identities and documentation.
     fn ingest_table_node_with_collations(
         mut builder: ParserDBBuilder,
         create_table: Arc<CreateTable>,
@@ -4823,13 +4838,18 @@ impl ParserDB {
         collations: &[CreatedCollationMetadata],
         catalog: &PostgresCatalog,
         preserved: &[PreservedColumnMetadata],
-        identity: Option<RelationIdentity>,
+        mut origin: TableOrigin,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         validate_table_schema(&builder, &create_table)?;
         validate_distinct_columns(&create_table, builder.identifier_case())?;
         validate_relation_names(&builder, &create_table)?;
 
-        let identity = identity.unwrap_or_else(|| builder.draw_relation_identity());
+        let (identity, documentation) = match &mut origin {
+            TableOrigin::Declaration(documentation) => {
+                (builder.draw_relation_identity(), documentation.table.take())
+            }
+            TableOrigin::Replacement(identity) => (*identity, table_metadata.take_documentation()),
+        };
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
         let validate_missing = should_validate_missing_collations(*builder.dialect());
@@ -4849,6 +4869,12 @@ impl ParserDB {
                 preserved,
                 validate_missing,
             )?;
+            let metadata = match &mut origin {
+                TableOrigin::Declaration(documentation) => {
+                    metadata.with_documentation(documentation.take_column(&column.attribute().name))
+                }
+                TableOrigin::Replacement(_) => metadata,
+            };
             let column_identity = preserved_column_identity(column.attribute(), preserved)
                 .unwrap_or_else(|| builder.draw_column_identity());
             builder = builder.add_column_with_identity(column.clone(), metadata, column_identity);
@@ -4860,6 +4886,7 @@ impl ParserDB {
             &mut table_metadata,
             builder,
         )?;
+        table_metadata.set_documentation(documentation);
 
         Ok(builder.add_table_with_identity(create_table, table_metadata, identity)?)
     }
@@ -6060,6 +6087,7 @@ impl ParserDB {
         mut collation_metadata: Vec<CreatedCollationMetadata>,
         access_resolution: AccessResolution,
         statements: &mut dyn Iterator<Item = Statement>,
+        source: Option<StatementSource<'_>>,
     ) -> Result<
         (ParserDBBuilder, Arc<PostgresCatalog>, Vec<CreatedCollationMetadata>),
         crate::errors::Error,
@@ -7040,6 +7068,9 @@ impl ParserDB {
                     }
                 }
                 Statement::CreateTable(mut create_table) => {
+                    let documentation = source.map_or_else(TableDocumentation::default, |source| {
+                        TableDocumentation::from_source(&create_table, source)
+                    });
                     require_named_in_catalog(
                         &mut create_table.name,
                         crate::errors::ObjectKind::Table,
@@ -7099,7 +7130,7 @@ impl ParserDB {
                         &collation_metadata,
                         &active_postgres_catalog,
                         &inherited.column_metadata,
-                        None,
+                        TableOrigin::Declaration(documentation),
                     )?;
                 }
                 Statement::CreateView(create_view) => {
@@ -7718,7 +7749,9 @@ impl ParserDB {
         options: ParseOptions,
     ) -> Result<Self, crate::errors::Error> {
         let ingestor = ParserDBIngestor::with_dialect(catalog_name, dialect, options);
-        Ok(ingestor.apply_statements(statements)?.finish())
+        Ok(ingestor
+            .apply_statements(statements.into_iter().map(|statement| (statement, None)))?
+            .finish())
     }
 
     /// Parses SQL using the specified dialect.
@@ -7768,24 +7801,13 @@ impl ParserDB {
         options: ParseOptions,
     ) -> Result<Self, crate::errors::Error> {
         let dialect = D::default();
-        let mut parser = Parser::new(&dialect).try_with_sql(sql)?;
-        let statements = parser.parse_statements()?;
-        let mut db = Self::from_statements_with_options(
-            statements,
+        let source = ParsedSource::parse(sql, &dialect)?;
+        let ingestor = ParserDBIngestor::with_dialect(
             "unknown_catalog".to_string(),
             SqlparserDialect::of::<D>(),
             options,
-        )?;
-
-        if let Ok(documentation) = SqlDoc::builder_from_str(sql).build::<D>() {
-            for (table, metadata) in db.tables_metadata_mut() {
-                if let Ok(table_doc) = documentation.table(table.table_name(), table.table_schema())
-                {
-                    metadata.set_doc(table_doc.to_owned());
-                }
-            }
-        }
-        Ok(db)
+        );
+        Ok(ingestor.apply_parsed(source)?.finish())
     }
 
     /// Constructs a `ParserDB` from a git URL.
@@ -7878,8 +7900,7 @@ impl ParserDB {
         paths: &[&Path],
         options: ParseOptions,
     ) -> Result<Self, crate::errors::Error> {
-        let mut statements = Vec::new();
-        let mut sql_str: Vec<(String, PathBuf)> = Vec::new();
+        let mut files = Vec::new();
 
         for path in paths {
             if !path.exists() {
@@ -7904,32 +7925,22 @@ impl ParserDB {
                     })?;
 
                 let dialect = D::default();
-                let mut parser = Parser::new(&dialect).try_with_sql(&sql_content).map_err(|e| {
-                    crate::errors::Error::SqlParserError { error: e, file: Some(sql_path.clone()) }
+                let source = ParsedSource::parse(&sql_content, &dialect).map_err(|error| {
+                    crate::errors::Error::SqlParserError { error, file: Some(sql_path.clone()) }
                 })?;
-                statements.extend(parser.parse_statements().map_err(|e| {
-                    crate::errors::Error::SqlParserError { error: e, file: Some(sql_path.clone()) }
-                })?);
-                sql_str.push((sql_content, sql_path));
+                files.push(source);
             }
         }
 
-        let mut db = Self::from_statements_with_options(
-            statements,
+        let mut ingestor = ParserDBIngestor::with_dialect(
             "unknown_catalog".to_string(),
             SqlparserDialect::of::<D>(),
             options,
-        )?;
-
-        if let Ok(documentation) = SqlDoc::builder_from_strs_with_paths(&sql_str).build::<D>() {
-            for (table, metadata) in db.tables_metadata_mut() {
-                if let Ok(table_doc) = documentation.table(table.table_name(), table.table_schema())
-                {
-                    metadata.set_doc(table_doc.to_owned());
-                }
-            }
+        );
+        for source in files {
+            ingestor = ingestor.apply_parsed(source)?;
         }
-        Ok(db)
+        Ok(ingestor.finish())
     }
 }
 

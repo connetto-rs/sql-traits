@@ -191,14 +191,6 @@ plain_metadata!(
     MemoryColumnGrant,
 );
 
-impl DocumentationMetadata for MemoryTable {
-    type Documentation = ();
-}
-
-impl DocumentationMetadata for MemoryPolicy {
-    type Documentation = ();
-}
-
 impl DatabaseLike for MemoryCatalog {
     type Table = MemoryTable;
     type View = MemoryView;

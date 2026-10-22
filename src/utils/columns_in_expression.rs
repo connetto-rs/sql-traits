@@ -5,7 +5,7 @@ use alloc::{
     vec::Vec,
 };
 
-use sqlparser::ast::{Expr, Ident};
+use sqlparser::ast::{Expr, Ident, InTarget};
 
 use crate::{
     structs::TargetName, traits::column::ColumnLike,
@@ -172,13 +172,13 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
                 }
             }
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::In { expr, target: InTarget::List(list), .. } => {
             result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
             for list_expr in list {
                 result.extend(columns_in_expression(list_expr, catalog_name, table, columns)?);
             }
         }
-        Expr::InSubquery { expr, .. } => {
+        Expr::In { expr, target: InTarget::Subquery(_), .. } => {
             result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
             // Note: We don't traverse into subqueries as they have their own
             // column scope
@@ -378,9 +378,9 @@ mod tests {
         let col_b = create_column("b");
         let columns = vec![col_a.clone(), col_b.clone()];
         // a IN (b)
-        let expr = Expr::InList {
+        let expr = Expr::In {
             expr: Box::new(Expr::Identifier(Ident::new("a"))),
-            list: vec![Expr::Identifier(Ident::new("b"))],
+            target: InTarget::List(vec![Expr::Identifier(Ident::new("b"))]),
             negated: false,
             global: false,
         };

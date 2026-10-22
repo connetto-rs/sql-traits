@@ -11,7 +11,7 @@ use sqlparser::ast::{Ident, Statement, TransactionModifier};
 
 use super::{
     AccessResolution, CreatedCollationMetadata, ParserDB, ParserDBBuilder, ParserIngestion,
-    PostgresCatalog,
+    PostgresCatalog, parsed_source::StatementSource,
 };
 use crate::{errors::Error, impls::SqlparserDialect, structs::IdentifierCase};
 
@@ -56,6 +56,7 @@ impl Catalog {
         self,
         statement: Statement,
         access_resolution: AccessResolution,
+        source: Option<StatementSource<'_>>,
     ) -> Result<Self, Error> {
         let (builder, postgres, collations) = ParserDB::apply_statements(
             self.builder,
@@ -63,6 +64,7 @@ impl Catalog {
             self.collations,
             access_resolution,
             &mut core::iter::once(statement),
+            source,
         )?;
         Ok(Self { builder, postgres, collations })
     }
@@ -102,6 +104,7 @@ pub(super) fn apply(
     transaction: &mut Option<Transaction>,
     access_resolution: AccessResolution,
     statement: Statement,
+    source: Option<StatementSource<'_>>,
 ) -> Result<Catalog, Error> {
     let rules = Rules::of(*catalog.builder.dialect());
     let control = Control::of(&statement);
@@ -134,7 +137,7 @@ pub(super) fn apply(
             Definitions::Last => open.defined = true,
         }
     }
-    catalog.apply(statement, access_resolution)
+    catalog.apply(statement, access_resolution, source)
 }
 
 /// The catalog an ingestion ending now leaves behind. A session that ends

@@ -31,6 +31,31 @@ jobs:
     - name: Run tests
       run: cargo test --all-targets --features git,serde
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+    - name: Read MSRV
+      id: msrv
+      run: |
+        version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "sql-traits") | .rust_version')
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+    - name: Install MSRV
+      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+      with:
+        toolchain: ${{ steps.msrv.outputs.version }}
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+    - name: Check library feature combinations
+      run: |
+        cargo check --locked -p sql-traits --lib --all-features
+        cargo check --locked -p sql-traits --lib
+        cargo check --locked -p sql-traits --lib --features serde
+        cargo check --locked -p sql-traits --lib --features git
+        cargo check --locked -p sql-traits --lib --no-default-features
+        cargo check --locked -p sql-traits --lib --no-default-features --features serde
+
   no_std:
     name: no_std + alloc build
     # Verifies the library is truly `no_std + alloc`-portable, in two

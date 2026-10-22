@@ -220,7 +220,7 @@ impl<P: SchemaProfile> GenericDB<P> {
     ///     .table_by_target(TargetName::new("test_table", false), IdentifierCase::AsWritten)?
     ///     .unwrap();
     /// let metadata = db.table_metadata(table).unwrap();
-    /// assert_eq!(metadata.table_doc().and_then(|d| d.doc()), Some("This is a test table"));
+    /// assert_eq!(metadata.documentation(), Some("This is a test table"));
     /// # Ok(())
     /// # }
     /// ```
@@ -647,10 +647,8 @@ impl<P: SchemaProfile> GenericDB<P> {
     /// CREATE TABLE a (id INT);",
     /// )?;
     ///
-    /// let mut parsed: Vec<(&str, Option<&str>)> = db
-    ///     .tables_metadata()
-    ///     .map(|(t, meta)| (t.table_name(), meta.table_doc().and_then(|d| d.doc())))
-    ///     .collect();
+    /// let mut parsed: Vec<(&str, Option<&str>)> =
+    ///     db.tables_metadata().map(|(t, meta)| (t.table_name(), meta.documentation())).collect();
     ///
     /// parsed.sort_by(|(a, _), (b, _)| a.cmp(b));
     /// assert_eq!(parsed, vec![("a", Some("table a")), ("b", Some("table b"))]);

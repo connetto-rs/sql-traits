@@ -2,7 +2,7 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
-use sqlparser::ast::{Expr, ObjectName};
+use sqlparser::ast::{Expr, InTarget, ObjectName};
 
 use crate::{
     traits::{DatabaseLike, function_like::FunctionLike},
@@ -73,13 +73,13 @@ pub(super) fn functions_in_expression<DB: DatabaseLike>(
         | Expr::IsNotNull(expr) => {
             result.extend(functions_in_expression::<DB>(expr, functions));
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::In { expr, target: InTarget::List(list), .. } => {
             result.extend(functions_in_expression::<DB>(expr, functions));
             for list_expr in list {
                 result.extend(functions_in_expression::<DB>(list_expr, functions));
             }
         }
-        Expr::InSubquery { expr, .. } => {
+        Expr::In { expr, target: InTarget::Subquery(_), .. } => {
             result.extend(functions_in_expression::<DB>(expr, functions));
             // Note: We don't traverse into subqueries as they have their own
             // scope
@@ -178,9 +178,7 @@ mod tests {
         assert!(names.contains(&"inner_fn"), "inner function attributed via recursion");
     }
 
-    /// `Expr::InList` branch in `functions_in_expression`: a function
-    /// call appearing inside an `IN (...)` list is attributed via the
-    /// `list_expr` recursion.
+    /// Functions in an `IN` list belong to the check constraint.
     #[test]
     fn test_in_list_function_call_is_attributed() {
         let sql = "

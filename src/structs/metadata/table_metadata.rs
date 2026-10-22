@@ -2,7 +2,7 @@
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use crate::traits::{ColumnLike, DatabaseLike, DocumentationMetadata, TableLike};
+use crate::traits::{ColumnLike, DatabaseLike, TableLike};
 
 #[derive(Debug, Clone)]
 /// Metadata about a database table.
@@ -43,8 +43,8 @@ pub struct TableMetadata<T: TableLike> {
     rls_forced: bool,
     /// The role the input names as the table's owner, if it names one.
     owner: Option<String>,
-    /// The optional documentation associated with the table
-    documentation: Option<<T as DocumentationMetadata>::Documentation>,
+    /// The comment block written above the table.
+    documentation: Option<String>,
 }
 
 impl<T: TableLike> Default for TableMetadata<T> {
@@ -69,6 +69,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
 impl<T: TableLike> TableMetadata<T> {
     /// Returns whether Row Level Security is enabled for the table.
     #[inline]
+    #[must_use]
     pub fn rls_enabled(&self) -> bool {
         self.rls_enabled
     }
@@ -88,6 +89,7 @@ impl<T: TableLike> TableMetadata<T> {
     /// When RLS is forced, the policies apply even to the table owner,
     /// unlike regular RLS where the owner bypasses policies.
     #[inline]
+    #[must_use]
     pub fn rls_forced(&self) -> bool {
         self.rls_forced
     }
@@ -104,6 +106,7 @@ impl<T: TableLike> TableMetadata<T> {
 
     /// Returns the role the input names as the table's owner.
     #[inline]
+    #[must_use]
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
     }
@@ -244,16 +247,23 @@ impl<T: TableLike> TableMetadata<T> {
         self.primary_key.iter().map(core::convert::AsRef::as_ref)
     }
 
-    /// Returns the documentation, if exists, for the table
+    /// Returns the comment block written above the table.
     #[inline]
-    pub fn table_doc(&self) -> Option<&<T as DocumentationMetadata>::Documentation> {
-        self.documentation.as_ref()
+    #[must_use]
+    pub fn documentation(&self) -> Option<&str> {
+        self.documentation.as_deref()
     }
 
-    /// Updates the `documentation` field
+    /// Sets the comment block written above the table.
     #[inline]
-    pub fn set_doc(&mut self, s: <T as DocumentationMetadata>::Documentation) {
-        self.documentation = Some(s);
+    pub fn set_documentation(&mut self, documentation: Option<String>) {
+        self.documentation = documentation;
+    }
+
+    /// Moves the documentation out, leaving the table undocumented.
+    #[inline]
+    pub(crate) fn take_documentation(&mut self) -> Option<String> {
+        self.documentation.take()
     }
 
     /// Adds a column to the table metadata.

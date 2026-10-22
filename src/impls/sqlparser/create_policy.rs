@@ -5,7 +5,7 @@ use sqlparser::ast::{CreatePolicy, CreatePolicyCommand, CreatePolicyType, Expr, 
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, TargetName, metadata::PolicyMetadata},
-    traits::{DatabaseLike, DocumentationMetadata, Metadata, PolicyLike},
+    traits::{DatabaseLike, Metadata, PolicyLike},
     utils::{
         identifier_resolution::is_public_pseudo_role,
         object_name::{resolve_required_bound_table, target_name_of_object_name},
@@ -14,10 +14,6 @@ use crate::{
 
 impl Metadata for CreatePolicy {
     type Meta = PolicyMetadata<Self>;
-}
-
-impl DocumentationMetadata for CreatePolicy {
-    type Documentation = ();
 }
 
 /// Resolves the metadata `database` holds for `policy`.
