@@ -1,2 +1,0 @@
-CREATE TABLE d (CHECK (a.R.* > 0),
-at T);

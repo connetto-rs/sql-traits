@@ -1,4 +1,0 @@
-CREATE ROLE a;
-GRANT USAGE ON SCHEMA puAL.FL.*,
-AL.AL.*,
-L,NUA.*,bl, pubAL.*EA

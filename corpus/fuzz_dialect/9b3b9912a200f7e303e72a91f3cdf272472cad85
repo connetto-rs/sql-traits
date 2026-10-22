@@ -1,3 +1,0 @@
-CREATE INDEX il ON uss(il);
-CREATE INDEX idxdate ON orders(uDESC#);
-CREATE INDEX is ON orders(sus)

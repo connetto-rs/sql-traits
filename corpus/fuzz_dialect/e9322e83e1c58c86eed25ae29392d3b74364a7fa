@@ -1,3 +1,0 @@
-CREATE POLICY us#on ON rs
-USING(   ||/L
-  

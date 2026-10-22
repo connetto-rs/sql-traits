@@ -1,7 +1,0 @@
-
-CREATE ROLE re, p,l,C,d, p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,d,only;
-GRANT SELEcT ON ALL TABLES IN SCHEMA p,KEC,lC,nowlocK,KElCREC,lCREC,l,lCglCREC,lCKElREC,lCREC,l,lCREC,KnowlocK,KElCREC,lCREC,l,lCgenCREK,KEerl,lKElREC,lCREC,l,l,lCREC,KEC,lCREK,KElREC,lCREC,l,lCREC,KEC,oC,lonlwcK,KElREC,KEC,lC,cCREC,KElREc TO  p,l.C,re, p,l,C,d,only;
-¹©ANT SELEcT ON ALL TABLESES IN SCHEMA pcS IN SCHEMA pc ¬°ßàp,l,C,onšly;
-GRN@ANT SELEcT ON ALL TABLES 'IN SCHEMA pc TO  p, pÌ“;
-GRANT S

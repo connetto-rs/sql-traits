@@ -1,5 +1,0 @@
-CREATE TABLE orde (
-   id@@JJ IN DEFAULT 'pending',
-    caeertd_at P DEFAULT CURRENT_TIMESTAMP,
-UNIQUE (user _id_at)
-)

@@ -1,2 +1,0 @@
-(SELECT $ON res$2 FOR UPDATE
-OF RPTEres$2 FOR TEtime(E0

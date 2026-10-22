@@ -1,4 +1,0 @@
-CREATE POLICY n ON u   FOR ALL
-    USING (u_ur_id());CREATE POLICY in_all ON us
-    FOR ALL
- USING (true);

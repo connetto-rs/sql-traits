@@ -1,3 +1,0 @@
-CREATE INDEX memail ON s(eil) 
-    USING   ON  USING  eL
-  USING  `

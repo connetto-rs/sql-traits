@@ -1,4 +1,0 @@
-CREATE FUNCTION cat#_to(R)
-RETURN $$
-o//*
-*///$$;

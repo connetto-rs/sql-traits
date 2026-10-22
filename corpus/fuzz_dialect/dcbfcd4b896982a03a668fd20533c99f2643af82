@@ -1,2 +1,0 @@
-CREATE POLICY u ON rs
-    USING (l[lll:lll:

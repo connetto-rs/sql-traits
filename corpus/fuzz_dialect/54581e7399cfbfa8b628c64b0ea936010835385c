@@ -1,4 +1,0 @@
-CREATE TABLE orders ( 
-   o VARCHAR KEY,
-  FAULT BB0U(u)
-);

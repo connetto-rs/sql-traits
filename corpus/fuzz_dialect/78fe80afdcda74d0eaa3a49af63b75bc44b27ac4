@@ -1,3 +1,0 @@
-CREATE TABLE orders (
- amount DEESTthAMP DEFAULT CUT_TI0MESTAMAL(09, *) CHECK (amount > 0),DEFAULT CURREN(TABLE@10,ed_at)
-);

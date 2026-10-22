@@ -1,3 +1,0 @@
-CREATE TABLE ors (
- CHECK (a(09, 902,02,9,2))
-);

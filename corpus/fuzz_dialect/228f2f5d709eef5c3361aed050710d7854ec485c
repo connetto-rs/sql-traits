@@ -1,4 +1,0 @@
-CREATE ROLE a ;CREATE POLICY _all ON r
-  TO  a ;CREATE POLICY _all ON use
-  TO ad,st,L
-  

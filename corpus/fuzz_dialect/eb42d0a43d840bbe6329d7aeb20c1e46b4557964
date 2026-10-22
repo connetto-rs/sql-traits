@@ -1,2 +1,0 @@
-CREATE TABLE s(
-    id I REFERENCES se.NBB.BBBE (u_id, c));

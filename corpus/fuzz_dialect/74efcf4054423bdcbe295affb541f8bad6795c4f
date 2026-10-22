@@ -1,4 +1,0 @@
-CREATE POLICY se ON r USING (ls+un:
-  [1:
-  [+m: 
- [

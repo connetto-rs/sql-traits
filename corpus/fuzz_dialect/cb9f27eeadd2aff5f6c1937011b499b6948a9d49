@@ -1,4 +1,0 @@
-CREATE TABLE a (
-    id UUM DEFAULT TSVECTOR/IpAEuuiULL,
-   t TSVECTOR
-);

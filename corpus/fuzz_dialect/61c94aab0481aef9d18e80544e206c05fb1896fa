@@ -1,2 +1,0 @@
-CREATE POLICY un ON resus
- USING (lld = cr&t_usa~~

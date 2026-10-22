@@ -1,3 +1,0 @@
-CREATE TABLE rders (  id RIES ,amount CK CHECK (amount > 0),
-   CHECK (amount > 1),
-us d_it)ÿÿ`(O

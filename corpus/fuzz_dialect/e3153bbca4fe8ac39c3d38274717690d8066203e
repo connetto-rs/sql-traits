@@ -1,2 +1,0 @@
-SELECT L*Lo.*R,
-A*L.*Eu,UA*L.*

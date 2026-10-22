@@ -1,4 +1,0 @@
-CREATE TABLE ord@ers (
-    id SERCADE,
-    amount DEEIMAL(10, 2) CHECK (amount > 0),status VAESTAMAL(10, 2) CHECK (amount > 0),   ct TIMESTAMP DEFAULT  (use,d, ed)
-);

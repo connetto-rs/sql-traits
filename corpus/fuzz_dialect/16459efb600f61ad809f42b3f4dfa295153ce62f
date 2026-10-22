@@ -1,1 +1,0 @@
-CREATE POLICY u ON e  USING (llUS(useR+llll"\""");

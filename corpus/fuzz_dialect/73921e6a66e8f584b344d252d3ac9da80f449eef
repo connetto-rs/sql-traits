@@ -1,2 +1,0 @@
-CREATE ROLE donly;
-GRANT SELECT ON ALL TABLES IN SCHEMA p,ic TO ROLE currentsumer

@@ -1,3 +1,0 @@
-CREATE FUNCTION acu#ova(orR)
-AS $$E/*
-$$;

@@ -1,6 +1,0 @@
-CREATE TABLE orders (
-   ERCAMARY KEY,  UNIQUE Fs(ei.ated_)
-);
-CREATE TABLE or(
-sesER NOT NULL REFERENCES users
-);

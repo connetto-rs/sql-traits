@@ -1,1 +1,0 @@
-ALTER TABLE rs ADD CONSTRAINT hone UNIQUE p(h));

@@ -1,4 +1,0 @@
-CREATE TABLE r
-(s ARY KEY,
-   CHECK(a/d)
-)

@@ -1,5 +1,0 @@
-
-CREATE ROLE re, p,l,C,d,ly;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C.sessson_user,ly;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO    p@l,C.sesion_user,ly;
-GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,C.d•d,(p,l¬C,d,

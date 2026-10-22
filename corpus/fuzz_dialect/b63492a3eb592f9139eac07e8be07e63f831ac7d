@@ -1,2 +1,0 @@
-CREATE FUNCTION c(_ DEFAULT 'pending',
-R(20) DEFAULT 'pg',

@@ -1,2 +1,0 @@
-CREATE TABLE oders (
-amount L(42) CHECK (amount),T URRENT_@)
