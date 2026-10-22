@@ -10,8 +10,8 @@ use crate::{
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
-        ColumnLike, DatabaseLike, DocumentationMetadata, ForeignKeyLike, GrantLike, Metadata,
-        PolicyLike, TableGrantLike, TriggerLike, check_constraint::CheckConstraintLike,
+        ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, TableGrantLike,
+        TriggerLike, check_constraint::CheckConstraintLike,
     },
     utils::{
         identifier_resolution::{identifiers_match, normalize_identifier},
@@ -44,7 +44,6 @@ pub trait TableLike:
     + Ord
     + Eq
     + Metadata
-    + DocumentationMetadata
     + Borrow<<<Self as TableLike>::DB as DatabaseLike>::Table>
 {
     /// The database type the table belongs to.
@@ -188,7 +187,8 @@ pub trait TableLike:
         }))
     }
 
-    /// Returns the documentation of the table, if any.
+    /// Returns documentation from standalone comments above `CREATE`.
+    /// A blank line detaches the preceding comment group.
     ///
     /// # Arguments
     ///

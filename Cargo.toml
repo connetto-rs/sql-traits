@@ -24,7 +24,6 @@ std = [
     "sqlparser/recursive-protection",
     "geometric-traits/std",
     "thiserror/std",
-    "sql_docs/std",
 ]
 # Adds git-backed construction: `ParserDB::from_git_url*` clones a remote
 # repository into a temporary directory and parses the SQL it contains.
@@ -46,17 +45,11 @@ geometric-traits = { git = "https://github.com/earth-metabolome-initiative/geome
 thiserror = { version = "2.0", default-features = false }
 git2 = { version = "0.20.3", optional = true }
 tempfile = { version = "3.25", optional = true }
-sql_docs = { version = "1.0.11", git = "https://github.com/LucaCappelletti94/sql-docs", branch = "main", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 unicode-normalization = { version = "0.1", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
 
-# Use the upstream sqlparser from git until a crates.io release ships the
-# `no_std`-compatible `visitor` feature (the published `sqlparser_derive 0.5.0`
-# emits `::std::ops::ControlFlow`, while apache/datafusion-sqlparser-rs main
-# emits `::core::ops::ControlFlow`). Patching at the workspace root unifies every
-# dependent (including `sql_docs`) onto a single `sqlparser`, so dialect types
-# stay compatible across crate boundaries.
+# Follow upstream parser and comment APIs.
 [patch.crates-io]
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 

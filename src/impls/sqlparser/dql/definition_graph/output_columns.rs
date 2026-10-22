@@ -2,8 +2,8 @@ use alloc::{borrow::ToOwned, collections::BTreeMap, format, string::String, vec,
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AccessExpr, ArrayElemTypeDef, BinaryOperator, DataType, ExactNumberInfo, Expr, Ident, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, TimezoneInfo,
+    AccessExpr, ArrayElemTypeDef, BinaryOperator, DataType, ExactNumberInfo, Expr, Ident, InTarget,
+    Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, TimezoneInfo,
     TrimWhereField, Values, Visit, Visitor,
 };
 
@@ -241,8 +241,7 @@ fn figure(expression: &Expr) -> Figure {
         | Expr::IsNotUnknown(_)
         | Expr::IsDistinctFrom(..)
         | Expr::IsNotDistinctFrom(..)
-        | Expr::InList { .. }
-        | Expr::InSubquery { .. }
+        | Expr::In { target: InTarget::List(_) | InTarget::Subquery(_), .. }
         | Expr::Between { .. }
         | Expr::Like { .. }
         | Expr::ILike { .. }

@@ -6,8 +6,8 @@ use core::{fmt::Write as _, ops::ControlFlow};
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{
-        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, SetExpr,
-        SetOperator, Statement, Value, Visit, VisitMut, Visitor, VisitorMut,
+        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, Query, Select, SelectItem,
+        SetExpr, SetOperator, Statement, Value, Visit, VisitMut, Visitor, VisitorMut,
     },
     dialect::{
         BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, GenericDialect,
@@ -794,7 +794,9 @@ fn exists_nested_select(expression: &Expr) -> &sqlparser::ast::Select {
 }
 
 fn in_nested_select(expression: &Expr) -> &sqlparser::ast::Select {
-    let Expr::InSubquery { subquery, .. } = expression else { panic!("expected an IN subquery") };
+    let Expr::In { target: InTarget::Subquery(subquery), .. } = expression else {
+        panic!("expected an IN subquery")
+    };
     select_body(subquery)
 }
 

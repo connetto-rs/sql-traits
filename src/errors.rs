@@ -622,9 +622,6 @@ pub enum Error {
     #[cfg(feature = "std")]
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-    /// Wrapper around sql_doc errors
-    #[error("Table Doc Error: {0}")]
-    TableDocError(#[from] sql_docs::error::DocError),
     /// Error indicating that a REVOKE statement uses semantics we cannot
     /// represent in the current grant model.
     #[error("Unsupported revoke statement `{statement}`: {reason}")]

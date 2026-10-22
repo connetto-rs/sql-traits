@@ -40,10 +40,9 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
         Self: 'db,
     {
         Ok(database
-            .table_metadata(self.table())
+            .column_metadata(self)
             .ok_or_else(|| ObjectKind::Table.not_in_database(&self.table().name.to_string()))?
-            .table_doc()
-            .and_then(|d| d.column(self.column_name()).ok().and_then(|c| c.doc())))
+            .documentation())
     }
 
     #[inline]

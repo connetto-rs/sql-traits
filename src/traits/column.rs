@@ -240,7 +240,8 @@ pub trait ColumnLike:
         normalize_identifier(self.column_name(), self.column_name_is_quoted())
     }
 
-    /// Returns the documentation of the column, if any.
+    /// Returns documentation from standalone comments above the column name.
+    /// A blank line detaches the preceding comment group.
     ///
     /// # Arguments
     ///
