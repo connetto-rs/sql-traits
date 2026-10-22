@@ -400,6 +400,30 @@ mod tests {
         );
     }
 
+    /// `DROP SCHEMA ... CASCADE` takes the keys from other schemas into the
+    /// tables it removes, and leaves the referencing table its columns.
+    #[test]
+    fn test_drop_schema_cascade_drops_keys_into_removed_tables() {
+        use crate::traits::TableLike;
+
+        let db = parse_postgres(
+            "
+            CREATE SCHEMA my_schema;
+            CREATE TABLE my_schema.my_table (id INT PRIMARY KEY);
+            CREATE TABLE other_table (id INT PRIMARY KEY, ref_id INT REFERENCES my_schema.my_table(id));
+            DROP SCHEMA my_schema CASCADE;
+            ",
+        )
+        .unwrap();
+        let other_table = db
+            .table_by_target(TargetName::new("other_table", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("other_table survives the drop");
+
+        assert_eq!(other_table.columns(&db).expect("column lookup").count(), 2);
+        assert_eq!(other_table.foreign_keys(&db).expect("fk lookup").count(), 0);
+    }
+
     #[test]
     fn test_drop_multiple_schemas() {
         let db = parse_postgres(

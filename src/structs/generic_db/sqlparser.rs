@@ -2340,19 +2340,15 @@ fn option_involves_column(
     }
 }
 
-/// Removes the foreign keys a node declares against a column of `target`.
-fn drop_foreign_keys_to_column(node: &mut CreateTable, target: &StoredTable, column: &NamedColumn) {
-    let names = |foreign_key: &ForeignKeyConstraint| {
-        target.named_by(&foreign_key.foreign_table)
-            && column.in_idents(&foreign_key.referred_columns)
-    };
-
+/// Removes the foreign keys a node declares, in either spelling, that `doomed`
+/// selects.
+fn drop_foreign_keys(node: &mut CreateTable, doomed: impl Fn(&ForeignKeyConstraint) -> bool) {
     node.constraints.retain(|constraint| {
-        !matches!(constraint, TableConstraint::ForeignKey(foreign_key) if names(foreign_key))
+        !matches!(constraint, TableConstraint::ForeignKey(foreign_key) if doomed(foreign_key))
     });
     for declared in &mut node.columns {
         declared.options.retain(|option| {
-            !matches!(&option.option, ColumnOption::ForeignKey(foreign_key) if names(foreign_key))
+            !matches!(&option.option, ColumnOption::ForeignKey(foreign_key) if doomed(foreign_key))
         });
     }
 }
@@ -5424,6 +5420,46 @@ impl ParserDB {
             .ok_or_else(|| ObjectKind::Table.not_in_database(&stored.name).into())
     }
 
+    /// Removes tables together with the foreign keys the remaining tables
+    /// declare against them.
+    ///
+    /// PostgreSQL drops such a key under `CASCADE` and keeps the columns it
+    /// was declared on, so each referencing table is rebuilt from its node
+    /// with the key cut out. A drop without `CASCADE` has already refused any
+    /// such key, and finds nothing to rebuild.
+    fn remove_tables(
+        mut builder: ParserDBBuilder,
+        doomed: &[StoredTable],
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        for table in doomed {
+            builder.remove_table(
+                &table.name,
+                table.name_quoted,
+                table.schema.as_deref(),
+                table.schema_quoted,
+            );
+        }
+
+        let names_doomed = |foreign_key: &ForeignKeyConstraint| {
+            doomed.iter().any(|table| table.named_by(&foreign_key.foreign_table))
+        };
+        let hosts: Vec<StoredTable> = builder
+            .tables()
+            .iter()
+            .map(|(host, _, _)| host.as_ref())
+            .filter(|host| foreign_keys_of(host).any(names_doomed))
+            .map(StoredTable::of)
+            .collect();
+        for host in &hosts {
+            builder = Self::replace_table_node(builder, host, |_, node| {
+                drop_foreign_keys(node, names_doomed);
+                Ok(())
+            })?;
+        }
+
+        Ok(builder)
+    }
+
     /// Refuses a change `ONLY` would withhold from tables that inherit it.
     ///
     /// PostgreSQL grants `ONLY` only where the change can stand on one table
@@ -5632,7 +5668,10 @@ impl ParserDB {
             // that is on its way out.
             for host in builder.take_column_outside_dependents(&stored, &declaring, &column) {
                 builder = Self::replace_table_node(builder, &host, |_, node| {
-                    drop_foreign_keys_to_column(node, &stored, &column);
+                    drop_foreign_keys(node, |foreign_key| {
+                        stored.named_by(&foreign_key.foreign_table)
+                            && column.in_idents(&foreign_key.referred_columns)
+                    });
                     Ok(())
                 })?;
             }
@@ -6263,20 +6302,12 @@ impl ParserDB {
                         // A child builds its column list out of its parents,
                         // so a parent cannot leave while a child still names
                         // it. `CASCADE` takes the children with it.
-                        let children = inheritance::descendants(&builder, &dropped);
-                        if !cascade && let Some(child) = children.first() {
+                        let mut doomed = inheritance::descendants(&builder, &dropped);
+                        if !cascade && let Some(child) = doomed.first() {
                             return Err(crate::errors::Error::DropTableInheritedFrom {
                                 parent_table: resolved_table_name.clone(),
                                 child_table: child.name.clone(),
                             });
-                        }
-                        for child in &children {
-                            builder.remove_table(
-                                &child.name,
-                                child.name_quoted,
-                                child.schema.as_deref(),
-                                child.schema_quoted,
-                            );
                         }
 
                         // Check for references from other tables (unless
@@ -6294,13 +6325,10 @@ impl ParserDB {
                             });
                         }
 
-                        // Remove the table and all associated objects
-                        builder.remove_table(
-                            &resolved_table_name,
-                            resolved_table_quoted,
-                            resolved_schema_name.as_deref(),
-                            resolved_schema_quoted,
-                        );
+                        // Remove the table, its children and all associated
+                        // objects
+                        doomed.push(dropped);
+                        builder = Self::remove_tables(builder, &doomed)?;
                     }
                 }
                 Statement::Drop {
@@ -6634,10 +6662,11 @@ impl ParserDB {
                         // If CASCADE, remove all tables in the schema first
                         if cascade {
                             use crate::traits::TableLike;
-                            let tables_to_remove: Vec<_> = builder
+                            let doomed: Vec<StoredTable> = builder
                                 .tables()
                                 .iter()
-                                .filter(|(t, _, _)| {
+                                .map(|(t, _, _)| t.as_ref())
+                                .filter(|t| {
                                     t.table_schema().is_some_and(|table_schema| {
                                         identifiers_match(
                                             table_schema,
@@ -6647,30 +6676,9 @@ impl ParserDB {
                                         )
                                     })
                                 })
-                                .map(|(t, _, _)| {
-                                    (
-                                        t.table_name().to_string(),
-                                        t.table_name_is_quoted(),
-                                        t.table_schema().map(str::to_string),
-                                        t.table_schema_is_quoted(),
-                                    )
-                                })
+                                .map(StoredTable::of)
                                 .collect();
-
-                            for (
-                                table_name,
-                                table_name_quoted,
-                                table_schema_name,
-                                table_schema_quoted,
-                            ) in tables_to_remove
-                            {
-                                builder.remove_table(
-                                    &table_name,
-                                    table_name_quoted,
-                                    table_schema_name.as_deref(),
-                                    table_schema_quoted,
-                                );
-                            }
+                            builder = Self::remove_tables(builder, &doomed)?;
                         }
 
                         // Remove the schema
@@ -8784,7 +8792,10 @@ mod tests {
     }
 
     mod drop_table_errors {
+        use sqlparser::dialect::PostgreSqlDialect;
+
         use super::*;
+        use crate::traits::ForeignKeyLike;
 
         #[test]
         fn test_drop_table_not_found_error_type() {
@@ -8857,6 +8868,82 @@ mod tests {
                     .expect("unambiguous lookup")
                     .is_some()
             );
+        }
+
+        /// `CASCADE` takes the referencing foreign keys along, in both
+        /// spellings, and leaves the referencing table and its columns.
+        #[test]
+        fn test_drop_table_cascade_drops_referencing_foreign_keys() {
+            let sql = r"
+                CREATE TABLE b (id INT PRIMARY KEY);
+                CREATE TABLE a (
+                    id INT PRIMARY KEY,
+                    b_id INT REFERENCES b(id),
+                    other_b_id INT,
+                    a_id INT REFERENCES a(id),
+                    FOREIGN KEY (other_b_id) REFERENCES b(id)
+                );
+                DROP TABLE b CASCADE;
+            ";
+            let db = ParserDB::parse::<GenericDialect>(sql).expect("cascade drop parses");
+            let a = db
+                .table_by_target(TargetName::new("a", false), IdentifierCase::AsWritten)
+                .expect("unambiguous lookup")
+                .expect("a survives the drop");
+
+            assert_eq!(a.columns(&db).expect("column lookup").count(), 4);
+            let referenced: Vec<&str> = a
+                .foreign_keys(&db)
+                .expect("fk lookup")
+                .map(|fk| fk.referenced_table(&db).expect("ref table lookup").table_name())
+                .collect();
+            assert_eq!(referenced, ["a"]);
+        }
+
+        /// Only the keys into the dropped table go, so a key into a table
+        /// that itself lost one survives.
+        #[test]
+        fn test_drop_table_cascade_keeps_keys_to_surviving_tables() {
+            let sql = r"
+                CREATE TABLE b (id INT PRIMARY KEY);
+                CREATE TABLE a (id INT PRIMARY KEY, b_id INT REFERENCES b(id));
+                CREATE TABLE c (id INT PRIMARY KEY, a_id INT REFERENCES a(id));
+                DROP TABLE b CASCADE;
+            ";
+            let db = ParserDB::parse::<GenericDialect>(sql).expect("cascade drop parses");
+            let table = |name: &str| {
+                db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+                    .expect("unambiguous lookup")
+                    .expect("table survives the drop")
+            };
+
+            assert_eq!(table("a").foreign_keys(&db).expect("fk lookup").count(), 0);
+            let c_keys: Vec<&str> = table("c")
+                .foreign_keys(&db)
+                .expect("fk lookup")
+                .map(|fk| fk.referenced_table(&db).expect("ref table lookup").table_name())
+                .collect();
+            assert_eq!(c_keys, ["a"]);
+        }
+
+        /// An inheriting child leaves with its parent under `CASCADE`, and the
+        /// keys into the child go with it.
+        #[test]
+        fn test_drop_table_cascade_drops_keys_into_removed_children() {
+            let sql = r"
+                CREATE TABLE p (id INT);
+                CREATE TABLE k (k_id INT PRIMARY KEY) INHERITS (p);
+                CREATE TABLE r (id INT PRIMARY KEY, k_id INT REFERENCES k(k_id));
+                DROP TABLE p CASCADE;
+            ";
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("cascade drop parses");
+            let r = db
+                .table_by_target(TargetName::new("r", false), IdentifierCase::AsWritten)
+                .expect("unambiguous lookup")
+                .expect("r survives the drop");
+
+            assert_eq!(r.columns(&db).expect("column lookup").count(), 2);
+            assert_eq!(r.foreign_keys(&db).expect("fk lookup").count(), 0);
         }
 
         #[test]
