@@ -42,7 +42,7 @@ jobs:
         version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "sql-traits") | .rust_version')
         echo "version=$version" >> "$GITHUB_OUTPUT"
     - name: Install MSRV
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
       with:
         toolchain: ${{ steps.msrv.outputs.version }}
     - name: Rust Cache
