@@ -7068,7 +7068,7 @@ impl ParserDB {
                     }
                 }
                 Statement::CreateTable(mut create_table) => {
-                    let documentation = source.map_or_default(|source| {
+                    let documentation = source.map_or_else(TableDocumentation::default, |source| {
                         TableDocumentation::from_source(&create_table, source)
                     });
                     require_named_in_catalog(
