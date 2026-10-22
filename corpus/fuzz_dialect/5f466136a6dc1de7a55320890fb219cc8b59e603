@@ -1,0 +1,2 @@
+CREATE TABLE obde(  UNIQUE (TIME:e)
+);

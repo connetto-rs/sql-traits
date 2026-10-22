@@ -1,0 +1,4 @@
+CREATE POLICY us ON L
+ ;
+
+CREATE POLICY d@al ON ut

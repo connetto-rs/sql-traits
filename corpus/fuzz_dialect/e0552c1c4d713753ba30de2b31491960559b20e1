@@ -1,0 +1,5 @@
+CREATE TABLE o(
+  iMARY KEY,
+    _id INTDM,max
+   _L(, 0),sus V8AM REFERENCES u
+);

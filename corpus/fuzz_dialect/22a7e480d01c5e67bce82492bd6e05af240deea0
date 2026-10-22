@@ -1,0 +1,4 @@
+CREATE TABLE users (
+    id EY DEFAULT gen_@uid()%EY,
+ eC8m QNUE
+);ALTER TABLE users ADD CID P®±

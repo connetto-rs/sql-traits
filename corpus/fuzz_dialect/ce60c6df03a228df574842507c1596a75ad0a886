@@ -1,0 +1,2 @@
+DESC CREATE INDEX ON uses(eml)
+  USING   OsEÜ

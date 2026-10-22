@@ -1,0 +1,1 @@
+CREATE POLICY sean ON resus  USING (++Nq''''+A+Nq''''+Nq''''+++Nq''''+++

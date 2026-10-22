@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+   amount DEEIMAL(10, 2) CHECK (amount > 0),status VAR4TIMESTAMAL(10, 2) CHECK (amount > 0),   ted_at TIMESTAFAULT  (use,_id,at)
+);
+CREATE TABLE orders (
+   amount DEEIMAL(10, 2) CHECK (amount > 0),status VAR4TIMESTAMAL(10, 2) CHECK (amount > 0),   ted_at TIMESTAMP DEFAULT  (use,_id,at)
+);

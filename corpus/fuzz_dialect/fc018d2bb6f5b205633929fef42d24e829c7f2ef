@@ -1,0 +1,7 @@
+CREATE TABLE orders (
+    id SERIA,
+   CHECK (amoun > 0),
+ CHECK (aout > 0),EE CASCADE,
+   CHECK (a),
+ FERENCES uE,
+  CHECK (t > 0)

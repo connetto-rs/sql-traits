@@ -1,0 +1,9 @@
+CREATE TABLE g_data (   
+ id U,UID PRid(),
+ p
+SCe_,
+aCot PT,  a JSOL,
+ OT NULL, metadata HSTORE,
+    tsvASTNFOT NULL,
+    tsv TSVECQOR
+);

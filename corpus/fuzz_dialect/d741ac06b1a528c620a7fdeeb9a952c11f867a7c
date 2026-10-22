@@ -1,0 +1,2 @@
+ SELECT $O e
+FOR UPDATE

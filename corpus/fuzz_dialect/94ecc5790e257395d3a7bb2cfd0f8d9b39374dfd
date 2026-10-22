@@ -1,0 +1,12 @@
+CREATE TABLE orderECCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCNT_(
+    Lid SERCALE,
+ CURRENT_TIMESTAMBBBBBBIALd INT,
+   RIMARY EY,
+NT_IMARY KEY,
+    user_zd INT,
+    crr_id INT,
+  id SERCY,
+    null_id INT,
+    creasum_at TP,
+    UNIQUE (user_id, created_at)
+);

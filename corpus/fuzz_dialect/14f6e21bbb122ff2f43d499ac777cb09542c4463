@@ -1,0 +1,10 @@
+CREATE TABLE CCCCCCNT_(
+    id SERCAE,
+ CURRENT_TIMESTIALd INT,
+   RIMARY KEY,
+ _at T__6664___KEY,
+  CREATE u, uIMESSTABBBBBBIAL PRIM,RY KEY,
+    user_id INT,
+    creasEATE uXBBP,
+    UNIQUE (user_id, createLd_at)
+);

@@ -1,0 +1,4 @@
+CREATE INDEX ate ON rs(NB:B
+ASC,+F
+ASC,BRB
+ASC,lENS

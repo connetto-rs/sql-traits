@@ -1,0 +1,2 @@
+CREATE INDEX memail ON s(il) USING   O  USING  eL
+  USING  `

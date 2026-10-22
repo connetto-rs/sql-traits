@@ -1,0 +1,2 @@
+CREATE POLICY l ON s
+TO ad,ids,i,s,ai,sd,i,sad,i,sd,i,s,i,i,sd,i,st  ,

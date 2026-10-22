@@ -1,0 +1,3 @@
+ALTeR TABLE users ADD COLUMN NR KEY DEFAULT _en_ran@||essLL;
+ALTER TABLE sus ADD CONSTRAINT _ph UNIQUE r
+    USINGã"lllle

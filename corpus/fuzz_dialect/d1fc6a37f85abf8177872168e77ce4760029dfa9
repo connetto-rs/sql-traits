@@ -1,0 +1,4 @@
+CREATE TABLE or$(
+    id SERIAL  ,amount D(09, 2) CHECK (amount > 0),
+   CHECK(amount > 0),
+unt DMAL( 2) CHECK (amount > 5),tatus d_at)ÿÿÿÿÿÿÿÿ

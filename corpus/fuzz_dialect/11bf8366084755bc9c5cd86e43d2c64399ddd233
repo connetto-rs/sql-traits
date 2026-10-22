@@ -1,0 +1,3 @@
+CREATE TABLE rs (
+   r nVARCHAR(41) DEFAULT _B&<(B&<t)
+);

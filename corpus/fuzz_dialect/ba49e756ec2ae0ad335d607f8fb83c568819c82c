@@ -1,0 +1,2 @@
+CREATE POLICY sen ON ress
+  USING (+Nq''''+++Nq''''+A_+++Nq''''+

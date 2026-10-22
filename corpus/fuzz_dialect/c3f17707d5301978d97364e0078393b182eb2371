@@ -1,0 +1,3 @@
+CREATE TABLE os (
+ a ECI(0) CHECK (a(09, 9, 2)/@_at)
+)

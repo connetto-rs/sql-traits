@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id IMAL(09, 2) CHECK (mo&nt > 0),
+    rtoweed_qt TIMMP DEFAULT CURRET<MBBBBB?BBB (at)
+);

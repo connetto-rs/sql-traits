@@ -1,0 +1,3 @@
+CREATE TABLE ers (
+ROT NULL REFERENCES
+ U(uRd,t_)

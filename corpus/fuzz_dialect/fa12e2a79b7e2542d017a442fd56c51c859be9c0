@@ -1,0 +1,1 @@
+CREATE INDEX dte ON se(odnr);CREATE TRIGGER updat@ UPDATE ON u

@@ -1,0 +1,3 @@
+CREATE POLICY use ON users       WITH CHECK (usre_ud);
+CREATE POLICY admiisoln ON nsers
+   WITH CHECK (u?ser/id_id)d;

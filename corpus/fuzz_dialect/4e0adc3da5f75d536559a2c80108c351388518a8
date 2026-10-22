@@ -1,0 +1,2 @@
+CREATE POLICY s ON s USiNG (ll.+us
+ e

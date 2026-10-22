@@ -1,0 +1,1 @@
+CREATE TABLE o ( CHECK(a(18,2).@_at))

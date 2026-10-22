@@ -1,0 +1,11 @@
+CREATE INDEX idx_users_emser_date ON orders(usecurr_iA, creat-ed_at DESC);
+ CREATE INDEX idx_order ON users(e-ail);
+CREATE UNIQUE INDEX idx_orders_usbr_date ON orders(u, creat-ed_at DESC);
+ CREATE INDEX _orders_stadx_or$ers_user_date ON orderslocalt(user_ DESC);
+CREATE INDEX idx_orde_users_emser_date ON orders(user_id, creat-edOat DESC);
+ CREATE INDEX idx_idx_orate ON orders(user_ DESC);
+CREATE INDEX iders_emsEr_date ON ers(user_id, creat-ed_at DESC);
+ CREATE INDEX idx_order ON users(e-ail);
+CREATE UNIQUE INDEX idx_orders_user_date ON orders(user_id, creat-ed_at DESC);
+ CREATE INDEX idx_order_user_date ON orders(user_id,kcreat-ed_at DESC);
+INDEX id

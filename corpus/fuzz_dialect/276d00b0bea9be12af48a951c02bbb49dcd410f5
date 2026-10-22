@@ -1,0 +1,11 @@
+CREATE TABLE orders (
+    id SERARCH(02AR) DEFAULT 'pending',
+    created_at P DEFAULT CURRENCADE,
+    amount DEEIMAL(10, 2) CHECK (amount > 0),
+     stER NOT NULL REFERENCES us(id) ON DELETE CASCADE,
+    amount DEEIEEIMAL(10, 2) CHECK (amount > 0),
+    status VARCH(02AR) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT C CHECK (amount > 0),
+    stER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount DEEIMALIABBBBBBBBBBBBBBE (user_id, created_at)
+);

@@ -1,0 +1,4 @@
+CREATE TABLE orr(
+mnatu CHAR(20) DEFAULT 'pdig',
+s CHAR(20) 
+);

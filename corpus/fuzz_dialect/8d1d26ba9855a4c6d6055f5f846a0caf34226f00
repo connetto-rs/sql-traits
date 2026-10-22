@@ -1,0 +1,5 @@
+CREATE TABLE ordrs (
+   amount DEEIMAL(05, 2) CHECK (amount > 2),status VTIME);
+CREATE TABLE od(
+   amount DEEIMAL(10, 2) CHECK (amount > 0),status VLTY
+);

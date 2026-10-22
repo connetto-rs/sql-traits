@@ -1,0 +1,2 @@
+CREATE ROLE doy;
+GRANT SELECT ON p,ub,ic,ub,ic TO  l

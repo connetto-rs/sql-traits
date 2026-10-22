@@ -1,0 +1,3 @@
+CREATE TABLE orders (
+  iIN NL REFERENCES usenow.SAVARCHERRNBBB#
+);

@@ -1,0 +1,6 @@
+(UPDATE(((
+(((WITH soz(
+ SELECT  R
+),et_oz(
+ SELECT  R
+),
