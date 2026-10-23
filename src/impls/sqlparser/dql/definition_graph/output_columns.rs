@@ -563,18 +563,27 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         self.queries.binary_search_by_key(&address, |node| node.address).ok().map(QueryId)
     }
 
+    fn query_entries(&self, query: QueryId) -> &[OutputEntry<'query, 'db>] {
+        match &self.queries[query.0].outputs {
+            QueryOutputs::Select(scope) => &self.scopes[scope.0].outputs,
+            QueryOutputs::Merged(entries) => entries,
+        }
+    }
+
     pub(crate) fn query_outputs<'scope>(
         &'scope self,
         query: QueryId,
     ) -> impl ExactSizeIterator<Item = QueryOutput<'scope, 'query, 'db, DB>> {
-        let entries = match &self.queries[query.0].outputs {
-            QueryOutputs::Select(scope) => self.scopes[scope.0].outputs.as_slice(),
-            QueryOutputs::Merged(entries) => entries.as_slice(),
-        };
-        entries.iter().map(|entry| {
+        self.query_entries(query).iter().map(|entry| {
             match entry {
                 OutputEntry::Column(column) => {
-                    QueryOutput::Column(self.definition(column.definition))
+                    QueryOutput::Column {
+                        name: match &column.name {
+                            OutputName::Known { name, quoted } => Some((name.as_str(), *quoted)),
+                            OutputName::Unknown => None,
+                        },
+                        definition: self.definition(column.definition),
+                    }
                 }
                 OutputEntry::Unexpanded => QueryOutput::Unexpanded,
             }
@@ -585,11 +594,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     /// the way PostgreSQL names an unaliased select-list item, or `None` when
     /// some output cannot be named.
     pub(crate) fn query_output_names(&self, query: QueryId) -> Option<Vec<(String, bool)>> {
-        let entries = match &self.queries[query.0].outputs {
-            QueryOutputs::Select(scope) => self.scopes[scope.0].outputs.as_slice(),
-            QueryOutputs::Merged(entries) => entries.as_slice(),
-        };
-        entries
+        self.query_entries(query)
             .iter()
             .map(|entry| {
                 match entry {

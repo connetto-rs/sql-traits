@@ -1,4 +1,4 @@
-//! Integration tests for the ordered output definitions of a recorded query.
+//! Integration tests for the ordered outputs of a recorded query.
 #![expect(
     clippy::expect_used,
     clippy::panic,
@@ -61,13 +61,12 @@ fn outputs_of(sql: &str, pick: fn(&Query) -> &Query) -> Vec<String> {
     let query = query(sql);
     let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
         .expect("scope builds");
-    let outputs =
-        scope.scope_for_query(pick(&query)).expect("query is recorded").output_definitions();
+    let outputs = scope.scope_for_query(pick(&query)).expect("query is recorded").outputs();
     let entries = outputs.len();
     let described = outputs
         .map(|output| {
             match output {
-                QueryOutput::Column(definition) => describe(&definition),
+                QueryOutput::Column { definition, .. } => describe(&definition),
                 QueryOutput::Unexpanded => "unexpanded".to_owned(),
             }
         })
@@ -78,6 +77,36 @@ fn outputs_of(sql: &str, pick: fn(&Query) -> &Query) -> Vec<String> {
 
 fn outputs(sql: &str) -> Vec<String> {
     outputs_of(sql, |query| query)
+}
+
+/// Renders each output name, double-quoting a quoted one, with `?` for an
+/// unmodeled name and `*` for an unexpanded wildcard.
+fn names_of(sql: &str, pick: impl Fn(&Query) -> &Query) -> Vec<String> {
+    let database = database();
+    let query = query(sql);
+    let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
+        .expect("scope builds");
+    scope
+        .scope_for_query(pick(&query))
+        .expect("query is recorded")
+        .outputs()
+        .map(|output| {
+            match output {
+                QueryOutput::Column { name: Some((name, true)), .. } => format!("\"{name}\""),
+                QueryOutput::Column { name: Some((name, false)), .. } => name.to_owned(),
+                QueryOutput::Column { name: None, .. } => "?".to_owned(),
+                QueryOutput::Unexpanded => "*".to_owned(),
+            }
+        })
+        .collect()
+}
+
+fn names(sql: &str) -> Vec<String> {
+    names_of(sql, |query| query)
+}
+
+fn cte_body(index: usize) -> impl Fn(&Query) -> &Query {
+    move |query| &query.with.as_ref().expect("a WITH clause").cte_tables[index].query
 }
 
 fn first_subquery(query: &Query) -> &Query {
@@ -116,10 +145,11 @@ fn expression_outputs_keep_their_defining_scope() {
     let query = query("SELECT id + x FROM a");
     let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
         .expect("scope builds");
-    let mut outputs =
-        scope.scope_for_query(&query).expect("query is recorded").output_definitions();
-    let Some(QueryOutput::Column(ColumnDefinition::Expression { scope: defining, .. })) =
-        outputs.next()
+    let mut outputs = scope.scope_for_query(&query).expect("query is recorded").outputs();
+    let Some(QueryOutput::Column {
+        definition: ColumnDefinition::Expression { scope: defining, .. },
+        ..
+    }) = outputs.next()
     else {
         panic!("expected an expression output")
     };
@@ -177,14 +207,15 @@ fn folded_wildcards_preserve_order_and_expression_scopes() {
     };
     let scope =
         ColumnScope::from_query(&query, &database, IdentifierCase::Folded).expect("scope builds");
-    let mut outputs =
-        scope.scope_for_query(&query).expect("query is recorded").output_definitions();
-    let Some(QueryOutput::Column(first)) = outputs.next() else {
+    let mut outputs = scope.scope_for_query(&query).expect("query is recorded").outputs();
+    let Some(QueryOutput::Column { definition: first, .. }) = outputs.next() else {
         panic!("expected the expanded column")
     };
     assert_eq!(describe(&first), "docs.id");
-    let Some(QueryOutput::Column(ColumnDefinition::Expression { expression, scope: defining })) =
-        outputs.next()
+    let Some(QueryOutput::Column {
+        definition: ColumnDefinition::Expression { expression, scope: defining },
+        ..
+    }) = outputs.next()
     else {
         panic!("expected an expression output")
     };
@@ -195,4 +226,40 @@ fn folded_wildcards_preserve_order_and_expression_scopes() {
     assert_eq!(binding.relation(), Some(("d", true)));
     assert_eq!(binding.exposed(), Some(("VaLuE", true)));
     assert!(outputs.next().is_none());
+}
+
+#[test]
+fn output_names_follow_aliases_through_nested_wildcards() {
+    let sql = "WITH c AS (SELECT id AS alias, x FROM a), d AS (SELECT * FROM c) SELECT * FROM d";
+    assert_eq!(names(sql), ["alias", "x"]);
+    assert_eq!(outputs(sql), ["a.id", "a.x"]);
+    assert_eq!(names("SELECT a.id, x AS \"Value\", * FROM a"), ["id", "\"Value\"", "id", "x"]);
+}
+
+#[test]
+fn declared_column_lists_rename_a_prefix_where_the_relation_is_read() {
+    let sql = "WITH c(stable) AS (SELECT id, x FROM a), d AS (SELECT * FROM c) SELECT * FROM d";
+    assert_eq!(names(sql), ["stable", "x"]);
+    assert_eq!(names_of(sql, cte_body(0)), ["id", "x"]);
+    assert_eq!(names_of(sql, cte_body(1)), ["stable", "x"]);
+    assert_eq!(names("SELECT d.* FROM (SELECT id, x FROM a) AS d(k)"), ["k", "x"]);
+}
+
+#[test]
+fn set_operations_and_values_keep_their_leading_names() {
+    assert_eq!(names("SELECT id AS l FROM a UNION ALL SELECT id AS r FROM b"), ["l"]);
+    assert_eq!(names("VALUES (1, 2)"), ["\"column1\"", "\"column2\""]);
+    let sql =
+        "WITH RECURSIVE r(n) AS (SELECT id FROM b UNION ALL SELECT n + 1 FROM r) SELECT * FROM r";
+    assert_eq!(names(sql), ["n"]);
+    assert_eq!(names_of(sql, cte_body(0)), ["id"]);
+}
+
+#[test]
+fn unexpanded_wildcards_and_unmodeled_names_stay_unknown() {
+    assert_eq!(
+        names("SELECT b.id, *, 1 + 1, b.id AS again FROM b, generate_series(1, 2) AS g"),
+        ["id", "*", "\"?column?\"", "again"]
+    );
+    assert_eq!(names("SELECT '1'::tsvector FROM b"), ["?"]);
 }

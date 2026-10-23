@@ -183,8 +183,10 @@ fn stored_set_output_arms_keep_their_own_comparison() {
     for case in [IdentifierCase::Folded, IdentifierCase::Exact] {
         let scope = ColumnScope::from_query(&query, &db, case).expect("scope builds");
         let outputs = scope.scope_for_query(&query).expect("query is recorded");
-        let Some(QueryOutput::Column(ColumnDefinition::SetOperation { left, right, .. })) =
-            outputs.output_definitions().next()
+        let Some(QueryOutput::Column {
+            definition: ColumnDefinition::SetOperation { left, right, .. },
+            ..
+        }) = outputs.outputs().next()
         else {
             panic!("expected a stored set operation")
         };
