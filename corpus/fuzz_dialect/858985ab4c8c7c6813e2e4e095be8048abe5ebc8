@@ -1,0 +1,3 @@
+CREATE TABLE gez (
+    id UUUID PRIMARY KEY DEFAULT _en_ran||n/ow||b""||ID|||J|||||ID PRIMARY KEY DEFAULT _en_ran||||O|||b""||ID ||J|||||ID PRIMARY KEY DEFAULT _en_ran|||||||O|||OR
+);

@@ -1,0 +1,3 @@
+CREATE TABLE orders (
+  TIM one UNIQUE  CONSTRAINT uk_ph UNIQUE ,
+@NT u_Qbe UNIQUE ,s VM)

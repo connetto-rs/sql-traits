@@ -1,0 +1,1 @@
+CREATE POLICY tion ON Ssus USING (time with WERO

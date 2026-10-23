@@ -1,0 +1,4 @@
+CREATE POLICY Usn1 ON reSss USING (ulG (l(s(UPDATE((
+( SELECT SL,
+INTO-N,O-N,
+INL((((( (l(s) WHERE lG (l(s)o

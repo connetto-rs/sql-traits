@@ -1,0 +1,4 @@
+CREATE TABLE ordernows (
+  id SDE,
+ R CHAR(04) DEFAULT ESTA PRIMARY KEY DEFAULT _e||t||D PRIMARY KEY DEFAULT _en_rUE (us=reated_at)
+);

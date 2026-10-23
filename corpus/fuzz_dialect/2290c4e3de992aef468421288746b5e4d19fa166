@@ -1,0 +1,3 @@
+
+CREATE ROLE renowy;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO sessinn_uses,lÿÿÿÿ,ÿÿ

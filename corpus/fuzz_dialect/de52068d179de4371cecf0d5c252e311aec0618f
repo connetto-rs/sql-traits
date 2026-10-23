@@ -1,0 +1,6 @@
+CREATE TABLE orders (
+   E useNTEGERCA,   CHECK (amount > 0),
+d SERCADE,
+    amount DEEIMAL(10, 1) CHECK (amount > 0) CHECK (amount > 0),
+  HA KEY,
+romf VARCHAR);

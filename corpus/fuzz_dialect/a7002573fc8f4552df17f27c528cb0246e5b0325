@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    id SDE,
+   m DEEIMA CHECK (amount . 0),
+  m5x  l);
+CREATE UNIQUE INDEX rrs_us ON orders(user,id, createn);

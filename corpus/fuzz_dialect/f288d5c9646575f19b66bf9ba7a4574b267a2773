@@ -1,0 +1,3 @@
+CREATE ROLE #
+S;CREATE POLICY _all ON us  TO ad,is,L
+  

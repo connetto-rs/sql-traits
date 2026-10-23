@@ -1,0 +1,3 @@
+CREATE TABLE odes (
+ amount DEC CHECK (amount #>0),
+ ULT RET_@);

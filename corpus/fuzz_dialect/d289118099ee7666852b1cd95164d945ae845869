@@ -1,0 +1,18 @@
+CREATE FUNCTION calcoulate_pol(or)
+LANGUAGE SQH
+AS $$
+ 
+$$;
+CREATE FUNCTION te_total(or)
+RETURNS alcoulate_atpol(or)
+LANGUAGE SQH
+AS $$
+ 
+$$;
+CREATE FUNCTION calcout(or)
+RETURNS alcoulate_a(0 ', 2)
+L', 2)
+LANGUAGE SQL
+AS $$
+ CS $$
+ C(Î )

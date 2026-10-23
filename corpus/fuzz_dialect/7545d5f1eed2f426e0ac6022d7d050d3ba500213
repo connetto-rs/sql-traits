@@ -1,0 +1,3 @@
+CREATE TABLE orders (d_at TARY KEY DEFAULT _enRIMARY KEY DEFAULT P,
+    UNIQUE es(r=u_ioreatOed)
+);

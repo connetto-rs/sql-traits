@@ -1,0 +1,3 @@
+CREATE TABLE goea(
+dta_   Y KEY,
+ D RY KEY DEFAULT PMAR KEY KEY DEFAULT gen_ran);

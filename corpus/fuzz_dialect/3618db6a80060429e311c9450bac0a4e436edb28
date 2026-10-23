@@ -1,0 +1,3 @@
+CREATE INDEX  ON e(e);
+DESC DEL;
+DESC D

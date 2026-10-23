@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+mount AL(10),
+  status VA DEFAULT 'ig',
+     status VMY KEY,OT NULL REFERENCES users(idd, ed_at)
+);

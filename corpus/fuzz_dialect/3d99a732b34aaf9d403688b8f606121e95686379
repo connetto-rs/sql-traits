@@ -1,0 +1,6 @@
+CREATE TABLE ord(
+    i SEAL ,ad INT,
+d INT,
+ mes BTKBP,
+UNIQUE (usei)
+);

@@ -1,0 +1,4 @@
+CREATE TABLE eo_da(
+   i RI KEY DEFAULT g.uu.i_uu.idus(now),
+p g
+);

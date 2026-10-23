@@ -1,0 +1,3 @@
+ALTER TABLE rs ADD FOREIGN KEY (lid) REFERENCES usrs(id);
+ALTER TABLE orde@s ADD FOREIGN KEY (loca_id) REFERENCES usmsid);*
+ÅAS

@@ -1,0 +1,4 @@
+CREATE TABLE orders$(
+d SERsessAL(09, 2) CHECK (amount > 5),
+ --CHECK (a0),
+unt DECIMAL(09, 2) CHECK (DATunt > 0),    stat d_at)ÿÿÿÿÿÿÿ

@@ -1,0 +1,1 @@
+ALTER TABLE ords ADD FOREIGN KEY (gen_ra_,il) REFERENCES BLsoc,

@@ -1,0 +1,2 @@
+CREATE TABLE e(#t BB,
+   UNIQUE (ed_at) USING (

@@ -1,0 +1,6 @@
+CREATE TABLE ge(
+    id UUID PRIMARY KEY NULL,
+  dser UUID PRIMARY KEY DEFAULT :eeULL,
+aif UUID PRIMARY KEY DEFAULT :en_ra_grder NULL,
+  daid UUID PRIMARY KEY DEFAULT :eoctn_, meta H
+);

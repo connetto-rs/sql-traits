@@ -1,0 +1,3 @@
+CREATE TABLE wdata(M ARY KEY KEY DEFAULT gl()(2=222),
+   t Y DEFAULT randomid()
+);

@@ -1,0 +1,3 @@
+UPDATE(
+((((A(
+ ( SELECT/*+*//*!z*//*+*/(UPDATE(E( VARCHAR(c0+)

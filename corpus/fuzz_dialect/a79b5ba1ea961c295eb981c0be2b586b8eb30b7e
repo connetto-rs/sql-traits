@@ -1,0 +1,4 @@
+
+CREATE TABLE s (
+CHECK((8, 2)|t)
+);ù

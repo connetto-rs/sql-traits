@@ -1,0 +1,2 @@
+CREATE TABLE r(out D(1) CHECK (+out#N'')
+);

@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id SDRNT_TIMil);
+CREATE INDEX idx_orderrs_user_date ON orders(user,id, c-ed_aRl);
+CREATE UNIQUE INDEX idx_orderrs_user_date ON orders(user,id, c-ed_at Dcen)

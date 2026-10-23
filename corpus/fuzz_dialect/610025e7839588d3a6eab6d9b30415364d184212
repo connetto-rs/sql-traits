@@ -1,0 +1,4 @@
+(UPDATE(((
+ SELECT(N )UNION
+ SELECT 
+L

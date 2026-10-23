@@ -1,0 +1,2 @@
+ALTER TABLE users ADD COLse UE (`hondeo c`e);
+ALTER TABLE order ADD FOREIGN KEY (usid);

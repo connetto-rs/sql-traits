@@ -1,0 +1,2 @@
+CREATE TABLE a ( d UUID DEFAULT gd()
+)ÿ

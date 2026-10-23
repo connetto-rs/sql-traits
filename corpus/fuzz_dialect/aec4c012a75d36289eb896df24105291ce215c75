@@ -1,0 +1,3 @@
+
+CREATE ROLE donlI;
+GRANT SELEcT ON ALL TO  p,c:re,ta, c:sea, c:re,ta: c:r

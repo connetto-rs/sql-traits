@@ -1,0 +1,6 @@
+
+CREATE ROLE re, p,l,C,d, p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA p,KEC,lC,no,lCREC,l,lCglCREC,lCKElREC,lCREC,l,lCREC,KnowlocK,KElCREC,lCREC,l,lCgenCREK,KEerl,lKElREC,lCREC,l,l,lCREC,KEC,lCREK,KElREC,lCREC,l,lCREC,KEC,oC,lonlwcK,KElREC,KEC,lC,cCREC,KElREc TO  p,l.C,re, p,l,C,d,only;
+¹©ANT SELEcT ON ALL TABLESES IN SCHEMCREATE TaBLE ord(
+ a:d_@:@:at )A pcS, CHEC INK (@ 

@@ -1,0 +1,2 @@
+CREATE ROLE eedonlya;
+GRANT USAGE ON SCHEMA publ, pHH,Han,HHd,minH,HHHH,d,minH,Han,HHHH,HNan,HH,Hsessio_uersnHHHHinHn,HHd,minH,uui,HHHH,Hi

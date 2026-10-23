@@ -1,0 +1,2 @@
+CREATE ROLE dnly;
+GRANT SELECT TO surOLeEnrier

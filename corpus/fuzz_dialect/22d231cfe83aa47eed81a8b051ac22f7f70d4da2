@@ -1,0 +1,3 @@
+CREATE TABLE ods (amount M(11
+)CHECK (amount @> 0)
+);

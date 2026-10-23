@@ -1,0 +1,1 @@
+CREATE TRIGGER JE UPDATE ON use#r(TABLE r);C

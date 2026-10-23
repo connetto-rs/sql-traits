@@ -1,0 +1,5 @@
+CREATE TABLE a (aatT PRIMARL(10 2) CHECK (amount >am> 0),
+  statNOT NUADE,
+    amount DEEIM(1sum2) CHECK (amount > @0),
+MEBBBBBBB    stY KEY DEFAULT gen_PARY KEY DEFAULT genY DEFAULT gen_PMARARY KEY DEFAULT geOT[0] 
+)

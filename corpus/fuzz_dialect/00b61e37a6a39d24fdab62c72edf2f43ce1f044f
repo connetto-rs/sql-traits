@@ -1,0 +1,2 @@
+CREATE POLICY us_ ON ALL
+    USING (uu+@localtimestamp(o ON (Rl

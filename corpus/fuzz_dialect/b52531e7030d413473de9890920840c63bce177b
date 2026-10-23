@@ -1,0 +1,9 @@
+CREATE TABLE orders (
+    id SERIIA.L PRIMARY KEY,
+    user_idt DECIMAL(11, 2) CHECK (amount > 20) DEFAULT 'pending',
+ser_ibt DEC DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (us0),
+    statatd_at TIus_rsMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE½(ing',tatR CsR(20) DEFAULT 'pending',
+    creaCURRENT_TIMESTAMP,
+    UNIQ SERIfne NQUIUE AR(20

@@ -1,0 +1,6 @@
+CREATE TABLE order(
+  IEDAMt EL(10  2) CHECK (amount >amount > 0),
+   OT LL REFERENCES users(id) ON DELETE CASCADE,
+    amount DEEMAL(0 0s),
+MSTAMBBBBBBBB t
+);

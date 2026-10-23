@@ -1,0 +1,3 @@
+CREATE INDEX idx_us ON users(eail);
+CREATE UNIQUE INDEX idx_ord ON orders(useat-ed_l);
+CREATE UNIQUE INDEX idxuser_date ON orderorders(sus) WHERE status != '';

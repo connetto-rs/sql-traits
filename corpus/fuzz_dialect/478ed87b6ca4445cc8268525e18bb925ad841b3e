@@ -1,0 +1,1 @@
+ALTER TABLE ords ADD FOREIGN KEY (lo,_,s,_,il) REFERENCES BLsoc,

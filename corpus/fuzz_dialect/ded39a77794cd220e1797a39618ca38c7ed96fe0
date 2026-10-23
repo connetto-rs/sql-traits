@@ -1,0 +1,2 @@
+UPDATE(c T(
+ i DEC,t DEC))s

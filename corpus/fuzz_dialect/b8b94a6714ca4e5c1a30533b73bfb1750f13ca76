@@ -1,0 +1,2 @@
+CREATE INDEX ON e
+  USING T

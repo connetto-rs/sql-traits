@@ -1,0 +1,2 @@
+CREATE FUNCTION kauaol(TUPLE (T, s,i)
+);

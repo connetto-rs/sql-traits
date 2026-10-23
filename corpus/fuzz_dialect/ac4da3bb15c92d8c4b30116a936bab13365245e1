@@ -1,0 +1,5 @@
+CREATE TABLE krders (
+    id SDE,
+    ad_at TIMESTAMP DEFAULT CURRENTMEBBBBB||||||ID PRIMARY KEY DEFAULT _en_ran||||||||||||||||||||||||||ID PRIMARY KEY DEFAULT _||t|||||||ID PRIMARY KEY DEFAULT _en_ran||||||||||||||||D PRIMARY KEY DEFAULT _en_|||||||BBBBP,
+    UNIQUE (us=er._created_at)
+);

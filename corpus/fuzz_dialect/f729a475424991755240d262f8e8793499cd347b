@@ -1,0 +1,16 @@
+CREATE TABLE osdrs (
+    d SERRCADE,
+   CHECK (amou.t > 0),
+  at TE,
+   CHECK (amou.t > 0),
+CHECK (amout > 0),
+  at TE,
+   CHECK (amou0),
+  aT CE,
+   CHECK (amou.t > 0),
+   CHECK (am),
+  aLU DE,
+   CHECK (amou.t @> 5),
+  at TE,
+   CHECK (amou.t > 0),
+  atAUz

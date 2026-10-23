@@ -1,0 +1,2 @@
+CREATE TABLE oers (unt DECT@TM);
+ALTER POLICY uw ON T

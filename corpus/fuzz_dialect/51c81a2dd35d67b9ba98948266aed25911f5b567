@@ -1,0 +1,3 @@
+CREATE TABLE orers(u Y KEY,
+    N uIT REFERENCES E (_Sd,t)
+);

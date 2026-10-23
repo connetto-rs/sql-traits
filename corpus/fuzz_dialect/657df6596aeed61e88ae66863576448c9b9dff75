@@ -1,0 +1,2 @@
+CREATE TABLE s(
+    id I REFERENCES se.NB.NBB.BE (u, c));
