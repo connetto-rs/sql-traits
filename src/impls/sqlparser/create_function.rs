@@ -93,9 +93,9 @@ impl FunctionLike for CreateFunction {
         self.return_type.as_ref().map(|rt| {
             match rt {
                 FunctionReturnType::DataType(dt) => normalize_sqlparser_type(dt),
-                // The SETOF marker survives the way an array's `[]` does: whether
-                // the declaration names one value or a set of them is part of the
-                // answer.
+                // The SETOF marker survives the way an array's `[]` does:
+                // whether the declaration names one value or a set of them is
+                // part of the answer.
                 FunctionReturnType::SetOf(dt) => {
                     Cow::Owned(format!("SETOF {}", normalize_sqlparser_type(dt)))
                 }

@@ -534,7 +534,8 @@ impl<DB: DatabaseLike> Visitor for Sites<'_, '_, '_, '_, DB> {
                 };
                 self.walk.record(expression, reached);
             }
-            // A whole-row reference names a relation the resolver does not follow.
+            // A whole-row reference names a relation the resolver does not
+            // follow.
             Expr::QualifiedWildcard(..) => self.walk.record(expression, Reached::Unknown),
             _ => {}
         }

@@ -253,7 +253,8 @@ impl Iterator for MaintenanceBodyIterator {
                     found_semi = true;
                     break;
                 }
-                // Should not hit END inside expression unless missing semicolon.
+                // Should not hit END inside expression unless missing
+                // semicolon.
                 Some(Token::Word(w)) if w.keyword == Keyword::END && balance_parens == 0 => break,
                 Some(Token::EOF) | None => break,
                 _ => {}
