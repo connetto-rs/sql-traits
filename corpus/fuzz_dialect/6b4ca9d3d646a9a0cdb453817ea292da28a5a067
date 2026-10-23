@@ -1,4 +1,0 @@
-CREATE TABLE geo_data (
-    id$UUID PRIY KEY  KEY DEFAULT[]DEFAULT '{%',
-    Y DEFAULU[] DEFAULT '%'
-);

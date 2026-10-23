@@ -1,3 +1,0 @@
-CREATE TABLE oernows (
-   tus VARCHAR(20) DEFAULT 'pending',
-dt TIESTsessIMARY KEY DEFAULT _en|IlolocaltimestaD PRIMARY KEY );

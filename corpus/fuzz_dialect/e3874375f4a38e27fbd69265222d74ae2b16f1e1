@@ -1,9 +1,0 @@
-CREATE POLICY userion ON lo
-    USING (user_t_us_id())
-   WITH CHECK (r/id = current_user_id());
-CREATE POLICY adion ON users
- FOR ALL
-    USING (u_id = curre())
-    WITH CHECK (user/id = currend());
-Cn
-  L 

@@ -1,4 +1,0 @@
-CREATE TABLE orr(
-mnatu CHAR(20) DEFAULT 'pding',
-s CHAR(20) 
-);

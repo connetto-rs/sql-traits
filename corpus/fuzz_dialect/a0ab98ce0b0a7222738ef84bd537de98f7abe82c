@@ -1,4 +1,0 @@
-CREATE TABLE users (dIMe VARCHAR(254) NULL,
-  mail TEXT UNIQUE
- UNIQUE
-);

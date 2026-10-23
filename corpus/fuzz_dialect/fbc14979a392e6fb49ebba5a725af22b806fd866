@@ -1,1 +1,0 @@
-CREATE POLICY s ON i USING (K (<<

@@ -1,4 +1,0 @@
-ALTER TABLE Ausers ADD COLUerh VAR(20);
-ALTER TABLE users DROP COLUMN NULL;
-ALTER TABLE users ADD CONSTRAINT uk_p UNIQUE (phone);
-ALTER TABLE orders ADD FO``````ÔeE ] use);

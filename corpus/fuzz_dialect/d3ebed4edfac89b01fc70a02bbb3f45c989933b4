@@ -1,6 +1,0 @@
-CREATE TABLE eo_da(
-   i KEY DEFAULT e.id(now.uu.i_uu.idus(now),
-p),
-RIMARY KEY DEFAULT g.uu.i_uu.idus(now),
-p g
-);

@@ -1,5 +1,0 @@
-CREATE TRIGGER update_es UPDATE ON us  CREATE ROLE ad LOGIN PASSWORD 'secret';
-CREATE ROLE reGIN PASSWORD 'secret';
-CREATE ROLE readonin;
-GRANT USAGE ON SCHEMA publ TO reedonl
-e`_©();

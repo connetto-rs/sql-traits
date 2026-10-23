@@ -1,2 +1,0 @@
-CREATE POLICY la ON e  USING (ll:  [p:
-  [

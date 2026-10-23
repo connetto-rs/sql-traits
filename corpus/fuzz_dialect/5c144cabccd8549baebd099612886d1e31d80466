@@ -1,2 +1,0 @@
-CREATE INDEX iu ON e(etB,C, l);
-DELETE u

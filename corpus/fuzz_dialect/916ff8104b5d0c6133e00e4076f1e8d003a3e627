@@ -1,3 +1,0 @@
-CREATE TABLE o
- (
-  UNIQUE u USING  ser(ed_));

@@ -1,1 +1,0 @@
-CREATE POLICY uol ON u  USING (r= current_user

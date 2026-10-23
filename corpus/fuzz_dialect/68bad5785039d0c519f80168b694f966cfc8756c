@@ -1,5 +1,0 @@
-CREATE TABLE orders (
-    amount DEEIMAL(11,) CHECK (amount > 0),
-  tus VARCHAR44444STAMP DEFAULT CURRM?AL(11, 2) CHECK (amount > 0),
-
-   s VARCSTAMP DEFAULT  (userated_at));

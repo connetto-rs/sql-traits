@@ -1,2 +1,0 @@
-CREATE POLICY kti ON L
-  USING (l<^lll~~true)

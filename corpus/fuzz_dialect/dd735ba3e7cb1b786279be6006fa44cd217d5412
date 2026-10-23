@@ -1,1 +1,0 @@
-CREATE POLICY n ON us USING(N);

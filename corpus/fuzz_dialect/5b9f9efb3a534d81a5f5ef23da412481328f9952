@@ -1,3 +1,0 @@
-CREATE TAbLE uss (nam O NULL KEY,
-    nam  UNIQUE
-);

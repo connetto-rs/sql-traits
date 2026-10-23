@@ -1,2 +1,0 @@
-ALTER  FUNCTION sum
-SET l=P ,Q,Q

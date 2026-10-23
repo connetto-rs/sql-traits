@@ -1,3 +1,0 @@
-CREATE ROLE a ;CREATE POLICY _ll ON user
-  TO st,L
-  

@@ -1,3 +1,0 @@
-CREATE TABLE o(
- amu DECIMAL(182 ), CHECK(@@@:d_ad)
-)

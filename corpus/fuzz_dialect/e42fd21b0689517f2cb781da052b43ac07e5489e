@@ -1,1 +1,0 @@
-CREATE POLICY usersolation ON usersloc   USING (nullifstamp(dUPT(TDATE(TUPLE (A(DUPT(TUPLE (localtimestamp(dUE(TUPLE (P(PDE (P(PD(Amp(dUPT(TUPLE(TUPLE (P(D(ATED(TUPLE (A(DUPT(TUUPLL(TUPLE (P(PDATE(DATE(TUPLE (A(DUPT(se~/idre.t._uszer_id()ÿÿN;

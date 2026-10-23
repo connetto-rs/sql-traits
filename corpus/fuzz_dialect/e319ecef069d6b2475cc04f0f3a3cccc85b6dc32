@@ -1,4 +1,0 @@
-CREATE INDEX  ON ors(C);
-CREATE INDEX  ON ord(SC);
-
- 

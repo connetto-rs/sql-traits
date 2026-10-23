@@ -1,1 +1,0 @@
-CREATE POLICY n ON sL  USING (# rue)1

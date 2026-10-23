@@ -1,4 +1,0 @@
-CREATE TABLE orders (
- tus VARCHAR(20) DEFAULT 'pending',
-    credE CASCADE,
-    amount DEIARCHAR(20) DEFAULT 'pending', cated_at TIMESTAMP DEFAULT CUERRNT_TIMESTAM@@@@@@@@@@@@@@@@@@@@@@@@@@@@smallint@@@TEGER NOT NULL REFECREd

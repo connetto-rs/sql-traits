@@ -1,6 +1,0 @@
-CREATE FUNCTION ctotal(EGE#)
-LANGUAGE QL
-AS $$
-/*
- *
-FO$$;

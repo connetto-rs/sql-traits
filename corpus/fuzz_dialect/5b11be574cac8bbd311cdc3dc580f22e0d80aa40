@@ -1,1 +1,0 @@
-CREATE POLICY usean ON resus  USING (++Nq''''+AI++Nq''''+Nq''''+++Nq''''+++

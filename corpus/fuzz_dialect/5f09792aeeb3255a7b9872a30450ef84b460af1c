@@ -1,2 +1,0 @@
-CREATE FUNCTION cauaol(TUPLE (T, sC, i)
-);

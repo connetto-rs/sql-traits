@@ -1,3 +1,0 @@
-CREATE INDEX ismail ON users(eml);
-CREATE UNIQUE INDEX e ON ors(usrd, cen);
-cREATE INDEX  ON orde(2status) WHERE st

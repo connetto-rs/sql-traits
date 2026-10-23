@@ -1,6 +1,0 @@
-CREATE TAbLE orders (
-   id S1ERIAL  ,amount DECIMAL(09, 2) CHECK (amount > 0),
-   stnt DEAL(09, 2) CHECK (amount > 0),
- atus AR(20) DEFAULT e'', 
- I UQNUE (reated_at)
-);

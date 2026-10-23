@@ -1,3 +1,0 @@
-CREATE POLICY use ON use  WITH CHECK (d());d 
-  
-ÿ

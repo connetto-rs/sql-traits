@@ -1,7 +1,0 @@
-CREATE TABLE ordrs (
-  t EL(10  2) CHECK (amount >amn:t > 0),
- st CQ2A,
-  amount Ddevs (
-1) CHECK (amount > 0),
-MESTAB st
-);

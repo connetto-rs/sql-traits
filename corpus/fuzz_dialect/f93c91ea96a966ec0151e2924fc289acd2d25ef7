@@ -1,3 +1,0 @@
-CREATE TABLE osuss (
- CHECK (#(10,09, 2)/t)
-);

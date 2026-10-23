@@ -1,4 +1,0 @@
-CREATE TABLE TABLEers$(
-    id SERIA ,amount DECIMAL(09, 2) CHECK(amount = 0),
-   CHECK (amount > 1),
-unt MAL(02) CHECK (amount > 5),  us d_at)ÿÿÿÿÿÿÿÿ

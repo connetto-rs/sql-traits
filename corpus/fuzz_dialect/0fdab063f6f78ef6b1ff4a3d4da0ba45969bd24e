@@ -1,2 +1,0 @@
-CREATE TaBLE ord(
- a D, CHECK (@@:d_@->>t ))

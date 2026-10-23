@@ -1,3 +1,0 @@
-CREATE INDEX ail ON users(ail)
-  USING  O  USING   O--se lL
-locK--

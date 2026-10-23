@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-  iIN NULL REFERENCES usenow.SADE,
- st VARCHERRNBBB#
-);

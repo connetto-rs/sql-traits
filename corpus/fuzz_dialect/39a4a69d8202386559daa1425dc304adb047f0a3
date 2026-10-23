@@ -1,1 +1,0 @@
-CREATE POLICY on ON r  USING (lll[l@lll.l(TABLE order)

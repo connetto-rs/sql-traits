@@ -1,3 +1,0 @@
-CREATE FUNCTION acu#va(o)
-AS $$E/*
-$$;

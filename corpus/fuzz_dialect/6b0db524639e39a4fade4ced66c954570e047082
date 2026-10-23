@@ -1,3 +1,0 @@
-CREATE ROLE donin;
-GRANT USAGE ON SCHEMA pl,c TO reyn;
-GRANT USAGE ON SCHEMA publ,cnly;

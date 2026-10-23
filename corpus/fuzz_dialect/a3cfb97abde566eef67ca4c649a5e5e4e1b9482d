@@ -1,5 +1,0 @@
-CREATE TABLE geo_data (
-    id UUMARY KEY DEFAULT guuil(),
-    data JSONB NOT NULL,
- a JSONB NOT NULL,
- ata JSONB A

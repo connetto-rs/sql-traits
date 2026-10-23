@@ -1,1 +1,0 @@
-CREATE POLICY _isolaon ON A     USING (l|l+ll%ll <@ll;

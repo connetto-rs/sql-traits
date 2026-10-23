@@ -1,2 +1,0 @@
-CREATE TRIGGER #tC.a.a
- UPDATE ON u

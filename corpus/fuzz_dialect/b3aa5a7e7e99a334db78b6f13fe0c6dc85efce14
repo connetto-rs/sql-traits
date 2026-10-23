@@ -1,1 +1,0 @@
-CREATE POLICY Un ON s USING (nll(l(s() WHERE l) (l(s) WHERE l=lUs) WHERE l))ÿE ÿÿÿ

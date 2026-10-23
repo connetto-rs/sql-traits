@@ -1,2 +1,0 @@
-CREATE POLICY u_oAn ON es
-  USING (llul|l-N @>@tru\
