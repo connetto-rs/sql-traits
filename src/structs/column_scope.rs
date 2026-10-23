@@ -54,8 +54,14 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
 /// One entry of a query's ordered output list.
 #[derive(Debug)]
 pub enum QueryOutput<'scope, 'query, 'db, DB: DatabaseLike> {
-    /// One output column and the definition that determines its type.
-    Column(ColumnDefinition<'scope, 'query, 'db, DB>),
+    /// One output column.
+    Column {
+        /// The output name and whether it is quoted, named the way PostgreSQL
+        /// names the column, or `None` when that name is not modeled.
+        name: Option<(&'scope str, bool)>,
+        /// The definition that determines the column's type.
+        definition: ColumnDefinition<'scope, 'query, 'db, DB>,
+    },
     /// A wildcard whose columns cannot be enumerated, such as one over an
     /// opaque relation or one reshaped by `EXCLUDE`, `REPLACE` or `RENAME`.
     /// It stands for an unknown number of columns, possibly none.
@@ -683,6 +689,10 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     /// Returns the query's outputs in select-list order, with every enumerable
     /// wildcard expanded in place.
     ///
+    /// Each column carries its alias, PostgreSQL's inferred name, or the name a
+    /// wildcard reads after the relation's declared column list, and a set
+    /// operation keeps its leading operand's names.
+    ///
     /// The iterator's length counts entries, and an
     /// [`QueryOutput::Unexpanded`] entry stands for an unknown number of
     /// columns. The SQL column count, and the ordinal of every entry after an
@@ -695,47 +705,43 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     ///
     /// ```
     /// use sql_traits::prelude::*;
-    /// use sqlparser::{
-    ///     ast::{Expr, SelectItem, SetExpr, Statement},
-    ///     dialect::PostgreSqlDialect,
-    ///     parser::Parser,
-    /// };
+    /// use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE a(id INT, x INT);")?;
-    /// let sql = "SELECT (SELECT * FROM a LIMIT 1) FROM a";
+    /// let sql = "WITH c AS (SELECT id AS alias, x FROM a) SELECT * FROM c";
     /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
-    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
-    /// let SelectItem::UnnamedExpr(Expr::Subquery(nested)) = &select.projection[0] else {
-    ///     unreachable!()
-    /// };
     /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
-    /// let outputs = scope.scope_for_query(nested).expect("the nested query is recorded");
-    /// let names = outputs
-    ///     .output_definitions()
+    /// let root = scope.scope_for_query(&query).expect("the root query is recorded");
+    /// let columns = root
+    ///     .outputs()
     ///     .map(|output| {
-    ///         let QueryOutput::Column(ColumnDefinition::Base { column, .. }) = output else {
+    ///         let QueryOutput::Column {
+    ///             name: Some((name, false)),
+    ///             definition: ColumnDefinition::Base { column, .. },
+    ///         } = output
+    ///         else {
     ///             unreachable!()
     ///         };
-    ///         column.column_name()
+    ///         (name, column.column_name())
     ///     })
     ///     .collect::<Vec<_>>();
-    /// assert_eq!(names, ["id", "x"]);
+    /// assert_eq!(columns, [("alias", "id"), ("x", "x")]);
     ///
     /// let sql = "SELECT a.id, * FROM a, generate_series(1, 2) AS g";
     /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
     ///     unreachable!()
     /// };
     /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
-    /// let outputs = scope.scope_for_query(&query).expect("the root query is recorded");
-    /// let mut entries = outputs.output_definitions();
+    /// let root = scope.scope_for_query(&query).expect("the root query is recorded");
+    /// let mut entries = root.outputs();
     /// assert_eq!(entries.len(), 2);
-    /// assert!(matches!(entries.next(), Some(QueryOutput::Column(ColumnDefinition::Base { .. }))));
+    /// assert!(matches!(entries.next(), Some(QueryOutput::Column { name: Some(("id", false)), .. })));
     /// assert!(matches!(entries.next(), Some(QueryOutput::Unexpanded)));
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
-    pub fn output_definitions(
+    pub fn outputs(
         &self,
     ) -> impl ExactSizeIterator<Item = QueryOutput<'scope, 'query, 'db, DB>> + use<'scope, 'query, 'db, DB>
     {
