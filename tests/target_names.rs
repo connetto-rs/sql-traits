@@ -314,7 +314,8 @@ fn a_generic_catalog_resolves_every_policy_target() {
     assert_eq!(
         targets,
         [
-            // Written qualified and quoted, and the quoting survives the round trip.
+            // Written qualified and quoted, and the quoting survives the round
+            // trip.
             ("app.\"Notes\"".to_string(), Some("app".to_string())),
             // Written unqualified, bound into `app` by the search path.
             ("app.docs".to_string(), Some("app".to_string())),

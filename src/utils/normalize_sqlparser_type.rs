@@ -152,8 +152,8 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
         DataType::Int4(_) | DataType::Int4Unsigned(_) => "INT4".into(),
         DataType::Int8(_) | DataType::Int8Unsigned(_) => "INT8".into(),
         DataType::HugeInt | DataType::UHugeInt => "HUGEINT".into(),
-        // `ClickHouse` widths name a size the aliases above do not, so they stay
-        // distinct rather than folding into the platform integer.
+        // `ClickHouse` widths name a size the aliases above do not, so they
+        // stay distinct rather than folding into the platform integer.
         DataType::Int16 => "INT16".into(),
         DataType::Int32 => "INT32".into(),
         DataType::Int64 => "INT64".into(),
@@ -231,8 +231,8 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
         // MySQL wall-clock timestamp, precision dropped like a length.
         DataType::Datetime(_) => "DATETIME".into(),
         DataType::Datetime64(..) => "DATETIME64".into(),
-        // A field list such as `YEAR TO MONTH` narrows the same type, exactly as
-        // a length narrows `VARCHAR`.
+        // A field list such as `YEAR TO MONTH` narrows the same type, exactly
+        // as a length narrows `VARCHAR`.
         DataType::Interval { .. } => "INTERVAL".into(),
         // UUID
         DataType::Uuid => "UUID".into(),
@@ -292,8 +292,9 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
         // in a schema is an ordinary declaration.
         DataType::Custom(ObjectName(parts), segments) => {
             match parts.as_slice() {
-                // No name was written, so no type was named. Answering the empty
-                // string here would collapse into a neighbouring declaration.
+                // No name was written, so no type was named. Answering the
+                // empty string here would collapse into a neighbouring
+                // declaration.
                 //
                 // The parser never produces a name with no parts, which is why
                 // `last_str` and `target_name_of_object_name` lean on that and
