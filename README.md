@@ -1,10 +1,10 @@
 # SQL Traits
 
-[![CI](https://github.com/earth-metabolome-initiative/sql-traits/workflows/Rust%20CI/badge.svg)](https://github.com/earth-metabolome-initiative/sql-traits/actions)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88.0-blue.svg)](https://github.com/earth-metabolome-initiative/sql-traits/blob/main/Cargo.toml)
-[![Security Audit](https://github.com/earth-metabolome-initiative/sql-traits/workflows/Security%20Audit/badge.svg)](https://github.com/earth-metabolome-initiative/sql-traits/actions)
+[![CI](https://github.com/connetto-rs/sql-traits/workflows/Rust%20CI/badge.svg)](https://github.com/connetto-rs/sql-traits/actions)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88.0-blue.svg)](https://github.com/connetto-rs/sql-traits/blob/main/Cargo.toml)
+[![Security Audit](https://github.com/connetto-rs/sql-traits/workflows/Security%20Audit/badge.svg)](https://github.com/connetto-rs/sql-traits/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Codecov](https://codecov.io/gh/earth-metabolome-initiative/sql-traits/branch/main/graph/badge.svg)](https://codecov.io/gh/earth-metabolome-initiative/sql-traits)
+[![Codecov](https://codecov.io/gh/connetto-rs/sql-traits/branch/main/graph/badge.svg)](https://codecov.io/gh/connetto-rs/sql-traits)
 
 Rust traits describing SQL-like objects.
 
@@ -22,7 +22,7 @@ This crate is currently not published to `crates.io`. You can add it to your pro
 
 ```toml
 [dependencies]
-sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits" }
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits" }
 ```
 
 ## Example: Parsing SQL DDL
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Implementations
 
 - **[`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) AST**: Included in this crate (`ParserDB`), useful for static analysis and schema validation of SQL files.
-- **[`pg_diesel`](https://github.com/earth-metabolome-initiative/pg_diesel)**: An external, downstream crate that implements these traits for inspecting an existing PostgreSQL database.
+- **[`pg_diesel`](https://github.com/connetto-rs/pg_diesel)**: An external, downstream crate that implements these traits for inspecting an existing PostgreSQL database.
 
 ## Status
 

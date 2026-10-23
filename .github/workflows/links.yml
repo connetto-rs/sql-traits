@@ -20,8 +20,8 @@ jobs:
           args: >
             --verbose
             --no-progress
-            --exclude 'https://codecov.io/gh/earth-metabolome-initiative/sql-traits'
-            --exclude 'https://codecov.io/gh/earth-metabolome-initiative/sql-traits/branch/main/graph/badge.svg'
+            --exclude 'https://codecov.io/gh/connetto-rs/sql-traits'
+            --exclude 'https://codecov.io/gh/connetto-rs/sql-traits/branch/main/graph/badge.svg'
             './**/*.md' './**/*.rs'
           # Fail the action if broken links are found
           fail: true
