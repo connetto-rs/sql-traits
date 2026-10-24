@@ -1,6 +1,7 @@
 //! Submodule providing a function for normalizing `SQLParser` data types.
 
 use alloc::{borrow::Cow, format, string::String};
+use core::fmt::Write;
 
 use sqlparser::ast::{ArrayElemTypeDef, DataType, GeometricTypeKind, ObjectName, TimezoneInfo};
 
@@ -13,18 +14,17 @@ use crate::utils::object_name::object_name_part_value;
 /// that introduces a type stops this crate from building until the type is
 /// classified, rather than reaching a caller as a runtime failure.
 ///
-/// A parameter that only sizes or decorates a type is dropped, so
-/// `VARCHAR(255)` and `BIT(8)` normalize to `VARCHAR` and `BIT`, and a member
-/// or column list is dropped the same way. The pinned `GEOGRAPHY(Point, 4326)`
-/// and `GEOMETRY(Point, 4326)` spellings are the exception and keep theirs. An
-/// element type is kept, so an array recurses into what it holds.
-/// MySQL's `ZEROFILL` padding reports its normalized inner type.
+/// One-part custom types retain modifiers, and arrays retain element types.
+///
+/// Built-in parameters and MySQL's `ZEROFILL` decoration are omitted.
 ///
 /// # Examples
 ///
 /// ```
 /// use sql_traits::utils::normalize_sqlparser_type;
-/// use sqlparser::ast::{DataType, ExactNumberInfo, ObjectName, ObjectNamePart};
+/// use sqlparser::ast::{
+///     DataType, ExactNumberInfo, Ident, ObjectName, ObjectNamePart, TypeModifier,
+/// };
 ///
 /// assert_eq!(normalize_sqlparser_type(&DataType::Text), "TEXT");
 /// assert_eq!(normalize_sqlparser_type(&DataType::Int(None)), "INT");
@@ -64,15 +64,21 @@ use crate::utils::object_name::object_name_part_value;
 /// // Custom types
 /// let custom = DataType::Custom(
 ///     ObjectName(vec![ObjectNamePart::Identifier(sqlparser::ast::Ident::new("GEOGRAPHY"))]),
-///     vec!["Point".to_string(), "4326".to_string()],
+///     vec![
+///         TypeModifier::Identifier(Ident::new("Point")),
+///         TypeModifier::Number("4326".into(), false),
+///     ],
 /// );
 /// assert_eq!(normalize_sqlparser_type(&custom), "GEOGRAPHY(Point, 4326)");
 ///
 /// let custom_geom = DataType::Custom(
-///     ObjectName(vec![ObjectNamePart::Identifier(sqlparser::ast::Ident::new("GEOMETRY"))]),
-///     vec!["Point".to_string(), "4326".to_string()],
+///     ObjectName(vec![ObjectNamePart::Identifier(Ident::new("geometry"))]),
+///     vec![
+///         TypeModifier::Identifier(Ident::new("Point")),
+///         TypeModifier::Number("3857".into(), false),
+///     ],
 /// );
-/// assert_eq!(normalize_sqlparser_type(&custom_geom), "GEOMETRY(Point, 4326)");
+/// assert_eq!(normalize_sqlparser_type(&custom_geom), "geometry(Point, 3857)");
 ///
 /// let custom_other = DataType::Custom(
 ///     ObjectName(vec![ObjectNamePart::Identifier(sqlparser::ast::Ident::new("OTHER"))]),
@@ -287,9 +293,6 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
             | ArrayElemTypeDef::SquareBracket(element, _)
             | ArrayElemTypeDef::Qualified(element, _),
         ) => format!("{}[]", normalize_sqlparser_type(element)).into(),
-        // Custom: the written name, with pinned GEOGRAPHY/GEOMETRY recognition.
-        // A qualified name keeps its schema, since a composite type or a domain
-        // in a schema is an ordinary declaration.
         DataType::Custom(ObjectName(parts), segments) => {
             match parts.as_slice() {
                 // No name was written, so no type was named. Answering the
@@ -308,15 +311,19 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
                     let Some(name) = object_name_part_value(only) else {
                         return "UNSPECIFIED".into();
                     };
-                    if segments == &["Point", "4326"] {
-                        if name == "GEOGRAPHY" {
-                            return "GEOGRAPHY(Point, 4326)".into();
+                    if segments.is_empty() {
+                        name.into()
+                    } else {
+                        let mut normalized = format!("{name}(");
+                        for (index, segment) in segments.iter().enumerate() {
+                            if index > 0 {
+                                normalized.push_str(", ");
+                            }
+                            let _ = write!(normalized, "{segment}");
                         }
-                        if name == "GEOMETRY" {
-                            return "GEOMETRY(Point, 4326)".into();
-                        }
+                        normalized.push(')');
+                        normalized.into()
                     }
-                    name.into()
                 }
                 qualified => {
                     let mut joined = String::new();
@@ -340,7 +347,7 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
 mod tests {
     use alloc::boxed::Box;
 
-    use sqlparser::ast::{DataType, Ident, ObjectName, ObjectNamePart, TimezoneInfo};
+    use sqlparser::ast::{DataType, Ident, ObjectName, ObjectNamePart, TimezoneInfo, TypeModifier};
 
     use super::*;
 
@@ -381,13 +388,19 @@ mod tests {
     fn test_normalize_sqlparser_type_custom() {
         let geography = DataType::Custom(
             ObjectName(vec![ObjectNamePart::Identifier(Ident::new("GEOGRAPHY"))]),
-            vec!["Point".to_string(), "4326".to_string()],
+            vec![
+                TypeModifier::Identifier(Ident::new("Point")),
+                TypeModifier::Number("4326".into(), false),
+            ],
         );
         assert_eq!(normalize_sqlparser_type(&geography), "GEOGRAPHY(Point, 4326)");
 
         let geometry = DataType::Custom(
             ObjectName(vec![ObjectNamePart::Identifier(Ident::new("GEOMETRY"))]),
-            vec!["Point".to_string(), "4326".to_string()],
+            vec![
+                TypeModifier::Identifier(Ident::new("Point")),
+                TypeModifier::Number("4326".into(), false),
+            ],
         );
         assert_eq!(normalize_sqlparser_type(&geometry), "GEOMETRY(Point, 4326)");
 
@@ -397,14 +410,14 @@ mod tests {
         );
         assert_eq!(normalize_sqlparser_type(&other), "OTHER");
 
-        // The pinned recognition keys on the name as well as the modifiers, so
-        // another type carrying the same modifiers keeps its own name and drops
-        // them like any other custom type.
         let same_modifiers = DataType::Custom(
             ObjectName(vec![ObjectNamePart::Identifier(Ident::new("shape"))]),
-            vec!["Point".to_string(), "4326".to_string()],
+            vec![
+                TypeModifier::Identifier(Ident::new("Point")),
+                TypeModifier::Number("4326".into(), false),
+            ],
         );
-        assert_eq!(normalize_sqlparser_type(&same_modifiers), "shape");
+        assert_eq!(normalize_sqlparser_type(&same_modifiers), "shape(Point, 4326)");
     }
 
     /// A name in a schema keeps every part, and a name of any depth resolves
@@ -440,14 +453,16 @@ mod tests {
         );
         assert_eq!(normalize_sqlparser_type(&quoted), "App.My Type");
 
-        // The pinned geometry recognition is a one-part rule, so a qualified
-        // name of the same shape stays a qualified name.
+        // Qualified custom types report only their qualified name.
         let qualified_geography = DataType::Custom(
             ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::new("app")),
                 ObjectNamePart::Identifier(Ident::new("GEOGRAPHY")),
             ]),
-            vec!["Point".to_string(), "4326".to_string()],
+            vec![
+                TypeModifier::Identifier(Ident::new("Point")),
+                TypeModifier::Number("4326".into(), false),
+            ],
         );
         assert_eq!(normalize_sqlparser_type(&qualified_geography), "app.GEOGRAPHY");
     }
