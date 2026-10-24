@@ -11,11 +11,11 @@ use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{
         Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, OrderByKind,
-        Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+        Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
     },
     dialect::{Dialect, PostgreSqlDialect, SQLiteDialect},
-    parser::Parser,
 };
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/query_parsing.rs"));
 
 const SCHEMA: &str = "CREATE TABLE docs(id INT, x INT);";
 
@@ -26,12 +26,7 @@ fn database() -> ParserDB {
 }
 
 fn query(dialect: &dyn Dialect, sql: &str) -> Query {
-    let mut statements = Parser::parse_sql(dialect, sql)
-        .unwrap_or_else(|error| panic!("statement `{sql}` parses: {error}"));
-    match statements.pop().expect("one statement") {
-        Statement::Query(query) => *query,
-        other => panic!("expected a query, got {other:?}"),
-    }
+    query_with(dialect, sql)
 }
 
 fn body_select(query: &Query) -> &Select {

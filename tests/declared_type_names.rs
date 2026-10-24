@@ -10,21 +10,7 @@ use sqlparser::{
     dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect, SnowflakeDialect},
     parser::Parser,
 };
-
-/// Builds a one-table database from `ddl` and returns the declared type of
-/// every one of its columns, in declaration order.
-fn column_types(ddl: &str) -> Vec<String> {
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, ddl).expect("SQL parses");
-    let database =
-        ParserDB::from_statements(statements, "test".to_string()).expect("schema builds");
-    let table = database.tables().next().expect("input declares a table");
-
-    table
-        .columns(&database)
-        .expect("table belongs to the database")
-        .map(|column| column.data_type(&database).into_owned())
-        .collect()
-}
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_type_probes.rs"));
 
 /// Builds a database from `ddl` and returns the declared argument types and
 /// return type of its `probe_fn` function.
@@ -154,14 +140,6 @@ fn test_snowflake_object_columns_are_one_family() {
 /// any other, and two different such types stay different.
 #[test]
 fn test_formerly_aborting_column_type_fingerprints() {
-    let fingerprint = |ddl: &str| {
-        let statements = Parser::parse_sql(&PostgreSqlDialect {}, ddl).expect("parses");
-        let database =
-            ParserDB::from_statements(statements, "test".to_string()).expect("schema builds");
-        let table = database.tables().next().expect("input declares a table");
-        table.schema_fingerprint(&database).expect("fingerprint computes")
-    };
-
     assert_eq!(
         fingerprint("CREATE TABLE t (span INTERVAL);"),
         fingerprint("CREATE TABLE t (span INTERVAL);")

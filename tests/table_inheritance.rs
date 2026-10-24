@@ -20,6 +20,7 @@
 
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::{BigQueryDialect, PostgreSqlDialect};
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_names.rs"));
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -27,17 +28,6 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
 
 fn database(sql: &str) -> ParserDB {
     parse(sql).expect("schema parses")
-}
-
-fn column_names(database: &ParserDB, table_name: &str) -> Vec<String> {
-    database
-        .table_by_target(TargetName::new(table_name, false), IdentifierCase::AsWritten)
-        .expect("unambiguous lookup")
-        .expect("table exists")
-        .columns(database)
-        .expect("table is in this database")
-        .map(|column| column.column_name().to_owned())
-        .collect()
 }
 
 fn local_column_names(database: &ParserDB, table_name: &str) -> Vec<String> {

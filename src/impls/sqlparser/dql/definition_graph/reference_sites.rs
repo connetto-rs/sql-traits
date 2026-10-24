@@ -417,21 +417,13 @@ fn unqualified_wildcard_items<DB: DatabaseLike>(
             WildcardEntry::Base(index) => {
                 let base = &data.bases[*index];
                 let qualifier = (!single).then(|| [key_identifier(base.key)]);
-                for column in &base.output_columns {
-                    if !subsumed_exposure(
-                        &data.merged,
-                        base.entry_index,
-                        &column.name,
-                        column.quoted,
-                        data.case,
-                    ) {
-                        items.push(column_item(
-                            qualifier.as_ref().map(<[Ident; 1]>::as_slice),
-                            &column.name,
-                            column.quoted,
-                        ));
-                    }
-                }
+                push_exposed_columns(
+                    &mut items,
+                    data,
+                    base.entry_index,
+                    qualifier.as_ref().map(<[Ident; 1]>::as_slice),
+                    base.output_columns.iter().map(|column| (&*column.name, column.quoted)),
+                );
             }
             WildcardEntry::Derived(index) => {
                 let relation = &data.derived[*index];
@@ -440,21 +432,13 @@ fn unqualified_wildcard_items<DB: DatabaseLike>(
                     (false, Some(key)) => Some([key_identifier(key)]),
                     (false, None) => return None,
                 };
-                for column in &relation.shape.columns {
-                    if !subsumed_exposure(
-                        &data.merged,
-                        relation.entry_index,
-                        &column.name,
-                        column.quoted,
-                        data.case,
-                    ) {
-                        items.push(column_item(
-                            qualifier.as_ref().map(<[Ident; 1]>::as_slice),
-                            &column.name,
-                            column.quoted,
-                        ));
-                    }
-                }
+                push_exposed_columns(
+                    &mut items,
+                    data,
+                    relation.entry_index,
+                    qualifier.as_ref().map(<[Ident; 1]>::as_slice),
+                    relation.shape.columns.iter().map(|column| (&*column.name, column.quoted)),
+                );
             }
             WildcardEntry::Merged { name, quoted, provider } => {
                 let qualifier =
@@ -468,6 +452,22 @@ fn unqualified_wildcard_items<DB: DatabaseLike>(
         }
     }
     (!items.is_empty()).then_some(items)
+}
+
+/// Pushes an item for each of `columns` that no join merged away from the
+/// `FROM` item at `entry_index`, under `qualifier` when given.
+fn push_exposed_columns<'c, DB: DatabaseLike>(
+    items: &mut Vec<SelectItem>,
+    data: &FromScope<'_, '_, DB, DefinitionId>,
+    entry_index: usize,
+    qualifier: Option<&[Ident]>,
+    columns: impl Iterator<Item = (&'c str, bool)>,
+) {
+    for (name, quoted) in columns {
+        if !subsumed_exposure(&data.merged, entry_index, name, quoted, data.case) {
+            items.push(column_item(qualifier, name, quoted));
+        }
+    }
 }
 
 /// The items a qualified `t.*` stands for, each under the qualifier as
