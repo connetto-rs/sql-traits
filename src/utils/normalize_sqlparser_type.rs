@@ -293,7 +293,6 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
             | ArrayElemTypeDef::SquareBracket(element, _)
             | ArrayElemTypeDef::Qualified(element, _),
         ) => format!("{}[]", normalize_sqlparser_type(element)).into(),
-        // One-part custom names retain modifiers, and qualified names retain their schema.
         DataType::Custom(ObjectName(parts), segments) => {
             match parts.as_slice() {
                 // No name was written, so no type was named. Answering the
