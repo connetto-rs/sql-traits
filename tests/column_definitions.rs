@@ -7,15 +7,15 @@ use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{
         Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, Query, Select, SelectItem,
-        SetExpr, SetOperator, Statement, Value, Visit, VisitMut, Visitor, VisitorMut,
+        SetExpr, SetOperator, Value, Visit, VisitMut, Visitor, VisitorMut,
     },
     dialect::{
         BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, GenericDialect,
         HiveDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, RedshiftSqlDialect,
         SnowflakeDialect,
     },
-    parser::Parser,
 };
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/query_parsing.rs"));
 
 const SCHEMA: &str = "
     CREATE TABLE a(payload TEXT, id INT);
@@ -24,15 +24,6 @@ const SCHEMA: &str = "
 
 fn schema_db() -> ParserDB {
     ParserDB::parse::<GenericDialect>(SCHEMA).expect("schema parses")
-}
-
-fn query_with<D: Dialect>(dialect: &D, sql: &str) -> Query {
-    let mut statements = Parser::parse_sql(dialect, sql)
-        .unwrap_or_else(|error| panic!("statement `{sql}` parses: {error}"));
-    match statements.pop().expect("one statement") {
-        Statement::Query(query) => *query,
-        other => panic!("expected a query, got {other:?}"),
-    }
 }
 
 fn query(sql: &str) -> Query {

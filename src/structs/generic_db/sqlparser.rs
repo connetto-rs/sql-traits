@@ -80,6 +80,7 @@ mod views;
 use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
 use parsed_source::{ParsedSource, StatementSource};
+use postgres_catalog::CatalogName;
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};
 
 /// The object kinds a schema parsed from SQL text holds, each an `sqlparser`
@@ -652,18 +653,25 @@ fn catalog_collation_for_schema<'a>(
     schema: &str,
     schema_quoted: bool,
 ) -> Option<&'a PostgresCatalogCollation> {
-    catalog.collations().rev().find(|metadata| {
-        let Some(metadata_schema) = metadata.schema() else {
-            return false;
-        };
-        collation_names_match_parts(metadata.name(), metadata.name_is_quoted(), lookup)
-            && identifiers_match(
-                metadata_schema,
-                metadata.schema_is_quoted(),
-                schema,
-                schema_quoted,
-            )
-    })
+    catalog
+        .collations()
+        .rev()
+        .find(|metadata| catalog_name_matches(metadata.identity(), lookup, schema, schema_quoted))
+}
+
+/// Whether a catalog fact's name spells `lookup` within `schema`. A fact with
+/// no schema matches nothing.
+fn catalog_name_matches(
+    name: &CatalogName,
+    lookup: &ObjectName,
+    schema: &str,
+    schema_quoted: bool,
+) -> bool {
+    let Some(name_schema) = name.schema() else {
+        return false;
+    };
+    collation_names_match_parts(name.name(), name.name_is_quoted(), lookup)
+        && identifiers_match(name_schema, name.schema_is_quoted(), schema, schema_quoted)
 }
 
 fn collation_resolution_for_name<'a>(
@@ -711,18 +719,9 @@ fn catalog_type_for_schema<'a>(
     schema: &str,
     schema_quoted: bool,
 ) -> Option<&'a PostgresCatalogType> {
-    catalog.collatable_types().find(|metadata| {
-        let Some(metadata_schema) = metadata.schema() else {
-            return false;
-        };
-        collation_names_match_parts(metadata.name(), metadata.name_is_quoted(), lookup)
-            && identifiers_match(
-                metadata_schema,
-                metadata.schema_is_quoted(),
-                schema,
-                schema_quoted,
-            )
-    })
+    catalog
+        .collatable_types()
+        .find(|metadata| catalog_name_matches(metadata.identity(), lookup, schema, schema_quoted))
 }
 
 fn catalog_type_for_name<'a>(
@@ -1076,10 +1075,10 @@ impl ParserDBBuilder {
             )
         });
 
-        // Remove table grants for this table
-        self.table_grants_mut().retain(|(g, ())| {
+        // Remove table and column grants for this table
+        let grants_this_table = |objects: &Option<sqlparser::ast::GrantObjects>| {
             use sqlparser::ast::GrantObjects;
-            !matches!(&g.objects, Some(GrantObjects::Tables(tables)) if tables.iter().any(|t| {
+            matches!(objects, Some(GrantObjects::Tables(tables)) if tables.iter().any(|t| {
                 object_name_matches_resolved_identity(
                     t,
                     table_name,
@@ -1088,21 +1087,9 @@ impl ParserDBBuilder {
                     schema_quoted,
                 )
             }))
-        });
-
-        // Remove column grants for this table
-        self.column_grants_mut().retain(|(g, ())| {
-            use sqlparser::ast::GrantObjects;
-            !matches!(&g.objects, Some(GrantObjects::Tables(tables)) if tables.iter().any(|t| {
-                object_name_matches_resolved_identity(
-                    t,
-                    table_name,
-                    table_name_quoted,
-                    schema_name,
-                    schema_quoted,
-                )
-            }))
-        });
+        };
+        self.table_grants_mut().retain(|(g, ())| !grants_this_table(&g.objects));
+        self.column_grants_mut().retain(|(g, ())| !grants_this_table(&g.objects));
     }
 
     /// Rewrites every stored reference to a renamed table that names it
@@ -4232,6 +4219,29 @@ impl ParserDB {
         Ok((columns_in_expression, functions_in_expression))
     }
 
+    /// Registers `check` on the table and the builder, with the columns and
+    /// functions its expression reads.
+    fn add_check_constraint(
+        check: &CheckConstraint,
+        create_table: &Arc<CreateTable>,
+        table_metadata: &mut TableMetadata<CreateTable>,
+        builder: ParserDBBuilder,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let check_arc = Arc::new(TableAttribute::new(create_table.clone(), check.clone()));
+        table_metadata.add_check_constraint(check_arc.clone());
+        let (columns_in_expression, functions_in_expression) =
+            Self::process_check_constraint(&check.expr, create_table, table_metadata, &builder)?;
+        Ok(builder.add_check_constraint(
+            check_arc,
+            CheckMetadata::new(
+                *check.expr.clone(),
+                create_table.clone(),
+                columns_in_expression,
+                functions_in_expression,
+            ),
+        ))
+    }
+
     /// Helper function to create an index expression from columns.
     ///
     /// The shape mirrors a parsed parenthesized list, which is what
@@ -4478,27 +4488,12 @@ impl ParserDB {
         for option in &column.attribute().options {
             match option.option.clone() {
                 ColumnOption::Check(check_constraint) => {
-                    let check_arc = Arc::new(TableAttribute::new(
-                        create_table.clone(),
-                        check_constraint.clone(),
-                    ));
-                    table_metadata.add_check_constraint(check_arc.clone());
-                    let (columns_in_expression, functions_in_expression) =
-                        Self::process_check_constraint(
-                            &check_constraint.expr,
-                            create_table,
-                            table_metadata,
-                            &builder,
-                        )?;
-                    builder = builder.add_check_constraint(
-                        check_arc,
-                        CheckMetadata::new(
-                            *check_constraint.expr.clone(),
-                            create_table.clone(),
-                            columns_in_expression,
-                            functions_in_expression,
-                        ),
-                    );
+                    builder = Self::add_check_constraint(
+                        &check_constraint,
+                        create_table,
+                        table_metadata,
+                        builder,
+                    )?;
                 }
                 // The same constraint written inline on the column rather than
                 // as a table constraint, so it takes the same path: both
@@ -4719,25 +4714,8 @@ impl ParserDB {
                     )?;
                 }
                 TableConstraint::Check(check) => {
-                    let check_arc =
-                        Arc::new(TableAttribute::new(create_table.clone(), check.clone()));
-                    table_metadata.add_check_constraint(check_arc.clone());
-                    let (columns_in_expression, functions_in_expression) =
-                        Self::process_check_constraint(
-                            &check.expr,
-                            create_table,
-                            table_metadata,
-                            &builder,
-                        )?;
-                    builder = builder.add_check_constraint(
-                        check_arc,
-                        CheckMetadata::new(
-                            *check.expr.clone(),
-                            create_table.clone(),
-                            columns_in_expression,
-                            functions_in_expression,
-                        ),
-                    );
+                    builder =
+                        Self::add_check_constraint(check, create_table, table_metadata, builder)?;
                 }
                 TableConstraint::PrimaryKey(pk) => {
                     Self::validate_constraint_columns(&pk.columns, create_table, table_metadata)?;
@@ -5360,17 +5338,14 @@ impl ParserDB {
         }
     }
 
-    /// Resolves the stored function an `ALTER FUNCTION` names.
+    /// The positions of the stored functions `func_desc` names.
     ///
     /// A statement that spells the argument list names one function, and one
     /// that omits it names whichever function carries the name, so long as only
     /// one does.
-    fn alter_function_target(
-        builder: &ParserDBBuilder,
-        func_desc: &FunctionDesc,
-    ) -> Result<usize, crate::errors::Error> {
+    fn functions_named(builder: &ParserDBBuilder, func_desc: &FunctionDesc) -> Vec<usize> {
         let case = builder.identifier_case();
-        let matching: Vec<usize> = builder
+        builder
             .functions()
             .iter()
             .enumerate()
@@ -5389,7 +5364,15 @@ impl ParserDB {
                 }
             })
             .map(|(position, _)| position)
-            .collect();
+            .collect()
+    }
+
+    /// Resolves the stored function an `ALTER FUNCTION` names.
+    fn alter_function_target(
+        builder: &ParserDBBuilder,
+        func_desc: &FunctionDesc,
+    ) -> Result<usize, crate::errors::Error> {
+        let matching = Self::functions_named(builder, func_desc);
 
         let Some(&position) = matching.first() else {
             return Err(crate::errors::Error::AlterFunctionNotFound {
@@ -6199,32 +6182,7 @@ impl ParserDB {
                             });
                         };
 
-                        // A statement that spells the argument list names one
-                        // function, and one that omits it names whichever
-                        // function carries the name, so long as only one does.
-                        let case = builder.identifier_case();
-                        let matching: Vec<usize> = builder
-                            .functions()
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, (function, _))| {
-                                match &func_desc.args {
-                                    Some(args) => {
-                                        function_signatures_match(
-                                            &function.name,
-                                            function.args.as_deref(),
-                                            &func_desc.name,
-                                            Some(args),
-                                            case,
-                                        )
-                                    }
-                                    None => {
-                                        object_names_match(&function.name, &func_desc.name, case)
-                                    }
-                                }
-                            })
-                            .map(|(position, _)| position)
-                            .collect();
+                        let matching = Self::functions_named(&builder, func_desc);
 
                         let Some(&position) = matching.first() else {
                             if drop_function.if_exists {

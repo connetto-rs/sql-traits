@@ -1034,25 +1034,35 @@ fn merge_output_names(
     Some(names)
 }
 
+/// The constraint carried by the join operator `$operator`, borrowed as
+/// `$operator` is, so the shared and the mutable accessor list the variants
+/// carrying one in a single place.
+macro_rules! join_operator_constraint {
+    ($operator:expr) => {
+        match $operator {
+            sqlparser::ast::JoinOperator::Join(constraint)
+            | sqlparser::ast::JoinOperator::Inner(constraint)
+            | sqlparser::ast::JoinOperator::Left(constraint)
+            | sqlparser::ast::JoinOperator::LeftOuter(constraint)
+            | sqlparser::ast::JoinOperator::Right(constraint)
+            | sqlparser::ast::JoinOperator::RightOuter(constraint)
+            | sqlparser::ast::JoinOperator::FullOuter(constraint)
+            | sqlparser::ast::JoinOperator::CrossJoin(constraint)
+            | sqlparser::ast::JoinOperator::Semi(constraint)
+            | sqlparser::ast::JoinOperator::LeftSemi(constraint)
+            | sqlparser::ast::JoinOperator::RightSemi(constraint)
+            | sqlparser::ast::JoinOperator::Anti(constraint)
+            | sqlparser::ast::JoinOperator::LeftAnti(constraint)
+            | sqlparser::ast::JoinOperator::RightAnti(constraint) => Some(constraint),
+            _ => None,
+        }
+    };
+}
+pub(crate) use join_operator_constraint;
+
 /// The constraint carried by a join operator, if it carries one.
 pub(crate) fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
-    match operator {
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint) => Some(constraint),
-        _ => None,
-    }
+    join_operator_constraint!(operator)
 }
 
 /// The name a `USING (...) AS alias` constraint gives its join's merged

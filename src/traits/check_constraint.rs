@@ -489,6 +489,20 @@ where
     }
 }
 
+/// The constraints among `checks` that are not tautologies, in order.
+pub(crate) fn non_tautological<'db, C: CheckConstraintLike>(
+    checks: impl Iterator<Item = &'db C>,
+    database: &C::DB,
+) -> Result<Vec<&'db C>, LookupError> {
+    let mut kept = Vec::new();
+    for check in checks {
+        if !check.is_tautology(database)? {
+            kept.push(check);
+        }
+    }
+    Ok(kept)
+}
+
 /// A check constraint is a rule that specifies a condition that must be met
 /// for data to be inserted or updated in a table. This trait represents such
 /// a check constraint in a database-agnostic way.

@@ -11,7 +11,7 @@ use crate::{
     },
     traits::{
         ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, TableGrantLike,
-        TriggerLike, check_constraint::CheckConstraintLike,
+        TriggerLike, check_constraint::non_tautological,
     },
     utils::{
         identifier_resolution::{identifiers_match, normalize_identifier},
@@ -1743,14 +1743,7 @@ pub trait TableLike:
     where
         Self: 'db,
     {
-        let mut check_constraints = Vec::new();
-        for check_constraint in self.check_constraints(database)? {
-            if !check_constraint.is_tautology(database)? {
-                check_constraints.push(check_constraint);
-            }
-        }
-
-        Ok(check_constraints.into_iter())
+        Ok(non_tautological(self.check_constraints(database)?, database)?.into_iter())
     }
 
     /// Returns whether the table has any check constraints.

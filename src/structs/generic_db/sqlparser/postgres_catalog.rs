@@ -32,20 +32,56 @@ pub struct PostgresCatalog {
 /// A PostgreSQL collation identity and its deterministic flag.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PostgresCatalogCollation {
-    schema: Option<Cow<'static, str>>,
-    schema_is_quoted: bool,
-    name: Cow<'static, str>,
-    name_is_quoted: bool,
+    identity: CatalogName,
     deterministic: bool,
 }
 
 /// A PostgreSQL type whose values can carry a collation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PostgresCatalogType {
+    identity: CatalogName,
+}
+
+/// The optional schema and the name of a catalog fact, each with its quoting.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CatalogName {
     schema: Option<Cow<'static, str>>,
     schema_is_quoted: bool,
     name: Cow<'static, str>,
     name_is_quoted: bool,
+}
+
+impl CatalogName {
+    /// A name in `pg_catalog`, which is unquoted.
+    const fn in_pg_catalog(name: Cow<'static, str>, name_is_quoted: bool) -> Self {
+        Self {
+            schema: Some(Cow::Borrowed(PG_CATALOG)),
+            schema_is_quoted: false,
+            name,
+            name_is_quoted,
+        }
+    }
+
+    fn set_schema(&mut self, schema: String, schema_is_quoted: bool) {
+        self.schema = Some(Cow::Owned(schema));
+        self.schema_is_quoted = schema_is_quoted;
+    }
+
+    pub(crate) fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
+    pub(crate) const fn schema_is_quoted(&self) -> bool {
+        self.schema_is_quoted
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) const fn name_is_quoted(&self) -> bool {
+        self.name_is_quoted
+    }
 }
 
 impl Default for PostgresCatalog {
@@ -74,7 +110,7 @@ impl PostgresCatalog {
     #[must_use]
     pub fn with_collation(mut self, collation: PostgresCatalogCollation) -> Self {
         let collations = self.collations.to_mut();
-        collations.retain(|held| !held.same_identity(&collation));
+        collations.retain(|held| held.identity != collation.identity);
         collations.push(collation);
         self
     }
@@ -83,7 +119,7 @@ impl PostgresCatalog {
     #[must_use]
     pub fn with_collatable_type(mut self, ty: PostgresCatalogType) -> Self {
         let collatable_types = self.collatable_types.to_mut();
-        collatable_types.retain(|held| !held.same_identity(&ty));
+        collatable_types.retain(|held| held.identity != ty.identity);
         collatable_types.push(ty);
         self
     }
@@ -110,8 +146,9 @@ impl PostgresCatalog {
         to_quoted: bool,
     ) {
         let in_renamed_schema = |collation: &PostgresCatalogCollation| {
-            collation.schema.as_ref().is_some_and(|schema| {
-                identifiers_match(schema, collation.schema_is_quoted, from, from_quoted)
+            let identity = &collation.identity;
+            identity.schema().is_some_and(|schema| {
+                identifiers_match(schema, identity.schema_is_quoted, from, from_quoted)
             })
         };
         if !self.collations.iter().any(in_renamed_schema) {
@@ -119,8 +156,7 @@ impl PostgresCatalog {
         }
         for collation in self.collations.to_mut() {
             if in_renamed_schema(collation) {
-                collation.schema = Some(Cow::Owned(String::from(to)));
-                collation.schema_is_quoted = to_quoted;
+                collation.identity.set_schema(String::from(to), to_quoted);
             }
         }
     }
@@ -131,10 +167,7 @@ impl PostgresCatalogCollation {
     #[must_use]
     pub fn new(name: impl Into<String>, name_is_quoted: bool) -> Self {
         Self {
-            schema: Some(Cow::Borrowed(PG_CATALOG)),
-            schema_is_quoted: false,
-            name: Cow::Owned(name.into()),
-            name_is_quoted,
+            identity: CatalogName::in_pg_catalog(Cow::Owned(name.into()), name_is_quoted),
             deterministic: true,
         }
     }
@@ -142,10 +175,7 @@ impl PostgresCatalogCollation {
     /// Creates a deterministic built-in collation in `pg_catalog`.
     pub(super) const fn built_in(name: &'static str, name_is_quoted: bool) -> Self {
         Self {
-            schema: Some(Cow::Borrowed(PG_CATALOG)),
-            schema_is_quoted: false,
-            name: Cow::Borrowed(name),
-            name_is_quoted,
+            identity: CatalogName::in_pg_catalog(Cow::Borrowed(name), name_is_quoted),
             deterministic: true,
         }
     }
@@ -153,8 +183,7 @@ impl PostgresCatalogCollation {
     /// Stores the schema that owns this collation.
     #[must_use]
     pub fn with_schema(mut self, schema: impl Into<String>, schema_is_quoted: bool) -> Self {
-        self.schema = Some(Cow::Owned(schema.into()));
-        self.schema_is_quoted = schema_is_quoted;
+        self.identity.set_schema(schema.into(), schema_is_quoted);
         self
     }
 
@@ -168,25 +197,25 @@ impl PostgresCatalogCollation {
     /// Returns the owning schema.
     #[must_use]
     pub fn schema(&self) -> Option<&str> {
-        self.schema.as_deref()
+        self.identity.schema()
     }
 
     /// Returns whether the schema is quoted.
     #[must_use]
     pub const fn schema_is_quoted(&self) -> bool {
-        self.schema_is_quoted
+        self.identity.schema_is_quoted
     }
 
     /// Returns the collation name.
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        &self.identity.name
     }
 
     /// Returns whether the collation name is quoted.
     #[must_use]
     pub const fn name_is_quoted(&self) -> bool {
-        self.name_is_quoted
+        self.identity.name_is_quoted
     }
 
     /// Returns whether the collation is deterministic.
@@ -195,11 +224,8 @@ impl PostgresCatalogCollation {
         self.deterministic
     }
 
-    fn same_identity(&self, other: &Self) -> bool {
-        self.schema == other.schema
-            && self.schema_is_quoted == other.schema_is_quoted
-            && self.name == other.name
-            && self.name_is_quoted == other.name_is_quoted
+    pub(crate) const fn identity(&self) -> &CatalogName {
+        &self.identity
     }
 }
 
@@ -207,62 +233,48 @@ impl PostgresCatalogType {
     /// Creates a collatable type in `pg_catalog`.
     #[must_use]
     pub fn new(name: impl Into<String>, name_is_quoted: bool) -> Self {
-        Self {
-            schema: Some(Cow::Borrowed(PG_CATALOG)),
-            schema_is_quoted: false,
-            name: Cow::Owned(name.into()),
-            name_is_quoted,
-        }
+        Self { identity: CatalogName::in_pg_catalog(Cow::Owned(name.into()), name_is_quoted) }
     }
 
     /// Creates a built-in collatable type in `pg_catalog`, whose name is
     /// unquoted.
     const fn built_in(name: &'static str) -> Self {
-        Self {
-            schema: Some(Cow::Borrowed(PG_CATALOG)),
-            schema_is_quoted: false,
-            name: Cow::Borrowed(name),
-            name_is_quoted: false,
-        }
+        Self { identity: CatalogName::in_pg_catalog(Cow::Borrowed(name), false) }
     }
 
     /// Stores the schema that owns this type.
     #[must_use]
     pub fn with_schema(mut self, schema: impl Into<String>, schema_is_quoted: bool) -> Self {
-        self.schema = Some(Cow::Owned(schema.into()));
-        self.schema_is_quoted = schema_is_quoted;
+        self.identity.set_schema(schema.into(), schema_is_quoted);
         self
     }
 
     /// Returns the owning schema.
     #[must_use]
     pub fn schema(&self) -> Option<&str> {
-        self.schema.as_deref()
+        self.identity.schema()
     }
 
     /// Returns whether the schema is quoted.
     #[must_use]
     pub const fn schema_is_quoted(&self) -> bool {
-        self.schema_is_quoted
+        self.identity.schema_is_quoted
     }
 
     /// Returns the type name.
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        &self.identity.name
     }
 
     /// Returns whether the type name is quoted.
     #[must_use]
     pub const fn name_is_quoted(&self) -> bool {
-        self.name_is_quoted
+        self.identity.name_is_quoted
     }
 
-    fn same_identity(&self, other: &Self) -> bool {
-        self.schema == other.schema
-            && self.schema_is_quoted == other.schema_is_quoted
-            && self.name == other.name
-            && self.name_is_quoted == other.name_is_quoted
+    pub(crate) const fn identity(&self) -> &CatalogName {
+        &self.identity
     }
 }
 

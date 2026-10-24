@@ -13,6 +13,7 @@
 
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::PostgreSqlDialect;
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_nullability.rs"));
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -52,18 +53,6 @@ fn foreign_keys(database: &ParserDB, table_name: &str) -> usize {
         .count()
 }
 
-fn requires_a_value(database: &ParserDB, table_name: &str, column_name: &str) -> bool {
-    !database
-        .table_by_target(TargetName::new(table_name, false), IdentifierCase::AsWritten)
-        .expect("unambiguous lookup")
-        .expect("table exists")
-        .column(column_name, database, IdentifierCase::AsWritten)
-        .expect("lookup succeeds")
-        .expect("column exists")
-        .is_nullable(database)
-        .expect("table is in this database")
-}
-
 #[test]
 fn a_check_written_on_a_column_is_droppable_by_name() {
     let database = database(
@@ -98,7 +87,7 @@ fn a_key_written_on_a_column_is_droppable_by_name_and_takes_its_index() {
             .count(),
         0
     );
-    assert!(requires_a_value(&primary, "t", "id"));
+    assert!(accepts_nothing(&primary, "t", "id"));
 }
 
 #[test]
@@ -119,7 +108,7 @@ fn a_named_requirement_to_hold_a_value_is_droppable_by_name() {
         "CREATE TABLE t (id INT CONSTRAINT nn NOT NULL);
          ALTER TABLE t DROP CONSTRAINT nn;",
     );
-    assert!(!requires_a_value(&database, "t", "id"));
+    assert!(!accepts_nothing(&database, "t", "id"));
 }
 
 #[test]
@@ -240,7 +229,7 @@ fn dropping_a_roots_key_takes_the_copy_its_partition_renamed() {
     assert_eq!(unique_indices(&database, "part"), 0);
     // As on the root, the requirement to hold a value stays.
     for table in ["root", "part"] {
-        assert!(requires_a_value(&database, table, "id"), "{table}");
+        assert!(accepts_nothing(&database, table, "id"), "{table}");
     }
 }
 

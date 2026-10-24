@@ -20,7 +20,7 @@ use super::{
 use crate::{
     impls::dql::{
         definition_graph::reference_sites::{QueryReferences, SiteOutcome, query_references},
-        join_constraint,
+        join_constraint, join_operator_constraint,
     },
     structs::{IdentifierCase, ParserDB, TableAttribute},
     traits::ViewLike,
@@ -340,23 +340,7 @@ fn spells_anything(query: &Query) -> bool {
 
 /// The constraint a join operator carries, for a rewrite that respells it.
 fn constraint_mut(operator: &mut JoinOperator) -> Option<&mut JoinConstraint> {
-    match operator {
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint) => Some(constraint),
-        _ => None,
-    }
+    join_operator_constraint!(operator)
 }
 
 /// Finds every `FROM` item of `query` reading a relation `renames` renamed,
