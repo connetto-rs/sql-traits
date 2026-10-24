@@ -9,12 +9,11 @@
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{
-        Distinct, Expr, GroupByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-        TableFactor,
+        Distinct, Expr, GroupByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, TableFactor,
     },
     dialect::PostgreSqlDialect,
-    parser::Parser,
 };
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/query_parsing.rs"));
 
 const SCHEMA: &str = "
     CREATE TABLE a(id INT, row_alias INT);
@@ -26,12 +25,7 @@ fn database() -> ParserDB {
 }
 
 fn query(sql: &str) -> Query {
-    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-        .unwrap_or_else(|error| panic!("statement `{sql}` parses: {error}"));
-    match statements.pop().expect("one statement") {
-        Statement::Query(query) => *query,
-        other => panic!("expected a query, got {other:?}"),
-    }
+    query_with(&PostgreSqlDialect {}, sql)
 }
 
 fn order_key(query: &Query) -> &Expr {

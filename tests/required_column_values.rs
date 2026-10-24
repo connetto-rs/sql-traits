@@ -18,21 +18,10 @@
 
 use sql_traits::prelude::*;
 use sqlparser::dialect::PostgreSqlDialect;
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_nullability.rs"));
 
 fn database(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses")
-}
-
-fn accepts_nothing(database: &ParserDB, table_name: &str, column_name: &str) -> bool {
-    !database
-        .table_by_target(TargetName::new(table_name, false), IdentifierCase::AsWritten)
-        .expect("unambiguous lookup")
-        .expect("table exists")
-        .column(column_name, database, IdentifierCase::AsWritten)
-        .expect("lookup succeeds")
-        .expect("column exists")
-        .is_nullable(database)
-        .expect("table is in this database")
 }
 
 #[test]

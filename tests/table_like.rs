@@ -18,6 +18,7 @@
 
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::PostgreSqlDialect;
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_names.rs"));
 
 /// A source table exercising every column feature a copy might carry.
 const SOURCE: &str = "CREATE TABLE src (
@@ -38,17 +39,6 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
 
 fn database(sql: &str) -> ParserDB {
     parse(sql).expect("schema parses")
-}
-
-fn column_names(database: &ParserDB, table_name: &str) -> Vec<String> {
-    database
-        .table_by_target(TargetName::new(table_name, false), IdentifierCase::AsWritten)
-        .expect("unambiguous lookup")
-        .expect("table exists")
-        .columns(database)
-        .expect("table is in this database")
-        .map(|column| column.column_name().to_owned())
-        .collect()
 }
 
 fn nullability(database: &ParserDB, table_name: &str) -> Vec<(String, bool)> {
