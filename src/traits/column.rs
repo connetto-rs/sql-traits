@@ -6,7 +6,10 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 use crate::{
     errors::LookupError,
     structs::TargetName,
-    traits::{CheckConstraintLike, DatabaseLike, ForeignKeyLike, IndexLike, Metadata, TableLike},
+    traits::{
+        CheckConstraintLike, DatabaseLike, ForeignKeyLike, IndexLike, Metadata, TableLike,
+        check_constraint::non_tautological,
+    },
     utils::{
         identifier_resolution::normalize_identifier,
         normalize_postgres_type_cow,
@@ -1460,14 +1463,7 @@ pub trait ColumnLike:
         impl Iterator<Item = &'db <Self::DB as DatabaseLike>::CheckConstraint> + 'db,
         LookupError,
     > {
-        let mut check_constraints = Vec::new();
-        for check in self.check_constraints(database)? {
-            if !check.is_tautology(database)? {
-                check_constraints.push(check);
-            }
-        }
-
-        Ok(check_constraints.into_iter())
+        Ok(non_tautological(self.check_constraints(database)?, database)?.into_iter())
     }
 
     #[inline]

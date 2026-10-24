@@ -132,6 +132,13 @@ fn schema_matches_table<T: TableLike>(schema_name: &ObjectName, table: &T) -> bo
     )
 }
 
+fn schema_matches_view<V: ViewLike>(schema_name: &ObjectName, view: &V) -> bool {
+    schema_matches_relation(
+        schema_name,
+        view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())),
+    )
+}
+
 fn grantees_match(left_grantee: &Grantee, right_grantee: &Grantee) -> bool {
     if left_grantee.grantee_type == GranteesType::Public
         || right_grantee.grantee_type == GranteesType::Public
@@ -707,9 +714,7 @@ fn granted_relations<'a>(
                     database
                         .views()
                         .filter(|view| {
-                            let stored =
-                                view.view_schema().map(|s| (s, view.view_schema_is_quoted()));
-                            schemas.iter().any(|schema| schema_matches_relation(schema, stored))
+                            schemas.iter().any(|schema| schema_matches_view(schema, *view))
                         })
                         .map(GrantRelation::View),
                 )
@@ -717,9 +722,7 @@ fn granted_relations<'a>(
                     database
                         .materialized_views()
                         .filter(|view| {
-                            let stored =
-                                view.view_schema().map(|s| (s, view.view_schema_is_quoted()));
-                            schemas.iter().any(|schema| schema_matches_relation(schema, stored))
+                            schemas.iter().any(|schema| schema_matches_view(schema, *view))
                         })
                         .map(GrantRelation::MaterializedView),
                 )
