@@ -2274,7 +2274,7 @@ where
                 partitions: _,
                 json_path,
                 sample,
-                index_hints: _,
+                index_directives: _,
             } => {
                 self.expressions(with_hints)?;
                 if let Some(version) = version {
@@ -2366,7 +2366,7 @@ where
                 partitions: _,
                 json_path: _,
                 sample: _,
-                index_hints: _,
+                index_directives: _,
             } => {
                 if let Some(arguments) = args {
                     self.table_function_args(arguments)?;

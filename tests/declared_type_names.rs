@@ -73,6 +73,32 @@ fn test_postgres_column_types_are_answered() {
     }
 }
 
+#[test]
+fn test_custom_column_types_keep_modifiers() {
+    for (declared, expected) in [
+        ("GEOMETRY(Point, 4326)", "GEOMETRY(Point, 4326)"),
+        ("GEOGRAPHY(Point, 4326)", "GEOGRAPHY(Point, 4326)"),
+        ("geometry(Point, 4326)", "geometry(Point, 4326)"),
+        ("geometry(Point, 3857)", "geometry(Point, 3857)"),
+        ("geography(Polygon)", "geography(Polygon)"),
+        ("GEOGRAPHY(Point, 4269)", "GEOGRAPHY(Point, 4269)"),
+        ("GeOmEtRy(point, 3857)", "GeOmEtRy(point, 3857)"),
+        ("shape(Point, 4326)", "shape(Point, 4326)"),
+        ("custom_type(1, two, 3)", "custom_type(1, two, 3)"),
+        (r#"custom_type("Point", 'it''s', 3)"#, r#"custom_type("Point", 'it''s', 3)"#),
+        (r#""Geometry"(Point, 3857)"#, "Geometry(Point, 3857)"),
+        ("geometry(Point, 3857)[]", "geometry(Point, 3857)[]"),
+        ("geometry", "geometry"),
+        ("geography", "geography"),
+    ] {
+        assert_eq!(
+            column_types(&format!("CREATE TABLE t (value {declared});")),
+            vec![expected],
+            "failed for {declared}"
+        );
+    }
+}
+
 /// A composite type or a domain declared in a schema keeps the schema, since
 /// the schema is what tells two same-named types apart.
 #[test]
