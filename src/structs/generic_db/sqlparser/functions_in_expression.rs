@@ -306,16 +306,18 @@ mod tests {
         )
         .expect("function declarations parse");
         let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
-        let statements = Parser::parse_sql(&GenericDialect {}, "SELECT f(a) IN UNNEST(g(b))")
-            .expect("query parses");
-        let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
-        let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
-        let sqlparser::ast::SelectItem::UnnamedExpr(expression) = &select.projection[0] else {
-            panic!("expected an expression")
-        };
-        let calls = super::functions_in_expression::<ParserDB>(expression, &functions);
-        let names: Vec<_> = calls.iter().map(|function| function.name()).collect();
-        assert_eq!(names, ["f", "g"]);
+        for (sql, expected) in
+            [("f(a) IN UNNEST(g(b))", ["f", "g"]), ("COUNT(*) IN UNNEST(g(b))", ["count", "g"])]
+        {
+            let expression = Parser::new(&GenericDialect {})
+                .try_with_sql(sql)
+                .expect("expression tokenizes")
+                .parse_expr()
+                .expect("expression parses");
+            let calls = super::functions_in_expression::<ParserDB>(&expression, &functions);
+            let names: Vec<_> = calls.iter().map(|function| function.name()).collect();
+            assert_eq!(names, expected, "{sql}");
+        }
     }
 
     /// A call whose name is built at run time matches no declaration, since

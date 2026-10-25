@@ -537,34 +537,35 @@ mod tests {
     #[test]
     fn in_unnest_reads_both_operands() {
         let columns = vec![create_column("a"), create_column("b")];
-        let statements = Parser::parse_sql(&GenericDialect {}, "SELECT f(a) IN UNNEST(b)")
-            .expect("query parses");
-        let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
-        let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
-        let SelectItem::UnnamedExpr(expression) = &select.projection[0] else {
-            panic!("expected an expression")
-        };
-        let found =
-            columns_in_expression(expression, "catalog", &TargetName::new("t", false), &columns)
-                .expect("local columns resolve");
-        let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
-        assert_eq!(names, ["a", "b"]);
+        for (sql, expected) in
+            [("f(a) IN UNNEST(b)", vec!["a", "b"]), ("COUNT(*) IN UNNEST(b)", vec!["b"])]
+        {
+            let expression = Parser::new(&GenericDialect {})
+                .try_with_sql(sql)
+                .expect("expression tokenizes")
+                .parse_expr()
+                .expect("expression parses");
+            let found = columns_in_expression(
+                &expression,
+                "catalog",
+                &TargetName::new("t", false),
+                &columns,
+            )
+            .expect("local columns resolve");
+            let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
+            assert_eq!(names, expected, "{sql}");
+        }
     }
 
     #[test]
     fn in_unnest_named_arguments_read_values_without_reading_labels() {
-        let statements = Parser::parse_sql(
-            &sqlparser::dialect::PostgreSqlDialect {},
-            "SELECT f(input => a) IN UNNEST(g(other => b))",
-        )
-        .expect("query parses");
-        let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
-        let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
-        let SelectItem::UnnamedExpr(expression) = &select.projection[0] else {
-            panic!("expected an expression")
-        };
+        let expression = Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql("f(input => a) IN UNNEST(g(other => b))")
+            .expect("expression tokenizes")
+            .parse_expr()
+            .expect("expression parses");
         let found = columns_in_expression(
-            expression,
+            &expression,
             "catalog",
             &TargetName::new("t", false),
             &[create_column("a"), create_column("b")],
