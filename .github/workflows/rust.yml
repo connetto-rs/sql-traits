@@ -16,7 +16,7 @@ jobs:
     name: Build and Test
     # Linux only. The macOS and Windows runners bill at several times the
     # Linux rate and this crate has no platform-specific code to cover.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         rust: [stable, beta, nightly]
@@ -33,7 +33,7 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Read MSRV
@@ -76,7 +76,7 @@ jobs:
     # `wasm32-*` would require a `wasm-bindgen-test` rewrite of every
     # test — out of scope; the cross-compile check is the practical
     # "works in wasm" gate for a no-IO library.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust + no_std cross-compile targets
@@ -105,7 +105,7 @@ jobs:
 
   fmt:
     name: Rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust
@@ -117,7 +117,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust
@@ -131,7 +131,7 @@ jobs:
 
   doc:
     name: Documentation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust
@@ -145,7 +145,7 @@ jobs:
 
   coverage:
     name: Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Coverage maps need no debug info, and each persisted doctest binary otherwise carries it.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
