@@ -228,6 +228,14 @@ fn figure(expression: &Expr) -> Figure {
         Expr::Trim { trim_where: Some(TrimWhereField::Trailing), .. } => Figure::strong("rtrim"),
         Expr::Trim { .. } => Figure::strong("btrim"),
         Expr::BinaryOp { op: BinaryOperator::Overlaps, .. } => Figure::strong("overlaps"),
+        Expr::In { target, .. } => {
+            match target {
+                InTarget::List(_)
+                | InTarget::Subquery(_)
+                | InTarget::Unnest(_)
+                | InTarget::Table { .. } => Figure::Unnamed,
+            }
+        }
         Expr::Value(_)
         | Expr::BinaryOp { .. }
         | Expr::UnaryOp { .. }
@@ -241,7 +249,6 @@ fn figure(expression: &Expr) -> Figure {
         | Expr::IsNotUnknown(_)
         | Expr::IsDistinctFrom(..)
         | Expr::IsNotDistinctFrom(..)
-        | Expr::In { target: InTarget::List(_) | InTarget::Subquery(_), .. }
         | Expr::Between { .. }
         | Expr::Like { .. }
         | Expr::ILike { .. }

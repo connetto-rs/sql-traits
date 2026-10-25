@@ -259,3 +259,31 @@ fn unexpanded_wildcards_and_unmodeled_names_stay_unknown() {
     );
     assert_eq!(names("SELECT '1'::tsvector FROM b"), ["?"]);
 }
+
+#[test]
+fn in_table_and_unnest_outputs_have_unnamed_expression_names() {
+    use sqlparser::dialect::SQLiteDialect;
+
+    let database =
+        ParserDB::parse::<SQLiteDialect>("CREATE TABLE t(a INT, b INT); CREATE TABLE u(a INT);")
+            .expect("schema parses");
+    for (dialect, sql) in [
+        (
+            &SQLiteDialect {} as &dyn sqlparser::dialect::Dialect,
+            "SELECT a IN u, f(a) IN json_each(b), a NOT IN u FROM t",
+        ),
+        (&PostgreSqlDialect {}, "SELECT a IN UNNEST(b) FROM t"),
+    ] {
+        let query = query_with(dialect, sql);
+        let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
+            .expect("scope builds");
+        let outputs = scope.scope_for_query(&query).expect("query is recorded").outputs();
+        for output in outputs {
+            let QueryOutput::Column { name, definition } = output else {
+                panic!("expected an expression output")
+            };
+            assert_eq!(name, Some(("?column?", true)), "{sql}");
+            assert!(matches!(definition, ColumnDefinition::Expression { .. }));
+        }
+    }
+}

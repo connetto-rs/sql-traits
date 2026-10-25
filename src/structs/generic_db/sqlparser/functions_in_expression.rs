@@ -1,8 +1,8 @@
-//! Functions to extract functions from SQL expressions.
+//! Collects local function dependencies, including table-valued `IN` targets.
 
 use alloc::{sync::Arc, vec::Vec};
 
-use sqlparser::ast::{Expr, InTarget, ObjectName};
+use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName};
 
 use crate::{
     traits::{DatabaseLike, function_like::FunctionLike},
@@ -16,6 +16,23 @@ fn function_matches_object_name<DB: DatabaseLike>(
     object_name_last_part(object_name).is_some_and(|(called, called_quoted)| {
         identifiers_match(function.name(), function.name_is_quoted(), called, called_quoted)
     })
+}
+
+fn functions_in_arguments<DB: DatabaseLike>(
+    arguments: &[FunctionArg],
+    functions: &[Arc<DB::Function>],
+    result: &mut Vec<Arc<DB::Function>>,
+) {
+    for argument in arguments {
+        let argument = match argument {
+            FunctionArg::Named { arg, .. }
+            | FunctionArg::ExprNamed { arg, .. }
+            | FunctionArg::Unnamed(arg) => arg,
+        };
+        if let FunctionArgExpr::Expr(expression) = argument {
+            result.extend(functions_in_expression::<DB>(expression, functions));
+        }
+    }
 }
 
 pub(super) fn functions_in_expression<DB: DatabaseLike>(
@@ -35,24 +52,8 @@ pub(super) fn functions_in_expression<DB: DatabaseLike>(
                     .cloned(),
             );
 
-            // Recursively check function arguments for nested function calls
-            if let sqlparser::ast::FunctionArguments::List(args) = &func.args {
-                for arg in &args.args {
-                    match arg {
-                        sqlparser::ast::FunctionArg::Named {
-                            arg: sqlparser::ast::FunctionArgExpr::Expr(expr),
-                            ..
-                        }
-                        | sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(expr),
-                        ) => {
-                            result.extend(functions_in_expression::<DB>(expr, functions));
-                        }
-                        sqlparser::ast::FunctionArg::ExprNamed { .. }
-                        | sqlparser::ast::FunctionArg::Named { .. }
-                        | sqlparser::ast::FunctionArg::Unnamed(_) => {}
-                    }
-                }
+            if let FunctionArguments::List(args) = &func.args {
+                functions_in_arguments::<DB>(&args.args, functions, &mut result);
             }
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -73,16 +74,32 @@ pub(super) fn functions_in_expression<DB: DatabaseLike>(
         | Expr::IsNotNull(expr) => {
             result.extend(functions_in_expression::<DB>(expr, functions));
         }
-        Expr::In { expr, target: InTarget::List(list), .. } => {
+        Expr::In { expr, target, .. } => {
             result.extend(functions_in_expression::<DB>(expr, functions));
-            for list_expr in list {
-                result.extend(functions_in_expression::<DB>(list_expr, functions));
+            match target {
+                InTarget::List(list) => {
+                    for expression in list {
+                        result.extend(functions_in_expression::<DB>(expression, functions));
+                    }
+                }
+                InTarget::Subquery(_) => {}
+                InTarget::Unnest(expression) => {
+                    result.extend(functions_in_expression::<DB>(expression, functions));
+                }
+                InTarget::Table { name, args } => {
+                    if let Some(arguments) = args {
+                        result.extend(
+                            functions
+                                .iter()
+                                .filter(|function| {
+                                    function_matches_object_name::<DB>(function.as_ref(), name)
+                                })
+                                .cloned(),
+                        );
+                        functions_in_arguments::<DB>(arguments, functions, &mut result);
+                    }
+                }
             }
-        }
-        Expr::In { expr, target: InTarget::Subquery(_), .. } => {
-            result.extend(functions_in_expression::<DB>(expr, functions));
-            // Note: We don't traverse into subqueries as they have their own
-            // scope
         }
         _ => {}
     }
@@ -107,9 +124,12 @@ mod tests {
     //! the shapes that drive the un-tested branches: no-arg calls, nested
     //! calls, and call-twice-dedup.
 
+    use alloc::sync::Arc;
+
     use sqlparser::{
-        ast::{Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction},
-        dialect::GenericDialect,
+        ast::{Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction, SetExpr, Statement},
+        dialect::{GenericDialect, SQLiteDialect},
+        parser::Parser,
     };
 
     use crate::{
@@ -245,6 +265,57 @@ mod tests {
         let metadata = db.check_constraint_metadata(check).expect("metadata resolves");
         let names: Vec<&str> = metadata.functions().map(FunctionLike::name).collect();
         assert_eq!(names, vec!["outside_fn"]);
+    }
+
+    #[test]
+    fn in_table_targets_collect_calls_without_confusing_tables_with_functions() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT $1';
+             CREATE FUNCTION g(x INT) RETURNS INT AS 'SELECT $1';
+             CREATE FUNCTION json_each(x INT) RETURNS INT AS 'SELECT $1';
+             CREATE FUNCTION u() RETURNS INT AS 'SELECT 1';",
+        )
+        .expect("function declarations parse");
+        let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
+        for (sql, expected) in [
+            ("SELECT * FROM t WHERE a IN u", vec![]),
+            ("SELECT * FROM t WHERE f(a) IN u", vec!["f"]),
+            ("SELECT * FROM t WHERE f(a) IN json_each(b)", vec!["f", "json_each"]),
+            ("SELECT * FROM t WHERE f(a) NOT IN json_each(g(b), a)", vec!["f", "json_each", "g"]),
+            ("SELECT * FROM t WHERE a IN json_each()", vec!["json_each"]),
+            ("SELECT * FROM t WHERE f(a) IN f(f(b))", vec!["f"]),
+            ("SELECT * FROM t WHERE f(a) IN json_each((SELECT g(b)))", vec!["f", "json_each"]),
+        ] {
+            let statements = Parser::parse_sql(&SQLiteDialect {}, sql).expect("query parses");
+            let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
+            let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
+            let calls = super::functions_in_expression::<ParserDB>(
+                select.selection.as_ref().expect("a predicate"),
+                &functions,
+            );
+            let names: Vec<_> = calls.iter().map(|function| function.name()).collect();
+            assert_eq!(names, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn in_unnest_collects_calls_from_both_operands() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT $1';
+             CREATE FUNCTION g(x INT) RETURNS INT AS 'SELECT $1';",
+        )
+        .expect("function declarations parse");
+        let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
+        let statements = Parser::parse_sql(&GenericDialect {}, "SELECT f(a) IN UNNEST(g(b))")
+            .expect("query parses");
+        let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
+        let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expression) = &select.projection[0] else {
+            panic!("expected an expression")
+        };
+        let calls = super::functions_in_expression::<ParserDB>(expression, &functions);
+        let names: Vec<_> = calls.iter().map(|function| function.name()).collect();
+        assert_eq!(names, ["f", "g"]);
     }
 
     /// A call whose name is built at run time matches no declaration, since
