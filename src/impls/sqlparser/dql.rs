@@ -2905,11 +2905,25 @@ where
         Ok(())
     }
 
+    fn in_target(&mut self, target: &'source InTarget) -> Result<(), LookupError> {
+        match target {
+            InTarget::List(list) => self.expressions(list),
+            InTarget::Subquery(subquery) => self.query(subquery),
+            InTarget::Unnest(array_expr) => self.expression(array_expr),
+            InTarget::Table { name: _, args } => {
+                if let Some(arguments) = args {
+                    self.function_argument_list(arguments)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn expression(&mut self, expression: &'source Expr) -> Result<(), LookupError> {
         match expression {
-            Expr::In { expr, target: InTarget::Subquery(subquery), .. } => {
+            Expr::In { expr, target, .. } => {
                 self.expression(expr)?;
-                self.query(subquery)
+                self.in_target(target)
             }
             Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => self.query(subquery),
             Expr::CompoundFieldAccess { root, access_chain, .. } => {
@@ -2954,9 +2968,6 @@ where
             | Expr::BinaryOp { left, right, .. }
             | Expr::AnyOp { left, right, .. }
             | Expr::AllOp { left, right, .. } => self.expression_pair(left, right),
-            Expr::In { expr, target: InTarget::Unnest(array_expr), .. } => {
-                self.expression_pair(expr, array_expr)
-            }
             Expr::Like { expr, pattern, .. }
             | Expr::ILike { expr, pattern, .. }
             | Expr::SimilarTo { expr, pattern, .. }
@@ -2964,9 +2975,6 @@ where
             Expr::AtTimeZone { timestamp, time_zone } => self.expression_pair(timestamp, time_zone),
             Expr::Position { expr, r#in } => self.expression_pair(expr, r#in),
             Expr::MemberOf(member) => self.expression_pair(&member.value, &member.array),
-            Expr::In { expr, target: InTarget::List(list), .. } => {
-                self.expression_with_many(expr, list)
-            }
             Expr::Between { expr, low, high, .. } => self.expression_triple(expr, low, high),
             Expr::Convert { expr, styles, .. } => self.expression_with_many(expr, styles),
             Expr::Substring { expr, substring_from, substring_for, .. } => {

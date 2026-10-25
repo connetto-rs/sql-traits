@@ -5,7 +5,7 @@ use alloc::{
     vec::Vec,
 };
 
-use sqlparser::ast::{Expr, Ident, InTarget};
+use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, InTarget};
 
 use crate::{
     structs::TargetName, traits::column::ColumnLike,
@@ -68,7 +68,29 @@ fn rendered_reference(idents: &[Ident]) -> String {
     rendered
 }
 
+fn columns_in_arguments<C: ColumnLike + Clone>(
+    arguments: &[FunctionArg],
+    catalog_name: &str,
+    table: &TargetName<'_>,
+    columns: &[C],
+    result: &mut Vec<C>,
+) -> Result<(), crate::errors::Error> {
+    for argument in arguments {
+        let argument = match argument {
+            FunctionArg::Named { arg, .. }
+            | FunctionArg::ExprNamed { arg, .. }
+            | FunctionArg::Unnamed(arg) => arg,
+        };
+        if let FunctionArgExpr::Expr(expression) = argument {
+            result.extend(columns_in_expression(expression, catalog_name, table, columns)?);
+        }
+    }
+    Ok(())
+}
+
 /// Extracts columns from a SQL expression.
+///
+/// `IN` table targets read local operands and table-function arguments.
 ///
 /// # Arguments
 ///
@@ -149,39 +171,32 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
         }
         Expr::Function(func) => {
             if let sqlparser::ast::FunctionArguments::List(args) = &func.args {
-                for arg in &args.args {
-                    match arg {
-                        sqlparser::ast::FunctionArg::Named {
-                            arg: sqlparser::ast::FunctionArgExpr::Expr(expr),
-                            ..
-                        }
-                        | sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(expr),
-                        ) => {
-                            result.extend(columns_in_expression(
-                                expr,
-                                catalog_name,
-                                table,
-                                columns,
-                            )?);
-                        }
-                        sqlparser::ast::FunctionArg::ExprNamed { .. }
-                        | sqlparser::ast::FunctionArg::Named { .. }
-                        | sqlparser::ast::FunctionArg::Unnamed(_) => {}
+                columns_in_arguments(&args.args, catalog_name, table, columns, &mut result)?;
+            }
+        }
+        Expr::In { expr, target, .. } => {
+            result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
+            match target {
+                InTarget::List(list) => {
+                    for expression in list {
+                        result.extend(columns_in_expression(
+                            expression,
+                            catalog_name,
+                            table,
+                            columns,
+                        )?);
+                    }
+                }
+                InTarget::Subquery(_) => {}
+                InTarget::Unnest(expression) => {
+                    result.extend(columns_in_expression(expression, catalog_name, table, columns)?);
+                }
+                InTarget::Table { name: _, args } => {
+                    if let Some(arguments) = args {
+                        columns_in_arguments(arguments, catalog_name, table, columns, &mut result)?;
                     }
                 }
             }
-        }
-        Expr::In { expr, target: InTarget::List(list), .. } => {
-            result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
-            for list_expr in list {
-                result.extend(columns_in_expression(list_expr, catalog_name, table, columns)?);
-            }
-        }
-        Expr::In { expr, target: InTarget::Subquery(_), .. } => {
-            result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
-            // Note: We don't traverse into subqueries as they have their own
-            // column scope
         }
         Expr::Tuple(exprs) => {
             for expr in exprs {
@@ -205,7 +220,7 @@ mod tests {
             BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
             ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement,
         },
-        dialect::GenericDialect,
+        dialect::{GenericDialect, SQLiteDialect},
         parser::Parser,
     };
 
@@ -471,5 +486,92 @@ mod tests {
                 .expect("column resolves");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].column_name(), "a");
+    }
+
+    #[test]
+    fn in_table_targets_read_local_operands_and_arguments() {
+        let columns = vec![create_column("a"), create_column("b")];
+        for (sql, expected) in [
+            ("SELECT * FROM t WHERE a IN u", vec!["a"]),
+            ("SELECT * FROM t WHERE a IN b", vec!["a"]),
+            ("SELECT * FROM t WHERE f(a) IN json_each(b)", vec!["a", "b"]),
+            ("SELECT * FROM t WHERE f(a) NOT IN json_each(b, a)", vec!["a", "b"]),
+            ("SELECT * FROM t WHERE a IN json_each()", vec!["a"]),
+            ("SELECT * FROM t WHERE a IN json_each((SELECT missing))", vec!["a"]),
+        ] {
+            let statements = Parser::parse_sql(&SQLiteDialect {}, sql).expect("query parses");
+            let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
+            let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
+            let found = columns_in_expression(
+                select.selection.as_ref().expect("a predicate"),
+                "catalog",
+                &TargetName::new("t", false),
+                &columns,
+            )
+            .expect("local columns resolve");
+            let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
+            assert_eq!(names, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn in_table_target_arguments_reject_unknown_local_columns() {
+        let statements =
+            Parser::parse_sql(&SQLiteDialect {}, "SELECT * FROM t WHERE a IN json_each(missing)")
+                .expect("query parses");
+        let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
+        let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
+        let result = columns_in_expression(
+            select.selection.as_ref().expect("a predicate"),
+            "catalog",
+            &TargetName::new("t", false),
+            &[create_column("a")],
+        );
+        assert!(matches!(
+            result,
+            Err(crate::errors::Error::UnknownColumnInCheckConstraint { column_name, .. })
+                if column_name == "missing"
+        ));
+    }
+
+    #[test]
+    fn in_unnest_reads_both_operands() {
+        let columns = vec![create_column("a"), create_column("b")];
+        for (sql, expected) in
+            [("f(a) IN UNNEST(b)", vec!["a", "b"]), ("COUNT(*) IN UNNEST(b)", vec!["b"])]
+        {
+            let expression = Parser::new(&GenericDialect {})
+                .try_with_sql(sql)
+                .expect("expression tokenizes")
+                .parse_expr()
+                .expect("expression parses");
+            let found = columns_in_expression(
+                &expression,
+                "catalog",
+                &TargetName::new("t", false),
+                &columns,
+            )
+            .expect("local columns resolve");
+            let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
+            assert_eq!(names, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn in_unnest_named_arguments_read_values_without_reading_labels() {
+        let expression = Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql("f(input => a) IN UNNEST(g(other => b))")
+            .expect("expression tokenizes")
+            .parse_expr()
+            .expect("expression parses");
+        let found = columns_in_expression(
+            &expression,
+            "catalog",
+            &TargetName::new("t", false),
+            &[create_column("a"), create_column("b")],
+        )
+        .expect("argument values resolve");
+        let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
+        assert_eq!(names, ["a", "b"]);
     }
 }

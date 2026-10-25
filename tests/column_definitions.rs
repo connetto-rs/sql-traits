@@ -12,7 +12,7 @@ use sqlparser::{
     dialect::{
         BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, GenericDialect,
         HiveDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, RedshiftSqlDialect,
-        SnowflakeDialect,
+        SQLiteDialect, SnowflakeDialect,
     },
 };
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/query_parsing.rs"));
@@ -1452,6 +1452,23 @@ fn non_select_nested_queries_follow_the_sqlparser_visitor() {
     ] {
         let query = query(&format!("SELECT d.x FROM (SELECT {expression} AS x) AS d"));
         assert_expression_nested_selects_indexed(&query, select_count, false);
+    }
+}
+
+#[test]
+fn in_table_targets_index_nested_queries_in_operands_and_arguments() {
+    for predicate in [
+        "needle IN b",
+        "f(needle) IN json_each(needle, needle)",
+        "f(needle) NOT IN json_each(needle)",
+        "needle IN json_each()",
+    ] {
+        let query = query_with(
+            &SQLiteDialect {},
+            &format!("SELECT d.x FROM (SELECT needle AS x FROM a WHERE {predicate}) AS d"),
+        );
+        let (query, query_count) = inject_nested_queries(query, true);
+        assert_injected_container_children_indexed(&query, query_count);
     }
 }
 
