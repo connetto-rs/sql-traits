@@ -1,0 +1,4 @@
+CREATE FUNCTION e(rE)
+LANGUAGE S
+AS 
+$$E $$`> 

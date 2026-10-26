@@ -1,0 +1,4 @@
+CREATE TRIGGER RE UPDATE ON use#(TABLE r);
+DROP ROLE ReE ON user(TABLE r)CREATE user NRe;
+CR;
+:Rgth

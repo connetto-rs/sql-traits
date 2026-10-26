@@ -1,0 +1,4 @@
+DESC
+ CREATE INDEX ON uye(e);
+DESC
+ SeLECT

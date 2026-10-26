@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    id  DECIMAL(11, 2) CHECK (amount > 20) DEFAULT 'pending',
+ser_idt DECIMAL(11, 2) CHECK (amount > 0),
+      uidt DECIMAL(11, 2) CHECK (amount > 20[ DEFAULT 'pending',
+ser_idt DECIMAECK (amount > 0),E (user_idUPDATE(EC(N x'QA'c Á, creD

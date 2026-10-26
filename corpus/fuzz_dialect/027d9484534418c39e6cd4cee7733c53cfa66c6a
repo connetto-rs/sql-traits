@@ -1,0 +1,5 @@
+CREATE POLICY userisolation ON users
+   WITH CHECK (user/id = _user_id());
+CREATE POLICY admsiion ON users
+   FOR ALL
+    USING (ur_= current_us_id())  WITH CHECK (ser_id());ÿÿ  

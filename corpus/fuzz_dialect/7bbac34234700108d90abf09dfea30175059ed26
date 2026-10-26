@@ -1,0 +1,3 @@
+CREATE TABLE ord(
+ u DECIMAL(1822 )CHECK (@@(@@@:d_at), CHECK (@@(@@@:d_), CHECK (@@@local@:d@::td_a191 ), CHECK (@@@local@:d@::at ), CHECK (@@@local@:d@::td_e198 ), CHECK (@l@:d@::td_a644 ), CHECK (@@@:d_at), CHECK (@@(@@@:d_@local@:d::at ), CHECK (@@@local@:d@::ta)
+)

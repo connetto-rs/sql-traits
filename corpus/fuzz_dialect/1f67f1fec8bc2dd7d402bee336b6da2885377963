@@ -1,0 +1,3 @@
+CREATE TABLE
+ dr (ou DECIM(644 )CHECK (@@@:at ), CHECK (@@(@@@:d_), CHECK(@@@:@_at)
+)

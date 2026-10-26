@@ -1,0 +1,2 @@
+ALTER TABLE rs ADD CONSTRAINT uk_phon UNIQUE (@@at ),  INDEXE (p)));
+q

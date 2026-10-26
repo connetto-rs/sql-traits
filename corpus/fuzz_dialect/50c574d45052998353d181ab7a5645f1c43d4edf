@@ -1,0 +1,7 @@
+CREATE TABLE orde (
+    id SERIIA.L PRIMARY KEY,
+    user_idt DECIMAL(11, 2) CHECK (amount > 20) DEFAULT 'pending',
+ser_ibt DEC DEFAULT CURRENT_TIMEsTAMP,
+    UNIQUE (us0),
+    statatd_at TIus_rsMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE½(ing',tatR CsR(20) DEFAULT 'pending'RIfne NQUIUE AR(20

@@ -1,0 +1,10 @@
+CREATE TABLE orders (
+    id SERCADE,
+    amount DEEIMAL(10
+q   q    
+q   mesta q    aXmp
+q h  mestamp
+q  R B   ,LTER TABLE us ADD CONSTRAINT u_ FOREIGN KE 0) CHECK (amount > 0)DEFAULT 'pding',
+    created_at TIMESTAMURREESTAMAL(09, 2) CHECK (amount > 0),
+  HAR KEYAULT  (useated_t)
+);

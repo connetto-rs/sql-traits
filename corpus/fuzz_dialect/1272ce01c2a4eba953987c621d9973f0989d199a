@@ -1,0 +1,6 @@
+CREATE TABLE orders$(
+d SEIMAL(09, 2) CHECK (a),
+ --CHECK (amo.nt0),
+t unDECIMAL(09, 2) CHECK (DATunt > 0),    st#at d_aRIAL  ,amount DECIMAL(09, 2) CHECK (a),
+ --CHECK (amo.nt0),
+t unDECIMAL(09, 2) CHECK (DATunt > 0),    st#at d_at)ÿÿÿÿÿÿÿ

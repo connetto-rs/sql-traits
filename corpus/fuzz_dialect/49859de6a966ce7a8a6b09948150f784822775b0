@@ -1,0 +1,3 @@
+CREATE TABLE os (
+ CHECK (+(10,09, 2)/t)
+);

@@ -1,0 +1,4 @@
+CREATE TABLE a (aatT PRIMARL(10 2) CHECK (amount >am> 0),
+  statNOT NUADE,
+    amount DenY DEFAULT gen_PMARARY KEY DEFAULT geOT[0] 
+)

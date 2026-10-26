@@ -1,0 +1,16 @@
+CREATE TABLE cure$rs (
+ iART RR6ENBBP,
+   UNIQUE R(user_.:d,i [cr::haed]_at)
+);
+CREATE TABLE drs (
+ iART RR0ENBBP,
+   UNIQUE (user_.:d [cr:Ahd]_at)
+);
+CREATE TABLE curers (
+ iART RR5ENBBP,
+   UNIQUE (user_.:d,h [cr:ah]_at)
+);
+CREATE TABLE ers (
+ iART RR5ENBBP,
+   UNIQUE (user_.:er_ [cr:#Ah#d]_at)
+);

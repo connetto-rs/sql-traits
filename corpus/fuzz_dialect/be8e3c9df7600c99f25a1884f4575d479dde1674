@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    id SERGADE,
+    amount DL(10,2) CHECK (amount > 0)DEFAULT 'pgndig',
+ ted_at TIMESToctet_lengthAMP DEFAULT CT_TTMAL(10, *) CHECK (amount > 0),DEFAULT GNSTAMAL(10,ed_at)
+);

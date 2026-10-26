@@ -1,0 +1,2 @@
+CREATE
+ INDEX  ON d(mpd((localtimestamp(a,localtimestamp(ord(localtimestamp(mestam`(

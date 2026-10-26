@@ -1,0 +1,8 @@
+
+CREATE ROLE re, p,l,C,d, p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA p,KEC,lC,no,lCREC,l,lCglCREC,lCKElREC,lCREC,l,lCREC,KnowlocK,KElCREC,lCREC,l,lCgenCREK,KEerl,lKElREC,lCREC,l,KEC,lCREK,KElREC,lCREC,l,lCREC,KEC,oC,lonlwcK,KElREC,KE,CCl,cCREC,KElREc TO  p,l,C,d, p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA p,KEC,lC,no,lCREC,l,lCglCREC,lCKElREC,lCREC,l,lCREC,KnowlocK,KElCREC,lCREC,l,lCgenCREK,KEerl,lKElREC,lCREC,l,KEC,lCREK,KElREC,lCREC,l,lCREC,KEC,oC,lonlwcK,KElREC,KE,CCl,cCREC,KElREc TO  p,l.C,re, p,l,C,d,only;
+¹©ANT SELEcT ON ALL TABLESES IN SCHEMCREACREATE current_( p,l.C,re, p,l,C,d,only;
+¹©ANT SELEcT ON ALL TABLESES IN SCHEMCREACREATE current_(Y K7[7.333TE _T3

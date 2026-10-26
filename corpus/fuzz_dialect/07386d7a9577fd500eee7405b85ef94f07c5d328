@@ -1,0 +1,10 @@
+CREATE TABLE orders (
+    id SE,
+    UNIQUE (us0),
+    sDEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (us0),
+    s4atRser_idt DECSTAMP,
+    UNIQUE (us0),
+    statatd_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (us0),
+    statR Csu,   user_iAR(20

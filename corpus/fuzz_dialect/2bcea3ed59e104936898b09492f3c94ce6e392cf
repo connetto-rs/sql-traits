@@ -1,0 +1,4 @@
+CREATE TABLE ders#(
+   tuat nVARCHAR(55) DEFAULT CRRQ);CREATE TABLE dlens#(
+   tuat nVARCHAR);
+

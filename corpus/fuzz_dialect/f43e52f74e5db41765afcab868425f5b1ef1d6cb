@@ -1,0 +1,1 @@
+ALTER TABlE s ADD FOREIGN KEY (lo,_#s,_,il) REFERENCES BLsoc,

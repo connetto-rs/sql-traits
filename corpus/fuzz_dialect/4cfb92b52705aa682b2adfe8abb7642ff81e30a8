@@ -1,0 +1,5 @@
+CREATE POLICY user_isolation ON u
+    WITH CHECK (i);
+
+CREATE POLICY ail ON u@    TO ad  USING (llid())
+ WITH CHECK (useOG 

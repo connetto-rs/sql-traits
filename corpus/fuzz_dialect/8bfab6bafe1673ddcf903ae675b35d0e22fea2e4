@@ -1,0 +1,7 @@
+CREATE FUNCTION calcol()
+LANGUAGE SQH
+AS session_uSQH
+AS $$
+ 
+$$;
+CREATE FUNCTIONÎÎ )

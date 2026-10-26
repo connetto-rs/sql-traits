@@ -1,0 +1,6 @@
+CREATE TABLE geo_data (
+    id UUAD PRIMARY KEY DEFAULT _en||m_uI,
+    tags T9XT[] DEFAULT+'{}'||||_enID PRIMARY KEY DEFAULT _en_|||||||VEnull);
+
+CREATE ROLE renowy;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO sessinn_uses,lÿÿÿÿ,ÿÿ

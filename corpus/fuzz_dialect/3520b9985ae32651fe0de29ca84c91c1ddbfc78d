@@ -1,0 +1,2 @@
+CREATE ROLE donl;
+GRANT SELECT ON ALL TABLES IN SCHEMA ub,ic TO ROLE current_uier

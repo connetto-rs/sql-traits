@@ -1,0 +1,2 @@
+( WITH s(SELECT
+TOP(&

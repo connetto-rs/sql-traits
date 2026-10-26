@@ -1,0 +1,3 @@
+CREATE FUNCTION t#_al(GE)AS $$
+$$,
+;:

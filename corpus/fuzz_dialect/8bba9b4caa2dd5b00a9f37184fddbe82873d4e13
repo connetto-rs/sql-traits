@@ -1,0 +1,5 @@
+CREATE TABLE orders (
+    unt DEEIMAL(1,00) ,
+    created_at TIMESTA PRIMARY KEY DEFAULT _|||||||||ID PRIMARY KEY DEFAULT _en_ran|BPran|||||||ID PRIMARY KEY DEFAULT _|||||||ID PRIMARY KEY DEFAULT _en_rbn|||||||||||||x||||||||||||||||||||J|||||||||ID PRIMARY KEY DEFAULT _en|||||||||||||||||||BBBBP,
+    UNIQUE es(r=u_d_at)
+);

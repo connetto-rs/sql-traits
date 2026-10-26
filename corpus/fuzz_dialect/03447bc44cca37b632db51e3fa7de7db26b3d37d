@@ -1,0 +1,7 @@
+CREATE TABLE orders (
+    id SERCADE,
+    amount DEEsumL(10) CHECK (amount > 0),
+  Has HAR4TAMP DEFAULT CU-AL(11, 2) CHECK (amount > 0),
+  HAR KEY,
+   s MP DEFAULT  (usrated_at)
+);

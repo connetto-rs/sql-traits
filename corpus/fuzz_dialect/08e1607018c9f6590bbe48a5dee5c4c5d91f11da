@@ -1,0 +1,4 @@
+CREATE TABLE orders$(
+d SERIAL  ,amount DECIMAL(09, 2) CHECK (amount > 0),
+ --CHECK (amount1),
+unt DECIMAL(09, 2) CHECK (amount > 0),   at d_at)ÿÿÿÿÿÿÿ

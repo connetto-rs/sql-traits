@@ -1,0 +1,4 @@
+CREATE TABLE ge(   i UUI DEFAULT ge,
+ NB tON NULL,
+   s TEXT[]DEFAULT '{}',a HT NULL,   v PSVEC
+);

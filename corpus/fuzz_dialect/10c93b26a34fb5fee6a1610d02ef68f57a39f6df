@@ -1,0 +1,4 @@
+CREATE TaBLE ord(
+ CHECK (@@(@@@:d:@geond_at ), CHECK (session_user ), CHECK (session_user ), CHECK (@@@P@:d__a:@geond_at ), CHECK (session_user ), CHECK (@@(@P@:@@@:@geond_at ), CHECK
+ (session_user ), CHECK (_aiA@2@@@:a_at)
+)

@@ -1,0 +1,16 @@
+CREATE TABLE cus (
+ iART RR5ENBBP,
+   UNIQUE (use2_.:d,i [cr::haed]_at)
+);
+CREATE TABLE drs (
+ iART RR5ENBBP,
+   UNIQUE (use[cr:Ahd]_am)
+);
+CREATE TABLE curers (
+ iART RR5ENBBP,
+   UNIQUE (user_.:d,k [cr:ah:ed]_at)
+);
+CREATE TABLE ers (
+ iART RR5ENBBP,
+   UNIQUE (user_.:d,i [cr:Ahd]_at)
+);

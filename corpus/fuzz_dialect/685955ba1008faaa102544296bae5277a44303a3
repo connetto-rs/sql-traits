@@ -1,0 +1,1 @@
+ALTER TABLE u@ersers ALTER COLUMN name SET NOT NULL, N$L{se

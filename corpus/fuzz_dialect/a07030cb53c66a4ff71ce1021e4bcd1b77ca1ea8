@@ -1,0 +1,6 @@
+CREATE TABLE d (CHECK (amC.AK.R.* > 0));
+;
+CREATE ROLE re;
+
+DROP ROLE re;
+·­EATEE ROLÿÿÿ
