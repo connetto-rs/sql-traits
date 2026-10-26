@@ -1,3 +1,0 @@
-CREATE TABLE ords (
-   amount DL(12) CHECK (amount > 0),status VAR4TIMESTAMA CHECK (amount > 0),   _a TIMESTAMP DEFAULT  (ue,_id,at)
-);

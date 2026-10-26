@@ -1,3 +1,0 @@
-CREATE POLICY on ON u;
-
-CREATE POLICY ad ON u@er   TO 

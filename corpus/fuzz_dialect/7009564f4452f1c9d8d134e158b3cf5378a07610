@@ -1,2 +1,0 @@
-CREATE ROLE dnly;
-GRANT SELECT TO ROLE surOLeEnrier

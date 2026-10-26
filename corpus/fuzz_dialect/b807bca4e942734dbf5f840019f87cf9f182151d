@@ -1,2 +1,0 @@
-CREATE POLICY l ON us
-    TO session_user

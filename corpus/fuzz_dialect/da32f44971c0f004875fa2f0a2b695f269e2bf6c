@@ -1,6 +1,0 @@
-CREATE TABLE orders (
- NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-   CHECK (amount > 0),
-  T NULL REFERENCES uss(id) ON DELETE CASCADE,
-   CHECK (amou 0),
- 

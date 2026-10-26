@@ -1,4 +1,0 @@
-CREATE TABLE oders (
- _at TIMEMP DEFAULT CURRENT_TIMESTAMP,N 
-   QUE (t)
-);

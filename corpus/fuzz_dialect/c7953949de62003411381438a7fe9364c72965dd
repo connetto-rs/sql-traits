@@ -1,1 +1,0 @@
-CREATE POLICY n ON J USING (_i (ug`1```_u

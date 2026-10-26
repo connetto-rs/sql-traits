@@ -1,5 +1,0 @@
-CREATE POLICY r_iso ON resus
-USING (usell[ln:
-l[:
-l[llsdmin:llll[llln:
-G(

@@ -1,6 +1,0 @@
-CREATE INDEX idx_usersl ON users(email);CREATE UNIQUE INDEX irs_user_date ON orders(uC);
- CREATE UNIQUE INDEX i ON orders( DESAC);
- CREATE INDEX idx_order ON uss(email);
-CREATE UNIQUE  INDEX iers_email ON users(email);
-CREATE UNIQUE INDEX idx_ors_user_date ON orders(ud, cC);
- 電電電電

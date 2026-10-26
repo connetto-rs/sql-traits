@@ -1,3 +1,0 @@
-
-CREATE ROLE RE ROLE read;
-GRANT ADD 

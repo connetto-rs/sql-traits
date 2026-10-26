@@ -1,2 +1,0 @@
-CREATE POLICY use ON users       WITH CHECK(usre_ud);
-CREATE POLICY admiisoln ON nser   WITH CHECK (u?ser/id_id)d;

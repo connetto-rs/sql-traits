@@ -1,1 +1,0 @@
-CREATE POLICY tl ON u  TO ad,i,t , n USING; 

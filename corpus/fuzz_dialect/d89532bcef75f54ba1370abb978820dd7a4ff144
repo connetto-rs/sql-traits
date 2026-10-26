@@ -1,2 +1,0 @@
-ALTER TABLE users ADD COLUMse UE (`hondeo c`e);
-ALTER TABLE order ADD FOREIGN KEY (usid);

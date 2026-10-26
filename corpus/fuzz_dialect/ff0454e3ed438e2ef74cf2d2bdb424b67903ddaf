@@ -1,3 +1,0 @@
-CREATE FUNCTION ca_tt(rR,TUPLE (N cC, id 
-t)
-);

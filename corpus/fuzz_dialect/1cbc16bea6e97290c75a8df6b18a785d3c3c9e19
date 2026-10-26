@@ -1,1 +1,0 @@
-CREATE POLICY ll ON us TO ad,i,p{

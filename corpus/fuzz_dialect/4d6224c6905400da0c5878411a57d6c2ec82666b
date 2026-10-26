@@ -1,3 +1,0 @@
-CREATE TABLE ord(
-    Id SERIAL  ,amount DECIM CHECK (amount > id),
- tus d_at)ÿÿÿÿÿÿ

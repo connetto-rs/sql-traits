@@ -1,5 +1,0 @@
-CREATE TABLE users (
-    id IY,
-    na   n KEY,
- TABLE rs UNIQUE
-);ALTER TABLE users ADD CID P®

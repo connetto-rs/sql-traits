@@ -1,2 +1,0 @@
-CREaTE TABLE s(
- d I REFERENCES uRENB.B(u_cn));

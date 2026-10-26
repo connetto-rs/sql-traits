@@ -1,2 +1,0 @@
-CREATE TABLE gedata (id UUID PRIMARY KEY DEFAULT t_ PRIMARY KEY DEFAULT timetz@_en|user|||R
-);

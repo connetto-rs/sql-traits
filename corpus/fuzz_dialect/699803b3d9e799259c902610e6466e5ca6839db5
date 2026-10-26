@@ -1,3 +1,0 @@
-CREATE TABLE oss (
- CHECK (#(10,09, 2)/t)
-);

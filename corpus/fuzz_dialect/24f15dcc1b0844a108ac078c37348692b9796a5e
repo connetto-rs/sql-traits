@@ -1,3 +1,0 @@
-CREATE TABLE order(  r_id INTEGER NOT NULL,
- amou INTEGER 
-);ù)

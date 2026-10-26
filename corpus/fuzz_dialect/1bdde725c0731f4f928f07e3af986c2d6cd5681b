@@ -1,3 +1,0 @@
-CREATE TABLE ods (amount DEEIM(11
-)CHECK (amount @> 0)
-);

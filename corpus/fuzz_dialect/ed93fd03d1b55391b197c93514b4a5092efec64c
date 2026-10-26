@@ -1,5 +1,0 @@
-CREATE TABLE oders (
-   amount DEEIMAL(10, 2) CHECK (amount > 2),sESTAMP DEFAU);
-CREATE TABLE odrers (
-   amount DEEIMAL(10, 2) CHECK (amount > 0),status Vnow (use,@_id,at)
-);

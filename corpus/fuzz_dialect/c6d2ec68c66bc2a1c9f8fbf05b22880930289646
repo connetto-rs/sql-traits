@@ -1,4 +1,0 @@
-CREATE TABLE orders (
-    RIAL bool ,menaoaunt DEC,
-   CHECK (Amount%>id),
- tus d1)ÿÿÿÿÿ
