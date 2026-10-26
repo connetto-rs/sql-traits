@@ -419,6 +419,27 @@ mod tests {
     }
 
     #[test]
+    fn mysql_multi_table_delete_from_items_see_ctes() {
+        let db = schema_db();
+        let statements = Parser::parse_sql(
+            &MySqlDialect {},
+            "WITH users AS (SELECT 1 AS id) \
+             DELETE orders FROM users JOIN orders ON orders.user_id = users.id",
+        )
+        .expect("statement parses");
+        assert_eq!(referenced_names(as_query(&statements[0]), &db), vec!["orders".to_string()]);
+    }
+
+    #[test]
+    fn derived_mutation_target_reads_ctes() {
+        let db = schema_db();
+        let statement = parse_one(
+            "WITH users AS (SELECT 1 AS id) UPDATE (SELECT id FROM users) AS d SET id = 1",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+    }
+
+    #[test]
     fn unknown_relation_is_skipped() {
         let db = schema_db();
         let statement = parse_one("SELECT * FROM nonexistent_table");
