@@ -352,6 +352,46 @@ pub trait ColumnLike:
         None
     }
 
+    /// Returns the most characters a value of the column can hold, or `None`
+    /// when the engine does not bound it by the declared type.
+    ///
+    /// `VARCHAR(n)`, `CHARACTER VARYING(n)`, `CHAR(n)` and `CHARACTER(n)`
+    /// answer `n` wherever the engine rejects or truncates a longer value. A
+    /// bare `CHAR` is `CHAR(1)`. A bare `VARCHAR` takes the engine's default
+    /// length where it has one, as in SQL Server, and answers `None` where it
+    /// is unbounded, as in PostgreSQL. `TEXT` and a length that is not an
+    /// integer literal, such as `VARCHAR(MAX)`, answer `None`. So does every
+    /// declared length in an engine that stores any length regardless, as
+    /// SQLite, DuckDB and ClickHouse do. A length counted in bytes or in UTF-16
+    /// code units still bounds the characters, since every character takes at
+    /// least one of them.
+    ///
+    /// The default answers `None`, so an implementation over a backend with a
+    /// bounded character type must override it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE notes (title VARCHAR(100), code CHAR(8), body TEXT);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("notes", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let lengths: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.max_character_length(&db)).collect();
+    /// assert_eq!(lengths, [Some(100), Some(8), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn max_character_length(&self, _database: &Self::DB) -> Option<u64> {
+        None
+    }
+
     /// Returns the builtin scalar family of the column's declared type.
     ///
     /// # Example
@@ -1608,6 +1648,11 @@ where
     }
 
     #[inline]
+    fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
+        (*self).max_character_length(database)
+    }
+
+    #[inline]
     fn collation<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -1672,6 +1717,11 @@ where
     #[inline]
     fn fixed_binary_length(&self, database: &Self::DB) -> Option<u64> {
         (**self).fixed_binary_length(database)
+    }
+
+    #[inline]
+    fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
+        (**self).max_character_length(database)
     }
 
     #[inline]

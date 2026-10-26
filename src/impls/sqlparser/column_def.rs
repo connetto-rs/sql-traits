@@ -56,6 +56,11 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     }
 
     #[inline]
+    fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
+        super::dialect::max_character_length(*database.dialect(), &self.attribute().data_type)
+    }
+
+    #[inline]
     fn collation<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -335,6 +340,102 @@ mod tests {
         let column = column_named(&db, "token");
         assert_eq!(<&_ as ColumnLike>::fixed_binary_length(&column, &db), Some(16));
         assert_eq!(Arc::new(column.clone()).fixed_binary_length(&db), Some(16));
+    }
+
+    mod max_character_length {
+        use sqlparser::dialect::{
+            AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
+            DuckDbDialect, GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+            PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
+            SparkSqlDialect, TeradataDialect,
+        };
+
+        use super::{Arc, ColumnLike, column_named, parse_with};
+
+        fn lengths<D: Dialect + Default + 'static, const N: usize>(
+            columns: &str,
+            names: [&str; N],
+        ) -> [Option<u64>; N] {
+            let db = parse_with::<D>(&format!("CREATE TABLE t ({columns});"));
+            names.map(|name| column_named(&db, name).max_character_length(&db))
+        }
+
+        fn common<D: Dialect + Default + 'static>() -> [Option<u64>; 8] {
+            lengths::<D, 8>(
+                "vc VARCHAR(100), cv CHARACTER VARYING(50), c CHAR(8), ch CHARACTER(4), \
+                 bare_char CHAR, bare_vc VARCHAR, body TEXT, num INT",
+                ["vc", "cv", "c", "ch", "bare_char", "bare_vc", "body", "num"],
+            )
+        }
+
+        #[test]
+        fn declared_lengths_bound_where_the_engine_enforces_them() {
+            let bounded = [Some(100), Some(50), Some(8), Some(4), Some(1), None, None, None];
+            assert_eq!(common::<PostgreSqlDialect>(), bounded);
+            assert_eq!(common::<MySqlDialect>(), bounded);
+            assert_eq!(common::<GenericDialect>(), bounded);
+            assert_eq!(common::<AnsiDialect>(), bounded);
+            assert_eq!(common::<SnowflakeDialect>(), bounded);
+            assert_eq!(common::<OracleDialect>(), bounded);
+            assert_eq!(common::<TeradataDialect>(), bounded);
+            assert_eq!(common::<BigQueryDialect>(), bounded);
+            assert_eq!(common::<HiveDialect>(), bounded);
+            assert_eq!(common::<SparkSqlDialect>(), bounded);
+            assert_eq!(common::<DatabricksDialect>(), bounded);
+        }
+
+        #[test]
+        fn bare_varying_type_takes_the_engine_default() {
+            let one = [Some(100), Some(50), Some(8), Some(4), Some(1), Some(1), None, None];
+            assert_eq!(common::<MsSqlDialect>(), one);
+            let redshift = [Some(100), Some(50), Some(8), Some(4), Some(1), Some(256), None, None];
+            assert_eq!(common::<RedshiftSqlDialect>(), redshift);
+        }
+
+        #[test]
+        fn declared_lengths_do_not_bound_where_the_engine_ignores_them() {
+            assert_eq!(common::<SQLiteDialect>(), [None; 8]);
+            assert_eq!(common::<DuckDbDialect>(), [None; 8]);
+            assert_eq!(common::<ClickHouseDialect>(), [None; 8]);
+        }
+
+        #[test]
+        fn national_and_max_lengths() {
+            assert_eq!(
+                lengths::<MsSqlDialect, 4>(
+                    "n NVARCHAR(30), bare_n NVARCHAR, vc_max VARCHAR(MAX), n_max NVARCHAR(MAX)",
+                    ["n", "bare_n", "vc_max", "n_max"],
+                ),
+                [Some(30), Some(1), None, None]
+            );
+        }
+
+        #[test]
+        fn octet_lengths_bound_characters_too() {
+            assert_eq!(
+                lengths::<AnsiDialect, 2>(
+                    "o VARCHAR(10 OCTETS), c VARCHAR(12 CHARACTERS)",
+                    ["o", "c"],
+                ),
+                [Some(10), Some(12)]
+            );
+        }
+
+        #[test]
+        fn parameterized_string_is_bounded() {
+            assert_eq!(
+                lengths::<BigQueryDialect, 2>("s STRING(10), bare STRING", ["s", "bare"]),
+                [Some(10), None]
+            );
+        }
+
+        #[test]
+        fn forwards_through_reference_and_arc() {
+            let db = parse_with::<PostgreSqlDialect>("CREATE TABLE t (title VARCHAR(100));");
+            let column = column_named(&db, "title");
+            assert_eq!(<&_ as ColumnLike>::max_character_length(&column, &db), Some(100));
+            assert_eq!(Arc::new(column.clone()).max_character_length(&db), Some(100));
+        }
     }
 
     fn column_named<'db>(db: &'db ParserDB, name: &str) -> &'db <ParserDB as DatabaseLike>::Column {

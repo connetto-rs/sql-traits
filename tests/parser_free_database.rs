@@ -1513,6 +1513,7 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
     let first_column = docs.columns(&catalog)?.next().expect("a column");
     assert_eq!(catalog.dialect().is_bool(&catalog, first_column), TypeMatch::No);
     assert_eq!(first_column.fixed_binary_length(&catalog), None);
+    assert_eq!(first_column.max_character_length(&catalog), None);
 
     Ok(())
 }
