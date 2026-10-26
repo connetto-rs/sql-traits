@@ -12,7 +12,7 @@
 use core::any::TypeId;
 
 use sqlparser::{
-    ast::{ColumnDef, CreateTable, DataType, ObjectName, ObjectNamePart},
+    ast::{CharacterLength, ColumnDef, CreateTable, DataType, ObjectName, ObjectNamePart},
     dialect::{
         AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
         HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect,
@@ -256,6 +256,41 @@ pub(super) fn fixed_binary_length(dialect: SqlparserDialect, ty: &DataType) -> O
     (dialect.is_mysql_family()
         || matches!(dialect, SqlparserDialect::MsSql | SqlparserDialect::Ansi))
     .then(|| length.unwrap_or(1))
+}
+
+/// Most characters a value of a character type can hold, where the engine
+/// enforces the declared length.
+///
+/// SQLite and DuckDB store a string of any length in a `VARCHAR(n)` column,
+/// and ClickHouse aliases it to an unbounded `String`. Every other engine
+/// rejects or truncates a longer value. A bare `CHAR` is `CHAR(1)`, and a bare
+/// varying type is one character in SQL Server and 256 bytes in Redshift.
+pub(super) fn max_character_length(dialect: SqlparserDialect, ty: &DataType) -> Option<u64> {
+    if matches!(
+        dialect,
+        SqlparserDialect::ClickHouse | SqlparserDialect::DuckDb | SqlparserDialect::SQLite
+    ) {
+        return None;
+    }
+    let bare_varying = match dialect {
+        SqlparserDialect::MsSql => Some(1),
+        SqlparserDialect::Redshift => Some(256),
+        _ => None,
+    };
+    let (spec, bare) = match ty {
+        DataType::Char(spec) | DataType::Character(spec) => (spec, Some(1)),
+        DataType::Varchar(spec)
+        | DataType::CharacterVarying(spec)
+        | DataType::CharVarying(spec)
+        | DataType::Nvarchar(spec) => (spec, bare_varying),
+        DataType::String(length) => return *length,
+        _ => return None,
+    };
+    match spec {
+        None => bare,
+        Some(CharacterLength::IntegerLength { length, .. }) => Some(*length),
+        Some(CharacterLength::Max) => None,
+    }
 }
 
 impl DialectLike for SqlparserDialect {
