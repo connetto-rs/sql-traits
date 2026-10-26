@@ -4,7 +4,7 @@
 use alloc::{borrow::Cow, format, string::ToString};
 
 use sqlparser::ast::{
-    CreateFunction, CreateFunctionBody, DataType, Expr, FunctionCalledOnNull,
+    CreateFunction, CreateFunctionBody, DataType, Expr, FunctionBehavior, FunctionCalledOnNull,
     FunctionDefinitionSetParam, FunctionReturnType, FunctionSecurity, Value, ValueWithSpan,
 };
 
@@ -149,6 +149,11 @@ impl FunctionLike for CreateFunction {
     #[inline]
     fn null_input_behavior(&self) -> FunctionCalledOnNull {
         self.called_on_null.clone().unwrap_or(FunctionCalledOnNull::CalledOnNullInput)
+    }
+
+    #[inline]
+    fn volatility(&self) -> FunctionBehavior {
+        self.behavior.clone().unwrap_or(FunctionBehavior::Volatile)
     }
 
     #[inline]

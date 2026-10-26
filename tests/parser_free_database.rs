@@ -20,8 +20,8 @@ use sql_traits::{
 use sqlparser::{
     ast::{
         Action, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType, Expr,
-        FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query,
-        Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
+        FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionSecurity,
+        Grantee, Owner, Query, Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -1275,6 +1275,17 @@ fn the_inherited_function_resolver_walks_the_default_schema() -> Result<(), Look
         Err(LookupError::AmbiguousFunctionLookup { .. })
     ));
 
+    Ok(())
+}
+
+#[test]
+fn functions_without_volatility_metadata_report_volatile() -> Result<(), LookupError> {
+    let catalog = catalog();
+    let function = catalog
+        .resolve_target_function(TargetName::new("touch", false), IdentifierCase::AsWritten)?
+        .expect("the default schema holds one");
+
+    assert_eq!(function.volatility(), FunctionBehavior::Volatile);
     Ok(())
 }
 
