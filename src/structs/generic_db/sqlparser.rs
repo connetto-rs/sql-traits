@@ -7395,8 +7395,6 @@ impl ParserDB {
                     operation,
                     ..
                 }) => {
-                    // Owner, security, and configuration changes update the
-                    // stored function. Other operations remain ignored.
                     match operation {
                         AlterFunctionOperation::OwnerTo(new_owner) => {
                             // An aggregate reaches here as this same statement,
@@ -7445,7 +7443,8 @@ impl ParserDB {
                             let tracked = actions.iter().any(|action| {
                                 matches!(
                                     action,
-                                    AlterFunctionAction::Security { .. }
+                                    AlterFunctionAction::Behavior(_)
+                                        | AlterFunctionAction::Security { .. }
                                         | AlterFunctionAction::Set(_)
                                         | AlterFunctionAction::Reset(_)
                                 )
@@ -7460,6 +7459,9 @@ impl ParserDB {
                             let function = Arc::make_mut(function_arc);
                             for action in actions {
                                 match action {
+                                    AlterFunctionAction::Behavior(behavior) => {
+                                        function.behavior = Some(behavior);
+                                    }
                                     AlterFunctionAction::Security { security, .. } => {
                                         function.security = Some(security);
                                     }

@@ -3,7 +3,9 @@
 use alloc::{borrow::Cow, vec::Vec};
 use core::{fmt::Debug, hash::Hash};
 
-use sqlparser::ast::{Expr, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionSecurity};
+use sqlparser::ast::{
+    Expr, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionSecurity,
+};
 
 use crate::{
     errors::LookupError,
@@ -404,6 +406,31 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
 
     /// Returns the null-input behavior with PostgreSQL's default folded in.
     fn null_input_behavior(&self) -> FunctionCalledOnNull;
+
+    /// Returns effective volatility after alterations, defaulting to
+    /// PostgreSQL's `VOLATILE`.
+    ///
+    /// Implementations with declared volatility override the conservative
+    /// default.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::FunctionBehavior, dialect::PostgreSqlDialect};
+    ///
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION helper() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+    ///      ALTER FUNCTION helper() STABLE;",
+    /// )?;
+    /// let helper = database.functions().find(|function| function.name() == "helper").unwrap();
+    /// assert_eq!(helper.volatility(), FunctionBehavior::Stable);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn volatility(&self) -> FunctionBehavior {
+        FunctionBehavior::Volatile
+    }
 
     /// Returns whether the function runs with the privileges of the user
     /// that defined it (`SECURITY DEFINER`) or of the user that calls it
