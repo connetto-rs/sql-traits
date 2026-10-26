@@ -368,7 +368,7 @@ pub trait PolicyLike:
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError>;
 
-    /// Returns the `WITH CHECK` expression of the policy, if any.
+    /// Returns explicit `WITH CHECK`, or `None` without a `USING` fallback.
     ///
     /// # Example
     ///

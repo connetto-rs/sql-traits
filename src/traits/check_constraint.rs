@@ -17,121 +17,88 @@ use crate::{
     traits::{DatabaseLike, Metadata, TableLike, column::ColumnLike, function_like::FunctionLike},
 };
 
-/// Helper function to determine if an expression evaluates to a constant
-/// boolean value. Returns `Some(true)` if always true, `Some(false)` if always
-/// false, and `None` otherwise.
-fn evaluate_constant_expr<C: ColumnLike>(columns: &[(&C, bool)], expr: &Expr) -> Option<bool> {
-    match expr {
-        // Literal true/false
-        Expr::Value(value_with_span) => {
-            match value_with_span.value {
-                Value::Boolean(true) => Some(true),
-                Value::Boolean(false) => Some(false),
+fn unnested(mut expr: &Expr) -> &Expr {
+    while let Expr::Nested(inner) = expr {
+        expr = inner;
+    }
+    expr
+}
+
+fn literal_equality(left: &Expr, right: &Expr) -> Option<bool> {
+    let (Expr::Value(left), Expr::Value(right)) = (unnested(left), unnested(right)) else {
+        return None;
+    };
+    match (&left.value, &right.value) {
+        (Value::Boolean(left), Value::Boolean(right)) => Some(left == right),
+        (Value::Number(left, _), Value::Number(right, _)) => {
+            if left == right {
+                Some(true)
+            } else {
+                Some(left.parse::<u128>().ok()? == right.parse::<u128>().ok()?)
+            }
+        }
+        (Value::SingleQuotedString(left), Value::SingleQuotedString(right)) if left == right => {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn evaluate_constant_expr(
+    expr: &Expr,
+    nullable: &mut impl FnMut(&Expr) -> Result<Option<bool>, LookupError>,
+) -> Result<Option<bool>, LookupError> {
+    let result = match unnested(expr) {
+        Expr::Value(value) => {
+            match value.value {
+                Value::Boolean(value) => Some(value),
                 _ => None,
             }
         }
-
-        Expr::IsNotNull(col_expr) => {
-            // Check if the column is declared NOT NULL in the table schema
-            if let Expr::Identifier(ident) = col_expr.as_ref() {
-                for (column, is_nullable) in columns {
-                    if column.column_name() == ident.value {
-                        // If column is NOT NULL, IS NOT NULL is TRUE.
-                        // If column is NULLABLE, IS NOT NULL is variable
-                        // (None).
-                        return if *is_nullable { None } else { Some(true) };
-                    }
-                }
-                None
-            } else {
-                None
+        Expr::IsNull(column) | Expr::IsNotNull(column) => {
+            match nullable(unnested(column))? {
+                Some(false) => Some(matches!(unnested(expr), Expr::IsNotNull(_))),
+                _ => None,
             }
         }
-
-        Expr::IsNull(col_expr) => {
-            // Check if the column is declared NOT NULL in the table schema
-            if let Expr::Identifier(ident) = col_expr.as_ref() {
-                for (column, is_nullable) in columns {
-                    if column.column_name() == ident.value {
-                        // If column is NOT NULL, IS NULL is FALSE.
-                        // If column is NULLABLE, IS NULL is variable (None).
-                        return if *is_nullable { None } else { Some(false) };
-                    }
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => literal_equality(left, right),
+        Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+            let complement = match (unnested(left), unnested(right)) {
+                (Expr::IsNull(left), Expr::IsNotNull(right))
+                | (Expr::IsNotNull(left), Expr::IsNull(right)) => {
+                    unnested(left) == unnested(right) && nullable(unnested(left))?.is_some()
                 }
-                None
+                _ => false,
+            };
+            if complement {
+                Some(true)
             } else {
-                None
-            }
-        }
-
-        // Nested expressions
-        Expr::Nested(inner) => evaluate_constant_expr(columns, inner),
-
-        // Binary operations
-        Expr::BinaryOp { left, op, right } => {
-            // Check for patterns like 1 = 1, 0 = 0, etc.
-            if matches!(op, BinaryOperator::Eq)
-                && let (Expr::Value(left_val), Expr::Value(right_val)) =
-                    (left.as_ref(), right.as_ref())
-            {
-                return Some(left_val.value == right_val.value);
-            }
-
-            // Check for IS NULL OR IS NOT NULL pattern (always true)
-            if matches!(op, BinaryOperator::Or) {
-                if let (Expr::IsNull(null_col), Expr::IsNotNull(not_null_col)) =
-                    (left.as_ref(), right.as_ref())
-                    && null_col == not_null_col
-                {
-                    return Some(true);
-                }
-                if let (Expr::IsNotNull(not_null_col), Expr::IsNull(null_col)) =
-                    (left.as_ref(), right.as_ref())
-                    && null_col == not_null_col
-                {
-                    return Some(true);
-                }
-            }
-
-            // Recursively check if both sides are tautological for AND
-            if matches!(op, BinaryOperator::And) {
-                return match (
-                    evaluate_constant_expr(columns, left),
-                    evaluate_constant_expr(columns, right),
-                ) {
-                    (Some(true), Some(true)) => Some(true),
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    _ => None,
-                };
-            }
-
-            // Recursively check if either side is tautological for OR
-            if matches!(op, BinaryOperator::Or) {
-                return match (
-                    evaluate_constant_expr(columns, left),
-                    evaluate_constant_expr(columns, right),
+                match (
+                    evaluate_constant_expr(left, nullable)?,
+                    evaluate_constant_expr(right, nullable)?,
                 ) {
                     (Some(true), _) | (_, Some(true)) => Some(true),
                     (Some(false), Some(false)) => Some(false),
                     _ => None,
-                };
+                }
             }
-
-            None
         }
-
-        // NOT false is true, NOT true is false
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            match (
+                evaluate_constant_expr(left, nullable)?,
+                evaluate_constant_expr(right, nullable)?,
+            ) {
+                (Some(true), Some(true)) => Some(true),
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                _ => None,
+            }
+        }
         Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr } => {
-            match evaluate_constant_expr(columns, expr) {
-                Some(true) => Some(false),
-                Some(false) => Some(true),
-                None => None,
-            }
+            evaluate_constant_expr(expr, nullable)?.map(|value| !value)
         }
-
-        // Everything else is not obviously tautological
         _ => None,
-    }
+    };
+    Ok(result)
 }
 
 /// Helper to extract column names from nullability checks in an AND chain
@@ -972,19 +939,11 @@ pub trait CheckConstraintLike:
     /// # }
     /// ```
     fn is_tautology(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        let mut columns = Vec::new();
-        for column in self.columns(database)? {
-            let is_nullable = column.is_nullable(database)?;
-            columns.push((column, is_nullable));
-        }
-        let expr = self.expression(database);
-
-        // First check using expression analysis
-        if let Some(true) = evaluate_constant_expr(&columns, expr) {
-            return Ok(true);
-        }
-
-        Ok(false)
+        Ok(self.table(database)?.expression_truth(
+            database,
+            self.expression(database),
+            IdentifierCase::AsWritten,
+        )? == Some(true))
     }
 
     /// Returns whether the check constraint is a negation (always false).
@@ -1046,15 +1005,12 @@ pub trait CheckConstraintLike:
     /// # }
     /// ```
     fn is_negation(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        let mut columns = Vec::new();
-        for column in self.columns(database)? {
-            let is_nullable = column.is_nullable(database)?;
-            columns.push((column, is_nullable));
-        }
-        let expr = self.expression(database);
-
-        // First check using expression analysis
-        if let Some(false) = evaluate_constant_expr(&columns, expr) {
+        if self.table(database)?.expression_truth(
+            database,
+            self.expression(database),
+            IdentifierCase::AsWritten,
+        )? == Some(false)
+        {
             return Ok(true);
         }
 
