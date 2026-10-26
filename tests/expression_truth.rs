@@ -59,6 +59,7 @@ fn nulls_mixed_literals_and_collation_sensitive_comparisons_are_unknown() -> Res
         "'a' = 'A'",
         "'1' = 1",
         "tenant_id = 7",
+        "tenant_id > 7",
         "tenant_id IS NULL",
         "tenant_id IS NOT NULL",
         "unknown_column IS NOT NULL",
@@ -68,7 +69,6 @@ fn nulls_mixed_literals_and_collation_sensitive_comparisons_are_unknown() -> Res
         "random() IS NULL OR random() IS NOT NULL",
         "missing IS NULL OR missing IS NOT NULL",
         "elsewhere.id IS NULL OR elsewhere.id IS NOT NULL",
-        "340282366920938463463374607431768211456 = 1",
     ] {
         assert_eq!(truth(sql)?, None, "{sql}");
     }
@@ -104,24 +104,27 @@ fn policy_expressions_can_be_analyzed_independently() -> Result<(), Error> {
          CREATE POLICY public_rows ON invoices USING (NOT false);
          CREATE POLICY tenant_rows ON invoices USING (tenant_id = 7);
          CREATE POLICY unchecked_writes ON invoices USING (tenant_id = 7) WITH CHECK (1 = 1);
-         CREATE POLICY denied ON invoices USING (false);",
+         CREATE POLICY denied ON invoices USING (false);
+         CREATE POLICY only_check ON invoices WITH CHECK (NOT false);
+         CREATE POLICY nullable_writes ON invoices USING (NOT false) WITH CHECK (tenant_id IS NOT NULL);",
     )?;
     for policy in db.policies() {
         let table = policy.table(&db)?;
-        let using = table.expression_truth(
-            &db,
-            policy.using_expression(&db).unwrap(),
-            IdentifierCase::AsWritten,
-        )?;
+        let using = policy
+            .using_expression(&db)
+            .map(|expr| table.expression_truth(&db, expr, IdentifierCase::AsWritten))
+            .transpose()?;
         let check = policy
             .check_expression(&db)
             .map(|expr| table.expression_truth(&db, expr, IdentifierCase::AsWritten))
             .transpose()?;
         let expected = match policy.name() {
-            "public_rows" => (Some(true), None),
-            "tenant_rows" => (None, None),
-            "unchecked_writes" => (None, Some(Some(true))),
-            "denied" => (Some(false), None),
+            "public_rows" => (Some(Some(true)), None),
+            "tenant_rows" => (Some(None), None),
+            "unchecked_writes" => (Some(None), Some(Some(true))),
+            "denied" => (Some(Some(false)), None),
+            "only_check" => (None, Some(Some(true))),
+            "nullable_writes" => (Some(Some(true)), Some(None)),
             _ => unreachable!(),
         };
         assert_eq!((using, check), expected, "{}", policy.name());
@@ -186,5 +189,47 @@ fn an_absent_table_is_an_error_even_for_a_literal() -> Result<(), Error> {
         table.expression_truth(&elsewhere, &expression("true"), IdentifierCase::AsWritten),
         Err(sql_traits::errors::LookupError::ObjectNotInDatabase { .. }),
     ));
+    Ok(())
+}
+
+#[test]
+fn integer_proofs_preserve_precision_and_refuse_either_unrepresentable_operand() -> Result<(), Error>
+{
+    let max = u128::MAX;
+    assert_eq!(truth(&format!("0{max} = {max}"))?, Some(true));
+    assert_eq!(truth(&format!("{max} = {}", max - 1))?, Some(false));
+    assert_eq!(truth("0 = 340282366920938463463374607431768211456")?, None);
+    assert_eq!(truth("340282366920938463463374607431768211456 = 0")?, None);
+    assert_eq!(truth("1.0 = 1")?, None);
+    Ok(())
+}
+
+#[test]
+fn nested_predicates_preserve_unknowns_and_absorbing_booleans() -> Result<(), Error> {
+    for (sql, expected) in [
+        ("NOT (tenant_id = 7 AND false)", Some(true)),
+        ("(tenant_id = 7 OR true) AND id IS NOT NULL", Some(true)),
+        ("NOT (tenant_id IS NOT NULL OR false)", None),
+        ("NOT NOT ((tenant_id) IS NULL OR tenant_id IS NOT NULL)", Some(true)),
+        ("id IS NULL OR tenant_id IS NOT NULL", None),
+        ("tenant_id IS NULL OR \"ID\" IS NOT NULL", None),
+    ] {
+        assert_eq!(truth(sql)?, expected, "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn check_truth_analysis_reports_absent_constraint_metadata() -> Result<(), Error> {
+    let owned =
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE invoices (id INT, CHECK (NOT false));")?;
+    let elsewhere = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE invoices (id INT);")?;
+    let table = owned.tables().next().unwrap();
+    let check = table.check_constraints(&owned)?.next().unwrap();
+    for result in [check.is_tautology(&elsewhere), check.is_negation(&elsewhere)] {
+        assert!(
+            matches!(result, Err(sql_traits::errors::LookupError::ObjectNotInDatabase { .. }),)
+        );
+    }
     Ok(())
 }

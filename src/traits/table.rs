@@ -4501,15 +4501,6 @@ where
         T::columns(self, database)
     }
 
-    fn expression_truth(
-        &self,
-        database: &Self::DB,
-        expression: &sqlparser::ast::Expr,
-        case: IdentifierCase,
-    ) -> Result<Option<bool>, LookupError> {
-        T::expression_truth(self, database, expression, case)
-    }
-
     fn local_columns<'db>(
         &'db self,
         database: &'db Self::DB,
