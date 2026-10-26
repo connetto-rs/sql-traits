@@ -1,22 +1,27 @@
 //! Implementations of [`DataStatementLike`] for the sqlparser data-statement
 //! AST nodes (`Query`, `Insert`, `Update`, `Delete`).
 //!
-//! `referenced_tables` is built on sqlparser's [`visit_relations`], which
-//! recurses through subqueries, CTE bodies, and set operations, and which
-//! already visits the `INSERT` / `UPDATE` / `DELETE` mutation targets. The one
-//! relation source it does not reach is the MySQL multi-table `DELETE ... t1,
-//! t2` list, which the `Delete` implementation resolves explicitly.
+//! `referenced_tables` walks every relation sqlparser's [`Visitor`] reaches,
+//! which covers subqueries, CTE bodies, set operations and the `INSERT` /
+//! `UPDATE` / `DELETE` mutation targets. A bare name that a visible `WITH`
+//! item binds reads that item, so it is skipped, except as a mutation target,
+//! which always names a stored table. The one relation source the walk does
+//! not reach is the MySQL multi-table `DELETE ... t1, t2` list, which the
+//! `Delete` implementation resolves explicitly.
 
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{Delete, Insert, ObjectName, Query, Update, Visit, visit_relations};
+use sqlparser::ast::{
+    Delete, FromTable, Insert, ObjectName, Query, Statement, TableFactor, TableObject, Update,
+    Visit, Visitor,
+};
 
 use crate::{
     errors::LookupError,
     structs::IdentifierCase,
     traits::{DataStatementLike, DatabaseLike},
-    utils::object_name::resolve_object_name,
+    utils::{object_name::resolve_object_name, with_scopes::WithScopes},
 };
 
 /// Accumulates resolved base tables, deduplicating by their position in the
@@ -63,25 +68,94 @@ impl<'db, DB: DatabaseLike> ReferencedTables<'db, DB> {
     }
 }
 
-/// Resolves every relation reachable from `node` via [`visit_relations`] and
-/// records the base tables, propagating the first resolution error.
-fn collect_referenced_tables<'db, N: Visit, DB: DatabaseLike>(
-    node: &N,
+/// Walks a data statement, recording the base table each relation it reads
+/// resolves to and stopping at the first resolution error.
+struct RelationCollector<'db, 'acc, DB: DatabaseLike> {
     database: &'db DB,
-    accumulator: &mut ReferencedTables<'db, DB>,
-) -> Result<(), LookupError> {
-    let flow = visit_relations(node, |object_name: &ObjectName| {
-        match resolve_object_name(object_name, database, IdentifierCase::AsWritten) {
+    accumulator: &'acc mut ReferencedTables<'db, DB>,
+    scopes: WithScopes,
+    /// The mutation targets met so far, compared by address.
+    targets: Vec<*const ObjectName>,
+}
+
+impl<DB: DatabaseLike> RelationCollector<'_, '_, DB> {
+    /// Records the names a mutation writes to. PostgreSQL resolves them
+    /// against stored tables only, so a `WITH` item of the same name does not
+    /// hide them.
+    fn record_targets(&mut self, statement: &Statement) {
+        let relation_name = |factor: &TableFactor| {
+            match factor {
+                TableFactor::Table { name, .. } => Some(&raw const *name),
+                _ => None,
+            }
+        };
+        match statement {
+            Statement::Insert(Insert { table: TableObject::TableName(name), .. }) => {
+                self.targets.push(name);
+            }
+            Statement::Update(Update { table, .. }) => {
+                self.targets.extend(relation_name(&table.relation));
+            }
+            // With a multi-table list the `FROM` items are the rows read, and
+            // the list holds the targets.
+            Statement::Delete(Delete { tables, from, .. }) if tables.is_empty() => {
+                let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
+                self.targets.extend(from.iter().filter_map(|item| relation_name(&item.relation)));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
+    type Break = LookupError;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        self.scopes.enter(query);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        self.scopes.leave(query);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+        self.record_targets(statement);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        if self.scopes.reads_item(relation)
+            && !self.targets.iter().any(|target| core::ptr::eq(*target, relation))
+        {
+            return ControlFlow::Continue(());
+        }
+        match resolve_object_name(relation, self.database, IdentifierCase::AsWritten) {
             Ok(Some(table)) => {
-                accumulator.add(table, database);
+                self.accumulator.add(table, self.database);
                 ControlFlow::Continue(())
             }
             Ok(None) => ControlFlow::Continue(()),
             Err(error) => ControlFlow::Break(error),
         }
-    });
+    }
+}
 
-    match flow {
+/// Resolves every relation reachable from `node` and records the base tables,
+/// propagating the first resolution error.
+fn collect_referenced_tables<'db, N: Visit, DB: DatabaseLike>(
+    node: &N,
+    database: &'db DB,
+    accumulator: &mut ReferencedTables<'db, DB>,
+) -> Result<(), LookupError> {
+    let mut collector = RelationCollector {
+        database,
+        accumulator,
+        scopes: WithScopes::default(),
+        targets: Vec::new(),
+    };
+    match node.visit(&mut collector) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(error) => Err(error),
     }
@@ -243,6 +317,126 @@ mod tests {
         // `orders` (CTE body) resolves; `recent` (the CTE name) does not match
         // a base table and is skipped.
         assert_eq!(referenced_names(as_query(&statement), &db), vec!["orders".to_string()]);
+    }
+
+    #[test]
+    fn cte_shadows_base_table_of_the_same_name() {
+        let db = schema_db();
+        let statement = parse_one("WITH users AS (SELECT 1 AS id) SELECT id FROM users");
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+    }
+
+    #[test]
+    fn cte_shadowing_folds_unquoted_names() {
+        let db = schema_db();
+        let statement = parse_one("WITH USERS AS (SELECT 1 AS id) SELECT id FROM Users");
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+        let statement = parse_one("WITH \"USERS\" AS (SELECT 1 AS id) SELECT id FROM users");
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["users".to_string()]);
+    }
+
+    #[test]
+    fn schema_qualified_name_reaches_the_shadowed_table() {
+        let db = schema_db();
+        let statement = parse_one("WITH users AS (SELECT 1 AS id) SELECT id FROM public.users");
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["users".to_string()]);
+    }
+
+    #[test]
+    fn non_recursive_cte_body_naming_itself_reads_the_table() {
+        let db = schema_db();
+        let statement = parse_one("WITH users AS (SELECT id FROM users) SELECT id FROM users");
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["users".to_string()]);
+    }
+
+    #[test]
+    fn recursive_cte_body_reads_itself() {
+        let db = schema_db();
+        let statement = parse_one(
+            "WITH RECURSIVE users AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM users WHERE id < 3) \
+             SELECT id FROM users",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+    }
+
+    #[test]
+    fn cte_body_sees_only_earlier_ctes() {
+        let db = schema_db();
+        let statement = parse_one(
+            "WITH users AS (SELECT 1 AS id), later AS (SELECT id FROM users) SELECT id FROM later",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+        let statement = parse_one(
+            "WITH earlier AS (SELECT id FROM users), users AS (SELECT 2 AS id) SELECT id FROM earlier",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["users".to_string()]);
+    }
+
+    #[test]
+    fn with_scope_ends_at_its_query() {
+        let db = schema_db();
+        let statement = parse_one(
+            "SELECT id FROM users WHERE id IN (WITH users AS (SELECT 1 AS id) SELECT id FROM users)",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["users".to_string()]);
+        let statement = parse_one(
+            "WITH orders AS (SELECT 1 AS user_id) \
+             SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["users".to_string()]);
+    }
+
+    #[test]
+    fn mutation_targets_ignore_ctes_of_the_same_name() {
+        let db = schema_db();
+        for sql in [
+            "WITH audit AS (SELECT 'x' AS note) INSERT INTO audit (note) VALUES ('y')",
+            "WITH audit AS (SELECT 1 AS id) UPDATE audit SET note = 'y'",
+            "WITH audit AS (SELECT 1 AS id) DELETE FROM audit",
+        ] {
+            let statement = parse_one(sql);
+            assert_eq!(
+                referenced_names(as_query(&statement), &db),
+                vec!["audit".to_string()],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_sources_see_ctes() {
+        let db = schema_db();
+        let statement = parse_one(
+            "WITH users AS (SELECT 1 AS id) \
+             DELETE FROM orders USING users WHERE orders.user_id = users.id",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["orders".to_string()]);
+        let statement = parse_one(
+            "WITH users AS (SELECT 1 AS id) \
+             UPDATE orders SET total = 0 FROM users WHERE orders.user_id = users.id",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["orders".to_string()]);
+    }
+
+    #[test]
+    fn mysql_multi_table_delete_from_items_see_ctes() {
+        let db = schema_db();
+        let statements = Parser::parse_sql(
+            &MySqlDialect {},
+            "WITH users AS (SELECT 1 AS id) \
+             DELETE orders FROM users JOIN orders ON orders.user_id = users.id",
+        )
+        .expect("statement parses");
+        assert_eq!(referenced_names(as_query(&statements[0]), &db), vec!["orders".to_string()]);
+    }
+
+    #[test]
+    fn derived_mutation_target_reads_ctes() {
+        let db = schema_db();
+        let statement = parse_one(
+            "WITH users AS (SELECT 1 AS id) UPDATE (SELECT id FROM users) AS d SET id = 1",
+        );
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
     }
 
     #[test]
