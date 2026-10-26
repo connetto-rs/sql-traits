@@ -27,7 +27,7 @@ jobs:
       with:
         toolchain: ${{ matrix.rust }}
     - name: Rust Cache
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Run tests
       run: cargo test --all-targets --features git,serde
 
@@ -46,7 +46,7 @@ jobs:
       with:
         toolchain: ${{ steps.msrv.outputs.version }}
     - name: Rust Cache
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Check library feature combinations
       run: |
         cargo check --locked -p sql-traits --lib --all-features
@@ -85,7 +85,7 @@ jobs:
         components: clippy
         targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
     - name: Rust Cache
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Build lib (host, no default features → no_std + alloc)
       run: cargo build --lib --no-default-features
     - name: Clippy under no_std
@@ -125,7 +125,7 @@ jobs:
       with:
         components: clippy
     - name: Rust Cache
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Run clippy
       run: cargo clippy --all-targets --features git,serde -- -D warnings
 
@@ -137,7 +137,7 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
     - name: Rust Cache
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Check documentation
       run: cargo doc --no-deps --document-private-items --features git,serde
       env:
