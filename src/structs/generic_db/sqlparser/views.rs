@@ -25,8 +25,8 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, SelectItem, SetExpr, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    AlterTableOperation, CreateView, Expr, Ident, ObjectName, Owner, Query, RenameTableNameKind,
+    SelectItem, SetExpr, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use super::{
@@ -44,6 +44,7 @@ use crate::{
         object_name::{
             RelationKey, qualifier_of, stored_view_key, target_key, target_name_from_object_name,
         },
+        with_scopes::WithScopes,
     },
 };
 
@@ -666,80 +667,6 @@ pub(super) fn view_owner_names(builder: &ParserDBBuilder) -> Vec<String> {
         .chain(builder.materialized_views().iter().map(|(_, metadata, _)| metadata))
         .filter_map(|metadata| metadata.owner().map(ToString::to_string))
         .collect()
-}
-
-/// The `WITH` names visible where a walk over a query stands, scoped as
-/// PostgreSQL scopes them.
-///
-/// An item's body sees the items before it, or every item under `WITH
-/// RECURSIVE`, and the rest of the query sees them all, so a body naming its
-/// own item reads the outer relation unless the `WITH` is recursive.
-#[derive(Default)]
-pub(super) struct WithScopes {
-    frames: Vec<WithFrame>,
-}
-
-/// The items one `WITH` clause binds.
-struct WithFrame {
-    /// The query carrying the clause, compared by address.
-    owner: *const Query,
-    /// Each item's body, compared by address.
-    bodies: Vec<*const Query>,
-    /// Each item's name.
-    names: Vec<Ident>,
-    /// Whether the clause is `WITH RECURSIVE`.
-    recursive: bool,
-    /// How many items, from the first, the walk currently sees.
-    visible: usize,
-}
-
-impl WithScopes {
-    pub(super) fn enter(&mut self, query: &Query) {
-        if let Some(frame) = self.frames.last_mut()
-            && let Some(position) = frame.bodies.iter().position(|body| core::ptr::eq(*body, query))
-        {
-            frame.visible = if frame.recursive { frame.names.len() } else { position };
-        }
-        if let Some(with) = &query.with {
-            self.frames.push(WithFrame {
-                owner: query,
-                bodies: with.cte_tables.iter().map(|cte| &raw const *cte.query).collect(),
-                names: with.cte_tables.iter().map(|cte| cte.alias.name.clone()).collect(),
-                recursive: with.recursive,
-                visible: 0,
-            });
-        }
-    }
-
-    pub(super) fn leave(&mut self, query: &Query) {
-        if self.frames.last().is_some_and(|frame| core::ptr::eq(frame.owner, query)) {
-            self.frames.pop();
-        }
-        if let Some(frame) = self.frames.last_mut()
-            && !frame.recursive
-            && let Some(position) = frame.bodies.iter().position(|body| core::ptr::eq(*body, query))
-        {
-            frame.visible = position + 1;
-        }
-    }
-
-    /// Whether `name` reads a visible `WITH` item rather than a stored
-    /// relation.
-    pub(super) fn reads_item(&self, name: &ObjectName) -> bool {
-        let [ObjectNamePart::Identifier(written)] = name.0.as_slice() else {
-            return false;
-        };
-        self.frames.iter().any(|frame| {
-            frame.names[..frame.visible].iter().any(|item| {
-                identifiers_match(
-                    item.value.as_str(),
-                    item.quote_style.is_some(),
-                    written.value.as_str(),
-                    written.quote_style.is_some(),
-                )
-            })
-        })
-    }
 }
 
 /// Binds every stored relation a definition reads, remembering the first

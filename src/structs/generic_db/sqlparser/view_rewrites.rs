@@ -13,10 +13,7 @@ use sqlparser::ast::{
     Visitor, VisitorMut,
 };
 
-use super::{
-    ParserDBBuilder,
-    views::{WithScopes, relations_read_in},
-};
+use super::{ParserDBBuilder, views::relations_read_in};
 use crate::{
     impls::dql::{
         definition_graph::reference_sites::{QueryReferences, SiteOutcome, query_references},
@@ -27,6 +24,7 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         object_name::{RelationKey, target_key, target_name_from_object_name, view_matches_key},
+        with_scopes::WithScopes,
     },
 };
 

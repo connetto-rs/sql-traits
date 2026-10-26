@@ -33,6 +33,14 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// functions, otherwise unknown names) are skipped rather than reported as
     /// errors.
     ///
+    /// A bare name that a common table expression in scope binds reads that
+    /// expression even when a base table shares the name, and is skipped. The
+    /// innermost `WITH` wins. An expression is in scope in the query that
+    /// declares it and in the bodies of the expressions after it, and under
+    /// `WITH RECURSIVE` in every body of its clause, its own included. A
+    /// schema-qualified name and a DML mutation target always name a base
+    /// table.
+    ///
     /// Tables are returned in first-seen order and deduplicated by their
     /// position in [`DatabaseLike`] (so the same base table reached through
     /// several aliases or self-joins appears once).

@@ -18,3 +18,4 @@ pub mod identifier_resolution;
 pub mod maintenance_trigger_parser;
 pub(crate) mod object_name;
 pub mod scalar_family;
+pub(crate) mod with_scopes;
