@@ -6,12 +6,13 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 use crate::{
     errors::{Error, LookupError, ObjectKind},
     structs::{
-        IdentifierCase, SchemaFingerprint,
+        ColumnDefinition, ColumnScope, IdentifierCase, SchemaFingerprint,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
         ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, TableGrantLike,
-        TriggerLike, check_constraint::non_tautological,
+        TriggerLike,
+        check_constraint::{evaluate_constant_expr, non_tautological},
     },
     utils::{
         identifier_resolution::{identifiers_match, normalize_identifier},
@@ -453,6 +454,70 @@ pub trait TableLike:
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Column>, LookupError>
     where
         Self: 'db;
+
+    /// Proves a Boolean expression constant within this table's column scope.
+    ///
+    /// `Some(true)` proves a tautology and `Some(false)` proves a negation.
+    ///
+    /// `None` covers nullable, unresolved, and unsupported expressions.
+    ///
+    /// Supports literals, equality, `NOT`, `AND`, `OR`, and nullability.
+    ///
+    /// `case` controls identifier matching.
+    ///
+    /// Equality compares Booleans, numbers, and identical strings.
+    ///
+    /// Unequal numeric spellings must parse as unsigned `u128` integers.
+    ///
+    /// # Errors
+    ///
+    /// Returns membership, resolution, and nullability lookup errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "CREATE TABLE invoices (id INT NOT NULL, tenant_id INT);
+    ///      CREATE POLICY public_rows ON invoices USING (NOT false)
+    ///          WITH CHECK (tenant_id IS NOT NULL);",
+    /// )?;
+    /// let policy = db.policies().next().unwrap();
+    /// let table = policy.table(&db)?;
+    /// let case = IdentifierCase::AsWritten;
+    /// assert_eq!(
+    ///     table.expression_truth(&db, policy.using_expression(&db).unwrap(), case)?,
+    ///     Some(true),
+    /// );
+    /// assert_eq!(table.expression_truth(&db, policy.check_expression(&db).unwrap(), case)?, None,);
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    fn expression_truth(
+        &self,
+        database: &Self::DB,
+        expression: &sqlparser::ast::Expr,
+        case: IdentifierCase,
+    ) -> Result<Option<bool>, LookupError> {
+        self.require_in_database(database)?;
+        let mut scope = None;
+        evaluate_constant_expr(expression, &mut |reference| {
+            if !matches!(
+                reference,
+                sqlparser::ast::Expr::Identifier(_) | sqlparser::ast::Expr::CompoundIdentifier(_)
+            ) {
+                return Ok(None);
+            }
+            let scope =
+                scope.get_or_insert_with(|| ColumnScope::for_table(self.borrow(), database, case));
+            match scope.resolve_column_definition(reference)? {
+                Some(ColumnDefinition::Base { column, .. }) => {
+                    column.is_nullable(database).map(Some)
+                }
+                _ => Ok(None),
+            }
+        })
+    }
 
     /// Iterates over the columns the table declares itself.
     ///
@@ -4434,6 +4499,15 @@ where
         Self: 'db,
     {
         T::columns(self, database)
+    }
+
+    fn expression_truth(
+        &self,
+        database: &Self::DB,
+        expression: &sqlparser::ast::Expr,
+        case: IdentifierCase,
+    ) -> Result<Option<bool>, LookupError> {
+        T::expression_truth(self, database, expression, case)
     }
 
     fn local_columns<'db>(
