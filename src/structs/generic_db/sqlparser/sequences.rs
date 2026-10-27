@@ -369,20 +369,16 @@ fn forget(builder: &mut ParserDBBuilder, doomed: &[Arc<Sequence>]) {
     };
     let forget_in = |grants: &mut Vec<(Arc<Grant>, ())>| {
         grants.retain_mut(|(grant, ())| {
-            let Some(GrantObjects::Sequences(names) | GrantObjects::Tables(names)) = &grant.objects
-            else {
-                return true;
-            };
-            if !names.iter().any(names_doomed) {
-                return true;
+            if let Some(GrantObjects::Sequences(names) | GrantObjects::Tables(names)) =
+                &grant.objects
+                && names.iter().any(names_doomed)
+                && let Some(GrantObjects::Sequences(names) | GrantObjects::Tables(names)) =
+                    &mut Arc::make_mut(grant).objects
+            {
+                names.retain(|name| !names_doomed(name));
+                return !names.is_empty();
             }
-            let Some(GrantObjects::Sequences(names) | GrantObjects::Tables(names)) =
-                &mut Arc::make_mut(grant).objects
-            else {
-                return true;
-            };
-            names.retain(|name| !names_doomed(name));
-            !names.is_empty()
+            true
         });
     };
     forget_in(builder.table_grants_mut());

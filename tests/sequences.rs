@@ -240,14 +240,37 @@ fn drop_sequence_removes_the_sequence_and_the_grants_on_it() {
          CREATE SEQUENCE b;
          CREATE SEQUENCE keep;
          GRANT USAGE ON SEQUENCE a TO PUBLIC;
+         GRANT USAGE ON SEQUENCE a, keep TO PUBLIC;
          GRANT SELECT ON keep TO PUBLIC;
+         GRANT USAGE ON SCHEMA app TO PUBLIC;
          DROP SEQUENCE a, b;
          DROP SEQUENCE IF EXISTS missing;",
     )
     .expect("schema parses");
 
     assert_eq!(sequence_names(&db), ["app.keep"]);
-    assert_eq!(db.table_grants().count(), 1);
+    let targets: Vec<String> = db
+        .table_grants()
+        .map(|grant| {
+            match grant.target() {
+                GrantTarget::Sequences(names) => {
+                    format!(
+                        "sequences {}",
+                        names.map(|name| name.to_string()).collect::<Vec<_>>().join(",")
+                    )
+                }
+                GrantTarget::Tables(names) => {
+                    format!(
+                        "tables {}",
+                        names.map(|name| name.to_string()).collect::<Vec<_>>().join(",")
+                    )
+                }
+                GrantTarget::Schemas(_) => "schemas".to_string(),
+                _ => "other".to_string(),
+            }
+        })
+        .collect();
+    assert_eq!(targets, ["sequences app.keep", "tables app.keep", "schemas"]);
 }
 
 #[test]
@@ -350,6 +373,8 @@ fn a_grant_spelled_for_a_table_may_name_a_sequence() {
     assert_eq!(db.unresolved_access_references().expect("targets are well formed").count(), 0);
     let grant = db.table_grants().next().expect("the grant is recorded");
     assert_eq!(relations_of(&db, grant), ["sequence public.s"]);
+    let relation = grant.relations(&db).next().expect("the grant reaches the sequence");
+    assert!(format!("{relation:?}").starts_with("Sequence("), "{relation:?}");
 }
 
 /// Every relation a grant covers, as `kind schema.name`, in the order the
