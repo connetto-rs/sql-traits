@@ -288,6 +288,9 @@ fn unaliased_expressions_carry_postgres_implicit_names() {
         ("'2020-01-01'::timestamp", "\"timestamp\""),
         ("'2020-01-01'::timestamptz", "timestamptz"),
         ("'a'::name", "\"name\""),
+        ("'a'::tsvector", "tsvector"),
+        ("'pg_class'::regclass", "regclass"),
+        ("'(1,2)'::point", "point"),
     ] {
         let sql = format!("SELECT {projection} FROM b ORDER BY {key}");
         let resolved = order_by(&sql).unwrap();
@@ -308,7 +311,7 @@ fn unknown_output_names_answer_opaque() {
     );
     assert_eq!(order_by("SELECT 'a' IS NORMALIZED, id AS x FROM b ORDER BY x").unwrap(), "b.id");
     for projection in [
-        "'a'::tsvector",
+        "'a'::nvarchar",
         "(WITH c AS (SELECT 1) TABLE b)",
         "(SELECT * FROM b)",
         "(SELECT 'a' IS NORMALIZED)",

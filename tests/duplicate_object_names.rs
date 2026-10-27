@@ -210,16 +210,20 @@ fn a_repeated_table_name_is_still_a_lookup_conflict() {
     );
 }
 
-/// An index the statement does not name is named by the server, so it contests
-/// nothing and any number of them may sit on one table.
+/// An index the statement does not name takes the first free name PostgreSQL
+/// would give it, so any number of them may sit on one table.
 #[test]
 fn unnamed_indexes_never_collide() {
-    parse(
+    let db = parse(
         "CREATE TABLE docs (id INT);
          CREATE INDEX ON docs (id);
          CREATE INDEX ON docs (id);",
     )
-    .expect("neither has a name to contest");
+    .expect("each takes a free name");
+    assert_eq!(
+        db.indexes().filter_map(IndexLike::name).collect::<Vec<_>>(),
+        ["docs_id_idx", "docs_id_idx1"]
+    );
 }
 
 /// `IF NOT EXISTS` skips the statement whole, whatever kind of object holds the

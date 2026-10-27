@@ -180,12 +180,13 @@ fn a_policy_reports_itself_by_name() {
     assert_eq!(policy.check_functions(&other).err(), Some(ObjectKind::Policy.not_in_database("p")));
 }
 
-/// `CREATE INDEX` without a name is valid, so the anonymous branch is reachable
-/// for an index too, not only for a constraint.
+/// An index over an expression whose name is not modeled stays unnamed, so the
+/// anonymous branch is reachable for an index too, not only for a constraint.
 #[test]
 fn an_anonymous_index_reports_its_table() {
     let host = ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT); CREATE INDEX ON t (name);",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE INDEX ON t (((name || 'x')::nvarchar));",
     )
     .expect("host schema builds");
     let other = ParserDB::parse::<PostgreSqlDialect>(OTHER).expect("other schema builds");

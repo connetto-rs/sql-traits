@@ -257,7 +257,7 @@ fn unexpanded_wildcards_and_unmodeled_names_stay_unknown() {
         names("SELECT b.id, *, 1 + 1, b.id AS again FROM b, generate_series(1, 2) AS g"),
         ["id", "*", "\"?column?\"", "again"]
     );
-    assert_eq!(names("SELECT '1'::tsvector FROM b"), ["?"]);
+    assert_eq!(names("SELECT '1'::nvarchar FROM b"), ["?"]);
 }
 
 #[test]

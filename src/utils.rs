@@ -14,6 +14,7 @@ pub(crate) use is_identity::identity_generation;
 pub use is_identity::is_identity;
 mod common_snake_affix;
 pub use common_snake_affix::{common_column_name_snake_prefix, common_column_name_snake_suffix};
+pub(crate) mod figured_names;
 pub mod fingerprint_type_token;
 pub mod identifier_resolution;
 pub mod maintenance_trigger_parser;
