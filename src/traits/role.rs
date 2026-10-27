@@ -221,8 +221,9 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
 
     /// Returns the connection limit for this role, if any.
     ///
-    /// A value of `None` means unlimited connections.
-    /// A value of `Some(-1)` also typically means unlimited.
+    /// `None` means unlimited connections, whether no limit was written or
+    /// it was written as `-1`, the value PostgreSQL stores for no limit.
+    /// `Some(0)` admits no connection at all.
     ///
     /// # Example
     ///
@@ -234,6 +235,7 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
     ///     "
     /// CREATE ROLE limited_role CONNECTION LIMIT 5;
     /// CREATE ROLE unlimited_role;
+    /// CREATE ROLE reset_role CONNECTION LIMIT -1;
     /// ",
     /// )?;
     ///
@@ -242,6 +244,9 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
     ///
     /// let unlimited = db.role("unlimited_role").unwrap();
     /// assert!(unlimited.connection_limit().is_none());
+    ///
+    /// let reset = db.role("reset_role").unwrap();
+    /// assert!(reset.connection_limit().is_none());
     /// # Ok(())
     /// # }
     /// ```

@@ -4,7 +4,7 @@
     reason = "sqlparser only produces a CreateRole after parsing at least one role name"
 )]
 
-use sqlparser::ast::CreateRole;
+use sqlparser::ast::{CreateRole, Expr, UnaryOperator, Value, ValueWithSpan};
 
 use crate::{
     structs::ParserDB,
@@ -62,17 +62,8 @@ impl RoleLike for CreateRole {
     }
 
     fn connection_limit(&self) -> Option<i32> {
-        self.connection_limit.as_ref().and_then(|expr| {
-            if let sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
-                value: sqlparser::ast::Value::Number(n, _),
-                ..
-            }) = expr
-            {
-                n.parse().ok()
-            } else {
-                None
-            }
-        })
+        // PostgreSQL stores `-1` for a role without a limit.
+        self.connection_limit.as_ref().and_then(signed_integer).filter(|&limit| limit != -1)
     }
 
     fn member_of<'db>(
@@ -117,6 +108,17 @@ fn owner_matches_role(owner: &sqlparser::ast::Owner, role: &CreateRole) -> bool 
         | sqlparser::ast::Owner::CurrentUser
         | sqlparser::ast::Owner::CurrentRole
         | sqlparser::ast::Owner::SessionUser => false,
+    }
+}
+
+/// Reads an integer literal with an optional sign, the shape PostgreSQL takes
+/// after `CONNECTION LIMIT`.
+fn signed_integer(expr: &Expr) -> Option<i32> {
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::Number(digits, _), .. }) => digits.parse().ok(),
+        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => signed_integer(expr),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => signed_integer(expr)?.checked_neg(),
+        _ => None,
     }
 }
 
@@ -199,6 +201,30 @@ mod tests {
         assert!(role.can_bypass_rls());
         assert!(role.is_replication());
         assert_eq!(role.connection_limit(), Some(10));
+    }
+
+    /// PostgreSQL stores `-1` for a role without a limit, so both spellings of
+    /// unlimited answer `None`, while `0` admits no connection at all.
+    #[test]
+    fn connection_limit_reads_the_sign() {
+        let db = parse_postgres(
+            "CREATE ROLE unlimited CONNECTION LIMIT -1;
+             CREATE ROLE plus CONNECTION LIMIT +5;
+             CREATE ROLE closed CONNECTION LIMIT 0;",
+        );
+
+        assert_eq!(db.role("unlimited").unwrap().connection_limit(), None);
+        assert_eq!(db.role("plus").unwrap().connection_limit(), Some(5));
+        assert_eq!(db.role("closed").unwrap().connection_limit(), Some(0));
+    }
+
+    /// A prepared statement binds the limit only when it runs, so the schema
+    /// holds no limit to report.
+    #[test]
+    fn connection_limit_of_a_placeholder_is_unknown() {
+        let db = parse_postgres("CREATE ROLE templated CONNECTION LIMIT $1;");
+
+        assert_eq!(db.role("templated").unwrap().connection_limit(), None);
     }
 
     #[test]
