@@ -8,11 +8,23 @@
 //! where resolution fails.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::Error, prelude::*};
-use sqlparser::dialect::PostgreSqlDialect;
+use sql_traits::{errors::Error, prelude::*, traits::grant::GrantTarget};
+use sqlparser::{ast::Action, dialect::PostgreSqlDialect};
 
 fn parse(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")
+}
+
+/// Reads a grant's target names out of the one kind the test expects it to
+/// name, failing when the grant names another.
+macro_rules! names_in {
+    ($grant:expr, $kind:ident) => {
+        match $grant.target() {
+            GrantTarget::$kind(names) => Some(names.collect::<Vec<_>>()),
+            _ => None,
+        }
+        .expect(concat!("the grant targets ", stringify!($kind)))
+    };
 }
 
 /// The only `docs` table lives in schema `app`, the schema puts `app` on the
@@ -196,7 +208,7 @@ fn grant_lists_its_table_targets_as_written() {
          GRANT SELECT ON users, app.\"Posts\" TO reader;",
     );
     let grant = db.table_grants().next().expect("the grant exists");
-    let targets: Vec<_> = grant.target_table_names().collect();
+    let targets = names_in!(grant, Tables);
 
     assert_eq!(targets.len(), 2);
     assert_eq!(targets[0].name(), "users");
@@ -206,8 +218,6 @@ fn grant_lists_its_table_targets_as_written() {
     assert!(targets[1].name_is_quoted());
     assert_eq!(targets[1].schema(), Some("app"));
     assert!(!targets[1].schema_is_quoted());
-
-    assert!(grant.target_schema_names().next().is_none());
 }
 
 /// A column grant is the same statement seen through another trait, and it
@@ -221,7 +231,7 @@ fn column_grant_lists_every_table_target() {
          GRANT SELECT (id, name) ON users, posts TO reader;",
     );
     let grant = db.column_grants().next().expect("the grant exists");
-    let targets: Vec<_> = grant.target_table_names().collect();
+    let targets = names_in!(grant, Tables);
     let names: Vec<_> = targets.iter().map(TargetName::name).collect();
 
     assert_eq!(names, ["users", "posts"]);
@@ -235,12 +245,11 @@ fn schema_wide_grant_names_the_schema_not_the_tables() {
          GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader;",
     );
     let grant = db.table_grants().next().expect("the grant exists");
-    let schemas: Vec<_> = grant.target_schema_names().collect();
+    let schemas = names_in!(grant, TablesInSchema);
 
     assert_eq!(schemas.len(), 1);
     assert_eq!(schemas[0].name(), "public");
     assert_eq!(schemas[0].schema(), None);
-    assert!(grant.target_table_names().next().is_none());
 }
 
 #[test]
@@ -261,22 +270,79 @@ fn grant_target_reads_back_when_it_does_not_resolve() {
         .parse::<PostgreSqlDialect>(sql)
         .expect("an open world records it");
     let grant = db.table_grants().next().expect("the grant exists");
+    let targets = names_in!(grant, Tables);
 
-    assert_eq!(grant.target_table_names().next().expect("one target").name(), "absent_table");
+    assert_eq!(targets.first().expect("one target").name(), "absent_table");
     assert!(grant.tables(&db).next().is_none(), "the target resolves to nothing");
 }
 
+/// `ALL PRIVILEGES` on a schema carries `CREATE`, and on the tables of a
+/// schema it carries none, so the two grants must not read alike.
 #[test]
-fn grant_on_a_non_table_object_names_neither() {
+fn direct_schema_grant_names_the_schema_apart_from_its_tables() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE SCHEMA \"Ops\";
+         GRANT ALL ON ALL TABLES IN SCHEMA app TO PUBLIC;
+         GRANT CREATE ON SCHEMA app, \"Ops\" TO PUBLIC;",
+    );
+    let grants: Vec<_> = db.table_grants().collect();
+
+    assert!(matches!(grants[0].target(), GrantTarget::TablesInSchema(_)));
+    let schemas = names_in!(grants[1], Schemas);
+
+    assert_eq!(schemas.len(), 2);
+    assert_eq!(schemas[0].name(), "app");
+    assert!(!schemas[0].name_is_quoted());
+    assert_eq!(schemas[1].name(), "Ops");
+    assert!(schemas[1].name_is_quoted());
+}
+
+/// A revoke that leaves part of a schema grant standing keeps it naming the
+/// schema, with only the privileges the revoke spared.
+#[test]
+fn partial_revoke_of_a_schema_grant_keeps_the_schema_target() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         GRANT USAGE, CREATE ON SCHEMA app TO PUBLIC;
+         REVOKE CREATE ON SCHEMA app FROM PUBLIC;",
+    );
+    let grant = db.table_grants().next().expect("the usage grant survives");
+    let schemas = names_in!(grant, Schemas);
+
+    assert_eq!(schemas.iter().map(TargetName::name).collect::<Vec<_>>(), ["app"]);
+    assert_eq!(grant.privileges(&db).cloned().collect::<Vec<_>>(), [Action::Usage]);
+}
+
+#[test]
+fn sequence_grants_name_sequences_and_the_schemas_they_sweep() {
+    let db = parse(
+        "CREATE SEQUENCE ticket_seq;
+         CREATE SCHEMA app;
+         CREATE SEQUENCE app.order_seq;
+         GRANT USAGE ON SEQUENCE ticket_seq, app.order_seq TO PUBLIC;
+         GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO PUBLIC;",
+    );
+    let grants: Vec<_> = db.table_grants().collect();
+
+    let sequences = names_in!(grants[0], Sequences);
+    assert_eq!(sequences.len(), 2);
+    assert_eq!((sequences[0].name(), sequences[0].schema()), ("ticket_seq", None));
+    assert_eq!((sequences[1].name(), sequences[1].schema()), ("order_seq", Some("app")));
+
+    let schemas = names_in!(grants[1], SequencesInSchema);
+    assert_eq!(schemas.iter().map(TargetName::name).collect::<Vec<_>>(), ["public"]);
+}
+
+#[test]
+fn grant_on_an_undescribed_object_kind_is_other() {
     let db = parse(
         "CREATE ROLE reader;
-         CREATE SCHEMA app;
-         GRANT USAGE ON SCHEMA app TO reader;",
+         GRANT CONNECT ON DATABASE app TO reader;",
     );
     let grant = db.table_grants().next().expect("the grant exists");
 
-    assert!(grant.target_table_names().next().is_none());
-    assert!(grant.target_schema_names().next().is_none());
+    assert!(matches!(grant.target(), GrantTarget::Other));
 }
 
 /// The point of the whole exercise: a caller can classify every policy in a

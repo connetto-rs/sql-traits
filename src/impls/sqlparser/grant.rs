@@ -17,7 +17,8 @@ use crate::{
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{
         ColumnGrantLike, ColumnLike, DatabaseLike, GrantLike, Metadata, RoleLike, TableGrantLike,
-        TableLike, ViewLike, grant::GrantRelation,
+        TableLike, ViewLike,
+        grant::{GrantRelation, GrantTarget},
     },
     utils::{
         identifier_resolution::{
@@ -616,20 +617,22 @@ impl GrantLike for Grant {
         self.grantees.iter().any(grantee_is_public)
     }
 
-    fn target_table_names(&self) -> impl Iterator<Item = TargetName<'_>> {
-        let names: &[ObjectName] = match &self.objects {
-            Some(GrantObjects::Tables(tables)) => tables,
-            _ => &[],
-        };
-        names.iter().filter_map(target_name_from_object_name)
-    }
-
-    fn target_schema_names(&self) -> impl Iterator<Item = TargetName<'_>> {
-        let names: &[ObjectName] = match &self.objects {
-            Some(GrantObjects::AllTablesInSchema { schemas }) => schemas,
-            _ => &[],
-        };
-        names.iter().filter_map(target_name_from_object_name)
+    fn target(&self) -> GrantTarget<impl Iterator<Item = TargetName<'_>>> {
+        fn read(names: &[ObjectName]) -> impl Iterator<Item = TargetName<'_>> {
+            names.iter().filter_map(target_name_from_object_name)
+        }
+        match &self.objects {
+            Some(GrantObjects::Tables(names)) => GrantTarget::Tables(read(names)),
+            Some(GrantObjects::AllTablesInSchema { schemas }) => {
+                GrantTarget::TablesInSchema(read(schemas))
+            }
+            Some(GrantObjects::Schemas(names)) => GrantTarget::Schemas(read(names)),
+            Some(GrantObjects::Sequences(names)) => GrantTarget::Sequences(read(names)),
+            Some(GrantObjects::AllSequencesInSchema { schemas }) => {
+                GrantTarget::SequencesInSchema(read(schemas))
+            }
+            _ => GrantTarget::Other,
+        }
     }
 
     fn with_grant_option(&self) -> bool {

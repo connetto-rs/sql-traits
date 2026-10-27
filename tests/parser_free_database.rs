@@ -15,7 +15,10 @@ use sql_traits::{
     errors::LookupError,
     prelude::*,
     structs::TargetName,
-    traits::{ColumnCollation, TypeMatch, grant::GrantRelation},
+    traits::{
+        ColumnCollation, TypeMatch,
+        grant::{GrantRelation, GrantTarget},
+    },
 };
 use sqlparser::{
     ast::{
@@ -1067,12 +1070,8 @@ impl GrantLike for MemoryTableGrant {
         true
     }
 
-    fn target_table_names(&self) -> impl Iterator<Item = TargetName<'_>> {
-        core::iter::once(TargetName::new(&self.table_name, false))
-    }
-
-    fn target_schema_names(&self) -> impl Iterator<Item = TargetName<'_>> {
-        core::iter::empty()
+    fn target(&self) -> GrantTarget<impl Iterator<Item = TargetName<'_>>> {
+        GrantTarget::Tables(core::iter::once(TargetName::new(&self.table_name, false)))
     }
 
     fn with_grant_option(&self) -> bool {
@@ -1130,12 +1129,8 @@ impl GrantLike for MemoryColumnGrant {
         true
     }
 
-    fn target_table_names(&self) -> impl Iterator<Item = TargetName<'_>> {
-        core::iter::once(TargetName::new(&self.table_name, false))
-    }
-
-    fn target_schema_names(&self) -> impl Iterator<Item = TargetName<'_>> {
-        core::iter::empty()
+    fn target(&self) -> GrantTarget<impl Iterator<Item = TargetName<'_>>> {
+        GrantTarget::Tables(core::iter::once(TargetName::new(&self.table_name, false)))
     }
 
     fn with_grant_option(&self) -> bool {
