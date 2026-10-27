@@ -24,6 +24,8 @@ pub mod function_like;
 pub use function_like::FunctionLike;
 pub mod trigger;
 pub use trigger::TriggerLike;
+pub mod rule;
+pub use rule::{RuleLike, RuleRelation};
 pub mod policy;
 pub use policy::PolicyLike;
 pub mod role;

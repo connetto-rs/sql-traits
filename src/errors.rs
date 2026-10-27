@@ -29,6 +29,8 @@ pub enum ObjectKind {
     Function,
     /// A trigger declared by a `CREATE TRIGGER` statement.
     Trigger,
+    /// A rewrite rule declared by a `CREATE RULE` statement.
+    Rule,
     /// A role declared by a `CREATE ROLE` statement.
     Role,
     /// A schema declared by a `CREATE SCHEMA` statement.
@@ -48,6 +50,7 @@ impl core::fmt::Display for ObjectKind {
             Self::Policy => "Policy",
             Self::Function => "Function",
             Self::Trigger => "Trigger",
+            Self::Rule => "Rule",
             Self::Role => "Role",
             Self::Schema => "Schema",
         })
@@ -154,6 +157,13 @@ pub enum LookupError {
     /// denote one.
     #[error("Table `{object_name}` not found.")]
     TableNotFound {
+        /// Lookup object name as rendered by sqlparser.
+        object_name: String,
+    },
+    /// Relation resolution found neither a table nor a view for a name that is
+    /// required to denote one of the two.
+    #[error("Relation `{object_name}` not found.")]
+    RelationNotFound {
         /// Lookup object name as rendered by sqlparser.
         object_name: String,
     },
@@ -548,6 +558,40 @@ pub enum Error {
         table_name: String,
         /// Name of the policy.
         policy_name: String,
+    },
+    #[error("Relation `{relation_name}` not found for rule `{rule_name}`.")]
+    /// Error indicating that a rule names a table or view that does not exist.
+    ///
+    /// A rule exists only on its relation, so the database refuses one whose
+    /// relation is absent, and so does this crate.
+    RelationNotFoundForRule {
+        /// Name of the relation the rule is declared on.
+        relation_name: String,
+        /// Name of the rule.
+        rule_name: String,
+    },
+    #[error("Rule `{rule_name}` cannot be defined on materialized view `{view_name}`.")]
+    /// Error indicating that a rule names a materialized view, which
+    /// PostgreSQL refuses: rules exist on tables and plain views only.
+    RuleOnMaterializedView {
+        /// Name of the rule.
+        rule_name: String,
+        /// Name of the materialized view the rule names.
+        view_name: String,
+    },
+    #[error(
+        "Rule `{rule_name}` on `{relation_name}` is an `ON SELECT` rule, which is not supported."
+    )]
+    /// Error indicating that a `CREATE RULE` fires `ON SELECT`.
+    ///
+    /// PostgreSQL refuses an `ON SELECT` rule on a table, and on a view it
+    /// only replaces the query behind the view, which `CREATE OR REPLACE
+    /// VIEW` spells directly. The model records neither conversion.
+    SelectRuleUnsupported {
+        /// Name of the rule.
+        rule_name: String,
+        /// Name of the relation the rule names.
+        relation_name: String,
     },
     #[error("Role `{role_name}` not found for the owner of `{object_name}`.")]
     /// Error indicating that an ownership statement names a role that does not
@@ -1028,6 +1072,16 @@ pub enum Error {
         trigger_name: String,
         /// Name of the table carrying it.
         table_name: String,
+    },
+    #[error("Rule `{rule_name}` already exists on relation `{relation_name}`.")]
+    /// Error indicating that a `CREATE RULE` statement names a rule the table
+    /// or view already carries without `OR REPLACE`. A rule name is unique per
+    /// relation, so the same name on another relation is fine.
+    RuleAlreadyExists {
+        /// Name of the rule that already exists.
+        rule_name: String,
+        /// Name of the relation carrying it.
+        relation_name: String,
     },
     #[error("Role `{role_name}` already exists.")]
     /// Error indicating that a `CREATE ROLE` statement names a role that

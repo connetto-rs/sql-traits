@@ -12,8 +12,8 @@ use crate::{
     structs::GenericDB,
     traits::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DialectLike, ForeignKeyLike,
-        FunctionLike, IndexLike, Metadata, PolicyLike, RoleLike, SchemaLike, TableGrantLike,
-        TableLike, TriggerLike, UniqueIndexLike, ViewLike,
+        FunctionLike, IndexLike, Metadata, PolicyLike, RoleLike, RuleLike, SchemaLike,
+        TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, ViewLike,
     },
 };
 
@@ -64,6 +64,8 @@ pub trait SchemaProfile: Sized {
     type CheckConstraint: CheckConstraintLike<DB = GenericDB<Self>>;
     /// The triggers the schema holds.
     type Trigger: TriggerLike<DB = GenericDB<Self>>;
+    /// The rewrite rules the schema holds.
+    type Rule: RuleLike<DB = GenericDB<Self>>;
     /// The row-security policies the schema holds.
     type Policy: PolicyLike<DB = GenericDB<Self>>;
     /// The roles the schema holds.
