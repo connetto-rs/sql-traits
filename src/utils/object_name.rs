@@ -19,7 +19,7 @@ use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
-    traits::{DatabaseLike, FunctionLike, Relation, TableLike, ViewLike},
+    traits::{DatabaseLike, FunctionLike, Relation, SequenceLike, TableLike, ViewLike},
     utils::identifier_resolution::{identifiers_match, normalize_identifier},
 };
 
@@ -508,6 +508,36 @@ pub(crate) fn view_matches_key<V: ViewLike>(
         })
 }
 
+/// Key a stored sequence is indexed under under `case`, folding a schema-less
+/// sequence into `public` exactly as a table is folded.
+pub(crate) fn stored_sequence_key<S: SequenceLike>(
+    sequence: &S,
+    case: IdentifierCase,
+) -> RelationKey {
+    RelationKey {
+        schema: sequence.sequence_schema().map_or_else(
+            || String::from("public"),
+            |schema| case.compared_form(schema, sequence.sequence_schema_is_quoted()).into_owned(),
+        ),
+        name: case
+            .compared_form(sequence.sequence_name(), sequence.sequence_name_is_quoted())
+            .into_owned(),
+    }
+}
+
+/// Returns whether a stored sequence answers a key normalized under `case`,
+/// normalizing only the stored side.
+pub(crate) fn sequence_matches_key<S: SequenceLike>(
+    sequence: &S,
+    key: &RelationKey,
+    case: IdentifierCase,
+) -> bool {
+    key.name == case.compared_form(sequence.sequence_name(), sequence.sequence_name_is_quoted())
+        && sequence.sequence_schema().map_or(key.schema == "public", |schema| {
+            key.schema == case.compared_form(schema, sequence.sequence_schema_is_quoted())
+        })
+}
+
 /// Reference matcher used by tests: compares a table against a written target
 /// without precomputing a key.
 #[cfg(test)]
@@ -555,6 +585,12 @@ pub(crate) fn resolve_one_relation<'a, R>(
 /// originally quoted.
 pub(crate) fn render_view_candidate<V: ViewLike>(view: &V) -> String {
     view.target_name().to_string()
+}
+
+/// Renders a sequence for inclusion in an ambiguity error, quoting parts that
+/// were originally quoted.
+pub(crate) fn render_sequence_candidate<S: SequenceLike>(sequence: &S) -> String {
+    sequence.target_name().to_string()
 }
 
 /// Resolves a single table from a list of candidate matches.
@@ -669,9 +705,9 @@ where
 
 /// Whether any relation of any kind in `database` is stored under `key`.
 ///
-/// Tables, views and materialized views share one pool of names, so this is
-/// what ends a search-path walk: a schema holding the name under another kind
-/// is not looked past.
+/// Tables, views, materialized views and sequences share one pool of names,
+/// so this is what ends a search-path walk: a schema holding the name under
+/// another kind is not looked past.
 pub(crate) fn relation_name_is_claimed<DB: DatabaseLike>(
     database: &DB,
     key: &RelationKey,
@@ -680,6 +716,7 @@ pub(crate) fn relation_name_is_claimed<DB: DatabaseLike>(
     database.tables().any(|table| stored_table_key(table, case) == *key)
         || database.views().any(|view| stored_view_key(view, case) == *key)
         || database.materialized_views().any(|view| stored_view_key(view, case) == *key)
+        || database.sequences().any(|sequence| stored_sequence_key(sequence, case) == *key)
 }
 
 /// Resolves a written target name against an iterator of tables, trying each
@@ -762,6 +799,57 @@ pub(crate) fn resolve_view_in_iter<'a, V: ViewLike>(
     let key = target_key(target, case);
     let candidates: Vec<&V> = views.filter(|view| stored_view_key(*view, case) == key).collect();
     resolve_one_relation(target, &candidates, render_view_candidate)
+}
+
+/// Resolves a written target name against an iterator of sequences, trying
+/// each schema on `search_path` in turn for an unqualified name.
+///
+/// `claimed` carries the same meaning it has for
+/// [`resolve_target_on_search_path_in_iter`].
+///
+/// # Errors
+///
+/// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
+/// than one sequence in the schema that wins, reported under the name the
+/// statement wrote.
+pub(crate) fn resolve_sequence_on_search_path_in_iter<'a, 'path, S: SequenceLike, I>(
+    sequences: impl Iterator<Item = &'a S>,
+    target: &TargetName<'_>,
+    search_path: impl Fn() -> I,
+    case: IdentifierCase,
+    claimed: impl Fn(&RelationKey) -> bool,
+) -> Result<Option<&'a S>, LookupError>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
+    resolve_relation_on_search_path(
+        sequences,
+        target,
+        search_path,
+        case,
+        stored_sequence_key,
+        claimed,
+        render_sequence_candidate,
+    )
+}
+
+/// Resolves a written target name against an iterator of sequences,
+/// consulting no search path, so an unqualified name names the default
+/// schema.
+///
+/// # Errors
+///
+/// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
+/// than one sequence.
+pub(crate) fn resolve_sequence_in_iter<'a, S: SequenceLike>(
+    sequences: impl Iterator<Item = &'a S>,
+    target: &TargetName<'_>,
+    case: IdentifierCase,
+) -> Result<Option<&'a S>, LookupError> {
+    let key = target_key(target, case);
+    let candidates: Vec<&S> =
+        sequences.filter(|sequence| stored_sequence_key(*sequence, case) == key).collect();
+    resolve_one_relation(target, &candidates, render_sequence_candidate)
 }
 
 /// Resolves a written function reference against an iterator of declarations,

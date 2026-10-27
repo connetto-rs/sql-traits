@@ -39,14 +39,14 @@ use crate::{
     impls::SqlparserDialect,
     structs::{
         ColumnIdentity, ColumnMetadata, FunctionKind, GenericDB, IdentifierCase, MaterializedView,
-        RelationIdentity, RoleMembership, Schema, SchemaProfile, TableAttribute, TableMetadata,
-        View,
+        RelationIdentity, RoleMembership, Schema, SchemaProfile, Sequence, TableAttribute,
+        TableMetadata, View,
         metadata::{
             CheckMetadata, ExpressionCalls, FunctionMetadata, IndexMetadata, PolicyMetadata,
             UniqueIndexMetadata,
         },
     },
-    traits::{ColumnLike, IndexLike, TableLike, ViewLike},
+    traits::{ColumnLike, IndexLike, SequenceLike, TableLike, ViewLike},
     utils::{
         columns_in_expression,
         identifier_resolution::{
@@ -57,10 +57,11 @@ use crate::{
             Qualifier, RelationKey, TEMPORARY_SCHEMA, is_temporary_schema, object_name_identifiers,
             object_name_last_part, overqualified_object_name, qualifier_of, relation_search_path,
             require_local_object_name, require_static_object_name,
-            resolve_table_object_name_in_iter, resolve_table_object_name_on_search_path_in_iter,
+            resolve_sequence_on_search_path_in_iter, resolve_table_object_name_in_iter,
+            resolve_table_object_name_on_search_path_in_iter,
             resolve_target_on_search_path_in_iter, resolve_view_on_search_path_in_iter,
-            stored_table_key, table_matches_key, table_matches_object_name, target_name_of_idents,
-            target_name_of_object_name, view_matches_key,
+            sequence_matches_key, stored_table_key, table_matches_key, table_matches_object_name,
+            target_name_of_idents, target_name_of_object_name, view_matches_key,
         },
     },
 };
@@ -82,6 +83,7 @@ mod postgres_catalog;
 mod role_memberships;
 mod routine_privileges;
 mod rules;
+mod sequences;
 mod table_owner;
 mod transactions;
 mod view_rewrites;
@@ -103,6 +105,7 @@ impl SchemaProfile for SqlparserProfile {
     type Table = CreateTable;
     type View = View;
     type MaterializedView = MaterializedView;
+    type Sequence = Sequence;
     type Column = TableAttribute<CreateTable, ColumnDef>;
     type DataType = DataType;
     type Index = TableAttribute<CreateTable, CreateIndex>;
@@ -1389,8 +1392,8 @@ impl ParserDBBuilder {
 
     /// Whether any relation belongs to this schema.
     ///
-    /// A view counts as much as a table: PostgreSQL refuses `DROP SCHEMA`
-    /// without `CASCADE` while a schema holds either.
+    /// A view or a sequence counts as much as a table: PostgreSQL refuses
+    /// `DROP SCHEMA` without `CASCADE` while a schema holds any of them.
     fn is_schema_non_empty(&self, schema_name: &str, schema_quoted: bool) -> bool {
         let in_schema = |stored: Option<(&str, bool)>| {
             stored.is_some_and(|(stored_schema, stored_quoted)| {
@@ -1403,6 +1406,12 @@ impl ParserDBBuilder {
             in_schema(view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())))
         }) || self.materialized_views().iter().any(|(view, _, _)| {
             in_schema(view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())))
+        }) || self.sequences().iter().any(|(sequence, ())| {
+            in_schema(
+                sequence
+                    .sequence_schema()
+                    .map(|schema| (schema, sequence.sequence_schema_is_quoted())),
+            )
         }) || extensions::schema_holds_extension(self, schema_name, schema_quoted)
     }
 
@@ -1482,7 +1491,8 @@ impl ParserDBBuilder {
         }
     }
 
-    /// Whether any table, view or materialized view is stored under `key`.
+    /// Whether any table, view, materialized view or sequence is stored under
+    /// `key`.
     fn relation_key_is_held(&self, key: &RelationKey, case: IdentifierCase) -> bool {
         self.tables().iter().any(|(table, _, _)| table_matches_key(table.as_ref(), key, case))
             || self.views().iter().any(|(view, _, _)| view_matches_key(view.as_ref(), key, case))
@@ -1490,6 +1500,10 @@ impl ParserDBBuilder {
                 .materialized_views()
                 .iter()
                 .any(|(view, _, _)| view_matches_key(view.as_ref(), key, case))
+            || self
+                .sequences()
+                .iter()
+                .any(|(sequence, ())| sequence_matches_key(sequence.as_ref(), key, case))
     }
 
     /// Binds every relation a grant or revoke names to the one it reaches
@@ -1574,9 +1588,9 @@ impl ParserDBBuilder {
         }
     }
 
-    /// The table, view or materialized view a reference reaches through the
-    /// session's path, the first schema holding the name under any kind ending
-    /// the walk.
+    /// The table, view, materialized view or sequence a reference reaches
+    /// through the session's path, the first schema holding the name under
+    /// any kind ending the walk.
     fn bound_relation(&self, reference: &ObjectName) -> Option<BoundRelation> {
         let (schema_ident, name_ident) = object_name_identifiers(reference).ok()?;
         let target = target_name_of_idents(schema_ident, name_ident);
@@ -1611,7 +1625,7 @@ impl ParserDBBuilder {
                 temporary: view.is_temporary(),
             });
         }
-        resolve_view_on_search_path_in_iter(
+        if let Some(view) = resolve_view_on_search_path_in_iter(
             self.materialized_views().iter().map(|(view, _, _)| view.as_ref()),
             &target,
             path,
@@ -1619,8 +1633,31 @@ impl ParserDBBuilder {
             claimed,
         )
         .ok()?
-        .map(|view| {
-            BoundRelation { qualifier: stored_view_qualifier(view), temporary: view.is_temporary() }
+        {
+            return Some(BoundRelation {
+                qualifier: stored_view_qualifier(view),
+                temporary: view.is_temporary(),
+            });
+        }
+        resolve_sequence_on_search_path_in_iter(
+            self.sequences().iter().map(|(sequence, ())| sequence.as_ref()),
+            &target,
+            path,
+            case,
+            claimed,
+        )
+        .ok()?
+        .map(|sequence| {
+            BoundRelation {
+                qualifier: sequence.sequence_schema().map(|schema| {
+                    if sequence.sequence_schema_is_quoted() {
+                        Ident::with_quote('"', schema)
+                    } else {
+                        Ident::new(schema)
+                    }
+                }),
+                temporary: sequence.is_temporary(),
+            }
         })
     }
 }
@@ -3313,11 +3350,39 @@ fn view_holds_name<V: ViewLike>(
     )
 }
 
+/// Returns the kind of a sequence already holding `name` in `schema`, if one
+/// does.
+fn sequence_name_holder(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    schema: SchemaQualifier<'_>,
+) -> Option<ObjectKind> {
+    let case = builder.identifier_case();
+    builder
+        .sequences()
+        .iter()
+        .any(|(sequence, ())| {
+            case.identifiers_match(
+                sequence.sequence_name(),
+                sequence.sequence_name_is_quoted(),
+                name.value.as_str(),
+                name.quote_style.is_some(),
+            ) && schema_qualifiers_match(
+                sequence
+                    .sequence_schema()
+                    .map(|value| (value, sequence.sequence_schema_is_quoted())),
+                schema,
+                case,
+            )
+        })
+        .then_some(ObjectKind::Sequence)
+}
+
 /// Returns the kind of relation already holding `name` in `schema`, if any.
 ///
-/// Tables in a schema, views and materialized views over them, and indexes on
-/// them all share one pool of names. A relation the caller is about to replace
-/// has to be out of the stores before this is asked.
+/// Tables in a schema, views and materialized views over them, sequences, and
+/// indexes on tables all share one pool of names. A relation the caller is
+/// about to replace has to be out of the stores before this is asked.
 fn relation_name_holder(
     builder: &ParserDBBuilder,
     name: &Ident,
@@ -3335,7 +3400,9 @@ fn relation_name_holder(
     if table {
         return Some(ObjectKind::Table);
     }
-    view_name_holder(builder, name, schema).or_else(|| index_name_holder(builder, name, schema))
+    view_name_holder(builder, name, schema)
+        .or_else(|| sequence_name_holder(builder, name, schema))
+        .or_else(|| index_name_holder(builder, name, schema))
 }
 
 /// Checks that nothing in the schema of a table node already holds a name the
@@ -3358,6 +3425,7 @@ fn validate_relation_names(
             // Views and indexes are asked for here.
             ObjectKind::Table => {
                 view_name_holder(builder, name, schema)
+                    .or_else(|| sequence_name_holder(builder, name, schema))
                     .or_else(|| index_name_holder(builder, name, schema))
             }
             _ => relation_name_holder(builder, name, schema),
@@ -6630,9 +6698,9 @@ impl ParserDB {
                     // table an earlier name takes along still counts as found.
                     let mut targets = Vec::with_capacity(names.len());
                     for name in &names {
-                        // A view is refused rather than dropped, and named as
-                        // the wrong kind, as PostgreSQL does.
-                        views::refuse_dropping_view_as_table(&builder, name)?;
+                        // A view or a sequence is refused rather than dropped,
+                        // and named as the wrong kind, as PostgreSQL does.
+                        views::refuse_dropping_relation_as_table(&builder, name)?;
                         match builder.resolve_table_object_name(name)? {
                             Some(table) => targets.push(StoredTable::of(table)),
                             None if if_exists => {}
@@ -7049,7 +7117,8 @@ impl ParserDB {
                             });
                         }
 
-                        // If CASCADE, remove all tables and extensions in the
+                        // If CASCADE, remove all tables, sequences and
+                        // extensions in the
                         // schema first
                         if cascade {
                             use crate::traits::TableLike;
@@ -7070,6 +7139,11 @@ impl ParserDB {
                                 .map(StoredTable::of)
                                 .collect();
                             builder = Self::remove_tables(builder, &doomed)?;
+                            sequences::drop_sequences_in(
+                                &mut builder,
+                                &resolved_schema_name,
+                                resolved_schema_quoted,
+                            );
                             extensions::drop_extensions_in(
                                 &mut builder,
                                 &resolved_schema_name,
@@ -7626,6 +7700,24 @@ impl ParserDB {
                         &inherited.column_metadata,
                         TableOrigin::Declaration(documentation),
                     )?;
+                }
+                Statement::CreateSequence { temporary, if_not_exists, name, sequence_options } => {
+                    builder = sequences::create_sequence(
+                        builder,
+                        temporary,
+                        if_not_exists,
+                        name,
+                        sequence_options,
+                    )?;
+                }
+                Statement::Drop {
+                    object_type: sqlparser::ast::ObjectType::Sequence,
+                    if_exists,
+                    names,
+                    cascade,
+                    ..
+                } => {
+                    builder = sequences::drop_sequences(builder, &names, if_exists, cascade)?;
                 }
                 Statement::CreateView(create_view) => {
                     builder = views::create_view(builder, create_view)?;

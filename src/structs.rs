@@ -14,6 +14,7 @@ mod identity;
 pub mod metadata;
 mod role_membership;
 mod schema;
+mod sequence;
 mod target_name;
 mod view;
 
@@ -29,5 +30,6 @@ pub use identity::{ColumnIdentity, RelationIdentity};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
 pub use role_membership::RoleMembership;
 pub use schema::Schema;
+pub use sequence::Sequence;
 pub use target_name::TargetName;
 pub use view::{MaterializedView, View, ViewDeclaration};

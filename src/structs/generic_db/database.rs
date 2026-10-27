@@ -14,9 +14,10 @@ use crate::{
     traits::{DatabaseLike, Relation, TableLike},
     utils::object_name::{
         RelationKey, function_has_stored_identity, function_search_path, relation_search_path,
-        render_relation, render_table_candidate, render_view_candidate, resolve_one_function,
-        resolve_one_relation, resolve_target_from_candidates, stored_function_key,
-        stored_identity_key, stored_table_key, stored_view_key,
+        render_relation, render_sequence_candidate, render_table_candidate, render_view_candidate,
+        resolve_one_function, resolve_one_relation, resolve_target_from_candidates,
+        stored_function_key, stored_identity_key, stored_sequence_key, stored_table_key,
+        stored_view_key,
     },
 };
 
@@ -24,6 +25,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type Table = P::Table;
     type View = P::View;
     type MaterializedView = P::MaterializedView;
+    type Sequence = P::Sequence;
     type Column = P::Column;
     type DataType = P::DataType;
     type Index = P::Index;
@@ -85,6 +87,10 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         self.materialized_views.iter().map(|(view, _, _)| view.as_ref())
     }
 
+    fn sequences(&self) -> impl Iterator<Item = &Self::Sequence> {
+        self.sequences.iter().map(|(sequence, _)| sequence.as_ref())
+    }
+
     fn table_id(&self, table: &Self::Table) -> Option<usize> {
         self.tables
             .binary_search_by_key(&(table.table_schema(), table.table_name()), |(t, _, _)| {
@@ -130,14 +136,18 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     fn table_by_identity(&self, identity: Self::RelationId) -> Option<&Self::Table> {
         match self.relation_slot(identity)? {
             RelationSlot::Table(position) => Some(self.tables[position].0.as_ref()),
-            RelationSlot::View(_) | RelationSlot::MaterializedView(_) => None,
+            RelationSlot::View(_)
+            | RelationSlot::MaterializedView(_)
+            | RelationSlot::Sequence(_) => None,
         }
     }
 
     fn view_by_identity(&self, identity: Self::RelationId) -> Option<&Self::View> {
         match self.relation_slot(identity)? {
             RelationSlot::View(position) => Some(self.views[position].0.as_ref()),
-            RelationSlot::Table(_) | RelationSlot::MaterializedView(_) => None,
+            RelationSlot::Table(_)
+            | RelationSlot::MaterializedView(_)
+            | RelationSlot::Sequence(_) => None,
         }
     }
 
@@ -149,7 +159,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
             RelationSlot::MaterializedView(position) => {
                 Some(self.materialized_views[position].0.as_ref())
             }
-            RelationSlot::Table(_) | RelationSlot::View(_) => None,
+            RelationSlot::Table(_) | RelationSlot::View(_) | RelationSlot::Sequence(_) => None,
         }
     }
 
@@ -200,6 +210,19 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         self.resolve_probed_relation(&probe, &target)
     }
 
+    fn resolve_target_sequence(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Sequence>, LookupError> {
+        self.resolve_relation_on_path(
+            &target,
+            case,
+            Self::probed_sequences,
+            render_sequence_candidate,
+        )
+    }
+
     fn table_by_target(
         &self,
         target: TargetName<'_>,
@@ -228,6 +251,15 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
             &self.probed_materialized_views(&probe),
             render_view_candidate,
         )
+    }
+
+    fn sequence_by_target(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Sequence>, LookupError> {
+        let probe = IndexProbe::new(&target, case, None);
+        resolve_one_relation(&target, &self.probed_sequences(&probe), render_sequence_candidate)
     }
 
     fn function_by_target(
@@ -415,7 +447,9 @@ impl<P: SchemaProfile> GenericDB<P> {
             .filter_map(|slot| {
                 match slot {
                     RelationSlot::Table(position) => self.tables.get(*position),
-                    RelationSlot::View(_) | RelationSlot::MaterializedView(_) => None,
+                    RelationSlot::View(_)
+                    | RelationSlot::MaterializedView(_)
+                    | RelationSlot::Sequence(_) => None,
                 }
             })
             .map(|(table, _, _)| table.as_ref())
@@ -429,7 +463,9 @@ impl<P: SchemaProfile> GenericDB<P> {
             .filter_map(|slot| {
                 match slot {
                     RelationSlot::View(position) => self.views.get(*position),
-                    RelationSlot::Table(_) | RelationSlot::MaterializedView(_) => None,
+                    RelationSlot::Table(_)
+                    | RelationSlot::MaterializedView(_)
+                    | RelationSlot::Sequence(_) => None,
                 }
             })
             .map(|(view, _, _)| view.as_ref())
@@ -448,7 +484,9 @@ impl<P: SchemaProfile> GenericDB<P> {
                     RelationSlot::MaterializedView(position) => {
                         self.materialized_views.get(*position)
                     }
-                    RelationSlot::Table(_) | RelationSlot::View(_) => None,
+                    RelationSlot::Table(_) | RelationSlot::View(_) | RelationSlot::Sequence(_) => {
+                        None
+                    }
                 }
             })
             .map(|(view, _, _)| view.as_ref())
@@ -456,11 +494,29 @@ impl<P: SchemaProfile> GenericDB<P> {
             .collect()
     }
 
+    /// Sequences a probe accepts, in storage order.
+    fn probed_sequences<'db>(&'db self, probe: &IndexProbe) -> Vec<&'db P::Sequence> {
+        self.probed_relation_slots(probe)
+            .filter_map(|slot| {
+                match slot {
+                    RelationSlot::Sequence(position) => self.sequences.get(*position),
+                    RelationSlot::Table(_)
+                    | RelationSlot::View(_)
+                    | RelationSlot::MaterializedView(_) => None,
+                }
+            })
+            .map(|(sequence, _)| sequence.as_ref())
+            .filter(|sequence| {
+                probe.accepts(|| stored_sequence_key(*sequence, IdentifierCase::Exact))
+            })
+            .collect()
+    }
+
     /// Whether any relation of any kind answers a probe.
     ///
-    /// Tables, views and materialized views share one pool of names, so a
-    /// schema holding the name under any kind ends a search-path walk, as
-    /// PostgreSQL's own name resolution does.
+    /// Tables, views, materialized views and sequences share one pool of
+    /// names, so a schema holding the name under any kind ends a search-path
+    /// walk, as PostgreSQL's own name resolution does.
     fn probed_name_is_taken(&self, probe: &IndexProbe) -> bool {
         self.probed_relation_slots(probe).any(|slot| {
             match slot {
@@ -477,6 +533,13 @@ impl<P: SchemaProfile> GenericDB<P> {
                 RelationSlot::MaterializedView(position) => {
                     self.materialized_views.get(*position).is_some_and(|(view, _, _)| {
                         probe.accepts(|| stored_view_key(view.as_ref(), IdentifierCase::Exact))
+                    })
+                }
+                RelationSlot::Sequence(position) => {
+                    self.sequences.get(*position).is_some_and(|(sequence, _)| {
+                        probe.accepts(|| {
+                            stored_sequence_key(sequence.as_ref(), IdentifierCase::Exact)
+                        })
                     })
                 }
             }
@@ -545,7 +608,9 @@ impl<P: SchemaProfile> GenericDB<P> {
             .filter_map(|slot| {
                 match slot {
                     RelationSlot::Table(position) => self.tables.get(*position),
-                    RelationSlot::View(_) | RelationSlot::MaterializedView(_) => None,
+                    RelationSlot::View(_)
+                    | RelationSlot::MaterializedView(_)
+                    | RelationSlot::Sequence(_) => None,
                 }
             })
             .map(|(table, _, _)| table.as_ref())

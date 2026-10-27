@@ -239,6 +239,7 @@ fn every_kind_renders_its_own_spelling() {
         (ObjectKind::Extension, "Extension"),
         (ObjectKind::Role, "Role"),
         (ObjectKind::Schema, "Schema"),
+        (ObjectKind::Sequence, "Sequence"),
     ] {
         assert_eq!(
             kind.not_in_database("x").to_string(),

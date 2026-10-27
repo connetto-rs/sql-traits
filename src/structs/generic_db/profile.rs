@@ -13,8 +13,8 @@ use crate::{
     traits::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, ExtensionLike,
         ForeignKeyLike, FunctionLike, IndexLike, Metadata, PolicyLike, RoleLike,
-        RoleMembershipLike, RuleLike, SchemaLike, TableGrantLike, TableLike, TriggerLike,
-        UniqueIndexLike, ViewLike,
+        RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike,
+        TriggerLike, UniqueIndexLike, ViewLike,
     },
 };
 
@@ -51,6 +51,8 @@ pub trait SchemaProfile: Sized {
     type View: ViewLike<DB = GenericDB<Self>>;
     /// The materialized views the schema holds.
     type MaterializedView: ViewLike<DB = GenericDB<Self>>;
+    /// The sequences the schema holds.
+    type Sequence: SequenceLike<DB = GenericDB<Self>>;
     /// The columns the schema holds.
     type Column: ColumnLike<DB = GenericDB<Self>>;
     /// The declared data types of the columns the schema holds.

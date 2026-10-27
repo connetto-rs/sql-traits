@@ -321,18 +321,21 @@ fn materialized_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> O
         .position(|(view, _, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == key)
 }
 
-/// Refuses a `DROP TABLE` naming a view, as PostgreSQL does.
+/// Refuses a `DROP TABLE` naming a view or a sequence, as PostgreSQL does.
 ///
 /// # Errors
 ///
 /// Returns [`Error::RelationKindMismatch`] when the name is held by either
-/// view kind.
-pub(super) fn refuse_dropping_view_as_table(
+/// view kind or by a sequence.
+pub(super) fn refuse_dropping_relation_as_table(
     builder: &ParserDBBuilder,
     name: &ObjectName,
 ) -> Result<(), Error> {
     match builder.relation_reached(name) {
-        Some((actual_kind @ (ObjectKind::View | ObjectKind::MaterializedView), _)) => {
+        Some((
+            actual_kind @ (ObjectKind::View | ObjectKind::MaterializedView | ObjectKind::Sequence),
+            _,
+        )) => {
             Err(Error::RelationKindMismatch {
                 object_name: rendered_name(name),
                 expected_kind: ObjectKind::Table,

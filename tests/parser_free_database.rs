@@ -23,6 +23,7 @@ use sqlparser::{
         Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
         CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, ReferentialAction,
+        SequenceOptions,
         Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
     dialect::GenericDialect,
@@ -38,6 +39,7 @@ struct MemoryCatalog {
     schemas: Vec<MemorySchema>,
     views: Vec<MemoryView>,
     materialized_views: Vec<MemoryView>,
+    sequences: Vec<MemorySequence>,
     indexes: Vec<MemoryIndex>,
     unique_indexes: Vec<MemoryUniqueIndex>,
     foreign_keys: Vec<MemoryForeignKey>,
@@ -108,6 +110,12 @@ struct MemoryView {
     materialized: bool,
     definition: Query,
     declared_column_names: Vec<(String, bool)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct MemorySequence {
+    schema: Option<String>,
+    name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -208,6 +216,7 @@ plain_metadata!(
     MemoryColumn,
     MemorySchema,
     MemoryView,
+    MemorySequence,
     MemoryIndex,
     MemoryUniqueIndex,
     MemoryForeignKey,
@@ -227,6 +236,7 @@ impl DatabaseLike for MemoryCatalog {
     type Table = MemoryTable;
     type View = MemoryView;
     type MaterializedView = MemoryView;
+    type Sequence = MemorySequence;
     type Column = MemoryColumn;
     type DataType = MemoryDataType;
     type Index = MemoryIndex;
@@ -302,6 +312,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn materialized_views(&self) -> impl Iterator<Item = &Self::MaterializedView> {
         self.materialized_views.iter()
+    }
+
+    fn sequences(&self) -> impl Iterator<Item = &Self::Sequence> {
+        self.sequences.iter()
     }
 
     fn table_id(&self, table: &Self::Table) -> Option<usize> {
@@ -639,6 +653,22 @@ impl ViewLike for MemoryView {
 
     fn declared_column_names(&self) -> &[(String, bool)] {
         &self.declared_column_names
+    }
+}
+
+impl SequenceLike for MemorySequence {
+    type DB = MemoryCatalog;
+
+    fn sequence_name(&self) -> &str {
+        &self.name
+    }
+
+    fn sequence_schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
+    fn options(&self) -> &[SequenceOptions] {
+        &[]
     }
 }
 
@@ -1824,6 +1854,40 @@ fn the_inherited_resolver_reads_one_pool_of_names() -> Result<(), LookupError> {
             .resolve_target_table(TargetName::new("notes", false), IdentifierCase::AsWritten)?
             .is_some()
     );
+
+    Ok(())
+}
+
+/// A sequence takes its name from the pool tables and views share, so the
+/// inherited resolvers stop at a schema holding it, and the sequence lookups
+/// answer only sequences.
+#[test]
+fn the_inherited_resolvers_count_sequences_in_the_pool() -> Result<(), LookupError> {
+    let mut catalog = catalog();
+    catalog.search_path = vec![(String::from("app"), false), (String::from("public"), false)];
+    catalog.tables = vec![table(None, "docs")];
+    catalog.columns = vec![column(None, "docs", "id")];
+    catalog.sequences =
+        vec![MemorySequence { schema: Some(String::from("app")), name: String::from("docs") }];
+    let case = IdentifierCase::AsWritten;
+
+    assert!(catalog.resolve_target_table(TargetName::new("docs", false), case)?.is_none());
+    let sequence = catalog
+        .resolve_target_sequence(TargetName::new("docs", false), case)?
+        .expect("the path reaches the sequence in `app`");
+    assert_eq!(sequence.sequence_schema(), Some("app"));
+    assert!(catalog.sequence_by_target(TargetName::new("docs", false), case)?.is_none());
+    assert!(
+        catalog
+            .sequence_by_target(TargetName::new("docs", false).with_schema("app", false), case)?
+            .is_some()
+    );
+
+    // Mirrored, the table earlier on the path hides the sequence.
+    catalog.tables = vec![table(Some("app"), "notes")];
+    catalog.columns = vec![column(Some("app"), "notes", "id")];
+    catalog.sequences = vec![MemorySequence { schema: None, name: String::from("notes") }];
+    assert!(catalog.resolve_target_sequence(TargetName::new("notes", false), case)?.is_none());
 
     Ok(())
 }

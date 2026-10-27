@@ -19,8 +19,8 @@ use crate::{
         TriggerLike, ViewLike,
     },
     utils::object_name::{
-        RelationKey, render_table_candidate, stored_function_key, stored_table_key,
-        stored_view_key, table_matches_key, view_matches_key,
+        RelationKey, render_table_candidate, stored_function_key, stored_sequence_key,
+        stored_table_key, stored_view_key, table_matches_key, view_matches_key,
     },
 };
 
@@ -93,6 +93,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     views: Vec<Identified<P::View, RelationIdentity>>,
     /// List of materialized views in the database.
     materialized_views: Vec<Identified<P::MaterializedView, RelationIdentity>>,
+    /// List of sequences in the database.
+    sequences: Vec<Stored<P::Sequence>>,
     /// List of columns in the database.
     columns: Vec<Identified<P::Column, ColumnIdentity>>,
     /// List of indices in the database.
@@ -144,6 +146,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             tables: self.tables.clone(),
             views: self.views.clone(),
             materialized_views: self.materialized_views.clone(),
+            sequences: self.sequences.clone(),
             columns: self.columns.clone(),
             indices: self.indices.clone(),
             unique_indices: self.unique_indices.clone(),
@@ -205,6 +208,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             timezone: self.timezone.clone(),
             views: views_named_by(&self.views, keys),
             materialized_views: views_named_by(&self.materialized_views, keys),
+            sequences: Vec::new(),
             tables,
             columns,
             indices: Vec::new(),
@@ -255,6 +259,16 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &self,
     ) -> &[Identified<P::MaterializedView, RelationIdentity>] {
         &self.materialized_views
+    }
+
+    /// Returns the sequences recorded so far, with their metadata.
+    pub(crate) fn sequences(&self) -> &[Stored<P::Sequence>] {
+        &self.sequences
+    }
+
+    /// Returns a mutable reference to the sequences list.
+    pub(crate) fn sequences_mut(&mut self) -> &mut Vec<Stored<P::Sequence>> {
+        &mut self.sequences
     }
 
     /// Returns `saved` as the builder a rollback leaves, keeping this
@@ -458,6 +472,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             tables: Vec::new(),
             views: Vec::new(),
             materialized_views: Vec::new(),
+            sequences: Vec::new(),
             columns: Vec::new(),
             indices: Vec::new(),
             unique_indices: Vec::new(),
@@ -898,6 +913,14 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             .fold(self, |builder, (view, metadata)| builder.add_materialized_view(view, metadata))
     }
 
+    /// Adds a sequence with its metadata to the builder.
+    #[must_use]
+    #[inline]
+    pub fn add_sequence(mut self, sequence: Arc<P::Sequence>, metadata: Meta<P::Sequence>) -> Self {
+        self.sequences.push((sequence, metadata));
+        self
+    }
+
     /// Reopens a built database for further ingestion, handing its
     /// continuation state back beside the builder.
     ///
@@ -911,6 +934,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             tables,
             views,
             materialized_views,
+            sequences,
             relation_index: _,
             folded_relation_index: _,
             columns,
@@ -944,6 +968,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             tables,
             views,
             materialized_views,
+            sequences,
             columns,
             indices,
             unique_indices,
@@ -1007,6 +1032,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             stored_view_key(a.as_ref(), IdentifierCase::AsWritten)
                 .cmp(&stored_view_key(b.as_ref(), IdentifierCase::AsWritten))
         });
+        self.sequences.sort_unstable_by(|(a, _), (b, _)| {
+            stored_sequence_key(a.as_ref(), IdentifierCase::AsWritten)
+                .cmp(&stored_sequence_key(b.as_ref(), IdentifierCase::AsWritten))
+        });
         // Grants are not sorted as their order may be significant
     }
 
@@ -1016,9 +1045,9 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.sort_stores();
         let catalog_name = self.catalog_name;
 
-        // Tables, views and materialized views share one pool of names, so one
-        // index answers all three. Slots of a kind stay ascending because each
-        // kind is walked in storage order.
+        // Tables, views, materialized views and sequences share one pool of
+        // names, so one index answers all four. Slots of a kind stay ascending
+        // because each kind is walked in storage order.
         let mut relation_index: BTreeMap<_, Vec<RelationSlot>> = BTreeMap::new();
         let mut relation_identities = Vec::with_capacity(
             self.tables.len() + self.views.len() + self.materialized_views.len(),
@@ -1043,6 +1072,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
                 .or_default()
                 .push(RelationSlot::MaterializedView(position));
             relation_identities.push((*identity, RelationSlot::MaterializedView(position)));
+        }
+        for (position, (sequence, _)) in self.sequences.iter().enumerate() {
+            relation_index
+                .entry(stored_sequence_key(sequence.as_ref(), IdentifierCase::AsWritten))
+                .or_default()
+                .push(RelationSlot::Sequence(position));
         }
         relation_identities.sort_unstable_by_key(|(identity, _)| *identity);
         let mut column_identities: Vec<_> = self
@@ -1073,6 +1108,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             tables: self.tables,
             views: self.views,
             materialized_views: self.materialized_views,
+            sequences: self.sequences,
             relation_index,
             folded_relation_index,
             columns: self.columns,
