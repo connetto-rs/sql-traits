@@ -6,6 +6,7 @@ use sql_traits::prelude::*;
 pub(crate) fn relation_label(relation: Relation<'_, ParserDB>) -> String {
     match relation {
         Relation::Table(table) => format!("table {}", table.table_name()),
+        Relation::ForeignTable(table) => format!("foreign table {}", table.table_name()),
         Relation::View(view) => format!("view {}", view.view_name()),
         Relation::MaterializedView(view) => format!("materialized view {}", view.view_name()),
         Relation::Sequence(sequence) => format!("sequence {}", sequence.sequence_name()),

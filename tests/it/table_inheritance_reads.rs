@@ -72,7 +72,9 @@ fn named(sql: &str, database: &ParserDB) -> Vec<String> {
         .iter()
         .map(|relation| {
             match relation {
-                Relation::Table(table) => table.table_name().to_owned(),
+                Relation::Table(table) | Relation::ForeignTable(table) => {
+                    table.table_name().to_owned()
+                }
                 Relation::View(view) => view.view_name().to_owned(),
                 Relation::MaterializedView(view) => view.view_name().to_owned(),
                 Relation::Sequence(sequence) => sequence.sequence_name().to_owned(),

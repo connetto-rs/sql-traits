@@ -385,7 +385,10 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
                 }
                 Ok(None)
             }
-            Relation::MaterializedView(_) | Relation::Sequence(_) => Ok(None),
+            // A foreign table carries no policies, so nothing expands below it.
+            Relation::ForeignTable(_) | Relation::MaterializedView(_) | Relation::Sequence(_) => {
+                Ok(None)
+            }
         }
     }
 }

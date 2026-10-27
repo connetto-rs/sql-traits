@@ -40,7 +40,9 @@ fn reached(db: &ParserDB) -> Vec<String> {
         .flat_map(|grant| grant.relations(db).collect::<Vec<_>>())
         .map(|relation| {
             let (schema, name) = match relation {
-                Relation::Table(table) => (table.table_schema(), table.table_name()),
+                Relation::Table(table) | Relation::ForeignTable(table) => {
+                    (table.table_schema(), table.table_name())
+                }
                 Relation::View(view) => (view.view_schema(), view.view_name()),
                 Relation::MaterializedView(view) => (view.view_schema(), view.view_name()),
                 Relation::Sequence(sequence) => {
