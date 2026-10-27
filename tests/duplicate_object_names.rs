@@ -629,6 +629,36 @@ fn dropping_a_function_without_an_argument_list_needs_the_name_to_be_unique() {
     );
 }
 
+/// A name without an argument list still names a schema, `public` when it
+/// writes none, so a function of that name in another schema neither answers
+/// nor makes the name ambiguous.
+#[test]
+fn dropping_a_function_without_an_argument_list_stays_in_its_schema() {
+    let dropped = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION f() RETURNS INT AS 'SELECT 1;';
+         CREATE FUNCTION app.f() RETURNS INT AS 'SELECT 2;';
+         DROP FUNCTION f;",
+    )
+    .expect("only public.f carries the unqualified name");
+    let left: Vec<_> = dropped
+        .functions()
+        .filter(|function| function.name() == "f")
+        .map(|function| function.target_name().schema().map(str::to_string))
+        .collect();
+    assert_eq!(left, [Some("app".to_string())]);
+
+    let missing = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.f() RETURNS INT AS 'SELECT 1;';
+         DROP FUNCTION f;",
+    );
+    assert!(
+        matches!(&missing, Err(Error::DropFunctionNotFound { function_name }) if function_name == "f"),
+        "got {missing:?}"
+    );
+}
+
 #[test]
 fn a_dropped_function_frees_its_signature() {
     parse(
