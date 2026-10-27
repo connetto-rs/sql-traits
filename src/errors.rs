@@ -963,6 +963,13 @@ pub enum Error {
         /// Name of the table the statement names.
         table_name: String,
     },
+    #[error("Partitioned table `{table_name}` cannot take storage parameters.")]
+    /// Error indicating that `ALTER TABLE ... SET (...)` names a partitioned
+    /// table, which PostgreSQL 18 refuses because it holds no rows.
+    StorageParametersOnPartitionedTable {
+        /// Name of the table the statement names.
+        table_name: String,
+    },
     #[error(
         "Permanent table `{table_name}` cannot inherit from temporary relation `{parent_name}`."
     )]
