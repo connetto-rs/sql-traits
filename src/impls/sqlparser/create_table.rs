@@ -30,6 +30,23 @@ fn table_metadata<'db>(
         .ok_or_else(|| ObjectKind::Table.not_in_database(&table.name.to_string()))
 }
 
+/// Whether `table` holds the table constraint rendered as `constraint`
+/// validated, read from the record ingestion keeps of what it holds
+/// unvalidated.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not hold
+/// `table`.
+pub(super) fn holds_validated(
+    table: &CreateTable,
+    constraint: &impl core::fmt::Display,
+    database: &ParserDB,
+) -> Result<bool, LookupError> {
+    let rendered = constraint.to_string();
+    Ok(!table_metadata(table, database)?.unvalidated_constraints().contains(&rendered))
+}
+
 /// Reads the strategy off a `PARTITION BY` clause.
 ///
 /// PostgreSQL takes one of three words there and parses the clause as a call,

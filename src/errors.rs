@@ -63,7 +63,8 @@ impl core::fmt::Display for ObjectKind {
 /// what is asked for can be undone one table at a time. Adding is not one of
 /// those, because a table below would then be missing something its parent
 /// declares, and neither is renaming, because the two would disagree on what
-/// the column is called.
+/// the column is called. Validating a check is refused too, because the
+/// parent's could then vouch for rows a table below never had checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InheritedChange {
     /// `ALTER TABLE ONLY ... ADD CONSTRAINT`.
@@ -72,6 +73,8 @@ pub enum InheritedChange {
     AddColumn,
     /// `ALTER TABLE ONLY ... RENAME COLUMN`.
     RenameColumn,
+    /// `ALTER TABLE ONLY ... VALIDATE CONSTRAINT`.
+    ValidateConstraint,
 }
 
 impl core::fmt::Display for InheritedChange {
@@ -80,6 +83,7 @@ impl core::fmt::Display for InheritedChange {
             Self::AddConstraint => "add a constraint to",
             Self::AddColumn => "add a column to",
             Self::RenameColumn => "rename a column of",
+            Self::ValidateConstraint => "validate a constraint of",
         })
     }
 }
@@ -1310,6 +1314,54 @@ pub enum Error {
         /// Name of the constraint that was not found.
         constraint_name: String,
     },
+    #[error(
+        "Constraint `{constraint_name}` not found on table `{table_name}` for ALTER TABLE VALIDATE CONSTRAINT statement."
+    )]
+    /// Error indicating that an `ALTER TABLE ... VALIDATE CONSTRAINT`
+    /// statement names a constraint the table does not declare. Constraints
+    /// declared without a name have no name to validate them by.
+    ValidateConstraintNotFound {
+        /// Name of the table the constraint was looked up on.
+        table_name: String,
+        /// Name of the constraint that was not found.
+        constraint_name: String,
+    },
+    #[error(
+        "Constraint `{constraint_name}` of table `{table_name}` cannot be validated, because only a check, a foreign key or a `NOT NULL` constraint can be."
+    )]
+    /// Error indicating that an `ALTER TABLE ... VALIDATE CONSTRAINT`
+    /// statement names a key, which is checked against every row the moment
+    /// it is added and so has nothing left to validate.
+    ConstraintNotValidatable {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the constraint the statement names.
+        constraint_name: String,
+    },
+    #[error(
+        "Constraint `{constraint}` added to table `{table_name}` cannot be marked `NOT VALID`, because only a check or a foreign key can be."
+    )]
+    /// Error indicating that `ALTER TABLE ... ADD ... NOT VALID` asked to skip
+    /// checking existing rows against a key, which PostgreSQL refuses while
+    /// reading the statement.
+    NotValidRefused {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// The constraint as the statement wrote it.
+        constraint: String,
+    },
+    #[error(
+        "Constraint `{constraint}` arriving at table `{table_name}` from a parent conflicts with the `NOT VALID` copy the table holds."
+    )]
+    /// Error indicating that a parent added a validated check which a table
+    /// below already holds `NOT VALID`, which PostgreSQL refuses because the
+    /// merged check would claim rows nobody has checked.
+    NotValidConstraintConflict {
+        /// Name of the table holding the unvalidated copy.
+        table_name: String,
+        /// The constraint as the table holds it.
+        constraint: String,
+    },
     #[error("Schema `{schema_name}` not found for ALTER SCHEMA statement.")]
     /// Error indicating that an ALTER SCHEMA statement references a schema
     /// that does not exist.
@@ -1409,6 +1461,7 @@ mod tests {
         assert_eq!(InheritedChange::AddConstraint.to_string(), "add a constraint to");
         assert_eq!(InheritedChange::AddColumn.to_string(), "add a column to");
         assert_eq!(InheritedChange::RenameColumn.to_string(), "rename a column of");
+        assert_eq!(InheritedChange::ValidateConstraint.to_string(), "validate a constraint of");
         assert_eq!(RequiredValue::CoveredByKey.to_string(), "a key covers it");
         assert_eq!(RequiredValue::EnforcedByParent.to_string(), "a parent requires it");
         assert_eq!(FixedPersistence::Temporary.to_string(), "it is temporary");

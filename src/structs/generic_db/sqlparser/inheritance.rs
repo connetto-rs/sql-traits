@@ -21,7 +21,9 @@ use sqlparser::ast::{
     ExactNumberInfo, Expr, Ident, IndexColumn, ObjectName, TableConstraint, TimezoneInfo,
 };
 
-use super::{ParserDBBuilder, StoredTable, column_copy::copy_column};
+use super::{
+    ParserDBBuilder, StoredTable, column_copy::copy_column, constraint_validity::unvalidated_copies,
+};
 use crate::{errors::Error, traits::TableLike, utils::is_identity};
 
 /// Which spelling links a child to a table it takes its shape from.
@@ -600,8 +602,8 @@ pub(super) fn records_inherited_constraint(
         .is_some_and(|(_, metadata, _)| metadata.inherited_constraints().contains(&rendered))
 }
 
-/// Carries the record of which constraints a table received across a rebuild
-/// of its node.
+/// Carries a record kept per table constraint, such as which ones a table
+/// received or which it holds unvalidated, across a rebuild of its node.
 ///
 /// An edit that rewrites the list in place, which is what a column rename
 /// reaching into a check expression does, keeps its length and its order, so
@@ -794,6 +796,8 @@ pub(super) struct Inherited {
     pub(super) columns: Vec<String>,
     /// The rendering of each table constraint received.
     pub(super) constraints: Vec<String>,
+    /// The rendering of each table constraint received unvalidated.
+    pub(super) unvalidated_constraints: Vec<String>,
     /// Metadata copied with inherited columns.
     pub(super) column_metadata: Vec<super::PreservedColumnMetadata>,
 }
@@ -931,6 +935,7 @@ pub(super) fn apply_parents(
             .map(|name| name.value.clone())
             .collect(),
         constraints: constraints.iter().map(TableConstraint::to_string).collect(),
+        unvalidated_constraints: unvalidated_copies(builder, &parents, &constraints),
         column_metadata,
     };
 

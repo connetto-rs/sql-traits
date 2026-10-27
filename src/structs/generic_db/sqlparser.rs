@@ -66,6 +66,7 @@ use crate::{
 };
 
 mod column_copy;
+mod constraint_validity;
 mod functions_in_expression;
 mod inheritance;
 mod leading_comments;
@@ -4580,6 +4581,11 @@ impl ParserDB {
             &previous_node.constraints,
             &replacement.constraints,
         ));
+        metadata.set_unvalidated_constraints(inheritance::follow_constraint_rewrite(
+            previous_metadata.unvalidated_constraints(),
+            &previous_node.constraints,
+            &replacement.constraints,
+        ));
 
         let mut preserved_collations =
             preserved_column_metadata_for_table(&builder, &previous_node);
@@ -5090,12 +5096,20 @@ impl ParserDB {
     /// depends on the spelling of the edge it arrives through: an `INHERITS`
     /// child receives a check and nothing else, while a partition receives the
     /// root's keys and foreign keys as well.
+    ///
+    /// `validated` is false for a constraint added `NOT VALID`, which every
+    /// copy made by the walk shares, since the rows below were not read
+    /// either.
     fn alter_table_add_constraint(
         builder: ParserDBBuilder,
         table_name: &ObjectName,
         scope: AlterTableScope,
         mut constraint: TableConstraint,
+        validated: bool,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        if !validated {
+            constraint_validity::refuse_not_valid(table_name, &constraint)?;
+        }
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
@@ -5108,6 +5122,9 @@ impl ParserDB {
             constraints.push(constraint.clone());
             Ok(())
         })?;
+        if !validated {
+            constraint_validity::record(&mut builder, &stored, &constraint, false);
+        }
 
         // Nothing below the named table changes under `ONLY`: a table created
         // afterwards still receives its copy at creation, which is also what
@@ -5155,7 +5172,12 @@ impl ParserDB {
                 if let Some(held) =
                     node.constraints.iter().find(|held| inheritance::is_copy_of(held, &passed))
                 {
-                    frontier.push((child, held.clone()));
+                    let held = held.clone();
+                    let merged = constraint_validity::merged_copy_validated(
+                        &builder, &child, &held, validated,
+                    )?;
+                    constraint_validity::record(&mut builder, &child, &held, merged);
+                    frontier.push((child, held));
                     continue;
                 }
 
@@ -5184,6 +5206,9 @@ impl ParserDB {
                     Ok(())
                 })?;
                 inheritance::mark_inherited_constraint(&mut builder, &child, &copy);
+                if !validated {
+                    constraint_validity::record(&mut builder, &child, &copy, false);
+                }
                 frontier.push((child, copy));
             }
         }
@@ -6997,7 +7022,7 @@ impl ParserDB {
                                     alter_table.if_exists,
                                 )?;
                             }
-                            AlterTableOperation::AddConstraint { constraint, .. } => {
+                            AlterTableOperation::AddConstraint { constraint, not_valid } => {
                                 if let TableConstraint::ForeignKey(foreign_key) = &constraint {
                                     Self::refuse_reference_from_permanent_start(
                                         &builder,
@@ -7011,6 +7036,15 @@ impl ParserDB {
                                     &alter_table.name,
                                     scope,
                                     constraint,
+                                    !not_valid,
+                                )?;
+                            }
+                            AlterTableOperation::ValidateConstraint { name } => {
+                                builder = constraint_validity::validate_constraint(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
                                 )?;
                             }
                             AlterTableOperation::DropConstraint { if_exists, name, .. } => {
@@ -7258,10 +7292,6 @@ impl ParserDB {
                             // identify a row downstream, which the model does
                             // not track.
                             | AlterTableOperation::ReplicaIdentity { .. }
-                            // Constraint validity is not modelled: a constraint
-                            // added `NOT VALID` is already stored as declared,
-                            // so validating it changes nothing.
-                            | AlterTableOperation::ValidateConstraint { .. }
                             // The next value of an auto-increment counter is
                             // table data rather than schema.
                             | AlterTableOperation::AutoIncrement { .. }
@@ -7364,6 +7394,7 @@ impl ParserDB {
                     let mut metadata = TableMetadata::default();
                     metadata.set_inherited_column_names(inherited.columns);
                     metadata.set_inherited_constraints(inherited.constraints);
+                    metadata.set_unvalidated_constraints(inherited.unvalidated_constraints);
                     builder = Self::ingest_table_node_with_collations(
                         builder,
                         Arc::new(create_table),

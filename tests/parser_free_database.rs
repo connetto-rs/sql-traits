@@ -1369,6 +1369,26 @@ fn functions_without_volatility_metadata_report_volatile() -> Result<(), LookupE
     Ok(())
 }
 
+/// A catalog that keeps no `NOT VALID` state reports every constraint
+/// validated.
+#[test]
+fn constraints_without_validation_records_report_validated() -> Result<(), LookupError> {
+    let catalog = catalog();
+    let check = MemoryCheckConstraint {
+        table_name: String::from("docs"),
+        expression: Expr::Identifier("id".into()),
+    };
+    let key = MemoryForeignKey {
+        name: None,
+        host_table_name: String::from("notes"),
+        referenced_table_name: String::from("docs"),
+    };
+
+    assert!(check.is_validated(&catalog)?);
+    assert!(key.is_validated(&catalog)?);
+    Ok(())
+}
+
 /// The inherited function identity lookup compares both parts as stored, and
 /// reports a name carrying several declarations rather than choosing one.
 #[test]

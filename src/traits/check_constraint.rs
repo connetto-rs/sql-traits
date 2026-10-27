@@ -545,6 +545,47 @@ pub trait CheckConstraintLike:
         false
     }
 
+    /// Returns whether the rows the table held when the check arrived have
+    /// been checked against it.
+    ///
+    /// False for a check added `NOT VALID` until `ALTER TABLE ... VALIDATE
+    /// CONSTRAINT` runs, matching `pg_constraint.convalidated`. New rows are
+    /// checked either way. Defaults to `true`, which is what every check not
+    /// added `NOT VALID` means.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table of this check constraint.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let added = "CREATE TABLE orders (amount INT);
+    ///     ALTER TABLE orders ADD CONSTRAINT positive CHECK (amount > 0) NOT VALID;";
+    /// for (sql, validated) in [
+    ///     (added.to_owned(), false),
+    ///     (format!("{added} ALTER TABLE orders VALIDATE CONSTRAINT positive;"), true),
+    /// ] {
+    ///     let db = ParserDB::parse::<PostgreSqlDialect>(&sql)?;
+    ///     let table = db
+    ///         .table_by_target(TargetName::new("orders", false), IdentifierCase::AsWritten)?
+    ///         .unwrap();
+    ///     let check = table.check_constraints(&db)?.next().unwrap();
+    ///     assert_eq!(check.is_validated(&db)?, validated);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_validated(&self, _database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(true)
+    }
+
     /// Returns a reference to the table that the check constraint is defined
     /// on.
     ///

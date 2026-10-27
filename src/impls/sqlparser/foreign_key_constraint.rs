@@ -60,6 +60,10 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
         self.attribute().match_kind.unwrap_or(ConstraintReferenceMatchKind::Simple)
     }
 
+    fn is_validated(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        super::create_table::holds_validated(self.table(), self.attribute(), database)
+    }
+
     fn host_columns<'db>(
         &'db self,
         database: &'db Self::DB,

@@ -580,6 +580,48 @@ pub trait ForeignKeyLike:
         matches!(self.match_kind(database), ConstraintReferenceMatchKind::Full)
     }
 
+    /// Returns whether the rows the host table held when the foreign key
+    /// arrived have been checked against it.
+    ///
+    /// False for a foreign key added `NOT VALID` until `ALTER TABLE ...
+    /// VALIDATE CONSTRAINT` runs, matching `pg_constraint.convalidated`. New
+    /// rows are checked either way. Defaults to `true`, which is what every
+    /// foreign key not added `NOT VALID` means.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the host table of this foreign key.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let added = "CREATE TABLE customers (id INT PRIMARY KEY);
+    ///     CREATE TABLE orders (customer INT);
+    ///     ALTER TABLE orders ADD CONSTRAINT buyer FOREIGN KEY (customer) REFERENCES customers (id) NOT VALID;";
+    /// for (sql, validated) in [
+    ///     (added.to_owned(), false),
+    ///     (format!("{added} ALTER TABLE orders VALIDATE CONSTRAINT buyer;"), true),
+    /// ] {
+    ///     let db = ParserDB::parse::<PostgreSqlDialect>(&sql)?;
+    ///     let table = db
+    ///         .table_by_target(TargetName::new("orders", false), IdentifierCase::AsWritten)?
+    ///         .unwrap();
+    ///     let foreign_key = table.foreign_keys(&db)?.next().unwrap();
+    ///     assert_eq!(foreign_key.is_validated(&db)?, validated);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_validated(&self, _database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(true)
+    }
+
     /// Returns whether the foreign key includes any host columns that are
     /// nullable.
     ///
