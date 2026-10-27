@@ -208,8 +208,9 @@ impl ParseOptions {
     /// let db = ParseOptions::default()
     ///     .with_access_resolution(AccessResolution::OpenWorld)
     ///     .parse::<PostgreSqlDialect>(sql)?;
-    /// // Nothing granted the privilege here, so subtracting it changes nothing.
-    /// assert_eq!(db.table_grants().count(), 0);
+    /// // `app` held no grant of its own, so subtracting it changes nothing.
+    /// let f = db.function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?;
+    /// assert_eq!(f.expect("f exists").is_executable_by_public(&db), Ok(true));
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
     pub fn parse<D: Dialect + Default + 'static>(self, sql: &str) -> Result<ParserDB, Error> {

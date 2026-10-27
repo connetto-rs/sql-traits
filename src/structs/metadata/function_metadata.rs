@@ -1,16 +1,22 @@
 //! Submodule defining a `FunctionMetadata` struct.
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
+
+use sqlparser::ast::{CreateRole, Grantee};
+
+use crate::impls::{grantee_is_public, grantee_matches_role, grantees_match};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// Metadata about a database function.
 ///
 /// Holds what the input says about a function that the function's own
-/// declaration cannot carry, which today is the role a later statement hands it
-/// to.
+/// declaration cannot carry, which is the role a later statement hands it to
+/// and who may execute it.
 pub struct FunctionMetadata {
     /// The role the input names as the function's owner, if it names one.
     owner: Option<String>,
+    /// Who holds `EXECUTE` on the function.
+    execute: ExecutePrivileges,
 }
 
 impl FunctionMetadata {
@@ -49,5 +55,154 @@ impl FunctionMetadata {
     #[inline]
     pub fn set_owner(&mut self, owner: Option<String>) {
         self.owner = owner;
+    }
+
+    /// Returns who holds `EXECUTE` on the function.
+    #[must_use]
+    pub(crate) fn execute_privileges(&self) -> &ExecutePrivileges {
+        &self.execute
+    }
+
+    /// Returns who holds `EXECUTE` on the function, for a statement to change.
+    pub(crate) fn execute_privileges_mut(&mut self) -> &mut ExecutePrivileges {
+        &mut self.execute
+    }
+
+    /// Returns whether `role` is the role the input names as the owner.
+    fn is_owned_by(&self, role: &CreateRole) -> bool {
+        use crate::traits::RoleLike as _;
+
+        self.owner.as_deref().is_some_and(|owner| owner == role.stored_name())
+    }
+
+    /// Returns whether `role` may execute the function, which it may when
+    /// `PUBLIC` holds the privilege, when the role holds an entry of its own,
+    /// or when the role is the recorded owner and still holds the owner's
+    /// entry.
+    #[must_use]
+    pub(crate) fn can_execute(&self, role: &CreateRole) -> bool {
+        self.execute.public
+            || self.execute.grants.iter().any(|grant| grantee_matches_role(&grant.grantee, role))
+            || (self.execute.owner && self.is_owned_by(role))
+    }
+
+    /// Returns whether `role` may grant `EXECUTE` on the function to others,
+    /// which it may when an entry of its own carries the grant option, or when
+    /// it is the recorded owner, whom ownership lets grant whatever its own
+    /// entry says.
+    #[must_use]
+    pub(crate) fn can_grant_execute(&self, role: &CreateRole) -> bool {
+        self.is_owned_by(role)
+            || self
+                .execute
+                .grants
+                .iter()
+                .any(|grant| grant.with_grant_option && grantee_matches_role(&grant.grantee, role))
+    }
+
+    /// Takes `EXECUTE`, or only the right to grant it, from `grantees`.
+    ///
+    /// A grantee naming the recorded owner, as `names_owner` decides from the
+    /// grantee and the owner's name, takes the owner's entry as well, which
+    /// PostgreSQL keeps apart from the others only by whom it names.
+    pub(crate) fn revoke_execute(
+        &mut self,
+        grantees: &[Grantee],
+        grant_option_only: bool,
+        names_owner: impl Fn(&Grantee, &str) -> bool,
+    ) {
+        let execute = &mut self.execute;
+        if grant_option_only {
+            // Ownership confers the grant option, so the owner keeps it.
+            for grant in &mut execute.grants {
+                if grantees.iter().any(|revoked| grantees_match(&grant.grantee, revoked)) {
+                    grant.with_grant_option = false;
+                }
+            }
+            return;
+        }
+
+        for revoked in grantees {
+            if grantee_is_public(revoked) {
+                execute.public = false;
+            } else if self.owner.as_deref().is_some_and(|owner| names_owner(revoked, owner)) {
+                execute.owner = false;
+            }
+        }
+        execute.grants.retain(|grant| {
+            !grantees.iter().any(|revoked| grantees_match(&grant.grantee, revoked))
+        });
+    }
+}
+
+/// Who holds `EXECUTE` on a function, as PostgreSQL's `pg_proc.proacl`
+/// records it.
+///
+/// A function starts out executable by `PUBLIC` and by its owner. Each other
+/// grantee holds one entry, which a later grant to the same grantee widens
+/// rather than repeats. Grantors are not kept, since the input never says who
+/// runs a statement, so the entries PostgreSQL tells apart by grantor fold
+/// into one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutePrivileges {
+    /// Whether `PUBLIC` holds `EXECUTE`.
+    public: bool,
+    /// Whether the owner holds its own entry.
+    owner: bool,
+    /// The entries of every other grantee.
+    grants: Vec<ExecuteGrant>,
+}
+
+/// One grantee's `EXECUTE` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecuteGrant {
+    /// The role, or keyword principal, the entry names.
+    grantee: Grantee,
+    /// Whether the grantee may grant `EXECUTE` to others.
+    with_grant_option: bool,
+}
+
+impl Default for ExecutePrivileges {
+    /// The privileges PostgreSQL gives a new function.
+    fn default() -> Self {
+        Self { public: true, owner: true, grants: Vec::new() }
+    }
+}
+
+impl ExecutePrivileges {
+    /// Returns whether `PUBLIC` holds `EXECUTE`.
+    #[must_use]
+    pub(crate) fn public(&self) -> bool {
+        self.public
+    }
+
+    /// Gives `EXECUTE` to `grantees`.
+    ///
+    /// PostgreSQL refuses a grant option for `PUBLIC`, so `PUBLIC` takes only
+    /// the privilege.
+    pub(crate) fn grant(&mut self, grantees: &[Grantee], with_grant_option: bool) {
+        for grantee in grantees {
+            if grantee_is_public(grantee) {
+                self.public = true;
+                continue;
+            }
+            match self.grants.iter_mut().find(|grant| grantees_match(&grant.grantee, grantee)) {
+                Some(grant) => grant.with_grant_option |= with_grant_option,
+                None => {
+                    self.grants.push(ExecuteGrant { grantee: grantee.clone(), with_grant_option });
+                }
+            }
+        }
+    }
+
+    /// Returns the grantees holding an entry of their own.
+    pub(crate) fn grantees(&self) -> impl Iterator<Item = &Grantee> {
+        self.grants.iter().map(|grant| &grant.grantee)
+    }
+
+    /// Returns the grantees holding an entry of their own, for a rename to
+    /// rewrite.
+    pub(crate) fn grantees_mut(&mut self) -> impl Iterator<Item = &mut Grantee> {
+        self.grants.iter_mut().map(|grant| &mut grant.grantee)
     }
 }

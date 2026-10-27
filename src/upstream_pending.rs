@@ -20,12 +20,20 @@
 //!   [`Error::AggregateOwnerUnsupported`](crate::errors::Error::AggregateOwnerUnsupported)
 //!   refuses `ALTER AGGREGATE ... OWNER TO` rather than attributing the owner
 //!   to a function of the same name.
+//! - [`sqlparser#2417`](https://github.com/apache/datafusion-sqlparser-rs/pull/2417),
+//!   `ALTER DEFAULT PRIVILEGES` does not parse, so a schema carrying one fails
+//!   to parse, and the `EXECUTE` a function receives on creation is always
+//!   PostgreSQL's built-in default rather than the one such a statement set.
 //!
 //! Found and written up, not yet filed:
 //!
 //! - `ALTER TABLE ... INHERIT` and `NO INHERIT` do not parse, so a schema
 //!   history that attaches or detaches a parent leaves the inheritance edges as
 //!   the `CREATE TABLE` wrote them.
+//! - `GRANT` and `REVOKE ... ON ROUTINE` and `ON ALL PROCEDURES | ROUTINES IN
+//!   SCHEMA` do not parse, so a schema carrying one fails to parse.
+//! - A grantee written after `PUBLIC` in a `GRANT` or `REVOKE` does not parse,
+//!   so `REVOKE ... FROM PUBLIC, anon` fails while `FROM anon, PUBLIC` reads.
 //! - The `CREATE TABLE ... LIKE` option list (`INCLUDING INDEXES` and its
 //!   siblings) does not parse beyond the spellings already honoured here.
 //! - Role membership `GRANT role TO role` does not parse, so membership is

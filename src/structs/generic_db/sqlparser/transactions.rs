@@ -7,7 +7,7 @@
 
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 
-use sqlparser::ast::{Ident, Statement, TransactionModifier};
+use sqlparser::ast::{FunctionDesc, Ident, Statement, TransactionModifier};
 
 use super::{
     AccessResolution, CreatedCollationMetadata, ParserDB, ParserDBBuilder, ParserIngestion,
@@ -24,15 +24,25 @@ pub(super) struct Catalog {
     pub(super) postgres: Arc<PostgresCatalog>,
     /// Collations the ingested statements created.
     pub(super) collations: Vec<CreatedCollationMetadata>,
+    /// Signatures open-world grants named without reaching a function.
+    pub(super) unresolved_function_grants: Vec<FunctionDesc>,
 }
 
 impl Catalog {
     pub(super) fn from_database(database: ParserDB) -> (Self, AccessResolution) {
         let (builder, ingestion) = ParserDBBuilder::from_database(database);
-        let ParserIngestion { access_resolution, active_postgres_catalog, collation_metadata } =
-            Arc::try_unwrap(ingestion).unwrap_or_else(|shared| (*shared).clone());
-        let catalog =
-            Self { builder, postgres: active_postgres_catalog, collations: collation_metadata };
+        let ParserIngestion {
+            access_resolution,
+            active_postgres_catalog,
+            collation_metadata,
+            unresolved_function_grants,
+        } = Arc::try_unwrap(ingestion).unwrap_or_else(|shared| (*shared).clone());
+        let catalog = Self {
+            builder,
+            postgres: active_postgres_catalog,
+            collations: collation_metadata,
+            unresolved_function_grants,
+        };
         (catalog, access_resolution)
     }
 
@@ -41,6 +51,7 @@ impl Catalog {
             access_resolution,
             active_postgres_catalog: self.postgres,
             collation_metadata: self.collations,
+            unresolved_function_grants: self.unresolved_function_grants,
         }))
     }
 
@@ -49,6 +60,7 @@ impl Catalog {
             access_resolution,
             active_postgres_catalog: Arc::clone(&self.postgres),
             collation_metadata: self.collations.clone(),
+            unresolved_function_grants: self.unresolved_function_grants.clone(),
         }))
     }
 
@@ -58,15 +70,12 @@ impl Catalog {
         access_resolution: AccessResolution,
         source: Option<StatementSource<'_>>,
     ) -> Result<Self, Error> {
-        let (builder, postgres, collations) = ParserDB::apply_statements(
-            self.builder,
-            self.postgres,
-            self.collations,
+        ParserDB::apply_statements(
+            self,
             access_resolution,
             &mut core::iter::once(statement),
             source,
-        )?;
-        Ok(Self { builder, postgres, collations })
+        )
     }
 
     /// Returns `saved` as the catalog a rollback leaves, still drawing

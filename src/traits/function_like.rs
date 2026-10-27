@@ -529,6 +529,157 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError>;
 
+    /// Returns whether every role may execute the function, which is what
+    /// `PUBLIC` holding `EXECUTE` on it means.
+    ///
+    /// PostgreSQL gives `PUBLIC` `EXECUTE` on every new function, so this
+    /// answers `true` until a `REVOKE` takes it away, and again once a
+    /// `GRANT ... TO PUBLIC` restores it. Every spelling reaches it, whether a
+    /// signature, a name that covers one function alone, or `ALL FUNCTIONS IN
+    /// SCHEMA`, which covers the functions the schema holds when it runs.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance the function belongs
+    ///   to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE FUNCTION open() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+    /// CREATE FUNCTION closed() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+    /// REVOKE EXECUTE ON FUNCTION closed() FROM PUBLIC;
+    /// ",
+    /// )?;
+    /// let executable_by_public = |name: &str| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    ///         .is_executable_by_public(&db)
+    /// };
+    /// assert_eq!(executable_by_public("open"), Ok(true));
+    /// assert_eq!(executable_by_public("closed"), Ok(false));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_executable_by_public(&self, database: &Self::DB) -> Result<bool, LookupError>;
+
+    /// Returns whether `role` may execute the function.
+    ///
+    /// A role may when `PUBLIC` holds `EXECUTE`, when an entry of its own
+    /// grants it, or when it is the role
+    /// [`owner`](FunctionLike::owner) names and the owner's own entry was not
+    /// revoked. The owner's entry is an ordinary one, which the owner can
+    /// revoke and grant back. Like [`GrantLike::applies_to_role`], a grant
+    /// reaches the role it names and not the roles that are members of it.
+    ///
+    /// An owner the input never names cannot be recognised, so this answers
+    /// for it as for any other role.
+    ///
+    /// # Arguments
+    ///
+    /// * `role` - The role to check.
+    /// * `database` - A reference to the database instance the function belongs
+    ///   to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE anon;
+    /// CREATE ROLE authenticated;
+    /// CREATE FUNCTION f() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+    /// REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;
+    /// GRANT EXECUTE ON FUNCTION f() TO authenticated;
+    /// ",
+    /// )?;
+    /// let f = db
+    ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// assert_eq!(f.can_execute(db.role("authenticated").expect("declared"), &db), Ok(true));
+    /// assert_eq!(f.can_execute(db.role("anon").expect("declared"), &db), Ok(false));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`GrantLike::applies_to_role`]: crate::traits::GrantLike::applies_to_role
+    fn can_execute(
+        &self,
+        role: &<Self::DB as DatabaseLike>::Role,
+        database: &Self::DB,
+    ) -> Result<bool, LookupError>;
+
+    /// Returns whether `role` may grant `EXECUTE` on the function to other
+    /// roles.
+    ///
+    /// A role may when an entry of its own was granted `WITH GRANT OPTION`
+    /// and no `REVOKE GRANT OPTION FOR` took that away, or when it is the role
+    /// [`owner`](FunctionLike::owner) names, which ownership lets grant
+    /// whatever its own entry says. `PUBLIC` never holds the option, since
+    /// PostgreSQL grants it to roles alone.
+    ///
+    /// # Arguments
+    ///
+    /// * `role` - The role to check.
+    /// * `database` - A reference to the database instance the function belongs
+    ///   to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE client;
+    /// CREATE ROLE reader;
+    /// CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+    /// GRANT EXECUTE ON FUNCTION f() TO client WITH GRANT OPTION;
+    /// GRANT EXECUTE ON FUNCTION f() TO reader;
+    /// ",
+    /// )?;
+    /// let f = db
+    ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// assert_eq!(f.can_grant_execute(db.role("client").expect("declared"), &db), Ok(true));
+    /// assert_eq!(f.can_grant_execute(db.role("reader").expect("declared"), &db), Ok(false));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn can_grant_execute(
+        &self,
+        role: &<Self::DB as DatabaseLike>::Role,
+        database: &Self::DB,
+    ) -> Result<bool, LookupError>;
+
     /// Returns the normalized return type name of the function as a string.
     ///
     /// # Example

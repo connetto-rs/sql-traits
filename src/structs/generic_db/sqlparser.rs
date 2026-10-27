@@ -74,6 +74,7 @@ mod parse_options;
 mod parsed_source;
 mod postgres_18_collations;
 mod postgres_catalog;
+mod routine_privileges;
 mod rules;
 mod transactions;
 mod view_rewrites;
@@ -119,6 +120,7 @@ impl SchemaProfile for SqlparserProfile {
                 PostgresCatalog::empty()
             }),
             collation_metadata: Vec::new(),
+            unresolved_function_grants: Vec::new(),
         })
     }
 }
@@ -140,8 +142,9 @@ enum TableOrigin {
 
 /// The continuation state the parser carries inside every built database so
 /// statement-by-statement ingestion can resume from it: the
-/// access-resolution mode, the active PostgreSQL catalog, and metadata for
-/// collations the ingested DDL created.
+/// access-resolution mode, the active PostgreSQL catalog, metadata for
+/// collations the ingested DDL created, and the function signatures open-world
+/// grants named without reaching a function.
 ///
 /// The catalog sits behind an [`Arc`], so cloning a database or taking a
 /// snapshot bumps a reference count rather than copying the catalog's
@@ -152,6 +155,7 @@ pub struct ParserIngestion {
     access_resolution: AccessResolution,
     active_postgres_catalog: Arc<PostgresCatalog>,
     collation_metadata: Vec<CreatedCollationMetadata>,
+    unresolved_function_grants: Vec<FunctionDesc>,
 }
 
 impl core::fmt::Debug for ParserIngestion {
@@ -166,6 +170,7 @@ impl core::fmt::Debug for ParserIngestion {
                 &self.active_postgres_catalog.collatable_types().count(),
             )
             .field("created_collations", &self.collation_metadata.len())
+            .field("unresolved_function_grants", &self.unresolved_function_grants.len())
             .finish()
     }
 }
@@ -1323,23 +1328,21 @@ impl ParserDBBuilder {
     /// Returns whether a modeled blocking dependency names the role.
     fn is_role_referenced(&self, role_ident: &Ident) -> bool {
         let stored_name = stored_role_name(role_ident);
-        let grantees_name_role = |grantees: &[Grantee]| {
-            grantees.iter().any(|grantee| {
-                grantee_role_ident(grantee)
-                    .is_some_and(|grantee_ident| idents_match(grantee_ident, role_ident))
-            })
+        let names_role = |grantee: &Grantee| {
+            grantee_role_ident(grantee)
+                .is_some_and(|grantee_ident| idents_match(grantee_ident, role_ident))
         };
 
-        self.table_grants().iter().any(|(grant, ())| grantees_name_role(&grant.grantees))
-            || self.column_grants().iter().any(|(grant, ())| grantees_name_role(&grant.grantees))
+        self.table_grants().iter().any(|(grant, ())| grant.grantees.iter().any(names_role))
+            || self.column_grants().iter().any(|(grant, ())| grant.grantees.iter().any(names_role))
             || self
                 .tables()
                 .iter()
                 .any(|(_, metadata, _)| metadata.owner() == Some(stored_name.as_str()))
-            || self
-                .functions()
-                .iter()
-                .any(|(_, metadata)| metadata.owner() == Some(stored_name.as_str()))
+            || self.functions().iter().any(|(_, metadata)| {
+                metadata.owner() == Some(stored_name.as_str())
+                    || metadata.execute_privileges().grantees().any(names_role)
+            })
             || views::view_owner_names(self).iter().any(|owner| owner == stored_name.as_str())
             || self
                 .schemas()
@@ -1700,8 +1703,11 @@ fn require_static_access_names(objects: Option<&GrantObjects>) -> Result<(), Loo
         | GrantObjects::FailoverGroup(names)
         | GrantObjects::ReplicationGroup(names)
         | GrantObjects::ExternalVolumes(names) => names,
-        GrantObjects::Procedure { name, .. } | GrantObjects::Function { name, .. } => {
-            return require_static_object_name(name);
+        GrantObjects::Procedures(signatures) | GrantObjects::Functions(signatures) => {
+            for signature in signatures {
+                require_static_object_name(&signature.name)?;
+            }
+            return Ok(());
         }
     };
     for name in names {
@@ -2519,6 +2525,17 @@ fn function_argument_types(args: Option<&[OperateFunctionArg]>) -> Vec<Cow<'_, s
         .collect()
 }
 
+/// Returns whether two function names name the same function or set of
+/// overloads, which takes the same name in the same schema, a missing
+/// qualifier reading as `public`. A qualifier built at run time names no
+/// schema yet, so it matches nothing.
+fn function_names_match(left: &ObjectName, right: &ObjectName, case: IdentifierCase) -> bool {
+    object_names_match(left, right, case)
+        && !matches!(qualifier_of(left), Qualifier::RunTime)
+        && !matches!(qualifier_of(right), Qualifier::RunTime)
+        && schema_qualifiers_match(qualifier_of(left).named(), qualifier_of(right).named(), case)
+}
+
 /// Returns whether two functions are the same function to PostgreSQL, which
 /// identifies one by its schema, its name and the types it takes, and not by
 /// what it returns.
@@ -2529,11 +2546,7 @@ fn function_signatures_match(
     right_args: Option<&[OperateFunctionArg]>,
     case: IdentifierCase,
 ) -> bool {
-    if !object_names_match(left, right, case)
-        || matches!(qualifier_of(left), Qualifier::RunTime)
-        || matches!(qualifier_of(right), Qualifier::RunTime)
-        || !schema_qualifiers_match(qualifier_of(left).named(), qualifier_of(right).named(), case)
-    {
+    if !function_names_match(left, right, case) {
         return false;
     }
     let left_types = function_argument_types(left_args);
@@ -3543,27 +3556,43 @@ fn remove_copied_column_constraint(
     }
 }
 
+/// Whether a grantee names the role spelled `role`.
+fn grantee_names(grantee: &Grantee, role: &Ident) -> bool {
+    matches!(
+        &grantee.name,
+        Some(GranteeName::ObjectName(name))
+            if object_name_last_identifier(name).is_some_and(|ident| idents_match(ident, role))
+    )
+}
+
+/// Points a grantee at `replacement`.
+fn rename_grantee(grantee: &mut Grantee, replacement: &Ident) {
+    grantee.name = Some(GranteeName::ObjectName(ObjectName(vec![ObjectNamePart::Identifier(
+        replacement.clone(),
+    )])));
+}
+
 /// Rewrites every grant grantee naming `previous`.
 fn rename_grantee_role(grants: &mut [(Arc<Grant>, ())], previous: &Ident, replacement: &Ident) {
-    let names_previous = |grantee: &Grantee| {
-        matches!(
-            &grantee.name,
-            Some(GranteeName::ObjectName(name))
-                if object_name_last_identifier(name)
-                    .is_some_and(|ident| idents_match(ident, previous))
-        )
-    };
-
     for (grant, ()) in grants {
-        if !grant.grantees.iter().any(names_previous) {
+        if !grant.grantees.iter().any(|grantee| grantee_names(grantee, previous)) {
             continue;
         }
         for grantee in &mut Arc::make_mut(grant).grantees {
-            if names_previous(grantee) {
-                grantee.name =
-                    Some(GranteeName::ObjectName(ObjectName(vec![ObjectNamePart::Identifier(
-                        replacement.clone(),
-                    )])));
+            if grantee_names(grantee, previous) {
+                rename_grantee(grantee, replacement);
+            }
+        }
+    }
+}
+
+/// Rewrites every grantee of a function's `EXECUTE` privileges naming
+/// `previous`.
+fn rename_execute_grantees(builder: &mut ParserDBBuilder, previous: &Ident, replacement: &Ident) {
+    for (_, metadata) in builder.functions_mut() {
+        for grantee in metadata.execute_privileges_mut().grantees_mut() {
+            if grantee_names(grantee, previous) {
+                rename_grantee(grantee, replacement);
             }
         }
     }
@@ -3771,6 +3800,9 @@ pub enum UnresolvedAccessReference<'a> {
     GranteeRole(&'a Ident),
     /// A grant target naming a table no `CREATE TABLE` in the input creates.
     GrantTable(&'a ObjectName),
+    /// A grant target naming a function no `CREATE FUNCTION` before the grant
+    /// creates, with the argument list the grant wrote.
+    GrantFunction(&'a FunctionDesc),
     /// A policy applying to a role no `CREATE ROLE` in the input creates.
     PolicyRole {
         /// Name of the policy.
@@ -3896,7 +3928,12 @@ impl ParserDBIngestor {
         }
 
         Self {
-            catalog: transactions::Catalog { builder, postgres, collations: Vec::new() },
+            catalog: transactions::Catalog {
+                builder,
+                postgres,
+                collations: Vec::new(),
+                unresolved_function_grants: Vec::new(),
+            },
             access_resolution,
             transaction: None,
         }
@@ -4065,12 +4102,13 @@ impl ParserDB {
         Ok(self.materialized_view_by_target(target, IdentifierCase::AsWritten)?.map(|_| ()))
     }
 
-    /// Reports the roles and table targets that this database's access control
-    /// statements name and the database does not itself hold: the grantees and
-    /// table targets of its grants, and the roles its policies apply to. The
-    /// grant object shapes the closed world never resolved either, `ALL TABLES
-    /// IN SCHEMA` and the sequence and schema forms, are left alone here
-    /// too.
+    /// Reports the roles, table targets and function targets that this
+    /// database's access control statements name and the database does not
+    /// itself hold: the grantees and targets of its grants, the grantees of the
+    /// `EXECUTE` privileges its functions carry, and the roles its policies
+    /// apply to. The grant object shapes the closed world never resolved
+    /// either, `ALL TABLES IN SCHEMA` and the sequence and schema forms, are
+    /// left alone here too.
     ///
     /// An [`AccessResolution::ClosedWorld`] parse rejects such a reference on
     /// the spot, so one surfaces here because the database was parsed under
@@ -4079,7 +4117,10 @@ impl ParserDB {
     /// ROLE` it names resolves. A table target is read as ingestion bound it,
     /// which is how the reading accessors read it, so one the grant reached
     /// keeps resolving whatever the input does to the search path afterwards.
-    /// Each distinct reference is reported once, in a deterministic order.
+    /// A function target is the exception. A grant on a function changes that
+    /// function as it runs, so one reaching no function is reported as it was
+    /// when it ran, whatever the input creates afterwards. Each distinct
+    /// reference is reported once, in a deterministic order.
     ///
     /// # Errors
     ///
@@ -4149,6 +4190,22 @@ impl ParserDB {
             }
         }
 
+        for (_, metadata) in &self.functions {
+            for grantee_ident in
+                metadata.execute_privileges().grantees().filter_map(grantee_role_ident)
+            {
+                if !declares(grantee_ident) {
+                    unresolved.insert(UnresolvedAccessReference::GranteeRole(grantee_ident));
+                }
+            }
+        }
+        unresolved.extend(
+            self.ingestion
+                .unresolved_function_grants
+                .iter()
+                .map(UnresolvedAccessReference::GrantFunction),
+        );
+
         for (policy, _) in &self.policies {
             for owner in policy.to.iter().flatten() {
                 let Some(role_ident) = policy_role_ident(owner) else {
@@ -4167,8 +4224,8 @@ impl ParserDB {
     }
 
     /// Checks that every access control statement resolves: each grantee names
-    /// a role, each table target names a table, and each policy applies to
-    /// a role that this database holds.
+    /// a role, each table or function target names a table or a function, and
+    /// each policy applies to a role that this database holds.
     ///
     /// This is the [`AccessResolution::ClosedWorld`] verdict on a database
     /// parsed under [`AccessResolution::OpenWorld`], deferred until the whole
@@ -4178,7 +4235,8 @@ impl ParserDB {
     ///
     /// Returns the first unresolved reference as
     /// [`RoleNotFoundForGrant`](crate::errors::Error::RoleNotFoundForGrant),
-    /// [`TableNotFoundForGrant`](crate::errors::Error::TableNotFoundForGrant)
+    /// [`TableNotFoundForGrant`](crate::errors::Error::TableNotFoundForGrant),
+    /// [`FunctionNotFoundForGrant`](crate::errors::Error::FunctionNotFoundForGrant)
     /// or
     /// [`RoleNotFoundForPolicy`](crate::errors::Error::RoleNotFoundForPolicy).
     /// A malformed or ambiguous target name surfaces as
@@ -4217,6 +4275,11 @@ impl ParserDB {
             Some(UnresolvedAccessReference::GrantTable(table_obj)) => {
                 Err(crate::errors::Error::TableNotFoundForGrant {
                     table_name: last_str(table_obj).to_string(),
+                })
+            }
+            Some(UnresolvedAccessReference::GrantFunction(function)) => {
+                Err(crate::errors::Error::FunctionNotFoundForGrant {
+                    function_name: function.to_string(),
                 })
             }
             Some(UnresolvedAccessReference::PolicyRole { policy, role }) => {
@@ -6135,16 +6198,17 @@ impl ParserDB {
 
     #[allow(clippy::too_many_lines)]
     fn apply_statements(
-        mut builder: ParserDBBuilder,
-        mut active_postgres_catalog: Arc<PostgresCatalog>,
-        mut collation_metadata: Vec<CreatedCollationMetadata>,
+        catalog: transactions::Catalog,
         access_resolution: AccessResolution,
         statements: &mut dyn Iterator<Item = Statement>,
         source: Option<StatementSource<'_>>,
-    ) -> Result<
-        (ParserDBBuilder, Arc<PostgresCatalog>, Vec<CreatedCollationMetadata>),
-        crate::errors::Error,
-    > {
+    ) -> Result<transactions::Catalog, crate::errors::Error> {
+        let transactions::Catalog {
+            mut builder,
+            postgres: mut active_postgres_catalog,
+            collations: mut collation_metadata,
+            mut unresolved_function_grants,
+        } = catalog;
         let dialect = *builder.dialect();
         for statement in statements {
             match statement {
@@ -6616,6 +6680,7 @@ impl ParserDB {
                     rename_role_references(&mut builder, &name, &new_name);
                     rename_grantee_role(builder.table_grants_mut(), &name, &new_name);
                     rename_grantee_role(builder.column_grants_mut(), &name, &new_name);
+                    rename_execute_grantees(&mut builder, &name, &new_name);
                 }
                 Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Schema,
@@ -7308,6 +7373,15 @@ impl ParserDB {
                     // against a name nothing can read covers nothing and says
                     // so nowhere.
                     require_static_access_names(grant.objects.as_ref())?;
+                    if let Some(routines) = routine_privileges::Routines::take(&mut grant.objects) {
+                        unresolved_function_grants.extend(routine_privileges::grant(
+                            &mut builder,
+                            routines,
+                            &grant,
+                            access_resolution,
+                        )?);
+                        continue;
+                    }
                     if access_resolution == AccessResolution::ClosedWorld {
                         validate_access_targets_against_builder(
                             &builder,
@@ -7337,6 +7411,16 @@ impl ParserDB {
                 }
                 Statement::Revoke(mut revoke) => {
                     require_static_access_names(revoke.objects.as_ref())?;
+                    if let Some(routines) = routine_privileges::Routines::take(&mut revoke.objects)
+                    {
+                        routine_privileges::revoke(
+                            &mut builder,
+                            &routines,
+                            &revoke,
+                            access_resolution,
+                        )?;
+                        continue;
+                    }
                     // A revoke naming no recorded grant is a no-op, as it is in
                     // the database.
                     if access_resolution == AccessResolution::ClosedWorld {
@@ -7739,7 +7823,12 @@ impl ParserDB {
                 }
             }
         }
-        Ok((builder, active_postgres_catalog, collation_metadata))
+        Ok(transactions::Catalog {
+            builder,
+            postgres: active_postgres_catalog,
+            collations: collation_metadata,
+            unresolved_function_grants,
+        })
     }
 
     /// Same as [`Self::from_statements_with_dialect`] but under caller-chosen
@@ -8043,8 +8132,8 @@ mod tests {
                 GrantObjects::FailoverGroup(names.clone()),
                 GrantObjects::ReplicationGroup(names.clone()),
                 GrantObjects::ExternalVolumes(names.clone()),
-                GrantObjects::Procedure { name: name.clone(), arg_types: Vec::new() },
-                GrantObjects::Function { name, arg_types: Vec::new() },
+                GrantObjects::Procedures(vec![FunctionDesc { name: name.clone(), args: None }]),
+                GrantObjects::Functions(vec![FunctionDesc { name, args: None }]),
             ];
 
             for form in &forms {
@@ -10679,45 +10768,6 @@ mod tests {
             );
         }
 
-        #[test]
-        fn test_revoke_function_object_matching_is_case_insensitive_for_unquoted_identifiers() {
-            let sql = r"
-                CREATE ROLE my_role;
-                GRANT EXECUTE ON FUNCTION F() TO my_role;
-                REVOKE EXECUTE ON FUNCTION f() FROM my_role;
-            ";
-            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("Failed to parse SQL");
-
-            assert_eq!(db.table_grants().count(), 0);
-            assert_eq!(db.column_grants().count(), 0);
-        }
-
-        /// A quoted `"F"` and an unquoted `F` are two different functions, so
-        /// the revoke subtracts nothing and the grant stands.
-        #[test]
-        fn test_revoke_function_object_matching_preserves_quoted_identifier_semantics() {
-            let sql = r#"
-                CREATE ROLE my_role;
-                GRANT EXECUTE ON FUNCTION F() TO my_role;
-                REVOKE EXECUTE ON FUNCTION "F"() FROM my_role;
-            "#;
-            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("Failed to parse SQL");
-
-            assert_eq!(db.table_grants().count(), 1, "the grant was left alone");
-        }
-
-        #[test]
-        fn test_revoke_function_object_matching_does_not_match_quoted_grant_with_unquoted_lookup() {
-            let sql = r#"
-                CREATE ROLE my_role;
-                GRANT EXECUTE ON FUNCTION "F"() TO my_role;
-                REVOKE EXECUTE ON FUNCTION f() FROM my_role;
-            "#;
-            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("Failed to parse SQL");
-
-            assert_eq!(db.table_grants().count(), 1, "the grant was left alone");
-        }
-
         // ----------------------------------------------------------------
         // Coverage-targeted tests for `impls/sqlparser/grant.rs`:
         // `partition_grantees_for_revoke`, `apply_revoke_to_grant`,
@@ -10759,19 +10809,6 @@ mod tests {
                 CREATE TABLE s.t (id INT);
                 CREATE ROLE r;
                 GRANT SELECT ON ALL TABLES IN SCHEMA s TO r;
-            ";
-            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("parse");
-            assert_eq!(db.table_grants().count(), 1);
-        }
-
-        /// `grant_objects_inner_match` Function arm: an EXECUTE grant on a
-        /// concrete function object lands in `table_grants`.
-        #[test]
-        fn test_grant_execute_on_function() {
-            let sql = r"
-                CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT $1';
-                CREATE ROLE r;
-                GRANT EXECUTE ON FUNCTION f(INT) TO r;
             ";
             let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("parse");
             assert_eq!(db.table_grants().count(), 1);
@@ -10921,21 +10958,6 @@ mod tests {
                 CREATE ROLE r;
                 GRANT USAGE ON SCHEMA s TO r;
                 REVOKE USAGE ON SCHEMA s FROM r;
-            ";
-            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("parse");
-            assert_eq!(db.table_grants().count(), 0);
-        }
-
-        /// `grant_objects_inner_match` Function arm: REVOKE on a
-        /// specific function-by-signature matches the corresponding
-        /// GRANT EXECUTE on that function.
-        #[test]
-        fn test_revoke_execute_on_function_matches_grant() {
-            let sql = r"
-                CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT $1';
-                CREATE ROLE r;
-                GRANT EXECUTE ON FUNCTION f(INT) TO r;
-                REVOKE EXECUTE ON FUNCTION f(INT) FROM r;
             ";
             let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("parse");
             assert_eq!(db.table_grants().count(), 0);

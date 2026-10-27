@@ -797,6 +797,24 @@ impl FunctionLike for MemoryFunction {
     fn owner<'db>(&self, _database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         Ok(None)
     }
+
+    /// This catalog records no grants, so every function keeps PostgreSQL's
+    /// default.
+    fn is_executable_by_public(&self, _database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(true)
+    }
+
+    fn can_execute(&self, _role: &MemoryRole, _database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(true)
+    }
+
+    fn can_grant_execute(
+        &self,
+        _role: &MemoryRole,
+        _database: &Self::DB,
+    ) -> Result<bool, LookupError> {
+        Ok(false)
+    }
 }
 
 impl TriggerLike for MemoryTrigger {

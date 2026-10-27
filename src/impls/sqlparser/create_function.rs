@@ -4,8 +4,9 @@
 use alloc::{borrow::Cow, format, string::ToString};
 
 use sqlparser::ast::{
-    CreateFunction, CreateFunctionBody, DataType, Expr, FunctionBehavior, FunctionCalledOnNull,
-    FunctionDefinitionSetParam, FunctionReturnType, FunctionSecurity, Value, ValueWithSpan,
+    CreateFunction, CreateFunctionBody, CreateRole, DataType, Expr, FunctionBehavior,
+    FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionReturnType, FunctionSecurity, Value,
+    ValueWithSpan,
 };
 
 use crate::{
@@ -164,6 +165,25 @@ impl FunctionLike for CreateFunction {
     #[inline]
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         Ok(function_metadata(self, database)?.owner())
+    }
+
+    #[inline]
+    fn is_executable_by_public(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(function_metadata(self, database)?.execute_privileges().public())
+    }
+
+    #[inline]
+    fn can_execute(&self, role: &CreateRole, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(function_metadata(self, database)?.can_execute(role))
+    }
+
+    #[inline]
+    fn can_grant_execute(
+        &self,
+        role: &CreateRole,
+        database: &Self::DB,
+    ) -> Result<bool, LookupError> {
+        Ok(function_metadata(self, database)?.can_grant_execute(role))
     }
 }
 
