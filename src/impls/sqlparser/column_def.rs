@@ -511,6 +511,7 @@ mod tests {
                 ("DATETIME2(0)", Some(0)),
                 ("DATETIMEOFFSET", Some(7)),
                 ("DATETIMEOFFSET(3)", Some(3)),
+                ("DATETIME2(MAX)", None),
                 ("TIME", Some(7)),
                 ("TIME(2)", Some(2)),
                 ("SMALLDATETIME", Some(0)),
@@ -526,6 +527,7 @@ mod tests {
                 ("TIMESTAMP(0)", Some(0)),
                 ("TIMESTAMP(9) WITH TIME ZONE", Some(9)),
                 ("DATE", Some(0)),
+                ("NUMBER(10)", None),
             ]);
         }
 
@@ -631,6 +633,7 @@ mod tests {
                 ("DATETIME2", None),
                 ("DateTime64(5)", Some(5)),
                 ("TIMESTAMP_NTZ(1)", Some(1)),
+                ("INT", None),
             ]);
         }
 
