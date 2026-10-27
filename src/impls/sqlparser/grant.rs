@@ -17,7 +17,7 @@ use crate::{
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{
         ColumnGrantLike, ColumnLike, DatabaseLike, GrantLike, Metadata, Relation, RoleLike,
-        TableGrantLike, TableLike, ViewLike, grant::GrantTarget,
+        SequenceLike, TableGrantLike, TableLike, ViewLike, grant::GrantTarget,
     },
     utils::{
         identifier_resolution::{
@@ -132,6 +132,19 @@ fn schema_matches_view<V: ViewLike>(schema_name: &ObjectName, view: &V) -> bool 
     schema_matches_relation(
         schema_name,
         view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())),
+    )
+}
+
+/// Whether the schema a blanket grant names holds a sequence, a sequence
+/// stored without a schema sitting in the default one.
+fn schema_matches_sequence<S: SequenceLike>(schema_name: &ObjectName, sequence: &S) -> bool {
+    schema_matches_relation(
+        schema_name,
+        Some(
+            sequence
+                .sequence_schema()
+                .map_or(("public", false), |schema| (schema, sequence.sequence_schema_is_quoted())),
+        ),
     )
 }
 
@@ -678,15 +691,40 @@ fn granted_tables<'a>(
 }
 
 /// Resolves each relation a grant names, in the order the grant wrote them,
-/// looking for a table first and then each view kind, since one name holds at
-/// most one of the three.
+/// looking for a table first and then each view kind and a sequence, since one
+/// name holds at most one of them.
 ///
 /// `ALL TABLES IN SCHEMA` covers views and materialized views as well as
-/// tables, which is what PostgreSQL grants, so all three are walked.
+/// tables, which is what PostgreSQL grants, so all three are walked. It leaves
+/// sequences out, which `ON SEQUENCE` and `ALL SEQUENCES IN SCHEMA` reach.
 fn granted_relations<'a>(grant: &'a Grant, database: &'a ParserDB) -> Vec<Relation<'a, ParserDB>> {
     match &grant.objects {
         Some(GrantObjects::Tables(names)) => {
             names.iter().filter_map(|name| resolve_relation_name(name, database)).collect()
+        }
+        Some(GrantObjects::Sequences(names)) => {
+            names
+                .iter()
+                .filter_map(|name| {
+                    database
+                        .sequence_by_target(
+                            target_name_from_object_name(name)?,
+                            IdentifierCase::AsWritten,
+                        )
+                        .ok()
+                        .flatten()
+                })
+                .map(Relation::Sequence)
+                .collect()
+        }
+        Some(GrantObjects::AllSequencesInSchema { schemas }) => {
+            database
+                .sequences()
+                .filter(|sequence| {
+                    schemas.iter().any(|schema| schema_matches_sequence(schema, *sequence))
+                })
+                .map(Relation::Sequence)
+                .collect()
         }
         Some(GrantObjects::AllTablesInSchema { schemas }) => {
             database
@@ -729,11 +767,18 @@ fn resolve_relation_name<'a>(
     {
         return Some(Relation::View(view));
     }
-    database
-        .materialized_view_by_target(target, IdentifierCase::AsWritten)
+    if let Some(view) = database
+        .materialized_view_by_target(target.clone(), IdentifierCase::AsWritten)
         .ok()
         .flatten()
-        .map(Relation::MaterializedView)
+    {
+        return Some(Relation::MaterializedView(view));
+    }
+    database
+        .sequence_by_target(target, IdentifierCase::AsWritten)
+        .ok()
+        .flatten()
+        .map(Relation::Sequence)
 }
 
 impl TableGrantLike for Grant {

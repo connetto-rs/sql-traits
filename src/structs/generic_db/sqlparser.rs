@@ -1513,7 +1513,7 @@ impl ParserDBBuilder {
     /// Binds every relation a grant or revoke names to the one it reaches
     /// through the session's path, leaving a name reaching none as written.
     fn bind_access_targets(&self, objects: &mut Option<GrantObjects>) {
-        let Some(GrantObjects::Tables(names)) = objects else {
+        let Some(GrantObjects::Tables(names) | GrantObjects::Sequences(names)) = objects else {
             return;
         };
         for name in names {
@@ -3497,13 +3497,13 @@ fn validate_declared_column(
 }
 
 /// Enforces [`AccessResolution::ClosedWorld`] on one `GRANT` or `REVOKE`: every
-/// relation target names a table or a view, and every grantee names a role,
-/// that the input has created up to this statement.
+/// relation target names a table, a view or a sequence, and every grantee
+/// names a role, that the input has created up to this statement.
 ///
 /// The two statements carry the same targets and the database answers for them
 /// alike, reporting an absent relation before an absent role, which is the
-/// order here. A view is a legal target: granting on one is ordinary
-/// PostgreSQL, and a blanket grant over a schema covers views too.
+/// order here. A view or a sequence is a legal target of the table spelling:
+/// granting on one is ordinary PostgreSQL.
 fn validate_access_targets_against_builder(
     builder: &ParserDBBuilder,
     grantees: &[Grantee],
@@ -3513,6 +3513,7 @@ fn validate_access_targets_against_builder(
         for table_obj in tables {
             if builder.resolve_table_object_name(table_obj)?.is_none()
                 && views::holds_view(builder, table_obj).is_none()
+                && !sequences::holds_sequence(builder, table_obj)
             {
                 return Err(crate::errors::Error::TableNotFoundForGrant {
                     table_name: last_str(table_obj).to_string(),
@@ -3969,7 +3970,8 @@ pub type ParserDB = GenericDB<SqlparserProfile>;
 pub enum UnresolvedAccessReference<'a> {
     /// A grantee naming a role no `CREATE ROLE` in the input creates.
     GranteeRole(&'a Ident),
-    /// A grant target naming a table no `CREATE TABLE` in the input creates.
+    /// A grant target naming a relation no table, view or sequence the input
+    /// creates holds.
     GrantTable(&'a ObjectName),
     /// A grant target naming a function no `CREATE FUNCTION` before the grant
     /// creates, with the argument list the grant wrote.
@@ -4228,24 +4230,30 @@ impl ParserDB {
         )
     }
 
-    /// Whether either view kind holds the relation name a grant wrote.
+    /// Whether a view, a materialized view or a sequence holds the relation
+    /// name a grant wrote.
     ///
-    /// A grant target is a relation, so a view answers it as readily as a
-    /// table, and the caller only needs to know that something holds the name.
+    /// A grant target is a relation, so any of these answers it as readily as
+    /// a table, and the caller only needs to know that something holds the
+    /// name.
     ///
     /// # Errors
     ///
     /// Returns an error when the object name is malformed for relation lookup,
     /// or when lookup is ambiguous.
-    fn resolve_grant_view(&self, object_name: &ObjectName) -> Result<Option<()>, LookupError> {
+    fn resolve_grant_relation(&self, object_name: &ObjectName) -> Result<Option<()>, LookupError> {
         use crate::traits::DatabaseLike as _;
 
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let target = target_name_of_idents(schema_ident, name_ident);
-        if self.view_by_target(target.clone(), IdentifierCase::AsWritten)?.is_some() {
+        if self.view_by_target(target.clone(), IdentifierCase::AsWritten)?.is_some()
+            || self
+                .materialized_view_by_target(target.clone(), IdentifierCase::AsWritten)?
+                .is_some()
+        {
             return Ok(Some(()));
         }
-        Ok(self.materialized_view_by_target(target, IdentifierCase::AsWritten)?.map(|_| ()))
+        Ok(self.sequence_by_target(target, IdentifierCase::AsWritten)?.map(|_| ()))
     }
 
     /// Reports the roles, table targets and function targets that this
@@ -4341,7 +4349,7 @@ impl ParserDB {
                     // A view is as legal a target as a table, so only a name
                     // no relation holds is unresolved.
                     if self.resolve_table_object_name(table_obj)?.is_none()
-                        && self.resolve_grant_view(table_obj)?.is_none()
+                        && self.resolve_grant_relation(table_obj)?.is_none()
                     {
                         unresolved.insert(UnresolvedAccessReference::GrantTable(table_obj));
                     }
