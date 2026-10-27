@@ -8634,11 +8634,12 @@ mod tests {
         /// The statement names a table the input never creates, so only the
         /// edit below can make the refusal an unnamed-object one.
         fn create_rule(edit: impl FnOnce(&mut sqlparser::ast::CreateRule)) -> Statement {
-            let mut statement = parse_postgres("CREATE RULE r AS ON DELETE TO t DO NOTHING;");
-            if let Statement::CreateRule(rule) = &mut statement {
-                edit(rule);
-            }
-            statement
+            let mut rule = Parser::new(&PostgreSqlDialect {})
+                .try_with_sql("r AS ON DELETE TO t DO NOTHING")
+                .and_then(|mut parser| parser.parse_create_rule(false))
+                .expect("parse");
+            edit(&mut rule);
+            Statement::CreateRule(rule)
         }
 
         #[test]
