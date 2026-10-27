@@ -750,6 +750,17 @@ mod tests {
         let grantees: Vec<_> = <&_ as GrantLike>::grantees(&grant_ref, &db).collect();
         assert_eq!(grantees.len(), 1);
 
+        let names: Option<Vec<_>> = match <&_ as GrantLike>::target(&grant_ref) {
+            GrantTarget::Tables(targets) => {
+                Some(targets.map(|target| target.name().to_owned()).collect())
+            }
+            _ => None,
+        };
+        assert_eq!(
+            names.as_deref(),
+            Some(["my_table", "my_view", "my_materialized"].map(String::from).as_slice())
+        );
+
         let table = db
             .table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)
             .expect("unambiguous lookup")
