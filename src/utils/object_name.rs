@@ -796,9 +796,7 @@ pub(crate) fn resolve_view_in_iter<'a, V: ViewLike>(
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> Result<Option<&'a V>, LookupError> {
-    let key = target_key(target, case);
-    let candidates: Vec<&V> = views.filter(|view| stored_view_key(*view, case) == key).collect();
-    resolve_one_relation(target, &candidates, render_view_candidate)
+    resolve_relation_in_iter(views, target, case, stored_view_key, render_view_candidate)
 }
 
 /// Resolves a written target name against an iterator of sequences, trying
@@ -846,10 +844,33 @@ pub(crate) fn resolve_sequence_in_iter<'a, S: SequenceLike>(
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> Result<Option<&'a S>, LookupError> {
+    resolve_relation_in_iter(
+        sequences,
+        target,
+        case,
+        stored_sequence_key,
+        render_sequence_candidate,
+    )
+}
+
+/// Resolves a written target name against an iterator of relations of one
+/// kind, consulting no search path, so an unqualified name names the default
+/// schema.
+///
+/// # Errors
+///
+/// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
+/// than one relation.
+fn resolve_relation_in_iter<'a, R>(
+    relations: impl Iterator<Item = &'a R>,
+    target: &TargetName<'_>,
+    case: IdentifierCase,
+    key_of: impl Fn(&R, IdentifierCase) -> RelationKey,
+    render: impl Fn(&R) -> String,
+) -> Result<Option<&'a R>, LookupError> {
     let key = target_key(target, case);
-    let candidates: Vec<&S> =
-        sequences.filter(|sequence| stored_sequence_key(*sequence, case) == key).collect();
-    resolve_one_relation(target, &candidates, render_sequence_candidate)
+    let candidates: Vec<&R> = relations.filter(|relation| key_of(relation, case) == key).collect();
+    resolve_one_relation(target, &candidates, render)
 }
 
 /// Resolves a written function reference against an iterator of declarations,
