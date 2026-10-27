@@ -2917,6 +2917,31 @@ fn refuse_no_inherit_check_on_partitioned(
     Ok(())
 }
 
+/// Refuses a foreign key joining two tables PostgreSQL keeps apart by how
+/// durably it stores them. A temporary table and one that is not may not
+/// reference each other, and a permanent table may not reference an unlogged
+/// one.
+fn refuse_reference_across_storage(
+    host: &CreateTable,
+    referenced: &CreateTable,
+    referenced_name: &str,
+) -> Result<(), crate::errors::Error> {
+    if referenced.is_temporary() != host.is_temporary() {
+        return Err(crate::errors::Error::ForeignKeyCrossesTemporaryStorage {
+            host_table: host.name.to_string(),
+            referenced_table: referenced_name.to_string(),
+            host_is_temporary: host.is_temporary(),
+        });
+    }
+    if referenced.unlogged && !host.unlogged && !host.is_temporary() {
+        return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
+            host_table: host.name.to_string(),
+            referenced_table: referenced_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Qualifies the name of a relation being created with the schema it lands in,
 /// answering whether that is the temporary schema.
 fn place_relation(
@@ -4743,13 +4768,7 @@ impl ParserDB {
                 host_table: create_table.name.to_string(),
             });
         };
-        if referenced_table.is_temporary() != create_table.is_temporary() {
-            return Err(crate::errors::Error::ForeignKeyCrossesTemporaryStorage {
-                host_table: create_table.name.to_string(),
-                referenced_table: referenced_table_name,
-                host_is_temporary: create_table.is_temporary(),
-            });
-        }
+        refuse_reference_across_storage(create_table, referenced_table, &referenced_table_name)?;
 
         for ref_col_ident in &fk.referred_columns {
             let column_exists = referenced_table.columns.iter().any(|col| {
@@ -5521,6 +5540,117 @@ impl ParserDB {
             .map(|(table, _, _)| table.as_ref())
             .find(|table| stored.matches(table, builder.identifier_case()))
             .ok_or_else(|| ObjectKind::Table.not_in_database(&stored.name).into())
+    }
+
+    /// Applies `ALTER TABLE ... SET UNLOGGED`, when `unlogged`, or `SET LOGGED`
+    /// to the table the statement names.
+    ///
+    /// The checks run in PostgreSQL 18's order. A partitioned table refuses
+    /// either clause, a second change in one statement is refused, and so is
+    /// either clause on a temporary table. A clause naming the state the table
+    /// already holds then changes nothing and checks nothing further.
+    /// `changed` holds, for the whole statement, the persistence the table had
+    /// before a clause changed it.
+    ///
+    /// A permanent table never references an unlogged one, so `SET UNLOGGED`
+    /// is refused while a permanent table references this one. `SET LOGGED`
+    /// needs no check of its own, because the rebuild checks the table's own
+    /// foreign keys again and refuses one referencing an unlogged table.
+    fn alter_table_persistence(
+        builder: ParserDBBuilder,
+        table_name: &ObjectName,
+        scope: AlterTableScope,
+        unlogged: bool,
+        changed: &mut Option<bool>,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
+            return Ok(builder);
+        };
+        let node = Self::stored_node(&builder, &stored)?;
+        if node.partition_by.is_some() {
+            return Err(crate::errors::Error::PersistenceNotChangeable {
+                table_name: stored.name.clone(),
+                reason: crate::errors::FixedPersistence::Partitioned,
+            });
+        }
+        if changed.is_some() {
+            return Err(crate::errors::Error::PersistenceChangedTwice {
+                table_name: stored.name.clone(),
+            });
+        }
+        if node.is_temporary() {
+            return Err(crate::errors::Error::PersistenceNotChangeable {
+                table_name: stored.name.clone(),
+                reason: crate::errors::FixedPersistence::Temporary,
+            });
+        }
+        if node.unlogged == unlogged {
+            return Ok(builder);
+        }
+        if unlogged && let Some(host) = Self::permanent_table_referencing(&builder, &stored)? {
+            return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
+                host_table: host.name.to_string(),
+                referenced_table: node.name.to_string(),
+            });
+        }
+        *changed = Some(node.unlogged);
+        Self::replace_table_node(builder, &stored, |_, replacement| {
+            replacement.unlogged = unlogged;
+            Ok(())
+        })
+    }
+
+    /// A permanent table other than `stored` whose foreign key references it.
+    fn permanent_table_referencing<'builder>(
+        builder: &'builder ParserDBBuilder,
+        stored: &StoredTable,
+    ) -> Result<Option<&'builder CreateTable>, crate::errors::Error> {
+        let case = builder.identifier_case();
+        for (foreign_key, ()) in builder.foreign_keys() {
+            let host: &CreateTable = foreign_key.table();
+            if host.unlogged || host.is_temporary() || stored.matches(host, case) {
+                continue;
+            }
+            if builder
+                .resolve_table_object_name(&foreign_key.attribute().foreign_table)?
+                .is_some_and(|referenced| stored.matches(referenced, case))
+            {
+                return Ok(Some(host));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Refuses a foreign key on an unlogged table when an earlier clause of
+    /// the same statement made it unlogged and the key references another
+    /// unlogged table.
+    ///
+    /// PostgreSQL checks an added key against the persistence the table had
+    /// when the statement began, which the rebuild no longer sees once the
+    /// earlier clause has changed the node. `changed` is what
+    /// [`Self::alter_table_persistence`] recorded for the statement.
+    fn refuse_reference_from_permanent_start(
+        builder: &ParserDBBuilder,
+        table_name: &ObjectName,
+        changed: Option<bool>,
+        foreign_table: &ObjectName,
+    ) -> Result<(), crate::errors::Error> {
+        if changed != Some(false) {
+            return Ok(());
+        }
+        let (Some(host), Some(referenced)) = (
+            builder.resolve_table_object_name(table_name)?,
+            builder.resolve_table_object_name(foreign_table)?,
+        ) else {
+            return Ok(());
+        };
+        if referenced.unlogged && !core::ptr::eq(host, referenced) {
+            return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
+                host_table: host.name.to_string(),
+                referenced_table: foreign_table.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Removes tables together with the foreign keys the remaining tables
@@ -6809,6 +6939,9 @@ impl ParserDB {
                         if_exists: alter_table.if_exists,
                         only: alter_table.only,
                     };
+                    // The persistence the table had before a clause of this
+                    // statement changed it.
+                    let mut persistence_before_change = None;
                     for operation in alter_table.operations {
                         // `ALTER TABLE` names a relation, and PostgreSQL
                         // accepts it against a view for the actions a view
@@ -6865,6 +6998,14 @@ impl ParserDB {
                                 )?;
                             }
                             AlterTableOperation::AddConstraint { constraint, .. } => {
+                                if let TableConstraint::ForeignKey(foreign_key) = &constraint {
+                                    Self::refuse_reference_from_permanent_start(
+                                        &builder,
+                                        &alter_table.name,
+                                        persistence_before_change,
+                                        &foreign_key.foreign_table,
+                                    )?;
+                                }
                                 builder = Self::alter_table_add_constraint(
                                     builder,
                                     &alter_table.name,
@@ -6887,6 +7028,16 @@ impl ParserDB {
                                 column_position,
                                 ..
                             } => {
+                                for option in &column_def.options {
+                                    if let ColumnOption::ForeignKey(foreign_key) = &option.option {
+                                        Self::refuse_reference_from_permanent_start(
+                                            &builder,
+                                            &alter_table.name,
+                                            persistence_before_change,
+                                            &foreign_key.foreign_table,
+                                        )?;
+                                    }
+                                }
                                 builder = Self::alter_table_add_column(
                                     builder,
                                     &alter_table.name,
@@ -7051,6 +7202,16 @@ impl ParserDB {
                                 }
                             }
 
+                            AlterTableOperation::SetLogged | AlterTableOperation::SetUnlogged => {
+                                builder = Self::alter_table_persistence(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    matches!(operation, AlterTableOperation::SetUnlogged),
+                                    &mut persistence_before_change,
+                                )?;
+                            }
+
                             // Ignored: each of these changes something the
                             // model carries no representation of, so nothing it
                             // answers can change.
@@ -7112,11 +7273,7 @@ impl ParserDB {
                             // MySQL hints choosing how the server performs the
                             // change, with no effect on the result.
                             | AlterTableOperation::Algorithm { .. }
-                            | AlterTableOperation::Lock { .. }
-                            // Whether a table is write-ahead logged is a
-                            // durability choice the model does not describe.
-                            | AlterTableOperation::SetLogged
-                            | AlterTableOperation::SetUnlogged => {}
+                            | AlterTableOperation::Lock { .. } => {}
                         }
                     }
                 }
@@ -7155,6 +7312,14 @@ impl ParserDB {
                         ObjectKind::Table,
                     )?;
 
+                    // Refused before `IF NOT EXISTS`, as PostgreSQL refuses it
+                    // while placing the name.
+                    if create_table.temporary && create_table.unlogged {
+                        return Err(crate::errors::Error::UnloggedTemporaryTable {
+                            table_name: create_table.table_name().to_string(),
+                        });
+                    }
+
                     // `IF NOT EXISTS` skips the statement whole when anything
                     // in the relation pool of the schema already holds the
                     // name, an index as much as a table.
@@ -7169,6 +7334,12 @@ impl ParserDB {
                         .is_some()
                     {
                         continue;
+                    }
+
+                    if create_table.unlogged && create_table.partition_by.is_some() {
+                        return Err(crate::errors::Error::UnloggedPartitionedTable {
+                            table_name: create_table.table_name().to_string(),
+                        });
                     }
 
                     // A `LIKE` copy becomes the table's own columns, so it

@@ -103,6 +103,26 @@ impl core::fmt::Display for RequiredValue {
     }
 }
 
+/// Why a table's persistence may not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FixedPersistence {
+    /// A temporary table lives and dies with its session, so it is never
+    /// logged and never unlogged.
+    Temporary,
+    /// A partitioned table holds no rows of its own, so PostgreSQL 18 gives it
+    /// no persistence to change.
+    Partitioned,
+}
+
+impl core::fmt::Display for FixedPersistence {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Temporary => "it is temporary",
+            Self::Partitioned => "it is partitioned",
+        })
+    }
+}
+
 impl ObjectKind {
     /// Reports an object of this kind that the queried database does not hold,
     /// identified by its own `name`.
@@ -864,6 +884,59 @@ pub enum Error {
         host_is_temporary: bool,
     },
     #[error(
+        "Foreign key of permanent table `{host_table}` cannot reference unlogged table `{referenced_table}`: constraints on permanent tables may reference only permanent tables."
+    )]
+    /// Error indicating that a permanent table would reference an unlogged one
+    /// through a foreign key, which PostgreSQL refuses.
+    ///
+    /// Raised for a foreign key declared or added on a permanent table, for
+    /// `SET LOGGED` on a table whose foreign key references an unlogged one,
+    /// and for `SET UNLOGGED` on a table a permanent one references.
+    ForeignKeyReferencesUnloggedTable {
+        /// The permanent table declaring the foreign key.
+        host_table: String,
+        /// The unlogged table it references.
+        referenced_table: String,
+    },
+    #[error("Table `{table_name}` cannot be both temporary and unlogged.")]
+    /// Error indicating that an unlogged table is declared temporary or placed
+    /// in `pg_temp`.
+    ///
+    /// PostgreSQL rejects `CREATE TEMP UNLOGGED TABLE` as a syntax error and
+    /// `CREATE UNLOGGED TABLE pg_temp.t` because only temporary relations live
+    /// in the temporary schema.
+    UnloggedTemporaryTable {
+        /// Name of the table the statement creates.
+        table_name: String,
+    },
+    #[error("Partitioned table `{table_name}` cannot be unlogged.")]
+    /// Error indicating that `CREATE UNLOGGED TABLE` declares a partitioned
+    /// table, which PostgreSQL 18 refuses.
+    UnloggedPartitionedTable {
+        /// Name of the table the statement creates.
+        table_name: String,
+    },
+    #[error("Cannot change logged status of table `{table_name}` because {reason}.")]
+    /// Error indicating that `ALTER TABLE ... SET LOGGED` or `SET UNLOGGED`
+    /// names a table whose persistence is fixed, refused even when the table
+    /// already holds the state named.
+    PersistenceNotChangeable {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// What fixes the table's persistence.
+        reason: FixedPersistence,
+    },
+    #[error("Cannot change persistence of table `{table_name}` twice in one statement.")]
+    /// Error indicating that one `ALTER TABLE` changes a table's persistence
+    /// and then names a persistence again.
+    ///
+    /// A clause naming the state the table already holds changes nothing, so
+    /// only a clause after an actual change is refused.
+    PersistenceChangedTwice {
+        /// Name of the table the statement names.
+        table_name: String,
+    },
+    #[error(
         "Permanent table `{table_name}` cannot inherit from temporary relation `{parent_name}`."
     )]
     /// Error indicating that a permanent table names a temporary parent in
@@ -1338,6 +1411,8 @@ mod tests {
         assert_eq!(InheritedChange::RenameColumn.to_string(), "rename a column of");
         assert_eq!(RequiredValue::CoveredByKey.to_string(), "a key covers it");
         assert_eq!(RequiredValue::EnforcedByParent.to_string(), "a parent requires it");
+        assert_eq!(FixedPersistence::Temporary.to_string(), "it is temporary");
+        assert_eq!(FixedPersistence::Partitioned.to_string(), "it is partitioned");
     }
 
     #[test]
