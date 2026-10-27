@@ -637,6 +637,10 @@ impl IndexLike for MemoryIndex {
             .find(|table| table.name == self.table_name)
             .expect("every index of this catalog belongs to one of its tables")
     }
+
+    fn is_unique(&self) -> bool {
+        false
+    }
 }
 
 impl IndexLike for MemoryUniqueIndex {
@@ -662,6 +666,10 @@ impl IndexLike for MemoryUniqueIndex {
         Self: 'db,
     {
         self.0.table(database)
+    }
+
+    fn is_unique(&self) -> bool {
+        true
     }
 }
 
@@ -1429,6 +1437,24 @@ fn constraints_without_validation_records_report_validated() -> Result<(), Looku
 
     assert!(check.is_validated(&catalog)?);
     assert!(key.is_validated(&catalog)?);
+    Ok(())
+}
+
+/// A catalog that records no index clauses reports every index as written
+/// without `USING`, `INCLUDE` or `WHERE`.
+#[test]
+fn indexes_without_clause_records_report_none_written() -> Result<(), LookupError> {
+    let catalog = catalog();
+    let index = MemoryIndex {
+        name: Some(String::from("docs_id")),
+        schema: None,
+        table_name: String::from("docs"),
+        expression: Expr::Identifier("id".into()),
+    };
+
+    assert_eq!(index.access_method(), None);
+    assert_eq!(index.include_columns(&catalog)?.count(), 0);
+    assert_eq!(index.predicate(), None);
     Ok(())
 }
 

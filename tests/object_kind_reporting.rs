@@ -107,6 +107,10 @@ fn an_index_reports_itself_by_name() {
         index.expression(&other).err(),
         Some(ObjectKind::Index.not_in_database("idx_anon_name"))
     );
+    assert_eq!(
+        index.include_columns(&other).err(),
+        Some(ObjectKind::Index.not_in_database("idx_anon_name"))
+    );
 }
 
 #[test]
@@ -116,6 +120,10 @@ fn a_named_unique_constraint_reports_itself_by_name() {
 
     assert_eq!(
         unique_index.expression(&other).err(),
+        Some(ObjectKind::UniqueIndex.not_in_database("uq_named"))
+    );
+    assert_eq!(
+        unique_index.include_columns(&other).err(),
         Some(ObjectKind::UniqueIndex.not_in_database("uq_named"))
     );
 }

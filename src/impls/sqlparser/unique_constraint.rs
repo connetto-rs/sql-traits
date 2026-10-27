@@ -1,8 +1,9 @@
 //! Implement the [`UniqueConstraint`] trait for the `sqlparser` crate's
 //! [`TableAttribute`] wrapper.
 
-use sqlparser::ast::{CreateTable, Expr, UniqueConstraint};
+use sqlparser::ast::{ColumnDef, CreateTable, Expr, IndexType, UniqueConstraint};
 
+use super::index_clauses::{included_columns, written_access_method};
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, TableAttribute, metadata::UniqueIndexMetadata},
@@ -22,6 +23,24 @@ fn unique_constraint_name(constraint: &UniqueConstraint) -> Option<&sqlparser::a
     constraint.name.as_ref().or(constraint.index_name.as_ref())
 }
 
+impl TableAttribute<CreateTable, UniqueConstraint> {
+    /// The metadata `database` keeps for the index backing this constraint,
+    /// or the error saying it holds no such index.
+    fn metadata<'db>(
+        &self,
+        database: &'db ParserDB,
+    ) -> Result<&'db UniqueIndexMetadata<Self>, LookupError> {
+        database.unique_index_metadata(self).ok_or_else(|| {
+            match unique_constraint_name(self.attribute()) {
+                Some(name) => ObjectKind::UniqueIndex.not_in_database(&name.value),
+                None => {
+                    ObjectKind::UniqueIndex.anonymous_not_in_database(self.table().table_name())
+                }
+            }
+        })
+    }
+}
+
 impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     type DB = ParserDB;
 
@@ -31,6 +50,13 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
         Self: 'db,
     {
         self.table()
+    }
+
+    /// Always `true`, since the parser stores here only primary keys and
+    /// unique constraints, whose backing indexes are unique by definition.
+    #[inline]
+    fn is_unique(&self) -> bool {
+        true
     }
 
     /// PostgreSQL builds the backing index under the constraint name and MySQL
@@ -58,16 +84,24 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     where
         Self: 'db,
     {
-        Ok(database
-            .unique_index_metadata(self)
-            .ok_or_else(|| {
-                match unique_constraint_name(self.attribute()) {
-                    Some(name) => ObjectKind::UniqueIndex.not_in_database(&name.value),
-                    None => {
-                        ObjectKind::UniqueIndex.anonymous_not_in_database(self.table().table_name())
-                    }
-                }
-            })?
-            .expression())
+        Ok(self.metadata(database)?.expression())
+    }
+
+    #[inline]
+    fn access_method(&self) -> Option<&IndexType> {
+        let constraint = self.attribute();
+        written_access_method(constraint.index_type.as_ref(), &constraint.index_options)
+    }
+
+    #[inline]
+    fn include_columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db TableAttribute<CreateTable, ColumnDef>>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.metadata(database)?;
+        included_columns(&self.attribute().include, self.table(), database)
     }
 }

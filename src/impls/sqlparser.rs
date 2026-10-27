@@ -17,6 +17,7 @@ mod dml;
 pub(crate) mod dql;
 mod foreign_key_constraint;
 mod grant;
+mod index_clauses;
 mod schema;
 mod unique_constraint;
 mod view;

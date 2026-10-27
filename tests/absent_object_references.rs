@@ -69,6 +69,21 @@ fn an_index_including_an_absent_column_is_refused() {
     );
 }
 
+/// A key constraint is backed by an index carrying its `INCLUDE` list, so an
+/// absent column there is the same mistake as on `CREATE INDEX`.
+#[test]
+fn a_key_constraint_including_an_absent_column_is_refused() {
+    for constraint in ["UNIQUE (a) INCLUDE (missing)", "PRIMARY KEY (id) INCLUDE (missing)"] {
+        let error = parse(&format!("CREATE TABLE t (id INT, a INT, CONSTRAINT c {constraint});"))
+            .expect_err("missing is not declared");
+        assert!(
+            matches!(&error, Error::IdentifierLookupError(LookupError::ColumnNotFound {
+                table_name, column_name }) if table_name == "t" && column_name == "missing"),
+            "{constraint}: got {error:?}"
+        );
+    }
+}
+
 /// An entry that is an expression rather than a plain column names no single
 /// column, so it is left alone, matching how an index-shaped constraint is
 /// checked.
