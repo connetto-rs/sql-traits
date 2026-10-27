@@ -32,6 +32,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type CheckConstraint = P::CheckConstraint;
     type Trigger = P::Trigger;
     type Rule = P::Rule;
+    type Extension = P::Extension;
     type Policy = P::Policy;
     type Role = P::Role;
     type TableGrant = P::TableGrant;
@@ -237,6 +238,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     #[inline]
     fn rules(&self) -> impl Iterator<Item = &Self::Rule> {
         self.rules.iter().map(|(rule, _)| rule.as_ref())
+    }
+
+    #[inline]
+    fn extensions(&self) -> impl Iterator<Item = &Self::Extension> {
+        self.extensions.iter().map(|(extension, _)| extension.as_ref())
     }
 
     #[inline]

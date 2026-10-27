@@ -3,6 +3,7 @@
 
 mod check_constraint;
 mod column_def;
+mod create_extension;
 mod create_function;
 mod create_index;
 mod create_policy;

@@ -13,9 +13,9 @@ use crate::{
     errors::{Error, LookupError},
     structs::{IdentifierCase, TargetName},
     traits::{
-        CheckConstraintLike, ColumnGrantLike, ColumnLike, DialectLike, ForeignKeyLike,
-        FunctionLike, IndexLike, PolicyLike, RoleLike, RuleLike, SchemaLike, TableGrantLike,
-        TableLike, TriggerLike, UniqueIndexLike, ViewLike,
+        CheckConstraintLike, ColumnGrantLike, ColumnLike, DialectLike, ExtensionLike,
+        ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike, RuleLike, SchemaLike,
+        TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, ViewLike,
     },
     utils::{
         identifier_resolution::stored_identifier_matches_lookup,
@@ -48,6 +48,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type Trigger: TriggerLike<DB = Self>;
     /// Type of the rewrite rules in the schema.
     type Rule: RuleLike<DB = Self>;
+    /// Type of the extensions in the database.
+    type Extension: ExtensionLike<DB = Self>;
     /// Type of the unique indexes in the schema.
     type UniqueIndex: UniqueIndexLike<DB = Self>;
     /// Type of the check constraints in the schema.
@@ -200,6 +202,33 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # }
     /// ```
     fn rules(&self) -> impl Iterator<Item = &Self::Rule>;
+
+    /// Iterates over the extensions installed in the database.
+    ///
+    /// A PostgreSQL database always holds `plpgsql`, so one parsed under the
+    /// PostgreSQL dialect starts with it in `pg_catalog`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE SCHEMA exts;
+    /// CREATE EXTENSION pgcrypto WITH SCHEMA exts;
+    /// ",
+    /// )?;
+    /// let mut extensions: Vec<(&str, Option<&str>)> =
+    ///     db.extensions().map(|extension| (extension.name(), extension.schema())).collect();
+    /// extensions.sort_unstable();
+    /// assert_eq!(extensions, vec![("pgcrypto", Some("exts")), ("plpgsql", Some("pg_catalog"))]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn extensions(&self) -> impl Iterator<Item = &Self::Extension>;
 
     /// Iterates over the indexes defined in the schema.
     ///

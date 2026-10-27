@@ -44,6 +44,7 @@ struct MemoryCatalog {
     functions: Vec<MemoryFunction>,
     triggers: Vec<MemoryTrigger>,
     rules: Vec<MemoryRule>,
+    extensions: Vec<MemoryExtension>,
     policies: Vec<MemoryPolicy>,
     roles: Vec<MemoryRole>,
     table_grants: Vec<MemoryTableGrant>,
@@ -148,6 +149,12 @@ struct MemoryRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct MemoryExtension {
+    name: String,
+    schema: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryPolicy {
     name: String,
     table_name: String,
@@ -195,6 +202,7 @@ plain_metadata!(
     MemoryFunction,
     MemoryTrigger,
     MemoryRule,
+    MemoryExtension,
     MemoryPolicy,
     MemoryRole,
     MemoryTableGrant,
@@ -213,6 +221,7 @@ impl DatabaseLike for MemoryCatalog {
     type CheckConstraint = MemoryCheckConstraint;
     type Trigger = MemoryTrigger;
     type Rule = MemoryRule;
+    type Extension = MemoryExtension;
     type Policy = MemoryPolicy;
     type Role = MemoryRole;
     type TableGrant = MemoryTableGrant;
@@ -257,6 +266,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn rules(&self) -> impl Iterator<Item = &Self::Rule> {
         self.rules.iter()
+    }
+
+    fn extensions(&self) -> impl Iterator<Item = &Self::Extension> {
+        self.extensions.iter()
     }
 
     fn indexes(&self) -> impl Iterator<Item = &Self::Index> {
@@ -867,6 +880,22 @@ impl TriggerLike for MemoryTrigger {
     }
 
     fn function_name(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl ExtensionLike for MemoryExtension {
+    type DB = MemoryCatalog;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
+    fn version(&self) -> Option<&str> {
         None
     }
 }
