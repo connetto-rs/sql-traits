@@ -665,4 +665,12 @@ fn a_view_column_it_cannot_list_is_refused_as_an_owner() {
         Err(Error::UnsupportedSequenceOwner { sequence_name, owner })
             if sequence_name == "s" && owner == "v.generate_series"
     ));
+
+    // The declaration's own column list names the column, so it is found.
+    let db = parse(
+        "CREATE VIEW v (series) AS SELECT * FROM generate_series(1, 3);
+         CREATE SEQUENCE s OWNED BY v.series;",
+    )
+    .expect("the declared column list names the owner");
+    assert_eq!(owner_of(&db, "s"), Some(("v".to_string(), "#0".to_string())));
 }

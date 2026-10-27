@@ -115,18 +115,16 @@ fn resolve_owner(
 ) -> Result<StoredSequenceOwner, Error> {
     require_static_object_name(owner)?;
     let sequence_name = || sequence.value.clone();
-    let Some((ObjectNamePart::Identifier(column), relation_parts)) = owner.0.split_last() else {
+    // A static name ends in an identifier, so this refuses only a name with
+    // no relation before the column.
+    let Some((ObjectNamePart::Identifier(column), relation_parts)) =
+        owner.0.split_last().filter(|(_, relation_parts)| !relation_parts.is_empty())
+    else {
         return Err(Error::InvalidSequenceOwner {
             sequence_name: sequence_name(),
             owner: owner.to_string(),
         });
     };
-    if relation_parts.is_empty() {
-        return Err(Error::InvalidSequenceOwner {
-            sequence_name: sequence_name(),
-            owner: owner.to_string(),
-        });
-    }
     let mut relation = ObjectName(relation_parts.to_vec());
     require_named_in_catalog(&mut relation, ObjectKind::Table, builder.catalog_name())?;
     let relation_name = || last_str(&relation).to_string();
@@ -160,36 +158,33 @@ fn resolve_owner(
     };
 
     if kind == ObjectKind::Table {
-        let Some(table) = builder.resolve_table_object_name(&relation)? else {
-            return Err(column_not_found());
-        };
         return builder
-            .columns()
-            .iter()
-            .find(|(candidate, _, _)| {
-                core::ptr::eq(TableAttribute::table(candidate.as_ref()), table)
-                    && case.identifiers_match(
-                        candidate.column_name(),
-                        candidate.column_name_is_quoted(),
-                        &column.value,
-                        column.quote_style.is_some(),
-                    )
+            .resolve_table_object_name(&relation)?
+            .and_then(|table| {
+                builder.columns().iter().find(|(candidate, _, _)| {
+                    core::ptr::eq(TableAttribute::table(candidate.as_ref()), table)
+                        && case.identifiers_match(
+                            candidate.column_name(),
+                            candidate.column_name_is_quoted(),
+                            &column.value,
+                            column.quote_style.is_some(),
+                        )
+                })
             })
             .map(|(_, _, identity)| StoredSequenceOwner::Column(*identity))
             .ok_or_else(column_not_found);
     }
 
-    let Some(view) = builder.resolve_view_object_name(&relation)? else {
-        return Err(column_not_found());
-    };
-    let Some(identity) = builder
-        .views()
-        .iter()
-        .find(|(candidate, _, _)| core::ptr::eq(candidate.as_ref(), view))
-        .map(|(_, _, identity)| *identity)
-    else {
-        return Err(column_not_found());
-    };
+    let (view, identity) = builder
+        .resolve_view_object_name(&relation)?
+        .and_then(|view| {
+            builder
+                .views()
+                .iter()
+                .find(|(candidate, _, _)| core::ptr::eq(candidate.as_ref(), view))
+                .map(|(candidate, _, identity)| (candidate.as_ref(), *identity))
+        })
+        .ok_or_else(column_not_found)?;
     let (names, enumerable) = views::output_names(builder, view.declaration())?;
     match names.iter().position(|(name, quoted)| {
         case.identifiers_match(name, *quoted, &column.value, column.quote_style.is_some())
