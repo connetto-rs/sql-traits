@@ -46,7 +46,7 @@ use crate::{
             CheckMetadata, FunctionMetadata, IndexMetadata, PolicyMetadata, UniqueIndexMetadata,
         },
     },
-    traits::{ColumnLike, FunctionLike, IndexLike, TableLike, ViewLike},
+    traits::{ColumnLike, IndexLike, TableLike, ViewLike},
     utils::{
         columns_in_expression,
         identifier_resolution::{
@@ -916,49 +916,78 @@ fn existing_child_column_collation_conflict(
 }
 
 impl ParserDBBuilder {
-    /// Checks if a function with the given name is referenced by any schema
-    /// object.
+    /// The functions the calls in `expression` may run, as of this statement.
+    fn functions_called_in(&self, expression: &Expr) -> Vec<Arc<CreateFunction>> {
+        let functions = self.function_arc_vec();
+        let search_path: Vec<(&str, bool)> = self.search_path().collect();
+        functions_in_expression::functions_in_expression(
+            expression,
+            &functions_in_expression::CallScope {
+                functions: &functions,
+                search_path: &search_path,
+                case: self.identifier_case(),
+            },
+        )
+    }
+
+    /// Whether a check constraint, a policy or a trigger still reaches the
+    /// stored function `dropped`.
     ///
-    /// Returns `true` if the function is used by:
-    /// - Check constraints (via their metadata)
-    /// - Policies (via USING or WITH CHECK expressions)
-    /// - Triggers (via EXECUTE FUNCTION)
-    fn is_function_used(&self, function_name: &str, function_name_quoted: bool) -> bool {
-        use crate::traits::{FunctionLike, TriggerLike};
+    /// Checks and policies hold the functions their calls reached when they
+    /// were written, so the comparison is by node. A trigger holds the name
+    /// it was bound to, which reaches a function taking no arguments.
+    fn is_function_used(&self, dropped: &Arc<CreateFunction>) -> bool {
+        let is_dropped = |function: &CreateFunction| core::ptr::eq(function, dropped.as_ref());
+        // A bound name left bare is one in the default schema.
+        let trigger_scope = functions_in_expression::CallScope {
+            functions: &[],
+            search_path: &[("public", false)],
+            case: self.identifier_case(),
+        };
 
-        // Check if any check constraint references the function
-        for (_, metadata) in self.check_constraints() {
-            if metadata.functions().any(|f| {
-                identifiers_match(f.name(), f.name_is_quoted(), function_name, function_name_quoted)
-            }) {
-                return true;
-            }
-        }
+        self.check_constraints().iter().any(|(_, metadata)| metadata.functions().any(is_dropped))
+            || self.policies().iter().any(|(_, metadata)| {
+                metadata.using_functions().chain(metadata.check_functions()).any(is_dropped)
+            })
+            || self.triggers().iter().any(|(trigger, ())| {
+                trigger.exec_body.as_ref().is_some_and(|body| {
+                    trigger_scope.reaches(dropped, &body.func_desc.name, 0)
+                        && function_argument_types(dropped.args.as_deref()).is_empty()
+                })
+            })
+    }
 
-        // Check if any policy references the function
-        for (_, metadata) in self.policies() {
-            if metadata.using_functions().any(|f| {
-                identifiers_match(f.name(), f.name_is_quoted(), function_name, function_name_quoted)
-            }) {
-                return true;
-            }
-            if metadata.check_functions().any(|f| {
-                identifiers_match(f.name(), f.name_is_quoted(), function_name, function_name_quoted)
-            }) {
-                return true;
-            }
-        }
-
-        // Check if any trigger executes the function
-        for (trigger, ()) in self.triggers() {
-            if trigger.function_name_ident().is_some_and(|(name, quoted)| {
-                identifiers_match(name, quoted, function_name, function_name_quoted)
-            }) {
-                return true;
-            }
-        }
-
-        false
+    /// The function a trigger written to run `called` runs, as of this
+    /// statement.
+    ///
+    /// PostgreSQL looks for a function of that name taking no arguments, in the
+    /// named schema or else in the first schema of the path holding one,
+    /// `pg_catalog` first unless the path names it.
+    fn trigger_function(&self, called: &ObjectName) -> Option<Arc<CreateFunction>> {
+        let functions = self.function_arc_vec();
+        let search_path: Vec<(&str, bool)> = self.search_path().collect();
+        let case = self.identifier_case();
+        let scope = functions_in_expression::CallScope {
+            functions: &functions,
+            search_path: &search_path,
+            case,
+        };
+        // `pg_catalog` comes first when the path leaves it out.
+        let path_position = |function: &CreateFunction| {
+            let declared_in = qualifier_of(&function.name).named();
+            search_path
+                .iter()
+                .position(|&entry| schema_qualifiers_match(declared_in, Some(entry), case))
+                .map_or(0, |position| position + 1)
+        };
+        functions
+            .iter()
+            .filter(|function| {
+                scope.reaches(function, called, 0)
+                    && function_argument_types(function.args.as_deref()).is_empty()
+            })
+            .min_by_key(|function| path_position(function))
+            .cloned()
     }
 
     /// Checks if a table with the given name is referenced by foreign keys from
@@ -4306,10 +4335,7 @@ impl ParserDB {
                 &target_name_of_object_name(&create_table.name),
                 table_metadata.column_arc_slice(),
             )?;
-        let functions_in_expression = functions_in_expression::functions_in_expression::<Self>(
-            check_expr,
-            builder.function_arc_vec().as_slice(),
-        );
+        let functions_in_expression = builder.functions_called_in(check_expr);
         Ok((columns_in_expression, functions_in_expression))
     }
 
@@ -6269,14 +6295,7 @@ impl ParserDB {
                 }
                 Statement::DropFunction(drop_function) => {
                     for func_desc in &drop_function.func_desc {
-                        let Some((function_name, function_quoted)) =
-                            object_name_last_part(&func_desc.name)
-                        else {
-                            return Err(crate::errors::Error::DropFunctionNotFound {
-                                function_name: last_str(&func_desc.name).to_string(),
-                            });
-                        };
-
+                        let function_name = last_str(&func_desc.name);
                         let matching = Self::functions_named(&builder, func_desc);
 
                         let Some(&position) = matching.first() else {
@@ -6294,9 +6313,7 @@ impl ParserDB {
                             });
                         }
 
-                        // Check for references in check constraints, policies,
-                        // or triggers
-                        if builder.is_function_used(function_name, function_quoted) {
+                        if builder.is_function_used(&builder.functions()[position].0) {
                             return Err(crate::errors::Error::FunctionReferenced {
                                 function_name: function_name.to_string(),
                             });
@@ -6487,30 +6504,18 @@ impl ParserDB {
                         });
                     }
 
-                    if let Some(exec_body) = &create_trigger.exec_body {
-                        let Some((function_name, function_quoted)) =
-                            object_name_last_part(&exec_body.func_desc.name)
+                    if let Some(exec_body) = &mut create_trigger.exec_body {
+                        let Some(function) = builder.trigger_function(&exec_body.func_desc.name)
                         else {
                             return Err(crate::errors::Error::FunctionNotFoundForTrigger {
                                 function_name: last_str(&exec_body.func_desc.name).to_string(),
                                 trigger_name: last_str(&create_trigger.name).to_string(),
                             });
                         };
-                        let function_exists = builder.function_arc_vec().iter().any(|f| {
-                            identifiers_match(
-                                f.name(),
-                                f.name_is_quoted(),
-                                function_name,
-                                function_quoted,
-                            )
-                        });
-
-                        if !function_exists {
-                            return Err(crate::errors::Error::FunctionNotFoundForTrigger {
-                                function_name: function_name.to_string(),
-                                trigger_name: last_str(&create_trigger.name).to_string(),
-                            });
-                        }
+                        bind_reference(
+                            &mut exec_body.func_desc.name,
+                            stored_qualifier(&function.name),
+                        );
                     }
 
                     builder.bind_table_reference(&mut create_trigger.table_name);
@@ -7252,23 +7257,14 @@ impl ParserDB {
                         });
                     }
 
-                    let using_functions = if let Some(using_expr) = &policy.using {
-                        functions_in_expression::functions_in_expression::<Self>(
-                            using_expr,
-                            builder.function_arc_vec().as_slice(),
-                        )
-                    } else {
-                        Vec::new()
-                    };
-
-                    let check_functions = if let Some(check_expr) = &policy.with_check {
-                        functions_in_expression::functions_in_expression::<Self>(
-                            check_expr,
-                            builder.function_arc_vec().as_slice(),
-                        )
-                    } else {
-                        Vec::new()
-                    };
+                    let using_functions = policy
+                        .using
+                        .as_ref()
+                        .map_or_else(Vec::new, |using| builder.functions_called_in(using));
+                    let check_functions = policy
+                        .with_check
+                        .as_ref()
+                        .map_or_else(Vec::new, |check| builder.functions_called_in(check));
 
                     let metadata = PolicyMetadata::new(using_functions, check_functions);
                     builder = builder.add_policy(Arc::new(policy), metadata);
@@ -7656,12 +7652,7 @@ impl ParserDB {
                             // against the builder, so they are collected before
                             // the store is borrowed mutably.
                             let functions = |expression: Option<&Expr>| {
-                                expression.map(|expression| {
-                                    functions_in_expression::functions_in_expression::<Self>(
-                                        expression,
-                                        builder.function_arc_vec().as_slice(),
-                                    )
-                                })
+                                expression.map(|expression| builder.functions_called_in(expression))
                             };
                             let using_functions = functions(using.as_ref());
                             let check_functions = functions(with_check.as_ref());
@@ -9295,12 +9286,13 @@ mod tests {
             assert!(matches!(result, Err(Error::FunctionReferenced { .. })));
         }
 
+        /// A qualified call reaches the function in the schema it names, which
+        /// for one declared bare is `public`.
         #[test]
         fn test_function_used_by_schema_qualified_call() {
             let sql = r"
-                CREATE SCHEMA s;
                 CREATE FUNCTION check_access() RETURNS BOOLEAN AS 'SELECT true;';
-                CREATE TABLE t (id INT CHECK (s.check_access()));
+                CREATE TABLE t (id INT CHECK (public.check_access()));
             ";
             let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse");
 

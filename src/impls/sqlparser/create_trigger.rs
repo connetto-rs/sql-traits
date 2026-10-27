@@ -1,20 +1,28 @@
 //! Implementation of the `TriggerLike` trait for sqlparser's `CreateTrigger`
 //! type.
 
-use sqlparser::ast::CreateTrigger;
+use alloc::borrow::Cow;
+
+use sqlparser::ast::{ArgMode, CreateTrigger};
 
 use crate::{
     errors::LookupError,
     structs::{ParserDB, TargetName},
     traits::{DatabaseLike, FunctionLike, Metadata, TriggerLike},
     utils::{
-        identifier_resolution::identifiers_match,
+        identifier_resolution::normalize_identifier,
         last_str,
         object_name::{
-            object_name_last_part, resolve_required_bound_table, target_name_of_object_name,
+            object_name_last_part, qualifier_of, resolve_required_bound_table,
+            target_name_of_object_name,
         },
     },
 };
+
+/// The schema a stored or bound name lives in, `public` when it writes none.
+fn in_schema(schema: Option<(&str, bool)>) -> Cow<'_, str> {
+    schema.map_or(Cow::Borrowed("public"), |(schema, quoted)| normalize_identifier(schema, quoted))
+}
 
 impl Metadata for CreateTrigger {
     type Meta = ();
@@ -59,6 +67,8 @@ impl TriggerLike for CreateTrigger {
         self.trigger_object
     }
 
+    /// The function ingestion bound the trigger to, which takes no arguments
+    /// and lives in the schema the bound name carries, `public` when bare.
     #[inline]
     fn function<'db>(
         &'db self,
@@ -67,14 +77,21 @@ impl TriggerLike for CreateTrigger {
     where
         Self: 'db,
     {
-        let (function_name, function_quoted) = self.function_name_ident()?;
+        let called = &self.exec_body.as_ref()?.func_desc.name;
+        let (name, quoted) = object_name_last_part(called)?;
+        let name = normalize_identifier(name, quoted);
+        let schema = in_schema(qualifier_of(called).named());
         database.functions().find(|function| {
-            identifiers_match(
-                function.name(),
-                function.name_is_quoted(),
-                function_name,
-                function_quoted,
-            )
+            let target = function.target_name();
+            function
+                .args
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .all(|argument| argument.mode == Some(ArgMode::Out))
+                && function.stored_name() == name
+                && in_schema(target.schema().map(|schema| (schema, target.schema_is_quoted())))
+                    == schema
         })
     }
 

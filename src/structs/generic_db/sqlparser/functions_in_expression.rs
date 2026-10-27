@@ -2,26 +2,100 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName};
-
-use crate::{
-    traits::{DatabaseLike, function_like::FunctionLike},
-    utils::{identifier_resolution::identifiers_match, object_name::object_name_last_part},
+use sqlparser::ast::{
+    ArgMode, CreateFunction, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget,
+    ObjectName,
 };
 
-fn function_matches_object_name<DB: DatabaseLike>(
-    function: &DB::Function,
-    object_name: &ObjectName,
-) -> bool {
-    object_name_last_part(object_name).is_some_and(|(called, called_quoted)| {
-        identifiers_match(function.name(), function.name_is_quoted(), called, called_quoted)
-    })
+use super::schema_qualifiers_match;
+use crate::{
+    structs::IdentifierCase,
+    traits::function_like::FunctionLike,
+    utils::{
+        identifier_resolution::identifiers_match,
+        object_name::{Qualifier, object_name_last_part, qualifier_of},
+    },
+};
+
+/// The functions a call may reach, and the path an unqualified call walks.
+pub(super) struct CallScope<'a> {
+    /// Every function the schema holds.
+    pub(super) functions: &'a [Arc<CreateFunction>],
+    /// The search path in force where the call is written.
+    pub(super) search_path: &'a [(&'a str, bool)],
+    /// The comparison schema names are taken under.
+    pub(super) case: IdentifierCase,
 }
 
-fn functions_in_arguments<DB: DatabaseLike>(
+impl CallScope<'_> {
+    /// Whether a call to `called` passing `arguments` arguments may run
+    /// `function`.
+    ///
+    /// PostgreSQL picks among the reachable overloads by argument type, which
+    /// is not inferred here, so every overload accepting that many arguments
+    /// counts.
+    pub(super) fn reaches(
+        &self,
+        function: &CreateFunction,
+        called: &ObjectName,
+        arguments: usize,
+    ) -> bool {
+        let names_match = object_name_last_part(called).is_some_and(|(called, called_quoted)| {
+            identifiers_match(function.name(), function.name_is_quoted(), called, called_quoted)
+        });
+        let declared_in = qualifier_of(&function.name).named();
+        let schema_reached = match qualifier_of(called) {
+            Qualifier::Named(schema, quoted) => {
+                schema_qualifiers_match(declared_in, Some((schema, quoted)), self.case)
+            }
+            // PostgreSQL searches `pg_catalog` first unless the path names it.
+            Qualifier::Absent => {
+                declared_in.is_some_and(|(schema, quoted)| {
+                    self.case.identifiers_match(schema, quoted, "pg_catalog", false)
+                }) || self
+                    .search_path
+                    .iter()
+                    .any(|&entry| schema_qualifiers_match(declared_in, Some(entry), self.case))
+            }
+            Qualifier::RunTime => false,
+        };
+        names_match && schema_reached && accepts(function, arguments)
+    }
+
+    /// The functions a call to `called` passing `arguments` arguments may run.
+    fn reached_by<'s>(
+        &'s self,
+        called: &'s ObjectName,
+        arguments: usize,
+    ) -> impl Iterator<Item = &'s Arc<CreateFunction>> {
+        self.functions.iter().filter(move |function| self.reaches(function, called, arguments))
+    }
+}
+
+/// Whether `function` takes `arguments` arguments, counting the trailing
+/// ones a default fills and any number a `VARIADIC` parameter collects.
+fn accepts(function: &CreateFunction, arguments: usize) -> bool {
+    let inputs: Vec<_> = function
+        .args
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|argument| argument.mode != Some(ArgMode::Out))
+        .collect();
+    let variadic = inputs.last().is_some_and(|argument| argument.mode == Some(ArgMode::Variadic));
+    let required = inputs
+        .iter()
+        .filter(|argument| {
+            argument.default_expr.is_none() && argument.mode != Some(ArgMode::Variadic)
+        })
+        .count();
+    arguments >= required && (variadic || arguments <= inputs.len())
+}
+
+fn functions_in_arguments(
     arguments: &[FunctionArg],
-    functions: &[Arc<DB::Function>],
-    result: &mut Vec<Arc<DB::Function>>,
+    scope: &CallScope<'_>,
+    result: &mut Vec<Arc<CreateFunction>>,
 ) {
     for argument in arguments {
         let argument = match argument {
@@ -30,73 +104,64 @@ fn functions_in_arguments<DB: DatabaseLike>(
             | FunctionArg::Unnamed(arg) => arg,
         };
         if let FunctionArgExpr::Expr(expression) = argument {
-            result.extend(functions_in_expression::<DB>(expression, functions));
+            result.extend(functions_in_expression(expression, scope));
         }
     }
 }
 
-pub(super) fn functions_in_expression<DB: DatabaseLike>(
+pub(super) fn functions_in_expression(
     expr: &Expr,
-    functions: &[Arc<DB::Function>],
-) -> Vec<Arc<DB::Function>> {
+    scope: &CallScope<'_>,
+) -> Vec<Arc<CreateFunction>> {
     let mut result = Vec::new();
 
     match expr {
         Expr::Function(func) => {
-            // Match by function identifier, ignoring optional schema
-            // qualifiers.
-            result.extend(
-                functions
-                    .iter()
-                    .filter(|f| function_matches_object_name::<DB>(f.as_ref(), &func.name))
-                    .cloned(),
-            );
+            let arguments = match &func.args {
+                FunctionArguments::None => 0,
+                FunctionArguments::Subquery(_) => 1,
+                FunctionArguments::List(list) => list.args.len(),
+            };
+            result.extend(scope.reached_by(&func.name, arguments).cloned());
 
             if let FunctionArguments::List(args) = &func.args {
-                functions_in_arguments::<DB>(&args.args, functions, &mut result);
+                functions_in_arguments(&args.args, scope, &mut result);
             }
         }
         Expr::BinaryOp { left, right, .. } => {
-            result.extend(functions_in_expression::<DB>(left, functions));
-            result.extend(functions_in_expression::<DB>(right, functions));
+            result.extend(functions_in_expression(left, scope));
+            result.extend(functions_in_expression(right, scope));
         }
         Expr::Nested(nested_expr) => {
-            result.extend(functions_in_expression::<DB>(nested_expr, functions));
+            result.extend(functions_in_expression(nested_expr, scope));
         }
         Expr::Between { expr, negated: _, low, high } => {
-            result.extend(functions_in_expression::<DB>(expr, functions));
-            result.extend(functions_in_expression::<DB>(low, functions));
-            result.extend(functions_in_expression::<DB>(high, functions));
+            result.extend(functions_in_expression(expr, scope));
+            result.extend(functions_in_expression(low, scope));
+            result.extend(functions_in_expression(high, scope));
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr) => {
-            result.extend(functions_in_expression::<DB>(expr, functions));
+            result.extend(functions_in_expression(expr, scope));
         }
         Expr::In { expr, target, .. } => {
-            result.extend(functions_in_expression::<DB>(expr, functions));
+            result.extend(functions_in_expression(expr, scope));
             match target {
                 InTarget::List(list) => {
                     for expression in list {
-                        result.extend(functions_in_expression::<DB>(expression, functions));
+                        result.extend(functions_in_expression(expression, scope));
                     }
                 }
                 InTarget::Subquery(_) => {}
                 InTarget::Unnest(expression) => {
-                    result.extend(functions_in_expression::<DB>(expression, functions));
+                    result.extend(functions_in_expression(expression, scope));
                 }
                 InTarget::Table { name, args } => {
                     if let Some(arguments) = args {
-                        result.extend(
-                            functions
-                                .iter()
-                                .filter(|function| {
-                                    function_matches_object_name::<DB>(function.as_ref(), name)
-                                })
-                                .cloned(),
-                        );
-                        functions_in_arguments::<DB>(arguments, functions, &mut result);
+                        result.extend(scope.reached_by(name, arguments.len()).cloned());
+                        functions_in_arguments(arguments, scope, &mut result);
                     }
                 }
             }
@@ -272,11 +337,14 @@ mod tests {
         let db = ParserDB::parse::<GenericDialect>(
             "CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT $1';
              CREATE FUNCTION g(x INT) RETURNS INT AS 'SELECT $1';
+             CREATE FUNCTION json_each() RETURNS INT AS 'SELECT 1';
              CREATE FUNCTION json_each(x INT) RETURNS INT AS 'SELECT $1';
+             CREATE FUNCTION json_each(x INT, y INT) RETURNS INT AS 'SELECT $1';
              CREATE FUNCTION u() RETURNS INT AS 'SELECT 1';",
         )
         .expect("function declarations parse");
         let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
+        let scope = scope(&functions);
         for (sql, expected) in [
             ("SELECT * FROM t WHERE a IN u", vec![]),
             ("SELECT * FROM t WHERE f(a) IN u", vec!["f"]),
@@ -289,9 +357,9 @@ mod tests {
             let statements = Parser::parse_sql(&SQLiteDialect {}, sql).expect("query parses");
             let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
             let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
-            let calls = super::functions_in_expression::<ParserDB>(
+            let calls = super::functions_in_expression(
                 select.selection.as_ref().expect("a predicate"),
-                &functions,
+                &scope,
             );
             let names: Vec<_> = calls.iter().map(|function| function.name()).collect();
             assert_eq!(names, expected, "{sql}");
@@ -306,15 +374,21 @@ mod tests {
         )
         .expect("function declarations parse");
         let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
-        for (sql, expected) in
-            [("f(a) IN UNNEST(g(b))", ["f", "g"]), ("COUNT(*) IN UNNEST(g(b))", ["count", "g"])]
-        {
+        let scope = scope(&functions);
+        let cases: [(&str, &[&str]); 4] = [
+            ("f(a) IN UNNEST(g(b))", &["f", "g"]),
+            ("COUNT(*) IN UNNEST(g(b))", &["count", "g"]),
+            ("(f(a)) IN UNNEST(g(b))", &["f", "g"]),
+            // `ARRAY(SELECT ...)` passes its query as the one argument.
+            ("ARRAY(SELECT 1) IN UNNEST(g(b))", &["g"]),
+        ];
+        for (sql, expected) in cases {
             let expression = Parser::new(&GenericDialect {})
                 .try_with_sql(sql)
                 .expect("expression tokenizes")
                 .parse_expr()
                 .expect("expression parses");
-            let calls = super::functions_in_expression::<ParserDB>(&expression, &functions);
+            let calls = super::functions_in_expression(&expression, &scope);
             let names: Vec<_> = calls.iter().map(|function| function.name()).collect();
             assert_eq!(names, expected, "{sql}");
         }
@@ -336,10 +410,25 @@ mod tests {
             name: Ident::new("ping"),
             args: Vec::new(),
         })]);
-        assert!(!super::function_matches_object_name::<ParserDB>(function, &dynamic_name));
-        assert!(!super::function_matches_object_name::<ParserDB>(
-            function,
-            &ObjectName(Vec::new()),
-        ));
+        let scope = scope(&[]);
+        assert!(!scope.reaches(function, &dynamic_name, 0));
+        assert!(!scope.reaches(function, &ObjectName(Vec::new()), 0));
+        let run_time_schema = ObjectName(vec![
+            ObjectNamePart::Function(ObjectNamePartFunction {
+                name: Ident::new("IDENTIFIER"),
+                args: Vec::new(),
+            }),
+            ObjectNamePart::Identifier(Ident::new("ping")),
+        ]);
+        assert!(!scope.reaches(function, &run_time_schema, 0));
+    }
+
+    /// The scope a call written on the default search path sees.
+    fn scope(functions: &[Arc<sqlparser::ast::CreateFunction>]) -> super::CallScope<'_> {
+        super::CallScope {
+            functions,
+            search_path: &[("public", false)],
+            case: IdentifierCase::AsWritten,
+        }
     }
 }
