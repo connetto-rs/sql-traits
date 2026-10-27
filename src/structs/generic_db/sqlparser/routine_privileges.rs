@@ -13,9 +13,8 @@ use sqlparser::ast::{
 };
 
 use super::{
-    AccessResolution, ParserDBBuilder, function_names_match, function_signatures_match,
-    grantee_role_ident, schema_qualifiers_match, stored_role_name,
-    validate_access_targets_against_builder,
+    AccessResolution, ParserDB, ParserDBBuilder, grantee_role_ident, schema_qualifiers_match,
+    stored_role_name, validate_access_targets_against_builder,
 };
 use crate::{
     errors::Error,
@@ -160,25 +159,7 @@ impl Reached {
         match routines {
             Routines::Functions(signatures) => {
                 for (index, signature) in signatures.iter().enumerate() {
-                    let matching: Vec<usize> = functions
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, (function, _))| {
-                            match signature.args.as_deref() {
-                                Some(args) => {
-                                    function_signatures_match(
-                                        &function.name,
-                                        function.args.as_deref(),
-                                        &signature.name,
-                                        Some(args),
-                                        case,
-                                    )
-                                }
-                                None => function_names_match(&function.name, &signature.name, case),
-                            }
-                        })
-                        .map(|(position, _)| position)
-                        .collect();
+                    let matching = ParserDB::functions_named(builder, signature);
                     match matching.as_slice() {
                         [] => reached.miss(index, signature, access_resolution)?,
                         [_, _, ..] if signature.args.is_none() => {

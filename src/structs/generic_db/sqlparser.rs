@@ -5435,8 +5435,8 @@ impl ParserDB {
     /// The positions of the stored functions `func_desc` names.
     ///
     /// A statement that spells the argument list names one function, and one
-    /// that omits it names whichever function carries the name, so long as only
-    /// one does.
+    /// that omits it names whichever function carries the name in the schema it
+    /// names, so long as only one does.
     fn functions_named(builder: &ParserDBBuilder, func_desc: &FunctionDesc) -> Vec<usize> {
         let case = builder.identifier_case();
         builder
@@ -5454,7 +5454,7 @@ impl ParserDB {
                             case,
                         )
                     }
-                    None => object_names_match(&function.name, &func_desc.name, case),
+                    None => function_names_match(&function.name, &func_desc.name, case),
                 }
             })
             .map(|(position, _)| position)

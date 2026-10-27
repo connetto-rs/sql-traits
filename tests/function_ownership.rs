@@ -335,6 +335,30 @@ fn an_ambiguous_owner_change_is_reported() {
     );
 }
 
+/// A bare name reaches the function in the schema it names, `public` when it
+/// writes none, whatever other schemas hold under that name.
+#[test]
+fn an_owner_change_by_bare_name_stays_in_its_schema() {
+    let database = parse(
+        "CREATE ROLE app_reader;
+         CREATE SCHEMA app;
+         CREATE FUNCTION f() RETURNS INT AS 'SELECT 1';
+         CREATE FUNCTION app.f() RETURNS INT AS 'SELECT 2';
+         ALTER FUNCTION app.f OWNER TO app_reader;",
+    )
+    .expect("app.f is the only function app.f names");
+
+    let owner_in = |schema: Option<&str>| {
+        database
+            .functions()
+            .find(|function| function.name() == "f" && function.target_name().schema() == schema)
+            .expect("the function exists")
+            .owner(&database)
+    };
+    assert_eq!(owner_in(Some("app")), Ok(Some("app_reader")));
+    assert_eq!(owner_in(None), Ok(None));
+}
+
 /// Ownership follows the same setting as a grant, because it names a role for
 /// the same reason and a dump omits the role for the same reason. A real
 /// PostgreSQL 18.4 refuses `ALTER FUNCTION f() OWNER TO no_such_role`, which is
