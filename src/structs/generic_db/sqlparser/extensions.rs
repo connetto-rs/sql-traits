@@ -1,0 +1,201 @@
+//! Records `CREATE EXTENSION` with the schema the extension lands in, and
+//! keeps that schema current through `ALTER SCHEMA ... RENAME` and the drops
+//! that take the extension along.
+//!
+//! The requirements an extension's control file declares, which `CASCADE`
+//! installs alongside it, are not visible in SQL text and are not recorded.
+
+use alloc::sync::Arc;
+
+use sqlparser::ast::{CreateExtension, DropExtension, Ident};
+
+use super::{ParserDBBuilder, case_idents_match, declared_schema};
+use crate::{
+    errors::{Error, ObjectKind},
+    utils::{
+        identifier_resolution::identifiers_match,
+        object_name::{TEMPORARY_SCHEMA, is_temporary_schema},
+    },
+};
+
+/// The schema holding PostgreSQL's built-in objects.
+const PG_CATALOG: &str = "pg_catalog";
+
+/// The extension every PostgreSQL database is created with: PL/pgSQL in
+/// `pg_catalog`, at the only version it has shipped since PostgreSQL 9.0.
+pub(super) fn plpgsql() -> CreateExtension {
+    CreateExtension {
+        name: Ident::new("plpgsql"),
+        if_not_exists: false,
+        cascade: false,
+        schema: Some(Ident::new(PG_CATALOG)),
+        version: Some(Ident::with_quote('\'', "1.0")),
+    }
+}
+
+/// Records a `CREATE EXTENSION`, bound to the schema it lands in.
+///
+/// # Errors
+///
+/// Returns [`Error::UnnamedObject`] for an empty name,
+/// [`Error::SchemaNotFoundForExtension`] when `WITH SCHEMA` names a schema
+/// the input never creates, [`Error::NoSchemaSelectedForExtension`] when no
+/// schema is named and the search path selects none, and
+/// [`Error::ExtensionAlreadyExists`] when the database holds the name and the
+/// statement wrote no `IF NOT EXISTS`.
+pub(super) fn create_extension(
+    builder: ParserDBBuilder,
+    mut extension: CreateExtension,
+) -> Result<ParserDBBuilder, Error> {
+    if extension.name.value.is_empty() {
+        return Err(Error::UnnamedObject { object_kind: ObjectKind::Extension });
+    }
+    // PostgreSQL looks for the name before it resolves the schema, so a
+    // repeated name is skipped or refused whatever schema it asks for.
+    let case = builder.identifier_case();
+    if builder
+        .extensions()
+        .iter()
+        .any(|(existing, ())| case_idents_match(&existing.name, &extension.name, case))
+    {
+        if extension.if_not_exists {
+            return Ok(builder);
+        }
+        return Err(Error::ExtensionAlreadyExists { extension_name: extension.name.value });
+    }
+    extension.schema = match extension.schema.take() {
+        Some(schema) => Some(named_schema(&builder, schema, &extension.name)?),
+        None => search_path_schema(&builder, &extension.name)?,
+    };
+    Ok(builder.add_extension(Arc::new(extension), ()))
+}
+
+/// Applies a `DROP EXTENSION` to every extension it names.
+///
+/// What depends on an extension is not modelled, so `CASCADE` and `RESTRICT`
+/// drop the same.
+///
+/// # Errors
+///
+/// Returns [`Error::DropExtensionNotFound`] for a name the database does not
+/// hold, unless the statement wrote `IF EXISTS`.
+pub(super) fn drop_extensions(
+    mut builder: ParserDBBuilder,
+    drop: DropExtension,
+) -> Result<ParserDBBuilder, Error> {
+    let case = builder.identifier_case();
+    for name in drop.names {
+        let position = builder
+            .extensions()
+            .iter()
+            .position(|(extension, ())| case_idents_match(&extension.name, &name, case));
+        match position {
+            Some(position) => {
+                builder.extensions_mut().remove(position);
+            }
+            None if drop.if_exists => {}
+            None => return Err(Error::DropExtensionNotFound { extension_name: name.value }),
+        }
+    }
+    Ok(builder)
+}
+
+/// Whether the extension was created in this schema.
+fn created_in(extension: &CreateExtension, schema_name: &str, schema_quoted: bool) -> bool {
+    extension.schema.as_ref().is_some_and(|schema| {
+        identifiers_match(&schema.value, schema.quote_style.is_some(), schema_name, schema_quoted)
+    })
+}
+
+/// Whether any extension was created in this schema, which keeps a `DROP
+/// SCHEMA` without `CASCADE` from removing it.
+pub(super) fn schema_holds_extension(
+    builder: &ParserDBBuilder,
+    schema_name: &str,
+    schema_quoted: bool,
+) -> bool {
+    builder
+        .extensions()
+        .iter()
+        .any(|(extension, ())| created_in(extension, schema_name, schema_quoted))
+}
+
+/// Drops the extensions created in a schema a `DROP SCHEMA ... CASCADE`
+/// removes.
+pub(super) fn drop_extensions_in(
+    builder: &mut ParserDBBuilder,
+    schema_name: &str,
+    schema_quoted: bool,
+) {
+    builder
+        .extensions_mut()
+        .retain(|(extension, ())| !created_in(extension, schema_name, schema_quoted));
+}
+
+/// Points the extensions created in a renamed schema at its new name.
+pub(super) fn follow_schema_rename(
+    builder: &mut ParserDBBuilder,
+    (from, from_quoted): (&str, bool),
+    (to, to_quoted): (&str, bool),
+) {
+    for (extension, ()) in builder.extensions_mut() {
+        if created_in(extension, from, from_quoted) {
+            Arc::make_mut(extension).schema = Some(schema_ident(to, to_quoted));
+        }
+    }
+}
+
+/// The identifier a stored schema name is written with.
+fn schema_ident(name: &str, quoted: bool) -> Ident {
+    if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
+}
+
+/// Checks the schema `WITH SCHEMA` names, keeping it as written.
+///
+/// `public` and `pg_catalog` exist in every database. `pg_temp` is refused,
+/// since PostgreSQL resolves the spelling to no schema here.
+fn named_schema(
+    builder: &ParserDBBuilder,
+    schema: Ident,
+    extension_name: &Ident,
+) -> Result<Ident, Error> {
+    let (name, quoted) = (schema.value.as_str(), schema.quote_style.is_some());
+    if identifiers_match(name, quoted, "public", false)
+        || identifiers_match(name, quoted, PG_CATALOG, false)
+        || declared_schema(builder, name, quoted).is_some()
+    {
+        return Ok(schema);
+    }
+    Err(Error::SchemaNotFoundForExtension {
+        schema_name: schema.value,
+        extension_name: extension_name.value.clone(),
+    })
+}
+
+/// The schema the search path selects for an extension naming none, or
+/// [`None`] for the default schema, which this model leaves unwritten.
+///
+/// PostgreSQL takes the first schema on the path that exists, and unlike a
+/// relation an extension may land in `pg_catalog` when the path names it.
+fn search_path_schema(
+    builder: &ParserDBBuilder,
+    extension_name: &Ident,
+) -> Result<Option<Ident>, Error> {
+    for (entry, quoted) in builder.search_path().filter(|(entry, _)| !entry.is_empty()) {
+        if identifiers_match(entry, quoted, "public", false) {
+            return Ok(None);
+        }
+        if is_temporary_schema(entry, quoted) {
+            return Ok(Some(Ident::new(TEMPORARY_SCHEMA)));
+        }
+        if identifiers_match(entry, quoted, PG_CATALOG, false) {
+            return Ok(Some(Ident::new(PG_CATALOG)));
+        }
+        // The catalog spelling wins over the one the path used, since the two
+        // only differ where quoting makes them the same name anyway.
+        if let Some(schema) = declared_schema(builder, entry, quoted) {
+            return Ok(Some(schema_ident(schema.name(), schema.is_quoted())));
+        }
+    }
+    Err(Error::NoSchemaSelectedForExtension { extension_name: extension_name.value.clone() })
+}

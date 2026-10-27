@@ -28,6 +28,8 @@ pub mod trigger;
 pub use trigger::TriggerLike;
 pub mod rule;
 pub use rule::{RuleLike, RuleRelation};
+pub mod extension;
+pub use extension::ExtensionLike;
 pub mod policy;
 pub use policy::PolicyLike;
 pub mod role;

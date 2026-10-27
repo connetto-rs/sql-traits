@@ -104,6 +104,8 @@ pub struct GenericDB<P: SchemaProfile> {
     triggers: Vec<Stored<P::Trigger>>,
     /// List of rewrite rules created in the database.
     rules: Vec<Stored<P::Rule>>,
+    /// List of extensions installed in the database.
+    extensions: Vec<Stored<P::Extension>>,
     /// List of policies created in the database.
     policies: Vec<Stored<P::Policy>>,
     /// List of check constraints in the database.
@@ -143,6 +145,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("functions", &self.functions.len())
             .field("triggers", &self.triggers.len())
             .field("rules", &self.rules.len())
+            .field("extensions", &self.extensions.len())
             .field("policies", &self.policies.len())
             .field("check_constraints", &self.check_constraints.len())
             .field("roles", &self.roles.len())
@@ -180,6 +183,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             functions: self.functions.clone(),
             triggers: self.triggers.clone(),
             rules: self.rules.clone(),
+            extensions: self.extensions.clone(),
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),

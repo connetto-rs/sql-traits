@@ -47,6 +47,7 @@ struct MemoryCatalog {
     functions: Vec<MemoryFunction>,
     triggers: Vec<MemoryTrigger>,
     rules: Vec<MemoryRule>,
+    extensions: Vec<MemoryExtension>,
     policies: Vec<MemoryPolicy>,
     roles: Vec<MemoryRole>,
     table_grants: Vec<MemoryTableGrant>,
@@ -151,6 +152,12 @@ struct MemoryRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct MemoryExtension {
+    name: String,
+    schema: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryPolicy {
     name: String,
     table_name: String,
@@ -198,6 +205,7 @@ plain_metadata!(
     MemoryFunction,
     MemoryTrigger,
     MemoryRule,
+    MemoryExtension,
     MemoryPolicy,
     MemoryRole,
     MemoryTableGrant,
@@ -216,6 +224,7 @@ impl DatabaseLike for MemoryCatalog {
     type CheckConstraint = MemoryCheckConstraint;
     type Trigger = MemoryTrigger;
     type Rule = MemoryRule;
+    type Extension = MemoryExtension;
     type Policy = MemoryPolicy;
     type Role = MemoryRole;
     type TableGrant = MemoryTableGrant;
@@ -260,6 +269,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn rules(&self) -> impl Iterator<Item = &Self::Rule> {
         self.rules.iter()
+    }
+
+    fn extensions(&self) -> impl Iterator<Item = &Self::Extension> {
+        self.extensions.iter()
     }
 
     fn indexes(&self) -> impl Iterator<Item = &Self::Index> {
@@ -874,6 +887,22 @@ impl TriggerLike for MemoryTrigger {
     }
 }
 
+impl ExtensionLike for MemoryExtension {
+    type DB = MemoryCatalog;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
+    fn version(&self) -> Option<&str> {
+        None
+    }
+}
+
 impl RuleLike for MemoryRule {
     type DB = MemoryCatalog;
 
@@ -1366,6 +1395,17 @@ fn functions_without_volatility_metadata_report_volatile() -> Result<(), LookupE
 
     assert_eq!(function.volatility(), FunctionBehavior::Volatile);
     Ok(())
+}
+
+/// An extension that keeps no quoting reads as unquoted, so its stored name
+/// and schema fold to lowercase.
+#[test]
+fn extensions_without_quoting_records_store_folded_names() {
+    let extension =
+        MemoryExtension { name: String::from("PgCrypto"), schema: Some(String::from("Lab")) };
+
+    assert_eq!(extension.stored_name(), "pgcrypto");
+    assert_eq!(extension.stored_schema().as_deref(), Some("lab"));
 }
 
 /// A catalog that keeps no `NOT VALID` state reports every constraint

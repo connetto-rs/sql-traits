@@ -22,15 +22,15 @@ use sqlparser::{
         AlterFunctionOperation, AlterIndexOperation, AlterPolicy, AlterPolicyOperation,
         AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, ArgMode,
         ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
-        CreateCollation, CreateCollationDefinition, CreateFunction, CreateFunctionBody,
-        CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTrigger, DataType,
-        DropBehavior, ExactNumberInfo, Expr, ForeignKeyConstraint, FunctionDesc,
-        FunctionReturnType, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName, GranteesType,
-        Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart, OperateFunctionArg,
-        OrderByExpr, OrderByOptions, Owner, Privileges, Query, RenameTableNameKind, ResetConfig,
-        RoleOption, SchemaName, SqlOption, Statement, TableConstraint, TimezoneInfo, TriggerEvent,
-        UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
-        visit_relations,
+        CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction,
+        CreateFunctionBody, CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable,
+        CreateTrigger, DataType, DropBehavior, ExactNumberInfo, Expr, ForeignKeyConstraint,
+        FunctionDesc, FunctionReturnType, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName,
+        GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart,
+        OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
+        RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
+        TableConstraint, TimezoneInfo, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
+        VisitMut, Visitor, VisitorMut, visit_relations,
     },
     dialect::Dialect,
     tokenizer::Span,
@@ -67,6 +67,7 @@ use crate::{
 
 mod column_copy;
 mod constraint_validity;
+mod extensions;
 mod functions_in_expression;
 mod inheritance;
 mod leading_comments;
@@ -104,6 +105,7 @@ impl SchemaProfile for SqlparserProfile {
     type CheckConstraint = TableAttribute<CreateTable, CheckConstraint>;
     type Trigger = CreateTrigger;
     type Rule = CreateRule;
+    type Extension = CreateExtension;
     type Policy = CreatePolicy;
     type Role = CreateRole;
     type Schema = Schema;
@@ -1428,7 +1430,7 @@ impl ParserDBBuilder {
             in_schema(view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())))
         }) || self.materialized_views().iter().any(|(view, _, _)| {
             in_schema(view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())))
-        })
+        }) || extensions::schema_holds_extension(self, schema_name, schema_quoted)
     }
 
     fn resolve_schema_ident(&self, ident: &Ident) -> Option<&Schema> {
@@ -4035,6 +4037,10 @@ impl ParserDBIngestor {
                 set_params: vec![],
             };
             builder = builder.add_function(Arc::new(create_function), FunctionMetadata::default());
+        }
+        // Every PostgreSQL database is created holding PL/pgSQL.
+        if matches!(dialect, SqlparserDialect::PostgreSql) {
+            builder = builder.add_extension(Arc::new(extensions::plpgsql()), ());
         }
 
         Self {
@@ -7004,7 +7010,8 @@ impl ParserDB {
                             });
                         }
 
-                        // If CASCADE, remove all tables in the schema first
+                        // If CASCADE, remove all tables and extensions in the
+                        // schema first
                         if cascade {
                             use crate::traits::TableLike;
                             let doomed: Vec<StoredTable> = builder
@@ -7024,6 +7031,11 @@ impl ParserDB {
                                 .map(StoredTable::of)
                                 .collect();
                             builder = Self::remove_tables(builder, &doomed)?;
+                            extensions::drop_extensions_in(
+                                &mut builder,
+                                &resolved_schema_name,
+                                resolved_schema_quoted,
+                            );
                         }
 
                         // Remove the schema
@@ -7434,6 +7446,12 @@ impl ParserDB {
                             | AlterTableOperation::Lock { .. } => {}
                         }
                     }
+                }
+                Statement::CreateExtension(create_extension) => {
+                    builder = extensions::create_extension(builder, create_extension)?;
+                }
+                Statement::DropExtension(drop_extension) => {
+                    builder = extensions::drop_extensions(builder, drop_extension)?;
                 }
                 Statement::CreateCollation(create_collation) => {
                     if matches!(dialect, SqlparserDialect::PostgreSql) {
@@ -8092,6 +8110,11 @@ impl ParserDB {
                                     current_schema_quoted,
                                     &new_schema_name,
                                     new_schema_quoted,
+                                );
+                                extensions::follow_schema_rename(
+                                    &mut builder,
+                                    (&current_schema_name, current_schema_quoted),
+                                    (&new_schema_name, new_schema_quoted),
                                 );
                                 current_schema_name = new_schema_name;
                                 current_schema_quoted = new_schema_quoted;
@@ -9104,6 +9127,16 @@ mod tests {
             };
             ci.name = Some(empty_name());
             assert!(matches!(apply(Statement::CreateIndex(ci)), Err(Error::UnnamedObject { .. })));
+        }
+
+        #[test]
+        fn create_extension_with_empty_name_returns_unnamed_object() {
+            let mut ce = extensions::plpgsql();
+            ce.name = Ident::new("");
+            assert!(matches!(
+                apply(Statement::CreateExtension(ce)),
+                Err(Error::UnnamedObject { object_kind: ObjectKind::Extension })
+            ));
         }
     }
 

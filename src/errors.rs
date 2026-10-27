@@ -31,6 +31,8 @@ pub enum ObjectKind {
     Trigger,
     /// A rewrite rule declared by a `CREATE RULE` statement.
     Rule,
+    /// An extension installed by a `CREATE EXTENSION` statement.
+    Extension,
     /// A role declared by a `CREATE ROLE` statement.
     Role,
     /// A schema declared by a `CREATE SCHEMA` statement.
@@ -51,6 +53,7 @@ impl core::fmt::Display for ObjectKind {
             Self::Function => "Function",
             Self::Trigger => "Trigger",
             Self::Rule => "Rule",
+            Self::Extension => "Extension",
             Self::Role => "Role",
             Self::Schema => "Schema",
         })
@@ -828,6 +831,26 @@ pub enum Error {
         /// Name of the collation qualified with it.
         collation_name: String,
     },
+    #[error("Schema `{schema_name}` not found for extension `{extension_name}`.")]
+    /// Error indicating that a `CREATE EXTENSION` statement names, in `WITH
+    /// SCHEMA`, a schema the input never creates.
+    ///
+    /// `public` and `pg_catalog` are exempt, since every database holds them.
+    /// `pg_temp` is refused, since PostgreSQL resolves no schema by that
+    /// spelling here.
+    SchemaNotFoundForExtension {
+        /// Name of the schema that was not found.
+        schema_name: String,
+        /// Name of the extension the statement installs.
+        extension_name: String,
+    },
+    #[error("No schema has been selected to create extension `{extension_name}` in.")]
+    /// Error indicating that a `CREATE EXTENSION` statement names no schema
+    /// while the search path names no schema that exists either.
+    NoSchemaSelectedForExtension {
+        /// Name of the extension the statement installs.
+        extension_name: String,
+    },
     #[error("No schema has been selected to create {object_kind} `{relation_name}` in.")]
     /// Error indicating that a statement creating a relation names no schema at
     /// a point where the search path selects none either, because `SET
@@ -1186,6 +1209,14 @@ pub enum Error {
         /// Name of the relation carrying it.
         relation_name: String,
     },
+    #[error("Extension `{extension_name}` already exists.")]
+    /// Error indicating that a `CREATE EXTENSION` statement without `IF NOT
+    /// EXISTS` names an extension the database already holds. An extension
+    /// name is unique in the database, whatever schema each was created in.
+    ExtensionAlreadyExists {
+        /// Name of the extension that already exists.
+        extension_name: String,
+    },
     #[error("Role `{role_name}` already exists.")]
     /// Error indicating that a `CREATE ROLE` statement names a role that
     /// already exists.
@@ -1225,6 +1256,13 @@ pub enum Error {
     DropSchemaNotFound {
         /// Name of the schema that was not found.
         schema_name: String,
+    },
+    #[error("Extension `{extension_name}` not found for DROP EXTENSION statement.")]
+    /// Error indicating that a `DROP EXTENSION` statement without `IF EXISTS`
+    /// names an extension the database does not hold.
+    DropExtensionNotFound {
+        /// Name of the extension that was not found.
+        extension_name: String,
     },
     #[error("Cannot drop schema `{schema_name}`: still contains objects.")]
     /// Error indicating that a DROP SCHEMA statement references a schema
