@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::{ast::Password, dialect::PostgreSqlDialect};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -150,4 +150,97 @@ fn drop_removes_membership_before_role_recreation() {
     let child = database.role("child_role").expect("child resolves");
 
     assert_eq!(child.member_of(&database).count(), 0);
+}
+
+/// Every attribute `RoleLike` reports, in trait order, for the role `a`.
+fn attributes(sql: &str) -> (bool, bool, bool, bool, bool, bool, bool, Option<i32>) {
+    let database = parse(sql).expect("schema builds");
+    let role = database.role("a").expect("a resolves");
+    (
+        role.is_superuser(),
+        role.can_create_db(),
+        role.can_create_role(),
+        role.inherits(),
+        role.can_login(),
+        role.can_bypass_rls(),
+        role.is_replication(),
+        role.connection_limit(),
+    )
+}
+
+#[test]
+fn alter_role_grants_every_attribute() {
+    let granted = (true, true, true, true, true, true, true, Some(3));
+    let options =
+        "SUPERUSER CREATEDB CREATEROLE INHERIT LOGIN BYPASSRLS REPLICATION CONNECTION LIMIT 3";
+
+    assert_eq!(attributes(&format!("CREATE ROLE a NOINHERIT; ALTER ROLE a {options};")), granted);
+    assert_eq!(
+        attributes(&format!("CREATE ROLE a NOINHERIT; ALTER ROLE a WITH {options};")),
+        granted
+    );
+}
+
+#[test]
+fn alter_role_revokes_every_attribute() {
+    assert_eq!(
+        attributes(
+            "CREATE ROLE a SUPERUSER CREATEDB CREATEROLE LOGIN BYPASSRLS REPLICATION CONNECTION LIMIT 3;
+             ALTER ROLE a NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN NOBYPASSRLS NOREPLICATION CONNECTION LIMIT 0;",
+        ),
+        (false, false, false, false, false, false, false, Some(0)),
+    );
+}
+
+#[test]
+fn alter_role_keeps_the_attributes_it_does_not_name() {
+    assert_eq!(
+        attributes("CREATE ROLE a SUPERUSER LOGIN CONNECTION LIMIT 3; ALTER ROLE a BYPASSRLS;"),
+        (true, false, false, true, true, true, false, Some(3)),
+    );
+}
+
+#[test]
+fn later_alter_role_statements_override_earlier_ones() {
+    assert_eq!(
+        attributes("CREATE ROLE a; ALTER ROLE a BYPASSRLS; ALTER ROLE a NOBYPASSRLS SUPERUSER;"),
+        (true, false, false, true, false, false, false, None),
+    );
+}
+
+/// `CREATE ROLE a, b` stores both roles in one node, and altering one of them
+/// leaves the other as it was created.
+#[test]
+fn alter_role_changes_only_the_role_it_names() {
+    let database = parse("CREATE ROLE a, b LOGIN; ALTER ROLE b BYPASSRLS;").expect("schema builds");
+    let a = database.role("a").expect("a resolves");
+    let b = database.role("b").expect("b resolves");
+
+    assert!(!a.can_bypass_rls());
+    assert!(a.can_login());
+    assert!(b.can_bypass_rls());
+    assert!(b.can_login());
+}
+
+#[test]
+fn a_rolled_back_alter_role_leaves_the_role_as_created() {
+    assert_eq!(
+        attributes("CREATE ROLE a; BEGIN; ALTER ROLE a SUPERUSER BYPASSRLS; ROLLBACK;"),
+        (false, false, false, true, false, false, false, None),
+    );
+}
+
+/// `RoleLike` reports no credentials, so a consumer reads them off the stored
+/// `CREATE ROLE` node.
+#[test]
+fn alter_role_replaces_the_stored_credentials() {
+    let database = parse(
+        "CREATE ROLE a PASSWORD 'old' VALID UNTIL '2020-01-01';
+         ALTER ROLE a PASSWORD NULL VALID UNTIL '2030-01-01';",
+    )
+    .expect("schema builds");
+    let role = database.role("a").expect("a resolves");
+
+    assert_eq!(role.password, Some(Password::NullPassword));
+    assert_eq!(role.valid_until.as_ref().map(ToString::to_string).as_deref(), Some("'2030-01-01'"));
 }

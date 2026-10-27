@@ -11,7 +11,7 @@ use sqlparser::ast::{FunctionDesc, Ident, Statement, TransactionModifier};
 
 use super::{
     AccessResolution, CreatedCollationMetadata, ParserDB, ParserDBBuilder, ParserIngestion,
-    PostgresCatalog, parsed_source::StatementSource,
+    PostgresCatalog, UndeclaredRoleAlteration, parsed_source::StatementSource,
 };
 use crate::{errors::Error, impls::SqlparserDialect, structs::IdentifierCase};
 
@@ -26,6 +26,8 @@ pub(super) struct Catalog {
     pub(super) collations: Vec<CreatedCollationMetadata>,
     /// Signatures open-world grants named without reaching a function.
     pub(super) unresolved_function_grants: Vec<FunctionDesc>,
+    /// Attribute changes aimed at roles no `CREATE ROLE` had created.
+    pub(super) role_alterations: Vec<UndeclaredRoleAlteration>,
 }
 
 impl Catalog {
@@ -36,12 +38,14 @@ impl Catalog {
             active_postgres_catalog,
             collation_metadata,
             unresolved_function_grants,
+            role_alterations,
         } = Arc::try_unwrap(ingestion).unwrap_or_else(|shared| (*shared).clone());
         let catalog = Self {
             builder,
             postgres: active_postgres_catalog,
             collations: collation_metadata,
             unresolved_function_grants,
+            role_alterations,
         };
         (catalog, access_resolution)
     }
@@ -52,6 +56,7 @@ impl Catalog {
             active_postgres_catalog: self.postgres,
             collation_metadata: self.collations,
             unresolved_function_grants: self.unresolved_function_grants,
+            role_alterations: self.role_alterations,
         }))
     }
 
@@ -61,6 +66,7 @@ impl Catalog {
             active_postgres_catalog: Arc::clone(&self.postgres),
             collation_metadata: self.collations.clone(),
             unresolved_function_grants: self.unresolved_function_grants.clone(),
+            role_alterations: self.role_alterations.clone(),
         }))
     }
 
