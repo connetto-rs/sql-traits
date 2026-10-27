@@ -4,7 +4,7 @@
 use alloc::{borrow::Cow, format, string::ToString};
 
 use sqlparser::ast::{
-    CreateFunction, CreateFunctionBody, CreateRole, DataType, Expr, FunctionBehavior,
+    ArgMode, CreateFunction, CreateFunctionBody, CreateRole, DataType, Expr, FunctionBehavior,
     FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionReturnType, FunctionSecurity, Value,
     ValueWithSpan,
 };
@@ -150,6 +150,29 @@ impl FunctionLike for CreateFunction {
     #[inline]
     fn null_input_behavior(&self) -> FunctionCalledOnNull {
         self.called_on_null.clone().unwrap_or(FunctionCalledOnNull::CalledOnNullInput)
+    }
+
+    #[inline]
+    fn returns_null_on_null_argument(&self, database: &Self::DB, index: usize) -> bool {
+        let Some(argument) = self
+            .args
+            .iter()
+            .flatten()
+            .filter(|argument| !matches!(argument.mode, Some(ArgMode::Out)))
+            .nth(index)
+        else {
+            return false;
+        };
+        if matches!(argument.mode, Some(ArgMode::Variadic)) {
+            return false;
+        }
+        match self.null_input_behavior() {
+            FunctionCalledOnNull::Strict | FunctionCalledOnNull::ReturnsNullOnNullInput => true,
+            FunctionCalledOnNull::CalledOnNullInput => {
+                function_metadata(self, database)
+                    .is_ok_and(|metadata| metadata.returns_null_on_null_argument(index))
+            }
+        }
     }
 
     #[inline]

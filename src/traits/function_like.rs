@@ -407,6 +407,41 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// Returns the null-input behavior with PostgreSQL's default folded in.
     fn null_input_behavior(&self) -> FunctionCalledOnNull;
 
+    /// Returns whether the call is `NULL` whenever its `index`-th positional
+    /// argument, counting no `OUT` parameter, is `NULL`, and false wherever
+    /// that is not certain, a `VARIADIC` parameter included.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION padded(s TEXT, width INT) RETURNS TEXT LANGUAGE sql STRICT
+    ///          AS 'SELECT s';",
+    /// )?;
+    /// let padded = db
+    ///     .function_by_target(TargetName::new("padded", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// assert!(padded.returns_null_on_null_argument(&db, 1));
+    /// assert!(!padded.returns_null_on_null_argument(&db, 2));
+    ///
+    /// // `string_to_array(NULL, ',')` is NULL, `string_to_array('ab', NULL)` is `{a,b}`.
+    /// let split = db
+    ///     .functions()
+    ///     .find(|function| {
+    ///         function.name() == "string_to_array" && function.argument_type_names(&db).count() == 2
+    ///     })
+    ///     .expect("string_to_array is registered");
+    /// assert!(split.returns_null_on_null_argument(&db, 0));
+    /// assert!(!split.returns_null_on_null_argument(&db, 1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn returns_null_on_null_argument(&self, database: &Self::DB, index: usize) -> bool;
+
     /// Returns effective volatility after alterations, defaulting to
     /// PostgreSQL's `VOLATILE`.
     ///

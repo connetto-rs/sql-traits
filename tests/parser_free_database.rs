@@ -818,6 +818,10 @@ impl FunctionLike for MemoryFunction {
         FunctionCalledOnNull::CalledOnNullInput
     }
 
+    fn returns_null_on_null_argument(&self, _database: &Self::DB, _index: usize) -> bool {
+        false
+    }
+
     fn security_mode(&self) -> FunctionSecurity {
         FunctionSecurity::Invoker
     }

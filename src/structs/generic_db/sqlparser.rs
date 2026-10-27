@@ -22,18 +22,16 @@ use sqlparser::{
         AlterFunctionOperation, AlterIndexOperation, AlterPolicy, AlterPolicyOperation,
         AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, ArgMode,
         ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
-        CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction,
-        CreateFunctionBody, CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable,
-        CreateTableOptions, CreateTrigger, DataType, DropBehavior, ExactNumberInfo, Expr,
-        ForeignKeyConstraint, FunctionDesc, FunctionReturnType, GeneratedAs, Grant, GrantObjects,
-        Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName,
-        ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
-        RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
-        TableConstraint, TimezoneInfo, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
+        CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction, CreateIndex,
+        CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
+        DataType, DropBehavior, Expr, ForeignKeyConstraint, FunctionDesc, GeneratedAs, Grant,
+        GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition,
+        ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner,
+        Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption,
+        Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
         VisitMut, Visitor, VisitorMut, visit_relations,
     },
     dialect::Dialect,
-    tokenizer::Span,
 };
 
 use crate::{
@@ -75,6 +73,7 @@ mod like;
 mod parse_options;
 mod parsed_source;
 mod postgres_18_collations;
+mod postgres_builtins;
 mod postgres_catalog;
 mod routine_privileges;
 mod rules;
@@ -3949,94 +3948,8 @@ impl ParserDBIngestor {
         let mut builder: ParserDBBuilder = super::GenericDBBuilder::new(catalog_name, dialect)
             .with_identifier_case(identifier_case);
 
-        let any_type = DataType::Custom(
-            ObjectName(vec![ObjectNamePart::Identifier(Ident::with_quote('"', "any"))]),
-            vec![],
-        );
-
-        let arg = |data_type: DataType| {
-            OperateFunctionArg { mode: None, name: None, data_type, default_expr: None }
-        };
-
-        // The mode, not a name: an argument reader hands back what the input
-        // declares, and `VARIADIC` as a name would invent an argument called
-        // that.
-        let variadic_arg = |data_type: DataType| {
-            OperateFunctionArg {
-                mode: Some(ArgMode::Variadic),
-                name: None,
-                data_type,
-                default_expr: None,
-            }
-        };
-
-        let builtins = vec![
-            ("length", vec![arg(DataType::Text)], DataType::Int(None)),
-            ("len", vec![arg(DataType::Text)], DataType::Int(None)),
-            ("char_length", vec![arg(DataType::Text)], DataType::Int(None)),
-            ("character_length", vec![arg(DataType::Text)], DataType::Int(None)),
-            ("octet_length", vec![arg(DataType::Text)], DataType::Int(None)),
-            ("coalesce", vec![variadic_arg(any_type.clone())], any_type.clone()),
-            ("nullif", vec![arg(any_type.clone()), arg(any_type.clone())], any_type.clone()),
-            ("now", vec![], DataType::Timestamp(None, TimezoneInfo::WithTimeZone)),
-            ("current_timestamp", vec![], DataType::Timestamp(None, TimezoneInfo::WithTimeZone)),
-            ("current_date", vec![], DataType::Date),
-            ("current_time", vec![], DataType::Time(None, TimezoneInfo::WithTimeZone)),
-            ("localtimestamp", vec![], DataType::Timestamp(None, TimezoneInfo::None)),
-            ("localtime", vec![], DataType::Time(None, TimezoneInfo::None)),
-            ("gen_random_uuid", vec![], DataType::Uuid),
-            ("uuidv4", vec![], DataType::Uuid),
-            ("uuidv7", vec![], DataType::Uuid),
-            (
-                "uuidv7",
-                vec![arg(DataType::Interval { fields: None, precision: None })],
-                DataType::Uuid,
-            ),
-            ("count", vec![arg(any_type.clone())], DataType::BigInt(None)),
-            ("sum", vec![arg(any_type.clone())], DataType::Numeric(ExactNumberInfo::None)),
-            ("avg", vec![arg(any_type.clone())], DataType::Numeric(ExactNumberInfo::None)),
-            ("min", vec![arg(any_type.clone())], any_type.clone()),
-            ("max", vec![arg(any_type.clone())], any_type.clone()),
-            ("current_user", vec![], DataType::Text),
-            ("session_user", vec![], DataType::Text),
-            ("user", vec![], DataType::Text),
-        ];
-
-        // Qualified the way PostgreSQL holds them, in `pg_catalog` rather than
-        // in the schema a `CREATE FUNCTION` lands in. A user function that
-        // shadows a builtin is accepted by the server for exactly that reason,
-        // so without the qualifier the duplicate check would refuse it.
-        for (name, args, return_type) in builtins {
-            let create_function = CreateFunction {
-                or_alter: false,
-                or_replace: false,
-                temporary: false,
-                if_not_exists: false,
-                name: ObjectName(vec![
-                    ObjectNamePart::Identifier(Ident::new("pg_catalog")),
-                    ObjectNamePart::Identifier(Ident::new(name)),
-                ]),
-                args: Some(args),
-                return_type: Some(FunctionReturnType::DataType(return_type)),
-                function_body: Some(CreateFunctionBody::AsBeforeOptions {
-                    body: Expr::Value(ValueWithSpan {
-                        value: Value::SingleQuotedString(String::new()),
-                        span: Span::empty(),
-                    }),
-                    link_symbol: None,
-                }),
-                behavior: None,
-                called_on_null: None,
-                parallel: None,
-                using: None,
-                language: Some(Ident::new("internal")),
-                determinism_specifier: None,
-                options: None,
-                remote_connection: None,
-                security: None,
-                set_params: vec![],
-            };
-            builder = builder.add_function(Arc::new(create_function), FunctionMetadata::default());
+        for builtin in postgres_builtins::POSTGRES_BUILTINS {
+            builder = builder.add_function(Arc::new(builtin.function()), builtin.metadata());
         }
         // Every PostgreSQL database is created holding PL/pgSQL.
         if matches!(dialect, SqlparserDialect::PostgreSql) {
@@ -6556,13 +6469,13 @@ impl ParserDB {
                         (None, _) => None,
                     };
 
-                    // PostgreSQL keeps the same `pg_proc` entry across a
-                    // replacement, so the owner a later statement set on the
-                    // old definition still owns the new one.
-                    let (replaced, metadata) = match replaced {
+                    // The `pg_proc` entry and its owner survive, the new body
+                    // decides what a `NULL` argument does.
+                    let (replaced, mut metadata) = match replaced {
                         Some((stale, metadata)) => (Some(stale), metadata),
                         None => (None, FunctionMetadata::default()),
                     };
+                    metadata.set_null_returning_arguments(&[]);
 
                     let fresh = Arc::new(create_function);
                     builder = builder.add_function(Arc::clone(&fresh), metadata);
@@ -7959,6 +7872,7 @@ impl ParserDB {
                                 matches!(
                                     action,
                                     AlterFunctionAction::Behavior(_)
+                                        | AlterFunctionAction::CalledOnNull(_)
                                         | AlterFunctionAction::Security { .. }
                                         | AlterFunctionAction::Set(_)
                                         | AlterFunctionAction::Reset(_)
@@ -7976,6 +7890,9 @@ impl ParserDB {
                                 match action {
                                     AlterFunctionAction::Behavior(behavior) => {
                                         function.behavior = Some(behavior);
+                                    }
+                                    AlterFunctionAction::CalledOnNull(called_on_null) => {
+                                        function.called_on_null = Some(called_on_null);
                                     }
                                     AlterFunctionAction::Security { security, .. } => {
                                         function.security = Some(security);
