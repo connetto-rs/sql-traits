@@ -282,6 +282,8 @@ pub(super) fn drop_views(
                     rules::drop_rules_on(&mut builder, &RuleHost::of_view(view.as_ref()));
                 }
             }
+            // A sequence the view owned goes with it.
+            super::sequences::drop_orphaned_sequences(&mut builder);
             continue;
         }
 
@@ -537,17 +539,7 @@ fn rename_view_column(
         (kind == ObjectKind::View).then(|| RuleHost::of_view(builder.views()[position].0.as_ref()));
     let view_name = declaration.name().to_string();
 
-    let read = view_rewrites::catalog(&builder, core::iter::once(declaration.query()));
-    let derived = query_output_names(declaration.query(), &read, IdentifierCase::AsWritten)?;
-    let enumerable = derived.is_some();
-    let mut names = derived.unwrap_or_default();
-    let declared = declaration.columns();
-    if names.len() < declared.len() {
-        names.resize(declared.len(), (String::new(), false));
-    }
-    for (name, written) in names.iter_mut().zip(declared) {
-        name.clone_from(written);
-    }
+    let (names, enumerable) = output_names(&builder, declaration)?;
     let same = |(name, quoted): &(String, bool), ident: &Ident| {
         identifiers_match(name, *quoted, &ident.value, ident.quote_style.is_some())
     };
@@ -596,6 +588,34 @@ fn rename_view_column(
         rules::follow_column_rename(&mut builder, host, old_name, new_name);
     }
     Ok(builder)
+}
+
+/// The names a view exposes, in output order, each with its quote state, and
+/// whether they list every output column.
+///
+/// The declaration's own column list wins position by position over what the
+/// definition produces. When the definition cannot be read the list holds
+/// only the declared names, and the flag says it may be short.
+///
+/// # Errors
+///
+/// Returns the [`LookupError`] reading the definition raises.
+pub(super) fn output_names(
+    builder: &ParserDBBuilder,
+    declaration: &ViewDeclaration,
+) -> Result<(Vec<(String, bool)>, bool), Error> {
+    let read = view_rewrites::catalog(builder, core::iter::once(declaration.query()));
+    let derived = query_output_names(declaration.query(), &read, IdentifierCase::AsWritten)?;
+    let enumerable = derived.is_some();
+    let mut names = derived.unwrap_or_default();
+    let declared = declaration.columns();
+    if names.len() < declared.len() {
+        names.resize(declared.len(), (String::new(), false));
+    }
+    for (name, written) in names.iter_mut().zip(declared) {
+        name.clone_from(written);
+    }
+    Ok((names, enumerable))
 }
 
 /// Exposes output column `ordinal` of a view under `new_name`, in the
@@ -885,4 +905,5 @@ pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &Relati
     for host in &hosts {
         rules::drop_rules_on(builder, host);
     }
+    super::sequences::drop_orphaned_sequences(builder);
 }

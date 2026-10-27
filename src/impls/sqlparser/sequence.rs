@@ -3,8 +3,8 @@
 use sqlparser::ast::SequenceOptions;
 
 use crate::{
-    structs::{ParserDB, Sequence},
-    traits::{Metadata, SequenceLike},
+    structs::{ParserDB, Sequence, StoredSequenceOwner},
+    traits::{DatabaseLike, Metadata, SequenceLike, SequenceOwner},
 };
 
 impl Metadata for Sequence {
@@ -32,5 +32,21 @@ impl SequenceLike for Sequence {
 
     fn options(&self) -> &[SequenceOptions] {
         Sequence::options(self)
+    }
+
+    fn owner<'db>(&'db self, database: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>
+    where
+        Self: 'db,
+    {
+        match self.stored_owner()? {
+            StoredSequenceOwner::Column(identity) => {
+                database.column_by_identity(identity).map(SequenceOwner::Column)
+            }
+            StoredSequenceOwner::ViewColumn { view, ordinal } => {
+                database
+                    .view_by_identity(view)
+                    .map(|view| SequenceOwner::ViewColumn { view, ordinal })
+            }
+        }
     }
 }

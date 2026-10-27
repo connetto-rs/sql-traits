@@ -31,5 +31,6 @@ pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetada
 pub use role_membership::RoleMembership;
 pub use schema::Schema;
 pub use sequence::Sequence;
+pub(crate) use sequence::StoredSequenceOwner;
 pub use target_name::TargetName;
 pub use view::{MaterializedView, View, ViewDeclaration};

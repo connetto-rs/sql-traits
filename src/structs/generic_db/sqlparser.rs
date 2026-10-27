@@ -1066,6 +1066,7 @@ impl ParserDBBuilder {
     /// - All rules on the table
     /// - All policies on the table
     /// - All grants on the table
+    /// - All sequences its columns own
     fn remove_table(
         &mut self,
         table_name: &str,
@@ -1140,6 +1141,9 @@ impl ParserDBBuilder {
         };
         self.table_grants_mut().retain(|(g, ())| !grants_this_table(&g.objects));
         self.column_grants_mut().retain(|(g, ())| !grants_this_table(&g.objects));
+
+        // A sequence owned by one of the table's columns goes with it.
+        sequences::drop_orphaned_sequences(self);
     }
 
     /// Rewrites every stored reference to a renamed table that names it
@@ -4755,6 +4759,8 @@ impl ParserDB {
             (a.table_schema(), a.table_name()).cmp(&(b.table_schema(), b.table_name()))
         });
 
+        // A sequence owned by a column the rebuild left out goes with it.
+        sequences::drop_orphaned_sequences(&mut builder);
         Ok(builder)
     }
 

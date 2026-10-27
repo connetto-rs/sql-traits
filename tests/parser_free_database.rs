@@ -669,6 +669,13 @@ impl SequenceLike for MemorySequence {
     fn options(&self) -> &[SequenceOptions] {
         &[]
     }
+
+    fn owner<'db>(&'db self, _database: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>
+    where
+        Self: 'db,
+    {
+        None
+    }
 }
 
 impl IndexLike for MemoryIndex {
