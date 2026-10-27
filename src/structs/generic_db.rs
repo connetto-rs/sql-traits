@@ -209,6 +209,11 @@ impl<P: SchemaProfile> GenericDB<P> {
         GenericDBBuilder::new(catalog_name, dialect)
     }
 
+    /// The comparison the creations in this catalog were taken under.
+    pub(crate) const fn identifier_case(&self) -> IdentifierCase {
+        self.identifier_case
+    }
+
     /// Returns a reference to the metadata of the specified table, if it exists
     /// in the database.
     ///

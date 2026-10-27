@@ -2314,12 +2314,29 @@ fn rename_column_in_node(
         }
     }
 
-    // An exclusion constraint's `INCLUDE` list is plain identifiers rather than
-    // expressions, so the walker above does not reach it.
     for constraint in &mut node.constraints {
-        if let TableConstraint::Exclude(exclude) = constraint {
-            rename_column_idents(&mut exclude.include, from, to);
-        }
+        rename_column_idents(include_of_mut(constraint), from, to);
+    }
+}
+
+/// The `INCLUDE` list of a constraint backed by an index, plain identifiers
+/// that the expression walk does not reach.
+fn include_of(constraint: &TableConstraint) -> &[Ident] {
+    match constraint {
+        TableConstraint::Unique(unique) => &unique.include,
+        TableConstraint::PrimaryKey(primary_key) => &primary_key.include,
+        TableConstraint::Exclude(exclude) => &exclude.include,
+        _ => &[],
+    }
+}
+
+/// [`include_of`], for mutation.
+fn include_of_mut(constraint: &mut TableConstraint) -> &mut [Ident] {
+    match constraint {
+        TableConstraint::Unique(unique) => &mut unique.include,
+        TableConstraint::PrimaryKey(primary_key) => &mut primary_key.include,
+        TableConstraint::Exclude(exclude) => &mut exclude.include,
+        _ => &mut [],
     }
 }
 
@@ -2370,12 +2387,9 @@ fn constraint_involves_column(
                 || (table.named_by(&foreign_key.foreign_table)
                     && column.in_idents(&foreign_key.referred_columns))
         }
-        // The `INCLUDE` list is plain identifiers, which the expression walk
-        // does not reach.
-        TableConstraint::Exclude(exclude) => {
-            column.in_idents(&exclude.include) || column.in_expressions(exclude, table, declaring)
+        other => {
+            column.in_idents(include_of(other)) || column.in_expressions(other, table, declaring)
         }
-        other => column.in_expressions(other, table, declaring),
     }
 }
 
@@ -3387,30 +3401,38 @@ fn validate_index_columns(
     create_table: &CreateTable,
     case: IdentifierCase,
 ) -> Result<(), LookupError> {
-    let absent = |ident: &Ident| {
-        (!NamedColumn::of(ident, case).declared_by(create_table)).then(|| {
-            LookupError::ColumnNotFound {
-                table_name: create_table.name.to_string(),
-                column_name: ident.value.clone(),
-            }
-        })
-    };
-
     for column in columns {
-        if let Expr::Identifier(name) = &column.column.expr
-            && let Some(error) = absent(name)
-        {
-            return Err(error);
+        if let Expr::Identifier(name) = &column.column.expr {
+            validate_declared_column(name, create_table, case)?;
         }
     }
+    validate_include_columns(include, create_table, case)
+}
 
-    for name in include {
-        if let Some(error) = absent(name) {
-            return Err(error);
-        }
+/// Checks that every column an `INCLUDE` list names is declared by its table,
+/// for an index and for the key constraint backing one alike.
+fn validate_include_columns(
+    include: &[Ident],
+    create_table: &CreateTable,
+    case: IdentifierCase,
+) -> Result<(), LookupError> {
+    include.iter().try_for_each(|name| validate_declared_column(name, create_table, case))
+}
+
+/// Checks that `create_table` declares the column `name` spells.
+fn validate_declared_column(
+    name: &Ident,
+    create_table: &CreateTable,
+    case: IdentifierCase,
+) -> Result<(), LookupError> {
+    if NamedColumn::of(name, case).declared_by(create_table) {
+        Ok(())
+    } else {
+        Err(LookupError::ColumnNotFound {
+            table_name: create_table.name.to_string(),
+            column_name: name.value.clone(),
+        })
     }
-
-    Ok(())
 }
 
 /// Enforces [`AccessResolution::ClosedWorld`] on one `GRANT` or `REVOKE`: every
@@ -4930,6 +4952,7 @@ impl ParserDB {
             match constraint {
                 TableConstraint::Unique(uc) => {
                     Self::validate_constraint_columns(&uc.columns, create_table, table_metadata)?;
+                    validate_include_columns(&uc.include, create_table, builder.identifier_case())?;
                     if let Some((unique_index, unique_index_metadata)) =
                         Self::process_unique_constraint(uc.clone(), create_table)
                     {
@@ -4951,6 +4974,7 @@ impl ParserDB {
                 }
                 TableConstraint::PrimaryKey(pk) => {
                     Self::validate_constraint_columns(&pk.columns, create_table, table_metadata)?;
+                    validate_include_columns(&pk.include, create_table, builder.identifier_case())?;
                     let mut primary_key_columns = Vec::new();
                     for col_name in &pk.columns {
                         let Expr::Identifier(column_name) = &col_name.column.expr else {
@@ -4981,10 +5005,10 @@ impl ParserDB {
                         name: pk.name.clone(),
                         index_name: None,
                         index_type_display: sqlparser::ast::KeyOrIndexDisplay::None,
-                        index_type: None,
+                        index_type: pk.index_type.clone(),
                         columns: pk.columns.clone(),
                         include: pk.include.clone(),
-                        index_options: vec![],
+                        index_options: pk.index_options.clone(),
                         characteristics: pk.characteristics,
                         nulls_distinct: sqlparser::ast::NullsDistinctOption::None,
                     };

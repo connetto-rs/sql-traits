@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
-use sqlparser::ast::Expr;
+use sqlparser::ast::{Expr, IndexType};
 
 use crate::{
     errors::LookupError,
@@ -136,6 +136,30 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     where
         Self: 'db;
 
+    /// Returns whether the index enforces uniqueness over its key.
+    ///
+    /// A `CREATE UNIQUE INDEX` answers `true` here while
+    /// [`TableLike::unique_indices`] lists only the indexes backing key
+    /// constraints, so this is the reader that covers both spellings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "CREATE TABLE users (id int, email text);
+    ///      CREATE UNIQUE INDEX users_email ON users (email);
+    ///      CREATE INDEX users_id ON users (id);",
+    /// )?;
+    /// let unique: Vec<_> = db.indexes().map(|index| index.is_unique()).collect();
+    /// assert_eq!(unique, [true, false]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_unique(&self) -> bool;
+
     /// Returns whether the index is defined using simply columns
     /// and no other expressions.
     ///
@@ -221,5 +245,106 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
                 .unwrap_or_default();
 
         Ok(found_cols.into_iter())
+    }
+
+    /// Returns the access method the index was written with, or `None` when
+    /// the statement named none and the engine default applies.
+    ///
+    /// A default is kept apart from a written method even where the two agree,
+    /// as `btree` does on PostgreSQL, because only the statement can say which
+    /// one it was.
+    ///
+    /// Defaults to `None`, which is what every index not spelling `USING`
+    /// means.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::IndexType, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id int, body tsvector);
+    ///      CREATE INDEX docs_body ON docs USING gin (body);
+    ///      CREATE INDEX docs_id ON docs (id);",
+    /// )?;
+    /// let methods: Vec<_> = db.indexes().map(|index| index.access_method()).collect();
+    /// assert_eq!(methods, [Some(&IndexType::GIN), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn access_method(&self) -> Option<&IndexType> {
+        None
+    }
+
+    /// Returns the columns the index carries in its `INCLUDE` list, in the
+    /// order written.
+    ///
+    /// They are stored alongside the key for index-only scans and take no part
+    /// in its ordering or its uniqueness.
+    ///
+    /// Defaults to none, which is what every index not spelling `INCLUDE`
+    /// means.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id int, name text, email text);
+    ///      CREATE INDEX users_name ON users (name) INCLUDE (email, id);",
+    /// )?;
+    /// let index = db.indexes().next().unwrap();
+    /// let included: Vec<_> = index.include_columns(&db)?.map(|column| column.column_name()).collect();
+    /// assert_eq!(included, ["email", "id"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn include_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(core::iter::empty())
+    }
+
+    /// Returns the predicate of a partial index, the `WHERE` clause choosing
+    /// the rows the index holds, or `None` for an index over every row.
+    ///
+    /// Defaults to `None`, which is what every index not spelling `WHERE`
+    /// means.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id int, shipped boolean);
+    ///      CREATE INDEX pending ON orders (id) WHERE NOT shipped;",
+    /// )?;
+    /// let index = db.indexes().next().unwrap();
+    /// assert_eq!(index.predicate().map(ToString::to_string).as_deref(), Some("NOT shipped"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn predicate(&self) -> Option<&Expr> {
+        None
     }
 }

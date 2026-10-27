@@ -2,8 +2,9 @@
 
 use alloc::string::ToString;
 
-use sqlparser::ast::{CreateIndex, CreateTable, Expr};
+use sqlparser::ast::{ColumnDef, CreateIndex, CreateTable, Expr, IndexType};
 
+use super::index_clauses::{included_columns, written_access_method};
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, TableAttribute, metadata::IndexMetadata},
@@ -21,6 +22,20 @@ impl TableAttribute<CreateTable, CreateIndex> {
     fn index_qualifier(&self) -> Qualifier<'_> {
         self.attribute().name.as_ref().map_or(Qualifier::Absent, qualifier_of)
     }
+
+    /// The metadata `database` keeps for this index, or the error saying it
+    /// holds no such index.
+    fn metadata<'db>(
+        &self,
+        database: &'db ParserDB,
+    ) -> Result<&'db IndexMetadata<Self>, LookupError> {
+        database.index_metadata(self).ok_or_else(|| {
+            match self.attribute().name.as_ref() {
+                Some(name) => ObjectKind::Index.not_in_database(&name.to_string()),
+                None => ObjectKind::Index.anonymous_not_in_database(self.table().table_name()),
+            }
+        })
+    }
 }
 
 impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
@@ -32,6 +47,11 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
         Self: 'db,
     {
         self.table()
+    }
+
+    #[inline]
+    fn is_unique(&self) -> bool {
+        self.attribute().unique
     }
 
     #[inline]
@@ -63,14 +83,29 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
     where
         Self: 'db,
     {
-        Ok(database
-            .index_metadata(self)
-            .ok_or_else(|| {
-                match self.attribute().name.as_ref() {
-                    Some(name) => ObjectKind::Index.not_in_database(&name.to_string()),
-                    None => ObjectKind::Index.anonymous_not_in_database(self.table().table_name()),
-                }
-            })?
-            .expression())
+        Ok(self.metadata(database)?.expression())
+    }
+
+    #[inline]
+    fn access_method(&self) -> Option<&IndexType> {
+        let index = self.attribute();
+        written_access_method(index.using.as_ref(), &index.index_options)
+    }
+
+    #[inline]
+    fn include_columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db TableAttribute<CreateTable, ColumnDef>>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.metadata(database)?;
+        included_columns(&self.attribute().include, self.table(), database)
+    }
+
+    #[inline]
+    fn predicate(&self) -> Option<&Expr> {
+        self.attribute().predicate.as_ref()
     }
 }
