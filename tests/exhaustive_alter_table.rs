@@ -141,9 +141,8 @@ fn operations_over_things_the_model_does_not_describe_change_nothing() {
         // A trigger is modelled, but whether it is armed is not.
         "ALTER TABLE t DISABLE TRIGGER g",
         "ALTER TABLE t ENABLE REPLICA TRIGGER g",
-        // Replication identity and constraint validity.
+        // Replication identity.
         "ALTER TABLE t REPLICA IDENTITY FULL",
-        "ALTER TABLE t VALIDATE CONSTRAINT c",
     ];
 
     for tail in ignored {

@@ -36,6 +36,13 @@ pub struct TableMetadata<T: TableLike> {
     /// it follows from their nodes and is read when it is asked for. Held as
     /// renderings for the same reason the columns above are held as names.
     inherited_constraints: Vec<String>,
+    /// The rendering of each table constraint the table holds without having
+    /// checked the rows it held when the constraint was added.
+    ///
+    /// Mirrors `pg_constraint.convalidated` being false, which is what `ADD
+    /// CONSTRAINT ... NOT VALID` leaves until `VALIDATE CONSTRAINT` runs. Held
+    /// as renderings for the same reason as the inherited constraints above.
+    unvalidated_constraints: Vec<String>,
     /// Whether Row Level Security is enabled for the table.
     rls_enabled: bool,
     /// Whether Row Level Security is forced for the table (applies to table
@@ -58,6 +65,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             primary_key: Vec::new(),
             inherited_column_names: Vec::new(),
             inherited_constraints: Vec::new(),
+            unvalidated_constraints: Vec::new(),
             rls_enabled: false,
             rls_forced: false,
             owner: None,
@@ -182,6 +190,31 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub fn set_inherited_constraints(&mut self, inherited_constraints: Vec<String>) {
         self.inherited_constraints = inherited_constraints;
+    }
+
+    /// Returns the rendering of each table constraint the table holds
+    /// unvalidated.
+    #[must_use]
+    #[inline]
+    pub fn unvalidated_constraints(&self) -> &[String] {
+        &self.unvalidated_constraints
+    }
+
+    /// Records the rendering of each table constraint the table holds
+    /// unvalidated.
+    #[inline]
+    pub fn set_unvalidated_constraints(&mut self, unvalidated_constraints: Vec<String>) {
+        self.unvalidated_constraints = unvalidated_constraints;
+    }
+
+    /// Records whether the table holds the table constraint rendered as
+    /// `rendering` validated.
+    #[inline]
+    pub fn set_constraint_validated(&mut self, rendering: String, validated: bool) {
+        self.unvalidated_constraints.retain(|held| *held != rendering);
+        if !validated {
+            self.unvalidated_constraints.push(rendering);
+        }
     }
 
     /// Returns an iterator over the check constraints of the table.
