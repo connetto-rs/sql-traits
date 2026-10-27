@@ -336,6 +336,53 @@ fn a_view_reading_a_sequence_holds_it() {
 }
 
 #[test]
+fn a_view_holds_the_sequence_its_path_reached() {
+    for (schema, sequence) in [("app", "app.s"), ("\"App\"", "\"App\".s")] {
+        let refused = parse(&format!(
+            "CREATE SCHEMA {schema};
+             CREATE SEQUENCE {sequence};
+             SET search_path = {schema};
+             CREATE VIEW public.v AS SELECT last_value FROM s;
+             SET search_path = public;
+             DROP SEQUENCE {sequence};"
+        ));
+        assert!(
+            matches!(
+                refused,
+                Err(Error::RelationHasDependents { object_kind: ObjectKind::Sequence, ref dependent_name, .. })
+                    if dependent_name == "v"
+            ),
+            "{sequence}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_sequence_reports_its_stored_names() {
+    let db = parse(
+        "CREATE SCHEMA \"App\";
+         CREATE SCHEMA Other;
+         CREATE SEQUENCE \"App\".s;
+         CREATE SEQUENCE Other.\"T\";",
+    )
+    .expect("schema parses");
+    let case = IdentifierCase::AsWritten;
+    let quoted = db
+        .sequence_by_target(TargetName::new("s", false).with_schema("App", true), case)
+        .expect("the name is well formed")
+        .expect("the quoted schema keeps its case");
+    assert_eq!(quoted.stored_sequence_schema().as_deref(), Some("App"));
+    assert_eq!(quoted.target_name().to_string(), "\"App\".s");
+    let folded = db
+        .sequence_by_target(TargetName::new("T", true).with_schema("other", false), case)
+        .expect("the name is well formed")
+        .expect("the unquoted schema folds");
+    assert_eq!(folded.stored_sequence_schema().as_deref(), Some("other"));
+    assert_eq!(folded.stored_sequence_name(), "T");
+    assert!(db.table_by_stored_identity(Some("App"), "s").is_none(), "a sequence is no table");
+}
+
+#[test]
 fn a_folding_lookup_reports_two_sequences_it_cannot_tell_apart() {
     let db = parse("CREATE SEQUENCE \"Seq\"; CREATE SEQUENCE seq;").expect("two names as written");
     for lookup in [

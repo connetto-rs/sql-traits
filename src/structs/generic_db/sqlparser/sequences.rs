@@ -46,9 +46,10 @@ pub(super) fn create_sequence(
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, ObjectKind::Sequence, builder.catalog_name())?;
     place_relation(&builder, &mut name, temporary, ObjectKind::Sequence)?;
-    let Some(name_ident) = object_name_last_identifier(&name) else {
-        return Err(Error::UnnamedObject { object_kind: ObjectKind::Sequence });
-    };
+    // The name is known to be static and non-empty here, so it ends in an
+    // identifier.
+    let name_ident = object_name_last_identifier(&name)
+        .ok_or(Error::UnnamedObject { object_kind: ObjectKind::Sequence })?;
     let schema = qualifier_of(&name).named();
 
     if let Some(conflicting_kind) = relation_name_holder(&builder, name_ident, schema) {
@@ -78,13 +79,14 @@ fn resolve_sequence<'builder>(
 ) -> Result<Option<&'builder Sequence>, Error> {
     let (schema_ident, name_ident) = object_name_identifiers(name)?;
     let case = builder.identifier_case();
-    Ok(resolve_sequence_on_search_path_in_iter(
+    resolve_sequence_on_search_path_in_iter(
         builder.sequences().iter().map(|(sequence, ())| sequence.as_ref()),
         &target_name_of_idents(schema_ident, name_ident),
         || builder.search_path(),
         case,
         |key| builder.relation_key_is_held(key, case),
-    )?)
+    )
+    .map_err(Error::from)
 }
 
 /// Drops the sequences a `DROP SEQUENCE` names.

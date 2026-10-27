@@ -1646,7 +1646,8 @@ impl ParserDBBuilder {
             case,
             claimed,
         )
-        .ok()?
+        .ok()
+        .flatten()
         .map(|sequence| {
             BoundRelation {
                 qualifier: sequence.sequence_schema().map(|schema| {
@@ -9325,6 +9326,25 @@ mod tests {
                 apply(Statement::CreateExtension(ce)),
                 Err(Error::UnnamedObject { object_kind: ObjectKind::Extension })
             ));
+        }
+
+        #[test]
+        fn create_sequence_with_empty_name_returns_unnamed_object() {
+            let stmt = Statement::CreateSequence {
+                temporary: false,
+                if_not_exists: false,
+                name: empty_name(),
+                sequence_options: Vec::new(),
+            };
+            assert!(matches!(apply(stmt), Err(Error::UnnamedObject { .. })));
+        }
+
+        #[test]
+        fn drop_sequence_with_empty_name_returns_unnamed_object() {
+            let mut stmt = parse_postgres("DROP SEQUENCE s;");
+            let Statement::Drop { ref mut names, .. } = stmt else { panic!("expected Drop") };
+            *names = vec![empty_name()];
+            assert!(matches!(apply(stmt), Err(Error::UnnamedObject { .. })));
         }
     }
 
