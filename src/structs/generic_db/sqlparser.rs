@@ -9131,9 +9131,7 @@ mod tests {
 
         #[test]
         fn create_extension_with_empty_name_returns_unnamed_object() {
-            let Statement::CreateExtension(mut ce) = parse_postgres("CREATE EXTENSION e;") else {
-                panic!("expected CreateExtension")
-            };
+            let mut ce = extensions::plpgsql();
             ce.name = Ident::new("");
             assert!(matches!(
                 apply(Statement::CreateExtension(ce)),

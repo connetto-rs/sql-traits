@@ -12,20 +12,20 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
 }
 
-/// Every extension as `name@schema version`, sorted, with `-` for the default
-/// schema and for no version.
+/// An extension as `name@schema version`, with `-` for the default schema and
+/// for no version, read the way generic consumer code reads it.
+fn describe(extension: impl ExtensionLike) -> String {
+    format!(
+        "{}@{} {}",
+        extension.name(),
+        extension.schema().unwrap_or("-"),
+        extension.version().unwrap_or("-")
+    )
+}
+
+/// Every extension as [`describe`] spells it, sorted.
 fn extensions(database: &ParserDB) -> Vec<String> {
-    let mut listed: Vec<String> = database
-        .extensions()
-        .map(|extension| {
-            format!(
-                "{}@{} {}",
-                extension.name(),
-                extension.schema().unwrap_or("-"),
-                extension.version().unwrap_or("-")
-            )
-        })
-        .collect();
+    let mut listed: Vec<String> = database.extensions().map(describe).collect();
     listed.sort();
     listed
 }
@@ -146,18 +146,38 @@ fn public_and_pg_catalog_need_no_create_schema() {
     assert_eq!(created(&database), listed(&["hstore@pg_catalog -", "pgcrypto@public -"]));
 }
 
+/// The stored name and schema of an extension, and whether each was quoted.
+fn stored_identity(extension: impl ExtensionLike) -> (String, Option<String>, bool, bool) {
+    (
+        extension.stored_name().into_owned(),
+        extension.stored_schema().map(std::borrow::Cow::into_owned),
+        extension.name_is_quoted(),
+        extension.schema_is_quoted(),
+    )
+}
+
 #[test]
-fn quoting_of_the_name_and_schema_is_kept() {
-    let database =
-        parse("CREATE SCHEMA \"Tools\"; CREATE EXTENSION \"uuid-ossp\" WITH SCHEMA \"Tools\";")
-            .expect("the extension is created");
-    let extension = database
+fn stored_names_fold_unquoted_identifiers_and_keep_quoted_ones() {
+    let database = parse(
+        "CREATE SCHEMA \"Tools\";
+         CREATE SCHEMA Lab;
+         CREATE EXTENSION \"UUID-ossp\" WITH SCHEMA \"Tools\";
+         CREATE EXTENSION PgCrypto WITH SCHEMA Lab;",
+    )
+    .expect("both extensions are created");
+    let mut identities: Vec<_> = database
         .extensions()
-        .find(|extension| extension.name() == "uuid-ossp")
-        .expect("the extension is recorded");
-    assert!(extension.name_is_quoted());
-    assert_eq!(extension.schema(), Some("Tools"));
-    assert!(extension.schema_is_quoted());
+        .filter(|extension| extension.name() != "plpgsql")
+        .map(stored_identity)
+        .collect();
+    identities.sort();
+    assert_eq!(
+        identities,
+        vec![
+            (String::from("UUID-ossp"), Some(String::from("Tools")), true, true),
+            (String::from("pgcrypto"), Some(String::from("lab")), false, false),
+        ]
+    );
 }
 
 #[test]

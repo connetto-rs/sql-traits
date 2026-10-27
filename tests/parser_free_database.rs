@@ -1402,6 +1402,17 @@ fn functions_without_volatility_metadata_report_volatile() -> Result<(), LookupE
     Ok(())
 }
 
+/// An extension that keeps no quoting reads as unquoted, so its stored name
+/// and schema fold to lowercase.
+#[test]
+fn extensions_without_quoting_records_store_folded_names() {
+    let extension =
+        MemoryExtension { name: String::from("PgCrypto"), schema: Some(String::from("Lab")) };
+
+    assert_eq!(extension.stored_name(), "pgcrypto");
+    assert_eq!(extension.stored_schema().as_deref(), Some("lab"));
+}
+
 /// A catalog that keeps no `NOT VALID` state reports every constraint
 /// validated.
 #[test]
