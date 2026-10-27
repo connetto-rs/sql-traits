@@ -689,6 +689,32 @@ pub enum Error {
         /// Name of the undefined table.
         table_name: String,
     },
+    #[error("Function `{function_name}` not found for a grant or revoke.")]
+    /// Error indicating that a grant or a revoke names a function or procedure
+    /// that does not exist.
+    ///
+    /// The name is reported with the argument list the statement wrote, since
+    /// that list is what tells overloads apart.
+    FunctionNotFoundForGrant {
+        /// Name of the undefined function, with its argument list if written.
+        function_name: String,
+    },
+    #[error(
+        "Function name `{function_name}` is not unique: a grant or revoke naming no argument list cannot say which one it covers."
+    )]
+    /// Error indicating that a grant or a revoke omits the argument list of a
+    /// function whose name covers more than one function.
+    AmbiguousFunctionForGrant {
+        /// The name covering more than one function.
+        function_name: String,
+    },
+    #[error("Privilege `{privilege}` cannot be granted on a function.")]
+    /// Error indicating that a grant or a revoke on a function names a
+    /// privilege other than `EXECUTE`, the only one PostgreSQL defines there.
+    InvalidFunctionPrivilege {
+        /// The privilege as the statement spelled it.
+        privilege: String,
+    },
     #[error("Function `{function_name}` not found for DROP FUNCTION statement.")]
     /// Error indicating that a DROP FUNCTION statement references a function
     /// that does not exist.

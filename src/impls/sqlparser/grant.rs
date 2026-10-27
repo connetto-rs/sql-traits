@@ -64,7 +64,7 @@ fn role_matches_ident(role: &CreateRole, lookup_name: &str, lookup_quoted: bool)
 /// Returns whether a grantee names the `PUBLIC` pseudo-role, in either
 /// spelling the parser produces: the dedicated grantee type for the keyword,
 /// and a bare unquoted `PUBLIC` identifier for dialects that reserve it.
-fn grantee_is_public(grantee: &Grantee) -> bool {
+pub(crate) fn grantee_is_public(grantee: &Grantee) -> bool {
     if grantee.grantee_type == GranteesType::Public {
         return true;
     }
@@ -85,7 +85,7 @@ fn grantee_is_session_principal(grantee: &Grantee) -> Option<SessionPrincipal> {
     session_principal(value, quoted)
 }
 
-fn grantee_matches_role(grantee: &Grantee, role: &CreateRole) -> bool {
+pub(crate) fn grantee_matches_role(grantee: &Grantee, role: &CreateRole) -> bool {
     if grantee_is_public(grantee) {
         return true;
     }
@@ -139,7 +139,7 @@ fn schema_matches_view<V: ViewLike>(schema_name: &ObjectName, view: &V) -> bool 
     )
 }
 
-fn grantees_match(left_grantee: &Grantee, right_grantee: &Grantee) -> bool {
+pub(crate) fn grantees_match(left_grantee: &Grantee, right_grantee: &Grantee) -> bool {
     if left_grantee.grantee_type == GranteesType::Public
         || right_grantee.grantee_type == GranteesType::Public
     {
@@ -212,10 +212,6 @@ fn grant_objects_inner_match(left: &GrantObjects, right: &GrantObjects) -> bool 
             GrantObjects::AllExternalTablesInSchema { schemas: right_schemas },
         )
         | (
-            GrantObjects::AllFunctionsInSchema { schemas: left_schemas },
-            GrantObjects::AllFunctionsInSchema { schemas: right_schemas },
-        )
-        | (
             GrantObjects::FutureTablesInSchema { schemas: left_schemas },
             GrantObjects::FutureTablesInSchema { schemas: right_schemas },
         )
@@ -262,14 +258,6 @@ fn grant_objects_inner_match(left: &GrantObjects, right: &GrantObjects) -> bool 
             GrantObjects::ExternalVolumes(left_objects),
             GrantObjects::ExternalVolumes(right_objects),
         ) => object_name_lists_match(left_objects, right_objects),
-        (
-            GrantObjects::Procedure { name: left_name, arg_types: left_arg_types },
-            GrantObjects::Procedure { name: right_name, arg_types: right_arg_types },
-        )
-        | (
-            GrantObjects::Function { name: left_name, arg_types: left_arg_types },
-            GrantObjects::Function { name: right_name, arg_types: right_arg_types },
-        ) => object_names_match(left_name, right_name) && left_arg_types == right_arg_types,
         (left_objects, right_objects) => left_objects == right_objects,
     }
 }
