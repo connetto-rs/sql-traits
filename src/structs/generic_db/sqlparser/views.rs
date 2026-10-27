@@ -44,6 +44,7 @@ use crate::{
         object_name::{
             RelationKey, qualifier_of, stored_view_key, target_key, target_name_from_object_name,
         },
+        output_from_wildcard,
         with_scopes::WithScopes,
     },
 };
@@ -89,6 +90,8 @@ pub(super) fn create_view(
     // A view reading a temporary relation is temporary whatever it wrote.
     let temporary_read = bind_definition(&builder, &mut node.query);
     let promoted = temporary_read.is_some();
+    // Read before the wildcards are spelled out of the definition.
+    let selects_wildcard = output_from_wildcard(&node.query);
     view_rewrites::spell_out(&builder, &mut node.query);
     if node.materialized
         && let Some(relation_name) = temporary_read
@@ -112,9 +115,10 @@ pub(super) fn create_view(
     {
         let (existing, metadata, identity) = builder.views_mut().remove(position);
         check_replacement_columns(existing.as_ref(), &node)?;
-        let Some(view) = View::from_node(&node) else {
+        let Some(mut view) = View::from_node(&node) else {
             return Err(Error::UnnamedObject { object_kind: kind });
         };
+        view.declaration_mut().set_selects_wildcard(selects_wildcard);
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
     }
 
@@ -135,14 +139,16 @@ pub(super) fn create_view(
     }
 
     if node.materialized {
-        let Some(view) = MaterializedView::from_node(&node) else {
+        let Some(mut view) = MaterializedView::from_node(&node) else {
             return Err(Error::UnnamedObject { object_kind: kind });
         };
+        view.declaration_mut().set_selects_wildcard(selects_wildcard);
         Ok(builder.add_materialized_view(Arc::new(view), ViewMetadata::default()))
     } else {
-        let Some(view) = View::from_node(&node) else {
+        let Some(mut view) = View::from_node(&node) else {
             return Err(Error::UnnamedObject { object_kind: kind });
         };
+        view.declaration_mut().set_selects_wildcard(selects_wildcard);
         Ok(builder.add_view(Arc::new(view), ViewMetadata::default()))
     }
 }

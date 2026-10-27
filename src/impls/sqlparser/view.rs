@@ -40,6 +40,10 @@ impl ViewLike for View {
         self.declaration().query()
     }
 
+    fn selects_wildcard(&self) -> bool {
+        self.declaration().selects_wildcard()
+    }
+
     fn declared_column_names(&self) -> &[(String, bool)] {
         self.declaration().columns()
     }
@@ -74,6 +78,10 @@ impl ViewLike for MaterializedView {
 
     fn definition(&self) -> &Query {
         self.declaration().query()
+    }
+
+    fn selects_wildcard(&self) -> bool {
+        self.declaration().selects_wildcard()
     }
 
     fn declared_column_names(&self) -> &[(String, bool)] {
