@@ -17,7 +17,8 @@ use sqlparser::ast::{
 
 use super::{
     NamedColumn, ParserDBBuilder, bind_reference, case_idents_match,
-    object_name_matches_resolved_identity, require_named, target_tables_match,
+    object_name_matches_resolved_identity, require_named, stored_qualifier, stored_view_qualifier,
+    target_tables_match,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -44,30 +45,30 @@ pub(super) fn create_rule(
     require_named(&rule.table_name, ObjectKind::Rule)?;
     let relation_name = |rule: &CreateRule| last_str(&rule.table_name).to_string();
 
-    let on_relation = builder.resolve_table_object_name(&rule.table_name)?.is_some()
-        || builder.resolve_view_object_name(&rule.table_name)?.is_some();
-    if !on_relation {
-        if builder.resolve_materialized_view_object_name(&rule.table_name)?.is_some() {
-            return Err(Error::RuleOnMaterializedView {
-                view_name: relation_name(&rule),
-                rule_name: rule.name.value,
-            });
-        }
+    // Bound to the qualifier of the relation reached, as the other objects
+    // naming a relation are.
+    let qualifier = if let Some(table) = builder.resolve_table_object_name(&rule.table_name)? {
+        stored_qualifier(&table.name)
+    } else if let Some(view) = builder.resolve_view_object_name(&rule.table_name)? {
+        stored_view_qualifier(view)
+    } else if builder.resolve_materialized_view_object_name(&rule.table_name)?.is_some() {
+        return Err(Error::RuleOnMaterializedView {
+            view_name: relation_name(&rule),
+            rule_name: rule.name.value,
+        });
+    } else {
         return Err(Error::RelationNotFoundForRule {
             relation_name: relation_name(&rule),
             rule_name: rule.name.value,
         });
-    }
+    };
     if rule.event == CreateRuleEvent::Select {
         return Err(Error::SelectRuleUnsupported {
             relation_name: relation_name(&rule),
             rule_name: rule.name.value,
         });
     }
-
-    if let Some(bound) = builder.bound_relation(&rule.table_name) {
-        bind_reference(&mut rule.table_name, bound.qualifier);
-    }
+    bind_reference(&mut rule.table_name, qualifier);
 
     let case = builder.identifier_case();
     let existing = builder.rules().iter().position(|(existing, ())| {

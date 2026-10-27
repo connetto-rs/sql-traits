@@ -6,7 +6,10 @@
 //! current. Relations the action names are kept as written.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, LookupError},
+    prelude::*,
+};
 use sqlparser::{
     ast::{CreateRuleAction, CreateRuleEvent},
     dialect::PostgreSqlDialect,
@@ -42,6 +45,10 @@ fn rule_targets(database: &ParserDB) -> Vec<String> {
 
 fn action_text(rule: &<ParserDB as DatabaseLike>::Rule) -> String {
     rule.action().to_string()
+}
+
+fn rule_named<'db>(database: &'db ParserDB, name: &str) -> &'db <ParserDB as DatabaseLike>::Rule {
+    database.rules().find(|rule| rule.name() == name).expect("the rule is recorded")
 }
 
 /// The kind and name of the relation a rule resolves to.
@@ -111,6 +118,59 @@ fn a_rule_on_a_view_is_readable() {
     let rule = only_rule(&database);
     assert!(rule.is_instead());
     assert_eq!(relation_of(&database, rule), ("view", "recent".to_string()));
+}
+
+/// Everything a rule answers, read through whichever implementation `R` is.
+fn answers<R: RuleLike<DB = ParserDB>>(
+    rule: &R,
+    database: &ParserDB,
+) -> (String, String, CreateRuleEvent, bool, Option<String>, String, String) {
+    let relation = rule.relation(database).expect("the rule's relation resolves");
+    (
+        rule.name().to_string(),
+        rule.target_relation_name().to_string(),
+        rule.event(),
+        rule.is_instead(),
+        rule.condition().map(ToString::to_string),
+        rule.action().to_string(),
+        format!("{relation:?}"),
+    )
+}
+
+/// A caller iterating rules holds references, and reading through one answers
+/// what the rule itself answers, quoting and qualification included.
+#[test]
+fn a_rule_read_through_a_reference_answers_the_same() {
+    let database = parse(
+        "CREATE SCHEMA \"App\";
+         CREATE TABLE \"App\".\"Docs\" (id INT);
+         CREATE RULE keep AS ON DELETE TO \"App\".\"Docs\" WHERE old.id > 0 DO INSTEAD NOTHING;",
+    )
+    .expect("schema builds");
+    let rule = only_rule(&database);
+
+    let direct = answers(rule, &database);
+    assert_eq!(&direct.1, "\"App\".\"Docs\"");
+    assert_eq!(direct.4.as_deref(), Some("old.id > 0"));
+    assert!(direct.6.starts_with("Table("), "got {}", direct.6);
+    assert_eq!(answers(&rule, &database), direct);
+}
+
+/// A rule asked about a database that never created its relation reports the
+/// relation missing.
+#[test]
+fn a_rule_asked_about_another_database_finds_no_relation() {
+    let with_view = parse(&format!(
+        "{ORDERS}CREATE VIEW recent AS SELECT id FROM orders;
+         CREATE RULE r AS ON DELETE TO recent DO INSTEAD NOTHING;"
+    ))
+    .expect("schema builds");
+    let without_view = parse(ORDERS).expect("schema builds");
+
+    assert_eq!(
+        only_rule(&with_view).relation(&without_view).err(),
+        Some(LookupError::RelationNotFound { object_name: "recent".to_string() })
+    );
 }
 
 #[test]
@@ -296,28 +356,32 @@ fn a_cascade_through_a_view_drops_its_rules() {
 #[test]
 fn renaming_the_table_carries_its_rules() {
     let database = parse(&format!(
-        "{ORDERS}CREATE RULE r AS ON INSERT TO orders DO NOTHING;
+        "{ORDERS}CREATE RULE on_orders AS ON INSERT TO orders DO NOTHING;
+         CREATE RULE on_audit AS ON INSERT TO audit DO NOTHING;
          ALTER TABLE orders RENAME TO purchases;"
     ))
     .expect("schema builds");
 
-    let rule = only_rule(&database);
+    let rule = rule_named(&database, "on_orders");
     assert_eq!(rule.target_relation_name().to_string(), "purchases");
     assert_eq!(relation_of(&database, rule), ("table", "purchases".to_string()));
+    assert_eq!(rule_named(&database, "on_audit").target_relation_name().to_string(), "audit");
 }
 
 #[test]
 fn renaming_the_view_carries_its_rules() {
     let database = parse(&format!(
         "{ORDERS}CREATE VIEW recent AS SELECT id FROM orders;
-         CREATE RULE r AS ON DELETE TO recent DO INSTEAD NOTHING;
+         CREATE RULE on_recent AS ON DELETE TO recent DO INSTEAD NOTHING;
+         CREATE RULE on_orders AS ON DELETE TO orders DO NOTHING;
          ALTER TABLE recent RENAME TO latest;"
     ))
     .expect("schema builds");
 
-    let rule = only_rule(&database);
+    let rule = rule_named(&database, "on_recent");
     assert_eq!(rule.target_relation_name().to_string(), "latest");
     assert_eq!(relation_of(&database, rule), ("view", "latest".to_string()));
+    assert_eq!(rule_named(&database, "on_orders").target_relation_name().to_string(), "orders");
 }
 
 #[test]
@@ -350,17 +414,45 @@ fn renaming_a_column_of_another_table_leaves_the_rule_alone() {
     assert_eq!(action_text(only_rule(&database)), "INSERT INTO audit VALUES (new.id)");
 }
 
+/// A view column rename reaches the rules on that view only, so a rule on the
+/// table under it keeps reading the table's column.
 #[test]
 fn renaming_a_view_column_rewrites_new_references() {
     let database = parse(&format!(
         "{ORDERS}CREATE VIEW recent AS SELECT id, total FROM orders;
-         CREATE RULE r AS ON INSERT TO recent
+         CREATE RULE on_recent AS ON INSERT TO recent
              DO INSTEAD INSERT INTO orders VALUES (new.id, new.total);
+         CREATE RULE on_orders AS ON INSERT TO orders DO ALSO INSERT INTO audit VALUES (new.total);
          ALTER TABLE recent RENAME COLUMN total TO amount;"
     ))
     .expect("schema builds");
 
-    assert_eq!(action_text(only_rule(&database)), "INSERT INTO orders VALUES (new.id, new.amount)");
+    assert_eq!(
+        action_text(rule_named(&database, "on_recent")),
+        "INSERT INTO orders VALUES (new.id, new.amount)"
+    );
+    assert_eq!(
+        action_text(rule_named(&database, "on_orders")),
+        "INSERT INTO audit VALUES (new.total)"
+    );
+}
+
+/// Only a two-part `NEW.column` or `OLD.column` names the rule's row, so a
+/// fully qualified column of another table is left alone.
+#[test]
+fn a_qualified_column_of_another_table_is_not_a_row_reference() {
+    let database = parse(&format!(
+        "{ORDERS}CREATE RULE r AS ON INSERT TO orders
+             DO ALSO INSERT INTO audit (id) SELECT public.audit.id FROM public.audit
+                 WHERE public.audit.id = new.id;
+         ALTER TABLE orders RENAME COLUMN id TO order_id;"
+    ))
+    .expect("schema builds");
+
+    assert_eq!(
+        action_text(only_rule(&database)),
+        "INSERT INTO audit (id) SELECT public.audit.id FROM public.audit WHERE public.audit.id = new.order_id"
+    );
 }
 
 #[test]

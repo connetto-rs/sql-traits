@@ -14,7 +14,7 @@ use crate::{
 ///
 /// PostgreSQL attaches a rule to a table or to a plain view, and refuses one
 /// on a materialized view, so these are the two cases a caller handles.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum RuleRelation<'a, DB: DatabaseLike> {
     /// A table.
     Table(&'a DB::Table),
@@ -23,15 +23,6 @@ pub enum RuleRelation<'a, DB: DatabaseLike> {
 }
 
 impl<DB: DatabaseLike> Copy for RuleRelation<'_, DB> {}
-
-impl<DB: DatabaseLike> Debug for RuleRelation<'_, DB> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Table(table) => f.debug_tuple("Table").field(table).finish(),
-            Self::View(view) => f.debug_tuple("View").field(view).finish(),
-        }
-    }
-}
 
 /// A trait for types that can be treated as PostgreSQL rewrite rules, the
 /// objects `CREATE RULE` defines.

@@ -8631,6 +8631,31 @@ mod tests {
             ));
         }
 
+        /// The statement names a table the input never creates, so only the
+        /// edit below can make the refusal an unnamed-object one.
+        fn create_rule(edit: impl FnOnce(&mut sqlparser::ast::CreateRule)) -> Statement {
+            let mut statement = parse_postgres("CREATE RULE r AS ON DELETE TO t DO NOTHING;");
+            if let Statement::CreateRule(rule) = &mut statement {
+                edit(rule);
+            }
+            statement
+        }
+
+        #[test]
+        fn create_rule_with_empty_name_returns_unnamed_object() {
+            let statement = create_rule(|rule| rule.name = sqlparser::ast::Ident::new(""));
+            assert!(matches!(
+                apply(statement),
+                Err(Error::UnnamedObject { object_kind: ObjectKind::Rule })
+            ));
+        }
+
+        #[test]
+        fn create_rule_with_empty_relation_name_returns_unnamed_object() {
+            let statement = create_rule(|rule| rule.table_name = empty_name());
+            assert!(matches!(apply(statement), Err(Error::UnnamedObject { .. })));
+        }
+
         #[test]
         fn create_policy_with_empty_table_name_returns_unnamed_object() {
             let Statement::CreatePolicy(mut cp) = parse_postgres("CREATE POLICY pol ON t;") else {
