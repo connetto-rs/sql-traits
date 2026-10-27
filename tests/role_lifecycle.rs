@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::{ast::Password, dialect::PostgreSqlDialect};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -228,4 +228,19 @@ fn a_rolled_back_alter_role_leaves_the_role_as_created() {
         attributes("CREATE ROLE a; BEGIN; ALTER ROLE a SUPERUSER BYPASSRLS; ROLLBACK;"),
         (false, false, false, true, false, false, false, None),
     );
+}
+
+/// `RoleLike` reports no credentials, so a consumer reads them off the stored
+/// `CREATE ROLE` node.
+#[test]
+fn alter_role_replaces_the_stored_credentials() {
+    let database = parse(
+        "CREATE ROLE a PASSWORD 'old' VALID UNTIL '2020-01-01';
+         ALTER ROLE a PASSWORD NULL VALID UNTIL '2030-01-01';",
+    )
+    .expect("schema builds");
+    let role = database.role("a").expect("a resolves");
+
+    assert_eq!(role.password, Some(Password::NullPassword));
+    assert_eq!(role.valid_until.as_ref().map(ToString::to_string).as_deref(), Some("'2030-01-01'"));
 }
