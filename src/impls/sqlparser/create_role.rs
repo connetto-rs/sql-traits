@@ -218,6 +218,15 @@ mod tests {
         assert_eq!(db.role("closed").unwrap().connection_limit(), Some(0));
     }
 
+    /// A prepared statement binds the limit only when it runs, so the schema
+    /// holds no limit to report.
+    #[test]
+    fn connection_limit_of_a_placeholder_is_unknown() {
+        let db = parse_postgres("CREATE ROLE templated CONNECTION LIMIT $1;");
+
+        assert_eq!(db.role("templated").unwrap().connection_limit(), None);
+    }
+
     #[test]
     fn test_role_noinherit() {
         let db = parse_postgres("CREATE ROLE noinherit_role NOINHERIT;");
