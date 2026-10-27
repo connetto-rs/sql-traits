@@ -9,12 +9,12 @@ use ::sqlparser::ast::{
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ParserDB, TableMetadata},
+    structs::{ForeignTableSource, ParserDB, TableMetadata},
     traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
     utils::{
         identifier_resolution::{identifiers_match, stored_ident_name},
         last_str,
-        object_name::qualifier_of,
+        object_name::{qualifier_of, resolve_bound_table_or_foreign_table},
     },
 };
 
@@ -193,6 +193,14 @@ impl TableLike for CreateTable {
         namespaced_parameters(self, Some("toast"))
     }
 
+    #[inline]
+    fn foreign_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db ForeignTableSource>, LookupError> {
+        Ok(table_metadata(self, database)?.foreign_source())
+    }
+
     fn columns<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -224,8 +232,9 @@ impl TableLike for CreateTable {
         // list is read off the node rather than the metadata.
         self.require_in_database(database)?;
         let mut parents = Vec::new();
+        // A parent may be a foreign table, which inheritance treats as a table.
         for name in self.inherits.iter().flatten() {
-            if let Some(parent) = database.resolve_table_object_name(name)? {
+            if let Some(parent) = resolve_bound_table_or_foreign_table(name, database)? {
                 parents.push(parent);
             }
         }

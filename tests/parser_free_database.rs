@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use sql_traits::{
     errors::LookupError,
     prelude::*,
-    structs::TargetName,
+    structs::{ForeignTableSource, TargetName},
     traits::{ColumnCollation, TypeMatch, grant::GrantTarget},
     utils::{identifier_resolution::SearchPath, scalar_family::ScalarFamily},
 };
@@ -34,6 +34,7 @@ struct MemoryCatalog {
     catalog_name: String,
     dialect: MemoryDialect,
     tables: Vec<MemoryTable>,
+    foreign_tables: Vec<MemoryTable>,
     columns: Vec<MemoryColumn>,
     schemas: Vec<MemorySchema>,
     views: Vec<MemoryView>,
@@ -64,6 +65,7 @@ struct MemoryDialect;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum MemoryRelationKind {
     Table,
+    ForeignTable,
     View,
     MaterializedView,
 }
@@ -77,6 +79,8 @@ struct MemoryTable {
     /// A key column the table does not declare, which a catalog read from a
     /// live server can hand back when the key and the column list disagree.
     undeclared_key_column: Option<MemoryColumn>,
+    /// The server a foreign table reads through, absent for a table.
+    foreign_source: Option<ForeignTableSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -285,6 +289,10 @@ impl DatabaseLike for MemoryCatalog {
         self.tables.iter()
     }
 
+    fn foreign_tables(&self) -> impl Iterator<Item = &Self::Table> {
+        self.foreign_tables.iter()
+    }
+
     fn triggers(&self) -> impl Iterator<Item = &Self::Trigger> {
         self.triggers.iter()
     }
@@ -322,7 +330,12 @@ impl DatabaseLike for MemoryCatalog {
     }
 
     fn table_identity(&self, table: &Self::Table) -> Option<Self::RelationId> {
-        self.table_id(table).map(|position| (MemoryRelationKind::Table, position))
+        self.table_id(table).map(|position| (MemoryRelationKind::Table, position)).or_else(|| {
+            self.foreign_tables
+                .iter()
+                .position(|candidate| candidate == table)
+                .map(|position| (MemoryRelationKind::ForeignTable, position))
+        })
     }
 
     fn view_identity(&self, view: &Self::View) -> Option<Self::RelationId> {
@@ -483,6 +496,17 @@ impl TableLike for MemoryTable {
 
     fn toast_storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
         std::iter::empty()
+    }
+
+    fn foreign_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db ForeignTableSource>, LookupError> {
+        Ok(database
+            .foreign_tables
+            .iter()
+            .find(|candidate| *candidate == self)
+            .and_then(|table| table.foreign_source.as_ref()))
     }
 
     fn primary_key_columns<'db>(
@@ -1378,6 +1402,7 @@ fn table(schema: Option<&str>, name: &str) -> MemoryTable {
         name: String::from(name),
         name_is_quoted: false,
         undeclared_key_column: None,
+        foreign_source: None,
     }
 }
 
@@ -1538,12 +1563,14 @@ fn the_inherited_resolver_walks_a_given_path() -> Result<(), LookupError> {
     catalog.materialized_views = vec![view(Some("app"), "counted", true)];
     catalog.sequences =
         vec![MemorySequence { schema: Some(String::from("app")), name: String::from("tickets") }];
+    catalog.foreign_tables = vec![table(Some("app"), "remote")];
     let case = IdentifierCase::AsWritten;
     let found = |path: &[(&str, bool)], name: &str| -> Result<_, LookupError> {
         Ok(catalog.resolve_target_relation_on_path(TargetName::new(name, false), path, case)?.map(
             |relation| {
                 match relation {
                     Relation::Table(table) => format!("table {:?}", table.table_schema()),
+                    Relation::ForeignTable(table) => format!("foreign table {}", table.name),
                     Relation::View(view) => format!("view {}", view.name),
                     Relation::MaterializedView(view) => format!("materialized view {}", view.name),
                     Relation::Sequence(sequence) => format!("sequence {}", sequence.name),
@@ -1558,6 +1585,7 @@ fn the_inherited_resolver_walks_a_given_path() -> Result<(), LookupError> {
     assert_eq!(found(&app_first, "recent")?.as_deref(), Some("view recent"));
     assert_eq!(found(&app_first, "counted")?.as_deref(), Some("materialized view counted"));
     assert_eq!(found(&app_first, "tickets")?.as_deref(), Some("sequence tickets"));
+    assert_eq!(found(&app_first, "remote")?.as_deref(), Some("foreign table remote"));
     assert_eq!(found(&[("public", false)], "tickets")?, None);
     // An emptied path reaches no unqualified name.
     assert_eq!(found(&[("", false)], "docs")?, None);
@@ -2064,6 +2092,46 @@ fn the_inherited_identity_lookups_answer_each_kind() -> Result<(), LookupError> 
     let identity = catalog.column_identity(body).expect("the catalog holds the column");
     assert_eq!(catalog.column_by_identity(identity), Some(body));
     assert_eq!(catalog.column_identity(&column(Some("app"), "docs", "absent")), None);
+
+    Ok(())
+}
+
+/// The inherited foreign table lookups answer from the foreign pool alone, and
+/// a foreign table's column is reached by its identity.
+#[test]
+fn the_inherited_foreign_table_lookups_answer_only_foreign_tables() -> Result<(), LookupError> {
+    let mut catalog = catalog();
+    let mut remote = table(Some("app"), "remote");
+    remote.foreign_source = Some(ForeignTableSource::new("warehouse", false, []));
+    catalog.foreign_tables.push(remote);
+    catalog.columns.push(column(Some("app"), "remote", "amount"));
+    catalog.search_path = vec![(String::from("app"), false)];
+
+    let target = || TargetName::new("remote", false);
+    let reached = catalog
+        .resolve_target_foreign_table(target(), IdentifierCase::AsWritten)?
+        .expect("the path reaches the foreign table");
+    assert_eq!(
+        catalog.foreign_table_by_target(
+            target().with_schema("app", false),
+            IdentifierCase::AsWritten
+        )?,
+        Some(reached)
+    );
+    assert_eq!(catalog.resolve_target_table(target(), IdentifierCase::AsWritten)?, None);
+    assert!(reached.is_foreign(&catalog)?);
+    assert_eq!(
+        reached.foreign_source(&catalog)?.map(ForeignTableSource::server_name),
+        Some("warehouse")
+    );
+    assert_eq!(catalog.tables_and_foreign_tables().last(), Some(reached));
+
+    let identity = catalog.table_identity(reached).expect("the catalog holds it");
+    assert_eq!(catalog.foreign_table_by_identity(identity), Some(reached));
+    assert_eq!(catalog.table_by_identity(identity), None);
+    let amount = reached.columns(&catalog)?.next().expect("a column");
+    let column_identity = catalog.column_identity(amount).expect("the catalog holds it");
+    assert_eq!(catalog.column_by_identity(column_identity), Some(amount));
 
     Ok(())
 }

@@ -83,8 +83,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// SQL Server's `UNIQUEIDENTIFIER` never leak into the generic column
     /// trait. See [`DialectLike`].
     type Dialect: DialectLike<DB = Self>;
-    /// Identity of a table, view or materialized view, which the relation
-    /// keeps for as long as it exists, through its renames and rebuilds.
+    /// Identity of a table, foreign table, view or materialized view, which
+    /// the relation keeps for as long as it exists, through its renames and
+    /// rebuilds.
     type RelationId: Copy + Eq + Ord + Hash + Debug + Send + Sync;
     /// Identity of a table column, on the terms of [`Self::RelationId`].
     type ColumnId: Copy + Eq + Ord + Hash + Debug + Send + Sync;
@@ -604,6 +605,34 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// ```
     fn sequences(&self) -> impl Iterator<Item = &Self::Sequence>;
 
+    /// Iterates over the foreign tables, which [`Self::tables`] leaves out
+    /// since their rows live behind a foreign server.
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE local (id INT);
+    ///      CREATE FOREIGN TABLE remote (id INT, amount INT) SERVER warehouse;",
+    /// )?;
+    /// assert_eq!(db.tables().count(), 1);
+    /// let remote = db.foreign_tables().next().expect("the foreign table is recorded");
+    /// assert_eq!(remote.table_name(), "remote");
+    /// assert_eq!(remote.columns(&db)?.count(), 2);
+    /// assert!(remote.is_foreign(&db)?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn foreign_tables(&self) -> impl Iterator<Item = &Self::Table>;
+
+    /// Iterates over the tables and then the foreign tables.
+    #[inline]
+    fn tables_and_foreign_tables(&self) -> impl Iterator<Item = &Self::Table> {
+        self.tables().chain(self.foreign_tables())
+    }
+
     /// Resolves a name a statement wrote into the table it denotes, comparing
     /// identifiers as `case` says the engine does.
     ///
@@ -713,10 +742,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     }
 
     /// Resolves a name a statement wrote into the relation it denotes,
-    /// whether table, plain view, materialized view or sequence, applying the
-    /// same rules as [`Self::resolve_target_table`].
+    /// whether table, foreign table, plain view, materialized view or
+    /// sequence, applying the same rules as [`Self::resolve_target_table`].
     ///
-    /// The four kinds share one pool of names, so at most one kind answers a
+    /// The five kinds share one pool of names, so at most one kind answers a
     /// name and the kind that holds it is the answer.
     ///
     /// # Errors
@@ -759,6 +788,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     ) -> Result<Option<Relation<'_, Self>>, LookupError> {
         if let Some(table) = self.resolve_target_table(target.clone(), case)? {
             return Ok(Some(Relation::Table(table)));
+        }
+        if let Some(table) = self.resolve_target_foreign_table(target.clone(), case)? {
+            return Ok(Some(Relation::ForeignTable(table)));
         }
         if let Some(view) = self.resolve_target_view(target.clone(), case)? {
             return Ok(Some(Relation::View(view)));
@@ -817,6 +849,15 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             resolve_target_on_search_path_in_iter(self.tables(), &target, path, case, claimed)?
         {
             return Ok(Some(Relation::Table(table)));
+        }
+        if let Some(table) = resolve_target_on_search_path_in_iter(
+            self.foreign_tables(),
+            &target,
+            path,
+            case,
+            claimed,
+        )? {
+            return Ok(Some(Relation::ForeignTable(table)));
         }
         if let Some(view) =
             resolve_view_on_search_path_in_iter(self.views(), &target, path, case, claimed)?
@@ -885,6 +926,11 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         if let Some(table) = self.table_by_target(target.clone(), IdentifierCase::AsWritten)? {
             return Ok(Some(Relation::Table(table)));
         }
+        if let Some(table) =
+            self.foreign_table_by_target(target.clone(), IdentifierCase::AsWritten)?
+        {
+            return Ok(Some(Relation::ForeignTable(table)));
+        }
         if let Some(view) = self.view_by_target(target.clone(), IdentifierCase::AsWritten)? {
             return Ok(Some(Relation::View(view)));
         }
@@ -933,6 +979,28 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     ) -> Result<Option<&Self::Sequence>, LookupError> {
         resolve_sequence_on_search_path_in_iter(
             self.sequences(),
+            &target,
+            || self.search_path(),
+            case,
+            |key| relation_name_is_claimed(self, key, case),
+        )
+    }
+
+    /// Resolves a name a statement wrote into the foreign table it denotes,
+    /// applying the same rules as [`Self::resolve_target_table`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
+    /// than one foreign table.
+    #[inline]
+    fn resolve_target_foreign_table(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Table>, LookupError> {
+        resolve_target_on_search_path_in_iter(
+            self.foreign_tables(),
             &target,
             || self.search_path(),
             case,
@@ -994,6 +1062,40 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
         resolve_target_in_iter(self.tables(), &target, case)
+    }
+
+    /// Returns the foreign table a name in parts denotes, applying the same
+    /// rules as [`Self::table_by_target`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
+    /// more than one foreign table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FOREIGN TABLE remote (id INT) SERVER warehouse;",
+    /// )?;
+    /// let target = || TargetName::new("remote", false);
+    /// assert!(db.foreign_table_by_target(target(), IdentifierCase::AsWritten)?.is_some());
+    /// // A foreign table is no table, so the table lookup does not reach it.
+    /// assert!(db.table_by_target(target(), IdentifierCase::AsWritten)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn foreign_table_by_target(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Table>, LookupError> {
+        resolve_target_in_iter(self.foreign_tables(), &target, case)
     }
 
     /// Returns the plain view a name in parts denotes, applying the same rules
@@ -1206,8 +1308,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         self.tables().nth(table_id)
     }
 
-    /// Returns the identity of a table this database holds, or `None` for a
-    /// table it does not hold.
+    /// Returns the identity of a table or foreign table this database holds,
+    /// or `None` for one it does not hold.
     ///
     /// # Example
     ///
@@ -1297,7 +1399,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     fn column_identity(&self, column: &Self::Column) -> Option<Self::ColumnId>;
 
     /// Returns the table holding `identity`, or `None` when no table here
-    /// holds it, because it was dropped, never created, or names a view.
+    /// holds it, because it was dropped, never created, or names a foreign
+    /// table or a view.
     ///
     /// # Example
     ///
@@ -1326,6 +1429,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         self.tables().find(|table| self.table_identity(table) == Some(identity))
     }
 
+    /// Returns the foreign table holding `identity`, or `None` when no foreign
+    /// table here holds it.
+    fn foreign_table_by_identity(&self, identity: Self::RelationId) -> Option<&Self::Table> {
+        self.foreign_tables().find(|table| self.table_identity(table) == Some(identity))
+    }
+
     /// Returns the plain view holding `identity`, or `None` when no plain
     /// view here holds it.
     fn view_by_identity(&self, identity: Self::RelationId) -> Option<&Self::View> {
@@ -1346,7 +1455,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// renames gave it, or `None` when no column here holds it, because it
     /// or its table was dropped.
     fn column_by_identity(&self, identity: Self::ColumnId) -> Option<&Self::Column> {
-        self.tables()
+        self.tables_and_foreign_tables()
             .filter_map(|table| table.columns(self).ok())
             .flatten()
             .find(|column| self.column_identity(column) == Some(identity))
@@ -2183,9 +2292,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
 
 /// One relation a database holds, tagged with the kind it is.
 ///
-/// Tables, plain views, materialized views and sequences share one pool of
-/// names, so a name resolves to at most one of them. A reader that needs to
-/// say which kind a lookup reached, whether from a grant, a rule or a
+/// Tables, foreign tables, plain views, materialized views and sequences share
+/// one pool of names, so a name resolves to at most one of them. A reader that
+/// needs to say which kind a lookup reached, whether from a grant, a rule or a
 /// statement's reads, handles this enum one variant at a time.
 ///
 /// # Example
@@ -2212,6 +2321,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
 pub enum Relation<'a, DB: DatabaseLike> {
     /// A table.
     Table(&'a DB::Table),
+    /// A foreign table, whose rows live behind a foreign server, so a read or
+    /// a grant reaches the remote relation with no row-level security between.
+    ForeignTable(&'a DB::Table),
     /// A plain view.
     View(&'a DB::View),
     /// A materialized view.
@@ -2226,6 +2338,7 @@ impl<DB: DatabaseLike> Debug for Relation<'_, DB> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Table(table) => f.debug_tuple("Table").field(table).finish(),
+            Self::ForeignTable(table) => f.debug_tuple("ForeignTable").field(table).finish(),
             Self::View(view) => f.debug_tuple("View").field(view).finish(),
             Self::MaterializedView(view) => f.debug_tuple("MaterializedView").field(view).finish(),
             Self::Sequence(sequence) => f.debug_tuple("Sequence").field(sequence).finish(),
