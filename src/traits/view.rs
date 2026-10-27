@@ -8,7 +8,10 @@ use sqlparser::ast::Query;
 use crate::{
     structs::TargetName,
     traits::{DatabaseLike, Metadata},
-    utils::{identifier_resolution::normalize_identifier, object_name::is_temporary_schema},
+    utils::{
+        identifier_resolution::normalize_identifier, object_name::is_temporary_schema,
+        output_from_wildcard,
+    },
 };
 
 /// A trait for types that can be treated as SQL views.
@@ -208,6 +211,47 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// # }
     /// ```
     fn definition(&self) -> &Query;
+
+    /// Returns whether the definition as written took the view's columns from
+    /// a wildcard: `*` or `t.*` in its outermost select list or in an arm of a
+    /// set operation at the top, or a `TABLE t` query.
+    ///
+    /// PostgreSQL expands such a wildcard into the columns it reaches when the
+    /// view is created, so a column added to the relation later never joins
+    /// the view. A wildcard nested in a `FROM` subquery, a common table
+    /// expression or a predicate does not count, since only the outer select
+    /// list decides what the view exposes.
+    ///
+    /// The default reads [`Self::definition`], so an implementation whose
+    /// definition no longer holds the wildcards it was written with, as the
+    /// [`ParserDB`](crate::structs::ParserDB) views spelled out at creation,
+    /// must override it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "CREATE TABLE t (id INT, name TEXT);
+    ///      CREATE VIEW starred AS SELECT * FROM t;
+    ///      CREATE VIEW listed AS SELECT id, name FROM t;",
+    /// )?;
+    /// let view = |name| db.view_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// let starred = view("starred")?.expect("the view is recorded");
+    /// let listed = view("listed")?.expect("the view is recorded");
+    /// // Both definitions now read the same, but only one wrote the wildcard.
+    /// assert_eq!(starred.definition().to_string(), listed.definition().to_string());
+    /// assert!(starred.selects_wildcard());
+    /// assert!(!listed.selects_wildcard());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn selects_wildcard(&self) -> bool {
+        output_from_wildcard(self.definition())
+    }
 
     /// Returns the column names the declaration wrote, each with its quote
     /// state, or an empty slice when it wrote none.

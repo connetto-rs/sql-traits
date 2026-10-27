@@ -15,7 +15,10 @@ use alloc::{
 
 use sqlparser::ast::{CreateView, Query};
 
-use crate::utils::object_name::{Qualifier, TEMPORARY_SCHEMA, object_name_last_part, qualifier_of};
+use crate::utils::{
+    object_name::{Qualifier, TEMPORARY_SCHEMA, object_name_last_part, qualifier_of},
+    output_from_wildcard,
+};
 
 /// The parts of a `CREATE VIEW` a schema records, shared by both view kinds.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -32,6 +35,8 @@ pub struct ViewDeclaration {
     query: Query,
     /// The column names the declaration wrote, each with its quote state.
     columns: Vec<(String, bool)>,
+    /// Whether the definition as written took its columns from a wildcard.
+    selects_wildcard: bool,
 }
 
 impl ViewDeclaration {
@@ -84,6 +89,7 @@ impl ViewDeclaration {
                 .iter()
                 .map(|column| (column.name.value.clone(), column.name.quote_style.is_some()))
                 .collect(),
+            selects_wildcard: output_from_wildcard(&node.query),
         })
     }
 
@@ -124,6 +130,14 @@ impl ViewDeclaration {
         &self.columns
     }
 
+    /// Returns whether the definition as written took the view's columns from
+    /// a wildcard, which [`Self::query`] no longer shows once ingestion has
+    /// spelled the wildcard out.
+    #[must_use]
+    pub fn selects_wildcard(&self) -> bool {
+        self.selects_wildcard
+    }
+
     /// Replaces the view's own identifier, which a rename supplies.
     ///
     /// Crate-private: the container keys views by their stored identity and
@@ -144,6 +158,13 @@ impl ViewDeclaration {
     /// renames one, on the terms of [`Self::query_mut`].
     pub(crate) fn columns_mut(&mut self) -> &mut Vec<(String, bool)> {
         &mut self.columns
+    }
+
+    /// Records whether the definition as written took its columns from a
+    /// wildcard, for ingestion, which spells the wildcards out of the query
+    /// before the declaration is built from it.
+    pub(crate) fn set_selects_wildcard(&mut self, selects_wildcard: bool) {
+        self.selects_wildcard = selects_wildcard;
     }
 }
 

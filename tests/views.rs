@@ -357,6 +357,105 @@ fn a_column_list_renames_what_the_definition_produces() {
     assert_eq!(resolve(schema, "SELECT 1 FROM v", "v.a"), None, "the original name is hidden");
 }
 
+/// Whether the view or materialized view `name` of `db` filled its output from
+/// a wildcard.
+fn selects_wildcard(db: &ParserDB, name: &str) -> bool {
+    let target = || TargetName::new(name, false);
+    match db.view_by_target(target(), IdentifierCase::AsWritten).expect("unambiguous lookup") {
+        Some(view) => view.selects_wildcard(),
+        None => {
+            db.materialized_view_by_target(target(), IdentifierCase::AsWritten)
+                .expect("unambiguous lookup")
+                .expect("found")
+                .selects_wildcard()
+        }
+    }
+}
+
+#[test]
+fn a_view_remembers_a_wildcard_its_creation_spelled_out() {
+    // Measured on PostgreSQL 18.4: after `ADD COLUMN`, a view created over
+    // `SELECT *`, `t.*` or `TABLE t` keeps only the columns that existed then.
+    let db = parse(
+        "CREATE TABLE people (id INT, name TEXT);
+         CREATE VIEW star AS SELECT * FROM people;
+         CREATE VIEW qualified AS SELECT p.* FROM people AS p;
+         CREATE VIEW written AS SELECT id, name FROM people;
+         CREATE VIEW arm AS SELECT id, name FROM people UNION SELECT * FROM people;
+         CREATE VIEW nested_arm AS (SELECT id, name FROM people) UNION ((SELECT id, name FROM people) EXCEPT (SELECT p.* FROM people AS p));
+         CREATE VIEW table_query AS TABLE people;
+         CREATE VIEW over_cte AS WITH c AS (SELECT id FROM people) SELECT * FROM c;
+         CREATE VIEW inside_cte AS WITH c AS (SELECT * FROM people) SELECT id FROM c;
+         CREATE VIEW inside_from AS SELECT s.id FROM (SELECT * FROM people) AS s;
+         CREATE VIEW inside_exists AS SELECT id FROM people WHERE EXISTS (SELECT * FROM people);
+         CREATE VIEW count_star AS SELECT count(*) AS n FROM people;
+         CREATE MATERIALIZED VIEW snapshot AS SELECT * FROM people;",
+    )
+    .expect("every view is recorded");
+
+    let star = db
+        .view_by_target(TargetName::new("star", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("found");
+    assert_eq!(star.definition().to_string(), "SELECT id, name FROM people");
+
+    for (name, expected) in [
+        ("star", true),
+        ("qualified", true),
+        ("written", false),
+        ("arm", true),
+        ("nested_arm", true),
+        ("table_query", true),
+        ("over_cte", true),
+        ("inside_cte", false),
+        ("inside_from", false),
+        ("inside_exists", false),
+        ("count_star", false),
+        ("snapshot", true),
+    ] {
+        assert_eq!(selects_wildcard(&db, name), expected, "{name}");
+    }
+}
+
+#[test]
+fn a_remembered_wildcard_follows_the_view_through_later_statements() {
+    let db = parse(
+        "CREATE TABLE people (id INT, name TEXT);
+         CREATE VIEW kept AS SELECT * FROM people;
+         CREATE VIEW replaced AS SELECT * FROM people;
+         CREATE OR REPLACE VIEW replaced AS SELECT id, name FROM people;
+         CREATE VIEW starred AS SELECT id, name FROM people;
+         CREATE OR REPLACE VIEW starred AS SELECT * FROM people;
+         ALTER TABLE people RENAME COLUMN name TO full_name;
+         ALTER TABLE people RENAME TO persons;
+         ALTER TABLE kept RENAME TO still_kept;
+         ALTER TABLE still_kept RENAME COLUMN id TO person_id;",
+    )
+    .expect("every statement applies");
+
+    assert!(selects_wildcard(&db, "still_kept"));
+    assert!(!selects_wildcard(&db, "replaced"));
+    assert!(selects_wildcard(&db, "starred"));
+}
+
+#[test]
+fn the_default_reads_the_wildcard_off_the_definition() {
+    let query = |sql: &str| {
+        let Statement::Query(query) =
+            Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses").pop().expect("one")
+        else {
+            panic!("expected a query");
+        };
+        *query
+    };
+    let view =
+        |sql: &str| DefaultView { name: "v".to_string(), schema: None, definition: query(sql) };
+
+    assert!(view("SELECT * FROM t").selects_wildcard());
+    assert!(view("SELECT a FROM t UNION SELECT t.* FROM t").selects_wildcard());
+    assert!(!view("SELECT a FROM t WHERE EXISTS (SELECT * FROM t)").selects_wildcard());
+}
+
 #[test]
 fn replacing_a_view_may_only_add_columns_on_the_end() {
     // Measured: `cannot change name of view column`, `cannot drop columns from

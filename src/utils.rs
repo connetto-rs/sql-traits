@@ -17,5 +17,7 @@ pub mod fingerprint_type_token;
 pub mod identifier_resolution;
 pub mod maintenance_trigger_parser;
 pub(crate) mod object_name;
+mod output_from_wildcard;
+pub(crate) use output_from_wildcard::output_from_wildcard;
 pub mod scalar_family;
 pub(crate) mod with_scopes;
