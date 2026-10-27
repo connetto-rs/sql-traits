@@ -419,6 +419,10 @@ impl TableLike for MemoryTable {
         None
     }
 
+    fn is_unlogged(&self) -> bool {
+        false
+    }
+
     fn primary_key_columns<'db>(
         &'db self,
         database: &'db Self::DB,

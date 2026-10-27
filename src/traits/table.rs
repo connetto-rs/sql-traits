@@ -404,6 +404,40 @@ pub trait TableLike:
             .is_some_and(|schema| is_temporary_schema(schema, self.table_schema_is_quoted()))
     }
 
+    /// Returns whether this table is unlogged.
+    ///
+    /// PostgreSQL writes no WAL for an unlogged table, so it truncates the
+    /// table after a crash, does not replicate it to standbys and does not
+    /// publish it through logical replication. A table is unlogged when
+    /// `CREATE UNLOGGED TABLE` created it or the last `ALTER TABLE ... SET
+    /// UNLOGGED` or `SET LOGGED` naming it made it so. A temporary table is
+    /// never unlogged.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE UNLOGGED TABLE cache (id INT);
+    /// CREATE TABLE staging (id INT);
+    /// ALTER TABLE staging SET UNLOGGED;
+    /// CREATE UNLOGGED TABLE events (id INT);
+    /// ALTER TABLE events SET LOGGED;
+    /// ",
+    /// )?;
+    /// let lookup = |name| db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// assert!(lookup("cache")?.unwrap().is_unlogged());
+    /// assert!(lookup("staging")?.unwrap().is_unlogged());
+    /// assert!(!lookup("events")?.unwrap().is_unlogged());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_unlogged(&self) -> bool;
+
     /// Returns the table ID according to its position in the database's table
     /// iterator.
     ///
@@ -4538,6 +4572,10 @@ where
 
     fn table_schema_is_quoted(&self) -> bool {
         T::table_schema_is_quoted(self)
+    }
+
+    fn is_unlogged(&self) -> bool {
+        T::is_unlogged(self)
     }
 
     fn table_id(&self, database: &Self::DB) -> Option<usize> {

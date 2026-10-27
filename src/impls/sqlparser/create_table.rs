@@ -95,6 +95,11 @@ impl TableLike for CreateTable {
         )
     }
 
+    #[inline]
+    fn is_unlogged(&self) -> bool {
+        self.unlogged
+    }
+
     fn columns<'db>(
         &'db self,
         database: &'db Self::DB,

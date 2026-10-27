@@ -133,10 +133,8 @@ fn operations_over_things_the_model_does_not_describe_change_nothing() {
     let bare = ParserDB::parse::<PostgreSqlDialect>(TABLE).expect("the table alone parses");
 
     let ignored = [
-        // Physical layout and durability.
+        // Physical layout.
         "ALTER TABLE t SET (fillfactor = 70)",
-        "ALTER TABLE t SET LOGGED",
-        "ALTER TABLE t SET UNLOGGED",
         // Rewrite rules, whose enablement has nothing to attach to.
         "ALTER TABLE t DISABLE RULE r",
         "ALTER TABLE t ENABLE ALWAYS RULE r",
