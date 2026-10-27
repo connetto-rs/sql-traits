@@ -8,7 +8,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::ops::ControlFlow;
+use core::{mem::discriminant, ops::ControlFlow};
 #[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
 
@@ -28,7 +28,7 @@ use sqlparser::{
         FunctionReturnType, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName, GranteesType,
         Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart, OperateFunctionArg,
         OrderByExpr, OrderByOptions, Owner, Privileges, Query, RenameTableNameKind, ResetConfig,
-        SchemaName, SqlOption, Statement, TableConstraint, TimezoneInfo, TriggerEvent,
+        RoleOption, SchemaName, SqlOption, Statement, TableConstraint, TimezoneInfo, TriggerEvent,
         UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
         visit_relations,
     },
@@ -121,6 +121,7 @@ impl SchemaProfile for SqlparserProfile {
             }),
             collation_metadata: Vec::new(),
             unresolved_function_grants: Vec::new(),
+            role_alterations: Vec::new(),
         })
     }
 }
@@ -135,6 +136,26 @@ struct CreatedCollationMetadata {
     postgres_deterministic: Option<bool>,
 }
 
+/// The net attribute changes [`AccessResolution::OpenWorld`] ingestion kept
+/// for one role that no `CREATE ROLE` had created when `ALTER ROLE` named it.
+#[derive(Debug, Clone)]
+struct UndeclaredRoleAlteration {
+    role: Ident,
+    /// At most one option of each kind, the last one written.
+    options: Vec<RoleOption>,
+}
+
+impl UndeclaredRoleAlteration {
+    /// Folds a later `ALTER ROLE` into the kept changes, each option replacing
+    /// the one of its kind an earlier statement set.
+    fn apply(&mut self, options: Vec<RoleOption>) {
+        for option in options {
+            self.options.retain(|kept| discriminant(kept) != discriminant(&option));
+            self.options.push(option);
+        }
+    }
+}
+
 enum TableOrigin {
     Declaration(TableDocumentation),
     Replacement(RelationIdentity),
@@ -143,8 +164,9 @@ enum TableOrigin {
 /// The continuation state the parser carries inside every built database so
 /// statement-by-statement ingestion can resume from it: the
 /// access-resolution mode, the active PostgreSQL catalog, metadata for
-/// collations the ingested DDL created, and the function signatures open-world
-/// grants named without reaching a function.
+/// collations the ingested DDL created, the function signatures open-world
+/// grants named without reaching a function, and the attribute changes aimed
+/// at roles the input never created.
 ///
 /// The catalog sits behind an [`Arc`], so cloning a database or taking a
 /// snapshot bumps a reference count rather than copying the catalog's
@@ -156,6 +178,7 @@ pub struct ParserIngestion {
     active_postgres_catalog: Arc<PostgresCatalog>,
     collation_metadata: Vec<CreatedCollationMetadata>,
     unresolved_function_grants: Vec<FunctionDesc>,
+    role_alterations: Vec<UndeclaredRoleAlteration>,
 }
 
 impl core::fmt::Debug for ParserIngestion {
@@ -171,6 +194,7 @@ impl core::fmt::Debug for ParserIngestion {
             )
             .field("created_collations", &self.collation_metadata.len())
             .field("unresolved_function_grants", &self.unresolved_function_grants.len())
+            .field("undeclared_role_alterations", &self.role_alterations.len())
             .finish()
     }
 }
@@ -3690,6 +3714,25 @@ fn remove_role_memberships(roles: &mut [(Arc<CreateRole>, ())], removed: &Ident)
     }
 }
 
+/// Applies the attributes one `ALTER ROLE ... WITH` names, in written order,
+/// leaving every attribute it does not name as it stood.
+fn apply_role_options(role: &mut CreateRole, options: Vec<RoleOption>) {
+    for option in options {
+        match option {
+            RoleOption::BypassRLS(value) => role.bypassrls = Some(value),
+            RoleOption::ConnectionLimit(limit) => role.connection_limit = Some(limit),
+            RoleOption::CreateDB(value) => role.create_db = Some(value),
+            RoleOption::CreateRole(value) => role.create_role = Some(value),
+            RoleOption::Inherit(value) => role.inherit = Some(value),
+            RoleOption::Login(value) => role.login = Some(value),
+            RoleOption::Password(password) => role.password = Some(password),
+            RoleOption::Replication(value) => role.replication = Some(value),
+            RoleOption::SuperUser(value) => role.superuser = Some(value),
+            RoleOption::ValidUntil(until) => role.valid_until = Some(until),
+        }
+    }
+}
+
 /// Subtracts a revoke from a grant store and returns an unsupported shape.
 fn apply_revoke_to_grant_store(
     grants: &mut Vec<(Arc<Grant>, ())>,
@@ -3839,6 +3882,18 @@ pub enum UnresolvedAccessReference<'a> {
         /// The role it applies to.
         role: &'a Ident,
     },
+    /// An `ALTER ROLE` changing attributes of a role no `CREATE ROLE` had
+    /// created when it ran.
+    ///
+    /// The change never reached a stored role, so it stays reported even when
+    /// a later statement creates the role.
+    AlteredRole {
+        /// The role the statements name.
+        role: &'a Ident,
+        /// The net change every such `ALTER ROLE` on the role made, at most
+        /// one option of each kind, the last one written.
+        options: &'a [RoleOption],
+    },
 }
 
 impl ParserDBIngestor {
@@ -3962,6 +4017,7 @@ impl ParserDBIngestor {
                 postgres,
                 collations: Vec::new(),
                 unresolved_function_grants: Vec::new(),
+                role_alterations: Vec::new(),
             },
             access_resolution,
             transaction: None,
@@ -4134,8 +4190,10 @@ impl ParserDB {
     /// Reports the roles, table targets and function targets that this
     /// database's access control statements name and the database does not
     /// itself hold: the grantees and targets of its grants, the grantees of the
-    /// `EXECUTE` privileges its functions carry, and the roles its policies
-    /// apply to. The grant object shapes the closed world never resolved
+    /// `EXECUTE` privileges its functions carry, the roles its policies apply
+    /// to, and the roles whose attributes an `ALTER ROLE` changed before any
+    /// `CREATE ROLE` created them. The grant object shapes the closed world
+    /// never resolved
     /// either, `ALL TABLES IN SCHEMA` and the sequence and schema forms, are
     /// left alone here too.
     ///
@@ -4146,10 +4204,12 @@ impl ParserDB {
     /// ROLE` it names resolves. A table target is read as ingestion bound it,
     /// which is how the reading accessors read it, so one the grant reached
     /// keeps resolving whatever the input does to the search path afterwards.
-    /// A function target is the exception. A grant on a function changes that
-    /// function as it runs, so one reaching no function is reported as it was
-    /// when it ran, whatever the input creates afterwards. Each distinct
-    /// reference is reported once, in a deterministic order.
+    /// A function target and an attribute change are the exceptions. A grant
+    /// on a function changes that function as it runs, so one reaching no
+    /// function is reported as it was when it ran, whatever the input creates
+    /// afterwards. An attribute change applied to no stored role, so it is
+    /// reported whatever follows it. Each distinct reference is reported once,
+    /// in a deterministic order.
     ///
     /// # Errors
     ///
@@ -4160,14 +4220,15 @@ impl ParserDB {
     ///
     /// ```
     /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use sqlparser::{ast::RoleOption, dialect::PostgreSqlDialect};
     ///
     /// let db = ParseOptions::default()
     ///     .with_access_resolution(AccessResolution::OpenWorld)
     ///     .parse::<PostgreSqlDialect>(
     ///         "CREATE TABLE docs (id uuid PRIMARY KEY);
     ///          GRANT SELECT ON docs TO app;
-    ///          CREATE POLICY docs_owner ON docs TO auditor USING (true);",
+    ///          CREATE POLICY docs_owner ON docs TO auditor USING (true);
+    ///          ALTER ROLE anon BYPASSRLS;",
     ///     )?;
     ///
     /// let unresolved: Vec<_> = db.unresolved_access_references()?.collect();
@@ -4176,7 +4237,14 @@ impl ParserDB {
     ///     [
     ///         UnresolvedAccessReference::GranteeRole(grantee),
     ///         UnresolvedAccessReference::PolicyRole { policy, role },
-    ///     ] if grantee.value == "app" && policy.value == "docs_owner" && role.value == "auditor"
+    ///         UnresolvedAccessReference::AlteredRole {
+    ///             role: altered,
+    ///             options: [RoleOption::BypassRLS(true)],
+    ///         },
+    ///     ] if grantee.value == "app"
+    ///         && policy.value == "docs_owner"
+    ///         && role.value == "auditor"
+    ///         && altered.value == "anon"
     /// ));
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
@@ -4249,25 +4317,35 @@ impl ParserDB {
             }
         }
 
+        for alteration in &self.ingestion.role_alterations {
+            unresolved.insert(UnresolvedAccessReference::AlteredRole {
+                role: &alteration.role,
+                options: &alteration.options,
+            });
+        }
+
         Ok(unresolved.into_iter())
     }
 
     /// Checks that every access control statement resolves: each grantee names
     /// a role, each table or function target names a table or a function, and
-    /// each policy applies to a role that this database holds.
+    /// each policy applies to a role that this database holds, and that no
+    /// `ALTER ROLE` changed a role before it was created.
     ///
     /// This is the [`AccessResolution::ClosedWorld`] verdict on a database
     /// parsed under [`AccessResolution::OpenWorld`], deferred until the whole
-    /// input is in and therefore insensitive to statement order.
+    /// input is in and therefore insensitive to where a grant or a policy sits
+    /// relative to the `CREATE ROLE` it names.
     ///
     /// # Errors
     ///
     /// Returns the first unresolved reference as
     /// [`RoleNotFoundForGrant`](crate::errors::Error::RoleNotFoundForGrant),
     /// [`TableNotFoundForGrant`](crate::errors::Error::TableNotFoundForGrant),
-    /// [`FunctionNotFoundForGrant`](crate::errors::Error::FunctionNotFoundForGrant)
+    /// [`FunctionNotFoundForGrant`](crate::errors::Error::FunctionNotFoundForGrant),
+    /// [`RoleNotFoundForPolicy`](crate::errors::Error::RoleNotFoundForPolicy)
     /// or
-    /// [`RoleNotFoundForPolicy`](crate::errors::Error::RoleNotFoundForPolicy).
+    /// [`AlterRoleNotFound`](crate::errors::Error::AlterRoleNotFound).
     /// A malformed or ambiguous target name surfaces as
     /// [`IdentifierLookupError`](crate::errors::Error::IdentifierLookupError).
     ///
@@ -4316,6 +4394,9 @@ impl ParserDB {
                     role_name: role.value.clone(),
                     policy_name: policy.value.clone(),
                 })
+            }
+            Some(UnresolvedAccessReference::AlteredRole { role, .. }) => {
+                Err(crate::errors::Error::AlterRoleNotFound { role_name: role.value.clone() })
             }
             None => Ok(()),
         }
@@ -6234,6 +6315,7 @@ impl ParserDB {
             postgres: mut active_postgres_catalog,
             collations: mut collation_metadata,
             mut unresolved_function_grants,
+            mut role_alterations,
         } = catalog;
         let dialect = *builder.dialect();
         for statement in statements {
@@ -6686,6 +6768,52 @@ impl ParserDB {
                     rename_grantee_role(builder.table_grants_mut(), &name, &new_name);
                     rename_grantee_role(builder.column_grants_mut(), &name, &new_name);
                     rename_execute_grantees(&mut builder, &name, &new_name);
+                }
+                Statement::AlterRole {
+                    name,
+                    operation: AlterRoleOperation::WithOptions { options },
+                } => {
+                    let Some(position) = builder
+                        .roles()
+                        .iter()
+                        .position(|(role, ())| role_matches_lookup_ident(role, &name))
+                    else {
+                        if access_resolution == AccessResolution::ClosedWorld {
+                            return Err(crate::errors::Error::AlterRoleNotFound {
+                                role_name: name.value,
+                            });
+                        }
+                        if let Some(kept) =
+                            role_alterations.iter_mut().find(|kept| idents_match(&kept.role, &name))
+                        {
+                            kept.apply(options);
+                        } else {
+                            let mut kept =
+                                UndeclaredRoleAlteration { role: name, options: Vec::new() };
+                            kept.apply(options);
+                            role_alterations.push(kept);
+                        }
+                        continue;
+                    };
+
+                    let names_role = |stored_name: &ObjectName| {
+                        object_name_last_identifier(stored_name)
+                            .is_some_and(|stored_name| idents_match(stored_name, &name))
+                    };
+                    let stored = Arc::make_mut(&mut builder.roles_mut()[position].0);
+                    if stored.names.iter().all(names_role) {
+                        apply_role_options(stored, options);
+                    } else {
+                        // `CREATE ROLE a, b` keeps both roles in one node, and
+                        // the change reaches only the role the statement names.
+                        let (named, others) =
+                            core::mem::take(&mut stored.names).into_iter().partition(names_role);
+                        let mut altered = stored.clone();
+                        stored.names = others;
+                        altered.names = named;
+                        apply_role_options(&mut altered, options);
+                        builder = builder.add_role(Arc::new(altered), ());
+                    }
                 }
                 Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Schema,
@@ -7819,6 +7947,7 @@ impl ParserDB {
             postgres: active_postgres_catalog,
             collations: collation_metadata,
             unresolved_function_grants,
+            role_alterations,
         })
     }
 

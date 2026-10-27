@@ -15,18 +15,21 @@ use crate::{
 /// How an access control statement is resolved against the objects the parsed
 /// input creates.
 ///
-/// Governs `GRANT`, `REVOKE` and `CREATE POLICY`, all of which name a role, and
-/// which a schema dump leaves unresolved for the same reason.
+/// Governs `GRANT`, `REVOKE`, `CREATE POLICY` and the attribute forms of
+/// `ALTER ROLE`, all of which name a role, and which a schema dump or a
+/// migration against platform roles leaves unresolved for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum AccessResolution {
     /// Every role and every access target must be created by the same input.
     ///
-    /// A grant or a revoke naming an absent role or table, and a policy
-    /// applying to an absent role, each abort the parse. This is the default.
+    /// A grant or a revoke naming an absent role or table, a policy applying
+    /// to an absent role, and an `ALTER ROLE` changing the attributes of an
+    /// absent role each abort the parse. This is the default.
     #[default]
     ClosedWorld,
-    /// Grants, revokes and policies may name roles, and grants and revokes may
-    /// name tables, that the input does not create.
+    /// Grants, revokes, policies and `ALTER ROLE` attribute changes may name
+    /// roles, and grants and revokes may name tables, that the input does not
+    /// create.
     ///
     /// Roles are cluster objects that `pg_dump` does not emit, so a dump of a
     /// schema carrying a single grant or policy has no `CREATE ROLE` to resolve

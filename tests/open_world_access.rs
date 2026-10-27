@@ -13,6 +13,7 @@ use sql_traits::{
     prelude::*,
 };
 use sqlparser::{
+    ast::RoleOption,
     dialect::{MySqlDialect, PostgreSqlDialect},
     parser::Parser,
 };
@@ -435,4 +436,66 @@ fn options_apply_to_a_directory_of_migrations() {
     assert_eq!(from_file.table_grants().count(), 1);
 
     std::fs::remove_dir_all(&directory).expect("the temporary directory is removable");
+}
+
+/// Supabase provisions `anon` outside every migration, and a migration
+/// granting it `BYPASSRLS` is the change an RLS audit must still see.
+#[test]
+fn altering_an_absent_role_is_refused_or_reported() {
+    let sql = "ALTER ROLE anon WITH BYPASSRLS LOGIN; ALTER ROLE anon NOBYPASSRLS SUPERUSER;";
+    assert!(matches!(
+        ParserDB::parse::<PostgreSqlDialect>(sql),
+        Err(Error::AlterRoleNotFound { role_name }) if role_name == "anon"
+    ));
+
+    let db = open_world().parse::<PostgreSqlDialect>(sql).expect("schema parses");
+    assert!(db.role("anon").is_none(), "no attribute change invents the role");
+    let unresolved: Vec<_> = db.unresolved_access_references().expect("well formed").collect();
+    let net_change =
+        [RoleOption::BypassRLS(false), RoleOption::Login(true), RoleOption::SuperUser(true)];
+    assert!(
+        matches!(unresolved[..], [UnresolvedAccessReference::AlteredRole { role, options }]
+        if role.value == "anon" && {
+            let mut options = options.to_vec();
+            options.sort_unstable();
+            options == net_change
+        }),
+        "the net change on anon is reported: {unresolved:?}"
+    );
+    assert!(matches!(
+        db.validate_access_targets(),
+        Err(Error::AlterRoleNotFound { role_name }) if role_name == "anon"
+    ));
+}
+
+/// The change ran while no role existed, so a role created afterwards starts
+/// without it and the change stays reported.
+#[test]
+fn a_role_created_after_its_alteration_does_not_inherit_it() {
+    let db = open_world()
+        .parse::<PostgreSqlDialect>("ALTER ROLE anon BYPASSRLS; CREATE ROLE anon;")
+        .expect("schema parses");
+
+    assert!(!db.role("anon").expect("anon is created").can_bypass_rls());
+    assert!(matches!(
+        db.validate_access_targets(),
+        Err(Error::AlterRoleNotFound { role_name }) if role_name == "anon"
+    ));
+}
+
+#[test]
+fn a_rolled_back_alteration_of_an_absent_role_is_not_reported() {
+    let db = open_world()
+        .parse::<PostgreSqlDialect>("BEGIN; ALTER ROLE anon BYPASSRLS; ROLLBACK;")
+        .expect("schema parses");
+
+    assert_eq!(db.unresolved_access_references().expect("well formed").count(), 0);
+}
+
+/// Supabase migrations set session parameters on platform roles, and the
+/// closed world never demanded those roles exist.
+#[test]
+fn setting_a_parameter_on_an_absent_role_still_parses() {
+    ParserDB::parse::<PostgreSqlDialect>("ALTER ROLE authenticated SET statement_timeout = '8s';")
+        .expect("a parameter change names no attribute");
 }
