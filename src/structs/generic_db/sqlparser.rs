@@ -24,10 +24,10 @@ use sqlparser::{
         ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
         CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction,
         CreateFunctionBody, CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable,
-        CreateTrigger, DataType, DropBehavior, ExactNumberInfo, Expr, ForeignKeyConstraint,
-        FunctionDesc, FunctionReturnType, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName,
-        GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart,
-        OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
+        CreateTableOptions, CreateTrigger, DataType, DropBehavior, ExactNumberInfo, Expr,
+        ForeignKeyConstraint, FunctionDesc, FunctionReturnType, GeneratedAs, Grant, GrantObjects,
+        Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName,
+        ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
         RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
         TableConstraint, TimezoneInfo, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
         VisitMut, Visitor, VisitorMut, visit_relations,
@@ -5712,6 +5712,51 @@ impl ParserDB {
         })
     }
 
+    /// Applies `ALTER TABLE ... SET (...)` to the storage parameters of the
+    /// table it names.
+    fn alter_table_storage_parameters(
+        builder: ParserDBBuilder,
+        table_name: &ObjectName,
+        scope: AlterTableScope,
+        options: Vec<SqlOption>,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
+            return Ok(builder);
+        };
+        let node = Self::stored_node(&builder, &stored)?;
+        if node.partition_by.is_some() {
+            return Err(crate::errors::Error::StorageParametersOnPartitionedTable {
+                table_name: stored.name.clone(),
+            });
+        }
+        // Another dialect's table options, such as MySQL's `ENGINE`, leave the
+        // parameters nowhere to go.
+        if !matches!(node.table_options, CreateTableOptions::None | CreateTableOptions::With(_)) {
+            return Err(crate::errors::Error::UnsupportedAlterTableOperation {
+                table_name: stored.name.clone(),
+                operation: AlterTableOperation::SetOptionsParens { options }.to_string(),
+            });
+        }
+        Self::replace_table_node(builder, &stored, |_, replacement| {
+            let mut parameters = match core::mem::take(&mut replacement.table_options) {
+                CreateTableOptions::With(parameters) => parameters,
+                _ => Vec::new(),
+            };
+            for option in options {
+                // PostgreSQL moves a replaced parameter after the others in
+                // `reloptions`.
+                if let SqlOption::KeyValue { key, .. } = &option {
+                    parameters.retain(|stored| {
+                        !matches!(stored, SqlOption::KeyValue { key: stored, .. } if idents_match(stored, key))
+                    });
+                }
+                parameters.push(option);
+            }
+            replacement.table_options = CreateTableOptions::With(parameters);
+            Ok(())
+        })
+    }
+
     /// A permanent table other than `stored` whose foreign key references it.
     fn permanent_table_referencing<'builder>(
         builder: &'builder ParserDBBuilder,
@@ -7386,15 +7431,23 @@ impl ParserDB {
                                 )?;
                             }
 
+                            AlterTableOperation::SetOptionsParens { options } => {
+                                builder = Self::alter_table_storage_parameters(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    options,
+                                )?;
+                            }
+
                             // Ignored: each of these changes something the
                             // model carries no representation of, so nothing it
                             // answers can change.
                             //
-                            // Physical layout: storage parameters, clustering
-                            // and sort keys describe how rows are kept, which
-                            // the model does not describe at all.
+                            // Physical layout: Hive table properties,
+                            // clustering and sort keys describe how rows are
+                            // kept, which the model does not describe at all.
                             AlterTableOperation::SetTblProperties { .. }
-                            | AlterTableOperation::SetOptionsParens { .. }
                             | AlterTableOperation::ClusterBy { .. }
                             | AlterTableOperation::DropClusteringKey
                             | AlterTableOperation::AlterSortKey { .. }

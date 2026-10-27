@@ -1,15 +1,17 @@
 //! Submodule implementing the [`TableLike`] trait for `sqlparser`'s
 //! [`CreateTable`] struct.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
-use ::sqlparser::ast::{CreateTable, Expr, ObjectNamePart};
+use ::sqlparser::ast::{
+    CreateTable, CreateTableOptions, Expr, ObjectNamePart, SqlOption, Value, ValueWithSpan,
+};
 
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, TableMetadata},
     traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
-    utils::{last_str, object_name::qualifier_of},
+    utils::{identifier_resolution::stored_ident_name, last_str, object_name::qualifier_of},
 };
 
 impl Metadata for CreateTable {
@@ -74,6 +76,28 @@ fn declared_strategy(clause: &Expr) -> Option<PartitionStrategy> {
     }
 }
 
+/// Reads the text PostgreSQL keeps for a storage parameter's value.
+fn parameter_value(value: &Expr) -> Cow<'_, str> {
+    match value {
+        Expr::Value(ValueWithSpan {
+            value:
+                Value::SingleQuotedString(text)
+                | Value::EscapedStringLiteral(text)
+                | Value::UnicodeStringLiteral(text)
+                | Value::Number(text, _),
+            ..
+        }) => Cow::Borrowed(text),
+        Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(text), .. }) => {
+            Cow::Borrowed(&text.value)
+        }
+        Expr::Value(ValueWithSpan { value: Value::Boolean(flag), .. }) => {
+            Cow::Borrowed(if *flag { "true" } else { "false" })
+        }
+        Expr::Identifier(word) => stored_ident_name(word),
+        other => Cow::Owned(other.to_string()),
+    }
+}
+
 impl TableLike for CreateTable {
     type DB = ParserDB;
 
@@ -115,6 +139,21 @@ impl TableLike for CreateTable {
     #[inline]
     fn is_unlogged(&self) -> bool {
         self.unlogged
+    }
+
+    fn storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+        let options: &[SqlOption] = match &self.table_options {
+            CreateTableOptions::With(options) => options,
+            _ => &[],
+        };
+        options.iter().filter_map(|option| {
+            match option {
+                SqlOption::KeyValue { key, value } => {
+                    Some((stored_ident_name(key), parameter_value(value)))
+                }
+                _ => None,
+            }
+        })
     }
 
     fn columns<'db>(

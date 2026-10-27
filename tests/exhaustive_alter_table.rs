@@ -134,7 +134,7 @@ fn operations_over_things_the_model_does_not_describe_change_nothing() {
 
     let ignored = [
         // Physical layout.
-        "ALTER TABLE t SET (fillfactor = 70)",
+        "ALTER TABLE t CLUSTER BY (a)",
         // Rewrite rules, whose enablement has nothing to attach to.
         "ALTER TABLE t DISABLE RULE r",
         "ALTER TABLE t ENABLE ALWAYS RULE r",

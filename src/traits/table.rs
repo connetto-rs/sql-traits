@@ -438,6 +438,61 @@ pub trait TableLike:
     /// ```
     fn is_unlogged(&self) -> bool;
 
+    /// Iterates over this table's storage parameters (`pg_class.reloptions`)
+    /// as name and value, after every `ALTER TABLE ... SET (...)` naming it.
+    ///
+    /// Names fold to lowercase unless quoted. Values read as written, with
+    /// string literals unquoted and unquoted words folded to lowercase.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE staging (id INT) WITH (AUTOVACUUM_ENABLED = FALSE, fillfactor = 70);
+    /// ALTER TABLE staging SET (autovacuum_enabled = true);
+    /// ",
+    /// )?;
+    /// let staging =
+    ///     db.table_by_target(TargetName::new("staging", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let parameters: Vec<_> = staging.storage_parameters().collect();
+    /// assert_eq!(
+    ///     parameters,
+    ///     [("fillfactor".into(), "70".into()), ("autovacuum_enabled".into(), "true".into())]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)>;
+
+    /// Returns the value of the storage parameter stored under `name`, as
+    /// [`TableLike::storage_parameters`] names it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE staging (id INT) WITH (Autovacuum_Enabled = false);",
+    /// )?;
+    /// let staging =
+    ///     db.table_by_target(TargetName::new("staging", false), IdentifierCase::AsWritten)?.unwrap();
+    /// assert_eq!(staging.storage_parameter("autovacuum_enabled").as_deref(), Some("false"));
+    /// assert_eq!(staging.storage_parameter("fillfactor"), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn storage_parameter(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.storage_parameters().find_map(|(stored, value)| (stored == name).then_some(value))
+    }
+
     /// Returns the table ID according to its position in the database's table
     /// iterator.
     ///
@@ -4576,6 +4631,14 @@ where
 
     fn is_unlogged(&self) -> bool {
         T::is_unlogged(self)
+    }
+
+    fn storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+        T::storage_parameters(self)
+    }
+
+    fn storage_parameter(&self, name: &str) -> Option<Cow<'_, str>> {
+        T::storage_parameter(self, name)
     }
 
     fn table_id(&self, database: &Self::DB) -> Option<usize> {
