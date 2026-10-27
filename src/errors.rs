@@ -11,6 +11,9 @@ use crate::structs::{FunctionKind, IdentifierCase};
 pub enum ObjectKind {
     /// A base table.
     Table,
+    /// A table whose rows live behind a foreign server, declared by a `CREATE
+    /// FOREIGN TABLE` statement.
+    ForeignTable,
     /// A view declared by a `CREATE VIEW` statement.
     View,
     /// A view declared by a `CREATE MATERIALIZED VIEW` statement.
@@ -45,6 +48,7 @@ impl core::fmt::Display for ObjectKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::Table => "Table",
+            Self::ForeignTable => "Foreign table",
             Self::View => "View",
             Self::MaterializedView => "Materialized view",
             Self::Column => "Column",
@@ -59,6 +63,31 @@ impl core::fmt::Display for ObjectKind {
             Self::Role => "Role",
             Self::Schema => "Schema",
             Self::Sequence => "Sequence",
+        })
+    }
+}
+
+/// A constraint PostgreSQL enforces against the rows a table stores, which a
+/// foreign table, storing none, cannot carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyConstraint {
+    /// A `PRIMARY KEY` constraint.
+    PrimaryKey,
+    /// A `UNIQUE` constraint.
+    Unique,
+    /// A `FOREIGN KEY` or `REFERENCES` constraint.
+    ForeignKey,
+    /// An `EXCLUDE` constraint.
+    Exclusion,
+}
+
+impl core::fmt::Display for KeyConstraint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::PrimaryKey => "Primary key",
+            Self::Unique => "Unique",
+            Self::ForeignKey => "Foreign key",
+            Self::Exclusion => "Exclusion",
         })
     }
 }
@@ -716,14 +745,19 @@ pub enum Error {
         /// Name of the rule.
         rule_name: String,
     },
-    #[error("Rule `{rule_name}` cannot be defined on materialized view `{view_name}`.")]
-    /// Error indicating that a rule names a materialized view, which
-    /// PostgreSQL refuses: rules exist on tables and plain views only.
-    RuleOnMaterializedView {
+    #[error(
+        "{relation_kind} `{relation_name}` cannot have rules, so rule `{rule_name}` is refused."
+    )]
+    /// Error indicating that a rule names a relation PostgreSQL keeps rules
+    /// off: rules exist on tables and plain views only, so a materialized view
+    /// or a foreign table refuses one.
+    RuleOnUnsupportedRelation {
         /// Name of the rule.
         rule_name: String,
-        /// Name of the materialized view the rule names.
-        view_name: String,
+        /// Kind of relation the rule names.
+        relation_kind: ObjectKind,
+        /// Name of the relation the rule names.
+        relation_name: String,
     },
     #[error(
         "Rule `{rule_name}` on `{relation_name}` is an `ON SELECT` rule, which is not supported."
@@ -1417,6 +1451,15 @@ pub enum Error {
         expected_kind: ObjectKind,
         /// Kind the name actually holds.
         actual_kind: ObjectKind,
+    },
+    #[error("{constraint} constraints are not supported on foreign table `{table_name}`.")]
+    /// Error indicating that a statement gives a foreign table a primary key,
+    /// unique, exclusion or foreign key constraint, which PostgreSQL refuses.
+    ConstraintUnsupportedOnForeignTable {
+        /// Name of the foreign table.
+        table_name: String,
+        /// The kind of constraint refused.
+        constraint: KeyConstraint,
     },
     #[error(
         "Cannot change name of view column `{existing_column}` to `{new_column}` of view `{view_name}`."

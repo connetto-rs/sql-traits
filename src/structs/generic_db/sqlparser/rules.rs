@@ -31,10 +31,10 @@ use crate::{
 /// # Errors
 ///
 /// Returns [`Error::RelationNotFoundForRule`] when no table or view holds the
-/// target, [`Error::RuleOnMaterializedView`] when a materialized view does,
-/// [`Error::SelectRuleUnsupported`] for an `ON SELECT` rule, and
-/// [`Error::RuleAlreadyExists`] when the relation carries a rule of the same
-/// name and the statement wrote no `OR REPLACE`.
+/// target, [`Error::RuleOnUnsupportedRelation`] when a foreign table or a
+/// materialized view does, [`Error::SelectRuleUnsupported`] for an `ON SELECT`
+/// rule, and [`Error::RuleAlreadyExists`] when the relation carries a rule of
+/// the same name and the statement wrote no `OR REPLACE`.
 pub(super) fn create_rule(
     mut builder: ParserDBBuilder,
     mut rule: CreateRule,
@@ -47,15 +47,22 @@ pub(super) fn create_rule(
 
     // Bound to the qualifier of the relation reached, as the other objects
     // naming a relation are.
+    let unsupported = |rule: CreateRule, relation_kind| {
+        Err(Error::RuleOnUnsupportedRelation {
+            relation_name: relation_name(&rule),
+            rule_name: rule.name.value,
+            relation_kind,
+        })
+    };
     let qualifier = if let Some(table) = builder.resolve_table_object_name(&rule.table_name)? {
+        if builder.is_foreign_table(table) {
+            return unsupported(rule, ObjectKind::ForeignTable);
+        }
         stored_qualifier(&table.name)
     } else if let Some(view) = builder.resolve_view_object_name(&rule.table_name)? {
         stored_view_qualifier(view)
     } else if builder.resolve_materialized_view_object_name(&rule.table_name)?.is_some() {
-        return Err(Error::RuleOnMaterializedView {
-            view_name: relation_name(&rule),
-            rule_name: rule.name.value,
-        });
+        return unsupported(rule, ObjectKind::MaterializedView);
     } else {
         return Err(Error::RelationNotFoundForRule {
             relation_name: relation_name(&rule),

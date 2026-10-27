@@ -103,4 +103,8 @@ pub trait SchemaProfile: Sized {
     /// dialect's defaults: the parser profile answers PostgreSQL with the
     /// full default catalog and every other dialect with an empty one.
     fn default_ingestion(dialect: &Self::Dialect) -> Self::Ingestion;
+
+    /// Returns whether the table `metadata` describes is a foreign table, which
+    /// the built database lists apart from ordinary tables.
+    fn is_foreign_table(metadata: &Meta<Self::Table>) -> bool;
 }

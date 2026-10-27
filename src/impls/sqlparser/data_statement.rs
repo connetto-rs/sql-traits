@@ -126,7 +126,11 @@ impl<'db, DB: DatabaseLike> RelationCollector<'db, DB> {
                 Ok(())
             }
             Relation::View(view) => self.expand_view(view),
-            Relation::MaterializedView(_) | Relation::Sequence(_) => Ok(()),
+            // A foreign table is listed among the relations read, and like
+            // `tables()` the base-table answer leaves it out.
+            Relation::ForeignTable(_) | Relation::MaterializedView(_) | Relation::Sequence(_) => {
+                Ok(())
+            }
         }
     }
 
@@ -149,6 +153,9 @@ impl<'db, DB: DatabaseLike> RelationCollector<'db, DB> {
             }
         }
         for child in reached.into_iter().skip(1) {
+            if child.is_foreign(self.database)? {
+                continue;
+            }
             if !self.tables.iter().any(|seen| core::ptr::eq(*seen, child)) {
                 self.tables.push(child);
             }
@@ -174,7 +181,10 @@ impl<'db, DB: DatabaseLike> RelationCollector<'db, DB> {
 /// database hands back for it.
 fn same_relation<DB: DatabaseLike>(left: &Relation<'_, DB>, right: &Relation<'_, DB>) -> bool {
     match (left, right) {
-        (Relation::Table(left), Relation::Table(right)) => core::ptr::eq(*left, *right),
+        (Relation::Table(left), Relation::Table(right))
+        | (Relation::ForeignTable(left), Relation::ForeignTable(right)) => {
+            core::ptr::eq(*left, *right)
+        }
         (Relation::View(left), Relation::View(right)) => core::ptr::eq(*left, *right),
         (Relation::MaterializedView(left), Relation::MaterializedView(right)) => {
             core::ptr::eq(*left, *right)
@@ -387,6 +397,9 @@ mod tests {
             .map(|relation| {
                 match relation {
                     Relation::Table(table) => format!("table {}", table.table_name()),
+                    Relation::ForeignTable(table) => {
+                        format!("foreign table {}", table.table_name())
+                    }
                     Relation::View(view) => format!("view {}", view.view_name()),
                     Relation::MaterializedView(view) => {
                         format!("materialized view {}", view.view_name())

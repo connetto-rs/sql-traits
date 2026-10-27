@@ -961,7 +961,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             dialect,
             catalog_name,
             timezone,
-            tables,
+            mut tables,
+            foreign_tables,
             views,
             materialized_views,
             sequences,
@@ -991,6 +992,9 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             identifier_case,
             ingestion,
         } = database;
+        // Ingestion keeps both kinds of table in one store, since most
+        // statements treat them alike.
+        tables.extend(foreign_tables);
         let builder = Self {
             dialect,
             catalog_name,
@@ -1075,20 +1079,29 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     pub(crate) fn into_database(mut self, ingestion: P::Ingestion) -> GenericDB<P> {
         self.sort_stores();
         let catalog_name = self.catalog_name;
+        let (foreign_tables, tables): (Vec<_>, Vec<_>) =
+            self.tables.into_iter().partition(|(_, metadata, _)| P::is_foreign_table(metadata));
 
-        // Tables, views, materialized views and sequences share one pool of
-        // names, so one index answers all four. Slots of a kind stay ascending
-        // because each kind is walked in storage order.
+        // Tables, foreign tables, views, materialized views and sequences share
+        // one pool of names, so one index answers all five. Slots of a kind
+        // stay ascending because each kind is walked in storage order.
         let mut relation_index: BTreeMap<_, Vec<RelationSlot>> = BTreeMap::new();
         let mut relation_identities = Vec::with_capacity(
-            self.tables.len() + self.views.len() + self.materialized_views.len(),
+            tables.len() + foreign_tables.len() + self.views.len() + self.materialized_views.len(),
         );
-        for (position, (table, _, identity)) in self.tables.iter().enumerate() {
+        for (position, (table, _, identity)) in tables.iter().enumerate() {
             relation_index
                 .entry(stored_table_key(table.as_ref(), IdentifierCase::AsWritten))
                 .or_default()
                 .push(RelationSlot::Table(position));
             relation_identities.push((*identity, RelationSlot::Table(position)));
+        }
+        for (position, (table, _, identity)) in foreign_tables.iter().enumerate() {
+            relation_index
+                .entry(stored_table_key(table.as_ref(), IdentifierCase::AsWritten))
+                .or_default()
+                .push(RelationSlot::ForeignTable(position));
+            relation_identities.push((*identity, RelationSlot::ForeignTable(position)));
         }
         for (position, (view, _, identity)) in self.views.iter().enumerate() {
             relation_index
@@ -1136,7 +1149,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             dialect: self.dialect,
             catalog_name,
             timezone: self.timezone,
-            tables: self.tables,
+            tables,
+            foreign_tables,
             views: self.views,
             materialized_views: self.materialized_views,
             sequences: self.sequences,
