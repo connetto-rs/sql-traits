@@ -262,6 +262,8 @@ fn create_index_name_answers_a_written_name_and_refuses_a_missing_table() {
 
     let missing = ingestor.create_index_name(&create_index("CREATE INDEX ON absent (s);"));
     assert!(matches!(missing, Err(Error::TableNotFoundForIndex { .. })), "got {missing:?}");
+    let applied = parse("CREATE INDEX ON absent (s);");
+    assert!(matches!(applied, Err(Error::TableNotFoundForIndex { .. })), "got {applied:?}");
 }
 
 #[test]
@@ -292,4 +294,20 @@ fn a_partition_key_name_is_cut_to_fit_and_counted_in_the_schema() {
         key_names(&format!("{a61}2")),
         [format!("{}_{}_key1", &a61[..29], &b63[..28]), format!("{}_pkey1", &a61[..57])]
     );
+}
+
+#[test]
+fn a_partition_names_its_copy_of_an_inline_unique_key_after_the_column() {
+    let db = parse(
+        "CREATE TABLE r (A INT UNIQUE) PARTITION BY RANGE (A);
+         CREATE TABLE p PARTITION OF r FOR VALUES FROM (1) TO (2);",
+    )
+    .expect("schema builds");
+
+    let names: Vec<_> = table(&db, "p")
+        .unique_indices(&db)
+        .expect("in database")
+        .filter_map(|index| IndexLike::name(index).map(ToString::to_string))
+        .collect();
+    assert_eq!(names, ["p_a_key"]);
 }
