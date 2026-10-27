@@ -1,12 +1,40 @@
-//! Whether a column option makes the column an identity column.
+//! Whether a column option makes the column an identity column, and with
+//! which mode.
 
-use sqlparser::ast::ColumnOption;
+use sqlparser::ast::{ColumnOption, GeneratedAs};
 
-/// Returns whether the option makes the column an identity column.
+use crate::{impls::SqlparserDialect, traits::IdentityGeneration};
+
+/// Returns the mode of the identity the option declares, or `None` when the
+/// option declares none.
 ///
 /// `GENERATED ... AS IDENTITY` and `GENERATED ... AS (expr) STORED` share one
-/// variant and are told apart by whether an expression is present. Other
-/// dialects spell the same idea as a variant of its own.
+/// variant and are told apart by whether an expression is present. SQL
+/// Server's and Snowflake's `IDENTITY` and `AUTOINCREMENT` write no mode, so
+/// the one the engine enforces is reported. SQL Server refuses an explicit
+/// value unless `IDENTITY_INSERT` is on, and Snowflake takes one whenever an
+/// insert gives it.
+pub(crate) fn identity_generation(
+    option: &ColumnOption,
+    dialect: SqlparserDialect,
+) -> Option<IdentityGeneration> {
+    match option {
+        ColumnOption::Generated { generated_as, generation_expr: None, .. } => {
+            Some(match generated_as {
+                GeneratedAs::ByDefault => IdentityGeneration::ByDefault,
+                GeneratedAs::Always | GeneratedAs::ExpStored => IdentityGeneration::Always,
+            })
+        }
+        ColumnOption::Identity(_) if dialect == SqlparserDialect::MsSql => {
+            Some(IdentityGeneration::Always)
+        }
+        ColumnOption::Identity(_) => Some(IdentityGeneration::ByDefault),
+        _ => None,
+    }
+}
+
+/// Returns whether the option makes the column an identity column, in any
+/// mode and under any dialect's spelling.
 ///
 /// # Examples
 ///
@@ -35,9 +63,5 @@ use sqlparser::ast::ColumnOption;
 /// ```
 #[must_use]
 pub fn is_identity(option: &ColumnOption) -> bool {
-    match option {
-        ColumnOption::Identity(_) => true,
-        ColumnOption::Generated { generation_expr, .. } => generation_expr.is_none(),
-        _ => false,
-    }
+    identity_generation(option, SqlparserDialect::Generic).is_some()
 }

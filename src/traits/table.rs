@@ -1036,7 +1036,7 @@ pub trait TableLike:
     /// ```
     #[inline]
     fn has_generated_columns(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(self.columns(database)?.any(ColumnLike::is_generated))
+        Ok(self.columns(database)?.any(|column| column.is_generated(database)))
     }
 
     /// Returns the number of columns in the table.
@@ -1548,7 +1548,7 @@ pub trait TableLike:
     /// # }
     /// ```
     fn has_surrogate_primary_key(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(self.primary_key_columns(database)?.all(ColumnLike::is_generated)
+        Ok(self.primary_key_columns(database)?.all(|column| column.is_generated(database))
             && self.has_primary_key(database)?)
     }
 

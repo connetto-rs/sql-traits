@@ -521,7 +521,11 @@ impl ColumnLike for MemoryColumn {
         Ok(ColumnCollation::DatabaseDefault)
     }
 
-    fn is_generated(&self) -> bool {
+    fn identity_generation(&self, _database: &Self::DB) -> Option<IdentityGeneration> {
+        None
+    }
+
+    fn is_serial(&self) -> bool {
         false
     }
 

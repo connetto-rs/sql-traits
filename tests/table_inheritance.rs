@@ -597,10 +597,16 @@ fn an_identity_stays_with_the_parent_while_a_stored_expression_comes_down() {
             column(parent, name, &database).data_type(&database),
             "`{name}` keeps the parent's type"
         );
+    }
+    assert_eq!(
+        column(parent, "counted", &database).identity_generation(&database),
+        Some(IdentityGeneration::Always)
+    );
+    for name in ["counted", "base", "doubled", "labelled"] {
         assert_eq!(
-            column(child, name, &database).is_generated(),
-            column(parent, name, &database).is_generated(),
-            "`{name}` keeps the parent's generated flag"
+            column(child, name, &database).identity_generation(&database),
+            None,
+            "`{name}` is no identity in the child"
         );
     }
 
