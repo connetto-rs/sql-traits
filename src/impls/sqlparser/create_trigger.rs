@@ -83,15 +83,15 @@ impl TriggerLike for CreateTrigger {
         let schema = in_schema(qualifier_of(called).named());
         database.functions().find(|function| {
             let target = function.target_name();
-            function.stored_name() == name
+            function
+                .args
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .all(|argument| argument.mode == Some(ArgMode::Out))
+                && function.stored_name() == name
                 && in_schema(target.schema().map(|schema| (schema, target.schema_is_quoted())))
                     == schema
-                && function
-                    .args
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .all(|argument| argument.mode == Some(ArgMode::Out))
         })
     }
 

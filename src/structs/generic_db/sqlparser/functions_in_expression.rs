@@ -375,9 +375,14 @@ mod tests {
         .expect("function declarations parse");
         let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
         let scope = scope(&functions);
-        for (sql, expected) in
-            [("f(a) IN UNNEST(g(b))", ["f", "g"]), ("COUNT(*) IN UNNEST(g(b))", ["count", "g"])]
-        {
+        let cases: [(&str, &[&str]); 4] = [
+            ("f(a) IN UNNEST(g(b))", &["f", "g"]),
+            ("COUNT(*) IN UNNEST(g(b))", &["count", "g"]),
+            ("(f(a)) IN UNNEST(g(b))", &["f", "g"]),
+            // `ARRAY(SELECT ...)` passes its query as the one argument.
+            ("ARRAY(SELECT 1) IN UNNEST(g(b))", &["g"]),
+        ];
+        for (sql, expected) in cases {
             let expression = Parser::new(&GenericDialect {})
                 .try_with_sql(sql)
                 .expect("expression tokenizes")
@@ -408,6 +413,14 @@ mod tests {
         let scope = scope(&[]);
         assert!(!scope.reaches(function, &dynamic_name, 0));
         assert!(!scope.reaches(function, &ObjectName(Vec::new()), 0));
+        let run_time_schema = ObjectName(vec![
+            ObjectNamePart::Function(ObjectNamePartFunction {
+                name: Ident::new("IDENTIFIER"),
+                args: Vec::new(),
+            }),
+            ObjectNamePart::Identifier(Ident::new("ping")),
+        ]);
+        assert!(!scope.reaches(function, &run_time_schema, 0));
     }
 
     /// The scope a call written on the default search path sees.
