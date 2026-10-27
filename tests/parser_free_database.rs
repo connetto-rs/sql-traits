@@ -1590,6 +1590,7 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
     assert_eq!(catalog.dialect().is_bool(&catalog, first_column), TypeMatch::No);
     assert_eq!(first_column.fixed_binary_length(&catalog), None);
     assert_eq!(first_column.max_character_length(&catalog), None);
+    assert_eq!(first_column.fractional_seconds_precision(&catalog), None);
 
     Ok(())
 }
