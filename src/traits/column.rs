@@ -392,6 +392,47 @@ pub trait ColumnLike:
         None
     }
 
+    /// Returns how many fractional digits of a second a value of a time or
+    /// timestamp column keeps, or `None` when the declared type holds no time
+    /// of day.
+    ///
+    /// A written precision such as `TIMESTAMP(0)` or `TIME(3)` answers the
+    /// digits the engine keeps for it, and a bare type answers the engine's
+    /// default, which is 6 in PostgreSQL, 0 in MySQL and 9 in Snowflake. An
+    /// engine with a fixed resolution answers that resolution whatever was
+    /// written, as BigQuery does with microseconds. The engine rounds or
+    /// truncates a value with more digits, so `Some(0)` marks a column that
+    /// cannot hold the fraction of a second `now()` returns. A type without a
+    /// time of day, such as a standard `DATE`, answers `None`, and so does an
+    /// interval, which measures a duration. Oracle's `DATE` keeps whole seconds
+    /// and answers `Some(0)`.
+    ///
+    /// The default answers `None`, so an implementation over a backend with a
+    /// time or timestamp type must override it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE events (at timestamptz(0), seen timestamp, starts time(2), day date);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("events", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let precisions: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.fractional_seconds_precision(&db)).collect();
+    /// assert_eq!(precisions, [Some(0), Some(6), Some(2), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn fractional_seconds_precision(&self, _database: &Self::DB) -> Option<u64> {
+        None
+    }
+
     /// Returns the builtin scalar family of the column's declared type.
     ///
     /// # Example
@@ -1653,6 +1694,11 @@ where
     }
 
     #[inline]
+    fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
+        (*self).fractional_seconds_precision(database)
+    }
+
+    #[inline]
     fn collation<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -1722,6 +1768,11 @@ where
     #[inline]
     fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
         (**self).max_character_length(database)
+    }
+
+    #[inline]
+    fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
+        (**self).fractional_seconds_precision(database)
     }
 
     #[inline]

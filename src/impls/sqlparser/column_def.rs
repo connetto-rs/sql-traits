@@ -61,6 +61,14 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     }
 
     #[inline]
+    fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
+        super::dialect::fractional_seconds_precision(
+            *database.dialect(),
+            &self.attribute().data_type,
+        )
+    }
+
+    #[inline]
     fn collation<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -435,6 +443,212 @@ mod tests {
             let column = column_named(&db, "title");
             assert_eq!(<&_ as ColumnLike>::max_character_length(&column, &db), Some(100));
             assert_eq!(Arc::new(column.clone()).max_character_length(&db), Some(100));
+        }
+    }
+
+    mod fractional_seconds_precision {
+        use sqlparser::dialect::{
+            AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
+            DuckDbDialect, GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+            PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
+            SparkSqlDialect, TeradataDialect,
+        };
+
+        use super::{Arc, ColumnLike, column_named, parse_with};
+
+        /// Asserts the precision of a column declared with each type.
+        fn assert_precisions<D: Dialect + Default + 'static>(cases: &[(&str, Option<u64>)]) {
+            let columns: Vec<String> =
+                cases.iter().enumerate().map(|(index, (ty, _))| format!("c{index} {ty}")).collect();
+            let db = parse_with::<D>(&format!("CREATE TABLE t ({});", columns.join(", ")));
+            for (index, (ty, expected)) in cases.iter().enumerate() {
+                let column = column_named(&db, &format!("c{index}"));
+                assert_eq!(column.fractional_seconds_precision(&db), *expected, "{ty}");
+            }
+        }
+
+        #[test]
+        fn postgres_keeps_microseconds_by_default_and_clamps_to_them() {
+            let cases = [
+                ("TIMESTAMP", Some(6)),
+                ("TIMESTAMP(0)", Some(0)),
+                ("TIMESTAMPTZ(0)", Some(0)),
+                ("TIMESTAMP(3) WITH TIME ZONE", Some(3)),
+                ("TIME", Some(6)),
+                ("TIME(2)", Some(2)),
+                ("TIMETZ(3)", Some(3)),
+                ("TIMESTAMP(9)", Some(6)),
+                ("DATE", None),
+                ("INTERVAL", None),
+                ("INT", None),
+            ];
+            assert_precisions::<PostgreSqlDialect>(&cases);
+            assert_precisions::<RedshiftSqlDialect>(&cases);
+            assert_precisions::<PostgreSqlDialect>(&[
+                ("INTERVAL(2)", None),
+                ("INTERVAL DAY TO SECOND(1)", None),
+            ]);
+        }
+
+        #[test]
+        fn mysql_drops_the_fraction_by_default() {
+            assert_precisions::<MySqlDialect>(&[
+                ("DATETIME", Some(0)),
+                ("DATETIME(3)", Some(3)),
+                ("TIMESTAMP", Some(0)),
+                ("TIMESTAMP(0)", Some(0)),
+                ("TIME", Some(0)),
+                ("TIME(2)", Some(2)),
+                ("DATE", None),
+            ]);
+        }
+
+        #[test]
+        fn sql_server_types_and_rowversion() {
+            assert_precisions::<MsSqlDialect>(&[
+                ("DATETIME", Some(3)),
+                ("DATETIME2", Some(7)),
+                ("DATETIME2(0)", Some(0)),
+                ("DATETIMEOFFSET", Some(7)),
+                ("DATETIMEOFFSET(3)", Some(3)),
+                ("TIME", Some(7)),
+                ("TIME(2)", Some(2)),
+                ("SMALLDATETIME", Some(0)),
+                ("DATE", None),
+                ("TIMESTAMP", None),
+            ]);
+        }
+
+        #[test]
+        fn oracle_dates_keep_whole_seconds() {
+            assert_precisions::<OracleDialect>(&[
+                ("TIMESTAMP", Some(6)),
+                ("TIMESTAMP(0)", Some(0)),
+                ("TIMESTAMP(9) WITH TIME ZONE", Some(9)),
+                ("DATE", Some(0)),
+            ]);
+        }
+
+        #[test]
+        fn snowflake_keeps_nanoseconds_by_default() {
+            assert_precisions::<SnowflakeDialect>(&[
+                ("TIMESTAMP", Some(9)),
+                ("TIMESTAMP_NTZ(3)", Some(3)),
+                ("TIMESTAMP_LTZ", Some(9)),
+                ("TIMESTAMP_TZ(0)", Some(0)),
+                ("TIME", Some(9)),
+                ("DATETIME(6)", Some(6)),
+                ("DATE", None),
+            ]);
+        }
+
+        #[test]
+        fn duckdb_raises_written_precision_to_a_stored_unit() {
+            assert_precisions::<DuckDbDialect>(&[
+                ("TIMESTAMP", Some(6)),
+                ("TIMESTAMP(0)", Some(0)),
+                ("TIMESTAMP(1)", Some(3)),
+                ("TIMESTAMP(3)", Some(3)),
+                ("TIMESTAMP(4)", Some(6)),
+                ("TIMESTAMP(6)", Some(6)),
+                ("TIMESTAMP(7)", Some(9)),
+                ("DATETIME(0)", Some(0)),
+                ("TIMESTAMPTZ", Some(6)),
+                ("TIME", Some(6)),
+                ("TIMESTAMP_S", Some(0)),
+                ("TIMESTAMP_MS", Some(3)),
+                ("TIMESTAMP_NS", Some(9)),
+                ("TIME_NS", Some(9)),
+                ("DATE", None),
+            ]);
+        }
+
+        #[test]
+        fn clickhouse_counts_whole_seconds_unless_widened() {
+            assert_precisions::<ClickHouseDialect>(&[
+                ("DateTime", Some(0)),
+                ("DateTime(3)", Some(3)),
+                ("DateTime64(9, 'UTC')", Some(9)),
+                ("TIMESTAMP", Some(0)),
+                ("Time", Some(0)),
+                ("Time64(3)", Some(3)),
+                ("Time64", Some(3)),
+                ("Date", None),
+            ]);
+        }
+
+        #[test]
+        fn fixed_resolution_engines_ignore_written_precision() {
+            assert_precisions::<BigQueryDialect>(&[
+                ("TIMESTAMP", Some(6)),
+                ("DATETIME", Some(6)),
+                ("TIME", Some(6)),
+                ("DATE", None),
+            ]);
+            assert_precisions::<HiveDialect>(&[("TIMESTAMP", Some(9)), ("DATE", None)]);
+        }
+
+        #[test]
+        fn spark_keeps_microseconds_and_a_written_time_precision() {
+            let cases = [
+                ("TIMESTAMP", Some(6)),
+                ("TIMESTAMP_NTZ", Some(6)),
+                ("TIMESTAMP_LTZ", Some(6)),
+                ("TIME", Some(6)),
+                ("TIME(0)", Some(0)),
+                ("DATE", None),
+            ];
+            assert_precisions::<SparkSqlDialect>(&cases);
+            assert_precisions::<DatabricksDialect>(&cases);
+        }
+
+        #[test]
+        fn standard_and_teradata_defaults() {
+            assert_precisions::<AnsiDialect>(&[
+                ("TIMESTAMP", Some(6)),
+                ("TIMESTAMP(0)", Some(0)),
+                ("TIME", Some(0)),
+                ("TIME(2)", Some(2)),
+                ("DATE", None),
+            ]);
+            assert_precisions::<TeradataDialect>(&[
+                ("TIMESTAMP", Some(6)),
+                ("TIMESTAMP(0)", Some(0)),
+                ("TIME", Some(6)),
+                ("TIME(2)", Some(2)),
+                ("DATE", None),
+            ]);
+        }
+
+        #[test]
+        fn generic_answers_only_a_written_precision() {
+            assert_precisions::<GenericDialect>(&[
+                ("TIMESTAMP", None),
+                ("TIMESTAMP(0)", Some(0)),
+                ("TIME(2)", Some(2)),
+                ("DATETIME(3)", Some(3)),
+                ("DATETIME2(4)", Some(4)),
+                ("DATETIME2", None),
+                ("DateTime64(5)", Some(5)),
+                ("TIMESTAMP_NTZ(1)", Some(1)),
+            ]);
+        }
+
+        #[test]
+        fn sqlite_has_no_temporal_type() {
+            assert_precisions::<SQLiteDialect>(&[
+                ("TIMESTAMP(3)", None),
+                ("DATETIME", None),
+                ("TIME", None),
+            ]);
+        }
+
+        #[test]
+        fn forwards_through_reference_and_arc() {
+            let db = parse_with::<PostgreSqlDialect>("CREATE TABLE t (at TIMESTAMPTZ(0));");
+            let column = column_named(&db, "at");
+            assert_eq!(<&_ as ColumnLike>::fractional_seconds_precision(&column, &db), Some(0));
+            assert_eq!(Arc::new(column.clone()).fractional_seconds_precision(&db), Some(0));
         }
     }
 

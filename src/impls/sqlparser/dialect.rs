@@ -12,7 +12,10 @@
 use core::any::TypeId;
 
 use sqlparser::{
-    ast::{CharacterLength, ColumnDef, CreateTable, DataType, ObjectName, ObjectNamePart},
+    ast::{
+        CharacterLength, ColumnDef, CreateTable, DataType, ObjectName, ObjectNamePart,
+        TimezoneInfo, TypeModifier,
+    },
     dialect::{
         AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
         HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect,
@@ -290,6 +293,192 @@ pub(super) fn max_character_length(dialect: SqlparserDialect, ty: &DataType) -> 
         None => bare,
         Some(CharacterLength::IntegerLength { length, .. }) => Some(*length),
         Some(CharacterLength::Max) => None,
+    }
+}
+
+/// Fractional digits of a second a value of a time or timestamp type keeps.
+///
+/// A bare type takes the engine default. PostgreSQL keeps microseconds and
+/// reduces a larger written precision to 6, and Redshift, which documents
+/// microsecond values, is read the same way. MySQL keeps none, Oracle and
+/// Teradata keep 6, and the standard keeps 0 in `TIME` and 6 in `TIMESTAMP`.
+/// Oracle's `DATE` holds whole seconds. BigQuery, Spark and Databricks keep
+/// microseconds and Hive keeps nanoseconds, of which only a Spark `TIME` takes
+/// a written precision. SQLite has no temporal type. The generic dialect names
+/// no engine, so it answers only a written precision.
+pub(super) fn fractional_seconds_precision(
+    dialect: SqlparserDialect,
+    ty: &DataType,
+) -> Option<u64> {
+    match dialect {
+        SqlparserDialect::Generic => written_seconds_precision(ty),
+        SqlparserDialect::MsSql => sql_server_seconds_precision(ty),
+        SqlparserDialect::Snowflake => snowflake_seconds_precision(ty),
+        SqlparserDialect::DuckDb => duckdb_seconds_precision(ty),
+        SqlparserDialect::ClickHouse => clickhouse_seconds_precision(ty),
+        SqlparserDialect::Ansi => {
+            match ty {
+                DataType::Time(p, _) => Some(p.unwrap_or(0)),
+                DataType::Timestamp(p, _) => Some(p.unwrap_or(6)),
+                _ => None,
+            }
+        }
+        SqlparserDialect::Teradata => {
+            match ty {
+                DataType::Time(p, _) | DataType::Timestamp(p, _) => Some(p.unwrap_or(6)),
+                _ => None,
+            }
+        }
+        SqlparserDialect::PostgreSql | SqlparserDialect::Redshift => {
+            match ty {
+                DataType::Time(p, _) | DataType::Timestamp(p, _) => Some(p.map_or(6, |p| p.min(6))),
+                _ => None,
+            }
+        }
+        SqlparserDialect::MySql => {
+            match ty {
+                DataType::Time(p, _) | DataType::Timestamp(p, _) | DataType::Datetime(p) => {
+                    Some(p.unwrap_or(0))
+                }
+                _ => None,
+            }
+        }
+        SqlparserDialect::Oracle => {
+            match ty {
+                DataType::Timestamp(p, _) => Some(p.unwrap_or(6)),
+                DataType::Date => Some(0),
+                _ => None,
+            }
+        }
+        SqlparserDialect::BigQuery => {
+            match ty {
+                DataType::Time(..) | DataType::Timestamp(..) | DataType::Datetime(_) => Some(6),
+                _ => None,
+            }
+        }
+        SqlparserDialect::Hive => {
+            match ty {
+                DataType::Timestamp(..) => Some(9),
+                _ => None,
+            }
+        }
+        SqlparserDialect::Spark | SqlparserDialect::Databricks => {
+            match ty {
+                DataType::Time(p, _) => Some(p.unwrap_or(6)),
+                DataType::Timestamp(..) | DataType::TimestampNtz(_) => Some(6),
+                DataType::Custom(name, _) if custom_type_is(name, "TIMESTAMP_LTZ") => Some(6),
+                _ => None,
+            }
+        }
+        SqlparserDialect::SQLite => None,
+    }
+}
+
+/// SQL Server keeps 7 digits in `TIME`, `DATETIME2` and `DATETIMEOFFSET`, 3
+/// in `DATETIME` and none in `SMALLDATETIME`. Its `TIMESTAMP` is a row
+/// version.
+fn sql_server_seconds_precision(ty: &DataType) -> Option<u64> {
+    match ty {
+        DataType::Time(p, _) => Some(p.unwrap_or(7)),
+        DataType::Datetime(_) => Some(3),
+        DataType::Custom(name, modifiers)
+            if custom_type_is(name, "DATETIME2") || custom_type_is(name, "DATETIMEOFFSET") =>
+        {
+            modifier_precision(modifiers, 7)
+        }
+        DataType::Custom(name, modifiers) if custom_type_is(name, "SMALLDATETIME") => {
+            modifiers.is_empty().then_some(0)
+        }
+        _ => None,
+    }
+}
+
+/// Snowflake keeps 9 digits in every time and timestamp type.
+fn snowflake_seconds_precision(ty: &DataType) -> Option<u64> {
+    match ty {
+        DataType::Time(p, _)
+        | DataType::Timestamp(p, _)
+        | DataType::Datetime(p)
+        | DataType::TimestampNtz(p) => Some(p.unwrap_or(9)),
+        DataType::Custom(name, modifiers)
+            if custom_type_is(name, "TIMESTAMP_LTZ") || custom_type_is(name, "TIMESTAMP_TZ") =>
+        {
+            modifier_precision(modifiers, 9)
+        }
+        _ => None,
+    }
+}
+
+/// DuckDB stores whole seconds, milliseconds, microseconds or nanoseconds, so
+/// a written timestamp precision rises to the next of them. Its other types
+/// reject a written precision and keep microseconds.
+fn duckdb_seconds_precision(ty: &DataType) -> Option<u64> {
+    match ty {
+        DataType::Timestamp(Some(p), TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
+        | DataType::Datetime(Some(p)) => {
+            Some(match p {
+                0 => 0,
+                1..=3 => 3,
+                4..=6 => 6,
+                _ => 9,
+            })
+        }
+        DataType::Time(..) | DataType::Timestamp(..) | DataType::Datetime(None) => Some(6),
+        DataType::Custom(name, modifiers) if modifiers.is_empty() => {
+            [("TIMESTAMP_S", 0), ("TIMESTAMP_MS", 3), ("TIMESTAMP_NS", 9), ("TIME_NS", 9)]
+                .into_iter()
+                .find_map(|(spelling, digits)| custom_type_is(name, spelling).then_some(digits))
+        }
+        _ => None,
+    }
+}
+
+/// ClickHouse keeps whole seconds in `DateTime` and `Time`, widens
+/// `DateTime(p)` to `DateTime64(p)` and `Time(p)` to `Time64(p)`, and keeps
+/// milliseconds in a bare `Time64`.
+fn clickhouse_seconds_precision(ty: &DataType) -> Option<u64> {
+    match ty {
+        DataType::Time(p, _) | DataType::Timestamp(p, _) | DataType::Datetime(p) => {
+            Some(p.unwrap_or(0))
+        }
+        DataType::Datetime64(p, _) => Some(*p),
+        DataType::Custom(name, modifiers) if custom_type_is(name, "TIME64") => {
+            modifier_precision(modifiers, 3)
+        }
+        _ => None,
+    }
+}
+
+/// Precision written on a time or timestamp type, in any dialect's spelling.
+fn written_seconds_precision(ty: &DataType) -> Option<u64> {
+    match ty {
+        DataType::Time(p, _)
+        | DataType::Timestamp(p, _)
+        | DataType::Datetime(p)
+        | DataType::TimestampNtz(p) => *p,
+        DataType::Datetime64(p, _) => Some(*p),
+        DataType::Custom(name, modifiers)
+            if ["DATETIME2", "DATETIMEOFFSET", "TIMESTAMP_LTZ", "TIMESTAMP_TZ", "TIME64"]
+                .into_iter()
+                .any(|spelling| custom_type_is(name, spelling)) =>
+        {
+            written_modifier(modifiers)
+        }
+        _ => None,
+    }
+}
+
+/// Precision a custom type spells as its single integer modifier, or `bare`
+/// when it has none.
+fn modifier_precision(modifiers: &[TypeModifier], bare: u64) -> Option<u64> {
+    if modifiers.is_empty() { Some(bare) } else { written_modifier(modifiers) }
+}
+
+/// Value of a single integer modifier written on a custom type.
+fn written_modifier(modifiers: &[TypeModifier]) -> Option<u64> {
+    match modifiers {
+        [TypeModifier::Number(digits, false)] => digits.parse().ok(),
+        _ => None,
     }
 }
 
