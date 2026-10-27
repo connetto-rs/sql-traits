@@ -1,88 +1,106 @@
-//! When a function call is `NULL` because one of its arguments is `NULL`.
+//! What PostgreSQL declares for each builtin, and when a function call is
+//! `NULL` because one of its arguments is `NULL`.
 #![expect(clippy::expect_used, reason = "test fixtures must parse and resolve")]
 
 use sql_traits::prelude::*;
-use sqlparser::{ast::FunctionCalledOnNull, dialect::PostgreSqlDialect};
+use sqlparser::{
+    ast::{FunctionBehavior, FunctionCalledOnNull},
+    dialect::PostgreSqlDialect,
+};
 
 fn db(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")
 }
 
-/// The overload of `name` in `schema` whose arguments are `argument_types`.
-fn overload<'db>(
-    database: &'db ParserDB,
-    schema: &str,
-    name: &str,
-    argument_types: &[&str],
-) -> &'db <ParserDB as DatabaseLike>::Function {
-    database
-        .functions()
-        .find(|function| {
-            function.target_name().schema() == Some(schema)
-                && function.name() == name
-                && function
-                    .argument_type_names(database)
-                    .map(|declared| declared.to_ascii_lowercase())
-                    .eq(argument_types.iter().copied())
-        })
-        .expect("the overload is registered")
-}
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/function_overloads.rs"));
 
 #[test]
 fn every_builtin_answers_as_postgres_declares() {
+    use FunctionBehavior::{Immutable, Stable, Volatile};
     use FunctionCalledOnNull::{CalledOnNullInput as Called, Strict};
 
+    /// Name, argument types, null-input behavior, the answer at every call
+    /// position and one past the last, and volatility.
+    type Row = (
+        &'static str,
+        &'static [&'static str],
+        FunctionCalledOnNull,
+        &'static [bool],
+        FunctionBehavior,
+    );
+
     let database = db("");
-    // Each row lists the answer at every call position and one past the last.
-    let expected: &[(&str, &[&str], FunctionCalledOnNull, &[bool])] = &[
-        ("length", &["text"], Strict, &[true, false]),
-        ("len", &["text"], Called, &[false, false]),
-        ("char_length", &["text"], Strict, &[true, false]),
-        ("character_length", &["text"], Strict, &[true, false]),
-        ("octet_length", &["text"], Strict, &[true, false]),
-        ("lower", &["text"], Strict, &[true, false]),
-        ("upper", &["text"], Strict, &[true, false]),
-        ("btrim", &["text"], Strict, &[true, false]),
-        ("btrim", &["text", "text"], Strict, &[true, true, false]),
-        ("split_part", &["text", "text", "int"], Strict, &[true, true, true, false]),
+    // The SQL value functions such as `current_date` have no `pg_proc` row,
+    // and the planner holds them stable.
+    let expected: &[Row] = &[
+        ("length", &["text"], Strict, &[true, false], Immutable),
+        // Not a PostgreSQL function, so nothing vouches for it.
+        ("len", &["text"], Called, &[false, false], Volatile),
+        ("char_length", &["text"], Strict, &[true, false], Immutable),
+        ("character_length", &["text"], Strict, &[true, false], Immutable),
+        ("octet_length", &["text"], Strict, &[true, false], Immutable),
+        ("lower", &["text"], Strict, &[true, false], Immutable),
+        ("upper", &["text"], Strict, &[true, false], Immutable),
+        ("btrim", &["text"], Strict, &[true, false], Immutable),
+        ("btrim", &["text", "text"], Strict, &[true, true, false], Immutable),
+        ("split_part", &["text", "text", "int"], Strict, &[true, true, true, false], Immutable),
         // `string_to_array('ab', NULL)` is `{a,b}`, and a `NULL` third
         // argument only disables replacement.
-        ("string_to_array", &["text", "text"], Called, &[true, false, false]),
-        ("string_to_array", &["text", "text", "text"], Called, &[true, false, false, false]),
-        ("current_setting", &["text"], Strict, &[true, false]),
-        ("current_setting", &["text", "boolean"], Strict, &[true, true, false]),
+        ("string_to_array", &["text", "text"], Called, &[true, false, false], Immutable),
+        (
+            "string_to_array",
+            &["text", "text", "text"],
+            Called,
+            &[true, false, false, false],
+            Immutable,
+        ),
+        ("current_setting", &["text"], Strict, &[true, false], Stable),
+        ("current_setting", &["text", "boolean"], Strict, &[true, true, false], Stable),
         // The variadic array is not `NULL` when one of its elements is.
-        ("coalesce", &["any"], Called, &[false, false]),
+        ("coalesce", &["any"], Called, &[false, false], Immutable),
         // `nullif(NULL, 1)` is `NULL`, `nullif(1, NULL)` is 1.
-        ("nullif", &["any", "any"], Called, &[true, false, false]),
-        ("now", &[], Strict, &[false]),
-        ("current_timestamp", &[], Called, &[false]),
-        ("current_date", &[], Called, &[false]),
-        ("current_time", &[], Called, &[false]),
-        ("localtimestamp", &[], Called, &[false]),
-        ("localtime", &[], Called, &[false]),
-        ("gen_random_uuid", &[], Strict, &[false]),
-        ("uuidv4", &[], Strict, &[false]),
-        ("uuidv7", &[], Strict, &[false]),
-        ("uuidv7", &["interval"], Strict, &[true, false]),
-        ("count", &["any"], Called, &[false, false]),
-        ("sum", &["any"], Called, &[false, false]),
-        ("avg", &["any"], Called, &[false, false]),
-        ("min", &["any"], Called, &[false, false]),
-        ("max", &["any"], Called, &[false, false]),
-        ("current_user", &[], Strict, &[false]),
-        ("session_user", &[], Strict, &[false]),
-        ("user", &[], Called, &[false]),
+        ("nullif", &["any", "any"], Called, &[true, false, false], Immutable),
+        ("now", &[], Strict, &[false], Stable),
+        ("current_timestamp", &[], Called, &[false], Stable),
+        ("current_date", &[], Called, &[false], Stable),
+        ("current_time", &[], Called, &[false], Stable),
+        ("localtimestamp", &[], Called, &[false], Stable),
+        ("localtime", &[], Called, &[false], Stable),
+        ("gen_random_uuid", &[], Strict, &[false], Volatile),
+        ("uuidv4", &[], Strict, &[false], Volatile),
+        ("uuidv7", &[], Strict, &[false], Volatile),
+        ("uuidv7", &["interval"], Strict, &[true, false], Volatile),
+        ("count", &["any"], Called, &[false, false], Immutable),
+        ("sum", &["any"], Called, &[false, false], Immutable),
+        ("avg", &["any"], Called, &[false, false], Immutable),
+        ("min", &["any"], Called, &[false, false], Immutable),
+        ("max", &["any"], Called, &[false, false], Immutable),
+        ("current_user", &[], Strict, &[false], Stable),
+        ("session_user", &[], Strict, &[false], Stable),
+        ("user", &[], Called, &[false], Stable),
+        ("random", &[], Strict, &[false], Volatile),
+        ("random", &["int", "int"], Strict, &[true, true, false], Volatile),
+        ("random", &["bigint", "bigint"], Strict, &[true, true, false], Volatile),
+        ("random", &["numeric", "numeric"], Strict, &[true, true, false], Volatile),
+        ("clock_timestamp", &[], Strict, &[false], Volatile),
+        ("statement_timestamp", &[], Strict, &[false], Stable),
+        ("transaction_timestamp", &[], Strict, &[false], Stable),
+        ("timeofday", &[], Strict, &[false], Volatile),
+        ("md5", &["text"], Strict, &[true, false], Immutable),
+        ("substring", &["text", "int"], Strict, &[true, true, false], Immutable),
+        ("substring", &["text", "int", "int"], Strict, &[true, true, true, false], Immutable),
+        ("substring", &["text", "text"], Strict, &[true, true, false], Immutable),
+        ("substring", &["text", "text", "text"], Strict, &[true, true, true, false], Immutable),
     ];
 
-    for (name, argument_types, behavior, answers) in expected {
+    for (name, argument_types, behavior, answers, volatility) in expected {
         let function = overload(&database, "pg_catalog", name, argument_types);
         let actual = (0..answers.len())
             .map(|index| function.returns_null_on_null_argument(&database, index))
             .collect::<Vec<_>>();
         assert_eq!(
-            (function.null_input_behavior(), actual.as_slice()),
-            (behavior.clone(), *answers),
+            (function.null_input_behavior(), actual.as_slice(), function.volatility()),
+            (behavior.clone(), *answers, volatility.clone()),
             "{name}({argument_types:?})"
         );
     }

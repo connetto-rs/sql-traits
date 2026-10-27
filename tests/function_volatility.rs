@@ -19,6 +19,8 @@ fn volatility<DB: DatabaseLike>(database: &DB, name: &str) -> FunctionBehavior {
         .volatility()
 }
 
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/function_overloads.rs"));
+
 #[test]
 fn declarations_expose_effective_volatility_to_generic_consumers() {
     let database = db("CREATE FUNCTION omitted() RETURNS INT LANGUAGE sql AS 'SELECT 1';
@@ -34,6 +36,18 @@ fn declarations_expose_effective_volatility_to_generic_consumers() {
     ] {
         assert_eq!(volatility(&database, name), expected);
     }
+}
+
+#[test]
+fn a_declaration_shadowing_a_builtin_keeps_its_own_volatility() {
+    let database =
+        db("CREATE FUNCTION public.now() RETURNS TIMESTAMPTZ LANGUAGE sql AS 'SELECT 1';");
+
+    assert_eq!(overload(&database, "public", "now", &[]).volatility(), FunctionBehavior::Volatile);
+    assert_eq!(
+        overload(&database, "pg_catalog", "now", &[]).volatility(),
+        FunctionBehavior::Stable
+    );
 }
 
 #[test]
