@@ -3,7 +3,9 @@
 
 use alloc::string::ToString;
 
-use sqlparser::ast::{ConstraintReferenceMatchKind, CreateTable, ForeignKeyConstraint};
+use sqlparser::ast::{
+    ConstraintReferenceMatchKind, CreateTable, ForeignKeyConstraint, ReferentialAction,
+};
 
 use crate::{
     errors::LookupError,
@@ -51,8 +53,13 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     }
 
     #[inline]
-    fn on_delete_cascade(&self, _database: &Self::DB) -> bool {
-        matches!(self.attribute().on_delete, Some(sqlparser::ast::ReferentialAction::Cascade))
+    fn on_delete(&self, _database: &Self::DB) -> ReferentialAction {
+        self.attribute().on_delete.unwrap_or(ReferentialAction::NoAction)
+    }
+
+    #[inline]
+    fn on_update(&self, _database: &Self::DB) -> ReferentialAction {
+        self.attribute().on_update.unwrap_or(ReferentialAction::NoAction)
     }
 
     #[inline]
@@ -162,15 +169,22 @@ mod tests {
         assert_eq!(fk.foreign_key_name(), Some("fk_parent"));
     }
 
-    /// `ON DELETE SET NULL` is not CASCADE, so `on_delete_cascade()` is false.
+    /// Every written action reaches `on_delete` and `on_update` unchanged,
+    /// from both the table-constraint and the inline column spelling, and an
+    /// action left unwritten reads as `NO ACTION`, the PostgreSQL default.
     #[test]
-    fn test_on_delete_set_null_is_not_cascade() {
+    fn test_referential_actions_follow_the_declaration() {
+        use sqlparser::ast::ReferentialAction::{Cascade, NoAction, Restrict, SetDefault, SetNull};
+
         let sql = "
             CREATE TABLE parent (id INT PRIMARY KEY);
             CREATE TABLE child (
-                id INT PRIMARY KEY,
-                parent_id INT,
-                CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE SET NULL
+                unwritten INT REFERENCES parent(id),
+                inline_key INT REFERENCES parent(id) ON DELETE SET NULL ON UPDATE CASCADE,
+                FOREIGN KEY (unwritten) REFERENCES parent(id) ON DELETE SET DEFAULT ON UPDATE RESTRICT,
+                FOREIGN KEY (unwritten) REFERENCES parent(id) ON UPDATE SET NULL ON DELETE NO ACTION,
+                FOREIGN KEY (unwritten) REFERENCES parent(id) ON DELETE CASCADE ON UPDATE SET DEFAULT,
+                FOREIGN KEY (unwritten) REFERENCES parent(id) ON DELETE RESTRICT
             );
         ";
         let db = ParserDB::parse::<GenericDialect>(sql).expect("parse");
@@ -178,8 +192,25 @@ mod tests {
             .table_by_target(TargetName::new("child", false), IdentifierCase::AsWritten)
             .expect("unambiguous lookup")
             .unwrap();
-        let fk = child.foreign_keys(&db).expect("fk lookup").next().expect("FK should exist");
-        assert!(!fk.on_delete_cascade(&db));
+        let mut actions: Vec<_> = child
+            .foreign_keys(&db)
+            .expect("fk lookup")
+            .map(|fk| {
+                let host = fk.host_columns(&db).expect("host columns").next().expect("one column");
+                (host.column_name(), fk.on_delete(&db), fk.on_update(&db))
+            })
+            .collect();
+        actions.sort_unstable_by_key(|&(_, on_delete, on_update)| (on_delete, on_update));
+        let mut expected = vec![
+            ("unwritten", NoAction, NoAction),
+            ("inline_key", SetNull, Cascade),
+            ("unwritten", SetDefault, Restrict),
+            ("unwritten", NoAction, SetNull),
+            ("unwritten", Cascade, SetDefault),
+            ("unwritten", Restrict, NoAction),
+        ];
+        expected.sort_unstable_by_key(|&(_, on_delete, on_update)| (on_delete, on_update));
+        assert_eq!(actions, expected);
     }
 
     /// A multi-column FK reports both host and referenced columns in

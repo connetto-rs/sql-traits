@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::{borrow::Borrow, fmt::Debug};
 
-use sqlparser::ast::ConstraintReferenceMatchKind;
+use sqlparser::ast::{ConstraintReferenceMatchKind, ReferentialAction};
 
 use crate::{
     errors::LookupError,
@@ -58,20 +58,23 @@ pub trait ForeignKeyLike:
     /// ```
     fn foreign_key_name(&self) -> Option<&str>;
 
-    /// Returns whether the foreign key is on delete cascade.
+    /// Returns the action the foreign key takes on its referencing rows when
+    /// a referenced row is deleted, [`ReferentialAction::NoAction`] when the
+    /// declaration writes no `ON DELETE` clause.
     ///
     /// # Example
     ///
     /// ```rust
     /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::ast::ReferentialAction;
     ///
     /// let db = ParserDB::parse::<GenericDialect>(
     ///     "
     /// CREATE TABLE referenced_table (id INT PRIMARY KEY);
     /// CREATE TABLE host_table (
     ///     id INT,
-    ///     FOREIGN KEY (id) REFERENCES referenced_table(id) ON DELETE CASCADE,
+    ///     FOREIGN KEY (id) REFERENCES referenced_table(id) ON DELETE SET NULL,
     ///     FOREIGN KEY (id) REFERENCES referenced_table(id)
     /// );
     /// ",
@@ -80,14 +83,44 @@ pub trait ForeignKeyLike:
     ///     .table_by_target(TargetName::new("host_table", false), IdentifierCase::AsWritten)?
     ///     .unwrap();
     /// let foreign_keys: Vec<_> = host_table.foreign_keys(&db)?.collect();
-    /// let cascade_fk = &foreign_keys[0];
-    /// let normal_fk = &foreign_keys[1];
-    /// assert!(cascade_fk.on_delete_cascade(&db));
-    /// assert!(!normal_fk.on_delete_cascade(&db));
+    /// assert_eq!(foreign_keys[0].on_delete(&db), ReferentialAction::SetNull);
+    /// assert_eq!(foreign_keys[1].on_delete(&db), ReferentialAction::NoAction);
     /// # Ok(())
     /// # }
     /// ```
-    fn on_delete_cascade(&self, database: &Self::DB) -> bool;
+    fn on_delete(&self, database: &Self::DB) -> ReferentialAction;
+
+    /// Returns the action the foreign key takes on its referencing rows when
+    /// a referenced key is updated, [`ReferentialAction::NoAction`] when the
+    /// declaration writes no `ON UPDATE` clause.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::ast::ReferentialAction;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "
+    /// CREATE TABLE referenced_table (id INT PRIMARY KEY);
+    /// CREATE TABLE host_table (
+    ///     id INT,
+    ///     FOREIGN KEY (id) REFERENCES referenced_table(id) ON UPDATE CASCADE,
+    ///     FOREIGN KEY (id) REFERENCES referenced_table(id)
+    /// );
+    /// ",
+    /// )?;
+    /// let host_table = db
+    ///     .table_by_target(TargetName::new("host_table", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// let foreign_keys: Vec<_> = host_table.foreign_keys(&db)?.collect();
+    /// assert_eq!(foreign_keys[0].on_update(&db), ReferentialAction::Cascade);
+    /// assert_eq!(foreign_keys[1].on_update(&db), ReferentialAction::NoAction);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn on_update(&self, database: &Self::DB) -> ReferentialAction;
 
     /// Returns the host table that contains the foreign key.
     ///
