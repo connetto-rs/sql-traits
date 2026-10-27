@@ -328,8 +328,9 @@ fn the_open_world_reports_a_grant_on_a_function_the_schema_does_not_declare() {
 #[test]
 fn the_open_world_reports_a_grantee_the_schema_does_not_declare() {
     let db = open_world(
-        "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
-         GRANT EXECUTE ON FUNCTION f() TO app;",
+        "CREATE ROLE known;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         GRANT EXECUTE ON FUNCTION f() TO known, app;",
     )
     .expect("schema parses");
 
@@ -399,18 +400,20 @@ fn a_grant_option_is_kept_and_can_be_revoked_alone() {
 
     let revoked = parse(
         "CREATE ROLE client;
+         CREATE ROLE partner;
          CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
          REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;
-         GRANT EXECUTE ON FUNCTION f() TO client WITH GRANT OPTION;
+         GRANT EXECUTE ON FUNCTION f() TO client, partner WITH GRANT OPTION;
          REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION f() FROM client;",
     )
     .expect("schema parses");
     let f = function(&revoked, "f", &[]);
     assert_eq!(f.can_grant_execute(role(&revoked, "client"), &revoked), Ok(false));
     assert_eq!(f.can_execute(role(&revoked, "client"), &revoked), Ok(true));
+    assert_eq!(f.can_grant_execute(role(&revoked, "partner"), &revoked), Ok(true));
 }
 
-/// A grant reaches its grantee alone, the roles it belongs to included.
+/// A grant reaches the role it names, and not the roles that are its members.
 #[test]
 fn membership_is_not_followed() {
     let db = parse(

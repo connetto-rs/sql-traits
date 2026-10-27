@@ -7367,28 +7367,21 @@ impl ParserDB {
                         builder = builder.add_schema(Arc::new(schema), ());
                     }
                 }
-                Statement::Grant(grant)
-                    if routine_privileges::names_routines(grant.objects.as_ref()) =>
-                {
-                    require_static_access_names(grant.objects.as_ref())?;
-                    unresolved_function_grants.extend(routine_privileges::grant(
-                        &mut builder,
-                        grant,
-                        access_resolution,
-                    )?);
-                }
-                Statement::Revoke(revoke)
-                    if routine_privileges::names_routines(revoke.objects.as_ref()) =>
-                {
-                    require_static_access_names(revoke.objects.as_ref())?;
-                    routine_privileges::revoke(&mut builder, &revoke, access_resolution)?;
-                }
                 Statement::Grant(mut grant) => {
                     // Every name the statement carries first, including the
                     // schemas of a blanket grant, since a grant recorded
                     // against a name nothing can read covers nothing and says
                     // so nowhere.
                     require_static_access_names(grant.objects.as_ref())?;
+                    if let Some(routines) = routine_privileges::Routines::take(&mut grant.objects) {
+                        unresolved_function_grants.extend(routine_privileges::grant(
+                            &mut builder,
+                            routines,
+                            &grant,
+                            access_resolution,
+                        )?);
+                        continue;
+                    }
                     if access_resolution == AccessResolution::ClosedWorld {
                         validate_access_targets_against_builder(
                             &builder,
@@ -7418,6 +7411,16 @@ impl ParserDB {
                 }
                 Statement::Revoke(mut revoke) => {
                     require_static_access_names(revoke.objects.as_ref())?;
+                    if let Some(routines) = routine_privileges::Routines::take(&mut revoke.objects)
+                    {
+                        routine_privileges::revoke(
+                            &mut builder,
+                            &routines,
+                            &revoke,
+                            access_resolution,
+                        )?;
+                        continue;
+                    }
                     // A revoke naming no recorded grant is a no-op, as it is in
                     // the database.
                     if access_resolution == AccessResolution::ClosedWorld {

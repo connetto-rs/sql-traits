@@ -51,6 +51,45 @@ fn rename_repoints_every_modeled_role_reference() {
     assert_eq!(docs.can_select(renamed, &database), Ok(true));
 }
 
+/// A rename repoints only the grantees naming the renamed role.
+#[test]
+fn rename_leaves_the_grants_of_other_roles_alone() {
+    let database = parse(
+        "CREATE ROLE before;
+         CREATE ROLE other;
+         CREATE ROLE bystander;
+         CREATE TABLE docs (id INT);
+         CREATE TABLE notes (id INT);
+         CREATE FUNCTION f() RETURNS INT AS 'SELECT 1';
+         GRANT SELECT ON docs TO before, other;
+         GRANT SELECT ON notes TO bystander;
+         REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION f() TO before, other;
+         ALTER ROLE before RENAME TO after;",
+    )
+    .expect("schema builds");
+
+    let role = |name: &str| database.role(name).expect("role resolves");
+    let table = |name: &str| {
+        database
+            .table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("table exists")
+    };
+    let function = database
+        .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("f exists");
+
+    assert_eq!(table("docs").can_select(role("after"), &database), Ok(true));
+    assert_eq!(table("docs").can_select(role("other"), &database), Ok(true));
+    assert_eq!(table("notes").can_select(role("bystander"), &database), Ok(true));
+    assert_eq!(table("notes").can_select(role("after"), &database), Ok(false));
+    assert_eq!(function.can_execute(role("after"), &database), Ok(true));
+    assert_eq!(function.can_execute(role("other"), &database), Ok(true));
+    assert_eq!(function.can_execute(role("bystander"), &database), Ok(false));
+}
+
 #[test]
 fn drop_refuses_every_blocking_role_dependency() {
     let cases = [

@@ -8,7 +8,9 @@
 
 use alloc::{string::ToString, vec::Vec};
 
-use sqlparser::ast::{Action, FunctionDesc, Grant, GrantObjects, Grantee, Privileges, Revoke};
+use sqlparser::ast::{
+    Action, FunctionDesc, Grant, GrantObjects, Grantee, ObjectName, Privileges, Revoke,
+};
 
 use super::{
     AccessResolution, ParserDBBuilder, function_names_match, function_signatures_match,
@@ -19,20 +21,34 @@ use crate::{
     errors::Error,
     utils::{
         last_str,
-        object_name::{Qualifier, object_name_last_part, qualifier_of},
+        object_name::{object_name_last_part, qualifier_of},
     },
 };
 
-/// Whether a grant or a revoke reaches functions rather than relations.
-pub(super) fn names_routines(objects: Option<&GrantObjects>) -> bool {
-    matches!(
-        objects,
-        Some(
-            GrantObjects::Functions(_)
-                | GrantObjects::Procedures(_)
-                | GrantObjects::AllFunctionsInSchema { .. }
-        )
-    )
+/// The functions a grant or a revoke names, taken out of its object list.
+pub(super) enum Routines {
+    /// `ON FUNCTION`, one signature per function.
+    Functions(Vec<FunctionDesc>),
+    /// `ON PROCEDURE`, one signature per procedure.
+    Procedures(Vec<FunctionDesc>),
+    /// `ON ALL FUNCTIONS IN SCHEMA`.
+    Schemas(Vec<ObjectName>),
+}
+
+impl Routines {
+    /// Takes the objects out when they name functions, and leaves relation
+    /// objects in place.
+    pub(super) fn take(objects: &mut Option<GrantObjects>) -> Option<Self> {
+        match objects.take() {
+            Some(GrantObjects::Functions(signatures)) => Some(Self::Functions(signatures)),
+            Some(GrantObjects::Procedures(signatures)) => Some(Self::Procedures(signatures)),
+            Some(GrantObjects::AllFunctionsInSchema { schemas }) => Some(Self::Schemas(schemas)),
+            other => {
+                *objects = other;
+                None
+            }
+        }
+    }
 }
 
 /// Gives `EXECUTE` on each function the grant reaches.
@@ -41,32 +57,27 @@ pub(super) fn names_routines(objects: Option<&GrantObjects>) -> bool {
 /// lets through and keeps so it can report them.
 pub(super) fn grant(
     builder: &mut ParserDBBuilder,
-    grant: Grant,
+    routines: Routines,
+    grant: &Grant,
     access_resolution: AccessResolution,
 ) -> Result<Vec<FunctionDesc>, Error> {
-    let Some(objects) = &grant.objects else {
-        return Ok(Vec::new());
-    };
-    let reached = Reached::of(builder, objects)?;
-    validate(builder, &reached, &grant.grantees, &grant.privileges, access_resolution)?;
-    let Reached { functions, unresolved, .. } = reached;
+    let reached = Reached::of(builder, &routines, access_resolution)?;
+    validate(builder, &grant.grantees, &grant.privileges, access_resolution)?;
 
-    for position in functions {
+    for &position in &reached.functions {
         builder.functions_mut()[position]
             .1
             .execute_privileges_mut()
             .grant(&grant.grantees, grant.with_grant_option);
     }
 
-    let Some(GrantObjects::Functions(signatures) | GrantObjects::Procedures(signatures)) =
-        grant.objects
-    else {
+    let (Routines::Functions(signatures) | Routines::Procedures(signatures)) = routines else {
         return Ok(Vec::new());
     };
     Ok(signatures
         .into_iter()
         .enumerate()
-        .filter(|(index, _)| unresolved.contains(index))
+        .filter(|(index, _)| reached.unresolved.contains(index))
         .map(|(_, signature)| signature)
         .collect())
 }
@@ -78,14 +89,12 @@ pub(super) fn grant(
 /// nothing to take, so the open world drops it.
 pub(super) fn revoke(
     builder: &mut ParserDBBuilder,
+    routines: &Routines,
     revoke: &Revoke,
     access_resolution: AccessResolution,
 ) -> Result<(), Error> {
-    let Some(objects) = &revoke.objects else {
-        return Ok(());
-    };
-    let reached = Reached::of(builder, objects)?;
-    validate(builder, &reached, &revoke.grantees, &revoke.privileges, access_resolution)?;
+    let reached = Reached::of(builder, routines, access_resolution)?;
+    validate(builder, &revoke.grantees, &revoke.privileges, access_resolution)?;
 
     let names_owner = |grantee: &Grantee, owner: &str| {
         grantee_role_ident(grantee).is_some_and(|ident| stored_role_name(ident) == owner)
@@ -100,23 +109,16 @@ pub(super) fn revoke(
     Ok(())
 }
 
-/// Refuses what PostgreSQL refuses, in the order it reports it, which is a
-/// signature reaching no function, then a grantee naming no role, then a
-/// privilege functions do not have. The first two are the closed world's to
-/// refuse.
+/// Refuses a grantee naming no role, which only the closed world refuses, and
+/// then a privilege functions do not have, in the order PostgreSQL reports
+/// them once the functions resolved.
 fn validate(
     builder: &ParserDBBuilder,
-    reached: &Reached<'_>,
     grantees: &[Grantee],
     privileges: &Privileges,
     access_resolution: AccessResolution,
 ) -> Result<(), Error> {
     if access_resolution == AccessResolution::ClosedWorld {
-        if let Some(&index) = reached.unresolved.first() {
-            return Err(Error::FunctionNotFoundForGrant {
-                function_name: reached.signatures[index].to_string(),
-            });
-        }
         validate_access_targets_against_builder(builder, grantees, None)?;
     }
 
@@ -130,31 +132,33 @@ fn validate(
 }
 
 /// The stored functions a statement reaches.
-struct Reached<'statement> {
-    /// The signatures the statement lists, empty for a schema-wide statement.
-    signatures: &'statement [FunctionDesc],
+struct Reached {
     /// Positions in the function store of every function reached.
     functions: Vec<usize>,
-    /// Indices into `signatures` of those reaching no function.
+    /// Indices into the statement's signatures of those reaching no function.
     unresolved: Vec<usize>,
 }
 
-impl<'statement> Reached<'statement> {
-    /// Resolves the functions `objects` names, as of this statement.
+impl Reached {
+    /// Resolves the functions `routines` names, as of this statement.
     ///
     /// A signature with an argument list reaches the one function of that
     /// identity, and one without reaches the only function of that name,
     /// which PostgreSQL refuses to guess between when there are several. A
     /// schema-wide statement reaches the functions the schema holds now, and
-    /// none created after it.
-    fn of(builder: &ParserDBBuilder, objects: &'statement GrantObjects) -> Result<Self, Error> {
+    /// none created after it. A signature reaching nothing is refused under
+    /// the closed world, in list order alongside an ambiguous one.
+    fn of(
+        builder: &ParserDBBuilder,
+        routines: &Routines,
+        access_resolution: AccessResolution,
+    ) -> Result<Self, Error> {
         let case = builder.identifier_case();
         let functions = builder.functions();
-        let mut reached = Self { signatures: &[], functions: Vec::new(), unresolved: Vec::new() };
+        let mut reached = Self { functions: Vec::new(), unresolved: Vec::new() };
 
-        match objects {
-            GrantObjects::Functions(signatures) => {
-                reached.signatures = signatures;
+        match routines {
+            Routines::Functions(signatures) => {
                 for (index, signature) in signatures.iter().enumerate() {
                     let matching: Vec<usize> = functions
                         .iter()
@@ -176,7 +180,7 @@ impl<'statement> Reached<'statement> {
                         .map(|(position, _)| position)
                         .collect();
                     match matching.as_slice() {
-                        [] => reached.unresolved.push(index),
+                        [] => reached.miss(index, signature, access_resolution)?,
                         [_, _, ..] if signature.args.is_none() => {
                             return Err(Error::AmbiguousFunctionForGrant {
                                 function_name: last_str(&signature.name).to_string(),
@@ -187,18 +191,17 @@ impl<'statement> Reached<'statement> {
                 }
             }
             // This model holds no procedure, so none is ever reached.
-            GrantObjects::Procedures(signatures) => {
-                reached.signatures = signatures;
-                reached.unresolved.extend(0..signatures.len());
+            Routines::Procedures(signatures) => {
+                for (index, signature) in signatures.iter().enumerate() {
+                    reached.miss(index, signature, access_resolution)?;
+                }
             }
-            GrantObjects::AllFunctionsInSchema { schemas } => {
+            Routines::Schemas(schemas) => {
                 reached.functions.extend(functions.iter().enumerate().filter_map(
                     |(position, (function, _))| {
-                        let qualifier = match qualifier_of(&function.name) {
-                            Qualifier::Absent => None,
-                            Qualifier::Named(name, quoted) => Some((name, quoted)),
-                            Qualifier::RunTime => return None,
-                        };
+                        // `CREATE FUNCTION` refuses a qualifier built at run
+                        // time.
+                        let qualifier = qualifier_of(&function.name).named();
                         schemas
                             .iter()
                             .filter_map(object_name_last_part)
@@ -207,8 +210,22 @@ impl<'statement> Reached<'statement> {
                     },
                 ));
             }
-            _ => {}
         }
         Ok(reached)
+    }
+
+    /// Records a signature reaching no function, which the closed world
+    /// refuses and the open world keeps.
+    fn miss(
+        &mut self,
+        index: usize,
+        signature: &FunctionDesc,
+        access_resolution: AccessResolution,
+    ) -> Result<(), Error> {
+        if access_resolution == AccessResolution::ClosedWorld {
+            return Err(Error::FunctionNotFoundForGrant { function_name: signature.to_string() });
+        }
+        self.unresolved.push(index);
+        Ok(())
     }
 }
