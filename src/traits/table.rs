@@ -10,8 +10,8 @@ use crate::{
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
-        ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, TableGrantLike,
-        TriggerLike,
+        ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, RuleLike,
+        RuleRelation, TableGrantLike, TriggerLike,
         check_constraint::{evaluate_constant_expr, non_tautological},
     },
     utils::{
@@ -185,6 +185,59 @@ pub trait TableLike:
 
         Ok(database.triggers().filter(move |trigger| {
             trigger.table(database).is_ok_and(|t| t.borrow() == self.borrow())
+        }))
+    }
+
+    /// Returns the rewrite rules defined on the table.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance to query the rules
+    ///   from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE orders (id INT);
+    /// CREATE TABLE audit (id INT);
+    /// CREATE RULE log_orders AS ON INSERT TO orders DO ALSO INSERT INTO audit VALUES (new.id);
+    /// ",
+    /// )?;
+    /// let orders =
+    ///     db.table_by_target(TargetName::new("orders", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let rules: Vec<&str> = orders.rules(&db)?.map(|rule| rule.name()).collect();
+    /// assert_eq!(rules, vec!["log_orders"]);
+    /// let audit =
+    ///     db.table_by_target(TargetName::new("audit", false), IdentifierCase::AsWritten)?.unwrap();
+    /// assert_eq!(audit.rules(&db)?.count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn rules<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Rule>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.require_in_database(database)?;
+
+        Ok(database.rules().filter(move |rule| {
+            matches!(
+                rule.relation(database),
+                Ok(RuleRelation::Table(table)) if table.borrow() == self.borrow()
+            )
         }))
     }
 

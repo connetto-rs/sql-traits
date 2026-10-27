@@ -14,7 +14,9 @@ use crate::{
         SchemaProfile,
         generic_db::{Identified, RelationSlot, Stored},
     },
-    traits::{FunctionLike, PolicyLike, RoleLike, SchemaLike, TableLike, TriggerLike, ViewLike},
+    traits::{
+        FunctionLike, PolicyLike, RoleLike, RuleLike, SchemaLike, TableLike, TriggerLike, ViewLike,
+    },
     utils::object_name::{
         RelationKey, render_table_candidate, stored_function_key, stored_table_key,
         stored_view_key, table_matches_key, view_matches_key,
@@ -102,6 +104,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     functions: Vec<Stored<P::Function>>,
     /// List of triggers created in the database.
     triggers: Vec<Stored<P::Trigger>>,
+    /// List of rewrite rules created in the database.
+    rules: Vec<Stored<P::Rule>>,
     /// List of policies created in the database.
     policies: Vec<Stored<P::Policy>>,
     /// List of check constraints in the database.
@@ -141,6 +145,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             foreign_keys: self.foreign_keys.clone(),
             functions: self.functions.clone(),
             triggers: self.triggers.clone(),
+            rules: self.rules.clone(),
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),
@@ -200,6 +205,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             foreign_keys: Vec::new(),
             functions: Vec::new(),
             triggers: Vec::new(),
+            rules: Vec::new(),
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
@@ -316,6 +322,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &self.triggers
     }
 
+    /// Returns a slice of rule Arc references with their metadata.
+    pub(crate) fn rules(&self) -> &[Stored<P::Rule>] {
+        &self.rules
+    }
+
     /// Returns a slice of foreign key Arc references with their metadata.
     pub(crate) fn foreign_keys(&self) -> &[Stored<P::ForeignKey>] {
         &self.foreign_keys
@@ -381,6 +392,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &mut self.triggers
     }
 
+    /// Returns a mutable reference to the rules list.
+    pub(crate) fn rules_mut(&mut self) -> &mut Vec<Stored<P::Rule>> {
+        &mut self.rules
+    }
+
     /// Returns a mutable reference to the policies list.
     pub(crate) fn policies_mut(&mut self) -> &mut Vec<Stored<P::Policy>> {
         &mut self.policies
@@ -417,6 +433,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             foreign_keys: Vec::new(),
             functions: Vec::new(),
             triggers: Vec::new(),
+            rules: Vec::new(),
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
@@ -626,6 +643,14 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     #[inline]
     pub fn add_trigger(mut self, trigger: Arc<P::Trigger>, metadata: Meta<P::Trigger>) -> Self {
         self.triggers.push((trigger, metadata));
+        self
+    }
+
+    /// Adds a rewrite rule with its metadata to the builder.
+    #[must_use]
+    #[inline]
+    pub fn add_rule(mut self, rule: Arc<P::Rule>, metadata: Meta<P::Rule>) -> Self {
+        self.rules.push((rule, metadata));
         self
     }
 
@@ -854,6 +879,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             function_index: _,
             folded_function_index: _,
             triggers,
+            rules,
             policies,
             check_constraints,
             roles,
@@ -877,6 +903,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             foreign_keys,
             functions,
             triggers,
+            rules,
             policies,
             check_constraints,
             roles,
@@ -890,11 +917,9 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         (builder, ingestion)
     }
 
-    /// Sorts, indexes, and seals the built objects into a database carrying
-    /// the given ingestion state.
-    pub(crate) fn into_database(mut self, ingestion: P::Ingestion) -> GenericDB<P> {
-        let catalog_name = self.catalog_name;
-
+    /// Sorts every store into the order lookups on the built database rely
+    /// on.
+    fn sort_stores(&mut self) {
         self.tables.sort_unstable_by_key(|(table, _, _)| {
             (
                 table.table_schema().map(alloc::string::ToString::to_string),
@@ -912,6 +937,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             a.name().cmp(b.name()).then_with(|| a.as_ref().cmp(b.as_ref()))
         });
         self.triggers.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
+        // A rule name is unique per relation, so the relation breaks the tie.
+        self.rules.sort_unstable_by(|(a, _), (b, _)| {
+            a.name()
+                .cmp(b.name())
+                .then_with(|| a.target_relation_name().cmp(&b.target_relation_name()))
+        });
         self.policies.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
         self.check_constraints.sort_unstable_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
         self.roles
@@ -926,6 +957,13 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
                 .cmp(&stored_view_key(b.as_ref(), IdentifierCase::AsWritten))
         });
         // Grants are not sorted as their order may be significant
+    }
+
+    /// Sorts, indexes, and seals the built objects into a database carrying
+    /// the given ingestion state.
+    pub(crate) fn into_database(mut self, ingestion: P::Ingestion) -> GenericDB<P> {
+        self.sort_stores();
+        let catalog_name = self.catalog_name;
 
         // Tables, views and materialized views share one pool of names, so one
         // index answers all three. Slots of a kind stay ascending because each
@@ -997,6 +1035,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             function_index,
             folded_function_index,
             triggers: self.triggers,
+            rules: self.rules,
             policies: self.policies,
             check_constraints: self.check_constraints,
             roles: self.roles,

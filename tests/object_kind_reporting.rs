@@ -226,6 +226,7 @@ fn every_kind_renders_its_own_spelling() {
         (ObjectKind::Policy, "Policy"),
         (ObjectKind::Function, "Function"),
         (ObjectKind::Trigger, "Trigger"),
+        (ObjectKind::Rule, "Rule"),
         (ObjectKind::Role, "Role"),
         (ObjectKind::Schema, "Schema"),
     ] {

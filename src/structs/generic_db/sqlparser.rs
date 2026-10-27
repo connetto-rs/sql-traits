@@ -23,13 +23,14 @@ use sqlparser::{
         AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, ArgMode,
         ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
         CreateCollation, CreateCollationDefinition, CreateFunction, CreateFunctionBody,
-        CreateIndex, CreatePolicy, CreateRole, CreateTable, CreateTrigger, DataType, DropBehavior,
-        ExactNumberInfo, Expr, ForeignKeyConstraint, FunctionDesc, FunctionReturnType, GeneratedAs,
-        Grant, GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn,
-        MySQLColumnPosition, ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr,
-        OrderByOptions, Owner, Privileges, Query, RenameTableNameKind, ResetConfig, SchemaName,
-        SqlOption, Statement, TableConstraint, TimezoneInfo, TriggerEvent, UniqueConstraint, Value,
-        ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut, visit_relations,
+        CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTrigger, DataType,
+        DropBehavior, ExactNumberInfo, Expr, ForeignKeyConstraint, FunctionDesc,
+        FunctionReturnType, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName, GranteesType,
+        Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart, OperateFunctionArg,
+        OrderByExpr, OrderByOptions, Owner, Privileges, Query, RenameTableNameKind, ResetConfig,
+        SchemaName, SqlOption, Statement, TableConstraint, TimezoneInfo, TriggerEvent,
+        UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
+        visit_relations,
     },
     dialect::Dialect,
     tokenizer::Span,
@@ -73,6 +74,7 @@ mod parse_options;
 mod parsed_source;
 mod postgres_18_collations;
 mod postgres_catalog;
+mod rules;
 mod transactions;
 mod view_rewrites;
 mod views;
@@ -99,6 +101,7 @@ impl SchemaProfile for SqlparserProfile {
     type Function = CreateFunction;
     type CheckConstraint = TableAttribute<CreateTable, CheckConstraint>;
     type Trigger = CreateTrigger;
+    type Rule = CreateRule;
     type Policy = CreatePolicy;
     type Role = CreateRole;
     type Schema = Schema;
@@ -1024,6 +1027,7 @@ impl ParserDBBuilder {
     /// - All foreign keys from the table
     /// - All check constraints on the table
     /// - All triggers on the table
+    /// - All rules on the table
     /// - All policies on the table
     /// - All grants on the table
     fn remove_table(
@@ -1075,6 +1079,16 @@ impl ParserDBBuilder {
             )
         });
 
+        self.rules_mut().retain(|(rule, ())| {
+            !object_name_matches_resolved_identity(
+                &rule.table_name,
+                table_name,
+                table_name_quoted,
+                schema_name,
+                schema_quoted,
+            )
+        });
+
         // Remove table and column grants for this table
         let grants_this_table = |objects: &Option<sqlparser::ast::GrantObjects>| {
             use sqlparser::ast::GrantObjects;
@@ -1106,6 +1120,12 @@ impl ParserDBBuilder {
             }
         }
 
+        for (rule, ()) in self.rules_mut() {
+            if renamed.named_by(&rule.table_name) {
+                target.rewrite(&mut Arc::make_mut(rule).table_name);
+            }
+        }
+
         for (policy, _) in self.policies_mut() {
             if renamed.named_by(&policy.table_name) {
                 target.rewrite(&mut Arc::make_mut(policy).table_name);
@@ -1125,8 +1145,8 @@ impl ParserDBBuilder {
     ///
     /// The indexes and constraints that live on the table are dropped along
     /// with the column, so only a foreign key from another table, a policy that
-    /// reads the column, and a trigger that fires on updates to it call for
-    /// `CASCADE`.
+    /// reads the column, a trigger that fires on updates to it, and a rule that
+    /// reads it through `NEW` or `OLD` call for `CASCADE`.
     fn column_has_outside_dependents(
         &self,
         table: &StoredTable,
@@ -1141,6 +1161,8 @@ impl ParserDBBuilder {
                 && column.in_expressions(policy.as_ref(), table, declaring)
         }) || self.triggers().iter().any(|(trigger, ())| {
             table.named_by(&trigger.table_name) && trigger_fires_on_column(trigger, column)
+        }) || self.rules().iter().any(|(rule, ())| {
+            table.named_by(&rule.table_name) && rules::reads_row_column(rule, column)
         })
     }
 
@@ -1188,6 +1210,9 @@ impl ParserDBBuilder {
         self.triggers_mut().retain(|(trigger, ())| {
             !(table.named_by(&trigger.table_name) && trigger_fires_on_column(trigger, column))
         });
+        self.rules_mut().retain(|(rule, ())| {
+            !(table.named_by(&rule.table_name) && rules::reads_row_column(rule, column))
+        });
 
         self.tables()
             .iter()
@@ -1199,8 +1224,8 @@ impl ParserDBBuilder {
 
     /// Renames a column in the objects that name it from outside the table's
     /// own node: the indexes built by `CREATE INDEX`, the policies that
-    /// read it, the triggers that fire on it, and the permissions granted
-    /// on it.
+    /// read it, the triggers that fire on it, the rules that read it through
+    /// `NEW` or `OLD`, and the permissions granted on it.
     fn rewrite_column_references(
         &mut self,
         table: &StoredTable,
@@ -1230,6 +1255,12 @@ impl ParserDBBuilder {
                         rename_column_idents(columns, from, to);
                     }
                 }
+            }
+        }
+
+        for (rule, ()) in self.rules_mut() {
+            if table.named_by(&rule.table_name) {
+                rules::rename_row_column(Arc::make_mut(rule), from, to);
             }
         }
 
@@ -6451,6 +6482,9 @@ impl ParserDB {
                     }
 
                     builder = builder.add_trigger(Arc::new(create_trigger), ());
+                }
+                Statement::CreateRule(create_rule) => {
+                    builder = rules::create_rule(builder, create_rule)?;
                 }
                 Statement::DropTrigger(mut drop_trigger) => {
                     if let Some(table_name) = &mut drop_trigger.table_name {

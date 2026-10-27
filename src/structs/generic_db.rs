@@ -102,6 +102,8 @@ pub struct GenericDB<P: SchemaProfile> {
     folded_function_index: BTreeMap<RelationKey, Vec<RelationKey>>,
     /// List of triggers created in the database.
     triggers: Vec<Stored<P::Trigger>>,
+    /// List of rewrite rules created in the database.
+    rules: Vec<Stored<P::Rule>>,
     /// List of policies created in the database.
     policies: Vec<Stored<P::Policy>>,
     /// List of check constraints in the database.
@@ -140,6 +142,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("foreign_keys", &self.foreign_keys.len())
             .field("functions", &self.functions.len())
             .field("triggers", &self.triggers.len())
+            .field("rules", &self.rules.len())
             .field("policies", &self.policies.len())
             .field("check_constraints", &self.check_constraints.len())
             .field("roles", &self.roles.len())
@@ -176,6 +179,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             foreign_keys: self.foreign_keys.clone(),
             functions: self.functions.clone(),
             triggers: self.triggers.clone(),
+            rules: self.rules.clone(),
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),

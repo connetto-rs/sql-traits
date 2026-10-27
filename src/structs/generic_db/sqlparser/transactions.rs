@@ -617,6 +617,7 @@ fn defines_schema(statement: &Statement) -> bool {
             | Statement::CreateDatabase { .. }
             | Statement::CreateFunction(_)
             | Statement::CreateTrigger(_)
+            | Statement::CreateRule(_)
             | Statement::DropTrigger(_)
             | Statement::CreateProcedure { .. }
             | Statement::CreateMacro { .. }

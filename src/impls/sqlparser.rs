@@ -7,6 +7,7 @@ mod create_function;
 mod create_index;
 mod create_policy;
 mod create_role;
+mod create_rule;
 mod create_table;
 mod create_trigger;
 mod data_statement;

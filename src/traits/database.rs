@@ -14,8 +14,8 @@ use crate::{
     structs::{IdentifierCase, TargetName},
     traits::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DialectLike, ForeignKeyLike,
-        FunctionLike, IndexLike, PolicyLike, RoleLike, SchemaLike, TableGrantLike, TableLike,
-        TriggerLike, UniqueIndexLike, ViewLike,
+        FunctionLike, IndexLike, PolicyLike, RoleLike, RuleLike, SchemaLike, TableGrantLike,
+        TableLike, TriggerLike, UniqueIndexLike, ViewLike,
     },
     utils::{
         identifier_resolution::stored_identifier_matches_lookup,
@@ -46,6 +46,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type Function: FunctionLike<DB = Self>;
     /// Type of the triggers in the schema.
     type Trigger: TriggerLike<DB = Self>;
+    /// Type of the rewrite rules in the schema.
+    type Rule: RuleLike<DB = Self>;
     /// Type of the unique indexes in the schema.
     type UniqueIndex: UniqueIndexLike<DB = Self>;
     /// Type of the check constraints in the schema.
@@ -172,6 +174,32 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # }
     /// ```
     fn triggers(&self) -> impl Iterator<Item = &Self::Trigger>;
+
+    /// Iterates over the rewrite rules defined in the schema, on tables and
+    /// views alike.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE t (id INT);
+    /// CREATE VIEW v AS SELECT id FROM t;
+    /// CREATE RULE keep_rows AS ON DELETE TO t DO INSTEAD NOTHING;
+    /// CREATE RULE v_insert AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.id);
+    /// ",
+    /// )?;
+    /// let mut rules: Vec<&str> = db.rules().map(|rule| rule.name()).collect();
+    /// rules.sort_unstable();
+    /// assert_eq!(rules, vec!["keep_rows", "v_insert"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn rules(&self) -> impl Iterator<Item = &Self::Rule>;
 
     /// Iterates over the indexes defined in the schema.
     ///

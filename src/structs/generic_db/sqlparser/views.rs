@@ -32,6 +32,7 @@ use sqlparser::ast::{
 use super::{
     ParserDBBuilder, SchemaQualifier, bind_reference, object_name_last_identifier, place_relation,
     relation_name_holder, require_named_in_catalog,
+    rules::{self, RuleHost},
     view_rewrites::{self, Rename},
 };
 use crate::{
@@ -271,7 +272,8 @@ pub(super) fn drop_views(
                 if materialized {
                     builder.materialized_views_mut().remove(position);
                 } else {
-                    builder.views_mut().remove(position);
+                    let (view, _, _) = builder.views_mut().remove(position);
+                    rules::drop_rules_on(&mut builder, &RuleHost::of_view(view.as_ref()));
                 }
             }
             continue;
@@ -440,6 +442,9 @@ fn rename_view(
             stored_view_key(view, IdentifierCase::AsWritten),
         )
     };
+    // Only a plain view carries rules.
+    let host =
+        (kind == ObjectKind::View).then(|| RuleHost::of_view(builder.views()[position].0.as_ref()));
 
     // A rename to the name it already answers to changes nothing, and asking
     // the name pool first would report the view colliding with itself.
@@ -475,6 +480,9 @@ fn rename_view(
             readers,
             &[Rename::Relation { key, to: new_ident.clone() }],
         );
+    }
+    if let Some(host) = &host {
+        rules::follow_relation_rename(&mut builder, host, new_ident);
     }
     Ok(builder)
 }
@@ -515,6 +523,9 @@ fn rename_view_column(
         let view = builder.views()[position].0.as_ref();
         (view.declaration(), stored_view_key(view, IdentifierCase::AsWritten))
     };
+    // Only a plain view carries rules.
+    let host =
+        (kind == ObjectKind::View).then(|| RuleHost::of_view(builder.views()[position].0.as_ref()));
     let view_name = declaration.name().to_string();
 
     let read = view_rewrites::catalog(&builder, core::iter::once(declaration.query()));
@@ -571,6 +582,9 @@ fn rename_view_column(
             readers,
             &[Rename::Column { key, ordinal, to: new_name.clone(), columns }],
         );
+    }
+    if let Some(host) = &host {
+        rules::follow_column_rename(&mut builder, host, old_name, new_name);
     }
     Ok(builder)
 }
@@ -838,16 +852,28 @@ pub(super) fn refuse_dependent_views(
 /// Removes the views a `CASCADE` takes along with the relation `key` names.
 pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &RelationKey) {
     let doomed = dependent_views(builder, key);
-    builder.views_mut().retain(|(view, _, _)| {
-        !doomed.iter().any(|(kind, dead)| {
-            *kind == ObjectKind::View
-                && *dead == stored_view_key(view.as_ref(), IdentifierCase::AsWritten)
+    let is_doomed = |kind: ObjectKind, own_key: RelationKey| {
+        doomed.iter().any(|(dead_kind, dead)| *dead_kind == kind && *dead == own_key)
+    };
+    let hosts: Vec<RuleHost> = builder
+        .views()
+        .iter()
+        .map(|(view, _, _)| view.as_ref())
+        .filter(|view| {
+            is_doomed(ObjectKind::View, stored_view_key(*view, IdentifierCase::AsWritten))
         })
+        .map(RuleHost::of_view)
+        .collect();
+    builder.views_mut().retain(|(view, _, _)| {
+        !is_doomed(ObjectKind::View, stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
     });
     builder.materialized_views_mut().retain(|(view, _, _)| {
-        !doomed.iter().any(|(kind, dead)| {
-            *kind == ObjectKind::MaterializedView
-                && *dead == stored_view_key(view.as_ref(), IdentifierCase::AsWritten)
-        })
+        !is_doomed(
+            ObjectKind::MaterializedView,
+            stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
+        )
     });
+    for host in &hosts {
+        rules::drop_rules_on(builder, host);
+    }
 }

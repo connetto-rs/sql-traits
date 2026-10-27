@@ -19,9 +19,10 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        Action, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType, Expr,
-        FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionSecurity,
-        Grantee, Owner, Query, Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
+        Action, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
+        CreateRuleAction, CreateRuleEvent, Expr, FunctionBehavior, FunctionCalledOnNull,
+        FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, Statement,
+        TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -42,6 +43,7 @@ struct MemoryCatalog {
     check_constraints: Vec<MemoryCheckConstraint>,
     functions: Vec<MemoryFunction>,
     triggers: Vec<MemoryTrigger>,
+    rules: Vec<MemoryRule>,
     policies: Vec<MemoryPolicy>,
     roles: Vec<MemoryRole>,
     table_grants: Vec<MemoryTableGrant>,
@@ -139,6 +141,13 @@ struct MemoryTrigger {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct MemoryRule {
+    name: String,
+    table_name: String,
+    action: CreateRuleAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryPolicy {
     name: String,
     table_name: String,
@@ -185,6 +194,7 @@ plain_metadata!(
     MemoryCheckConstraint,
     MemoryFunction,
     MemoryTrigger,
+    MemoryRule,
     MemoryPolicy,
     MemoryRole,
     MemoryTableGrant,
@@ -202,6 +212,7 @@ impl DatabaseLike for MemoryCatalog {
     type UniqueIndex = MemoryUniqueIndex;
     type CheckConstraint = MemoryCheckConstraint;
     type Trigger = MemoryTrigger;
+    type Rule = MemoryRule;
     type Policy = MemoryPolicy;
     type Role = MemoryRole;
     type TableGrant = MemoryTableGrant;
@@ -242,6 +253,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn triggers(&self) -> impl Iterator<Item = &Self::Trigger> {
         self.triggers.iter()
+    }
+
+    fn rules(&self) -> impl Iterator<Item = &Self::Rule> {
+        self.rules.iter()
     }
 
     fn indexes(&self) -> impl Iterator<Item = &Self::Index> {
@@ -827,6 +842,49 @@ impl TriggerLike for MemoryTrigger {
 
     fn function_name(&self) -> Option<&str> {
         None
+    }
+}
+
+impl RuleLike for MemoryRule {
+    type DB = MemoryCatalog;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn target_relation_name(&self) -> TargetName<'_> {
+        TargetName::new(&self.table_name, false)
+    }
+
+    fn relation<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<RuleRelation<'db, Self::DB>, LookupError>
+    where
+        Self: 'db,
+    {
+        database
+            .tables
+            .iter()
+            .find(|table| table.name == self.table_name)
+            .map(RuleRelation::Table)
+            .ok_or(LookupError::RelationNotFound { object_name: self.table_name.clone() })
+    }
+
+    fn event(&self) -> CreateRuleEvent {
+        CreateRuleEvent::Insert
+    }
+
+    fn is_instead(&self) -> bool {
+        false
+    }
+
+    fn condition(&self) -> Option<&Expr> {
+        None
+    }
+
+    fn action(&self) -> &CreateRuleAction {
+        &self.action
     }
 }
 
