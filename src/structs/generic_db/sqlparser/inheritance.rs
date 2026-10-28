@@ -18,11 +18,12 @@ use alloc::{
 
 use sqlparser::ast::{
     CharacterLength, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType,
-    ExactNumberInfo, Expr, Ident, IndexColumn, ObjectName, TableConstraint, TimezoneInfo,
+    ExactNumberInfo, Ident, ObjectName, TableConstraint, TimezoneInfo,
 };
 
 use super::{
-    ParserDBBuilder, StoredTable, column_copy::copy_column, constraint_validity::unvalidated_copies,
+    ParserDBBuilder, StoredTable, column_copy::copy_column,
+    constraint_validity::unvalidated_copies, generated_names,
 };
 use crate::{errors::Error, traits::TableLike, utils::is_identity};
 
@@ -293,16 +294,14 @@ fn inherited_column(
     let mut copy = copy_column(column, |option| option_passes_down(kind, option));
 
     if kind == ParentKind::PartitionOf {
-        let unique_stem = format!("_{}_key", copy.name.value);
+        let unique_columns = generated_names::column_part(&copy.name);
         for option in &mut copy.options {
-            let stem = match option.option {
-                ColumnOption::PrimaryKey(_) => Some("_pkey"),
-                ColumnOption::Unique(_) => Some(unique_stem.as_str()),
-                _ => None,
+            let (columns, label) = match option.option {
+                ColumnOption::PrimaryKey(_) => (None, "pkey"),
+                ColumnOption::Unique(_) => (Some(unique_columns.as_str()), "key"),
+                _ => continue,
             };
-            if let Some(stem) = stem {
-                option.name = Some(generated_key_name(builder, child, stem, taken));
-            }
+            option.name = Some(generated_key_name(builder, child, columns, label, taken));
         }
     }
 
@@ -404,22 +403,8 @@ pub(super) fn passes_down(kind: ParentKind, constraint: &TableConstraint) -> boo
     }
 }
 
-/// The columns a generated index name is built from, an unnamed expression
-/// contributing the same `expr` PostgreSQL uses for one.
-fn index_name_columns(columns: &[IndexColumn]) -> Vec<&str> {
-    columns
-        .iter()
-        .map(|column| {
-            match &column.column.expr {
-                Expr::Identifier(ident) => ident.value.as_str(),
-                _ => "expr",
-            }
-        })
-        .collect()
-}
-
-/// The name PostgreSQL gives an index it creates on its own behalf, with a
-/// counter appended until the schema has room for it.
+/// The name PostgreSQL gives a partition's copy of a key, which `taken` then
+/// holds as well.
 ///
 /// A key is also an index, and two indexes in one schema cannot share a name,
 /// which is why a partition's copy of the root's key cannot simply keep the
@@ -427,29 +412,15 @@ fn index_name_columns(columns: &[IndexColumn]) -> Vec<&str> {
 fn generated_key_name(
     builder: &ParserDBBuilder,
     child: &CreateTable,
-    stem: &str,
+    columns: Option<&str>,
+    label: &str,
     taken: &mut Vec<Ident>,
 ) -> Ident {
-    let table = super::last_str(&child.name);
-    let base = format!("{table}{stem}");
-    let schema = super::table_schema_qualifier(child);
-    // A generated name follows the quoting of the table it is built from, so
-    // one built off a quoted name stays reachable under the spelling it needs.
-    let spell = |value: &str| {
-        if child.table_name_is_quoted() { Ident::with_quote('"', value) } else { Ident::new(value) }
-    };
-
-    let mut candidate = spell(&base);
-    let mut counter = 0u32;
-    while super::relation_name_holder(builder, &candidate, schema).is_some()
-        || taken.iter().any(|held| super::idents_match(held, &candidate))
-    {
-        counter += 1;
-        candidate = spell(&format!("{base}{counter}"));
-    }
-
-    taken.push(candidate.clone());
-    candidate
+    let name = generated_names::index_name_on(builder, child, columns, label, |candidate| {
+        taken.iter().any(|held| super::idents_match(held, candidate))
+    });
+    taken.push(name.clone());
+    name
 }
 
 /// The copy of a parent's constraint the child holds, or [`None`] when the
@@ -473,12 +444,12 @@ pub(super) fn received_constraint(
     let mut copy = constraint.clone();
     match &mut copy {
         TableConstraint::PrimaryKey(primary_key) => {
-            primary_key.name = Some(generated_key_name(builder, child, "_pkey", taken));
+            primary_key.name = Some(generated_key_name(builder, child, None, "pkey", taken));
             primary_key.index_name = None;
         }
         TableConstraint::Unique(unique) => {
-            let stem = format!("_{}_key", index_name_columns(&unique.columns).join("_"));
-            unique.name = Some(generated_key_name(builder, child, &stem, taken));
+            unique.name = generated_names::index_columns_part(&unique.columns, &unique.include)
+                .map(|columns| generated_key_name(builder, child, Some(&columns), "key", taken));
             unique.index_name = None;
         }
         _ => {}

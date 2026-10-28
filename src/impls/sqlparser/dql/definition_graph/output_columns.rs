@@ -2,9 +2,8 @@ use alloc::{borrow::ToOwned, collections::BTreeMap, format, string::String, vec,
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AccessExpr, ArrayElemTypeDef, BinaryOperator, DataType, ExactNumberInfo, Expr, Ident, InTarget,
-    Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator, TimezoneInfo,
-    TrimWhereField, Values, Visit, Visitor,
+    Expr, Ident, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
+    Values, Visit, Visitor,
 };
 
 use super::{
@@ -19,7 +18,7 @@ use crate::{
     errors::LookupError,
     structs::{ColumnBinding, ColumnDefinition, IdentifierCase, QueryOutput},
     traits::DatabaseLike,
-    utils::object_name::object_name_last_part,
+    utils::figured_names::{Figure, figure},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +33,17 @@ enum OutputName {
 impl OutputName {
     fn exact(name: &str) -> Self {
         Self::Known { name: name.to_owned(), quoted: true }
+    }
+
+    /// The name a select-list entry without an alias takes.
+    fn figured(figure: Figure) -> Self {
+        match figure {
+            Figure::Strong(name, quoted) | Figure::Weak(name, quoted) => {
+                Self::Known { name, quoted }
+            }
+            Figure::Unnamed => Self::exact("?column?"),
+            Figure::Unknown => Self::Unknown,
+        }
     }
 }
 
@@ -148,181 +158,6 @@ fn match_output<'entries>(
     Err(LookupError::AmbiguousTableLookup { object_name: key.value.clone(), candidates })
 }
 
-enum Figure {
-    Strong(String, bool),
-    Weak(String, bool),
-    Unnamed,
-    Unknown,
-}
-
-impl Figure {
-    fn strong(name: &str) -> Self {
-        Self::Strong(name.to_owned(), true)
-    }
-
-    fn ident(ident: &Ident) -> Self {
-        Self::Strong(ident.value.clone(), ident.quote_style.is_some())
-    }
-
-    fn output_name(self) -> OutputName {
-        match self {
-            Self::Strong(name, quoted) | Self::Weak(name, quoted) => {
-                OutputName::Known { name, quoted }
-            }
-            Self::Unnamed => OutputName::exact("?column?"),
-            Self::Unknown => OutputName::Unknown,
-        }
-    }
-}
-
-/// Mirrors PostgreSQL's `FigureColname`, answering `Unknown` where the name is
-/// not modeled.
-fn figure(expression: &Expr) -> Figure {
-    match expression {
-        Expr::Identifier(ident) => Figure::ident(ident),
-        Expr::CompoundIdentifier(parts) => parts.last().map_or(Figure::Unknown, Figure::ident),
-        Expr::CompoundFieldAccess { root, access_chain } => {
-            let mut field = None;
-            for access in access_chain {
-                if let AccessExpr::Dot(part) = access {
-                    let Expr::Identifier(ident) = part else {
-                        return Figure::Unknown;
-                    };
-                    field = Some(ident);
-                }
-            }
-            field.map_or_else(|| figure(root), Figure::ident)
-        }
-        Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => figure(inner),
-        Expr::Function(function) => {
-            object_name_last_part(&function.name)
-                .map_or(Figure::Unknown, |(name, quoted)| Figure::Strong(name.to_owned(), quoted))
-        }
-        Expr::Cast { expr, data_type, .. } => {
-            match figure(expr) {
-                Figure::Weak(..) | Figure::Unnamed => type_figure(data_type),
-                named => named,
-            }
-        }
-        Expr::TypedString(typed) => type_figure(&typed.data_type),
-        Expr::Interval(_) => Figure::Weak("interval".to_owned(), true),
-        Expr::Case { else_result, .. } => {
-            match else_result.as_deref().map_or(Figure::Unnamed, figure) {
-                Figure::Weak(..) | Figure::Unnamed => Figure::Weak("case".to_owned(), true),
-                named => named,
-            }
-        }
-        Expr::Array(_) => Figure::strong("array"),
-        Expr::Tuple(_) => Figure::strong("row"),
-        Expr::Exists { negated: false, .. } => Figure::strong("exists"),
-        Expr::Subquery(query) => first_output_figure(&query.body),
-        Expr::Extract { .. } => Figure::strong("extract"),
-        Expr::Ceil { .. } => Figure::strong("ceil"),
-        Expr::Floor { .. } => Figure::strong("floor"),
-        Expr::Position { .. } => Figure::strong("position"),
-        Expr::Overlay { .. } => Figure::strong("overlay"),
-        Expr::AtTimeZone { .. } => Figure::strong("timezone"),
-        Expr::Substring { shorthand: true, .. } => Figure::strong("substr"),
-        Expr::Substring { shorthand: false, .. } => Figure::strong("substring"),
-        Expr::Trim { trim_where: Some(TrimWhereField::Leading), .. } => Figure::strong("ltrim"),
-        Expr::Trim { trim_where: Some(TrimWhereField::Trailing), .. } => Figure::strong("rtrim"),
-        Expr::Trim { .. } => Figure::strong("btrim"),
-        Expr::BinaryOp { op: BinaryOperator::Overlaps, .. } => Figure::strong("overlaps"),
-        Expr::In { target, .. } => {
-            match target {
-                InTarget::List(_)
-                | InTarget::Subquery(_)
-                | InTarget::Unnest(_)
-                | InTarget::Table { .. } => Figure::Unnamed,
-            }
-        }
-        Expr::Value(_)
-        | Expr::BinaryOp { .. }
-        | Expr::UnaryOp { .. }
-        | Expr::IsFalse(_)
-        | Expr::IsNotFalse(_)
-        | Expr::IsTrue(_)
-        | Expr::IsNotTrue(_)
-        | Expr::IsNull(_)
-        | Expr::IsNotNull(_)
-        | Expr::IsUnknown(_)
-        | Expr::IsNotUnknown(_)
-        | Expr::IsDistinctFrom(..)
-        | Expr::IsNotDistinctFrom(..)
-        | Expr::Between { .. }
-        | Expr::Like { .. }
-        | Expr::ILike { .. }
-        | Expr::SimilarTo { .. }
-        | Expr::AnyOp { .. }
-        | Expr::AllOp { .. }
-        | Expr::Exists { negated: true, .. } => Figure::Unnamed,
-        _ => Figure::Unknown,
-    }
-}
-
-fn first_output_figure(body: &SetExpr) -> Figure {
-    match body {
-        SetExpr::Select(select) => {
-            match select.projection.first() {
-                Some(SelectItem::ExprWithAlias { alias, .. }) => Figure::ident(alias),
-                Some(SelectItem::UnnamedExpr(expression)) => {
-                    match figure(expression) {
-                        Figure::Strong(name, quoted) | Figure::Weak(name, quoted) => {
-                            Figure::Strong(name, quoted)
-                        }
-                        Figure::Unnamed => Figure::strong("?column?"),
-                        Figure::Unknown => Figure::Unknown,
-                    }
-                }
-                _ => Figure::Unknown,
-            }
-        }
-        SetExpr::Query(query) => first_output_figure(&query.body),
-        SetExpr::SetOperation { left, .. } => first_output_figure(left),
-        SetExpr::Values(_) => Figure::strong("column1"),
-        _ => Figure::Unknown,
-    }
-}
-
-fn type_figure(data_type: &DataType) -> Figure {
-    let name = match data_type {
-        DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => "int4",
-        DataType::BigInt(_) | DataType::Int8(_) => "int8",
-        DataType::SmallInt(_) | DataType::Int2(_) => "int2",
-        DataType::Text => "text",
-        DataType::Varchar(_) | DataType::CharacterVarying(_) => "varchar",
-        DataType::Numeric(_) | DataType::Decimal(_) => "numeric",
-        DataType::Boolean | DataType::Bool => "bool",
-        DataType::Float(ExactNumberInfo::Precision(precision)) if *precision <= 24 => "float4",
-        DataType::Float(ExactNumberInfo::None | ExactNumberInfo::Precision(_))
-        | DataType::Float8
-        | DataType::DoublePrecision => "float8",
-        DataType::Real | DataType::Float4 => "float4",
-        DataType::Date => "date",
-        DataType::JSON => "json",
-        DataType::JSONB => "jsonb",
-        DataType::Char(_) | DataType::Character(_) => "bpchar",
-        DataType::Bytea => "bytea",
-        DataType::Uuid => "uuid",
-        DataType::Interval { .. } => "interval",
-        DataType::Bit(_) => "bit",
-        DataType::VarBit(_) | DataType::BitVarying(_) => "varbit",
-        DataType::Time(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => "time",
-        DataType::Time(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => "timetz",
-        DataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => "timestamp",
-        DataType::Timestamp(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => "timestamptz",
-        DataType::Array(ArrayElemTypeDef::SquareBracket(element, _)) => {
-            return type_figure(element);
-        }
-        DataType::Custom(name, _) => {
-            return object_name_last_part(name)
-                .map_or(Figure::Unknown, |(name, quoted)| Figure::Weak(name.to_owned(), quoted));
-        }
-        _ => return Figure::Unknown,
-    };
-    Figure::Weak(name.to_owned(), true)
-}
-
 fn values_entries<'query, 'db>(values: &Values) -> Vec<OutputEntry<'query, 'db>> {
     let width = values.rows.first().map_or(0, |row| row.len());
     (1..=width)
@@ -378,7 +213,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                             quoted: alias.quote_style.is_some(),
                         }
                     }
-                    _ => figure(expression.get()).output_name(),
+                    _ => OutputName::figured(figure(expression.get())),
                 };
                 let definition = self.expression_definition(expression, Some(cursor))?;
                 outputs.push(OutputEntry::Column(OutputColumn {

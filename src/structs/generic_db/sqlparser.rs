@@ -67,6 +67,7 @@ mod column_copy;
 mod constraint_validity;
 mod extensions;
 mod functions_in_expression;
+mod generated_names;
 mod inheritance;
 mod leading_comments;
 mod like;
@@ -1538,6 +1539,21 @@ impl ParserDBBuilder {
             let qualifier = stored_qualifier(&table.name);
             bind_reference(reference, qualifier);
         }
+    }
+
+    /// The name PostgreSQL gives an index `create_index` leaves unnamed, or
+    /// [`None`] when an index expression's name is not modeled.
+    fn generated_index_name(
+        &self,
+        create_index: &CreateIndex,
+    ) -> Result<Option<Ident>, crate::errors::Error> {
+        let Some(table) = self.resolve_table_object_name(&create_index.table_name)? else {
+            return Err(crate::errors::Error::TableNotFoundForIndex {
+                table_name: last_str(&create_index.table_name).to_string(),
+                index_name: "<unnamed>".to_string(),
+            });
+        };
+        Ok(generated_names::create_index_name(self, table, create_index))
     }
 
     /// Resolves a reference a stored node carries, which ingestion bound, so
@@ -4031,6 +4047,47 @@ impl ParserDBIngestor {
     #[must_use]
     pub fn snapshot(&self) -> ParserDB {
         self.catalog.snapshot(self.access_resolution)
+    }
+
+    /// The name applying `create_index` now stores the index under, which is
+    /// PostgreSQL's choice when the statement writes none, and [`None`] when
+    /// that choice rests on an index expression whose name is not modeled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the written name is one no schema can hold, or
+    /// when the statement leaves the name to the server and its table does not
+    /// exist.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+    ///
+    /// let statement =
+    ///     |sql| Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("SQL parses").remove(0);
+    /// let ingestor = ParserDBIngestor::new::<PostgreSqlDialect>("catalog".to_owned())
+    ///     .apply_statement(statement("CREATE TABLE t (s TEXT);"))?
+    ///     .apply_statement(statement("CREATE TABLE t_s_idx (id INT);"))?;
+    ///
+    /// let create_index = Parser::new(&PostgreSqlDialect {})
+    ///     .try_with_sql("ON t (s)")
+    ///     .and_then(|mut parser| parser.parse_create_index(false))
+    ///     .expect("the part after CREATE INDEX parses");
+    /// let name = ingestor.create_index_name(&create_index)?.expect("named after its column");
+    /// assert_eq!(name.value, "t_s_idx1");
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn create_index_name(
+        &self,
+        create_index: &CreateIndex,
+    ) -> Result<Option<Ident>, crate::errors::Error> {
+        let Some(name) = &create_index.name else {
+            return self.catalog.builder.generated_index_name(create_index);
+        };
+        require_named(name, crate::errors::ObjectKind::Index)?;
+        Ok(object_name_last_identifier(name).cloned())
     }
 
     /// Returns the final queryable schema, rolling back a transaction still
@@ -7036,6 +7093,11 @@ impl ParserDB {
                         require_named(index_name, crate::errors::ObjectKind::Index)?;
                     }
                     builder.bind_table_reference(&mut create_index.table_name);
+                    if create_index.name.is_none() {
+                        create_index.name = builder
+                            .generated_index_name(&create_index)?
+                            .map(|name| ObjectName::from(vec![name]));
+                    }
                     let if_not_exists = create_index.if_not_exists;
                     let (index, metadata) = Self::process_create_index(create_index, &builder)?;
                     let resolved_table = index.table();
@@ -7046,8 +7108,7 @@ impl ParserDB {
 
                     // An index takes its schema from its table, and shares one
                     // pool of names there with tables and with the indexes
-                    // behind named constraints. An unnamed index is named by
-                    // the server and contests nothing.
+                    // behind named constraints.
                     if let Some(index_name) = index.attribute().name.as_ref()
                         && let Some(ObjectNamePart::Identifier(index_name)) = index_name.0.last()
                         && let Some(conflicting_kind) = relation_name_holder(
@@ -10216,7 +10277,7 @@ mod tests {
         }
 
         #[test]
-        fn test_anonymous_index_has_no_name() {
+        fn test_unnamed_index_takes_the_generated_name() {
             let sql = r"
                 CREATE TABLE t (id INT PRIMARY KEY, name TEXT);
                 CREATE INDEX ON t(name);
@@ -10224,7 +10285,7 @@ mod tests {
             let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
 
             let index = db.indexes().next().expect("index should exist");
-            assert!(index.name().is_none());
+            assert_eq!(index.name(), Some("t_name_idx"));
         }
 
         #[test]
