@@ -13,7 +13,8 @@ use alloc::{
 
 use sqlparser::ast::{
     AlterTableOperation, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable,
-    Expr, ForValues, Ident, IndexColumn, ObjectName, OrderByExpr, OrderByOptions, TableConstraint,
+    Expr, ForValues, ForeignKeyConstraint, Ident, IndexColumn, ObjectName, OrderByExpr,
+    OrderByOptions, TableConstraint,
 };
 
 use super::{
@@ -130,10 +131,10 @@ pub(super) fn attach_partition(
         if received.passed_on.is_empty() {
             continue;
         }
-        for (kind, child) in inheritance::direct_children(&builder, &table) {
-            if kind != ParentKind::PartitionOf {
-                continue;
-            }
+        let partitions = inheritance::direct_children(&builder, &table)
+            .into_iter()
+            .filter_map(|(kind, child)| (kind == ParentKind::PartitionOf).then_some(child));
+        for child in partitions {
             let parent_node = ParserDB::stored_node(&builder, &table)?;
             let child_node = ParserDB::stored_node(&builder, &child)?;
             let next = receive(&builder, parent_node, &child, child_node, &received.passed_on)?;
@@ -424,26 +425,18 @@ fn table_form(column: &Ident, option: &ColumnOptionDef) -> Option<TableConstrain
     })
 }
 
-/// The constraint with every name stripped, since PostgreSQL matches an index
-/// or a foreign key by what it enforces rather than by what it is called.
-fn nameless(constraint: &TableConstraint) -> TableConstraint {
-    let mut bare = constraint.clone();
-    match &mut bare {
-        TableConstraint::PrimaryKey(primary_key) => {
-            primary_key.name = None;
-            primary_key.index_name = None;
+/// Whether two keys or foreign keys enforce the same thing, whatever each is
+/// called, which is how PostgreSQL matches an index or a foreign key.
+fn same_key(left: &TableConstraint, right: &TableConstraint) -> bool {
+    match (left, right) {
+        (TableConstraint::ForeignKey(left), TableConstraint::ForeignKey(right)) => {
+            let bare = |key: &ForeignKeyConstraint| {
+                ForeignKeyConstraint { name: None, index_name: None, ..key.clone() }
+            };
+            bare(left) == bare(right)
         }
-        TableConstraint::Unique(unique) => {
-            unique.name = None;
-            unique.index_name = None;
-        }
-        TableConstraint::ForeignKey(foreign_key) => {
-            foreign_key.name = None;
-            foreign_key.index_name = None;
-        }
-        _ => {}
+        _ => inheritance::is_copy_of(left, right),
     }
-    bare
 }
 
 /// What `table` receives of the keys and foreign keys its parent passes down.
@@ -462,8 +455,7 @@ fn receive(
     let mut taken = Vec::new();
 
     for arriving in passed {
-        let bare = nameless(&arriving.constraint);
-        if let Some(own) = held.iter().find(|own| nameless(&own.constraint) == bare) {
+        if let Some(own) = held.iter().find(|own| same_key(&own.constraint, &arriving.constraint)) {
             if own.written_on.is_none() {
                 let validated = constraint_validity::merged_copy_validated(
                     builder,
@@ -494,13 +486,8 @@ fn receive(
                 validated: true,
             });
             received.options.push((column.clone(), copy));
-        } else if let Some(copy) = inheritance::received_constraint(
-            builder,
-            ParentKind::PartitionOf,
-            node,
-            &arriving.constraint,
-            &mut taken,
-        ) {
+        } else {
+            let copy = inheritance::partition_copy(builder, node, &arriving.constraint, &mut taken);
             received.passed_on.push(Passed {
                 constraint: copy.clone(),
                 written_on: None,
@@ -520,19 +507,19 @@ fn apply(
     received: &mut Received,
 ) -> Result<ParserDBBuilder, Error> {
     let edge = received.edge.take();
-    let options = core::mem::take(&mut received.options);
+    let mut options = core::mem::take(&mut received.options);
     let constraints = &received.constraints;
     let mut builder = ParserDB::replace_table_node(builder, table, |_, node| {
         if let Some((root, for_values)) = edge {
             node.partition_of = Some(root);
             node.for_values = Some(for_values);
         }
-        for (column, option) in options {
-            if let Some(declared) =
-                node.columns.iter_mut().find(|declared| idents_match(&declared.name, &column))
-            {
-                declared.options.push(option);
-            }
+        for declared in &mut node.columns {
+            declared.options.extend(
+                options
+                    .extract_if(.., |(column, _)| idents_match(column, &declared.name))
+                    .map(|(_, option)| option),
+            );
         }
         node.constraints.extend(constraints.iter().map(|(constraint, _)| constraint.clone()));
         Ok(())

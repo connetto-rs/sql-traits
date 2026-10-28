@@ -449,10 +449,17 @@ pub(super) fn received_constraint(
     constraint: &TableConstraint,
     taken: &mut Vec<Ident>,
 ) -> Option<TableConstraint> {
-    if !passes_down(kind, constraint) {
-        return None;
-    }
+    passes_down(kind, constraint).then(|| partition_copy(builder, child, constraint, taken))
+}
 
+/// A partition's copy of a constraint, with a key renamed for the index behind
+/// it.
+pub(super) fn partition_copy(
+    builder: &ParserDBBuilder,
+    child: &CreateTable,
+    constraint: &TableConstraint,
+    taken: &mut Vec<Ident>,
+) -> TableConstraint {
     let mut copy = constraint.clone();
     match &mut copy {
         TableConstraint::PrimaryKey(primary_key) => {
@@ -466,7 +473,7 @@ pub(super) fn received_constraint(
         }
         _ => {}
     }
-    Some(copy)
+    copy
 }
 
 /// The constraint with the name a copy would have been given stripped away.
