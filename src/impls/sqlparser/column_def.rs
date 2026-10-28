@@ -845,6 +845,27 @@ mod tests {
         }
 
         #[test]
+        fn a_decimal_spelling_answers_only_in_the_engines_that_own_it() {
+            assert_scales::<PostgreSqlDialect>(&[
+                ("NUMBER(10,2)", None),
+                ("FIXED(10,2)", None),
+                ("Decimal64(4)", None),
+                ("money_amount", None),
+            ]);
+            assert_scales::<MySqlDialect>(&[("NUMBER(10,2)", None), ("Decimal64(4)", None)]);
+            assert_scales::<OracleDialect>(&[("FIXED(10,2)", None)]);
+        }
+
+        #[test]
+        fn a_number_with_modifiers_other_than_precision_and_scale_has_no_scale() {
+            assert_scales::<OracleDialect>(&[
+                ("NUMBER(10,2,1)", None),
+                ("NUMBER(p,2)", None),
+                ("NUMBER('10')", None),
+            ]);
+        }
+
+        #[test]
         fn sqlite_stores_decimals_regardless_of_the_declared_scale() {
             assert_scales::<SQLiteDialect>(&[
                 ("NUMERIC(10,2)", None),
