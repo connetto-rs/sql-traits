@@ -502,9 +502,7 @@ pub(super) fn numeric_scale(dialect: SqlparserDialect, ty: &DataType) -> Option<
         _ => Some(0),
     };
     match ty {
-        DataType::Nullable(inner) | DataType::LowCardinality(inner) | DataType::Zerofill(inner) => {
-            numeric_scale(dialect, inner)
-        }
+        DataType::Nullable(inner) | DataType::Zerofill(inner) => numeric_scale(dialect, inner),
         DataType::Numeric(info)
         | DataType::Decimal(info)
         | DataType::DecimalUnsigned(info)

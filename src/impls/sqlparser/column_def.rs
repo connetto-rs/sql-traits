@@ -828,7 +828,6 @@ mod tests {
                 ("Decimal128(10)", Some(10)),
                 ("Decimal256(20)", Some(20)),
                 ("Nullable(Decimal(10,2))", Some(2)),
-                ("LowCardinality(Nullable(Decimal(10,3)))", Some(3)),
             ]);
         }
 
