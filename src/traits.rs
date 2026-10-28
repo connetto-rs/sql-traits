@@ -34,6 +34,8 @@ pub mod policy;
 pub use policy::PolicyLike;
 pub mod role;
 pub use role::RoleLike;
+pub mod role_membership;
+pub use role_membership::RoleMembershipLike;
 pub mod schema;
 pub use schema::SchemaLike;
 pub mod grant;

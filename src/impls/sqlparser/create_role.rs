@@ -10,7 +10,7 @@ use crate::{
     structs::ParserDB,
     traits::{DatabaseLike, Metadata, PolicyLike, RoleLike},
     utils::{
-        identifier_resolution::{identifiers_match, is_public_pseudo_role, normalize_identifier},
+        identifier_resolution::{identifiers_match, is_public_pseudo_role},
         last_str,
         object_name::object_name_last_part,
     },
@@ -64,17 +64,6 @@ impl RoleLike for CreateRole {
     fn connection_limit(&self) -> Option<i32> {
         // PostgreSQL stores `-1` for a role without a limit.
         self.connection_limit.as_ref().and_then(signed_integer).filter(|&limit| limit != -1)
-    }
-
-    fn member_of<'db>(
-        &'db self,
-        database: &'db Self::DB,
-    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Role> {
-        self.in_role.iter().filter_map(move |role_ident| {
-            let stored_name =
-                normalize_identifier(&role_ident.value, role_ident.quote_style.is_some());
-            database.role(stored_name.as_ref())
-        })
     }
 
     fn policies<'db>(

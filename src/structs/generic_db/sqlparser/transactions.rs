@@ -640,6 +640,7 @@ fn defines_schema(statement: &Statement) -> bool {
             | Statement::CreateFileFormat { .. }
             | Statement::CreateWarehouse { .. }
             | Statement::Grant(_)
+            | Statement::GrantRole(_)
             | Statement::Deny(_)
             | Statement::Revoke(_)
             | Statement::CreateSequence { .. }

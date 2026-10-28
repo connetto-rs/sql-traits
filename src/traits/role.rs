@@ -4,7 +4,7 @@ use alloc::borrow::Cow;
 use core::fmt::Debug;
 
 use crate::{
-    traits::{DatabaseLike, Metadata},
+    traits::{DatabaseLike, Metadata, RoleMembershipLike},
     utils::identifier_resolution::normalize_identifier,
 };
 
@@ -252,7 +252,48 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
     /// ```
     fn connection_limit(&self) -> Option<i32>;
 
-    /// Returns the roles that this role is a member of (IN ROLE clause).
+    /// Returns the memberships this role holds, one for each role it was
+    /// granted, whether by `GRANT role TO role` or by a membership clause of
+    /// `CREATE ROLE`.
+    ///
+    /// A membership may name a granted role the database does not hold, as a
+    /// schema checked under an open world may.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE bypasser BYPASSRLS;
+    /// CREATE ROLE app_user NOINHERIT;
+    /// GRANT bypasser TO app_user;
+    /// ",
+    /// )?;
+    ///
+    /// let app_user = db.role("app_user").unwrap();
+    /// let membership = app_user.memberships(&db).next().unwrap();
+    /// assert_eq!(membership.role_name(), "bypasser");
+    /// assert!(!membership.admin_option());
+    /// assert!(!membership.inherit_option());
+    /// assert!(membership.set_option());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn memberships<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::RoleMembership> {
+        let name = self.stored_name();
+        database
+            .role_memberships()
+            .filter(move |membership| membership.stored_member_name() == name)
+    }
+
+    /// Returns the roles that this role is a member of, those of its
+    /// [`memberships`](Self::memberships) the database holds.
     ///
     /// # Example
     ///
@@ -263,21 +304,24 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
     /// CREATE ROLE parent_role;
+    /// CREATE ROLE granted_role;
     /// CREATE ROLE child_role IN ROLE parent_role;
+    /// GRANT granted_role TO child_role;
     /// ",
     /// )?;
     ///
     /// let child = db.role("child_role").unwrap();
-    /// let memberships: Vec<_> = child.member_of(&db).collect();
-    /// assert_eq!(memberships.len(), 1);
-    /// assert_eq!(memberships[0].name(), "parent_role");
+    /// let parents: Vec<_> = child.member_of(&db).map(RoleLike::name).collect();
+    /// assert_eq!(parents, ["parent_role", "granted_role"]);
     /// # Ok(())
     /// # }
     /// ```
     fn member_of<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Role>;
+    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Role> {
+        self.memberships(database).filter_map(move |membership| membership.role(database))
+    }
 
     /// Returns the policies that reference this role.
     ///
@@ -353,13 +397,6 @@ impl<T: RoleLike> RoleLike for &T {
 
     fn connection_limit(&self) -> Option<i32> {
         (*self).connection_limit()
-    }
-
-    fn member_of<'db>(
-        &'db self,
-        database: &'db Self::DB,
-    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Role> {
-        (*self).member_of(database)
     }
 
     fn policies<'db>(

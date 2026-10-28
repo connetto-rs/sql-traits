@@ -115,6 +115,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     check_constraints: Vec<Stored<P::CheckConstraint>>,
     /// List of roles in the database.
     roles: Vec<Stored<P::Role>>,
+    /// List of role memberships in the database, in the order granted.
+    role_memberships: Vec<Stored<P::RoleMembership>>,
     /// List of schemas in the database.
     schemas: Vec<Stored<P::Schema>>,
     /// List of table grants in the database.
@@ -153,6 +155,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),
+            role_memberships: self.role_memberships.clone(),
             schemas: self.schemas.clone(),
             table_grants: self.table_grants.clone(),
             column_grants: self.column_grants.clone(),
@@ -214,6 +217,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
+            role_memberships: Vec::new(),
             schemas: self.schemas.clone(),
             table_grants: Vec::new(),
             column_grants: Vec::new(),
@@ -422,6 +426,18 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &mut self.roles
     }
 
+    /// Returns a slice of role membership Arc references with their metadata,
+    /// in the order granted.
+    #[must_use]
+    pub fn role_memberships(&self) -> &[Stored<P::RoleMembership>] {
+        &self.role_memberships
+    }
+
+    /// Returns a mutable reference to the role memberships list.
+    pub(crate) fn role_memberships_mut(&mut self) -> &mut Vec<Stored<P::RoleMembership>> {
+        &mut self.role_memberships
+    }
+
     /// Returns a slice of schema Arc references with their metadata.
     pub(crate) fn schemas(&self) -> &[Stored<P::Schema>] {
         &self.schemas
@@ -453,6 +469,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
+            role_memberships: Vec::new(),
             schemas: Vec::new(),
             table_grants: Vec::new(),
             column_grants: Vec::new(),
@@ -761,6 +778,18 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self
     }
 
+    /// Adds a role membership with its metadata to the builder.
+    #[must_use]
+    #[inline]
+    pub fn add_role_membership(
+        mut self,
+        membership: Arc<P::RoleMembership>,
+        metadata: Meta<P::RoleMembership>,
+    ) -> Self {
+        self.role_memberships.push((membership, metadata));
+        self
+    }
+
     /// Adds a schema with its metadata to the builder.
     #[must_use]
     #[inline]
@@ -912,6 +941,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             policies,
             check_constraints,
             roles,
+            role_memberships,
             table_grants,
             column_grants,
             schemas,
@@ -937,6 +967,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             policies,
             check_constraints,
             roles,
+            role_memberships,
             schemas,
             table_grants,
             column_grants,
@@ -1072,6 +1103,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             policies: self.policies,
             check_constraints: self.check_constraints,
             roles: self.roles,
+            role_memberships: self.role_memberships,
             schemas: self.schemas,
             table_grants: self.table_grants,
             column_grants: self.column_grants,
