@@ -89,6 +89,7 @@ pub use parse_options::{AccessResolution, ParseOptions};
 use parsed_source::{ParsedSource, StatementSource};
 use postgres_catalog::CatalogName;
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};
+use role_memberships::CreateRoleMemberships;
 
 /// The object kinds a schema parsed from SQL text holds, each an `sqlparser`
 /// AST node or a wrapper pairing one with the table it belongs to.
@@ -7725,8 +7726,7 @@ impl ParserDB {
                             });
                         }
                     }
-                    let memberships =
-                        role_memberships::CreateRoleMemberships::take(&mut create_role);
+                    let memberships = CreateRoleMemberships::take(&mut create_role);
                     memberships.validate(&builder, access_resolution)?;
                     let created = Arc::new(create_role);
                     builder = builder.add_role(Arc::clone(&created), ());
