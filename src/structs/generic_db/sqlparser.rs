@@ -42,7 +42,8 @@ use crate::{
         RelationIdentity, RoleMembership, Schema, SchemaProfile, TableAttribute, TableMetadata,
         View,
         metadata::{
-            CheckMetadata, FunctionMetadata, IndexMetadata, PolicyMetadata, UniqueIndexMetadata,
+            CheckMetadata, ExpressionCalls, FunctionMetadata, IndexMetadata, PolicyMetadata,
+            UniqueIndexMetadata,
         },
     },
     traits::{ColumnLike, IndexLike, TableLike, ViewLike},
@@ -64,10 +65,10 @@ use crate::{
     },
 };
 
+mod calls_in_expression;
 mod column_copy;
 mod constraint_validity;
 mod extensions;
-mod functions_in_expression;
 mod generated_names;
 mod inheritance;
 mod leading_comments;
@@ -947,13 +948,14 @@ fn existing_child_column_collation_conflict(
 }
 
 impl ParserDBBuilder {
-    /// The functions the calls in `expression` may run, as of this statement.
-    fn functions_called_in(&self, expression: &Expr) -> Vec<Arc<CreateFunction>> {
+    /// The calls in `expression` and the functions each may run, as of this
+    /// statement.
+    fn calls_in(&self, expression: &Expr) -> ExpressionCalls<CreateFunction> {
         let functions = self.function_arc_vec();
         let search_path: Vec<(&str, bool)> = self.search_path().collect();
-        functions_in_expression::functions_in_expression(
+        calls_in_expression::calls_in_expression(
             expression,
-            &functions_in_expression::CallScope {
+            &calls_in_expression::CallScope {
                 functions: &functions,
                 search_path: &search_path,
                 case: self.identifier_case(),
@@ -970,7 +972,7 @@ impl ParserDBBuilder {
     fn is_function_used(&self, dropped: &Arc<CreateFunction>) -> bool {
         let is_dropped = |function: &CreateFunction| core::ptr::eq(function, dropped.as_ref());
         // A bound name left bare is one in the default schema.
-        let trigger_scope = functions_in_expression::CallScope {
+        let trigger_scope = calls_in_expression::CallScope {
             functions: &[],
             search_path: &[("public", false)],
             case: self.identifier_case(),
@@ -978,7 +980,11 @@ impl ParserDBBuilder {
 
         self.check_constraints().iter().any(|(_, metadata)| metadata.functions().any(is_dropped))
             || self.policies().iter().any(|(_, metadata)| {
-                metadata.using_functions().chain(metadata.check_functions()).any(is_dropped)
+                metadata
+                    .using_calls()
+                    .functions()
+                    .chain(metadata.check_calls().functions())
+                    .any(is_dropped)
             })
             || self.triggers().iter().any(|(trigger, ())| {
                 trigger.exec_body.as_ref().is_some_and(|body| {
@@ -998,7 +1004,7 @@ impl ParserDBBuilder {
         let functions = self.function_arc_vec();
         let search_path: Vec<(&str, bool)> = self.search_path().collect();
         let case = self.identifier_case();
-        let scope = functions_in_expression::CallScope {
+        let scope = calls_in_expression::CallScope {
             functions: &functions,
             search_path: &search_path,
             case,
@@ -1659,7 +1665,7 @@ impl ParserDBBuilder {
 
 /// A type alias for the result of processing check constraints.
 type CheckConstraintResult =
-    (Vec<Arc<TableAttribute<CreateTable, ColumnDef>>>, Vec<Arc<CreateFunction>>);
+    (Vec<Arc<TableAttribute<CreateTable, ColumnDef>>>, ExpressionCalls<CreateFunction>);
 
 /// A type alias for the result of processing unique constraints.
 type UniqueConstraintResult = (
@@ -4452,8 +4458,8 @@ impl ParserDB {
                 &target_name_of_object_name(&create_table.name),
                 table_metadata.column_arc_slice(),
             )?;
-        let functions_in_expression = builder.functions_called_in(check_expr);
-        Ok((columns_in_expression, functions_in_expression))
+        let calls = builder.calls_in(check_expr);
+        Ok((columns_in_expression, calls))
     }
 
     /// Registers `check` on the table and the builder, with the columns and
@@ -4466,7 +4472,7 @@ impl ParserDB {
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let check_arc = Arc::new(TableAttribute::new(create_table.clone(), check.clone()));
         table_metadata.add_check_constraint(check_arc.clone());
-        let (columns_in_expression, functions_in_expression) =
+        let (columns_in_expression, calls) =
             Self::process_check_constraint(&check.expr, create_table, table_metadata, &builder)?;
         Ok(builder.add_check_constraint(
             check_arc,
@@ -4474,7 +4480,7 @@ impl ParserDB {
                 *check.expr.clone(),
                 create_table.clone(),
                 columns_in_expression,
-                functions_in_expression,
+                calls,
             ),
         ))
     }
@@ -7668,16 +7674,16 @@ impl ParserDB {
                         });
                     }
 
-                    let using_functions = policy
+                    let using_calls = policy
                         .using
                         .as_ref()
-                        .map_or_else(Vec::new, |using| builder.functions_called_in(using));
-                    let check_functions = policy
+                        .map_or_else(ExpressionCalls::default, |using| builder.calls_in(using));
+                    let check_calls = policy
                         .with_check
                         .as_ref()
-                        .map_or_else(Vec::new, |check| builder.functions_called_in(check));
+                        .map_or_else(ExpressionCalls::default, |check| builder.calls_in(check));
 
-                    let metadata = PolicyMetadata::new(using_functions, check_functions);
+                    let metadata = PolicyMetadata::new(using_calls, check_calls);
                     builder = builder.add_policy(Arc::new(policy), metadata);
                 }
                 Statement::CreateRole(mut create_role) => {
@@ -8075,14 +8081,14 @@ impl ParserDB {
                                 )?;
                             }
 
-                            // The functions an expression calls are resolved
-                            // against the builder, so they are collected before
-                            // the store is borrowed mutably.
-                            let functions = |expression: Option<&Expr>| {
-                                expression.map(|expression| builder.functions_called_in(expression))
+                            // The calls of an expression are resolved against
+                            // the builder, so they are collected before the
+                            // store is borrowed mutably.
+                            let calls = |expression: Option<&Expr>| {
+                                expression.map(|expression| builder.calls_in(expression))
                             };
-                            let using_functions = functions(using.as_ref());
-                            let check_functions = functions(with_check.as_ref());
+                            let using_calls = calls(using.as_ref());
+                            let check_calls = calls(with_check.as_ref());
 
                             // PostgreSQL applies each clause on its own, so one
                             // the statement omits is left as it was rather than
@@ -8098,11 +8104,11 @@ impl ParserDB {
                             if with_check.is_some() {
                                 policy.with_check = with_check;
                             }
-                            if let Some(using_functions) = using_functions {
-                                metadata.set_using_functions(using_functions);
+                            if let Some(using_calls) = using_calls {
+                                metadata.set_using_calls(using_calls);
                             }
-                            if let Some(check_functions) = check_functions {
-                                metadata.set_check_functions(check_functions);
+                            if let Some(check_calls) = check_calls {
+                                metadata.set_check_calls(check_calls);
                             }
                         }
                     }

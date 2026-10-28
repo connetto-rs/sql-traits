@@ -1,7 +1,9 @@
 //! Implement the [`CheckConstraint`] trait for the `sqlparser` crate's
 //! [`TableAttribute`] wrapper.
 
-use sqlparser::ast::{CheckConstraint, CreateTable, Expr};
+use alloc::string::ToString;
+
+use sqlparser::ast::{CheckConstraint, CreateTable, Expr, Function};
 
 use crate::{
     errors::{LookupError, ObjectKind},
@@ -69,5 +71,17 @@ impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
         Ok(check_constraint_metadata(self, database)?.functions())
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        check_constraint_metadata(self, database)?
+            .calls()
+            .reached_by(self.expression(database), call)
+            .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })
     }
 }

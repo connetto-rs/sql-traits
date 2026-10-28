@@ -1,17 +1,16 @@
-//! Collects local function dependencies, including table-valued `IN` targets.
+//! Resolves each call an expression makes to the functions it may reach.
 
 use alloc::{sync::Arc, vec::Vec};
+use core::{convert::Infallible, ops::ControlFlow};
 
-use sqlparser::ast::{
-    ArgMode, CreateFunction, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget,
-    ObjectName,
-};
+use sqlparser::ast::{ArgMode, CreateFunction, Expr, ObjectName};
 
 use super::schema_qualifiers_match;
 use crate::{
-    structs::IdentifierCase,
+    structs::{IdentifierCase, metadata::ExpressionCalls},
     traits::function_like::FunctionLike,
     utils::{
+        call_sites::for_each_call,
         identifier_resolution::identifiers_match,
         object_name::{Qualifier, object_name_last_part, qualifier_of},
     },
@@ -92,107 +91,31 @@ fn accepts(function: &CreateFunction, arguments: usize) -> bool {
     arguments >= required && (variadic || arguments <= inputs.len())
 }
 
-fn functions_in_arguments(
-    arguments: &[FunctionArg],
+/// Resolves every call in `expression`, subqueries included, under `scope`.
+pub(super) fn calls_in_expression(
+    expression: &Expr,
     scope: &CallScope<'_>,
-    result: &mut Vec<Arc<CreateFunction>>,
-) {
-    for argument in arguments {
-        let argument = match argument {
-            FunctionArg::Named { arg, .. }
-            | FunctionArg::ExprNamed { arg, .. }
-            | FunctionArg::Unnamed(arg) => arg,
-        };
-        if let FunctionArgExpr::Expr(expression) = argument {
-            result.extend(functions_in_expression(expression, scope));
-        }
-    }
-}
-
-pub(super) fn functions_in_expression(
-    expr: &Expr,
-    scope: &CallScope<'_>,
-) -> Vec<Arc<CreateFunction>> {
-    let mut result = Vec::new();
-
-    match expr {
-        Expr::Function(func) => {
-            let arguments = match &func.args {
-                FunctionArguments::None => 0,
-                FunctionArguments::Subquery(_) => 1,
-                FunctionArguments::List(list) => list.args.len(),
-            };
-            result.extend(scope.reached_by(&func.name, arguments).cloned());
-
-            if let FunctionArguments::List(args) = &func.args {
-                functions_in_arguments(&args.args, scope, &mut result);
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            result.extend(functions_in_expression(left, scope));
-            result.extend(functions_in_expression(right, scope));
-        }
-        Expr::Nested(nested_expr) => {
-            result.extend(functions_in_expression(nested_expr, scope));
-        }
-        Expr::Between { expr, negated: _, low, high } => {
-            result.extend(functions_in_expression(expr, scope));
-            result.extend(functions_in_expression(low, scope));
-            result.extend(functions_in_expression(high, scope));
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr) => {
-            result.extend(functions_in_expression(expr, scope));
-        }
-        Expr::In { expr, target, .. } => {
-            result.extend(functions_in_expression(expr, scope));
-            match target {
-                InTarget::List(list) => {
-                    for expression in list {
-                        result.extend(functions_in_expression(expression, scope));
-                    }
-                }
-                InTarget::Subquery(_) => {}
-                InTarget::Unnest(expression) => {
-                    result.extend(functions_in_expression(expression, scope));
-                }
-                InTarget::Table { name, args } => {
-                    if let Some(arguments) = args {
-                        result.extend(scope.reached_by(name, arguments.len()).cloned());
-                        functions_in_arguments(arguments, scope, &mut result);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    // Remove duplicates while preserving order. BTreeSet works on raw
-    // pointers (which implement `Ord`) and keeps the helper `alloc`-only
-    // for a no_std-compatible build.
-    let mut seen: alloc::collections::BTreeSet<*const ()> = alloc::collections::BTreeSet::new();
-    result
-        .into_iter()
-        .filter(|func| {
-            let ptr = Arc::as_ptr(func).cast::<()>();
-            seen.insert(ptr)
-        })
-        .collect()
+) -> ExpressionCalls<CreateFunction> {
+    let mut sites = Vec::new();
+    let ControlFlow::<Infallible>::Continue(()) = for_each_call(expression, |call| {
+        sites.push(scope.reached_by(call.name, call.arguments).cloned().collect());
+        ControlFlow::Continue(())
+    });
+    ExpressionCalls::new(sites)
 }
 
 #[cfg(test)]
 mod tests {
-    //! These tests exercise `functions_in_expression` indirectly by parsing
-    //! schemas whose CHECK constraints reference user-defined functions in
-    //! the shapes that drive the un-tested branches: no-arg calls, nested
-    //! calls, and call-twice-dedup.
+    //! These tests exercise `calls_in_expression` directly on parsed
+    //! expressions, and indirectly through the CHECK constraints of parsed
+    //! schemas.
 
-    use alloc::sync::Arc;
+    use alloc::{borrow::ToOwned, string::String, sync::Arc, vec::Vec};
 
     use sqlparser::{
-        ast::{Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction, SetExpr, Statement},
+        ast::{
+            Expr, Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction, SetExpr, Statement,
+        },
         dialect::{GenericDialect, SQLiteDialect},
         parser::Parser,
     };
@@ -311,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn in_subqueries_only_read_the_outer_expression() {
+    fn in_subqueries_are_read_with_the_outer_expression() {
         let sql = "
             CREATE FUNCTION outside_fn(x INT) RETURNS BOOLEAN AS 'SELECT TRUE';
             CREATE FUNCTION inside_fn(x INT) RETURNS INT AS 'SELECT $1';
@@ -329,7 +252,38 @@ mod tests {
             table.check_constraints(&db).expect("constraints resolve").next().expect("check");
         let metadata = db.check_constraint_metadata(check).expect("metadata resolves");
         let names: Vec<&str> = metadata.functions().map(FunctionLike::name).collect();
-        assert_eq!(names, vec!["outside_fn"]);
+        assert_eq!(names, vec!["outside_fn", "inside_fn"]);
+    }
+
+    /// Every expression form holding a call is walked, subqueries and their
+    /// own clauses included, and a relation is a call only with arguments.
+    #[test]
+    fn calls_are_found_at_any_depth() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT $1';
+             CREATE FUNCTION g(x INT) RETURNS INT AS 'SELECT $1';
+             CREATE FUNCTION rows_of(x INT) RETURNS SETOF INT AS 'SELECT $1';",
+        )
+        .expect("function declarations parse");
+        let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
+        let scope = scope(&functions);
+        let cases: [(&str, &[&str]); 12] = [
+            ("a = ANY(ARRAY[f(a)])", &["f"]),
+            ("a = ANY(f(a))", &["f"]),
+            ("EXISTS (SELECT 1 FROM m WHERE f(m.a) = 1)", &["f"]),
+            ("EXISTS (SELECT f(m.a) FROM m)", &["f"]),
+            ("a = (SELECT max(g(b)) FROM m GROUP BY f(c) HAVING f(d) > 0)", &["max", "g", "f"]),
+            ("CASE WHEN f(a) > 0 THEN g(a) ELSE 0 END = 1", &["f", "g"]),
+            ("COALESCE(f(a), 0) = 1", &["coalesce", "f"]),
+            ("a IN (SELECT g(b) FROM m)", &["g"]),
+            ("EXISTS (SELECT 1 FROM rows_of(g(a)) AS r)", &["rows_of", "g"]),
+            ("EXISTS (SELECT 1 FROM m, LATERAL rows_of(m.a) AS r)", &["rows_of"]),
+            ("EXISTS (SELECT 1 FROM m JOIN n ON f(m.a) = n.a)", &["f"]),
+            ("EXISTS (SELECT 1 FROM m)", &[]),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(reached_names(&expression(sql), &scope), expected, "{sql}");
+        }
     }
 
     #[test]
@@ -348,21 +302,17 @@ mod tests {
         for (sql, expected) in [
             ("SELECT * FROM t WHERE a IN u", vec![]),
             ("SELECT * FROM t WHERE f(a) IN u", vec!["f"]),
-            ("SELECT * FROM t WHERE f(a) IN json_each(b)", vec!["f", "json_each"]),
-            ("SELECT * FROM t WHERE f(a) NOT IN json_each(g(b), a)", vec!["f", "json_each", "g"]),
+            ("SELECT * FROM t WHERE f(a) IN json_each(b)", vec!["json_each", "f"]),
+            ("SELECT * FROM t WHERE f(a) NOT IN json_each(g(b), a)", vec!["json_each", "f", "g"]),
             ("SELECT * FROM t WHERE a IN json_each()", vec!["json_each"]),
             ("SELECT * FROM t WHERE f(a) IN f(f(b))", vec!["f"]),
-            ("SELECT * FROM t WHERE f(a) IN json_each((SELECT g(b)))", vec!["f", "json_each"]),
+            ("SELECT * FROM t WHERE f(a) IN json_each((SELECT g(b)))", vec!["json_each", "f", "g"]),
         ] {
             let statements = Parser::parse_sql(&SQLiteDialect {}, sql).expect("query parses");
             let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
             let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
-            let calls = super::functions_in_expression(
-                select.selection.as_ref().expect("a predicate"),
-                &scope,
-            );
-            let names: Vec<_> = calls.iter().map(|function| function.name()).collect();
-            assert_eq!(names, expected, "{sql}");
+            let predicate = select.selection.as_ref().expect("a predicate");
+            assert_eq!(reached_names(predicate, &scope), expected, "{sql}");
         }
     }
 
@@ -383,15 +333,23 @@ mod tests {
             ("ARRAY(SELECT 1) IN UNNEST(g(b))", &["g"]),
         ];
         for (sql, expected) in cases {
-            let expression = Parser::new(&GenericDialect {})
-                .try_with_sql(sql)
-                .expect("expression tokenizes")
-                .parse_expr()
-                .expect("expression parses");
-            let calls = super::functions_in_expression(&expression, &scope);
-            let names: Vec<_> = calls.iter().map(|function| function.name()).collect();
-            assert_eq!(names, expected, "{sql}");
+            assert_eq!(reached_names(&expression(sql), &scope), expected, "{sql}");
         }
+    }
+
+    /// Parses `sql` as a standalone expression.
+    fn expression(sql: &str) -> Expr {
+        Parser::new(&GenericDialect {})
+            .try_with_sql(sql)
+            .expect("expression tokenizes")
+            .parse_expr()
+            .expect("expression parses")
+    }
+
+    /// The names of the functions the calls in `expression` reach, each once.
+    fn reached_names(expression: &Expr, scope: &super::CallScope<'_>) -> Vec<String> {
+        let calls = super::calls_in_expression(expression, scope);
+        calls.functions().map(|function| function.name().to_owned()).collect()
     }
 
     /// A call whose name is built at run time matches no declaration, since

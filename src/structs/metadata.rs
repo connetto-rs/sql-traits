@@ -12,6 +12,8 @@ mod function_metadata;
 pub use function_metadata::FunctionMetadata;
 mod check_metadata;
 pub use check_metadata::CheckMetadata;
+mod expression_calls;
+pub use expression_calls::ExpressionCalls;
 mod policy_metadata;
 pub use policy_metadata::PolicyMetadata;
 mod view_metadata;

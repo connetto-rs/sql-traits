@@ -23,7 +23,7 @@ use sql_traits::{
 use sqlparser::{
     ast::{
         Action, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
-        CreateRuleAction, CreateRuleEvent, Expr, FunctionBehavior, FunctionCalledOnNull,
+        CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, Statement,
         TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
@@ -777,6 +777,14 @@ impl CheckConstraintLike for MemoryCheckConstraint {
     ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
         Ok(core::iter::empty())
     }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        _call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        Ok(core::iter::empty())
+    }
 }
 
 impl FunctionLike for MemoryFunction {
@@ -1043,6 +1051,15 @@ impl PolicyLike for MemoryPolicy {
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction>, LookupError> {
         Ok(core::iter::empty())
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction>, LookupError> {
+        // The policy holds no expression, so no call is one of its nodes.
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
     }
 }
 

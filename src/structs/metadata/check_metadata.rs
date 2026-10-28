@@ -4,6 +4,7 @@ use alloc::{sync::Arc, vec::Vec};
 
 use sqlparser::ast::Expr;
 
+use super::ExpressionCalls;
 use crate::traits::{CheckConstraintLike, DatabaseLike};
 
 #[derive(Debug, Clone)]
@@ -15,8 +16,8 @@ pub struct CheckMetadata<U: CheckConstraintLike> {
     table: Arc<<U::DB as DatabaseLike>::Table>,
     /// The columns involved in the constraint.
     columns: Vec<Arc<<U::DB as DatabaseLike>::Column>>,
-    /// The functions involved in the constraint.
-    functions: Vec<Arc<<U::DB as DatabaseLike>::Function>>,
+    /// The calls of the constraint's expression.
+    calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
 }
 
 impl<U: CheckConstraintLike> CheckMetadata<U> {
@@ -26,9 +27,9 @@ impl<U: CheckConstraintLike> CheckMetadata<U> {
         expression: Expr,
         table: Arc<<U::DB as DatabaseLike>::Table>,
         columns: Vec<Arc<<U::DB as DatabaseLike>::Column>>,
-        functions: Vec<Arc<<U::DB as DatabaseLike>::Function>>,
+        calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
     ) -> Self {
-        Self { expression, table, columns, functions }
+        Self { expression, table, columns, calls }
     }
 
     /// Returns a reference to the expression defining the constraint.
@@ -91,7 +92,14 @@ impl<U: CheckConstraintLike> CheckMetadata<U> {
     /// ```
     #[inline]
     pub fn functions(&self) -> impl Iterator<Item = &<U::DB as DatabaseLike>::Function> {
-        self.functions.iter().map(core::convert::AsRef::as_ref)
+        self.calls.functions()
+    }
+
+    /// Returns the calls of the constraint's expression.
+    #[must_use]
+    #[inline]
+    pub fn calls(&self) -> &ExpressionCalls<<U::DB as DatabaseLike>::Function> {
+        &self.calls
     }
 
     /// Re-points every cached function still referencing the allocation
@@ -106,10 +114,6 @@ impl<U: CheckConstraintLike> CheckMetadata<U> {
         stale: &Arc<<U::DB as DatabaseLike>::Function>,
         fresh: &Arc<<U::DB as DatabaseLike>::Function>,
     ) {
-        for slot in &mut self.functions {
-            if Arc::ptr_eq(slot, stale) {
-                *slot = Arc::clone(fresh);
-            }
-        }
+        self.calls.replace_function(stale, fresh);
     }
 }

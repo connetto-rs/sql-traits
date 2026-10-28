@@ -228,6 +228,14 @@ pub enum LookupError {
         /// Name of the column that was not found.
         column_name: String,
     },
+    /// A call handed to a per-call resolver is not a node of the expressions
+    /// the queried object holds, for instance because it was borrowed from a
+    /// copy of them.
+    #[error("Call `{call}` is not a node of the queried object's expressions.")]
+    CallNotInExpression {
+        /// The call as rendered by sqlparser.
+        call: String,
+    },
 }
 
 /// Why a text could not be read back as a target name by
