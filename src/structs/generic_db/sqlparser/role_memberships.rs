@@ -189,21 +189,21 @@ pub(super) fn revoke_role(
     Ok(())
 }
 
-/// What a revoke does to one grant of the revoked role.
+/// What a revoke changes in one grant of the revoked role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Revocation {
-    Keep,
+enum Change {
     Clear(MembershipOption),
     Delete,
 }
 
 /// One grant of the revoked role, by its membership's position in the
-/// builder and its own position in that membership.
+/// builder and its own position in that membership, with the change planned
+/// for it, if any.
 #[derive(Debug, Clone, Copy)]
 struct PlannedGrant {
     membership: usize,
     grant: usize,
-    revocation: Revocation,
+    change: Option<Change>,
 }
 
 /// Plans the revoke of `role` from each of `members` over every grant of
@@ -222,7 +222,7 @@ fn plan_revoke(
         .filter(|(_, (membership, ()))| idents_match(&membership.role, role))
         .flat_map(|(membership, (granted, ()))| {
             (0..granted.grants.len())
-                .map(move |grant| PlannedGrant { membership, grant, revocation: Revocation::Keep })
+                .map(move |grant| PlannedGrant { membership, grant, change: None })
         })
         .collect();
     for member in members {
@@ -235,7 +235,7 @@ fn plan_revoke(
         };
         match option {
             Some(cleared @ (MembershipOption::Inherit | MembershipOption::Set)) => {
-                rows[index].revocation = Revocation::Clear(cleared);
+                rows[index].change = Some(Change::Clear(cleared));
             }
             Some(MembershipOption::Admin) => {
                 plan_recursive_revoke(memberships, &mut rows, index, true, cascade, role)?;
@@ -257,28 +257,25 @@ fn plan_recursive_revoke(
     cascade: bool,
     role: &Ident,
 ) -> Result<(), Error> {
-    match rows[index].revocation {
-        Revocation::Delete => return Ok(()),
-        Revocation::Clear(MembershipOption::Admin) if admin_only => return Ok(()),
-        _ => {}
+    // A deletion is final, even where a later member's visit asks for less.
+    if rows[index].change == Some(Change::Delete) {
+        return Ok(());
     }
     let (membership, grant) = planned(memberships, &rows[index]);
     if !admin_only {
-        rows[index].revocation = Revocation::Delete;
+        rows[index].change = Some(Change::Delete);
     }
     if !grant.admin {
         return Ok(());
     }
     if admin_only {
-        rows[index].revocation = Revocation::Clear(MembershipOption::Admin);
+        rows[index].change = Some(Change::Clear(MembershipOption::Admin));
     }
 
     let member = &membership.member;
     let still_admin = rows.iter().any(|row| {
         let (other, other_grant) = planned(memberships, row);
-        row.revocation == Revocation::Keep
-            && other_grant.admin
-            && idents_match(&other.member, member)
+        row.change.is_none() && other_grant.admin && idents_match(&other.member, member)
     });
     if still_admin {
         return Ok(());
@@ -286,7 +283,7 @@ fn plan_recursive_revoke(
     // Indexed because each recursion replans rows this loop has yet to reach.
     for dependent in 0..rows.len() {
         let (_, dependent_grant) = planned(memberships, &rows[dependent]);
-        if rows[dependent].revocation == Revocation::Delete
+        if rows[dependent].change == Some(Change::Delete)
             || !dependent_grant
                 .grantor
                 .as_ref()
@@ -321,15 +318,14 @@ fn apply_revoke(builder: &mut ParserDBBuilder, rows: &[PlannedGrant]) {
     let mut emptied = false;
     // Rows run in ascending grant order within a membership, so walking them
     // backwards removes each grant before the ones ahead of it shift.
-    for row in rows.iter().rev().filter(|row| row.revocation != Revocation::Keep) {
+    for (row, change) in rows.iter().rev().filter_map(|row| Some((row, row.change?))) {
         let membership = Arc::make_mut(&mut memberships[row.membership].0);
         let grant = &mut membership.grants[row.grant];
-        match row.revocation {
-            Revocation::Keep => {}
-            Revocation::Clear(MembershipOption::Admin) => grant.admin = false,
-            Revocation::Clear(MembershipOption::Inherit) => grant.inherit = false,
-            Revocation::Clear(MembershipOption::Set) => grant.set = false,
-            Revocation::Delete => {
+        match change {
+            Change::Clear(MembershipOption::Admin) => grant.admin = false,
+            Change::Clear(MembershipOption::Inherit) => grant.inherit = false,
+            Change::Clear(MembershipOption::Set) => grant.set = false,
+            Change::Delete => {
                 membership.grants.remove(row.grant);
                 emptied |= membership.grants.is_empty();
             }

@@ -750,6 +750,24 @@ fn revoke_cascade_removes_dependent_grants() {
     assert_eq!(memberships_of(&database, "other"), [membership("parent", true, true, true)]);
 }
 
+/// A grant `CASCADE` deletes stays deleted when the statement also names its
+/// member for less, as PostgreSQL's revoke planning keeps it, over a
+/// self-granted `ADMIN` that only this model accepts.
+#[test]
+fn revoke_cascade_deletion_outlasts_a_later_option_revoke() {
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE g;
+         CREATE ROLE b;
+         GRANT parent TO g WITH ADMIN TRUE GRANTED BY g;
+         GRANT parent TO b WITH ADMIN TRUE GRANTED BY g;
+         REVOKE ADMIN OPTION FOR parent FROM g, b GRANTED BY g CASCADE;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(database.role_memberships().count(), 0);
+}
+
 /// A member keeping `ADMIN` through another grantor's grant strands nothing,
 /// and `INHERIT` and `SET` back no grant, as measured on PostgreSQL 18.
 #[test]
