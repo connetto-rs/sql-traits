@@ -81,6 +81,7 @@ fn a_foreign_table_keeps_its_columns_checks_server_and_options() {
 
     let source = remote.foreign_source(&db).expect("held").expect("a foreign table names a server");
     assert_eq!(source.server_name(), "warehouse");
+    assert!(!source.server_name_is_quoted());
     assert_eq!(
         source.options(),
         [
@@ -88,6 +89,19 @@ fn a_foreign_table_keeps_its_columns_checks_server_and_options() {
             ("Table_Name".to_string(), "Orders".to_string())
         ]
     );
+    // A reference to a foreign table answers as the table does.
+    assert_eq!(
+        <&CreateTable as TableLike>::foreign_source(&remote, &db).expect("held"),
+        Some(source)
+    );
+
+    let quoted = self::db("CREATE FOREIGN TABLE remote (id INT) SERVER \"Warehouse\";");
+    let quoted_source = foreign(&quoted, "remote")
+        .foreign_source(&quoted)
+        .expect("held")
+        .expect("a foreign table names a server");
+    assert!(quoted_source.server_name_is_quoted());
+    assert_eq!(quoted_source.stored_server_name(), "Warehouse");
 }
 
 #[test]
@@ -102,10 +116,12 @@ fn a_grant_on_a_foreign_table_resolves_to_it() {
     assert_eq!(grants.len(), 2);
     for grant in &grants {
         assert!(grant.applies_to_table(remote, &db));
+        let relations: Vec<_> = grant.relations(&db).collect();
         assert!(matches!(
-            grant.relations(&db).collect::<Vec<_>>().as_slice(),
+            relations.as_slice(),
             [Relation::ForeignTable(table)] if *table == remote
         ));
+        assert!(format!("{relations:?}").starts_with("[ForeignTable("));
         // A foreign table is no table, so the narrower question omits it.
         assert_eq!(grant.tables(&db).count(), 0);
     }
@@ -182,6 +198,10 @@ fn a_foreign_table_refuses_constraints_enforced_against_stored_rows() {
         ("CREATE FOREIGN TABLE f (id INT, PRIMARY KEY (id)) SERVER s;", KeyConstraint::PrimaryKey),
         ("CREATE FOREIGN TABLE f (id INT UNIQUE) SERVER s;", KeyConstraint::Unique),
         ("CREATE FOREIGN TABLE f (id INT, UNIQUE (id)) SERVER s;", KeyConstraint::Unique),
+        (
+            "CREATE FOREIGN TABLE f (id INT, EXCLUDE USING gist (id WITH =)) SERVER s;",
+            KeyConstraint::Exclusion,
+        ),
         (
             "CREATE FOREIGN TABLE f (id INT REFERENCES parent (id)) SERVER s;",
             KeyConstraint::ForeignKey,
@@ -339,12 +359,20 @@ fn drop_schema_counts_and_cascades_to_a_foreign_table() {
 
 #[test]
 fn a_foreign_table_keeps_its_identity_and_its_columns_are_reachable_by_identity() {
-    let db = db(REMOTE);
+    let db = db(&format!(
+        "{REMOTE} CREATE TABLE local (id INT); CREATE MATERIALIZED VIEW m AS SELECT 1 AS one;"
+    ));
     let remote = foreign(&db, "remote");
     let identity = db.table_identity(remote).expect("held");
     assert_eq!(db.foreign_table_by_identity(identity), Some(remote));
     assert_eq!(db.table_by_identity(identity), None);
     assert_eq!(db.table_id(remote), None);
+    let local = db.tables().next().expect("one table");
+    assert_eq!(db.foreign_table_by_identity(db.table_identity(local).expect("held")), None);
+    // The stored-identity lookup answers for tables alone, whatever else holds
+    // the name.
+    assert_eq!(db.table_by_stored_identity(None, "remote"), None);
+    assert_eq!(db.table_by_stored_identity(None, "m"), None);
 
     let column = remote.columns(&db).expect("held").next().expect("a column");
     let column_identity = db.column_identity(column).expect("held");
