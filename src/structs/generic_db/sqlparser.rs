@@ -7757,6 +7757,9 @@ impl ParserDB {
                         &role_alterations,
                     )?;
                 }
+                Statement::RevokeRole(revoke) => {
+                    role_memberships::revoke_role(&mut builder, &revoke, access_resolution)?;
+                }
                 Statement::CreateSchema { schema_name, if_not_exists, .. } => {
                     if let SchemaName::Simple(name) | SchemaName::NamedAuthorization(name, _) =
                         &schema_name

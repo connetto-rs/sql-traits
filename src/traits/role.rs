@@ -254,7 +254,7 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
 
     /// Returns the memberships this role holds, one for each role it was
     /// granted, whether by `GRANT role TO role` or by a membership clause of
-    /// `CREATE ROLE`.
+    /// `CREATE ROLE`, and not since revoked by `REVOKE role FROM role`.
     ///
     /// A membership may name a granted role the database does not hold, as a
     /// schema checked under an open world may.
