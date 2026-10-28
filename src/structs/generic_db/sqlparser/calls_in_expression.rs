@@ -110,10 +110,12 @@ mod tests {
     //! expressions, and indirectly through the CHECK constraints of parsed
     //! schemas.
 
-    use alloc::sync::Arc;
+    use alloc::{borrow::ToOwned, string::String, sync::Arc, vec::Vec};
 
     use sqlparser::{
-        ast::{Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction, SetExpr, Statement},
+        ast::{
+            Expr, Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction, SetExpr, Statement,
+        },
         dialect::{GenericDialect, SQLiteDialect},
         parser::Parser,
     };
@@ -279,14 +281,7 @@ mod tests {
             ("EXISTS (SELECT 1 FROM m)", &[]),
         ];
         for (sql, expected) in cases {
-            let expression = Parser::new(&GenericDialect {})
-                .try_with_sql(sql)
-                .expect("expression tokenizes")
-                .parse_expr()
-                .expect("expression parses");
-            let calls = super::calls_in_expression(&expression, &scope);
-            let names: Vec<_> = calls.functions().map(FunctionLike::name).collect();
-            assert_eq!(names, expected, "{sql}");
+            assert_eq!(reached_names(&expression(sql), &scope), expected, "{sql}");
         }
     }
 
@@ -315,10 +310,8 @@ mod tests {
             let statements = Parser::parse_sql(&SQLiteDialect {}, sql).expect("query parses");
             let Statement::Query(query) = &statements[0] else { panic!("expected a query") };
             let SetExpr::Select(select) = query.body.as_ref() else { panic!("expected a select") };
-            let calls =
-                super::calls_in_expression(select.selection.as_ref().expect("a predicate"), &scope);
-            let names: Vec<_> = calls.functions().map(FunctionLike::name).collect();
-            assert_eq!(names, expected, "{sql}");
+            let predicate = select.selection.as_ref().expect("a predicate");
+            assert_eq!(reached_names(predicate, &scope), expected, "{sql}");
         }
     }
 
@@ -339,15 +332,23 @@ mod tests {
             ("ARRAY(SELECT 1) IN UNNEST(g(b))", &["g"]),
         ];
         for (sql, expected) in cases {
-            let expression = Parser::new(&GenericDialect {})
-                .try_with_sql(sql)
-                .expect("expression tokenizes")
-                .parse_expr()
-                .expect("expression parses");
-            let calls = super::calls_in_expression(&expression, &scope);
-            let names: Vec<_> = calls.functions().map(FunctionLike::name).collect();
-            assert_eq!(names, expected, "{sql}");
+            assert_eq!(reached_names(&expression(sql), &scope), expected, "{sql}");
         }
+    }
+
+    /// Parses `sql` as a standalone expression.
+    fn expression(sql: &str) -> Expr {
+        Parser::new(&GenericDialect {})
+            .try_with_sql(sql)
+            .expect("expression tokenizes")
+            .parse_expr()
+            .expect("expression parses")
+    }
+
+    /// The names of the functions the calls in `expression` reach, each once.
+    fn reached_names(expression: &Expr, scope: &super::CallScope<'_>) -> Vec<String> {
+        let calls = super::calls_in_expression(expression, scope);
+        calls.functions().map(|function| function.name().to_owned()).collect()
     }
 
     /// A call whose name is built at run time matches no declaration, since
