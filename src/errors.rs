@@ -2029,6 +2029,11 @@ mod tests {
         assert_eq!(RequiredValue::EnforcedByParent.to_string(), "a parent requires it");
         assert_eq!(FixedPersistence::Temporary.to_string(), "it is temporary");
         assert_eq!(FixedPersistence::Partitioned.to_string(), "it is partitioned");
+        assert_eq!(KeyConstraint::PrimaryKey.to_string(), "Primary key");
+        assert_eq!(KeyConstraint::Unique.to_string(), "Unique");
+        assert_eq!(KeyConstraint::ForeignKey.to_string(), "Foreign key");
+        assert_eq!(KeyConstraint::Exclusion.to_string(), "Exclusion");
+        assert_eq!(ObjectKind::ForeignTable.to_string(), "Foreign table");
     }
 
     #[test]
