@@ -1,7 +1,5 @@
 //! The kind of a function, as PostgreSQL's `pg_proc.prokind` records it.
 
-use core::fmt::{Display, Formatter, Result as FmtResult};
-
 /// What a call of the function computes, mirroring `pg_proc.prokind`.
 ///
 /// The kind decides how a call behaves over the rows it is evaluated on. An
@@ -44,14 +42,4 @@ pub enum FunctionKind {
     /// `prokind = 'w'`, a window function computing one value per row of its
     /// window.
     Window,
-}
-
-impl Display for FunctionKind {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.write_str(match self {
-            Self::Normal => "a normal function",
-            Self::Aggregate => "an aggregate function",
-            Self::Window => "a window function",
-        })
-    }
 }

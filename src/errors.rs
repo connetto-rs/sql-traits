@@ -1277,7 +1277,9 @@ pub enum Error {
         /// Name of the function whose signature is repeated.
         function_name: String,
     },
-    #[error("Cannot change routine kind: `{function_name}` is {kind}.")]
+    #[error(
+        "Cannot change routine kind: `{function_name}` is an aggregate or window function, which `CREATE OR REPLACE FUNCTION` cannot replace."
+    )]
     /// Error indicating that a `CREATE OR REPLACE FUNCTION` statement would
     /// replace an aggregate or a window function.
     ///
