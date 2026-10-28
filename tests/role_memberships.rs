@@ -1,5 +1,6 @@
 //! Role memberships, from `GRANT role TO role` and from the membership
-//! clauses of `CREATE ROLE`, with the options PostgreSQL 16 gives each one.
+//! clauses of `CREATE ROLE`, with the options PostgreSQL 16 gives each one,
+//! and their removal by `REVOKE role FROM role`.
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
@@ -18,8 +19,11 @@ fn open_world(sql: &str) -> Result<ParserDB, Error> {
         .parse::<PostgreSqlDialect>(sql)
 }
 
-/// The memberships `member` holds, as `(role, admin, inherit, set)`.
-fn memberships_of(database: &ParserDB, member: &str) -> Vec<(String, bool, bool, bool)> {
+/// A membership as `(role, admin, inherit, set)`.
+type Membership = (String, bool, bool, bool);
+
+/// The memberships `member` holds.
+fn memberships_of(database: &ParserDB, member: &str) -> Vec<Membership> {
     database
         .role(member)
         .expect("the member resolves")
@@ -35,7 +39,7 @@ fn memberships_of(database: &ParserDB, member: &str) -> Vec<(String, bool, bool,
         .collect()
 }
 
-fn membership(role: &str, admin: bool, inherit: bool, set: bool) -> (String, bool, bool, bool) {
+fn membership(role: &str, admin: bool, inherit: bool, set: bool) -> Membership {
     (role.to_owned(), admin, inherit, set)
 }
 
@@ -602,4 +606,249 @@ fn mysql_account_grantee_records_nothing() {
     .expect("schema builds");
 
     assert_eq!(database.role_memberships().count(), 0);
+}
+
+/// Measured on PostgreSQL 18 through `pg_auth_members`.
+#[test]
+fn revoke_removes_every_named_membership() {
+    let database = parse(
+        "CREATE ROLE a;
+         CREATE ROLE b;
+         CREATE ROLE kept;
+         CREATE ROLE x;
+         CREATE ROLE y;
+         GRANT a, b, kept TO x, y;
+         REVOKE a, b FROM x, y;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(memberships_of(&database, "x"), [membership("kept", false, true, true)]);
+    assert_eq!(memberships_of(&database, "y"), [membership("kept", false, true, true)]);
+}
+
+/// `OPTION FOR` clears that option and keeps the membership, as measured on
+/// PostgreSQL 18.
+#[test]
+fn revoke_option_for_clears_only_that_option() {
+    for (option, expected) in [
+        ("ADMIN", membership("parent", false, true, true)),
+        ("INHERIT", membership("parent", true, false, true)),
+        ("set", membership("parent", true, true, false)),
+    ] {
+        let database = parse(&format!(
+            "CREATE ROLE parent;
+             CREATE ROLE child;
+             GRANT parent TO child WITH ADMIN TRUE;
+             REVOKE {option} OPTION FOR parent FROM child;"
+        ))
+        .expect("schema builds");
+
+        assert_eq!(memberships_of(&database, "child"), [expected], "{option} OPTION FOR");
+    }
+}
+
+/// `GRANTED BY` revokes that grantor's grant and leaves the others, as
+/// measured on PostgreSQL 18.
+#[test]
+fn revoke_granted_by_removes_that_grantors_grant() {
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE child;
+         CREATE ROLE g;
+         GRANT parent TO g WITH ADMIN TRUE;
+         GRANT parent TO child WITH ADMIN TRUE GRANTED BY g;
+         GRANT parent TO child WITH SET FALSE;
+         REVOKE parent FROM child GRANTED BY G;",
+    )
+    .expect("schema builds");
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, false)]);
+
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE child;
+         CREATE ROLE g;
+         GRANT parent TO g WITH ADMIN TRUE;
+         GRANT parent TO child GRANTED BY g;
+         REVOKE parent FROM child;",
+    )
+    .expect("schema builds");
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, true)]);
+}
+
+/// PostgreSQL 18 answers a revoke naming no recorded grant with a warning
+/// and changes nothing.
+#[test]
+fn revoke_of_an_absent_grant_changes_nothing() {
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE child;
+         CREATE ROLE other;
+         REVOKE parent FROM child;
+         GRANT parent TO child;
+         REVOKE parent FROM other;
+         REVOKE ADMIN OPTION FOR parent FROM other;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, true)]);
+    assert_eq!(memberships_of(&database, "other"), [] as [Membership; 0]);
+}
+
+/// A grant the member made with its `ADMIN` option depends on it, and
+/// PostgreSQL 18 refuses to take that option away without `CASCADE`, with
+/// `dependent privileges exist`.
+#[test]
+fn revoke_refuses_to_strand_dependent_grants() {
+    for revoke in [
+        "REVOKE parent FROM admin",
+        "REVOKE parent FROM admin RESTRICT",
+        "REVOKE ADMIN OPTION FOR parent FROM admin",
+    ] {
+        let error = parse(&format!(
+            "CREATE ROLE parent;
+             CREATE ROLE admin;
+             CREATE ROLE child;
+             GRANT parent TO admin WITH ADMIN TRUE;
+             GRANT parent TO child GRANTED BY admin;
+             {revoke};"
+        ))
+        .expect_err("child's grant depends on admin's");
+
+        assert!(
+            matches!(
+                &error,
+                Error::DependentRoleMemberships { role_name, member_name }
+                    if role_name == "parent" && member_name == "admin"
+            ),
+            "{revoke}: {error:?}"
+        );
+    }
+}
+
+/// `CASCADE` follows the dependent grants down the chain of grantors, as
+/// measured on PostgreSQL 18.
+#[test]
+fn revoke_cascade_removes_dependent_grants() {
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE admin;
+         CREATE ROLE deputy;
+         CREATE ROLE child;
+         CREATE ROLE other;
+         GRANT parent TO admin WITH ADMIN TRUE;
+         GRANT parent TO other WITH ADMIN TRUE;
+         GRANT parent TO deputy WITH ADMIN TRUE GRANTED BY admin;
+         GRANT parent TO child GRANTED BY deputy;
+         GRANT parent TO child GRANTED BY other;
+         REVOKE ADMIN OPTION FOR parent FROM admin CASCADE;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(memberships_of(&database, "admin"), [membership("parent", false, true, true)]);
+    assert_eq!(memberships_of(&database, "deputy"), [] as [Membership; 0]);
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, true)]);
+    assert_eq!(memberships_of(&database, "other"), [membership("parent", true, true, true)]);
+}
+
+/// A grant `CASCADE` deletes stays deleted when the statement also names its
+/// member for less, as PostgreSQL's revoke planning keeps it, over a
+/// self-granted `ADMIN` that only this model accepts.
+#[test]
+fn revoke_cascade_deletion_outlasts_a_later_option_revoke() {
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE g;
+         CREATE ROLE b;
+         GRANT parent TO g WITH ADMIN TRUE GRANTED BY g;
+         GRANT parent TO b WITH ADMIN TRUE GRANTED BY g;
+         REVOKE ADMIN OPTION FOR parent FROM g, b GRANTED BY g CASCADE;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(database.role_memberships().count(), 0);
+}
+
+/// A member keeping `ADMIN` through another grantor's grant strands nothing,
+/// and `INHERIT` and `SET` back no grant, as measured on PostgreSQL 18.
+#[test]
+fn revoke_keeps_grants_still_backed_by_admin() {
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE admin;
+         CREATE ROLE child;
+         CREATE ROLE g;
+         GRANT parent TO g WITH ADMIN TRUE;
+         GRANT parent TO admin WITH ADMIN TRUE;
+         GRANT parent TO admin WITH ADMIN TRUE GRANTED BY g;
+         GRANT parent TO child GRANTED BY admin;
+         REVOKE INHERIT OPTION FOR parent FROM admin GRANTED BY g;
+         REVOKE SET OPTION FOR parent FROM admin GRANTED BY g;
+         REVOKE parent FROM admin;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(memberships_of(&database, "admin"), [membership("parent", true, false, false)]);
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, true)]);
+}
+
+/// PostgreSQL 18 refuses an unknown option, an absent role and `PUBLIC` as it
+/// does in a grant.
+#[test]
+fn revoke_refuses_what_a_grant_refuses() {
+    let error = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE child;
+         GRANT parent TO child;
+         REVOKE FOO OPTION FOR parent FROM child;",
+    )
+    .expect_err("FOO is no role option");
+    assert!(matches!(error, Error::UnrecognizedRoleOption { option } if option == "FOO"));
+
+    for (revoke, absent) in [
+        ("REVOKE nobody FROM child", "nobody"),
+        ("REVOKE parent FROM nobody", "nobody"),
+        ("REVOKE parent FROM PUBLIC", "public"),
+        ("REVOKE public FROM child", "public"),
+    ] {
+        let error = parse(&format!("CREATE ROLE parent; CREATE ROLE child; {revoke};"))
+            .expect_err("the revoke names no role");
+        assert!(
+            matches!(&error, Error::RoleNotFoundForMembership { role_name } if role_name == absent),
+            "{revoke}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn open_world_revoke_removes_memberships_naming_undeclared_roles() {
+    let database = open_world(
+        "GRANT parent TO child;
+         GRANT other TO child;
+         REVOKE parent FROM child;
+         REVOKE parent FROM nobody;",
+    )
+    .expect("schema builds");
+
+    let recorded: Vec<_> = database
+        .role_memberships()
+        .map(|membership| (membership.role_name().to_owned(), membership.member_name().to_owned()))
+        .collect();
+    assert_eq!(recorded, [("other".to_owned(), "child".to_owned())]);
+}
+
+/// MySQL commits the open transaction before a definition, so a rollback
+/// leaves the membership revoked.
+#[test]
+fn mysql_role_revoke_commits_the_open_transaction() {
+    let database = ParserDB::parse::<MySqlDialect>(
+        "CREATE ROLE parent;
+         CREATE ROLE child;
+         GRANT parent TO child;
+         START TRANSACTION;
+         REVOKE parent FROM child;
+         ROLLBACK;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(memberships_of(&database, "child"), [] as [Membership; 0]);
 }

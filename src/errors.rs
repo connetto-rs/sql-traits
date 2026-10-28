@@ -799,9 +799,9 @@ pub enum Error {
     /// Error indicating that a role membership names a role that does not
     /// exist, as the granted role or as the member.
     ///
-    /// Covers `GRANT role TO role` and the `IN ROLE`, `IN GROUP`, `ROLE`,
-    /// `USER` and `ADMIN` clauses of `CREATE ROLE`. Like the other role
-    /// checks this one follows
+    /// Covers `GRANT role TO role`, `REVOKE role FROM role` and the
+    /// `IN ROLE`, `IN GROUP`, `ROLE`, `USER` and `ADMIN` clauses of
+    /// `CREATE ROLE`. Like the other role checks this one follows
     /// [`AccessResolution`](crate::structs::AccessResolution), except for
     /// `PUBLIC`, which names no role under either setting and which
     /// PostgreSQL refuses as `role "public" does not exist`.
@@ -809,12 +809,27 @@ pub enum Error {
         /// Name of the undefined role.
         role_name: String,
     },
-    #[error("Unrecognized role option `{option}` in a role membership grant.")]
-    /// Error indicating that `GRANT role TO role ... WITH` names an option
-    /// other than `ADMIN`, `INHERIT` and `SET`, which PostgreSQL refuses.
+    #[error("Unrecognized role option `{option}` in a role membership grant or revoke.")]
+    /// Error indicating that `GRANT role TO role ... WITH` or
+    /// `REVOKE option OPTION FOR role FROM role` names an option other than
+    /// `ADMIN`, `INHERIT` and `SET`, which PostgreSQL refuses.
     UnrecognizedRoleOption {
         /// The option as written.
         option: String,
+    },
+    #[error(
+        "Revoking role `{role_name}` from `{member_name}` strands the memberships `{member_name}` \
+         granted with its ADMIN option."
+    )]
+    /// Error indicating that `REVOKE role FROM role` without `CASCADE` takes
+    /// away the last `ADMIN` option the member holds on the role while
+    /// memberships it granted depend on it, which PostgreSQL refuses with
+    /// `dependent privileges exist`.
+    DependentRoleMemberships {
+        /// Name of the revoked role, as written.
+        role_name: String,
+        /// Name of the member losing the `ADMIN` option, as written.
+        member_name: String,
     },
     #[error("Table `{table_name}` not found for a grant or revoke.")]
     /// Error indicating that a grant or a revoke names a table that does not

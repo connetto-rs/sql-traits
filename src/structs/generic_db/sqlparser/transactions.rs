@@ -643,6 +643,7 @@ fn defines_schema(statement: &Statement) -> bool {
             | Statement::GrantRole(_)
             | Statement::Deny(_)
             | Statement::Revoke(_)
+            | Statement::RevokeRole(_)
             | Statement::CreateSequence { .. }
             | Statement::CreateDomain(_)
             | Statement::CreateType { .. }

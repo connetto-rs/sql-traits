@@ -1254,7 +1254,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
 
     /// Iterates over the role memberships recorded in the database, from
     /// `GRANT role TO role` and from the membership clauses of `CREATE ROLE`,
-    /// one for each granted role and member.
+    /// one for each granted role and member that `REVOKE role FROM role` has
+    /// not taken away.
     ///
     /// # Example
     ///

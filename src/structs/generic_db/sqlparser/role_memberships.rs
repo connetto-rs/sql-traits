@@ -1,5 +1,6 @@
 //! Role memberships, from `GRANT role TO role` and from the `IN ROLE`,
-//! `IN GROUP`, `ROLE`, `USER` and `ADMIN` clauses of `CREATE ROLE`.
+//! `IN GROUP`, `ROLE`, `USER` and `ADMIN` clauses of `CREATE ROLE`, and their
+//! removal by `REVOKE role FROM role`.
 //!
 //! PostgreSQL keeps one membership row for each granted role, member and
 //! grantor. A repeated grant from the same grantor changes only the options
@@ -10,8 +11,8 @@ use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::mem::take;
 
 use sqlparser::ast::{
-    CreateRole, GrantRole, Grantee, GranteeName, GranteesType, Ident, RoleGrantOption,
-    RoleGrantOptionValue, RoleOption,
+    CascadeOption, CreateRole, GrantRole, Grantee, GranteeName, GranteesType, Ident, RevokeRole,
+    RoleGrantOption, RoleGrantOptionValue, RoleOption,
 };
 
 use super::{
@@ -24,6 +25,26 @@ use crate::{
     traits::RoleLike,
     utils::identifier_resolution::{is_public_pseudo_role, normalize_identifier},
 };
+
+/// One of the options a membership grant carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MembershipOption {
+    Admin,
+    Inherit,
+    Set,
+}
+
+impl MembershipOption {
+    /// Reads an option name as PostgreSQL does, refusing any other name.
+    fn read(name: &Ident) -> Result<Self, Error> {
+        match normalize_identifier(&name.value, name.quote_style.is_some()).as_ref() {
+            "admin" => Ok(Self::Admin),
+            "inherit" => Ok(Self::Inherit),
+            "set" => Ok(Self::Set),
+            _ => Err(Error::UnrecognizedRoleOption { option: name.value.clone() }),
+        }
+    }
+}
 
 /// The options one grant writes, each `None` when the grant leaves it out.
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,16 +63,10 @@ impl WrittenOptions {
     fn read(options: &[RoleGrantOption]) -> Result<Self, Error> {
         let mut written = Self::default();
         for option in options {
-            let name = normalize_identifier(&option.name.value, option.name.quote_style.is_some());
-            let slot = match name.as_ref() {
-                "admin" => &mut written.admin,
-                "inherit" => &mut written.inherit,
-                "set" => &mut written.set,
-                _ => {
-                    return Err(Error::UnrecognizedRoleOption {
-                        option: option.name.value.clone(),
-                    });
-                }
+            let slot = match MembershipOption::read(&option.name)? {
+                MembershipOption::Admin => &mut written.admin,
+                MembershipOption::Inherit => &mut written.inherit,
+                MembershipOption::Set => &mut written.set,
             };
             *slot = Some(option.value != RoleGrantOptionValue::False);
         }
@@ -135,15 +150,7 @@ pub(super) fn grant_role(
     role_alterations: &[UndeclaredRoleAlteration],
 ) -> Result<(), Error> {
     let written = WrittenOptions::read(&grant.options)?;
-    let mut members = Vec::with_capacity(grant.grantees.len());
-    for grantee in &grant.grantees {
-        members.extend(grantee_member(grantee)?);
-    }
-    for role in grant.roles.iter().chain(members.iter().copied()) {
-        refuse_public(role)?;
-        require_role(builder, access_resolution, role)?;
-    }
-
+    let members = named_members(&grant.roles, &grant.grantees, builder, access_resolution)?;
     for role in &grant.roles {
         for member in &members {
             let inherits = member_inherits(builder, role_alterations, member);
@@ -151,6 +158,212 @@ pub(super) fn grant_role(
         }
     }
     Ok(())
+}
+
+/// Applies `REVOKE [option OPTION FOR] role [, ...] FROM grantee [, ...]` to
+/// the grant each named member holds from the grantor in `GRANTED BY`, or
+/// from no written grantor, one role after another as PostgreSQL does.
+///
+/// A revoke reaching no grant changes nothing, as PostgreSQL only warns.
+/// Taking away a member's last `ADMIN` option strands the grants it made,
+/// which only `CASCADE` revokes.
+pub(super) fn revoke_role(
+    builder: &mut ParserDBBuilder,
+    revoke: &RevokeRole,
+    access_resolution: AccessResolution,
+) -> Result<(), Error> {
+    let option = revoke.option_for.as_ref().map(MembershipOption::read).transpose()?;
+    let members = named_members(&revoke.roles, &revoke.grantees, builder, access_resolution)?;
+    let cascade = revoke.cascade == Some(CascadeOption::Cascade);
+    for role in &revoke.roles {
+        let rows = plan_revoke(
+            builder.role_memberships(),
+            role,
+            &members,
+            revoke.granted_by.as_ref(),
+            option,
+            cascade,
+        )?;
+        apply_revoke(builder, &rows);
+    }
+    Ok(())
+}
+
+/// What a revoke changes in one grant of the revoked role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Clear(MembershipOption),
+    Delete,
+}
+
+/// One grant of the revoked role, by its membership's position in the
+/// builder and its own position in that membership, with the change planned
+/// for it, if any.
+#[derive(Debug, Clone, Copy)]
+struct PlannedGrant {
+    membership: usize,
+    grant: usize,
+    change: Option<Change>,
+}
+
+/// Plans the revoke of `role` from each of `members` over every grant of
+/// `role`, following PostgreSQL's `plan_single_revoke`.
+fn plan_revoke(
+    memberships: &[(Arc<RoleMembership>, ())],
+    role: &Ident,
+    members: &[&Ident],
+    grantor: Option<&Ident>,
+    option: Option<MembershipOption>,
+    cascade: bool,
+) -> Result<Vec<PlannedGrant>, Error> {
+    let mut rows: Vec<PlannedGrant> = memberships
+        .iter()
+        .enumerate()
+        .filter(|(_, (membership, ()))| idents_match(&membership.role, role))
+        .flat_map(|(membership, (granted, ()))| {
+            (0..granted.grants.len())
+                .map(move |grant| PlannedGrant { membership, grant, change: None })
+        })
+        .collect();
+    for member in members {
+        let Some(index) = rows.iter().position(|row| {
+            let (membership, grant) = planned(memberships, row);
+            idents_match(&membership.member, member)
+                && same_grantor(grant.grantor.as_ref(), grantor)
+        }) else {
+            continue;
+        };
+        match option {
+            Some(cleared @ (MembershipOption::Inherit | MembershipOption::Set)) => {
+                rows[index].change = Some(Change::Clear(cleared));
+            }
+            Some(MembershipOption::Admin) => {
+                plan_recursive_revoke(memberships, &mut rows, index, true, cascade, role)?;
+            }
+            None => plan_recursive_revoke(memberships, &mut rows, index, false, cascade, role)?,
+        }
+    }
+    Ok(rows)
+}
+
+/// Plans taking away the grant at `index`, or only its `ADMIN` option, and
+/// with it the grants its member can no longer back, following
+/// PostgreSQL's `plan_recursive_revoke`.
+fn plan_recursive_revoke(
+    memberships: &[(Arc<RoleMembership>, ())],
+    rows: &mut [PlannedGrant],
+    index: usize,
+    admin_only: bool,
+    cascade: bool,
+    role: &Ident,
+) -> Result<(), Error> {
+    // A deletion is final, even where a later member's visit asks for less.
+    if rows[index].change == Some(Change::Delete) {
+        return Ok(());
+    }
+    let (membership, grant) = planned(memberships, &rows[index]);
+    if !admin_only {
+        rows[index].change = Some(Change::Delete);
+    }
+    if !grant.admin {
+        return Ok(());
+    }
+    if admin_only {
+        rows[index].change = Some(Change::Clear(MembershipOption::Admin));
+    }
+
+    let member = &membership.member;
+    let still_admin = rows.iter().any(|row| {
+        let (other, other_grant) = planned(memberships, row);
+        row.change.is_none() && other_grant.admin && idents_match(&other.member, member)
+    });
+    if still_admin {
+        return Ok(());
+    }
+    // Indexed because each recursion replans rows this loop has yet to reach.
+    for dependent in 0..rows.len() {
+        let (_, dependent_grant) = planned(memberships, &rows[dependent]);
+        if rows[dependent].change == Some(Change::Delete)
+            || !dependent_grant
+                .grantor
+                .as_ref()
+                .is_some_and(|grantor| idents_match(grantor, member))
+        {
+            continue;
+        }
+        if !cascade {
+            return Err(Error::DependentRoleMemberships {
+                role_name: role.value.clone(),
+                member_name: member.value.clone(),
+            });
+        }
+        plan_recursive_revoke(memberships, rows, dependent, false, cascade, role)?;
+    }
+    Ok(())
+}
+
+/// The membership and grant a planned row stands for.
+fn planned<'a>(
+    memberships: &'a [(Arc<RoleMembership>, ())],
+    row: &PlannedGrant,
+) -> (&'a RoleMembership, &'a MembershipGrant) {
+    let membership = memberships[row.membership].0.as_ref();
+    (membership, &membership.grants[row.grant])
+}
+
+/// Applies a planned revoke, dropping the memberships it leaves without a
+/// grant.
+fn apply_revoke(builder: &mut ParserDBBuilder, rows: &[PlannedGrant]) {
+    let memberships = builder.role_memberships_mut();
+    let mut emptied = false;
+    // Rows run in ascending grant order within a membership, so walking them
+    // backwards removes each grant before the ones ahead of it shift.
+    for (row, change) in rows.iter().rev().filter_map(|row| Some((row, row.change?))) {
+        let membership = Arc::make_mut(&mut memberships[row.membership].0);
+        let grant = &mut membership.grants[row.grant];
+        match change {
+            Change::Clear(MembershipOption::Admin) => grant.admin = false,
+            Change::Clear(MembershipOption::Inherit) => grant.inherit = false,
+            Change::Clear(MembershipOption::Set) => grant.set = false,
+            Change::Delete => {
+                membership.grants.remove(row.grant);
+                emptied |= membership.grants.is_empty();
+            }
+        }
+    }
+    if emptied {
+        memberships.retain(|(membership, ())| !membership.grants.is_empty());
+    }
+}
+
+/// Refuses `PUBLIC` and, under [`AccessResolution::ClosedWorld`], a role the
+/// input has not created, among the roles and grantees of a membership
+/// statement, and returns the members the grantees name.
+fn named_members<'a>(
+    roles: &[Ident],
+    grantees: &'a [Grantee],
+    builder: &ParserDBBuilder,
+    access_resolution: AccessResolution,
+) -> Result<Vec<&'a Ident>, Error> {
+    let mut members = Vec::with_capacity(grantees.len());
+    for grantee in grantees {
+        members.extend(grantee_member(grantee)?);
+    }
+    for role in roles.iter().chain(members.iter().copied()) {
+        refuse_public(role)?;
+        require_role(builder, access_resolution, role)?;
+    }
+    Ok(members)
+}
+
+/// Whether a grant's grantor is the one a statement names, a grant written
+/// without `GRANTED BY` matching only a statement written without it.
+fn same_grantor(granted_by: Option<&Ident>, grantor: Option<&Ident>) -> bool {
+    match (granted_by, grantor) {
+        (None, None) => true,
+        (Some(granted_by), Some(grantor)) => idents_match(granted_by, grantor),
+        _ => false,
+    }
 }
 
 /// Repoints every membership naming `previous`, as the granted role, the
@@ -288,14 +501,9 @@ fn record(
         });
     let membership = Arc::make_mut(&mut memberships[position].0);
 
-    let same_grantor = |grant: &&mut MembershipGrant| {
-        match (&grant.grantor, grantor) {
-            (None, None) => true,
-            (Some(granted_by), Some(grantor)) => idents_match(granted_by, grantor),
-            _ => false,
-        }
-    };
-    if let Some(grant) = membership.grants.iter_mut().find(same_grantor) {
+    if let Some(grant) =
+        membership.grants.iter_mut().find(|grant| same_grantor(grant.grantor.as_ref(), grantor))
+    {
         if let Some(admin) = written.admin {
             grant.admin = admin;
         }
