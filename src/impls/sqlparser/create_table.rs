@@ -278,6 +278,14 @@ impl TableLike for CreateTable {
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         Ok(table_metadata(self, database)?.owner())
     }
+
+    #[inline]
+    fn owner_privileges<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
+        Ok(table_metadata(self, database)?.owner_privileges())
+    }
 }
 
 #[cfg(test)]

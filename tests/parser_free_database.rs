@@ -524,6 +524,14 @@ impl TableLike for MemoryTable {
     fn owner<'db>(&self, _database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         Ok(None)
     }
+
+    /// This catalog records no owner, so no entry of the owner's is kept.
+    fn owner_privileges<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
+        Ok(core::iter::empty())
+    }
 }
 
 impl ColumnLike for MemoryColumn {

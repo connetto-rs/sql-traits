@@ -81,6 +81,7 @@ mod postgres_catalog;
 mod role_memberships;
 mod routine_privileges;
 mod rules;
+mod table_owner;
 mod transactions;
 mod view_rewrites;
 mod views;
@@ -4669,6 +4670,7 @@ impl ParserDB {
         metadata.set_rls_enabled(previous_metadata.rls_enabled());
         metadata.set_rls_forced(previous_metadata.rls_forced());
         metadata.set_owner(previous_metadata.owner().map(str::to_string));
+        metadata.set_owner_privileges(previous_metadata.take_owner_privileges());
         metadata.set_documentation(previous_metadata.take_documentation());
         // Which columns came from a parent is not spelled by the node, so it
         // has to survive the rebuild the way the other unspelled settings do.
@@ -7414,8 +7416,8 @@ impl ParserDB {
                                     Owner::Ident(ident) => Some(ident.clone()),
                                     _ => None,
                                 };
-                                let owner = match new_owner {
-                                    Owner::Ident(ident) => Some(stored_role_name(&ident)),
+                                let owner = match &new_owner {
+                                    Owner::Ident(ident) => Some(stored_role_name(ident)),
                                     // These name whoever runs the statement,
                                     // so the owner changed to one the input
                                     // never spells and the model can no longer
@@ -7424,12 +7426,36 @@ impl ParserDB {
                                     | Owner::CurrentUser
                                     | Owner::SessionUser => None,
                                 };
+                                let handed = builder
+                                    .resolve_table_object_name(&alter_table.name)?
+                                    .map(StoredTable::of);
+                                let previous = handed.as_ref().and_then(|stored| {
+                                    builder
+                                        .tables()
+                                        .iter()
+                                        .find(|(table, _, _)| {
+                                            stored.matches(table, builder.identifier_case())
+                                        })
+                                        .and_then(|(_, metadata, _)| metadata.owner())
+                                        .map(str::to_string)
+                                });
+                                let changes_hands = previous.is_some() && previous != owner;
                                 builder = Self::alter_table_metadata(
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
                                     |metadata| metadata.set_owner(owner),
                                 )?;
+                                if changes_hands
+                                    && let (Some(stored), Some(previous)) = (&handed, &previous)
+                                {
+                                    table_owner::change_owner(
+                                        &mut builder,
+                                        stored,
+                                        previous,
+                                        &new_owner,
+                                    );
+                                }
                                 // After the table, because the database reports
                                 // an absent table first, and skipped entirely
                                 // when `IF EXISTS` excused an absent one, since
@@ -7889,6 +7915,7 @@ impl ParserDB {
                             reason: reason.to_string(),
                         });
                     }
+                    table_owner::revoke(&mut builder, &revoke);
                 }
                 Statement::Set(sqlparser::ast::Set::SetTimeZone { local, value }) => {
                     if local {
