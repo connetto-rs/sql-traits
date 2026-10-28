@@ -557,8 +557,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use core::{convert::Infallible, ops::ControlFlow};
+
     use sqlparser::{
-        ast::{CreatePolicyCommand, CreatePolicyType},
+        ast::{CreatePolicyCommand, CreatePolicyType, visit_expressions},
         dialect::GenericDialect,
     };
 
@@ -613,14 +615,20 @@ mod tests {
         assert_eq!(using_funcs.len(), 1);
         assert_eq!(using_funcs[0].name(), "my_func");
 
-        let Some(Expr::BinaryOp { right, .. }) = using_expr else {
-            panic!("expected a conjunction")
-        };
-        let Expr::Function(call) = right.as_ref() else { panic!("expected a call") };
-        let reached: Vec<_> = policy_ref
-            .functions_reached_by(call, &db)
-            .expect("call belongs to the policy")
-            .collect();
+        // Every call of the clause answers through the reference, and the
+        // answers together are the clause's functions.
+        let mut reached = Vec::new();
+        let ControlFlow::<Infallible>::Continue(()) =
+            visit_expressions(using_expr.expect("USING clause"), |expression| {
+                if let Expr::Function(call) = expression {
+                    reached.extend(
+                        policy_ref
+                            .functions_reached_by(call, &db)
+                            .expect("call belongs to the policy"),
+                    );
+                }
+                ControlFlow::Continue(())
+            });
         assert_eq!(reached, using_funcs);
 
         let check_expr = policy_ref.check_expression(&db);
