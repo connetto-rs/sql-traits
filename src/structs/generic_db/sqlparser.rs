@@ -6648,6 +6648,11 @@ impl ParserDB {
                             .retain(|(role, ())| !role_matches_lookup_ident(role, role_ident));
                     }
                 }
+                membership @ (Statement::GrantRole(_) | Statement::RevokeRole(_)) => {
+                    return Err(crate::errors::Error::RoleMembershipUnsupported {
+                        statement: membership.to_string(),
+                    });
+                }
                 Statement::AlterRole {
                     name,
                     operation: AlterRoleOperation::RenameRole { role_name: new_name },
@@ -7070,6 +7075,7 @@ impl ParserDB {
                             // partitions it is split across.
                             | AlterTableOperation::AttachPartition { .. }
                             | AlterTableOperation::DetachPartition { .. }
+                            | AlterTableOperation::AttachPartitionOf { .. }
                             | AlterTableOperation::AddPartitions { .. }
                             | AlterTableOperation::DropPartitions { .. }
                             | AlterTableOperation::RenamePartitions { .. }

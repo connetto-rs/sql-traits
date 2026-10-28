@@ -114,7 +114,7 @@ fn a_role_keeps_its_own_grant_after_public_loses_execute() {
         "CREATE ROLE anon;
          CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
          GRANT EXECUTE ON FUNCTION f() TO anon;
-         REVOKE EXECUTE ON FUNCTION f() FROM anon, PUBLIC;",
+         REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC, anon;",
     )
     .expect("schema parses");
     assert_eq!(
@@ -361,7 +361,7 @@ fn the_owner_holds_execute_until_it_is_revoked_from_the_owner() {
         "CREATE ROLE owner_role;
          CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
          ALTER FUNCTION f() OWNER TO owner_role;
-         REVOKE EXECUTE ON FUNCTION f() FROM owner_role, PUBLIC;",
+         REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC, owner_role;",
     )
     .expect("schema parses");
     let f = function(&revoked, "f", &[]);

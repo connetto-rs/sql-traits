@@ -151,3 +151,31 @@ fn drop_removes_membership_before_role_recreation() {
 
     assert_eq!(child.member_of(&database).count(), 0);
 }
+
+/// `CREATE GROUP` is PostgreSQL's older spelling of `CREATE ROLE`, so the name
+/// it takes is a role name like any other.
+#[test]
+fn a_group_takes_a_role_name() {
+    let duplicate = parse("CREATE GROUP readers; CREATE ROLE readers;");
+    assert!(
+        matches!(&duplicate, Err(Error::RoleAlreadyExists { role_name }) if role_name == "readers"),
+        "got {duplicate:?}"
+    );
+}
+
+/// A membership granted or revoked by statement is refused rather than
+/// dropped, since dropping it would hide a membership the server records.
+#[test]
+fn a_membership_statement_is_refused() {
+    for statement in ["GRANT parent_role TO child_role;", "REVOKE parent_role FROM child_role;"] {
+        let result = parse(&format!(
+            "CREATE ROLE parent_role;
+             CREATE ROLE child_role;
+             {statement}"
+        ));
+        assert!(
+            matches!(&result, Err(Error::RoleMembershipUnsupported { .. })),
+            "{statement} gave {result:?}"
+        );
+    }
+}
