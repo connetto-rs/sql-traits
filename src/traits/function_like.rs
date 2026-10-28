@@ -446,7 +446,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// PostgreSQL's `VOLATILE`.
     ///
     /// Implementations with declared volatility override the conservative
-    /// default.
+    /// default. A builtin [`ParserDB`](crate::structs::ParserDB) registers in
+    /// `pg_catalog` answers the volatility PostgreSQL declares for it, so
+    /// `now()` is `STABLE` and `lower(text)` is `IMMUTABLE`.
     ///
     /// ```
     /// # fn main() -> Result<(), sql_traits::errors::Error> {
