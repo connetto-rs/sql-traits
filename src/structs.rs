@@ -8,6 +8,7 @@ pub use generic_db::{
     ParserIngestion, PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType, SchemaProfile,
     SqlparserProfile, UnresolvedAccessReference,
 };
+mod function_kind;
 mod identifier_case;
 mod identity;
 pub mod metadata;
@@ -21,6 +22,7 @@ pub use column_scope::{
     ColumnScope, QueryOutput, RelationBinding,
 };
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
+pub use function_kind::FunctionKind;
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};

@@ -4,7 +4,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 
 use sqlparser::parser::ParserError;
 
-use crate::structs::IdentifierCase;
+use crate::structs::{FunctionKind, IdentifierCase};
 
 /// Kind of database object a metadata lookup was made for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1276,6 +1276,20 @@ pub enum Error {
     FunctionAlreadyExists {
         /// Name of the function whose signature is repeated.
         function_name: String,
+    },
+    #[error(
+        "Cannot change routine kind: `{function_name}` is an aggregate or window function, which `CREATE OR REPLACE FUNCTION` cannot replace."
+    )]
+    /// Error indicating that a `CREATE OR REPLACE FUNCTION` statement would
+    /// replace an aggregate or a window function.
+    ///
+    /// The replacement keeps the function's `pg_proc` row, and PostgreSQL
+    /// refuses one that would change the row's `prokind`.
+    FunctionKindChange {
+        /// Name of the function the statement would replace.
+        function_name: String,
+        /// The kind of the function the statement would replace.
+        kind: FunctionKind,
     },
     #[error(
         "Function name `{function_name}` is not unique: a `DROP FUNCTION` naming no argument list cannot say which one to drop."

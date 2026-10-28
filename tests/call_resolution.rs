@@ -114,6 +114,43 @@ fn each_call_reaches_the_overloads_accepting_its_arguments() {
     );
 }
 
+/// A `VARIADIC` parameter collects at least one argument unless it has a
+/// default, so a call passing none reaches only the overloads that need none.
+#[test]
+fn a_variadic_parameter_without_a_default_needs_an_argument() {
+    let db = parse(
+        "CREATE FUNCTION f(VARIADIC xs INT[]) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE FUNCTION g(VARIADIC xs INT[] DEFAULT '{}') RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE TABLE items (owner TEXT);
+         CREATE POLICY p ON items USING (
+             f() AND f(1) AND f(1, 2) AND g() AND g(1)
+             AND EXISTS (SELECT rank() OVER () FROM items)
+         );",
+    );
+    let policy = policy(&db, "p");
+    let calls = reached_per_call(policy.using_expression(&db).expect("USING clause"), |call| {
+        names(policy.functions_reached_by(call, &db).expect("call belongs to the policy"))
+    });
+    assert_eq!(
+        calls,
+        [
+            ("f".to_owned(), vec![]),
+            ("f".to_owned(), vec!["f".to_owned()]),
+            ("f".to_owned(), vec!["f".to_owned()]),
+            ("g".to_owned(), vec!["g".to_owned()]),
+            ("g".to_owned(), vec!["g".to_owned()]),
+            // The window function, and not the hypothetical-set aggregate.
+            ("rank".to_owned(), vec!["pg_catalog.rank".to_owned()]),
+        ]
+    );
+    let rank = policy
+        .using_functions(&db)
+        .expect("policy is held")
+        .find(|function| function.name() == "rank")
+        .expect("rank is called");
+    assert_eq!(rank.argument_type_names(&db).count(), 0);
+}
+
 /// A call inside a subquery resolves under the path in force at the policy's
 /// statement, whatever path the script ends on.
 #[test]
