@@ -787,6 +787,46 @@ pub trait CheckConstraintLike:
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
 
+    /// Returns the functions one call in the constraint's expression may
+    /// reach, resolved under the search path of the statement that wrote it.
+    ///
+    /// `call` is a node of [`Self::expression`] at any depth, subqueries
+    /// included. Resolution follows the rules of
+    /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this check constraint, and [`LookupError::CallNotInExpression`]
+    /// when `call` is not a node of its expression, which is matched by
+    /// address.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (name TEXT CHECK (lower(name) = name));",
+    /// )?;
+    /// let table = db.tables().next().unwrap();
+    /// let check = table.check_constraints(&db)?.next().unwrap();
+    /// let Expr::BinaryOp { left, .. } = check.expression(&db) else { panic!() };
+    /// let Expr::Function(call) = left.as_ref() else { panic!() };
+    /// let reached: Vec<_> = check.functions_reached_by(call, &db)?.collect();
+    /// assert_eq!(reached.len(), 1);
+    /// assert_eq!(reached[0].target_name().to_string(), "pg_catalog.lower");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
+
     /// Returns a reference to the requested function by name, if any.
     ///
     /// # Arguments

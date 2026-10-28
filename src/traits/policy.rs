@@ -2,7 +2,7 @@
 
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
-use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Owner};
+use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Function, Owner};
 
 use crate::{
     errors::LookupError,
@@ -426,6 +426,53 @@ pub trait PolicyLike:
         &'db self,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError>;
+
+    /// Returns the functions one call in the policy's expressions may reach,
+    /// resolved under the search path of the statement that wrote the clause.
+    ///
+    /// `call` is a node of [`Self::using_expression`] or
+    /// [`Self::check_expression`], at any depth, subqueries included. An
+    /// unqualified name reaches `pg_catalog` and every schema on the path, a
+    /// qualified one only its own schema, and every overload accepting the
+    /// call's argument count counts, since argument types are not inferred.
+    /// A caller needing a property of whatever the call runs asks each
+    /// reachable function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this policy, and [`LookupError::CallNotInExpression`] when `call`
+    /// is not a node of the policy's expressions. Nodes are matched by
+    /// address, so `call` has to be borrowed from the expressions this policy
+    /// returns rather than from a copy.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE items (owner TEXT);
+    ///      CREATE POLICY p ON items USING (owner = ANY(string_to_array(owner, ',')));",
+    /// )?;
+    /// let policy = db.policies().next().unwrap();
+    /// let Some(Expr::AnyOp { right, .. }) = policy.using_expression(&db) else { panic!() };
+    /// let Expr::Function(call) = right.as_ref() else { panic!() };
+    /// let reached: Vec<_> = policy.functions_reached_by(call, &db)?.collect();
+    /// // The built-in overload taking two arguments, found in `pg_catalog`.
+    /// assert_eq!(reached.len(), 1);
+    /// assert_eq!(reached[0].target_name().to_string(), "pg_catalog.string_to_array");
+    /// assert!(reached[0].returns_null_on_null_argument(&db, 0));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError>;
 }
 
 impl<T: PolicyLike> PolicyLike for &T
@@ -497,6 +544,14 @@ where
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError> {
         (*self).check_functions(database)
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError> {
+        (*self).functions_reached_by(call, database)
     }
 }
 

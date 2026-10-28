@@ -1112,7 +1112,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// so a name carrying several declarations is reported as ambiguous here
     /// rather than resolved. A registered builtin lives in `pg_catalog`, which
     /// the recorded search path does not carry, so an unqualified reference to
-    /// one stays unresolved and the schema has to be written.
+    /// one stays unresolved and the schema has to be written. A call written in
+    /// a policy or a check constraint is resolved, built-ins and overloads
+    /// included, by [`PolicyLike::functions_reached_by`] and
+    /// [`CheckConstraintLike::functions_reached_by`].
     ///
     /// # Errors
     ///

@@ -1,6 +1,8 @@
 //! Implementation of the `PolicyLike` trait for `CreatePolicy` struct.
 
-use sqlparser::ast::{CreatePolicy, CreatePolicyCommand, CreatePolicyType, Expr, Owner};
+use alloc::string::ToString;
+
+use sqlparser::ast::{CreatePolicy, CreatePolicyCommand, CreatePolicyType, Expr, Function, Owner};
 
 use crate::{
     errors::{LookupError, ObjectKind},
@@ -90,7 +92,7 @@ impl PolicyLike for CreatePolicy {
         &'db self,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError> {
-        Ok(policy_metadata(self, database)?.using_functions())
+        Ok(policy_metadata(self, database)?.using_calls().functions())
     }
 
     fn check_expression<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Expr>
@@ -104,6 +106,23 @@ impl PolicyLike for CreatePolicy {
         &'db self,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError> {
-        Ok(policy_metadata(self, database)?.check_functions())
+        Ok(policy_metadata(self, database)?.check_calls().functions())
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError> {
+        let metadata = policy_metadata(self, database)?;
+        self.using
+            .as_ref()
+            .and_then(|using| metadata.using_calls().reached_by(using, call))
+            .or_else(|| {
+                self.with_check
+                    .as_ref()
+                    .and_then(|check| metadata.check_calls().reached_by(check, call))
+            })
+            .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })
     }
 }
