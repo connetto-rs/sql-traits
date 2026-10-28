@@ -70,9 +70,13 @@ fn carries_identity(database: &ParserDB, name: &str, column: &str) -> bool {
         .any(|option| sql_traits::utils::is_identity(&option.option))
 }
 
+/// The reason a refusal gives, after checking the report names both tables.
 fn refusal(sql: &str) -> UnattachablePartition {
-    match parse(sql) {
-        Err(Error::PartitionNotAttachable { table_name, partition_name, reason }) => {
+    let error = parse(sql).expect_err("the table is refused");
+    let message = error.to_string();
+    match error {
+        Error::PartitionNotAttachable { table_name, partition_name, reason } => {
+            assert!(message.contains("`c`") && message.contains("`p`"), "{message}");
             assert_eq!((table_name.as_str(), partition_name.as_str()), ("p", "c"), "{sql}");
             reason
         }
@@ -507,7 +511,20 @@ fn the_columns_have_to_match_the_roots() {
          UnattachablePartition::OtherPrimaryKey),
     ];
     for (setup, expected) in cases {
-        assert_eq!(refusal(&format!("{setup} {attach}")), expected, "{setup}");
+        let sql = format!("{setup} {attach}");
+        let message = parse(&sql).expect_err("the table is refused").to_string();
+        let named = match &expected {
+            UnattachablePartition::ExtraColumn { column_name }
+            | UnattachablePartition::MissingColumn { column_name }
+            | UnattachablePartition::IdentityColumn { column_name }
+            | UnattachablePartition::NullableColumn { column_name }
+            | UnattachablePartition::GenerationMismatch { column_name, .. } => {
+                format!("`{column_name}`")
+            }
+            _ => "`c`".to_owned(),
+        };
+        assert!(message.contains(&named), "{message} does not name {named}");
+        assert_eq!(refusal(&sql), expected, "{setup}");
     }
 
     assert!(matches!(
@@ -572,9 +589,47 @@ fn the_roots_checks_have_to_be_held_already() {
          ALTER TABLE p ADD CONSTRAINT ck CHECK (id > 0) NOT VALID;
          CREATE TABLE c (id INT, CONSTRAINT ck CHECK (id > 0)); {attach}"
     ));
-    // A check written on the column is held whichever way the table writes it.
+    // A check is held whichever way either table writes it.
     database(&format!(
         "CREATE TABLE p (id INT CONSTRAINT ck CHECK (id > 0)) PARTITION BY LIST (id);
          CREATE TABLE c (id INT, CONSTRAINT ck CHECK (id > 0)); {attach}"
     ));
+    database(&format!("{root} CREATE TABLE c (id INT CONSTRAINT ck CHECK (id > 0)); {attach}"));
+    assert_eq!(
+        refusal(&format!(
+            "CREATE TABLE p (id INT CHECK (id > 0)) PARTITION BY LIST (id);
+             CREATE TABLE c (id INT CHECK (id < 9)); {attach}"
+        )),
+        UnattachablePartition::MissingCheck { constraint: "CHECK (id > 0)".to_owned() }
+    );
+}
+
+#[test]
+fn a_key_written_on_the_attached_tables_column_stands_for_the_roots() {
+    let database = database(
+        "CREATE TABLE p (id INT, PRIMARY KEY (id)) PARTITION BY LIST (id);
+         CREATE TABLE c (id INT CONSTRAINT mine PRIMARY KEY);
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);",
+    );
+
+    assert_eq!(unique_index_names(&database, "c"), ["mine"]);
+}
+
+#[test]
+fn an_unvalidated_foreign_key_reaches_the_attached_table_unvalidated() {
+    let database = database(
+        "CREATE TABLE r (id INT PRIMARY KEY);
+         CREATE TABLE p (id INT, rid INT) PARTITION BY LIST (id);
+         ALTER TABLE p ADD CONSTRAINT p_rid_fkey FOREIGN KEY (rid) REFERENCES r (id) NOT VALID;
+         CREATE TABLE c (id INT, rid INT);
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);",
+    );
+
+    let key = table(&database, "c")
+        .foreign_keys(&database)
+        .expect("in database")
+        .next()
+        .expect("the root's foreign key arrives");
+    assert_eq!(key.foreign_key_name(), Some("p_rid_fkey"));
+    assert!(!key.is_validated(&database).expect("in database"));
 }

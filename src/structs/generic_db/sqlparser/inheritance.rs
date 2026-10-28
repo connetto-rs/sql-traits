@@ -630,10 +630,10 @@ pub(super) fn collations_conflict(
             })
             .map(|(_, metadata, _)| metadata)
     };
-    match (metadata(parent, parent_column), metadata(child, child_column)) {
-        (Some(parent), Some(child)) => parent.postgres_collation_matches(child) == Some(false),
-        _ => false,
-    }
+    matches!(
+        (metadata(parent, parent_column), metadata(child, child_column)),
+        (Some(parent), Some(child)) if parent.postgres_collation_matches(child) == Some(false)
+    )
 }
 
 fn inherited_column_metadata(

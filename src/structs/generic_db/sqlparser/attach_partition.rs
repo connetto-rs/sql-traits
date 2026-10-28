@@ -31,6 +31,7 @@ use crate::{
 /// A key or foreign key a table passes to a partition, in the table-constraint
 /// spelling.
 struct Passed {
+    /// Compared without names, since a partition's copy is named afresh.
     constraint: TableConstraint,
     /// The column and option holding it, when the holder writes it on a column.
     written_on: Option<(Ident, ColumnOptionDef)>,
@@ -302,9 +303,6 @@ fn held_checks(
     let mut merged = Vec::new();
 
     for (check, validated) in checks_of(builder, root, root_node) {
-        if check.no_inherit {
-            continue;
-        }
         let found = held.iter().find(|(own, _)| {
             match &check.name {
                 Some(name) => own.name.as_ref().is_some_and(|own| idents_match(own, name)),
@@ -490,13 +488,11 @@ fn receive(
         if let Some((column, option)) = &arriving.written_on {
             let mut copy = option.clone();
             inheritance::name_partition_key(builder, node, column, &mut copy, &mut taken);
-            if let Some(constraint) = table_form(column, &copy) {
-                received.passed_on.push(Passed {
-                    constraint,
-                    written_on: Some((column.clone(), copy.clone())),
-                    validated: true,
-                });
-            }
+            received.passed_on.push(Passed {
+                constraint: arriving.constraint.clone(),
+                written_on: Some((column.clone(), copy.clone())),
+                validated: true,
+            });
             received.options.push((column.clone(), copy));
         } else if let Some(copy) = inheritance::received_constraint(
             builder,
@@ -549,9 +545,7 @@ fn apply(
         }
     }
     for (constraint, validated) in &received.merged {
-        if !inheritance::records_inherited_constraint(&builder, table, constraint) {
-            inheritance::mark_inherited_constraint(&mut builder, table, constraint);
-        }
+        inheritance::mark_inherited_constraint(&mut builder, table, constraint);
         constraint_validity::record(&mut builder, table, constraint, *validated);
     }
 
