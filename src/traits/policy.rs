@@ -613,6 +613,16 @@ mod tests {
         assert_eq!(using_funcs.len(), 1);
         assert_eq!(using_funcs[0].name(), "my_func");
 
+        let Some(Expr::BinaryOp { right, .. }) = using_expr else {
+            panic!("expected a conjunction")
+        };
+        let Expr::Function(call) = right.as_ref() else { panic!("expected a call") };
+        let reached: Vec<_> = policy_ref
+            .functions_reached_by(call, &db)
+            .expect("call belongs to the policy")
+            .collect();
+        assert_eq!(reached, using_funcs);
+
         let check_expr = policy_ref.check_expression(&db);
         assert!(check_expr.is_some());
         let check_str = check_expr.unwrap().to_string();

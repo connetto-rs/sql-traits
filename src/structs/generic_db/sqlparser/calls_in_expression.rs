@@ -267,7 +267,7 @@ mod tests {
         .expect("function declarations parse");
         let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
         let scope = scope(&functions);
-        let cases: [(&str, &[&str]); 11] = [
+        let cases: [(&str, &[&str]); 12] = [
             ("a = ANY(ARRAY[f(a)])", &["f"]),
             ("a = ANY(f(a))", &["f"]),
             ("EXISTS (SELECT 1 FROM m WHERE f(m.a) = 1)", &["f"]),
@@ -277,6 +277,7 @@ mod tests {
             ("COALESCE(f(a), 0) = 1", &["coalesce", "f"]),
             ("a IN (SELECT g(b) FROM m)", &["g"]),
             ("EXISTS (SELECT 1 FROM rows_of(g(a)) AS r)", &["rows_of", "g"]),
+            ("EXISTS (SELECT 1 FROM m, LATERAL rows_of(m.a) AS r)", &["rows_of"]),
             ("EXISTS (SELECT 1 FROM m JOIN n ON f(m.a) = n.a)", &["f"]),
             ("EXISTS (SELECT 1 FROM m)", &[]),
         ];

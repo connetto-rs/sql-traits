@@ -161,14 +161,15 @@ fn a_call_from_elsewhere_is_refused() {
     }
 }
 
-/// `CREATE OR REPLACE FUNCTION` and `ALTER POLICY` reach the per-call answers.
+/// `CREATE OR REPLACE FUNCTION` and `ALTER POLICY` reach the per-call answers,
+/// and a call to a function left alone keeps its answer.
 #[test]
 fn per_call_answers_follow_replacements_and_altered_clauses() {
     let db = parse(
         "CREATE FUNCTION f(x TEXT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
          CREATE FUNCTION g(x TEXT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
          CREATE TABLE items (owner TEXT);
-         CREATE POLICY p ON items USING (f(owner)) WITH CHECK (true);
+         CREATE POLICY p ON items USING (f(owner) AND g(owner)) WITH CHECK (true);
          CREATE OR REPLACE FUNCTION f(x TEXT) RETURNS BOOL LANGUAGE sql STRICT AS 'SELECT true';
          ALTER POLICY p ON items WITH CHECK (EXISTS (SELECT g(owner)));",
     );
@@ -184,7 +185,10 @@ fn per_call_answers_follow_replacements_and_altered_clauses() {
     };
     assert_eq!(
         behaviour(policy.using_expression(&db).expect("USING clause")),
-        [("f".to_owned(), vec!["f STRICT".to_owned()])]
+        [
+            ("f".to_owned(), vec!["f STRICT".to_owned()]),
+            ("g".to_owned(), vec!["g CALLED ON NULL INPUT".to_owned()]),
+        ]
     );
     assert_eq!(
         behaviour(policy.check_expression(&db).expect("WITH CHECK clause")),
@@ -193,7 +197,7 @@ fn per_call_answers_follow_replacements_and_altered_clauses() {
 }
 
 /// A check constraint answers per call the same way, so a rule can name the
-/// call that runs a volatile function.
+/// call that runs a volatile function, and refuses a call from a copy.
 #[test]
 fn check_constraint_calls_reach_their_functions() {
     let db = parse(
@@ -214,6 +218,21 @@ fn check_constraint_calls_reach_their_functions() {
         [
             ("lower".to_owned(), vec!["pg_catalog.lower Immutable".to_owned()]),
             ("stamp".to_owned(), vec!["stamp Volatile".to_owned()]),
+        ]
+    );
+    let copy = check.expression(&db).clone();
+    let refusals = reached_per_call(&copy, |call| {
+        match check.functions_reached_by(call, &db) {
+            Err(LookupError::CallNotInExpression { call }) => vec![call],
+            Err(error) => panic!("unexpected error {error}"),
+            Ok(_) => panic!("a call of a copy was answered"),
+        }
+    });
+    assert_eq!(
+        refusals,
+        [
+            ("lower".to_owned(), vec!["lower(name)".to_owned()]),
+            ("stamp".to_owned(), vec!["stamp(name)".to_owned()]),
         ]
     );
 }
