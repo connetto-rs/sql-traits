@@ -1029,65 +1029,24 @@ impl ParserDBBuilder {
             .cloned()
     }
 
-    /// Checks if a table with the given name is referenced by foreign keys from
-    /// other tables.
-    ///
-    /// Returns `true` if any other table has a foreign key pointing to this
-    /// table.
-    fn is_table_referenced(
-        &self,
-        table_name: &str,
-        table_name_quoted: bool,
-        schema_name: Option<&str>,
-        schema_quoted: bool,
-    ) -> bool {
+    /// Whether a table outside `doomed` holds a foreign key to a table inside
+    /// it.
+    fn is_referenced_from_outside(&self, doomed: &[StoredTable]) -> bool {
         let case = self.identifier_case();
-        for (fk, ()) in self.foreign_keys() {
-            // Check if this FK references the table being dropped
-            // and is NOT from the same table (self-referential FKs are OK to
-            // drop)
-            let Some(referenced_table) = resolve_table_object_name_in_iter(
+        let resolve = |name: &ObjectName| {
+            resolve_table_object_name_in_iter(
                 self.tables().iter().map(|(table, _, _)| table.as_ref()),
-                &fk.attribute().foreign_table,
-                self.identifier_case(),
+                name,
+                case,
             )
             .ok()
-            .flatten() else {
-                continue;
-            };
-            let Some(host_table) = resolve_table_object_name_in_iter(
-                self.tables().iter().map(|(table, _, _)| table.as_ref()),
-                &fk.table().name,
-                self.identifier_case(),
-            )
-            .ok()
-            .flatten() else {
-                continue;
-            };
-
-            let referenced_matches = table_matches_resolved_identity(
-                referenced_table,
-                table_name,
-                table_name_quoted,
-                schema_name,
-                schema_quoted,
-                case,
-            );
-            let host_matches = table_matches_resolved_identity(
-                host_table,
-                table_name,
-                table_name_quoted,
-                schema_name,
-                schema_quoted,
-                case,
-            );
-
-            if referenced_matches && !host_matches {
-                return true;
-            }
-        }
-
-        false
+            .flatten()
+        };
+        let is_doomed = |table: &CreateTable| doomed.iter().any(|held| held.matches(table, case));
+        self.foreign_keys().iter().any(|(fk, ())| {
+            resolve(&fk.attribute().foreign_table).is_some_and(is_doomed)
+                && resolve(&fk.table().name).is_some_and(|host| !is_doomed(host))
+        })
     }
 
     /// Removes a table and all its associated schema objects.
@@ -5825,6 +5784,22 @@ impl ParserDB {
         Ok(())
     }
 
+    /// Removes the views reading `table` under `CASCADE`, and otherwise refuses
+    /// the drop of `dropped` that would take `table` away from under them.
+    fn release_dependent_views(
+        builder: &mut ParserDBBuilder,
+        table: &StoredTable,
+        dropped: &StoredTable,
+        cascade: bool,
+    ) -> Result<(), crate::errors::Error> {
+        let key = stored_table_key(Self::stored_node(builder, table)?, IdentifierCase::AsWritten);
+        if cascade {
+            views::remove_dependent_views(builder, &key);
+            return Ok(());
+        }
+        views::refuse_dependent_views(builder, &key, ObjectKind::Table, &dropped.name)
+    }
+
     /// Removes tables together with the foreign keys the remaining tables
     /// declare against them.
     ///
@@ -6641,75 +6616,60 @@ impl ParserDB {
                     cascade,
                     ..
                 } => {
-                    for name in names {
-                        let table_name = last_str(&name);
-
+                    // Every name resolves before anything is dropped, so a
+                    // table an earlier name takes along still counts as found.
+                    let mut targets = Vec::with_capacity(names.len());
+                    for name in &names {
                         // A view is refused rather than dropped, and named as
                         // the wrong kind, as PostgreSQL does.
-                        views::refuse_dropping_view_as_table(&builder, &name)?;
-
-                        // Check if table exists and resolve the canonical
-                        // stored table.
-                        let maybe_table = builder.resolve_table_object_name(&name)?;
-
-                        let Some(table) = maybe_table else {
-                            if if_exists {
-                                continue;
+                        views::refuse_dropping_view_as_table(&builder, name)?;
+                        match builder.resolve_table_object_name(name)? {
+                            Some(table) => targets.push(StoredTable::of(table)),
+                            None if if_exists => {}
+                            None => {
+                                return Err(crate::errors::Error::DropTableNotFound {
+                                    table_name: last_str(name).to_string(),
+                                });
                             }
-                            return Err(crate::errors::Error::DropTableNotFound {
-                                table_name: table_name.to_string(),
-                            });
-                        };
-                        let resolved_table_name = table.table_name().to_string();
-                        let resolved_table_quoted = table.table_name_is_quoted();
-                        let resolved_schema_name = table.table_schema().map(str::to_string);
-                        let resolved_schema_quoted = table.table_schema_is_quoted();
-                        let dropped = StoredTable::of(table);
-
-                        // A view reading the table would name nothing once
-                        // the table left, so it blocks the drop and `CASCADE`
-                        // takes it along, as PostgreSQL does.
-                        let relation_key = stored_table_key(table, IdentifierCase::AsWritten);
-                        if cascade {
-                            views::remove_dependent_views(&mut builder, &relation_key);
-                        } else {
-                            views::refuse_dependent_views(
-                                &builder,
-                                &relation_key,
-                                ObjectKind::Table,
-                                &resolved_table_name,
-                            )?;
                         }
+                    }
 
-                        // A child builds its column list out of its parents,
-                        // so a parent cannot leave while a child still names
-                        // it. `CASCADE` takes the children with it.
-                        let mut doomed = inheritance::descendants(&builder, &dropped);
-                        if !cascade && let Some(child) = doomed.first() {
-                            return Err(crate::errors::Error::DropTableInheritedFrom {
-                                parent_table: resolved_table_name.clone(),
-                                child_table: child.name.clone(),
-                            });
-                        }
-
-                        // Check for references from other tables (unless
-                        // CASCADE)
-                        if !cascade
-                            && builder.is_table_referenced(
-                                &resolved_table_name,
-                                resolved_table_quoted,
-                                resolved_schema_name.as_deref(),
-                                resolved_schema_quoted,
-                            )
+                    for dropped in targets {
+                        let case = builder.identifier_case();
+                        if !builder
+                            .tables()
+                            .iter()
+                            .any(|(table, _, _)| dropped.matches(table, case))
                         {
-                            return Err(crate::errors::Error::TableReferenced {
-                                table_name: resolved_table_name.clone(),
+                            continue;
+                        }
+
+                        Self::release_dependent_views(&mut builder, &dropped, &dropped, cascade)?;
+
+                        // An `INHERITS` child builds its column list out of its
+                        // parents, so only `CASCADE` takes it along, while a
+                        // partition always goes with its partitioned table.
+                        if !cascade
+                            && let Some(child) =
+                                inheritance::first_inheritor_below(&builder, &dropped)
+                        {
+                            return Err(crate::errors::Error::DropTableInheritedFrom {
+                                parent_table: dropped.name.clone(),
+                                child_table: child.name,
                             });
                         }
 
-                        // Remove the table, its children and all associated
-                        // objects
+                        let mut doomed = inheritance::descendants(&builder, &dropped);
+                        for table in &doomed {
+                            Self::release_dependent_views(&mut builder, table, &dropped, cascade)?;
+                        }
+                        let table_name = dropped.name.clone();
                         doomed.push(dropped);
+
+                        if !cascade && builder.is_referenced_from_outside(&doomed) {
+                            return Err(crate::errors::Error::TableReferenced { table_name });
+                        }
+
                         builder = Self::remove_tables(builder, &doomed)?;
                     }
                 }
@@ -9923,7 +9883,7 @@ mod tests {
         }
     }
 
-    mod is_table_referenced_tests {
+    mod referenced_table_drop_tests {
         use super::*;
 
         #[test]
