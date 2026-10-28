@@ -65,6 +65,7 @@ use crate::{
     },
 };
 
+mod attach_partition;
 mod calls_in_expression;
 mod column_copy;
 mod constraint_validity;
@@ -7384,6 +7385,16 @@ impl ParserDB {
                                 )?;
                             }
 
+                            AlterTableOperation::AttachPartitionOf { partition, for_values } => {
+                                builder = attach_partition::attach_partition(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &partition,
+                                    &for_values,
+                                )?;
+                            }
+
                             // Refused: each of these changes part of the schema
                             // the model represents, so discarding it would
                             // leave the model wrong rather than merely coarse.
@@ -7496,8 +7507,8 @@ impl ParserDB {
                             | AlterTableOperation::ModifyOrderBy { .. }
                             | AlterTableOperation::SuspendRecluster
                             | AlterTableOperation::ResumeRecluster
-                            // Partitions: the model describes a table, never the
-                            // partitions it is split across.
+                            // ClickHouse and Hive partitions group a table's
+                            // rows on disk, which the model does not describe.
                             | AlterTableOperation::AttachPartition { .. }
                             | AlterTableOperation::DetachPartition { .. }
                             | AlterTableOperation::AddPartitions { .. }

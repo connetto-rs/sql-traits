@@ -130,6 +130,84 @@ impl core::fmt::Display for FixedPersistence {
     }
 }
 
+/// Why `ALTER TABLE ... ATTACH PARTITION` refuses the table it names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UnattachablePartition {
+    /// The table already is a partition.
+    AlreadyPartition,
+    /// The table inherits from a parent through `INHERITS`.
+    InheritanceChild,
+    /// Another table inherits from it through `INHERITS`.
+    InheritanceParent,
+    /// The table is the partitioned table itself or one of its ancestors.
+    Circular,
+    /// The table declares a column the partitioned table does not.
+    ExtraColumn {
+        /// Name of the column.
+        column_name: String,
+    },
+    /// The table lacks a column the partitioned table declares.
+    MissingColumn {
+        /// Name of the column.
+        column_name: String,
+    },
+    /// The table declares an identity column of its own.
+    IdentityColumn {
+        /// Name of the column.
+        column_name: String,
+    },
+    /// The column may hold nothing where the partitioned table requires a
+    /// value.
+    NullableColumn {
+        /// Name of the column.
+        column_name: String,
+    },
+    /// The column is a stored generated column on one side only.
+    GenerationMismatch {
+        /// Name of the column.
+        column_name: String,
+        /// Whether the partitioned table is the side generating it.
+        generated_in_root: bool,
+    },
+    /// The table lacks a check the partitioned table passes down.
+    MissingCheck {
+        /// The check as the partitioned table holds it.
+        constraint: String,
+    },
+    /// The table holds a primary key on other columns than the partitioned
+    /// table's.
+    OtherPrimaryKey,
+}
+
+impl core::fmt::Display for UnattachablePartition {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AlreadyPartition => f.write_str("it already is a partition"),
+            Self::InheritanceChild => f.write_str("it inherits from another table"),
+            Self::InheritanceParent => f.write_str("another table inherits from it"),
+            Self::Circular => f.write_str("it is the partitioned table or one of its ancestors"),
+            Self::ExtraColumn { column_name } => {
+                write!(f, "column `{column_name}` is not found in the partitioned table")
+            }
+            Self::MissingColumn { column_name } => write!(f, "it lacks column `{column_name}`"),
+            Self::IdentityColumn { column_name } => {
+                write!(f, "column `{column_name}` is an identity column")
+            }
+            Self::NullableColumn { column_name } => {
+                write!(f, "column `{column_name}` must be marked `NOT NULL`")
+            }
+            Self::GenerationMismatch { column_name, generated_in_root: true } => {
+                write!(f, "column `{column_name}` must be a generated column")
+            }
+            Self::GenerationMismatch { column_name, generated_in_root: false } => {
+                write!(f, "column `{column_name}` must not be a generated column")
+            }
+            Self::MissingCheck { constraint } => write!(f, "it lacks check `{constraint}`"),
+            Self::OtherPrimaryKey => f.write_str("it holds a primary key of its own"),
+        }
+    }
+}
+
 impl ObjectKind {
     /// Reports an object of this kind that the queried database does not hold,
     /// identified by its own `name`.
@@ -1003,24 +1081,37 @@ pub enum Error {
         "Permanent table `{table_name}` cannot inherit from temporary relation `{parent_name}`."
     )]
     /// Error indicating that a permanent table names a temporary parent in
-    /// `INHERITS` or `PARTITION OF`, which PostgreSQL refuses.
+    /// `INHERITS` or `PARTITION OF`, or is attached as its partition.
     PermanentRelationInheritsTemporary {
-        /// Table the statement creates.
+        /// Table the statement creates or attaches.
         table_name: String,
         /// Temporary parent it names.
         parent_name: String,
     },
     #[error(
-        "Temporary table `{table_name}` cannot be created as a partition of permanent relation `{parent_name}`."
+        "Temporary table `{table_name}` cannot be a partition of permanent relation `{parent_name}`."
     )]
     /// Error indicating that a temporary table is declared `PARTITION OF` a
-    /// permanent one, which PostgreSQL refuses. A temporary table may still
+    /// permanent one or attached as its partition. A temporary table may still
     /// inherit from a permanent one through `INHERITS`.
     TemporaryPartitionOfPermanent {
-        /// Table the statement creates.
+        /// Table the statement creates or attaches.
         table_name: String,
         /// Permanent parent it names.
         parent_name: String,
+    },
+    #[error(
+        "Table `{partition_name}` cannot be attached as a partition of `{table_name}` because {reason}."
+    )]
+    /// Error indicating that `ALTER TABLE ... ATTACH PARTITION` names a table
+    /// PostgreSQL refuses to make a partition of the one the statement alters.
+    PartitionNotAttachable {
+        /// Name of the partitioned table the statement alters.
+        table_name: String,
+        /// Name of the table being attached.
+        partition_name: String,
+        /// What keeps the table from becoming a partition.
+        reason: UnattachablePartition,
     },
     #[error("No schema has been selected to create collation `{collation_name}` in.")]
     /// Error indicating that a `CREATE COLLATION` statement names no creatable
@@ -1201,12 +1292,9 @@ pub enum Error {
     #[error(
         "ALTER action {operation} cannot be performed on {object_kind} `{relation_name}`: this operation is not supported for it."
     )]
-    /// Error indicating that an `ALTER TABLE` names a view and asks for
-    /// something only a table can do.
-    ///
-    /// PostgreSQL accepts `ALTER TABLE` against a view for the handful of
-    /// actions a view supports, renaming it and changing its owner among them,
-    /// and refuses the rest naming the action.
+    /// Error indicating that an `ALTER TABLE` asks a relation for an action
+    /// its kind cannot take: a view for most actions, and a table that is not
+    /// partitioned for `ATTACH PARTITION`.
     AlterActionUnsupportedOnRelation {
         /// Kind of relation the name holds.
         object_kind: ObjectKind,
