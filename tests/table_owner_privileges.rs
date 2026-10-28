@@ -103,6 +103,23 @@ fn only_a_whole_table_revoke_of_the_privilege_itself_takes_it() {
     assert!(can_select(&database, None, "one_column", "owners"));
 }
 
+/// A revoke on a schema or a view reaches no table, so it leaves every
+/// owner's entry alone.
+#[test]
+fn a_revoke_reaching_no_table_leaves_the_entry() {
+    let database = parse(
+        "CREATE ROLE owners;
+         CREATE SCHEMA app;
+         CREATE TABLE app.t (id INTEGER PRIMARY KEY);
+         ALTER TABLE app.t OWNER TO owners;
+         CREATE VIEW app.v AS SELECT id FROM app.t;
+         REVOKE ALL ON SCHEMA app FROM owners;
+         REVOKE SELECT ON app.v FROM owners;",
+    );
+
+    assert!(can_select(&database, Some("app"), "t", "owners"));
+}
+
 /// `ALL TABLES IN SCHEMA` reaches the tables the schema holds when the revoke
 /// runs, and only the owner's entry on those the role owns.
 #[test]
@@ -158,6 +175,7 @@ fn an_owner_change_moves_the_grants_naming_the_old_owner_on_that_table() {
          REVOKE SELECT ON t FROM previous;
          GRANT SELECT ON t, u TO previous;
          GRANT SELECT ON t TO reader GRANTED BY previous;
+         GRANT INSERT ON u TO previous;
          ALTER TABLE t OWNER TO next;",
     );
 
@@ -165,6 +183,8 @@ fn an_owner_change_moves_the_grants_naming_the_old_owner_on_that_table() {
     assert!(!can_select(&database, None, "t", "previous"));
     assert!(can_select(&database, None, "u", "previous"));
     assert!(can_select(&database, None, "t", "reader"));
+    let previous = database.role("previous").expect("the role exists");
+    assert_eq!(table(&database, None, "u").can_insert(previous, &database), Ok(true));
 
     let t = table(&database, None, "t");
     let grantors: Vec<_> = t
