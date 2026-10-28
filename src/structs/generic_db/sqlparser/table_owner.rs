@@ -58,25 +58,27 @@ pub(super) fn revoke(builder: &mut ParserDBBuilder, revoke: &Revoke) {
     }
 }
 
-/// Hands every grant on `table` naming `previous`, as grantee or grantor, to
-/// `next`, splitting a schema-wide grant into explicit ones since a stored
-/// schema-wide grant cannot leave one table out.
+/// Hands every grant on the table `name` reaches that names `previous`, as
+/// grantee or grantor, to `next`, splitting a schema-wide grant into explicit
+/// ones since a stored schema-wide grant cannot leave one table out.
 pub(super) fn change_owner(
     builder: &mut ParserDBBuilder,
-    table: &StoredTable,
+    name: &ObjectName,
     previous: &str,
     next: &Owner,
 ) {
     let tables: Vec<Arc<CreateTable>> =
         builder.tables().iter().map(|(table, _, _)| Arc::clone(table)).collect();
     let case = builder.identifier_case();
-    let Some(handed) = tables.iter().find(|candidate| table.matches(candidate, case)) else {
-        return;
-    };
-    let handover =
-        Handover { table, handed, tables: &tables, previous, next: owner_ident(next), case };
-    handover.apply(builder.table_grants_mut());
-    handover.apply(builder.column_grants_mut());
+    let table = builder.resolve_table_object_name(name).ok().flatten().map(StoredTable::of);
+    if let Some(table) = &table
+        && let Some(handed) = tables.iter().find(|candidate| table.matches(candidate, case))
+    {
+        let handover =
+            Handover { table, handed, tables: &tables, previous, next: owner_ident(next), case };
+        handover.apply(builder.table_grants_mut());
+        handover.apply(builder.column_grants_mut());
+    }
 }
 
 /// One owner change of one table.

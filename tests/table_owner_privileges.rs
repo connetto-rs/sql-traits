@@ -4,7 +4,7 @@
 //! PostgreSQL's `aclnewowner` does.
 #![allow(clippy::expect_used)]
 
-use sql_traits::prelude::*;
+use sql_traits::{prelude::*, traits::grant::GrantTarget};
 use sqlparser::dialect::PostgreSqlDialect;
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/table_lookup.rs"));
 
@@ -169,31 +169,46 @@ fn an_owner_change_moves_the_grants_naming_the_old_owner_on_that_table() {
         "CREATE ROLE previous;
          CREATE ROLE next;
          CREATE ROLE reader;
+         CREATE ROLE admin;
          CREATE TABLE t (id INTEGER PRIMARY KEY);
          CREATE TABLE u (id INTEGER PRIMARY KEY);
          ALTER TABLE t OWNER TO previous;
          REVOKE SELECT ON t FROM previous;
          GRANT SELECT ON t, u TO previous;
          GRANT SELECT ON t TO reader GRANTED BY previous;
+         GRANT UPDATE ON t TO previous, next GRANTED BY admin;
          GRANT INSERT ON u TO previous;
+         GRANT DELETE ON t TO reader;
          ALTER TABLE t OWNER TO next;",
     );
 
     assert!(can_select(&database, None, "t", "next"));
     assert!(!can_select(&database, None, "t", "previous"));
     assert!(can_select(&database, None, "u", "previous"));
-    assert!(can_select(&database, None, "t", "reader"));
     let previous = database.role("previous").expect("the role exists");
     assert_eq!(table(&database, None, "u").can_insert(previous, &database), Ok(true));
 
-    let t = table(&database, None, "t");
-    let grantors: Vec<_> = t
+    let mut grants_on_t: Vec<(String, Vec<String>, Option<&str>)> = table(&database, None, "t")
         .grants(&database)
         .expect("the table is in the database")
-        .filter(|grant| grant.applies_to_role(database.role("reader").expect("the role exists")))
-        .map(|grant| grant.granted_by(&database).map(RoleLike::name))
+        .map(|grant| {
+            (
+                grant.privileges(&database).map(ToString::to_string).collect(),
+                grant.grantees(&database).map(ToString::to_string).collect(),
+                grant.granted_by(&database).map(RoleLike::name),
+            )
+        })
         .collect();
-    assert_eq!(grantors, [Some("next")]);
+    grants_on_t.sort();
+    assert_eq!(
+        grants_on_t,
+        [
+            ("DELETE".to_owned(), vec!["reader".to_owned()], None),
+            ("SELECT".to_owned(), vec!["next".to_owned()], None),
+            ("SELECT".to_owned(), vec!["reader".to_owned()], Some("next")),
+            ("UPDATE".to_owned(), vec!["next".to_owned()], Some("admin")),
+        ]
+    );
 }
 
 /// A schema-wide grant naming the old owner stops reaching the table that
@@ -210,6 +225,7 @@ fn an_owner_change_carves_the_table_out_of_a_schema_wide_grant() {
          ALTER TABLE app.t OWNER TO previous;
          REVOKE ALL ON app.t FROM previous;
          GRANT SELECT ON ALL TABLES IN SCHEMA app TO previous, reader;
+         GRANT USAGE ON SCHEMA app TO previous;
          ALTER TABLE app.t OWNER TO next;",
     );
 
@@ -218,6 +234,10 @@ fn an_owner_change_carves_the_table_out_of_a_schema_wide_grant() {
     assert!(can_select(&database, Some("app"), "t", "next"));
     assert!(can_select(&database, Some("app"), "t", "reader"));
     assert!(can_select(&database, Some("app"), "u", "reader"));
+    let previous = database.role("previous").expect("the role exists");
+    assert!(database.table_grants().any(|grant| {
+        matches!(grant.target(), GrantTarget::Schemas(_)) && grant.applies_to_role(previous)
+    }));
 }
 
 /// `CURRENT_USER` names a role the schema never spells, so the old owner

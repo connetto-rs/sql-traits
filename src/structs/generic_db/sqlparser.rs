@@ -7426,33 +7426,24 @@ impl ParserDB {
                                     | Owner::CurrentUser
                                     | Owner::SessionUser => None,
                                 };
-                                let handed = builder
-                                    .resolve_table_object_name(&alter_table.name)?
-                                    .map(StoredTable::of);
-                                let previous = handed.as_ref().and_then(|stored| {
-                                    builder
-                                        .tables()
-                                        .iter()
-                                        .find(|(table, _, _)| {
-                                            stored.matches(table, builder.identifier_case())
-                                        })
-                                        .and_then(|(_, metadata, _)| metadata.owner())
-                                        .map(str::to_string)
-                                });
-                                let changes_hands = previous.is_some() && previous != owner;
+                                let mut previous = None;
                                 builder = Self::alter_table_metadata(
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_owner(owner),
+                                    |metadata| {
+                                        previous = metadata
+                                            .owner()
+                                            .filter(|previous| owner.as_deref() != Some(*previous))
+                                            .map(str::to_string);
+                                        metadata.set_owner(owner);
+                                    },
                                 )?;
-                                if changes_hands
-                                    && let (Some(stored), Some(previous)) = (&handed, &previous)
-                                {
+                                if let Some(previous) = previous {
                                     table_owner::change_owner(
                                         &mut builder,
-                                        stored,
-                                        previous,
+                                        &alter_table.name,
+                                        &previous,
                                         &new_owner,
                                     );
                                 }

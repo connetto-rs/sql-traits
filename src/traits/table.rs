@@ -5083,6 +5083,11 @@ mod tests {
                 <&_ as TableLike>::schema_fingerprint(table_ref, &db),
                 table.schema_fingerprint(&db)
             );
+            assert!(
+                <&_ as TableLike>::owner_privileges(table_ref, &db)
+                    .expect("owner_privileges on &T")
+                    .eq(table.owner_privileges(&db).expect("owner_privileges"))
+            );
         }
 
         #[test]
