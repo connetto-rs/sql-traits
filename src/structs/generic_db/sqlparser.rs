@@ -5532,8 +5532,8 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// Applies `edit` to the metadata of the table an `ALTER TABLE` statement
-    /// targets.
+    /// Applies `edit` to the node and metadata of the table an `ALTER TABLE`
+    /// statement targets.
     ///
     /// Metadata carries settings the table node does not spell, so unlike
     /// [`Self::alter_table_constraints`] nothing derived from the node needs
@@ -5547,7 +5547,7 @@ impl ParserDB {
         mut builder: ParserDBBuilder,
         table_name: &ObjectName,
         if_exists: bool,
-        edit: impl FnOnce(&mut TableMetadata<CreateTable>),
+        edit: impl FnOnce(&Arc<CreateTable>, &mut TableMetadata<CreateTable>),
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(resolved_table) = builder.resolve_table_object_name(table_name)? else {
             if if_exists {
@@ -5580,7 +5580,7 @@ impl ParserDB {
             return Err(ObjectKind::Table.not_in_database(&resolved_table_name).into());
         };
 
-        edit(&mut entry.1);
+        edit(&entry.0, &mut entry.1);
 
         Ok(builder)
     }
@@ -7195,7 +7195,7 @@ impl ParserDB {
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_rls_enabled(true),
+                                    |_, metadata| metadata.set_rls_enabled(true),
                                 )?;
                             }
                             AlterTableOperation::DisableRowLevelSecurity => {
@@ -7203,7 +7203,7 @@ impl ParserDB {
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_rls_enabled(false),
+                                    |_, metadata| metadata.set_rls_enabled(false),
                                 )?;
                             }
                             AlterTableOperation::ForceRowLevelSecurity => {
@@ -7211,7 +7211,7 @@ impl ParserDB {
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_rls_forced(true),
+                                    |_, metadata| metadata.set_rls_forced(true),
                                 )?;
                             }
                             AlterTableOperation::NoForceRowLevelSecurity => {
@@ -7219,7 +7219,7 @@ impl ParserDB {
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_rls_forced(false),
+                                    |_, metadata| metadata.set_rls_forced(false),
                                 )?;
                             }
                             AlterTableOperation::RenameTable { table_name } => {
@@ -7426,23 +7426,23 @@ impl ParserDB {
                                     | Owner::CurrentUser
                                     | Owner::SessionUser => None,
                                 };
-                                let mut previous = None;
+                                let mut handover = None;
                                 builder = Self::alter_table_metadata(
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| {
-                                        previous = metadata
+                                    |table, metadata| {
+                                        handover = metadata
                                             .owner()
                                             .filter(|previous| owner.as_deref() != Some(*previous))
-                                            .map(str::to_string);
+                                            .map(|previous| (Arc::clone(table), previous.to_string()));
                                         metadata.set_owner(owner);
                                     },
                                 )?;
-                                if let Some(previous) = previous {
+                                if let Some((table, previous)) = handover {
                                     table_owner::change_owner(
                                         &mut builder,
-                                        &alter_table.name,
+                                        &table,
                                         &previous,
                                         &new_owner,
                                     );
