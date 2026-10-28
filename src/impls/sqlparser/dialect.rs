@@ -13,8 +13,8 @@ use core::any::TypeId;
 
 use sqlparser::{
     ast::{
-        CharacterLength, ColumnDef, CreateTable, DataType, ObjectName, ObjectNamePart,
-        TimezoneInfo, TypeModifier,
+        CharacterLength, ColumnDef, CreateTable, DataType, ExactNumberInfo, ObjectName,
+        ObjectNamePart, TimezoneInfo, TypeModifier,
     },
     dialect::{
         AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
@@ -478,6 +478,93 @@ fn modifier_precision(modifiers: &[TypeModifier], bare: u64) -> Option<u64> {
 fn written_modifier(modifiers: &[TypeModifier]) -> Option<u64> {
     match modifiers {
         [TypeModifier::Number(digits, false)] => digits.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Digits a value of a decimal type keeps to the right of the decimal point.
+///
+/// A precision without a scale means scale 0 wherever a scale is kept. A bare
+/// type takes the engine default, which is 0 in the standard and most
+/// engines, 3 in DuckDB, 9 for BigQuery's `NUMERIC` and 38 for its
+/// `BIGNUMERIC`. A bare PostgreSQL `NUMERIC` and a bare `NUMBER` in Oracle and
+/// Teradata hold any scale, while Snowflake's bare `NUMBER` holds whole
+/// numbers. ClickHouse's `Decimal32(s)` through `Decimal256(s)` take the scale
+/// alone. SQLite stores a decimal as an integer or a float whatever its
+/// declared scale. The generic dialect names no engine, so it answers only a
+/// written scale.
+pub(super) fn numeric_scale(dialect: SqlparserDialect, ty: &DataType) -> Option<i64> {
+    let bare = match dialect {
+        SqlparserDialect::SQLite => return None,
+        SqlparserDialect::PostgreSql | SqlparserDialect::Generic => None,
+        SqlparserDialect::DuckDb => Some(3),
+        SqlparserDialect::BigQuery => Some(9),
+        _ => Some(0),
+    };
+    match ty {
+        DataType::Nullable(inner) | DataType::LowCardinality(inner) | DataType::Zerofill(inner) => {
+            numeric_scale(dialect, inner)
+        }
+        DataType::Numeric(info)
+        | DataType::Decimal(info)
+        | DataType::DecimalUnsigned(info)
+        | DataType::Dec(info)
+        | DataType::DecUnsigned(info) => written_scale(info, bare),
+        DataType::BigNumeric(info) | DataType::BigDecimal(info) => {
+            written_scale(info, if dialect == SqlparserDialect::BigQuery { Some(38) } else { bare })
+        }
+        DataType::Custom(name, modifiers) => custom_scale(dialect, name, modifiers),
+        _ => None,
+    }
+}
+
+/// Scale written on a `NUMERIC`-like type, or `bare` when it has neither
+/// precision nor scale.
+fn written_scale(info: &ExactNumberInfo, bare: Option<i64>) -> Option<i64> {
+    match info {
+        ExactNumberInfo::None => bare,
+        ExactNumberInfo::Precision(_) => Some(0),
+        ExactNumberInfo::PrecisionAndScale(_, scale) => Some(*scale),
+    }
+}
+
+/// Scale of a decimal type the parser keeps as a custom name, which is
+/// `NUMBER` in Oracle, Teradata and Snowflake, `FIXED` in MySQL and the sized
+/// `Decimal` types in ClickHouse.
+fn custom_scale(
+    dialect: SqlparserDialect,
+    name: &ObjectName,
+    modifiers: &[TypeModifier],
+) -> Option<i64> {
+    let generic = dialect == SqlparserDialect::Generic;
+    if custom_type_is(name, "NUMBER")
+        && (generic
+            || matches!(
+                dialect,
+                SqlparserDialect::Oracle | SqlparserDialect::Teradata | SqlparserDialect::Snowflake
+            ))
+    {
+        modifier_scale(modifiers, (dialect == SqlparserDialect::Snowflake).then_some(0))
+    } else if custom_type_is(name, "FIXED") && (generic || dialect.is_mysql_family()) {
+        modifier_scale(modifiers, (!generic).then_some(0))
+    } else if (generic || dialect == SqlparserDialect::ClickHouse)
+        && ["DECIMAL32", "DECIMAL64", "DECIMAL128", "DECIMAL256"]
+            .into_iter()
+            .any(|spelling| custom_type_is(name, spelling))
+    {
+        written_modifier(modifiers).and_then(|scale| i64::try_from(scale).ok())
+    } else {
+        None
+    }
+}
+
+/// Scale spelled by the precision and scale modifiers of a custom decimal
+/// type, or `bare` when it has none.
+fn modifier_scale(modifiers: &[TypeModifier], bare: Option<i64>) -> Option<i64> {
+    match modifiers {
+        [] => bare,
+        [TypeModifier::Number(_, false)] => Some(0),
+        [TypeModifier::Number(_, false), TypeModifier::Number(scale, false)] => scale.parse().ok(),
         _ => None,
     }
 }

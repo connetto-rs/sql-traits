@@ -97,6 +97,11 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     }
 
     #[inline]
+    fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
+        super::dialect::numeric_scale(*database.dialect(), &self.attribute().data_type)
+    }
+
+    #[inline]
     fn collation<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -688,6 +693,173 @@ mod tests {
             let column = column_named(&db, "at");
             assert_eq!(<&_ as ColumnLike>::fractional_seconds_precision(&column, &db), Some(0));
             assert_eq!(Arc::new(column.clone()).fractional_seconds_precision(&db), Some(0));
+        }
+    }
+
+    mod numeric_scale {
+        use sqlparser::dialect::{
+            AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
+            DuckDbDialect, GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+            PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
+            SparkSqlDialect, TeradataDialect,
+        };
+
+        use super::{Arc, ColumnLike, column_named, parse_with};
+
+        /// Asserts the scale of a column declared with each type.
+        fn assert_scales<D: Dialect + Default + 'static>(cases: &[(&str, Option<i64>)]) {
+            let columns: Vec<String> =
+                cases.iter().enumerate().map(|(index, (ty, _))| format!("c{index} {ty}")).collect();
+            let db = parse_with::<D>(&format!("CREATE TABLE t ({});", columns.join(", ")));
+            for (index, (ty, expected)) in cases.iter().enumerate() {
+                let column = column_named(&db, &format!("c{index}"));
+                assert_eq!(column.numeric_scale(&db), *expected, "{ty}");
+            }
+        }
+
+        /// Written scales and precisions, which every engine but SQLite reads
+        /// alike.
+        const WRITTEN: [(&str, Option<i64>); 8] = [
+            ("NUMERIC(10,2)", Some(2)),
+            ("DECIMAL(5,4)", Some(4)),
+            ("NUMERIC(10,0)", Some(0)),
+            ("NUMERIC(10)", Some(0)),
+            ("DECIMAL(12)", Some(0)),
+            ("INT", None),
+            ("DOUBLE PRECISION", None),
+            ("VARCHAR(10)", None),
+        ];
+
+        #[test]
+        fn a_written_scale_answers_as_written_and_a_precision_alone_means_zero() {
+            assert_scales::<PostgreSqlDialect>(&WRITTEN);
+            assert_scales::<RedshiftSqlDialect>(&WRITTEN);
+            assert_scales::<MySqlDialect>(&WRITTEN);
+            assert_scales::<MsSqlDialect>(&WRITTEN);
+            assert_scales::<OracleDialect>(&WRITTEN);
+            assert_scales::<SnowflakeDialect>(&WRITTEN);
+            assert_scales::<TeradataDialect>(&WRITTEN);
+            assert_scales::<BigQueryDialect>(&WRITTEN);
+            assert_scales::<DuckDbDialect>(&WRITTEN);
+            assert_scales::<ClickHouseDialect>(&WRITTEN);
+            assert_scales::<HiveDialect>(&WRITTEN);
+            assert_scales::<SparkSqlDialect>(&WRITTEN);
+            assert_scales::<DatabricksDialect>(&WRITTEN);
+            assert_scales::<AnsiDialect>(&WRITTEN);
+            assert_scales::<GenericDialect>(&WRITTEN);
+        }
+
+        #[test]
+        fn postgres_bare_numeric_holds_any_scale_and_a_negative_scale_rounds() {
+            assert_scales::<PostgreSqlDialect>(&[
+                ("NUMERIC", None),
+                ("DECIMAL", None),
+                ("DEC(5,2)", Some(2)),
+                ("NUMERIC(5,-2)", Some(-2)),
+                ("NUMERIC(10,2)[]", None),
+            ]);
+        }
+
+        #[test]
+        fn bare_decimal_keeps_no_fraction_where_the_engine_defaults_scale_to_zero() {
+            let cases = [("NUMERIC", Some(0)), ("DECIMAL", Some(0))];
+            assert_scales::<RedshiftSqlDialect>(&cases);
+            assert_scales::<MySqlDialect>(&cases);
+            assert_scales::<MsSqlDialect>(&cases);
+            assert_scales::<OracleDialect>(&cases);
+            assert_scales::<SnowflakeDialect>(&cases);
+            assert_scales::<TeradataDialect>(&cases);
+            assert_scales::<ClickHouseDialect>(&cases);
+            assert_scales::<HiveDialect>(&cases);
+            assert_scales::<SparkSqlDialect>(&cases);
+            assert_scales::<DatabricksDialect>(&cases);
+            assert_scales::<AnsiDialect>(&cases);
+        }
+
+        #[test]
+        fn mysql_unsigned_zerofill_and_fixed_keep_their_scale() {
+            assert_scales::<MySqlDialect>(&[
+                ("DECIMAL(10,2) UNSIGNED", Some(2)),
+                ("DEC UNSIGNED", Some(0)),
+                ("DECIMAL(10,2) ZEROFILL", Some(2)),
+                ("FIXED(10,2)", Some(2)),
+                ("FIXED", Some(0)),
+            ]);
+        }
+
+        #[test]
+        fn number_is_floating_when_bare_in_oracle_and_teradata() {
+            let cases = [("NUMBER", None), ("NUMBER(10)", Some(0)), ("NUMBER(10,2)", Some(2))];
+            assert_scales::<OracleDialect>(&cases);
+            assert_scales::<TeradataDialect>(&cases);
+        }
+
+        #[test]
+        fn snowflake_number_defaults_to_whole_numbers() {
+            assert_scales::<SnowflakeDialect>(&[
+                ("NUMBER", Some(0)),
+                ("NUMBER(10)", Some(0)),
+                ("NUMBER(38,6)", Some(6)),
+            ]);
+        }
+
+        #[test]
+        fn bigquery_bare_types_keep_nine_and_thirty_eight_digits() {
+            assert_scales::<BigQueryDialect>(&[
+                ("NUMERIC", Some(9)),
+                ("DECIMAL", Some(9)),
+                ("BIGNUMERIC", Some(38)),
+                ("BIGDECIMAL", Some(38)),
+                ("BIGNUMERIC(40)", Some(0)),
+                ("BIGNUMERIC(50,20)", Some(20)),
+            ]);
+        }
+
+        #[test]
+        fn duckdb_bare_decimal_keeps_three_digits() {
+            assert_scales::<DuckDbDialect>(&[("DECIMAL", Some(3)), ("NUMERIC", Some(3))]);
+        }
+
+        #[test]
+        fn clickhouse_sized_decimals_take_the_scale_alone() {
+            assert_scales::<ClickHouseDialect>(&[
+                ("Decimal32(4)", Some(4)),
+                ("Decimal64(6)", Some(6)),
+                ("Decimal128(10)", Some(10)),
+                ("Decimal256(20)", Some(20)),
+                ("Nullable(Decimal(10,2))", Some(2)),
+                ("LowCardinality(Nullable(Decimal(10,3)))", Some(3)),
+            ]);
+        }
+
+        #[test]
+        fn generic_answers_only_a_written_scale() {
+            assert_scales::<GenericDialect>(&[
+                ("NUMERIC", None),
+                ("DECIMAL", None),
+                ("BIGNUMERIC(40,20)", Some(20)),
+                ("NUMBER", None),
+                ("NUMBER(10,2)", Some(2)),
+                ("NUMBER(10)", Some(0)),
+                ("Decimal64(4)", Some(4)),
+            ]);
+        }
+
+        #[test]
+        fn sqlite_stores_decimals_regardless_of_the_declared_scale() {
+            assert_scales::<SQLiteDialect>(&[
+                ("NUMERIC(10,2)", None),
+                ("DECIMAL(5,4)", None),
+                ("NUMERIC", None),
+            ]);
+        }
+
+        #[test]
+        fn forwards_through_reference_and_arc() {
+            let db = parse_with::<PostgreSqlDialect>("CREATE TABLE t (amount NUMERIC(10,2));");
+            let column = column_named(&db, "amount");
+            assert_eq!(<&_ as ColumnLike>::numeric_scale(&column, &db), Some(2));
+            assert_eq!(Arc::new(column.clone()).numeric_scale(&db), Some(2));
         }
     }
 
