@@ -4150,7 +4150,7 @@ impl ParserDBIngestor {
     ///
     /// ```
     /// use sql_traits::prelude::*;
-    /// use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
+    /// use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
     ///
     /// let statement =
     ///     |sql| Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("SQL parses").remove(0);
@@ -4158,9 +4158,10 @@ impl ParserDBIngestor {
     ///     .apply_statement(statement("CREATE TABLE t (s TEXT);"))?
     ///     .apply_statement(statement("CREATE TABLE t_s_idx (id INT);"))?;
     ///
-    /// let Statement::CreateIndex(create_index) = statement("CREATE INDEX ON t (s);") else {
-    ///     unreachable!()
-    /// };
+    /// let create_index = Parser::new(&PostgreSqlDialect {})
+    ///     .try_with_sql("ON t (s)")
+    ///     .and_then(|mut parser| parser.parse_create_index(false))
+    ///     .expect("the part after CREATE INDEX parses");
     /// let name = ingestor.create_index_name(&create_index)?.expect("named after its column");
     /// assert_eq!(name.value, "t_s_idx1");
     /// # Ok::<(), sql_traits::errors::Error>(())

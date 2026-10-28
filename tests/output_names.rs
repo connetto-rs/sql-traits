@@ -320,6 +320,7 @@ fn unknown_output_names_answer_opaque() {
     assert_eq!(order_by("SELECT 'a' IS NORMALIZED, id AS x FROM b ORDER BY x").unwrap(), "b.id");
     for projection in [
         "'a'::nvarchar",
+        "(b.id).f()",
         "(WITH c AS (SELECT 1) TABLE b)",
         "(SELECT * FROM b)",
         "(SELECT 'a' IS NORMALIZED)",
