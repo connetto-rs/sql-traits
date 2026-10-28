@@ -11,6 +11,8 @@
 //! keys, unique constraints, checks, foreign keys, identities, stored
 //! generated expressions, indexes and comments all stay with the original,
 //! while the `NOT NULL` that a primary key or an identity implied is kept.
+//! A serial column arrives as its integer type, drawing from the original's
+//! sequence only under `INCLUDING DEFAULTS`.
 
 use alloc::{string::ToString, vec::Vec};
 
@@ -18,7 +20,7 @@ use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateTable, CreateTableLikeDefaults, CreateTableLikeKind, ObjectName,
 };
 
-use super::{ParserDBBuilder, column_copy::copy_column};
+use super::{ParserDBBuilder, column_copy::copy_column, sequences};
 use crate::errors::Error;
 
 /// The table a `LIKE` clause copies from, and whether it asks for defaults.
@@ -71,7 +73,13 @@ pub(super) fn apply_like(
     let mut columns: Vec<ColumnDef> = copied
         .columns
         .iter()
-        .map(|column| copy_column(column, |option| is_copied_option(option, with_defaults)))
+        .map(|column| {
+            let mut copy = copy_column(column, |option| is_copied_option(option, with_defaults));
+            if let Some(drawn) = sequences::serial_default(builder, copied, column) {
+                sequences::spell_out_serial(&mut copy, with_defaults.then_some(drawn));
+            }
+            copy
+        })
         .collect();
 
     // The clause sits among the column list, so anything written beside it

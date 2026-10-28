@@ -76,12 +76,17 @@ impl Catalog {
         access_resolution: AccessResolution,
         source: Option<StatementSource<'_>>,
     ) -> Result<Self, Error> {
-        ParserDB::apply_statements(
+        // A drop without `CASCADE` may leave a default drawing from a dropped
+        // sequence.
+        let cascade = matches!(statement, Statement::Drop { cascade: true, .. });
+        let mut catalog = ParserDB::apply_statements(
             self,
             access_resolution,
             &mut core::iter::once(statement),
             source,
-        )
+        )?;
+        catalog.builder = super::sequences::settle_dropped_sequences(catalog.builder, cascade)?;
+        Ok(catalog)
     }
 
     /// Returns `saved` as the catalog a rollback leaves, still drawing

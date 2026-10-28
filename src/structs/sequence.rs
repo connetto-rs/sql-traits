@@ -108,4 +108,10 @@ impl Sequence {
         self.options.retain(|option| !matches!(option, SequenceOptions::DataType(_)));
         self.options.insert(0, SequenceOptions::DataType(data_type));
     }
+
+    /// Ties the sequence to its owner, which a column's sequence receives
+    /// once the table holding the column is stored.
+    pub(crate) fn set_owner(&mut self, owner: StoredSequenceOwner) {
+        self.owner = Some(owner);
+    }
 }
