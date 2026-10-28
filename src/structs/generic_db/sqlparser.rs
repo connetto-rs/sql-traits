@@ -38,7 +38,7 @@ use crate::{
     errors::{LookupError, ObjectKind},
     impls::SqlparserDialect,
     structs::{
-        ColumnIdentity, ColumnMetadata, GenericDB, IdentifierCase, MaterializedView,
+        ColumnIdentity, ColumnMetadata, FunctionKind, GenericDB, IdentifierCase, MaterializedView,
         RelationIdentity, RoleMembership, Schema, SchemaProfile, TableAttribute, TableMetadata,
         View,
         metadata::{
@@ -6564,7 +6564,16 @@ impl ParserDB {
                                 function_name: last_str(&create_function.name).to_string(),
                             });
                         }
-                        (Some(position), true) => Some(builder.functions_mut().remove(position)),
+                        (Some(position), true) => {
+                            let kind = builder.functions()[position].1.kind();
+                            if kind != FunctionKind::Normal {
+                                return Err(crate::errors::Error::FunctionKindChange {
+                                    function_name: last_str(&create_function.name).to_string(),
+                                    kind,
+                                });
+                            }
+                            Some(builder.functions_mut().remove(position))
+                        }
                         (None, _) => None,
                     };
 

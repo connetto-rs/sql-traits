@@ -3,7 +3,8 @@
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArguments, InTarget, ObjectName, TableFactor, Visit, Visitor,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName,
+    TableFactor, Visit, Visitor,
 };
 
 /// One call an expression makes.
@@ -45,6 +46,15 @@ impl<B, F: FnMut(Call<'_>) -> ControlFlow<B>> Visitor for Calls<F> {
                 let arguments = match &function.args {
                     FunctionArguments::None => 0,
                     FunctionArguments::Subquery(_) => 1,
+                    // PostgreSQL reads `count(*)` as a call passing nothing.
+                    FunctionArguments::List(list)
+                        if matches!(
+                            list.args.as_slice(),
+                            [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+                        ) =>
+                    {
+                        0
+                    }
                     FunctionArguments::List(list) => list.args.len(),
                 };
                 (self.each)(Call { name: &function.name, arguments, node: Some(function) })

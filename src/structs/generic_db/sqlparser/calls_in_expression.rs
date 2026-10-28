@@ -72,7 +72,8 @@ impl CallScope<'_> {
 }
 
 /// Whether `function` takes `arguments` arguments, counting the trailing
-/// ones a default fills and any number a `VARIADIC` parameter collects.
+/// ones a default fills and any number a `VARIADIC` parameter collects. A
+/// `VARIADIC` parameter without a default collects at least one.
 fn accepts(function: &CreateFunction, arguments: usize) -> bool {
     let inputs: Vec<_> = function
         .args
@@ -82,12 +83,7 @@ fn accepts(function: &CreateFunction, arguments: usize) -> bool {
         .filter(|argument| argument.mode != Some(ArgMode::Out))
         .collect();
     let variadic = inputs.last().is_some_and(|argument| argument.mode == Some(ArgMode::Variadic));
-    let required = inputs
-        .iter()
-        .filter(|argument| {
-            argument.default_expr.is_none() && argument.mode != Some(ArgMode::Variadic)
-        })
-        .count();
+    let required = inputs.iter().filter(|argument| argument.default_expr.is_none()).count();
     arguments >= required && (variadic || arguments <= inputs.len())
 }
 

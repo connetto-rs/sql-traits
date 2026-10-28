@@ -4,7 +4,10 @@ use alloc::{string::String, vec::Vec};
 
 use sqlparser::ast::{CreateRole, Grantee};
 
-use crate::impls::{grantee_is_public, grantee_matches_role, grantees_match};
+use crate::{
+    impls::{grantee_is_public, grantee_matches_role, grantees_match},
+    structs::FunctionKind,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// Metadata about a database function.
@@ -19,6 +22,8 @@ pub struct FunctionMetadata {
     /// Call argument positions where `NULL` yields `NULL` despite
     /// non-strictness.
     null_returning_arguments: &'static [usize],
+    /// The function's `pg_proc.prokind`.
+    kind: FunctionKind,
 }
 
 impl FunctionMetadata {
@@ -72,6 +77,19 @@ impl FunctionMetadata {
     #[inline]
     pub(crate) fn set_null_returning_arguments(&mut self, positions: &'static [usize]) {
         self.null_returning_arguments = positions;
+    }
+
+    /// Returns the function's `pg_proc.prokind`.
+    #[must_use]
+    #[inline]
+    pub(crate) fn kind(&self) -> FunctionKind {
+        self.kind
+    }
+
+    /// Sets the function's `pg_proc.prokind`.
+    #[inline]
+    pub(crate) fn set_kind(&mut self, kind: FunctionKind) {
+        self.kind = kind;
     }
 
     /// Returns who holds `EXECUTE` on the function.

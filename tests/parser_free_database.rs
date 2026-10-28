@@ -824,6 +824,11 @@ impl FunctionLike for MemoryFunction {
         false
     }
 
+    /// This catalog holds only functions it declares, which are normal.
+    fn kind(&self, _database: &Self::DB) -> Result<FunctionKind, LookupError> {
+        Ok(FunctionKind::Normal)
+    }
+
     fn language(&self) -> Option<&str> {
         None
     }

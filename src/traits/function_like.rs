@@ -9,7 +9,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::TargetName,
+    structs::{FunctionKind, TargetName},
     traits::{DatabaseLike, Metadata},
     utils::{identifier_resolution::normalize_identifier, normalize_postgres_type_cow},
 };
@@ -282,6 +282,46 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # }
     /// ```
     fn returns_set(&self) -> bool;
+
+    /// Returns what a call of the function computes, mirroring
+    /// `pg_proc.prokind`.
+    ///
+    /// A function the input declares is [`FunctionKind::Normal`]. The
+    /// built-in aggregates such as `count` and the built-in window functions
+    /// such as `row_number` answer their own kinds, and `count(*)` reaches the
+    /// parameterless `count` PostgreSQL resolves it to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION is_member(who TEXT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';
+    ///      CREATE TABLE members (member TEXT);
+    ///      CREATE TABLE items (owner TEXT);
+    ///      CREATE POLICY p ON items
+    ///          USING (EXISTS (SELECT count(*) FROM members WHERE is_member(owner)));",
+    /// )?;
+    /// let policy = db.policies().next().expect("Policy should exist");
+    /// let kinds = policy
+    ///     .using_functions(&db)?
+    ///     .map(|function| Ok((function.name(), function.kind(&db)?)))
+    ///     .collect::<Result<Vec<_>, sql_traits::errors::LookupError>>()?;
+    /// // The aggregate yields one row from no input, so this `EXISTS` holds
+    /// // even when no member matches.
+    /// assert_eq!(kinds, [("count", FunctionKind::Aggregate), ("is_member", FunctionKind::Normal)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn kind(&self, database: &Self::DB) -> Result<FunctionKind, LookupError>;
 
     /// Returns the language the body is written in, as the input spells it.
     ///

@@ -11,7 +11,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{FunctionMetadata, ParserDB, TargetName},
+    structs::{FunctionKind, FunctionMetadata, ParserDB, TargetName},
     traits::{FunctionLike, Metadata, role::privilege_holders},
     utils::{
         last_str, normalize_sqlparser_type,
@@ -116,6 +116,11 @@ impl FunctionLike for CreateFunction {
             }
             None => false,
         }
+    }
+
+    #[inline]
+    fn kind(&self, database: &Self::DB) -> Result<FunctionKind, LookupError> {
+        Ok(function_metadata(self, database)?.kind())
     }
 
     #[inline]

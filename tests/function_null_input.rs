@@ -3,10 +3,7 @@
 #![expect(clippy::expect_used, reason = "test fixtures must parse and resolve")]
 
 use sql_traits::prelude::*;
-use sqlparser::{
-    ast::{FunctionBehavior, FunctionCalledOnNull},
-    dialect::PostgreSqlDialect,
-};
+use sqlparser::{ast::FunctionCalledOnNull, dialect::PostgreSqlDialect};
 
 fn db(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")
@@ -14,93 +11,152 @@ fn db(sql: &str) -> ParserDB {
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/function_overloads.rs"));
 
-#[test]
-fn every_builtin_answers_as_postgres_declares() {
+/// What PostgreSQL 18 declares for every builtin this crate registers.
+mod builtins {
     use FunctionBehavior::{Immutable, Stable, Volatile};
     use FunctionCalledOnNull::{CalledOnNullInput as Called, Strict};
+    use sql_traits::prelude::FunctionKind::{self, Aggregate, Normal, Window};
+    use sqlparser::ast::{FunctionBehavior, FunctionCalledOnNull};
 
     /// Name, argument types, null-input behavior, the answer at every call
-    /// position and one past the last, and volatility.
-    type Row = (
+    /// position and one past the last, volatility and kind.
+    pub(super) type Row = (
         &'static str,
         &'static [&'static str],
         FunctionCalledOnNull,
         &'static [bool],
         FunctionBehavior,
+        FunctionKind,
     );
 
-    let database = db("");
     // The SQL value functions such as `current_date` have no `pg_proc` row,
     // and the planner holds them stable.
-    let expected: &[Row] = &[
-        ("length", &["text"], Strict, &[true, false], Immutable),
+    pub(super) const EXPECTED: &[Row] = &[
+        ("length", &["text"], Strict, &[true, false], Immutable, Normal),
         // Not a PostgreSQL function, so nothing vouches for it.
-        ("len", &["text"], Called, &[false, false], Volatile),
-        ("char_length", &["text"], Strict, &[true, false], Immutable),
-        ("character_length", &["text"], Strict, &[true, false], Immutable),
-        ("octet_length", &["text"], Strict, &[true, false], Immutable),
-        ("lower", &["text"], Strict, &[true, false], Immutable),
-        ("upper", &["text"], Strict, &[true, false], Immutable),
-        ("btrim", &["text"], Strict, &[true, false], Immutable),
-        ("btrim", &["text", "text"], Strict, &[true, true, false], Immutable),
-        ("split_part", &["text", "text", "int"], Strict, &[true, true, true, false], Immutable),
+        ("len", &["text"], Called, &[false, false], Volatile, Normal),
+        ("char_length", &["text"], Strict, &[true, false], Immutable, Normal),
+        ("character_length", &["text"], Strict, &[true, false], Immutable, Normal),
+        ("octet_length", &["text"], Strict, &[true, false], Immutable, Normal),
+        ("lower", &["text"], Strict, &[true, false], Immutable, Normal),
+        ("upper", &["text"], Strict, &[true, false], Immutable, Normal),
+        ("btrim", &["text"], Strict, &[true, false], Immutable, Normal),
+        ("btrim", &["text", "text"], Strict, &[true, true, false], Immutable, Normal),
+        (
+            "split_part",
+            &["text", "text", "int"],
+            Strict,
+            &[true, true, true, false],
+            Immutable,
+            Normal,
+        ),
         // `string_to_array('ab', NULL)` is `{a,b}`, and a `NULL` third
         // argument only disables replacement.
-        ("string_to_array", &["text", "text"], Called, &[true, false, false], Immutable),
+        ("string_to_array", &["text", "text"], Called, &[true, false, false], Immutable, Normal),
         (
             "string_to_array",
             &["text", "text", "text"],
             Called,
             &[true, false, false, false],
             Immutable,
+            Normal,
         ),
-        ("current_setting", &["text"], Strict, &[true, false], Stable),
-        ("current_setting", &["text", "boolean"], Strict, &[true, true, false], Stable),
+        ("current_setting", &["text"], Strict, &[true, false], Stable, Normal),
+        ("current_setting", &["text", "boolean"], Strict, &[true, true, false], Stable, Normal),
         // The variadic array is not `NULL` when one of its elements is.
-        ("coalesce", &["any"], Called, &[false, false], Immutable),
+        ("coalesce", &["any"], Called, &[false, false], Immutable, Normal),
         // `nullif(NULL, 1)` is `NULL`, `nullif(1, NULL)` is 1.
-        ("nullif", &["any", "any"], Called, &[true, false, false], Immutable),
-        ("now", &[], Strict, &[false], Stable),
-        ("current_timestamp", &[], Called, &[false], Stable),
-        ("current_date", &[], Called, &[false], Stable),
-        ("current_time", &[], Called, &[false], Stable),
-        ("localtimestamp", &[], Called, &[false], Stable),
-        ("localtime", &[], Called, &[false], Stable),
-        ("gen_random_uuid", &[], Strict, &[false], Volatile),
-        ("uuidv4", &[], Strict, &[false], Volatile),
-        ("uuidv7", &[], Strict, &[false], Volatile),
-        ("uuidv7", &["interval"], Strict, &[true, false], Volatile),
-        ("count", &["any"], Called, &[false, false], Immutable),
-        ("sum", &["any"], Called, &[false, false], Immutable),
-        ("avg", &["any"], Called, &[false, false], Immutable),
-        ("min", &["any"], Called, &[false, false], Immutable),
-        ("max", &["any"], Called, &[false, false], Immutable),
-        ("current_user", &[], Strict, &[false], Stable),
-        ("session_user", &[], Strict, &[false], Stable),
-        ("user", &[], Called, &[false], Stable),
-        ("random", &[], Strict, &[false], Volatile),
-        ("random", &["int", "int"], Strict, &[true, true, false], Volatile),
-        ("random", &["bigint", "bigint"], Strict, &[true, true, false], Volatile),
-        ("random", &["numeric", "numeric"], Strict, &[true, true, false], Volatile),
-        ("clock_timestamp", &[], Strict, &[false], Volatile),
-        ("statement_timestamp", &[], Strict, &[false], Stable),
-        ("transaction_timestamp", &[], Strict, &[false], Stable),
-        ("timeofday", &[], Strict, &[false], Volatile),
-        ("md5", &["text"], Strict, &[true, false], Immutable),
-        ("substring", &["text", "int"], Strict, &[true, true, false], Immutable),
-        ("substring", &["text", "int", "int"], Strict, &[true, true, true, false], Immutable),
-        ("substring", &["text", "text"], Strict, &[true, true, false], Immutable),
-        ("substring", &["text", "text", "text"], Strict, &[true, true, true, false], Immutable),
+        ("nullif", &["any", "any"], Called, &[true, false, false], Immutable, Normal),
+        ("now", &[], Strict, &[false], Stable, Normal),
+        ("current_timestamp", &[], Called, &[false], Stable, Normal),
+        ("current_date", &[], Called, &[false], Stable, Normal),
+        ("current_time", &[], Called, &[false], Stable, Normal),
+        ("localtimestamp", &[], Called, &[false], Stable, Normal),
+        ("localtime", &[], Called, &[false], Stable, Normal),
+        ("gen_random_uuid", &[], Strict, &[false], Volatile, Normal),
+        ("uuidv4", &[], Strict, &[false], Volatile, Normal),
+        ("uuidv7", &[], Strict, &[false], Volatile, Normal),
+        ("uuidv7", &["interval"], Strict, &[true, false], Volatile, Normal),
+        ("count", &[], Called, &[false], Immutable, Aggregate),
+        ("count", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("sum", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("avg", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("min", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("max", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("array_agg", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("string_agg", &["text", "text"], Called, &[false, false, false], Immutable, Aggregate),
+        ("bool_and", &["boolean"], Called, &[false, false], Immutable, Aggregate),
+        ("bool_or", &["boolean"], Called, &[false, false], Immutable, Aggregate),
+        ("every", &["boolean"], Called, &[false, false], Immutable, Aggregate),
+        ("rank", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("dense_rank", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("percent_rank", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("cume_dist", &["any"], Called, &[false, false], Immutable, Aggregate),
+        ("row_number", &[], Called, &[false], Immutable, Window),
+        ("rank", &[], Called, &[false], Immutable, Window),
+        ("dense_rank", &[], Called, &[false], Immutable, Window),
+        ("percent_rank", &[], Called, &[false], Immutable, Window),
+        ("cume_dist", &[], Called, &[false], Immutable, Window),
+        ("ntile", &["int"], Strict, &[true, false], Immutable, Window),
+        ("lag", &["any"], Strict, &[true, false], Immutable, Window),
+        ("lag", &["any", "int"], Strict, &[true, true, false], Immutable, Window),
+        ("lag", &["any", "int", "any"], Strict, &[true, true, true, false], Immutable, Window),
+        ("lead", &["any"], Strict, &[true, false], Immutable, Window),
+        ("lead", &["any", "int"], Strict, &[true, true, false], Immutable, Window),
+        ("lead", &["any", "int", "any"], Strict, &[true, true, true, false], Immutable, Window),
+        ("first_value", &["any"], Strict, &[true, false], Immutable, Window),
+        ("last_value", &["any"], Strict, &[true, false], Immutable, Window),
+        ("nth_value", &["any", "int"], Strict, &[true, true, false], Immutable, Window),
+        ("current_user", &[], Strict, &[false], Stable, Normal),
+        ("session_user", &[], Strict, &[false], Stable, Normal),
+        ("user", &[], Called, &[false], Stable, Normal),
+        ("random", &[], Strict, &[false], Volatile, Normal),
+        ("random", &["int", "int"], Strict, &[true, true, false], Volatile, Normal),
+        ("random", &["bigint", "bigint"], Strict, &[true, true, false], Volatile, Normal),
+        ("random", &["numeric", "numeric"], Strict, &[true, true, false], Volatile, Normal),
+        ("clock_timestamp", &[], Strict, &[false], Volatile, Normal),
+        ("statement_timestamp", &[], Strict, &[false], Stable, Normal),
+        ("transaction_timestamp", &[], Strict, &[false], Stable, Normal),
+        ("timeofday", &[], Strict, &[false], Volatile, Normal),
+        ("md5", &["text"], Strict, &[true, false], Immutable, Normal),
+        ("substring", &["text", "int"], Strict, &[true, true, false], Immutable, Normal),
+        (
+            "substring",
+            &["text", "int", "int"],
+            Strict,
+            &[true, true, true, false],
+            Immutable,
+            Normal,
+        ),
+        ("substring", &["text", "text"], Strict, &[true, true, false], Immutable, Normal),
+        (
+            "substring",
+            &["text", "text", "text"],
+            Strict,
+            &[true, true, true, false],
+            Immutable,
+            Normal,
+        ),
     ];
+}
 
-    for (name, argument_types, behavior, answers, volatility) in expected {
+#[test]
+fn every_builtin_answers_as_postgres_declares() {
+    let database = db("");
+    let expected = builtins::EXPECTED;
+    for (name, argument_types, behavior, answers, volatility, kind) in expected {
         let function = overload(&database, "pg_catalog", name, argument_types);
         let actual = (0..answers.len())
             .map(|index| function.returns_null_on_null_argument(&database, index))
             .collect::<Vec<_>>();
         assert_eq!(
-            (function.null_input_behavior(), actual.as_slice(), function.volatility()),
-            (behavior.clone(), *answers, volatility.clone()),
+            (
+                function.null_input_behavior(),
+                actual.as_slice(),
+                function.volatility(),
+                function.kind(&database)
+            ),
+            (behavior.clone(), *answers, volatility.clone(), Ok(*kind)),
             "{name}({argument_types:?})"
         );
     }
