@@ -778,18 +778,6 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self
     }
 
-    /// Adds a role membership with its metadata to the builder.
-    #[must_use]
-    #[inline]
-    pub fn add_role_membership(
-        mut self,
-        membership: Arc<P::RoleMembership>,
-        metadata: Meta<P::RoleMembership>,
-    ) -> Self {
-        self.role_memberships.push((membership, metadata));
-        self
-    }
-
     /// Adds a schema with its metadata to the builder.
     #[must_use]
     #[inline]

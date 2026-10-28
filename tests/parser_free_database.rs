@@ -174,7 +174,6 @@ struct MemoryRole {
 struct MemoryRoleMembership {
     role_name: String,
     member_name: String,
-    member_name_is_quoted: bool,
     set: bool,
 }
 
@@ -1105,10 +1104,6 @@ impl RoleMembershipLike for MemoryRoleMembership {
         &self.member_name
     }
 
-    fn member_name_is_quoted(&self) -> bool {
-        self.member_name_is_quoted
-    }
-
     fn admin_option(&self) -> bool {
         false
     }
@@ -1315,25 +1310,23 @@ fn catalog() -> MemoryCatalog {
         schemas: vec![MemorySchema { name: String::from("app"), name_is_quoted: false }],
         roles: vec![
             MemoryRole { name: String::from("reader"), name_is_quoted: false },
+            MemoryRole { name: String::from("writer"), name_is_quoted: false },
             MemoryRole { name: String::from("Writer"), name_is_quoted: true },
         ],
         role_memberships: vec![
             MemoryRoleMembership {
                 role_name: String::from("READER"),
-                member_name: String::from("Writer"),
-                member_name_is_quoted: true,
+                member_name: String::from("WRITER"),
                 set: false,
             },
             MemoryRoleMembership {
                 role_name: String::from("platform"),
                 member_name: String::from("Writer"),
-                member_name_is_quoted: true,
                 set: true,
             },
             MemoryRoleMembership {
-                role_name: String::from("reader"),
-                member_name: String::from("writer"),
-                member_name_is_quoted: false,
+                role_name: String::from("writer"),
+                member_name: String::from("reader"),
                 set: true,
             },
         ],
@@ -1341,26 +1334,28 @@ fn catalog() -> MemoryCatalog {
     }
 }
 
-/// The inherited membership readers find a role's memberships by its stored
-/// name and resolve the granted role through the stored name the membership
-/// folds to, skipping one the catalog does not hold.
+/// The inherited membership readers fold unquoted names before comparing, so
+/// a membership reaches the role its member name folds to and never the
+/// quoted role spelled alike.
 #[test]
-fn the_inherited_membership_readers_compare_stored_names() {
+fn the_inherited_membership_readers_compare_folded_names() {
     let catalog = catalog();
-    let writer = catalog.role("Writer").expect("the quoted role resolves");
+    let writer = catalog.role("writer").expect("the unquoted role resolves");
+    let quoted_writer = catalog.role("Writer").expect("the quoted role resolves");
 
     let memberships: Vec<_> = writer
         .memberships(&catalog)
         .map(|membership| (membership.stored_role_name().into_owned(), membership.set_option()))
         .collect();
     assert_eq!(memberships, [(String::from("reader"), false), (String::from("platform"), true)]);
+    assert_eq!(quoted_writer.memberships(&catalog).count(), 0);
 
     let parents: Vec<_> = writer.member_of(&catalog).map(RoleLike::name).collect();
     assert_eq!(parents, ["reader"]);
 
     let first = catalog.role_memberships().next().expect("one membership");
-    assert_eq!(first.member(&catalog).map(RoleLike::name), Some("Writer"));
-    assert!(!first.role_name_is_quoted());
+    assert_eq!(first.member(&catalog).map(RoleLike::name), Some("writer"));
+    assert_eq!(first.role(&catalog).map(RoleLike::name), Some("reader"));
 }
 
 /// The inherited resolver reads an unqualified name through the default schema

@@ -3,7 +3,10 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::{
+    dialect::{MySqlDialect, PostgreSqlDialect},
+    parser::Parser,
+};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -101,16 +104,20 @@ fn inherit_default_is_taken_when_the_grant_runs() {
 /// PostgreSQL 18.
 #[test]
 fn repeated_grant_changes_only_the_options_it_names() {
-    let database = parse(
-        "CREATE ROLE parent;
+    let granted = "CREATE ROLE parent;
          CREATE ROLE child;
          GRANT parent TO child WITH ADMIN TRUE, SET FALSE;
          GRANT parent TO child WITH INHERIT FALSE;
-         GRANT parent TO child;",
-    )
-    .expect("schema builds");
-
+         GRANT parent TO child;";
+    let database = parse(granted).expect("schema builds");
     assert_eq!(memberships_of(&database, "child"), [membership("parent", true, false, false)]);
+
+    let regranted = format!(
+        "{granted}
+         GRANT parent TO child WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;"
+    );
+    let database = parse(&regranted).expect("schema builds");
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, true)]);
 }
 
 /// Each grantor keeps its own row in `pg_auth_members`, and the member reaches
@@ -122,6 +129,7 @@ fn grants_from_two_grantors_answer_their_union() {
          CREATE ROLE m;
          CREATE ROLE g1;
          CREATE ROLE g2;
+         GRANT bypasser TO g1, g2 WITH ADMIN TRUE;
          GRANT bypasser TO m GRANTED BY g1;
          GRANT bypasser TO m WITH SET FALSE, INHERIT FALSE GRANTED BY g2;",
     )
@@ -130,20 +138,40 @@ fn grants_from_two_grantors_answer_their_union() {
     assert_eq!(memberships_of(&database, "m"), [membership("bypasser", false, true, true)]);
 }
 
+/// The union holds for each option on its own, so one grantor's `ADMIN` and
+/// another's `SET` both stand.
+#[test]
+fn each_option_is_the_union_of_its_grants() {
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE child NOINHERIT;
+         CREATE ROLE g1;
+         CREATE ROLE g2;
+         GRANT parent TO g1, g2 WITH ADMIN TRUE;
+         GRANT parent TO child WITH ADMIN TRUE, SET FALSE GRANTED BY g1;
+         GRANT parent TO child WITH INHERIT TRUE, SET FALSE GRANTED BY g2;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", true, true, false)]);
+}
+
 /// A grant written without `GRANTED BY` is a grantor of its own, apart from
-/// one that names its grantor.
+/// one that names its grantor, and grantors compare as identifiers.
 #[test]
 fn unwritten_grantor_is_its_own_grant() {
     let database = parse(
         "CREATE ROLE parent;
          CREATE ROLE child;
          CREATE ROLE g;
+         GRANT parent TO g WITH ADMIN TRUE;
          GRANT parent TO child WITH ADMIN TRUE GRANTED BY g;
-         GRANT parent TO child WITH SET FALSE;",
+         GRANT parent TO child WITH SET FALSE;
+         GRANT parent TO child WITH ADMIN FALSE GRANTED BY G;",
     )
     .expect("schema builds");
 
-    assert_eq!(memberships_of(&database, "child"), [membership("parent", true, true, true)]);
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, true)]);
 }
 
 #[test]
@@ -258,9 +286,13 @@ fn closed_world_accepts_an_absent_grantor() {
 /// PostgreSQL answers `role "public" does not exist` under either setting.
 #[test]
 fn public_is_refused_as_a_member_or_a_granted_role() {
-    for sql in
-        ["CREATE ROLE parent; GRANT parent TO PUBLIC;", "CREATE ROLE child; GRANT public TO child;"]
-    {
+    for sql in [
+        "CREATE ROLE parent; GRANT parent TO PUBLIC;",
+        "CREATE ROLE parent; GRANT parent TO GROUP public;",
+        "CREATE ROLE child; GRANT public TO child;",
+        "CREATE ROLE child IN ROLE public;",
+        "CREATE ROLE parent ADMIN public;",
+    ] {
         for result in [parse(sql), open_world(sql)] {
             assert!(
                 matches!(result, Err(Error::RoleNotFoundForMembership { ref role_name }) if role_name.eq_ignore_ascii_case("public")),
@@ -316,20 +348,38 @@ fn open_world_records_memberships_naming_undeclared_roles() {
     ));
 }
 
-/// The member's `INHERIT` default reads an `ALTER ROLE` kept for a role the
-/// input never creates.
+/// The member's `INHERIT` default reads the `INHERIT` an `ALTER ROLE` kept for
+/// a role the input never creates, and the PostgreSQL default otherwise.
 #[test]
 fn open_world_inherit_default_reads_a_kept_alteration() {
     let database = open_world(
         "CREATE ROLE parent;
-         ALTER ROLE platform NOINHERIT;
-         GRANT parent TO platform;",
+         ALTER ROLE platform BYPASSRLS NOINHERIT;
+         ALTER ROLE other BYPASSRLS;
+         GRANT parent TO platform, other;",
     )
     .expect("schema builds");
 
-    let inherit: Vec<_> =
-        database.role_memberships().map(RoleMembershipLike::inherit_option).collect();
-    assert_eq!(inherit, [false]);
+    let inherit: Vec<_> = database
+        .role_memberships()
+        .map(|membership| (membership.member_name().to_owned(), membership.inherit_option()))
+        .collect();
+    assert_eq!(inherit, [("platform".to_owned(), false), ("other".to_owned(), true)]);
+}
+
+#[test]
+fn open_world_records_a_create_role_clause_naming_an_undeclared_role() {
+    let database =
+        open_world("CREATE ROLE app_user IN ROLE authenticated;").expect("schema builds");
+
+    assert_eq!(
+        memberships_of(&database, "app_user"),
+        [membership("authenticated", false, true, true)]
+    );
+    assert!(matches!(
+        database.validate_access_targets(),
+        Err(Error::RoleNotFoundForMembership { role_name }) if role_name == "authenticated"
+    ));
 }
 
 #[test]
@@ -388,20 +438,86 @@ fn drop_role_removes_its_memberships_on_both_sides() {
     assert_eq!(recorded, [("top".to_owned(), "kept".to_owned())]);
 }
 
+/// A rename repoints the memberships naming the renamed role, on either side,
+/// and leaves every other membership as it was.
 #[test]
 fn rename_carries_memberships_on_both_sides() {
     let database = parse(
         "CREATE ROLE top;
          CREATE ROLE middle;
          CREATE ROLE bottom;
+         CREATE ROLE bystander;
          GRANT top TO middle WITH ADMIN TRUE;
          GRANT middle TO bottom WITH SET FALSE;
+         GRANT top TO bystander WITH INHERIT FALSE;
          ALTER ROLE middle RENAME TO \"Middle\";",
     )
     .expect("schema builds");
 
     assert_eq!(memberships_of(&database, "Middle"), [membership("top", true, true, true)]);
     assert_eq!(memberships_of(&database, "bottom"), [membership("Middle", false, true, false)]);
+    assert_eq!(memberships_of(&database, "bystander"), [membership("top", false, false, true)]);
+}
+
+/// A renamed grantor keeps its grant, so a later grant under the new name
+/// updates it, and dropping the grantor stays refused, as measured on
+/// PostgreSQL 18.
+#[test]
+fn rename_carries_the_grantor() {
+    let renamed = "CREATE ROLE parent;
+         CREATE ROLE child;
+         CREATE ROLE g;
+         GRANT parent TO g WITH ADMIN TRUE;
+         GRANT parent TO child GRANTED BY g;
+         ALTER ROLE g RENAME TO h;
+         GRANT parent TO child WITH SET FALSE GRANTED BY h;";
+    let database = parse(renamed).expect("schema builds");
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, false)]);
+
+    let error = parse(&format!("{renamed} DROP ROLE h;")).expect_err("h granted a membership");
+    assert!(matches!(error, Error::RoleReferenced { role_name } if role_name == "h"));
+}
+
+/// A resumed ingestion keeps the memberships recorded before it, and a later
+/// grant updates them.
+#[test]
+fn resumed_ingestion_keeps_and_updates_memberships() {
+    let database = parse(
+        "CREATE ROLE parent;
+         CREATE ROLE child;
+         GRANT parent TO child WITH SET FALSE;",
+    )
+    .expect("schema builds");
+
+    let mut ingestor = database.into_ingestor();
+    for statement in Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "CREATE ROLE other; GRANT parent TO child WITH ADMIN TRUE; GRANT parent TO other;",
+    )
+    .expect("SQL parses")
+    {
+        ingestor = ingestor.apply_statement(statement).expect("statement applies");
+    }
+    let resumed = ingestor.finish();
+
+    assert_eq!(memberships_of(&resumed, "child"), [membership("parent", true, true, false)]);
+    assert_eq!(memberships_of(&resumed, "other"), [membership("parent", false, true, true)]);
+}
+
+/// MySQL commits the open transaction before a definition, so a rollback
+/// leaves the membership standing.
+#[test]
+fn mysql_role_grant_commits_the_open_transaction() {
+    let database = ParserDB::parse::<MySqlDialect>(
+        "CREATE ROLE parent;
+         CREATE ROLE child;
+         START TRANSACTION;
+         GRANT parent TO child;
+         ROLLBACK;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, true)]);
 }
 
 #[test]
