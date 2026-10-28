@@ -1,0 +1,11 @@
+CREATE SCHEMA app;
+CREATE SEQUENCE app.tickets_id_seq;
+CREATE TABLE app.tickets (id serial, n BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 10), m smallserial);
+CREATE TABLE app.copies (LIKE app.tickets);
+CREATE TABLE app.children () INHERITS (app.tickets);
+ALTER TABLE app.tickets ADD COLUMN extra bigserial;
+ALTER TABLE app.tickets ALTER COLUMN n TYPE INT;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA app TO PUBLIC;
+ALTER TABLE app.tickets DROP COLUMN m;
+DROP SEQUENCE app.tickets_id_seq1;
+DROP TABLE app.tickets CASCADE;

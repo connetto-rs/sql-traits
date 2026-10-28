@@ -20,23 +20,34 @@ use crate::{
 const SERIAL_TYPES: [&str; 6] =
     ["smallserial", "serial", "bigserial", "serial2", "serial4", "serial8"];
 
-/// Whether the declared type names a serial pseudo-type. PostgreSQL folds an
-/// unquoted name to lower case before comparing it, and a quoted name is
-/// compared as written.
-fn is_serial_type(data_type: &DataType) -> bool {
+/// The integer type behind a serial pseudo-type, which is also the type of
+/// the sequence PostgreSQL creates for it, or `None` for any other type.
+/// PostgreSQL folds an unquoted name to lower case before comparing it, and a
+/// quoted name is compared as written.
+pub(crate) fn serial_sequence_type(data_type: &DataType) -> Option<DataType> {
     let DataType::Custom(name, _) = data_type else {
-        return false;
+        return None;
     };
     let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
-        return false;
+        return None;
     };
-    SERIAL_TYPES.iter().any(|serial| {
+    let serial = SERIAL_TYPES.iter().find(|serial| {
         if ident.quote_style.is_some() {
-            ident.value == *serial
+            ident.value == **serial
         } else {
             ident.value.eq_ignore_ascii_case(serial)
         }
+    })?;
+    Some(match *serial {
+        "smallserial" | "serial2" => DataType::SmallInt(None),
+        "bigserial" | "serial8" => DataType::BigInt(None),
+        _ => DataType::Integer(None),
     })
+}
+
+/// Whether the declared type names a serial pseudo-type.
+fn is_serial_type(data_type: &DataType) -> bool {
+    serial_sequence_type(data_type).is_some()
 }
 
 impl Metadata for TableAttribute<CreateTable, ColumnDef> {

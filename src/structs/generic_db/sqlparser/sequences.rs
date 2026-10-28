@@ -12,22 +12,38 @@
 //! `OWNED BY` ties the sequence to a column of a table or of a plain view in
 //! the sequence's own schema, and the sequence leaves when that column or its
 //! relation does. The tie is kept by identity, so renaming either keeps it.
+//!
+//! PostgreSQL also creates a sequence for every `serial` column and every
+//! identity column a statement declares, named `<table>_<column>_seq` and
+//! numbered when that name is taken, in the table's schema and owned by the
+//! column. A column copied from a `LIKE` source or a parent brings none. An
+//! identity sequence follows its column's type and cannot be dropped on its
+//! own.
 
-use alloc::{collections::BTreeSet, string::ToString, sync::Arc, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
-use sqlparser::ast::{Grant, GrantObjects, Ident, ObjectName, ObjectNamePart, SequenceOptions};
+use sqlparser::ast::{
+    ColumnDef, ColumnOption, DataType, Grant, GrantObjects, Ident, ObjectName, ObjectNamePart,
+    SequenceOptions,
+};
 
 use super::{
-    ParserDBBuilder, SchemaQualifier, object_name_last_identifier,
+    ParserDBBuilder, SchemaQualifier, StoredTable, object_name_last_identifier,
     object_name_matches_resolved_identity, place_relation, relation_name_holder,
     require_named_in_catalog, schema_qualifiers_match, views,
 };
 use crate::{
     errors::{Error, ObjectKind},
+    impls::{SqlparserDialect, serial_sequence_type},
     structs::{IdentifierCase, Sequence, StoredSequenceOwner, TableAttribute},
-    traits::{ColumnLike, SequenceLike},
+    traits::{ColumnLike, SequenceLike, SequenceOrigin, TableLike},
     utils::{
-        identifier_resolution::identifiers_match,
+        identifier_resolution::{identifiers_match, normalize_identifier},
         last_str,
         object_name::{
             object_name_identifiers, qualifier_of, require_static_object_name,
@@ -87,6 +103,7 @@ pub(super) fn create_sequence(
         schema.map(|(value, quoted)| (value.to_string(), quoted)),
         kept,
         owner,
+        SequenceOrigin::Declared,
     );
     Ok(builder.add_sequence(Arc::new(sequence), ()))
 }
@@ -231,8 +248,9 @@ pub(super) fn holds_sequence(builder: &ParserDBBuilder, name: &ObjectName) -> bo
 ///
 /// Returns [`Error::RelationKindMismatch`] for a name another relation kind
 /// holds, [`Error::RelationNotFound`] for a name nothing holds unless the
-/// statement wrote `IF EXISTS`, and [`Error::RelationHasDependents`] when a
-/// view reads the sequence and the statement wrote no `CASCADE`.
+/// statement wrote `IF EXISTS`, [`Error::SequenceRequiredByColumn`] for the
+/// sequence of an identity column, and [`Error::RelationHasDependents`] when
+/// a view reads the sequence and the statement wrote no `CASCADE`.
 pub(super) fn drop_sequences(
     mut builder: ParserDBBuilder,
     names: &[ObjectName],
@@ -253,6 +271,7 @@ pub(super) fn drop_sequences(
                 .cloned()
         });
         if let Some(doomed) = doomed {
+            refuse_dropping_identity_sequence(&builder, &doomed)?;
             let key = stored_sequence_key(doomed.as_ref(), IdentifierCase::AsWritten);
             if cascade {
                 views::remove_dependent_views(&mut builder, &key);
@@ -340,6 +359,222 @@ pub(super) fn drop_orphaned_sequences(builder: &mut ParserDBBuilder) {
         .cloned()
         .collect();
     forget(builder, &doomed);
+}
+
+/// Refuses dropping the sequence of an identity column on its own, which
+/// PostgreSQL refuses even under `CASCADE`.
+///
+/// # Errors
+///
+/// Returns [`Error::SequenceRequiredByColumn`] for such a sequence.
+fn refuse_dropping_identity_sequence(
+    builder: &ParserDBBuilder,
+    sequence: &Sequence,
+) -> Result<(), Error> {
+    if let (SequenceOrigin::Identity, Some(StoredSequenceOwner::Column(identity))) =
+        (sequence.origin(), sequence.stored_owner())
+        && let Some((column, _, _)) =
+            builder.columns().iter().find(|(_, _, held)| *held == identity)
+    {
+        return Err(Error::SequenceRequiredByColumn {
+            sequence_name: sequence.sequence_name().to_string(),
+            table_name: TableAttribute::table(column.as_ref()).table_name().to_string(),
+            column_name: column.column_name().to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The longest name PostgreSQL keeps, in bytes.
+const NAME_BYTES: usize = 63;
+
+/// The longest prefix of `name` that fits in `bytes` without splitting a
+/// character.
+fn clipped(name: &str, bytes: usize) -> &str {
+    let mut end = bytes.min(name.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
+/// Joins a table name, a column name and a label the way PostgreSQL's
+/// `makeObjectName` does, cutting the longer of the two names a byte at a
+/// time until the whole fits in [`NAME_BYTES`].
+fn object_name(table: &str, column: &str, label: &str) -> String {
+    let available = NAME_BYTES.saturating_sub(label.len() + 2);
+    let (mut table_bytes, mut column_bytes) = (table.len(), column.len());
+    while table_bytes + column_bytes > available {
+        if table_bytes > column_bytes {
+            table_bytes -= 1;
+        } else {
+            column_bytes -= 1;
+        }
+    }
+    format!("{}_{}_{label}", clipped(table, table_bytes), clipped(column, column_bytes))
+}
+
+/// A sequence PostgreSQL creates for a column a statement declares, named
+/// before the statement runs.
+pub(super) struct ColumnSequence {
+    /// The column as the statement declared it.
+    column: Ident,
+    /// Whether a serial type or an identity calls for the sequence.
+    origin: SequenceOrigin,
+    /// The `AS` type and the identity's own options.
+    options: Vec<SequenceOptions>,
+    /// The name chosen for it.
+    name: String,
+}
+
+/// What a column declaration calls for, if PostgreSQL creates a sequence for
+/// it: an identity, or else a serial type.
+fn column_sequence_request(column: &ColumnDef) -> Option<(SequenceOrigin, Vec<SequenceOptions>)> {
+    let identity = column.options.iter().find_map(|option| {
+        match &option.option {
+            ColumnOption::Generated { generation_expr: None, sequence_options, .. } => {
+                Some(sequence_options)
+            }
+            _ => None,
+        }
+    });
+    if let Some(sequence_options) = identity {
+        let mut options = alloc::vec![SequenceOptions::DataType(column.data_type.clone())];
+        options.extend(sequence_options.iter().flatten().cloned());
+        return Some((SequenceOrigin::Identity, options));
+    }
+    let data_type = serial_sequence_type(&column.data_type)?;
+    Some((SequenceOrigin::Serial, alloc::vec![SequenceOptions::DataType(data_type)]))
+}
+
+/// Names the sequences PostgreSQL creates for the columns a statement declares
+/// on `table`, a `serial` type or an identity each calling for one.
+///
+/// PostgreSQL names each `<table>_<column>_seq`, cut to fit, and numbers the
+/// label when a relation of the schema already holds the name. It names them
+/// all before creating any, so two columns of one statement may arrive at the
+/// same name, which [`add_column_sequences`] then refuses. Only PostgreSQL
+/// creates such sequences.
+pub(super) fn plan_column_sequences<'column>(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+    columns: impl IntoIterator<Item = &'column ColumnDef>,
+) -> Vec<ColumnSequence> {
+    if *builder.dialect() != SqlparserDialect::PostgreSql {
+        return Vec::new();
+    }
+    let schema = table.schema.as_deref().map(|schema| (schema, table.schema_quoted));
+    let table_name = normalize_identifier(&table.name, table.name_quoted);
+    columns
+        .into_iter()
+        .filter_map(|column| {
+            let (origin, options) = column_sequence_request(column)?;
+            let column_name =
+                normalize_identifier(&column.name.value, column.name.quote_style.is_some());
+            let table_name = clipped(&table_name, NAME_BYTES);
+            let column_name = clipped(&column_name, NAME_BYTES);
+            // Each pass that finds the name taken found a relation holding it,
+            // so the passes end before the relations do.
+            let name = (0..=builder.relation_count())
+                .map(|pass| {
+                    let label =
+                        if pass == 0 { "seq".to_string() } else { alloc::format!("seq{pass}") };
+                    object_name(table_name, column_name, &label)
+                })
+                .find(|candidate| {
+                    relation_name_holder(
+                        builder,
+                        &Ident::with_quote('"', candidate.as_str()),
+                        schema,
+                    )
+                    .is_none()
+                })?;
+            Some(ColumnSequence { column: column.name.clone(), origin, options, name })
+        })
+        .collect()
+}
+
+/// Records the sequences [`plan_column_sequences`] named, each owned by its
+/// column of `table`, which holds the columns by now.
+///
+/// # Errors
+///
+/// Returns [`Error::RelationNameAlreadyTaken`] when a relation took a planned
+/// name meanwhile, another sequence of the same statement included.
+pub(super) fn add_column_sequences(
+    mut builder: ParserDBBuilder,
+    table: &StoredTable,
+    planned: Vec<ColumnSequence>,
+) -> Result<ParserDBBuilder, Error> {
+    let case = builder.identifier_case();
+    let schema = table.schema.as_ref().map(|schema| (schema.clone(), table.schema_quoted));
+    for ColumnSequence { column, origin, options, name } in planned {
+        let qualifier = schema.as_ref().map(|(schema, quoted)| (schema.as_str(), *quoted));
+        if let Some(conflicting_kind) =
+            relation_name_holder(&builder, &Ident::with_quote('"', name.as_str()), qualifier)
+        {
+            return Err(Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::Sequence,
+                conflicting_kind,
+                object_name: name,
+            });
+        }
+        let owner = builder.columns().iter().find_map(|(candidate, _, identity)| {
+            (table.matches(TableAttribute::table(candidate.as_ref()), case)
+                && case.identifiers_match(
+                    candidate.column_name(),
+                    candidate.column_name_is_quoted(),
+                    &column.value,
+                    column.quote_style.is_some(),
+                ))
+            .then_some(StoredSequenceOwner::Column(*identity))
+        });
+        let quoted = normalize_identifier(&name, false) != name.as_str();
+        let sequence = Sequence::new((name, quoted), schema.clone(), options, owner, origin);
+        builder = builder.add_sequence(Arc::new(sequence), ());
+    }
+    Ok(builder)
+}
+
+/// Gives every identity sequence the type its column holds now, which
+/// PostgreSQL carries over whenever the column's type changes.
+///
+/// A serial sequence keeps the type it was created with.
+pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) {
+    if builder
+        .sequences()
+        .iter()
+        .all(|(sequence, ())| sequence.origin() != SequenceOrigin::Identity)
+    {
+        return;
+    }
+    let types: BTreeMap<_, _> = builder
+        .columns()
+        .iter()
+        .map(|(column, _, identity)| (*identity, &column.attribute().data_type))
+        .collect();
+    let changed: Vec<(usize, DataType)> = builder
+        .sequences()
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (sequence, ()))| {
+            let (SequenceOrigin::Identity, Some(StoredSequenceOwner::Column(identity))) =
+                (sequence.origin(), sequence.stored_owner())
+            else {
+                return None;
+            };
+            let data_type = *types.get(&identity)?;
+            // An identity sequence is created with its `AS` type first.
+            let current = matches!(
+                sequence.options().first(),
+                Some(SequenceOptions::DataType(current)) if current == data_type
+            );
+            (!current).then(|| (position, data_type.clone()))
+        })
+        .collect();
+    for (position, data_type) in changed {
+        Arc::make_mut(&mut builder.sequences_mut()[position].0).set_data_type(data_type);
+    }
 }
 
 /// Removes the `doomed` sequences and takes them out of every grant naming

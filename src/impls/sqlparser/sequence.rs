@@ -4,7 +4,7 @@ use sqlparser::ast::SequenceOptions;
 
 use crate::{
     structs::{ParserDB, Sequence, StoredSequenceOwner},
-    traits::{DatabaseLike, Metadata, SequenceLike, SequenceOwner},
+    traits::{DatabaseLike, Metadata, SequenceLike, SequenceOrigin, SequenceOwner},
 };
 
 impl Metadata for Sequence {
@@ -48,5 +48,9 @@ impl SequenceLike for Sequence {
                     .map(|view| SequenceOwner::ViewColumn { view, ordinal })
             }
         }
+    }
+
+    fn origin(&self) -> SequenceOrigin {
+        Sequence::origin(self)
     }
 }

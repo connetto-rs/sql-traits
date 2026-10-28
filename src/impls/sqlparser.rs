@@ -25,6 +25,7 @@ mod sequence;
 mod unique_constraint;
 mod view;
 
+pub(crate) use column_def::serial_sequence_type;
 pub use dialect::SqlparserDialect;
 pub use grant::apply_revoke_to_grant;
 pub(crate) use grant::{
