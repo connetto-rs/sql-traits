@@ -18,6 +18,7 @@ pub(crate) mod dql;
 mod foreign_key_constraint;
 mod grant;
 mod index_clauses;
+mod role_membership;
 mod schema;
 mod unique_constraint;
 mod view;

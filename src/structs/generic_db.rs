@@ -112,6 +112,8 @@ pub struct GenericDB<P: SchemaProfile> {
     check_constraints: Vec<Stored<P::CheckConstraint>>,
     /// List of roles in the database.
     roles: Vec<Stored<P::Role>>,
+    /// List of role memberships in the database, in the order granted.
+    role_memberships: Vec<Stored<P::RoleMembership>>,
     /// List of table grants in the database.
     table_grants: Vec<Stored<P::TableGrant>>,
     /// List of column grants in the database.
@@ -149,6 +151,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("policies", &self.policies.len())
             .field("check_constraints", &self.check_constraints.len())
             .field("roles", &self.roles.len())
+            .field("role_memberships", &self.role_memberships.len())
             .field("table_grants", &self.table_grants.len())
             .field("column_grants", &self.column_grants.len())
             .field("schemas", &self.schemas.len())
@@ -187,6 +190,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),
+            role_memberships: self.role_memberships.clone(),
             table_grants: self.table_grants.clone(),
             column_grants: self.column_grants.clone(),
             schemas: self.schemas.clone(),

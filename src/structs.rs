@@ -11,6 +11,7 @@ pub use generic_db::{
 mod identifier_case;
 mod identity;
 pub mod metadata;
+mod role_membership;
 mod schema;
 mod target_name;
 mod view;
@@ -24,6 +25,7 @@ pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
+pub use role_membership::RoleMembership;
 pub use schema::Schema;
 pub use target_name::TargetName;
 pub use view::{MaterializedView, View, ViewDeclaration};

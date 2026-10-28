@@ -14,8 +14,8 @@ use crate::{
     structs::{IdentifierCase, TargetName},
     traits::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DialectLike, ExtensionLike,
-        ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike, RuleLike, SchemaLike,
-        TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, ViewLike,
+        ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike, RoleMembershipLike,
+        RuleLike, SchemaLike, TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, ViewLike,
     },
     utils::{
         identifier_resolution::stored_identifier_matches_lookup,
@@ -58,6 +58,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type Policy: PolicyLike<DB = Self>;
     /// Type of the roles in the schema.
     type Role: RoleLike<DB = Self>;
+    /// Type of the role memberships in the database.
+    type RoleMembership: RoleMembershipLike<DB = Self>;
     /// Type of the table grants in the schema.
     type TableGrant: TableGrantLike<DB = Self>;
     /// Type of the column grants in the schema.
@@ -1246,6 +1248,33 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     fn role(&self, name: &str) -> Option<&Self::Role> {
         self.roles().find(|role| role.stored_name().as_ref() == name)
     }
+
+    /// Iterates over the role memberships recorded in the database, from
+    /// `GRANT role TO role` and from the membership clauses of `CREATE ROLE`,
+    /// one for each granted role and member.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE parent;
+    /// CREATE ROLE child IN ROLE parent;
+    /// CREATE ROLE other;
+    /// GRANT parent TO other WITH SET FALSE;
+    /// ",
+    /// )?;
+    ///
+    /// let members: Vec<_> = db.role_memberships().map(RoleMembershipLike::member_name).collect();
+    /// assert_eq!(members, ["child", "other"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn role_memberships(&self) -> impl Iterator<Item = &Self::RoleMembership>;
 
     /// Returns whether the database has any roles defined.
     ///

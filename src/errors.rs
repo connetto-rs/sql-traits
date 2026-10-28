@@ -709,6 +709,27 @@ pub enum Error {
         /// Name of the undefined role.
         role_name: String,
     },
+    #[error("Role `{role_name}` not found for a role membership.")]
+    /// Error indicating that a role membership names a role that does not
+    /// exist, as the granted role or as the member.
+    ///
+    /// Covers `GRANT role TO role` and the `IN ROLE`, `IN GROUP`, `ROLE`,
+    /// `USER` and `ADMIN` clauses of `CREATE ROLE`. Like the other role
+    /// checks this one follows
+    /// [`AccessResolution`](crate::structs::AccessResolution), except for
+    /// `PUBLIC`, which names no role under either setting and which
+    /// PostgreSQL refuses as `role "public" does not exist`.
+    RoleNotFoundForMembership {
+        /// Name of the undefined role.
+        role_name: String,
+    },
+    #[error("Unrecognized role option `{option}` in a role membership grant.")]
+    /// Error indicating that `GRANT role TO role ... WITH` names an option
+    /// other than `ADMIN`, `INHERIT` and `SET`, which PostgreSQL refuses.
+    UnrecognizedRoleOption {
+        /// The option as written.
+        option: String,
+    },
     #[error("Table `{table_name}` not found for a grant or revoke.")]
     /// Error indicating that a grant or a revoke names a table that does not
     /// exist.

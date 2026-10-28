@@ -35,6 +35,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type Extension = P::Extension;
     type Policy = P::Policy;
     type Role = P::Role;
+    type RoleMembership = P::RoleMembership;
     type TableGrant = P::TableGrant;
     type ColumnGrant = P::ColumnGrant;
     type Schema = P::Schema;
@@ -283,6 +284,10 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
 
     fn roles(&self) -> impl Iterator<Item = &Self::Role> {
         self.roles.iter().map(|(r, _)| r.as_ref())
+    }
+
+    fn role_memberships(&self) -> impl Iterator<Item = &Self::RoleMembership> {
+        self.role_memberships.iter().map(|(membership, _)| membership.as_ref())
     }
 
     fn table_grants(&self) -> impl Iterator<Item = &Self::TableGrant> {

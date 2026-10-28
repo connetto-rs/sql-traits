@@ -359,6 +359,11 @@ fn mysql_definitions_commit_the_open_transaction() {
         "savepoint not found",
         "an index definition commits like a table definition"
     );
+    assert_eq!(
+        outcome::<MySqlDialect>("BEGIN; SAVEPOINT s; SELECT 1; RELEASE SAVEPOINT s; COMMIT;"),
+        "ok []",
+        "a query defines nothing, so the transaction stays open"
+    );
 }
 
 #[test]

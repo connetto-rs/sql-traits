@@ -50,6 +50,7 @@ struct MemoryCatalog {
     extensions: Vec<MemoryExtension>,
     policies: Vec<MemoryPolicy>,
     roles: Vec<MemoryRole>,
+    role_memberships: Vec<MemoryRoleMembership>,
     table_grants: Vec<MemoryTableGrant>,
     column_grants: Vec<MemoryColumnGrant>,
     /// Schemas an unqualified name resolves against, in order. Empty answers
@@ -170,6 +171,13 @@ struct MemoryRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct MemoryRoleMembership {
+    role_name: String,
+    member_name: String,
+    set: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryTableGrant {
     table_name: String,
 }
@@ -208,6 +216,7 @@ plain_metadata!(
     MemoryExtension,
     MemoryPolicy,
     MemoryRole,
+    MemoryRoleMembership,
     MemoryTableGrant,
     MemoryColumnGrant,
 );
@@ -227,6 +236,7 @@ impl DatabaseLike for MemoryCatalog {
     type Extension = MemoryExtension;
     type Policy = MemoryPolicy;
     type Role = MemoryRole;
+    type RoleMembership = MemoryRoleMembership;
     type TableGrant = MemoryTableGrant;
     type ColumnGrant = MemoryColumnGrant;
     type Schema = MemorySchema;
@@ -326,6 +336,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn roles(&self) -> impl Iterator<Item = &Self::Role> {
         self.roles.iter()
+    }
+
+    fn role_memberships(&self) -> impl Iterator<Item = &Self::RoleMembership> {
+        self.role_memberships.iter()
     }
 
     fn table_grants(&self) -> impl Iterator<Item = &Self::TableGrant> {
@@ -1075,18 +1089,35 @@ impl RoleLike for MemoryRole {
         None
     }
 
-    fn member_of<'db>(
-        &'db self,
-        _database: &'db Self::DB,
-    ) -> impl Iterator<Item = &'db MemoryRole> {
-        core::iter::empty()
-    }
-
     fn policies<'db>(
         &'db self,
         _database: &'db Self::DB,
     ) -> impl Iterator<Item = &'db MemoryPolicy> {
         core::iter::empty()
+    }
+}
+
+impl RoleMembershipLike for MemoryRoleMembership {
+    type DB = MemoryCatalog;
+
+    fn role_name(&self) -> &str {
+        &self.role_name
+    }
+
+    fn member_name(&self) -> &str {
+        &self.member_name
+    }
+
+    fn admin_option(&self) -> bool {
+        false
+    }
+
+    fn inherit_option(&self) -> bool {
+        true
+    }
+
+    fn set_option(&self) -> bool {
+        self.set
     }
 }
 
@@ -1281,9 +1312,54 @@ fn catalog() -> MemoryCatalog {
             function(Some("app"), "overloaded", &["TEXT"]),
         ],
         schemas: vec![MemorySchema { name: String::from("app"), name_is_quoted: false }],
-        roles: vec![MemoryRole { name: String::from("reader"), name_is_quoted: false }],
+        roles: vec![
+            MemoryRole { name: String::from("reader"), name_is_quoted: false },
+            MemoryRole { name: String::from("writer"), name_is_quoted: false },
+            MemoryRole { name: String::from("Writer"), name_is_quoted: true },
+        ],
+        role_memberships: vec![
+            MemoryRoleMembership {
+                role_name: String::from("READER"),
+                member_name: String::from("WRITER"),
+                set: false,
+            },
+            MemoryRoleMembership {
+                role_name: String::from("platform"),
+                member_name: String::from("Writer"),
+                set: true,
+            },
+            MemoryRoleMembership {
+                role_name: String::from("writer"),
+                member_name: String::from("reader"),
+                set: true,
+            },
+        ],
         ..MemoryCatalog::default()
     }
+}
+
+/// The inherited membership readers fold unquoted names before comparing, so
+/// a membership reaches the role its member name folds to and never the
+/// quoted role spelled alike.
+#[test]
+fn the_inherited_membership_readers_compare_folded_names() {
+    let catalog = catalog();
+    let writer = catalog.role("writer").expect("the unquoted role resolves");
+    let quoted_writer = catalog.role("Writer").expect("the quoted role resolves");
+
+    let memberships: Vec<_> = writer
+        .memberships(&catalog)
+        .map(|membership| (membership.stored_role_name().into_owned(), membership.set_option()))
+        .collect();
+    assert_eq!(memberships, [(String::from("reader"), false), (String::from("platform"), true)]);
+    assert_eq!(quoted_writer.memberships(&catalog).count(), 0);
+
+    let parents: Vec<_> = writer.member_of(&catalog).map(RoleLike::name).collect();
+    assert_eq!(parents, ["reader"]);
+
+    let first = catalog.role_memberships().next().expect("one membership");
+    assert_eq!(first.member(&catalog).map(RoleLike::name), Some("writer"));
+    assert_eq!(first.role(&catalog).map(RoleLike::name), Some("reader"));
 }
 
 /// The inherited resolver reads an unqualified name through the default schema

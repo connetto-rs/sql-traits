@@ -39,7 +39,8 @@ use crate::{
     impls::SqlparserDialect,
     structs::{
         ColumnIdentity, ColumnMetadata, GenericDB, IdentifierCase, MaterializedView,
-        RelationIdentity, Schema, SchemaProfile, TableAttribute, TableMetadata, View,
+        RelationIdentity, RoleMembership, Schema, SchemaProfile, TableAttribute, TableMetadata,
+        View,
         metadata::{
             CheckMetadata, FunctionMetadata, IndexMetadata, PolicyMetadata, UniqueIndexMetadata,
         },
@@ -76,6 +77,7 @@ mod parsed_source;
 mod postgres_18_collations;
 mod postgres_builtins;
 mod postgres_catalog;
+mod role_memberships;
 mod routine_privileges;
 mod rules;
 mod transactions;
@@ -87,6 +89,7 @@ pub use parse_options::{AccessResolution, ParseOptions};
 use parsed_source::{ParsedSource, StatementSource};
 use postgres_catalog::CatalogName;
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};
+use role_memberships::CreateRoleMemberships;
 
 /// The object kinds a schema parsed from SQL text holds, each an `sqlparser`
 /// AST node or a wrapper pairing one with the table it belongs to.
@@ -108,6 +111,7 @@ impl SchemaProfile for SqlparserProfile {
     type Extension = CreateExtension;
     type Policy = CreatePolicy;
     type Role = CreateRole;
+    type RoleMembership = RoleMembership;
     type Schema = Schema;
     type TableGrant = Grant;
     type ColumnGrant = Grant;
@@ -1412,6 +1416,7 @@ impl ParserDBBuilder {
                     .filter_map(policy_role_ident)
                     .any(|policy_ident| idents_match(policy_ident, role_ident))
             })
+            || role_memberships::granted_by(self, role_ident)
     }
 
     /// Whether any relation belongs to this schema.
@@ -3764,19 +3769,7 @@ fn rename_role_references(builder: &mut ParserDBBuilder, previous: &Ident, repla
             }
         }
     }
-    for (role, ()) in builder.roles_mut() {
-        for parent in &mut Arc::make_mut(role).in_role {
-            if idents_match(parent, previous) {
-                *parent = replacement.clone();
-            }
-        }
-    }
-}
-
-fn remove_role_memberships(roles: &mut [(Arc<CreateRole>, ())], removed: &Ident) {
-    for (role, ()) in roles {
-        Arc::make_mut(role).in_role.retain(|parent| !idents_match(parent, removed));
-    }
+    role_memberships::rename_role(builder, previous, replacement);
 }
 
 /// Applies the attributes one `ALTER ROLE ... WITH` names, in written order,
@@ -3947,6 +3940,9 @@ pub enum UnresolvedAccessReference<'a> {
         /// The role it applies to.
         role: &'a Ident,
     },
+    /// A role membership naming, as the granted role or as the member, a role
+    /// no `CREATE ROLE` in the input creates.
+    MembershipRole(&'a Ident),
     /// An `ALTER ROLE` changing attributes of a role no `CREATE ROLE` had
     /// created when it ran.
     ///
@@ -4215,7 +4211,8 @@ impl ParserDB {
     /// database's access control statements name and the database does not
     /// itself hold: the grantees and targets of its grants, the grantees of the
     /// `EXECUTE` privileges its functions carry, the roles its policies apply
-    /// to, and the roles whose attributes an `ALTER ROLE` changed before any
+    /// to, the granted roles and members of its role memberships, and the
+    /// roles whose attributes an `ALTER ROLE` changed before any
     /// `CREATE ROLE` created them. The grant object shapes the closed world
     /// never resolved
     /// either, `ALL TABLES IN SCHEMA` and the sequence and schema forms, are
@@ -4341,6 +4338,14 @@ impl ParserDB {
             }
         }
 
+        for (membership, ()) in &self.role_memberships {
+            for role_ident in [&membership.role, &membership.member] {
+                if !declares(role_ident) {
+                    unresolved.insert(UnresolvedAccessReference::MembershipRole(role_ident));
+                }
+            }
+        }
+
         for alteration in &self.ingestion.role_alterations {
             unresolved.insert(UnresolvedAccessReference::AlteredRole {
                 role: &alteration.role,
@@ -4352,9 +4357,10 @@ impl ParserDB {
     }
 
     /// Checks that every access control statement resolves: each grantee names
-    /// a role, each table or function target names a table or a function, and
-    /// each policy applies to a role that this database holds, and that no
-    /// `ALTER ROLE` changed a role before it was created.
+    /// a role, each table or function target names a table or a function,
+    /// each policy applies to a role and each role membership names roles that
+    /// this database holds, and that no `ALTER ROLE` changed a role before it
+    /// was created.
     ///
     /// This is the [`AccessResolution::ClosedWorld`] verdict on a database
     /// parsed under [`AccessResolution::OpenWorld`], deferred until the whole
@@ -4367,7 +4373,8 @@ impl ParserDB {
     /// [`RoleNotFoundForGrant`](crate::errors::Error::RoleNotFoundForGrant),
     /// [`TableNotFoundForGrant`](crate::errors::Error::TableNotFoundForGrant),
     /// [`FunctionNotFoundForGrant`](crate::errors::Error::FunctionNotFoundForGrant),
-    /// [`RoleNotFoundForPolicy`](crate::errors::Error::RoleNotFoundForPolicy)
+    /// [`RoleNotFoundForPolicy`](crate::errors::Error::RoleNotFoundForPolicy),
+    /// [`RoleNotFoundForMembership`](crate::errors::Error::RoleNotFoundForMembership)
     /// or
     /// [`AlterRoleNotFound`](crate::errors::Error::AlterRoleNotFound).
     /// A malformed or ambiguous target name surfaces as
@@ -4417,6 +4424,11 @@ impl ParserDB {
                 Err(crate::errors::Error::RoleNotFoundForPolicy {
                     role_name: role.value.clone(),
                     policy_name: policy.value.clone(),
+                })
+            }
+            Some(UnresolvedAccessReference::MembershipRole(role)) => {
+                Err(crate::errors::Error::RoleNotFoundForMembership {
+                    role_name: role.value.clone(),
                 })
             }
             Some(UnresolvedAccessReference::AlteredRole { role, .. }) => {
@@ -6924,7 +6936,7 @@ impl ParserDB {
                             });
                         }
 
-                        remove_role_memberships(builder.roles_mut(), role_ident);
+                        role_memberships::drop_role(&mut builder, role_ident);
                         builder
                             .roles_mut()
                             .retain(|(role, ())| !role_matches_lookup_ident(role, role_ident));
@@ -7668,7 +7680,7 @@ impl ParserDB {
                     let metadata = PolicyMetadata::new(using_functions, check_functions);
                     builder = builder.add_policy(Arc::new(policy), metadata);
                 }
-                Statement::CreateRole(create_role) => {
+                Statement::CreateRole(mut create_role) => {
                     // A role name is cluster-wide. Unlike the checks on a role
                     // a grant or a policy names, this one is ungated: the
                     // access setting excuses a dump that omits role creation,
@@ -7688,7 +7700,19 @@ impl ParserDB {
                             });
                         }
                     }
-                    builder = builder.add_role(Arc::new(create_role), ());
+                    let memberships = CreateRoleMemberships::take(&mut create_role);
+                    memberships.validate(&builder, access_resolution)?;
+                    let created = Arc::new(create_role);
+                    builder = builder.add_role(Arc::clone(&created), ());
+                    memberships.record(&mut builder, &created, &role_alterations);
+                }
+                Statement::GrantRole(grant) => {
+                    role_memberships::grant_role(
+                        &mut builder,
+                        &grant,
+                        access_resolution,
+                        &role_alterations,
+                    )?;
                 }
                 Statement::CreateSchema { schema_name, if_not_exists, .. } => {
                     if let SchemaName::Simple(name) | SchemaName::NamedAuthorization(name, _) =
