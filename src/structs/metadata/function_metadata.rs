@@ -10,13 +10,15 @@ use crate::impls::{grantee_is_public, grantee_matches_role, grantees_match};
 /// Metadata about a database function.
 ///
 /// Holds what the input says about a function that the function's own
-/// declaration cannot carry, which is the role a later statement hands it to
-/// and who may execute it.
+/// declaration cannot carry.
 pub struct FunctionMetadata {
     /// The role the input names as the function's owner, if it names one.
     owner: Option<String>,
     /// Who holds `EXECUTE` on the function.
     execute: ExecutePrivileges,
+    /// Call argument positions where `NULL` yields `NULL` despite
+    /// non-strictness.
+    null_returning_arguments: &'static [usize],
 }
 
 impl FunctionMetadata {
@@ -55,6 +57,21 @@ impl FunctionMetadata {
     #[inline]
     pub fn set_owner(&mut self, owner: Option<String>) {
         self.owner = owner;
+    }
+
+    /// Returns whether a `NULL` call argument at `index` yields `NULL` despite
+    /// non-strictness.
+    #[must_use]
+    #[inline]
+    pub(crate) fn returns_null_on_null_argument(&self, index: usize) -> bool {
+        self.null_returning_arguments.contains(&index)
+    }
+
+    /// Sets the call argument positions where `NULL` yields `NULL` despite
+    /// non-strictness.
+    #[inline]
+    pub(crate) fn set_null_returning_arguments(&mut self, positions: &'static [usize]) {
+        self.null_returning_arguments = positions;
     }
 
     /// Returns who holds `EXECUTE` on the function.
