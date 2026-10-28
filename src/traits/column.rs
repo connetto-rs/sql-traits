@@ -447,6 +447,44 @@ pub trait ColumnLike:
         None
     }
 
+    /// Returns how many digits a value of a decimal column keeps to the right
+    /// of the decimal point, or `None` when the declared type fixes no scale.
+    ///
+    /// `NUMERIC(p, s)` and `DECIMAL(p, s)` answer `s`, and `NUMERIC(p)` answers
+    /// `0`. A bare type answers the engine's default, which is 0 in MySQL, SQL
+    /// Server and the standard, 3 in DuckDB and 9 in BigQuery. A bare `NUMERIC`
+    /// in PostgreSQL holds any scale and answers `None`, and so does a bare
+    /// `NUMBER` in Oracle. A negative scale, which PostgreSQL accepts and which
+    /// rounds a value to tens or hundreds, answers as written. Integer,
+    /// floating-point and non-numeric types answer `None`. So does every
+    /// declared type in SQLite, which stores a decimal value as an integer or a
+    /// float whatever scale it declares.
+    ///
+    /// The default answers `None`, so an implementation over a backend with a
+    /// decimal type must override it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE amounts (id INT, amount NUMERIC(10,2), rate DECIMAL(5,4), bare NUMERIC);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("amounts", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let scales: Vec<_> = table.columns(&db)?.map(|column| column.numeric_scale(&db)).collect();
+    /// assert_eq!(scales, [None, Some(2), Some(4), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn numeric_scale(&self, _database: &Self::DB) -> Option<i64> {
+        None
+    }
+
     /// Returns the builtin scalar family of the column's declared type.
     ///
     /// # Example
@@ -1792,6 +1830,11 @@ where
     }
 
     #[inline]
+    fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
+        (*self).numeric_scale(database)
+    }
+
+    #[inline]
     fn collation<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -1876,6 +1919,11 @@ where
     #[inline]
     fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
         (**self).fractional_seconds_precision(database)
+    }
+
+    #[inline]
+    fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
+        (**self).numeric_scale(database)
     }
 
     #[inline]
