@@ -145,6 +145,23 @@ mod tests {
         assert!(fk.foreign_key_name().is_none(), "inline REFERENCES has no name");
     }
 
+    /// `CONSTRAINT name REFERENCES` names the foreign key the way the
+    /// table-constraint spelling does.
+    #[test]
+    fn test_named_inline_foreign_key_keeps_its_name() {
+        let sql = "
+            CREATE TABLE parent (id INT PRIMARY KEY);
+            CREATE TABLE child (id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_parent REFERENCES parent(id));
+        ";
+        let db = ParserDB::parse::<GenericDialect>(sql).expect("parse");
+        let child = db
+            .table_by_target(TargetName::new("child", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .unwrap();
+        let fk = child.foreign_keys(&db).expect("fk lookup").next().expect("FK should exist");
+        assert_eq!(fk.foreign_key_name(), Some("fk_parent"));
+    }
+
     /// `ON DELETE SET NULL` is not CASCADE, so `on_delete_cascade()` is false.
     #[test]
     fn test_on_delete_set_null_is_not_cascade() {

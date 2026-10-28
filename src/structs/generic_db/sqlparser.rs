@@ -4748,8 +4748,10 @@ impl ParserDB {
                 }
                 // The same constraint written inline on the column rather than
                 // as a table constraint, so it takes the same path: both
-                // spellings must resolve their target alike.
+                // spellings must resolve their target and read back their name
+                // alike.
                 ColumnOption::ForeignKey(mut foreign_key) => {
+                    foreign_key.name.clone_from(&option.name);
                     foreign_key.columns.push(column.attribute().name.clone());
                     builder = Self::process_foreign_key_table_constraint(
                         &foreign_key,
