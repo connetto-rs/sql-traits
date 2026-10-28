@@ -590,3 +590,16 @@ fn grant_options_are_read_as_postgres_reads_them() {
     .expect("schema builds");
     assert_eq!(memberships_of(&database, "child"), [membership("parent", false, true, true)]);
 }
+
+/// A MySQL account grantee names a user the schema does not model as a role,
+/// so it records nothing.
+#[test]
+fn mysql_account_grantee_records_nothing() {
+    let database = ParserDB::parse::<MySqlDialect>(
+        "CREATE ROLE parent;
+         GRANT parent TO 'app'@'localhost';",
+    )
+    .expect("schema builds");
+
+    assert_eq!(database.role_memberships().count(), 0);
+}
