@@ -391,6 +391,12 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
 
     /// Returns the policies that reference this role.
     ///
+    /// These are the policies whose `TO` clause names this role.
+    /// [`PolicyLike::applies_to_role`] answers which policies apply to it,
+    /// `PUBLIC` and inherited roles included.
+    ///
+    /// [`PolicyLike::applies_to_role`]: crate::traits::PolicyLike::applies_to_role
+    ///
     /// # Example
     ///
     /// ```rust

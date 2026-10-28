@@ -1,5 +1,6 @@
 //! Submodule providing a trait for describing SQL Policy-like entities.
 
+use alloc::vec::Vec;
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Owner};
@@ -7,7 +8,8 @@ use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Owner};
 use crate::{
     errors::LookupError,
     structs::TargetName,
-    traits::{DatabaseLike, Metadata},
+    traits::{DatabaseLike, Metadata, RoleLike, role::privilege_holders},
+    utils::identifier_resolution::normalize_identifier,
 };
 
 /// A trait for types that can be treated as SQL policies.
@@ -308,6 +310,64 @@ pub trait PolicyLike:
     /// # }
     /// ```
     fn applies_to_public(&self) -> bool;
+
+    /// Returns whether the policy applies to `role`, as PostgreSQL decides
+    /// for a session running as `role`.
+    ///
+    /// A policy applies to every role when [`Self::applies_to_public`] says
+    /// so. Otherwise it applies to each role its `TO` clause names, under the
+    /// usual identifier rules, and to each role that has one of those among
+    /// its [`inherited_roles`](RoleLike::inherited_roles), since PostgreSQL
+    /// applies a policy to every role that uses the named role's privileges.
+    /// A `TO` entry such as `CURRENT_USER` names whichever role runs the
+    /// statement, which the schema never says, so it matches no role.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE reader;
+    /// CREATE ROLE app_user IN ROLE reader;
+    /// CREATE ROLE auditor;
+    /// CREATE TABLE docs (id INT);
+    /// CREATE POLICY readers_only ON docs TO reader USING (true);
+    /// ",
+    /// )?;
+    /// let policy = db.policies().next().unwrap();
+    ///
+    /// assert!(policy.applies_to_role(db.role("reader").unwrap(), &db));
+    /// assert!(policy.applies_to_role(db.role("app_user").unwrap(), &db));
+    /// assert!(!policy.applies_to_role(db.role("auditor").unwrap(), &db));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn applies_to_role(
+        &self,
+        role: &<Self::DB as DatabaseLike>::Role,
+        database: &Self::DB,
+    ) -> bool {
+        if self.applies_to_public() {
+            return true;
+        }
+        let named: Vec<_> = self
+            .roles(database)
+            .filter_map(|owner| {
+                match owner {
+                    Owner::Ident(ident) => {
+                        Some(normalize_identifier(&ident.value, ident.quote_style.is_some()))
+                    }
+                    Owner::CurrentRole | Owner::CurrentUser | Owner::SessionUser => None,
+                }
+            })
+            .collect();
+        !named.is_empty()
+            && privilege_holders(role, database).any(|holder| named.contains(&holder.stored_name()))
+    }
 
     /// Returns the `USING` expression of the policy, if any.
     ///
