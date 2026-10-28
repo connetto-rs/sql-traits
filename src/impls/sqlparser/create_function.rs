@@ -12,7 +12,7 @@ use sqlparser::ast::{
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{FunctionMetadata, ParserDB, TargetName},
-    traits::{FunctionLike, Metadata},
+    traits::{FunctionLike, Metadata, role::privilege_holders},
     utils::{
         last_str, normalize_sqlparser_type,
         object_name::{object_name_last_part, target_name_of_object_name},
@@ -197,7 +197,8 @@ impl FunctionLike for CreateFunction {
 
     #[inline]
     fn can_execute(&self, role: &CreateRole, database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(function_metadata(self, database)?.can_execute(role))
+        let metadata = function_metadata(self, database)?;
+        Ok(privilege_holders(role, database).any(|holder| metadata.can_execute(holder)))
     }
 
     #[inline]
@@ -206,7 +207,8 @@ impl FunctionLike for CreateFunction {
         role: &CreateRole,
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
-        Ok(function_metadata(self, database)?.can_grant_execute(role))
+        let metadata = function_metadata(self, database)?;
+        Ok(privilege_holders(role, database).any(|holder| metadata.can_grant_execute(holder)))
     }
 }
 

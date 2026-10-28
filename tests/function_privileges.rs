@@ -413,21 +413,6 @@ fn a_grant_option_is_kept_and_can_be_revoked_alone() {
     assert_eq!(f.can_grant_execute(role(&revoked, "partner"), &revoked), Ok(true));
 }
 
-/// A grant reaches the role it names, and not the roles that are its members.
-#[test]
-fn membership_is_not_followed() {
-    let db = parse(
-        "CREATE ROLE parent;
-         CREATE ROLE child IN ROLE parent;
-         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
-         REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;
-         GRANT EXECUTE ON FUNCTION f() TO parent;",
-    )
-    .expect("schema parses");
-
-    assert_eq!(function(&db, "f", &[]).can_execute(role(&db, "child"), &db), Ok(false));
-}
-
 /// A replacement keeps the catalog entry and so its privileges, while a drop
 /// and a new creation start again from the default.
 #[test]

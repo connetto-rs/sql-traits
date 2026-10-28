@@ -618,8 +618,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// grants it, or when it is the role
     /// [`owner`](FunctionLike::owner) names and the owner's own entry was not
     /// revoked. The owner's entry is an ordinary one, which the owner can
-    /// revoke and grant back. Like [`GrantLike::applies_to_role`], a grant
-    /// reaches the role it names and not the roles that are members of it.
+    /// revoke and grant back. A role also may whenever one of its
+    /// [`inherited_roles`] may, since PostgreSQL passes privileges on along
+    /// every membership carrying `INHERIT`.
     ///
     /// An owner the input never names cannot be recognised, so this answers
     /// for it as for any other role.
@@ -660,7 +661,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # }
     /// ```
     ///
-    /// [`GrantLike::applies_to_role`]: crate::traits::GrantLike::applies_to_role
+    /// [`inherited_roles`]: crate::traits::RoleLike::inherited_roles
     fn can_execute(
         &self,
         role: &<Self::DB as DatabaseLike>::Role,
@@ -673,8 +674,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// A role may when an entry of its own was granted `WITH GRANT OPTION`
     /// and no `REVOKE GRANT OPTION FOR` took that away, or when it is the role
     /// [`owner`](FunctionLike::owner) names, which ownership lets grant
-    /// whatever its own entry says. `PUBLIC` never holds the option, since
-    /// PostgreSQL grants it to roles alone.
+    /// whatever its own entry says. A role also may whenever one of its
+    /// [`inherited_roles`](crate::traits::RoleLike::inherited_roles) may.
+    /// `PUBLIC` never holds the option, since PostgreSQL grants it to roles
+    /// alone.
     ///
     /// # Arguments
     ///
