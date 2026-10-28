@@ -3,7 +3,6 @@
 
 use sql_traits::prelude::*;
 use sqlparser::{
-    ast::CreateTable,
     dialect::{
         BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
         GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect,
@@ -11,16 +10,7 @@ use sqlparser::{
     },
     parser::Parser,
 };
-
-fn table<'db>(db: &'db ParserDB, schema: Option<&str>, name: &str) -> &'db CreateTable {
-    let target = match schema {
-        Some(schema) => TargetName::new(name, false).with_schema(schema, false),
-        None => TargetName::new(name, false),
-    };
-    db.table_by_target(target, IdentifierCase::AsWritten)
-        .expect("unambiguous lookup")
-        .expect("the table exists")
-}
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/table_lookup.rs"));
 
 fn table_doc<'db>(db: &'db ParserDB, schema: Option<&str>, name: &str) -> Option<&'db str> {
     table(db, schema, name).table_doc(db).expect("the table is in this database")

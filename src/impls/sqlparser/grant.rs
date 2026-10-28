@@ -126,7 +126,7 @@ fn schema_matches_relation(
     identifiers_match(relation_schema, relation_schema_quoted, lookup_schema, lookup_schema_quoted)
 }
 
-fn schema_matches_table<T: TableLike>(schema_name: &ObjectName, table: &T) -> bool {
+pub(crate) fn schema_matches_table<T: TableLike>(schema_name: &ObjectName, table: &T) -> bool {
     schema_matches_relation(
         schema_name,
         table.table_schema().map(|schema| (schema, table.table_schema_is_quoted())),

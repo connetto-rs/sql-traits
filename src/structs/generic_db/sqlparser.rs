@@ -81,6 +81,7 @@ mod postgres_catalog;
 mod role_memberships;
 mod routine_privileges;
 mod rules;
+mod table_owner;
 mod transactions;
 mod view_rewrites;
 mod views;
@@ -4669,6 +4670,7 @@ impl ParserDB {
         metadata.set_rls_enabled(previous_metadata.rls_enabled());
         metadata.set_rls_forced(previous_metadata.rls_forced());
         metadata.set_owner(previous_metadata.owner().map(str::to_string));
+        metadata.set_owner_privileges(previous_metadata.take_owner_privileges());
         metadata.set_documentation(previous_metadata.take_documentation());
         // Which columns came from a parent is not spelled by the node, so it
         // has to survive the rebuild the way the other unspelled settings do.
@@ -5530,8 +5532,8 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// Applies `edit` to the metadata of the table an `ALTER TABLE` statement
-    /// targets.
+    /// Applies `edit` to the node and metadata of the table an `ALTER TABLE`
+    /// statement targets.
     ///
     /// Metadata carries settings the table node does not spell, so unlike
     /// [`Self::alter_table_constraints`] nothing derived from the node needs
@@ -5545,7 +5547,7 @@ impl ParserDB {
         mut builder: ParserDBBuilder,
         table_name: &ObjectName,
         if_exists: bool,
-        edit: impl FnOnce(&mut TableMetadata<CreateTable>),
+        edit: impl FnOnce(&Arc<CreateTable>, &mut TableMetadata<CreateTable>),
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(resolved_table) = builder.resolve_table_object_name(table_name)? else {
             if if_exists {
@@ -5578,7 +5580,7 @@ impl ParserDB {
             return Err(ObjectKind::Table.not_in_database(&resolved_table_name).into());
         };
 
-        edit(&mut entry.1);
+        edit(&entry.0, &mut entry.1);
 
         Ok(builder)
     }
@@ -7193,7 +7195,7 @@ impl ParserDB {
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_rls_enabled(true),
+                                    |_, metadata| metadata.set_rls_enabled(true),
                                 )?;
                             }
                             AlterTableOperation::DisableRowLevelSecurity => {
@@ -7201,7 +7203,7 @@ impl ParserDB {
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_rls_enabled(false),
+                                    |_, metadata| metadata.set_rls_enabled(false),
                                 )?;
                             }
                             AlterTableOperation::ForceRowLevelSecurity => {
@@ -7209,7 +7211,7 @@ impl ParserDB {
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_rls_forced(true),
+                                    |_, metadata| metadata.set_rls_forced(true),
                                 )?;
                             }
                             AlterTableOperation::NoForceRowLevelSecurity => {
@@ -7217,7 +7219,7 @@ impl ParserDB {
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_rls_forced(false),
+                                    |_, metadata| metadata.set_rls_forced(false),
                                 )?;
                             }
                             AlterTableOperation::RenameTable { table_name } => {
@@ -7414,8 +7416,8 @@ impl ParserDB {
                                     Owner::Ident(ident) => Some(ident.clone()),
                                     _ => None,
                                 };
-                                let owner = match new_owner {
-                                    Owner::Ident(ident) => Some(stored_role_name(&ident)),
+                                let owner = match &new_owner {
+                                    Owner::Ident(ident) => Some(stored_role_name(ident)),
                                     // These name whoever runs the statement,
                                     // so the owner changed to one the input
                                     // never spells and the model can no longer
@@ -7424,12 +7426,27 @@ impl ParserDB {
                                     | Owner::CurrentUser
                                     | Owner::SessionUser => None,
                                 };
+                                let mut handover = None;
                                 builder = Self::alter_table_metadata(
                                     builder,
                                     &alter_table.name,
                                     alter_table.if_exists,
-                                    |metadata| metadata.set_owner(owner),
+                                    |table, metadata| {
+                                        handover = metadata
+                                            .owner()
+                                            .filter(|previous| owner.as_deref() != Some(*previous))
+                                            .map(|previous| (Arc::clone(table), previous.to_string()));
+                                        metadata.set_owner(owner);
+                                    },
                                 )?;
+                                if let Some((table, previous)) = handover {
+                                    table_owner::change_owner(
+                                        &mut builder,
+                                        &table,
+                                        &previous,
+                                        &new_owner,
+                                    );
+                                }
                                 // After the table, because the database reports
                                 // an absent table first, and skipped entirely
                                 // when `IF EXISTS` excused an absent one, since
@@ -7889,6 +7906,7 @@ impl ParserDB {
                             reason: reason.to_string(),
                         });
                     }
+                    table_owner::revoke(&mut builder, &revoke);
                 }
                 Statement::Set(sqlparser::ast::Set::SetTimeZone { local, value }) => {
                     if local {

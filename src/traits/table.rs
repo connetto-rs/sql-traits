@@ -10,8 +10,8 @@ use crate::{
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
-        ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, RuleLike,
-        RuleRelation, TableGrantLike, TriggerLike,
+        ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, RoleLike,
+        RuleLike, RuleRelation, TableGrantLike, TriggerLike,
         check_constraint::{evaluate_constant_expr, non_tautological},
         role::privilege_holders,
     },
@@ -4217,6 +4217,48 @@ pub trait TableLike:
     /// ```
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError>;
 
+    /// Iterates over the table-level privileges the owner's own entry holds.
+    ///
+    /// PostgreSQL gives the owner every table privilege when it creates the
+    /// table, through an entry the owner can revoke and grant back like any
+    /// other. A `REVOKE` naming the [`owner`](Self::owner) takes from it, and
+    /// an owner change hands it to the new owner as it stands. The entry is
+    /// kept while no owner is recorded, since the role that ran `CREATE
+    /// TABLE` holds it then.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Action, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE app_owner;
+    /// CREATE TABLE docs (id INT);
+    /// ALTER TABLE docs OWNER TO app_owner;
+    /// REVOKE TRUNCATE, TRIGGER ON docs FROM app_owner;
+    /// ",
+    /// )?;
+    /// let docs =
+    ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let held: Vec<_> = docs.owner_privileges(&db)?.map(ToString::to_string).collect();
+    /// assert_eq!(held, ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES"]);
+    /// assert!(!docs.owner_privileges(&db)?.any(|privilege| matches!(privilege, Action::Truncate)));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn owner_privileges<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError>;
+
     /// Iterates over the policies associated with the table.
     ///
     /// # Arguments
@@ -4342,6 +4384,12 @@ pub trait TableLike:
     ///   [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of this
     ///   role
     /// - Includes SELECT privilege or ALL PRIVILEGES
+    ///
+    /// A role also can read when it, or one of its inherited roles, is the
+    /// table's [`owner`](Self::owner) and the owner's own entry still holds
+    /// SELECT, as [`owner_privileges`](Self::owner_privileges) reports.
+    /// `can_insert`, `can_update`, `can_delete` and `can_truncate` follow the
+    /// same two paths.
     ///
     /// # Errors
     ///
@@ -4585,7 +4633,8 @@ pub trait TableLike:
 
 /// Returns whether `role` holds a privilege on `table` that `privilege`
 /// accepts, through a grant to the role itself, to `PUBLIC`, or to one of
-/// the roles it inherits from.
+/// the roles it inherits from, or through the owner's own entry when the
+/// role or one it inherits from owns the table.
 fn holds_privilege<T: TableLike>(
     table: &T,
     role: &<T::DB as DatabaseLike>::Role,
@@ -4594,6 +4643,12 @@ fn holds_privilege<T: TableLike>(
 ) -> Result<bool, LookupError> {
     let mut grants = table.grants(database)?;
     let holders: Vec<_> = privilege_holders(role, database).collect();
+    if let Some(owner) = table.owner(database)?
+        && holders.iter().any(|holder| holder.stored_name() == owner)
+        && table.owner_privileges(database)?.any(&privilege)
+    {
+        return Ok(true);
+    }
     Ok(grants.any(|grant| {
         holders.iter().any(|holder| grant.applies_to_role(holder))
             && (grant.is_all_privileges() || grant.privileges(database).any(&privilege))
@@ -4758,6 +4813,13 @@ where
 
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         T::owner(self, database)
+    }
+
+    fn owner_privileges<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
+        T::owner_privileges(self, database)
     }
 
     fn primary_key_columns<'db>(
@@ -5020,6 +5082,11 @@ mod tests {
             assert_eq!(
                 <&_ as TableLike>::schema_fingerprint(table_ref, &db),
                 table.schema_fingerprint(&db)
+            );
+            assert!(
+                <&_ as TableLike>::owner_privileges(table_ref, &db)
+                    .expect("owner_privileges on &T")
+                    .eq(table.owner_privileges(&db).expect("owner_privileges"))
             );
         }
 

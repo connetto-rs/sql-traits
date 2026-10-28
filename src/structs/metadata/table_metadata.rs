@@ -1,6 +1,8 @@
 //! Submodule defining a generic `TableMetadata` struct.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
+
+use sqlparser::ast::{Action, Privileges};
 
 use crate::traits::{ColumnLike, DatabaseLike, TableLike};
 
@@ -50,6 +52,11 @@ pub struct TableMetadata<T: TableLike> {
     rls_forced: bool,
     /// The role the input names as the table's owner, if it names one.
     owner: Option<String>,
+    /// The table-level privileges the owner's own entry holds.
+    ///
+    /// Mirrors the owner's item in `pg_class.relacl`, which starts with every
+    /// table privilege and loses the ones a `REVOKE` naming the owner takes.
+    owner_privileges: Vec<Action>,
     /// The comment block written above the table.
     documentation: Option<String>,
 }
@@ -69,6 +76,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             rls_enabled: false,
             rls_forced: false,
             owner: None,
+            owner_privileges: every_table_privilege(),
             documentation: None,
         }
     }
@@ -127,6 +135,39 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub fn set_owner(&mut self, owner: Option<String>) {
         self.owner = owner;
+    }
+
+    /// Returns the table-level privileges the owner's own entry holds.
+    #[inline]
+    pub fn owner_privileges(&self) -> impl Iterator<Item = &Action> {
+        self.owner_privileges.iter()
+    }
+
+    /// Takes the owner's own entry, for a rebuilt table to carry it over.
+    pub(crate) fn take_owner_privileges(&mut self) -> Vec<Action> {
+        core::mem::take(&mut self.owner_privileges)
+    }
+
+    /// Replaces the owner's own entry.
+    pub(crate) fn set_owner_privileges(&mut self, privileges: Vec<Action>) {
+        self.owner_privileges = privileges;
+    }
+
+    /// Takes from the owner's own entry the table-level privileges a `REVOKE`
+    /// names. A privilege limited to columns leaves it alone, since column
+    /// privileges live in entries of their own.
+    pub(crate) fn revoke_owner_privileges(&mut self, revoked: &Privileges) {
+        match revoked {
+            Privileges::All { .. } => self.owner_privileges.clear(),
+            Privileges::Actions(actions) => {
+                self.owner_privileges.retain(|held| {
+                    !actions.iter().any(|action| {
+                        is_table_wide(action)
+                            && core::mem::discriminant(action) == core::mem::discriminant(held)
+                    })
+                });
+            }
+        }
     }
 
     /// Returns an iterator over the references of columns of the table.
@@ -389,5 +430,30 @@ impl<T: TableLike> TableMetadata<T> {
                 *index = replacement.clone();
             }
         }
+    }
+}
+
+/// Every privilege PostgreSQL gives a table's owner when it creates the table.
+fn every_table_privilege() -> Vec<Action> {
+    vec![
+        Action::Select { columns: None },
+        Action::Insert { columns: None },
+        Action::Update { columns: None },
+        Action::Delete,
+        Action::Truncate,
+        Action::References { columns: None },
+        Action::Trigger,
+    ]
+}
+
+/// Returns whether `action` covers the whole table rather than some of its
+/// columns.
+fn is_table_wide(action: &Action) -> bool {
+    match action {
+        Action::Select { columns }
+        | Action::Insert { columns }
+        | Action::Update { columns }
+        | Action::References { columns } => columns.is_none(),
+        _ => true,
     }
 }
