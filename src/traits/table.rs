@@ -13,6 +13,7 @@ use crate::{
         ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, RuleLike,
         RuleRelation, TableGrantLike, TriggerLike,
         check_constraint::{evaluate_constant_expr, non_tautological},
+        role::privilege_holders,
     },
     utils::{
         identifier_resolution::{identifiers_match, normalize_identifier},
@@ -4337,7 +4338,9 @@ pub trait TableLike:
     ///
     /// A role can read if there's a grant that:
     /// - Applies to this table (directly or via ALL TABLES IN SCHEMA)
-    /// - Applies to this role as a grantee
+    /// - Names this role, `PUBLIC`, or one of the
+    ///   [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of this
+    ///   role
     /// - Includes SELECT privilege or ALL PRIVILEGES
     ///
     /// # Errors
@@ -4377,11 +4380,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        Ok(self.grants(database)?.any(|grant| {
-            grant.applies_to_role(role)
-                && (grant.is_all_privileges()
-                    || grant.privileges(database).any(|p| matches!(p, Action::Select { .. })))
-        }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Select { .. }))
     }
 
     /// Returns whether the given role can insert into this table.
@@ -4419,11 +4418,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        Ok(self.grants(database)?.any(|grant| {
-            grant.applies_to_role(role)
-                && (grant.is_all_privileges()
-                    || grant.privileges(database).any(|p| matches!(p, Action::Insert { .. })))
-        }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Insert { .. }))
     }
 
     /// Returns whether the given role can update this table.
@@ -4461,11 +4456,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        Ok(self.grants(database)?.any(|grant| {
-            grant.applies_to_role(role)
-                && (grant.is_all_privileges()
-                    || grant.privileges(database).any(|p| matches!(p, Action::Update { .. })))
-        }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Update { .. }))
     }
 
     /// Returns whether the given role can delete from this table.
@@ -4503,11 +4494,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        Ok(self.grants(database)?.any(|grant| {
-            grant.applies_to_role(role)
-                && (grant.is_all_privileges()
-                    || grant.privileges(database).any(|p| matches!(p, Action::Delete)))
-        }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Delete))
     }
 
     /// Returns whether the given role can write to this table (INSERT, UPDATE,
@@ -4592,12 +4579,25 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        Ok(self.grants(database)?.any(|grant| {
-            grant.applies_to_role(role)
-                && (grant.is_all_privileges()
-                    || grant.privileges(database).any(|p| matches!(p, Action::Truncate)))
-        }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Truncate))
     }
+}
+
+/// Returns whether `role` holds a privilege on `table` that `privilege`
+/// accepts, through a grant to the role itself, to `PUBLIC`, or to one of
+/// the roles it inherits from.
+fn holds_privilege<T: TableLike>(
+    table: &T,
+    role: &<T::DB as DatabaseLike>::Role,
+    database: &T::DB,
+    privilege: impl Fn(&sqlparser::ast::Action) -> bool,
+) -> Result<bool, LookupError> {
+    let mut grants = table.grants(database)?;
+    let holders: Vec<_> = privilege_holders(role, database).collect();
+    Ok(grants.any(|grant| {
+        holders.iter().any(|holder| grant.applies_to_role(holder))
+            && (grant.is_all_privileges() || grant.privileges(database).any(&privilege))
+    }))
 }
 
 impl<T: TableLike> TableLike for &T

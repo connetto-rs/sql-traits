@@ -1,7 +1,7 @@
 //! Submodule providing a trait for describing SQL Role-like entities.
 
-use alloc::borrow::Cow;
-use core::fmt::Debug;
+use alloc::{borrow::Cow, vec::Vec};
+use core::{fmt::Debug, iter::once};
 
 use crate::{
     traits::{DatabaseLike, Metadata, RoleMembershipLike},
@@ -323,6 +323,72 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
         self.memberships(database).filter_map(move |membership| membership.role(database))
     }
 
+    /// Returns the roles whose privileges this role uses without `SET ROLE`,
+    /// each once and never the role itself.
+    ///
+    /// PostgreSQL passes a granted role's privileges on along a membership
+    /// carrying [`inherit_option`](RoleMembershipLike::inherit_option), and
+    /// on again along each inheriting membership of that role in turn. A
+    /// membership without the option ends the chain there, and a granted
+    /// role the database does not hold passes nothing on.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE reader;
+    /// CREATE ROLE auditor;
+    /// CREATE ROLE staff IN ROLE reader;
+    /// CREATE ROLE app_user;
+    /// GRANT staff TO app_user;
+    /// GRANT auditor TO app_user WITH INHERIT FALSE;
+    /// ",
+    /// )?;
+    ///
+    /// let app_user = db.role("app_user").unwrap();
+    /// let inherited: Vec<_> = app_user.inherited_roles(&db).map(RoleLike::name).collect();
+    /// assert_eq!(inherited, ["staff", "reader"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn inherited_roles<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Role> {
+        /// Appends to `reached` each role an inheriting membership among
+        /// `memberships` grants, unless it is the walk's own role or was
+        /// reached already.
+        fn reach<'db, DB: DatabaseLike>(
+            memberships: impl Iterator<Item = &'db DB::RoleMembership>,
+            database: &'db DB,
+            own_name: &str,
+            reached: &mut Vec<&'db DB::Role>,
+        ) {
+            for granted in memberships
+                .filter(|membership| membership.inherit_option())
+                .filter_map(|membership| membership.role(database))
+            {
+                if granted.stored_name() != own_name && !reached.contains(&granted) {
+                    reached.push(granted);
+                }
+            }
+        }
+
+        let own_name = self.stored_name();
+        let mut reached = Vec::new();
+        reach(self.memberships(database), database, &own_name, &mut reached);
+        let mut next = 0;
+        while let Some(&role) = reached.get(next) {
+            next += 1;
+            reach(role.memberships(database), database, &own_name, &mut reached);
+        }
+        reached.into_iter()
+    }
+
     /// Returns the policies that reference this role.
     ///
     /// # Example
@@ -350,6 +416,15 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
         &'db self,
         database: &'db Self::DB,
     ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Policy>;
+}
+
+/// Returns `role` and its [`inherited_roles`](RoleLike::inherited_roles),
+/// which together hold every privilege `role` uses without `SET ROLE`.
+pub(crate) fn privilege_holders<'db, DB: DatabaseLike>(
+    role: &'db DB::Role,
+    database: &'db DB,
+) -> impl Iterator<Item = &'db DB::Role> {
+    once(role).chain(role.inherited_roles(database))
 }
 
 impl<T: RoleLike> RoleLike for &T {
