@@ -112,6 +112,25 @@ pub(super) fn descendants(builder: &ParserDBBuilder, parent: &StoredTable) -> Ve
     found
 }
 
+/// The first table below `table` that inherits through `INHERITS`, which only
+/// `CASCADE` may drop, whereas PostgreSQL drops a partition along with its
+/// partitioned table on its own.
+pub(super) fn first_inheritor_below(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+) -> Option<StoredTable> {
+    let mut frontier = alloc::vec![table.clone()];
+    while let Some(current) = frontier.pop() {
+        for (kind, child) in direct_children(builder, &current) {
+            if kind == ParentKind::Inherits {
+                return Some(child);
+            }
+            frontier.push(child);
+        }
+    }
+    None
+}
+
 /// The tables linked directly to `parent`, each under the spelling that links
 /// it.
 ///
