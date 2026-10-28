@@ -1204,18 +1204,14 @@ pub enum Error {
         /// Name of the aggregate the statement names.
         aggregate_name: String,
     },
-    #[error(
-        "Role membership statement `{statement}` is refused because this model does not record the memberships it changes."
-    )]
-    /// Error indicating that a `GRANT role TO role` or `REVOKE role FROM role`
-    /// statement changes a role membership, which this model records only
-    /// from `CREATE ROLE ... IN ROLE`.
-    ///
-    /// Dropping the statement would hide a membership the server holds and
-    /// let a `DROP ROLE` through that the server refuses, so it is refused.
-    RoleMembershipUnsupported {
-        /// The statement as sqlparser renders it.
-        statement: String,
+    #[error("Granting role `{role_name}` to `{member_name}` would make a role a member of itself.")]
+    /// Error indicating that a `GRANT role TO role` would close a cycle of
+    /// memberships, which PostgreSQL refuses.
+    CircularRoleMembership {
+        /// Name of the role being granted.
+        role_name: String,
+        /// Name of the role it is granted to.
+        member_name: String,
     },
     #[error("Index `{index_name}` not found for ALTER INDEX statement.")]
     /// Error indicating that an ALTER INDEX statement references an index that

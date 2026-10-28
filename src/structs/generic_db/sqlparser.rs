@@ -74,6 +74,7 @@ mod parse_options;
 mod parsed_source;
 mod postgres_18_collations;
 mod postgres_catalog;
+mod role_memberships;
 mod routine_privileges;
 mod rules;
 mod transactions;
@@ -6648,10 +6649,11 @@ impl ParserDB {
                             .retain(|(role, ())| !role_matches_lookup_ident(role, role_ident));
                     }
                 }
-                membership @ (Statement::GrantRole(_) | Statement::RevokeRole(_)) => {
-                    return Err(crate::errors::Error::RoleMembershipUnsupported {
-                        statement: membership.to_string(),
-                    });
+                Statement::GrantRole(grant) => {
+                    role_memberships::grant(&mut builder, &grant, access_resolution)?;
+                }
+                Statement::RevokeRole(revoke) => {
+                    role_memberships::revoke(&mut builder, &revoke, access_resolution)?;
                 }
                 Statement::AlterRole {
                     name,

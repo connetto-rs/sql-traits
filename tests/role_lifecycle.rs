@@ -163,19 +163,133 @@ fn a_group_takes_a_role_name() {
     );
 }
 
-/// A membership granted or revoked by statement is refused rather than
-/// dropped, since dropping it would hide a membership the server records.
+fn memberships(database: &ParserDB, role: &str) -> Vec<String> {
+    database
+        .role(role)
+        .expect("role resolves")
+        .member_of(database)
+        .map(|parent| parent.stored_name().into_owned())
+        .collect()
+}
+
 #[test]
-fn a_membership_statement_is_refused() {
-    for statement in ["GRANT parent_role TO child_role;", "REVOKE parent_role FROM child_role;"] {
+fn a_granted_membership_is_recorded_once_and_revoked() {
+    let granted = parse(
+        "CREATE ROLE parent_role;
+         CREATE ROLE child_role;
+         GRANT parent_role TO child_role;
+         GRANT parent_role TO child_role WITH ADMIN OPTION;",
+    )
+    .expect("schema builds");
+    assert_eq!(memberships(&granted, "child_role"), ["parent_role"]);
+
+    let revoked = parse(
+        "CREATE ROLE parent_role;
+         CREATE ROLE child_role IN ROLE parent_role;
+         REVOKE parent_role FROM child_role;",
+    )
+    .expect("schema builds");
+    assert_eq!(memberships(&revoked, "child_role"), Vec::<String>::new());
+
+    // Revoking an option leaves the membership itself in place.
+    let option_revoked = parse(
+        "CREATE ROLE parent_role;
+         CREATE ROLE child_role;
+         GRANT parent_role TO child_role WITH ADMIN OPTION;
+         REVOKE ADMIN OPTION FOR parent_role FROM child_role;",
+    )
+    .expect("schema builds");
+    assert_eq!(memberships(&option_revoked, "child_role"), ["parent_role"]);
+}
+
+#[test]
+fn a_granted_membership_follows_renames_and_drops() {
+    let renamed = parse(
+        "CREATE ROLE parent_role;
+         CREATE ROLE child_role;
+         GRANT parent_role TO child_role;
+         ALTER ROLE parent_role RENAME TO elder_role;",
+    )
+    .expect("schema builds");
+    assert_eq!(memberships(&renamed, "child_role"), ["elder_role"]);
+
+    let dropped = parse(
+        "CREATE ROLE parent_role;
+         CREATE ROLE child_role;
+         GRANT parent_role TO child_role;
+         DROP ROLE parent_role;
+         CREATE ROLE parent_role;",
+    )
+    .expect("schema builds");
+    assert_eq!(memberships(&dropped, "child_role"), Vec::<String>::new());
+}
+
+/// PostgreSQL refuses a membership naming a role it does not hold, `PUBLIC`
+/// included, and one that would make a role a member of itself.
+#[test]
+fn a_membership_the_server_refuses_is_refused() {
+    for (statement, absent) in [
+        ("GRANT ghost TO child_role;", "ghost"),
+        ("GRANT parent_role TO ghost;", "ghost"),
+        ("REVOKE ghost FROM child_role;", "ghost"),
+        ("GRANT parent_role TO PUBLIC;", "public"),
+    ] {
         let result = parse(&format!(
             "CREATE ROLE parent_role;
              CREATE ROLE child_role;
              {statement}"
         ));
         assert!(
-            matches!(&result, Err(Error::RoleMembershipUnsupported { .. })),
+            matches!(&result, Err(Error::RoleNotFoundForGrant { role_name }) if role_name == absent),
             "{statement} gave {result:?}"
         );
     }
+
+    for statement in [
+        "GRANT child_role TO child_role;",
+        "GRANT child_role TO parent_role;",
+        "GRANT grandchild_role TO parent_role;",
+    ] {
+        let result = parse(&format!(
+            "CREATE ROLE parent_role;
+             CREATE ROLE child_role IN ROLE parent_role;
+             CREATE ROLE grandchild_role IN ROLE child_role;
+             {statement}"
+        ));
+        assert!(
+            matches!(&result, Err(Error::CircularRoleMembership { .. })),
+            "{statement} gave {result:?}"
+        );
+    }
+}
+
+/// A dump omits role creation, so the open world records a membership whose
+/// roles the input never creates and reports none of them as members.
+#[test]
+fn the_open_world_accepts_a_membership_naming_absent_roles() {
+    let database = ParseOptions::default()
+        .with_access_resolution(AccessResolution::OpenWorld)
+        .parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE ROLE child_role;
+             GRANT ghost TO child_role;
+             GRANT child_role TO phantom;
+             REVOKE child_role FROM phantom;",
+        )
+        .expect("schema builds");
+    assert_eq!(memberships(&database, "child_role"), Vec::<String>::new());
+}
+
+/// Two paths up to one role are no cycle, so a grant below them goes through.
+#[test]
+fn a_diamond_of_memberships_is_not_a_cycle() {
+    let database = parse(
+        "CREATE ROLE top_role;
+         CREATE ROLE left_role IN ROLE top_role;
+         CREATE ROLE right_role IN ROLE top_role;
+         CREATE ROLE bottom_role IN ROLE left_role, right_role;
+         CREATE ROLE other_role;
+         GRANT bottom_role TO other_role;",
+    )
+    .expect("schema builds");
+    assert_eq!(memberships(&database, "other_role"), ["bottom_role"]);
 }
