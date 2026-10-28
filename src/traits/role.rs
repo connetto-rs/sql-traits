@@ -369,7 +369,7 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
             reached: &mut Vec<&'db DB::Role>,
         ) {
             for granted in memberships
-                .filter(RoleMembershipLike::inherit_option)
+                .filter(|membership| membership.inherit_option())
                 .filter_map(|membership| membership.role(database))
             {
                 if granted.stored_name() != own_name && !reached.contains(&granted) {
