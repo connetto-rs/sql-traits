@@ -870,6 +870,47 @@ fn a_schema_wide_grant_covers_every_relation_kind() {
     assert_eq!(kinds, vec!["materialized view", "table", "view"]);
 }
 
+/// A relation created without a qualifier lives in `public`, so a blanket
+/// grant on `public` reaches it as one on any other schema reaches its own.
+/// A temporary relation lives in `pg_temp` and stays out.
+#[test]
+fn a_schema_wide_grant_on_public_covers_unqualified_relations() {
+    for schema in ["public", "PUBLIC"] {
+        let db = parse(&format!(
+            "CREATE ROLE r;
+             CREATE TABLE t (a INT);
+             CREATE TABLE public.u (a INT);
+             CREATE TEMP TABLE scratch (a INT);
+             CREATE VIEW v AS SELECT a FROM t;
+             CREATE MATERIALIZED VIEW m AS SELECT a FROM t;
+             GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO r;"
+        ))
+        .expect("the blanket grant is accepted");
+        let grant = db.table_grants().next().expect("one grant");
+        let mut tables: Vec<&str> = grant.tables(&db).map(TableLike::table_name).collect();
+        tables.sort_unstable();
+        assert_eq!(tables, ["t", "u"], "{schema}");
+        // The plain and the materialized view are reached as well.
+        assert_eq!(grant.relations(&db).count(), 4, "{schema}");
+        let bare = db
+            .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+            .expect("the name is well formed")
+            .expect("the table is recorded");
+        assert!(grant.applies_to_table(bare, &db), "{schema}");
+    }
+
+    // A quoted spelling that keeps its case names another schema.
+    let db = parse(
+        "CREATE ROLE r;
+         CREATE SCHEMA \"PUBLIC\";
+         CREATE TABLE t (a INT);
+         GRANT SELECT ON ALL TABLES IN SCHEMA \"PUBLIC\" TO r;",
+    )
+    .expect("the blanket grant is accepted");
+    let grant = db.table_grants().next().expect("one grant");
+    assert_eq!(grant.relations(&db).count(), 0);
+}
+
 #[test]
 fn a_relation_a_view_reads_cannot_be_dropped_from_under_it() {
     // Measured: `cannot drop view v1 because other objects depend on it`, and

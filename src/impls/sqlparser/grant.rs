@@ -108,17 +108,13 @@ pub(crate) fn grantee_matches_role(grantee: &Grantee, role: &CreateRole) -> bool
 /// Whether a schema-wide grant's schema name covers a relation stored in
 /// `relation_schema`, with the quote state that decides case sensitivity.
 ///
-/// A relation stored without a schema is not covered: this crate leaves a
-/// `public` relation's qualifier unwritten, and `ALL TABLES IN SCHEMA public`
-/// naming it would then read differently from the same grant written against
-/// any other schema.
+/// A relation stored without a schema lives in `public`, where PostgreSQL
+/// created it, so `ALL TABLES IN SCHEMA public` covers it.
 fn schema_matches_relation(
     schema_name: &ObjectName,
     relation_schema: Option<(&str, bool)>,
 ) -> bool {
-    let Some((relation_schema, relation_schema_quoted)) = relation_schema else {
-        return false;
-    };
+    let (relation_schema, relation_schema_quoted) = relation_schema.unwrap_or(("public", false));
     let Some((lookup_schema, lookup_schema_quoted)) = object_name_last_part(schema_name) else {
         return false;
     };
