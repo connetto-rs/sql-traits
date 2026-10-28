@@ -294,18 +294,30 @@ fn inherited_column(
     let mut copy = copy_column(column, |option| option_passes_down(kind, option));
 
     if kind == ParentKind::PartitionOf {
-        let unique_columns = generated_names::column_part(&copy.name);
         for option in &mut copy.options {
-            let (columns, label) = match option.option {
-                ColumnOption::PrimaryKey(_) => (None, "pkey"),
-                ColumnOption::Unique(_) => (Some(unique_columns.as_str()), "key"),
-                _ => continue,
-            };
-            option.name = Some(generated_key_name(builder, child, columns, label, taken));
+            name_partition_key(builder, child, &copy.name, option, taken);
         }
     }
 
     copy
+}
+
+/// Gives a partition's copy of a key written on `column` the name of its own
+/// that its index needs.
+pub(super) fn name_partition_key(
+    builder: &ParserDBBuilder,
+    child: &CreateTable,
+    column: &Ident,
+    option: &mut ColumnOptionDef,
+    taken: &mut Vec<Ident>,
+) {
+    let unique_columns = generated_names::column_part(column);
+    let (columns, label) = match option.option {
+        ColumnOption::PrimaryKey(_) => (None, "pkey"),
+        ColumnOption::Unique(_) => (Some(unique_columns.as_str()), "key"),
+        _ => return,
+    };
+    option.name = Some(generated_key_name(builder, child, columns, label, taken));
 }
 
 /// The name PostgreSQL resolves the type to, or [`None`] when the spelling is
@@ -371,7 +383,7 @@ fn type_identity(data_type: &DataType) -> Option<String> {
 ///
 /// Answers `false` whenever either spelling cannot be placed, so an unfamiliar
 /// type never blocks a schema PostgreSQL accepts.
-fn types_conflict(parent: &DataType, child: &DataType) -> bool {
+pub(super) fn types_conflict(parent: &DataType, child: &DataType) -> bool {
     match (type_identity(parent), type_identity(child)) {
         (Some(parent), Some(child)) => parent != child,
         _ => false,
@@ -379,7 +391,7 @@ fn types_conflict(parent: &DataType, child: &DataType) -> bool {
 }
 
 /// Whether the two column names denote the same column.
-fn same_column(left: &Ident, right: &Ident) -> bool {
+pub(super) fn same_column(left: &Ident, right: &Ident) -> bool {
     super::identifiers_match(
         left.value.as_str(),
         left.quote_style.is_some(),
@@ -601,6 +613,27 @@ pub(super) fn follow_constraint_rewrite(
         .filter(|(index, constraint)| inherited(*index, constraint))
         .map(|(_, constraint)| constraint.to_string())
         .collect()
+}
+
+/// Whether the two columns hold collations PostgreSQL refuses to merge.
+pub(super) fn collations_conflict(
+    builder: &ParserDBBuilder,
+    (parent, parent_column): (&CreateTable, &ColumnDef),
+    (child, child_column): (&CreateTable, &ColumnDef),
+) -> bool {
+    let metadata = |table: &CreateTable, column: &ColumnDef| {
+        builder
+            .columns()
+            .iter()
+            .find(|(stored, _, _)| {
+                stored.table() == table && same_column(&stored.attribute().name, &column.name)
+            })
+            .map(|(_, metadata, _)| metadata)
+    };
+    match (metadata(parent, parent_column), metadata(child, child_column)) {
+        (Some(parent), Some(child)) => parent.postgres_collation_matches(child) == Some(false),
+        _ => false,
+    }
 }
 
 fn inherited_column_metadata(

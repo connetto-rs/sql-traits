@@ -50,7 +50,7 @@ pub(super) fn refuse_not_valid(
 }
 
 /// Whether the table holds `constraint` validated.
-fn is_validated(
+pub(super) fn is_validated(
     builder: &ParserDBBuilder,
     table: &StoredTable,
     constraint: &TableConstraint,
