@@ -289,3 +289,90 @@ fn an_extension_follows_its_schema_through_a_rename() {
         Err(Error::SchemaNotEmpty { schema_name }) if schema_name == "tools"
     ));
 }
+
+/// The function `name` resolves to from a bare reference, as
+/// `schema.name returns type`.
+fn resolved(database: &ParserDB, target: TargetName<'_>) -> Option<String> {
+    database.resolve_target_function(target, IdentifierCase::AsWritten).expect("unambiguous").map(
+        |function| {
+            format!(
+                "{} returns {}",
+                function.target_name(),
+                function.return_type_name(database).unwrap_or_default()
+            )
+        },
+    )
+}
+
+#[test]
+fn uuid_ossp_creates_its_functions_where_it_lands() {
+    let database = parse("CREATE EXTENSION \"uuid-ossp\";").expect("the extension is created");
+    let bare = |name| resolved(&database, TargetName::new(name, false));
+    for name in [
+        "uuid_nil",
+        "uuid_ns_dns",
+        "uuid_ns_url",
+        "uuid_ns_oid",
+        "uuid_ns_x500",
+        "uuid_generate_v1",
+        "uuid_generate_v1mc",
+        "uuid_generate_v3",
+        "uuid_generate_v4",
+        "uuid_generate_v5",
+    ] {
+        assert_eq!(bare(name), Some(format!("{name} returns UUID")));
+    }
+
+    let elsewhere = parse("CREATE SCHEMA ext; CREATE EXTENSION \"uuid-ossp\" WITH SCHEMA ext;")
+        .expect("the extension is created");
+    let v4 = TargetName::new("uuid_generate_v4", false);
+    assert_eq!(resolved(&elsewhere, v4.clone()), None);
+    assert_eq!(
+        resolved(&elsewhere, v4.with_schema("ext", false)),
+        Some("ext.uuid_generate_v4 returns UUID".to_owned())
+    );
+}
+
+#[test]
+fn uuid_ossp_functions_go_with_the_extension() {
+    let v4 = || TargetName::new("uuid_generate_v4", false);
+    let dropped = parse("CREATE EXTENSION \"uuid-ossp\"; DROP EXTENSION \"uuid-ossp\";")
+        .expect("the extension is dropped");
+    assert_eq!(resolved(&dropped, v4()), None);
+    let cascaded = parse(
+        "CREATE SCHEMA ext; CREATE EXTENSION \"uuid-ossp\" WITH SCHEMA ext;
+         DROP SCHEMA ext CASCADE;",
+    )
+    .expect("the schema is dropped");
+    assert_eq!(resolved(&cascaded, v4().with_schema("ext", false)), None);
+
+    assert!(matches!(
+        parse("CREATE EXTENSION \"uuid-ossp\"; DROP FUNCTION uuid_generate_v4();"),
+        Err(Error::FunctionRequiredByExtension { function_name, extension_name })
+            if function_name == "uuid_generate_v4" && extension_name == "uuid-ossp"
+    ));
+    assert!(matches!(
+        parse(
+            "CREATE EXTENSION \"uuid-ossp\";
+             CREATE TABLE t (id UUID CHECK (id <> uuid_nil()));
+             DROP EXTENSION \"uuid-ossp\";",
+        ),
+        Err(Error::FunctionReferenced { function_name }) if function_name == "uuid_nil"
+    ));
+    assert!(matches!(
+        parse(
+            "CREATE FUNCTION uuid_nil() RETURNS UUID LANGUAGE sql AS 'SELECT NULL::uuid';
+             CREATE EXTENSION \"uuid-ossp\";",
+        ),
+        Err(Error::FunctionAlreadyExists { function_name }) if function_name == "uuid_nil"
+    ));
+}
+
+#[test]
+fn decode_is_a_builtin_returning_bytea() {
+    let database = parse("").expect("empty input parses");
+    assert_eq!(
+        resolved(&database, TargetName::new("decode", false)),
+        Some("pg_catalog.decode returns BYTEA".to_owned())
+    );
+}

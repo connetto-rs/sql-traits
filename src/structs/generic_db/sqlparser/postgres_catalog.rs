@@ -1,10 +1,7 @@
 use alloc::{borrow::Cow, string::String};
 
 use super::postgres_18_collations::POSTGRES_18_COLLATIONS;
-use crate::utils::identifier_resolution::identifiers_match;
-
-/// The schema holding every built-in PostgreSQL catalog fact.
-const PG_CATALOG: &str = "pg_catalog";
+use crate::utils::{identifier_resolution::identifiers_match, object_name::PG_CATALOG};
 
 /// The types PostgreSQL 18 marks collatable in `pg_catalog`.
 static POSTGRES_18_COLLATABLE_TYPES: &[PostgresCatalogType] = &[

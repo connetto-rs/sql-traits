@@ -128,10 +128,11 @@ fn a_written_lookup_applies_the_identifier_rules() {
     );
 }
 
-/// A registered builtin lives in the catalog schema, so it is reached by naming
-/// that schema and not by a bare reference.
+/// A registered builtin lives in the catalog schema, which PostgreSQL searches
+/// before the path unless the path names it, so a bare reference reaches it.
+/// The parts lookup applies no path, so there the schema has to be written.
 #[test]
-fn a_builtin_is_reached_through_its_own_schema() -> Result<(), LookupError> {
+fn a_builtin_is_reached_through_the_implicit_catalog_schema() -> Result<(), LookupError> {
     let db = db("CREATE FUNCTION helper() RETURNS INT LANGUAGE sql AS 'SELECT 1';");
 
     assert!(
@@ -149,7 +150,11 @@ fn a_builtin_is_reached_through_its_own_schema() -> Result<(), LookupError> {
         db.resolve_target_function(target("pg_catalog.coalesce"), IdentifierCase::AsWritten)?
             .is_some()
     );
-    assert!(db.resolve_target_function(target("coalesce"), IdentifierCase::AsWritten)?.is_none());
+    assert_eq!(
+        db.resolve_target_function(target("coalesce"), IdentifierCase::AsWritten)?
+            .map(|function| function.target_name().to_string()),
+        Some("pg_catalog.coalesce".to_owned())
+    );
 
     // A declaration written without a schema resides in the default one, which
     // the path does carry.
@@ -158,6 +163,25 @@ fn a_builtin_is_reached_through_its_own_schema() -> Result<(), LookupError> {
             .is_some()
     );
     assert!(db.resolve_target_function(target("helper"), IdentifierCase::AsWritten)?.is_some());
+
+    Ok(())
+}
+
+/// The catalog schema wins over a same-named function on the path, unless
+/// the path names the catalog after the schema holding it.
+#[test]
+fn the_catalog_schema_is_searched_where_the_path_puts_it() -> Result<(), LookupError> {
+    let shadowing = "CREATE FUNCTION lower(x TEXT) RETURNS TEXT LANGUAGE sql AS 'SELECT x';";
+    let catalog_first = db(shadowing);
+    let public_first = db(&format!("{shadowing} SET search_path TO public, pg_catalog;"));
+
+    let reached = |db: &ParserDB| -> Result<Option<String>, LookupError> {
+        Ok(db
+            .resolve_target_function(target("lower"), IdentifierCase::AsWritten)?
+            .map(|function| function.target_name().to_string()))
+    };
+    assert_eq!(reached(&catalog_first)?.as_deref(), Some("pg_catalog.lower"));
+    assert_eq!(reached(&public_first)?.as_deref(), Some("lower"));
 
     Ok(())
 }

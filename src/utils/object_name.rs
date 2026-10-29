@@ -27,6 +27,9 @@ use crate::{
 /// relations.
 pub(crate) const TEMPORARY_SCHEMA: &str = "pg_temp";
 
+/// The schema holding PostgreSQL's built-in objects.
+pub(crate) const PG_CATALOG: &str = "pg_catalog";
+
 /// Whether a schema name denotes the session's temporary schema.
 ///
 /// Unquoted `PG_TEMP` folds onto it, while quoted `"PG_TEMP"` names an
@@ -48,6 +51,25 @@ where
 {
     let named = search_path().any(|(schema, quoted)| is_temporary_schema(schema, quoted));
     (!named).then_some((TEMPORARY_SCHEMA, false)).into_iter().chain(search_path())
+}
+
+/// The schemas a function lookup walks for an unqualified name.
+///
+/// PostgreSQL searches `pg_catalog` before the path unless the path names
+/// it, in which case it is searched where the path puts it. The temporary
+/// schema is never searched for functions.
+pub(crate) fn function_search_path<'path, I>(
+    search_path: impl Fn() -> I,
+) -> impl Iterator<Item = (&'path str, bool)>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
+    let named =
+        search_path().any(|(schema, quoted)| identifiers_match(schema, quoted, PG_CATALOG, false));
+    (!named)
+        .then_some((PG_CATALOG, false))
+        .into_iter()
+        .chain(search_path().filter(|&(schema, quoted)| !is_temporary_schema(schema, quoted)))
 }
 
 /// Reports a name a statement builds while it runs, which no static reader can

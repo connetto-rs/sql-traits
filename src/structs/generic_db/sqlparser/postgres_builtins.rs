@@ -15,7 +15,7 @@ use crate::structs::{FunctionKind, metadata::FunctionMetadata};
 
 /// The type of a builtin's argument or result.
 #[derive(Clone, Copy)]
-enum BuiltinType {
+pub(super) enum BuiltinType {
     Any,
     /// A `VARIADIC "any"` parameter, which gathers the remaining arguments.
     VariadicAny,
@@ -26,6 +26,7 @@ enum BuiltinType {
     BigInt,
     Numeric,
     DoublePrecision,
+    Bytea,
     Uuid,
     Date,
     Interval,
@@ -53,6 +54,7 @@ impl BuiltinType {
             Self::BigInt => DataType::BigInt(None),
             Self::Numeric => DataType::Numeric(ExactNumberInfo::None),
             Self::DoublePrecision => DataType::DoublePrecision,
+            Self::Bytea => DataType::Bytea,
             Self::Uuid => DataType::Uuid,
             Self::Date => DataType::Date,
             Self::Interval => DataType::Interval { fields: None, precision: None },
@@ -61,6 +63,11 @@ impl BuiltinType {
             Self::Timestamp => DataType::Timestamp(None, TimezoneInfo::None),
             Self::TimestampTz => DataType::Timestamp(None, TimezoneInfo::WithTimeZone),
         }
+    }
+
+    /// Whether a parameter of this type gathers the remaining arguments.
+    fn is_variadic(self) -> bool {
+        matches!(self, Self::VariadicAny)
     }
 }
 
@@ -80,7 +87,7 @@ enum NullInput {
 /// `pg_proc.provolatile`, a `Copy` stand-in for [`FunctionBehavior`] so a row
 /// can be read out of the static table.
 #[derive(Clone, Copy)]
-enum Volatility {
+pub(super) enum Volatility {
     Immutable,
     Stable,
     /// Also the answer for a name without a `pg_proc` row, as for a
@@ -115,49 +122,17 @@ impl PostgresBuiltin {
     /// shadow it the way the server allows.
     pub(super) fn function(&self) -> CreateFunction {
         let Self(name, arguments, returns, null_input, volatility, _) = *self;
-        let args = arguments
-            .iter()
-            .map(|argument| {
-                OperateFunctionArg {
-                    // The mode, since `VARIADIC` as a name would invent an
-                    // argument called that.
-                    mode: matches!(argument, BuiltinType::VariadicAny).then_some(ArgMode::Variadic),
-                    name: None,
-                    data_type: argument.data_type(),
-                    default_expr: None,
-                }
-            })
-            .collect::<Vec<_>>();
-        CreateFunction {
-            or_alter: false,
-            or_replace: false,
-            temporary: false,
-            if_not_exists: false,
-            name: ObjectName(vec![
+        declaration(
+            ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::new("pg_catalog")),
                 ObjectNamePart::Identifier(Ident::new(name)),
             ]),
-            args: Some(args),
-            return_type: Some(FunctionReturnType::DataType(returns.data_type())),
-            function_body: Some(CreateFunctionBody::AsBeforeOptions {
-                body: Expr::Value(ValueWithSpan {
-                    value: Value::SingleQuotedString(String::new()),
-                    span: Span::empty(),
-                }),
-                link_symbol: None,
-            }),
-            behavior: Some(volatility.behavior()),
-            called_on_null: matches!(null_input, NullInput::Strict)
-                .then_some(FunctionCalledOnNull::Strict),
-            parallel: None,
-            using: None,
-            language: Some(Ident::new("internal")),
-            determinism_specifier: None,
-            options: None,
-            remote_connection: None,
-            security: None,
-            set_params: vec![],
-        }
+            arguments.iter().map(|argument| parameter(None, *argument)).collect(),
+            returns,
+            matches!(null_input, NullInput::Strict),
+            volatility,
+            "internal",
+        )
     }
 
     pub(super) fn metadata(&self) -> FunctionMetadata {
@@ -170,9 +145,58 @@ impl PostgresBuiltin {
     }
 }
 
+/// A parameter of type `data_type`, called `name` when it has one.
+pub(super) fn parameter(name: Option<&'static str>, data_type: BuiltinType) -> OperateFunctionArg {
+    OperateFunctionArg {
+        // A mode, since `VARIADIC` as a name would invent an argument of that name.
+        mode: data_type.is_variadic().then_some(ArgMode::Variadic),
+        name: name.map(Ident::new),
+        data_type: data_type.data_type(),
+        default_expr: None,
+    }
+}
+
+/// The declaration of a function the server provides, whose body the input
+/// never sees.
+pub(super) fn declaration(
+    name: ObjectName,
+    args: Vec<OperateFunctionArg>,
+    returns: BuiltinType,
+    strict: bool,
+    volatility: Volatility,
+    language: &str,
+) -> CreateFunction {
+    CreateFunction {
+        or_alter: false,
+        or_replace: false,
+        temporary: false,
+        if_not_exists: false,
+        name,
+        args: Some(args),
+        return_type: Some(FunctionReturnType::DataType(returns.data_type())),
+        function_body: Some(CreateFunctionBody::AsBeforeOptions {
+            body: Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(String::new()),
+                span: Span::empty(),
+            }),
+            link_symbol: None,
+        }),
+        behavior: Some(volatility.behavior()),
+        called_on_null: strict.then_some(FunctionCalledOnNull::Strict),
+        parallel: None,
+        using: None,
+        language: Some(Ident::new(language)),
+        determinism_specifier: None,
+        options: None,
+        remote_connection: None,
+        security: None,
+        set_params: vec![],
+    }
+}
+
 use BuiltinType::{
-    Any, BigInt, Boolean, Date, DoublePrecision, Int, Interval, Numeric, Text, TextArray, Time,
-    TimeTz, Timestamp, TimestampTz, Uuid, VariadicAny,
+    Any, BigInt, Boolean, Bytea, Date, DoublePrecision, Int, Interval, Numeric, Text, TextArray,
+    Time, TimeTz, Timestamp, TimestampTz, Uuid, VariadicAny,
 };
 use FunctionKind::{Aggregate, Normal, Window};
 use NullInput::{CalledOnNull, NullAt, Strict};
@@ -207,6 +231,7 @@ pub(super) static POSTGRES_BUILTINS: &[PostgresBuiltin] = &[
     PostgresBuiltin("current_setting", &[Text, Boolean], Text, Strict, Stable, Normal),
     PostgresBuiltin("coalesce", &[VariadicAny], Any, CalledOnNull, Immutable, Normal),
     PostgresBuiltin("nullif", &[Any, Any], Any, NullAt(&[0]), Immutable, Normal),
+    PostgresBuiltin("decode", &[Text, Text], Bytea, Strict, Immutable, Normal),
     PostgresBuiltin("now", &[], TimestampTz, Strict, Stable, Normal),
     PostgresBuiltin("current_timestamp", &[], TimestampTz, CalledOnNull, Stable, Normal),
     PostgresBuiltin("current_date", &[], Date, CalledOnNull, Stable, Normal),
