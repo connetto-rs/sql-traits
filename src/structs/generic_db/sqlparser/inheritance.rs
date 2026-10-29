@@ -131,6 +131,31 @@ pub(super) fn first_inheritor_below(
     None
 }
 
+/// The first foreign table among the partitions below `table`, at any depth,
+/// which a unique index on `table` would have to reach.
+pub(super) fn first_foreign_partition_below(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+) -> Option<StoredTable> {
+    let case = builder.identifier_case();
+    let mut frontier = alloc::vec![table.clone()];
+    while let Some(current) = frontier.pop() {
+        for (kind, child) in direct_children(builder, &current) {
+            if kind != ParentKind::PartitionOf {
+                continue;
+            }
+            let foreign = builder.tables().iter().any(|(stored, metadata, _)| {
+                child.matches(stored, case) && metadata.foreign_source().is_some()
+            });
+            if foreign {
+                return Some(child);
+            }
+            frontier.push(child);
+        }
+    }
+    None
+}
+
 /// The tables linked directly to `parent`, each under the spelling that links
 /// it.
 ///

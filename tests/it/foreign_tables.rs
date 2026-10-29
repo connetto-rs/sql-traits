@@ -6,7 +6,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{
-    errors::{Error, KeyConstraint, ObjectKind},
+    errors::{Error, KeyConstraint, ObjectKind, UnattachablePartition},
     prelude::*,
     traits::Relation,
 };
@@ -348,6 +348,224 @@ fn a_table_inherits_from_or_copies_a_foreign_table() {
     assert_eq!(child.columns(&db).expect("held").count(), 3);
     assert!(!child.is_foreign(&db).expect("held"));
     assert_eq!(lookup("copy").columns(&db).expect("held").count(), 2);
+}
+
+#[test]
+fn drop_foreign_table_drops_only_a_foreign_table() {
+    let dropped = db(&format!("{REMOTE} DROP FOREIGN TABLE remote;"));
+    assert_eq!(dropped.foreign_tables().count(), 0);
+    assert_eq!(
+        db(&format!("{REMOTE} DROP FOREIGN TABLE IF EXISTS nowhere;")).foreign_tables().count(),
+        1
+    );
+
+    for (sql, actual_kind) in [
+        ("CREATE TABLE local (id INT); DROP FOREIGN TABLE local;", ObjectKind::Table),
+        ("CREATE VIEW v AS SELECT 1 AS one; DROP FOREIGN TABLE v;", ObjectKind::View),
+        (
+            "CREATE MATERIALIZED VIEW m AS SELECT 1 AS one; DROP FOREIGN TABLE m;",
+            ObjectKind::MaterializedView,
+        ),
+    ] {
+        let error = refusal(sql);
+        assert!(
+            matches!(
+                &error,
+                Error::RelationKindMismatch { expected_kind: ObjectKind::ForeignTable, actual_kind: kind, .. }
+                    if *kind == actual_kind
+            ),
+            "{sql}: {error:?}"
+        );
+    }
+    assert!(matches!(
+        refusal("DROP FOREIGN TABLE nowhere;"),
+        Error::RelationNotFound { object_kind: ObjectKind::ForeignTable, object_name } if object_name == "nowhere"
+    ));
+
+    // A name of another kind anywhere in the list refuses the whole statement.
+    let mixed = "CREATE FOREIGN TABLE f5 (id INT) SERVER s; CREATE TABLE local (id INT);";
+    assert!(matches!(
+        refusal(&format!("{mixed} DROP FOREIGN TABLE f5, local;")),
+        Error::RelationKindMismatch { actual_kind: ObjectKind::Table, .. }
+    ));
+}
+
+#[test]
+fn drop_foreign_table_takes_what_depends_on_it_only_under_cascade() {
+    let viewed = format!("{REMOTE} CREATE VIEW recent AS SELECT id FROM remote;");
+    assert!(matches!(
+        refusal(&format!("{viewed} DROP FOREIGN TABLE remote;")),
+        Error::RelationHasDependents { object_kind: ObjectKind::ForeignTable, object_name, .. }
+            if object_name == "remote"
+    ));
+    let cascaded = db(&format!("{viewed} DROP FOREIGN TABLE remote CASCADE;"));
+    assert_eq!(cascaded.foreign_tables().count(), 0);
+    assert_eq!(cascaded.views().count(), 0);
+
+    let inherited = format!("{REMOTE} CREATE TABLE child () INHERITS (remote);");
+    assert!(matches!(
+        refusal(&format!("{inherited} DROP FOREIGN TABLE remote;")),
+        Error::DropTableInheritedFrom { .. }
+    ));
+    let cascaded = db(&format!("{inherited} DROP FOREIGN TABLE remote CASCADE;"));
+    assert_eq!(cascaded.tables().count(), 0);
+    assert_eq!(cascaded.foreign_tables().count(), 0);
+}
+
+const PARTITIONED: &str = "CREATE TABLE target (id INT PRIMARY KEY);
+     CREATE TABLE orders (id INT NOT NULL) PARTITION BY RANGE (id);
+     CREATE FOREIGN TABLE remote_orders (id INT NOT NULL) SERVER warehouse;";
+
+const ATTACHED: &str =
+    "ALTER TABLE orders ATTACH PARTITION remote_orders FOR VALUES FROM (0) TO (10);";
+
+fn table<'db>(db: &'db ParserDB, name: &str) -> &'db CreateTable {
+    db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .unwrap_or_else(|| panic!("table {name} is recorded"))
+}
+
+#[test]
+fn an_attached_foreign_partition_stays_foreign_and_is_listed_as_a_partition() {
+    let db = db(&format!(
+        "{PARTITIONED} {ATTACHED}
+         CREATE INDEX orders_id ON orders (id);
+         ALTER TABLE orders ADD COLUMN note TEXT;
+         ALTER TABLE orders ADD CONSTRAINT positive CHECK (id >= 0);"
+    ));
+    let orders = table(&db, "orders");
+    let remote = foreign(&db, "remote_orders");
+    assert_eq!(orders.partitions(&db).expect("held").collect::<Vec<_>>(), [remote]);
+    assert_eq!(remote.partition_root(&db).expect("held"), Some(orders));
+    assert!(remote.is_foreign(&db).expect("held"));
+    assert_eq!(remote.columns(&db).expect("held").count(), 2);
+    assert_eq!(remote.check_constraints(&db).expect("held").count(), 1);
+    assert_eq!(remote.indices(&db).expect("held").count(), 0);
+}
+
+#[test]
+fn a_foreign_table_is_not_attached_below_a_unique_index() {
+    for root in [
+        "CREATE TABLE keyed (id INT PRIMARY KEY) PARTITION BY RANGE (id);",
+        "CREATE TABLE keyed (id INT, UNIQUE (id)) PARTITION BY RANGE (id);",
+        "CREATE TABLE keyed (id INT NOT NULL) PARTITION BY RANGE (id);
+         CREATE UNIQUE INDEX keyed_id ON keyed (id);",
+    ] {
+        let sql = format!(
+            "{root} CREATE FOREIGN TABLE f (id INT NOT NULL) SERVER s;
+             ALTER TABLE keyed ATTACH PARTITION f FOR VALUES FROM (0) TO (10);"
+        );
+        let error = refusal(&sql);
+        assert!(
+            matches!(
+                &error,
+                Error::PartitionNotAttachable {
+                    table_name,
+                    partition_name,
+                    reason: UnattachablePartition::ForeignTableUnderUniqueIndex,
+                } if table_name == "keyed" && partition_name == "f"
+            ),
+            "{root}: {error:?}"
+        );
+    }
+
+    // A partitioned table carrying a foreign partition cannot take the index
+    // either.
+    let error = refusal(&format!(
+        "{PARTITIONED} {ATTACHED}
+         CREATE TABLE keyed (id INT PRIMARY KEY) PARTITION BY RANGE (id);
+         ALTER TABLE keyed ATTACH PARTITION orders FOR VALUES FROM (0) TO (100);"
+    ));
+    assert!(
+        matches!(
+            &error,
+            Error::UniqueIndexOverForeignPartition { table_name, partition_name }
+                if table_name == "orders" && partition_name == "remote_orders"
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_foreign_table_is_not_attached_below_a_foreign_key() {
+    let error = refusal(
+        "CREATE TABLE target (id INT PRIMARY KEY);
+         CREATE TABLE referencing (id INT REFERENCES target (id)) PARTITION BY RANGE (id);
+         CREATE FOREIGN TABLE f (id INT) SERVER s;
+         ALTER TABLE referencing ATTACH PARTITION f FOR VALUES FROM (0) TO (10);",
+    );
+    assert!(
+        matches!(
+            &error,
+            Error::ConstraintUnsupportedOnForeignTable { table_name, constraint: KeyConstraint::ForeignKey }
+                if table_name == "f"
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_unique_index_does_not_reach_a_foreign_partition() {
+    let nested = "CREATE TABLE outer_root (id INT NOT NULL) PARTITION BY RANGE (id);
+         CREATE TABLE middle PARTITION OF outer_root FOR VALUES FROM (0) TO (100)
+             PARTITION BY RANGE (id);
+         CREATE FOREIGN TABLE leaf (id INT NOT NULL) SERVER s;
+         ALTER TABLE middle ATTACH PARTITION leaf FOR VALUES FROM (0) TO (10);";
+    for (setup, statement, table_name, partition_name) in [
+        (PARTITIONED, "CREATE UNIQUE INDEX orders_uq ON orders (id);", "orders", "remote_orders"),
+        (PARTITIONED, "ALTER TABLE orders ADD PRIMARY KEY (id);", "orders", "remote_orders"),
+        (
+            PARTITIONED,
+            "ALTER TABLE orders ADD CONSTRAINT u UNIQUE (id);",
+            "orders",
+            "remote_orders",
+        ),
+        (PARTITIONED, "ALTER TABLE orders ADD COLUMN code INT UNIQUE;", "orders", "remote_orders"),
+        (nested, "CREATE UNIQUE INDEX outer_uq ON outer_root (id);", "outer_root", "leaf"),
+    ] {
+        let attached = if setup == PARTITIONED { ATTACHED } else { "" };
+        let sql = format!("{setup} {attached} {statement}");
+        let error = refusal(&sql);
+        assert!(
+            matches!(
+                &error,
+                Error::UniqueIndexOverForeignPartition { table_name: table, partition_name: partition }
+                    if table == table_name && partition == partition_name
+            ),
+            "{statement}: {error:?}"
+        );
+    }
+
+    let error = refusal(&format!(
+        "{PARTITIONED} {ATTACHED}
+         ALTER TABLE orders ADD CONSTRAINT k FOREIGN KEY (id) REFERENCES target (id);"
+    ));
+    assert!(
+        matches!(
+            &error,
+            Error::ConstraintUnsupportedOnForeignTable { table_name, constraint: KeyConstraint::ForeignKey }
+                if table_name == "remote_orders"
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_foreign_partition_goes_with_its_partitioned_table_and_leaves_it_alone() {
+    let partitioned = format!("{PARTITIONED} {ATTACHED}");
+    let dropped_root = db(&format!("{partitioned} DROP TABLE orders;"));
+    assert_eq!(dropped_root.foreign_tables().count(), 0);
+
+    let dropped_partition = db(&format!("{partitioned} DROP FOREIGN TABLE remote_orders;"));
+    assert_eq!(
+        table(&dropped_partition, "orders").partitions(&dropped_partition).expect("held").count(),
+        0
+    );
+
+    // With the foreign partition gone, the unique index is accepted again.
+    db(&format!(
+        "{partitioned} DROP FOREIGN TABLE remote_orders; ALTER TABLE orders ADD PRIMARY KEY (id);"
+    ));
 }
 
 #[test]
