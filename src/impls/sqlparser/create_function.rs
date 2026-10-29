@@ -119,6 +119,51 @@ impl FunctionLike for CreateFunction {
     }
 
     #[inline]
+    fn argument_modes(&self) -> impl Iterator<Item = ArgMode> {
+        self.args.iter().flatten().map(|arg| arg.mode.clone().unwrap_or(ArgMode::In))
+    }
+
+    #[inline]
+    fn argument_default_count(&self) -> usize {
+        self.args
+            .iter()
+            .flatten()
+            .filter(|arg| arg.mode != Some(ArgMode::Out) && arg.default_expr.is_some())
+            .count()
+    }
+
+    fn result_type_name<'db>(&'db self, _database: &'db Self::DB) -> Option<Cow<'db, str>> {
+        let row = |columns: &mut dyn Iterator<Item = &DataType>| {
+            let first = columns.next()?;
+            Some(Cow::Owned(match columns.next() {
+                None => first.to_string(),
+                Some(_) => "record".to_string(),
+            }))
+        };
+        match &self.return_type {
+            Some(FunctionReturnType::DataType(DataType::Table(columns))) => {
+                row(&mut columns.iter().flatten().map(|column| &column.data_type))
+                    .or(Some(Cow::Borrowed("record")))
+            }
+            Some(FunctionReturnType::DataType(DataType::NamedTable { columns, .. })) => {
+                row(&mut columns.iter().map(|column| &column.data_type))
+                    .or(Some(Cow::Borrowed("record")))
+            }
+            Some(
+                FunctionReturnType::DataType(data_type) | FunctionReturnType::SetOf(data_type),
+            ) => Some(Cow::Owned(data_type.to_string())),
+            None => {
+                row(&mut self
+                    .args
+                    .iter()
+                    .flatten()
+                    .filter(|arg| matches!(arg.mode, Some(ArgMode::Out | ArgMode::InOut)))
+                    .map(|arg| &arg.data_type))
+            }
+        }
+    }
+
+    #[inline]
     fn kind(&self, database: &Self::DB) -> Result<FunctionKind, LookupError> {
         Ok(function_metadata(self, database)?.kind())
     }
