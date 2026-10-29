@@ -18,11 +18,7 @@ use sqlparser::ast::{
 use super::{ParserDBBuilder, bind_reference, views::relations_read_in};
 use crate::{
     errors::Error,
-    utils::{
-        last_str,
-        object_name::{RelationKey, target_name_from_object_name},
-        with_scopes::WithScopes,
-    },
+    utils::{last_str, object_name::RelationKey, with_scopes::WithScopes},
 };
 
 /// Binds every stored relation the body of `function` reads, refusing the
@@ -34,23 +30,18 @@ use crate::{
 /// relation the body names that the builder does not hold, the way PostgreSQL
 /// refuses the `CREATE FUNCTION`.
 pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> Result<(), Error> {
-    let Some(body) = function.function_body.as_mut() else {
+    let Some(CreateFunctionBody::Return(expression)) = function.function_body.as_mut() else {
         return Ok(());
     };
-    let Some(mut query) = definition(body) else {
-        return Ok(());
-    };
-    let mut binder = BodyBinder { builder, scopes: WithScopes::default(), missing: None };
-    let walked = query.visit(&mut binder);
-    debug_assert!(walked.is_continue(), "the binder never breaks");
-    if let Some(missing) = binder.missing {
-        return Err(Error::RelationNotFoundForFunctionBody {
-            relation_name: missing.to_string(),
-            function_name: last_str(&function.name).to_string(),
-        });
+    match expression.visit(&mut BodyBinder { builder, scopes: WithScopes::default() }) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(missing) => {
+            Err(Error::RelationNotFoundForFunctionBody {
+                relation_name: missing.to_string(),
+                function_name: last_str(&function.name).to_string(),
+            })
+        }
     }
-    write_definition(&mut function.function_body, query);
-    Ok(())
 }
 
 /// The query shape of a body that holds a parsed expression, or [`None`] for
@@ -128,16 +119,15 @@ pub(super) fn relations_read(body: &CreateFunctionBody) -> Option<Vec<RelationKe
     definition(body).map(|definition| relations_read_in(&definition))
 }
 
-/// Binds every stored relation a function body reads, remembering the first
+/// Binds every stored relation a function body reads, stopping at the first
 /// one the builder does not hold.
 struct BodyBinder<'builder> {
     builder: &'builder ParserDBBuilder,
     scopes: WithScopes,
-    missing: Option<ObjectName>,
 }
 
 impl VisitorMut for BodyBinder<'_> {
-    type Break = ();
+    type Break = ObjectName;
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
         self.scopes.enter(query);
@@ -153,17 +143,43 @@ impl VisitorMut for BodyBinder<'_> {
         if let TableFactor::Table { name, args: None, .. } = factor
             && !self.scopes.reads_item(name)
         {
-            match self.builder.bound_relation(name) {
-                Some(bound) => bind_reference(name, bound.qualifier),
-                // A name no readable target can read stays as written, as in
-                // a view definition; a plain name the builder does not hold
-                // is the one PostgreSQL refuses.
-                None if target_name_from_object_name(name).is_some() && self.missing.is_none() => {
-                    self.missing = Some(name.clone());
-                }
-                None => {}
-            }
+            let Some(bound) = self.builder.bound_relation(name) else {
+                return ControlFlow::Break(name.clone());
+            };
+            bind_reference(name, bound.qualifier);
         }
         ControlFlow::Continue(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    use super::*;
+    use crate::{
+        prelude::ParserDB,
+        structs::{IdentifierCase, TargetName},
+        traits::DatabaseLike,
+    };
+
+    /// The rename machinery stores a rewritten wrapper into a function slot,
+    /// which must never turn a string body into a `RETURN` one.
+    #[test]
+    fn a_rewrite_leaves_a_string_body_as_written() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+             CREATE FUNCTION g() RETURNS INT LANGUAGE sql RETURN 2;",
+        )
+        .expect("the schema parses");
+        let function = |name| {
+            db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+                .expect("unambiguous lookup")
+                .expect("the function exists")
+        };
+        let wrapper = function("g").function_body.as_ref().and_then(definition).expect("a wrapper");
+        let mut string = function("f").function_body.clone();
+        write_definition(&mut string, wrapper);
+        assert_eq!(string, function("f").function_body);
     }
 }
