@@ -259,7 +259,7 @@ pub(super) static POSTGRES_BUILTINS: &[PostgresBuiltin] = &[
     ),
     PostgresBuiltin("current_setting", &[Text], Text, Strict, Stable, Normal),
     PostgresBuiltin("current_setting", &[Text, Boolean], Text, Strict, Stable, Normal),
-    // With no `pg_proc` row, `COALESCE` takes the common type and `NULLIF` its first argument's.
+    // No `pg_proc` row, so `COALESCE` and `NULLIF` follow their expressions.
     PostgresBuiltin(
         "coalesce",
         &[VariadicAnyCompatible],
@@ -298,7 +298,7 @@ pub(super) static POSTGRES_BUILTINS: &[PostgresBuiltin] = &[
     PostgresBuiltin("avg", &[DoublePrecision], DoublePrecision, CalledOnNull, Immutable, Aggregate),
     PostgresBuiltin("avg", &[Numeric], Numeric, CalledOnNull, Immutable, Aggregate),
     PostgresBuiltin("avg", &[Interval], Interval, CalledOnNull, Immutable, Aggregate),
-    // `anyelement` stands for PostgreSQL's one `min` and `max` per ordered type.
+    // `anyelement` stands for the `min` and `max` of every ordered type.
     PostgresBuiltin("min", &[AnyElement], AnyElement, CalledOnNull, Immutable, Aggregate),
     PostgresBuiltin("max", &[AnyElement], AnyElement, CalledOnNull, Immutable, Aggregate),
     PostgresBuiltin("array_agg", &[AnyNonArray], AnyArray, CalledOnNull, Immutable, Aggregate),
