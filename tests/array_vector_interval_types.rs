@@ -58,18 +58,75 @@ fn every_reported_column_answers_its_structure() {
     assert_eq!(numeric.numeric_scale(&db), Some(2));
     assert_eq!(data_type(&db, "n").numeric_scale(&db), None, "an array has no scale of its own");
 
-    assert_eq!(data_type(&db, "v").vector(&db), Some(VectorType::new(VectorKind::Vector, Some(3))));
-    assert_eq!(data_type(&db, "vv").vector(&db), Some(VectorType::new(VectorKind::Vector, None)));
-    assert_eq!(
-        data_type(&db, "h").vector(&db),
-        Some(VectorType::new(VectorKind::HalfVec, Some(3)))
-    );
+    let vector = |name| data_type(&db, name).vector(&db).expect("column is a vector");
+    assert_eq!(vector("v").kind(), VectorKind::Vector);
+    assert_eq!(vector("v").dimensions(), Some(3));
+    assert_eq!(vector("vv").dimensions(), None, "a bare vector fixes no dimension count");
+    assert_eq!(vector("h").kind(), VectorKind::HalfVec, "a consumer can tell a halfvec apart");
+    assert_eq!(vector("h").dimensions(), Some(3));
     assert_eq!(data_type(&db, "a").vector(&db), None);
 
     assert_eq!(data_type(&db, "i").interval_fields(&db), None);
     assert_eq!(data_type(&db, "i2").interval_fields(&db), Some(IntervalFields::DayToSecond));
     assert_eq!(data_type(&db, "i").fractional_seconds_precision(&db), Some(6));
     assert_eq!(data_type(&db, "c").interval_fields(&db), None);
+}
+
+/// Every field restriction PostgreSQL accepts answers as written, and keeps
+/// fractional seconds exactly when it reaches the seconds field.
+#[test]
+fn every_interval_field_restriction_answers_its_fields_and_seconds() {
+    let cases = [
+        ("YEAR", IntervalFields::Year, None),
+        ("MONTH", IntervalFields::Month, None),
+        ("DAY", IntervalFields::Day, None),
+        ("HOUR", IntervalFields::Hour, None),
+        ("MINUTE", IntervalFields::Minute, None),
+        ("SECOND", IntervalFields::Second, Some(6)),
+        ("YEAR TO MONTH", IntervalFields::YearToMonth, None),
+        ("DAY TO HOUR", IntervalFields::DayToHour, None),
+        ("DAY TO MINUTE", IntervalFields::DayToMinute, None),
+        ("DAY TO SECOND", IntervalFields::DayToSecond, Some(6)),
+        ("HOUR TO MINUTE", IntervalFields::HourToMinute, None),
+        ("HOUR TO SECOND", IntervalFields::HourToSecond, Some(6)),
+        ("MINUTE TO SECOND", IntervalFields::MinuteToSecond, Some(6)),
+    ];
+    let columns: Vec<String> = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (fields, _, _))| format!("c{index} INTERVAL {fields}"))
+        .collect();
+    let db = postgres(&format!("CREATE TABLE t ({});", columns.join(", ")));
+    for (index, (written, fields, precision)) in cases.into_iter().enumerate() {
+        let column = data_type(&db, &format!("c{index}"));
+        assert_eq!(column.interval_fields(&db), Some(fields), "{written}");
+        assert_eq!(fields.holds_seconds(), precision.is_some(), "{written}");
+        assert_eq!(column.fractional_seconds_precision(&db), precision, "{written}");
+    }
+}
+
+/// A type spelled like a pgvector type that PostgreSQL would not resolve to
+/// it answers no vector.
+#[test]
+fn a_malformed_vector_spelling_answers_no_vector() {
+    let db = postgres(
+        "CREATE EXTENSION vector;
+         CREATE TABLE t (pair vector(3, 4), far other_db.public.vector(3), \
+         named vector(dims), huge vector(99999999999));",
+    );
+    for name in ["pair", "far", "named", "huge"] {
+        assert_eq!(data_type(&db, name).vector(&db), None, "{name}");
+    }
+
+    let run_time = ParserDB::parse::<SnowflakeDialect>(
+        "CREATE EXTENSION vector; CREATE TABLE t (x IDENTIFIER('public').vector(3));",
+    )
+    .expect("schema builds");
+    assert_eq!(
+        data_type(&run_time, "x").vector(&run_time),
+        None,
+        "a schema named only when the statement runs resolves to no known schema"
+    );
 }
 
 /// An array element answers every fact a column of its type answers.
