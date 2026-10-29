@@ -921,7 +921,7 @@ pub trait TableLike:
         let schema = self.table_schema();
         let name = self.table_name();
         let mut children = Vec::new();
-        for candidate in database.tables() {
+        for candidate in database.tables_and_foreign_tables() {
             let mut parents = candidate.inherits_from(database)?;
             if parents.any(|parent| parent.table_schema() == schema && parent.table_name() == name)
             {
@@ -1008,7 +1008,8 @@ pub trait TableLike:
     /// Iterates over the partitions of this table.
     ///
     /// The inverse of [`TableLike::partition_root`], one step deep, so a
-    /// partition that is itself partitioned answers its own.
+    /// partition that is itself partitioned answers its own. A foreign table
+    /// attached as a partition is listed too.
     ///
     /// # Arguments
     ///
@@ -1047,7 +1048,7 @@ pub trait TableLike:
         let schema = self.table_schema();
         let name = self.table_name();
         let mut partitions = Vec::new();
-        for candidate in database.tables() {
+        for candidate in database.tables_and_foreign_tables() {
             if candidate
                 .partition_root(database)?
                 .is_some_and(|root| root.table_schema() == schema && root.table_name() == name)
