@@ -20,10 +20,10 @@ use crate::{
     utils::{
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
-            function_has_stored_identity, relation_name_is_claimed, resolve_function_in_iter,
-            resolve_function_on_search_path_in_iter, resolve_one_function, resolve_target_in_iter,
-            resolve_target_on_search_path_in_iter, resolve_view_in_iter,
-            resolve_view_on_search_path_in_iter,
+            function_has_stored_identity, function_search_path, relation_name_is_claimed,
+            resolve_function_in_iter, resolve_function_on_search_path_in_iter,
+            resolve_one_function, resolve_target_in_iter, resolve_target_on_search_path_in_iter,
+            resolve_view_in_iter, resolve_view_on_search_path_in_iter,
         },
     },
 };
@@ -1107,16 +1107,16 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// Resolves a name a statement wrote into the function it denotes,
     /// applying the same rules as [`Self::resolve_target_table`]: a qualified
     /// name matches in its own schema, an unqualified one resolves through the
-    /// first schema on [`Self::search_path`] holding it, and quoting decides
-    /// case sensitivity on both parts.
+    /// first schema holding it, and quoting decides case sensitivity on both
+    /// parts. As in PostgreSQL, an unqualified name searches `pg_catalog`
+    /// before [`Self::search_path`] unless the path names it, so a builtin is
+    /// reached by its bare name.
     ///
     /// Resolution is by name only. PostgreSQL also weighs the argument list,
     /// so a name carrying several declarations is reported as ambiguous here
-    /// rather than resolved. A registered builtin lives in `pg_catalog`, which
-    /// the recorded search path does not carry, so an unqualified reference to
-    /// one stays unresolved and the schema has to be written. A call written in
-    /// a policy or a check constraint is resolved, built-ins and overloads
-    /// included, by [`PolicyLike::functions_reached_by`] and
+    /// rather than resolved. A call written in a policy or a check constraint
+    /// is resolved, overloads included, by
+    /// [`PolicyLike::functions_reached_by`] and
     /// [`CheckConstraintLike::functions_reached_by`].
     ///
     /// # Errors
@@ -1142,6 +1142,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// assert_eq!(touch.name(), "touch");
     /// let qualified = TargetName::new("touch", false).with_schema("app", false);
     /// assert!(db.resolve_target_function(qualified, IdentifierCase::AsWritten)?.is_some());
+    /// let builtin = TargetName::new("gen_random_uuid", false);
+    /// let builtin = db.resolve_target_function(builtin, IdentifierCase::AsWritten)?;
+    /// assert_eq!(
+    ///     builtin.and_then(|f| f.target_name().schema().map(str::to_owned)).as_deref(),
+    ///     Some("pg_catalog")
+    /// );
     /// let absent = TargetName::new("absent", false);
     /// assert!(db.resolve_target_function(absent, IdentifierCase::AsWritten)?.is_none());
     /// # Ok(())
@@ -1152,7 +1158,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Function>, LookupError> {
-        resolve_function_on_search_path_in_iter(self.functions(), &target, self.search_path(), case)
+        resolve_function_on_search_path_in_iter(
+            self.functions(),
+            &target,
+            function_search_path(|| self.search_path()),
+            case,
+        )
     }
 
     /// Iterates over the policies defined in the schema.

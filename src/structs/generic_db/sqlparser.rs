@@ -6602,7 +6602,14 @@ impl ParserDB {
                             });
                         }
 
-                        if builder.is_function_used(&builder.functions()[position].0) {
+                        let (function, metadata) = &builder.functions()[position];
+                        if let Some(extension) = metadata.extension() {
+                            return Err(crate::errors::Error::FunctionRequiredByExtension {
+                                function_name: function_name.to_string(),
+                                extension_name: extension.value.clone(),
+                            });
+                        }
+                        if builder.is_function_used(function) {
                             return Err(crate::errors::Error::FunctionReferenced {
                                 function_name: function_name.to_string(),
                             });
@@ -7066,7 +7073,7 @@ impl ParserDB {
                                 &mut builder,
                                 &resolved_schema_name,
                                 resolved_schema_quoted,
-                            );
+                            )?;
                         }
 
                         // Remove the schema

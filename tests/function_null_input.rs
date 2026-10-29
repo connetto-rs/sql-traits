@@ -67,6 +67,7 @@ mod builtins {
         ("coalesce", &["any"], Called, &[false, false], Immutable, Normal),
         // `nullif(NULL, 1)` is `NULL`, `nullif(1, NULL)` is 1.
         ("nullif", &["any", "any"], Called, &[true, false, false], Immutable, Normal),
+        ("decode", &["text", "text"], Strict, &[true, true, false], Immutable, Normal),
         ("now", &[], Strict, &[false], Stable, Normal),
         ("current_timestamp", &[], Called, &[false], Stable, Normal),
         ("current_date", &[], Called, &[false], Stable, Normal),

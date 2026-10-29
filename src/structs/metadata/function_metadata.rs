@@ -2,7 +2,7 @@
 
 use alloc::{string::String, vec::Vec};
 
-use sqlparser::ast::{CreateRole, Grantee};
+use sqlparser::ast::{CreateRole, Grantee, Ident};
 
 use crate::{
     impls::{grantee_is_public, grantee_matches_role, grantees_match},
@@ -24,6 +24,9 @@ pub struct FunctionMetadata {
     null_returning_arguments: &'static [usize],
     /// The function's `pg_proc.prokind`.
     kind: FunctionKind,
+    /// The name of the extension the function belongs to, which creates and
+    /// drops it.
+    extension: Option<Ident>,
 }
 
 impl FunctionMetadata {
@@ -90,6 +93,19 @@ impl FunctionMetadata {
     #[inline]
     pub(crate) fn set_kind(&mut self, kind: FunctionKind) {
         self.kind = kind;
+    }
+
+    /// Returns the name of the extension the function belongs to.
+    #[must_use]
+    #[inline]
+    pub(crate) fn extension(&self) -> Option<&Ident> {
+        self.extension.as_ref()
+    }
+
+    /// Records the extension the function belongs to.
+    #[inline]
+    pub(crate) fn set_extension(&mut self, extension: Ident) {
+        self.extension = Some(extension);
     }
 
     /// Returns who holds `EXECUTE` on the function.

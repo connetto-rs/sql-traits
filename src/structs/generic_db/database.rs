@@ -13,8 +13,8 @@ use crate::{
     },
     traits::{DatabaseLike, TableLike},
     utils::object_name::{
-        RelationKey, function_has_stored_identity, relation_search_path, render_table_candidate,
-        render_view_candidate, resolve_one_function, resolve_one_relation,
+        RelationKey, function_has_stored_identity, function_search_path, relation_search_path,
+        render_table_candidate, render_view_candidate, resolve_one_function, resolve_one_relation,
         resolve_target_from_candidates, stored_function_key, stored_identity_key, stored_table_key,
         stored_view_key,
     },
@@ -491,8 +491,8 @@ impl<P: SchemaProfile> GenericDB<P> {
             .collect()
     }
 
-    /// Resolves a written function reference through the index, walking the
-    /// search path for an unqualified name.
+    /// Resolves a written function reference through the index, walking
+    /// `pg_catalog` and then the search path for an unqualified name.
     ///
     /// # Errors
     ///
@@ -509,8 +509,9 @@ impl<P: SchemaProfile> GenericDB<P> {
             return resolve_one_function(&written, &self.probed_functions(&probe));
         }
 
-        for (entry_schema, entry_quoted) in &self.search_path {
-            let probe = IndexProbe::new(target, case, Some((entry_schema, *entry_quoted)));
+        let path = || self.search_path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted));
+        for entry in function_search_path(path) {
+            let probe = IndexProbe::new(target, case, Some(entry));
             let candidates = self.probed_functions(&probe);
             if !candidates.is_empty() {
                 return resolve_one_function(&written, &candidates);
