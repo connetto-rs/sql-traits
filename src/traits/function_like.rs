@@ -4,14 +4,22 @@ use alloc::{borrow::Cow, vec::Vec};
 use core::{fmt::Debug, hash::Hash};
 
 use sqlparser::ast::{
-    Expr, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionSecurity,
+    ArgMode, Expr, Function, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam,
+    FunctionSecurity,
 };
 
 use crate::{
     errors::LookupError,
     structs::{FunctionKind, TargetName},
     traits::{DatabaseLike, Metadata},
-    utils::{identifier_resolution::normalize_identifier, normalize_postgres_type_cow},
+    utils::{
+        call_typing::{
+            accepts_positional, actuals, bind, check_argument_count, declared_at_call, input_modes,
+            written_argument_names,
+        },
+        identifier_resolution::normalize_identifier,
+        normalize_postgres_type_cow,
+    },
 };
 
 /// A trait for describing SQL Function-like entities.
@@ -282,6 +290,198 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # }
     /// ```
     fn returns_set(&self) -> bool;
+
+    /// Returns the mode of each argument, in declaration order, mirroring
+    /// `pg_proc.proargmodes`. An argument declared without a mode is
+    /// [`ArgMode::In`].
+    ///
+    /// The positions line up with
+    /// [`argument_type_names`](FunctionLike::argument_type_names). A call
+    /// passes the `IN`, `INOUT` and `VARIADIC` arguments, and an `OUT`
+    /// argument describes the result.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::ArgMode, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION f(a INT, OUT b INT, VARIADIC c INT[]) LANGUAGE sql AS 'SELECT 1';",
+    /// )?;
+    /// let f = db
+    ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// assert_eq!(
+    ///     f.argument_modes().collect::<Vec<_>>(),
+    ///     [ArgMode::In, ArgMode::Out, ArgMode::Variadic]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn argument_modes(&self) -> impl Iterator<Item = ArgMode>;
+
+    /// Returns how many of the trailing input arguments carry a default,
+    /// mirroring `pg_proc.pronargdefaults`. A call may leave those out.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION f(a INT, b INT DEFAULT 1) RETURNS INT LANGUAGE sql AS 'SELECT a + b';",
+    /// )?;
+    /// let f = db
+    ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// assert_eq!(f.argument_default_count(), 1);
+    /// assert!(f.accepts_argument_count(1));
+    /// assert!(f.accepts_argument_count(2));
+    /// assert!(!f.accepts_argument_count(0));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn argument_default_count(&self) -> usize;
+
+    /// Returns whether a call passing `arguments` positional arguments
+    /// reaches the function. The trailing arguments a default fills may be
+    /// left out, and a `VARIADIC` argument collects any number, at least one
+    /// unless it has a default.
+    ///
+    /// See [`argument_default_count`](FunctionLike::argument_default_count)
+    /// for an example.
+    #[inline]
+    fn accepts_argument_count(&self, arguments: usize) -> bool {
+        accepts_positional(&input_modes(self), self.argument_default_count(), arguments)
+    }
+
+    /// Returns the type one call of the function yields, mirroring
+    /// `pg_proc.prorettype`.
+    ///
+    /// A set-returning function yields its element type once per row. A
+    /// function whose result is described by one `OUT` argument or one
+    /// `RETURNS TABLE` column yields that column's type, and one described
+    /// by several yields `record`. A polymorphic result keeps its
+    /// pseudo-type here, and
+    /// [`call_result_type_name`](FunctionLike::call_result_type_name) answers
+    /// what it becomes for a given call.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION ids() RETURNS SETOF UUID LANGUAGE sql AS 'SELECT gen_random_uuid()';
+    ///      CREATE FUNCTION one() RETURNS TABLE (id UUID) LANGUAGE sql AS 'SELECT gen_random_uuid()';
+    ///      CREATE FUNCTION two(OUT a INT, OUT b TEXT) LANGUAGE sql AS 'SELECT 1, ''x''';",
+    /// )?;
+    /// let result = |name: &str| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    ///         .result_type_name(&db)
+    ///         .map(|name| name.into_owned())
+    /// };
+    /// assert_eq!(result("ids").as_deref(), Some("UUID"));
+    /// assert_eq!(result("one").as_deref(), Some("UUID"));
+    /// assert_eq!(result("two").as_deref(), Some("record"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn result_type_name<'db>(&'db self, database: &'db Self::DB) -> Option<Cow<'db, str>>;
+
+    /// Returns the type a call of this function returns, given the type of
+    /// each argument the call writes, in written order.
+    ///
+    /// Each entry of `argument_types` names a type, `unknown` for an untyped
+    /// literal such as `NULL` or `'abc'`, or is [`None`] for an argument whose
+    /// type the caller does not know. A polymorphic result takes the type its
+    /// arguments bind as PostgreSQL's `enforce_generic_type_consistency`
+    /// decides, so `anyelement` takes the type its arguments share,
+    /// `anycompatible` their common type by
+    /// [`common_type_name`](crate::utils::common_type_name), and the array
+    /// forms the array over it. The answer reuses the caller's
+    /// spelling where it can and otherwise spells the type as sqlparser
+    /// writes it, so it parses back as a type with the PostgreSQL dialect.
+    ///
+    /// Answers [`None`] when the function cannot take the call, an argument
+    /// of a known type converting to its parameter by no implicit cast, when
+    /// an argument the result depends on has no known type, and when the
+    /// function declares no result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ArgumentTypeCount`] when `argument_types` does
+    /// not hold one entry per argument `call` writes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, SelectItem, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let call = |sql: &str| {
+    ///     let Statement::Query(query) =
+    ///         Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {sql}")).unwrap().remove(0)
+    ///     else {
+    ///         unreachable!()
+    ///     };
+    ///     let SetExpr::Select(select) = *query.body else { unreachable!() };
+    ///     let SelectItem::UnnamedExpr(Expr::Function(call)) = select.projection[0].clone() else {
+    ///         unreachable!()
+    ///     };
+    ///     call
+    /// };
+    /// let coalesce = db
+    ///     .function_by_target(
+    ///         TargetName::new("coalesce", false).with_schema("pg_catalog", false),
+    ///         IdentifierCase::AsWritten,
+    ///     )?
+    ///     .expect("Function should exist");
+    /// let returns = |sql: &str, types: &[Option<&str>]| {
+    ///     coalesce
+    ///         .call_result_type_name(&call(sql), types, &db)
+    ///         .map(|name| name.map(|name| name.into_owned()))
+    /// };
+    /// assert_eq!(
+    ///     returns("coalesce(b, NULL)", &[Some("BYTEA"), Some("unknown")])?.as_deref(),
+    ///     Some("BYTEA")
+    /// );
+    /// assert_eq!(
+    ///     returns("coalesce(i, j)", &[Some("INT"), Some("BIGINT")])?.as_deref(),
+    ///     Some("BIGINT")
+    /// );
+    /// // PostgreSQL finds no common type for a binary string and text.
+    /// assert_eq!(returns("coalesce(b, t)", &[Some("BYTEA"), Some("TEXT")])?, None);
+    /// assert_eq!(returns("coalesce(b, x)", &[Some("BYTEA"), None])?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn call_result_type_name<'a>(
+        &'a self,
+        call: &Function,
+        argument_types: &[Option<&'a str>],
+        database: &'a Self::DB,
+    ) -> Result<Option<Cow<'a, str>>, LookupError> {
+        let Some(written) = written_argument_names(call) else { return Ok(None) };
+        check_argument_count(call, written.len(), argument_types.len())?;
+        let Some(declared) = declared_at_call(self, database, &written) else { return Ok(None) };
+        let Some(binding) = bind(declared, &actuals(argument_types)) else { return Ok(None) };
+        Ok(self.result_type_name(database).and_then(|result| binding.result(result)))
+    }
 
     /// Returns what a call of the function computes, mirroring
     /// `pg_proc.prokind`.

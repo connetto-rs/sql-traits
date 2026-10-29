@@ -314,6 +314,17 @@ pub enum LookupError {
         /// The call as rendered by sqlparser.
         call: String,
     },
+    /// The argument types handed in with a call do not give one type per
+    /// argument the call writes.
+    #[error("Call `{call}` writes {arguments} arguments, but {types} argument types were given.")]
+    ArgumentTypeCount {
+        /// The call as rendered by sqlparser.
+        call: String,
+        /// How many arguments the call writes.
+        arguments: usize,
+        /// How many argument types were given.
+        types: usize,
+    },
 }
 
 /// Why a text could not be read back as a target name by

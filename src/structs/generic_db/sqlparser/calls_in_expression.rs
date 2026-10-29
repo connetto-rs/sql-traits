@@ -3,7 +3,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::{convert::Infallible, ops::ControlFlow};
 
-use sqlparser::ast::{ArgMode, CreateFunction, Expr, ObjectName};
+use sqlparser::ast::{CreateFunction, Expr, ObjectName};
 
 use super::schema_qualifiers_match;
 use crate::{
@@ -58,7 +58,7 @@ impl CallScope<'_> {
             }
             Qualifier::RunTime => false,
         };
-        names_match && schema_reached && accepts(function, arguments)
+        names_match && schema_reached && function.accepts_argument_count(arguments)
     }
 
     /// The functions a call to `called` passing `arguments` arguments may run.
@@ -69,22 +69,6 @@ impl CallScope<'_> {
     ) -> impl Iterator<Item = &'s Arc<CreateFunction>> {
         self.functions.iter().filter(move |function| self.reaches(function, called, arguments))
     }
-}
-
-/// Whether `function` takes `arguments` arguments, counting the trailing
-/// ones a default fills and any number a `VARIADIC` parameter collects. A
-/// `VARIADIC` parameter without a default collects at least one.
-fn accepts(function: &CreateFunction, arguments: usize) -> bool {
-    let inputs: Vec<_> = function
-        .args
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter(|argument| argument.mode != Some(ArgMode::Out))
-        .collect();
-    let variadic = inputs.last().is_some_and(|argument| argument.mode == Some(ArgMode::Variadic));
-    let required = inputs.iter().filter(|argument| argument.default_expr.is_none()).count();
-    arguments >= required && (variadic || arguments <= inputs.len())
 }
 
 /// Resolves every call in `expression`, subqueries included, under `scope`.

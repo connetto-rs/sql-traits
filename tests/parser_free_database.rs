@@ -22,7 +22,7 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        Action, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
+        Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
         CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, Statement,
         TriggerEvent, TriggerObjectKind, TriggerPeriod,
@@ -830,6 +830,18 @@ impl FunctionLike for MemoryFunction {
 
     fn returns_set(&self) -> bool {
         false
+    }
+
+    fn argument_modes(&self) -> impl Iterator<Item = ArgMode> {
+        self.argument_types.iter().map(|_| ArgMode::In)
+    }
+
+    fn argument_default_count(&self) -> usize {
+        0
+    }
+
+    fn result_type_name<'db>(&'db self, _database: &'db Self::DB) -> Option<Cow<'db, str>> {
+        None
     }
 
     /// This catalog holds only functions it declares, which are normal.

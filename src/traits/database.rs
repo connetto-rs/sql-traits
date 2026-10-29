@@ -1,6 +1,6 @@
 //! Submodule providing a trait for describing SQL Database-like entities.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use geometric_traits::{
@@ -8,6 +8,7 @@ use geometric_traits::{
     prelude::{GenericEdgesBuilder, Kahn, SquareCSR2D},
     traits::EdgesBuilder,
 };
+use sqlparser::ast::Function;
 
 use crate::{
     errors::{Error, LookupError},
@@ -18,6 +19,7 @@ use crate::{
         RuleLike, SchemaLike, TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, ViewLike,
     },
     utils::{
+        call_typing::{Selection, reached_functions, resolve_call},
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
             function_has_stored_identity, function_search_path, relation_name_is_claimed,
@@ -25,6 +27,7 @@ use crate::{
             resolve_one_function, resolve_target_in_iter, resolve_target_on_search_path_in_iter,
             resolve_view_in_iter, resolve_view_on_search_path_in_iter,
         },
+        postgres_types::PgType,
     },
 };
 
@@ -1112,12 +1115,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// before [`Self::search_path`] unless the path names it, so a builtin is
     /// reached by its bare name.
     ///
-    /// Resolution is by name only. PostgreSQL also weighs the argument list,
-    /// so a name carrying several declarations is reported as ambiguous here
-    /// rather than resolved. A call written in a policy or a check constraint
-    /// is resolved, overloads included, by
-    /// [`PolicyLike::functions_reached_by`] and
-    /// [`CheckConstraintLike::functions_reached_by`].
+    /// Resolution is by name only, so a name carrying several declarations
+    /// is reported as ambiguous here rather than resolved. A written call is
+    /// resolved by its arguments, the way PostgreSQL resolves it, by
+    /// [`Self::functions_reached_by`] and [`Self::resolve_call`].
     ///
     /// # Errors
     ///
@@ -1164,6 +1165,211 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             function_search_path(|| self.search_path()),
             case,
         )
+    }
+
+    /// Returns the functions a call written in any statement may run, as
+    /// PostgreSQL gathers them before it weighs argument types.
+    ///
+    /// A qualified name reaches its own schema. An unqualified one reaches
+    /// `pg_catalog`, unless [`Self::search_path`] names it, and every schema
+    /// of the path, a function hidden by one taking the same arguments in a
+    /// schema searched earlier left out. Only the functions taking the call's
+    /// arguments count, as many as it passes with the trailing ones a default
+    /// fills left out, a `VARIADIC` argument collecting the rest, and the
+    /// names it passes under named notation. A function stored without a
+    /// schema is in `public`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::InvalidObjectName`] when the called name has
+    /// more than two parts or a part built at run time.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, SelectItem, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let Statement::Query(query) =
+    ///     Parser::parse_sql(&PostgreSqlDialect {}, "SELECT array_agg(1)")?.remove(0)
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = *query.body else { unreachable!() };
+    /// let SelectItem::UnnamedExpr(Expr::Function(call)) = &select.projection[0] else {
+    ///     unreachable!()
+    /// };
+    /// // `array_agg` takes a scalar or an array, and both take one argument.
+    /// let mut reached: Vec<_> = db
+    ///     .functions_reached_by(call, IdentifierCase::AsWritten)?
+    ///     .map(|function| function.argument_type_names(&db).collect::<Vec<_>>().join(", "))
+    ///     .collect();
+    /// reached.sort_unstable();
+    /// assert_eq!(reached, ["anyarray", "anynonarray"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        case: IdentifierCase,
+    ) -> Result<impl Iterator<Item = &'db Self::Function>, LookupError> {
+        Ok(reached_functions(self, call, case)?.into_iter().map(|(function, _)| function))
+    }
+
+    /// Returns the function a call runs, given the type of each argument it
+    /// writes, as PostgreSQL's `func_get_detail` picks it among
+    /// [`Self::functions_reached_by`]. Of the functions whose parameters take
+    /// the argument types by an implicit cast or a consistent polymorphic
+    /// binding, an exact match wins, then the one with the most exact
+    /// matches, then the one taking preferred types where a conversion is
+    /// needed, then the one taking the categories untyped literals lean
+    /// towards.
+    ///
+    /// Each entry of `argument_types` names a type, `unknown` for an untyped
+    /// literal such as `NULL` or `'abc'`, or is [`None`] for an argument whose
+    /// type the caller does not know. Answers [`None`] when PostgreSQL would
+    /// refuse the call as matching no function or several alike, and when
+    /// the unknown argument types leave more than one function possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::InvalidObjectName`] when the called name has
+    /// more than two parts or a part built at run time, and
+    /// [`LookupError::ArgumentTypeCount`] when `argument_types` does not hold
+    /// one entry per argument `call` writes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, SelectItem, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
+    ///      CREATE FUNCTION f(x BYTEA) RETURNS BYTEA LANGUAGE sql AS 'SELECT x';",
+    /// )?;
+    /// let Statement::Query(query) =
+    ///     Parser::parse_sql(&PostgreSqlDialect {}, "SELECT f(b)")?.remove(0)
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = *query.body else { unreachable!() };
+    /// let SelectItem::UnnamedExpr(Expr::Function(call)) = &select.projection[0] else {
+    ///     unreachable!()
+    /// };
+    /// let chosen = db.resolve_call(call, &[Some("BYTEA")], IdentifierCase::AsWritten)?;
+    /// assert_eq!(chosen.and_then(|f| f.argument_type_names(&db).next()).as_deref(), Some("BYTEA"));
+    /// // Either declaration may run when the argument's type is not known.
+    /// assert!(db.resolve_call(call, &[None], IdentifierCase::AsWritten)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn resolve_call<'db>(
+        &'db self,
+        call: &Function,
+        argument_types: &[Option<&'db str>],
+        case: IdentifierCase,
+    ) -> Result<Option<&'db Self::Function>, LookupError> {
+        Ok(match resolve_call(self, call, argument_types, case)? {
+            Selection::Chosen((function, _)) => Some(function),
+            Selection::Refused | Selection::Undetermined(_) => None,
+        })
+    }
+
+    /// Returns the type a call written in any statement returns, given the
+    /// type of each argument it writes. It is the result of the function
+    /// [`Self::resolve_call`] picks, as
+    /// [`FunctionLike::call_result_type_name`] answers it for the call.
+    ///
+    /// When the arguments whose types the caller does not know leave several
+    /// functions possible, the answer is the type they all return, if they
+    /// agree. Answers [`None`] when PostgreSQL would refuse the call, and
+    /// when the result depends on a type nobody knows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::InvalidObjectName`] when the called name has
+    /// more than two parts or a part built at run time, and
+    /// [`LookupError::ArgumentTypeCount`] when `argument_types` does not hold
+    /// one entry per argument `call` writes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, SelectItem, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (b BYTEA);")?;
+    /// let Statement::Query(query) =
+    ///     Parser::parse_sql(&PostgreSqlDialect {}, "SELECT array_agg(b), decode(x, 'hex') FROM t")?
+    ///         .remove(0)
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = *query.body else { unreachable!() };
+    /// let calls: Vec<_> = select
+    ///     .projection
+    ///     .iter()
+    ///     .map(|item| {
+    ///         match item {
+    ///             SelectItem::UnnamedExpr(Expr::Function(call)) => call,
+    ///             _ => unreachable!(),
+    ///         }
+    ///     })
+    ///     .collect();
+    /// let case = IdentifierCase::AsWritten;
+    /// assert_eq!(
+    ///     db.call_result_type_name(calls[0], &[Some("BYTEA")], case)?.as_deref(),
+    ///     Some("BYTEA[]")
+    /// );
+    /// // `decode` returns `bytea` whatever text it decodes.
+    /// assert_eq!(
+    ///     db.call_result_type_name(calls[1], &[None, Some("unknown")], case)?.as_deref(),
+    ///     Some("BYTEA")
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn call_result_type_name<'db>(
+        &'db self,
+        call: &Function,
+        argument_types: &[Option<&'db str>],
+        case: IdentifierCase,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(match resolve_call(self, call, argument_types, case)? {
+            Selection::Chosen((_, result)) => result,
+            Selection::Refused => None,
+            Selection::Undetermined(possible) => {
+                let mut results = possible.into_iter().map(|(_, result)| result);
+                let first = results.next().flatten();
+                let agreed = first.as_ref().and_then(|first| PgType::parse(first));
+                agreed
+                    .filter(|agreed| {
+                        results.all(|result| {
+                            result.and_then(|result| PgType::parse(&result)).as_ref()
+                                == Some(agreed)
+                        })
+                    })
+                    .and(first)
+            }
+        })
     }
 
     /// Iterates over the policies defined in the schema.

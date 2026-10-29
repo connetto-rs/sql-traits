@@ -16,14 +16,30 @@ use crate::structs::{FunctionKind, metadata::FunctionMetadata};
 /// The type of a builtin's argument or result.
 #[derive(Clone, Copy)]
 pub(super) enum BuiltinType {
+    /// The `"any"` pseudo-type, which accepts a value of any type and decides
+    /// nothing about the result.
     Any,
     /// A `VARIADIC "any"` parameter, which gathers the remaining arguments.
     VariadicAny,
+    /// `anyelement`, bound to the type of its argument.
+    AnyElement,
+    /// `anynonarray`, bound like `anyelement` to a type that is not an array.
+    AnyNonArray,
+    /// `anyarray`, an array of the type `anyelement` binds.
+    AnyArray,
+    /// `anycompatible`, the common type of its arguments.
+    AnyCompatible,
+    /// A `VARIADIC anycompatiblearray` parameter, whose arguments each bind
+    /// `anycompatible`.
+    VariadicAnyCompatible,
     Text,
     TextArray,
     Boolean,
+    SmallInt,
     Int,
     BigInt,
+    Real,
+    Money,
     Numeric,
     DoublePrecision,
     Bytea,
@@ -36,6 +52,11 @@ pub(super) enum BuiltinType {
     TimestampTz,
 }
 
+/// A type PostgreSQL names by a plain identifier rather than a keyword.
+fn named_type(name: &'static str) -> DataType {
+    DataType::Custom(ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]), vec![])
+}
+
 impl BuiltinType {
     fn data_type(self) -> DataType {
         match self {
@@ -45,13 +66,21 @@ impl BuiltinType {
                     vec![],
                 )
             }
+            Self::AnyElement => named_type("anyelement"),
+            Self::AnyNonArray => named_type("anynonarray"),
+            Self::AnyArray => named_type("anyarray"),
+            Self::AnyCompatible => named_type("anycompatible"),
+            Self::VariadicAnyCompatible => named_type("anycompatiblearray"),
             Self::Text => DataType::Text,
             Self::TextArray => {
                 DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(DataType::Text), None))
             }
             Self::Boolean => DataType::Boolean,
+            Self::SmallInt => DataType::SmallInt(None),
             Self::Int => DataType::Int(None),
             Self::BigInt => DataType::BigInt(None),
+            Self::Real => DataType::Real,
+            Self::Money => named_type("money"),
             Self::Numeric => DataType::Numeric(ExactNumberInfo::None),
             Self::DoublePrecision => DataType::DoublePrecision,
             Self::Bytea => DataType::Bytea,
@@ -67,7 +96,7 @@ impl BuiltinType {
 
     /// Whether a parameter of this type gathers the remaining arguments.
     fn is_variadic(self) -> bool {
-        matches!(self, Self::VariadicAny)
+        matches!(self, Self::VariadicAny | Self::VariadicAnyCompatible)
     }
 }
 
@@ -195,8 +224,9 @@ pub(super) fn declaration(
 }
 
 use BuiltinType::{
-    Any, BigInt, Boolean, Bytea, Date, DoublePrecision, Int, Interval, Numeric, Text, TextArray,
-    Time, TimeTz, Timestamp, TimestampTz, Uuid, VariadicAny,
+    Any, AnyArray, AnyCompatible, AnyElement, AnyNonArray, BigInt, Boolean, Bytea, Date,
+    DoublePrecision, Int, Interval, Money, Numeric, Real, SmallInt, Text, TextArray, Time, TimeTz,
+    Timestamp, TimestampTz, Uuid, VariadicAny, VariadicAnyCompatible,
 };
 use FunctionKind::{Aggregate, Normal, Window};
 use NullInput::{CalledOnNull, NullAt, Strict};
@@ -229,8 +259,16 @@ pub(super) static POSTGRES_BUILTINS: &[PostgresBuiltin] = &[
     ),
     PostgresBuiltin("current_setting", &[Text], Text, Strict, Stable, Normal),
     PostgresBuiltin("current_setting", &[Text, Boolean], Text, Strict, Stable, Normal),
-    PostgresBuiltin("coalesce", &[VariadicAny], Any, CalledOnNull, Immutable, Normal),
-    PostgresBuiltin("nullif", &[Any, Any], Any, NullAt(&[0]), Immutable, Normal),
+    // No `pg_proc` row, so `COALESCE` and `NULLIF` follow their expressions.
+    PostgresBuiltin(
+        "coalesce",
+        &[VariadicAnyCompatible],
+        AnyCompatible,
+        CalledOnNull,
+        Immutable,
+        Normal,
+    ),
+    PostgresBuiltin("nullif", &[AnyElement, Any], AnyElement, NullAt(&[0]), Immutable, Normal),
     PostgresBuiltin("decode", &[Text, Text], Bytea, Strict, Immutable, Normal),
     PostgresBuiltin("now", &[], TimestampTz, Strict, Stable, Normal),
     PostgresBuiltin("current_timestamp", &[], TimestampTz, CalledOnNull, Stable, Normal),
@@ -245,11 +283,26 @@ pub(super) static POSTGRES_BUILTINS: &[PostgresBuiltin] = &[
     // `count(*)` calls the parameterless overload.
     PostgresBuiltin("count", &[], BigInt, CalledOnNull, Immutable, Aggregate),
     PostgresBuiltin("count", &[Any], BigInt, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[Any], Numeric, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("avg", &[Any], Numeric, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("min", &[Any], Any, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("max", &[Any], Any, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("array_agg", &[Any], Any, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("sum", &[SmallInt], BigInt, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("sum", &[Int], BigInt, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("sum", &[BigInt], Numeric, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("sum", &[Real], Real, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("sum", &[DoublePrecision], DoublePrecision, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("sum", &[Numeric], Numeric, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("sum", &[Money], Money, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("sum", &[Interval], Interval, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("avg", &[SmallInt], Numeric, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("avg", &[Int], Numeric, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("avg", &[BigInt], Numeric, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("avg", &[Real], DoublePrecision, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("avg", &[DoublePrecision], DoublePrecision, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("avg", &[Numeric], Numeric, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("avg", &[Interval], Interval, CalledOnNull, Immutable, Aggregate),
+    // `anyelement` stands for the `min` and `max` of every ordered type.
+    PostgresBuiltin("min", &[AnyElement], AnyElement, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("max", &[AnyElement], AnyElement, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("array_agg", &[AnyNonArray], AnyArray, CalledOnNull, Immutable, Aggregate),
+    PostgresBuiltin("array_agg", &[AnyArray], AnyArray, CalledOnNull, Immutable, Aggregate),
     PostgresBuiltin("string_agg", &[Text, Text], Text, CalledOnNull, Immutable, Aggregate),
     PostgresBuiltin("bool_and", &[Boolean], Boolean, CalledOnNull, Immutable, Aggregate),
     PostgresBuiltin("bool_or", &[Boolean], Boolean, CalledOnNull, Immutable, Aggregate),
@@ -280,15 +333,29 @@ pub(super) static POSTGRES_BUILTINS: &[PostgresBuiltin] = &[
     PostgresBuiltin("percent_rank", &[], DoublePrecision, CalledOnNull, Immutable, Window),
     PostgresBuiltin("cume_dist", &[], DoublePrecision, CalledOnNull, Immutable, Window),
     PostgresBuiltin("ntile", &[Int], Int, Strict, Immutable, Window),
-    PostgresBuiltin("lag", &[Any], Any, Strict, Immutable, Window),
-    PostgresBuiltin("lag", &[Any, Int], Any, Strict, Immutable, Window),
-    PostgresBuiltin("lag", &[Any, Int, Any], Any, Strict, Immutable, Window),
-    PostgresBuiltin("lead", &[Any], Any, Strict, Immutable, Window),
-    PostgresBuiltin("lead", &[Any, Int], Any, Strict, Immutable, Window),
-    PostgresBuiltin("lead", &[Any, Int, Any], Any, Strict, Immutable, Window),
-    PostgresBuiltin("first_value", &[Any], Any, Strict, Immutable, Window),
-    PostgresBuiltin("last_value", &[Any], Any, Strict, Immutable, Window),
-    PostgresBuiltin("nth_value", &[Any, Int], Any, Strict, Immutable, Window),
+    PostgresBuiltin("lag", &[AnyElement], AnyElement, Strict, Immutable, Window),
+    PostgresBuiltin("lag", &[AnyElement, Int], AnyElement, Strict, Immutable, Window),
+    PostgresBuiltin(
+        "lag",
+        &[AnyCompatible, Int, AnyCompatible],
+        AnyCompatible,
+        Strict,
+        Immutable,
+        Window,
+    ),
+    PostgresBuiltin("lead", &[AnyElement], AnyElement, Strict, Immutable, Window),
+    PostgresBuiltin("lead", &[AnyElement, Int], AnyElement, Strict, Immutable, Window),
+    PostgresBuiltin(
+        "lead",
+        &[AnyCompatible, Int, AnyCompatible],
+        AnyCompatible,
+        Strict,
+        Immutable,
+        Window,
+    ),
+    PostgresBuiltin("first_value", &[AnyElement], AnyElement, Strict, Immutable, Window),
+    PostgresBuiltin("last_value", &[AnyElement], AnyElement, Strict, Immutable, Window),
+    PostgresBuiltin("nth_value", &[AnyElement, Int], AnyElement, Strict, Immutable, Window),
     PostgresBuiltin("current_user", &[], Text, Strict, Stable, Normal),
     PostgresBuiltin("session_user", &[], Text, Strict, Stable, Normal),
     PostgresBuiltin("user", &[], Text, CalledOnNull, Stable, Normal),
