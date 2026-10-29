@@ -1,13 +1,16 @@
 //! Implementations of [`DataStatementLike`] for the sqlparser data-statement
 //! AST nodes (`Query`, `Insert`, `Update`, `Delete`).
 //!
-//! `referenced_tables` walks every relation sqlparser's [`Visitor`] reaches,
-//! which covers subqueries, CTE bodies, set operations and the `INSERT` /
-//! `UPDATE` / `DELETE` mutation targets. A bare name that a visible `WITH`
-//! item binds reads that item, so it is skipped, except as a mutation target,
-//! which always names a stored table. The one relation source the walk does
-//! not reach is the MySQL multi-table `DELETE ... t1, t2` list, which the
-//! `Delete` implementation resolves explicitly.
+//! Both accessors walk every relation sqlparser's [`Visitor`] reaches, which
+//! covers subqueries, CTE bodies, set operations and the `INSERT` / `UPDATE`
+//! / `DELETE` mutation targets. A bare name that a visible `WITH` item binds
+//! reads that item, so it is skipped, except as a mutation target, which
+//! always names a stored relation. The one relation source the walk does not
+//! reach is the MySQL multi-table `DELETE ... t1, t2` list, which the `Delete`
+//! implementation resolves explicitly. `referenced_relations` records what the
+//! statement names, and `referenced_tables` goes on to expand every plain view
+//! through the view's stored definition, which is bound at creation and read
+//! with no search path.
 
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -20,94 +23,131 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     structs::IdentifierCase,
-    traits::{DataStatementLike, DatabaseLike},
-    utils::{object_name::resolve_object_name, with_scopes::WithScopes},
+    traits::{DataStatementLike, DatabaseLike, Relation, ViewLike},
+    utils::{
+        object_name::{resolve_bound_relation_object_name, resolve_relation_object_name},
+        with_scopes::WithScopes,
+    },
 };
 
-/// Accumulates resolved base tables, deduplicating by their position in the
-/// database so the same table reached through several aliases or a self-join is
-/// recorded once. Tables are kept in first-seen order.
-struct ReferencedTables<'db, DB: DatabaseLike> {
-    ids: Vec<usize>,
-    tables: Vec<&'db DB::Table>,
-}
-
-impl<'db, DB: DatabaseLike> ReferencedTables<'db, DB> {
-    fn new() -> Self {
-        Self { ids: Vec::new(), tables: Vec::new() }
-    }
-
-    fn add(&mut self, table: &'db DB::Table, database: &'db DB) {
-        match database.table_id(table) {
-            Some(id) => {
-                if !self.ids.contains(&id) {
-                    self.ids.push(id);
-                    self.tables.push(table);
-                }
-            }
-            // Defensive: a table resolved from `database` should always have an
-            // id. Fall back to pointer identity rather than dropping it.
-            None => {
-                if !self.tables.iter().any(|existing| core::ptr::eq(*existing, table)) {
-                    self.tables.push(table);
-                }
-            }
-        }
-    }
-
-    fn resolve_and_add(
-        &mut self,
-        object_name: &ObjectName,
-        database: &'db DB,
-    ) -> Result<(), LookupError> {
-        if let Some(table) = resolve_object_name(object_name, database, IdentifierCase::AsWritten)?
-        {
-            self.add(table, database);
-        }
-        Ok(())
-    }
-}
-
-/// Walks a data statement, recording the base table each relation it reads
-/// resolves to and stopping at the first resolution error.
-struct RelationCollector<'db, 'acc, DB: DatabaseLike> {
+/// Walks a data statement, recording every relation it names and expanding
+/// the base tables each plain view reaches through the view's stored
+/// definition, stopping at the first resolution error.
+struct RelationCollector<'db, DB: DatabaseLike> {
     database: &'db DB,
-    accumulator: &'acc mut ReferencedTables<'db, DB>,
+    /// Every relation the statement names, deduplicated in first-seen order.
+    relations: Vec<Relation<'db, DB>>,
+    /// Every base table the statement names or reaches through a plain view,
+    /// deduplicated in first-seen order.
+    tables: Vec<&'db DB::Table>,
+    /// The plain views expanded so far, which a definition reading its view
+    /// back cannot re-expand.
+    expanded: Vec<&'db DB::View>,
     scopes: WithScopes,
     /// The mutation targets met so far, compared by address.
     targets: Vec<*const ObjectName>,
+    /// Whether the walk is inside a stored view's definition, where names are
+    /// bound and read with no search path.
+    bound: bool,
 }
 
-impl<DB: DatabaseLike> RelationCollector<'_, '_, DB> {
+impl<'db, DB: DatabaseLike> RelationCollector<'db, DB> {
+    fn new(database: &'db DB) -> Self {
+        Self {
+            database,
+            relations: Vec::new(),
+            tables: Vec::new(),
+            expanded: Vec::new(),
+            scopes: WithScopes::default(),
+            targets: Vec::new(),
+            bound: false,
+        }
+    }
+
     /// Records the names a mutation writes to. PostgreSQL resolves them
-    /// against stored tables only, so a `WITH` item of the same name does not
-    /// hide them.
+    /// against stored relations only, so a `WITH` item of the same name does
+    /// not hide them.
     fn record_targets(&mut self, statement: &Statement) {
-        let relation_name = |factor: &TableFactor| {
-            match factor {
-                TableFactor::Table { name, .. } => Some(&raw const *name),
-                _ => None,
-            }
-        };
         match statement {
-            Statement::Insert(Insert { table: TableObject::TableName(name), .. }) => {
-                self.targets.push(name);
-            }
-            Statement::Update(Update { table, .. }) => {
-                self.targets.extend(relation_name(&table.relation));
-            }
-            // With a multi-table list the `FROM` items are the rows read, and
-            // the list holds the targets.
-            Statement::Delete(Delete { tables, from, .. }) if tables.is_empty() => {
-                let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
-                self.targets.extend(from.iter().filter_map(|item| relation_name(&item.relation)));
-            }
+            Statement::Insert(insert) => self.record_insert_target(insert),
+            Statement::Update(update) => self.record_update_target(update),
+            Statement::Delete(delete) => self.record_delete_target(delete),
             _ => {}
         }
     }
+
+    fn record_insert_target(&mut self, insert: &Insert) {
+        if let TableObject::TableName(name) = &insert.table {
+            self.targets.push(&raw const *name);
+        }
+    }
+
+    fn record_update_target(&mut self, update: &Update) {
+        if let TableFactor::Table { name, .. } = &update.table.relation {
+            self.targets.push(&raw const *name);
+        }
+    }
+
+    /// With a multi-table list the `FROM` items are the rows read, and the
+    /// list holds the targets, which the `Delete` implementation resolves.
+    fn record_delete_target(&mut self, delete: &Delete) {
+        if delete.tables.is_empty() {
+            let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &delete.from;
+            self.targets.extend(from.iter().filter_map(|item| {
+                match &item.relation {
+                    TableFactor::Table { name, .. } => Some(&raw const *name),
+                    _ => None,
+                }
+            }));
+        }
+    }
+
+    /// Records a relation the walk names, and expands a plain view through
+    /// its stored definition.
+    fn read(&mut self, relation: Relation<'db, DB>) -> Result<(), LookupError> {
+        if !self.bound && !self.relations.iter().any(|seen| same_relation(seen, &relation)) {
+            self.relations.push(relation);
+        }
+        match relation {
+            Relation::Table(table) => {
+                if !self.tables.iter().any(|seen| core::ptr::eq(*seen, table)) {
+                    self.tables.push(table);
+                }
+                Ok(())
+            }
+            Relation::View(view) => self.expand_view(view),
+            Relation::MaterializedView(_) => Ok(()),
+        }
+    }
+
+    /// Expands a plain view through its stored definition, which reads its
+    /// names as bound at creation, with no search path.
+    fn expand_view(&mut self, view: &'db DB::View) -> Result<(), LookupError> {
+        if self.expanded.iter().any(|seen| core::ptr::eq(*seen, view)) {
+            return Ok(());
+        }
+        self.expanded.push(view);
+        let was_bound = core::mem::replace(&mut self.bound, true);
+        let outcome = view.definition().visit(self);
+        self.bound = was_bound;
+        outcome.break_value().map_or(Ok(()), Err)
+    }
 }
 
-impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
+/// Whether two relations are the same one, compared by the address the
+/// database hands back for it.
+fn same_relation<DB: DatabaseLike>(left: &Relation<'_, DB>, right: &Relation<'_, DB>) -> bool {
+    match (left, right) {
+        (Relation::Table(left), Relation::Table(right)) => core::ptr::eq(*left, *right),
+        (Relation::View(left), Relation::View(right)) => core::ptr::eq(*left, *right),
+        (Relation::MaterializedView(left), Relation::MaterializedView(right)) => {
+            core::ptr::eq(*left, *right)
+        }
+        _ => false,
+    }
+}
+
+impl<DB: DatabaseLike> Visitor for RelationCollector<'_, DB> {
     type Break = LookupError;
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
@@ -125,40 +165,47 @@ impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
-        if self.scopes.reads_item(relation)
-            && !self.targets.iter().any(|target| core::ptr::eq(*target, relation))
+    fn pre_visit_relation(&mut self, object_name: &ObjectName) -> ControlFlow<Self::Break> {
+        if self.scopes.reads_item(object_name)
+            && !self.targets.iter().any(|target| core::ptr::eq(*target, object_name))
         {
             return ControlFlow::Continue(());
         }
-        match resolve_object_name(relation, self.database, IdentifierCase::AsWritten) {
-            Ok(Some(table)) => {
-                self.accumulator.add(table, self.database);
-                ControlFlow::Continue(())
-            }
-            Ok(None) => ControlFlow::Continue(()),
+        let resolved = if self.bound {
+            resolve_bound_relation_object_name(object_name, self.database)
+        } else {
+            resolve_relation_object_name(object_name, self.database, IdentifierCase::AsWritten)
+        };
+        match resolved.and_then(|relation| relation.map_or(Ok(()), |relation| self.read(relation)))
+        {
+            Ok(()) => ControlFlow::Continue(()),
             Err(error) => ControlFlow::Break(error),
         }
     }
 }
 
-/// Resolves every relation reachable from `node` and records the base tables,
-/// propagating the first resolution error.
-fn collect_referenced_tables<'db, N: Visit, DB: DatabaseLike>(
+/// Walks `node` after `record` notes its own mutation targets, then reads the
+/// MySQL multi-table `DELETE` targets `listed`, which the visitor does not
+/// reach.
+fn collect<'db, N: Visit, DB: DatabaseLike>(
     node: &N,
     database: &'db DB,
-    accumulator: &mut ReferencedTables<'db, DB>,
-) -> Result<(), LookupError> {
-    let mut collector = RelationCollector {
-        database,
-        accumulator,
-        scopes: WithScopes::default(),
-        targets: Vec::new(),
-    };
-    match node.visit(&mut collector) {
-        ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(error) => Err(error),
+    record: impl FnOnce(&mut RelationCollector<'db, DB>),
+    listed: &[ObjectName],
+) -> Result<RelationCollector<'db, DB>, LookupError> {
+    let mut collector = RelationCollector::new(database);
+    record(&mut collector);
+    if let ControlFlow::Break(error) = node.visit(&mut collector) {
+        return Err(error);
     }
+    for object_name in listed {
+        if let Some(relation) =
+            resolve_relation_object_name(object_name, database, IdentifierCase::AsWritten)?
+        {
+            collector.read(relation)?;
+        }
+    }
+    Ok(collector)
 }
 
 impl<DB: DatabaseLike> DataStatementLike<DB> for Query {
@@ -166,9 +213,14 @@ impl<DB: DatabaseLike> DataStatementLike<DB> for Query {
         &self,
         database: &'db DB,
     ) -> Result<Vec<&'db DB::Table>, LookupError> {
-        let mut accumulator = ReferencedTables::new();
-        collect_referenced_tables(self, database, &mut accumulator)?;
-        Ok(accumulator.tables)
+        Ok(collect(self, database, |_| {}, &[])?.tables)
+    }
+
+    fn referenced_relations<'db>(
+        &self,
+        database: &'db DB,
+    ) -> Result<Vec<Relation<'db, DB>>, LookupError> {
+        Ok(collect(self, database, |_| {}, &[])?.relations)
     }
 }
 
@@ -177,9 +229,15 @@ impl<DB: DatabaseLike> DataStatementLike<DB> for Insert {
         &self,
         database: &'db DB,
     ) -> Result<Vec<&'db DB::Table>, LookupError> {
-        let mut accumulator = ReferencedTables::new();
-        collect_referenced_tables(self, database, &mut accumulator)?;
-        Ok(accumulator.tables)
+        Ok(collect(self, database, |collector| collector.record_insert_target(self), &[])?.tables)
+    }
+
+    fn referenced_relations<'db>(
+        &self,
+        database: &'db DB,
+    ) -> Result<Vec<Relation<'db, DB>>, LookupError> {
+        Ok(collect(self, database, |collector| collector.record_insert_target(self), &[])?
+            .relations)
     }
 }
 
@@ -188,9 +246,15 @@ impl<DB: DatabaseLike> DataStatementLike<DB> for Update {
         &self,
         database: &'db DB,
     ) -> Result<Vec<&'db DB::Table>, LookupError> {
-        let mut accumulator = ReferencedTables::new();
-        collect_referenced_tables(self, database, &mut accumulator)?;
-        Ok(accumulator.tables)
+        Ok(collect(self, database, |collector| collector.record_update_target(self), &[])?.tables)
+    }
+
+    fn referenced_relations<'db>(
+        &self,
+        database: &'db DB,
+    ) -> Result<Vec<Relation<'db, DB>>, LookupError> {
+        Ok(collect(self, database, |collector| collector.record_update_target(self), &[])?
+            .relations)
     }
 }
 
@@ -199,15 +263,16 @@ impl<DB: DatabaseLike> DataStatementLike<DB> for Delete {
         &self,
         database: &'db DB,
     ) -> Result<Vec<&'db DB::Table>, LookupError> {
-        let mut accumulator = ReferencedTables::new();
-        collect_referenced_tables(self, database, &mut accumulator)?;
-        // `visit_relations` does not descend into the MySQL multi-table
-        // `DELETE t1, t2 FROM ...` list (a `Vec<ObjectName>` rather than an
-        // annotated relation), so resolve those targets explicitly.
-        for object_name in &self.tables {
-            accumulator.resolve_and_add(object_name, database)?;
-        }
-        Ok(accumulator.tables)
+        Ok(collect(self, database, |collector| collector.record_delete_target(self), &self.tables)?
+            .tables)
+    }
+
+    fn referenced_relations<'db>(
+        &self,
+        database: &'db DB,
+    ) -> Result<Vec<Relation<'db, DB>>, LookupError> {
+        Ok(collect(self, database, |collector| collector.record_delete_target(self), &self.tables)?
+            .relations)
     }
 }
 
@@ -217,20 +282,24 @@ mod tests {
 
     use sqlparser::{
         ast::Statement,
-        dialect::{GenericDialect, MySqlDialect},
+        dialect::{ClickHouseDialect, GenericDialect, MySqlDialect},
         parser::Parser,
     };
 
     use crate::{
         errors::LookupError,
         prelude::ParserDB,
-        traits::{DataStatementLike, TableLike},
+        structs::{IdentifierCase, TargetName},
+        traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
     };
 
     const SCHEMA: &str = "
         CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
         CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total INT);
         CREATE TABLE audit (id INT PRIMARY KEY, note TEXT);
+        CREATE VIEW open_orders AS SELECT user_id, total FROM orders;
+        CREATE VIEW open_high AS SELECT user_id FROM open_orders WHERE total > 100;
+        CREATE MATERIALIZED VIEW big_orders AS SELECT user_id, total FROM orders;
     ";
 
     fn schema_db() -> ParserDB {
@@ -252,6 +321,23 @@ mod tests {
             .expect("referenced_tables succeeds")
             .iter()
             .map(|table| table.table_name().to_string())
+            .collect()
+    }
+
+    fn relation_names<S: DataStatementLike<ParserDB>>(statement: &S, db: &ParserDB) -> Vec<String> {
+        statement
+            .referenced_relations(db)
+            .expect("referenced_relations succeeds")
+            .iter()
+            .map(|relation| {
+                match relation {
+                    Relation::Table(table) => format!("table {}", table.table_name()),
+                    Relation::View(view) => format!("view {}", view.view_name()),
+                    Relation::MaterializedView(view) => {
+                        format!("materialized view {}", view.view_name())
+                    }
+                }
+            })
             .collect()
     }
 
@@ -315,8 +401,9 @@ mod tests {
         let statement =
             parse_one("WITH recent AS (SELECT user_id FROM orders) SELECT user_id FROM recent");
         // `orders` (CTE body) resolves; `recent` (the CTE name) does not match
-        // a base table and is skipped.
+        // a stored relation and is skipped.
         assert_eq!(referenced_names(as_query(&statement), &db), vec!["orders".to_string()]);
+        assert_eq!(relation_names(as_query(&statement), &db), vec!["table orders".to_string()]);
     }
 
     #[test]
@@ -444,6 +531,7 @@ mod tests {
         let db = schema_db();
         let statement = parse_one("SELECT * FROM nonexistent_table");
         assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+        assert_eq!(relation_names(as_query(&statement), &db), Vec::<String>::new());
     }
 
     #[test]
@@ -452,6 +540,10 @@ mod tests {
         let statement = parse_one("INSERT INTO audit (note) SELECT name FROM users");
         let Statement::Insert(insert) = &statement else { panic!("expected insert") };
         assert_eq!(referenced_names(insert, &db), vec!["audit".to_string(), "users".to_string()]);
+        assert_eq!(
+            relation_names(insert, &db),
+            vec!["table audit".to_string(), "table users".to_string()]
+        );
     }
 
     #[test]
@@ -488,10 +580,202 @@ mod tests {
     }
 
     #[test]
+    fn referenced_relations_tag_every_kind_the_statement_reads() {
+        let db = schema_db();
+        let statement = parse_one("SELECT * FROM users, open_orders, big_orders");
+        assert_eq!(
+            relation_names(as_query(&statement), &db),
+            vec![
+                "table users".to_string(),
+                "view open_orders".to_string(),
+                "materialized view big_orders".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn view_expands_to_its_base_table() {
+        let db = schema_db();
+        let statement = parse_one("SELECT * FROM open_orders");
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["orders".to_string()]);
+        assert_eq!(relation_names(as_query(&statement), &db), vec!["view open_orders".to_string()],);
+    }
+
+    #[test]
+    fn view_over_a_view_expands_to_the_base_table() {
+        let db = schema_db();
+        let statement = parse_one("SELECT * FROM open_high");
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["orders".to_string()]);
+        assert_eq!(relation_names(as_query(&statement), &db), vec!["view open_high".to_string()],);
+    }
+
+    #[test]
+    fn view_in_a_subquery_expands() {
+        let db = schema_db();
+        let statement =
+            parse_one("SELECT id FROM users WHERE id IN (SELECT user_id FROM open_orders)");
+        assert_eq!(
+            referenced_names(as_query(&statement), &db),
+            vec!["users".to_string(), "orders".to_string()],
+        );
+    }
+
+    #[test]
+    fn with_item_shadows_a_view() {
+        let db = schema_db();
+        let statement =
+            parse_one("WITH open_orders AS (SELECT 1 AS user_id) SELECT user_id FROM open_orders");
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+        assert_eq!(relation_names(as_query(&statement), &db), Vec::<String>::new());
+    }
+
+    #[test]
+    fn materialized_view_is_never_expanded() {
+        let db = schema_db();
+        let statement = parse_one("SELECT * FROM big_orders");
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+        assert_eq!(
+            relation_names(as_query(&statement), &db),
+            vec!["materialized view big_orders".to_string()],
+        );
+    }
+
+    #[test]
+    fn view_expansion_dedupes_the_base_table() {
+        let db = schema_db();
+        let statement = parse_one("SELECT * FROM orders, open_orders");
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["orders".to_string()]);
+        // The table reached through two views of it still appears once.
+        let statement = parse_one("SELECT * FROM open_orders, open_high");
+        assert_eq!(referenced_names(as_query(&statement), &db), vec!["orders".to_string()]);
+    }
+
+    /// Writing through an updatable view writes its base table, so a target
+    /// view expands like any view the statement names.
+    #[test]
+    fn a_dml_target_view_expands_to_the_table_it_writes() {
+        let db = schema_db();
+        let insert = parse_one("INSERT INTO open_orders (user_id) VALUES (1)");
+        let Statement::Insert(insert) = &insert else { panic!("expected insert") };
+        assert_eq!(referenced_names(insert, &db), vec!["orders".to_string()]);
+        assert_eq!(relation_names(insert, &db), vec!["view open_orders".to_string()]);
+
+        let update = parse_one("UPDATE open_orders SET total = 0 FROM users");
+        let Statement::Update(update) = &update else { panic!("expected update") };
+        assert_eq!(referenced_names(update, &db), vec!["orders".to_string(), "users".to_string()]);
+        assert_eq!(
+            relation_names(update, &db),
+            vec!["view open_orders".to_string(), "table users".to_string()]
+        );
+
+        let delete = parse_one("DELETE FROM open_orders WHERE user_id IN (SELECT id FROM users)");
+        let Statement::Delete(delete) = &delete else { panic!("expected delete") };
+        assert_eq!(referenced_names(delete, &db), vec!["orders".to_string(), "users".to_string()]);
+        assert_eq!(
+            relation_names(delete, &db),
+            vec!["view open_orders".to_string(), "table users".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_view_cycle_terminates() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "
+            CREATE TABLE t (id INT);
+            CREATE VIEW c1 AS SELECT id FROM t;
+            CREATE VIEW c2 AS SELECT id FROM c1;
+            CREATE OR REPLACE VIEW c1 AS SELECT id FROM c2;
+            ",
+        )
+        .expect("schema parses");
+        let statement = parse_one("SELECT * FROM c1");
+        assert_eq!(referenced_names(as_query(&statement), &db), Vec::<String>::new());
+        assert_eq!(relation_names(as_query(&statement), &db), vec!["view c1".to_string()],);
+    }
+
+    #[test]
+    fn a_view_definition_reads_its_bound_name() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "
+            CREATE TABLE orders (id INT, user_id INT, total INT);
+            CREATE SCHEMA alt;
+            CREATE TABLE alt.orders (id INT, user_id INT, total INT);
+            CREATE VIEW open_orders AS SELECT user_id FROM orders;
+            SET search_path TO alt, public;
+            ",
+        )
+        .expect("schema parses");
+        let statement = parse_one("SELECT * FROM open_orders");
+        // A bound read applies no search path, so the path's leading `alt`
+        // does not pull the expansion over to `alt.orders`.
+        let tables = as_query(&statement).referenced_tables(&db).expect("resolves");
+        assert_eq!(tables.len(), 1, "one base table is reached");
+        assert_eq!(tables[0].table_schema(), None, "the bound table is the bare one");
+        assert_eq!(relation_names(as_query(&statement), &db), vec!["view open_orders".to_string()],);
+        assert_eq!(
+            db.table_by_target(
+                TargetName::new("orders", false).with_schema("alt", false),
+                IdentifierCase::AsWritten
+            )
+            .expect("unambiguous")
+            .expect("the shadowing table")
+            .table_name(),
+            "orders"
+        );
+    }
+
+    #[test]
     fn overqualified_relation_propagates_resolver_error() {
         let db = schema_db();
         let statement = parse_one("SELECT * FROM a.b.c");
         let result = as_query(&statement).referenced_tables(&db);
         assert!(matches!(result, Err(LookupError::InvalidObjectName { .. })), "got {result:?}");
+    }
+
+    #[test]
+    fn a_materialized_view_named_twice_is_recorded_once() {
+        let db = schema_db();
+        let statement = parse_one("SELECT * FROM big_orders, big_orders AS again");
+        assert_eq!(
+            relation_names(as_query(&statement), &db),
+            vec!["materialized view big_orders".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_listed_delete_target_naming_nothing_is_skipped() {
+        let db = schema_db();
+        let statements = Parser::parse_sql(&MySqlDialect {}, "DELETE nowhere, orders FROM orders")
+            .expect("statement parses");
+        let Statement::Delete(delete) = &statements[0] else { panic!("expected delete") };
+        assert_eq!(relation_names(delete, &db), vec!["table orders".to_string()]);
+    }
+
+    #[test]
+    fn a_table_function_target_names_no_stored_relation() {
+        let db = schema_db();
+        let statements = Parser::parse_sql(
+            &ClickHouseDialect {},
+            "INSERT INTO FUNCTION remote('host', 'db', 'orders') SELECT id FROM users",
+        )
+        .expect("statement parses");
+        let Statement::Insert(insert) = &statements[0] else { panic!("expected insert") };
+        assert_eq!(relation_names(insert, &db), vec!["table users".to_string()]);
+    }
+
+    #[test]
+    fn a_derived_delete_target_names_no_stored_relation() {
+        let db = schema_db();
+        let statement = parse_one("DELETE FROM (SELECT id FROM orders) AS d");
+        let Statement::Delete(delete) = &statement else { panic!("expected delete") };
+        assert_eq!(relation_names(delete, &db), vec!["table orders".to_string()]);
+    }
+
+    #[test]
+    fn a_whole_select_statement_reads_its_relations() {
+        let db = schema_db();
+        let statement = parse_one("SELECT * FROM users");
+        let collected = super::collect(&statement, &db, |_| {}, &[]).expect("resolves");
+        assert_eq!(collected.tables.len(), 1);
     }
 }

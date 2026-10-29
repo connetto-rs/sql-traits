@@ -16,7 +16,7 @@ use sqlparser::ast::{Action, Grantee};
 use crate::{
     errors::LookupError,
     structs::TargetName,
-    traits::{DatabaseLike, Metadata},
+    traits::{DatabaseLike, Metadata, Relation},
 };
 
 /// A trait for types that can be treated as SQL grants.
@@ -370,35 +370,6 @@ pub enum GrantTarget<I> {
     Other,
 }
 
-/// One relation a grant covers, saying which kind it is.
-///
-/// A grant reaches tables, views and materialized views alike, so a caller
-/// wanting the whole picture asks [`TableGrantLike::relations`] and handles
-/// each case. [`TableGrantLike::tables`] answers the narrower question, which
-/// tables a grant covers, and quietly omits the views: that is the right
-/// answer to that question and the wrong answer to this one.
-#[derive(Clone)]
-pub enum GrantRelation<'a, DB: DatabaseLike> {
-    /// A table.
-    Table(&'a DB::Table),
-    /// A plain view.
-    View(&'a DB::View),
-    /// A materialized view.
-    MaterializedView(&'a DB::MaterializedView),
-}
-
-impl<DB: DatabaseLike> Copy for GrantRelation<'_, DB> {}
-
-impl<DB: DatabaseLike> Debug for GrantRelation<'_, DB> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Table(table) => f.debug_tuple("Table").field(table).finish(),
-            Self::View(view) => f.debug_tuple("View").field(view).finish(),
-            Self::MaterializedView(view) => f.debug_tuple("MaterializedView").field(view).finish(),
-        }
-    }
-}
-
 /// A trait for relation-level grants.
 ///
 /// A grant applies privileges to whole relations, whether written as a direct
@@ -484,7 +455,7 @@ pub trait TableGrantLike:
     ///
     /// ```rust
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::{prelude::*, traits::grant::GrantRelation};
+    /// use sql_traits::prelude::*;
     ///
     /// let db = ParserDB::parse::<GenericDialect>(
     ///     "
@@ -499,9 +470,9 @@ pub trait TableGrantLike:
     ///     .relations(&db)
     ///     .map(|relation| {
     ///         match relation {
-    ///             GrantRelation::Table(_) => "table",
-    ///             GrantRelation::View(_) => "view",
-    ///             GrantRelation::MaterializedView(_) => "materialized view",
+    ///             Relation::Table(_) => "table",
+    ///             Relation::View(_) => "view",
+    ///             Relation::MaterializedView(_) => "materialized view",
     ///         }
     ///     })
     ///     .collect();
@@ -514,7 +485,7 @@ pub trait TableGrantLike:
     fn relations<'a>(
         &'a self,
         database: &'a Self::DB,
-    ) -> impl Iterator<Item = GrantRelation<'a, Self::DB>>;
+    ) -> impl Iterator<Item = Relation<'a, Self::DB>>;
 
     /// Returns whether this grant applies to a specific table.
     ///
@@ -568,7 +539,7 @@ where
     fn relations<'a>(
         &'a self,
         database: &'a Self::DB,
-    ) -> impl Iterator<Item = GrantRelation<'a, Self::DB>> {
+    ) -> impl Iterator<Item = Relation<'a, Self::DB>> {
         (*self).relations(database)
     }
 
@@ -669,7 +640,7 @@ pub trait ColumnGrantLike:
     ///
     /// ```rust
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::{prelude::*, traits::grant::GrantRelation};
+    /// use sql_traits::prelude::*;
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
@@ -682,11 +653,11 @@ pub trait ColumnGrantLike:
     /// )?;
     /// let grant = db.column_grants().next().unwrap();
     /// assert!(grant.table(&db).is_none(), "the target is not a table");
-    /// assert!(matches!(grant.relation(&db), Some(GrantRelation::View(_))));
+    /// assert!(matches!(grant.relation(&db), Some(Relation::View(_))));
     /// # Ok(())
     /// # }
     /// ```
-    fn relation<'a>(&'a self, database: &'a Self::DB) -> Option<GrantRelation<'a, Self::DB>>;
+    fn relation<'a>(&'a self, database: &'a Self::DB) -> Option<Relation<'a, Self::DB>>;
 }
 
 impl<T: ColumnGrantLike> ColumnGrantLike for &T
@@ -708,7 +679,7 @@ where
         (*self).table(database)
     }
 
-    fn relation<'a>(&'a self, database: &'a Self::DB) -> Option<GrantRelation<'a, Self::DB>> {
+    fn relation<'a>(&'a self, database: &'a Self::DB) -> Option<Relation<'a, Self::DB>> {
         (*self).relation(database)
     }
 }
@@ -798,7 +769,7 @@ mod tests {
         assert_eq!(table.table_name(), "users");
         assert!(matches!(
             <&_ as ColumnGrantLike>::relation(&cg_ref, &db),
-            Some(GrantRelation::Table(_))
+            Some(Relation::Table(_))
         ));
         let cols: Vec<_> =
             <&_ as ColumnGrantLike>::columns(&cg_ref, table, &db).expect("columns").collect();

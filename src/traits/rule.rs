@@ -7,22 +7,8 @@ use sqlparser::ast::{CreateRuleAction, CreateRuleEvent, Expr};
 use crate::{
     errors::LookupError,
     structs::TargetName,
-    traits::{DatabaseLike, Metadata},
+    traits::{DatabaseLike, Metadata, Relation},
 };
-
-/// The relation a rule is defined on, saying which kind it is.
-///
-/// PostgreSQL attaches a rule to a table or to a plain view, and refuses one
-/// on a materialized view, so these are the two cases a caller handles.
-#[derive(Clone, Debug)]
-pub enum RuleRelation<'a, DB: DatabaseLike> {
-    /// A table.
-    Table(&'a DB::Table),
-    /// A plain view.
-    View(&'a DB::View),
-}
-
-impl<DB: DatabaseLike> Copy for RuleRelation<'_, DB> {}
 
 /// A trait for types that can be treated as PostgreSQL rewrite rules, the
 /// objects `CREATE RULE` defines.
@@ -118,7 +104,7 @@ pub trait RuleLike: Clone + Debug + Metadata + Send + Sync {
     /// let rule = db.rules().next().unwrap();
     /// assert!(matches!(
     ///     rule.relation(&db)?,
-    ///     RuleRelation::View(view) if view.view_name() == "recent"
+    ///     Relation::View(view) if view.view_name() == "recent"
     /// ));
     /// # Ok(())
     /// # }
@@ -126,7 +112,7 @@ pub trait RuleLike: Clone + Debug + Metadata + Send + Sync {
     fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<RuleRelation<'db, Self::DB>, LookupError>
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db;
 
@@ -241,7 +227,7 @@ impl<T: RuleLike> RuleLike for &T {
     fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<RuleRelation<'db, Self::DB>, LookupError>
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {

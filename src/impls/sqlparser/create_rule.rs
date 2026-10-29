@@ -7,7 +7,7 @@ use sqlparser::ast::{CreateRule, CreateRuleAction, CreateRuleDoKind, CreateRuleE
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
-    traits::{DatabaseLike, Metadata, RuleLike, RuleRelation},
+    traits::{DatabaseLike, Metadata, Relation, RuleLike},
     utils::object_name::{
         object_name_identifiers, resolve_bound_table, target_name_of_idents,
         target_name_of_object_name,
@@ -37,12 +37,12 @@ impl RuleLike for CreateRule {
     fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<RuleRelation<'db, Self::DB>, LookupError>
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
         if let Some(table) = resolve_bound_table(&self.table_name, database)? {
-            return Ok(RuleRelation::Table(table));
+            return Ok(Relation::Table(table));
         }
         let (schema_ident, name_ident) = object_name_identifiers(&self.table_name)?;
         database
@@ -50,7 +50,7 @@ impl RuleLike for CreateRule {
                 target_name_of_idents(schema_ident, name_ident),
                 IdentifierCase::AsWritten,
             )?
-            .map(RuleRelation::View)
+            .map(Relation::View)
             .ok_or_else(|| {
                 LookupError::RelationNotFound { object_name: self.table_name.to_string() }
             })

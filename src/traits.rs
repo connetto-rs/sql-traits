@@ -13,7 +13,7 @@ pub use column::{
 };
 pub use data_type::{DataTypeLike, IntervalFields, VectorKind, VectorType};
 pub mod index;
-pub use database::DatabaseLike;
+pub use database::{DatabaseLike, Relation};
 pub use dialect::DialectLike;
 pub use index::IndexLike;
 pub use table::{PartitionStrategy, TableLike};
@@ -29,7 +29,7 @@ pub use function_like::FunctionLike;
 pub mod trigger;
 pub use trigger::TriggerLike;
 pub mod rule;
-pub use rule::{RuleLike, RuleRelation};
+pub use rule::RuleLike;
 pub mod extension;
 pub use extension::ExtensionLike;
 pub mod policy;

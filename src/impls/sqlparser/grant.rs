@@ -16,9 +16,8 @@ use crate::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{
-        ColumnGrantLike, ColumnLike, DatabaseLike, GrantLike, Metadata, RoleLike, TableGrantLike,
-        TableLike, ViewLike,
-        grant::{GrantRelation, GrantTarget},
+        ColumnGrantLike, ColumnLike, DatabaseLike, GrantLike, Metadata, Relation, RoleLike,
+        TableGrantLike, TableLike, ViewLike, grant::GrantTarget,
     },
     utils::{
         identifier_resolution::{
@@ -684,10 +683,7 @@ fn granted_tables<'a>(
 ///
 /// `ALL TABLES IN SCHEMA` covers views and materialized views as well as
 /// tables, which is what PostgreSQL grants, so all three are walked.
-fn granted_relations<'a>(
-    grant: &'a Grant,
-    database: &'a ParserDB,
-) -> Vec<GrantRelation<'a, ParserDB>> {
+fn granted_relations<'a>(grant: &'a Grant, database: &'a ParserDB) -> Vec<Relation<'a, ParserDB>> {
     match &grant.objects {
         Some(GrantObjects::Tables(names)) => {
             names.iter().filter_map(|name| resolve_relation_name(name, database)).collect()
@@ -696,14 +692,14 @@ fn granted_relations<'a>(
             database
                 .tables()
                 .filter(|table| schemas.iter().any(|schema| schema_matches_table(schema, *table)))
-                .map(GrantRelation::Table)
+                .map(Relation::Table)
                 .chain(
                     database
                         .views()
                         .filter(|view| {
                             schemas.iter().any(|schema| schema_matches_view(schema, *view))
                         })
-                        .map(GrantRelation::View),
+                        .map(Relation::View),
                 )
                 .chain(
                     database
@@ -711,7 +707,7 @@ fn granted_relations<'a>(
                         .filter(|view| {
                             schemas.iter().any(|schema| schema_matches_view(schema, *view))
                         })
-                        .map(GrantRelation::MaterializedView),
+                        .map(Relation::MaterializedView),
                 )
                 .collect()
         }
@@ -723,21 +719,21 @@ fn granted_relations<'a>(
 fn resolve_relation_name<'a>(
     name: &ObjectName,
     database: &'a ParserDB,
-) -> Option<GrantRelation<'a, ParserDB>> {
+) -> Option<Relation<'a, ParserDB>> {
     if let Some(table) = resolve_bound_table(name, database).ok().flatten() {
-        return Some(GrantRelation::Table(table));
+        return Some(Relation::Table(table));
     }
     let target = target_name_from_object_name(name)?;
     if let Some(view) =
         database.view_by_target(target.clone(), IdentifierCase::AsWritten).ok().flatten()
     {
-        return Some(GrantRelation::View(view));
+        return Some(Relation::View(view));
     }
     database
         .materialized_view_by_target(target, IdentifierCase::AsWritten)
         .ok()
         .flatten()
-        .map(GrantRelation::MaterializedView)
+        .map(Relation::MaterializedView)
 }
 
 impl TableGrantLike for Grant {
@@ -751,7 +747,7 @@ impl TableGrantLike for Grant {
     fn relations<'a>(
         &'a self,
         database: &'a Self::DB,
-    ) -> impl Iterator<Item = GrantRelation<'a, Self::DB>> {
+    ) -> impl Iterator<Item = Relation<'a, Self::DB>> {
         granted_relations(self, database).into_iter()
     }
 
@@ -815,7 +811,7 @@ impl ColumnGrantLike for Grant {
         granted_tables(self, database).into_iter().next()
     }
 
-    fn relation<'a>(&'a self, database: &'a Self::DB) -> Option<GrantRelation<'a, Self::DB>> {
+    fn relation<'a>(&'a self, database: &'a Self::DB) -> Option<Relation<'a, Self::DB>> {
         granted_relations(self, database).into_iter().next()
     }
 }

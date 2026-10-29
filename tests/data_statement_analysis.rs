@@ -18,6 +18,10 @@ const SCHEMA: &str = "
         total INT
     );
     CREATE TABLE order_items (order_id INT, sku TEXT, qty INT, PRIMARY KEY (order_id, sku));
+    CREATE VIEW open_orders AS SELECT id, user_id, total FROM orders;
+    CREATE VIEW open_high AS SELECT user_id FROM open_orders WHERE total > 100;
+    CREATE MATERIALIZED VIEW big_orders AS SELECT id, user_id, total FROM orders;
+    CREATE VIEW over_big AS SELECT user_id FROM big_orders;
 ";
 
 fn schema_db() -> ParserDB {
@@ -41,6 +45,25 @@ fn referenced_names<S: DataStatementLike<ParserDB>>(stmt: &S, db: &ParserDB) -> 
         .expect("referenced_tables succeeds")
         .iter()
         .map(|table| table.table_name().to_string())
+        .collect()
+}
+
+fn referenced_relation_names<S: DataStatementLike<ParserDB>>(
+    stmt: &S,
+    db: &ParserDB,
+) -> Vec<String> {
+    stmt.referenced_relations(db)
+        .expect("referenced_relations succeeds")
+        .iter()
+        .map(|relation| {
+            match relation {
+                Relation::Table(table) => format!("table {}", table.table_name()),
+                Relation::View(view) => format!("view {}", view.view_name()),
+                Relation::MaterializedView(view) => {
+                    format!("materialized view {}", view.view_name())
+                }
+            }
+        })
         .collect()
 }
 
@@ -229,4 +252,170 @@ fn mysql_multi_table_delete_has_no_single_target() {
         panic!("expected delete");
     };
     assert!(matches!(delete.target_table(&db), Err(LookupError::InvalidObjectName { .. })));
+}
+
+#[test]
+fn referenced_relations_names_every_kind_the_statement_reads() {
+    let db = schema_db();
+    let names =
+        referenced_relation_names(&query("SELECT * FROM users, open_orders, big_orders"), &db);
+    assert_eq!(
+        names,
+        vec![
+            "table users".to_string(),
+            "view open_orders".to_string(),
+            "materialized view big_orders".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn referenced_tables_expands_a_view_to_its_base_table() {
+    let db = schema_db();
+    // The statement names the view; the base table is reached through it.
+    assert_eq!(
+        referenced_names(&query("SELECT * FROM open_orders"), &db),
+        vec!["orders".to_string()],
+    );
+    assert_eq!(
+        referenced_relation_names(&query("SELECT * FROM open_orders"), &db),
+        vec!["view open_orders".to_string()],
+    );
+}
+
+#[test]
+fn referenced_tables_expands_a_view_over_a_view() {
+    let db = schema_db();
+    assert_eq!(
+        referenced_names(&query("SELECT * FROM open_high"), &db),
+        vec!["orders".to_string()],
+    );
+}
+
+#[test]
+fn referenced_tables_expands_a_view_inside_a_subquery() {
+    let db = schema_db();
+    let names = referenced_names(
+        &query("SELECT id FROM users WHERE id IN (SELECT user_id FROM open_orders)"),
+        &db,
+    );
+    assert_eq!(names, vec!["users".to_string(), "orders".to_string()]);
+}
+
+#[test]
+fn with_item_shadows_a_view_name() {
+    let db = schema_db();
+    let sql = "WITH open_orders AS (SELECT 1 AS user_id) SELECT user_id FROM open_orders";
+    assert_eq!(referenced_names(&query(sql), &db), Vec::<String>::new());
+    assert_eq!(referenced_relation_names(&query(sql), &db), Vec::<String>::new());
+}
+
+#[test]
+fn a_materialized_view_is_not_expanded() {
+    let db = schema_db();
+    // Reading the materialized view reads its snapshot, never its base table.
+    assert_eq!(referenced_names(&query("SELECT * FROM big_orders"), &db), Vec::<String>::new());
+    assert_eq!(
+        referenced_relation_names(&query("SELECT * FROM big_orders"), &db),
+        vec!["materialized view big_orders".to_string()],
+    );
+    // A plain view reading the materialized view reaches no base table.
+    assert_eq!(referenced_names(&query("SELECT * FROM over_big"), &db), Vec::<String>::new());
+    assert_eq!(
+        referenced_relation_names(&query("SELECT * FROM over_big"), &db),
+        vec!["view over_big".to_string()],
+    );
+}
+
+#[test]
+fn referenced_tables_dedupes_a_table_read_directly_and_through_a_view() {
+    let db = schema_db();
+    assert_eq!(
+        referenced_names(&query("SELECT * FROM orders, open_orders"), &db),
+        vec!["orders".to_string()],
+    );
+    // The table reached through two views of it still appears once.
+    assert_eq!(
+        referenced_names(&query("SELECT * FROM open_orders, open_high"), &db),
+        vec!["orders".to_string()],
+    );
+}
+
+#[test]
+fn a_dml_target_resolves_against_the_relation_pool() {
+    let db = schema_db();
+    let Statement::Insert(insert) = statement("INSERT INTO open_orders (id) VALUES (1)") else {
+        panic!("expected insert");
+    };
+    // The target names the view, and writing through it writes its base
+    // table.
+    assert_eq!(referenced_relation_names(&insert, &db), vec!["view open_orders".to_string()],);
+    assert_eq!(referenced_names(&insert, &db), vec!["orders".to_string()]);
+}
+
+#[test]
+fn a_view_cycle_terminates_with_no_base_table() {
+    let db = ParserDB::parse::<GenericDialect>(
+        "
+        CREATE TABLE t (id INT);
+        CREATE VIEW v1 AS SELECT id FROM t;
+        CREATE VIEW v2 AS SELECT id FROM v1;
+        CREATE OR REPLACE VIEW v1 AS SELECT id FROM v2;
+        ",
+    )
+    .expect("schema parses");
+    assert_eq!(referenced_names(&query("SELECT * FROM v1"), &db), Vec::<String>::new());
+    assert_eq!(
+        referenced_relation_names(&query("SELECT * FROM v1"), &db),
+        vec!["view v1".to_string()],
+    );
+}
+
+/// Three spellings a case-sensitive server holds apart are one name under
+/// PostgreSQL's rule, and the unified resolvers report them as the ambiguity
+/// one name is supposed to be, whatever the kinds.
+#[test]
+fn a_name_held_by_relations_of_every_kind_is_an_error() {
+    let db = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Exact)
+        .parse::<GenericDialect>(
+            "
+            CREATE TABLE docs (id INT PRIMARY KEY);
+            CREATE VIEW Docs AS SELECT id FROM docs;
+            CREATE MATERIALIZED VIEW DOCS AS SELECT id FROM docs;
+            ",
+        )
+        .expect("a case-sensitive server holds all three spellings");
+
+    let Err(LookupError::AmbiguousTableLookup { candidates, .. }) =
+        db.resolve_target_relation(TargetName::new("docs", false), IdentifierCase::AsWritten)
+    else {
+        panic!("the written name is ambiguous");
+    };
+    assert_eq!(candidates, vec!["DOCS".to_string(), "Docs".to_string(), "docs".to_string()]);
+
+    // The bound reading takes the same comparison, so it is ambiguous too.
+    assert!(
+        matches!(
+            db.resolve_bound_relation(TargetName::new("docs", false)),
+            Err(LookupError::AmbiguousTableLookup { .. })
+        ),
+        "the bound name is ambiguous too"
+    );
+
+    // A statement reading the name carries the error through both accessors.
+    assert!(
+        matches!(
+            query("SELECT * FROM docs").referenced_tables(&db),
+            Err(LookupError::AmbiguousTableLookup { .. })
+        ),
+        "referenced_tables reports the ambiguity"
+    );
+    assert!(
+        matches!(
+            query("SELECT * FROM docs").referenced_relations(&db),
+            Err(LookupError::AmbiguousTableLookup { .. })
+        ),
+        "referenced_relations reports the ambiguity"
+    );
 }
