@@ -7713,7 +7713,7 @@ impl ParserDB {
                         }
                     }
                     let memberships = CreateRoleMemberships::take(&mut create_role);
-                    memberships.validate(&builder, access_resolution)?;
+                    memberships.validate(&builder, access_resolution, &create_role)?;
                     let created = Arc::new(create_role);
                     builder = builder.add_role(Arc::clone(&created), ());
                     memberships.record(&mut builder, &created, &role_alterations);

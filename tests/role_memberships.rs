@@ -306,6 +306,60 @@ fn public_is_refused_as_a_member_or_a_granted_role() {
     }
 }
 
+/// PostgreSQL refuses a membership that would make a role a member of itself,
+/// directly or through other memberships.
+#[test]
+fn a_membership_closing_a_cycle_is_refused() {
+    let refused = |result: &Result<ParserDB, Error>, role: &str, member: &str| {
+        matches!(result, Err(Error::CircularRoleMembership { role_name, member_name })
+            if role_name == role && member_name == member)
+    };
+
+    for (sql, role, member) in [
+        ("CREATE ROLE a; GRANT a TO a;", "a", "a"),
+        ("CREATE ROLE a; CREATE ROLE b IN ROLE a; GRANT b TO a;", "b", "a"),
+        (
+            "CREATE ROLE a; CREATE ROLE b; CREATE ROLE c IN ROLE b;
+             GRANT a TO b; GRANT c TO a;",
+            "c",
+            "a",
+        ),
+    ] {
+        for result in [parse(sql), open_world(sql)] {
+            assert!(refused(&result, role, member), "{sql} gave {result:?}");
+        }
+    }
+
+    // Only the open world lets a grant name a role created afterwards, and the
+    // `CREATE ROLE` clauses then close the cycle.
+    for (sql, role, member) in [
+        ("GRANT a TO b; CREATE ROLE b ROLE a;", "b", "a"),
+        ("GRANT a TO b; CREATE ROLE a IN ROLE b;", "b", "a"),
+    ] {
+        let result = open_world(sql);
+        assert!(refused(&result, role, member), "{sql} gave {result:?}");
+    }
+}
+
+/// Two paths up to one role are no cycle.
+#[test]
+fn a_diamond_of_memberships_is_accepted() {
+    let database = parse(
+        "CREATE ROLE top_role;
+         CREATE ROLE left_role IN ROLE top_role;
+         CREATE ROLE right_role IN ROLE top_role;
+         CREATE ROLE bottom_role IN ROLE left_role, right_role;
+         CREATE ROLE other_role;
+         GRANT bottom_role TO other_role;",
+    )
+    .expect("schema builds");
+
+    assert_eq!(
+        memberships_of(&database, "other_role"),
+        [membership("bottom_role", false, true, true)]
+    );
+}
+
 #[test]
 fn open_world_records_memberships_naming_undeclared_roles() {
     let database = open_world(
