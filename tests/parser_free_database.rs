@@ -24,8 +24,8 @@ use sqlparser::{
     ast::{
         Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
         CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
-        FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, Statement,
-        TriggerEvent, TriggerObjectKind, TriggerPeriod,
+        FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, ReferentialAction,
+        Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -702,8 +702,12 @@ impl ForeignKeyLike for MemoryForeignKey {
         self.name.as_deref()
     }
 
-    fn on_delete_cascade(&self, _database: &Self::DB) -> bool {
-        false
+    fn on_delete(&self, _database: &Self::DB) -> ReferentialAction {
+        ReferentialAction::NoAction
+    }
+
+    fn on_update(&self, _database: &Self::DB) -> ReferentialAction {
+        ReferentialAction::NoAction
     }
 
     fn host_table<'db>(&'db self, database: &'db Self::DB) -> &'db MemoryTable
