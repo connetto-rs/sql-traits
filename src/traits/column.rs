@@ -7,14 +7,10 @@ use crate::{
     errors::LookupError,
     structs::TargetName,
     traits::{
-        CheckConstraintLike, DatabaseLike, ForeignKeyLike, IndexLike, Metadata, TableLike,
-        check_constraint::non_tautological,
+        CheckConstraintLike, DataTypeLike, DatabaseLike, ForeignKeyLike, IndexLike, Metadata,
+        TableLike, check_constraint::non_tautological,
     },
-    utils::{
-        identifier_resolution::normalize_identifier,
-        normalize_postgres_type_cow,
-        scalar_family::{ScalarFamily, scalar_family as classify_scalar_family},
-    },
+    utils::identifier_resolution::normalize_identifier,
 };
 
 /// The padding rule MySQL exposes for a collation.
@@ -298,16 +294,15 @@ pub trait ColumnLike:
     where
         Self: 'db;
 
-    /// Returns the data type of the column as a string.
+    /// Returns the declared data type of the column.
     ///
-    /// The type is a borrowed canonical token whenever the implementation can
-    /// name one literally. An array type has to be assembled from its element
-    /// type, so it is owned.
+    /// The returned [`DataTypeLike`] value answers every fact about the type,
+    /// its name, family, scale, precision and array element among them.
     ///
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
     ///
     /// let db = ParserDB::parse::<GenericDialect>(
@@ -315,203 +310,16 @@ pub trait ColumnLike:
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let id_column =
-    ///     table.column("id", &db, IdentifierCase::AsWritten)?.expect("Column 'id' should exist");
-    /// let name_column =
-    ///     table.column("name", &db, IdentifierCase::AsWritten)?.expect("Column 'name' should exist");
-    /// let score_column = table
-    ///     .column("score", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'score' should exist");
-    /// assert_eq!(id_column.data_type(&db), "INT");
-    /// assert_eq!(name_column.data_type(&db), "TEXT");
-    /// assert_eq!(score_column.data_type(&db), "REAL");
+    /// let name_column = table.column("name", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// assert_eq!(name_column.data_type(&db).name(&db), "TEXT");
+    /// assert!(name_column.data_type(&db).is_textual(&db));
     /// # Ok(())
     /// # }
     /// ```
-    fn data_type<'db>(&'db self, database: &'db Self::DB) -> Cow<'db, str>;
-
-    /// Returns the width in bytes of a fixed-length binary column, or `None`
-    /// when the declared type is not a fixed-length binary type.
-    ///
-    /// MySQL, SQL Server and ANSI SQL pad every `BINARY(n)` value with zero
-    /// bytes to exactly `n` bytes, and read a bare `BINARY` as `BINARY(1)`. A
-    /// consumer receiving such a value without its trailing zero bytes, as the
-    /// MySQL binary log stores it, needs `n` to restore it. `VARBINARY(n)`
-    /// answers `None`, and so does `BINARY(n)` in a dialect where it bounds a
-    /// varying length.
-    ///
-    /// The default answers `None`, so an implementation over a backend with a
-    /// fixed-length binary type must override it.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), sql_traits::errors::Error> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::MySqlDialect;
-    ///
-    /// let db = ParserDB::parse::<MySqlDialect>(
-    ///     "CREATE TABLE t (token BINARY(16), flag BINARY, payload VARBINARY(8));",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let widths: Vec<_> =
-    ///     table.columns(&db)?.map(|column| column.fixed_binary_length(&db)).collect();
-    /// assert_eq!(widths, [Some(16), Some(1), None]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    fn fixed_binary_length(&self, _database: &Self::DB) -> Option<u64> {
-        None
-    }
-
-    /// Returns the most characters a value of the column can hold, or `None`
-    /// when the engine does not bound it by the declared type.
-    ///
-    /// `VARCHAR(n)`, `CHARACTER VARYING(n)`, `CHAR(n)` and `CHARACTER(n)`
-    /// answer `n` wherever the engine rejects or truncates a longer value. A
-    /// bare `CHAR` is `CHAR(1)`. A bare `VARCHAR` takes the engine's default
-    /// length where it has one, as in SQL Server, and answers `None` where it
-    /// is unbounded, as in PostgreSQL. `TEXT` and a length that is not an
-    /// integer literal, such as `VARCHAR(MAX)`, answer `None`. So does every
-    /// declared length in an engine that stores any length regardless, as
-    /// SQLite, DuckDB and ClickHouse do. A length counted in bytes or in UTF-16
-    /// code units still bounds the characters, since every character takes at
-    /// least one of them.
-    ///
-    /// The default answers `None`, so an implementation over a backend with a
-    /// bounded character type must override it.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), sql_traits::errors::Error> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TABLE notes (title VARCHAR(100), code CHAR(8), body TEXT);",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("notes", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let lengths: Vec<_> =
-    ///     table.columns(&db)?.map(|column| column.max_character_length(&db)).collect();
-    /// assert_eq!(lengths, [Some(100), Some(8), None]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    fn max_character_length(&self, _database: &Self::DB) -> Option<u64> {
-        None
-    }
-
-    /// Returns how many fractional digits of a second a value of a time or
-    /// timestamp column keeps, or `None` when the declared type holds no time
-    /// of day.
-    ///
-    /// A written precision such as `TIMESTAMP(0)` or `TIME(3)` answers the
-    /// digits the engine keeps for it, and a bare type answers the engine's
-    /// default, which is 6 in PostgreSQL, 0 in MySQL and 9 in Snowflake. An
-    /// engine with a fixed resolution answers that resolution whatever was
-    /// written, as BigQuery does with microseconds. The engine rounds or
-    /// truncates a value with more digits, so `Some(0)` marks a column that
-    /// cannot hold the fraction of a second `now()` returns. A type without a
-    /// time of day, such as a standard `DATE`, answers `None`, and so does an
-    /// interval, which measures a duration. Oracle's `DATE` keeps whole seconds
-    /// and answers `Some(0)`.
-    ///
-    /// The default answers `None`, so an implementation over a backend with a
-    /// time or timestamp type must override it.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), sql_traits::errors::Error> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TABLE events (at timestamptz(0), seen timestamp, starts time(2), day date);",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("events", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let precisions: Vec<_> =
-    ///     table.columns(&db)?.map(|column| column.fractional_seconds_precision(&db)).collect();
-    /// assert_eq!(precisions, [Some(0), Some(6), Some(2), None]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    fn fractional_seconds_precision(&self, _database: &Self::DB) -> Option<u64> {
-        None
-    }
-
-    /// Returns how many digits a value of a decimal column keeps to the right
-    /// of the decimal point, or `None` when the declared type fixes no scale.
-    ///
-    /// `NUMERIC(p, s)` and `DECIMAL(p, s)` answer `s`, and `NUMERIC(p)` answers
-    /// `0`. A bare type answers the engine's default, which is 0 in MySQL, SQL
-    /// Server and the standard, 3 in DuckDB and 9 in BigQuery. A bare `NUMERIC`
-    /// in PostgreSQL holds any scale and answers `None`, and so does a bare
-    /// `NUMBER` in Oracle. A negative scale, which PostgreSQL accepts and which
-    /// rounds a value to tens or hundreds, answers as written. Integer,
-    /// floating-point and non-numeric types answer `None`. So does every
-    /// declared type in SQLite, which stores a decimal value as an integer or a
-    /// float whatever scale it declares.
-    ///
-    /// The default answers `None`, so an implementation over a backend with a
-    /// decimal type must override it.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), sql_traits::errors::Error> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TABLE amounts (id INT, amount NUMERIC(10,2), rate DECIMAL(5,4), bare NUMERIC);",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("amounts", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let scales: Vec<_> = table.columns(&db)?.map(|column| column.numeric_scale(&db)).collect();
-    /// assert_eq!(scales, [None, Some(2), Some(4), None]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    fn numeric_scale(&self, _database: &Self::DB) -> Option<i64> {
-        None
-    }
-
-    /// Returns the builtin scalar family of the column's declared type.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), sql_traits::errors::Error> {
-    /// use sql_traits::{prelude::*, utils::scalar_family::ScalarFamily};
-    ///
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "CREATE TABLE measurements (id BIGINT, value NUMERIC(20, 4), label VARCHAR(255));",
-    /// )?;
-    /// let table = db
-    ///     .table_by_target(TargetName::new("measurements", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let id = table.column("id", &db, IdentifierCase::AsWritten)?.unwrap();
-    /// let value = table.column("value", &db, IdentifierCase::AsWritten)?.unwrap();
-    /// let label = table.column("label", &db, IdentifierCase::AsWritten)?.unwrap();
-    /// assert_eq!(id.scalar_family(&db), Some(ScalarFamily::Int));
-    /// assert_eq!(value.scalar_family(&db), Some(ScalarFamily::Decimal));
-    /// assert_eq!(label.scalar_family(&db), Some(ScalarFamily::String));
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    fn scalar_family(&self, database: &Self::DB) -> Option<ScalarFamily> {
-        classify_scalar_family(self.data_type(database).as_ref())
-    }
+    fn data_type<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> &'db <Self::DB as DatabaseLike>::DataType;
 
     /// Returns the collation rule used for string comparison.
     ///
@@ -608,7 +416,7 @@ pub trait ColumnLike:
     /// aliases `serial2`, `serial4` and `serial8`.
     ///
     /// The declared type reads as the integer type the pseudo-type stands
-    /// for (see [`Self::normalized_data_type`]), and this reader keeps the
+    /// for (see [`DataTypeLike::normalized_name`]), and this reader keeps the
     /// declaration apart from a plain integer column.
     ///
     /// # Example
@@ -764,77 +572,6 @@ pub trait ColumnLike:
     fn is_surrogate_key(&self, database: &Self::DB) -> Result<bool, LookupError> {
         let table: &<Self::DB as DatabaseLike>::Table = ColumnLike::table(self, database);
         Ok(table.has_surrogate_primary_key(database)? && self.is_primary_key(database)?)
-    }
-
-    /// Returns the normalized data type of the column as a string.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    ///
-    /// let db = ParserDB::parse::<GenericDialect>("CREATE TABLE my_table (id INT, serial_id SERIAL, bigg_id BIGSERIAL, small_id SMALLSERIAL, name TEXT);")?;
-    /// let table = db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let id_column = table.column("id", &db, IdentifierCase::AsWritten)?.expect("Column 'id' should exist");
-    /// let serial_id_column = table.column("serial_id", &db, IdentifierCase::AsWritten)?.expect("Column 'serial_id' should exist");
-    /// let bigg_id_column = table.column("bigg_id", &db, IdentifierCase::AsWritten)?.expect("Column 'bigg_id' should exist");
-    /// let small_id_column = table.column("small_id", &db, IdentifierCase::AsWritten)?.expect("Column 'small_id' should exist");
-    /// let name_column = table.column("name", &db, IdentifierCase::AsWritten)?.expect("Column 'name' should exist");
-    /// assert_eq!(id_column.normalized_data_type(&db), "INT");
-    /// assert_eq!(serial_id_column.normalized_data_type(&db), "INT");
-    /// assert_eq!(bigg_id_column.normalized_data_type(&db), "BIGINT");
-    /// assert_eq!(small_id_column.normalized_data_type(&db), "SMALLINT");
-    /// assert_eq!(name_column.normalized_data_type(&db), "TEXT");
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    fn normalized_data_type<'db>(&'db self, database: &'db Self::DB) -> Cow<'db, str> {
-        normalize_postgres_type_cow(self.data_type(database))
-    }
-
-    /// Returns whether the column type belongs to the string family.
-    ///
-    /// The family is the one the schema fingerprint records, so a type that
-    /// fingerprints as a string reads as textual here and the two cannot
-    /// drift apart.
-    ///
-    /// # Arguments
-    ///
-    /// * `database` - A reference to the database instance to query the column
-    ///   data type from.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// #  fn main() -> Result<(), sql_traits::errors::Error> {
-    /// use sql_traits::prelude::*;
-    ///
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "CREATE TABLE my_table (id INT, name TEXT, description VARCHAR, note CLOB);",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let id_column =
-    ///     table.column("id", &db, IdentifierCase::AsWritten)?.expect("Column 'id' should exist");
-    /// let name_column =
-    ///     table.column("name", &db, IdentifierCase::AsWritten)?.expect("Column 'name' should exist");
-    /// let description_column = table
-    ///     .column("description", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'description' should exist");
-    /// let note_column =
-    ///     table.column("note", &db, IdentifierCase::AsWritten)?.expect("Column 'note' should exist");
-    /// assert!(!id_column.is_textual(&db), "id column should not be textual");
-    /// assert!(name_column.is_textual(&db), "name column should be textual");
-    /// assert!(description_column.is_textual(&db), "description column should be textual");
-    /// assert!(note_column.is_textual(&db), "note (CLOB) column should be textual");
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    fn is_textual(&self, database: &Self::DB) -> bool {
-        self.scalar_family(database) == Some(ScalarFamily::String)
     }
 
     /// Returns whether the column is nullable.
@@ -1450,7 +1187,9 @@ pub trait ColumnLike:
             return Ok(false);
         }
 
-        if self.normalized_data_type(database) != other.normalized_data_type(database) {
+        if self.data_type(database).normalized_name(database)
+            != other.data_type(database).normalized_name(database)
+        {
             return Ok(false);
         }
 
@@ -1810,28 +1549,11 @@ where
     }
 
     #[inline]
-    fn data_type<'db>(&'db self, database: &'db Self::DB) -> Cow<'db, str> {
+    fn data_type<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> &'db <Self::DB as DatabaseLike>::DataType {
         (*self).data_type(database)
-    }
-
-    #[inline]
-    fn fixed_binary_length(&self, database: &Self::DB) -> Option<u64> {
-        (*self).fixed_binary_length(database)
-    }
-
-    #[inline]
-    fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
-        (*self).max_character_length(database)
-    }
-
-    #[inline]
-    fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
-        (*self).fractional_seconds_precision(database)
-    }
-
-    #[inline]
-    fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
-        (*self).numeric_scale(database)
     }
 
     #[inline]
@@ -1902,28 +1624,11 @@ where
     }
 
     #[inline]
-    fn data_type<'db>(&'db self, database: &'db Self::DB) -> Cow<'db, str> {
+    fn data_type<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> &'db <Self::DB as DatabaseLike>::DataType {
         (**self).data_type(database)
-    }
-
-    #[inline]
-    fn fixed_binary_length(&self, database: &Self::DB) -> Option<u64> {
-        (**self).fixed_binary_length(database)
-    }
-
-    #[inline]
-    fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
-        (**self).max_character_length(database)
-    }
-
-    #[inline]
-    fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
-        (**self).fractional_seconds_precision(database)
-    }
-
-    #[inline]
-    fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
-        (**self).numeric_scale(database)
     }
 
     #[inline]
@@ -1996,7 +1701,7 @@ mod tests {
             let col_ref = column;
 
             assert_eq!(<&_ as ColumnLike>::column_name(&col_ref), "name");
-            assert_eq!(<&_ as ColumnLike>::data_type(&col_ref, &db), "TEXT");
+            assert_eq!(<&_ as ColumnLike>::data_type(&col_ref, &db).name(&db), "TEXT");
             assert!(<&_ as ColumnLike>::is_nullable(&col_ref, &db).expect("is_nullable failed"));
             assert_eq!(<&_ as ColumnLike>::default_value(&col_ref).as_deref(), Some("'val'"));
             assert!(!<&_ as ColumnLike>::is_generated(&col_ref, &db));
@@ -2031,7 +1736,7 @@ mod tests {
             let col_arc = Arc::new(column.clone());
 
             assert_eq!(<Arc<_> as ColumnLike>::column_name(&col_arc), "price");
-            assert_eq!(<Arc<_> as ColumnLike>::data_type(&col_arc, &db), "INT");
+            assert_eq!(<Arc<_> as ColumnLike>::data_type(&col_arc, &db).name(&db), "INT");
             assert!(
                 <Arc<_> as ColumnLike>::is_nullable(&col_arc, &db).expect("is_nullable failed")
             );
@@ -2065,7 +1770,7 @@ mod tests {
                 .unwrap();
             for col_name in &["a", "b", "c"] {
                 let col = t.column(col_name, &db, IdentifierCase::AsWritten).unwrap().unwrap();
-                assert!(col.is_textual(&db), "{col_name} should be textual");
+                assert!(col.data_type(&db).is_textual(&db), "{col_name} should be textual");
             }
         }
 
@@ -2079,7 +1784,7 @@ mod tests {
                 .unwrap();
             for col_name in &["a", "b", "c", "d", "e"] {
                 let col = t.column(col_name, &db, IdentifierCase::AsWritten).unwrap().unwrap();
-                assert!(col.is_textual(&db), "{col_name} should be textual");
+                assert!(col.data_type(&db).is_textual(&db), "{col_name} should be textual");
             }
         }
 
@@ -2092,7 +1797,7 @@ mod tests {
                 .unwrap();
             for col_name in &["a", "b", "c"] {
                 let col = t.column(col_name, &db, IdentifierCase::AsWritten).unwrap().unwrap();
-                assert!(!col.is_textual(&db), "{col_name} should not be textual");
+                assert!(!col.data_type(&db).is_textual(&db), "{col_name} should not be textual");
             }
         }
     }

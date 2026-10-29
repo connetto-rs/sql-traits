@@ -104,6 +104,7 @@ impl SchemaProfile for SqlparserProfile {
     type View = View;
     type MaterializedView = MaterializedView;
     type Column = TableAttribute<CreateTable, ColumnDef>;
+    type DataType = DataType;
     type Index = TableAttribute<CreateTable, CreateIndex>;
     type UniqueIndex = TableAttribute<CreateTable, UniqueConstraint>;
     type ForeignKey = TableAttribute<CreateTable, ForeignKeyConstraint>;

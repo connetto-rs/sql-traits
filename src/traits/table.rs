@@ -10,8 +10,8 @@ use crate::{
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
-        ColumnLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike, RoleLike,
-        RuleLike, RuleRelation, TableGrantLike, TriggerLike,
+        ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike,
+        RoleLike, RuleLike, RuleRelation, TableGrantLike, TriggerLike,
         check_constraint::{evaluate_constant_expr, non_tautological},
         role::privilege_holders,
     },
@@ -1653,7 +1653,7 @@ pub trait TableLike:
     ) -> Result<Vec<Cow<'db, str>>, LookupError> {
         Ok(self
             .primary_key_columns(database)?
-            .map(|col| col.normalized_data_type(database))
+            .map(|col| col.data_type(database).normalized_name(database))
             .collect())
     }
 

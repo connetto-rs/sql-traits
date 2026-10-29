@@ -14,7 +14,10 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     structs::IdentifierCase,
-    traits::{DatabaseLike, Metadata, TableLike, column::ColumnLike, function_like::FunctionLike},
+    traits::{
+        DataTypeLike, DatabaseLike, Metadata, TableLike, column::ColumnLike,
+        function_like::FunctionLike,
+    },
 };
 
 fn unnested(mut expr: &Expr) -> &Expr {
@@ -241,7 +244,7 @@ where
     // Verify it's a textual column
     if !check_constraint
         .column(database, &col_ident.value, IdentifierCase::AsWritten)?
-        .is_some_and(|c| c.is_textual(database))
+        .is_some_and(|c| c.data_type(database).is_textual(database))
     {
         return Ok(None);
     }
@@ -437,7 +440,7 @@ where
                         && s.is_empty()
                         && check_constraint
                             .column(database, &ident.value, IdentifierCase::AsWritten)?
-                            .is_some_and(|c| c.is_textual(database))
+                            .is_some_and(|c| c.data_type(database).is_textual(database))
                     {
                         return Ok(true);
                     }

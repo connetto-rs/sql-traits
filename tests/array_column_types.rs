@@ -51,8 +51,8 @@ fn test_array_column_normalized_data_type() {
         .expect("lookup runs")
         .expect("column exists");
 
-    assert_eq!(column.normalized_data_type(&database), "TEXT[]");
-    assert!(!column.is_textual(&database));
+    assert_eq!(column.data_type(&database).normalized_name(&database), "TEXT[]");
+    assert!(!column.data_type(&database).is_textual(&database));
 }
 
 /// A Databricks element collation stays with the element, never the column.
@@ -71,14 +71,14 @@ fn test_array_column_collated_element() {
     };
 
     let tags = column("tags");
-    assert_eq!(tags.data_type(&database), "STRING[]");
+    assert_eq!(tags.data_type(&database).name(&database), "STRING[]");
     assert_eq!(
         tags.collation(&database).expect("collation resolves"),
         ColumnCollation::DatabaseDefault
     );
 
     let name = column("name");
-    assert_eq!(name.data_type(&database), "STRING");
+    assert_eq!(name.data_type(&database).name(&database), "STRING");
     assert!(matches!(
         name.collation(&database).expect("collation resolves"),
         ColumnCollation::Named(collation) if collation.name().name() == "UTF8_LCASE"

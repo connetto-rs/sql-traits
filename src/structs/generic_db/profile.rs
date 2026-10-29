@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use crate::{
     structs::GenericDB,
     traits::{
-        CheckConstraintLike, ColumnGrantLike, ColumnLike, DialectLike, ExtensionLike,
+        CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, ExtensionLike,
         ForeignKeyLike, FunctionLike, IndexLike, Metadata, PolicyLike, RoleLike,
         RoleMembershipLike, RuleLike, SchemaLike, TableGrantLike, TableLike, TriggerLike,
         UniqueIndexLike, ViewLike,
@@ -53,6 +53,8 @@ pub trait SchemaProfile: Sized {
     type MaterializedView: ViewLike<DB = GenericDB<Self>>;
     /// The columns the schema holds.
     type Column: ColumnLike<DB = GenericDB<Self>>;
+    /// The declared data types of the columns the schema holds.
+    type DataType: DataTypeLike<DB = GenericDB<Self>>;
     /// The indexes the schema holds.
     type Index: IndexLike<DB = GenericDB<Self>>;
     /// The unique indexes the schema holds.

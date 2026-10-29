@@ -1,10 +1,7 @@
 //! Submodule implementing the [`ColumnLike`] trait for `sqlparser`'s
 //! [`ColumnDef`] struct.
 
-use alloc::{
-    borrow::Cow,
-    string::{String, ToString},
-};
+use alloc::string::{String, ToString};
 
 use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, ObjectNamePart};
 
@@ -15,10 +12,7 @@ use crate::{
         ColumnCollation, ColumnLike, DatabaseLike, IdentityGeneration, Metadata,
         NamedColumnCollation,
     },
-    utils::{
-        identity_generation, is_identity, normalize_sqlparser_type,
-        object_name::target_name_of_object_name,
-    },
+    utils::{identity_generation, is_identity, object_name::target_name_of_object_name},
 };
 
 /// PostgreSQL's serial pseudo-types and their aliases, as the catalog spells
@@ -74,31 +68,8 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     }
 
     #[inline]
-    fn data_type<'db>(&'db self, _database: &'db Self::DB) -> Cow<'db, str> {
-        normalize_sqlparser_type(&self.attribute().data_type)
-    }
-
-    #[inline]
-    fn fixed_binary_length(&self, database: &Self::DB) -> Option<u64> {
-        super::dialect::fixed_binary_length(*database.dialect(), &self.attribute().data_type)
-    }
-
-    #[inline]
-    fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
-        super::dialect::max_character_length(*database.dialect(), &self.attribute().data_type)
-    }
-
-    #[inline]
-    fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
-        super::dialect::fractional_seconds_precision(
-            *database.dialect(),
-            &self.attribute().data_type,
-        )
-    }
-
-    #[inline]
-    fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
-        super::dialect::numeric_scale(*database.dialect(), &self.attribute().data_type)
+    fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db DataType {
+        &self.attribute().data_type
     }
 
     #[inline]
@@ -197,8 +168,8 @@ mod tests {
         },
         structs::{IdentifierCase, TargetName},
         traits::{
-            ColumnCollation, ColumnLike, DatabaseLike, DialectLike, TableLike, TypeMatch,
-            TypeMatchLike,
+            ColumnCollation, ColumnLike, DataTypeLike, DatabaseLike, DialectLike, TableLike,
+            TypeMatch, TypeMatchLike,
         },
     };
 
@@ -360,7 +331,7 @@ mod tests {
             "CREATE TABLE t (fixed BINARY(4), bare BINARY, varying VARBINARY(8), blob BLOB, num INT);",
         );
         ["fixed", "bare", "varying", "blob", "num"]
-            .map(|name| column_named(&db, name).fixed_binary_length(&db))
+            .map(|name| column_named(&db, name).data_type(&db).fixed_binary_length(&db))
     }
 
     #[test]
@@ -383,14 +354,6 @@ mod tests {
         assert_eq!(fixed_binary_lengths::<SQLiteDialect>(), [None; 5]);
     }
 
-    #[test]
-    fn fixed_binary_length_forwards_through_reference_and_arc() {
-        let db = parse_with::<MySqlDialect>("CREATE TABLE t (token BINARY(16));");
-        let column = column_named(&db, "token");
-        assert_eq!(<&_ as ColumnLike>::fixed_binary_length(&column, &db), Some(16));
-        assert_eq!(Arc::new(column.clone()).fixed_binary_length(&db), Some(16));
-    }
-
     mod max_character_length {
         use sqlparser::dialect::{
             AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
@@ -399,14 +362,14 @@ mod tests {
             SparkSqlDialect, TeradataDialect,
         };
 
-        use super::{Arc, ColumnLike, column_named, parse_with};
+        use super::{ColumnLike, DataTypeLike, column_named, parse_with};
 
         fn lengths<D: Dialect + Default + 'static, const N: usize>(
             columns: &str,
             names: [&str; N],
         ) -> [Option<u64>; N] {
             let db = parse_with::<D>(&format!("CREATE TABLE t ({columns});"));
-            names.map(|name| column_named(&db, name).max_character_length(&db))
+            names.map(|name| column_named(&db, name).data_type(&db).max_character_length(&db))
         }
 
         fn common<D: Dialect + Default + 'static>() -> [Option<u64>; 8] {
@@ -477,14 +440,6 @@ mod tests {
                 [Some(10), None]
             );
         }
-
-        #[test]
-        fn forwards_through_reference_and_arc() {
-            let db = parse_with::<PostgreSqlDialect>("CREATE TABLE t (title VARCHAR(100));");
-            let column = column_named(&db, "title");
-            assert_eq!(<&_ as ColumnLike>::max_character_length(&column, &db), Some(100));
-            assert_eq!(Arc::new(column.clone()).max_character_length(&db), Some(100));
-        }
     }
 
     mod fractional_seconds_precision {
@@ -495,7 +450,7 @@ mod tests {
             SparkSqlDialect, TeradataDialect,
         };
 
-        use super::{Arc, ColumnLike, column_named, parse_with};
+        use super::{ColumnLike, DataTypeLike, column_named, parse_with};
 
         /// Asserts the precision of a column declared with each type.
         fn assert_precisions<D: Dialect + Default + 'static>(cases: &[(&str, Option<u64>)]) {
@@ -504,7 +459,11 @@ mod tests {
             let db = parse_with::<D>(&format!("CREATE TABLE t ({});", columns.join(", ")));
             for (index, (ty, expected)) in cases.iter().enumerate() {
                 let column = column_named(&db, &format!("c{index}"));
-                assert_eq!(column.fractional_seconds_precision(&db), *expected, "{ty}");
+                assert_eq!(
+                    column.data_type(&db).fractional_seconds_precision(&db),
+                    *expected,
+                    "{ty}"
+                );
             }
         }
 
@@ -520,14 +479,26 @@ mod tests {
                 ("TIMETZ(3)", Some(3)),
                 ("TIMESTAMP(9)", Some(6)),
                 ("DATE", None),
-                ("INTERVAL", None),
+                ("INTERVAL", Some(6)),
                 ("INT", None),
             ];
             assert_precisions::<PostgreSqlDialect>(&cases);
             assert_precisions::<RedshiftSqlDialect>(&cases);
+        }
+
+        /// An interval keeps the digits of its seconds field, and one
+        /// restricted to coarser fields keeps no seconds at all.
+        #[test]
+        fn postgres_interval_keeps_the_digits_of_its_seconds() {
             assert_precisions::<PostgreSqlDialect>(&[
-                ("INTERVAL(2)", None),
-                ("INTERVAL DAY TO SECOND(1)", None),
+                ("INTERVAL(2)", Some(2)),
+                ("INTERVAL(9)", Some(6)),
+                ("INTERVAL DAY TO SECOND(1)", Some(1)),
+                ("INTERVAL HOUR TO SECOND", Some(6)),
+                ("INTERVAL SECOND", Some(6)),
+                ("INTERVAL YEAR TO MONTH", None),
+                ("INTERVAL DAY", None),
+                ("INTERVAL HOUR TO MINUTE", None),
             ]);
         }
 
@@ -686,14 +657,6 @@ mod tests {
                 ("TIME", None),
             ]);
         }
-
-        #[test]
-        fn forwards_through_reference_and_arc() {
-            let db = parse_with::<PostgreSqlDialect>("CREATE TABLE t (at TIMESTAMPTZ(0));");
-            let column = column_named(&db, "at");
-            assert_eq!(<&_ as ColumnLike>::fractional_seconds_precision(&column, &db), Some(0));
-            assert_eq!(Arc::new(column.clone()).fractional_seconds_precision(&db), Some(0));
-        }
     }
 
     mod numeric_scale {
@@ -704,7 +667,7 @@ mod tests {
             SparkSqlDialect, TeradataDialect,
         };
 
-        use super::{Arc, ColumnLike, column_named, parse_with};
+        use super::{ColumnLike, DataTypeLike, column_named, parse_with};
 
         /// Asserts the scale of a column declared with each type.
         fn assert_scales<D: Dialect + Default + 'static>(cases: &[(&str, Option<i64>)]) {
@@ -713,7 +676,7 @@ mod tests {
             let db = parse_with::<D>(&format!("CREATE TABLE t ({});", columns.join(", ")));
             for (index, (ty, expected)) in cases.iter().enumerate() {
                 let column = column_named(&db, &format!("c{index}"));
-                assert_eq!(column.numeric_scale(&db), *expected, "{ty}");
+                assert_eq!(column.data_type(&db).numeric_scale(&db), *expected, "{ty}");
             }
         }
 
@@ -872,14 +835,6 @@ mod tests {
                 ("DECIMAL(5,4)", None),
                 ("NUMERIC", None),
             ]);
-        }
-
-        #[test]
-        fn forwards_through_reference_and_arc() {
-            let db = parse_with::<PostgreSqlDialect>("CREATE TABLE t (amount NUMERIC(10,2));");
-            let column = column_named(&db, "amount");
-            assert_eq!(<&_ as ColumnLike>::numeric_scale(&column, &db), Some(2));
-            assert_eq!(Arc::new(column.clone()).numeric_scale(&db), Some(2));
         }
     }
 
