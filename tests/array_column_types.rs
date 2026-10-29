@@ -40,7 +40,7 @@ fn test_array_column_spellings() {
 /// The normalized type of an array column is the array token itself, since no
 /// PostgreSQL alias folds into it.
 #[test]
-fn test_array_column_normalized_data_type() {
+fn test_array_column_normalized_name() {
     let statements =
         Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE t (tags TEXT[]);").expect("parses");
     let database =

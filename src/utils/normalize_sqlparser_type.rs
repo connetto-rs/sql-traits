@@ -771,7 +771,7 @@ mod tests {
     }
 
     /// A decoration reports the type it wraps, so a family predicate such as
-    /// `ColumnLike::is_textual` still sees the text underneath.
+    /// `DataTypeLike::is_textual` still sees the text underneath.
     #[test]
     fn test_normalize_sqlparser_type_transparent_wrappers() {
         assert_eq!(
