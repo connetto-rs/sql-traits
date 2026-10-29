@@ -1445,6 +1445,19 @@ pub enum Error {
         /// The kind of the function the statement would replace.
         kind: FunctionKind,
     },
+    #[error("Relation `{relation_name}` not found for function `{function_name}`.")]
+    /// Error indicating that a function's `RETURN` body names a table or view
+    /// the database does not hold.
+    ///
+    /// PostgreSQL resolves the body's relation names at `CREATE FUNCTION`
+    /// time, so a statement whose body names a relation it cannot reach is
+    /// refused before it records or replaces anything.
+    RelationNotFoundForFunctionBody {
+        /// Name of the relation the body names.
+        relation_name: String,
+        /// Name of the function the statement declares.
+        function_name: String,
+    },
     #[error(
         "Function name `{function_name}` is not unique: a `DROP FUNCTION` naming no argument list cannot say which one to drop."
     )]

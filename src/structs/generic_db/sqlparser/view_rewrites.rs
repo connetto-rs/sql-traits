@@ -1,7 +1,8 @@
-//! Keeping stored view definitions reading what they read, and spelling out
-//! the wildcards and `NATURAL` joins a view's creation fixes.
+//! Keeping stored view and function body definitions reading what they read,
+//! and spelling out the wildcards and `NATURAL` joins a view's creation fixes.
 
 use alloc::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
 };
@@ -13,7 +14,7 @@ use sqlparser::ast::{
     Visitor, VisitorMut,
 };
 
-use super::{ParserDBBuilder, views::relations_read_in};
+use super::{ParserDBBuilder, function_bodies, views::relations_read_in};
 use crate::{
     impls::dql::{
         definition_graph::reference_sites::{QueryReferences, SiteOutcome, query_references},
@@ -34,12 +35,13 @@ const CASE: IdentifierCase = IdentifierCase::AsWritten;
 
 /// What a statement renamed, as stored definitions name it.
 pub(super) enum Rename {
-    /// The relation stored under `key` is now called `to`.
+    /// The relation stored under `key` is now called `to`, the schema part
+    /// included when the statement moved it between schemas.
     Relation {
         /// The relation's key under its old name.
         key: RelationKey,
-        /// The relation's new name.
-        to: Ident,
+        /// The relation's new name, as the statement wrote it.
+        to: ObjectName,
     },
     /// Output column `ordinal` of the relation stored under `key` is now
     /// called `to`.
@@ -64,35 +66,52 @@ impl Rename {
     }
 }
 
-/// Where a stored view sits in the builder.
+/// Where a stored definition sits in the builder.
 #[derive(Clone, Copy)]
 enum Slot {
     Plain(usize),
     Materialized(usize),
+    Function(usize),
 }
 
-fn definition_at(builder: &ParserDBBuilder, slot: Slot) -> &Query {
+/// The definition at `slot`, or [`None`] when the slot holds no definition
+/// the machinery rewrites. A function body is wrapped in a query, so only it
+/// is built afresh.
+fn definition_at(builder: &ParserDBBuilder, slot: Slot) -> Option<Cow<'_, Query>> {
     match slot {
-        Slot::Plain(position) => builder.views()[position].0.definition(),
-        Slot::Materialized(position) => builder.materialized_views()[position].0.definition(),
+        Slot::Plain(position) => Some(Cow::Borrowed(builder.views()[position].0.definition())),
+        Slot::Materialized(position) => {
+            Some(Cow::Borrowed(builder.materialized_views()[position].0.definition()))
+        }
+        Slot::Function(position) => {
+            let function = builder.functions()[position].0.as_ref();
+            function.function_body.as_ref().and_then(function_bodies::definition).map(Cow::Owned)
+        }
     }
 }
 
 fn store(builder: &mut ParserDBBuilder, slot: Slot, query: Query) {
-    let declaration = match slot {
+    match slot {
         Slot::Plain(position) => {
-            alloc::sync::Arc::make_mut(&mut builder.views_mut()[position].0).declaration_mut()
+            let declaration =
+                alloc::sync::Arc::make_mut(&mut builder.views_mut()[position].0).declaration_mut();
+            *declaration.query_mut() = query;
         }
         Slot::Materialized(position) => {
-            alloc::sync::Arc::make_mut(&mut builder.materialized_views_mut()[position].0)
-                .declaration_mut()
+            let declaration =
+                alloc::sync::Arc::make_mut(&mut builder.materialized_views_mut()[position].0)
+                    .declaration_mut();
+            *declaration.query_mut() = query;
         }
-    };
-    *declaration.query_mut() = query;
+        Slot::Function(position) => {
+            let function = alloc::sync::Arc::make_mut(&mut builder.functions_mut()[position].0);
+            function_bodies::write_definition(&mut function.function_body, query);
+        }
+    }
 }
 
-/// Every stored view whose definition names one of `keys`.
-fn views_reading(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Vec<Slot> {
+/// Every stored definition whose body names one of `keys`.
+fn definitions_reading(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Vec<Slot> {
     let reads =
         |definition: &Query| relations_read_in(definition).iter().any(|key| keys.contains(&key));
     let plain = builder
@@ -107,7 +126,19 @@ fn views_reading(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Vec<Slot> 
         .enumerate()
         .filter(|(_, (view, _, _))| reads(view.definition()))
         .map(|(position, _)| Slot::Materialized(position));
-    plain.chain(materialized).collect()
+    let functions = builder
+        .functions()
+        .iter()
+        .enumerate()
+        .filter(|(_, (function, _))| {
+            function
+                .function_body
+                .as_ref()
+                .and_then(function_bodies::relations_read)
+                .is_some_and(|read| read.iter().any(|key| keys.contains(&key)))
+        })
+        .map(|(position, _)| Slot::Function(position));
+    plain.chain(materialized).chain(functions).collect()
 }
 
 /// The part of the catalog `definitions` read, which is every relation they
@@ -136,21 +167,23 @@ pub(super) fn catalog<'q>(
     builder.relations_database(&keys, TableAttribute::table)
 }
 
-/// The stored views reading what a statement is about to rename, with the
-/// part of the catalog they read as it stands before the statement.
+/// The stored definitions reading what a statement is about to rename, with
+/// the part of the catalog they read as it stands before the statement.
 pub(super) struct Readers {
     slots: Vec<Slot>,
     before: ParserDB,
 }
 
-/// The stored views reading a relation one of `keys` names, or `None` when
-/// none does and a rename of them has nothing to follow.
+/// The stored definitions reading a relation one of `keys` names, or `None`
+/// when none does and a rename of them has nothing to follow.
 pub(super) fn readers(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Option<Readers> {
-    let slots = views_reading(builder, keys);
+    let slots = definitions_reading(builder, keys);
     if slots.is_empty() {
         return None;
     }
-    let before = catalog(builder, slots.iter().map(|slot| definition_at(builder, *slot)));
+    let definitions: Vec<Cow<'_, Query>> =
+        slots.iter().filter_map(|slot| definition_at(builder, *slot)).collect();
+    let before = catalog(builder, definitions.iter().map(AsRef::as_ref));
     Some(Readers { slots, before })
 }
 
@@ -159,27 +192,35 @@ pub(super) fn readers(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Optio
 struct Respelled {
     slot: Slot,
     original: Query,
+    /// The definition `store` put in place, which the check reads back.
+    stored: Query,
     /// What every reference of the original reached before the renames.
     expected: Vec<SiteOutcome>,
     /// How many `FROM` items the original holds.
     factors: usize,
 }
 
-/// Rewrites every stored view `readers` found so it keeps reading what
+/// Rewrites every stored definition `readers` found so it keeps reading what
 /// `renames` renamed, once the builder holds the renamed catalog.
 ///
-/// Views are only rewritten in place, never added or removed, so the
+/// Definitions are only rewritten in place, never added or removed, so the
 /// positions `readers` recorded before the renames still hold.
 pub(super) fn follow_renames(builder: &mut ParserDBBuilder, readers: Readers, renames: &[Rename]) {
     let Readers { slots, before } = readers;
     let mut respelled = Vec::new();
-    for slot in slots {
-        let original = definition_at(builder, slot).clone();
+    let originals: Vec<(Slot, Query)> = slots
+        .iter()
+        .filter_map(|&slot| {
+            definition_at(builder, slot).map(|original| (slot, original.into_owned()))
+        })
+        .collect();
+    for (slot, original) in originals {
         let mut query = original.clone();
         match respell(&mut query, &before, renames) {
             Some(references) => {
                 respelled.push(Respelled {
                     slot,
+                    stored: query.clone(),
                     original,
                     expected: references.sites.iter().map(|site| site.outcome).collect(),
                     factors: references.factors.len(),
@@ -194,10 +235,10 @@ pub(super) fn follow_renames(builder: &mut ParserDBBuilder, readers: Readers, re
     }
 
     // Every respelled definition is in place before any is checked.
-    let after = catalog(builder, respelled.iter().map(|view| definition_at(builder, view.slot)));
-    for Respelled { slot, original, expected, factors } in respelled {
-        let current = definition_at(builder, slot);
-        if query_references(current, &after, CASE)
+    let stored: Vec<Query> = respelled.iter().map(|respelled| respelled.stored.clone()).collect();
+    let after = catalog(builder, &stored);
+    for Respelled { slot, original, stored: current, expected, factors } in respelled {
+        if query_references(&current, &after, CASE)
             .is_some_and(|references| reaches(&references, &expected, factors))
         {
             continue;
@@ -537,8 +578,9 @@ struct Edits {
     columns: BTreeMap<usize, Ident>,
     /// A qualified reference's new relation identifier.
     qualifiers: BTreeMap<usize, Ident>,
-    /// A `FROM` item's new relation name.
-    names: BTreeMap<usize, Ident>,
+    /// A `FROM` item's new relation name, the schema part included when the
+    /// statement moved it between schemas.
+    names: BTreeMap<usize, ObjectName>,
     /// A `FROM` item's new alias.
     aliases: BTreeMap<usize, TableAlias>,
     /// A select-list item's output name, which a renamed column reference
@@ -552,10 +594,12 @@ impl VisitorMut for Edits {
     fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
         let at = address(&*factor);
         if let TableFactor::Table { name, alias, .. } = factor {
-            if let Some(to) = self.names.get(&at)
-                && let Some(ObjectNamePart::Identifier(last)) = name.0.last_mut()
-            {
-                *last = to.clone();
+            if let Some(to) = self.names.get(&at) {
+                // A new name written with its schema moves the relation, so it
+                // replaces the qualifier too.
+                let kept = if to.0.len() > 1 { 0 } else { name.0.len().saturating_sub(1) };
+                name.0.truncate(kept);
+                name.0.extend(to.0.iter().cloned());
             }
             if let Some(replacement) = self.aliases.get(&at) {
                 *alias = Some(replacement.clone());
@@ -746,7 +790,9 @@ fn respell(query: &mut Query, before: &ParserDB, renames: &[Rename]) -> Option<Q
         };
         match &renames[*rename] {
             Rename::Relation { to, .. } => {
-                if shape.alias.is_none() {
+                if shape.alias.is_none()
+                    && let Some(to) = last_identifier(to)
+                {
                     edits.qualifiers.insert(site.expression, to.clone());
                 }
             }
