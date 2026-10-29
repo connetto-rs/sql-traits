@@ -209,6 +209,9 @@ pub enum UnattachablePartition {
     /// The table holds a primary key on other columns than the partitioned
     /// table's.
     OtherPrimaryKey,
+    /// The table is a foreign table and the partitioned table holds a unique
+    /// index, which a foreign table cannot carry.
+    ForeignTableUnderUniqueIndex,
 }
 
 impl core::fmt::Display for UnattachablePartition {
@@ -236,6 +239,9 @@ impl core::fmt::Display for UnattachablePartition {
             }
             Self::MissingCheck { constraint } => write!(f, "it lacks check `{constraint}`"),
             Self::OtherPrimaryKey => f.write_str("it holds a primary key of its own"),
+            Self::ForeignTableUnderUniqueIndex => {
+                f.write_str("it is a foreign table and the partitioned table holds a unique index")
+            }
         }
     }
 }
@@ -1496,6 +1502,17 @@ pub enum Error {
         constraint: KeyConstraint,
     },
     #[error(
+        "Partitioned table `{table_name}` cannot hold a unique index, because its partition `{partition_name}` is a foreign table."
+    )]
+    /// Error indicating that a unique index would reach a foreign table through
+    /// the partitions of the table it is created on, which PostgreSQL refuses.
+    UniqueIndexOverForeignPartition {
+        /// Name of the partitioned table the unique index is created on.
+        table_name: String,
+        /// Name of the foreign table below it.
+        partition_name: String,
+    },
+    #[error(
         "Cannot change name of view column `{existing_column}` to `{new_column}` of view `{view_name}`."
     )]
     /// Error indicating that `CREATE OR REPLACE VIEW` renames an output column.
@@ -2034,6 +2051,10 @@ mod tests {
         assert_eq!(KeyConstraint::ForeignKey.to_string(), "Foreign key");
         assert_eq!(KeyConstraint::Exclusion.to_string(), "Exclusion");
         assert_eq!(ObjectKind::ForeignTable.to_string(), "Foreign table");
+        assert_eq!(
+            UnattachablePartition::ForeignTableUnderUniqueIndex.to_string(),
+            "it is a foreign table and the partitioned table holds a unique index"
+        );
     }
 
     #[test]

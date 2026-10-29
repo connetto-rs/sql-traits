@@ -4769,6 +4769,9 @@ impl ParserDB {
             });
         };
         builder.refuse_foreign_table(table, &create_index.table_name)?;
+        if create_index.unique {
+            Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
+        }
         validate_index_columns(
             &create_index.columns,
             &create_index.include,
@@ -5409,6 +5412,15 @@ impl ParserDB {
         scope: AlterTableScope,
         constraint: &TableConstraint,
     ) -> Result<(), crate::errors::Error> {
+        if matches!(
+            constraint,
+            TableConstraint::PrimaryKey(_)
+                | TableConstraint::PrimaryKeyUsingIndex(_)
+                | TableConstraint::Unique(_)
+                | TableConstraint::UniqueUsingIndex(_)
+        ) {
+            Self::refuse_unique_index_over_foreign_partition(builder, stored)?;
+        }
         match constraint {
             TableConstraint::Check(check) if check.no_inherit => {
                 if Self::stored_node(builder, stored)?.partition_by.is_some() {
@@ -5450,6 +5462,23 @@ impl ParserDB {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Refuses a unique index on `stored`, whichever statement creates it, when
+    /// a foreign table sits among its partitions.
+    fn refuse_unique_index_over_foreign_partition(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+    ) -> Result<(), crate::errors::Error> {
+        match inheritance::first_foreign_partition_below(builder, stored) {
+            Some(partition) => {
+                Err(crate::errors::Error::UniqueIndexOverForeignPartition {
+                    table_name: stored.name.clone(),
+                    partition_name: partition.name,
+                })
+            }
+            None => Ok(()),
+        }
     }
 
     /// Adds a constraint to a table and to every table that takes its shape
@@ -6144,7 +6173,12 @@ impl ParserDB {
             views::remove_dependent_views(builder, &key);
             return Ok(());
         }
-        views::refuse_dependent_views(builder, &key, ObjectKind::Table, &dropped.name)
+        let dropped_kind = if builder.is_foreign_table(Self::stored_node(builder, dropped)?) {
+            ObjectKind::ForeignTable
+        } else {
+            ObjectKind::Table
+        };
+        views::refuse_dependent_views(builder, &key, dropped_kind, &dropped.name)
     }
 
     /// Removes tables together with the foreign keys the remaining tables
@@ -6208,6 +6242,29 @@ impl ParserDB {
         Ok(())
     }
 
+    /// Refuses a column option the table cannot take: a `NO INHERIT` check on
+    /// a partitioned table, which would keep it from the partitions, and a key
+    /// whose unique index would reach a foreign partition.
+    fn refuse_unaddable_column_options(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        column_def: &ColumnDef,
+    ) -> Result<(), crate::errors::Error> {
+        if column_def.options.iter().any(is_no_inherit_check)
+            && Self::stored_node(builder, stored)?.partition_by.is_some()
+        {
+            return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
+                table_name: stored.name.clone(),
+            });
+        }
+        if column_def.options.iter().any(|option| {
+            matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_))
+        }) {
+            Self::refuse_unique_index_over_foreign_partition(builder, stored)?;
+        }
+        Ok(())
+    }
+
     /// Adds a column to a table.
     fn alter_table_add_column(
         builder: ParserDBBuilder,
@@ -6239,15 +6296,7 @@ impl ParserDB {
             crate::errors::InheritedChange::AddColumn,
         )?;
 
-        // A check riding the column as `NO INHERIT` stays with the named
-        // table, and a partitioned table cannot hold one at all.
-        if column_def.options.iter().any(is_no_inherit_check)
-            && Self::stored_node(&builder, &stored)?.partition_by.is_some()
-        {
-            return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
-                table_name: stored.name.clone(),
-            });
-        }
+        Self::refuse_unaddable_column_options(&builder, &stored, &column_def)?;
         // Named against the schema as it stands, before the column lands.
         let column_sequences =
             sequences::plan_column_sequences(&builder, &stored, core::iter::once(&column_def));
@@ -7039,25 +7088,36 @@ impl ParserDB {
                     }
                 }
                 Statement::Drop {
-                    object_type: sqlparser::ast::ObjectType::Table,
+                    object_type:
+                        object_type @ (sqlparser::ast::ObjectType::Table
+                        | sqlparser::ast::ObjectType::ForeignTable),
                     if_exists,
                     names,
                     cascade,
                     ..
                 } => {
+                    let expected_kind = if object_type == sqlparser::ast::ObjectType::Table {
+                        ObjectKind::Table
+                    } else {
+                        ObjectKind::ForeignTable
+                    };
                     // Every name resolves before anything is dropped, so a
                     // table an earlier name takes along still counts as found.
                     let mut targets = Vec::with_capacity(names.len());
                     for name in &names {
-                        // A view or a sequence is refused rather than dropped,
-                        // and named as the wrong kind, as PostgreSQL does.
-                        views::refuse_dropping_relation_as_table(&builder, name)?;
+                        views::refuse_dropping_other_kind(&builder, name, expected_kind)?;
                         match builder.resolve_table_object_name(name)? {
                             Some(table) => targets.push(StoredTable::of(table)),
                             None if if_exists => {}
-                            None => {
+                            None if expected_kind == ObjectKind::Table => {
                                 return Err(crate::errors::Error::DropTableNotFound {
                                     table_name: last_str(name).to_string(),
+                                });
+                            }
+                            None => {
+                                return Err(crate::errors::Error::RelationNotFound {
+                                    object_kind: expected_kind,
+                                    object_name: name.to_string(),
                                 });
                             }
                         }
