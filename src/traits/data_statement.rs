@@ -82,15 +82,10 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// )?;
     /// // The view reaches its base table, and the materialized view does
     /// // not.
-    /// let names = |sql| {
-    ///     let statement = sqlparser::parser::Parser::parse_sql(&GenericDialect, sql).expect("parses");
-    ///     match &statement[0] {
-    ///         sqlparser::ast::Statement::Query(query) => query.referenced_tables(&db),
-    ///         other => panic!("expected a query, got {other:?}"),
-    ///     }
-    /// };
-    /// assert_eq!(names("SELECT * FROM v")?.len(), 1);
-    /// assert_eq!(names("SELECT * FROM m")?.len(), 0);
+    /// let query =
+    ///     |sql| sqlparser::parser::Parser::new(&GenericDialect).try_with_sql(sql)?.parse_query();
+    /// assert_eq!(query("SELECT * FROM v")?.referenced_tables(&db)?.len(), 1);
+    /// assert_eq!(query("SELECT * FROM m")?.referenced_tables(&db)?.len(), 0);
     /// # Ok(())
     /// # }
     /// ```
@@ -131,10 +126,9 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
     /// ",
     /// )?;
-    /// let statement = sqlparser::parser::Parser::parse_sql(&GenericDialect, "SELECT * FROM v")?;
-    /// let sqlparser::ast::Statement::Query(query) = &statement[0] else {
-    ///     panic!("expected a query");
-    /// };
+    /// let query = sqlparser::parser::Parser::new(&GenericDialect)
+    ///     .try_with_sql("SELECT * FROM v")?
+    ///     .parse_query()?;
     /// assert!(matches!(
     ///     query.referenced_relations(&db)?.as_slice(),
     ///     [Relation::View(view)] if view.view_name() == "v"
