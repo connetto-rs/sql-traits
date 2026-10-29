@@ -10,10 +10,6 @@
 //! - [`sqlparser#2430`](https://github.com/apache/datafusion-sqlparser-rs/pull/2430),
 //!   `ALTER TRIGGER ... RENAME TO` does not parse, so a rename never frees the
 //!   old name and this crate refuses a schema PostgreSQL accepts.
-//! - [`sqlparser#2429`](https://github.com/apache/datafusion-sqlparser-rs/pull/2429),
-//!   `CREATE GROUP` does not parse, so a name it takes stays invisible to the
-//!   duplicate-role check and a second `CREATE ROLE` under that name is
-//!   accepted here and refused by the server.
 //! - [`sqlparser#2316`](https://github.com/apache/datafusion-sqlparser-rs/pull/2316),
 //!   opened by somebody else, adds `CREATE AGGREGATE`. Until it lands no
 //!   aggregate can exist here, which is why
@@ -32,12 +28,8 @@
 //!   the `CREATE TABLE` wrote them.
 //! - `GRANT` and `REVOKE ... ON ROUTINE` and `ON ALL PROCEDURES | ROUTINES IN
 //!   SCHEMA` do not parse, so a schema carrying one fails to parse.
-//! - A grantee written after `PUBLIC` in a `GRANT` or `REVOKE` does not parse,
-//!   so `REVOKE ... FROM PUBLIC, anon` fails while `FROM anon, PUBLIC` reads.
 //! - The `CREATE TABLE ... LIKE` option list (`INCLUDING INDEXES` and its
 //!   siblings) does not parse beyond the spellings already honoured here.
-//! - Role membership `GRANT role TO role` does not parse, so membership is
-//!   invisible and a `DROP ROLE` that the server would refuse is accepted.
 //! - `ALTER PROCEDURE` and the PostgreSQL body spelling of `CREATE PROCEDURE`
 //!   do not parse. This costs nothing yet, since no procedure can exist here
 //!   for a statement to alter.
