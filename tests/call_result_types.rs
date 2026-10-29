@@ -257,3 +257,190 @@ fn uuid_ossp_calls_return_uuid() {
     assert_eq!(returns(&in_schema, "uuid_generate_v4()", &[]), None);
     assert_eq!(returns(&in_schema, "ext.uuid_generate_v4()", &[]).as_deref(), Some("UUID"));
 }
+
+/// A call written without parentheses passes nothing, and a subquery passes
+/// one argument.
+#[test]
+fn bare_and_subquery_calls_count_their_arguments() -> Result<(), LookupError> {
+    let db = db("CREATE FUNCTION \"array\"(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';");
+    assert_eq!(returns(&db, "current_date", &[]).as_deref(), Some("DATE"));
+    assert_eq!(
+        db.functions_reached_by(&call("ARRAY(SELECT 1)"), IdentifierCase::AsWritten)?.count(),
+        1
+    );
+    Ok(())
+}
+
+/// Positional arguments must come first, and a parameter is named at most
+/// once and only by an identifier.
+#[test]
+fn named_notation_maps_every_argument_once() -> Result<(), LookupError> {
+    let db =
+        db("CREATE FUNCTION h(a INT, b TEXT DEFAULT 'x') RETURNS TEXT LANGUAGE sql AS 'SELECT b';");
+    let case = IdentifierCase::AsWritten;
+    let reached = |call: &Function| -> Result<usize, LookupError> {
+        Ok(db.functions_reached_by(call, case)?.count())
+    };
+    assert_eq!(reached(&call("h(1, b => 'y')"))?, 1);
+    assert_eq!(reached(&call("h(a => 1, 2)"))?, 0);
+    assert_eq!(reached(&call("h(1, a => 2)"))?, 0);
+
+    let mut by_expression = call("h(a => 1)");
+    let sqlparser::ast::FunctionArguments::List(list) = &mut by_expression.args else {
+        panic!("an argument list")
+    };
+    let Some(sqlparser::ast::FunctionArg::ExprNamed { name, .. }) = list.args.first_mut() else {
+        panic!("a named argument")
+    };
+    *name = Expr::value(sqlparser::ast::Value::SingleQuotedString("a".to_owned()));
+    assert_eq!(reached(&by_expression)?, 0);
+    assert_eq!(db.call_result_type_name(&by_expression, &[Some("INT")], case)?, None);
+    let h = db.functions().find(|function| function.name() == "h").expect("declared");
+    assert_eq!(h.call_result_type_name(&by_expression, &[Some("INT")], &db)?, None);
+    Ok(())
+}
+
+/// The `anyelement` family binds one type, and `anyarray` the array over it.
+#[test]
+fn the_element_family_binds_one_type() {
+    let db = db("CREATE FUNCTION first_of(xs anyarray) RETURNS anyelement LANGUAGE sql AS 'SELECT xs[1]';
+         CREATE FUNCTION wrap(x anyelement) RETURNS anyarray LANGUAGE sql AS 'SELECT ARRAY[x]';
+         CREATE FUNCTION both(x anyelement, xs anyarray) RETURNS anyelement LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION same(a anyelement, b anyelement) RETURNS anyelement LANGUAGE sql AS 'SELECT a';
+         CREATE FUNCTION firsts(VARIADIC xs anyarray) RETURNS anyelement LANGUAGE sql AS 'SELECT xs[1]';
+         CREATE FUNCTION ranged(x anyelement) RETURNS anyrange LANGUAGE sql AS 'SELECT NULL';");
+    let cases: &[Case<'_>] = &[
+        ("first_of(xs)", &[Some("INT[]")], Some("INT")),
+        ("first_of(xs)", &[Some("INT[][]")], Some("INT")),
+        ("first_of(xs)", &[Some("_int4")], Some("int4")),
+        ("first_of(xs)", &[Some("TEXT")], None),
+        ("first_of(NULL)", &[Some("unknown")], None),
+        ("wrap(x)", &[Some("UUID")], Some("UUID[]")),
+        // PostgreSQL has no array type over an array type.
+        ("wrap(x)", &[Some("INT[]")], None),
+        ("both(x, xs)", &[Some("INT"), Some("INT[]")], Some("INT")),
+        ("both(NULL, xs)", &[Some("unknown"), Some("INT[]")], Some("INT")),
+        ("both(x, xs)", &[Some("INT"), Some("TEXT[]")], None),
+        ("same(a, NULL)", &[Some("INT"), Some("unknown")], Some("INT")),
+        ("same(a, b)", &[Some("INT"), Some("BIGINT")], None),
+        ("firsts(1, 2)", &[Some("INT"), Some("INT")], Some("INT")),
+        ("firsts(1, 2)", &[Some("INT"), Some("BIGINT")], None),
+        ("ranged(x)", &[Some("INT")], None),
+        ("rank(x)", &[Some("TEXT")], Some("BIGINT")),
+    ];
+    for (expression, types, expected) in cases {
+        assert_eq!(returns(&db, expression, types).as_deref(), *expected, "{expression} {types:?}");
+    }
+}
+
+/// The `anycompatible` family binds the common type, and its array forms the
+/// array over it.
+#[test]
+fn the_compatible_family_binds_the_common_type() {
+    let db = db("CREATE FUNCTION pair(a anycompatible, b anycompatible) RETURNS anycompatiblearray
+             LANGUAGE sql AS 'SELECT ARRAY[a, b]';
+         CREATE FUNCTION extend(xs anycompatiblearray, y anycompatible) RETURNS anycompatiblearray
+             LANGUAGE sql AS 'SELECT xs || y';
+         CREATE FUNCTION scalar(x anycompatiblenonarray) RETURNS anycompatible
+             LANGUAGE sql AS 'SELECT x';");
+    let cases: &[Case<'_>] = &[
+        ("pair(a, b)", &[Some("INT"), Some("BIGINT")], Some("BIGINT[]")),
+        ("pair(NULL, NULL)", &[Some("unknown"), Some("unknown")], Some("TEXT[]")),
+        ("pair(a, b)", &[Some("INT"), None], None),
+        ("extend(xs, y)", &[Some("INT[]"), Some("BIGINT")], Some("BIGINT[]")),
+        ("extend(xs, y)", &[Some("INT"), Some("BIGINT")], None),
+        ("extend(NULL, y)", &[Some("unknown"), Some("INT")], Some("INT[]")),
+        ("extend(xs, y)", &[None, Some("INT")], None),
+        ("scalar(x)", &[Some("INT")], Some("INT")),
+        ("scalar(x)", &[Some("INT[]")], None),
+        ("coalesce(x, y)", &[Some("INT[]"), Some("BIGINT[]")], Some("BIGINT[]")),
+        ("coalesce(x, y, z)", &[Some("INT"), Some("INT"), Some("BIGINT")], Some("BIGINT")),
+        ("coalesce(x, y)", &[Some("geometry"), Some("vector(3)")], None),
+    ];
+    for (expression, types, expected) in cases {
+        assert_eq!(returns(&db, expression, types).as_deref(), *expected, "{expression} {types:?}");
+    }
+}
+
+/// Overloads taking the arguments by conversion are told apart as
+/// `func_select_candidate` tells them apart, or the call is refused.
+#[test]
+fn overload_heuristics_follow_func_select_candidate() {
+    let db = db("CREATE FUNCTION exact(a INT, b BIGINT) RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION exact(a BIGINT, b BIGINT) RETURNS BIGINT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION prefer(x NUMERIC) RETURNS NUMERIC LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION prefer(x FLOAT8) RETURNS FLOAT8 LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION tie(x BIGINT) RETURNS BIGINT LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION tie(x NUMERIC) RETURNS NUMERIC LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION gasp(a INT, b INT) RETURNS INT LANGUAGE sql AS 'SELECT a';
+         CREATE FUNCTION gasp(a INT, b UUID) RETURNS UUID LANGUAGE sql AS 'SELECT b';
+         CREATE FUNCTION wide(a BIGINT, b BIGINT) RETURNS BIGINT LANGUAGE sql AS 'SELECT a';
+         CREATE FUNCTION wide(a NUMERIC, b NUMERIC) RETURNS NUMERIC LANGUAGE sql AS 'SELECT a';
+         CREATE FUNCTION wide(a BIGINT, b BIGINT, c BIGINT) RETURNS BIGINT LANGUAGE sql AS 'SELECT a';
+         CREATE FUNCTION wide(a NUMERIC, b NUMERIC, c NUMERIC) RETURNS NUMERIC LANGUAGE sql AS 'SELECT a';");
+    let cases: &[Case<'_>] = &[
+        // The most exact matches win.
+        ("exact(a, b)", &[Some("INT"), Some("INT")], Some("INT")),
+        // A preferred type of the argument's category wins.
+        ("prefer(x)", &[Some("INT")], Some("FLOAT8")),
+        ("tie(x)", &[Some("SMALLINT")], None),
+        // The literal takes the one type the other arguments share.
+        ("gasp(a, '5')", &[Some("INT"), Some("unknown")], Some("INT")),
+        ("wide(a, '5')", &[Some("INT"), Some("unknown")], None),
+        // The other arguments share no one type for the literal to take.
+        ("wide(a, b, '5')", &[Some("SMALLINT"), Some("INT"), Some("unknown")], None),
+    ];
+    for (expression, types, expected) in cases {
+        assert_eq!(returns(&db, expression, types).as_deref(), *expected, "{expression} {types:?}");
+    }
+}
+
+/// A function on the path taking the same arguments as one in a schema
+/// searched earlier is hidden.
+#[test]
+fn an_earlier_schema_hides_a_function_of_the_same_arguments() -> Result<(), LookupError> {
+    let db = db("CREATE FUNCTION lower(x TEXT) RETURNS INT LANGUAGE sql AS 'SELECT 1';");
+    let reached: Vec<String> = db
+        .functions_reached_by(&call("lower(x)"), IdentifierCase::AsWritten)?
+        .map(|function| function.target_name().to_string())
+        .collect();
+    assert_eq!(reached, ["pg_catalog.lower"]);
+    assert_eq!(returns(&db, "lower(x)", &[Some("TEXT")]).as_deref(), Some("TEXT"));
+    Ok(())
+}
+
+/// One function answers what a call of it returns, or nothing when it does
+/// not take the call.
+#[test]
+fn a_function_answers_for_a_call_of_it() -> Result<(), LookupError> {
+    let db = db("CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';");
+    let f = db.functions().find(|function| function.name() == "f").expect("declared");
+    let one = call("f(x)");
+    let answer = |call: &Function, types: &[Option<&str>]| -> Result<Option<String>, LookupError> {
+        Ok(f.call_result_type_name(call, types, &db)?.map(std::borrow::Cow::into_owned))
+    };
+    assert_eq!(answer(&one, &[Some("SMALLINT")])?.as_deref(), Some("INT"));
+    assert_eq!(answer(&one, &[Some("BIGINT")])?, None);
+    assert_eq!(answer(&call("f(x, y)"), &[Some("INT"), Some("INT")])?, None);
+    assert!(matches!(answer(&one, &[]), Err(LookupError::ArgumentTypeCount { .. })));
+    Ok(())
+}
+
+/// A named table result yields one column's type or a record, as the anonymous
+/// one does.
+#[test]
+fn a_named_table_result_returns_its_column_type() {
+    let db = ParserDB::parse::<sqlparser::dialect::MsSqlDialect>(
+        "CREATE FUNCTION one() RETURNS @r TABLE (id INT) AS BEGIN RETURN; END;
+         CREATE FUNCTION two() RETURNS @r TABLE (id INT, name TEXT) AS BEGIN RETURN; END;",
+    )
+    .expect("schema parses");
+    let result = |name: &str| {
+        db.functions()
+            .find(|function| function.name() == name)
+            .and_then(|function| function.result_type_name(&db))
+            .map(std::borrow::Cow::into_owned)
+    };
+    assert_eq!(result("one").as_deref(), Some("INT"));
+    assert_eq!(result("two").as_deref(), Some("record"));
+}

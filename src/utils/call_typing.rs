@@ -248,18 +248,19 @@ impl<'a> Bound<'a> {
         match self.spelling {
             Spelling::Given(spelling) => Some(Cow::Borrowed(spelling)),
             Spelling::ElementOf(spelling) => {
-                let element = match parse_data_type(spelling)? {
-                    DataType::Array(
-                        ArrayElemTypeDef::AngleBracket(element)
-                        | ArrayElemTypeDef::SquareBracket(element, _)
-                        | ArrayElemTypeDef::Parenthesis(element)
-                        | ArrayElemTypeDef::ParenthesisNotNull(element)
-                        | ArrayElemTypeDef::Qualified(element, _),
-                    ) => *element,
-                    // `_int4` names the array by the catalog's own spelling.
-                    _ => return element_name(&self.pg_type).map(Cow::Borrowed),
-                };
-                Some(Cow::Owned(innermost_element(element).to_string()))
+                if let DataType::Array(
+                    ArrayElemTypeDef::AngleBracket(element)
+                    | ArrayElemTypeDef::SquareBracket(element, _)
+                    | ArrayElemTypeDef::Parenthesis(element)
+                    | ArrayElemTypeDef::ParenthesisNotNull(element)
+                    | ArrayElemTypeDef::Qualified(element, _),
+                ) = parse_data_type(spelling)?
+                {
+                    return Some(Cow::Owned(innermost_element(*element).to_string()));
+                }
+                // `_int4` names the array by the catalog's own spelling.
+                let PgType::Catalog(name) = self.pg_type else { return None };
+                Some(Cow::Borrowed(name))
             }
             Spelling::Text => Some(Cow::Borrowed("TEXT")),
         }
@@ -289,14 +290,6 @@ fn innermost_element(data_type: DataType) -> DataType {
             | ArrayElemTypeDef::Qualified(element, _),
         ) => innermost_element(*element),
         element => element,
-    }
-}
-
-/// The catalog name of a catalog element type.
-fn element_name(element: &PgType) -> Option<&'static str> {
-    match element {
-        PgType::Catalog(name) => Some(name),
-        PgType::Array(_) | PgType::Other(_) => None,
     }
 }
 
@@ -451,11 +444,9 @@ fn compatible_family(
     if undetermined {
         return Some(Family::Undetermined);
     }
-    if bounds.is_empty() {
-        return Some(Family::Unbound);
-    }
-    let CommonType::At(position) = select_common_type(&bounds, |bound| &bound.pg_type)? else {
-        return None;
+    let position = match select_common_type(&bounds, |bound| &bound.pg_type)? {
+        CommonType::At(position) => position,
+        CommonType::AllUnknown => return Some(Family::Unbound),
     };
     let common = bounds.swap_remove(position);
     (!(nonarray && common.pg_type.is_array())).then_some(Family::Decided(common))

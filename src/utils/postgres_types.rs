@@ -585,3 +585,74 @@ pub fn common_type_name<'a>(types: &[Option<&'a str>]) -> Option<Cow<'a, str>> {
         CommonType::AllUnknown => Some(Cow::Borrowed("TEXT")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::ast::{
+        DataType, GeometricTypeKind, Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction,
+    };
+
+    use super::PgType;
+
+    /// Every spelling PostgreSQL accepts for a catalog type denotes its row.
+    #[test]
+    fn spellings_denote_their_catalog_types() {
+        for (spelling, catalog) in [
+            ("FLOAT(10)", "float4"),
+            ("FLOAT(30)", "float8"),
+            ("BOOL", "bool"),
+            ("CHAR(3)", "bpchar"),
+            ("TIME", "time"),
+            ("TIME WITH TIME ZONE", "timetz"),
+            ("TIMETZ", "timetz"),
+            ("TIMESTAMP(3)", "timestamp"),
+            ("JSON", "json"),
+            ("JSONB", "jsonb"),
+            ("BIT(3)", "bit"),
+            ("BIT VARYING(3)", "varbit"),
+            ("REGCLASS", "regclass"),
+            ("TSVECTOR", "tsvector"),
+            ("TSQUERY", "tsquery"),
+            ("TRIGGER", "trigger"),
+            ("SMALLSERIAL", "int2"),
+            ("SERIAL", "int4"),
+            ("BIGSERIAL", "int8"),
+            ("pg_catalog.int4", "int4"),
+            ("anycompatiblenonarray", "anycompatiblenonarray"),
+            ("anyrange", "anyrange"),
+        ] {
+            assert_eq!(PgType::parse(spelling), Some(PgType::Catalog(catalog)), "{spelling}");
+        }
+        let int4_array = Some(PgType::Catalog("int4").array());
+        assert_eq!(PgType::parse("_int4"), int4_array);
+        assert_eq!(PgType::parse("INT[][]"), int4_array);
+        assert_eq!(PgType::parse("TINYINT"), Some(PgType::Other("TINYINT".to_owned())));
+        assert_eq!(PgType::parse("not a type ("), None);
+    }
+
+    /// The geometric types sqlparser names by kind are the catalog's.
+    #[test]
+    fn geometric_kinds_denote_their_catalog_types() {
+        for (kind, catalog) in [
+            (GeometricTypeKind::Point, "point"),
+            (GeometricTypeKind::Line, "line"),
+            (GeometricTypeKind::LineSegment, "lseg"),
+            (GeometricTypeKind::GeometricBox, "box"),
+            (GeometricTypeKind::GeometricPath, "path"),
+            (GeometricTypeKind::Polygon, "polygon"),
+            (GeometricTypeKind::Circle, "circle"),
+        ] {
+            assert_eq!(PgType::of(&DataType::GeometricType(kind)), PgType::Catalog(catalog));
+        }
+    }
+
+    /// A name part built at run time names a type of its own.
+    #[test]
+    fn a_run_time_name_part_is_a_type_of_its_own() {
+        let name = ObjectName(vec![ObjectNamePart::Function(ObjectNamePartFunction {
+            name: Ident::new("identifier"),
+            args: vec![],
+        })]);
+        assert!(matches!(PgType::of(&DataType::Custom(name, vec![])), PgType::Other(_)));
+    }
+}
