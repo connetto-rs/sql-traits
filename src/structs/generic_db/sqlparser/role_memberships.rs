@@ -98,15 +98,26 @@ impl CreateRoleMemberships {
     }
 
     /// Refuses a clause naming `PUBLIC`, or, under
-    /// [`AccessResolution::ClosedWorld`], a role the input has not created.
+    /// [`AccessResolution::ClosedWorld`], a role the input has not created, or
+    /// a membership that would make one of `created`'s names a member of
+    /// itself.
     pub(super) fn validate(
         &self,
         builder: &ParserDBBuilder,
         access_resolution: AccessResolution,
+        created: &CreateRole,
     ) -> Result<(), Error> {
         for role in self.parents.iter().chain(&self.members).chain(&self.admins) {
             refuse_public(role)?;
             require_role(builder, access_resolution, role)?;
+        }
+        for name in created.names.iter().filter_map(object_name_last_identifier) {
+            for parent in &self.parents {
+                refuse_cycle(builder, parent, name)?;
+            }
+            for member in self.members.iter().chain(&self.admins) {
+                refuse_cycle(builder, name, member)?;
+            }
         }
         Ok(())
     }
@@ -153,6 +164,7 @@ pub(super) fn grant_role(
     let members = named_members(&grant.roles, &grant.grantees, builder, access_resolution)?;
     for role in &grant.roles {
         for member in &members {
+            refuse_cycle(builder, role, member)?;
             let inherits = member_inherits(builder, role_alterations, member);
             record(builder, role, member, grant.granted_by.as_ref(), written, inherits);
         }
@@ -446,6 +458,34 @@ fn require_role(
         && !builder.roles().iter().any(|(declared, ())| role_matches_lookup_ident(declared, role))
     {
         return Err(Error::RoleNotFoundForMembership { role_name: role.value.clone() });
+    }
+    Ok(())
+}
+
+/// Refuses granting `role` to `member` when `role` is `member` or already a
+/// member of it, directly or through other memberships, since the grant would
+/// make `role` a member of itself.
+fn refuse_cycle(builder: &ParserDBBuilder, role: &Ident, member: &Ident) -> Result<(), Error> {
+    let mut pending = alloc::vec![role];
+    let mut visited: Vec<&Ident> = Vec::new();
+    while let Some(current) = pending.pop() {
+        if idents_match(current, member) {
+            return Err(Error::CircularRoleMembership {
+                role_name: role.value.clone(),
+                member_name: member.value.clone(),
+            });
+        }
+        if visited.iter().any(|seen| idents_match(seen, current)) {
+            continue;
+        }
+        visited.push(current);
+        pending.extend(
+            builder
+                .role_memberships()
+                .iter()
+                .filter(|(membership, ())| idents_match(&membership.member, current))
+                .map(|(membership, ())| &membership.role),
+        );
     }
     Ok(())
 }

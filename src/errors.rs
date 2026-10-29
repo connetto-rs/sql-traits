@@ -820,6 +820,18 @@ pub enum Error {
         /// Name of the undefined role.
         role_name: String,
     },
+    #[error(
+        "Role `{role_name}` cannot be granted to `{member_name}`: `{role_name}` would become a member of itself."
+    )]
+    /// Error indicating that a membership would make a role a member of
+    /// itself, directly or through other memberships, which PostgreSQL refuses
+    /// as `role "..." is a member of role "..."`.
+    CircularRoleMembership {
+        /// Name of the role being granted.
+        role_name: String,
+        /// Name of the role it would be granted to.
+        member_name: String,
+    },
     #[error("Unrecognized role option `{option}` in a role membership grant or revoke.")]
     /// Error indicating that `GRANT role TO role ... WITH` or
     /// `REVOKE option OPTION FOR role FROM role` names an option other than

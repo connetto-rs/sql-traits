@@ -100,22 +100,6 @@ fn a_link_without_inherit_stops_the_chain() {
 }
 
 #[test]
-fn a_membership_cycle_ends_the_walk() {
-    let database = parse(
-        "CREATE ROLE a;
-         CREATE ROLE b IN ROLE a;
-         CREATE ROLE c IN ROLE b;
-         GRANT c TO a;
-         CREATE TABLE t (id INTEGER PRIMARY KEY);
-         GRANT SELECT ON t TO b;",
-    );
-
-    assert_eq!(inherited_roles(&database, "a"), ["b", "c"]);
-    assert_eq!(inherited_roles(&database, "c"), ["a", "b"]);
-    assert!(can_select(&database, "t", "a"));
-}
-
-#[test]
 fn every_table_privilege_is_inherited() {
     let database = parse(
         "CREATE ROLE owner_group;
