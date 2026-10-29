@@ -244,3 +244,14 @@ fn alter_role_replaces_the_stored_credentials() {
     assert_eq!(role.password, Some(Password::NullPassword));
     assert_eq!(role.valid_until.as_ref().map(ToString::to_string).as_deref(), Some("'2030-01-01'"));
 }
+
+/// `CREATE GROUP` is PostgreSQL's older spelling of `CREATE ROLE`, so the name
+/// it takes is a role name like any other.
+#[test]
+fn a_group_takes_a_role_name() {
+    let duplicate = parse("CREATE GROUP readers; CREATE ROLE readers;");
+    assert!(
+        matches!(&duplicate, Err(Error::RoleAlreadyExists { role_name }) if role_name == "readers"),
+        "got {duplicate:?}"
+    );
+}
