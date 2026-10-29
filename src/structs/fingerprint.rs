@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     errors::LookupError,
-    traits::{ColumnLike, TableLike},
+    traits::{ColumnLike, DataTypeLike, TableLike},
     utils::fingerprint_type_token::canonical_type_token,
 };
 
@@ -374,7 +374,7 @@ pub fn canonical_bytes_v1<T: TableLike>(
         let col_name = column.stored_column_name();
         write_str(&mut buf, &col_name);
 
-        let type_token = canonical_type_token(&column.data_type(database));
+        let type_token = canonical_type_token(&column.data_type(database).name(database));
         write_str(&mut buf, &type_token);
 
         buf.push(u8::from(column.is_nullable(database)?));

@@ -15,7 +15,7 @@ fn column_types(ddl: &str) -> Vec<String> {
     table
         .columns(&database)
         .expect("table belongs to the database")
-        .map(|column| column.data_type(&database).into_owned())
+        .map(|column| column.data_type(&database).name(&database).into_owned())
         .collect()
 }
 

@@ -14,7 +14,7 @@ use crate::{
     errors::{Error, LookupError},
     structs::{IdentifierCase, TargetName},
     traits::{
-        CheckConstraintLike, ColumnGrantLike, ColumnLike, DialectLike, ExtensionLike,
+        CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, ExtensionLike,
         ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike, RoleMembershipLike,
         RuleLike, SchemaLike, TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, ViewLike,
     },
@@ -41,6 +41,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type MaterializedView: ViewLike<DB = Self>;
     /// Type of the columns in the schema.
     type Column: ColumnLike<DB = Self>;
+    /// Type of the declared data types of the columns in the schema.
+    type DataType: DataTypeLike<DB = Self>;
     /// Type of the indices in the schema.
     type Index: IndexLike<DB = Self>;
     /// Type of the foreign keys in the schema.

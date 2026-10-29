@@ -90,6 +90,8 @@ const FAMILY_CASES: &[ScalarFamilyCase] = &[
     ("json", Some(ScalarFamily::Json)),
     ("JSONB", Some(ScalarFamily::Jsonb)),
     ("jsonb", Some(ScalarFamily::Jsonb)),
+    ("INTERVAL", Some(ScalarFamily::Interval)),
+    ("interval", Some(ScalarFamily::Interval)),
 ];
 
 const DECORATED_CASES: &[ScalarFamilyCase] = &[
@@ -97,6 +99,11 @@ const DECORATED_CASES: &[ScalarFamilyCase] = &[
     ("NUMERIC(20, 4)", Some(ScalarFamily::Decimal)),
     ("DECIMAL(10,2)", Some(ScalarFamily::Decimal)),
     ("TIMESTAMP(6) WITH TIME ZONE", Some(ScalarFamily::TimestampTz)),
+    ("INTERVAL  YEAR  TO  MONTH", Some(ScalarFamily::Interval)),
+    ("INTERVAL(3)", Some(ScalarFamily::Interval)),
+    ("interval day to second(3)", Some(ScalarFamily::Interval)),
+    ("INTERVAL SECOND(0)", Some(ScalarFamily::Interval)),
+    ("INTERVAL HOUR", Some(ScalarFamily::Interval)),
     ("TIMESTAMP WITHOUT TIME ZONE", Some(ScalarFamily::Timestamp)),
     ("CHARACTER VARYING(16)", Some(ScalarFamily::String)),
     ("BIGINT UNSIGNED", Some(ScalarFamily::Int)),
@@ -156,7 +163,9 @@ const QUOTED_REJECTED_CASES: &[ScalarFamilyCase] = &[
 const REJECTED_CASES: &[ScalarFamilyCase] = &[
     ("", None),
     ("geometry", None),
-    ("INTERVAL  YEAR  TO  MONTH", None),
+    ("INTERVAL YEAR TO", None),
+    ("INTERVAL WEEK", None),
+    ("INTERVAL[]", None),
     ("GEOMETRY(Point, 4326)", None),
     ("VARCHAR[]", None),
     ("TIMESTAMP WITH LOCAL TIME ZONE", None),

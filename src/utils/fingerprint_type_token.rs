@@ -23,7 +23,11 @@ use super::scalar_family::scalar_family;
 /// assert_eq!(canonical_type_token("integer"), "INT");
 /// assert_eq!(canonical_type_token("VARCHAR"), "STRING");
 /// assert_eq!(canonical_type_token("geometry"), "OTHER:geometry");
-/// assert_eq!(canonical_type_token("INTERVAL  YEAR  TO  MONTH"), "OTHER:interval year to month");
+/// assert_eq!(
+///     canonical_type_token("TIMESTAMP  WITH  LOCAL  TIME  ZONE"),
+///     "OTHER:timestamp with local time zone"
+/// );
+/// assert_eq!(canonical_type_token("INTERVAL YEAR TO MONTH"), "INTERVAL");
 /// assert_eq!(canonical_type_token("TIMESTAMP WITH TIME ZONE"), "TIMESTAMPTZ");
 /// assert_eq!(canonical_type_token("JSONB"), "JSONB");
 /// ```
@@ -230,8 +234,8 @@ mod tests {
         // Spec §7.2.1: internal whitespace runs collapse to a single ASCII
         // space.
         assert_eq!(
-            canonical_type_token("INTERVAL  YEAR  TO  MONTH"),
-            "OTHER:interval year to month"
+            canonical_type_token("TIMESTAMP  WITH  LOCAL  TIME  ZONE"),
+            "OTHER:timestamp with local time zone"
         );
         // Tabs and other whitespace also collapse.
         assert_eq!(canonical_type_token("foo\tbar  \t baz"), "OTHER:foo bar baz");
@@ -260,7 +264,8 @@ mod tests {
             ("JSON", "JSON"),
             ("JSONB", "JSONB"),
             (" Geometry ", "OTHER:geometry"),
-            ("INTERVAL  YEAR  TO  MONTH", "OTHER:interval year to month"),
+            ("INTERVAL  YEAR  TO  MONTH", "INTERVAL"),
+            ("TIMESTAMP  WITH  LOCAL  TIME  ZONE", "OTHER:timestamp with local time zone"),
         ] {
             assert_eq!(canonical_type_token(declared_type), expected);
         }

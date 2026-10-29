@@ -25,6 +25,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type View = P::View;
     type MaterializedView = P::MaterializedView;
     type Column = P::Column;
+    type DataType = P::DataType;
     type Index = P::Index;
     type ForeignKey = P::ForeignKey;
     type Function = P::Function;

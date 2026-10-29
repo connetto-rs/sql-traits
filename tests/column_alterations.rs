@@ -57,7 +57,7 @@ fn adding_a_column_declares_it() {
         .expect("t is in this database")
         .expect("x is declared");
     assert!(!added.is_nullable(&database).expect("x is in this database"));
-    assert_eq!(added.data_type(&database).to_string(), "TEXT");
+    assert_eq!(added.data_type(&database).name(&database), "TEXT");
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn adding_a_column_that_exists_is_refused_unless_tolerated() {
         .expect("t is in this database")
         .expect("a is declared");
     assert_eq!(
-        untouched.data_type(&tolerated).to_string(),
+        untouched.data_type(&tolerated).name(&tolerated),
         "INT",
         "the tolerated statement changed nothing rather than redeclaring the column"
     );
@@ -677,7 +677,7 @@ fn altering_a_column_changes_what_it_declares() {
         .column("a", &retyped, IdentifierCase::AsWritten)
         .expect("t is in this database")
         .expect("a is declared");
-    assert_eq!(column.data_type(&retyped).to_string(), "TEXT");
+    assert_eq!(column.data_type(&retyped).name(&retyped), "TEXT");
 }
 
 #[test]
@@ -711,7 +711,7 @@ fn the_mysql_spellings_restate_the_declaration() {
         .column("b", &changed, IdentifierCase::AsWritten)
         .expect("t is in this database")
         .expect("b is declared");
-    assert_eq!(column.data_type(&changed).to_string(), "TEXT");
+    assert_eq!(column.data_type(&changed).name(&changed), "TEXT");
     assert!(!column.is_nullable(&changed).expect("b is in this database"));
 
     let modified = ParserDB::parse::<MySqlDialect>(
@@ -728,7 +728,7 @@ fn the_mysql_spellings_restate_the_declaration() {
         .column("a", &modified, IdentifierCase::AsWritten)
         .expect("t is in this database")
         .expect("a is declared");
-    assert_eq!(column.data_type(&modified).to_string(), "TEXT");
+    assert_eq!(column.data_type(&modified).name(&modified), "TEXT");
     assert!(
         column.is_nullable(&modified).expect("a is in this database"),
         "the clause left NOT NULL out, so the column loses it"

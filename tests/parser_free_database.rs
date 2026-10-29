@@ -19,6 +19,7 @@ use sql_traits::{
         ColumnCollation, TypeMatch,
         grant::{GrantRelation, GrantTarget},
     },
+    utils::scalar_family::ScalarFamily,
 };
 use sqlparser::{
     ast::{
@@ -86,10 +87,14 @@ struct MemoryColumn {
     table_name: String,
     name: String,
     name_is_quoted: bool,
-    data_type: String,
+    data_type: MemoryDataType,
     nullable: bool,
     primary_key: bool,
 }
+
+/// A declared type the catalog stores as its name alone.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct MemoryDataType(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemorySchema {
@@ -226,6 +231,7 @@ impl DatabaseLike for MemoryCatalog {
     type View = MemoryView;
     type MaterializedView = MemoryView;
     type Column = MemoryColumn;
+    type DataType = MemoryDataType;
     type Index = MemoryIndex;
     type ForeignKey = MemoryForeignKey;
     type Function = MemoryFunction;
@@ -360,7 +366,7 @@ impl DialectLike for MemoryDialect {
     type Match = TypeMatch;
 
     fn is_bool(&self, database: &Self::DB, column: &MemoryColumn) -> Self::Match {
-        if column.data_type(database).eq_ignore_ascii_case("boolean") {
+        if column.data_type(database).name(database).eq_ignore_ascii_case("boolean") {
             TypeMatch::Yes
         } else {
             TypeMatch::No
@@ -368,11 +374,19 @@ impl DialectLike for MemoryDialect {
     }
 
     fn is_uuid(&self, database: &Self::DB, column: &MemoryColumn) -> Self::Match {
-        if column.data_type(database).eq_ignore_ascii_case("uuid") {
+        if column.data_type(database).name(database).eq_ignore_ascii_case("uuid") {
             TypeMatch::Yes
         } else {
             TypeMatch::No
         }
+    }
+}
+
+impl DataTypeLike for MemoryDataType {
+    type DB = MemoryCatalog;
+
+    fn name<'db>(&'db self, _database: &'db Self::DB) -> Cow<'db, str> {
+        Cow::Borrowed(&self.0)
     }
 }
 
@@ -552,8 +566,8 @@ impl ColumnLike for MemoryColumn {
         Ok(None)
     }
 
-    fn data_type<'db>(&'db self, _database: &'db Self::DB) -> Cow<'db, str> {
-        Cow::Borrowed(&self.data_type)
+    fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db MemoryDataType {
+        &self.data_type
     }
 
     fn collation<'db>(
@@ -1302,7 +1316,7 @@ fn column(table_schema: Option<&str>, table_name: &str, name: &str) -> MemoryCol
         table_name: String::from(table_name),
         name: String::from(name),
         name_is_quoted: false,
-        data_type: String::from("INT"),
+        data_type: MemoryDataType(String::from("INT")),
         nullable: false,
         primary_key: name == "id",
     }
@@ -1807,10 +1821,18 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
     assert_eq!(docs.primary_key_columns(&catalog)?.count(), 1);
     let first_column = docs.columns(&catalog)?.next().expect("a column");
     assert_eq!(catalog.dialect().is_bool(&catalog, first_column), TypeMatch::No);
-    assert_eq!(first_column.fixed_binary_length(&catalog), None);
-    assert_eq!(first_column.max_character_length(&catalog), None);
-    assert_eq!(first_column.fractional_seconds_precision(&catalog), None);
-    assert_eq!(first_column.numeric_scale(&catalog), None);
+    let first_type = first_column.data_type(&catalog);
+    assert_eq!(first_type.scalar_family(&catalog), Some(ScalarFamily::Int));
+    assert_eq!(first_type.normalized_name(&catalog), "INT");
+    assert!(!first_type.is_textual(&catalog));
+    assert_eq!(first_type.fixed_binary_length(&catalog), None);
+    assert_eq!(first_type.max_character_length(&catalog), None);
+    assert_eq!(first_type.fractional_seconds_precision(&catalog), None);
+    assert_eq!(first_type.numeric_scale(&catalog), None);
+    assert_eq!(first_type.interval_fields(&catalog), None);
+    assert_eq!(first_type.vector(&catalog), None);
+    assert!(first_type.array_element(&catalog).is_none());
+    assert_eq!(first_type.array_dimensions(&catalog), None);
 
     Ok(())
 }

@@ -112,7 +112,7 @@ fn test_sqlite_typeless_column_is_answered() {
     let types: Vec<_> = table
         .columns(&database)
         .expect("table belongs to the database")
-        .map(|column| column.data_type(&database).into_owned())
+        .map(|column| column.data_type(&database).name(&database).into_owned())
         .collect();
 
     assert_eq!(types, vec!["UNSPECIFIED"]);
@@ -130,7 +130,7 @@ fn test_snowflake_object_columns_are_one_family() {
     let types: Vec<_> = table
         .columns(&database)
         .expect("table belongs to the database")
-        .map(|column| column.data_type(&database).into_owned())
+        .map(|column| column.data_type(&database).name(&database).into_owned())
         .collect();
 
     assert_eq!(types, vec!["OBJECT", "OBJECT"]);

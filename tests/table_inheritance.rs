@@ -307,7 +307,7 @@ fn a_column_a_parent_renames_or_retypes_changes_in_the_child_too() {
         .column("c", &database, IdentifierCase::AsWritten)
         .expect("lookup succeeds")
         .expect("column exists");
-    assert_eq!(retyped.data_type(&database), "BIGINT");
+    assert_eq!(retyped.data_type(&database).name(&database), "BIGINT");
 }
 
 #[test]
@@ -593,8 +593,8 @@ fn an_identity_stays_with_the_parent_while_a_stored_expression_comes_down() {
     // The declaration itself is the parent's, whatever it says.
     for name in ["counted", "base", "doubled", "labelled"] {
         assert_eq!(
-            column(child, name, &database).data_type(&database),
-            column(parent, name, &database).data_type(&database),
+            column(child, name, &database).data_type(&database).name(&database),
+            column(parent, name, &database).data_type(&database).name(&database),
             "`{name}` keeps the parent's type"
         );
     }

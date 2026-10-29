@@ -1,6 +1,7 @@
 //! Submodule providing traits for describing SQL-like entities.
 
 pub mod column;
+pub mod data_type;
 pub mod database;
 pub mod dialect;
 pub mod table;
@@ -10,6 +11,7 @@ use core::fmt::Debug;
 pub use column::{
     ColumnCollation, ColumnLike, IdentityGeneration, MySqlCollationPadding, NamedColumnCollation,
 };
+pub use data_type::{DataTypeLike, IntervalFields, VectorKind, VectorType};
 pub mod index;
 pub use database::DatabaseLike;
 pub use dialect::DialectLike;

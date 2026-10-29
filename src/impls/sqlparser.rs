@@ -12,6 +12,7 @@ mod create_rule;
 mod create_table;
 mod create_trigger;
 mod data_statement;
+mod data_type;
 mod dialect;
 mod dml;
 pub(crate) mod dql;

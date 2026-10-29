@@ -28,6 +28,8 @@ pub enum ScalarFamily {
     Timestamp,
     /// Timestamps with a timezone.
     TimestampTz,
+    /// Durations, as an interval type holds them.
+    Interval,
     /// JSON values.
     Json,
     /// Binary JSON values.
@@ -48,6 +50,7 @@ impl ScalarFamily {
             Self::Time => "TIME",
             Self::Timestamp => "TIMESTAMP",
             Self::TimestampTz => "TIMESTAMPTZ",
+            Self::Interval => "INTERVAL",
             Self::Json => "JSON",
             Self::Jsonb => "JSONB",
         }
@@ -168,6 +171,32 @@ fn timezone_tail(tokens: &mut Peekable<Tokens<'_>>) -> Option<bool> {
     }
 
     None
+}
+
+fn is_interval_field(token: Option<Token<'_>>) -> bool {
+    ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"].iter().any(|field| is_word(token, field))
+}
+
+/// Accepts what may follow `INTERVAL`: a precision alone, or a field, a
+/// field range such as `DAY TO SECOND`, and an optional precision.
+fn interval_tail(tokens: &mut Peekable<Tokens<'_>>) -> bool {
+    if matches!(tokens.peek(), Some(Token::Parameters)) {
+        tokens.next();
+        return has_no_tail(tokens);
+    }
+    let Some(first) = tokens.next() else {
+        return true;
+    };
+    if !is_interval_field(Some(first)) {
+        return false;
+    }
+    if is_word(tokens.peek().copied(), "TO") {
+        tokens.next();
+        if !is_interval_field(tokens.next()) {
+            return false;
+        }
+    }
+    simple_parameterized_tail(tokens)
 }
 
 fn integer_family(base: &str) -> bool {
@@ -315,6 +344,9 @@ pub fn scalar_family(declared_type: &str) -> Option<ScalarFamily> {
     if base.eq_ignore_ascii_case("JSON") {
         return has_no_tail(&mut tokens).then_some(ScalarFamily::Json);
     }
+    if base.eq_ignore_ascii_case("INTERVAL") {
+        return interval_tail(&mut tokens).then_some(ScalarFamily::Interval);
+    }
 
     None
 }
@@ -343,6 +375,7 @@ mod tests {
             ScalarFamily::Time => "TIME",
             ScalarFamily::Timestamp => "TIMESTAMP",
             ScalarFamily::TimestampTz => "TIMESTAMPTZ",
+            ScalarFamily::Interval => "INTERVAL",
             ScalarFamily::Json => "JSON",
             ScalarFamily::Jsonb => "JSONB",
         }

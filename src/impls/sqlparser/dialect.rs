@@ -23,6 +23,7 @@ use sqlparser::{
     },
 };
 
+use super::data_type::interval_fields;
 use crate::{
     structs::{ParserDB, TableAttribute},
     traits::{DialectLike, TypeMatch},
@@ -296,16 +297,20 @@ pub(super) fn max_character_length(dialect: SqlparserDialect, ty: &DataType) -> 
     }
 }
 
-/// Fractional digits of a second a value of a time or timestamp type keeps.
+/// Fractional digits of a second a value of a time, timestamp or interval
+/// type keeps.
 ///
 /// A bare type takes the engine default. PostgreSQL keeps microseconds and
 /// reduces a larger written precision to 6, and Redshift, which documents
-/// microsecond values, is read the same way. MySQL keeps none, Oracle and
-/// Teradata keep 6, and the standard keeps 0 in `TIME` and 6 in `TIMESTAMP`.
-/// Oracle's `DATE` holds whole seconds. BigQuery, Spark and Databricks keep
-/// microseconds and Hive keeps nanoseconds, of which only a Spark `TIME` takes
-/// a written precision. SQLite has no temporal type. The generic dialect names
-/// no engine, so it answers only a written precision.
+/// microsecond values, is read the same way. Both keep the seconds of an
+/// interval to the same precision, and no seconds at all in one restricted
+/// to coarser fields, such as `INTERVAL YEAR TO MONTH`. MySQL keeps none,
+/// Oracle and Teradata keep 6, and the standard keeps 0 in `TIME` and 6 in
+/// `TIMESTAMP`. Oracle's `DATE` holds whole seconds. BigQuery, Spark and
+/// Databricks keep microseconds and Hive keeps nanoseconds, of which only a
+/// Spark `TIME` takes a written precision. BigQuery and DuckDB keep the
+/// seconds of an interval to microseconds. SQLite has no temporal type. The
+/// generic dialect names no engine, so it answers only a written precision.
 pub(super) fn fractional_seconds_precision(
     dialect: SqlparserDialect,
     ty: &DataType,
@@ -332,6 +337,11 @@ pub(super) fn fractional_seconds_precision(
         SqlparserDialect::PostgreSql | SqlparserDialect::Redshift => {
             match ty {
                 DataType::Time(p, _) | DataType::Timestamp(p, _) => Some(p.map_or(6, |p| p.min(6))),
+                DataType::Interval { fields, precision }
+                    if fields.is_none_or(|fields| interval_fields(fields).holds_seconds()) =>
+                {
+                    Some(precision.map_or(6, |p| p.min(6)))
+                }
                 _ => None,
             }
         }
@@ -352,7 +362,10 @@ pub(super) fn fractional_seconds_precision(
         }
         SqlparserDialect::BigQuery => {
             match ty {
-                DataType::Time(..) | DataType::Timestamp(..) | DataType::Datetime(_) => Some(6),
+                DataType::Time(..)
+                | DataType::Timestamp(..)
+                | DataType::Datetime(_)
+                | DataType::Interval { .. } => Some(6),
                 _ => None,
             }
         }
@@ -410,8 +423,8 @@ fn snowflake_seconds_precision(ty: &DataType) -> Option<u64> {
 }
 
 /// DuckDB stores whole seconds, milliseconds, microseconds or nanoseconds, so
-/// a written timestamp precision rises to the next of them. Its other types
-/// reject a written precision and keep microseconds.
+/// a written timestamp precision rises to the next of them. Its other types,
+/// intervals among them, reject a written precision and keep microseconds.
 fn duckdb_seconds_precision(ty: &DataType) -> Option<u64> {
     match ty {
         DataType::Timestamp(Some(p), TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
@@ -423,7 +436,10 @@ fn duckdb_seconds_precision(ty: &DataType) -> Option<u64> {
                 _ => 9,
             })
         }
-        DataType::Time(..) | DataType::Timestamp(..) | DataType::Datetime(None) => Some(6),
+        DataType::Time(..)
+        | DataType::Timestamp(..)
+        | DataType::Datetime(None)
+        | DataType::Interval { .. } => Some(6),
         DataType::Custom(name, modifiers) if modifiers.is_empty() => {
             [("TIMESTAMP_S", 0), ("TIMESTAMP_MS", 3), ("TIMESTAMP_NS", 9), ("TIME_NS", 9)]
                 .into_iter()
@@ -449,13 +465,15 @@ fn clickhouse_seconds_precision(ty: &DataType) -> Option<u64> {
     }
 }
 
-/// Precision written on a time or timestamp type, in any dialect's spelling.
+/// Precision written on a time, timestamp or interval type, in any dialect's
+/// spelling.
 fn written_seconds_precision(ty: &DataType) -> Option<u64> {
     match ty {
         DataType::Time(p, _)
         | DataType::Timestamp(p, _)
         | DataType::Datetime(p)
-        | DataType::TimestampNtz(p) => *p,
+        | DataType::TimestampNtz(p)
+        | DataType::Interval { precision: p, .. } => *p,
         DataType::Datetime64(p, _) => Some(*p),
         DataType::Custom(name, modifiers)
             if ["DATETIME2", "DATETIMEOFFSET", "TIMESTAMP_LTZ", "TIMESTAMP_TZ", "TIME64"]
