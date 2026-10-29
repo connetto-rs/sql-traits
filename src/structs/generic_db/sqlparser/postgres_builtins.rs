@@ -148,7 +148,7 @@ impl PostgresBuiltin {
 /// A parameter of type `data_type`, called `name` when it has one.
 pub(super) fn parameter(name: Option<&'static str>, data_type: BuiltinType) -> OperateFunctionArg {
     OperateFunctionArg {
-        // A mode, since `VARIADIC` as a name would invent an argument of that name.
+        // A mode, since `VARIADIC` as a name would invent such an argument.
         mode: data_type.is_variadic().then_some(ArgMode::Variadic),
         name: name.map(Ident::new),
         data_type: data_type.data_type(),
