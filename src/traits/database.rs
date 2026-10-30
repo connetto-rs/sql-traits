@@ -713,10 +713,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     }
 
     /// Resolves a name a statement wrote into the relation it denotes,
-    /// whether table, plain view or materialized view, applying the same
-    /// rules as [`Self::resolve_target_table`].
+    /// whether table, plain view, materialized view or sequence, applying the
+    /// same rules as [`Self::resolve_target_table`].
     ///
-    /// The three kinds share one pool of names, so at most one kind answers a
+    /// The four kinds share one pool of names, so at most one kind answers a
     /// name and the kind that holds it is the answer.
     ///
     /// # Errors
@@ -763,10 +763,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         if let Some(view) = self.resolve_target_view(target.clone(), case)? {
             return Ok(Some(Relation::View(view)));
         }
-        match self.resolve_target_materialized_view(target, case)? {
-            Some(view) => Ok(Some(Relation::MaterializedView(view))),
-            None => Ok(None),
+        if let Some(view) = self.resolve_target_materialized_view(target.clone(), case)? {
+            return Ok(Some(Relation::MaterializedView(view)));
         }
+        Ok(self.resolve_target_sequence(target, case)?.map(Relation::Sequence))
     }
 
     /// Resolves a reference a stored object carries into the relation it
@@ -821,8 +821,13 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         if let Some(view) = self.view_by_target(target.clone(), IdentifierCase::AsWritten)? {
             return Ok(Some(Relation::View(view)));
         }
-        self.materialized_view_by_target(target, IdentifierCase::AsWritten)
-            .map(|view| view.map(Relation::MaterializedView))
+        if let Some(view) =
+            self.materialized_view_by_target(target.clone(), IdentifierCase::AsWritten)?
+        {
+            return Ok(Some(Relation::MaterializedView(view)));
+        }
+        self.sequence_by_target(target, IdentifierCase::AsWritten)
+            .map(|sequence| sequence.map(Relation::Sequence))
     }
 
     /// Resolves a name a statement wrote into the sequence it denotes,
@@ -2111,10 +2116,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
 
 /// One relation a database holds, tagged with the kind it is.
 ///
-/// Tables, plain views and materialized views share one pool of names, so a
-/// name resolves to at most one of them. A reader that needs to say which
-/// kind a lookup reached, whether from a grant, a rule or a statement's
-/// reads, handles this enum one variant at a time.
+/// Tables, plain views, materialized views and sequences share one pool of
+/// names, so a name resolves to at most one of them. A reader that needs to
+/// say which kind a lookup reached, whether from a grant, a rule or a
+/// statement's reads, handles this enum one variant at a time.
 ///
 /// # Example
 ///
@@ -2144,6 +2149,8 @@ pub enum Relation<'a, DB: DatabaseLike> {
     View(&'a DB::View),
     /// A materialized view.
     MaterializedView(&'a DB::MaterializedView),
+    /// A sequence.
+    Sequence(&'a DB::Sequence),
 }
 
 impl<DB: DatabaseLike> Copy for Relation<'_, DB> {}
@@ -2154,6 +2161,7 @@ impl<DB: DatabaseLike> Debug for Relation<'_, DB> {
             Self::Table(table) => f.debug_tuple("Table").field(table).finish(),
             Self::View(view) => f.debug_tuple("View").field(view).finish(),
             Self::MaterializedView(view) => f.debug_tuple("MaterializedView").field(view).finish(),
+            Self::Sequence(sequence) => f.debug_tuple("Sequence").field(sequence).finish(),
         }
     }
 }

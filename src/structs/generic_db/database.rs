@@ -764,6 +764,7 @@ impl<P: SchemaProfile> GenericDB<P> {
             .chain(
                 self.probed_materialized_views(probe).into_iter().map(Relation::MaterializedView),
             )
+            .chain(self.probed_sequences(probe).into_iter().map(Relation::Sequence))
             .collect();
         if candidates.len() > 1 {
             let mut rendered: Vec<String> = candidates.iter().map(render_relation).collect();

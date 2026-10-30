@@ -396,3 +396,75 @@ fn a_folding_lookup_reports_two_sequences_it_cannot_tell_apart() {
         ));
     }
 }
+
+/// The kind and name of a relation, as `kind schema.name`.
+fn describe(relation: &Relation<'_, ParserDB>) -> String {
+    match relation {
+        Relation::Table(table) => {
+            format!("table {}.{}", table.table_schema().unwrap_or("public"), table.table_name())
+        }
+        Relation::View(view) => {
+            format!("view {}.{}", view.view_schema().unwrap_or("public"), view.view_name())
+        }
+        Relation::MaterializedView(view) => {
+            format!(
+                "materialized view {}.{}",
+                view.view_schema().unwrap_or("public"),
+                view.view_name()
+            )
+        }
+        Relation::Sequence(sequence) => {
+            format!(
+                "sequence {}.{}",
+                sequence.sequence_schema().unwrap_or("public"),
+                sequence.sequence_name()
+            )
+        }
+    }
+}
+
+#[test]
+fn a_sequence_is_the_relation_its_name_reaches() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE SEQUENCE app.x;
+         CREATE TABLE x (id INT);
+         SET search_path = app, public;",
+    )
+    .expect("schema parses");
+    let reached = |name| {
+        db.resolve_target_relation(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("well formed")
+            .map(|relation| describe(&relation))
+    };
+    assert_eq!(
+        reached("x").as_deref(),
+        Some("sequence app.x"),
+        "the first schema holding the name"
+    );
+    assert_eq!(reached("absent"), None);
+
+    let bound = db
+        .resolve_bound_relation(TargetName::new("x", false).with_schema("app", false))
+        .expect("well formed")
+        .map(|relation| describe(&relation));
+    assert_eq!(bound.as_deref(), Some("sequence app.x"));
+}
+
+#[test]
+fn a_statement_reading_a_sequence_reports_it() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE SEQUENCE app.x;
+         CREATE TABLE x (id INT);
+         SET search_path = app, public;",
+    )
+    .expect("schema parses");
+    let query = sqlparser::parser::Parser::new(&PostgreSqlDialect {})
+        .try_with_sql("SELECT last_value FROM x, public.x AS t")
+        .and_then(|mut parser| parser.parse_query())
+        .expect("query parses");
+    let read: Vec<String> =
+        query.referenced_relations(&db).expect("names resolve").iter().map(describe).collect();
+    assert_eq!(read, ["sequence app.x", "table public.x"]);
+}

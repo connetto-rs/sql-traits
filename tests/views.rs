@@ -823,6 +823,7 @@ fn a_grant_reaches_views_and_says_which_kind_each_target_is() {
                 Relation::Table(_) => "table",
                 Relation::View(_) => "view",
                 Relation::MaterializedView(_) => "materialized view",
+                Relation::Sequence(_) => "sequence",
             }
         })
         .collect();
@@ -863,6 +864,7 @@ fn a_schema_wide_grant_covers_every_relation_kind() {
                 Relation::Table(_) => "table",
                 Relation::View(_) => "view",
                 Relation::MaterializedView(_) => "materialized view",
+                Relation::Sequence(_) => "sequence",
             }
         })
         .collect();

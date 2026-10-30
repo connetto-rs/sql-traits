@@ -1050,6 +1050,7 @@ pub(crate) fn render_relation<DB: DatabaseLike>(relation: &Relation<'_, DB>) -> 
         Relation::Table(table) => render_table_candidate(table),
         Relation::View(view) => render_view_candidate(*view),
         Relation::MaterializedView(view) => render_view_candidate(*view),
+        Relation::Sequence(sequence) => render_sequence_candidate(*sequence),
     }
 }
 

@@ -59,9 +59,10 @@ fn relation_of(
     match rule.relation(database).expect("the rule's relation resolves") {
         Relation::Table(table) => ("table", table.table_name().to_string()),
         Relation::View(view) => ("view", view.view_name().to_string()),
-        // Ingestion refuses a rule on a materialized view, so this is the
-        // only kind that cannot reach the helper.
-        Relation::MaterializedView(_) => panic!("a rule never resolves to a materialized view"),
+        // Ingestion refuses a rule on a materialized view or a sequence.
+        Relation::MaterializedView(_) | Relation::Sequence(_) => {
+            panic!("a rule never resolves to a materialized view or a sequence")
+        }
     }
 }
 

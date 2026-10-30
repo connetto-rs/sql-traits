@@ -96,7 +96,7 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// with the kind it is, resolved against `database` and deduplicated.
     ///
     /// This answers what the statement names, whether a base table, a
-    /// plain view or a materialized view, applying the resolution
+    /// plain view, a materialized view or a sequence, applying the resolution
     /// [`Self::referenced_tables`] spells out, the search path, the
     /// temporary schema first, the `WITH` shadowing and the DML rules,
     /// and the MySQL multi-table `DELETE ... t1, t2` list. A plain view
@@ -138,6 +138,7 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     ///             Relation::MaterializedView(view) => {
     ///                 format!("materialized view {}", view.view_name())
     ///             }
+    ///             Relation::Sequence(sequence) => format!("sequence {}", sequence.sequence_name()),
     ///         }
     ///     })
     ///     .collect();

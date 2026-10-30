@@ -473,6 +473,7 @@ pub trait TableGrantLike:
     ///             Relation::Table(_) => "table",
     ///             Relation::View(_) => "view",
     ///             Relation::MaterializedView(_) => "materialized view",
+    ///             Relation::Sequence(_) => "sequence",
     ///         }
     ///     })
     ///     .collect();

@@ -23,8 +23,7 @@ use sqlparser::{
         Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
         CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, ReferentialAction,
-        SequenceOptions,
-        Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
+        SequenceOptions, Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -1684,12 +1683,14 @@ fn the_inherited_view_resolvers_answer_only_views() -> Result<(), LookupError> {
 }
 
 /// The inherited unified resolvers answer whichever kind of relation a name
-/// holds, since tables, views and materialized views share one pool of names.
+/// holds, since tables, views, materialized views and sequences share one pool
+/// of names.
 #[test]
 fn the_inherited_relation_resolvers_answer_every_kind() -> Result<(), LookupError> {
     let mut catalog = catalog();
     catalog.views = vec![view(None, "recent", false)];
     catalog.materialized_views = vec![view(None, "counted", true)];
+    catalog.sequences = vec![MemorySequence { schema: None, name: String::from("tickets") }];
 
     let target = |name| {
         catalog.resolve_target_relation(TargetName::new(name, false), IdentifierCase::AsWritten)
@@ -1706,6 +1707,10 @@ fn the_inherited_relation_resolvers_answer_every_kind() -> Result<(), LookupErro
         target("counted")?,
         Some(Relation::MaterializedView(view)) if view.name == "counted"
     ));
+    assert!(matches!(
+        target("tickets")?,
+        Some(Relation::Sequence(sequence)) if sequence.name == "tickets"
+    ));
     assert!(target("absent")?.is_none());
 
     // The bound reading names the same relations without a search path.
@@ -1721,6 +1726,10 @@ fn the_inherited_relation_resolvers_answer_every_kind() -> Result<(), LookupErro
     assert!(matches!(
         bound("counted")?,
         Some(Relation::MaterializedView(view)) if view.name == "counted"
+    ));
+    assert!(matches!(
+        bound("tickets")?,
+        Some(Relation::Sequence(sequence)) if sequence.name == "tickets"
     ));
     assert!(bound("absent")?.is_none());
 
