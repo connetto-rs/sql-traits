@@ -1727,6 +1727,8 @@ fn require_static_access_names(objects: Option<&GrantObjects>) -> Result<(), Loo
         | GrantObjects::AllMaterializedViewsInSchema { schemas }
         | GrantObjects::AllExternalTablesInSchema { schemas }
         | GrantObjects::AllFunctionsInSchema { schemas }
+        | GrantObjects::AllProceduresInSchema { schemas }
+        | GrantObjects::AllRoutinesInSchema { schemas }
         | GrantObjects::FutureTablesInSchema { schemas }
         | GrantObjects::FutureViewsInSchema { schemas }
         | GrantObjects::FutureExternalTablesInSchema { schemas }
@@ -1747,7 +1749,9 @@ fn require_static_access_names(objects: Option<&GrantObjects>) -> Result<(), Loo
         | GrantObjects::FailoverGroup(names)
         | GrantObjects::ReplicationGroup(names)
         | GrantObjects::ExternalVolumes(names) => names,
-        GrantObjects::Procedures(signatures) | GrantObjects::Functions(signatures) => {
+        GrantObjects::Procedures(signatures)
+        | GrantObjects::Functions(signatures)
+        | GrantObjects::Routines(signatures) => {
             for signature in signatures {
                 require_static_object_name(&signature.name)?;
             }
@@ -8578,6 +8582,8 @@ mod tests {
                 GrantObjects::AllMaterializedViewsInSchema { schemas: names.clone() },
                 GrantObjects::AllExternalTablesInSchema { schemas: names.clone() },
                 GrantObjects::AllFunctionsInSchema { schemas: names.clone() },
+                GrantObjects::AllProceduresInSchema { schemas: names.clone() },
+                GrantObjects::AllRoutinesInSchema { schemas: names.clone() },
                 GrantObjects::FutureTablesInSchema { schemas: names.clone() },
                 GrantObjects::FutureViewsInSchema { schemas: names.clone() },
                 GrantObjects::FutureExternalTablesInSchema { schemas: names.clone() },
@@ -8599,7 +8605,8 @@ mod tests {
                 GrantObjects::ReplicationGroup(names.clone()),
                 GrantObjects::ExternalVolumes(names.clone()),
                 GrantObjects::Procedures(vec![FunctionDesc { name: name.clone(), args: None }]),
-                GrantObjects::Functions(vec![FunctionDesc { name, args: None }]),
+                GrantObjects::Functions(vec![FunctionDesc { name: name.clone(), args: None }]),
+                GrantObjects::Routines(vec![FunctionDesc { name, args: None }]),
             ];
 
             for form in &forms {

@@ -96,6 +96,21 @@ fn a_schema_wide_grant_over_a_run_time_name_is_refused() {
          CREATE ROLE r;
          GRANT USAGE ON FUNCTION IDENTIFIER('app').f TO r",
     );
+    assert_refused(
+        "CREATE SCHEMA app;
+         CREATE ROLE r;
+         GRANT EXECUTE ON ROUTINE IDENTIFIER('app').f() TO r",
+    );
+    assert_refused(
+        "CREATE SCHEMA app;
+         CREATE ROLE r;
+         GRANT EXECUTE ON ALL ROUTINES IN SCHEMA IDENTIFIER('app') TO r",
+    );
+    assert_refused(
+        "CREATE SCHEMA app;
+         CREATE ROLE r;
+         GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA IDENTIFIER('app') TO r",
+    );
 }
 
 /// Nothing about ordinary names changes, including the quoted spelling of the

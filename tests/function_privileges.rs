@@ -260,6 +260,65 @@ fn all_functions_in_schema_covers_the_functions_already_there() {
     );
 }
 
+/// `ROUTINE` names a function or a procedure, and this model holds only
+/// functions, so it reaches exactly what `FUNCTION` reaches.
+#[test]
+fn a_routine_target_reaches_its_function() {
+    let db = parse(
+        "CREATE ROLE bob;
+         CREATE FUNCTION f(INT) RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION f(TEXT) RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         REVOKE EXECUTE ON ROUTINE f(INT) FROM PUBLIC;
+         GRANT EXECUTE ON ROUTINE f(INT) TO bob WITH GRANT OPTION;",
+    )
+    .expect("schema parses");
+    let bob = role(&db, "bob");
+    let reached = function(&db, "f", &["INT"]);
+    let other = function(&db, "f", &["TEXT"]);
+
+    assert_eq!(reached.is_executable_by_public(&db), Ok(false));
+    assert_eq!(reached.can_execute(bob, &db), Ok(true));
+    assert_eq!(reached.can_grant_execute(bob, &db), Ok(true));
+    assert_eq!(other.is_executable_by_public(&db), Ok(true));
+    assert_eq!(other.can_grant_execute(bob, &db), Ok(false));
+}
+
+/// `ALL ROUTINES` covers the functions the schema holds when it runs, like
+/// `ALL FUNCTIONS`.
+#[test]
+fn all_routines_in_schema_covers_the_functions_already_there() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.before() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION outside() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA app FROM PUBLIC;
+         CREATE FUNCTION app.after() RETURNS INT LANGUAGE sql AS 'SELECT 1';",
+    )
+    .expect("schema parses");
+
+    assert_eq!(function(&db, "before", &[]).is_executable_by_public(&db), Ok(false));
+    assert_eq!(function(&db, "outside", &[]).is_executable_by_public(&db), Ok(true));
+    assert_eq!(function(&db, "after", &[]).is_executable_by_public(&db), Ok(true));
+}
+
+/// `ALL PROCEDURES` leaves every function alone, as no function is a
+/// procedure.
+#[test]
+fn all_procedures_in_schema_reaches_no_function() {
+    let db = parse(
+        "CREATE ROLE bob;
+         CREATE SCHEMA app;
+         CREATE FUNCTION app.f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         REVOKE EXECUTE ON ALL PROCEDURES IN SCHEMA app FROM PUBLIC;
+         GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA app TO bob WITH GRANT OPTION;",
+    )
+    .expect("schema parses");
+    let f = function(&db, "f", &[]);
+
+    assert_eq!(f.is_executable_by_public(&db), Ok(true));
+    assert_eq!(f.can_grant_execute(role(&db, "bob"), &db), Ok(false));
+}
+
 #[test]
 fn function_grants_are_not_table_or_column_grants() {
     let db = parse(
@@ -267,7 +326,10 @@ fn function_grants_are_not_table_or_column_grants() {
          CREATE SCHEMA app;
          CREATE FUNCTION app.f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
          GRANT EXECUTE ON FUNCTION app.f() TO bob;
-         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO bob;",
+         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO bob;
+         GRANT EXECUTE ON ROUTINE app.f() TO bob;
+         GRANT EXECUTE ON ALL ROUTINES IN SCHEMA app TO bob;
+         GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA app TO bob;",
     )
     .expect("schema parses");
 
@@ -282,6 +344,8 @@ fn the_closed_world_refuses_a_function_the_schema_does_not_declare() {
         "CREATE ROLE bob; GRANT EXECUTE ON FUNCTION nope() TO bob;",
         // No procedure can be declared in this model.
         "CREATE ROLE bob; GRANT EXECUTE ON PROCEDURE nope() TO bob;",
+        "CREATE ROLE bob; GRANT EXECUTE ON ROUTINE nope() TO bob;",
+        "REVOKE EXECUTE ON ROUTINE nope() FROM PUBLIC;",
     ] {
         let result = parse(sql);
         assert!(
@@ -301,23 +365,40 @@ fn the_closed_world_refuses_a_function_the_schema_does_not_declare() {
         matches!(&result, Err(Error::RoleNotFoundForGrant { role_name }) if role_name == "bob"),
         "got {result:?}"
     );
+
+    // The schema-wide forms still refuse a grantee naming no role.
+    for sql in [
+        "CREATE SCHEMA app; GRANT EXECUTE ON ALL ROUTINES IN SCHEMA app TO bob;",
+        "CREATE SCHEMA app; GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA app TO bob;",
+    ] {
+        let result = parse(sql);
+        assert!(
+            matches!(&result, Err(Error::RoleNotFoundForGrant { role_name }) if role_name == "bob"),
+            "{sql}: got {result:?}"
+        );
+    }
 }
 
 #[test]
 fn the_open_world_reports_a_grant_on_a_function_the_schema_does_not_declare() {
-    let db = open_world("GRANT EXECUTE ON FUNCTION auth.uid() TO app;").expect("schema parses");
+    for sql in [
+        "GRANT EXECUTE ON FUNCTION auth.uid() TO app;",
+        "GRANT EXECUTE ON ROUTINE auth.uid() TO app;",
+    ] {
+        let db = open_world(sql).expect("schema parses");
 
-    let unresolved: Vec<_> =
-        db.unresolved_access_references().expect("targets are well formed").collect();
-    assert!(
-        matches!(unresolved[..], [UnresolvedAccessReference::GrantFunction(function)]
-            if function.to_string() == "auth.uid()"),
-        "the absent function is reported, and its grantee goes with it: {unresolved:?}"
-    );
-    assert!(matches!(
-        db.validate_access_targets(),
-        Err(Error::FunctionNotFoundForGrant { function_name }) if function_name == "auth.uid()"
-    ));
+        let unresolved: Vec<_> =
+            db.unresolved_access_references().expect("targets are well formed").collect();
+        assert!(
+            matches!(unresolved[..], [UnresolvedAccessReference::GrantFunction(function)]
+                if function.to_string() == "auth.uid()"),
+            "{sql}: the absent function is reported, and its grantee goes with it: {unresolved:?}"
+        );
+        assert!(matches!(
+            db.validate_access_targets(),
+            Err(Error::FunctionNotFoundForGrant { function_name }) if function_name == "auth.uid()"
+        ));
+    }
 
     // A revoke naming nothing changes nothing, as for tables.
     let db =
@@ -470,6 +551,20 @@ fn a_privilege_functions_do_not_have_is_refused() {
         matches!(&result, Err(Error::InvalidFunctionPrivilege { privilege }) if privilege == "SELECT"),
         "got {result:?}"
     );
+
+    for sql in [
+        "CREATE ROLE bob;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         GRANT SELECT ON ROUTINE f() TO bob;",
+        "CREATE ROLE bob; CREATE SCHEMA app; GRANT SELECT ON ALL ROUTINES IN SCHEMA app TO bob;",
+        "CREATE ROLE bob; CREATE SCHEMA app; GRANT SELECT ON ALL PROCEDURES IN SCHEMA app TO bob;",
+    ] {
+        let result = parse(sql);
+        assert!(
+            matches!(&result, Err(Error::InvalidFunctionPrivilege { privilege }) if privilege == "SELECT"),
+            "{sql}: got {result:?}"
+        );
+    }
 }
 
 /// The keyword names whoever runs the statement, which is no declared role.
