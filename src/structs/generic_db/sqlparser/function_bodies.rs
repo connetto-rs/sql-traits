@@ -1,21 +1,36 @@
-//! Binding the relations a function's `RETURN` body reads, as PostgreSQL does
-//! at `CREATE FUNCTION` time.
+//! Binding the relations a function body reads, as PostgreSQL does at
+//! `CREATE FUNCTION` time.
 //!
-//! A body written `RETURN <expression>` parses the body up front, so its
-//! relation names resolve under the session's `search_path` in effect at
-//! creation, exactly as a view's definition does. A name the body cannot
-//! resolve refuses the statement. A body written as a string is never bound,
-//! and neither is a name a visible `WITH` item answers or a table function.
+//! Two body forms bind at creation: a `RETURN <expression>` statement and
+//! the statements of a `BEGIN ATOMIC` block. Every relation name in them
+//! resolves under the session's `search_path` in effect at creation, exactly
+//! as a view's definition does, and a name that does not resolve refuses the
+//! statement. A block also binds the target of each `INSERT`, which sits
+//! outside any query. A `CALL` names a procedure, which this model does not
+//! hold, so only the relations its arguments read are bound. `SET` is not
+//! yet supported by PostgreSQL in an unquoted SQL function body, so a block
+//! holding one is refused. A body written as a string is never bound, and
+//! neither is a name a visible `WITH` item answers or a table function.
+//!
+//! A block's statements are also analyzed the way PostgreSQL analyzes them
+//! at creation: a clause reference carrying a schema or a database part is
+//! dropped to the parts it keeps when it names a relation the statement's
+//! own clauses scope under a matching schema, and refused otherwise, and a
+//! factor name spelling this catalog's qualifier is dropped.
 
 use alloc::{boxed::Box, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CreateFunction, CreateFunctionBody, Expr, GroupByExpr, ObjectName, Query, Select, SelectFlavor,
-    SelectItem, SetExpr, TableFactor, VisitMut, VisitorMut, helpers::attached_token::AttachedToken,
+    CreateFunction, CreateFunctionBody, Expr, GroupByExpr, Insert, ObjectName, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, Statement, TableFactor, TableObject, VisitMut, VisitorMut,
+    helpers::attached_token::AttachedToken,
 };
 
-use super::{ParserDBBuilder, bind_reference, views::relations_read_in};
+use super::{
+    ParserDBBuilder, bind_reference,
+    views::{relations_read_in, statements_read},
+};
 use crate::{
     errors::Error,
     utils::{last_str, object_name::RelationKey, with_scopes::WithScopes},
@@ -24,50 +39,78 @@ use crate::{
 /// Binds every stored relation the body of `function` reads, refusing the
 /// statement when one of them is not held.
 ///
+/// A `BEGIN ATOMIC` body is also analyzed the way PostgreSQL analyzes it at
+/// `CREATE FUNCTION`: a clause reference with a schema or a database part is
+/// kept only when it names a relation the statement's own clauses scope
+/// under a matching schema, dropped to the parts it keeps, and a reference
+/// or a factor name naming another database is refused.
+///
 /// # Errors
 ///
 /// Returns [`Error::RelationNotFoundForFunctionBody`] naming the first
 /// relation the body names that the builder does not hold, the way PostgreSQL
-/// refuses the `CREATE FUNCTION`.
+/// refuses the `CREATE FUNCTION`. A `BEGIN ATOMIC` body is also refused with
+/// [`Error::FunctionBodyStatementUnsupported`] for a `SET` statement, which
+/// PostgreSQL does not support in an unquoted SQL function body, and with
+/// [`Error::IdentifierLookupError`] for a reference or a factor name it will
+/// not analyze.
 pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> Result<(), Error> {
-    let Some(CreateFunctionBody::Return(expression)) = function.function_body.as_mut() else {
+    let Some(body) = function.function_body.as_mut() else {
         return Ok(());
     };
-    match expression.visit(&mut BodyBinder { builder, scopes: WithScopes::default() }) {
-        ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(missing) => {
-            Err(Error::RelationNotFoundForFunctionBody {
-                relation_name: missing.to_string(),
-                function_name: last_str(&function.name).to_string(),
-            })
+    match body {
+        CreateFunctionBody::Return(expression) => {
+            let mut binder =
+                BodyBinder { builder, bare_temporary: false, scopes: WithScopes::default() };
+            match expression.visit(&mut binder) {
+                ControlFlow::Continue(()) => Ok(()),
+                ControlFlow::Break(missing) => missing_relation(&missing, function),
+            }
         }
+        CreateFunctionBody::BeginAtomic(block) => {
+            super::view_rewrites::normalize_block_references(builder, &mut block.statements)?;
+            let mut binder =
+                BodyBinder { builder, bare_temporary: true, scopes: WithScopes::default() };
+            for statement in &mut block.statements {
+                if let Statement::Set(_) = statement {
+                    return Err(Error::FunctionBodyStatementUnsupported {
+                        statement: statement.to_string(),
+                        function_name: last_str(&function.name).to_string(),
+                    });
+                }
+                match statement.visit(&mut binder) {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(missing) => return missing_relation(&missing, function),
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
-/// The query shape of a body that holds a parsed expression, or [`None`] for
-/// a body written as a string or as statements.
-///
-/// The wrapper is the shape the rename machinery rewrites and checks, so a
-/// body gains a relation to follow only by holding one of the variants here.
-/// When the parser grows the `BEGIN ATOMIC` body, its expression joins the
-/// match here.
-pub(super) fn definition(body: &CreateFunctionBody) -> Option<Query> {
-    match body {
-        CreateFunctionBody::Return(expr) => {
-            Some(Query {
-                with: None,
-                body: Box::new(SetExpr::Select(Box::new(body_select(expr)))),
-                order_by: None,
-                limit_clause: None,
-                fetch: None,
-                locks: Vec::new(),
-                for_clause: None,
-                settings: None,
-                format_clause: None,
-                pipe_operators: Vec::new(),
-            })
-        }
-        _ => None,
+/// The refusal a body's unresolvable relation names.
+fn missing_relation(missing: &ObjectName, function: &CreateFunction) -> Result<(), Error> {
+    Err(Error::RelationNotFoundForFunctionBody {
+        relation_name: missing.to_string(),
+        function_name: last_str(&function.name).to_string(),
+    })
+}
+
+/// The query a `RETURN` body's expression is wrapped in, the shape the
+/// rename machinery rewrites and checks.
+pub(super) fn definition(expr: &Expr) -> Query {
+    Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(body_select(expr)))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
     }
 }
 
@@ -113,17 +156,51 @@ pub(super) fn write_definition(body: &mut Option<CreateFunctionBody>, query: Que
     }
 }
 
-/// The normalized identity of every relation a function body reads, or
-/// [`None`] for a body that holds no parsed expression.
-pub(super) fn relations_read(body: &CreateFunctionBody) -> Option<Vec<RelationKey>> {
-    definition(body).map(|definition| relations_read_in(&definition))
+/// Writes the respelled statements of a `BEGIN ATOMIC` body back into `body`.
+pub(super) fn write_statements(body: &mut Option<CreateFunctionBody>, statements: Vec<Statement>) {
+    if let Some(CreateFunctionBody::BeginAtomic(block)) = body {
+        block.statements = statements;
+    }
+}
+
+/// The normalized identity of every relation a function body reads or
+/// writes, or [`None`] for a body PostgreSQL does not bind.
+pub(super) fn relations_read(
+    builder: &ParserDBBuilder,
+    body: &CreateFunctionBody,
+) -> Option<Vec<RelationKey>> {
+    match body {
+        CreateFunctionBody::Return(expr) => Some(relations_read_in(&definition(expr))),
+        CreateFunctionBody::BeginAtomic(block) => Some(statements_read(builder, &block.statements)),
+        _ => None,
+    }
 }
 
 /// Binds every stored relation a function body reads, stopping at the first
 /// one the builder does not hold.
 struct BodyBinder<'builder> {
     builder: &'builder ParserDBBuilder,
+    /// A `BEGIN ATOMIC` body drops the temporary schema a name binds under,
+    /// the way PostgreSQL stores it, while a `RETURN` body keeps it.
+    bare_temporary: bool,
     scopes: WithScopes,
+}
+
+impl BodyBinder<'_> {
+    /// Binds one factor's name, refusing it when no stored relation answers.
+    fn bind_factor_name(&mut self, name: &mut ObjectName) -> ControlFlow<ObjectName> {
+        if !self.scopes.reads_item(name) {
+            let Some(bound) = self.builder.bound_relation(name) else {
+                return ControlFlow::Break(name.clone());
+            };
+            if bound.temporary && self.bare_temporary {
+                name.0.truncate(1);
+            } else {
+                bind_reference(name, bound.qualifier);
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 impl VisitorMut for BodyBinder<'_> {
@@ -140,13 +217,17 @@ impl VisitorMut for BodyBinder<'_> {
     }
 
     fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
-        if let TableFactor::Table { name, args: None, .. } = factor
-            && !self.scopes.reads_item(name)
-        {
-            let Some(bound) = self.builder.bound_relation(name) else {
-                return ControlFlow::Break(name.clone());
-            };
-            bind_reference(name, bound.qualifier);
+        if let TableFactor::Table { name, args: None, .. } = factor {
+            return self.bind_factor_name(name);
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// The target of an `INSERT` sits outside any query, where the factor
+    /// hook does not reach.
+    fn pre_visit_statement(&mut self, statement: &mut Statement) -> ControlFlow<Self::Break> {
+        if let Statement::Insert(Insert { table: TableObject::TableName(name), .. }) = statement {
+            return self.bind_factor_name(name);
         }
         ControlFlow::Continue(())
     }
@@ -154,7 +235,7 @@ impl VisitorMut for BodyBinder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::{ast::Ident, dialect::PostgreSqlDialect};
 
     use super::*;
     use crate::{
@@ -168,18 +249,32 @@ mod tests {
     #[test]
     fn a_rewrite_leaves_a_string_body_as_written() {
         let db = ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
-             CREATE FUNCTION g() RETURNS INT LANGUAGE sql RETURN 2;",
+            "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';",
         )
         .expect("the schema parses");
-        let function = |name| {
-            db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
-                .expect("unambiguous lookup")
-                .expect("the function exists")
-        };
-        let wrapper = function("g").function_body.as_ref().and_then(definition).expect("a wrapper");
-        let mut string = function("f").function_body.clone();
-        write_definition(&mut string, wrapper);
-        assert_eq!(string, function("f").function_body);
+        let function = db
+            .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("the function exists");
+        let mut string = function.function_body.clone();
+        write_definition(&mut string, definition(&Expr::Identifier(Ident::new("x"))));
+        assert_eq!(string, function.function_body);
+    }
+
+    /// Respelling a statement body must never turn an expression body into a
+    /// `BEGIN ATOMIC` one.
+    #[test]
+    fn a_rewrite_leaves_an_expression_body_as_written() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE FUNCTION f() RETURNS INT LANGUAGE sql RETURN 1;",
+        )
+        .expect("the schema parses");
+        let function = db
+            .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("the function exists");
+        let mut body = function.function_body.clone();
+        write_statements(&mut body, Vec::new());
+        assert_eq!(body, function.function_body);
     }
 }

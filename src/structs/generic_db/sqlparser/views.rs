@@ -29,8 +29,9 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, SelectItem, SetExpr, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    AlterTableOperation, CreateView, Expr, Ident, Insert, ObjectName, ObjectNamePart, Owner, Query,
+    RenameTableNameKind, SelectItem, SetExpr, Statement, TableFactor, TableObject, Visit, VisitMut,
+    Visitor, VisitorMut,
 };
 
 use super::{
@@ -47,8 +48,8 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         object_name::{
-            RelationKey, qualifier_of, stored_function_key, stored_view_key, target_key,
-            target_name_from_object_name,
+            RelationKey, TEMPORARY_SCHEMA, qualifier_of, stored_function_key, stored_view_key,
+            target_key, target_name_from_object_name,
         },
         output_from_wildcard,
         with_scopes::WithScopes,
@@ -493,7 +494,7 @@ fn rename_view(
                 key,
                 to: ObjectName(vec![ObjectNamePart::Identifier(new_ident.clone())]),
             }],
-        );
+        )?;
     }
     if let Some(host) = &host {
         rules::follow_relation_rename(&mut builder, host, new_ident);
@@ -511,10 +512,11 @@ fn rename_view(
 /// # Errors
 ///
 /// Returns [`LookupError::ColumnNotFound`] when the view exposes no column of
-/// the old name, [`Error::UnsupportedAlterTableOperation`] when the model
 /// cannot name every column the view exposes and the declaration's own list
-/// does not name the old one, and [`Error::ColumnAlreadyExists`] when the view
-/// already exposes a column of the new name.
+/// does not name the old one, [`Error::ColumnAlreadyExists`] when the view
+/// already exposes a column of the new name, and
+/// [`Error::FunctionBodyBlocksColumnRename`] when a function body writes to
+/// the view in a statement the model could not bind.
 fn rename_view_column(
     mut builder: ParserDBBuilder,
     name: &ObjectName,
@@ -595,7 +597,7 @@ fn rename_view_column(
             &mut builder,
             readers,
             &[Rename::Column { key, ordinal, to: new_name.clone(), columns }],
-        );
+        )?;
     }
     if let Some(host) = &host {
         rules::follow_column_rename(&mut builder, host, old_name, new_name);
@@ -743,12 +745,15 @@ fn bind_definition(builder: &ParserDBBuilder, query: &mut Query) -> Option<Strin
 }
 
 /// Collects the identity of every stored relation a bound definition reads.
-struct RelationsRead {
+struct RelationsRead<'builder, 'read> {
+    /// The builder the names bound against, which a block statement needs to
+    /// reach a temporary relation under its temporary schema.
+    builder: Option<&'builder ParserDBBuilder>,
     scopes: WithScopes,
-    read: Vec<RelationKey>,
+    read: &'read mut Vec<RelationKey>,
 }
 
-impl Visitor for RelationsRead {
+impl Visitor for RelationsRead<'_, '_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
@@ -764,9 +769,9 @@ impl Visitor for RelationsRead {
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
         if let TableFactor::Table { name, args: None, .. } = factor
             && !self.scopes.reads_item(name)
-            && let Some(target) = target_name_from_object_name(name)
+            && let Some(key) = bound_read_key(self.builder, name)
         {
-            self.read.push(target_key(&target, IdentifierCase::AsWritten));
+            self.read.push(key);
         }
         ControlFlow::Continue(())
     }
@@ -782,10 +787,70 @@ fn relations_read_by<V: ViewLike>(view: &V) -> Vec<RelationKey> {
 
 /// The normalized identity of every relation a bound definition reads.
 pub(super) fn relations_read_in(definition: &Query) -> Vec<RelationKey> {
-    let mut visitor = RelationsRead { scopes: WithScopes::default(), read: Vec::new() };
+    let mut read = Vec::new();
+    let mut visitor =
+        RelationsRead { builder: None, scopes: WithScopes::default(), read: &mut read };
     let walk = definition.visit(&mut visitor);
     debug_assert!(walk.is_continue(), "the visitor never breaks");
-    visitor.read
+    read
+}
+
+/// The key a stored name reads its relation by, the relation it bound under
+/// at ingestion, which is the temporary schema for a temporary relation, or
+/// the key its written parts name for a name that bound nowhere.
+pub(super) fn bound_read_key(
+    builder: Option<&ParserDBBuilder>,
+    name: &ObjectName,
+) -> Option<RelationKey> {
+    let target = target_name_from_object_name(name)?;
+    let case = IdentifierCase::AsWritten;
+    match builder {
+        Some(builder) => {
+            let bound = builder.bound_relation(name)?;
+            let schema = if bound.temporary {
+                case.compared_form(TEMPORARY_SCHEMA, false)
+            } else {
+                match &bound.qualifier {
+                    Some(qualifier) => {
+                        case.compared_form(&qualifier.value, qualifier.quote_style.is_some())
+                    }
+                    None => case.compared_form("public", false),
+                }
+            };
+            Some(RelationKey {
+                schema: schema.into_owned(),
+                name: case.compared_form(target.name(), target.name_is_quoted()).into_owned(),
+            })
+        }
+        None => Some(target_key(&target, case)),
+    }
+}
+
+/// The normalized identity of every relation a block statement reads or
+/// writes, which is every relation its queries read and the target its
+/// writes name.
+pub(super) fn statements_read(
+    builder: &ParserDBBuilder,
+    statements: &[Statement],
+) -> Vec<RelationKey> {
+    let mut read = Vec::new();
+    for statement in statements {
+        // An `INSERT`'s target sits outside any query, so it is named
+        // before the statement is visited.
+        if let Statement::Insert(Insert { table: TableObject::TableName(name), .. }) = statement
+            && let Some(key) = bound_read_key(Some(builder), name)
+        {
+            read.push(key);
+        }
+        let mut visitor = RelationsRead {
+            builder: Some(builder),
+            scopes: WithScopes::default(),
+            read: &mut read,
+        };
+        let walk = statement.visit(&mut visitor);
+        debug_assert!(walk.is_continue(), "the visitor never breaks");
+    }
+    read
 }
 
 /// Every view and function reading the relation `key` names, and every
@@ -826,7 +891,7 @@ pub(super) fn dependent_views(
                 function
                     .function_body
                     .as_ref()
-                    .and_then(function_bodies::relations_read)
+                    .and_then(|body| function_bodies::relations_read(builder, body))
                     .unwrap_or_default(),
             )
         }))
