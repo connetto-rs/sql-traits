@@ -23,11 +23,11 @@ use crate::{
         call_typing::{Selection, reached_functions, resolve_call},
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
-            function_has_stored_identity, function_search_path, relation_name_is_claimed,
-            resolve_function_in_iter, resolve_function_on_search_path_in_iter,
-            resolve_one_function, resolve_sequence_in_iter,
-            resolve_sequence_on_search_path_in_iter, resolve_target_in_iter,
-            resolve_target_on_search_path_in_iter, resolve_view_in_iter,
+            RelationKey, function_has_stored_identity, function_search_path,
+            relation_name_is_claimed, resolve_function_in_iter,
+            resolve_function_on_search_path_in_iter, resolve_one_function,
+            resolve_sequence_in_iter, resolve_sequence_on_search_path_in_iter,
+            resolve_target_in_iter, resolve_target_on_search_path_in_iter, resolve_view_in_iter,
             resolve_view_on_search_path_in_iter,
         },
         postgres_types::PgType,
@@ -767,6 +767,73 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             return Ok(Some(Relation::MaterializedView(view)));
         }
         Ok(self.resolve_target_sequence(target, case)?.map(Relation::Sequence))
+    }
+
+    /// Resolves a name a statement wrote into the relation it denotes when the
+    /// statement runs under `search_path` rather than under
+    /// [`Self::search_path`], applying every other rule of
+    /// [`Self::resolve_target_relation`].
+    ///
+    /// A function that sets its own `search_path` runs a string body under
+    /// that path, whatever the caller's session holds, which is what this
+    /// answers for. The temporary schema `pg_temp` is still searched first
+    /// unless `search_path` names it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
+    /// more than one relation. A name matching none is `Ok(None)`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "CREATE SCHEMA app; CREATE VIEW app.docs AS SELECT 1 AS id; CREATE TABLE docs (id INT);",
+    /// )?;
+    /// let docs = || TargetName::new("docs", false);
+    /// let case = IdentifierCase::AsWritten;
+    /// let on_app = db.resolve_target_relation_on_path(docs(), &[("app", false)], case)?;
+    /// assert!(matches!(on_app, Some(Relation::View(_))));
+    /// let on_public = db.resolve_target_relation_on_path(docs(), &[("public", false)], case)?;
+    /// assert!(matches!(on_public, Some(Relation::Table(_))));
+    /// // An emptied path reaches no unqualified name.
+    /// assert!(db.resolve_target_relation_on_path(docs(), &[("", false)], case)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn resolve_target_relation_on_path<S: AsRef<str>>(
+        &self,
+        target: TargetName<'_>,
+        search_path: &[(S, bool)],
+        case: IdentifierCase,
+    ) -> Result<Option<Relation<'_, Self>>, LookupError> {
+        let path = || search_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
+        let claimed = |key: &RelationKey| relation_name_is_claimed(self, key, case);
+        if let Some(table) =
+            resolve_target_on_search_path_in_iter(self.tables(), &target, path, case, claimed)?
+        {
+            return Ok(Some(Relation::Table(table)));
+        }
+        if let Some(view) =
+            resolve_view_on_search_path_in_iter(self.views(), &target, path, case, claimed)?
+        {
+            return Ok(Some(Relation::View(view)));
+        }
+        if let Some(view) = resolve_view_on_search_path_in_iter(
+            self.materialized_views(),
+            &target,
+            path,
+            case,
+            claimed,
+        )? {
+            return Ok(Some(Relation::MaterializedView(view)));
+        }
+        resolve_sequence_on_search_path_in_iter(self.sequences(), &target, path, case, claimed)
+            .map(|sequence| sequence.map(Relation::Sequence))
     }
 
     /// Resolves a reference a stored object carries into the relation it

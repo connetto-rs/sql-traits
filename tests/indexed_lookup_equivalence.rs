@@ -297,6 +297,7 @@ fn oracle_by_target_with<'a>(
 #[test]
 fn every_comparison_matches_scan() {
     for (db, path_sql) in fixture_variants() {
+        let path: Vec<(&str, bool)> = db.search_path().collect();
         for target in target_matrix() {
             for case in [IdentifierCase::AsWritten, IdentifierCase::Folded, IdentifierCase::Exact] {
                 let shown = target.to_string();
@@ -304,6 +305,22 @@ fn every_comparison_matches_scan() {
                     outcome(&db.resolve_target_table(target.clone(), case)),
                     outcome(&oracle_resolve_with(&db, &target, case)),
                     "resolve_target_table({shown}, {case:?}) on {path_sql:?}"
+                );
+                assert_eq!(
+                    outcome(&db.resolve_target_relation_on_path(target.clone(), &path, case).map(
+                        |relation| {
+                            relation.and_then(|relation| {
+                                match relation {
+                                    Relation::Table(table) => Some(table),
+                                    Relation::View(_)
+                                    | Relation::MaterializedView(_)
+                                    | Relation::Sequence(_) => None,
+                                }
+                            })
+                        }
+                    )),
+                    outcome(&oracle_resolve_with(&db, &target, case)),
+                    "resolve_target_relation_on_path({shown}, {case:?}) on {path_sql:?}"
                 );
                 assert_eq!(
                     outcome(&db.table_by_target(target.clone(), case)),

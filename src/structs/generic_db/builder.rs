@@ -312,7 +312,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
 
     /// Returns the path a database starts with, and the one `RESET` restores.
     pub(crate) fn default_search_path() -> Vec<(String, bool)> {
-        alloc::vec![("public".to_string(), false)]
+        crate::utils::object_name::DEFAULT_SEARCH_PATH
+            .iter()
+            .map(|&(schema, quoted)| (schema.to_string(), quoted))
+            .collect()
     }
 
     /// Returns a mutable reference to the table grants list.

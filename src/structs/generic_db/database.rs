@@ -175,7 +175,26 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
-        self.resolve_target_table_on_path(&target, case)
+        self.resolve_relation_on_path(
+            &target,
+            || self.search_path(),
+            case,
+            Self::probed_tables,
+            render_table_candidate,
+        )
+    }
+
+    fn resolve_target_relation_on_path<S: AsRef<str>>(
+        &self,
+        target: TargetName<'_>,
+        search_path: &[(S, bool)],
+        case: IdentifierCase,
+    ) -> Result<Option<Relation<'_, Self>>, LookupError> {
+        self.resolve_relation_on_path_any(
+            &target,
+            || search_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted)),
+            case,
+        )
     }
 
     fn resolve_target_view(
@@ -183,7 +202,13 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::View>, LookupError> {
-        self.resolve_target_view_on_path(&target, case)
+        self.resolve_relation_on_path(
+            &target,
+            || self.search_path(),
+            case,
+            Self::probed_views,
+            render_view_candidate,
+        )
     }
 
     fn resolve_target_materialized_view(
@@ -191,7 +216,13 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
-        self.resolve_target_materialized_view_on_path(&target, case)
+        self.resolve_relation_on_path(
+            &target,
+            || self.search_path(),
+            case,
+            Self::probed_materialized_views,
+            render_view_candidate,
+        )
     }
 
     fn resolve_target_relation(
@@ -199,7 +230,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<Relation<'_, Self>>, LookupError> {
-        self.resolve_relation_on_path_any(&target, case)
+        self.resolve_relation_on_path_any(&target, || self.search_path(), case)
     }
 
     fn resolve_bound_relation(
@@ -217,6 +248,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     ) -> Result<Option<&Self::Sequence>, LookupError> {
         self.resolve_relation_on_path(
             &target,
+            || self.search_path(),
             case,
             Self::probed_sequences,
             render_sequence_candidate,
@@ -639,72 +671,26 @@ impl<P: SchemaProfile> GenericDB<P> {
         resolve_target_from_candidates(target, &self.probed_tables(&probe))
     }
 
-    /// Resolves a written target through the index and the search path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
-    /// more than one table in the schema that wins.
-    pub(super) fn resolve_target_table_on_path(
-        &self,
-        target: &TargetName<'_>,
-        case: IdentifierCase,
-    ) -> Result<Option<&P::Table>, LookupError> {
-        self.resolve_relation_on_path(target, case, Self::probed_tables, render_table_candidate)
-    }
-
-    /// Resolves a written target to a plain view, applying the search path to
-    /// an unqualified name exactly as a table lookup does.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
-    /// more than one view in the schema that wins.
-    pub(super) fn resolve_target_view_on_path(
-        &self,
-        target: &TargetName<'_>,
-        case: IdentifierCase,
-    ) -> Result<Option<&P::View>, LookupError> {
-        self.resolve_relation_on_path(target, case, Self::probed_views, render_view_candidate)
-    }
-
-    /// Resolves a written target to a materialized view, applying the search
-    /// path to an unqualified name exactly as a table lookup does.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
-    /// more than one materialized view in the schema that wins.
-    pub(super) fn resolve_target_materialized_view_on_path(
-        &self,
-        target: &TargetName<'_>,
-        case: IdentifierCase,
-    ) -> Result<Option<&P::MaterializedView>, LookupError> {
-        self.resolve_relation_on_path(
-            target,
-            case,
-            Self::probed_materialized_views,
-            render_view_candidate,
-        )
-    }
-
-    /// Resolves a written target to one relation of a kind, walking the search
-    /// path for an unqualified name, with the temporary schema first unless
-    /// the path names it.
-    fn resolve_relation_on_path<'db, R>(
+    /// Resolves a written target to one relation of a kind, walking
+    /// `search_path` for an unqualified name, with the temporary schema first
+    /// unless the path names it.
+    fn resolve_relation_on_path<'db, 'path, R, I>(
         &'db self,
         target: &TargetName<'_>,
+        search_path: impl Fn() -> I,
         case: IdentifierCase,
         candidates_of: impl for<'probe> Fn(&'db Self, &'probe IndexProbe) -> Vec<&'db R>,
         render: impl Fn(&R) -> String,
-    ) -> Result<Option<&'db R>, LookupError> {
+    ) -> Result<Option<&'db R>, LookupError>
+    where
+        I: Iterator<Item = (&'path str, bool)>,
+    {
         if target.schema().is_some() {
             let probe = IndexProbe::new(target, case, None);
             return resolve_one_relation(target, &candidates_of(self, &probe), render);
         }
 
-        let path = || self.search_path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted));
-        for (entry_schema, entry_quoted) in relation_search_path(path) {
+        for (entry_schema, entry_quoted) in relation_search_path(search_path) {
             let probe = IndexProbe::new(target, case, Some((entry_schema, entry_quoted)));
             if self.probed_name_is_taken(&probe) {
                 // Reported under the written name: the entry qualifier is
@@ -717,25 +703,28 @@ impl<P: SchemaProfile> GenericDB<P> {
     }
 
     /// Resolves a written target to the relation of any kind it denotes,
-    /// walking the search path for an unqualified name exactly as a table
-    /// lookup does, with the temporary schema first unless the path names it.
+    /// walking `search_path` for an unqualified name exactly as a table lookup
+    /// does, with the temporary schema first unless the path names it.
     ///
     /// # Errors
     ///
     /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
     /// more than one relation in the schema that wins.
-    fn resolve_relation_on_path_any<'db>(
+    fn resolve_relation_on_path_any<'db, 'path, I>(
         &'db self,
         target: &TargetName<'_>,
+        search_path: impl Fn() -> I,
         case: IdentifierCase,
-    ) -> Result<Option<Relation<'db, Self>>, LookupError> {
+    ) -> Result<Option<Relation<'db, Self>>, LookupError>
+    where
+        I: Iterator<Item = (&'path str, bool)>,
+    {
         if target.schema().is_some() {
             let probe = IndexProbe::new(target, case, None);
             return self.resolve_probed_relation(&probe, target);
         }
 
-        let path = || self.search_path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted));
-        for (entry_schema, entry_quoted) in relation_search_path(path) {
+        for (entry_schema, entry_quoted) in relation_search_path(search_path) {
             let probe = IndexProbe::new(target, case, Some((entry_schema, entry_quoted)));
             if self.probed_name_is_taken(&probe) {
                 return self.resolve_probed_relation(&probe, target);

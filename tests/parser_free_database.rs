@@ -920,6 +920,21 @@ impl FunctionLike for MemoryFunction {
         &[]
     }
 
+    fn referenced_tables<'db>(
+        &self,
+        _database: &'db Self::DB,
+    ) -> Result<Vec<&'db MemoryTable>, LookupError> {
+        // This catalog holds no function bodies.
+        Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() })
+    }
+
+    fn referenced_relations<'db>(
+        &self,
+        _database: &'db Self::DB,
+    ) -> Result<Vec<Relation<'db, MemoryCatalog>>, LookupError> {
+        Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() })
+    }
+
     fn null_input_behavior(&self) -> FunctionCalledOnNull {
         FunctionCalledOnNull::CalledOnNullInput
     }
@@ -1487,6 +1502,42 @@ fn the_inherited_resolver_walks_the_default_schema() -> Result<(), LookupError> 
             .resolve_target_table(TargetName::new("absent", false), IdentifierCase::AsWritten)?
             .is_none()
     );
+
+    Ok(())
+}
+
+/// The inherited resolver walks a path the caller names in its order, in place
+/// of the catalog's own, across every relation kind.
+#[test]
+fn the_inherited_resolver_walks_a_given_path() -> Result<(), LookupError> {
+    let mut catalog = catalog();
+    catalog.views = vec![view(Some("app"), "recent", false)];
+    catalog.materialized_views = vec![view(Some("app"), "counted", true)];
+    catalog.sequences =
+        vec![MemorySequence { schema: Some(String::from("app")), name: String::from("tickets") }];
+    let case = IdentifierCase::AsWritten;
+    let found = |path: &[(&str, bool)], name: &str| -> Result<_, LookupError> {
+        Ok(catalog.resolve_target_relation_on_path(TargetName::new(name, false), path, case)?.map(
+            |relation| {
+                match relation {
+                    Relation::Table(table) => format!("table {:?}", table.table_schema()),
+                    Relation::View(view) => format!("view {}", view.name),
+                    Relation::MaterializedView(view) => format!("materialized view {}", view.name),
+                    Relation::Sequence(sequence) => format!("sequence {}", sequence.name),
+                }
+            },
+        ))
+    };
+
+    let app_first = [("app", false), ("public", false)];
+    assert_eq!(found(&app_first, "docs")?.as_deref(), Some("table Some(\"app\")"));
+    assert_eq!(found(&[("public", false), ("app", false)], "docs")?.as_deref(), Some("table None"));
+    assert_eq!(found(&app_first, "recent")?.as_deref(), Some("view recent"));
+    assert_eq!(found(&app_first, "counted")?.as_deref(), Some("materialized view counted"));
+    assert_eq!(found(&app_first, "tickets")?.as_deref(), Some("sequence tickets"));
+    assert_eq!(found(&[("public", false)], "tickets")?, None);
+    // An emptied path reaches no unqualified name.
+    assert_eq!(found(&[("", false)], "docs")?, None);
 
     Ok(())
 }

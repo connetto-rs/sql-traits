@@ -11,7 +11,7 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     structs::{FunctionKind, TargetName},
-    traits::{DatabaseLike, Metadata},
+    traits::{DatabaseLike, Metadata, Relation},
     utils::{
         call_typing::{
             accepts_positional, actuals, bind, check_argument_count, declared_at_call, input_modes,
@@ -675,6 +675,114 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
 
     /// Returns the function-local configuration after later alterations.
     fn configuration_parameters(&self) -> &[FunctionDefinitionSetParam];
+
+    /// Returns every base table the body reads or writes, plain views
+    /// expanded to the base tables they read, resolved the way PostgreSQL
+    /// resolves them when the function runs, and deduplicated in first-seen
+    /// order.
+    ///
+    /// An unqualified name in a body written as a string resolves under the
+    /// function's own `search_path` when
+    /// [`configuration_parameters`](FunctionLike::configuration_parameters)
+    /// sets one, and under [`DatabaseLike::search_path`] otherwise. A body
+    /// written `RETURN <expression>` or as a `BEGIN ATOMIC` block was bound
+    /// when the function was created, so it reads the relations it reached
+    /// then, whatever path the function sets. The body is read with the rules
+    /// of
+    /// [`DataStatementLike::referenced_tables`](crate::traits::DataStatementLike::referenced_tables).
+    /// A body of several statements is read one statement after another, as
+    /// PostgreSQL 18 runs it, so a `SET` or `RESET` of `search_path` in it
+    /// reaches the statements after it. A function without a `LANGUAGE`
+    /// clause is read as SQL, which is what PostgreSQL assumes for a `RETURN`
+    /// body and what dialects without the clause mean.
+    ///
+    /// # Errors
+    ///
+    /// Which tables the body reads cannot be known when it is written in
+    /// another language ([`LookupError::FunctionBodyNotSql`]), when the
+    /// function's code lives outside the schema
+    /// ([`LookupError::FunctionBodyUnavailable`]), or when the body runs code
+    /// outside it, through `CALL`, `EXECUTE` or a `set_config` of
+    /// `search_path` before an unqualified name
+    /// ([`LookupError::FunctionBodyUnresolvable`]). Returns
+    /// [`LookupError::FunctionBodyUnparsable`] when the body text does not
+    /// parse under the database's dialect, and any error resolving a name the
+    /// body reads.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE owner_admins (owner uuid);
+    ///      CREATE FUNCTION has_admin(o uuid) RETURNS boolean LANGUAGE sql SECURITY DEFINER
+    ///          SET search_path = ''
+    ///          AS $$ SELECT EXISTS (SELECT 1 FROM public.owner_admins WHERE owner = o) $$;
+    ///      CREATE FUNCTION unreachable(o uuid) RETURNS boolean LANGUAGE sql
+    ///          SET search_path = ''
+    ///          AS $$ SELECT EXISTS (SELECT 1 FROM owner_admins WHERE owner = o) $$;",
+    /// )?;
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    /// };
+    /// let read = function("has_admin").referenced_tables(&db)?;
+    /// let names: Vec<_> = read.iter().map(|table| table.table_name()).collect();
+    /// assert_eq!(names, ["owner_admins"]);
+    /// // The emptied path carries the bare name nowhere when the function runs.
+    /// assert!(function("unreachable").referenced_tables(&db)?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn referenced_tables<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Table>, LookupError>;
+
+    /// Returns every relation the body names, whether table, plain view or
+    /// materialized view, resolved and deduplicated as
+    /// [`referenced_tables`](FunctionLike::referenced_tables) resolves them.
+    ///
+    /// This is what the body reads directly, before any view is expanded, as
+    /// [`DataStatementLike::referenced_relations`](crate::traits::DataStatementLike::referenced_relations)
+    /// answers for a statement.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`referenced_tables`](FunctionLike::referenced_tables).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id INT);
+    ///      CREATE VIEW open_docs AS SELECT id FROM docs;
+    ///      CREATE FUNCTION counted() RETURNS BIGINT LANGUAGE sql
+    ///          AS 'SELECT count(*) FROM open_docs';",
+    /// )?;
+    /// let counted = db
+    ///     .function_by_target(TargetName::new("counted", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let named = counted.referenced_relations(&db)?;
+    /// assert!(matches!(named.as_slice(), [Relation::View(view)] if view.view_name() == "open_docs"));
+    /// // The view's base table is what the body reads in the end.
+    /// let tables = counted.referenced_tables(&db)?;
+    /// assert_eq!(tables.iter().map(|table| table.table_name()).collect::<Vec<_>>(), ["docs"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn referenced_relations<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Vec<Relation<'db, Self::DB>>, LookupError>;
 
     /// Returns the null-input behavior with PostgreSQL's default folded in.
     fn null_input_behavior(&self) -> FunctionCalledOnNull;

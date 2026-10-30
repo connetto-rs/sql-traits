@@ -326,7 +326,8 @@ fn configuration_parameters_follow_create_and_alter_order() {
     assert_eq!(parameters("created"), ["SET search_path = a, pg_temp", "SET work_mem = '64kB'"]);
     assert_eq!(parameters("altered"), ["SET search_path = c", "SET statement_timeout = '1s'"]);
     assert_eq!(parameters("default_path"), ["SET search_path = DEFAULT"]);
-    assert_eq!(parameters("current_path"), ["SET search_path FROM CURRENT"]);
+    // PostgreSQL stores the path the clause read, as `pg_proc.proconfig` shows.
+    assert_eq!(parameters("current_path"), ["SET search_path = public"]);
 }
 
 #[test]

@@ -328,6 +328,40 @@ pub enum LookupError {
         /// How many argument types were given.
         types: usize,
     },
+    /// A function body is written in a language other than SQL.
+    #[error("Function `{function}` is written in `{language}`, which is not read as SQL.")]
+    FunctionBodyNotSql {
+        /// Name of the function, as written.
+        function: String,
+        /// Language the function declares, as PostgreSQL stores it.
+        language: String,
+    },
+    /// A function's code lives outside the schema: it declares no body, calls a
+    /// remote endpoint, or loads a class from a `USING` resource.
+    #[error("Function `{function}` has no body in the schema to read.")]
+    FunctionBodyUnavailable {
+        /// Name of the function, as written.
+        function: String,
+    },
+    /// A function body runs code outside it, such as `CALL`, `EXECUTE` or a
+    /// `set_config` of `search_path` before an unqualified name.
+    #[error(
+        "The body of function `{function}` runs `{statement}`, so what it reads is not known here."
+    )]
+    FunctionBodyUnresolvable {
+        /// Name of the function, as written.
+        function: String,
+        /// The statement that hides what the body reads.
+        statement: String,
+    },
+    /// A SQL function body does not parse under the database's dialect.
+    #[error("The body of function `{function}` does not parse: {reason}")]
+    FunctionBodyUnparsable {
+        /// Name of the function, as written.
+        function: String,
+        /// The parser's account of what it could not read.
+        reason: String,
+    },
 }
 
 /// Why a text could not be read back as a target name by
