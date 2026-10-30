@@ -11783,23 +11783,38 @@ mod tests {
         }
 
         /// `REFERENCES parent` with no column list points at the primary key,
-        /// so the target needs one.
+        /// so the target needs one, and a unique key declared beside it plays
+        /// no part. Verified against PostgreSQL 18.
         #[test]
         fn a_reference_naming_no_column_needs_a_primary_key() {
             let with_pk = "
                 CREATE TABLE parent (id INT PRIMARY KEY);
                 CREATE TABLE child (pid INT REFERENCES parent);
             ";
+            let unique_before_pk = "
+                CREATE TABLE parent (a INT, b INT, id INT, UNIQUE (a, b), PRIMARY KEY (id));
+                CREATE TABLE child (pid INT REFERENCES parent);
+            ";
             let without_pk = "
                 CREATE TABLE parent (id INT UNIQUE);
                 CREATE TABLE child (pid INT REFERENCES parent);
             ";
+            let only_table_unique = "
+                CREATE TABLE parent (a INT, b INT, UNIQUE (a, b));
+                CREATE TABLE child (x INT, y INT, FOREIGN KEY (x, y) REFERENCES parent);
+            ";
 
             assert!(ParserDB::parse::<GenericDialect>(with_pk).is_ok());
-            assert!(matches!(
-                ParserDB::parse::<GenericDialect>(without_pk),
-                Err(Error::ReferencedColumnsNotUniqueForForeignKey { .. })
-            ));
+            assert!(ParserDB::parse::<GenericDialect>(unique_before_pk).is_ok());
+            for sql in [without_pk, only_table_unique] {
+                assert!(
+                    matches!(
+                        ParserDB::parse::<GenericDialect>(sql),
+                        Err(Error::ReferencedColumnsNotUniqueForForeignKey { .. })
+                    ),
+                    "{sql}"
+                );
+            }
         }
 
         /// PostgreSQL pairs the host columns with the referenced ones by
