@@ -25,8 +25,8 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     ArgMode, CreateFunction, CreateFunctionBody, DataType, Expr, FunctionReturnType, GroupByExpr,
-    Insert, ObjectName, OperateFunctionArg, OutputClause, Query, Select, SelectFlavor, SelectItem,
-    SetExpr, Statement, TableFactor, TableObject, VisitMut, VisitorMut,
+    Insert, ObjectName, OperateFunctionArg, Query, Select, SelectFlavor, SelectItem, SetExpr,
+    Statement, TableFactor, TableObject, VisitMut, VisitorMut,
     helpers::attached_token::AttachedToken,
 };
 
@@ -156,33 +156,16 @@ fn is_void(data_type: &DataType) -> bool {
 fn final_statement_produces_no_result(statement: &Statement) -> bool {
     match statement {
         Statement::Query(query) => dml_without_returning(query.body.as_ref()),
-        Statement::Insert(insert) => returning_is_empty(insert.returning.as_deref()),
-        Statement::Update(update) => returning_is_empty(update.returning.as_deref()),
-        Statement::Delete(delete) => returning_is_empty(delete.returning.as_deref()),
-        Statement::Merge(merge) => {
-            !matches!(merge.output.as_ref(), Some(OutputClause::Returning { .. }))
+        _ => {
+            super::view_rewrites::statement_dml(statement)
+                .is_some_and(|dml| returning_is_empty(dml.returning()))
         }
-        _ => false,
     }
 }
 
 /// Whether a query body is a data-modifying statement without `RETURNING`.
 fn dml_without_returning(body: &SetExpr) -> bool {
-    match body {
-        SetExpr::Insert(Statement::Insert(insert)) => {
-            returning_is_empty(insert.returning.as_deref())
-        }
-        SetExpr::Update(Statement::Update(update)) => {
-            returning_is_empty(update.returning.as_deref())
-        }
-        SetExpr::Delete(Statement::Delete(delete)) => {
-            returning_is_empty(delete.returning.as_deref())
-        }
-        SetExpr::Merge(Statement::Merge(merge)) => {
-            !matches!(merge.output.as_ref(), Some(OutputClause::Returning { .. }))
-        }
-        _ => false,
-    }
+    super::view_rewrites::dml_ref(body).is_some_and(|dml| returning_is_empty(dml.returning()))
 }
 
 /// Whether a data-modifying statement's `RETURNING` list is absent or empty.

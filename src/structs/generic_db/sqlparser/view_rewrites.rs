@@ -119,67 +119,72 @@ fn store_query(builder: &mut ParserDBBuilder, slot: Slot, query: Query) {
     }
 }
 
-/// Every stored definition whose body names one of `keys`.
-fn definitions_reading(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Vec<Definition> {
+/// Every stored definition whose body names one of `keys`, with the union
+/// of every relation those definitions read.
+fn definitions_reading(
+    builder: &ParserDBBuilder,
+    keys: &[&RelationKey],
+) -> (Vec<Definition>, Vec<RelationKey>) {
     let names = |reads: &[RelationKey]| reads.iter().any(|key| keys.contains(&key));
-    let plain = builder.views().iter().enumerate().filter_map(|(position, (view, _, _))| {
+    let mut definitions = Vec::new();
+    let mut reads: Vec<RelationKey> = Vec::new();
+    for (position, (view, _, _)) in builder.views().iter().enumerate() {
         let definition = view.definition();
-        names(&relations_read_in(definition)).then_some(Definition::Query {
-            slot: Slot::Plain(position),
-            query: alloc::boxed::Box::new(definition.clone()),
-        })
-    });
-    let materialized =
-        builder.materialized_views().iter().enumerate().filter_map(|(position, (view, _, _))| {
-            let definition = view.definition();
-            names(&relations_read_in(definition)).then_some(Definition::Query {
+        let read = relations_read_in(definition);
+        if names(&read) {
+            definitions.push(Definition::Query {
+                slot: Slot::Plain(position),
+                query: alloc::boxed::Box::new(definition.clone()),
+            });
+            reads.extend(read);
+        }
+    }
+    for (position, (view, _, _)) in builder.materialized_views().iter().enumerate() {
+        let definition = view.definition();
+        let read = relations_read_in(definition);
+        if names(&read) {
+            definitions.push(Definition::Query {
                 slot: Slot::Materialized(position),
                 query: alloc::boxed::Box::new(definition.clone()),
-            })
-        });
-    let functions =
-        builder.functions().iter().enumerate().filter_map(|(position, (function, _))| {
-            let definition = match function.function_body.as_ref()? {
-                CreateFunctionBody::Return(expr) => {
-                    Definition::Query {
-                        slot: Slot::Function(position),
-                        query: alloc::boxed::Box::new(function_bodies::definition(expr)),
-                    }
-                }
-                CreateFunctionBody::BeginAtomic(block) => {
-                    Definition::Statements {
-                        function: position,
-                        statements: block.statements.clone(),
-                    }
-                }
-                // A body written as a string binds nothing to follow.
-                _ => return None,
-            };
-            names(&definition_read(builder, &definition)).then_some(definition)
-        });
-    plain.chain(materialized).chain(functions).collect()
-}
-
-/// Every relation a stored definition reads or writes.
-fn definition_read(builder: &ParserDBBuilder, definition: &Definition) -> Vec<RelationKey> {
-    match definition {
-        Definition::Query { query, .. } => relations_read_in(query),
-        Definition::Statements { statements, .. } => statements_read(builder, statements.iter()),
+            });
+            reads.extend(read);
+        }
     }
+    for (position, (function, _)) in builder.functions().iter().enumerate() {
+        let Some((definition, read)) =
+            function_definition_reads(builder, position, function.function_body.as_ref())
+        else {
+            continue;
+        };
+        if names(&read) {
+            definitions.push(definition);
+            reads.extend(read);
+        }
+    }
+    (definitions, reads)
 }
 
-/// The part of the catalog the stored `definitions` read, which is every
-/// relation they name and, transitively, every relation a view among those
-/// names.
-fn catalog_definitions<'q>(
+/// The stored form of one function's body with every relation it reads,
+/// or [`None`] for a body PostgreSQL does not bind.
+fn function_definition_reads(
     builder: &ParserDBBuilder,
-    definitions: impl IntoIterator<Item = &'q Definition>,
-) -> ParserDB {
-    let reads: Vec<RelationKey> = definitions
-        .into_iter()
-        .flat_map(|definition| definition_read(builder, definition))
-        .collect();
-    catalog_reads(builder, reads)
+    position: usize,
+    body: Option<&CreateFunctionBody>,
+) -> Option<(Definition, Vec<RelationKey>)> {
+    match body {
+        Some(CreateFunctionBody::Return(expr)) => {
+            let query = alloc::boxed::Box::new(function_bodies::definition(expr));
+            let read = relations_read_in(&query);
+            Some((Definition::Query { slot: Slot::Function(position), query }, read))
+        }
+        Some(CreateFunctionBody::BeginAtomic(block)) => {
+            Some((
+                Definition::Statements { function: position, statements: block.statements.clone() },
+                statements_read(builder, &block.statements),
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// The part of the catalog `definitions` read, which is every relation they
@@ -224,12 +229,11 @@ pub(super) struct Readers {
 /// The stored definitions reading a relation one of `keys` names, or `None`
 /// when none does and a rename of them has nothing to follow.
 pub(super) fn readers(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Option<Readers> {
-    let definitions = definitions_reading(builder, keys);
+    let (definitions, reads) = definitions_reading(builder, keys);
     if definitions.is_empty() {
         return None;
     }
-    let before = catalog_definitions(builder, definitions.iter());
-    Some(Readers { definitions, before })
+    Some(Readers { definitions, before: catalog_reads(builder, reads) })
 }
 
 /// How a block statement holds the query part it holds.
@@ -368,29 +372,13 @@ pub(super) fn follow_renames(
 
 /// Writes a checked query part back into the definition that holds it.
 fn store_part(builder: &mut ParserDBBuilder, part: &Part, query: Query) {
-    match part.slot {
-        Slot::Plain(position) => {
-            let declaration =
-                alloc::sync::Arc::make_mut(&mut builder.views_mut()[position].0).declaration_mut();
-            *declaration.query_mut() = query;
-        }
-        Slot::Materialized(position) => {
-            let declaration =
-                alloc::sync::Arc::make_mut(&mut builder.materialized_views_mut()[position].0)
-                    .declaration_mut();
-            *declaration.query_mut() = query;
-        }
-        Slot::Function(position) => {
-            let function = alloc::sync::Arc::make_mut(&mut builder.functions_mut()[position].0);
-            if let (Some((statement, shape)), Some(CreateFunctionBody::BeginAtomic(block))) =
-                (part.statement, function.function_body.as_mut())
-            {
-                block.statements[statement] = statement_with_query_part(shape, query);
-            } else {
-                function_bodies::write_definition(&mut function.function_body, query);
-            }
-        }
-    }
+    let (Slot::Function(position), Some((statement, shape))) = (part.slot, part.statement) else {
+        return store_query(builder, part.slot, query);
+    };
+    let body =
+        &mut alloc::sync::Arc::make_mut(&mut builder.functions_mut()[position].0).function_body;
+    let Some(CreateFunctionBody::BeginAtomic(block)) = body else { return };
+    block.statements[statement] = statement_with_query_part(shape, query);
 }
 
 /// A statement holding `query` as the part `shape` spells it.
@@ -746,6 +734,41 @@ fn restoring_alias(existing: Option<&TableAlias>, exposed: Ident, columns: &[Ide
     alias
 }
 
+/// The new relation names and aliases `FROM` items take, keyed by the
+/// factor's address.
+#[derive(Default)]
+struct FactorEdits {
+    /// A factor's new relation name, the schema part included when the
+    /// relation moved between schemas.
+    names: BTreeMap<usize, ObjectName>,
+    /// A factor's new alias.
+    aliases: BTreeMap<usize, TableAlias>,
+}
+
+impl FactorEdits {
+    /// Rewrites one factor, a schema-carrying new name replacing the
+    /// qualifier too.
+    fn apply(&self, factor: &mut TableFactor) {
+        let at = address(&*factor);
+        if let TableFactor::Table { name, alias, .. } = factor {
+            if let Some(to) = self.names.get(&at) {
+                let kept = if to.0.len() > 1 { 0 } else { name.0.len().saturating_sub(1) };
+                name.0.truncate(kept);
+                name.0.extend(to.0.iter().cloned());
+            }
+            if let Some(replacement) = self.aliases.get(&at) {
+                *alias = Some(replacement.clone());
+            }
+        }
+    }
+}
+
+/// The relation part of a qualified reference, which a reference of fewer
+/// than two parts lacks.
+fn relation_part(parts: &mut [Ident]) -> Option<&mut Ident> {
+    parts.len().checked_sub(2).and_then(|at| parts.get_mut(at))
+}
+
 /// The edits spelling a definition the way PostgreSQL spells it after the
 /// renames, keyed by the address of what they change.
 #[derive(Default)]
@@ -754,11 +777,8 @@ struct Edits {
     columns: BTreeMap<usize, Ident>,
     /// A qualified reference's new relation identifier.
     qualifiers: BTreeMap<usize, Ident>,
-    /// A `FROM` item's new relation name, the schema part included when the
-    /// statement moved it between schemas.
-    names: BTreeMap<usize, ObjectName>,
-    /// A `FROM` item's new alias.
-    aliases: BTreeMap<usize, TableAlias>,
+    /// The `FROM` items' new names and aliases.
+    factors: FactorEdits,
     /// A select-list item's output name, which a renamed column reference
     /// written alone would otherwise change.
     outputs: BTreeMap<usize, Ident>,
@@ -768,19 +788,7 @@ impl VisitorMut for Edits {
     type Break = ();
 
     fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
-        let at = address(&*factor);
-        if let TableFactor::Table { name, alias, .. } = factor {
-            if let Some(to) = self.names.get(&at) {
-                // A new name written with its schema moves the relation, so it
-                // replaces the qualifier too.
-                let kept = if to.0.len() > 1 { 0 } else { name.0.len().saturating_sub(1) };
-                name.0.truncate(kept);
-                name.0.extend(to.0.iter().cloned());
-            }
-            if let Some(replacement) = self.aliases.get(&at) {
-                *alias = Some(replacement.clone());
-            }
-        }
+        self.factors.apply(factor);
         ControlFlow::Continue(())
     }
 
@@ -800,7 +808,7 @@ impl VisitorMut for Edits {
         }
         if let Some(to) = self.qualifiers.get(&at)
             && let Expr::CompoundIdentifier(parts) = expression
-            && let Some(relation) = parts.len().checked_sub(2).and_then(|at| parts.get_mut(at))
+            && let Some(relation) = relation_part(parts)
         {
             *relation = to.clone();
         }
@@ -962,11 +970,12 @@ fn respell(query: &mut Query, before: &ParserDB, renames: &[Rename]) -> Option<Q
                 {
                     return None;
                 }
-                edits.names.insert(*factor, to.clone());
+                edits.factors.names.insert(*factor, to.clone());
             }
             Rename::Column { columns, .. } if through_using.contains(factor) => {
                 let exposed = shape.exposed()?.clone();
                 edits
+                    .factors
                     .aliases
                     .insert(*factor, restoring_alias(shape.alias.as_ref(), exposed, columns));
             }
@@ -1077,9 +1086,9 @@ fn shielded(original: &Query, renames: &[Rename]) -> Query {
         };
         match &renames[*rename] {
             Rename::Relation { to, .. } => {
-                edits.names.insert(*factor, to.clone());
+                edits.factors.names.insert(*factor, to.clone());
                 if shape.alias.is_none() {
-                    edits.aliases.insert(
+                    edits.factors.aliases.insert(
                         *factor,
                         TableAlias { explicit: true, name: exposed, columns: Vec::new(), at: None },
                     );
@@ -1088,6 +1097,7 @@ fn shielded(original: &Query, renames: &[Rename]) -> Query {
             Rename::Column { ordinal, columns, .. } => {
                 if !shape.renames_column(*ordinal) {
                     edits
+                        .factors
                         .aliases
                         .insert(*factor, restoring_alias(shape.alias.as_ref(), exposed, columns));
                 }
@@ -1118,40 +1128,19 @@ fn dml_shell(
         before: &'a ParserDB,
         renames: &'a [Rename],
         function_name: &'a str,
-        queries: Vec<usize>,
-        cte_owners: BTreeMap<usize, usize>,
-        query_ctes: BTreeMap<usize, Vec<(usize, ScopeFactor)>>,
+        scopes: CteScopes,
     }
 
     impl VisitorMut for Shells<'_> {
         type Break = Error;
 
         fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-            if let Some(with) = &query.with {
-                let factors = with
-                    .cte_tables
-                    .iter()
-                    .map(|cte| {
-                        (
-                            address(&*cte.query),
-                            ScopeFactor {
-                                exposed: cte.alias.name.clone(),
-                                columns: cte_output_columns(&cte.query, self.before),
-                            },
-                        )
-                    })
-                    .collect();
-                for cte in &with.cte_tables {
-                    self.cte_owners.insert(address(&*cte.query), address(query));
-                }
-                self.query_ctes.insert(address(query), factors);
-            }
-            self.queries.push(address(query));
+            self.scopes.enter_query(query, Some(self.before));
             ControlFlow::Continue(())
         }
 
         fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-            self.queries.pop();
+            self.scopes.leave_query();
             ControlFlow::Continue(())
         }
 
@@ -1174,9 +1163,7 @@ fn dml_shell(
         /// Returns [`Error::FunctionBodyBlocksColumnRename`] when a column
         /// rename reaches the statement's write target.
         fn shell_dml(&mut self, statement: &mut Statement) -> Result<(), Error> {
-            let ctes = self.queries.last().copied().map_or_else(Vec::new, |own| {
-                visible_ctes(&self.queries, &self.cte_owners, &self.query_ctes, own)
-            });
+            let ctes = self.scopes.visible();
             let respelled =
                 respell_shell(statement, &ctes, self.before, self.renames, self.function_name)?;
             if respelled.is_none() {
@@ -1186,14 +1173,7 @@ fn dml_shell(
         }
     }
 
-    let mut shells = Shells {
-        before,
-        renames,
-        function_name,
-        queries: Vec::new(),
-        cte_owners: BTreeMap::new(),
-        query_ctes: BTreeMap::new(),
-    };
+    let mut shells = Shells { before, renames, function_name, scopes: CteScopes::default() };
     match query.visit(&mut shells) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(error) => Err(error),
@@ -1280,49 +1260,25 @@ pub(super) fn normalize_block_references(
     struct NormalizeDmls<'a> {
         builder: &'a ParserDBBuilder,
         catalog: &'a str,
-        queries: Vec<usize>,
-        cte_owners: BTreeMap<usize, usize>,
-        query_ctes: BTreeMap<usize, Vec<(usize, ScopeFactor)>>,
+        scopes: CteScopes,
     }
 
     impl VisitorMut for NormalizeDmls<'_> {
         type Break = Error;
 
         fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-            if let Some(with) = &query.with {
-                let factors = with
-                    .cte_tables
-                    .iter()
-                    .map(|cte| {
-                        (
-                            address(&*cte.query),
-                            ScopeFactor {
-                                exposed: cte.alias.name.clone(),
-                                // The analysis only needs the item's name.
-                                columns: None,
-                            },
-                        )
-                    })
-                    .collect();
-                for cte in &with.cte_tables {
-                    self.cte_owners.insert(address(&*cte.query), address(query));
-                }
-                self.query_ctes.insert(address(query), factors);
-            }
-            self.queries.push(address(query));
+            self.scopes.enter_query(query, None);
             ControlFlow::Continue(())
         }
 
         fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-            self.queries.pop();
+            self.scopes.leave_query();
             ControlFlow::Continue(())
         }
 
         fn pre_visit_statement(&mut self, statement: &mut Statement) -> ControlFlow<Self::Break> {
             if let Some(mut dml) = statement_dml_mut(statement) {
-                let ctes = self.queries.last().copied().map_or_else(Vec::new, |own| {
-                    visible_ctes(&self.queries, &self.cte_owners, &self.query_ctes, own)
-                });
+                let ctes = self.scopes.visible();
                 if let Err(error) = strip_catalog_qualifier(&mut dml, self.catalog) {
                     return ControlFlow::Break(error);
                 }
@@ -1342,13 +1298,7 @@ pub(super) fn normalize_block_references(
     }
 
     let catalog = builder.catalog_name();
-    let mut normalizer = NormalizeDmls {
-        builder,
-        catalog,
-        queries: Vec::new(),
-        cte_owners: BTreeMap::new(),
-        query_ctes: BTreeMap::new(),
-    };
+    let mut normalizer = NormalizeDmls { builder, catalog, scopes: CteScopes::default() };
     for statement in statements.iter_mut() {
         match statement.visit(&mut normalizer) {
             ControlFlow::Continue(()) => {}
@@ -1367,53 +1317,11 @@ fn strip_catalog_qualifier(dml: &mut DmlMut<'_>, catalog: &str) -> Result<(), Er
         }
         Ok(())
     };
-    match dml {
-        DmlMut::Insert(Insert { table, .. }) => {
-            let TableObject::TableName(name) = table else { return Ok(()) };
-            strip_factor_name(name, catalog)
-        }
-        DmlMut::Update(Update { table, from, .. }) => {
-            strip_factor(&mut table.relation)?;
-            if let Some(from) = from.as_mut() {
-                let tables = match from {
-                    UpdateTableFromKind::BeforeSet(tables)
-                    | UpdateTableFromKind::AfterSet(tables) => tables,
-                };
-                for table in tables {
-                    strip_factor(&mut table.relation)?;
-                    for join in &mut table.joins {
-                        strip_factor(&mut join.relation)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        DmlMut::Delete(Delete { from, using, .. }) => {
-            let tables = match from {
-                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-            };
-            for table in tables {
-                strip_factor(&mut table.relation)?;
-                for join in &mut table.joins {
-                    strip_factor(&mut join.relation)?;
-                }
-            }
-            if let Some(using) = using {
-                for table in using {
-                    strip_factor(&mut table.relation)?;
-                    for join in &mut table.joins {
-                        strip_factor(&mut join.relation)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        DmlMut::Merge(Merge { table, source, .. }) => {
-            strip_factor(table)?;
-            strip_factor(source)?;
-            Ok(())
-        }
+    if let Some(name) = dml.insert_target_mut() {
+        strip_factor_name(name, catalog)?;
     }
+    dml.for_each_clause_factor(|factor| strip_factor(factor))?;
+    Ok(())
 }
 
 /// The name one clause factor spells, which a table function does not hold.
@@ -1530,51 +1438,11 @@ fn normalize_statement_references(
 /// excluded, which the reference analysis resolves.
 fn own_clause_factor_names(dml: &DmlMut<'_>) -> Vec<ObjectName> {
     let mut names = Vec::new();
-    match dml {
-        DmlMut::Insert(Insert { table, .. }) => {
-            let TableObject::TableName(name) = table else { return names };
-            names.push(name.clone());
-        }
-        DmlMut::Update(Update { table, from, .. }) => {
-            push_factor_name(&table.relation, &mut names);
-            if let Some(tables) = from.as_ref().map(|from| {
-                match from {
-                    UpdateTableFromKind::BeforeSet(tables)
-                    | UpdateTableFromKind::AfterSet(tables) => tables,
-                }
-            }) {
-                for table in tables {
-                    push_factor_name(&table.relation, &mut names);
-                    for join in &table.joins {
-                        push_factor_name(&join.relation, &mut names);
-                    }
-                }
-            }
-        }
-        DmlMut::Delete(Delete { from, using, .. }) => {
-            let tables = match from {
-                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-            };
-            for table in tables {
-                push_factor_name(&table.relation, &mut names);
-                for join in &table.joins {
-                    push_factor_name(&join.relation, &mut names);
-                }
-            }
-            if let Some(using) = using {
-                for table in using {
-                    push_factor_name(&table.relation, &mut names);
-                    for join in &table.joins {
-                        push_factor_name(&join.relation, &mut names);
-                    }
-                }
-            }
-        }
-        DmlMut::Merge(Merge { table, source, .. }) => {
-            push_factor_name(table, &mut names);
-            push_factor_name(source, &mut names);
-        }
+    let dml = dml.reference();
+    if let Some(name) = dml.insert_target() {
+        names.push(name.clone());
     }
+    dml.for_each_clause_factor(|factor| push_factor_name(factor, &mut names));
     names
 }
 
@@ -1588,7 +1456,7 @@ fn push_factor_name(factor: &TableFactor, names: &mut Vec<ObjectName>) {
 /// The key a factor name reaches its relation by, the relation it bound
 /// under at ingestion, which is the temporary schema for a temporary
 /// relation.
-fn bound_factor_key(bound: &BoundRelation, name: &ObjectName) -> RelationKey {
+pub(super) fn bound_factor_key(bound: &BoundRelation, name: &ObjectName) -> RelationKey {
     let target = target_name_of_object_name(name);
     let schema = if bound.temporary {
         CASE.compared_form(TEMPORARY_SCHEMA, false)
@@ -1615,17 +1483,16 @@ pub(super) fn shape_of_block_statement(
     function_name: &str,
 ) -> Result<(), Error> {
     let refused = match statement {
-        Statement::Update(update) => !update.table.joins.is_empty(),
-        Statement::Delete(delete) => dml_target_has_join(delete),
-        Statement::Merge(merge) => merge_has_refused_shape(merge),
         Statement::Query(query) => {
             dml_body_has_refused_shape(query.body.as_ref())
                 || query.with.as_ref().is_some_and(|with| {
                     with.cte_tables.iter().any(|cte| cte_has_refused_shape(&cte.query))
                 })
         }
-        Statement::Return(statement) => dml_subquery(statement.value.as_ref()),
-        _ => false,
+        Statement::Return(_) => {
+            part_of(statement).is_some_and(|query| dml_ref(&query.body).is_some())
+        }
+        _ => statement_dml(statement).is_some_and(|dml| dml.has_refused_shape()),
     };
     if refused {
         return Err(Error::FunctionBodyStatementUnsupported {
@@ -1638,10 +1505,7 @@ pub(super) fn shape_of_block_statement(
 
 /// Whether a `DELETE` names a join on its target.
 fn dml_target_has_join(delete: &Delete) -> bool {
-    let tables = match &delete.from {
-        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-    };
-    tables.iter().any(|table| !table.joins.is_empty())
+    delete_from_tables(&delete.from).iter().any(|table| !table.joins.is_empty())
 }
 
 /// Whether a `MERGE` writes a clause shape the body's kind cannot hold,
@@ -1656,16 +1520,6 @@ fn merge_has_refused_shape(merge: &Merge) -> bool {
         })
 }
 
-/// Whether a `RETURN` statement's value is a subquery holding a
-/// data-modifying statement.
-fn dml_subquery(value: Option<&ReturnStatementValue>) -> bool {
-    matches!(
-        value,
-        Some(ReturnStatementValue::Expr(Expr::Subquery(query)))
-            if dml_ref(&query.body).is_some()
-    )
-}
-
 /// Whether a `WITH` item's query holds a clause shape the body's own kind
 /// refuses, the items the item's own `WITH` clause writes included.
 fn cte_has_refused_shape(query: &Query) -> bool {
@@ -1678,12 +1532,7 @@ fn cte_has_refused_shape(query: &Query) -> bool {
 
 /// Whether a query body holds a clause shape the body's own kind refuses.
 fn dml_body_has_refused_shape(body: &SetExpr) -> bool {
-    match body {
-        SetExpr::Update(Statement::Update(update)) => !update.table.joins.is_empty(),
-        SetExpr::Delete(Statement::Delete(delete)) => dml_target_has_join(delete),
-        SetExpr::Merge(Statement::Merge(merge)) => merge_has_refused_shape(merge),
-        _ => false,
-    }
+    dml_ref(body).is_some_and(|dml| dml.has_refused_shape())
 }
 
 /// A relation a bare reference can reach in one scope, by the name it
@@ -1711,47 +1560,27 @@ pub(super) fn refuse_ambiguous_block_reference(
 ) -> Result<(), Error> {
     struct Scopes<'a> {
         slice: &'a ParserDB,
-        /// A `WITH` item's query by its own address, naming the query that
-        /// holds the item.
-        cte_owners: BTreeMap<usize, usize>,
-        /// A query's own `WITH` items by their address, in the order the
-        /// query's `WITH` clause writes them.
-        query_ctes: BTreeMap<usize, Vec<(usize, ScopeFactor)>>,
+        scopes: CteScopes,
     }
 
     impl Visitor for Scopes<'_> {
         type Break = ();
 
         fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-            if let Some(with) = &query.with {
-                let factors = with
-                    .cte_tables
-                    .iter()
-                    .map(|cte| {
-                        (
-                            address(&*cte.query),
-                            ScopeFactor {
-                                exposed: cte.alias.name.clone(),
-                                columns: cte_output_columns(&cte.query, self.slice),
-                            },
-                        )
-                    })
-                    .collect();
-                for cte in &with.cte_tables {
-                    self.cte_owners.insert(address(&*cte.query), address(query));
-                }
-                self.query_ctes.insert(address(query), factors);
-            }
+            self.scopes.enter_query(query, Some(self.slice));
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            self.scopes.leave_query();
             ControlFlow::Continue(())
         }
     }
 
     struct Ambiguous<'a> {
         slice: &'a ParserDB,
-        cte_owners: BTreeMap<usize, usize>,
-        query_ctes: BTreeMap<usize, Vec<(usize, ScopeFactor)>>,
+        scopes: CteScopes,
         chain: Vec<Vec<ScopeFactor>>,
-        queries: Vec<usize>,
     }
 
     impl Visitor for Ambiguous<'_> {
@@ -1761,10 +1590,8 @@ pub(super) fn refuse_ambiguous_block_reference(
             // A data-modifying statement scopes its own clauses, whose
             // factors a visible `WITH` item answers for by name.
             if let Some(dml) = statement_dml(statement) {
-                let ctes = self.queries.last().copied().map_or_else(Vec::new, |own| {
-                    visible_ctes(&self.queries, &self.cte_owners, &self.query_ctes, own)
-                });
-                self.chain.push(dml.clause_factors(self.slice, &ctes));
+                let ctes = self.scopes.visible();
+                self.chain.push(dml.scope_factors(self.slice, &ctes));
             }
             ControlFlow::Continue(())
         }
@@ -1777,15 +1604,14 @@ pub(super) fn refuse_ambiguous_block_reference(
         }
 
         fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-            let own = address(query);
-            self.queries.push(own);
-            let ctes = visible_ctes(&self.queries, &self.cte_owners, &self.query_ctes, own);
+            self.scopes.enter_query(query, Some(self.slice));
+            let ctes = self.scopes.visible();
             self.chain.push(select_scope_factors(query, self.slice, &ctes));
             ControlFlow::Continue(())
         }
 
         fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-            self.queries.pop();
+            self.scopes.leave_query();
             self.chain.pop();
             ControlFlow::Continue(())
         }
@@ -1802,13 +1628,11 @@ pub(super) fn refuse_ambiguous_block_reference(
 
     let reads = statements_read(builder, core::iter::once(statement));
     let slice = catalog_reads(builder, reads);
-    let mut scopes =
-        Scopes { slice: &slice, cte_owners: BTreeMap::new(), query_ctes: BTreeMap::new() };
+    let mut scopes = Scopes { slice: &slice, scopes: CteScopes::default() };
     let walked = statement.visit(&mut scopes);
     debug_assert!(walked.is_continue(), "the walker never breaks");
-    let Scopes { slice: _, cte_owners, query_ctes } = scopes;
-    let mut ambiguous =
-        Ambiguous { slice: &slice, cte_owners, query_ctes, chain: Vec::new(), queries: Vec::new() };
+    let Scopes { scopes, .. } = scopes;
+    let mut ambiguous = Ambiguous { slice: &slice, scopes, chain: Vec::new() };
     match statement.visit(&mut ambiguous) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(column) => {
@@ -1854,7 +1678,7 @@ fn simple_reference_name(expression: &Expr) -> Option<(String, bool)> {
 }
 
 /// A data-modifying statement, wherever a statement holds it.
-enum DmlRef<'a> {
+pub(super) enum DmlRef<'a> {
     /// An `INSERT` statement.
     Insert(&'a Insert),
     /// An `UPDATE` statement.
@@ -1866,64 +1690,85 @@ enum DmlRef<'a> {
 }
 
 impl<'a> DmlRef<'a> {
-    /// The clause factors the statement scopes, in the order PostgreSQL
-    /// scopes them.
-    fn clause_factors(&self, slice: &ParserDB, ctes: &[ScopeFactor]) -> Vec<ScopeFactor> {
-        let mut factors = Vec::new();
+    /// The name an `INSERT` statement writes, which sits outside its queries.
+    pub(super) fn insert_target(&self) -> Option<&'a ObjectName> {
         match self {
-            DmlRef::Insert(Insert { table, table_alias, .. }) => {
-                let TableObject::TableName(name) = table else { return factors };
-                factors.push(ScopeFactor {
-                    exposed: table_alias
-                        .as_ref()
-                        .map_or_else(|| last_part_as_ident(name), |alias| alias.alias.clone()),
-                    columns: factor_columns(name, slice, ctes),
-                });
-            }
+            DmlRef::Insert(Insert { table: TableObject::TableName(name), .. }) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Calls `visit` on the statement's clause factors, in the order
+    /// PostgreSQL scopes them, which an `INSERT` target is not among.
+    fn for_each_clause_factor(&self, mut visit: impl FnMut(&TableFactor)) {
+        match self {
+            DmlRef::Insert(_) => {}
             DmlRef::Update(Update { table, from, .. }) => {
-                push_scope_factor(&table.relation, slice, ctes, &mut factors);
-                if let Some(tables) = from.as_ref().map(|from| {
-                    match from {
-                        UpdateTableFromKind::BeforeSet(tables)
-                        | UpdateTableFromKind::AfterSet(tables) => tables,
-                    }
-                }) {
-                    for table in tables {
-                        push_scope_factor(&table.relation, slice, ctes, &mut factors);
+                visit(&table.relation);
+                if let Some(from) = from.as_ref() {
+                    for table in update_from_tables(from) {
+                        visit(&table.relation);
                         for join in &table.joins {
-                            push_scope_factor(&join.relation, slice, ctes, &mut factors);
+                            visit(&join.relation);
                         }
                     }
                 }
             }
             DmlRef::Delete(Delete { from, using, .. }) => {
-                let tables = match from {
-                    FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
-                        tables
+                for table in delete_from_tables(from) {
+                    visit(&table.relation);
+                    for join in &table.joins {
+                        visit(&join.relation);
                     }
-                };
-                for table in tables {
-                    push_scope_factor(&table.relation, slice, ctes, &mut factors);
                 }
                 if let Some(using) = using {
                     for table in using {
-                        push_scope_factor(&table.relation, slice, ctes, &mut factors);
+                        visit(&table.relation);
                         for join in &table.joins {
-                            push_scope_factor(&join.relation, slice, ctes, &mut factors);
+                            visit(&join.relation);
                         }
                     }
                 }
             }
             DmlRef::Merge(Merge { table, source, .. }) => {
-                push_scope_factor(table, slice, ctes, &mut factors);
-                push_scope_factor(source, slice, ctes, &mut factors);
+                visit(table);
+                visit(source);
             }
         }
+    }
+
+    /// The clause factors the statement scopes, in the order PostgreSQL
+    /// scopes them.
+    fn scope_factors(&self, slice: &ParserDB, ctes: &[ScopeFactor]) -> Vec<ScopeFactor> {
+        let mut factors = Vec::new();
+        if let DmlRef::Insert(Insert { table: TableObject::TableName(name), table_alias, .. }) =
+            self
+        {
+            factors.push(ScopeFactor {
+                exposed: table_alias
+                    .as_ref()
+                    .map_or_else(|| last_part_as_ident(name), |alias| alias.alias.clone()),
+                columns: factor_key_and_columns(name, ctes, slice).1,
+            });
+        }
+        self.for_each_clause_factor(|factor| {
+            factors.extend(table_factors(factor, slice, ctes));
+        });
         factors
     }
 
+    /// Whether the statement's clause shape is one the body's kind refuses.
+    fn has_refused_shape(&self) -> bool {
+        match self {
+            DmlRef::Insert(_) => false,
+            DmlRef::Update(update) => !update.table.joins.is_empty(),
+            DmlRef::Delete(delete) => dml_target_has_join(delete),
+            DmlRef::Merge(merge) => merge_has_refused_shape(merge),
+        }
+    }
+
     /// The `RETURNING` list the statement writes, if any.
-    fn returning(&self) -> Option<&'a [SelectItem]> {
+    pub(super) fn returning(&self) -> Option<&'a [SelectItem]> {
         match self {
             DmlRef::Insert(insert) => insert.returning.as_deref(),
             DmlRef::Update(update) => update.returning.as_deref(),
@@ -1963,10 +1808,66 @@ impl<'a> DmlMut<'a> {
         }
     }
 
+    /// The name an `INSERT` statement writes, held for its rewrites.
+    fn insert_target_mut(&mut self) -> Option<&mut ObjectName> {
+        match self {
+            DmlMut::Insert(Insert { table: TableObject::TableName(name), .. }) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Calls `visit` on the statement's clause factors, held for their
+    /// rewrites, in the order PostgreSQL scopes them, which an `INSERT`
+    /// target is not among.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error `visit` gives a factor.
+    fn for_each_clause_factor(
+        &mut self,
+        mut visit: impl FnMut(&mut TableFactor) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        match self {
+            DmlMut::Insert(_) => {}
+            DmlMut::Update(Update { table, from, .. }) => {
+                visit(&mut table.relation)?;
+                if let Some(from) = from.as_mut() {
+                    for table in update_from_tables_mut(from) {
+                        visit(&mut table.relation)?;
+                        for join in &mut table.joins {
+                            visit(&mut join.relation)?;
+                        }
+                    }
+                }
+            }
+            DmlMut::Delete(Delete { from, using, .. }) => {
+                for table in delete_from_tables_mut(from) {
+                    visit(&mut table.relation)?;
+                    for join in &mut table.joins {
+                        visit(&mut join.relation)?;
+                    }
+                }
+                if let Some(using) = using {
+                    for table in using {
+                        visit(&mut table.relation)?;
+                        for join in &mut table.joins {
+                            visit(&mut join.relation)?;
+                        }
+                    }
+                }
+            }
+            DmlMut::Merge(Merge { table, source, .. }) => {
+                visit(table)?;
+                visit(source)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The clause factors the statement scopes, in the order PostgreSQL
     /// scopes them.
-    fn clause_factors(&self, slice: &ParserDB, ctes: &[ScopeFactor]) -> Vec<ScopeFactor> {
-        self.reference().clause_factors(slice, ctes)
+    fn scope_factors(&self, slice: &ParserDB, ctes: &[ScopeFactor]) -> Vec<ScopeFactor> {
+        self.reference().scope_factors(slice, ctes)
     }
 
     /// The rewrites the statement takes at creation, which spell its
@@ -1978,7 +1879,7 @@ impl<'a> DmlMut<'a> {
     /// Returns [`Error::FunctionBodyInsertTooWide`] when the `INSERT` offers
     /// more expressions than its target has columns.
     fn spell(self, slice: &ParserDB, function_name: &str) -> Result<(), Error> {
-        let factors = self.clause_factors(slice, &[]);
+        let factors = self.scope_factors(slice, &[]);
         match self {
             DmlMut::Insert(insert) => {
                 let wildcard: &[ScopeFactor] = factors.first().map_or(&[], alloc::slice::from_ref);
@@ -2021,8 +1922,36 @@ impl<'a> DmlMut<'a> {
     }
 }
 
+/// The tables a `DELETE`'s `FROM` clause writes, whichever keyword spells it.
+fn delete_from_tables(from: &FromTable) -> &[TableWithJoins] {
+    match from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    }
+}
+
+/// The tables a `DELETE`'s `FROM` clause writes, held for their rewrites.
+fn delete_from_tables_mut(from: &mut FromTable) -> &mut [TableWithJoins] {
+    match from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    }
+}
+
+/// The tables an `UPDATE`'s `FROM` clause writes, whichever position holds.
+fn update_from_tables(from: &UpdateTableFromKind) -> &[TableWithJoins] {
+    match from {
+        UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables) => tables,
+    }
+}
+
+/// The tables an `UPDATE`'s `FROM` clause writes, held for their rewrites.
+fn update_from_tables_mut(from: &mut UpdateTableFromKind) -> &mut [TableWithJoins] {
+    match from {
+        UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables) => tables,
+    }
+}
+
 /// The data-modifying statement a query body holds, if any.
-fn dml_ref(body: &SetExpr) -> Option<DmlRef<'_>> {
+pub(super) fn dml_ref(body: &SetExpr) -> Option<DmlRef<'_>> {
     match body {
         SetExpr::Insert(Statement::Insert(insert)) => Some(DmlRef::Insert(insert)),
         SetExpr::Update(Statement::Update(update)) => Some(DmlRef::Update(update)),
@@ -2038,7 +1967,7 @@ fn dml_returning_items(body: &SetExpr) -> Option<&[SelectItem]> {
 }
 
 /// The data-modifying statement one statement holds, if any.
-fn statement_dml(statement: &Statement) -> Option<DmlRef<'_>> {
+pub(super) fn statement_dml(statement: &Statement) -> Option<DmlRef<'_>> {
     match statement {
         Statement::Insert(insert) => Some(DmlRef::Insert(insert)),
         Statement::Update(update) => Some(DmlRef::Update(update)),
@@ -2073,17 +2002,6 @@ fn select_scope_factors(query: &Query, slice: &ParserDB, ctes: &[ScopeFactor]) -
     factors
 }
 
-/// Adds one query `FROM` item to a scope's factors, which a factor with no
-/// name to count holds none for.
-fn push_scope_factor(
-    factor: &TableFactor,
-    slice: &ParserDB,
-    ctes: &[ScopeFactor],
-    factors: &mut Vec<ScopeFactor>,
-) {
-    factors.extend(table_factors(factor, slice, ctes));
-}
-
 /// The factors one `FROM` item contributes, which a nameless or unnameable
 /// one contributes none.
 fn table_factors(factor: &TableFactor, slice: &ParserDB, ctes: &[ScopeFactor]) -> Vec<ScopeFactor> {
@@ -2101,7 +2019,7 @@ fn table_factors(factor: &TableFactor, slice: &ParserDB, ctes: &[ScopeFactor]) -
                 exposed: alias
                     .as_ref()
                     .map_or_else(|| last_part_as_ident(name), |alias| alias.name.clone()),
-                columns: factor_columns(name, slice, ctes),
+                columns: factor_key_and_columns(name, ctes, slice).1,
             }]
         }
         TableFactor::Derived { subquery, alias: Some(alias), .. } => {
@@ -2114,19 +2032,6 @@ fn table_factors(factor: &TableFactor, slice: &ParserDB, ctes: &[ScopeFactor]) -
     }
 }
 
-/// The columns a factor named `name` exposes, which a visible `WITH` item
-/// answering the name does before a relation of it.
-fn factor_columns(
-    name: &ObjectName,
-    slice: &ParserDB,
-    ctes: &[ScopeFactor],
-) -> Option<Vec<(String, bool)>> {
-    ctes.iter().find(|cte| factor_name_answers_cte(name, cte)).map_or_else(
-        || relation_columns(slice, &resolved_factor_key(slice, name)),
-        |cte| cte.columns.clone(),
-    )
-}
-
 /// Whether a factor's name is the one a visible `WITH` item answers.
 fn factor_name_answers_cte(name: &ObjectName, cte: &ScopeFactor) -> bool {
     let target = target_name_of_object_name(name);
@@ -2136,6 +2041,59 @@ fn factor_name_answers_cte(name: &ObjectName, cte: &ScopeFactor) -> bool {
         target.name(),
         target.name_is_quoted(),
     )
+}
+
+/// The queries a statement walk sits in, with the `WITH` items each of
+/// them scopes.
+#[derive(Default)]
+struct CteScopes {
+    /// The addresses of the queries the walk sits in, innermost last.
+    queries: Vec<usize>,
+    /// A `WITH` item's query by its own address, naming the query that
+    /// holds the item.
+    cte_owners: BTreeMap<usize, usize>,
+    /// A query's own `WITH` items by their address, in the order the
+    /// query's `WITH` clause writes them.
+    query_ctes: BTreeMap<usize, Vec<(usize, ScopeFactor)>>,
+}
+
+impl CteScopes {
+    /// The query the walk enters, which its own `WITH` items join the
+    /// scope, their outputs named when `slice` can name them.
+    fn enter_query(&mut self, query: &Query, slice: Option<&ParserDB>) {
+        if let Some(with) = &query.with {
+            let factors = with
+                .cte_tables
+                .iter()
+                .map(|cte| {
+                    (
+                        address(&*cte.query),
+                        ScopeFactor {
+                            exposed: cte.alias.name.clone(),
+                            columns: slice.and_then(|slice| cte_output_columns(&cte.query, slice)),
+                        },
+                    )
+                })
+                .collect();
+            for cte in &with.cte_tables {
+                self.cte_owners.insert(address(&*cte.query), address(query));
+            }
+            self.query_ctes.insert(address(query), factors);
+        }
+        self.queries.push(address(query));
+    }
+
+    /// The query the walk leaves.
+    fn leave_query(&mut self) {
+        self.queries.pop();
+    }
+
+    /// The `WITH` items visible from the query the walk sits in.
+    fn visible(&self) -> Vec<ScopeFactor> {
+        self.queries.last().copied().map_or_else(Vec::new, |own| {
+            visible_ctes(&self.queries, &self.cte_owners, &self.query_ctes, own)
+        })
+    }
 }
 
 /// The `WITH` items visible from one query's own level, which the items of
@@ -2220,12 +2178,9 @@ pub(super) fn spell_block_statement(
     let reads = statements_read(builder, core::iter::once(&*statement));
     let slice = catalog_reads(builder, reads);
     let mut returning = ReturningSpeller { slice: &slice, function_name };
-    match statement {
-        Statement::Insert(insert) => DmlMut::Insert(insert).spell(&slice, function_name),
-        Statement::Update(update) => DmlMut::Update(update).spell(&slice, function_name),
-        Statement::Delete(delete) => DmlMut::Delete(delete).spell(&slice, function_name),
-        Statement::Merge(merge) => DmlMut::Merge(merge).spell(&slice, function_name),
-        _ => {
+    match statement_dml_mut(statement) {
+        Some(dml) => dml.spell(&slice, function_name),
+        None => {
             match statement.visit(&mut returning) {
                 ControlFlow::Continue(()) => Ok(()),
                 ControlFlow::Break(error) => Err(error),
@@ -2452,6 +2407,13 @@ struct ShellFactor {
     columns: Option<Vec<(String, bool)>>,
 }
 
+impl ShellFactor {
+    /// Whether its own alias column list renames output column `ordinal`.
+    fn renames_column(&self, ordinal: usize) -> bool {
+        self.alias.as_ref().is_some_and(|alias| alias.columns.len() > ordinal)
+    }
+}
+
 /// Every relation a statement's own clauses read, in the order PostgreSQL
 /// scopes them, a visible `WITH` item answering a factor's name by its
 /// outputs.
@@ -2476,46 +2438,13 @@ fn shell_factors(
                 columns,
             });
         }
-        Statement::Update(Update { table, from, .. }) => {
-            push_shell_factor(&mut factors, &table.relation, ctes, before);
-            if let Some(tables) = from.as_ref().map(|from| {
-                match from {
-                    UpdateTableFromKind::BeforeSet(tables)
-                    | UpdateTableFromKind::AfterSet(tables) => tables,
-                }
-            }) {
-                for table in tables {
-                    push_shell_factor(&mut factors, &table.relation, ctes, before);
-                    for join in &table.joins {
-                        push_shell_factor(&mut factors, &join.relation, ctes, before);
-                    }
-                }
+        _ => {
+            if let Some(dml) = statement_dml(statement) {
+                dml.for_each_clause_factor(|factor| {
+                    push_shell_factor(&mut factors, factor, ctes, before);
+                });
             }
         }
-        Statement::Delete(Delete { from, using, .. }) => {
-            let tables = match from {
-                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-            };
-            for table in tables {
-                push_shell_factor(&mut factors, &table.relation, ctes, before);
-                for join in &table.joins {
-                    push_shell_factor(&mut factors, &join.relation, ctes, before);
-                }
-            }
-            if let Some(using) = using {
-                for table in using {
-                    push_shell_factor(&mut factors, &table.relation, ctes, before);
-                    for join in &table.joins {
-                        push_shell_factor(&mut factors, &join.relation, ctes, before);
-                    }
-                }
-            }
-        }
-        Statement::Merge(Merge { table, source, .. }) => {
-            push_shell_factor(&mut factors, table, ctes, before);
-            push_shell_factor(&mut factors, source, ctes, before);
-        }
-        _ => {}
     }
     factors
 }
@@ -2975,7 +2904,7 @@ fn whole_row_outcomes(
                 to.quote_style.is_some(),
                 &factor.exposed.value,
                 factor.exposed.quote_style.is_some(),
-            ) || factor.alias.as_ref().is_some_and(|alias| alias.columns.len() > *ordinal)
+            ) || factor.renames_column(*ordinal)
             {
                 continue;
             }
@@ -3149,7 +3078,7 @@ fn post_columns(factor: &ShellFactor, renames: &[Rename]) -> Option<Vec<(String,
         let Rename::Column { ordinal, to, .. } = rename else {
             continue;
         };
-        if factor.alias.as_ref().is_some_and(|alias| alias.columns.len() > *ordinal) {
+        if factor.renames_column(*ordinal) {
             continue;
         }
         let Some(column) = columns.get_mut(*ordinal) else { continue };
@@ -3195,7 +3124,7 @@ fn shell_edits(
             if factor.insert_target {
                 edits.names.insert(factor.address, to);
             } else {
-                edits.factor_names.insert(factor.address, to);
+                edits.factors.names.insert(factor.address, to);
             }
         }
         // PostgreSQL respells a target's qualified references under the
@@ -3213,7 +3142,7 @@ fn shell_edits(
             }
         }
         for (ordinal, to) in column_renames {
-            let pinned = factor.alias.as_ref().is_some_and(|alias| alias.columns.len() > ordinal);
+            let pinned = factor.renames_column(ordinal);
             if pinned {
                 continue;
             }
@@ -3280,9 +3209,9 @@ fn shield_shell(
                         edits.names.insert(factor.address, to);
                         insert_alias = Some(factor.exposed.clone());
                     } else {
-                        edits.factor_names.insert(factor.address, to);
+                        edits.factors.names.insert(factor.address, to);
                         if !factor.has_alias {
-                            edits.aliases.insert(
+                            edits.factors.aliases.insert(
                                 factor.address,
                                 TableAlias {
                                     explicit: true,
@@ -3302,10 +3231,10 @@ fn shield_shell(
                             function_name: function_name.to_string(),
                         });
                     }
-                    if factor.alias.as_ref().is_some_and(|alias| alias.columns.len() > *ordinal) {
+                    if factor.renames_column(*ordinal) {
                         continue;
                     }
-                    edits.aliases.insert(
+                    edits.factors.aliases.insert(
                         factor.address,
                         restoring_alias(factor.alias.as_ref(), factor.exposed.clone(), columns),
                     );
@@ -3321,6 +3250,36 @@ fn shield_shell(
         *table_alias = Some(TableAliasWithoutColumns { explicit: true, alias });
     }
     Ok(())
+}
+
+/// The column names one assignment target writes, a tuple target listing
+/// the target's columns by name.
+fn assignment_target_entries<'a>(
+    target: &'a mut AssignmentTarget,
+    entries: &mut Vec<&'a mut ObjectName>,
+) {
+    match target {
+        AssignmentTarget::ColumnName(name) => entries.push(name),
+        AssignmentTarget::Tuple(names) => entries.extend(names.iter_mut()),
+    }
+}
+
+/// The new name a column rename writes over the part it still names, which
+/// the rename's old name must hold.
+fn renamed_part(rename: &Rename, written: &Ident) -> Option<Ident> {
+    let Rename::Column { ordinal, to, columns, .. } = rename else {
+        return None;
+    };
+    // `ordinal` is the position the renamed column held among `columns`,
+    // so it is in range.
+    let old = &columns[*ordinal];
+    identifiers_match(
+        &old.value,
+        old.quote_style.is_some(),
+        &written.value,
+        written.quote_style.is_some(),
+    )
+    .then(|| to.clone())
 }
 
 /// Renames the columns a write target lists, which name the target's own
@@ -3343,20 +3302,13 @@ fn rename_lists(dml: &mut DmlMut<'_>, factors: &[ShellFactor], renames: &[Rename
             {
                 conflict_columns.extend(conflict.iter_mut());
                 for assignment in assignments {
-                    match &mut assignment.target {
-                        AssignmentTarget::ColumnName(name) => entries.push(name),
-                        AssignmentTarget::Tuple(names) => entries.extend(names.iter_mut()),
-                    }
+                    assignment_target_entries(&mut assignment.target, &mut entries);
                 }
             }
         }
         DmlMut::Update(Update { assignments, .. }) => {
             for assignment in assignments {
-                match &mut assignment.target {
-                    AssignmentTarget::ColumnName(name) => entries.push(name),
-                    // A tuple target lists the target's columns by name.
-                    AssignmentTarget::Tuple(names) => entries.extend(names.iter_mut()),
-                }
+                assignment_target_entries(&mut assignment.target, &mut entries);
             }
         }
         DmlMut::Merge(Merge { clauses, .. }) => {
@@ -3368,10 +3320,7 @@ fn rename_lists(dml: &mut DmlMut<'_>, factors: &[ShellFactor], renames: &[Rename
                         ..
                     }) => {
                         for assignment in assignments {
-                            match &mut assignment.target {
-                                AssignmentTarget::ColumnName(name) => entries.push(name),
-                                AssignmentTarget::Tuple(names) => entries.extend(names.iter_mut()),
-                            }
+                            assignment_target_entries(&mut assignment.target, &mut entries);
                         }
                     }
                     _ => {}
@@ -3384,41 +3333,15 @@ fn rename_lists(dml: &mut DmlMut<'_>, factors: &[ShellFactor], renames: &[Rename
     // a composite column, which a column rename leaves alone.
     for part in entries.into_iter().filter_map(|entry| entry.0.first_mut()) {
         for rename in renames.iter().filter(|rename| rename.key() == key) {
-            let Rename::Column { ordinal, to, columns, .. } = rename else {
-                continue;
-            };
-            // `ordinal` is the position the renamed column held among
-            // `columns`, so it is in range.
-            let old = &columns[*ordinal];
-            let matches_old = part.as_ident().is_some_and(|written| {
-                identifiers_match(
-                    &old.value,
-                    old.quote_style.is_some(),
-                    &written.value,
-                    written.quote_style.is_some(),
-                )
-            });
-            if matches_old {
-                *part = ObjectNamePart::Identifier(to.clone());
+            if let Some(to) = part.as_ident().and_then(|written| renamed_part(rename, written)) {
+                *part = ObjectNamePart::Identifier(to);
             }
         }
     }
     for column in conflict_columns {
         for rename in renames.iter().filter(|rename| rename.key() == key) {
-            let Rename::Column { ordinal, to, columns, .. } = rename else {
-                continue;
-            };
-            // `ordinal` is the position the renamed column held among
-            // `columns`, so it is in range.
-            let old = &columns[*ordinal];
-            let matches_old = identifiers_match(
-                &old.value,
-                old.quote_style.is_some(),
-                &column.value,
-                column.quote_style.is_some(),
-            );
-            if matches_old {
-                *column = to.clone();
+            if let Some(to) = renamed_part(rename, column) {
+                *column = to;
             }
         }
     }
@@ -3430,10 +3353,8 @@ fn rename_lists(dml: &mut DmlMut<'_>, factors: &[ShellFactor], renames: &[Rename
 struct ShellEdits {
     /// A write target's or column list entry's new name.
     names: BTreeMap<usize, ObjectName>,
-    /// A clause factor's new relation name.
-    factor_names: BTreeMap<usize, ObjectName>,
-    /// A clause factor's new alias.
-    aliases: BTreeMap<usize, TableAlias>,
+    /// The clause factors' new names and aliases.
+    factors: FactorEdits,
     /// A qualified reference's new column identifier.
     columns: BTreeMap<usize, Ident>,
     /// A qualified reference's new relation identifier.
@@ -3465,19 +3386,7 @@ impl VisitorMut for ShellEdits {
     }
 
     fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
-        let at = address(&*factor);
-        if let TableFactor::Table { name, alias, .. } = factor {
-            if let Some(to) = self.factor_names.get(&at) {
-                // A new name written with its schema moves the relation, so it
-                // replaces the qualifier too.
-                let kept = if to.0.len() > 1 { 0 } else { name.0.len().saturating_sub(1) };
-                name.0.truncate(kept);
-                name.0.extend(to.0.iter().cloned());
-            }
-            if let Some(replacement) = self.aliases.get(&at) {
-                *alias = Some(replacement.clone());
-            }
-        }
+        self.factors.apply(factor);
         ControlFlow::Continue(())
     }
 
@@ -3511,7 +3420,7 @@ impl VisitorMut for ShellEdits {
         }
         if let Some(to) = self.qualifiers.get(&at)
             && let Expr::CompoundIdentifier(parts) = expression
-            && let Some(relation) = parts.len().checked_sub(2).and_then(|at| parts.get_mut(at))
+            && let Some(relation) = relation_part(parts)
         {
             *relation = to.clone();
         }

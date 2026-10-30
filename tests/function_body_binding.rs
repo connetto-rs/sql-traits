@@ -499,6 +499,20 @@ fn a_return_body_follows_renames_of_what_it_reads() {
     assert_eq!(body(&db, "r"), "(SELECT b AS a FROM t)");
 }
 
+/// A body that reads only a relation the rename does not touch stays as
+/// written.
+#[test]
+fn a_return_body_reading_an_unrenamed_relation_stays_as_written() {
+    let db = parse(
+        "CREATE TABLE t (a INT);
+         CREATE TABLE u (a INT);
+         CREATE FUNCTION r() RETURNS INT LANGUAGE sql RETURN (SELECT a FROM u);
+         ALTER TABLE t RENAME TO t2;",
+    )
+    .expect("the rename is accepted");
+    assert_eq!(body(&db, "r"), "(SELECT a FROM u)");
+}
+
 /// A relation the body reads cannot be dropped without `CASCADE`, and
 /// `CASCADE` takes the function with it.
 #[test]

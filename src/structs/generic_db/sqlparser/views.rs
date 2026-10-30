@@ -29,9 +29,9 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, CreateView, Expr, Ident, Insert, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, SelectItem, SetExpr, Statement, TableFactor, TableObject, Visit, VisitMut,
-    Visitor, VisitorMut,
+    AlterTableOperation, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Owner, Query,
+    RenameTableNameKind, SelectItem, SetExpr, Statement, TableFactor, Visit, VisitMut, Visitor,
+    VisitorMut,
 };
 
 use super::{
@@ -48,8 +48,8 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         object_name::{
-            RelationKey, TEMPORARY_SCHEMA, qualifier_of, stored_function_key, stored_view_key,
-            target_key, target_name_from_object_name,
+            RelationKey, qualifier_of, stored_function_key, stored_view_key, target_key,
+            target_name_from_object_name,
         },
         output_from_wildcard,
         with_scopes::WithScopes,
@@ -807,21 +807,7 @@ pub(super) fn bound_read_key(
     let case = IdentifierCase::AsWritten;
     match builder {
         Some(builder) => {
-            let bound = builder.bound_relation(name)?;
-            let schema = if bound.temporary {
-                case.compared_form(TEMPORARY_SCHEMA, false)
-            } else {
-                match &bound.qualifier {
-                    Some(qualifier) => {
-                        case.compared_form(&qualifier.value, qualifier.quote_style.is_some())
-                    }
-                    None => case.compared_form("public", false),
-                }
-            };
-            Some(RelationKey {
-                schema: schema.into_owned(),
-                name: case.compared_form(target.name(), target.name_is_quoted()).into_owned(),
-            })
+            Some(view_rewrites::bound_factor_key(&builder.bound_relation(name)?, name))
         }
         None => Some(target_key(&target, case)),
     }
@@ -858,16 +844,12 @@ pub(super) fn statements_read<'a>(
 /// The name an `INSERT` statement writes, which sits outside its queries,
 /// top-level and under a `WITH` clause alike.
 fn insert_target(statement: &Statement) -> Option<&ObjectName> {
+    if let Some(dml) = view_rewrites::statement_dml(statement) {
+        return dml.insert_target();
+    }
     match statement {
-        Statement::Insert(Insert { table: TableObject::TableName(name), .. }) => Some(name),
         Statement::Query(query) => {
-            match query.body.as_ref() {
-                SetExpr::Insert(Statement::Insert(Insert {
-                    table: TableObject::TableName(name),
-                    ..
-                })) => Some(name),
-                _ => None,
-            }
+            view_rewrites::dml_ref(&query.body).and_then(|dml| dml.insert_target())
         }
         _ => None,
     }
