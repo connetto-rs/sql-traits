@@ -1,4 +1,5 @@
-//! `GRANT` and `REVOKE` on functions, which change who may execute each one.
+//! `GRANT` and `REVOKE` on functions and routines, which change who may
+//! execute each function.
 //!
 //! A relation grant is stored as written and read back through
 //! [`TableGrantLike`](crate::traits::TableGrantLike). A function grant instead
@@ -25,13 +26,17 @@ use crate::{
 };
 
 /// The functions a grant or a revoke names, taken out of its object list.
+///
+/// This model holds no procedure, so a routine is a function or nothing.
 pub(super) enum Routines {
-    /// `ON FUNCTION`, one signature per function.
+    /// `ON FUNCTION` or `ON ROUTINE`, one signature per routine.
     Functions(Vec<FunctionDesc>),
     /// `ON PROCEDURE`, one signature per procedure.
     Procedures(Vec<FunctionDesc>),
-    /// `ON ALL FUNCTIONS IN SCHEMA`.
+    /// `ON ALL FUNCTIONS IN SCHEMA` or `ON ALL ROUTINES IN SCHEMA`.
     Schemas(Vec<ObjectName>),
+    /// `ON ALL PROCEDURES IN SCHEMA`, which reaches no function.
+    AllProcedures,
 }
 
 impl Routines {
@@ -39,9 +44,15 @@ impl Routines {
     /// objects in place.
     pub(super) fn take(objects: &mut Option<GrantObjects>) -> Option<Self> {
         match objects.take() {
-            Some(GrantObjects::Functions(signatures)) => Some(Self::Functions(signatures)),
+            Some(GrantObjects::Functions(signatures) | GrantObjects::Routines(signatures)) => {
+                Some(Self::Functions(signatures))
+            }
             Some(GrantObjects::Procedures(signatures)) => Some(Self::Procedures(signatures)),
-            Some(GrantObjects::AllFunctionsInSchema { schemas }) => Some(Self::Schemas(schemas)),
+            Some(
+                GrantObjects::AllFunctionsInSchema { schemas }
+                | GrantObjects::AllRoutinesInSchema { schemas },
+            ) => Some(Self::Schemas(schemas)),
+            Some(GrantObjects::AllProceduresInSchema { .. }) => Some(Self::AllProcedures),
             other => {
                 *objects = other;
                 None
@@ -191,6 +202,7 @@ impl Reached {
                     },
                 ));
             }
+            Routines::AllProcedures => {}
         }
         Ok(reached)
     }
