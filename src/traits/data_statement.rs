@@ -126,9 +126,8 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
     /// ",
     /// )?;
-    /// let query = sqlparser::parser::Parser::new(&GenericDialect)
-    ///     .try_with_sql("SELECT * FROM t, v, m")?
-    ///     .parse_query()?;
+    /// let sql = "SELECT * FROM t, v, m";
+    /// let query = sqlparser::parser::Parser::new(&GenericDialect).try_with_sql(sql)?.parse_query()?;
     /// let read: Vec<String> = query
     ///     .referenced_relations(&db)?
     ///     .iter()
