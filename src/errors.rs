@@ -655,6 +655,25 @@ pub enum Error {
         /// Name of the host table containing the foreign key.
         host_table: String,
     },
+    #[error(
+        "Foreign key in table `{host_table}` names {host_columns} column(s), but its target in table `{referenced_table}` has {referenced_columns}."
+    )]
+    /// Error indicating that a foreign key names a different number of host
+    /// columns than the referenced key holds.
+    ///
+    /// The columns pair up by position, so PostgreSQL, MySQL and SQLite all
+    /// refuse lists of different lengths. An omitted referenced list stands
+    /// for the primary key of the referenced table, as in PostgreSQL.
+    ForeignKeyColumnCountMismatch {
+        /// Name of the host table containing the foreign key.
+        host_table: String,
+        /// Number of host columns the foreign key names.
+        host_columns: usize,
+        /// Name of the referenced table.
+        referenced_table: String,
+        /// Number of columns in the referenced key.
+        referenced_columns: usize,
+    },
     #[error("Host column `{host_column}` not found in table `{host_table}` for foreign key.")]
     /// Error indicating that a foreign key references a host column that does
     /// not exist.

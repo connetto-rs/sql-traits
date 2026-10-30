@@ -2784,12 +2784,22 @@ fn declared_candidate_keys(table: &CreateTable) -> Vec<Vec<&Ident>> {
     keys
 }
 
-/// Returns whether the primary key of `table` exists, which is what a foreign
-/// key naming no columns points at.
-fn has_primary_key(table: &CreateTable) -> bool {
-    table.columns.iter().any(|column| {
+/// Returns the number of columns in the primary key of `table`, which is
+/// what a foreign key naming no columns points at, or `None` when the table
+/// has no primary key.
+fn primary_key_width(table: &CreateTable) -> Option<usize> {
+    let inline = table.columns.iter().any(|column| {
         column.options.iter().any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
-    }) || table.constraints.iter().any(|c| matches!(c, TableConstraint::PrimaryKey(_)))
+    });
+    if inline {
+        return Some(1);
+    }
+    table.constraints.iter().find_map(|constraint| {
+        match constraint {
+            TableConstraint::PrimaryKey(primary_key) => Some(primary_key.columns.len()),
+            _ => None,
+        }
+    })
 }
 
 /// Reads one entry of a `SET search_path` value list as a schema name and its
@@ -4862,8 +4872,8 @@ impl ParserDB {
         // `CREATE UNIQUE INDEX` counts and lives in the builder rather than on
         // the node, so both sources are gathered.
         let referred: Vec<&Ident> = fk.referred_columns.iter().collect();
-        let backed = if referred.is_empty() {
-            has_primary_key(referenced_table)
+        let referenced_width = if referred.is_empty() {
+            primary_key_width(referenced_table)
         } else {
             let mut candidates = declared_candidate_keys(referenced_table);
             candidates.extend(builder.indices().iter().filter_map(|(index, _)| {
@@ -4873,18 +4883,33 @@ impl ParserDB {
                 }
                 plain_key_columns(&node.columns)
             }));
-            candidates.iter().any(|candidate| key_columns_match(&referred, candidate))
+            candidates
+                .iter()
+                .any(|candidate| key_columns_match(&referred, candidate))
+                .then_some(referred.len())
         };
 
-        if !backed {
+        let Some(referenced_width) = referenced_width else {
             return Err(crate::errors::Error::ReferencedColumnsNotUniqueForForeignKey {
                 referenced_columns: referred
                     .iter()
                     .map(|ident| ident.value.clone())
                     .collect::<Vec<_>>()
                     .join(", "),
-                referenced_table: referenced_table_name.clone(),
+                referenced_table: referenced_table_name,
                 host_table: create_table.name.to_string(),
+            });
+        };
+
+        // The columns pair up by position, so the two lists must be as long
+        // as each other. PostgreSQL asks this after looking for the unique
+        // key, so a foreign key failing both reports the missing key.
+        if fk.columns.len() != referenced_width {
+            return Err(crate::errors::Error::ForeignKeyColumnCountMismatch {
+                host_table: create_table.name.to_string(),
+                host_columns: fk.columns.len(),
+                referenced_table: referenced_table_name,
+                referenced_columns: referenced_width,
             });
         }
 
@@ -11773,6 +11798,91 @@ mod tests {
             assert!(ParserDB::parse::<GenericDialect>(with_pk).is_ok());
             assert!(matches!(
                 ParserDB::parse::<GenericDialect>(without_pk),
+                Err(Error::ReferencedColumnsNotUniqueForForeignKey { .. })
+            ));
+        }
+
+        /// PostgreSQL pairs the host columns with the referenced ones by
+        /// position, so it refuses a foreign key whose two lists differ in
+        /// length, including a list left out to mean the primary key and a key
+        /// added later by `ALTER TABLE`. Verified against PostgreSQL 18.
+        #[test]
+        fn host_and_referenced_column_counts_must_agree() {
+            let composite = "CREATE TABLE owners (tenant TEXT, id TEXT, PRIMARY KEY (tenant, id));";
+            let single = "CREATE TABLE owners (id TEXT PRIMARY KEY);";
+            let accepted = [
+                "CREATE TABLE links (tenant TEXT, owner TEXT,
+                    FOREIGN KEY (tenant, owner) REFERENCES owners(tenant, id));",
+                "CREATE TABLE links (tenant TEXT, owner TEXT,
+                    FOREIGN KEY (tenant, owner) REFERENCES owners);",
+            ];
+            for links in accepted {
+                let sql = format!("{composite}\n{links}");
+                assert!(ParserDB::parse::<PostgreSqlDialect>(&sql).is_ok(), "{sql}");
+            }
+
+            let refused = [
+                (
+                    composite,
+                    "CREATE TABLE links (owner TEXT,
+                    FOREIGN KEY (owner) REFERENCES owners(tenant, id));",
+                    1,
+                    2,
+                ),
+                (composite, "CREATE TABLE links (owner TEXT REFERENCES owners(tenant, id));", 1, 2),
+                (composite, "CREATE TABLE links (owner TEXT REFERENCES owners);", 1, 2),
+                (
+                    single,
+                    "CREATE TABLE links (tenant TEXT, owner TEXT,
+                    FOREIGN KEY (tenant, owner) REFERENCES owners(id));",
+                    2,
+                    1,
+                ),
+                (
+                    single,
+                    "CREATE TABLE links (tenant TEXT, owner TEXT,
+                    FOREIGN KEY (tenant, owner) REFERENCES owners);",
+                    2,
+                    1,
+                ),
+                (
+                    single,
+                    "CREATE TABLE links (tenant TEXT, owner TEXT);
+                    ALTER TABLE links ADD CONSTRAINT links_owner
+                    FOREIGN KEY (tenant, owner) REFERENCES owners(id);",
+                    2,
+                    1,
+                ),
+            ];
+            for (owners, links, host_count, referenced_count) in refused {
+                let sql = format!("{owners}\n{links}");
+                match ParserDB::parse::<PostgreSqlDialect>(&sql) {
+                    Err(Error::ForeignKeyColumnCountMismatch {
+                        host_table,
+                        host_columns,
+                        referenced_table,
+                        referenced_columns,
+                    }) => {
+                        assert_eq!(host_table, "links", "{sql}");
+                        assert_eq!(host_columns, host_count, "{sql}");
+                        assert_eq!(referenced_table, "owners", "{sql}");
+                        assert_eq!(referenced_columns, referenced_count, "{sql}");
+                    }
+                    other => panic!("expected a column-count mismatch for {sql}, got {other:?}"),
+                }
+            }
+        }
+
+        /// PostgreSQL looks for the unique key before it counts the columns,
+        /// so a foreign key failing both reports the missing key.
+        #[test]
+        fn a_missing_unique_key_is_reported_before_a_count_mismatch() {
+            let sql = "
+                CREATE TABLE owners (id TEXT, tag TEXT);
+                CREATE TABLE links (a TEXT, b TEXT, FOREIGN KEY (a, b) REFERENCES owners(tag));
+            ";
+            assert!(matches!(
+                ParserDB::parse::<PostgreSqlDialect>(sql),
                 Err(Error::ReferencedColumnsNotUniqueForForeignKey { .. })
             ));
         }
