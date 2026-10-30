@@ -6,24 +6,27 @@
 //! resolves under the session's `search_path` in effect at creation, exactly
 //! as a view's definition does, and a name that does not resolve refuses the
 //! statement. A block also binds the target of each `INSERT`, which sits
-//! outside any query. A `CALL` names a procedure, which this model does not
-//! hold, so only the relations its arguments read are bound. `SET` is not
-//! yet supported by PostgreSQL in an unquoted SQL function body, so a block
-//! holding one is refused. A body written as a string is never bound, and
+//! outside any query. A block holding any statement other than a query,
+//! `INSERT`, `UPDATE`, `DELETE`, `MERGE` or `RETURN` is refused, as
+//! PostgreSQL refuses `CALL`, `SET` and DDL in an unquoted SQL function body.
+//! A body written as a string is never bound, and
 //! neither is a name a visible `WITH` item answers or a table function.
 //!
 //! A block's statements are also analyzed the way PostgreSQL analyzes them
 //! at creation: a clause reference carrying a schema or a database part is
 //! dropped to the parts it keeps when it names a relation the statement's
-//! own clauses scope under a matching schema, and refused otherwise, and a
-//! factor name spelling this catalog's qualifier is dropped.
+//! own clauses scope under a matching schema, and refused otherwise, a
+//! factor name spelling this catalog's qualifier is dropped, and an
+//! `INSERT` offering more expressions than its target has columns is
+//! refused.
 
 use alloc::{boxed::Box, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CreateFunction, CreateFunctionBody, Expr, GroupByExpr, Insert, ObjectName, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, Statement, TableFactor, TableObject, VisitMut, VisitorMut,
+    ArgMode, CreateFunction, CreateFunctionBody, DataType, Expr, FunctionReturnType, GroupByExpr,
+    Insert, ObjectName, OperateFunctionArg, OutputClause, Query, Select, SelectFlavor, SelectItem,
+    SetExpr, Statement, TableFactor, TableObject, VisitMut, VisitorMut,
     helpers::attached_token::AttachedToken,
 };
 
@@ -50,8 +53,14 @@ use crate::{
 /// Returns [`Error::RelationNotFoundForFunctionBody`] naming the first
 /// relation the body names that the builder does not hold, the way PostgreSQL
 /// refuses the `CREATE FUNCTION`. A `BEGIN ATOMIC` body is also refused with
-/// [`Error::FunctionBodyStatementUnsupported`] for a `SET` statement, which
-/// PostgreSQL does not support in an unquoted SQL function body, and with
+/// [`Error::FunctionBodyStatementUnsupported`] for a statement kind or a
+/// clause shape PostgreSQL does not support in an unquoted SQL function body,
+/// with [`Error::FunctionBodyResultMissing`] when it declares a result its
+/// final statement produces none, with
+/// [`Error::FunctionBodyReferenceAmbiguous`] for a bare column reference two
+/// relations in its scope expose, with
+/// [`Error::FunctionBodyInsertTooWide`] for an `INSERT` offering more
+/// expressions than its target has columns, and with
 /// [`Error::IdentifierLookupError`] for a reference or a factor name it will
 /// not analyze.
 pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> Result<(), Error> {
@@ -69,24 +78,116 @@ pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> 
         }
         CreateFunctionBody::BeginAtomic(block) => {
             super::view_rewrites::normalize_block_references(builder, &mut block.statements)?;
+            let function_name = last_str(&function.name).to_string();
             let mut binder =
                 BodyBinder { builder, bare_temporary: true, scopes: WithScopes::default() };
             for statement in &mut block.statements {
-                if let Statement::Set(_) = statement {
+                if !matches!(
+                    statement,
+                    Statement::Query(_)
+                        | Statement::Insert(_)
+                        | Statement::Update(_)
+                        | Statement::Delete(_)
+                        | Statement::Merge(_)
+                        | Statement::Return(_)
+                ) {
                     return Err(Error::FunctionBodyStatementUnsupported {
                         statement: statement.to_string(),
-                        function_name: last_str(&function.name).to_string(),
+                        function_name,
                     });
                 }
+                super::view_rewrites::shape_of_block_statement(statement, &function_name)?;
+                super::view_rewrites::refuse_ambiguous_block_reference(
+                    builder,
+                    statement,
+                    &function_name,
+                )?;
+                super::view_rewrites::spell_block_statement(builder, statement, &function_name)?;
                 match statement.visit(&mut binder) {
                     ControlFlow::Continue(()) => {}
                     ControlFlow::Break(missing) => return missing_relation(&missing, function),
                 }
             }
+            let declares_result =
+                function_declares_result(function.args.as_deref(), function.return_type.as_ref());
+            if declares_result
+                && (block.statements.is_empty()
+                    || block.statements.last().is_some_and(final_statement_produces_no_result))
+            {
+                return Err(Error::FunctionBodyResultMissing { function_name });
+            }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// Whether the function declares a result, which is any `RETURNS` other
+/// than `void` and any `OUT` or `INOUT` argument.
+fn function_declares_result(
+    args: Option<&[OperateFunctionArg]>,
+    return_type: Option<&FunctionReturnType>,
+) -> bool {
+    if args.is_some_and(|args| {
+        args.iter().any(|arg| matches!(arg.mode, Some(ArgMode::Out | ArgMode::InOut)))
+    }) {
+        return true;
+    }
+    match return_type {
+        Some(FunctionReturnType::DataType(data_type)) => !is_void(data_type),
+        Some(FunctionReturnType::SetOf(_)) => true,
+        None => false,
+    }
+}
+
+/// Whether a declared return type is `void`, which a body writes no result
+/// for.
+fn is_void(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Custom(name, segments)
+            if segments.is_empty() && name.to_string().eq_ignore_ascii_case("void")
+    )
+}
+
+/// Whether a block's final statement produces no result, which is a
+/// data-modifying statement without `RETURNING`, written directly or under
+/// its `WITH` clause.
+fn final_statement_produces_no_result(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => dml_without_returning(query.body.as_ref()),
+        Statement::Insert(insert) => returning_is_empty(insert.returning.as_deref()),
+        Statement::Update(update) => returning_is_empty(update.returning.as_deref()),
+        Statement::Delete(delete) => returning_is_empty(delete.returning.as_deref()),
+        Statement::Merge(merge) => {
+            !matches!(merge.output.as_ref(), Some(OutputClause::Returning { .. }))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a query body is a data-modifying statement without `RETURNING`.
+fn dml_without_returning(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Insert(Statement::Insert(insert)) => {
+            returning_is_empty(insert.returning.as_deref())
+        }
+        SetExpr::Update(Statement::Update(update)) => {
+            returning_is_empty(update.returning.as_deref())
+        }
+        SetExpr::Delete(Statement::Delete(delete)) => {
+            returning_is_empty(delete.returning.as_deref())
+        }
+        SetExpr::Merge(Statement::Merge(merge)) => {
+            !matches!(merge.output.as_ref(), Some(OutputClause::Returning { .. }))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a data-modifying statement's `RETURNING` list is absent or empty.
+fn returning_is_empty(returning: Option<&[SelectItem]>) -> bool {
+    returning.is_none_or(<[SelectItem]>::is_empty)
 }
 
 /// The refusal a body's unresolvable relation names.
@@ -194,7 +295,7 @@ impl BodyBinder<'_> {
                 return ControlFlow::Break(name.clone());
             };
             if bound.temporary && self.bare_temporary {
-                name.0.truncate(1);
+                name.0.drain(..name.0.len() - 1);
             } else {
                 bind_reference(name, bound.qualifier);
             }
@@ -224,9 +325,13 @@ impl VisitorMut for BodyBinder<'_> {
     }
 
     /// The target of an `INSERT` sits outside any query, where the factor
-    /// hook does not reach.
+    /// hook does not reach, and it must name a stored relation, which a
+    /// `WITH` item's name does not.
     fn pre_visit_statement(&mut self, statement: &mut Statement) -> ControlFlow<Self::Break> {
         if let Statement::Insert(Insert { table: TableObject::TableName(name), .. }) = statement {
+            if self.scopes.reads_item(name) {
+                return ControlFlow::Break(name.clone());
+            }
             return self.bind_factor_name(name);
         }
         ControlFlow::Continue(())

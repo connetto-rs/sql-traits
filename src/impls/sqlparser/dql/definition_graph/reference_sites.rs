@@ -225,6 +225,9 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, DB> {
                 self.set_expr(left);
                 self.set_expr(right);
             }
+            // A data-modifying body's clauses respell through the statement
+            // that holds it, so the queries nested in it walk on their own.
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {}
             other => self.node(other, None),
         }
     }

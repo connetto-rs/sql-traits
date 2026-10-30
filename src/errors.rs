@@ -1472,22 +1472,52 @@ pub enum Error {
         function_name: String,
     },
     #[error(
-        "Column `{column_name}` of `{relation_name}` cannot be renamed while function `{function_name}` writes to the relation in a statement whose references are not all bound."
+        "Column `{column_name}` of `{relation_name}` cannot be renamed while function `{function_name}` writes to the relation in a statement that cannot follow the rename."
     )]
     /// Error indicating that a column rename reaches the write target of a
-    /// `BEGIN ATOMIC` statement the model could not bind.
+    /// `BEGIN ATOMIC` statement in a position the stored text cannot follow.
     ///
     /// A statement reading a view whose columns are unknown keeps its
     /// references as written, and the relations it reads take back the old
     /// column names through an alias column list. PostgreSQL accepts no such
-    /// list on an `UPDATE`, `DELETE` or `MERGE` target, so the rename is
-    /// refused before it changes anything.
+    /// list on an `UPDATE`, `DELETE` or `MERGE` target. A whole-row reference
+    /// to the target in `RETURNING` that the new column name would capture
+    /// needs the form `t.*::t`, which the parser does not read. Either way the
+    /// rename is refused before it changes anything.
     FunctionBodyBlocksColumnRename {
         /// Name of the column the statement renames.
         column_name: String,
         /// Name of the relation the function writes to.
         relation_name: String,
         /// Name of the function whose body writes to the relation.
+        function_name: String,
+    },
+    #[error(
+        "Function `{function_name}` declares a result, but its body's final statement produces none."
+    )]
+    /// Error indicating that a `BEGIN ATOMIC` function declares a result
+    /// while its block is empty or ends in a data-modifying statement without
+    /// `RETURNING`, which PostgreSQL refuses at creation.
+    FunctionBodyResultMissing {
+        /// Name of the function whose final statement produces no result.
+        function_name: String,
+    },
+    #[error("Column `{column_name}` is ambiguous in the body of function `{function_name}`.")]
+    /// Error indicating that a body statement references a column bare while
+    /// more than one relation in its scope exposes that column, which
+    /// PostgreSQL refuses at creation.
+    FunctionBodyReferenceAmbiguous {
+        /// Name of the column the statement references ambiguously.
+        column_name: String,
+        /// Name of the function whose body is ambiguous.
+        function_name: String,
+    },
+    #[error("Function `{function_name}`'s `INSERT` has more expressions than target columns.")]
+    /// Error indicating that a `BEGIN ATOMIC` function's `INSERT` offers
+    /// more expressions than its target has columns, which PostgreSQL
+    /// refuses at creation.
+    FunctionBodyInsertTooWide {
+        /// Name of the function whose body holds the `INSERT`.
         function_name: String,
     },
     #[error(

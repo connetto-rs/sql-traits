@@ -512,6 +512,7 @@ fn rename_view(
 /// # Errors
 ///
 /// Returns [`LookupError::ColumnNotFound`] when the view exposes no column of
+/// the old name, [`Error::UnsupportedAlterTableOperation`] when the model
 /// cannot name every column the view exposes and the declaration's own list
 /// does not name the old one, [`Error::ColumnAlreadyExists`] when the view
 /// already exposes a column of the new name, and
@@ -829,15 +830,16 @@ pub(super) fn bound_read_key(
 /// The normalized identity of every relation a block statement reads or
 /// writes, which is every relation its queries read and the target its
 /// writes name.
-pub(super) fn statements_read(
+pub(super) fn statements_read<'a>(
     builder: &ParserDBBuilder,
-    statements: &[Statement],
+    statements: impl IntoIterator<Item = &'a Statement>,
 ) -> Vec<RelationKey> {
     let mut read = Vec::new();
     for statement in statements {
-        // An `INSERT`'s target sits outside any query, so it is named
-        // before the statement is visited.
-        if let Statement::Insert(Insert { table: TableObject::TableName(name), .. }) = statement
+        // An `INSERT`'s target sits outside the statement's queries,
+        // top-level and under a `WITH` clause alike, so it is named before
+        // the statement is visited.
+        if let Some(name) = insert_target(statement)
             && let Some(key) = bound_read_key(Some(builder), name)
         {
             read.push(key);
@@ -851,6 +853,24 @@ pub(super) fn statements_read(
         debug_assert!(walk.is_continue(), "the visitor never breaks");
     }
     read
+}
+
+/// The name an `INSERT` statement writes, which sits outside its queries,
+/// top-level and under a `WITH` clause alike.
+fn insert_target(statement: &Statement) -> Option<&ObjectName> {
+    match statement {
+        Statement::Insert(Insert { table: TableObject::TableName(name), .. }) => Some(name),
+        Statement::Query(query) => {
+            match query.body.as_ref() {
+                SetExpr::Insert(Statement::Insert(Insert {
+                    table: TableObject::TableName(name),
+                    ..
+                })) => Some(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Every view and function reading the relation `key` names, and every
