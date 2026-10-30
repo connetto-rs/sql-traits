@@ -127,12 +127,22 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// ",
     /// )?;
     /// let query = sqlparser::parser::Parser::new(&GenericDialect)
-    ///     .try_with_sql("SELECT * FROM v")?
+    ///     .try_with_sql("SELECT * FROM t, v, m")?
     ///     .parse_query()?;
-    /// assert!(matches!(
-    ///     query.referenced_relations(&db)?.as_slice(),
-    ///     [Relation::View(view)] if view.view_name() == "v"
-    /// ));
+    /// let read: Vec<String> = query
+    ///     .referenced_relations(&db)?
+    ///     .iter()
+    ///     .map(|relation| {
+    ///         match relation {
+    ///             Relation::Table(table) => format!("table {}", table.table_name()),
+    ///             Relation::View(view) => format!("view {}", view.view_name()),
+    ///             Relation::MaterializedView(view) => {
+    ///                 format!("materialized view {}", view.view_name())
+    ///             }
+    ///         }
+    ///     })
+    ///     .collect();
+    /// assert_eq!(read, ["table t", "view v", "materialized view m"]);
     /// # Ok(())
     /// # }
     /// ```
