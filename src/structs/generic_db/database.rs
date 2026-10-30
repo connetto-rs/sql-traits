@@ -11,12 +11,12 @@ use crate::{
         ColumnIdentity, GenericDB, IdentifierCase, RelationIdentity, SchemaProfile, TargetName,
         generic_db::RelationSlot,
     },
-    traits::{DatabaseLike, TableLike},
+    traits::{DatabaseLike, Relation, TableLike},
     utils::object_name::{
         RelationKey, function_has_stored_identity, function_search_path, relation_search_path,
-        render_table_candidate, render_view_candidate, resolve_one_function, resolve_one_relation,
-        resolve_target_from_candidates, stored_function_key, stored_identity_key, stored_table_key,
-        stored_view_key,
+        render_relation, render_table_candidate, render_view_candidate, resolve_one_function,
+        resolve_one_relation, resolve_target_from_candidates, stored_function_key,
+        stored_identity_key, stored_table_key, stored_view_key,
     },
 };
 
@@ -182,6 +182,22 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         case: IdentifierCase,
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
         self.resolve_target_materialized_view_on_path(&target, case)
+    }
+
+    fn resolve_target_relation(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<Relation<'_, Self>>, LookupError> {
+        self.resolve_relation_on_path_any(&target, case)
+    }
+
+    fn resolve_bound_relation(
+        &self,
+        target: TargetName<'_>,
+    ) -> Result<Option<Relation<'_, Self>>, LookupError> {
+        let probe = IndexProbe::new(&target, IdentifierCase::AsWritten, None);
+        self.resolve_probed_relation(&probe, &target)
     }
 
     fn table_by_target(
@@ -633,5 +649,66 @@ impl<P: SchemaProfile> GenericDB<P> {
         }
 
         Ok(None)
+    }
+
+    /// Resolves a written target to the relation of any kind it denotes,
+    /// walking the search path for an unqualified name exactly as a table
+    /// lookup does, with the temporary schema first unless the path names it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
+    /// more than one relation in the schema that wins.
+    fn resolve_relation_on_path_any<'db>(
+        &'db self,
+        target: &TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<Relation<'db, Self>>, LookupError> {
+        if target.schema().is_some() {
+            let probe = IndexProbe::new(target, case, None);
+            return self.resolve_probed_relation(&probe, target);
+        }
+
+        let path = || self.search_path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted));
+        for (entry_schema, entry_quoted) in relation_search_path(path) {
+            let probe = IndexProbe::new(target, case, Some((entry_schema, entry_quoted)));
+            if self.probed_name_is_taken(&probe) {
+                return self.resolve_probed_relation(&probe, target);
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Resolves the relation a probe answers, of whichever kind holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
+    /// more than one relation, reported under the written name.
+    fn resolve_probed_relation<'db>(
+        &'db self,
+        probe: &IndexProbe,
+        target: &TargetName<'_>,
+    ) -> Result<Option<Relation<'db, Self>>, LookupError> {
+        let mut candidates: Vec<Relation<'db, Self>> = self
+            .probed_tables(probe)
+            .into_iter()
+            .map(Relation::Table)
+            .chain(self.probed_views(probe).into_iter().map(Relation::View))
+            .chain(
+                self.probed_materialized_views(probe).into_iter().map(Relation::MaterializedView),
+            )
+            .collect();
+        if candidates.len() > 1 {
+            let mut rendered: Vec<String> = candidates.iter().map(render_relation).collect();
+            rendered.sort_unstable();
+            rendered.dedup();
+            return Err(LookupError::AmbiguousTableLookup {
+                object_name: target.to_string(),
+                candidates: rendered,
+            });
+        }
+        Ok(candidates.pop())
     }
 }

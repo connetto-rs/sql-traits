@@ -19,7 +19,7 @@ use sql_traits::{
     errors::{Error, ObjectKind},
     prelude::*,
     structs::{MaterializedView, ParserDBBuilder, View, ViewMetadata},
-    traits::{Metadata, grant::GrantRelation},
+    traits::Metadata,
 };
 use sqlparser::{
     ast::{CreateView, Query, SelectItem, SetExpr, Statement},
@@ -820,9 +820,9 @@ fn a_grant_reaches_views_and_says_which_kind_each_target_is() {
         .relations(&db)
         .map(|relation| {
             match relation {
-                GrantRelation::Table(_) => "table",
-                GrantRelation::View(_) => "view",
-                GrantRelation::MaterializedView(_) => "materialized view",
+                Relation::Table(_) => "table",
+                Relation::View(_) => "view",
+                Relation::MaterializedView(_) => "materialized view",
             }
         })
         .collect();
@@ -860,9 +860,9 @@ fn a_schema_wide_grant_covers_every_relation_kind() {
         .relations(&db)
         .map(|relation| {
             match relation {
-                GrantRelation::Table(_) => "table",
-                GrantRelation::View(_) => "view",
-                GrantRelation::MaterializedView(_) => "materialized view",
+                Relation::Table(_) => "table",
+                Relation::View(_) => "view",
+                Relation::MaterializedView(_) => "materialized view",
             }
         })
         .collect();
@@ -1355,7 +1355,7 @@ fn a_column_grant_names_the_kind_of_relation_it_covers() {
     let grant = db.column_grants().next().expect("one grant");
     assert!(grant.table(&db).is_none(), "the target is not a table");
     assert!(
-        matches!(grant.relation(&db), Some(GrantRelation::View(_))),
+        matches!(grant.relation(&db), Some(Relation::View(_))),
         "the kind-tagged answer names it",
     );
 
@@ -1364,7 +1364,7 @@ fn a_column_grant_names_the_kind_of_relation_it_covers() {
         .expect("a column grant on a table is accepted");
     let grant = db.column_grants().next().expect("one grant");
     assert_eq!(grant.table(&db).expect("a table target").table_name(), "t");
-    assert!(matches!(grant.relation(&db), Some(GrantRelation::Table(_))));
+    assert!(matches!(grant.relation(&db), Some(Relation::Table(_))));
 }
 
 #[test]

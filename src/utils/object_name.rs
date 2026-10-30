@@ -19,7 +19,7 @@ use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
-    traits::{DatabaseLike, FunctionLike, TableLike, ViewLike},
+    traits::{DatabaseLike, FunctionLike, Relation, TableLike, ViewLike},
     utils::identifier_resolution::{identifiers_match, normalize_identifier},
 };
 
@@ -836,6 +836,29 @@ pub(crate) fn resolve_object_name<'db, DB: DatabaseLike>(
     database.resolve_target_table(target_name_of_idents(schema_ident, table_ident), case)
 }
 
+/// Resolves a one-part or two-part object name to a relation of any kind of
+/// `database`, honouring `search_path` for an unqualified name.
+///
+/// This is the canonical entry point for trait-on-AST analysis that needs to
+/// turn an [`ObjectName`] into a stored relation of whatever kind. `Ok(None)`
+/// means no relation matched (for example a CTE name or a table function);
+/// an error means the name is malformed or the lookup is ambiguous.
+///
+/// # Errors
+///
+/// Returns an error when the object name is malformed for relation lookup, or
+/// when the lookup is ambiguous.
+pub(crate) fn resolve_relation_object_name<'db, DB: DatabaseLike>(
+    object_name: &ObjectName,
+    database: &'db DB,
+    case: IdentifierCase,
+) -> Result<Option<Relation<'db, DB>>, LookupError> {
+    let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
+    // Through the trait method, so a catalog overriding it answers every
+    // accessor the same way it answers a direct lookup.
+    database.resolve_target_relation(target_name_of_idents(schema_ident, table_ident), case)
+}
+
 /// Resolves an object name that is required to denote an existing base table of
 /// `database`.
 ///
@@ -894,6 +917,31 @@ pub(crate) fn resolve_required_bound_table<'db, DB: DatabaseLike>(
 ) -> Result<&'db DB::Table, LookupError> {
     resolve_bound_table(object_name, database)?
         .ok_or_else(|| LookupError::TableNotFound { object_name: object_name.to_string() })
+}
+
+/// Resolves a reference a stored object carries to the relation it names, of
+/// whatever kind, as [`resolve_bound_table`] reads its target.
+///
+/// # Errors
+///
+/// Returns an error when the object name is malformed for relation lookup, or
+/// when the lookup is ambiguous.
+pub(crate) fn resolve_bound_relation_object_name<'db, DB: DatabaseLike>(
+    object_name: &ObjectName,
+    database: &'db DB,
+) -> Result<Option<Relation<'db, DB>>, LookupError> {
+    let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
+    database.resolve_bound_relation(target_name_of_idents(schema_ident, table_ident))
+}
+
+/// Renders a relation of any kind for inclusion in an ambiguity error,
+/// quoting parts that were originally quoted.
+pub(crate) fn render_relation<DB: DatabaseLike>(relation: &Relation<'_, DB>) -> String {
+    match relation {
+        Relation::Table(table) => render_table_candidate(table),
+        Relation::View(view) => render_view_candidate(*view),
+        Relation::MaterializedView(view) => render_view_candidate(*view),
+    }
 }
 
 #[cfg(test)]

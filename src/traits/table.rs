@@ -11,7 +11,7 @@ use crate::{
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike,
-        RoleLike, RuleLike, RuleRelation, TableGrantLike, TriggerLike,
+        Relation, RoleLike, RuleLike, TableGrantLike, TriggerLike,
         check_constraint::{evaluate_constant_expr, non_tautological},
         role::privilege_holders,
     },
@@ -237,7 +237,7 @@ pub trait TableLike:
         Ok(database.rules().filter(move |rule| {
             matches!(
                 rule.relation(database),
-                Ok(RuleRelation::Table(table)) if table.borrow() == self.borrow()
+                Ok(Relation::Table(table)) if table.borrow() == self.borrow()
             )
         }))
     }

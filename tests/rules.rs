@@ -4,7 +4,7 @@
 //! A rule depends on its table or view and on the columns of it the condition
 //! and action read through `NEW` and `OLD`, so those are the references kept
 //! current. Relations the action names are kept as written.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{
     errors::{Error, LookupError},
@@ -57,8 +57,11 @@ fn relation_of(
     rule: &<ParserDB as DatabaseLike>::Rule,
 ) -> (&'static str, String) {
     match rule.relation(database).expect("the rule's relation resolves") {
-        RuleRelation::Table(table) => ("table", table.table_name().to_string()),
-        RuleRelation::View(view) => ("view", view.view_name().to_string()),
+        Relation::Table(table) => ("table", table.table_name().to_string()),
+        Relation::View(view) => ("view", view.view_name().to_string()),
+        // Ingestion refuses a rule on a materialized view, so this is the
+        // only kind that cannot reach the helper.
+        Relation::MaterializedView(_) => panic!("a rule never resolves to a materialized view"),
     }
 }
 

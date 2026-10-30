@@ -689,6 +689,119 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         )
     }
 
+    /// Resolves a name a statement wrote into the relation it denotes,
+    /// whether table, plain view or materialized view, applying the same
+    /// rules as [`Self::resolve_target_table`].
+    ///
+    /// The three kinds share one pool of names, so at most one kind answers a
+    /// name and the kind that holds it is the answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
+    /// more than one relation, and [`LookupError::InvalidObjectName`] when
+    /// the name is malformed.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "
+    /// CREATE SCHEMA app;
+    /// SET search_path TO app;
+    /// CREATE TABLE app.docs (id INT);
+    /// CREATE VIEW app.indexed AS SELECT id FROM docs;
+    /// ",
+    /// )?;
+    /// let resolve = |name| db.resolve_target_relation(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// assert!(matches!(
+    ///     resolve("docs")?,
+    ///     Some(Relation::Table(table)) if table.table_name() == "docs"
+    /// ));
+    /// assert!(matches!(
+    ///     resolve("indexed")?,
+    ///     Some(Relation::View(view)) if view.view_name() == "indexed"
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn resolve_target_relation(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<Relation<'_, Self>>, LookupError> {
+        if let Some(table) = self.resolve_target_table(target.clone(), case)? {
+            return Ok(Some(Relation::Table(table)));
+        }
+        if let Some(view) = self.resolve_target_view(target.clone(), case)? {
+            return Ok(Some(Relation::View(view)));
+        }
+        match self.resolve_target_materialized_view(target, case)? {
+            Some(view) => Ok(Some(Relation::MaterializedView(view))),
+            None => Ok(None),
+        }
+    }
+
+    /// Resolves a reference a stored object carries into the relation it
+    /// names, of whatever kind, reading the name the way ingestion bound it.
+    ///
+    /// Ingestion rewrites every stored reference to the qualifier of the
+    /// relation it reached when the object was created, leaving it bare only
+    /// for a relation stored bare. So the name is read as written, with no
+    /// search path, and neither a later path nor a later temporary relation
+    /// of the same name reaches it, exactly as PostgreSQL keeps the object it
+    /// bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
+    /// more than one relation, and [`LookupError::InvalidObjectName`] when
+    /// the name is malformed.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "
+    /// CREATE TABLE docs (id INT);
+    /// CREATE VIEW indexed AS SELECT id FROM docs;
+    /// ",
+    /// )?;
+    /// // The bound name reads without a search path, bare for the default
+    /// // schema.
+    /// assert!(matches!(
+    ///     db.resolve_bound_relation(TargetName::new("docs", false))?,
+    ///     Some(Relation::Table(_))
+    /// ));
+    /// assert!(matches!(
+    ///     db.resolve_bound_relation(TargetName::new("indexed", false))?,
+    ///     Some(Relation::View(_))
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn resolve_bound_relation(
+        &self,
+        target: TargetName<'_>,
+    ) -> Result<Option<Relation<'_, Self>>, LookupError> {
+        if let Some(table) = self.table_by_target(target.clone(), IdentifierCase::AsWritten)? {
+            return Ok(Some(Relation::Table(table)));
+        }
+        if let Some(view) = self.view_by_target(target.clone(), IdentifierCase::AsWritten)? {
+            return Ok(Some(Relation::View(view)));
+        }
+        self.materialized_view_by_target(target, IdentifierCase::AsWritten)
+            .map(|view| view.map(Relation::MaterializedView))
+    }
+
     /// Returns the table an identifier and its optional qualifier name,
     /// comparing them as `case` says the engine does and consulting no search
     /// path, so an unqualified target names the default schema `public` and a
@@ -1894,5 +2007,54 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     #[inline]
     fn has_schemas(&self) -> bool {
         self.schemas().next().is_some()
+    }
+}
+
+/// One relation a database holds, tagged with the kind it is.
+///
+/// Tables, plain views and materialized views share one pool of names, so a
+/// name resolves to at most one of them. A reader that needs to say which
+/// kind a lookup reached, whether from a grant, a rule or a statement's
+/// reads, handles this enum one variant at a time.
+///
+/// # Example
+///
+/// ```rust
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use sql_traits::prelude::*;
+///
+/// let db = ParserDB::parse::<GenericDialect>(
+///     "CREATE TABLE t (id INT); CREATE VIEW v AS SELECT id FROM t;",
+/// )?;
+/// assert!(matches!(
+///     db.resolve_target_relation(TargetName::new("t", false), IdentifierCase::AsWritten)?,
+///     Some(Relation::Table(table)) if table.table_name() == "t"
+/// ));
+/// assert!(matches!(
+///     db.resolve_target_relation(TargetName::new("v", false), IdentifierCase::AsWritten)?,
+///     Some(Relation::View(view)) if view.view_name() == "v"
+/// ));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+pub enum Relation<'a, DB: DatabaseLike> {
+    /// A table.
+    Table(&'a DB::Table),
+    /// A plain view.
+    View(&'a DB::View),
+    /// A materialized view.
+    MaterializedView(&'a DB::MaterializedView),
+}
+
+impl<DB: DatabaseLike> Copy for Relation<'_, DB> {}
+
+impl<DB: DatabaseLike> Debug for Relation<'_, DB> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Table(table) => f.debug_tuple("Table").field(table).finish(),
+            Self::View(view) => f.debug_tuple("View").field(view).finish(),
+            Self::MaterializedView(view) => f.debug_tuple("MaterializedView").field(view).finish(),
+        }
     }
 }

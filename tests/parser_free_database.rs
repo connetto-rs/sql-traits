@@ -15,10 +15,7 @@ use sql_traits::{
     errors::LookupError,
     prelude::*,
     structs::TargetName,
-    traits::{
-        ColumnCollation, TypeMatch,
-        grant::{GrantRelation, GrantTarget},
-    },
+    traits::{ColumnCollation, TypeMatch, grant::GrantTarget},
     utils::scalar_family::ScalarFamily,
 };
 use sqlparser::{
@@ -998,7 +995,7 @@ impl RuleLike for MemoryRule {
     fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<RuleRelation<'db, Self::DB>, LookupError>
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
@@ -1006,7 +1003,7 @@ impl RuleLike for MemoryRule {
             .tables
             .iter()
             .find(|table| table.name == self.table_name)
-            .map(RuleRelation::Table)
+            .map(Relation::Table)
             .ok_or(LookupError::RelationNotFound { object_name: self.table_name.clone() })
     }
 
@@ -1231,7 +1228,7 @@ impl TableGrantLike for MemoryTableGrant {
     fn relations<'a>(
         &'a self,
         _database: &'a Self::DB,
-    ) -> impl Iterator<Item = GrantRelation<'a, Self::DB>> {
+    ) -> impl Iterator<Item = Relation<'a, Self::DB>> {
         core::iter::empty()
     }
 
@@ -1295,7 +1292,7 @@ impl ColumnGrantLike for MemoryColumnGrant {
         database.tables.iter().find(|table| table.name == self.table_name)
     }
 
-    fn relation<'a>(&'a self, _database: &'a Self::DB) -> Option<GrantRelation<'a, Self::DB>> {
+    fn relation<'a>(&'a self, _database: &'a Self::DB) -> Option<Relation<'a, Self::DB>> {
         None
     }
 }
@@ -1652,6 +1649,50 @@ fn the_inherited_view_resolvers_answer_only_views() -> Result<(), LookupError> {
     );
     assert!(catalog.views().next().is_none());
     assert!(catalog.materialized_views().next().is_none());
+
+    Ok(())
+}
+
+/// The inherited unified resolvers answer whichever kind of relation a name
+/// holds, since tables, views and materialized views share one pool of names.
+#[test]
+fn the_inherited_relation_resolvers_answer_every_kind() -> Result<(), LookupError> {
+    let mut catalog = catalog();
+    catalog.views = vec![view(None, "recent", false)];
+    catalog.materialized_views = vec![view(None, "counted", true)];
+
+    let target = |name| {
+        catalog.resolve_target_relation(TargetName::new(name, false), IdentifierCase::AsWritten)
+    };
+    assert!(matches!(
+        target("docs")?,
+        Some(Relation::Table(table)) if table.name == "docs"
+    ));
+    assert!(matches!(
+        target("recent")?,
+        Some(Relation::View(view)) if view.name == "recent"
+    ));
+    assert!(matches!(
+        target("counted")?,
+        Some(Relation::MaterializedView(view)) if view.name == "counted"
+    ));
+    assert!(target("absent")?.is_none());
+
+    // The bound reading names the same relations without a search path.
+    let bound = |name| catalog.resolve_bound_relation(TargetName::new(name, false));
+    assert!(matches!(
+        bound("docs")?,
+        Some(Relation::Table(table)) if table.name == "docs"
+    ));
+    assert!(matches!(
+        bound("recent")?,
+        Some(Relation::View(view)) if view.name == "recent"
+    ));
+    assert!(matches!(
+        bound("counted")?,
+        Some(Relation::MaterializedView(view)) if view.name == "counted"
+    ));
+    assert!(bound("absent")?.is_none());
 
     Ok(())
 }
