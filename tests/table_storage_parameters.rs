@@ -274,11 +274,16 @@ fn a_parameter_is_looked_up_by_its_stored_name() {
 
 #[test]
 fn a_reference_to_a_table_reports_its_parameters() {
-    let database = db("CREATE TABLE staging (id INT) WITH (fillfactor = 70);");
+    let database = db(
+        "CREATE TABLE staging (id INT) WITH (fillfactor = 70, toast.autovacuum_enabled = false);",
+    );
     let staging = table(&database, "staging");
     let through_reference: Vec<_> =
         <&CreateTable as TableLike>::storage_parameters(&staging).collect();
     assert_eq!(through_reference, [("fillfactor".into(), "70".into())]);
+    let toast_through_reference: Vec<_> =
+        <&CreateTable as TableLike>::toast_storage_parameters(&staging).collect();
+    assert_eq!(toast_through_reference, [("autovacuum_enabled".into(), "false".into())]);
 }
 
 #[test]
