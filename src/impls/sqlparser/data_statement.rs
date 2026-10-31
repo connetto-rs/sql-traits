@@ -520,6 +520,7 @@ mod tests {
         CREATE VIEW open_high AS SELECT user_id FROM open_orders WHERE total > 100;
         CREATE MATERIALIZED VIEW big_orders AS SELECT user_id, total FROM orders;
         CREATE SEQUENCE ticket_seq;
+        CREATE FOREIGN TABLE remote_orders (id INT) SERVER warehouse;
     ";
 
     fn schema_db() -> ParserDB {
@@ -808,11 +809,13 @@ mod tests {
     #[test]
     fn referenced_relations_tag_every_kind_the_statement_reads() {
         let db = schema_db();
-        let statement = parse_one("SELECT * FROM users, open_orders, big_orders, ticket_seq");
+        let statement =
+            parse_one("SELECT * FROM users, remote_orders, open_orders, big_orders, ticket_seq");
         assert_eq!(
             relation_names(as_query(&statement), &db),
             vec![
                 "table users".to_string(),
+                "foreign table remote_orders".to_string(),
                 "view open_orders".to_string(),
                 "materialized view big_orders".to_string(),
                 "sequence ticket_seq".to_string(),

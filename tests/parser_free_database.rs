@@ -2125,6 +2125,14 @@ fn the_inherited_foreign_table_lookups_answer_only_foreign_tables() -> Result<()
         Some("warehouse")
     );
     assert_eq!(catalog.tables_and_foreign_tables().last(), Some(reached));
+    assert!(matches!(
+        catalog.resolve_target_relation(target(), IdentifierCase::AsWritten)?,
+        Some(Relation::ForeignTable(table)) if table == reached
+    ));
+    assert!(matches!(
+        catalog.resolve_bound_relation(target().with_schema("app", false))?,
+        Some(Relation::ForeignTable(table)) if table == reached
+    ));
 
     let identity = catalog.table_identity(reached).expect("the catalog holds it");
     assert_eq!(catalog.foreign_table_by_identity(identity), Some(reached));
