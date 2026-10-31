@@ -4,6 +4,23 @@ use alloc::{string::String, vec::Vec};
 
 use sqlparser::ast::SequenceOptions;
 
+use crate::structs::{ColumnIdentity, RelationIdentity};
+
+/// What owns a stored sequence, kept by identity so it follows the owner
+/// through renames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum StoredSequenceOwner {
+    /// A column of a table.
+    Column(ColumnIdentity),
+    /// An output column of a plain view, at this position.
+    ViewColumn {
+        /// The view.
+        view: RelationIdentity,
+        /// Position of the column in the view's output.
+        ordinal: usize,
+    },
+}
+
 /// A sequence, the number generator `CREATE SEQUENCE` declares.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sequence {
@@ -15,16 +32,19 @@ pub struct Sequence {
     schema: Option<String>,
     /// Whether that schema identifier was quoted.
     schema_is_quoted: bool,
-    /// The options the declaration wrote, in order.
+    /// The options the declaration wrote, in order, `OWNED BY` excepted.
     options: Vec<SequenceOptions>,
+    /// What owns the sequence, if anything does.
+    owner: Option<StoredSequenceOwner>,
 }
 
 impl Sequence {
-    /// Records a sequence ingestion has placed.
+    /// Records a sequence ingestion has placed and whose owner it resolved.
     pub(crate) fn new(
         (name, name_is_quoted): (String, bool),
         schema: Option<(String, bool)>,
         options: Vec<SequenceOptions>,
+        owner: Option<StoredSequenceOwner>,
     ) -> Self {
         let schema_is_quoted = schema.as_ref().is_some_and(|(_, quoted)| *quoted);
         Self {
@@ -33,6 +53,7 @@ impl Sequence {
             schema: schema.map(|(schema, _)| schema),
             schema_is_quoted,
             options,
+            owner,
         }
     }
 
@@ -57,8 +78,14 @@ impl Sequence {
         self.schema_is_quoted
     }
 
-    /// Returns the options the declaration wrote, in order.
+    /// Returns the options the declaration wrote, in order, `OWNED BY`
+    /// excepted.
     pub(crate) fn options(&self) -> &[SequenceOptions] {
         &self.options
+    }
+
+    /// Returns what owns the sequence, if anything does.
+    pub(crate) fn stored_owner(&self) -> Option<StoredSequenceOwner> {
+        self.owner
     }
 }

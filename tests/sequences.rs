@@ -1,6 +1,7 @@
 //! Tests that `CREATE SEQUENCE` records a sequence in the schema it lands in,
 //! that the sequence takes its name from the pool tables, views and indexes
-//! share, and that it leaves with `DROP SEQUENCE` and with its schema.
+//! share, and that it leaves with `DROP SEQUENCE`, with its schema, and with
+//! the column an `OWNED BY` ties it to.
 //!
 //! Every expectation was measured against PostgreSQL 18.4.
 #![allow(clippy::expect_used, clippy::panic)]
@@ -40,6 +41,24 @@ fn sequence<'db>(database: &'db ParserDB, name: &str) -> &'db <ParserDB as Datab
         .resolve_target_sequence(TargetName::new(name, false), IdentifierCase::AsWritten)
         .expect("the name is well formed")
         .expect("the sequence is recorded")
+}
+
+/// The relation and column owning a sequence, if any, a view column named by
+/// its position.
+fn owner_of(database: &ParserDB, name: &str) -> Option<(String, String)> {
+    sequence(database, name).owner(database).map(|owner| {
+        match owner {
+            SequenceOwner::Column(column) => {
+                (
+                    ColumnLike::table(column, database).table_name().to_string(),
+                    column.column_name().to_string(),
+                )
+            }
+            SequenceOwner::ViewColumn { view, ordinal } => {
+                (view.view_name().to_string(), format!("#{ordinal}"))
+            }
+        }
+    })
 }
 
 #[test]
@@ -314,6 +333,173 @@ fn a_sequence_name_ends_the_search_path_walk() {
 }
 
 #[test]
+fn owned_by_ties_the_sequence_to_its_column() {
+    let db = parse(
+        "CREATE TABLE t (id INT, other INT);
+         CREATE SEQUENCE s OWNED BY t.id;
+         CREATE SEQUENCE free OWNED BY NONE;",
+    )
+    .expect("schema parses");
+
+    assert_eq!(owner_of(&db, "s"), Some(("t".to_string(), "id".to_string())));
+    assert_eq!(owner_of(&db, "free"), None);
+    assert_eq!(sequence(&db, "s").options(), []);
+}
+
+#[test]
+fn an_owned_sequence_leaves_with_its_table() {
+    let db = parse(
+        "CREATE TABLE t (id INT);
+         CREATE SEQUENCE s OWNED BY t.id;
+         CREATE SEQUENCE kept;
+         DROP TABLE t;",
+    )
+    .expect("schema parses");
+    assert_eq!(sequence_names(&db), ["public.kept"]);
+
+    let renamed = parse(
+        "CREATE TABLE t (id INT);
+         CREATE SEQUENCE s OWNED BY t.id;
+         ALTER TABLE t RENAME TO u;
+         DROP TABLE u;",
+    )
+    .expect("schema parses");
+    assert_eq!(sequence_names(&renamed), NONE, "the rename keeps the tie");
+
+    let schema = parse(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.t (id INT);
+         CREATE SEQUENCE app.s OWNED BY app.t.id;
+         DROP SCHEMA app CASCADE;",
+    )
+    .expect("schema parses");
+    assert_eq!(sequence_names(&schema), NONE);
+}
+
+#[test]
+fn an_owned_sequence_leaves_with_its_column_alone() {
+    let db = parse(
+        "CREATE TABLE t (id INT, other INT, third INT);
+         CREATE SEQUENCE by_id OWNED BY t.id;
+         CREATE SEQUENCE by_other OWNED BY t.other;
+         ALTER TABLE t DROP COLUMN third;
+         ALTER TABLE t RENAME COLUMN other TO renamed;
+         ALTER TABLE t ALTER COLUMN id TYPE BIGINT;",
+    )
+    .expect("schema parses");
+    assert_eq!(sequence_names(&db), ["public.by_id", "public.by_other"]);
+    assert_eq!(owner_of(&db, "by_other"), Some(("t".to_string(), "renamed".to_string())));
+
+    let dropped = parse(
+        "CREATE TABLE t (id INT, other INT);
+         CREATE SEQUENCE by_id OWNED BY t.id;
+         CREATE SEQUENCE by_other OWNED BY t.other;
+         ALTER TABLE t RENAME COLUMN other TO renamed;
+         ALTER TABLE t DROP COLUMN renamed;",
+    )
+    .expect("schema parses");
+    assert_eq!(sequence_names(&dropped), ["public.by_id"]);
+}
+
+#[test]
+fn owned_by_is_resolved_and_checked() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.t (id INT);
+         SET search_path = app, public;
+         CREATE SEQUENCE s OWNED BY t.id;",
+    )
+    .expect("the table is reached through the path");
+    assert_eq!(sequence(&db, "s").sequence_schema(), Some("app"));
+    assert_eq!(owner_of(&db, "s"), Some(("t".to_string(), "id".to_string())));
+
+    assert!(matches!(
+        parse("CREATE SEQUENCE s OWNED BY t.id;"),
+        Err(Error::RelationNotFoundForSequenceOwner { relation_name, sequence_name })
+            if relation_name == "t" && sequence_name == "s"
+    ));
+    assert!(matches!(
+        parse("CREATE TABLE t (id INT); CREATE SEQUENCE s OWNED BY t.nope;"),
+        Err(Error::ColumnNotFoundForSequenceOwner { column_name, relation_name, sequence_name })
+            if column_name == "nope" && relation_name == "t" && sequence_name == "s"
+    ));
+    assert!(matches!(
+        parse("CREATE TABLE t (id INT); CREATE SEQUENCE s OWNED BY t;"),
+        Err(Error::InvalidSequenceOwner { sequence_name, owner })
+            if sequence_name == "s" && owner == "t"
+    ));
+    for sql in [
+        "CREATE SCHEMA app; CREATE TABLE t (id INT); CREATE SEQUENCE app.s OWNED BY t.id;",
+        "CREATE TABLE t (id INT); CREATE TEMP SEQUENCE s OWNED BY t.id;",
+        "CREATE TEMP TABLE t (id INT); CREATE SEQUENCE s OWNED BY t.id;",
+    ] {
+        assert!(
+            matches!(
+                parse(sql),
+                Err(Error::SequenceOwnerInAnotherSchema { ref sequence_name, ref relation_name })
+                    if sequence_name == "s" && relation_name == "t"
+            ),
+            "{sql}"
+        );
+    }
+    for (sql, kind) in [
+        (
+            "CREATE MATERIALIZED VIEW m AS SELECT 1 AS id; CREATE SEQUENCE s OWNED BY m.id;",
+            ObjectKind::MaterializedView,
+        ),
+        ("CREATE SEQUENCE m; CREATE SEQUENCE s OWNED BY m.last_value;", ObjectKind::Sequence),
+        (
+            "CREATE TABLE t (id INT); CREATE INDEX m ON t (id); CREATE SEQUENCE s OWNED BY m.id;",
+            ObjectKind::Index,
+        ),
+    ] {
+        assert!(
+            matches!(
+                parse(sql),
+                Err(Error::SequenceOwnerKindUnsupported { ref relation_name, relation_kind, .. })
+                    if relation_name == "m" && relation_kind == kind
+            ),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_view_column_may_own_a_sequence() {
+    let db = parse(
+        "CREATE VIEW v AS SELECT 1 AS a, 2 AS b;
+         CREATE SEQUENCE s OWNED BY v.b;
+         ALTER TABLE v RENAME COLUMN b TO renamed;
+         CREATE OR REPLACE VIEW v AS SELECT 1 AS a, 2 AS renamed, 3 AS c;",
+    )
+    .expect("schema parses");
+    assert_eq!(owner_of(&db, "s"), Some(("v".to_string(), "#1".to_string())));
+
+    let dropped = parse(
+        "CREATE VIEW v AS SELECT 1 AS a;
+         CREATE SEQUENCE s OWNED BY v.a;
+         DROP VIEW v;",
+    )
+    .expect("schema parses");
+    assert_eq!(sequence_names(&dropped), NONE);
+
+    let cascaded = parse(
+        "CREATE TABLE t (id INT);
+         CREATE VIEW v AS SELECT id FROM t;
+         CREATE SEQUENCE s OWNED BY v.id;
+         DROP TABLE t CASCADE;",
+    )
+    .expect("schema parses");
+    assert_eq!(sequence_names(&cascaded), NONE);
+
+    assert!(matches!(
+        parse("CREATE VIEW v AS SELECT 1 AS a; CREATE SEQUENCE s OWNED BY v.nope;"),
+        Err(Error::ColumnNotFoundForSequenceOwner { column_name, relation_name, .. })
+            if column_name == "nope" && relation_name == "v"
+    ));
+}
+
+#[test]
 fn a_view_reading_a_sequence_holds_it() {
     assert!(matches!(
         parse(
@@ -467,4 +653,24 @@ fn a_statement_reading_a_sequence_reports_it() {
     let read: Vec<String> =
         query.referenced_relations(&db).expect("names resolve").iter().map(describe).collect();
     assert_eq!(read, ["sequence app.x", "table public.x"]);
+}
+
+#[test]
+fn a_view_column_it_cannot_list_is_refused_as_an_owner() {
+    assert!(matches!(
+        parse(
+            "CREATE VIEW v AS SELECT * FROM generate_series(1, 3);
+             CREATE SEQUENCE s OWNED BY v.generate_series;"
+        ),
+        Err(Error::UnsupportedSequenceOwner { sequence_name, owner })
+            if sequence_name == "s" && owner == "v.generate_series"
+    ));
+
+    // The declaration's own column list names the column, so it is found.
+    let db = parse(
+        "CREATE VIEW v (series) AS SELECT * FROM generate_series(1, 3);
+         CREATE SEQUENCE s OWNED BY v.series;",
+    )
+    .expect("the declared column list names the owner");
+    assert_eq!(owner_of(&db, "s"), Some(("v".to_string(), "#0".to_string())));
 }

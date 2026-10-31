@@ -775,6 +775,77 @@ pub enum Error {
         /// Name of the index.
         index_name: String,
     },
+    #[error("Relation `{relation_name}` not found for the owner of sequence `{sequence_name}`.")]
+    /// Error indicating that `OWNED BY` names a relation that does not exist.
+    RelationNotFoundForSequenceOwner {
+        /// Name of the relation `OWNED BY` names.
+        relation_name: String,
+        /// Name of the sequence.
+        sequence_name: String,
+    },
+    #[error(
+        "Column `{column_name}` of relation `{relation_name}` not found for the owner of sequence `{sequence_name}`."
+    )]
+    /// Error indicating that `OWNED BY` names a column its relation does not
+    /// have.
+    ColumnNotFoundForSequenceOwner {
+        /// Name of the column `OWNED BY` names.
+        column_name: String,
+        /// Name of the relation `OWNED BY` names.
+        relation_name: String,
+        /// Name of the sequence.
+        sequence_name: String,
+    },
+    #[error("Sequence `{sequence_name}` cannot be owned by `{owner}`: write a table and a column.")]
+    /// Error indicating that `OWNED BY` names something other than a column
+    /// of a relation or `NONE`, which PostgreSQL refuses.
+    InvalidSequenceOwner {
+        /// Name of the sequence.
+        sequence_name: String,
+        /// The owner the statement wrote.
+        owner: String,
+    },
+    #[error(
+        "Sequence `{sequence_name}` cannot be owned by `{relation_name}`, which is in another schema."
+    )]
+    /// Error indicating that `OWNED BY` names a relation outside the schema
+    /// the sequence lands in.
+    ///
+    /// PostgreSQL keeps a sequence in the schema of the relation owning it,
+    /// and the temporary schema is a schema of its own, so a temporary
+    /// sequence cannot be owned by a permanent table nor the other way round.
+    SequenceOwnerInAnotherSchema {
+        /// Name of the sequence.
+        sequence_name: String,
+        /// Name of the relation `OWNED BY` names.
+        relation_name: String,
+    },
+    #[error("Sequence `{sequence_name}` cannot be owned by {relation_kind} `{relation_name}`.")]
+    /// Error indicating that `OWNED BY` names a relation of a kind that
+    /// cannot own a sequence.
+    ///
+    /// PostgreSQL lets a table or a plain view own one, and refuses a
+    /// materialized view, an index and another sequence.
+    SequenceOwnerKindUnsupported {
+        /// Name of the sequence.
+        sequence_name: String,
+        /// Name of the relation `OWNED BY` names.
+        relation_name: String,
+        /// Kind of that relation.
+        relation_kind: ObjectKind,
+    },
+    #[error(
+        "Sequence `{sequence_name}` cannot be owned by `{owner}`: the columns of the view cannot be listed."
+    )]
+    /// Error indicating that `OWNED BY` names a column of a view whose output
+    /// columns the model cannot list, and which its declaration's own column
+    /// list does not name, so the column the owner means is unknown.
+    UnsupportedSequenceOwner {
+        /// Name of the sequence.
+        sequence_name: String,
+        /// The owner the statement wrote.
+        owner: String,
+    },
     #[error("Invalid index `{index_name}`: {reason}")]
     /// Error indicating that an index definition is invalid.
     InvalidIndex {
