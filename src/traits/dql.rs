@@ -32,6 +32,10 @@ pub trait DQLLike<DB: DatabaseLike>: DataStatementLike<DB> {
     /// single base table, specifically when:
     ///
     /// - the projection draws from more than one base table,
+    /// - the projection draws from a table read without `ONLY` that other
+    ///   tables inherit from through `INHERITS`, whose rows join the table's
+    ///   own without its keys (partitions share their root's keys, so a
+    ///   partitioned table still answers),
     /// - any projected item is a computed expression (arithmetic, a function
     ///   call, an aggregate, a scalar subquery, `CASE`, ...) rather than a
     ///   pass-through column or wildcard,

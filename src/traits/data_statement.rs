@@ -46,6 +46,12 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// so reading one never reads its base tables, and it is absent from
     /// the answer even when a plain view reads it.
     ///
+    /// A table a `FROM`, `JOIN` or `UPDATE`/`DELETE` target item names
+    /// without `ONLY` also reaches every table below it, through
+    /// `INHERITS` and `PARTITION OF`, recursively, as PostgreSQL scans and
+    /// modifies them. `t` and `t *` read alike, and `ONLY t` or `ONLY (t)`
+    /// reads `t` alone.
+    ///
     /// A bare name that a common table expression in scope binds reads
     /// that expression even when a stored relation shares the name, and
     /// is skipped. The innermost `WITH` wins. An expression is in scope
@@ -101,7 +107,8 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// temporary schema first, the `WITH` shadowing and the DML rules,
     /// and the MySQL multi-table `DELETE ... t1, t2` list. A plain view
     /// the statement reads stands for its whole definition, so its
-    /// definition's reads stay the view's.
+    /// definition's reads stay the view's, and a table read without `ONLY`
+    /// stands for the tables below it.
     ///
     /// Relations are returned in first-seen order and deduplicated by
     /// their identity in [`DatabaseLike`].
