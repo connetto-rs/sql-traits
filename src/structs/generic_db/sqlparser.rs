@@ -2545,6 +2545,15 @@ fn idents_match(left: &Ident, right: &Ident) -> bool {
     )
 }
 
+/// The name a storage parameter is stored under, whether it carries a value
+/// or names one alone as in `SET (autovacuum_enabled)`.
+fn storage_parameter_key(option: &SqlOption) -> Option<&Ident> {
+    match option {
+        SqlOption::KeyValue { key, .. } | SqlOption::Ident(key) => Some(key),
+        _ => None,
+    }
+}
+
 /// Returns whether two object names carry the same final identifier under
 /// PostgreSQL folding.
 ///
@@ -5751,15 +5760,62 @@ impl ParserDB {
             for option in options {
                 // PostgreSQL moves a replaced parameter after the others in
                 // `reloptions`.
-                if let SqlOption::KeyValue { key, .. } = &option {
+                if let Some(key) = storage_parameter_key(&option) {
                     parameters.retain(|stored| {
-                        !matches!(stored, SqlOption::KeyValue { key: stored, .. } if idents_match(stored, key))
+                        !storage_parameter_key(stored)
+                            .is_some_and(|stored| idents_match(stored, key))
                     });
                 }
                 parameters.push(option);
             }
             replacement.table_options = CreateTableOptions::With(parameters);
             Ok(())
+        })
+    }
+
+    /// Applies `ALTER TABLE ... RESET (...)`, removing the named storage
+    /// parameters from the table.
+    ///
+    /// PostgreSQL resets a parameter the table does not hold without
+    /// complaint, and accepts the statement on a partitioned table, which
+    /// holds none.
+    fn alter_table_reset_storage_parameters(
+        builder: ParserDBBuilder,
+        table_name: &ObjectName,
+        scope: AlterTableScope,
+        names: Vec<ObjectName>,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
+            return Ok(builder);
+        };
+        Self::replace_table_node(builder, &stored, |_, replacement| {
+            match &mut replacement.table_options {
+                CreateTableOptions::With(parameters) => {
+                    // A namespaced name such as `toast.autovacuum_enabled`
+                    // resets the TOAST table's parameter, which PostgreSQL
+                    // keeps apart from the table's own.
+                    parameters.retain(|parameter| {
+                        !storage_parameter_key(parameter).is_some_and(|key| {
+                            names.iter().any(|name| {
+                                matches!(name.0.as_slice(), [ObjectNamePart::Identifier(name)] if idents_match(key, name))
+                            })
+                        })
+                    });
+                    if parameters.is_empty() {
+                        replacement.table_options = CreateTableOptions::None;
+                    }
+                    Ok(())
+                }
+                CreateTableOptions::None => Ok(()),
+                // Another dialect's table options, such as MySQL's `ENGINE`,
+                // hold no parameters to reset.
+                _ => {
+                    Err(crate::errors::Error::UnsupportedAlterTableOperation {
+                        table_name: stored.name.clone(),
+                        operation: AlterTableOperation::ResetOptions { options: names }.to_string(),
+                    })
+                }
+            }
         })
     }
 
@@ -7485,6 +7541,15 @@ impl ParserDB {
 
                             AlterTableOperation::SetOptionsParens { options } => {
                                 builder = Self::alter_table_storage_parameters(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    options,
+                                )?;
+                            }
+
+                            AlterTableOperation::ResetOptions { options } => {
+                                builder = Self::alter_table_reset_storage_parameters(
                                     builder,
                                     &alter_table.name,
                                     scope,

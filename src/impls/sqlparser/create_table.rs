@@ -151,6 +151,9 @@ impl TableLike for CreateTable {
                 SqlOption::KeyValue { key, value } => {
                     Some((stored_ident_name(key), parameter_value(value)))
                 }
+                // PostgreSQL stores a parameter named without a value as
+                // `true`.
+                SqlOption::Ident(key) => Some((stored_ident_name(key), Cow::Borrowed("true"))),
                 _ => None,
             }
         })
