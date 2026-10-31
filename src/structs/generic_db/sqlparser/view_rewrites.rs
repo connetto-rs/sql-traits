@@ -1705,30 +1705,11 @@ impl<'a> DmlRef<'a> {
             DmlRef::Insert(_) => {}
             DmlRef::Update(Update { table, from, .. }) => {
                 visit(&table.relation);
-                if let Some(from) = from.as_ref() {
-                    for table in update_from_tables(from) {
-                        visit(&table.relation);
-                        for join in &table.joins {
-                            visit(&join.relation);
-                        }
-                    }
-                }
+                visit_tables(from.as_ref().map_or(&[], update_from_tables), &mut visit);
             }
             DmlRef::Delete(Delete { from, using, .. }) => {
-                for table in delete_from_tables(from) {
-                    visit(&table.relation);
-                    for join in &table.joins {
-                        visit(&join.relation);
-                    }
-                }
-                if let Some(using) = using {
-                    for table in using {
-                        visit(&table.relation);
-                        for join in &table.joins {
-                            visit(&join.relation);
-                        }
-                    }
-                }
+                visit_tables(delete_from_tables(from), &mut visit);
+                visit_tables(using.as_deref().unwrap_or_default(), &mut visit);
             }
             DmlRef::Merge(Merge { table, source, .. }) => {
                 visit(table);
@@ -1828,40 +1809,20 @@ impl<'a> DmlMut<'a> {
         mut visit: impl FnMut(&mut TableFactor) -> Result<(), Error>,
     ) -> Result<(), Error> {
         match self {
-            DmlMut::Insert(_) => {}
+            DmlMut::Insert(_) => Ok(()),
             DmlMut::Update(Update { table, from, .. }) => {
                 visit(&mut table.relation)?;
-                if let Some(from) = from.as_mut() {
-                    for table in update_from_tables_mut(from) {
-                        visit(&mut table.relation)?;
-                        for join in &mut table.joins {
-                            visit(&mut join.relation)?;
-                        }
-                    }
-                }
+                visit_tables_mut(from.as_mut().map_or(&mut [], update_from_tables_mut), &mut visit)
             }
             DmlMut::Delete(Delete { from, using, .. }) => {
-                for table in delete_from_tables_mut(from) {
-                    visit(&mut table.relation)?;
-                    for join in &mut table.joins {
-                        visit(&mut join.relation)?;
-                    }
-                }
-                if let Some(using) = using {
-                    for table in using {
-                        visit(&mut table.relation)?;
-                        for join in &mut table.joins {
-                            visit(&mut join.relation)?;
-                        }
-                    }
-                }
+                visit_tables_mut(delete_from_tables_mut(from), &mut visit)?;
+                visit_tables_mut(using.as_deref_mut().unwrap_or_default(), &mut visit)
             }
             DmlMut::Merge(Merge { table, source, .. }) => {
                 visit(table)?;
-                visit(source)?;
+                visit(source)
             }
         }
-        Ok(())
     }
 
     /// The clause factors the statement scopes, in the order PostgreSQL
@@ -2003,14 +1964,40 @@ fn statement_dml_mut(statement: &mut Statement) -> Option<DmlMut<'_>> {
 fn select_scope_factors(query: &Query, slice: &ParserDB, ctes: &[ScopeFactor]) -> Vec<ScopeFactor> {
     let mut factors = Vec::new();
     if let SetExpr::Select(select) = query.body.as_ref() {
-        for table in &select.from {
-            factors.extend(table_factors(&table.relation, slice, ctes));
-            for join in &table.joins {
-                factors.extend(table_factors(&join.relation, slice, ctes));
-            }
-        }
+        visit_tables(&select.from, &mut |factor| {
+            factors.extend(table_factors(factor, slice, ctes));
+        });
     }
     factors
+}
+
+/// Calls `visit` on each table's relation and then on its joins' relations.
+fn visit_tables(tables: &[TableWithJoins], visit: &mut impl FnMut(&TableFactor)) {
+    for table in tables {
+        visit(&table.relation);
+        for join in &table.joins {
+            visit(&join.relation);
+        }
+    }
+}
+
+/// Calls `visit` on each table's relation and then on its joins' relations,
+/// for their rewrites, stopping at the first error.
+///
+/// # Errors
+///
+/// Returns the first error `visit` gives a factor.
+fn visit_tables_mut(
+    tables: &mut [TableWithJoins],
+    visit: &mut impl FnMut(&mut TableFactor) -> Result<(), Error>,
+) -> Result<(), Error> {
+    for table in tables {
+        visit(&mut table.relation)?;
+        for join in &mut table.joins {
+            visit(&mut join.relation)?;
+        }
+    }
+    Ok(())
 }
 
 /// The factors one `FROM` item contributes, which a nameless or unnameable
