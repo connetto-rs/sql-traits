@@ -134,15 +134,23 @@ fn the_path_is_walked_in_order() {
 
 #[test]
 fn resetting_returns_to_the_default() {
-    for tail in ["RESET search_path;", "SET search_path TO DEFAULT;"] {
+    for tail in ["RESET search_path;", "SET search_path TO DEFAULT;", "RESET ALL;"] {
         let db = parse(&format!("CREATE SCHEMA app; SET search_path TO app; {tail}"));
         let path: Vec<_> = db.search_path().collect();
         assert_eq!(path, [("public", false)], "after {tail}");
     }
 }
 
-/// Both spellings of an entry name a schema, and neither is a quoted
-/// identifier in the case-sensitivity sense.
+/// A custom setting whose last part is `search_path` is a different setting.
+#[test]
+fn a_qualified_setting_leaves_the_path_alone() {
+    let db = parse("CREATE SCHEMA app; SET search_path TO app; SET myext.search_path = other;");
+    let path: Vec<_> = db.search_path().collect();
+    assert_eq!(path, [("app", false)]);
+}
+
+/// A bare entry folds, while a string entry names its schema spelled exactly,
+/// as a quoted identifier would.
 #[test]
 fn an_entry_may_be_written_bare_or_quoted_as_a_string() {
     for statement in
@@ -155,7 +163,88 @@ fn an_entry_may_be_written_bare_or_quoted_as_a_string() {
 
     let db = parse("CREATE SCHEMA app; SET search_path TO 'app';");
     let path: Vec<_> = db.search_path().collect();
-    assert_eq!(path, [("app", false)]);
+    assert_eq!(path, [("app", true)]);
+}
+
+/// PostgreSQL reaches only `"App"` through `'App'`, never the folded `app`.
+#[test]
+fn a_string_entry_does_not_fold() {
+    let db = parse(
+        "CREATE SCHEMA \"App\"; CREATE TABLE \"App\".exact (id INT);
+         CREATE SCHEMA app; CREATE TABLE app.folded (id INT);
+         SET search_path = 'App';",
+    );
+    let reaches = |name| {
+        db.resolve_target_table(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .is_some()
+    };
+    assert!(reaches("exact"));
+    assert!(!reaches("folded"));
+}
+
+/// Every value PostgreSQL keeps names a schema spelled as it prints the value.
+#[test]
+fn non_identifier_entries_are_spelled_as_postgresql_prints_them() {
+    let db = parse(
+        "SET search_path = 007, 0x1F, 0X1f, 0o17, 0B101, 0x_1F, -0x10, 99999999999, 0xFFFFFFFFFF,
+             -1, +2, -0, -2147483648, 4.50, 1e3, -4.5, true, false, E'esc', $$dollar$$, U&'uni',
+             1_000;",
+    );
+    let path: Vec<_> = db.search_path().collect();
+    assert_eq!(
+        path,
+        [
+            ("7", true),
+            ("31", true),
+            ("31", true),
+            ("15", true),
+            ("5", true),
+            ("31", true),
+            ("-16", true),
+            ("99999999999", true),
+            ("0xFFFFFFFFFF", true),
+            ("-1", true),
+            ("2", true),
+            ("0", true),
+            ("-2147483648", true),
+            ("4.50", true),
+            ("1e3", true),
+            ("-4.5", true),
+            ("true", true),
+            ("false", true),
+            ("esc", true),
+            ("dollar", true),
+            ("uni", true),
+            ("1000", true),
+        ]
+    );
+}
+
+/// A value PostgreSQL rejects with a syntax error refuses the statement.
+#[test]
+fn an_entry_postgresql_rejects_is_refused() {
+    for value in ["a.b", "a + b", "-a", "-'app'", "+true", "N'app'", "B'101'", "X'1F'"] {
+        let result =
+            ParserDB::parse::<PostgreSqlDialect>(&format!("SET search_path = app, {value};"));
+        assert!(
+            matches!(
+                result,
+                Err(Error::IdentifierLookupError(LookupError::InvalidObjectName { .. }))
+            ),
+            "{value}: {result:?}"
+        );
+    }
+}
+
+/// `GenericDialect` reads `0x1F` as a binary string, which names the schema
+/// the integer would.
+#[test]
+fn a_generic_hex_literal_names_its_integer() {
+    let db = ParserDB::parse::<sqlparser::dialect::GenericDialect>("SET search_path = 0x1F;")
+        .expect("schema builds");
+    let path: Vec<_> = db.search_path().collect();
+    assert_eq!(path, [("31", true)]);
 }
 
 /// The whole shape a hand-written schema bundle uses: the path is set once and

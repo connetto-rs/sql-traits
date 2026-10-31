@@ -9,18 +9,20 @@
 //! `INTEGER` used as a boolean by convention, MySQL `CHAR(36)` used to hold
 //! a UUID).
 
+use alloc::vec::Vec;
 use core::any::TypeId;
 
 use sqlparser::{
     ast::{
         CharacterLength, ColumnDef, CreateTable, DataType, ExactNumberInfo, ObjectName,
-        ObjectNamePart, TimezoneInfo, TypeModifier,
+        ObjectNamePart, Statement, TimezoneInfo, TypeModifier,
     },
     dialect::{
         AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
-        HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect,
+        GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect,
         RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect, SparkSqlDialect, TeradataDialect,
     },
+    parser::{Parser, ParserError},
 };
 
 use super::data_type::interval_fields;
@@ -139,6 +141,39 @@ impl SqlparserDialect {
     #[inline]
     pub fn is_sqlite(self) -> bool {
         matches!(self, Self::SQLite)
+    }
+
+    /// Parses `sql` under the stock dialect this variant names.
+    pub(crate) fn parse_statements(self, sql: &str) -> Result<Vec<Statement>, ParserError> {
+        Parser::parse_sql(self.stock(), sql)
+    }
+
+    /// Whether this dialect parses `0x1F` into the hex string variant `X'1F'`
+    /// also parses to, so that variant may hold an integer.
+    pub(crate) fn hex_strings_may_be_integers(self) -> bool {
+        !self.stock().supports_non_decimal_integer_literals()
+    }
+
+    /// The stock sqlparser dialect this variant names.
+    fn stock(self) -> &'static dyn Dialect {
+        match self {
+            Self::Ansi => &AnsiDialect {},
+            Self::BigQuery => &BigQueryDialect,
+            Self::ClickHouse => &ClickHouseDialect {},
+            Self::Databricks => &DatabricksDialect,
+            Self::DuckDb => &DuckDbDialect,
+            Self::Generic => &GenericDialect,
+            Self::Hive => &HiveDialect {},
+            Self::MsSql => &MsSqlDialect {},
+            Self::MySql => &MySqlDialect {},
+            Self::Oracle => &OracleDialect,
+            Self::PostgreSql => &PostgreSqlDialect {},
+            Self::Redshift => &RedshiftSqlDialect {},
+            Self::Snowflake => &SnowflakeDialect,
+            Self::Spark => &SparkSqlDialect,
+            Self::SQLite => &SQLiteDialect {},
+            Self::Teradata => &TeradataDialect,
+        }
     }
 }
 
@@ -640,6 +675,45 @@ mod tests {
         assert_eq!(SqlparserDialect::of::<SparkSqlDialect>(), SqlparserDialect::Spark);
         assert_eq!(SqlparserDialect::of::<SQLiteDialect>(), SqlparserDialect::SQLite);
         assert_eq!(SqlparserDialect::of::<TeradataDialect>(), SqlparserDialect::Teradata);
+    }
+
+    /// Each variant parses as the dialect it classifies, over inputs on which
+    /// the stock dialects disagree.
+    #[test]
+    fn parse_statements_uses_the_classified_dialect() {
+        fn agrees<D: Dialect + Default + 'static>() {
+            for sql in [
+                "SELECT `a` FROM t",
+                "SELECT [a] FROM t",
+                "SELECT a::INT FROM t",
+                "SELECT @a, $1 FROM t",
+                "SELECT a FROM t QUALIFY a = 1",
+                "SELECT a FROM t LIMIT 1, 2",
+            ] {
+                assert_eq!(
+                    SqlparserDialect::of::<D>().parse_statements(sql),
+                    Parser::parse_sql(&D::default(), sql),
+                    "{sql} under {}",
+                    core::any::type_name::<D>()
+                );
+            }
+        }
+        agrees::<AnsiDialect>();
+        agrees::<BigQueryDialect>();
+        agrees::<ClickHouseDialect>();
+        agrees::<DatabricksDialect>();
+        agrees::<DuckDbDialect>();
+        agrees::<GenericDialect>();
+        agrees::<HiveDialect>();
+        agrees::<MsSqlDialect>();
+        agrees::<MySqlDialect>();
+        agrees::<OracleDialect>();
+        agrees::<PostgreSqlDialect>();
+        agrees::<RedshiftSqlDialect>();
+        agrees::<SnowflakeDialect>();
+        agrees::<SparkSqlDialect>();
+        agrees::<SQLiteDialect>();
+        agrees::<TeradataDialect>();
     }
 
     #[test]

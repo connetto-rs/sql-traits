@@ -24,12 +24,13 @@ use sqlparser::{
         ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
         CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction, CreateIndex,
         CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
-        DataType, DropBehavior, Expr, ForeignKeyConstraint, FunctionDesc, GeneratedAs, Grant,
-        GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition,
-        ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner,
-        Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption,
-        Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
-        VisitMut, Visitor, VisitorMut, visit_relations,
+        DataType, DropBehavior, Expr, ForeignKeyConstraint, FunctionDefinitionSetParam,
+        FunctionDesc, FunctionSetValue, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName,
+        GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart,
+        OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
+        RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
+        TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut,
+        Visitor, VisitorMut, visit_relations,
     },
     dialect::Dialect,
 };
@@ -54,14 +55,16 @@ use crate::{
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
         object_name::{
-            Qualifier, RelationKey, TEMPORARY_SCHEMA, is_temporary_schema, object_name_identifiers,
-            object_name_last_part, overqualified_object_name, qualifier_of, relation_search_path,
+            Qualifier, RelationKey, SearchPathChange, TEMPORARY_SCHEMA, is_search_path_parameter,
+            is_temporary_schema, object_name_identifiers, object_name_last_part,
+            overqualified_object_name, qualifier_of, relation_search_path,
             require_local_object_name, require_static_object_name,
             resolve_sequence_on_search_path_in_iter, resolve_table_object_name_in_iter,
             resolve_table_object_name_on_search_path_in_iter,
             resolve_target_on_search_path_in_iter, resolve_view_on_search_path_in_iter,
-            sequence_matches_key, stored_table_key, table_matches_key, table_matches_object_name,
-            target_name_of_idents, target_name_of_object_name, view_matches_key,
+            search_path_change, search_path_entry, sequence_matches_key, stored_table_key,
+            table_matches_key, table_matches_object_name, target_name_of_idents,
+            target_name_of_object_name, view_matches_key,
         },
     },
 };
@@ -2640,6 +2643,42 @@ fn parameter_names_match(left: &ObjectName, right: &ObjectName) -> bool {
         })
 }
 
+/// Settles a function's `search_path` setting the way `CREATE FUNCTION` and
+/// `ALTER FUNCTION` do: `FROM CURRENT` becomes the path in effect, which is
+/// what `pg_proc.proconfig` stores, and a value list is checked entry by entry.
+///
+/// # Errors
+///
+/// Returns [`LookupError::InvalidObjectName`] for an entry PostgreSQL refuses.
+fn settle_search_path_parameter(
+    parameter: &mut FunctionDefinitionSetParam,
+    builder: &ParserDBBuilder,
+) -> Result<(), LookupError> {
+    if !is_search_path_parameter(&parameter.name) {
+        return Ok(());
+    }
+    match &parameter.value {
+        FunctionSetValue::FromCurrent => {
+            let schema = |(name, quoted): (&str, bool)| {
+                Expr::Identifier(if quoted {
+                    Ident::with_quote('"', name)
+                } else {
+                    Ident::new(name)
+                })
+            };
+            parameter.value = FunctionSetValue::Values(builder.search_path().map(schema).collect());
+        }
+        FunctionSetValue::Values(values) => {
+            let hex_strings_may_be_integers = builder.dialect().hex_strings_may_be_integers();
+            for value in values {
+                search_path_entry(value, hex_strings_may_be_integers)?;
+            }
+        }
+        FunctionSetValue::Default => {}
+    }
+    Ok(())
+}
+
 /// Returns the argument types that make up a function's identity.
 ///
 /// An `OUT` parameter describes the result rather than the call, so PostgreSQL
@@ -2871,22 +2910,6 @@ fn primary_key_width(table: &CreateTable) -> Option<usize> {
             _ => None,
         }
     })
-}
-
-/// Reads one entry of a `SET search_path` value list as a schema name and its
-/// quoting.
-///
-/// PostgreSQL accepts both a bare identifier and a single-quoted string, and
-/// neither is a quoted identifier in the case-sensitivity sense. Anything else,
-/// such as an expression, names no schema and is skipped.
-fn search_path_entry(value: &Expr) -> Option<(String, bool)> {
-    match value {
-        Expr::Identifier(ident) => Some((ident.value.clone(), ident.quote_style.is_some())),
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(name), .. }) => {
-            Some((name.clone(), false))
-        }
-        _ => None,
-    }
 }
 
 /// Returns whether two table references name the same table.
@@ -4263,8 +4286,9 @@ impl ParserDB {
         object_name: &ObjectName,
     ) -> Result<Option<&CreateTable>, LookupError> {
         let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
-        self.resolve_target_table_on_path(
-            &target_name_of_idents(schema_ident, table_ident),
+        crate::traits::DatabaseLike::resolve_target_table(
+            self,
+            target_name_of_idents(schema_ident, table_ident),
             IdentifierCase::AsWritten,
         )
     }
@@ -6766,6 +6790,9 @@ impl ParserDB {
                         crate::errors::ObjectKind::Function,
                         builder.catalog_name(),
                     )?;
+                    for parameter in &mut create_function.set_params {
+                        settle_search_path_parameter(parameter, &builder)?;
+                    }
                     let case = builder.identifier_case();
                     let existing = builder.functions().iter().position(|(existing, _)| {
                         function_signatures_match(
@@ -8197,32 +8224,24 @@ impl ParserDB {
                     // Ignore unsupported SET TIME ZONE expressions (e.g.,
                     // binary ops)
                 }
-                Statement::Set(sqlparser::ast::Set::SingleAssignment {
-                    variable, values, ..
-                }) if object_name_last_part(&variable)
-                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("search_path")) =>
-                {
+                statement @ (Statement::Set(sqlparser::ast::Set::SingleAssignment { .. })
+                | Statement::Reset(_)) => {
                     // `SET` replaces the path rather than extending it, so
                     // `public` stops being reachable unless it is listed.
-                    // `TO DEFAULT` restores the starting path, as `RESET` does.
-                    let restores_default = matches!(
-                        values.as_slice(),
-                        [Expr::Identifier(ident)] if ident.quote_style.is_none()
-                            && ident.value.eq_ignore_ascii_case("DEFAULT")
-                    );
-                    let path = if restores_default {
-                        ParserDBBuilder::default_search_path()
-                    } else {
-                        values.iter().filter_map(search_path_entry).collect()
-                    };
-                    builder.set_search_path(path);
-                }
-                Statement::Reset(reset) => {
-                    if let sqlparser::ast::Reset::ConfigurationParameter(name) = &reset.reset
-                        && object_name_last_part(name)
-                            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("search_path"))
-                    {
-                        builder.set_search_path(ParserDBBuilder::default_search_path());
+                    let hex_strings_may_be_integers =
+                        builder.dialect().hex_strings_may_be_integers();
+                    match search_path_change(&statement, hex_strings_may_be_integers)? {
+                        Some(SearchPathChange::Set(path)) => {
+                            builder.set_search_path(
+                                path.into_iter()
+                                    .map(|(schema, quoted)| (schema.into_owned(), quoted))
+                                    .collect(),
+                            );
+                        }
+                        Some(SearchPathChange::Reset) => {
+                            builder.set_search_path(ParserDBBuilder::default_search_path());
+                        }
+                        None => {}
                     }
                 }
                 Statement::RenameTable(renames) => {
@@ -8285,7 +8304,7 @@ impl ParserDB {
                             };
                             builder.functions_mut()[position].1.set_owner(owner);
                         }
-                        AlterFunctionOperation::Actions { actions, .. } => {
+                        AlterFunctionOperation::Actions { mut actions, .. } => {
                             let tracked = actions.iter().any(|action| {
                                 matches!(
                                     action,
@@ -8298,6 +8317,12 @@ impl ParserDB {
                             });
                             if !tracked {
                                 continue;
+                            }
+
+                            for action in &mut actions {
+                                if let AlterFunctionAction::Set(parameter) = action {
+                                    settle_search_path_parameter(parameter, &builder)?;
+                                }
                             }
 
                             let position = Self::alter_function_target(&builder, &func_desc)?;

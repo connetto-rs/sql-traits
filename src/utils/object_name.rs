@@ -10,11 +10,15 @@
 
 use alloc::{
     borrow::Cow,
+    format,
     string::{String, ToString},
     vec::Vec,
 };
 
-use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+use sqlparser::ast::{
+    Expr, Ident, ObjectName, ObjectNamePart, Reset, Set, Statement, UnaryOperator, Value,
+    ValueWithSpan,
+};
 
 use crate::{
     errors::LookupError,
@@ -70,6 +74,167 @@ where
         .then_some((PG_CATALOG, false))
         .into_iter()
         .chain(search_path().filter(|&(schema, quoted)| !is_temporary_schema(schema, quoted)))
+}
+
+/// Whether a configuration parameter name is `search_path`, which PostgreSQL
+/// matches without regard to case or quoting.
+pub(crate) fn is_search_path_parameter(name: &ObjectName) -> bool {
+    matches!(
+        name.0.as_slice(),
+        [ObjectNamePart::Identifier(ident)] if ident.value.eq_ignore_ascii_case("search_path")
+    )
+}
+
+/// A `search_path` read from SQL: each schema as PostgreSQL stores it and
+/// whether it compares exactly.
+pub(crate) type SearchPath<'a> = Vec<(Cow<'a, str>, bool)>;
+
+/// The path a server starts with and `RESET` restores, `"$user", public` with
+/// no schema named after the role.
+pub(crate) const DEFAULT_SEARCH_PATH: &[(&str, bool)] = &[("public", false)];
+
+/// What a statement does to the session's `search_path`.
+pub(crate) enum SearchPathChange<'a> {
+    /// `SET search_path` names the schemas.
+    Set(SearchPath<'a>),
+    /// `SET search_path TO DEFAULT`, `RESET search_path` or `RESET ALL`
+    /// restore the path the server starts with.
+    Reset,
+}
+
+/// Reads the change a statement makes to `search_path`, or [`None`] when it
+/// leaves the path alone, reading entries as [`search_path_entry`] does.
+///
+/// # Errors
+///
+/// Returns [`LookupError::InvalidObjectName`] for an entry PostgreSQL refuses.
+pub(crate) fn search_path_change(
+    statement: &Statement,
+    hex_strings_may_be_integers: bool,
+) -> Result<Option<SearchPathChange<'_>>, LookupError> {
+    match statement {
+        Statement::Set(Set::SingleAssignment { variable, values, .. })
+            if is_search_path_parameter(variable) =>
+        {
+            if let [Expr::Identifier(ident)] = values.as_slice()
+                && ident.quote_style.is_none()
+                && ident.value.eq_ignore_ascii_case("DEFAULT")
+            {
+                return Ok(Some(SearchPathChange::Reset));
+            }
+            let path = values
+                .iter()
+                .map(|value| search_path_entry(value, hex_strings_may_be_integers))
+                .collect::<Result<_, _>>()?;
+            Ok(Some(SearchPathChange::Set(path)))
+        }
+        Statement::Reset(reset) => {
+            Ok(match &reset.reset {
+                Reset::ALL => Some(SearchPathChange::Reset),
+                Reset::ConfigurationParameter(name) if is_search_path_parameter(name) => {
+                    Some(SearchPathChange::Reset)
+                }
+                _ => None,
+            })
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Reads one entry of a `search_path` value list as the schema name
+/// PostgreSQL stores and whether that name compares exactly.
+///
+/// A bare identifier folds unless quoted. A string, number or boolean names
+/// the schema spelled as PostgreSQL prints the value, compared exactly, so
+/// `'App'` reaches only `"App"`, `007` and `0x7` name schema `7` and `true`
+/// names schema `true`. `hex_strings_may_be_integers` says whether the dialect
+/// parses `0x1F` into the hex string variant, which `X'1F'` shares.
+///
+/// # Errors
+///
+/// Returns [`LookupError::InvalidObjectName`] for a value PostgreSQL refuses
+/// in a `search_path` list, such as `a.b`, `a + b` or `-'app'`.
+pub(crate) fn search_path_entry(
+    value: &Expr,
+    hex_strings_may_be_integers: bool,
+) -> Result<(Cow<'_, str>, bool), LookupError> {
+    let spelled = match value {
+        Expr::Identifier(ident) => {
+            return Ok((Cow::Borrowed(ident.value.as_str()), ident.quote_style.is_some()));
+        }
+        Expr::Value(ValueWithSpan { value, .. }) => {
+            match value {
+                Value::SingleQuotedString(text)
+                | Value::EscapedStringLiteral(text)
+                | Value::UnicodeStringLiteral(text) => Some(Cow::Borrowed(text.as_str())),
+                Value::DollarQuotedString(text) => Some(Cow::Borrowed(text.value.as_str())),
+                Value::Boolean(true) => Some(Cow::Borrowed("true")),
+                Value::Boolean(false) => Some(Cow::Borrowed("false")),
+                numeric => numeric_spelling(numeric, false, hex_strings_may_be_integers),
+            }
+        }
+        Expr::UnaryOp { op: op @ (UnaryOperator::Minus | UnaryOperator::Plus), expr } => {
+            match expr.as_ref() {
+                Expr::Value(ValueWithSpan { value, .. }) => {
+                    numeric_spelling(
+                        value,
+                        *op == UnaryOperator::Minus,
+                        hex_strings_may_be_integers,
+                    )
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    spelled.map(|name| (name, true)).ok_or_else(|| {
+        LookupError::InvalidObjectName {
+            object_name: value.to_string(),
+            reason: "PostgreSQL accepts only names, strings, numbers and booleans in \
+                     search_path"
+                .to_string(),
+        }
+    })
+}
+
+/// Spells a numeric `search_path` entry the way PostgreSQL prints it, or
+/// [`None`] when `value` is not a number.
+///
+/// An integer that fits `int4` prints as its decimal value, so `007`, `0x1F`
+/// and `0o17` become `7`, `31` and `15`. Any other number keeps its written
+/// text.
+fn numeric_spelling(
+    value: &Value,
+    negative: bool,
+    hex_strings_may_be_integers: bool,
+) -> Option<Cow<'_, str>> {
+    let (written, digits, radix) = match value {
+        Value::Number(text, _) => {
+            match text.get(..2) {
+                Some("0x" | "0X") => (Cow::Borrowed(text.as_str()), &text[2..], 16),
+                Some("0o" | "0O") => (Cow::Borrowed(text.as_str()), &text[2..], 8),
+                Some("0b" | "0B") => (Cow::Borrowed(text.as_str()), &text[2..], 2),
+                _ => (Cow::Borrowed(text.as_str()), text.as_str(), 10),
+            }
+        }
+        Value::HexStringLiteral(digits) if hex_strings_may_be_integers => {
+            (Cow::Owned(format!("0x{digits}")), digits.as_str(), 16)
+        }
+        _ => return None,
+    };
+    let int4 = digits
+        .chars()
+        .filter(|digit| *digit != '_')
+        .try_fold(0_u32, |total, digit| {
+            total.checked_mul(radix)?.checked_add(digit.to_digit(radix)?)
+        })
+        .and_then(|total| i32::try_from(total).ok());
+    Some(match (int4, negative) {
+        (Some(total), false) => Cow::Owned(total.to_string()),
+        (Some(total), true) => Cow::Owned((-total).to_string()),
+        (None, false) => written,
+        (None, true) => Cow::Owned(format!("-{written}")),
+    })
 }
 
 /// Reports a name a statement builds while it runs, which no static reader can
@@ -966,6 +1131,26 @@ pub(crate) fn resolve_relation_object_name<'db, DB: DatabaseLike>(
     // Through the trait method, so a catalog overriding it answers every
     // accessor the same way it answers a direct lookup.
     database.resolve_target_relation(target_name_of_idents(schema_ident, table_ident), case)
+}
+
+/// Resolves an object name to a relation of any kind as a statement running
+/// under `search_path` reads it.
+///
+/// # Errors
+///
+/// Returns an error when the name is malformed or the lookup is ambiguous.
+pub(crate) fn resolve_relation_object_name_on_path<'db, DB: DatabaseLike, S: AsRef<str>>(
+    object_name: &ObjectName,
+    database: &'db DB,
+    search_path: &[(S, bool)],
+    case: IdentifierCase,
+) -> Result<Option<Relation<'db, DB>>, LookupError> {
+    let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
+    database.resolve_target_relation_on_path(
+        target_name_of_idents(schema_ident, table_ident),
+        search_path,
+        case,
+    )
 }
 
 /// Resolves an object name that is required to denote an existing base table of
