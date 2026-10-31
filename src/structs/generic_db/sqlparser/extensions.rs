@@ -23,9 +23,9 @@ use crate::{
     errors::{Error, ObjectKind},
     structs::metadata::FunctionMetadata,
     utils::{
-        identifier_resolution::{identifiers_match, normalize_identifier},
+        identifier_resolution::{identifiers_match, is_temporary_schema, normalize_identifier},
         last_str,
-        object_name::{PG_CATALOG, TEMPORARY_SCHEMA, is_temporary_schema},
+        object_name::{PG_CATALOG, TEMPORARY_SCHEMA},
     },
 };
 

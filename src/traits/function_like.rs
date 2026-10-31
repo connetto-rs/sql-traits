@@ -17,7 +17,7 @@ use crate::{
             accepts_positional, actuals, bind, check_argument_count, declared_at_call, input_modes,
             written_argument_names,
         },
-        identifier_resolution::normalize_identifier,
+        identifier_resolution::{SearchPath, normalize_identifier},
         normalize_postgres_type_cow,
     },
 };
@@ -619,7 +619,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// bound, and its names stay as written. A body written as a
     /// `BEGIN ATOMIC` block binds the same way, but it holds a list of
     /// statements rather than an expression, so it answers [`None`] here and
-    /// in [`body`](FunctionLike::body).
+    /// in [`body`](FunctionLike::body), and
+    /// [`body_is_bound`](FunctionLike::body_is_bound) tells it apart from a
+    /// function with no body.
     ///
     /// # Example
     ///
@@ -676,19 +678,123 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// Returns the function-local configuration after later alterations.
     fn configuration_parameters(&self) -> &[FunctionDefinitionSetParam];
 
+    /// Returns the `search_path` the function sets for its own body, each
+    /// schema as `pg_proc.proconfig` stores it with whether it compares
+    /// exactly, the way [`DatabaseLike::search_path`] yields the session's
+    /// path, or [`None`] when the body runs under the caller's path.
+    ///
+    /// The setting is read after every later `ALTER FUNCTION`, so
+    /// `RESET search_path`, `RESET ALL` and `SET search_path TO DEFAULT` leave
+    /// [`None`]. `SET search_path FROM CURRENT` answers the path in effect
+    /// where the clause ran. `SET search_path = ''` answers the one
+    /// zero-length quoted entry PostgreSQL stores, `("", true)`, which names
+    /// no schema, so the temporary schema stays implicit and is searched
+    /// first for relations.
+    ///
+    /// A body written as a string resolves its unqualified names under this
+    /// path when it runs. A body [bound at
+    /// creation](FunctionLike::body_is_bound) keeps the relations and functions
+    /// it reached then, whatever path is in effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::InvalidObjectName`] for an entry PostgreSQL
+    /// refuses in `search_path`, which only a node `database` never ingested
+    /// can hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::{prelude::*, utils::identifier_resolution::is_temporary_schema};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE SCHEMA app;
+    ///      SET search_path = app, public;
+    ///      CREATE FUNCTION pinned() RETURNS INT LANGUAGE sql SECURITY DEFINER
+    ///          SET search_path = app, pg_temp AS 'SELECT 1';
+    ///      CREATE FUNCTION captured() RETURNS INT LANGUAGE sql
+    ///          SET search_path FROM CURRENT AS 'SELECT 1';
+    ///      CREATE FUNCTION unpinned() RETURNS INT LANGUAGE sql
+    ///          SET search_path = app AS 'SELECT 1';
+    ///      ALTER FUNCTION unpinned() RESET search_path;",
+    /// )?;
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    /// };
+    /// let pinned = function("pinned").search_path(&db)?.expect("the function sets a path");
+    /// assert_eq!(pinned, [("app".into(), false), ("pg_temp".into(), false)]);
+    /// // The temporary schema comes last, so no relation in it shadows one in `app`.
+    /// assert!(pinned.last().is_some_and(|(schema, quoted)| is_temporary_schema(schema, *quoted)));
+    ///
+    /// assert_eq!(
+    ///     function("captured").search_path(&db)?,
+    ///     Some(vec![("app".into(), false), ("public".into(), false)]),
+    /// );
+    /// assert_eq!(function("unpinned").search_path(&db)?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn search_path<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<SearchPath<'db>>, LookupError>;
+
+    /// Returns whether PostgreSQL bound the body when the function was
+    /// created, so that no `search_path`, the caller's or the function's own,
+    /// redirects the relations and functions it names when it runs.
+    ///
+    /// `CREATE FUNCTION` parses and binds a body written `RETURN <expression>`
+    /// or as a `BEGIN ATOMIC` block. A body written as a string, in any
+    /// language, is read again each time the function runs, and code outside
+    /// the schema, as `AS 'library', 'symbol'` names it, holds no SQL to bind,
+    /// so both answer false.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id INT);
+    ///      CREATE FUNCTION returned() RETURNS BIGINT LANGUAGE sql
+    ///          RETURN (SELECT count(*) FROM docs);
+    ///      CREATE FUNCTION atomic() RETURNS BIGINT LANGUAGE sql
+    ///          BEGIN ATOMIC SELECT count(*) FROM docs; END;
+    ///      CREATE FUNCTION quoted() RETURNS BIGINT LANGUAGE sql
+    ///          AS 'SELECT count(*) FROM docs';",
+    /// )?;
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    /// };
+    /// assert!(function("returned").body_is_bound());
+    /// assert!(function("atomic").body_is_bound());
+    /// // A caller's temporary `docs` would shadow `public.docs` here.
+    /// assert!(!function("quoted").body_is_bound());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn body_is_bound(&self) -> bool;
+
     /// Returns every base table the body reads or writes, plain views
     /// expanded to the base tables they read, resolved the way PostgreSQL
     /// resolves them when the function runs, and deduplicated in first-seen
     /// order.
     ///
     /// An unqualified name in a body written as a string resolves under the
-    /// function's own `search_path` when
-    /// [`configuration_parameters`](FunctionLike::configuration_parameters)
-    /// sets one, and under [`DatabaseLike::search_path`] otherwise. A body
-    /// written `RETURN <expression>` or as a `BEGIN ATOMIC` block was bound
-    /// when the function was created, so it reads the relations it reached
-    /// then, whatever path the function sets. The body is read with the rules
-    /// of
+    /// function's own [`search_path`](FunctionLike::search_path) when it sets
+    /// one, and under [`DatabaseLike::search_path`] otherwise. A body written
+    /// `RETURN <expression>` or as a `BEGIN ATOMIC` block was
+    /// [bound at creation](FunctionLike::body_is_bound), so it reads the
+    /// relations it reached then, whatever path the function sets. The body
+    /// is read with the rules of
     /// [`DataStatementLike::referenced_tables`](crate::traits::DataStatementLike::referenced_tables).
     /// A body of several statements is read one statement after another, as
     /// PostgreSQL 18 runs it, so a `SET` or `RESET` of `search_path` in it

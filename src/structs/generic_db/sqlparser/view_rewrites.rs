@@ -31,12 +31,12 @@ use crate::{
     structs::{IdentifierCase, ParserDB, TableAttribute},
     traits::{ColumnLike, DatabaseLike, TableLike, ViewLike},
     utils::{
-        identifier_resolution::identifiers_match,
+        identifier_resolution::{identifiers_match, is_temporary_schema},
         last_str,
         object_name::{
-            RelationKey, TEMPORARY_SCHEMA, is_temporary_schema, overqualified_object_name,
-            relation_name_is_claimed, resolve_view_on_search_path_in_iter, stored_table_key,
-            stored_view_key, table_matches_key, target_key, target_name_from_object_name,
+            RelationKey, TEMPORARY_SCHEMA, overqualified_object_name, relation_name_is_claimed,
+            resolve_view_on_search_path_in_iter, stored_table_key, stored_view_key,
+            table_matches_key, target_key, target_name_from_object_name,
             target_name_of_object_name, view_matches_key,
         },
         with_scopes::WithScopes,

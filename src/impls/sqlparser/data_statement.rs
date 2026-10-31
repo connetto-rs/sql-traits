@@ -29,10 +29,11 @@ use crate::{
     structs::IdentifierCase,
     traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
     utils::{
+        identifier_resolution::SearchPath,
         object_name::{
-            DEFAULT_SEARCH_PATH, SearchPath, SearchPathChange, object_name_identifiers,
-            object_name_last_part, resolve_bound_relation_object_name,
-            resolve_relation_object_name, resolve_relation_object_name_on_path, search_path_change,
+            DEFAULT_SEARCH_PATH, SearchPathChange, object_name_identifiers, object_name_last_part,
+            resolve_bound_relation_object_name, resolve_relation_object_name,
+            resolve_relation_object_name_on_path, search_path_change,
         },
         with_scopes::WithScopes,
     },
