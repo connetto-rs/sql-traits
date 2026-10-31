@@ -40,6 +40,8 @@ pub mod role_membership;
 pub use role_membership::RoleMembershipLike;
 pub mod schema;
 pub use schema::SchemaLike;
+pub mod sequence;
+pub use sequence::SequenceLike;
 pub mod grant;
 pub use grant::{ColumnGrantLike, GrantLike, TableGrantLike};
 pub mod data_statement;

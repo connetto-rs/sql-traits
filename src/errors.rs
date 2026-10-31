@@ -37,6 +37,8 @@ pub enum ObjectKind {
     Role,
     /// A schema declared by a `CREATE SCHEMA` statement.
     Schema,
+    /// A sequence declared by a `CREATE SEQUENCE` statement.
+    Sequence,
 }
 
 impl core::fmt::Display for ObjectKind {
@@ -56,6 +58,7 @@ impl core::fmt::Display for ObjectKind {
             Self::Extension => "Extension",
             Self::Role => "Role",
             Self::Schema => "Schema",
+            Self::Sequence => "Sequence",
         })
     }
 }
@@ -1247,11 +1250,9 @@ pub enum Error {
     /// Error indicating that a statement names a relation with a name
     /// something else in the same schema already holds.
     ///
-    /// PostgreSQL keeps tables, views, materialized views and index names in
-    /// one pool per schema, and a named `UNIQUE` or `PRIMARY KEY` constraint
-    /// puts the name of the index behind it in that pool too. Sequences share
-    /// the pool as well, and this crate does not model those, so the rule it
-    /// enforces is the part of PostgreSQL's it can see.
+    /// PostgreSQL keeps tables, views, materialized views, sequences and index
+    /// names in one pool per schema, and a named `UNIQUE` or `PRIMARY KEY`
+    /// constraint puts the name of the index behind it in that pool too.
     RelationNameAlreadyTaken {
         /// Kind of object the statement tried to create.
         object_kind: ObjectKind,
@@ -1272,9 +1273,10 @@ pub enum Error {
     #[error("`{object_name}` is a {actual_kind}, not a {expected_kind}.")]
     /// Error indicating that a statement names an existing relation of the
     /// wrong kind, which PostgreSQL refuses rather than treating the spellings
-    /// as interchangeable: `DROP TABLE` will not drop a view, `DROP VIEW` will
-    /// not drop a table or a materialized view, and `DROP MATERIALIZED VIEW`
-    /// will not drop a plain view.
+    /// as interchangeable: `DROP TABLE` will not drop a view or a sequence,
+    /// `DROP VIEW` will not drop a table or a materialized view, `DROP
+    /// MATERIALIZED VIEW` will not drop a plain view, and `DROP SEQUENCE` will
+    /// drop nothing but a sequence.
     RelationKindMismatch {
         /// Name the statement wrote.
         object_name: String,

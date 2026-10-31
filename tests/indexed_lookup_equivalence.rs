@@ -37,6 +37,7 @@ const FIXTURE: &str = "
     CREATE VIEW app.bare_a AS SELECT id FROM bare_a;
     CREATE MATERIALIZED VIEW app_2.plain AS SELECT id FROM app.plain;
     CREATE VIEW app_2.\"MIXED\" AS SELECT id FROM \"Mixed\";
+    CREATE SEQUENCE app_2.\"Keyed\";
 ";
 
 fn fixture_variants() -> Vec<(ParserDB, String)> {
@@ -154,9 +155,9 @@ fn outcome(result: &Result<Option<&Table>, LookupError>) -> String {
 
 /// Scan oracle for the search-path resolver under any comparison.
 ///
-/// Tables, views and materialized views share one pool of names, so a schema
-/// holding the name under any kind ends the walk whether or not it holds a
-/// table.
+/// Tables, views, materialized views and sequences share one pool of names,
+/// so a schema holding the name under any kind ends the walk whether or not it
+/// holds a table.
 fn oracle_resolve_with<'a>(
     db: &'a ParserDB,
     target: &TargetName<'_>,
@@ -170,16 +171,17 @@ fn oracle_resolve_with<'a>(
     for (entry_schema, entry_quoted) in db.search_path().collect::<Vec<_>>() {
         let schema_key = case.compared_form(entry_schema, entry_quoted);
         let candidates = matching_tables(db, target, case, &schema_key);
-        if !candidates.is_empty() || name_is_claimed_by_a_view(db, target, case, &schema_key) {
+        if !candidates.is_empty() || name_is_claimed_by_another_kind(db, target, case, &schema_key)
+        {
             return resolve_candidates(target, &candidates);
         }
     }
     Ok(None)
 }
 
-/// Whether a view or a materialized view of either kind holds the name in the
+/// Whether a view, a materialized view or a sequence holds the name in the
 /// schema `schema_key` names, found by scanning.
-fn name_is_claimed_by_a_view(
+fn name_is_claimed_by_another_kind(
     db: &ParserDB,
     target: &TargetName<'_>,
     case: IdentifierCase,
@@ -206,6 +208,13 @@ fn name_is_claimed_by_a_view(
             view.view_schema_is_quoted(),
             view.view_name(),
             view.view_name_is_quoted(),
+        )
+    }) || db.sequences().any(|sequence| {
+        claims(
+            sequence.sequence_schema(),
+            sequence.sequence_schema_is_quoted(),
+            sequence.sequence_name(),
+            sequence.sequence_name_is_quoted(),
         )
     })
 }

@@ -16,7 +16,8 @@ use crate::{
     traits::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, ExtensionLike,
         ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike, RoleMembershipLike,
-        RuleLike, SchemaLike, TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, ViewLike,
+        RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike, TriggerLike,
+        UniqueIndexLike, ViewLike,
     },
     utils::{
         call_typing::{Selection, reached_functions, resolve_call},
@@ -24,8 +25,10 @@ use crate::{
         object_name::{
             function_has_stored_identity, function_search_path, relation_name_is_claimed,
             resolve_function_in_iter, resolve_function_on_search_path_in_iter,
-            resolve_one_function, resolve_target_in_iter, resolve_target_on_search_path_in_iter,
-            resolve_view_in_iter, resolve_view_on_search_path_in_iter,
+            resolve_one_function, resolve_sequence_in_iter,
+            resolve_sequence_on_search_path_in_iter, resolve_target_in_iter,
+            resolve_target_on_search_path_in_iter, resolve_view_in_iter,
+            resolve_view_on_search_path_in_iter,
         },
         postgres_types::PgType,
     },
@@ -39,6 +42,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type View: ViewLike<DB = Self>;
     /// Type of the materialized views in the schema.
     type MaterializedView: ViewLike<DB = Self>;
+    /// Type of the sequences in the schema.
+    type Sequence: SequenceLike<DB = Self>;
     /// Type of the columns in the schema.
     type Column: ColumnLike<DB = Self>;
     /// Type of the declared data types of the columns in the schema.
@@ -581,6 +586,24 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// ```
     fn materialized_views(&self) -> impl Iterator<Item = &Self::MaterializedView>;
 
+    /// Iterates over the sequences defined in the schema.
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE SEQUENCE ticket_seq;
+    ///      GRANT USAGE ON SEQUENCE ticket_seq TO PUBLIC;",
+    /// )?;
+    /// assert_eq!(db.sequences().count(), 1);
+    /// assert!(db.tables().next().is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn sequences(&self) -> impl Iterator<Item = &Self::Sequence>;
+
     /// Resolves a name a statement wrote into the table it denotes, comparing
     /// identifiers as `case` says the engine does.
     ///
@@ -690,10 +713,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     }
 
     /// Resolves a name a statement wrote into the relation it denotes,
-    /// whether table, plain view or materialized view, applying the same
-    /// rules as [`Self::resolve_target_table`].
+    /// whether table, plain view, materialized view or sequence, applying the
+    /// same rules as [`Self::resolve_target_table`].
     ///
-    /// The three kinds share one pool of names, so at most one kind answers a
+    /// The four kinds share one pool of names, so at most one kind answers a
     /// name and the kind that holds it is the answer.
     ///
     /// # Errors
@@ -740,10 +763,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         if let Some(view) = self.resolve_target_view(target.clone(), case)? {
             return Ok(Some(Relation::View(view)));
         }
-        match self.resolve_target_materialized_view(target, case)? {
-            Some(view) => Ok(Some(Relation::MaterializedView(view))),
-            None => Ok(None),
+        if let Some(view) = self.resolve_target_materialized_view(target.clone(), case)? {
+            return Ok(Some(Relation::MaterializedView(view)));
         }
+        Ok(self.resolve_target_sequence(target, case)?.map(Relation::Sequence))
     }
 
     /// Resolves a reference a stored object carries into the relation it
@@ -798,8 +821,56 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         if let Some(view) = self.view_by_target(target.clone(), IdentifierCase::AsWritten)? {
             return Ok(Some(Relation::View(view)));
         }
-        self.materialized_view_by_target(target, IdentifierCase::AsWritten)
-            .map(|view| view.map(Relation::MaterializedView))
+        if let Some(view) =
+            self.materialized_view_by_target(target.clone(), IdentifierCase::AsWritten)?
+        {
+            return Ok(Some(Relation::MaterializedView(view)));
+        }
+        self.sequence_by_target(target, IdentifierCase::AsWritten)
+            .map(|sequence| sequence.map(Relation::Sequence))
+    }
+
+    /// Resolves a name a statement wrote into the sequence it denotes,
+    /// applying the same rules as [`Self::resolve_target_table`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
+    /// than one sequence, and [`LookupError::InvalidObjectName`] when the name
+    /// is malformed.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE SCHEMA app;
+    ///      CREATE SEQUENCE app.ticket_seq;
+    ///      SET search_path = app, public;",
+    /// )?;
+    /// let sequence = db
+    ///     .resolve_target_sequence(TargetName::new("ticket_seq", false), IdentifierCase::AsWritten)?
+    ///     .expect("the path reaches `app`");
+    /// assert_eq!(sequence.sequence_schema(), Some("app"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn resolve_target_sequence(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Sequence>, LookupError> {
+        resolve_sequence_on_search_path_in_iter(
+            self.sequences(),
+            &target,
+            || self.search_path(),
+            case,
+            |key| relation_name_is_claimed(self, key, case),
+        )
     }
 
     /// Returns the table an identifier and its optional qualifier name,
@@ -930,6 +1001,39 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
         resolve_view_in_iter(self.materialized_views(), &target, case)
+    }
+
+    /// Returns the sequence a name in parts denotes, applying the same rules
+    /// as [`Self::table_by_target`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
+    /// more than one sequence.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db =
+    ///     ParserDB::parse::<PostgreSqlDialect>("CREATE SCHEMA app; CREATE SEQUENCE app.ticket_seq;")?;
+    /// let case = IdentifierCase::AsWritten;
+    /// let qualified = TargetName::new("ticket_seq", false).with_schema("app", false);
+    /// assert!(db.sequence_by_target(qualified, case)?.is_some());
+    /// assert!(db.sequence_by_target(TargetName::new("ticket_seq", false), case)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn sequence_by_target(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Sequence>, LookupError> {
+        resolve_sequence_in_iter(self.sequences(), &target, case)
     }
 
     /// Returns the function a name in parts denotes, applying the same rules
@@ -2012,10 +2116,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
 
 /// One relation a database holds, tagged with the kind it is.
 ///
-/// Tables, plain views and materialized views share one pool of names, so a
-/// name resolves to at most one of them. A reader that needs to say which
-/// kind a lookup reached, whether from a grant, a rule or a statement's
-/// reads, handles this enum one variant at a time.
+/// Tables, plain views, materialized views and sequences share one pool of
+/// names, so a name resolves to at most one of them. A reader that needs to
+/// say which kind a lookup reached, whether from a grant, a rule or a
+/// statement's reads, handles this enum one variant at a time.
 ///
 /// # Example
 ///
@@ -2045,6 +2149,8 @@ pub enum Relation<'a, DB: DatabaseLike> {
     View(&'a DB::View),
     /// A materialized view.
     MaterializedView(&'a DB::MaterializedView),
+    /// A sequence.
+    Sequence(&'a DB::Sequence),
 }
 
 impl<DB: DatabaseLike> Copy for Relation<'_, DB> {}
@@ -2055,6 +2161,7 @@ impl<DB: DatabaseLike> Debug for Relation<'_, DB> {
             Self::Table(table) => f.debug_tuple("Table").field(table).finish(),
             Self::View(view) => f.debug_tuple("View").field(view).finish(),
             Self::MaterializedView(view) => f.debug_tuple("MaterializedView").field(view).finish(),
+            Self::Sequence(sequence) => f.debug_tuple("Sequence").field(sequence).finish(),
         }
     }
 }

@@ -21,6 +21,7 @@ mod grant;
 mod index_clauses;
 mod role_membership;
 mod schema;
+mod sequence;
 mod unique_constraint;
 mod view;
 

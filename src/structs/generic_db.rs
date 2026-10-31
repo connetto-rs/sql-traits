@@ -33,10 +33,10 @@ use crate::{
 /// Where the relation holding a shared name lives: which kind it is, and its
 /// position in that kind's collection.
 ///
-/// PostgreSQL keeps tables, views and materialized views in one pool of
-/// names, so one index answers all three and a lookup for a kind keeps only
-/// the slots of that kind. Crate-private: it names positions inside private
-/// collections, which no caller outside can hold or use.
+/// PostgreSQL keeps tables, views, materialized views and sequences in one
+/// pool of names, so one index answers all four and a lookup for a kind keeps
+/// only the slots of that kind. Crate-private: it names positions inside
+/// private collections, which no caller outside can hold or use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RelationSlot {
     /// A table, at this position in the table collection.
@@ -45,6 +45,8 @@ pub(crate) enum RelationSlot {
     View(usize),
     /// A materialized view, at this position in its collection.
     MaterializedView(usize),
+    /// A sequence, at this position in the sequence collection.
+    Sequence(usize),
 }
 
 /// A generic representation of a database schema.
@@ -61,10 +63,12 @@ pub struct GenericDB<P: SchemaProfile> {
     views: Vec<Identified<P::View, RelationIdentity>>,
     /// List of materialized views in the database.
     materialized_views: Vec<Identified<P::MaterializedView, RelationIdentity>>,
+    /// List of sequences in the database.
+    sequences: Vec<Stored<P::Sequence>>,
     /// Relations by normalized `(schema, name)`, values their storage slots.
     ///
-    /// PostgreSQL keeps tables, views and materialized views in one pool of
-    /// names, so all three share this index and a creation collides with
+    /// PostgreSQL keeps tables, views, materialized views and sequences in one
+    /// pool of names, so all four share this index and a creation collides with
     /// whichever kind already holds the name. Lists hold every relation a key
     /// matched, ascending within a kind, so lookup answers and ambiguity
     /// reporting agree with scanning the list.
@@ -138,6 +142,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("tables", &self.tables.len())
             .field("views", &self.views.len())
             .field("materialized_views", &self.materialized_views.len())
+            .field("sequences", &self.sequences.len())
             .field("columns", &self.columns.len())
             .field("relation_identities", &self.relation_identities.len())
             .field("column_identities", &self.column_identities.len())
@@ -176,6 +181,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             tables: self.tables.clone(),
             views: self.views.clone(),
             materialized_views: self.materialized_views.clone(),
+            sequences: self.sequences.clone(),
             columns: self.columns.clone(),
             relation_identities: self.relation_identities.clone(),
             column_identities: self.column_identities.clone(),

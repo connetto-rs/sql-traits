@@ -126,7 +126,7 @@ impl<'db, DB: DatabaseLike> RelationCollector<'db, DB> {
                 Ok(())
             }
             Relation::View(view) => self.expand_view(view),
-            Relation::MaterializedView(_) => Ok(()),
+            Relation::MaterializedView(_) | Relation::Sequence(_) => Ok(()),
         }
     }
 
@@ -179,6 +179,7 @@ fn same_relation<DB: DatabaseLike>(left: &Relation<'_, DB>, right: &Relation<'_,
         (Relation::MaterializedView(left), Relation::MaterializedView(right)) => {
             core::ptr::eq(*left, *right)
         }
+        (Relation::Sequence(left), Relation::Sequence(right)) => core::ptr::eq(*left, *right),
         _ => false,
     }
 }
@@ -343,7 +344,7 @@ mod tests {
         errors::LookupError,
         prelude::ParserDB,
         structs::{IdentifierCase, TargetName},
-        traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
+        traits::{DataStatementLike, DatabaseLike, Relation, SequenceLike, TableLike, ViewLike},
     };
 
     const SCHEMA: &str = "
@@ -353,6 +354,7 @@ mod tests {
         CREATE VIEW open_orders AS SELECT user_id, total FROM orders;
         CREATE VIEW open_high AS SELECT user_id FROM open_orders WHERE total > 100;
         CREATE MATERIALIZED VIEW big_orders AS SELECT user_id, total FROM orders;
+        CREATE SEQUENCE ticket_seq;
     ";
 
     fn schema_db() -> ParserDB {
@@ -388,6 +390,9 @@ mod tests {
                     Relation::View(view) => format!("view {}", view.view_name()),
                     Relation::MaterializedView(view) => {
                         format!("materialized view {}", view.view_name())
+                    }
+                    Relation::Sequence(sequence) => {
+                        format!("sequence {}", sequence.sequence_name())
                     }
                 }
             })
@@ -635,13 +640,14 @@ mod tests {
     #[test]
     fn referenced_relations_tag_every_kind_the_statement_reads() {
         let db = schema_db();
-        let statement = parse_one("SELECT * FROM users, open_orders, big_orders");
+        let statement = parse_one("SELECT * FROM users, open_orders, big_orders, ticket_seq");
         assert_eq!(
             relation_names(as_query(&statement), &db),
             vec![
                 "table users".to_string(),
                 "view open_orders".to_string(),
                 "materialized view big_orders".to_string(),
+                "sequence ticket_seq".to_string(),
             ],
         );
     }

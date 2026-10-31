@@ -62,6 +62,7 @@ fn referenced_relation_names<S: DataStatementLike<ParserDB>>(
                 Relation::MaterializedView(view) => {
                     format!("materialized view {}", view.view_name())
                 }
+                Relation::Sequence(sequence) => format!("sequence {}", sequence.sequence_name()),
             }
         })
         .collect()
