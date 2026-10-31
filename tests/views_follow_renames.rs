@@ -53,6 +53,17 @@ fn a_view_follows_a_renamed_table_and_column() {
 }
 
 #[test]
+fn a_materialized_view_follows_a_renamed_table() {
+    assert_definition(
+        "CREATE TABLE t (id INT);
+         CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+         ALTER TABLE t RENAME TO t2;",
+        "m",
+        "SELECT id FROM t2",
+    );
+}
+
+#[test]
 fn a_qualifier_naming_the_renamed_table_follows_it() {
     assert_definition(
         "CREATE TABLE t (a INT); CREATE TABLE s (c INT);

@@ -15,6 +15,10 @@
 //! A view whose definition reads a temporary relation is temporary whatever
 //! the statement wrote, and lands in `pg_temp`. A materialized view may not
 //! read one at all.
+//!
+//! A function whose `RETURN` body reads a relation is a dependent of that
+//! relation as well, so the same drop checks refuse a drop while a body
+//! reads it and a `CASCADE` takes the function along.
 
 use alloc::{
     format,
@@ -25,13 +29,13 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, CreateView, Expr, Ident, ObjectName, Owner, Query, RenameTableNameKind,
-    SelectItem, SetExpr, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    AlterTableOperation, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Owner, Query,
+    RenameTableNameKind, SelectItem, SetExpr, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use super::{
-    ParserDBBuilder, SchemaQualifier, bind_reference, object_name_last_identifier, place_relation,
-    relation_name_holder, require_named_in_catalog,
+    ParserDBBuilder, SchemaQualifier, bind_reference, function_bodies, object_name_last_identifier,
+    place_relation, relation_name_holder, require_named_in_catalog,
     rules::{self, RuleHost},
     view_rewrites::{self, Rename},
 };
@@ -43,7 +47,8 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         object_name::{
-            RelationKey, qualifier_of, stored_view_key, target_key, target_name_from_object_name,
+            RelationKey, qualifier_of, stored_function_key, stored_view_key, target_key,
+            target_name_from_object_name,
         },
         output_from_wildcard,
         with_scopes::WithScopes,
@@ -489,7 +494,10 @@ fn rename_view(
         view_rewrites::follow_renames(
             &mut builder,
             readers,
-            &[Rename::Relation { key, to: new_ident.clone() }],
+            &[Rename::Relation {
+                key,
+                to: ObjectName(vec![ObjectNamePart::Identifier(new_ident.clone())]),
+            }],
         );
     }
     if let Some(host) = &host {
@@ -803,8 +811,8 @@ pub(super) fn relations_read_in(definition: &Query) -> Vec<RelationKey> {
     visitor.read
 }
 
-/// Every view reading the relation `key` names, and every view reading one of
-/// those, transitively.
+/// Every view and function reading the relation `key` names, and every
+/// reader among those, transitively.
 ///
 /// PostgreSQL refuses to drop a relation while anything reads it, and takes
 /// the whole chain with it under `CASCADE`, so the walk closes over the chain
@@ -834,6 +842,17 @@ pub(super) fn dependent_views(
                 relations_read_by(view.as_ref()),
             )
         }))
+        .chain(builder.functions().iter().map(|(function, _)| {
+            (
+                ObjectKind::Function,
+                stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
+                function
+                    .function_body
+                    .as_ref()
+                    .and_then(function_bodies::relations_read)
+                    .unwrap_or_default(),
+            )
+        }))
         .collect();
 
     let mut frontier = alloc::vec![key.clone()];
@@ -841,7 +860,12 @@ pub(super) fn dependent_views(
 
     while let Some(current) = frontier.pop() {
         for (kind, own_key, read) in &reads {
-            if !read.contains(&current) || *own_key == *key {
+            if !read.contains(&current) {
+                continue;
+            }
+            // A function never is the dropped relation, so a name collision
+            // still counts as a dependency.
+            if *own_key == *key && *kind != ObjectKind::Function {
                 continue;
             }
             let reader = (*kind, own_key.clone());
@@ -855,7 +879,7 @@ pub(super) fn dependent_views(
     found
 }
 
-/// Refuses dropping the relation `key` names while a view reads it.
+/// Refuses dropping the relation `key` names while a view or function reads it.
 ///
 /// # Errors
 ///
@@ -878,7 +902,8 @@ pub(super) fn refuse_dependent_views(
     Ok(())
 }
 
-/// Removes the views a `CASCADE` takes along with the relation `key` names.
+/// Removes the views and functions a `CASCADE` takes along with the relation
+/// `key` names.
 pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &RelationKey) {
     let doomed = dependent_views(builder, key);
     let is_doomed = |kind: ObjectKind, own_key: RelationKey| {
@@ -900,6 +925,12 @@ pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &Relati
         !is_doomed(
             ObjectKind::MaterializedView,
             stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
+        )
+    });
+    builder.functions_mut().retain(|(function, _)| {
+        !is_doomed(
+            ObjectKind::Function,
+            stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
         )
     });
     for host in &hosts {

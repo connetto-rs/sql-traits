@@ -612,6 +612,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// body in either spelling asks this first and falls back to parsing the
     /// text.
     ///
+    /// The relation names a body writes are bound at `CREATE FUNCTION` under
+    /// the session `search_path` in effect at creation, the way PostgreSQL
+    /// stores them, so the expression answers the name the store holds for
+    /// the relation each name reached. A body written as a string is never
+    /// bound, and its names stay as written.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -636,6 +642,29 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     .expect("Function should exist");
     /// assert_eq!(quoted.body(), Some("SELECT a"));
     /// assert_eq!(quoted.body_expression(), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE SCHEMA app;
+    /// CREATE TABLE app.t (a INT);
+    /// SET search_path = app;
+    /// CREATE FUNCTION reads_table() RETURNS INT LANGUAGE sql RETURN (SELECT a FROM t);
+    /// ",
+    /// )?;
+    /// let reads_table = db
+    ///     .function_by_target(TargetName::new("reads_table", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// assert_eq!(
+    ///     reads_table.body_expression().map(ToString::to_string).as_deref(),
+    ///     Some("(SELECT a FROM app.t)"),
+    /// );
     /// # Ok(())
     /// # }
     /// ```

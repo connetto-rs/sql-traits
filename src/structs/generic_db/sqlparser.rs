@@ -71,6 +71,7 @@ mod calls_in_expression;
 mod column_copy;
 mod constraint_validity;
 mod extensions;
+mod function_bodies;
 mod generated_names;
 mod inheritance;
 mod leading_comments;
@@ -4679,12 +4680,12 @@ impl ParserDB {
         builder.rewrite_table_references(&renamed, &target);
 
         if let Some(readers) = readers
-            && let Some(to) = object_name_last_identifier(&target.name)
+            && object_name_last_identifier(&target.name).is_some()
         {
             view_rewrites::follow_renames(
                 &mut builder,
                 readers,
-                &[view_rewrites::Rename::Relation { key, to: to.clone() }],
+                &[view_rewrites::Rename::Relation { key, to: target.name.clone() }],
             );
         }
 
@@ -6707,7 +6708,7 @@ impl ParserDB {
                             case,
                         )
                     });
-                    let replaced = match (existing, create_function.or_replace) {
+                    let replace_position = match (existing, create_function.or_replace) {
                         (Some(_), false) => {
                             return Err(crate::errors::Error::FunctionAlreadyExists {
                                 function_name: last_str(&create_function.name).to_string(),
@@ -6721,10 +6722,16 @@ impl ParserDB {
                                     kind,
                                 });
                             }
-                            Some(builder.functions_mut().remove(position))
+                            Some(position)
                         }
                         (None, _) => None,
                     };
+                    // The body binds before the stored node goes away, so a
+                    // replacement that names an absent relation refuses with
+                    // the old function still answering.
+                    function_bodies::bind(&builder, &mut create_function)?;
+                    let replaced =
+                        replace_position.map(|position| builder.functions_mut().remove(position));
 
                     // The `pg_proc` entry and its owner survive, the new body
                     // decides what a `NULL` argument does.
