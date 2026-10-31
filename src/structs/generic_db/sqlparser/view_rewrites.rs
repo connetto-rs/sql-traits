@@ -1953,10 +1953,21 @@ fn update_from_tables_mut(from: &mut UpdateTableFromKind) -> &mut [TableWithJoin
 /// The data-modifying statement a query body holds, if any.
 pub(super) fn dml_ref(body: &SetExpr) -> Option<DmlRef<'_>> {
     match body {
-        SetExpr::Insert(Statement::Insert(insert)) => Some(DmlRef::Insert(insert)),
-        SetExpr::Update(Statement::Update(update)) => Some(DmlRef::Update(update)),
-        SetExpr::Delete(Statement::Delete(delete)) => Some(DmlRef::Delete(delete)),
-        SetExpr::Merge(Statement::Merge(merge)) => Some(DmlRef::Merge(merge)),
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => statement_dml(statement),
+        _ => None,
+    }
+}
+
+/// The data-modifying statement a query body holds, held for its rewrites.
+fn dml_ref_mut(body: &mut SetExpr) -> Option<DmlMut<'_>> {
+    match body {
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => statement_dml_mut(statement),
         _ => None,
     }
 }
@@ -2206,17 +2217,6 @@ impl VisitorMut for ReturningSpeller<'_> {
             return ControlFlow::Break(error);
         }
         ControlFlow::Continue(())
-    }
-}
-
-/// The data-modifying statement a query body holds, held for its rewrites.
-fn dml_ref_mut(body: &mut SetExpr) -> Option<DmlMut<'_>> {
-    match body {
-        SetExpr::Insert(Statement::Insert(insert)) => Some(DmlMut::Insert(insert)),
-        SetExpr::Update(Statement::Update(update)) => Some(DmlMut::Update(update)),
-        SetExpr::Delete(Statement::Delete(delete)) => Some(DmlMut::Delete(delete)),
-        SetExpr::Merge(Statement::Merge(merge)) => Some(DmlMut::Merge(merge)),
-        _ => None,
     }
 }
 
