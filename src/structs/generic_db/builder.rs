@@ -271,6 +271,17 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &mut self.sequences
     }
 
+    /// Returns how many relations hold a name in some schema's pool: tables,
+    /// views of both kinds, sequences and indexes.
+    pub(crate) fn relation_count(&self) -> usize {
+        self.tables.len()
+            + self.views.len()
+            + self.materialized_views.len()
+            + self.sequences.len()
+            + self.indices.len()
+            + self.unique_indices.len()
+    }
+
     /// Returns `saved` as the builder a rollback leaves, keeping this
     /// builder's identity counter so no identity is handed out twice.
     pub(crate) fn rolled_back_to(&self, mut saved: Self) -> Self {

@@ -846,6 +846,20 @@ pub enum Error {
         /// The owner the statement wrote.
         owner: String,
     },
+    #[error(
+        "Sequence `{sequence_name}` cannot be dropped: column `{column_name}` of table `{table_name}` requires it."
+    )]
+    /// Error indicating that `DROP SEQUENCE` names the sequence of an
+    /// identity column, which PostgreSQL refuses even under `CASCADE`. The
+    /// sequence leaves with the column.
+    SequenceRequiredByColumn {
+        /// Name of the sequence.
+        sequence_name: String,
+        /// Name of the table holding the identity column.
+        table_name: String,
+        /// Name of the identity column.
+        column_name: String,
+    },
     #[error("Invalid index `{index_name}`: {reason}")]
     /// Error indicating that an index definition is invalid.
     InvalidIndex {

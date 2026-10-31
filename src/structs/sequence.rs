@@ -2,9 +2,12 @@
 
 use alloc::{string::String, vec::Vec};
 
-use sqlparser::ast::SequenceOptions;
+use sqlparser::ast::{DataType, SequenceOptions};
 
-use crate::structs::{ColumnIdentity, RelationIdentity};
+use crate::{
+    structs::{ColumnIdentity, RelationIdentity},
+    traits::SequenceOrigin,
+};
 
 /// What owns a stored sequence, kept by identity so it follows the owner
 /// through renames.
@@ -21,7 +24,7 @@ pub(crate) enum StoredSequenceOwner {
     },
 }
 
-/// A sequence, the number generator `CREATE SEQUENCE` declares.
+/// A sequence, declared by `CREATE SEQUENCE` or created for a column.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sequence {
     /// The sequence's own identifier, exactly as written.
@@ -32,10 +35,13 @@ pub struct Sequence {
     schema: Option<String>,
     /// Whether that schema identifier was quoted.
     schema_is_quoted: bool,
-    /// The options the declaration wrote, in order, `OWNED BY` excepted.
+    /// The options the sequence was created with, in order, `OWNED BY`
+    /// excepted.
     options: Vec<SequenceOptions>,
     /// What owns the sequence, if anything does.
     owner: Option<StoredSequenceOwner>,
+    /// Why the sequence exists.
+    origin: SequenceOrigin,
 }
 
 impl Sequence {
@@ -45,6 +51,7 @@ impl Sequence {
         schema: Option<(String, bool)>,
         options: Vec<SequenceOptions>,
         owner: Option<StoredSequenceOwner>,
+        origin: SequenceOrigin,
     ) -> Self {
         let schema_is_quoted = schema.as_ref().is_some_and(|(_, quoted)| *quoted);
         Self {
@@ -54,6 +61,7 @@ impl Sequence {
             schema_is_quoted,
             options,
             owner,
+            origin,
         }
     }
 
@@ -87,5 +95,17 @@ impl Sequence {
     /// Returns what owns the sequence, if anything does.
     pub(crate) fn stored_owner(&self) -> Option<StoredSequenceOwner> {
         self.owner
+    }
+
+    /// Returns why the sequence exists.
+    pub(crate) fn origin(&self) -> SequenceOrigin {
+        self.origin
+    }
+
+    /// Replaces the `AS` type, which an identity sequence takes from its
+    /// column whenever the column's type changes.
+    pub(crate) fn set_data_type(&mut self, data_type: DataType) {
+        self.options.retain(|option| !matches!(option, SequenceOptions::DataType(_)));
+        self.options.insert(0, SequenceOptions::DataType(data_type));
     }
 }

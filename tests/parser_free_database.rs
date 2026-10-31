@@ -680,6 +680,10 @@ impl SequenceLike for MemorySequence {
     {
         None
     }
+
+    fn origin(&self) -> SequenceOrigin {
+        SequenceOrigin::Declared
+    }
 }
 
 impl IndexLike for MemoryIndex {

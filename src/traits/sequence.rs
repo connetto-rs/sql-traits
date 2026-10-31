@@ -35,8 +35,26 @@ pub enum SequenceOwner<'a, DB: DatabaseLike> {
 
 impl<DB: DatabaseLike> Copy for SequenceOwner<'_, DB> {}
 
+/// Why a sequence exists.
+///
+/// PostgreSQL creates a sequence of its own for every `serial` column and
+/// every identity column, besides the ones `CREATE SEQUENCE` declares, and
+/// the column it serves owns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SequenceOrigin {
+    /// Declared by `CREATE SEQUENCE`.
+    Declared,
+    /// Created for a `serial`, `bigserial` or `smallserial` column, whose
+    /// default draws from it.
+    Serial,
+    /// Created for an identity column, which generates its values from it
+    /// and cannot be left without it.
+    Identity,
+}
+
 /// A trait for types that can be treated as SQL sequences, the number
-/// generators `CREATE SEQUENCE` defines.
+/// generators `CREATE SEQUENCE` defines and PostgreSQL creates for `serial`
+/// and identity columns.
 ///
 /// A sequence is a relation. It takes its name from the pool tables, views
 /// and indexes of its schema share, and a client reads or advances it through
@@ -171,12 +189,14 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
         }
     }
 
-    /// Returns the options the declaration wrote, in the order it wrote them.
+    /// Returns the options the sequence was created with, in order.
     ///
+    /// For a declared sequence these are the ones the declaration wrote, and
     /// `OWNED BY` is not among them, since [`Self::owner`] answers the column
-    /// it names and follows that column through renames. An option
-    /// the declaration left out takes PostgreSQL's default, which this does
-    /// not spell out.
+    /// it names and follows that column through renames. A sequence created
+    /// for a column carries the `AS` type PostgreSQL gives it, followed by the
+    /// options an identity wrote. An option left out takes PostgreSQL's
+    /// default, which this does not spell out.
     ///
     /// # Example
     ///
@@ -201,9 +221,10 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
 
     /// Returns the column owning this sequence, if one does.
     ///
-    /// The owning column was named by `OWNED BY` when the sequence was
-    /// created, and keeps owning it through every rename of the column and of
-    /// its relation. Dropping either drops the sequence.
+    /// A declared sequence is owned by the column its `OWNED BY` names, and
+    /// one created for a column by that column. The column keeps owning it
+    /// through every rename of the column and of its relation, and dropping
+    /// either drops the sequence.
     ///
     /// # Example
     ///
@@ -228,4 +249,27 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
     fn owner<'db>(&'db self, database: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>
     where
         Self: 'db;
+
+    /// Returns why the sequence exists.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE tickets (id BIGINT GENERATED ALWAYS AS IDENTITY, n serial);",
+    /// )?;
+    /// let origin = |name| {
+    ///     db.sequence_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .map(|sequence| sequence.map(SequenceLike::origin))
+    /// };
+    /// assert_eq!(origin("tickets_id_seq")?, Some(SequenceOrigin::Identity));
+    /// assert_eq!(origin("tickets_n_seq")?, Some(SequenceOrigin::Serial));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn origin(&self) -> SequenceOrigin;
 }

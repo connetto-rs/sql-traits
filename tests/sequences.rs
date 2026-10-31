@@ -20,22 +20,7 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
 /// No sequence at all, for comparing against [`sequence_names`].
 const NONE: [&str; 0] = [];
 
-/// Every sequence the database holds, as `schema.name` with `public` for one
-/// stored without a schema, sorted.
-fn sequence_names(database: &ParserDB) -> Vec<String> {
-    let mut names: Vec<String> = database
-        .sequences()
-        .map(|sequence| {
-            format!(
-                "{}.{}",
-                sequence.sequence_schema().unwrap_or("public"),
-                sequence.sequence_name()
-            )
-        })
-        .collect();
-    names.sort();
-    names
-}
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/sequence_names.rs"));
 
 fn sequence<'db>(database: &'db ParserDB, name: &str) -> &'db <ParserDB as DatabaseLike>::Sequence {
     database
