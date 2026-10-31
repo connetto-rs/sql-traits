@@ -2285,6 +2285,7 @@ where
                 json_path,
                 sample,
                 index_directives: _,
+                inheritance: _,
             } => {
                 self.expressions(with_hints)?;
                 if let Some(version) = version {
@@ -2377,6 +2378,7 @@ where
                 json_path: _,
                 sample: _,
                 index_directives: _,
+                inheritance: _,
             } => {
                 if let Some(arguments) = args {
                     self.table_function_args(arguments)?;
