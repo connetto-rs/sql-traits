@@ -30,7 +30,8 @@ use crate::{
 };
 
 /// The extension every PostgreSQL database is created with: PL/pgSQL in
-/// `pg_catalog`, at the only version it has shipped since PostgreSQL 9.0.
+/// `pg_catalog`, at the only version it has shipped since PostgreSQL 9.0,
+/// spelled with `WITH` as `pg_dump` writes it.
 pub(super) fn plpgsql() -> CreateExtension {
     CreateExtension {
         name: Ident::new("plpgsql"),

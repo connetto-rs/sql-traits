@@ -520,6 +520,7 @@ pub(crate) fn table_graph<'db, DB: DatabaseLike>(
         table,
         has_alias: false,
         nullable: false,
+        reads_inheritors: false,
         entry_index: 0,
         output_columns,
         factor: 0,

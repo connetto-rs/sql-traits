@@ -29,10 +29,10 @@ use sqlparser::ast::{
     Measure, NamedWindowExpr, ObjectName, OrderBy, OrderByExpr, OrderByKind, PipeOperator,
     PivotValueSource, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
     SetOperator, SetQuantifier, Subscript, SymbolDefinition, TableAlias, TableAliasColumnDef,
-    TableFactor, TableFunctionArgs, TableSample, TableSampleKind, TableVersion, TableWithJoins,
-    TopQuantity, Values, Visit, Visitor, WildcardAdditionalOptions, WindowFrameBound, WindowSpec,
-    WindowType, With, XmlNamespaceDefinition, XmlPassingClause, XmlTableColumn,
-    XmlTableColumnOption,
+    TableFactor, TableFunctionArgs, TableInheritance, TableSample, TableSampleKind, TableVersion,
+    TableWithJoins, TopQuantity, Values, Visit, Visitor, WildcardAdditionalOptions,
+    WindowFrameBound, WindowSpec, WindowType, With, XmlNamespaceDefinition, XmlPassingClause,
+    XmlTableColumn, XmlTableColumnOption,
 };
 
 use crate::{
@@ -206,10 +206,22 @@ struct FromTableRef<'query, 'db, DB: DatabaseLike, D: Copy> {
     /// declared name.
     has_alias: bool,
     nullable: bool,
+    /// Whether the item reads `table` without `ONLY` while other tables
+    /// inherit from it, so its rows include theirs, which do not carry
+    /// `table`'s keys.
+    reads_inheritors: bool,
     entry_index: usize,
     output_columns: BaseColumns<D>,
     /// The address of the `FROM` item, see [`factor_address`].
     factor: usize,
+}
+
+impl<DB: DatabaseLike, D: Copy> FromTableRef<'_, '_, DB, D> {
+    /// Whether every row the item yields is a row of `table` itself, which a
+    /// null-extended join side or a read reaching inheriting tables breaks.
+    fn yields_source_rows(&self) -> bool {
+        !self.nullable && !self.reads_inheritors
+    }
 }
 
 /// One output column of a derivable relation.
@@ -3415,7 +3427,7 @@ fn base_for_qualifier<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     bases
         .iter()
         .filter(|base| base.entry_index < visible_entries)
-        .filter(|base| !require_row_identity || !base.nullable)
+        .filter(|base| !require_row_identity || base.yields_source_rows())
         .find(|base| key_matches(base.key, value, quoted, case))
 }
 
@@ -3430,7 +3442,7 @@ fn base_for_qualified_name<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     bases
         .iter()
         .filter(|base| base.entry_index < visible_entries)
-        .filter(|base| !require_row_identity || !base.nullable)
+        .filter(|base| !require_row_identity || base.yields_source_rows())
         .find(|base| {
             base.schema_key.is_some_and(|stored| {
                 key_matches(stored, schema.0, schema.1, case)
@@ -3648,7 +3660,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
     {
         if let Some((ordinal, base_column)) = find_base_column(base, column, case) {
             definitions.push(ResolvedColumn {
-                source: (!require_row_identity || !base.nullable).then_some(base.table),
+                source: (!require_row_identity || base.yields_source_rows()).then_some(base.table),
                 definition: base_column.definition,
                 relation: Some(base_relation_identity(base)),
                 exposed: Some((base_column.name.as_str(), base_column.quoted)),
@@ -4358,6 +4370,11 @@ where
         return Ok(opaque_factor(OpaqueIdentity::Known { key, schema }));
     };
     let names = output_columns.iter().map(|column| (column.name.clone(), column.quoted)).collect();
+    let only = matches!(
+        factor.get(),
+        TableFactor::Table { inheritance: Some(TableInheritance::Only { .. }), .. }
+    );
+    let reads_inheritors = !only && table.inheritors(database)?.next().is_some();
     Ok(FactorContribution {
         relation: RelationContribution::Base(FromTableRef {
             key,
@@ -4365,6 +4382,7 @@ where
             table,
             has_alias: alias.is_some(),
             nullable: false,
+            reads_inheritors,
             entry_index: 0,
             output_columns,
             factor: address,
@@ -4522,7 +4540,8 @@ impl<DB: DatabaseLike> DQLLike<DB> for Query {
                     if wildcard_replaces_values(options) {
                         None
                     } else if scope.from_entry_count == 1 && scope.bases.len() == 1 {
-                        Some(scope.bases[0].table)
+                        let base = &scope.bases[0];
+                        base.yields_source_rows().then_some(base.table)
                     } else if scope.from_entry_count == 1 && scope.derived.len() == 1 {
                         single_source_relation(&scope.derived[0], database)
                     } else {

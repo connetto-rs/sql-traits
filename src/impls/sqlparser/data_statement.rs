@@ -10,20 +10,22 @@
 //! implementation resolves explicitly. `referenced_relations` records what the
 //! statement names, and `referenced_tables` goes on to expand every plain view
 //! through the view's stored definition, which is bound at creation and read
-//! with no search path.
+//! with no search path, and every table a `FROM` or target item without
+//! `ONLY` names into the tables below it through `INHERITS` and
+//! `PARTITION OF`.
 
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Delete, FromTable, Insert, ObjectName, Query, Statement, TableFactor, TableObject, Update,
-    Visit, Visitor,
+    Delete, FromTable, Insert, ObjectName, Query, Statement, TableFactor, TableInheritance,
+    TableObject, Update, Visit, Visitor,
 };
 
 use crate::{
     errors::LookupError,
     structs::IdentifierCase,
-    traits::{DataStatementLike, DatabaseLike, Relation, ViewLike},
+    traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
     utils::{
         object_name::{resolve_bound_relation_object_name, resolve_relation_object_name},
         with_scopes::WithScopes,
@@ -49,6 +51,12 @@ struct RelationCollector<'db, DB: DatabaseLike> {
     /// Whether the walk is inside a stored view's definition, where names are
     /// bound and read with no search path.
     bound: bool,
+    /// The name of the last table item met without `ONLY`, compared by
+    /// address, whose table the walk reads together with every table below
+    /// it.
+    descending: Option<*const ObjectName>,
+    /// The tables whose descendants are already in `tables`.
+    descended: Vec<&'db DB::Table>,
 }
 
 impl<'db, DB: DatabaseLike> RelationCollector<'db, DB> {
@@ -61,6 +69,8 @@ impl<'db, DB: DatabaseLike> RelationCollector<'db, DB> {
             scopes: WithScopes::default(),
             targets: Vec::new(),
             bound: false,
+            descending: None,
+            descended: Vec::new(),
         }
     }
 
@@ -120,6 +130,32 @@ impl<'db, DB: DatabaseLike> RelationCollector<'db, DB> {
         }
     }
 
+    /// Adds every table below `table` through `INHERITS` or `PARTITION OF`,
+    /// recursively, which a read or write of `table` without `ONLY` reaches.
+    fn read_descendants(&mut self, table: &'db DB::Table) -> Result<(), LookupError> {
+        if self.descended.iter().any(|seen| core::ptr::eq(*seen, table)) {
+            return Ok(());
+        }
+        self.descended.push(table);
+        let mut reached = alloc::vec![table];
+        let mut next = 0;
+        while let Some(&parent) = reached.get(next) {
+            next += 1;
+            for child in parent.inheritors(self.database)?.chain(parent.partitions(self.database)?)
+            {
+                if !reached.iter().any(|seen| core::ptr::eq(*seen, child)) {
+                    reached.push(child);
+                }
+            }
+        }
+        for child in reached.into_iter().skip(1) {
+            if !self.tables.iter().any(|seen| core::ptr::eq(*seen, child)) {
+                self.tables.push(child);
+            }
+        }
+        Ok(())
+    }
+
     /// Expands a plain view through its stored definition, which reads its
     /// names as bound at creation, with no search path.
     fn expand_view(&mut self, view: &'db DB::View) -> Result<(), LookupError> {
@@ -165,6 +201,15 @@ impl<DB: DatabaseLike> Visitor for RelationCollector<'_, DB> {
         ControlFlow::Continue(())
     }
 
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Table { name, inheritance, .. } = factor
+            && !matches!(inheritance, Some(TableInheritance::Only { .. }))
+        {
+            self.descending = Some(&raw const *name);
+        }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_relation(&mut self, object_name: &ObjectName) -> ControlFlow<Self::Break> {
         if self.scopes.reads_item(object_name)
             && !self.targets.iter().any(|target| core::ptr::eq(*target, object_name))
@@ -176,8 +221,16 @@ impl<DB: DatabaseLike> Visitor for RelationCollector<'_, DB> {
         } else {
             resolve_relation_object_name(object_name, self.database, IdentifierCase::AsWritten)
         };
-        match resolved.and_then(|relation| relation.map_or(Ok(()), |relation| self.read(relation)))
-        {
+        let descending = self.descending == Some(&raw const *object_name);
+        let outcome = resolved.and_then(|relation| {
+            let Some(relation) = relation else { return Ok(()) };
+            self.read(relation)?;
+            match relation {
+                Relation::Table(table) if descending => self.read_descendants(table),
+                _ => Ok(()),
+            }
+        });
+        match outcome {
             Ok(()) => ControlFlow::Continue(()),
             Err(error) => ControlFlow::Break(error),
         }

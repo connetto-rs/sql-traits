@@ -376,3 +376,27 @@ fn decode_is_a_builtin_returning_bytea() {
         Some("pg_catalog.decode returns BYTEA".to_owned())
     );
 }
+
+#[test]
+fn a_stored_extension_keeps_whether_with_was_written() {
+    let rendered = |sql: &str| -> Vec<String> {
+        let database = parse(sql).expect("the extension is created");
+        let mut rendered: Vec<String> = database.extensions().map(ToString::to_string).collect();
+        rendered.sort();
+        rendered
+    };
+    assert_eq!(
+        rendered("CREATE SCHEMA exts; CREATE EXTENSION pgcrypto WITH SCHEMA exts VERSION '1.3';"),
+        [
+            "CREATE EXTENSION pgcrypto WITH SCHEMA exts VERSION '1.3'",
+            "CREATE EXTENSION plpgsql WITH SCHEMA pg_catalog VERSION '1.0'",
+        ]
+    );
+    assert_eq!(
+        rendered("CREATE SCHEMA exts; CREATE EXTENSION pgcrypto SCHEMA exts VERSION '1.3';"),
+        [
+            "CREATE EXTENSION pgcrypto SCHEMA exts VERSION '1.3'",
+            "CREATE EXTENSION plpgsql WITH SCHEMA pg_catalog VERSION '1.0'",
+        ]
+    );
+}
