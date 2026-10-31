@@ -759,6 +759,15 @@ pub enum Error {
         /// Name of the materialized view the rule names.
         view_name: String,
     },
+    #[error("Rule `{rule_name}` cannot be defined on sequence `{sequence_name}`.")]
+    /// Error indicating that a rule names a sequence, which PostgreSQL
+    /// refuses: rules exist on tables and plain views only.
+    RuleOnSequence {
+        /// Name of the rule.
+        rule_name: String,
+        /// Name of the sequence the rule names.
+        sequence_name: String,
+    },
     #[error(
         "Rule `{rule_name}` on `{relation_name}` is an `ON SELECT` rule, which is not supported."
     )]
