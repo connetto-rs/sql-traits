@@ -26,8 +26,6 @@
 //! - `ALTER TABLE ... INHERIT` and `NO INHERIT` do not parse, so a schema
 //!   history that attaches or detaches a parent leaves the inheritance edges as
 //!   the `CREATE TABLE` wrote them.
-//! - `GRANT` and `REVOKE ... ON ROUTINE` and `ON ALL PROCEDURES | ROUTINES IN
-//!   SCHEMA` do not parse, so a schema carrying one fails to parse.
 //! - The `CREATE TABLE ... LIKE` option list (`INCLUDING INDEXES` and its
 //!   siblings) does not parse beyond the spellings already honoured here.
 //! - `ALTER PROCEDURE` and the PostgreSQL body spelling of `CREATE PROCEDURE`
