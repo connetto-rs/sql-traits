@@ -4601,11 +4601,8 @@ impl ParserDB {
         if let Some(readers) = readers
             && object_name_last_identifier(&target.name).is_some()
         {
-            view_rewrites::follow_renames(
-                &mut builder,
-                readers,
-                &[view_rewrites::Rename::Relation { key, to: target.name.clone() }],
-            )?;
+            let followed = [view_rewrites::Rename::Relation { key, to: target.name.clone() }];
+            view_rewrites::follow_renames(&mut builder, readers, &followed)?;
         }
 
         Ok(builder)
