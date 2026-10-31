@@ -35,6 +35,7 @@ pub(super) fn plpgsql() -> CreateExtension {
     CreateExtension {
         name: Ident::new("plpgsql"),
         if_not_exists: false,
+        with_keyword: true,
         cascade: false,
         schema: Some(Ident::new(PG_CATALOG)),
         version: Some(Ident::with_quote('\'', "1.0")),
