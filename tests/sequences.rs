@@ -9,6 +9,7 @@
 use sql_traits::{
     errors::{Error, LookupError, ObjectKind},
     prelude::*,
+    traits::grant::GrantTarget,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 
@@ -62,10 +63,11 @@ fn owner_of(database: &ParserDB, name: &str) -> Option<(String, String)> {
 }
 
 #[test]
-fn a_created_sequence_is_recorded_beside_the_grant_on_it() {
+fn a_created_sequence_is_recorded_and_reached_by_the_grants_on_it() {
     let db = parse(
         "CREATE SEQUENCE ticket_seq;
-         GRANT USAGE ON SEQUENCE ticket_seq TO PUBLIC;",
+         GRANT USAGE ON SEQUENCE ticket_seq TO PUBLIC;
+         GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO PUBLIC;",
     )
     .expect("schema parses");
 
@@ -74,7 +76,10 @@ fn a_created_sequence_is_recorded_beside_the_grant_on_it() {
     assert_eq!(ticket.sequence_schema(), None);
     assert!(!ticket.is_temporary());
     assert_eq!(ticket.options(), []);
-    assert_eq!(db.table_grants().count(), 1);
+    for grant in db.table_grants() {
+        assert_eq!(relations_of(&db, grant), ["sequence public.ticket_seq"]);
+    }
+    assert_eq!(db.table_grants().count(), 2);
 }
 
 #[test]
@@ -227,19 +232,45 @@ fn if_not_exists_skips_whatever_relation_holds_the_name() {
 }
 
 #[test]
-fn drop_sequence_removes_the_sequences_it_names() {
+fn drop_sequence_removes_the_sequence_and_the_grants_on_it() {
     let db = parse(
         "CREATE SCHEMA app;
          SET search_path = app, public;
          CREATE SEQUENCE a;
          CREATE SEQUENCE b;
          CREATE SEQUENCE keep;
+         GRANT USAGE ON SEQUENCE a TO PUBLIC;
+         GRANT USAGE ON SEQUENCE a, keep TO PUBLIC;
+         GRANT SELECT ON keep TO PUBLIC;
+         GRANT USAGE ON SCHEMA app TO PUBLIC;
          DROP SEQUENCE a, b;
          DROP SEQUENCE IF EXISTS missing;",
     )
     .expect("schema parses");
 
     assert_eq!(sequence_names(&db), ["app.keep"]);
+    let targets: Vec<String> = db
+        .table_grants()
+        .map(|grant| {
+            match grant.target() {
+                GrantTarget::Sequences(names) => {
+                    format!(
+                        "sequences {}",
+                        names.map(|name| name.to_string()).collect::<Vec<_>>().join(",")
+                    )
+                }
+                GrantTarget::Tables(names) => {
+                    format!(
+                        "tables {}",
+                        names.map(|name| name.to_string()).collect::<Vec<_>>().join(",")
+                    )
+                }
+                GrantTarget::Schemas(_) => "schemas".to_string(),
+                _ => "other".to_string(),
+            }
+        })
+        .collect();
+    assert_eq!(targets, ["sequences app.keep", "tables app.keep", "schemas"]);
 }
 
 #[test]
@@ -330,6 +361,66 @@ fn a_sequence_name_ends_the_search_path_walk() {
             .is_none(),
         "the strict lookup reads a bare name as `public`"
     );
+}
+
+#[test]
+fn a_grant_spelled_for_a_table_may_name_a_sequence() {
+    let db = parse(
+        "CREATE SEQUENCE s;
+         GRANT SELECT, UPDATE ON s TO PUBLIC;",
+    )
+    .expect("a sequence is a legal target of the table spelling");
+    assert_eq!(db.unresolved_access_references().expect("targets are well formed").count(), 0);
+    let grant = db.table_grants().next().expect("the grant is recorded");
+    assert_eq!(relations_of(&db, grant), ["sequence public.s"]);
+    let relation = grant.relations(&db).next().expect("the grant reaches the sequence");
+    assert!(format!("{relation:?}").starts_with("Sequence("), "{relation:?}");
+}
+
+/// Every relation a grant covers, as `kind schema.name`, in the order the
+/// grant reaches them.
+fn relations_of(
+    database: &ParserDB,
+    grant: &<ParserDB as DatabaseLike>::TableGrant,
+) -> Vec<String> {
+    grant.relations(database).map(|relation| describe(&relation)).collect()
+}
+
+#[test]
+fn a_grant_reaches_the_sequences_it_names_or_sweeps() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.t (id INT);
+         CREATE SEQUENCE app.a;
+         CREATE SEQUENCE app.b;
+         CREATE SEQUENCE elsewhere;
+         SET search_path = app, public;
+         GRANT USAGE ON SEQUENCE a, elsewhere TO PUBLIC;
+         GRANT SELECT ON ALL SEQUENCES IN SCHEMA app TO PUBLIC;
+         GRANT SELECT ON ALL TABLES IN SCHEMA app TO PUBLIC;
+         SET search_path = public;",
+    )
+    .expect("schema parses");
+    let grants: Vec<_> = db.table_grants().collect();
+    let [by_name, by_schema, by_table_schema] = grants[..] else {
+        panic!("expected three grants, got {}", grants.len());
+    };
+
+    assert_eq!(relations_of(&db, by_name), ["sequence app.a", "sequence public.elsewhere"]);
+    assert_eq!(relations_of(&db, by_schema), ["sequence app.a", "sequence app.b"]);
+    assert_eq!(
+        relations_of(&db, by_table_schema),
+        ["table app.t"],
+        "`ALL TABLES` leaves sequences out"
+    );
+
+    // The names were bound where they reached when the grant ran, so they
+    // keep naming those sequences after the path changes.
+    let GrantTarget::Sequences(targets) = by_name.target() else {
+        panic!("expected a sequence target");
+    };
+    let written: Vec<String> = targets.map(|target| target.to_string()).collect();
+    assert_eq!(written, ["app.a", "elsewhere"]);
 }
 
 #[test]

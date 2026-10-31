@@ -15,11 +15,12 @@
 
 use alloc::{collections::BTreeSet, string::ToString, sync::Arc, vec::Vec};
 
-use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, SequenceOptions};
+use sqlparser::ast::{Grant, GrantObjects, Ident, ObjectName, ObjectNamePart, SequenceOptions};
 
 use super::{
-    ParserDBBuilder, SchemaQualifier, object_name_last_identifier, place_relation,
-    relation_name_holder, require_named_in_catalog, schema_qualifiers_match, views,
+    ParserDBBuilder, SchemaQualifier, object_name_last_identifier,
+    object_name_matches_resolved_identity, place_relation, relation_name_holder,
+    require_named_in_catalog, schema_qualifiers_match, views,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -218,6 +219,12 @@ fn resolve_sequence<'builder>(
     .map_err(Error::from)
 }
 
+/// Whether a written relation name reaches a sequence through the session's
+/// path.
+pub(super) fn holds_sequence(builder: &ParserDBBuilder, name: &ObjectName) -> bool {
+    resolve_sequence(builder, name).ok().flatten().is_some()
+}
+
 /// Drops the sequences a `DROP SEQUENCE` names.
 ///
 /// # Errors
@@ -335,9 +342,45 @@ pub(super) fn drop_orphaned_sequences(builder: &mut ParserDBBuilder) {
     forget(builder, &doomed);
 }
 
-/// Removes the `doomed` sequences.
+/// Removes the `doomed` sequences and takes them out of every grant naming
+/// them, dropping a grant left naming nothing.
+///
+/// A grant's names were bound to the relation they reached when it ran, so a
+/// name is compared against a sequence's stored identity, as a dropped table's
+/// grants are.
 fn forget(builder: &mut ParserDBBuilder, doomed: &[Arc<Sequence>]) {
+    if doomed.is_empty() {
+        return;
+    }
     builder
         .sequences_mut()
         .retain(|(sequence, ())| !doomed.iter().any(|dead| Arc::ptr_eq(dead, sequence)));
+
+    let names_doomed = |name: &ObjectName| {
+        doomed.iter().any(|sequence| {
+            object_name_matches_resolved_identity(
+                name,
+                sequence.sequence_name(),
+                sequence.sequence_name_is_quoted(),
+                sequence.sequence_schema(),
+                sequence.sequence_schema_is_quoted(),
+            )
+        })
+    };
+    let forget_in = |grants: &mut Vec<(Arc<Grant>, ())>| {
+        grants.retain_mut(|(grant, ())| {
+            if let Some(GrantObjects::Sequences(names) | GrantObjects::Tables(names)) =
+                &grant.objects
+                && names.iter().any(names_doomed)
+                && let Some(GrantObjects::Sequences(names) | GrantObjects::Tables(names)) =
+                    &mut Arc::make_mut(grant).objects
+            {
+                names.retain(|name| !names_doomed(name));
+                return !names.is_empty();
+            }
+            true
+        });
+    };
+    forget_in(builder.table_grants_mut());
+    forget_in(builder.column_grants_mut());
 }

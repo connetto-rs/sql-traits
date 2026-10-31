@@ -152,12 +152,12 @@ pub trait GrantLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// schema privilege at all. So the names only come out of the variant
     /// that says what they are.
     ///
-    /// A table name carries the qualifier of the relation it reached when
-    /// the grant was made, or none for one in the default schema. Every other
-    /// name reads exactly as written. A schema name is the schema itself, so
-    /// [`TargetName::name`] is the schema and [`TargetName::schema`] is the
-    /// catalog qualifier when the SQL wrote one. A grant on a function is no
-    /// grant here at all, and is read through
+    /// A table or sequence name carries the qualifier of the relation it
+    /// reached when the grant was made, or none for one in the default schema.
+    /// Every other name reads exactly as written. A schema name is the schema
+    /// itself, so [`TargetName::name`] is the schema and [`TargetName::schema`]
+    /// is the catalog qualifier when the SQL wrote one. A grant on a function
+    /// is no grant here at all, and is read through
     /// [`FunctionLike::can_execute`](crate::traits::FunctionLike::can_execute).
     ///
     /// Unlike the resolving readers of [`TableGrantLike`] this applies no
@@ -352,7 +352,8 @@ impl<T: GrantLike> GrantLike for &T {
 /// the statement runs.
 #[derive(Debug, Clone)]
 pub enum GrantTarget<I> {
-    /// Tables, views or materialized views named one by one, `ON [TABLE] t`.
+    /// Tables, views, materialized views or sequences named one by one,
+    /// `ON [TABLE] t`.
     Tables(I),
     /// The schemas of `ON ALL TABLES IN SCHEMA s`, which reaches every table,
     /// view and materialized view in each.
@@ -375,7 +376,8 @@ pub enum GrantTarget<I> {
 /// A grant applies privileges to whole relations, whether written as a direct
 /// grant (`GRANT ... ON name`) or a schema-wide one (`GRANT ... ON ALL TABLES
 /// IN SCHEMA`), and PostgreSQL lets both reach views and materialized views as
-/// well as tables.
+/// well as tables. The sequence forms, `ON SEQUENCE` and `ON ALL SEQUENCES IN
+/// SCHEMA`, reach sequences, and so does the direct form naming one.
 ///
 /// This trait corresponds to PostgreSQL's `role_table_grants` system view.
 pub trait TableGrantLike:
@@ -448,8 +450,9 @@ pub trait TableGrantLike:
     /// This is the complete answer, where [`Self::tables`] answers the
     /// narrower question of which tables a grant covers. A caller that means
     /// "everything this grant reaches" has to ask this one, because a grant on
-    /// a view is ordinary PostgreSQL and `ALL TABLES IN SCHEMA` covers views
-    /// too.
+    /// a view or a sequence is ordinary PostgreSQL and `ALL TABLES IN SCHEMA`
+    /// covers views too. `ALL TABLES IN SCHEMA` leaves sequences out, and
+    /// `ALL SEQUENCES IN SCHEMA` reaches every sequence of each schema.
     ///
     /// # Example
     ///
@@ -461,8 +464,9 @@ pub trait TableGrantLike:
     ///     "
     /// CREATE TABLE t (id INT);
     /// CREATE VIEW v AS SELECT id FROM t;
+    /// CREATE SEQUENCE s;
     /// CREATE ROLE reader;
-    /// GRANT SELECT ON t, v TO reader;
+    /// GRANT SELECT ON t, v, s TO reader;
     /// ",
     /// )?;
     /// let grant = db.table_grants().next().unwrap();
@@ -477,7 +481,7 @@ pub trait TableGrantLike:
     ///         }
     ///     })
     ///     .collect();
-    /// assert_eq!(kinds, vec!["table", "view"]);
+    /// assert_eq!(kinds, vec!["table", "view", "sequence"]);
     /// // The narrower question still answers only the table.
     /// assert_eq!(grant.tables(&db).count(), 1);
     /// # Ok(())
