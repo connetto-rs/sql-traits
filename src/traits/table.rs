@@ -440,10 +440,12 @@ pub trait TableLike:
     fn is_unlogged(&self) -> bool;
 
     /// Iterates over this table's storage parameters (`pg_class.reloptions`)
-    /// as name and value, after every `ALTER TABLE ... SET (...)` naming it.
+    /// as name and value, after every `ALTER TABLE ... SET (...)` and
+    /// `ALTER TABLE ... RESET (...)` naming it.
     ///
     /// Names fold to lowercase unless quoted. Values read as written, with
-    /// string literals unquoted and unquoted words folded to lowercase.
+    /// string literals unquoted and unquoted words folded to lowercase. A
+    /// parameter named without a value reads `true`, as PostgreSQL stores it.
     ///
     /// # Example
     ///
@@ -454,8 +456,8 @@ pub trait TableLike:
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
-    /// CREATE TABLE staging (id INT) WITH (AUTOVACUUM_ENABLED = FALSE, fillfactor = 70);
-    /// ALTER TABLE staging SET (autovacuum_enabled = true);
+    /// CREATE TABLE staging (id INT) WITH (AUTOVACUUM_ENABLED = FALSE, fillfactor = 70, toast_tuple_target = 256);
+    /// ALTER TABLE staging SET (autovacuum_enabled), RESET (toast_tuple_target);
     /// ",
     /// )?;
     /// let staging =

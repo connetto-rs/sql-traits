@@ -86,15 +86,102 @@ fn a_table_without_a_with_clause_has_no_parameters() {
 }
 
 #[test]
-fn an_option_without_a_value_is_no_storage_parameter() {
-    let database = ParserDB::parse::<GenericDialect>(
-        "CREATE TABLE t (id INT) WITH (HEAP, fillfactor = 70);
-         CREATE TABLE s (id INT);
-         ALTER TABLE s SET (HEAP, fillfactor = 70);",
+fn a_parameter_without_a_value_reads_true() {
+    let database = db("CREATE TABLE t (id INT) WITH (autovacuum_enabled, fillfactor = 70);
+         CREATE TABLE s (id INT) WITH (autovacuum_enabled = false, fillfactor = 70);
+         ALTER TABLE s SET (AUTOVACUUM_ENABLED);
+         CREATE TABLE r (id INT) WITH (autovacuum_enabled);
+         ALTER TABLE r SET (autovacuum_enabled = false);");
+    assert_eq!(
+        parameters_of(&database, "t"),
+        pairs(&[("autovacuum_enabled", "true"), ("fillfactor", "70")])
+    );
+    assert_eq!(
+        parameters_of(&database, "s"),
+        pairs(&[("fillfactor", "70"), ("autovacuum_enabled", "true")])
+    );
+    assert_eq!(parameters_of(&database, "r"), pairs(&[("autovacuum_enabled", "false")]));
+    let generic =
+        ParserDB::parse::<GenericDialect>("CREATE TABLE t (id INT) WITH (HEAP, fillfactor = 70);")
+            .expect("the generic dialect reads HEAP as a bare option");
+    assert_eq!(parameters_of(&generic, "t"), pairs(&[("heap", "true"), ("fillfactor", "70")]));
+}
+
+#[test]
+fn alter_table_reset_removes_the_named_parameters() {
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE t (id INT) WITH (fillfactor = 70, autovacuum_enabled = false, toast_tuple_target = 256);
+             ALTER TABLE t RESET (FILLFACTOR, toast_tuple_target);",
+            "t"
+        ),
+        pairs(&[("autovacuum_enabled", "false")])
+    );
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE t (id INT) WITH (autovacuum_enabled);
+             ALTER TABLE t RESET (autovacuum_enabled);",
+            "t"
+        ),
+        pairs(&[])
+    );
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE t (id INT);
+             ALTER TABLE t SET (fillfactor = 70), RESET (fillfactor), SET (autovacuum_enabled = true);",
+            "t"
+        ),
+        pairs(&[("autovacuum_enabled", "true")])
+    );
+}
+
+#[test]
+fn alter_table_reset_leaves_parameters_it_does_not_name() {
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE t (id INT) WITH (autovacuum_enabled = false);
+             ALTER TABLE t RESET (fillfactor, nonexistent_param, toast.autovacuum_enabled);
+             ALTER TABLE t RESET (\"AUTOVACUUM_ENABLED\");",
+            "t"
+        ),
+        pairs(&[("autovacuum_enabled", "false")])
+    );
+    assert_eq!(
+        parameters_after("CREATE TABLE t (id INT); ALTER TABLE t RESET (fillfactor);", "t"),
+        pairs(&[])
+    );
+}
+
+#[test]
+fn a_table_reset_of_every_parameter_renders_without_a_with_clause() {
+    let database = db("CREATE TABLE t (id INT) WITH (fillfactor = 70);
+         ALTER TABLE t RESET (fillfactor);");
+    assert_eq!(table(&database, "t").to_string(), "CREATE TABLE t (id INT)");
+}
+
+#[test]
+fn alter_table_reset_follows_the_tables_that_take_it() {
+    let database = db("CREATE TABLE root (id INT) PARTITION BY RANGE (id);
+         ALTER TABLE root RESET (fillfactor);");
+    assert_eq!(parameters_of(&database, "root"), pairs(&[]));
+    let error =
+        parse("ALTER TABLE missing RESET (fillfactor);").expect_err("an absent table is refused");
+    assert!(
+        matches!(&error, Error::AlterTableNotFound { table_name } if table_name == "missing"),
+        "got {error:?}"
+    );
+    parse("ALTER TABLE IF EXISTS missing RESET (fillfactor);")
+        .expect("IF EXISTS skips an absent table");
+    let error = ParserDB::parse::<MySqlDialect>(
+        "CREATE TABLE t (id INT) ENGINE = InnoDB;
+         ALTER TABLE t RESET (fillfactor);",
     )
-    .expect("the generic dialect reads HEAP as a bare option");
-    assert_eq!(parameters_of(&database, "t"), pairs(&[("fillfactor", "70")]));
-    assert_eq!(parameters_of(&database, "s"), pairs(&[("fillfactor", "70")]));
+    .expect_err("the table holds no storage parameters to reset");
+    assert!(
+        matches!(&error, Error::UnsupportedAlterTableOperation { table_name, operation }
+            if table_name == "t" && operation == "RESET (fillfactor)"),
+        "got {error:?}"
+    );
 }
 
 #[test]
