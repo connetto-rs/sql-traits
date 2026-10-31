@@ -531,8 +531,8 @@ pub(super) fn spell_out_planned_serial(
 }
 
 /// Sequences created for columns of a table not stored yet, each beside its
-/// column.
-pub(super) struct UnownedSequences(Vec<(Ident, Arc<Sequence>)>);
+/// column and known by the address the store holds it at.
+pub(super) struct UnownedSequences(Vec<(Ident, *const Sequence)>);
 
 /// Records the sequences [`plan_column_sequences`] named, before the columns
 /// they serve land, handing each back beside its column for
@@ -563,8 +563,8 @@ pub(super) fn create_column_sequences(
         let quoted = normalize_identifier(&name, false) != name.as_str();
         let sequence =
             Arc::new(Sequence::new((name, quoted), schema.clone(), options, None, origin));
-        builder = builder.add_sequence(Arc::clone(&sequence), ());
-        created.push((column, sequence));
+        created.push((column, Arc::as_ptr(&sequence)));
+        builder = builder.add_sequence(sequence, ());
     }
     Ok((builder, UnownedSequences(created)))
 }
@@ -576,25 +576,33 @@ pub(super) fn own_column_sequences(
     table: &StoredTable,
     UnownedSequences(created): UnownedSequences,
 ) {
+    if created.is_empty() {
+        return;
+    }
     let case = builder.identifier_case();
-    for (column, sequence) in created {
-        let owner = builder.columns().iter().find_map(|(candidate, _, identity)| {
-            (table.matches(TableAttribute::table(candidate.as_ref()), case)
-                && case.identifiers_match(
-                    candidate.column_name(),
-                    candidate.column_name_is_quoted(),
-                    &column.value,
-                    column.quote_style.is_some(),
-                ))
-            .then_some(StoredSequenceOwner::Column(*identity))
-        });
-        let position =
-            builder.sequences().iter().position(|(held, ())| Arc::ptr_eq(held, &sequence));
-        // Dropping this handle leaves the store's as the only one, so the
-        // update below copies nothing.
-        drop(sequence);
-        if let (Some(owner), Some(position)) = (owner, position) {
-            Arc::make_mut(&mut builder.sequences_mut()[position].0).set_owner(owner);
+    let owners: Vec<(*const Sequence, ColumnIdentity)> = builder
+        .columns()
+        .iter()
+        .filter(|(column, _, _)| table.matches(TableAttribute::table(column.as_ref()), case))
+        .filter_map(|(column, _, identity)| {
+            created
+                .iter()
+                .find(|(declared, _)| {
+                    case.identifiers_match(
+                        column.column_name(),
+                        column.column_name_is_quoted(),
+                        &declared.value,
+                        declared.quote_style.is_some(),
+                    )
+                })
+                .map(|(_, sequence)| (*sequence, *identity))
+        })
+        .collect();
+    for (sequence, ()) in builder.sequences_mut() {
+        if let Some((_, identity)) =
+            owners.iter().find(|(address, _)| core::ptr::eq(*address, Arc::as_ptr(sequence)))
+        {
+            Arc::make_mut(sequence).set_owner(StoredSequenceOwner::Column(*identity));
         }
     }
 }

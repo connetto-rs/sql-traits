@@ -162,6 +162,22 @@ fn a_default_naming_no_relation_is_refused() {
 }
 
 #[test]
+fn a_serial_column_written_not_null_keeps_one_not_null() {
+    for (sql, table) in [
+        ("CREATE TABLE t (id serial NOT NULL); DROP SEQUENCE t_id_seq CASCADE;", "t"),
+        ("CREATE TABLE u (id serial NOT NULL); CREATE TABLE t (LIKE u);", "t"),
+    ] {
+        let db = parse(sql).expect("parses");
+        let written = db
+            .table_by_target(TargetName::new(table, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("table exists")
+            .to_string();
+        assert_eq!(written, "CREATE TABLE t (id INTEGER NOT NULL)", "{sql}");
+    }
+}
+
+#[test]
 fn a_serial_column_draws_from_its_sequence() {
     assert_eq!(
         refused_by_default(parse("CREATE TABLE t (id serial); DROP SEQUENCE t_id_seq;")),
