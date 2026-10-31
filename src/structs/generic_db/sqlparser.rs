@@ -5788,37 +5788,34 @@ impl ParserDB {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
-        let node = Self::stored_node(&builder, &stored)?;
-        let parameters = match &node.table_options {
-            CreateTableOptions::With(parameters) => parameters,
-            CreateTableOptions::None => return Ok(builder),
-            // Another dialect's table options, such as MySQL's `ENGINE`, hold
-            // no parameters to reset.
-            _ => {
-                return Err(crate::errors::Error::UnsupportedAlterTableOperation {
-                    table_name: stored.name.clone(),
-                    operation: AlterTableOperation::ResetOptions { options: names }.to_string(),
-                });
-            }
-        };
-        let reset = |parameter: &SqlOption| {
-            storage_parameter_key(parameter).is_some_and(|key| {
-                names.iter().any(|name| {
-                    matches!(name.0.as_slice(), [ObjectNamePart::Identifier(name)] if idents_match(key, name))
-                })
-            })
-        };
-        if !parameters.iter().any(reset) {
-            return Ok(builder);
-        }
         Self::replace_table_node(builder, &stored, |_, replacement| {
-            if let CreateTableOptions::With(parameters) = &mut replacement.table_options {
-                parameters.retain(|parameter| !reset(parameter));
-                if parameters.is_empty() {
-                    replacement.table_options = CreateTableOptions::None;
+            match &mut replacement.table_options {
+                CreateTableOptions::With(parameters) => {
+                    // A namespaced name such as `toast.autovacuum_enabled`
+                    // resets the TOAST table's parameter, which PostgreSQL
+                    // keeps apart from the table's own.
+                    parameters.retain(|parameter| {
+                        !storage_parameter_key(parameter).is_some_and(|key| {
+                            names.iter().any(|name| {
+                                matches!(name.0.as_slice(), [ObjectNamePart::Identifier(name)] if idents_match(key, name))
+                            })
+                        })
+                    });
+                    if parameters.is_empty() {
+                        replacement.table_options = CreateTableOptions::None;
+                    }
+                    Ok(())
+                }
+                CreateTableOptions::None => Ok(()),
+                // Another dialect's table options, such as MySQL's `ENGINE`,
+                // hold no parameters to reset.
+                _ => {
+                    Err(crate::errors::Error::UnsupportedAlterTableOperation {
+                        table_name: stored.name.clone(),
+                        operation: AlterTableOperation::ResetOptions { options: names }.to_string(),
+                    })
                 }
             }
-            Ok(())
         })
     }
 

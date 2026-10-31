@@ -185,6 +185,26 @@ fn alter_table_reset_follows_the_tables_that_take_it() {
 }
 
 #[test]
+fn set_and_reset_keep_table_options_that_name_no_parameter() {
+    let database = ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE t (id INT) WITH (CLUSTERED COLUMNSTORE INDEX, fillfactor = 70);
+         ALTER TABLE t SET (fillfactor = 80);
+         CREATE TABLE r (id INT) WITH (CLUSTERED COLUMNSTORE INDEX, fillfactor = 70);
+         ALTER TABLE r RESET (fillfactor);",
+    )
+    .expect("the generic dialect reads a clustered index option");
+    assert_eq!(
+        table(&database, "t").to_string(),
+        "CREATE TABLE t (id INT) WITH (CLUSTERED COLUMNSTORE INDEX, fillfactor = 80)"
+    );
+    assert_eq!(
+        table(&database, "r").to_string(),
+        "CREATE TABLE r (id INT) WITH (CLUSTERED COLUMNSTORE INDEX)"
+    );
+    assert_eq!(parameters_of(&database, "r"), pairs(&[]));
+}
+
+#[test]
 fn alter_table_set_is_reported_on_a_table_holding_another_dialects_options() {
     let error = ParserDB::parse::<MySqlDialect>(
         "CREATE TABLE t (id INT) ENGINE = InnoDB;
