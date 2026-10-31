@@ -66,6 +66,36 @@ fn a_foreign_table_is_recorded_apart_from_tables() {
 }
 
 #[test]
+fn a_foreign_table_resolves_as_a_relation_of_its_own_kind() {
+    let db = db(&format!("{REMOTE} CREATE TABLE local (id INT);"));
+    let remote = foreign(&db, "remote");
+    let target = || TargetName::new("remote", false);
+    assert!(matches!(
+        db.resolve_target_relation(target(), IdentifierCase::AsWritten).expect("lookup"),
+        Some(Relation::ForeignTable(table)) if table == remote
+    ));
+    assert!(matches!(
+        db.resolve_bound_relation(target()).expect("lookup"),
+        Some(Relation::ForeignTable(table)) if table == remote
+    ));
+
+    // A statement names the foreign table among what it reads, once however
+    // often it names it, and the base-table answer leaves it out.
+    let query = sqlparser::parser::Parser::new(&PostgreSqlDialect {})
+        .try_with_sql("SELECT * FROM remote, local WHERE id IN (SELECT id FROM remote)")
+        .expect("tokenizes")
+        .parse_query()
+        .expect("parses");
+    let relations = query.referenced_relations(&db).expect("resolves");
+    assert!(matches!(
+        relations.as_slice(),
+        [Relation::ForeignTable(first), Relation::Table(second)]
+            if *first == remote && second.table_name() == "local"
+    ));
+    assert_eq!(query.referenced_tables(&db).expect("resolves"), [table(&db, "local")]);
+}
+
+#[test]
 fn a_foreign_table_keeps_its_columns_checks_server_and_options() {
     let db = db(REMOTE);
     let remote = foreign(&db, "remote");
