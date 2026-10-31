@@ -11,6 +11,9 @@ use crate::structs::{FunctionKind, IdentifierCase};
 pub enum ObjectKind {
     /// A base table.
     Table,
+    /// A table whose rows live behind a foreign server, declared by a `CREATE
+    /// FOREIGN TABLE` statement.
+    ForeignTable,
     /// A view declared by a `CREATE VIEW` statement.
     View,
     /// A view declared by a `CREATE MATERIALIZED VIEW` statement.
@@ -45,6 +48,7 @@ impl core::fmt::Display for ObjectKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::Table => "Table",
+            Self::ForeignTable => "Foreign table",
             Self::View => "View",
             Self::MaterializedView => "Materialized view",
             Self::Column => "Column",
@@ -59,6 +63,31 @@ impl core::fmt::Display for ObjectKind {
             Self::Role => "Role",
             Self::Schema => "Schema",
             Self::Sequence => "Sequence",
+        })
+    }
+}
+
+/// A constraint PostgreSQL enforces against the rows a table stores, which a
+/// foreign table, storing none, cannot carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyConstraint {
+    /// A `PRIMARY KEY` constraint.
+    PrimaryKey,
+    /// A `UNIQUE` constraint.
+    Unique,
+    /// A `FOREIGN KEY` or `REFERENCES` constraint.
+    ForeignKey,
+    /// An `EXCLUDE` constraint.
+    Exclusion,
+}
+
+impl core::fmt::Display for KeyConstraint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::PrimaryKey => "Primary key",
+            Self::Unique => "Unique",
+            Self::ForeignKey => "Foreign key",
+            Self::Exclusion => "Exclusion",
         })
     }
 }
@@ -180,6 +209,9 @@ pub enum UnattachablePartition {
     /// The table holds a primary key on other columns than the partitioned
     /// table's.
     OtherPrimaryKey,
+    /// The table is a foreign table and the partitioned table holds a unique
+    /// index, which a foreign table cannot carry.
+    ForeignTableUnderUniqueIndex,
 }
 
 impl core::fmt::Display for UnattachablePartition {
@@ -207,6 +239,9 @@ impl core::fmt::Display for UnattachablePartition {
             }
             Self::MissingCheck { constraint } => write!(f, "it lacks check `{constraint}`"),
             Self::OtherPrimaryKey => f.write_str("it holds a primary key of its own"),
+            Self::ForeignTableUnderUniqueIndex => {
+                f.write_str("it is a foreign table and the partitioned table holds a unique index")
+            }
         }
     }
 }
@@ -716,14 +751,19 @@ pub enum Error {
         /// Name of the rule.
         rule_name: String,
     },
-    #[error("Rule `{rule_name}` cannot be defined on materialized view `{view_name}`.")]
-    /// Error indicating that a rule names a materialized view, which
-    /// PostgreSQL refuses: rules exist on tables and plain views only.
-    RuleOnMaterializedView {
+    #[error(
+        "{relation_kind} `{relation_name}` cannot have rules, so rule `{rule_name}` is refused."
+    )]
+    /// Error indicating that a rule names a relation PostgreSQL keeps rules
+    /// off: rules exist on tables and plain views only, so a materialized view
+    /// or a foreign table refuses one.
+    RuleOnUnsupportedRelation {
         /// Name of the rule.
         rule_name: String,
-        /// Name of the materialized view the rule names.
-        view_name: String,
+        /// Kind of relation the rule names.
+        relation_kind: ObjectKind,
+        /// Name of the relation the rule names.
+        relation_name: String,
     },
     #[error(
         "Rule `{rule_name}` on `{relation_name}` is an `ON SELECT` rule, which is not supported."
@@ -1418,6 +1458,26 @@ pub enum Error {
         /// Kind the name actually holds.
         actual_kind: ObjectKind,
     },
+    #[error("{constraint} constraints are not supported on foreign table `{table_name}`.")]
+    /// Error indicating that a statement gives a foreign table a primary key,
+    /// unique, exclusion or foreign key constraint, which PostgreSQL refuses.
+    ConstraintUnsupportedOnForeignTable {
+        /// Name of the foreign table.
+        table_name: String,
+        /// The kind of constraint refused.
+        constraint: KeyConstraint,
+    },
+    #[error(
+        "Partitioned table `{table_name}` cannot hold a unique index, because its partition `{partition_name}` is a foreign table."
+    )]
+    /// Error indicating that a unique index would reach a foreign table through
+    /// the partitions of the table it is created on, which PostgreSQL refuses.
+    UniqueIndexOverForeignPartition {
+        /// Name of the partitioned table the unique index is created on.
+        table_name: String,
+        /// Name of the foreign table below it.
+        partition_name: String,
+    },
     #[error(
         "Cannot change name of view column `{existing_column}` to `{new_column}` of view `{view_name}`."
     )]
@@ -1918,6 +1978,15 @@ mod tests {
         assert_eq!(RequiredValue::EnforcedByParent.to_string(), "a parent requires it");
         assert_eq!(FixedPersistence::Temporary.to_string(), "it is temporary");
         assert_eq!(FixedPersistence::Partitioned.to_string(), "it is partitioned");
+        assert_eq!(KeyConstraint::PrimaryKey.to_string(), "Primary key");
+        assert_eq!(KeyConstraint::Unique.to_string(), "Unique");
+        assert_eq!(KeyConstraint::ForeignKey.to_string(), "Foreign key");
+        assert_eq!(KeyConstraint::Exclusion.to_string(), "Exclusion");
+        assert_eq!(ObjectKind::ForeignTable.to_string(), "Foreign table");
+        assert_eq!(
+            UnattachablePartition::ForeignTableUnderUniqueIndex.to_string(),
+            "it is a foreign table and the partitioned table holds a unique index"
+        );
     }
 
     #[test]

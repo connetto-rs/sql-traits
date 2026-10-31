@@ -4,7 +4,10 @@ use alloc::{string::String, sync::Arc, vec, vec::Vec};
 
 use sqlparser::ast::{Action, Privileges};
 
-use crate::traits::{ColumnLike, DatabaseLike, TableLike};
+use crate::{
+    structs::ForeignTableSource,
+    traits::{ColumnLike, DatabaseLike, TableLike},
+};
 
 #[derive(Debug, Clone)]
 /// Metadata about a database table.
@@ -59,6 +62,9 @@ pub struct TableMetadata<T: TableLike> {
     owner_privileges: Vec<Action>,
     /// The comment block written above the table.
     documentation: Option<String>,
+    /// The server and options a foreign table reads its rows through, absent
+    /// for an ordinary table.
+    foreign_source: Option<ForeignTableSource>,
 }
 
 impl<T: TableLike> Default for TableMetadata<T> {
@@ -78,6 +84,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             owner: None,
             owner_privileges: every_table_privilege(),
             documentation: None,
+            foreign_source: None,
         }
     }
 }
@@ -338,6 +345,27 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub(crate) fn take_documentation(&mut self) -> Option<String> {
         self.documentation.take()
+    }
+
+    /// Returns the server and options a foreign table reads its rows through,
+    /// or [`None`] for an ordinary table.
+    #[inline]
+    #[must_use]
+    pub fn foreign_source(&self) -> Option<&ForeignTableSource> {
+        self.foreign_source.as_ref()
+    }
+
+    /// Marks the table as a foreign table reading its rows through `source`,
+    /// or as an ordinary table when [`None`].
+    #[inline]
+    pub fn set_foreign_source(&mut self, source: Option<ForeignTableSource>) {
+        self.foreign_source = source;
+    }
+
+    /// Moves the foreign source out, for a rebuild that carries it over.
+    #[inline]
+    pub(crate) fn take_foreign_source(&mut self) -> Option<ForeignTableSource> {
+        self.foreign_source.take()
     }
 
     /// Adds a column to the table metadata.

@@ -375,9 +375,10 @@ pub enum GrantTarget<I> {
 ///
 /// A grant applies privileges to whole relations, whether written as a direct
 /// grant (`GRANT ... ON name`) or a schema-wide one (`GRANT ... ON ALL TABLES
-/// IN SCHEMA`), and PostgreSQL lets both reach views and materialized views as
-/// well as tables. The sequence forms, `ON SEQUENCE` and `ON ALL SEQUENCES IN
-/// SCHEMA`, reach sequences, and so does the direct form naming one.
+/// IN SCHEMA`), and PostgreSQL lets both reach foreign tables, views and
+/// materialized views as well as tables. The sequence forms, `ON SEQUENCE`
+/// and `ON ALL SEQUENCES IN SCHEMA`, reach sequences, and so does the direct
+/// form naming one.
 ///
 /// This trait corresponds to PostgreSQL's `role_table_grants` system view.
 pub trait TableGrantLike:
@@ -450,9 +451,10 @@ pub trait TableGrantLike:
     /// This is the complete answer, where [`Self::tables`] answers the
     /// narrower question of which tables a grant covers. A caller that means
     /// "everything this grant reaches" has to ask this one, because a grant on
-    /// a view or a sequence is ordinary PostgreSQL and `ALL TABLES IN SCHEMA`
-    /// covers views too. `ALL TABLES IN SCHEMA` leaves sequences out, and
-    /// `ALL SEQUENCES IN SCHEMA` reaches every sequence of each schema.
+    /// a foreign table, a view or a sequence is ordinary PostgreSQL and `ALL
+    /// TABLES IN SCHEMA` covers foreign tables and views too. `ALL TABLES IN
+    /// SCHEMA` leaves sequences out, and `ALL SEQUENCES IN SCHEMA` reaches
+    /// every sequence of each schema.
     ///
     /// # Example
     ///
@@ -475,6 +477,7 @@ pub trait TableGrantLike:
     ///     .map(|relation| {
     ///         match relation {
     ///             Relation::Table(_) => "table",
+    ///             Relation::ForeignTable(_) => "foreign table",
     ///             Relation::View(_) => "view",
     ///             Relation::MaterializedView(_) => "materialized view",
     ///             Relation::Sequence(_) => "sequence",

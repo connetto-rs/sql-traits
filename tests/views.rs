@@ -821,6 +821,7 @@ fn a_grant_reaches_views_and_says_which_kind_each_target_is() {
         .map(|relation| {
             match relation {
                 Relation::Table(_) => "table",
+                Relation::ForeignTable(_) => "foreign table",
                 Relation::View(_) => "view",
                 Relation::MaterializedView(_) => "materialized view",
                 Relation::Sequence(_) => "sequence",
@@ -851,6 +852,7 @@ fn a_schema_wide_grant_covers_every_relation_kind() {
         "CREATE ROLE r;
          CREATE SCHEMA s;
          CREATE TABLE s.t (a INT);
+         CREATE FOREIGN TABLE s.f (a INT) SERVER remote;
          CREATE VIEW s.v AS SELECT a FROM s.t;
          CREATE MATERIALIZED VIEW s.m AS SELECT a FROM s.t;
          GRANT SELECT ON ALL TABLES IN SCHEMA s TO r;",
@@ -862,6 +864,7 @@ fn a_schema_wide_grant_covers_every_relation_kind() {
         .map(|relation| {
             match relation {
                 Relation::Table(_) => "table",
+                Relation::ForeignTable(_) => "foreign table",
                 Relation::View(_) => "view",
                 Relation::MaterializedView(_) => "materialized view",
                 Relation::Sequence(_) => "sequence",
@@ -869,7 +872,7 @@ fn a_schema_wide_grant_covers_every_relation_kind() {
         })
         .collect();
     kinds.sort_unstable();
-    assert_eq!(kinds, vec!["materialized view", "table", "view"]);
+    assert_eq!(kinds, vec!["foreign table", "materialized view", "table", "view"]);
 }
 
 /// A relation created without a qualifier lives in `public`, so a blanket

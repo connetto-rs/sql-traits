@@ -44,7 +44,9 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// a view's `security_invoker` setting does not change the expansion.
     /// A materialized view holds a snapshot of its definition's output,
     /// so reading one never reads its base tables, and it is absent from
-    /// the answer even when a plain view reads it.
+    /// the answer even when a plain view reads it. A foreign table holds no
+    /// rows of its own and is absent too, named or reached below a parent, as
+    /// [`DatabaseLike::tables`] leaves it out.
     ///
     /// A table a `FROM`, `JOIN` or `UPDATE`/`DELETE` target item names
     /// without `ONLY` also reaches every table below it, through
@@ -102,7 +104,8 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     /// with the kind it is, resolved against `database` and deduplicated.
     ///
     /// This answers what the statement names, whether a base table, a
-    /// plain view, a materialized view or a sequence, applying the resolution
+    /// foreign table, a plain view, a materialized view or a sequence,
+    /// applying the resolution
     /// [`Self::referenced_tables`] spells out, the search path, the
     /// temporary schema first, the `WITH` shadowing and the DML rules,
     /// and the MySQL multi-table `DELETE ... t1, t2` list. A plain view
@@ -141,6 +144,7 @@ pub trait DataStatementLike<DB: DatabaseLike> {
     ///     .map(|relation| {
     ///         match relation {
     ///             Relation::Table(table) => format!("table {}", table.table_name()),
+    ///             Relation::ForeignTable(table) => format!("foreign table {}", table.table_name()),
     ///             Relation::View(view) => format!("view {}", view.view_name()),
     ///             Relation::MaterializedView(view) => {
     ///                 format!("materialized view {}", view.view_name())

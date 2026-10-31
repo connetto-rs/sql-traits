@@ -7,7 +7,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{
-    errors::{Error, LookupError},
+    errors::{Error, LookupError, ObjectKind},
     prelude::*,
 };
 use sqlparser::{
@@ -59,9 +59,10 @@ fn relation_of(
     match rule.relation(database).expect("the rule's relation resolves") {
         Relation::Table(table) => ("table", table.table_name().to_string()),
         Relation::View(view) => ("view", view.view_name().to_string()),
-        // Ingestion refuses a rule on a materialized view or a sequence.
-        Relation::MaterializedView(_) | Relation::Sequence(_) => {
-            panic!("a rule never resolves to a materialized view or a sequence")
+        // Ingestion refuses a rule on a foreign table, a materialized view or a
+        // sequence.
+        Relation::ForeignTable(_) | Relation::MaterializedView(_) | Relation::Sequence(_) => {
+            panic!("a rule never resolves to a foreign table, a materialized view or a sequence")
         }
     }
 }
@@ -252,8 +253,10 @@ fn a_materialized_view_target_is_refused() {
     assert!(
         matches!(
             &error,
-            Error::RuleOnMaterializedView { rule_name, view_name }
-                if rule_name == "r" && view_name == "totals"
+            Error::RuleOnUnsupportedRelation { rule_name, relation_kind, relation_name }
+                if rule_name == "r"
+                    && *relation_kind == ObjectKind::MaterializedView
+                    && relation_name == "totals"
         ),
         "got {error:?}"
     );
