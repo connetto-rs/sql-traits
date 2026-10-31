@@ -11,7 +11,11 @@ use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, TableMetadata},
     traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
-    utils::{identifier_resolution::stored_ident_name, last_str, object_name::qualifier_of},
+    utils::{
+        identifier_resolution::{identifiers_match, stored_ident_name},
+        last_str,
+        object_name::qualifier_of,
+    },
 };
 
 impl Metadata for CreateTable {
@@ -98,6 +102,46 @@ fn parameter_value(value: &Expr) -> Cow<'_, str> {
     }
 }
 
+/// Iterates over the storage parameters `table` writes under `namespace`, or
+/// under none for [`None`], by their names within it.
+///
+/// PostgreSQL refuses a namespace other than `toast` and a name of more than
+/// two parts, so a parameter written that way is in no namespace asked for.
+fn namespaced_parameters<'table>(
+    table: &'table CreateTable,
+    namespace: Option<&'static str>,
+) -> impl Iterator<Item = (Cow<'table, str>, Cow<'table, str>)> {
+    let options: &[SqlOption] = match &table.table_options {
+        CreateTableOptions::With(options) => options,
+        _ => &[],
+    };
+    options.iter().filter_map(move |option| {
+        let (key, value) = match option {
+            SqlOption::KeyValue { key, value } => (key, Some(value)),
+            SqlOption::Ident(key) => (key, None),
+            _ => return None,
+        };
+        let name = match (key.0.as_slice(), namespace) {
+            ([ObjectNamePart::Identifier(name)], None) => name,
+            (
+                [ObjectNamePart::Identifier(written), ObjectNamePart::Identifier(name)],
+                Some(namespace),
+            ) if identifiers_match(
+                namespace,
+                false,
+                &written.value,
+                written.quote_style.is_some(),
+            ) =>
+            {
+                name
+            }
+            _ => return None,
+        };
+        // PostgreSQL stores a parameter named without a value as `true`.
+        Some((stored_ident_name(name), value.map_or(Cow::Borrowed("true"), parameter_value)))
+    })
+}
+
 impl TableLike for CreateTable {
     type DB = ParserDB;
 
@@ -142,21 +186,11 @@ impl TableLike for CreateTable {
     }
 
     fn storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
-        let options: &[SqlOption] = match &self.table_options {
-            CreateTableOptions::With(options) => options,
-            _ => &[],
-        };
-        options.iter().filter_map(|option| {
-            match option {
-                SqlOption::KeyValue { key, value } => {
-                    Some((stored_ident_name(key), parameter_value(value)))
-                }
-                // PostgreSQL stores a parameter named without a value as
-                // `true`.
-                SqlOption::Ident(key) => Some((stored_ident_name(key), Cow::Borrowed("true"))),
-                _ => None,
-            }
-        })
+        namespaced_parameters(self, None)
+    }
+
+    fn toast_storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+        namespaced_parameters(self, Some("toast"))
     }
 
     fn columns<'db>(

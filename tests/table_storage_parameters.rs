@@ -29,6 +29,13 @@ fn parameters_of(database: &ParserDB, name: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn toast_parameters_of(database: &ParserDB, name: &str) -> Vec<(String, String)> {
+    table(database, name)
+        .toast_storage_parameters()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect()
+}
+
 fn parameters_after(sql: &str, name: &str) -> Vec<(String, String)> {
     parameters_of(&db(sql), name)
 }
@@ -329,4 +336,58 @@ fn a_partitioned_table_takes_no_parameters() {
         matches!(&error, Error::StorageParametersOnPartitionedTable { table_name } if table_name == "root"),
         "got {error:?}"
     );
+}
+
+/// PostgreSQL keeps a `toast.` parameter in the reloptions of the table's TOAST
+/// relation, never in the table's own, as measured on PostgreSQL 18.
+#[test]
+fn toast_parameters_are_kept_apart_from_the_tables_own() {
+    let database = db("CREATE TABLE t (id INT, body TEXT) WITH (
+             toast.autovacuum_enabled = false,
+             autovacuum_enabled = true,
+             TOAST.Vacuum_Truncate,
+             \"toast\".autovacuum_vacuum_threshold = 256
+         );");
+    assert_eq!(parameters_of(&database, "t"), pairs(&[("autovacuum_enabled", "true")]));
+    assert_eq!(
+        toast_parameters_of(&database, "t"),
+        pairs(&[
+            ("autovacuum_enabled", "false"),
+            ("vacuum_truncate", "true"),
+            ("autovacuum_vacuum_threshold", "256"),
+        ])
+    );
+    let t = table(&database, "t");
+    assert_eq!(t.storage_parameter("autovacuum_enabled").as_deref(), Some("true"));
+    assert_eq!(t.toast_storage_parameter("autovacuum_enabled").as_deref(), Some("false"));
+    assert_eq!(t.storage_parameter("toast.autovacuum_enabled"), None);
+    assert_eq!(t.toast_storage_parameter("fillfactor"), None);
+    assert_eq!(
+        <&CreateTable as TableLike>::toast_storage_parameter(&t, "vacuum_truncate").as_deref(),
+        Some("true")
+    );
+}
+
+#[test]
+fn alter_table_set_and_reset_name_a_parameter_with_its_namespace() {
+    let sql = "CREATE TABLE t (id INT, body TEXT)
+             WITH (autovacuum_enabled = false, toast.autovacuum_enabled = false, fillfactor = 70);
+         ALTER TABLE t SET (TOAST.AUTOVACUUM_ENABLED = true);";
+    let database = db(sql);
+    assert_eq!(
+        parameters_of(&database, "t"),
+        pairs(&[("autovacuum_enabled", "false"), ("fillfactor", "70")])
+    );
+    assert_eq!(toast_parameters_of(&database, "t"), pairs(&[("autovacuum_enabled", "true")]));
+
+    let reset_toast = db(&format!("{sql} ALTER TABLE t RESET (Toast.autovacuum_enabled);"));
+    assert_eq!(
+        parameters_of(&reset_toast, "t"),
+        pairs(&[("autovacuum_enabled", "false"), ("fillfactor", "70")])
+    );
+    assert_eq!(toast_parameters_of(&reset_toast, "t"), pairs(&[]));
+
+    let reset_own = db(&format!("{sql} ALTER TABLE t RESET (autovacuum_enabled);"));
+    assert_eq!(parameters_of(&reset_own, "t"), pairs(&[("fillfactor", "70")]));
+    assert_eq!(toast_parameters_of(&reset_own, "t"), pairs(&[("autovacuum_enabled", "true")]));
 }

@@ -366,6 +366,11 @@ fn create_collation_options_deterministic(
         let SqlOption::KeyValue { key, value } = option else {
             return Err(invalid_collation_option("option", option.to_string()));
         };
+        // PostgreSQL's grammar takes a collation option as a single word, so
+        // a namespaced key such as `x.provider` names no option.
+        let [ObjectNamePart::Identifier(key)] = key.0.as_slice() else {
+            return Err(invalid_collation_option(&key.to_string(), value.to_string()));
+        };
         if seen.iter().any(|seen| idents_match(seen, key)) {
             return Err(crate::errors::Error::RepeatedCollationOption {
                 option_name: key.to_string().into_boxed_str(),
@@ -2589,8 +2594,9 @@ fn idents_match(left: &Ident, right: &Ident) -> bool {
 }
 
 /// The name a storage parameter is stored under, whether it carries a value
-/// or names one alone as in `SET (autovacuum_enabled)`.
-fn storage_parameter_key(option: &SqlOption) -> Option<&Ident> {
+/// or names one alone as in `SET (autovacuum_enabled)`, with its namespace as
+/// in `toast.autovacuum_enabled`.
+fn storage_parameter_key(option: &SqlOption) -> Option<&ObjectName> {
     match option {
         SqlOption::KeyValue { key, .. } | SqlOption::Ident(key) => Some(key),
         _ => None,
@@ -2612,7 +2618,10 @@ fn object_names_match(left: &ObjectName, right: &ObjectName, case: IdentifierCas
     }
 }
 
-fn function_configuration_names_match(left: &ObjectName, right: &ObjectName) -> bool {
+/// Returns whether two dotted names of a configuration parameter or a storage
+/// parameter have as many parts and match part by part under PostgreSQL
+/// folding.
+fn parameter_names_match(left: &ObjectName, right: &ObjectName) -> bool {
     left.0.len() == right.0.len()
         && left.0.iter().zip(&right.0).all(|(left, right)| {
             match (left.as_ident(), right.as_ident()) {
@@ -5844,7 +5853,7 @@ impl ParserDB {
                 if let Some(key) = storage_parameter_key(&option) {
                     parameters.retain(|stored| {
                         !storage_parameter_key(stored)
-                            .is_some_and(|stored| idents_match(stored, key))
+                            .is_some_and(|stored| parameter_names_match(stored, key))
                     });
                 }
                 parameters.push(option);
@@ -5873,13 +5882,10 @@ impl ParserDB {
             match &mut replacement.table_options {
                 CreateTableOptions::With(parameters) => {
                     // A namespaced name such as `toast.autovacuum_enabled`
-                    // resets the TOAST table's parameter, which PostgreSQL
-                    // keeps apart from the table's own.
+                    // resets only the parameter stored under that namespace.
                     parameters.retain(|parameter| {
                         !storage_parameter_key(parameter).is_some_and(|key| {
-                            names.iter().any(|name| {
-                                matches!(name.0.as_slice(), [ObjectNamePart::Identifier(name)] if idents_match(key, name))
-                            })
+                            names.iter().any(|name| parameter_names_match(key, name))
                         })
                     });
                     if parameters.is_empty() {
@@ -8235,10 +8241,7 @@ impl ParserDB {
                                     AlterFunctionAction::Set(parameter) => {
                                         if let Some(position) =
                                             function.set_params.iter().position(|stored| {
-                                                function_configuration_names_match(
-                                                    &stored.name,
-                                                    &parameter.name,
-                                                )
+                                                parameter_names_match(&stored.name, &parameter.name)
                                             })
                                         {
                                             function.set_params[position] = parameter;
@@ -8251,7 +8254,7 @@ impl ParserDB {
                                     }
                                     AlterFunctionAction::Reset(ResetConfig::ConfigName(name)) => {
                                         function.set_params.retain(|stored| {
-                                            !function_configuration_names_match(&stored.name, &name)
+                                            !parameter_names_match(&stored.name, &name)
                                         });
                                     }
                                     _ => {}
@@ -8819,10 +8822,10 @@ mod tests {
                 ObjectName(vec![ObjectNamePart::Identifier(Ident::new("IDENTIFIER"))]);
             let plain = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("search_path"))]);
 
-            assert!(function_configuration_names_match(&plain, &plain));
-            assert!(!function_configuration_names_match(&run_time, &run_time));
-            assert!(!function_configuration_names_match(&run_time, &producer_name));
-            assert!(!function_configuration_names_match(&producer_name, &run_time));
+            assert!(parameter_names_match(&plain, &plain));
+            assert!(!parameter_names_match(&run_time, &run_time));
+            assert!(!parameter_names_match(&run_time, &producer_name));
+            assert!(!parameter_names_match(&producer_name, &run_time));
         }
 
         #[test]

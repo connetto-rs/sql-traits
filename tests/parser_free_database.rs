@@ -481,6 +481,10 @@ impl TableLike for MemoryTable {
         std::iter::empty()
     }
 
+    fn toast_storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+        std::iter::empty()
+    }
+
     fn primary_key_columns<'db>(
         &'db self,
         database: &'db Self::DB,

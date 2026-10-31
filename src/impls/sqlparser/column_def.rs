@@ -1960,6 +1960,22 @@ mod tests {
     }
 
     #[test]
+    fn collation_create_rejects_namespaced_option_keys() {
+        let result = ParserDB::parse::<PostgreSqlDialect>(
+            "
+            CREATE COLLATION ci (
+                x.provider = icu,
+                locale = 'und-u-ks-level2'
+            );
+            ",
+        );
+        assert!(
+            matches!(&result, Err(Error::InvalidCollationOption { option_name, .. }) if &**option_name == "x.provider"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn collation_create_rejects_invalid_provider() {
         let result = ParserDB::parse::<PostgreSqlDialect>(
             "

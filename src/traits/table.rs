@@ -446,6 +446,9 @@ pub trait TableLike:
     /// Names fold to lowercase unless quoted. Values read as written, with
     /// string literals unquoted and unquoted words folded to lowercase. A
     /// parameter named without a value reads `true`, as PostgreSQL stores it.
+    /// A parameter written under the `toast` namespace, as in
+    /// `toast.autovacuum_enabled`, belongs to the table's TOAST relation and
+    /// is reported by [`TableLike::toast_storage_parameters`] instead.
     ///
     /// # Example
     ///
@@ -494,6 +497,67 @@ pub trait TableLike:
     /// ```
     fn storage_parameter(&self, name: &str) -> Option<Cow<'_, str>> {
         self.storage_parameters().find_map(|(stored, value)| (stored == name).then_some(value))
+    }
+
+    /// Iterates over the storage parameters of this table's TOAST relation,
+    /// those written under the `toast` namespace, as name and value without
+    /// the namespace, after every `ALTER TABLE ... SET (...)` and
+    /// `ALTER TABLE ... RESET (...)` naming them.
+    ///
+    /// Names and values read as [`TableLike::storage_parameters`] reads them,
+    /// the namespace folding like any unquoted name. PostgreSQL discards these
+    /// parameters for a table whose columns need no TOAST relation, which is
+    /// not modelled here.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE docs (id INT, body TEXT) WITH (autovacuum_enabled = true, TOAST.Autovacuum_Enabled = false);
+    /// ALTER TABLE docs SET (toast.vacuum_truncate);
+    /// ",
+    /// )?;
+    /// let docs =
+    ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let parameters: Vec<_> = docs.toast_storage_parameters().collect();
+    /// assert_eq!(
+    ///     parameters,
+    ///     [("autovacuum_enabled".into(), "false".into()), ("vacuum_truncate".into(), "true".into())]
+    /// );
+    /// assert_eq!(docs.storage_parameter("autovacuum_enabled").as_deref(), Some("true"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn toast_storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)>;
+
+    /// Returns the value of the TOAST relation's storage parameter stored
+    /// under `name`, as [`TableLike::toast_storage_parameters`] names it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id INT, body TEXT) WITH (toast.autovacuum_enabled = false);",
+    /// )?;
+    /// let docs =
+    ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
+    /// assert_eq!(docs.toast_storage_parameter("autovacuum_enabled").as_deref(), Some("false"));
+    /// assert_eq!(docs.storage_parameter("autovacuum_enabled"), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn toast_storage_parameter(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.toast_storage_parameters()
+            .find_map(|(stored, value)| (stored == name).then_some(value))
     }
 
     /// Returns the table ID according to its position in the database's table
@@ -4696,6 +4760,14 @@ where
 
     fn storage_parameter(&self, name: &str) -> Option<Cow<'_, str>> {
         T::storage_parameter(self, name)
+    }
+
+    fn toast_storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+        T::toast_storage_parameters(self)
+    }
+
+    fn toast_storage_parameter(&self, name: &str) -> Option<Cow<'_, str>> {
+        T::toast_storage_parameter(self, name)
     }
 
     fn table_id(&self, database: &Self::DB) -> Option<usize> {
