@@ -5056,6 +5056,50 @@ impl ParserDB {
         Ok(builder)
     }
 
+    /// Resolves the table a foreign key references, refusing a view or a
+    /// foreign table holding the name, which cannot be referenced.
+    ///
+    /// An unqualified target resolves through the search path, which carries
+    /// `public`, so a bare `parent` reaches `public.parent` as it does in the
+    /// database. The table being created is chained in so a table may
+    /// reference itself.
+    fn foreign_key_target<'a>(
+        builder: &'a ParserDBBuilder,
+        create_table: &'a CreateTable,
+        fk: &ForeignKeyConstraint,
+    ) -> Result<&'a CreateTable, crate::errors::Error> {
+        let case = builder.identifier_case();
+        let referenced_table = resolve_table_object_name_on_search_path_in_iter(
+            builder
+                .tables()
+                .iter()
+                .map(|(t, _, _)| t.as_ref())
+                .chain(core::iter::once(create_table)),
+            &fk.foreign_table,
+            || builder.search_path(),
+            case,
+            |key| builder.relation_key_is_held(key, case),
+        )?;
+        let Some(referenced_table) = referenced_table else {
+            // A view holding the name is a different complaint: the relation
+            // exists and simply cannot be referenced, which is what the
+            // database reports.
+            if let Some(actual_kind) = views::holds_view(builder, &fk.foreign_table) {
+                return Err(crate::errors::Error::RelationKindMismatch {
+                    object_name: fk.foreign_table.to_string(),
+                    expected_kind: ObjectKind::Table,
+                    actual_kind,
+                });
+            }
+            return Err(crate::errors::Error::ReferencedTableNotFoundForForeignKey {
+                referenced_table: fk.foreign_table.to_string(),
+                host_table: create_table.name.to_string(),
+            });
+        };
+        builder.refuse_foreign_table(referenced_table, &fk.foreign_table)?;
+        Ok(referenced_table)
+    }
+
     /// Helper function to process a foreign key table constraint.
     fn process_foreign_key_table_constraint(
         fk: &ForeignKeyConstraint,
@@ -5082,40 +5126,7 @@ impl ParserDB {
         }
 
         let referenced_table_name = fk.foreign_table.to_string();
-
-        // An unqualified target resolves through the search path, which carries
-        // `public`, so a bare `parent` reaches `public.parent` as it does in
-        // the database. The table being created is chained in so a
-        // table may reference itself.
-        let case = builder.identifier_case();
-        let referenced_table = resolve_table_object_name_on_search_path_in_iter(
-            builder
-                .tables()
-                .iter()
-                .map(|(t, _, _)| t.as_ref())
-                .chain(core::iter::once(create_table.as_ref())),
-            &fk.foreign_table,
-            || builder.search_path(),
-            case,
-            |key| builder.relation_key_is_held(key, case),
-        )?;
-        let Some(referenced_table) = referenced_table else {
-            // A view holding the name is a different complaint: the relation
-            // exists and simply cannot be referenced, which is what the
-            // database reports.
-            if let Some(actual_kind) = views::holds_view(&builder, &fk.foreign_table) {
-                return Err(crate::errors::Error::RelationKindMismatch {
-                    object_name: referenced_table_name.clone(),
-                    expected_kind: ObjectKind::Table,
-                    actual_kind,
-                });
-            }
-            return Err(crate::errors::Error::ReferencedTableNotFoundForForeignKey {
-                referenced_table: referenced_table_name.clone(),
-                host_table: create_table.name.to_string(),
-            });
-        };
-        builder.refuse_foreign_table(referenced_table, &fk.foreign_table)?;
+        let referenced_table = Self::foreign_key_target(&builder, create_table, fk)?;
         refuse_reference_across_storage(create_table, referenced_table, &referenced_table_name)?;
 
         for ref_col_ident in &fk.referred_columns {
