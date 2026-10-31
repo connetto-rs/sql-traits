@@ -1505,6 +1505,40 @@ pub enum Error {
         /// Name the statement wrote.
         view_name: String,
     },
+    #[error("{object_kind} `{view_name}` takes no option `{option_name}`.")]
+    /// Error indicating that a view's `WITH (...)` or an `ALTER TABLE ... SET
+    /// (...)` naming it writes an option its kind does not take.
+    ///
+    /// A plain view takes only `check_option`, `security_barrier` and
+    /// `security_invoker`. A materialized view takes storage parameters and
+    /// none of those three.
+    UnrecognizedViewOption {
+        /// Kind of view the option is written on.
+        object_kind: ObjectKind,
+        /// Name the statement wrote.
+        view_name: String,
+        /// Option name the statement wrote.
+        option_name: String,
+    },
+    #[error("Invalid value `{option_value}` for option `{option_name}` of view `{view_name}`.")]
+    /// Error indicating that a view option is given a value PostgreSQL does
+    /// not read as that option's type.
+    InvalidViewOptionValue {
+        /// Name the statement wrote.
+        view_name: String,
+        /// The option, as PostgreSQL names it.
+        option_name: String,
+        /// Value the statement supplied.
+        option_value: String,
+    },
+    #[error("Option `{option_name}` of view `{view_name}` is written more than once.")]
+    /// Error indicating that one option list names a view option twice.
+    RepeatedViewOption {
+        /// Name the statement wrote.
+        view_name: String,
+        /// The option, as PostgreSQL names it.
+        option_name: String,
+    },
     #[error(
         "{object_kind} `{object_name}` cannot be dropped because {dependent_kind} `{dependent_name}` reads it."
     )]

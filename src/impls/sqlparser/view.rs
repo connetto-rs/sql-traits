@@ -1,10 +1,11 @@
 //! Implementation of the `ViewLike` trait for the two view kinds.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 use sqlparser::ast::Query;
 
 use crate::{
+    errors::{LookupError, ObjectKind},
     structs::{MaterializedView, ParserDB, View, metadata::ViewMetadata},
     traits::{Metadata, ViewLike},
 };
@@ -42,6 +43,21 @@ impl ViewLike for View {
 
     fn selects_wildcard(&self) -> bool {
         self.declaration().selects_wildcard()
+    }
+
+    fn is_security_invoker(&self) -> bool {
+        self.security_invoker()
+    }
+
+    fn is_security_barrier(&self) -> bool {
+        self.security_barrier()
+    }
+
+    fn owner<'db>(&self, database: &'db ParserDB) -> Result<Option<&'db str>, LookupError> {
+        database
+            .view_metadata(self)
+            .map(ViewMetadata::owner)
+            .ok_or_else(|| ObjectKind::View.not_in_database(&self.target_name().to_string()))
     }
 
     fn declared_column_names(&self) -> &[(String, bool)] {
@@ -82,6 +98,12 @@ impl ViewLike for MaterializedView {
 
     fn selects_wildcard(&self) -> bool {
         self.declaration().selects_wildcard()
+    }
+
+    fn owner<'db>(&self, database: &'db ParserDB) -> Result<Option<&'db str>, LookupError> {
+        database.materialized_view_metadata(self).map(ViewMetadata::owner).ok_or_else(|| {
+            ObjectKind::MaterializedView.not_in_database(&self.target_name().to_string())
+        })
     }
 
     fn declared_column_names(&self) -> &[(String, bool)] {

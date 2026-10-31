@@ -7418,6 +7418,9 @@ impl ParserDB {
                     }
                     builder = builder.add_index(index, metadata);
                 }
+                Statement::AlterView(alter_view) => {
+                    builder = views::apply_alter_view(builder, &alter_view)?;
+                }
                 Statement::AlterTable(alter_table) => {
                     let scope = AlterTableScope {
                         if_exists: alter_table.if_exists,
