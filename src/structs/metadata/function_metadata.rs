@@ -119,6 +119,21 @@ impl FunctionMetadata {
         &mut self.execute
     }
 
+    /// Sets who holds `EXECUTE` on a new function, with `PUBLIC` and the
+    /// owner holding it as `public` and `owner` say, and each grantee of
+    /// `grants` holding it with whether it may grant the privilege on.
+    pub(crate) fn set_execute_defaults(
+        &mut self,
+        public: bool,
+        owner: bool,
+        grants: &[(Grantee, bool)],
+    ) {
+        self.execute = ExecutePrivileges { public, owner, grants: Vec::new() };
+        for (grantee, with_grant_option) in grants {
+            self.execute.grant(core::slice::from_ref(grantee), *with_grant_option);
+        }
+    }
+
     /// Returns whether `role` is the role the input names as the owner.
     fn is_owned_by(&self, role: &CreateRole) -> bool {
         use crate::traits::RoleLike as _;

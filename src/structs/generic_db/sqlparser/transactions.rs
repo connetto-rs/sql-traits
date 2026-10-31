@@ -10,8 +10,9 @@ use alloc::{string::ToString, sync::Arc, vec::Vec};
 use sqlparser::ast::{FunctionDesc, Ident, Statement, TransactionModifier};
 
 use super::{
-    AccessResolution, CreatedCollationMetadata, ParserDB, ParserDBBuilder, ParserIngestion,
-    PostgresCatalog, UndeclaredRoleAlteration, parsed_source::StatementSource,
+    AccessResolution, CreatedCollationMetadata, DefaultPrivileges, ParserDB, ParserDBBuilder,
+    ParserIngestion, PostgresCatalog, SessionRoles, UndeclaredRoleAlteration,
+    parsed_source::StatementSource,
 };
 use crate::{errors::Error, impls::SqlparserDialect, structs::IdentifierCase};
 
@@ -28,6 +29,10 @@ pub(super) struct Catalog {
     pub(super) unresolved_function_grants: Vec<FunctionDesc>,
     /// Attribute changes aimed at roles no `CREATE ROLE` had created.
     pub(super) role_alterations: Vec<UndeclaredRoleAlteration>,
+    /// The roles the session runs as.
+    pub(super) session_roles: SessionRoles,
+    /// The defaults `ALTER DEFAULT PRIVILEGES` recorded.
+    pub(super) default_privileges: DefaultPrivileges,
 }
 
 impl Catalog {
@@ -39,6 +44,8 @@ impl Catalog {
             collation_metadata,
             unresolved_function_grants,
             role_alterations,
+            session_roles,
+            default_privileges,
         } = Arc::try_unwrap(ingestion).unwrap_or_else(|shared| (*shared).clone());
         let catalog = Self {
             builder,
@@ -46,6 +53,8 @@ impl Catalog {
             collations: collation_metadata,
             unresolved_function_grants,
             role_alterations,
+            session_roles,
+            default_privileges,
         };
         (catalog, access_resolution)
     }
@@ -57,6 +66,8 @@ impl Catalog {
             collation_metadata: self.collations,
             unresolved_function_grants: self.unresolved_function_grants,
             role_alterations: self.role_alterations,
+            session_roles: self.session_roles,
+            default_privileges: self.default_privileges,
         }))
     }
 
@@ -67,6 +78,8 @@ impl Catalog {
             collation_metadata: self.collations.clone(),
             unresolved_function_grants: self.unresolved_function_grants.clone(),
             role_alterations: self.role_alterations.clone(),
+            session_roles: self.session_roles.clone(),
+            default_privileges: self.default_privileges.clone(),
         }))
     }
 
@@ -75,6 +88,7 @@ impl Catalog {
         statement: Statement,
         access_resolution: AccessResolution,
         source: Option<StatementSource<'_>>,
+        in_transaction: bool,
     ) -> Result<Self, Error> {
         // A drop without `CASCADE` may leave a default drawing from a dropped
         // sequence.
@@ -84,6 +98,7 @@ impl Catalog {
             access_resolution,
             &mut core::iter::once(statement),
             source,
+            in_transaction,
         )?;
         catalog.builder = super::sequences::settle_dropped_sequences(catalog.builder, cascade)?;
         Ok(catalog)
@@ -135,7 +150,12 @@ pub(super) fn apply(
     }
     if let Some(control) = control {
         let Some(rules) = rules else { return Err(unsupported(&statement)) };
-        return rules.control(control, &statement, catalog, transaction);
+        let mut catalog = rules.control(control, &statement, catalog, transaction)?;
+        // The end of a transaction takes what `SET LOCAL` set with it.
+        if matches!(control, Control::Commit { .. } | Control::Rollback { .. }) {
+            catalog.session_roles.end_transaction();
+        }
+        return Ok(catalog);
     }
     if let (Some(rules), Some(open)) = (rules, transaction.as_mut())
         && defines_schema(&statement)
@@ -157,7 +177,8 @@ pub(super) fn apply(
             Definitions::Last => open.defined = true,
         }
     }
-    catalog.apply(statement, access_resolution, source)
+    let in_transaction = transaction.is_some();
+    catalog.apply(statement, access_resolution, source, in_transaction)
 }
 
 /// The catalog an ingestion ending now leaves behind. A session that ends

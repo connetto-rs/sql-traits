@@ -4238,10 +4238,12 @@ pub trait TableLike:
     /// has forced Row Level Security, so a caller reporting that exemption
     /// needs the role's name to say who is exempt.
     ///
-    /// Only `ALTER TABLE ... OWNER TO <role>` names an owner. A table no such
-    /// statement altered has none, and neither has one handed to
-    /// `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`, which name whoever
-    /// runs the statement rather than a role the input declares.
+    /// The owner is the role the table was created under, as `SET ROLE` and
+    /// `SET SESSION AUTHORIZATION` leave it, until `ALTER TABLE ... OWNER TO
+    /// <role>` hands it to another. A table created while the input had set no
+    /// role has none, and neither has one handed to `CURRENT_ROLE`,
+    /// `CURRENT_USER` or `SESSION_USER`, which name whoever runs the statement
+    /// rather than a role the input declares.
     ///
     /// The role is reported as the statement spelled it, with no case folding,
     /// which is how [`DatabaseLike::role`] stores the names it matches against.
@@ -4266,14 +4268,21 @@ pub trait TableLike:
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
     /// CREATE ROLE app_owner;
+    /// CREATE ROLE app_writer;
     /// CREATE TABLE docs (id INT);
     /// ALTER TABLE docs OWNER TO app_owner;
     /// CREATE TABLE notes (id INT);
+    /// SET ROLE app_writer;
+    /// CREATE TABLE drafts (id INT);
     /// ",
     /// )?;
     /// let docs =
     ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
     /// assert_eq!(docs.owner(&db)?, Some("app_owner"));
+    ///
+    /// let drafts =
+    ///     db.table_by_target(TargetName::new("drafts", false), IdentifierCase::AsWritten)?.unwrap();
+    /// assert_eq!(drafts.owner(&db)?, Some("app_writer"));
     ///
     /// let notes =
     ///     db.table_by_target(TargetName::new("notes", false), IdentifierCase::AsWritten)?.unwrap();

@@ -43,8 +43,7 @@ use crate::{
         RelationIdentity, RoleMembership, Schema, SchemaProfile, Sequence, TableAttribute,
         TableMetadata, View,
         metadata::{
-            CheckMetadata, ExpressionCalls, FunctionMetadata, IndexMetadata, PolicyMetadata,
-            UniqueIndexMetadata,
+            CheckMetadata, ExpressionCalls, IndexMetadata, PolicyMetadata, UniqueIndexMetadata,
         },
     },
     traits::{ColumnLike, IndexLike, SequenceLike, TableLike, ViewLike},
@@ -73,6 +72,7 @@ mod attach_partition;
 mod calls_in_expression;
 mod column_copy;
 mod constraint_validity;
+mod default_privileges;
 mod extensions;
 mod function_bodies;
 mod generated_names;
@@ -93,6 +93,9 @@ mod transactions;
 mod view_rewrites;
 mod views;
 
+use default_privileges::{
+    Creator, DefaultKind, DefaultPrivileges, SessionChange, SessionRoles, tracks_session_roles,
+};
 use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
 use parsed_source::{ParsedSource, StatementSource};
@@ -140,6 +143,8 @@ impl SchemaProfile for SqlparserProfile {
             collation_metadata: Vec::new(),
             unresolved_function_grants: Vec::new(),
             role_alterations: Vec::new(),
+            session_roles: SessionRoles::default(),
+            default_privileges: DefaultPrivileges::default(),
         })
     }
 }
@@ -183,8 +188,9 @@ enum TableOrigin {
 /// statement-by-statement ingestion can resume from it: the
 /// access-resolution mode, the active PostgreSQL catalog, metadata for
 /// collations the ingested DDL created, the function signatures open-world
-/// grants named without reaching a function, and the attribute changes aimed
-/// at roles the input never created.
+/// grants named without reaching a function, the attribute changes aimed at
+/// roles the input never created, the roles the session runs as, and the
+/// defaults `ALTER DEFAULT PRIVILEGES` recorded.
 ///
 /// The catalog sits behind an [`Arc`], so cloning a database or taking a
 /// snapshot bumps a reference count rather than copying the catalog's
@@ -197,6 +203,8 @@ pub struct ParserIngestion {
     collation_metadata: Vec<CreatedCollationMetadata>,
     unresolved_function_grants: Vec<FunctionDesc>,
     role_alterations: Vec<UndeclaredRoleAlteration>,
+    session_roles: SessionRoles,
+    default_privileges: DefaultPrivileges,
 }
 
 impl core::fmt::Debug for ParserIngestion {
@@ -213,6 +221,8 @@ impl core::fmt::Debug for ParserIngestion {
             .field("created_collations", &self.collation_metadata.len())
             .field("unresolved_function_grants", &self.unresolved_function_grants.len())
             .field("undeclared_role_alterations", &self.role_alterations.len())
+            .field("session_roles", &self.session_roles)
+            .field("default_privileges", &self.default_privileges)
             .finish()
     }
 }
@@ -230,10 +240,13 @@ pub struct ParserDBIngestor {
     transaction: Option<transactions::Transaction>,
 }
 
+/// The collations a column added to a stored table may name, and the defaults
+/// the sequence it brings takes.
 #[derive(Clone, Copy)]
-struct ActiveCollations<'a> {
+struct AddedColumnContext<'a> {
     created: &'a [CreatedCollationMetadata],
     catalog: &'a PostgresCatalog,
+    defaults: &'a DefaultPrivileges,
 }
 
 enum CollationResolution<'a> {
@@ -2734,6 +2747,11 @@ fn stored_role_name(role_ident: &Ident) -> String {
     normalize_identifier(&role_ident.value, role_ident.quote_style.is_some()).into_owned()
 }
 
+/// The identifier a stored name is written with.
+fn stored_ident(name: &str, quoted: bool) -> Ident {
+    if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
+}
+
 /// Returns the identifier a grantee resolves a role by, or `None` when the
 /// grantee names no role of its own: the `PUBLIC` pseudo-role, however
 /// spelled, or a grantee whose name is not a plain identifier.
@@ -4102,6 +4120,8 @@ impl ParserDBIngestor {
                 collations: Vec::new(),
                 unresolved_function_grants: Vec::new(),
                 role_alterations: Vec::new(),
+                session_roles: SessionRoles::default(),
+                default_privileges: DefaultPrivileges::default(),
             },
             access_resolution,
             transaction: None,
@@ -5791,6 +5811,16 @@ impl ParserDB {
             .ok_or_else(|| ObjectKind::Table.not_in_database(&stored.name).into())
     }
 
+    /// The stored name of the role owning a stored table, which owns the
+    /// sequences its columns bring.
+    fn stored_owner(builder: &ParserDBBuilder, stored: &StoredTable) -> Option<String> {
+        builder
+            .tables()
+            .iter()
+            .find(|(table, _, _)| stored.matches(table, builder.identifier_case()))
+            .and_then(|(_, metadata, _)| metadata.owner().map(ToString::to_string))
+    }
+
     /// Applies `ALTER TABLE ... SET UNLOGGED`, when `unlogged`, or `SET LOGGED`
     /// to the table the statement names.
     ///
@@ -6076,7 +6106,7 @@ impl ParserDB {
         mut column_def: ColumnDef,
         if_not_exists: bool,
         position: Option<&MySQLColumnPosition>,
-        active_collations: ActiveCollations<'_>,
+        context: AddedColumnContext<'_>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
@@ -6118,14 +6148,16 @@ impl ParserDB {
         let mut inherited_def = column_def.clone();
         inherited_def.options.retain(|option| !is_no_inherit_check(option));
         sequences::spell_out_planned_serial(&mut inherited_def, &stored, &column_sequences);
+        let owner = Self::stored_owner(&builder, &stored);
+        let creator = Creator::new(owner.as_deref(), context.defaults);
         let (builder, column_sequences) =
-            sequences::create_column_sequences(builder, &stored, column_sequences)?;
+            sequences::create_column_sequences(builder, &stored, column_sequences, creator)?;
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
         let inherited_metadata = column_metadata_for_collations(
             &inherited_def,
-            active_collations.created,
-            active_collations.catalog,
+            context.created,
+            context.catalog,
             &search_path,
             &[],
             should_validate_missing_collations(*builder.dialect()),
@@ -6135,8 +6167,8 @@ impl ParserDB {
         let mut builder = Self::replace_table_node_with_collations(
             builder,
             &stored,
-            active_collations.created,
-            Some(active_collations.catalog),
+            context.created,
+            Some(context.catalog),
             |_| {},
             |_, node| {
                 let at = match position {
@@ -6175,8 +6207,8 @@ impl ParserDB {
             builder = Self::replace_table_node_with_collations(
                 builder,
                 child,
-                active_collations.created,
-                Some(active_collations.catalog),
+                context.created,
+                Some(context.catalog),
                 |_| {},
                 |_, node| {
                     node.columns.push(inherited_def);
@@ -6485,6 +6517,7 @@ impl ParserDB {
         scope: AlterTableScope,
         column_name: &Ident,
         operation: &AlterColumnOperation,
+        defaults: &DefaultPrivileges,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let mut operation = operation.clone();
         let mut identity_sequence = None;
@@ -6527,8 +6560,10 @@ impl ParserDB {
 
         let (builder, identity_sequence) = match identity_sequence {
             Some((stored, planned)) => {
+                let owner = Self::stored_owner(&builder, &stored);
+                let creator = Creator::new(owner.as_deref(), defaults);
                 let (builder, created) =
-                    sequences::create_column_sequences(builder, &stored, planned)?;
+                    sequences::create_column_sequences(builder, &stored, planned, creator)?;
                 (builder, Some((stored, created)))
             }
             None => (builder, None),
@@ -6769,6 +6804,7 @@ impl ParserDB {
         access_resolution: AccessResolution,
         statements: &mut dyn Iterator<Item = Statement>,
         source: Option<StatementSource<'_>>,
+        in_transaction: bool,
     ) -> Result<transactions::Catalog, crate::errors::Error> {
         let transactions::Catalog {
             mut builder,
@@ -6776,9 +6812,28 @@ impl ParserDB {
             collations: mut collation_metadata,
             mut unresolved_function_grants,
             mut role_alterations,
+            mut session_roles,
+            mut default_privileges,
         } = catalog;
         let dialect = *builder.dialect();
         for statement in statements {
+            if tracks_session_roles(dialect)
+                && let Some(change) = SessionChange::of(&statement)
+            {
+                if access_resolution == AccessResolution::ClosedWorld
+                    && let Some(role) = change.named_role()
+                    && !builder
+                        .roles()
+                        .iter()
+                        .any(|(declared, ())| role_matches_lookup_ident(declared, role))
+                {
+                    return Err(crate::errors::Error::RoleNotFoundForSession {
+                        role_name: role.value.clone(),
+                    });
+                }
+                session_roles.apply(&change, in_transaction);
+                continue;
+            }
             match statement {
                 Statement::CreateFunction(mut create_function) => {
                     // Two functions may share a name as long as they take
@@ -6828,11 +6883,13 @@ impl ParserDB {
                     let replaced =
                         replace_position.map(|position| builder.functions_mut().remove(position));
 
-                    // The `pg_proc` entry and its owner survive, the new body
-                    // decides what a `NULL` argument does.
-                    let (replaced, mut metadata) = match replaced {
-                        Some((stale, metadata)) => (Some(stale), metadata),
-                        None => (None, FunctionMetadata::default()),
+                    // A replacement keeps its owner and its privileges.
+                    let (replaced, mut metadata) = if let Some((stale, metadata)) = replaced {
+                        (Some(stale), metadata)
+                    } else {
+                        let creator = Creator::session(&session_roles, &default_privileges);
+                        let schema = qualifier_of(&create_function.name).named();
+                        (None, creator.function_metadata(schema, builder.identifier_case()))
                     };
                     metadata.set_null_returning_arguments(&[]);
 
@@ -7188,7 +7245,14 @@ impl ParserDB {
                             });
                         }
 
-                        if builder.is_role_referenced(role_ident) {
+                        if session_roles.runs_as(role_ident) {
+                            return Err(crate::errors::Error::RoleInUseBySession {
+                                role_name: role_name.to_string(),
+                            });
+                        }
+                        if builder.is_role_referenced(role_ident)
+                            || default_privileges.references_role(role_ident)
+                        {
                             return Err(crate::errors::Error::RoleReferenced {
                                 role_name: role_name.to_string(),
                             });
@@ -7213,6 +7277,11 @@ impl ParserDB {
                             role_name: name.value.clone(),
                         });
                     };
+                    if session_roles.runs_as(&name) {
+                        return Err(crate::errors::Error::RoleInUseBySession {
+                            role_name: name.value.clone(),
+                        });
+                    }
 
                     if builder
                         .roles()
@@ -7238,6 +7307,7 @@ impl ParserDB {
                     rename_grantee_role(builder.table_grants_mut(), &name, &new_name);
                     rename_grantee_role(builder.column_grants_mut(), &name, &new_name);
                     rename_execute_grantees(&mut builder, &name, &new_name);
+                    default_privileges.rename_role(&name, &new_name);
                 }
                 Statement::AlterRole {
                     name,
@@ -7362,6 +7432,10 @@ impl ParserDB {
                                 resolved_schema_quoted,
                             )
                         });
+                        default_privileges.drop_schema(
+                            (&resolved_schema_name, resolved_schema_quoted),
+                            builder.identifier_case(),
+                        );
                     }
                 }
                 Statement::CreateIndex(mut create_index) => {
@@ -7538,9 +7612,10 @@ impl ParserDB {
                                     column_def,
                                     if_not_exists,
                                     column_position.as_ref(),
-                                    ActiveCollations {
+                                    AddedColumnContext {
                                         created: &collation_metadata,
                                         catalog: &active_postgres_catalog,
+                                        defaults: &default_privileges,
                                     },
                                 )?;
                             }
@@ -7578,6 +7653,7 @@ impl ParserDB {
                                     scope,
                                     &column_name,
                                     &op,
+                                    &default_privileges,
                                 )?;
                             }
                             AlterTableOperation::ChangeColumn {
@@ -7809,7 +7885,8 @@ impl ParserDB {
                     }
                 }
                 Statement::CreateExtension(create_extension) => {
-                    builder = extensions::create_extension(builder, create_extension)?;
+                    let creator = Creator::session(&session_roles, &default_privileges);
+                    builder = extensions::create_extension(builder, create_extension, creator)?;
                 }
                 Statement::DropExtension(drop_extension) => {
                     builder = extensions::drop_extensions(builder, drop_extension)?;
@@ -7882,10 +7959,15 @@ impl ParserDB {
                     // Named before anything is created, so copied columns bring
                     // none.
                     let stored = StoredTable::of(&create_table);
+                    let creator = Creator::session(&session_roles, &default_privileges);
                     let column_sequences =
                         sequences::plan_column_sequences(&builder, &stored, &create_table.columns);
-                    let (with_sequences, column_sequences) =
-                        sequences::create_column_sequences(builder, &stored, column_sequences)?;
+                    let (with_sequences, column_sequences) = sequences::create_column_sequences(
+                        builder,
+                        &stored,
+                        column_sequences,
+                        creator,
+                    )?;
                     builder = with_sequences;
                     let table_name = create_table.name.to_string();
                     sequences::bind_column_defaults(
@@ -7913,7 +7995,13 @@ impl ParserDB {
                     refuse_no_inherit_check_on_partitioned(&create_table)?;
                     record_implied_not_null(&mut create_table);
                     bind_foreign_key_targets(&builder, &mut create_table);
+                    let name = create_table.name.clone();
                     let mut metadata = TableMetadata::default();
+                    metadata.set_owner(creator.owner());
+                    metadata.set_owner_privileges(creator.owner_table_privileges(
+                        qualifier_of(&name).named(),
+                        builder.identifier_case(),
+                    ));
                     metadata.set_inherited_column_names(inherited.columns);
                     metadata.set_inherited_constraints(inherited.constraints);
                     metadata.set_unvalidated_constraints(inherited.unvalidated_constraints);
@@ -7927,14 +8015,21 @@ impl ParserDB {
                         TableOrigin::Declaration(documentation),
                     )?;
                     sequences::own_column_sequences(&mut builder, &stored, column_sequences);
+                    builder = creator.grant(
+                        builder,
+                        DefaultKind::Relations,
+                        &GrantObjects::Tables(vec![name]),
+                    );
                 }
                 Statement::CreateSequence { temporary, if_not_exists, name, sequence_options } => {
+                    let creator = Creator::session(&session_roles, &default_privileges);
                     builder = sequences::create_sequence(
                         builder,
                         temporary,
                         if_not_exists,
                         name,
                         sequence_options,
+                        creator,
                     )?;
                 }
                 Statement::Drop {
@@ -7947,7 +8042,8 @@ impl ParserDB {
                     builder = sequences::drop_sequences(builder, &names, if_exists, cascade)?;
                 }
                 Statement::CreateView(create_view) => {
-                    builder = views::create_view(builder, create_view)?;
+                    let creator = Creator::session(&session_roles, &default_privileges);
+                    builder = views::create_view(builder, create_view, creator)?;
                 }
                 Statement::CreatePolicy(mut policy) => {
                     require_named(&policy.table_name, crate::errors::ObjectKind::Table)?;
@@ -8114,11 +8210,21 @@ impl ParserDB {
                         }
                         // IF NOT EXISTS - skip adding duplicate
                     } else {
-                        let schema = match authorization {
+                        // The owner's defaults apply, the creating role's
+                        // unless named.
+                        let owner = authorization.as_deref().or(session_roles.creating_role());
+                        let creator = Creator::new(owner, &default_privileges);
+                        let granted = ObjectName::from(vec![stored_ident(&name, quoted)]);
+                        let schema = match creator.owner() {
                             Some(auth) => Schema::with_authorization_and_quoted(name, auth, quoted),
                             None => Schema::with_quoted(name, quoted),
                         };
                         builder = builder.add_schema(Arc::new(schema), ());
+                        builder = creator.grant(
+                            builder,
+                            DefaultKind::Schemas,
+                            &GrantObjects::Schemas(vec![granted]),
+                        );
                     }
                 }
                 Statement::Grant(mut grant) => {
@@ -8526,6 +8632,11 @@ impl ParserDB {
                                     (&current_schema_name, current_schema_quoted),
                                     (&new_schema_name, new_schema_quoted),
                                 );
+                                default_privileges.rename_schema(
+                                    (&current_schema_name, current_schema_quoted),
+                                    (&new_schema_name, new_schema_quoted),
+                                    builder.identifier_case(),
+                                );
                                 current_schema_name = new_schema_name;
                                 current_schema_quoted = new_schema_quoted;
                             }
@@ -8567,6 +8678,14 @@ impl ParserDB {
                         }
                     }
                 }
+                Statement::AlterDefaultPrivileges(statement) => {
+                    default_privileges.alter(
+                        statement,
+                        &session_roles,
+                        &builder,
+                        access_resolution,
+                    )?;
+                }
                 _ => {
                     // Statements this model tracks nothing for.
                     //
@@ -8583,6 +8702,8 @@ impl ParserDB {
             collations: collation_metadata,
             unresolved_function_grants,
             role_alterations,
+            session_roles,
+            default_privileges,
         })
     }
 

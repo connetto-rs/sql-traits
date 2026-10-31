@@ -898,10 +898,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// [`security_mode`](FunctionLike::security_mode) leaves open: that reader
     /// says the body runs as its definer, and this one says who the definer is.
     ///
-    /// Only `ALTER FUNCTION ... OWNER TO <role>` names an owner. A function no
-    /// such statement altered has none, and neither has one handed to
-    /// `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`, which name whoever
-    /// runs the statement rather than a role the input declares.
+    /// The owner is the role the function was created under, as `SET ROLE` and
+    /// `SET SESSION AUTHORIZATION` leave it, until `ALTER FUNCTION ... OWNER
+    /// TO <role>` hands it to another. A function created while the input had
+    /// set no role has none, and neither has one handed to `CURRENT_ROLE`,
+    /// `CURRENT_USER` or `SESSION_USER`, which name whoever runs the statement
+    /// rather than a role the input declares.
     ///
     /// The role is reported as the statement spelled it, with no case folding,
     /// which is how [`DatabaseLike::role`] stores the names it matches against.
@@ -926,21 +928,24 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
     /// CREATE ROLE app_reader;
+    /// CREATE ROLE app_writer;
     /// CREATE FUNCTION reassigned() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
     /// ALTER FUNCTION reassigned() OWNER TO app_reader;
     /// CREATE FUNCTION untouched() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+    /// SET ROLE app_writer;
+    /// CREATE FUNCTION written() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
     /// ",
     /// )?;
-    /// let reassigned = db
-    ///     .function_by_target(TargetName::new("reassigned", false), IdentifierCase::AsWritten)?
-    ///     .expect("Function should exist");
-    /// assert_eq!(reassigned.owner(&db)?, Some("app_reader"));
-    ///
-    /// // Nobody reassigned this one, so the schema names no owner for it.
-    /// let untouched = db
-    ///     .function_by_target(TargetName::new("untouched", false), IdentifierCase::AsWritten)?
-    ///     .expect("Function should exist");
-    /// assert_eq!(untouched.owner(&db)?, None);
+    /// let owner = |name: &str| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    ///         .owner(&db)
+    /// };
+    /// assert_eq!(owner("reassigned")?, Some("app_reader"));
+    /// assert_eq!(owner("written")?, Some("app_writer"));
+    /// // Created before any role was set and never reassigned.
+    /// assert_eq!(owner("untouched")?, None);
     /// # Ok(())
     /// # }
     /// ```
@@ -949,11 +954,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// Returns whether every role may execute the function, which is what
     /// `PUBLIC` holding `EXECUTE` on it means.
     ///
-    /// PostgreSQL gives `PUBLIC` `EXECUTE` on every new function, so this
-    /// answers `true` until a `REVOKE` takes it away, and again once a
-    /// `GRANT ... TO PUBLIC` restores it. Every spelling reaches it, whether a
-    /// signature, a name that covers one function alone, or `ALL FUNCTIONS IN
-    /// SCHEMA`, which covers the functions the schema holds when it runs.
+    /// PostgreSQL gives `PUBLIC` `EXECUTE` on every new function unless an
+    /// `ALTER DEFAULT PRIVILEGES` of the role creating it takes it away first.
+    /// A `REVOKE` takes it away later and a `GRANT ... TO PUBLIC` restores it.
+    /// Every spelling reaches it, whether a signature, a name that covers one
+    /// function alone, or `ALL FUNCTIONS IN SCHEMA`, which covers the
+    /// functions the schema holds when it runs.
     ///
     /// # Arguments
     ///

@@ -29,14 +29,14 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, SelectItem, SetExpr, Statement, TableFactor, Visit, VisitMut, Visitor,
-    VisitorMut,
+    AlterTableOperation, CreateView, Expr, GrantObjects, Ident, ObjectName, ObjectNamePart, Owner,
+    Query, RenameTableNameKind, SelectItem, SetExpr, Statement, TableFactor, Visit, VisitMut,
+    Visitor, VisitorMut,
 };
 
 use super::{
-    ParserDBBuilder, SchemaQualifier, bind_reference, function_bodies, object_name_last_identifier,
-    place_relation, relation_name_holder, require_named_in_catalog,
+    Creator, DefaultKind, ParserDBBuilder, SchemaQualifier, bind_reference, function_bodies,
+    object_name_last_identifier, place_relation, relation_name_holder, require_named_in_catalog,
     rules::{self, RuleHost},
     view_rewrites::{self, Rename},
 };
@@ -66,7 +66,8 @@ fn view_schema_qualifier(name: &ObjectName) -> SchemaQualifier<'_> {
     qualifier_of(name).named()
 }
 
-/// Records a `CREATE VIEW` or `CREATE MATERIALIZED VIEW`.
+/// Records a `CREATE VIEW` or `CREATE MATERIALIZED VIEW`, a new one owned by
+/// the role `creator` names and under its defaults.
 ///
 /// # Errors
 ///
@@ -78,6 +79,7 @@ fn view_schema_qualifier(name: &ObjectName) -> SchemaQualifier<'_> {
 pub(super) fn create_view(
     mut builder: ParserDBBuilder,
     mut node: CreateView,
+    creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     let kind = declared_kind(&node);
     require_named_in_catalog(&mut node.name, kind, builder.catalog_name())?;
@@ -145,19 +147,22 @@ pub(super) fn create_view(
         });
     }
 
-    if node.materialized {
+    let mut metadata = ViewMetadata::default();
+    metadata.set_owner(creator.owner());
+    let builder = if node.materialized {
         let Some(mut view) = MaterializedView::from_node(&node) else {
             return Err(Error::UnnamedObject { object_kind: kind });
         };
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
-        Ok(builder.add_materialized_view(Arc::new(view), ViewMetadata::default()))
+        builder.add_materialized_view(Arc::new(view), metadata)
     } else {
         let Some(mut view) = View::from_node(&node) else {
             return Err(Error::UnnamedObject { object_kind: kind });
         };
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
-        Ok(builder.add_view(Arc::new(view), ViewMetadata::default()))
-    }
+        builder.add_view(Arc::new(view), metadata)
+    };
+    Ok(creator.grant(builder, DefaultKind::Relations, &GrantObjects::Tables(vec![node.name])))
 }
 
 /// Checks the two rules a replacement has to keep: it may not rename an output

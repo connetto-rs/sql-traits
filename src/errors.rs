@@ -1413,6 +1413,51 @@ pub enum Error {
         /// Name of the role being dropped.
         role_name: String,
     },
+    #[error(
+        "Role `{role_name}` is the current or session role, so it cannot be dropped or renamed."
+    )]
+    /// Error indicating that `DROP ROLE` or `ALTER ROLE ... RENAME TO` names
+    /// the role the session runs as, as `SET ROLE` or `SET SESSION
+    /// AUTHORIZATION` left it, which PostgreSQL refuses.
+    RoleInUseBySession {
+        /// Name of the role, as written.
+        role_name: String,
+    },
+    #[error("Role `{role_name}` not found for the session to run as.")]
+    /// Error indicating that `SET ROLE` or `SET SESSION AUTHORIZATION` names a
+    /// role that does not exist.
+    ///
+    /// Like the other role checks this one follows
+    /// [`AccessResolution`](crate::structs::AccessResolution).
+    RoleNotFoundForSession {
+        /// Name of the role, as written.
+        role_name: String,
+    },
+    #[error("Schema `{schema_name}` not found for ALTER DEFAULT PRIVILEGES.")]
+    /// Error indicating that `ALTER DEFAULT PRIVILEGES ... IN SCHEMA` names a
+    /// schema no `CREATE SCHEMA` in the input creates.
+    ///
+    /// `public` is exempt, since every database holds it.
+    SchemaNotFoundForDefaultPrivileges {
+        /// Name of the schema, as written.
+        schema_name: String,
+    },
+    #[error("ALTER DEFAULT PRIVILEGES cannot use IN SCHEMA with ON {object_type}.")]
+    /// Error indicating that `ALTER DEFAULT PRIVILEGES ... IN SCHEMA` names
+    /// `SCHEMAS` or `LARGE OBJECTS`, which no schema holds.
+    DefaultPrivilegesInSchema {
+        /// The object type, as PostgreSQL spells it.
+        object_type: String,
+    },
+    #[error("Privilege `{privilege}` cannot be a default on {object_type}.")]
+    /// Error indicating that `ALTER DEFAULT PRIVILEGES` names a privilege the
+    /// object type does not have, such as `EXECUTE` on `TABLES`.
+    InvalidDefaultPrivilege {
+        /// The privilege, as written.
+        privilege: String,
+        /// The object type, as PostgreSQL spells it.
+        object_type: String,
+    },
     #[error("Schema `{schema_name}` already exists.")]
     /// Error indicating that a CREATE SCHEMA statement tries to create a schema
     /// that already exists.

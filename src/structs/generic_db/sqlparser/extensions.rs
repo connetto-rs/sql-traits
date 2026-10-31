@@ -12,12 +12,13 @@ use alloc::{string::ToString, sync::Arc, vec::Vec};
 use sqlparser::ast::{CreateExtension, CreateFunction, DropExtension, Ident, ObjectName};
 
 use super::{
-    ParserDBBuilder, case_idents_match, declared_schema, function_signatures_match,
+    Creator, ParserDBBuilder, case_idents_match, declared_schema, function_signatures_match,
     postgres_builtins::{
         BuiltinType::{self, Text, Uuid},
         Volatility::{self, Immutable, Volatile},
         declaration, parameter,
     },
+    stored_ident,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -91,7 +92,8 @@ fn extension_functions(name: &Ident) -> &'static [ExtensionFunction] {
     }
 }
 
-/// Registers the functions `extension` creates, in the schema it landed in.
+/// Registers the functions `extension` creates, in the schema it landed in,
+/// under the defaults of the role `creator` names.
 ///
 /// # Errors
 ///
@@ -100,8 +102,13 @@ fn extension_functions(name: &Ident) -> &'static [ExtensionFunction] {
 fn create_extension_functions(
     mut builder: ParserDBBuilder,
     extension: &CreateExtension,
+    creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     let case = builder.identifier_case();
+    let schema = extension
+        .schema
+        .as_ref()
+        .map(|schema| (schema.value.as_str(), schema.quote_style.is_some()));
     for member in extension_functions(&extension.name) {
         let function = member.function(extension.schema.as_ref());
         let taken = builder.functions().iter().any(|(existing, _)| {
@@ -116,7 +123,7 @@ fn create_extension_functions(
         if taken {
             return Err(Error::FunctionAlreadyExists { function_name: member.0.to_string() });
         }
-        let mut metadata = FunctionMetadata::default();
+        let mut metadata = creator.function_metadata(schema, case);
         metadata.set_extension(extension.name.clone());
         builder = builder.add_function(Arc::new(function), metadata);
     }
@@ -162,6 +169,7 @@ fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Resu
 pub(super) fn create_extension(
     builder: ParserDBBuilder,
     mut extension: CreateExtension,
+    creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     if extension.name.value.is_empty() {
         return Err(Error::UnnamedObject { object_kind: ObjectKind::Extension });
@@ -183,7 +191,7 @@ pub(super) fn create_extension(
         Some(schema) => Some(named_schema(&builder, schema, &extension.name)?),
         None => search_path_schema(&builder, &extension.name)?,
     };
-    let builder = create_extension_functions(builder, &extension)?;
+    let builder = create_extension_functions(builder, &extension, creator)?;
     Ok(builder.add_extension(Arc::new(extension), ()))
 }
 
@@ -272,14 +280,9 @@ pub(super) fn follow_schema_rename(
 ) {
     for (extension, ()) in builder.extensions_mut() {
         if created_in(extension, from, from_quoted) {
-            Arc::make_mut(extension).schema = Some(schema_ident(to, to_quoted));
+            Arc::make_mut(extension).schema = Some(stored_ident(to, to_quoted));
         }
     }
-}
-
-/// The identifier a stored schema name is written with.
-fn schema_ident(name: &str, quoted: bool) -> Ident {
-    if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
 }
 
 /// Checks the schema `WITH SCHEMA` names, keeping it as written.
@@ -326,7 +329,7 @@ fn search_path_schema(
         // The catalog spelling wins over the one the path used, since the two
         // only differ where quoting makes them the same name anyway.
         if let Some(schema) = declared_schema(builder, entry, quoted) {
-            return Ok(Some(schema_ident(schema.name(), schema.is_quoted())));
+            return Ok(Some(stored_ident(schema.name(), schema.is_quoted())));
         }
     }
     Err(Error::NoSchemaSelectedForExtension { extension_name: extension_name.value.clone() })
