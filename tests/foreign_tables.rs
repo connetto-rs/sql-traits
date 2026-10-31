@@ -169,6 +169,16 @@ fn a_revoke_on_a_foreign_table_resolves_to_it() {
 }
 
 #[test]
+fn identity_and_serial_columns_of_a_foreign_table_create_their_sequences() {
+    let db = db(
+        "CREATE FOREIGN TABLE fseq (id INT GENERATED ALWAYS AS IDENTITY, n SERIAL) SERVER warehouse;",
+    );
+    let mut names: Vec<_> = db.sequences().map(SequenceLike::sequence_name).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["fseq_id_seq", "fseq_n_seq"]);
+}
+
+#[test]
 fn a_schema_wide_grant_covers_foreign_tables() {
     let db = db("CREATE ROLE app; CREATE SCHEMA s;
          CREATE FOREIGN TABLE s.remote (id INT) SERVER warehouse;
