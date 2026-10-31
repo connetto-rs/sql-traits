@@ -568,6 +568,127 @@ fn a_foreign_partition_goes_with_its_partitioned_table_and_leaves_it_alone() {
     ));
 }
 
+const PARENT: &str = "CREATE TABLE parent (
+         id INT NOT NULL,
+         note TEXT DEFAULT 'x',
+         CONSTRAINT positive CHECK (id > 0),
+         CONSTRAINT parent_pk PRIMARY KEY (id)
+     );";
+
+#[test]
+fn a_foreign_table_inherits_a_parent_columns_and_checks_but_not_its_keys() {
+    let db = db(&format!(
+        "{PARENT}
+         CREATE TABLE target (id INT PRIMARY KEY);
+         CREATE TABLE keyed (id INT REFERENCES target (id), code INT UNIQUE);
+         CREATE FOREIGN TABLE child (extra INT) INHERITS (parent) SERVER warehouse;
+         CREATE FOREIGN TABLE keyed_child () INHERITS (keyed) SERVER warehouse;"
+    ));
+    let parent = table(&db, "parent");
+    let child = foreign(&db, "child");
+    assert!(child.is_foreign(&db).expect("held"));
+    assert_eq!(child.inherits_from(&db).expect("held").collect::<Vec<_>>(), [parent]);
+    assert_eq!(parent.inheritors(&db).expect("held").collect::<Vec<_>>(), [child]);
+
+    let columns: Vec<_> = child
+        .columns(&db)
+        .expect("held")
+        .map(|column| (column.column_name(), column.is_nullable(&db).expect("held")))
+        .collect();
+    assert_eq!(columns, [("id", false), ("note", true), ("extra", true)]);
+    assert_eq!(child.check_constraints(&db).expect("held").count(), 1);
+    assert!(!child.has_primary_key(&db).expect("held"));
+
+    let keyed_child = foreign(&db, "keyed_child");
+    assert_eq!(keyed_child.foreign_keys(&db).expect("held").count(), 0);
+    assert_eq!(keyed_child.unique_indices(&db).expect("held").count(), 0);
+}
+
+#[test]
+fn a_foreign_table_inherits_from_several_parents_and_from_a_foreign_table() {
+    let db = db(&format!(
+        "{PARENT}
+         CREATE TABLE coded (code INT CHECK (code <> 0), CHECK (code > 1) NO INHERIT);
+         CREATE FOREIGN TABLE both_parents (id INT, note TEXT) INHERITS (parent, coded)
+             SERVER warehouse;
+         CREATE FOREIGN TABLE remote_parent (a INT) SERVER warehouse;
+         CREATE FOREIGN TABLE remote_child (b INT) INHERITS (remote_parent) SERVER warehouse;"
+    ));
+    let both = foreign(&db, "both_parents");
+    let names: Vec<_> = both.columns(&db).expect("held").map(ColumnLike::column_name).collect();
+    assert_eq!(names, ["id", "note", "code"]);
+    // The `NO INHERIT` check stays with its table.
+    assert_eq!(both.check_constraints(&db).expect("held").count(), 2);
+
+    let remote_child = foreign(&db, "remote_child");
+    assert_eq!(
+        remote_child.inherits_from(&db).expect("held").collect::<Vec<_>>(),
+        [foreign(&db, "remote_parent")]
+    );
+    assert_eq!(remote_child.columns(&db).expect("held").count(), 2);
+}
+
+#[test]
+fn a_foreign_table_inherits_only_from_a_table_postgresql_lets_it() {
+    for (sql, check) in [
+        ("CREATE FOREIGN TABLE c () INHERITS (nowhere) SERVER s;", "an absent parent"),
+        (
+            "CREATE VIEW v AS SELECT 1 AS a; CREATE FOREIGN TABLE c () INHERITS (v) SERVER s;",
+            "a view",
+        ),
+        (
+            "CREATE TEMP TABLE t (id INT); CREATE FOREIGN TABLE c () INHERITS (t) SERVER s;",
+            "a temporary table",
+        ),
+        (
+            &format!("{PARENT} CREATE FOREIGN TABLE c (id BIGINT) INHERITS (parent) SERVER s;"),
+            "a column type conflict",
+        ),
+    ] {
+        assert!(parse(sql).is_err(), "{check} was accepted");
+    }
+}
+
+#[test]
+fn a_parent_change_reaches_its_foreign_child() {
+    let inherited =
+        format!("{PARENT} CREATE FOREIGN TABLE child () INHERITS (parent) SERVER warehouse;");
+    let altered = db(&format!(
+        "{inherited}
+         ALTER TABLE parent ADD COLUMN added INT;
+         ALTER TABLE parent ADD CONSTRAINT small CHECK (id < 100);
+         CREATE UNIQUE INDEX parent_note ON parent (note);
+         ALTER TABLE parent ENABLE ROW LEVEL SECURITY;"
+    ));
+    let child = foreign(&altered, "child");
+    let names: Vec<_> =
+        child.columns(&altered).expect("held").map(ColumnLike::column_name).collect();
+    assert_eq!(names, ["id", "note", "added"]);
+    assert_eq!(child.check_constraints(&altered).expect("held").count(), 2);
+    assert_eq!(child.indices(&altered).expect("held").count(), 0);
+
+    // A read of the parent reaches the child's remote rows, which the base
+    // table answer leaves out as `tables()` does.
+    let query = sqlparser::parser::Parser::new(&PostgreSqlDialect {})
+        .try_with_sql("SELECT * FROM parent")
+        .expect("tokenizes")
+        .parse_query()
+        .expect("parses");
+    assert_eq!(query.referenced_tables(&altered).expect("resolves"), [table(&altered, "parent")]);
+
+    assert!(matches!(
+        refusal(&format!("{inherited} DROP TABLE parent;")),
+        Error::DropTableInheritedFrom { .. }
+    ));
+    let cascaded = db(&format!("{inherited} DROP TABLE parent CASCADE;"));
+    assert_eq!(cascaded.foreign_tables().count(), 0);
+    let child_dropped = db(&format!("{inherited} DROP FOREIGN TABLE child;"));
+    assert_eq!(
+        table(&child_dropped, "parent").inheritors(&child_dropped).expect("held").count(),
+        0
+    );
+}
+
 #[test]
 fn drop_schema_counts_and_cascades_to_a_foreign_table() {
     let schema = "CREATE SCHEMA s; CREATE FOREIGN TABLE s.remote (id INT) SERVER warehouse;";
