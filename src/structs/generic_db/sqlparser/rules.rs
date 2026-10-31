@@ -30,8 +30,9 @@ use crate::{
 ///
 /// # Errors
 ///
-/// Returns [`Error::RelationNotFoundForRule`] when no table or view holds the
+/// Returns [`Error::RelationNotFoundForRule`] when no relation holds the
 /// target, [`Error::RuleOnMaterializedView`] when a materialized view does,
+/// [`Error::RuleOnSequence`] when a sequence does,
 /// [`Error::SelectRuleUnsupported`] for an `ON SELECT` rule, and
 /// [`Error::RuleAlreadyExists`] when the relation carries a rule of the same
 /// name and the statement wrote no `OR REPLACE`.
@@ -54,6 +55,11 @@ pub(super) fn create_rule(
     } else if builder.resolve_materialized_view_object_name(&rule.table_name)?.is_some() {
         return Err(Error::RuleOnMaterializedView {
             view_name: relation_name(&rule),
+            rule_name: rule.name.value,
+        });
+    } else if super::sequences::holds_sequence(&builder, &rule.table_name) {
+        return Err(Error::RuleOnSequence {
+            sequence_name: relation_name(&rule),
             rule_name: rule.name.value,
         });
     } else {

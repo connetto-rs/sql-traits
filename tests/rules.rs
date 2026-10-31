@@ -260,6 +260,24 @@ fn a_materialized_view_target_is_refused() {
 }
 
 #[test]
+fn a_sequence_target_is_refused() {
+    let error = parse(
+        "CREATE SEQUENCE s9;
+         CREATE RULE r AS ON INSERT TO s9 DO INSTEAD NOTHING;",
+    )
+    .expect_err("PostgreSQL does not support rules on sequences");
+
+    assert!(
+        matches!(
+            &error,
+            Error::RuleOnSequence { rule_name, sequence_name }
+                if rule_name == "r" && sequence_name == "s9"
+        ),
+        "got {error:?}"
+    );
+}
+
+#[test]
 fn a_select_rule_is_refused() {
     let error = parse(&format!(
         "{ORDERS}CREATE RULE \"_RETURN\" AS ON SELECT TO orders DO INSTEAD SELECT 1 AS id, 2 AS total;"
