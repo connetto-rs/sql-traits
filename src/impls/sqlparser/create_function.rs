@@ -15,9 +15,10 @@ use crate::{
     structs::{FunctionKind, FunctionMetadata, ParserDB, TargetName},
     traits::{DatabaseLike, FunctionLike, Metadata, Relation, role::privilege_holders},
     utils::{
+        identifier_resolution::SearchPath,
         last_str, normalize_sqlparser_type,
         object_name::{
-            SearchPath, is_search_path_parameter, object_name_last_part, search_path_entry,
+            is_search_path_parameter, object_name_last_part, search_path_entry,
             target_name_of_object_name,
         },
     },
@@ -41,37 +42,6 @@ fn function_metadata<'db>(
         .ok_or_else(|| ObjectKind::Function.not_in_database(&function.name.to_string()))
 }
 
-/// The path a function's own setting gives its body, or [`None`] when the
-/// body runs under the caller's.
-///
-/// Ingestion stores `FROM CURRENT` as the path it read, so the clause reaches
-/// here only on a node never ingested, whose current path is the database's.
-///
-/// # Errors
-///
-/// Returns [`LookupError::InvalidObjectName`] for an entry PostgreSQL refuses,
-/// which only a node never ingested can hold.
-fn own_search_path(
-    parameters: &[FunctionDefinitionSetParam],
-    hex_strings_may_be_integers: bool,
-) -> Result<Option<SearchPath<'_>>, LookupError> {
-    let Some(parameter) =
-        parameters.iter().rev().find(|parameter| is_search_path_parameter(&parameter.name))
-    else {
-        return Ok(None);
-    };
-    match &parameter.value {
-        FunctionSetValue::Values(values) => {
-            values
-                .iter()
-                .map(|value| search_path_entry(value, hex_strings_may_be_integers))
-                .collect::<Result<_, _>>()
-                .map(Some)
-        }
-        FunctionSetValue::Default | FunctionSetValue::FromCurrent => Ok(None),
-    }
-}
-
 /// Everything the body of `function` reads, as
 /// [`FunctionLike::referenced_relations`] describes.
 fn body_reads<'db>(
@@ -90,10 +60,8 @@ fn body_reads<'db>(
         return Err(unavailable());
     }
     let hex_strings_may_be_integers = database.dialect().hex_strings_may_be_integers();
-    let path = || {
-        own_search_path(&function.set_params, hex_strings_may_be_integers)
-            .map(|own| own.map_or(BodyPath::Database, BodyPath::Set))
-    };
+    let path =
+        || function.search_path(database).map(|own| own.map_or(BodyPath::Database, BodyPath::Set));
     let walk = |statements: &[Statement]| {
         reads_of_body(function.name(), statements, database, path()?, hex_strings_may_be_integers)
     };
@@ -292,6 +260,50 @@ impl FunctionLike for CreateFunction {
         &self.set_params
     }
 
+    fn search_path<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<SearchPath<'db>>, LookupError> {
+        let Some(parameter) = self
+            .set_params
+            .iter()
+            .rev()
+            .find(|parameter| is_search_path_parameter(&parameter.name))
+        else {
+            return Ok(None);
+        };
+        match &parameter.value {
+            FunctionSetValue::Values(values) => {
+                let hex_strings_may_be_integers = database.dialect().hex_strings_may_be_integers();
+                values
+                    .iter()
+                    .map(|value| search_path_entry(value, hex_strings_may_be_integers))
+                    .collect::<Result<_, _>>()
+                    .map(Some)
+            }
+            // Ingestion stores the clause as the path it read, so it reaches
+            // here only on a node never ingested, whose current path is the
+            // database's.
+            FunctionSetValue::FromCurrent => {
+                Ok(Some(
+                    database
+                        .search_path()
+                        .map(|(schema, quoted)| (Cow::Borrowed(schema), quoted))
+                        .collect(),
+                ))
+            }
+            FunctionSetValue::Default => Ok(None),
+        }
+    }
+
+    #[inline]
+    fn body_is_bound(&self) -> bool {
+        matches!(
+            self.function_body,
+            Some(CreateFunctionBody::Return(_) | CreateFunctionBody::BeginAtomic(_))
+        )
+    }
+
     fn referenced_tables<'db>(
         &self,
         database: &'db Self::DB,
@@ -405,5 +417,107 @@ mod tests {
         assert_eq!(function.name(), "");
         function.name.0.clear();
         assert!(!function.name_is_quoted());
+    }
+
+    /// The definer functions of one schema, each written so that its own path
+    /// or its body's binding differs from the others.
+    const DEFINERS: &str = "
+        CREATE SCHEMA admin;
+        CREATE TABLE admin.docs (id INT);
+        SET search_path = admin, public;
+        CREATE FUNCTION string_body() RETURNS BIGINT LANGUAGE sql SECURITY DEFINER
+            AS 'SELECT count(*) FROM docs';
+        CREATE FUNCTION return_body() RETURNS BIGINT LANGUAGE sql SECURITY DEFINER
+            RETURN (SELECT count(*) FROM docs);
+        CREATE FUNCTION atomic_body() RETURNS BIGINT LANGUAGE sql SECURITY DEFINER
+            BEGIN ATOMIC SELECT count(*) FROM docs; END;
+        CREATE FUNCTION c_body() RETURNS BIGINT LANGUAGE c SECURITY DEFINER AS 'lib', 'sym';
+        CREATE FUNCTION quoted_path() RETURNS INT LANGUAGE sql SECURITY DEFINER
+            SET search_path = 'admin', \"pg_temp\" AS 'SELECT 1';
+        CREATE FUNCTION from_current() RETURNS INT LANGUAGE sql SECURITY DEFINER
+            SET search_path FROM CURRENT AS 'SELECT 1';
+        CREATE FUNCTION emptied() RETURNS INT LANGUAGE sql SECURITY DEFINER
+            SET search_path = '' AS 'SELECT 1';
+        CREATE FUNCTION reset_later() RETURNS INT LANGUAGE sql SECURITY DEFINER
+            SET search_path = '' AS 'SELECT 1';
+        ALTER FUNCTION reset_later() RESET search_path;
+        CREATE FUNCTION reset_all() RETURNS INT LANGUAGE sql SECURITY DEFINER
+            SET search_path = admin AS 'SELECT 1';
+        ALTER FUNCTION reset_all() RESET ALL;
+        CREATE FUNCTION set_later() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+        ALTER FUNCTION set_later() SET search_path = PG_TEMP, \"Admin\";
+        CREATE FUNCTION set_default() RETURNS INT LANGUAGE sql SECURITY DEFINER
+            SET search_path = admin AS 'SELECT 1';
+        ALTER FUNCTION set_default() SET search_path TO DEFAULT;
+    ";
+
+    fn own_path(database: &ParserDB, name: &str) -> Option<Vec<(String, bool)>> {
+        database
+            .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("function exists")
+            .search_path(database)
+            .expect("ingested path reads")
+            .map(|path| {
+                path.into_iter().map(|(schema, quoted)| (schema.into_owned(), quoted)).collect()
+            })
+    }
+
+    #[test]
+    fn own_search_path_follows_every_setting_and_reset() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(DEFINERS).expect("schema parses");
+        let schema = |name: &str, quoted| (name.to_string(), quoted);
+        for unset in ["string_body", "return_body", "atomic_body", "c_body", "reset_later"] {
+            assert_eq!(own_path(&database, unset), None, "{unset} runs under the caller's path");
+        }
+        for unset in ["reset_all", "set_default"] {
+            assert_eq!(own_path(&database, unset), None, "{unset} dropped its setting");
+        }
+        assert_eq!(
+            own_path(&database, "quoted_path"),
+            Some(vec![schema("admin", true), schema("pg_temp", true)]),
+        );
+        assert_eq!(
+            own_path(&database, "from_current"),
+            Some(vec![schema("admin", false), schema("public", false)]),
+        );
+        assert_eq!(own_path(&database, "emptied"), Some(vec![schema("", true)]));
+        assert_eq!(
+            own_path(&database, "set_later"),
+            Some(vec![schema("PG_TEMP", false), schema("Admin", true)]),
+        );
+    }
+
+    #[test]
+    fn only_return_and_atomic_bodies_are_bound() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(DEFINERS).expect("schema parses");
+        let mut bound: Vec<&str> = database
+            .functions()
+            .filter(|function| function.body_is_bound())
+            .map(FunctionLike::name)
+            .collect();
+        bound.sort_unstable();
+        assert_eq!(bound, ["atomic_body", "return_body"]);
+    }
+
+    #[test]
+    fn from_current_on_a_node_never_ingested_reads_the_database_path() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(DEFINERS).expect("schema parses");
+        let Ok(sqlparser::ast::Statement::CreateFunction(function)) =
+            database.dialect().parse_statements(
+                "CREATE FUNCTION loose() RETURNS INT LANGUAGE sql SET search_path FROM CURRENT AS 'SELECT 1'",
+            ).map(|mut statements| statements.remove(0))
+        else {
+            panic!("statement parses into a function");
+        };
+        let path = function.search_path(&database).expect("path reads");
+        assert_eq!(
+            path.map(|path| {
+                path.into_iter()
+                    .map(|(schema, quoted)| (schema.into_owned(), quoted))
+                    .collect::<Vec<_>>()
+            }),
+            Some(vec![("admin".to_string(), false), ("public".to_string(), false)]),
+        );
     }
 }

@@ -24,7 +24,9 @@ use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
     traits::{DatabaseLike, FunctionLike, Relation, SequenceLike, TableLike, ViewLike},
-    utils::identifier_resolution::{identifiers_match, normalize_identifier},
+    utils::identifier_resolution::{
+        SearchPath, identifiers_match, is_temporary_schema, normalize_identifier,
+    },
 };
 
 /// The name PostgreSQL gives the schema holding a session's temporary
@@ -33,14 +35,6 @@ pub(crate) const TEMPORARY_SCHEMA: &str = "pg_temp";
 
 /// The schema holding PostgreSQL's built-in objects.
 pub(crate) const PG_CATALOG: &str = "pg_catalog";
-
-/// Whether a schema name denotes the session's temporary schema.
-///
-/// Unquoted `PG_TEMP` folds onto it, while quoted `"PG_TEMP"` names an
-/// ordinary schema of that exact spelling.
-pub(crate) fn is_temporary_schema(name: &str, quoted: bool) -> bool {
-    identifiers_match(name, quoted, TEMPORARY_SCHEMA, false)
-}
 
 /// The schemas a relation lookup walks for an unqualified name.
 ///
@@ -84,10 +78,6 @@ pub(crate) fn is_search_path_parameter(name: &ObjectName) -> bool {
         [ObjectNamePart::Identifier(ident)] if ident.value.eq_ignore_ascii_case("search_path")
     )
 }
-
-/// A `search_path` read from SQL: each schema as PostgreSQL stores it and
-/// whether it compares exactly.
-pub(crate) type SearchPath<'a> = Vec<(Cow<'a, str>, bool)>;
 
 /// The path a server starts with and `RESET` restores, `"$user", public` with
 /// no schema named after the role.

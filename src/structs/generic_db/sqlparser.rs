@@ -51,16 +51,16 @@ use crate::{
     utils::{
         columns_in_expression,
         identifier_resolution::{
-            identifiers_match, is_public_pseudo_role, normalize_identifier, session_principal,
+            identifiers_match, is_public_pseudo_role, is_temporary_schema, normalize_identifier,
+            session_principal,
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
         object_name::{
             Qualifier, RelationKey, SearchPathChange, TEMPORARY_SCHEMA, is_search_path_parameter,
-            is_temporary_schema, object_name_identifiers, object_name_last_part,
-            overqualified_object_name, qualifier_of, relation_search_path,
-            require_local_object_name, require_static_object_name,
-            resolve_sequence_on_search_path_in_iter, resolve_table_object_name_in_iter,
-            resolve_table_object_name_on_search_path_in_iter,
+            object_name_identifiers, object_name_last_part, overqualified_object_name,
+            qualifier_of, relation_search_path, require_local_object_name,
+            require_static_object_name, resolve_sequence_on_search_path_in_iter,
+            resolve_table_object_name_in_iter, resolve_table_object_name_on_search_path_in_iter,
             resolve_target_on_search_path_in_iter, resolve_view_on_search_path_in_iter,
             search_path_change, search_path_entry, sequence_matches_key, stored_table_key,
             table_matches_key, table_matches_object_name, target_name_of_idents,

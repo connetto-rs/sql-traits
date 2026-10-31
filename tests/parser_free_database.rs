@@ -16,7 +16,7 @@ use sql_traits::{
     prelude::*,
     structs::TargetName,
     traits::{ColumnCollation, TypeMatch, grant::GrantTarget},
-    utils::scalar_family::ScalarFamily,
+    utils::{identifier_resolution::SearchPath, scalar_family::ScalarFamily},
 };
 use sqlparser::{
     ast::{
@@ -926,6 +926,17 @@ impl FunctionLike for MemoryFunction {
 
     fn configuration_parameters(&self) -> &[FunctionDefinitionSetParam] {
         &[]
+    }
+
+    fn search_path<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<SearchPath<'db>>, LookupError> {
+        Ok(None)
+    }
+
+    fn body_is_bound(&self) -> bool {
+        false
     }
 
     fn referenced_tables<'db>(

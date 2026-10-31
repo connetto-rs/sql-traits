@@ -15,10 +15,7 @@ use crate::{
         check_constraint::{evaluate_constant_expr, non_tautological},
         role::privilege_holders,
     },
-    utils::{
-        identifier_resolution::{identifiers_match, normalize_identifier},
-        object_name::is_temporary_schema,
-    },
+    utils::identifier_resolution::{identifiers_match, is_temporary_schema, normalize_identifier},
 };
 
 /// How a partitioned table routes a row to one of its partitions.

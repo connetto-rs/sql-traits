@@ -10,6 +10,8 @@ use alloc::{borrow::Cow, string::String};
 use sqlparser::ast::{Function, Ident};
 use unicode_normalization::UnicodeNormalization;
 
+use super::object_name::TEMPORARY_SCHEMA;
+
 /// Parsed lookup identifier from a textual query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupIdentifier<'a> {
@@ -86,6 +88,32 @@ pub fn stored_identifier_matches_lookup(
 #[must_use]
 pub fn is_public_pseudo_role(value: &str, quoted: bool) -> bool {
     !quoted && value.eq_ignore_ascii_case("PUBLIC")
+}
+
+/// A `search_path`, each schema as PostgreSQL stores it with whether it
+/// compares exactly, which is the quoting of the identifier it was read from
+/// and true for an entry written as a string, number or boolean.
+pub type SearchPath<'a> = Vec<(Cow<'a, str>, bool)>;
+
+/// Returns whether a schema name denotes the session's temporary schema,
+/// as an entry of a `search_path` or the qualifier of a name.
+///
+/// Unquoted `PG_TEMP` folds onto `pg_temp`, and a quoted `"pg_temp"` spells
+/// it exactly, while a quoted `"PG_TEMP"` names an ordinary schema of that
+/// spelling.
+///
+/// # Example
+///
+/// ```rust
+/// use sql_traits::utils::identifier_resolution::is_temporary_schema;
+///
+/// assert!(is_temporary_schema("PG_TEMP", false));
+/// assert!(is_temporary_schema("pg_temp", true));
+/// assert!(!is_temporary_schema("PG_TEMP", true));
+/// ```
+#[must_use]
+pub fn is_temporary_schema(name: &str, quoted: bool) -> bool {
+    identifiers_match(name, quoted, TEMPORARY_SCHEMA, false)
 }
 
 /// A principal the grammar spells as a keyword, naming whoever runs the

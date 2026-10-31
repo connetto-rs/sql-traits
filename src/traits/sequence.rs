@@ -8,7 +8,7 @@ use sqlparser::ast::SequenceOptions;
 use crate::{
     structs::TargetName,
     traits::{DatabaseLike, Metadata},
-    utils::{identifier_resolution::normalize_identifier, object_name::is_temporary_schema},
+    utils::identifier_resolution::{is_temporary_schema, normalize_identifier},
 };
 
 /// The column a sequence is owned by, saying which kind of relation holds it.
