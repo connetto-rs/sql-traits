@@ -8,17 +8,30 @@
 //! types puts those differences in the type system rather than in a flag every
 //! reader has to remember to check.
 
+pub(crate) mod options;
+
 use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
 
-use sqlparser::ast::{CreateView, Query};
+use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, SqlOption};
 
-use crate::utils::{
-    object_name::{Qualifier, TEMPORARY_SCHEMA, object_name_last_part, qualifier_of},
-    output_from_wildcard,
+use crate::{
+    errors::{Error, ObjectKind},
+    utils::{
+        object_name::{Qualifier, TEMPORARY_SCHEMA, object_name_last_part, qualifier_of},
+        output_from_wildcard,
+    },
 };
+
+/// The `WITH (...)` list of a parsed `CREATE VIEW`, empty when it wrote none.
+fn with_options(node: &CreateView) -> &[SqlOption] {
+    match &node.options {
+        CreateTableOptions::With(options) => options,
+        _ => &[],
+    }
+}
 
 /// The parts of a `CREATE VIEW` a schema records, shared by both view kinds.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -177,15 +190,30 @@ impl ViewDeclaration {
 pub struct View {
     /// What the declaration said.
     declaration: ViewDeclaration,
+    /// Whether the planner may not push a caller's functions below the view's
+    /// own conditions.
+    security_barrier: bool,
+    /// Whether the relations underneath are checked against the caller's
+    /// rights and policies rather than the view owner's.
+    security_invoker: bool,
 }
 
 impl View {
-    /// Records a parsed `CREATE VIEW` that carries no `MATERIALIZED` modifier.
+    /// Records a parsed `CREATE VIEW` that carries no `MATERIALIZED` modifier,
+    /// with the options its `WITH (...)` sets.
     ///
-    /// Answers [`None`] for a declaration carrying no usable name.
-    #[must_use]
-    pub fn from_node(node: &CreateView) -> Option<Self> {
-        ViewDeclaration::from_node(node).map(|declaration| Self { declaration })
+    /// # Errors
+    ///
+    /// Returns [`Error::UnnamedObject`] for a declaration carrying no usable
+    /// name, and [`Error::UnrecognizedViewOption`],
+    /// [`Error::InvalidViewOptionValue`] or [`Error::RepeatedViewOption`] for
+    /// an option list PostgreSQL refuses.
+    pub fn from_node(node: &CreateView) -> Result<Self, Error> {
+        let declaration = ViewDeclaration::from_node(node)
+            .ok_or(Error::UnnamedObject { object_kind: ObjectKind::View })?;
+        let mut view = Self { declaration, security_barrier: false, security_invoker: false };
+        view.set_options(&node.name, with_options(node))?;
+        Ok(view)
     }
 
     /// Returns what the declaration said.
@@ -199,6 +227,47 @@ impl View {
     /// Crate-private, for the same reason [`ViewDeclaration::set_name`] is.
     pub(crate) fn declaration_mut(&mut self) -> &mut ViewDeclaration {
         &mut self.declaration
+    }
+
+    /// Returns whether the view's `security_barrier` option is on.
+    pub(crate) fn security_barrier(&self) -> bool {
+        self.security_barrier
+    }
+
+    /// Returns whether the view's `security_invoker` option is on.
+    pub(crate) fn security_invoker(&self) -> bool {
+        self.security_invoker
+    }
+
+    /// Sets the options `options` names on view `view_name`, leaving the
+    /// others as they are, or none of them when the list is refused.
+    ///
+    /// # Errors
+    ///
+    /// The option errors of [`Self::from_node`].
+    pub(crate) fn set_options(
+        &mut self,
+        view_name: &ObjectName,
+        options: &[SqlOption],
+    ) -> Result<(), Error> {
+        self.apply(options::plain_view_options(view_name, options)?);
+        Ok(())
+    }
+
+    /// Turns off the options a `RESET (...)` names, leaving the others as they
+    /// are. Only the names written without a namespace reach here.
+    pub(crate) fn reset_options<'name>(&mut self, names: impl IntoIterator<Item = &'name Ident>) {
+        self.apply(options::plain_view_reset(names));
+    }
+
+    /// Applies every setting `written` carries.
+    fn apply(&mut self, written: options::PlainViewOptions) {
+        if let Some(on) = written.security_barrier {
+            self.security_barrier = on;
+        }
+        if let Some(on) = written.security_invoker {
+            self.security_invoker = on;
+        }
     }
 }
 
@@ -218,10 +287,18 @@ impl MaterializedView {
     /// Records a parsed `CREATE VIEW` that carries the `MATERIALIZED`
     /// modifier.
     ///
-    /// Answers [`None`] for a declaration carrying no usable name.
-    #[must_use]
-    pub fn from_node(node: &CreateView) -> Option<Self> {
-        ViewDeclaration::from_node(node).map(|declaration| Self { declaration })
+    /// Its `WITH (...)` sets storage parameters, which are not recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnnamedObject`] for a declaration carrying no usable
+    /// name, and [`Error::UnrecognizedViewOption`] for an option only a plain
+    /// view takes.
+    pub fn from_node(node: &CreateView) -> Result<Self, Error> {
+        let declaration = ViewDeclaration::from_node(node)
+            .ok_or(Error::UnnamedObject { object_kind: ObjectKind::MaterializedView })?;
+        options::refuse_plain_view_options(&node.name, with_options(node))?;
+        Ok(Self { declaration })
     }
 
     /// Returns what the declaration said.

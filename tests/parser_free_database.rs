@@ -657,6 +657,10 @@ impl ViewLike for MemoryView {
     fn declared_column_names(&self) -> &[(String, bool)] {
         &self.declared_column_names
     }
+
+    fn owner<'db>(&self, _database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
+        Ok(None)
+    }
 }
 
 impl SequenceLike for MemorySequence {

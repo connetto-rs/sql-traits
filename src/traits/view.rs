@@ -6,6 +6,7 @@ use core::{fmt::Debug, hash::Hash};
 use sqlparser::ast::Query;
 
 use crate::{
+    errors::LookupError,
     structs::TargetName,
     traits::{DatabaseLike, Metadata},
     utils::{
@@ -252,6 +253,117 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     fn selects_wildcard(&self) -> bool {
         output_from_wildcard(self.definition())
     }
+
+    /// Returns whether the relations underneath this view are checked against
+    /// the rights and row-level security policies of whoever reads through it,
+    /// rather than against the view owner's.
+    ///
+    /// PostgreSQL sets this with the `security_invoker` option of `CREATE VIEW
+    /// ... WITH (...)` and of `ALTER VIEW` or `ALTER TABLE ... SET (...)`,
+    /// which takes any spelling of a boolean the server reads, and reads the
+    /// option named alone as `true`. A `RESET (...)` naming it turns it off.
+    /// `CREATE OR REPLACE VIEW` replaces every option, so a replacement that
+    /// writes none turns it off too. A materialized view takes no such option,
+    /// and the default answers `false`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id INT, title TEXT);
+    ///      CREATE VIEW owner_rights AS SELECT id, title FROM docs;
+    ///      CREATE VIEW caller_rights WITH (security_invoker = on) AS SELECT id, title FROM docs;",
+    /// )?;
+    /// let view = |name| db.view_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// assert!(!view("owner_rights")?.expect("recorded").is_security_invoker());
+    /// assert!(view("caller_rights")?.expect("recorded").is_security_invoker());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_security_invoker(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this view is a security barrier, so the planner applies
+    /// its own conditions before any function or operator not marked
+    /// `LEAKPROOF` that a reader's query adds, which then never sees the rows
+    /// those conditions filter out.
+    ///
+    /// PostgreSQL sets this with the `security_barrier` option, on the same
+    /// terms as [`Self::is_security_invoker`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id INT);
+    ///      CREATE VIEW v AS SELECT id FROM docs;
+    ///      ALTER TABLE v SET (security_barrier = true);",
+    /// )?;
+    /// let view = db.view_by_target(TargetName::new("v", false), IdentifierCase::AsWritten)?.unwrap();
+    /// assert!(view.is_security_barrier());
+    /// assert!(!view.is_security_invoker());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_security_barrier(&self) -> bool {
+        false
+    }
+
+    /// Returns the role the input hands this view to, which PostgreSQL checks
+    /// the relations underneath against unless the view
+    /// [runs with its reader's rights](Self::is_security_invoker).
+    ///
+    /// Only `ALTER VIEW` or `ALTER TABLE ... OWNER TO <role>` names an owner.
+    /// A view no such statement altered has none, and neither has one handed
+    /// to `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`, which name whoever
+    /// runs the statement rather than a role the input declares. A
+    /// replacement keeps the owner.
+    ///
+    /// The role is reported as the statement spelled it, with no case folding,
+    /// which is how [`DatabaseLike::role`] stores the names it matches against.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance to which the view
+    ///   belongs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this view.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE app_owner;
+    ///      CREATE TABLE docs (id INT);
+    ///      CREATE VIEW owned AS SELECT id FROM docs;
+    ///      CREATE VIEW unowned AS SELECT id FROM docs;
+    ///      ALTER TABLE owned OWNER TO app_owner;",
+    /// )?;
+    /// let view = |name| db.view_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// assert_eq!(view("owned")?.expect("recorded").owner(&db)?, Some("app_owner"));
+    /// assert_eq!(view("unowned")?.expect("recorded").owner(&db)?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError>;
 
     /// Returns the column names the declaration wrote, each with its quote
     /// state, or an empty slice when it wrote none.

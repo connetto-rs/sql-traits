@@ -29,9 +29,9 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterTableOperation, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, SelectItem, SetExpr, Statement, TableFactor, Visit, VisitMut, Visitor,
-    VisitorMut,
+    AlterColumnOperation, AlterTableOperation, AlterView, AlterViewOperation, CreateView, Expr,
+    Ident, ObjectName, ObjectNamePart, Owner, Query, RenameTableNameKind, SelectItem, SetExpr,
+    SqlOption, Statement, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use super::{
@@ -43,7 +43,10 @@ use super::{
 use crate::{
     errors::{Error, LookupError, ObjectKind},
     impls::dql::query_output_names,
-    structs::{IdentifierCase, MaterializedView, View, ViewDeclaration, metadata::ViewMetadata},
+    structs::{
+        IdentifierCase, MaterializedView, View, ViewDeclaration, metadata::ViewMetadata,
+        view::options::refuse_plain_view_options,
+    },
     traits::ViewLike,
     utils::{
         identifier_resolution::identifiers_match,
@@ -122,9 +125,7 @@ pub(super) fn create_view(
     {
         let (existing, metadata, identity) = builder.views_mut().remove(position);
         check_replacement_columns(existing.as_ref(), &node)?;
-        let Some(mut view) = View::from_node(&node) else {
-            return Err(Error::UnnamedObject { object_kind: kind });
-        };
+        let mut view = View::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
     }
@@ -146,15 +147,11 @@ pub(super) fn create_view(
     }
 
     if node.materialized {
-        let Some(mut view) = MaterializedView::from_node(&node) else {
-            return Err(Error::UnnamedObject { object_kind: kind });
-        };
+        let mut view = MaterializedView::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         Ok(builder.add_materialized_view(Arc::new(view), ViewMetadata::default()))
     } else {
-        let Some(mut view) = View::from_node(&node) else {
-            return Err(Error::UnnamedObject { object_kind: kind });
-        };
+        let mut view = View::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         Ok(builder.add_view(Arc::new(view), ViewMetadata::default()))
     }
@@ -363,8 +360,9 @@ fn rendered_name(name: &ObjectName) -> String {
 ///
 /// PostgreSQL accepts `ALTER TABLE` against a view for the actions a view
 /// supports and refuses the rest naming the action. Of those the parser can
-/// read, this handles renaming the view or one of its columns and changing
-/// the owner.
+/// read, this handles renaming the view or one of its columns, changing the
+/// owner, setting and resetting options, and setting or dropping a plain
+/// view's column default.
 ///
 /// Only called when [`holds_view`] answered, so the name is known to be a
 /// view's.
@@ -373,8 +371,9 @@ fn rendered_name(name: &ObjectName) -> String {
 ///
 /// Returns [`Error::AlterActionUnsupportedOnRelation`] for an action a view
 /// does not support, [`Error::RelationNameAlreadyTaken`] when a rename asks
-/// for a name another relation in the schema holds, and the errors of
-/// [`rename_view_column`].
+/// for a name another relation in the schema holds, the errors of
+/// [`rename_view_column`], those of [`set_view_options`], and those of
+/// [`require_view_column`].
 pub(super) fn alter_view(
     builder: ParserDBBuilder,
     name: &ObjectName,
@@ -393,6 +392,24 @@ pub(super) fn alter_view(
         AlterTableOperation::OwnerTo { new_owner } => {
             Ok(set_view_owner(builder, name, kind, new_owner))
         }
+        AlterTableOperation::SetOptionsParens { options } => {
+            set_view_options(builder, name, kind, options)
+        }
+        AlterTableOperation::ResetOptions { options } => {
+            // A namespaced name such as `toast.security_invoker` resets a
+            // TOAST table's option, which no view has.
+            let own = options.iter().filter_map(|option| {
+                match option.0.as_slice() {
+                    [ObjectNamePart::Identifier(own)] => Some(own),
+                    _ => None,
+                }
+            });
+            Ok(reset_view_options(builder, name, kind, own))
+        }
+        AlterTableOperation::AlterColumn {
+            column_name,
+            op: AlterColumnOperation::SetDefault { .. } | AlterColumnOperation::DropDefault,
+        } if kind == ObjectKind::View => require_view_column(builder, name, column_name),
         other => {
             Err(Error::AlterActionUnsupportedOnRelation {
                 object_kind: kind,
@@ -401,6 +418,158 @@ pub(super) fn alter_view(
             })
         }
     }
+}
+
+/// Applies an `ALTER VIEW`, which PostgreSQL accepts only against a plain
+/// view.
+///
+/// `SET SCHEMA` and MySQL's `ALTER VIEW ... AS`, which redefines the view, are
+/// refused, since the model can apply neither and discarding either would
+/// leave it wrong.
+///
+/// # Errors
+///
+/// Returns [`Error::RelationKindMismatch`] when another kind of relation holds
+/// the name, [`Error::RelationNotFound`] when nothing does and the statement
+/// wrote no `IF EXISTS`, [`Error::UnsupportedAlterTableOperation`] for the two
+/// operations refused above, and the errors of [`alter_view`] for the
+/// operations it shares with `ALTER TABLE`.
+pub(super) fn apply_alter_view(
+    builder: ParserDBBuilder,
+    statement: &AlterView,
+) -> Result<ParserDBBuilder, Error> {
+    let AlterView { name, if_exists, operation } = statement;
+    if plain_view_position(&builder, name).is_none() {
+        return match builder.relation_reached(name).map(|(kind, _)| kind) {
+            Some(actual_kind) => {
+                Err(Error::RelationKindMismatch {
+                    object_name: rendered_name(name),
+                    expected_kind: ObjectKind::View,
+                    actual_kind,
+                })
+            }
+            None if *if_exists => Ok(builder),
+            None => {
+                Err(Error::RelationNotFound {
+                    object_kind: ObjectKind::View,
+                    object_name: rendered_name(name),
+                })
+            }
+        };
+    }
+    let kind = ObjectKind::View;
+    match operation {
+        AlterViewOperation::OwnerTo(owner) => Ok(set_view_owner(builder, name, kind, owner)),
+        AlterViewOperation::SetOptions { options } => {
+            set_view_options(builder, name, kind, options)
+        }
+        AlterViewOperation::ResetOptions { options } => {
+            Ok(reset_view_options(builder, name, kind, options))
+        }
+        AlterViewOperation::RenameTo { new_name } => rename_view(builder, name, kind, new_name),
+        AlterViewOperation::RenameColumn { old_column_name, new_column_name } => {
+            rename_view_column(builder, name, kind, old_column_name, new_column_name)
+        }
+        AlterViewOperation::AlterColumn { column_name, .. } => {
+            require_view_column(builder, name, column_name)
+        }
+        AlterViewOperation::SetSchema { .. } | AlterViewOperation::As { .. } => {
+            Err(Error::UnsupportedAlterTableOperation {
+                table_name: rendered_name(name),
+                operation: operation.to_string(),
+            })
+        }
+    }
+}
+
+/// Checks that the plain view `name` exposes `column_name`, for a column
+/// default an `ALTER ... ALTER COLUMN` sets or drops on it.
+///
+/// The default itself is not recorded. When the model cannot name every
+/// column the view exposes, a name it does not find is accepted, which never
+/// refuses input the server accepts.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ColumnNotFound`] when the view's columns can all be
+/// named and none is `column_name`.
+fn require_view_column(
+    builder: ParserDBBuilder,
+    name: &ObjectName,
+    column_name: &Ident,
+) -> Result<ParserDBBuilder, Error> {
+    plain_view_position(&builder, name).map_or(Ok(()), |position| {
+        require_exposed(&builder, builder.views()[position].0.declaration(), column_name)
+    })?;
+    Ok(builder)
+}
+
+/// Refuses `column_name` when the view `declaration` describes exposes no
+/// column of that name and every column it exposes can be named.
+fn require_exposed(
+    builder: &ParserDBBuilder,
+    declaration: &ViewDeclaration,
+    column_name: &Ident,
+) -> Result<(), Error> {
+    let (names, enumerable) = output_names(builder, declaration)?;
+    let exposed = names.iter().any(|(exposed, quoted)| {
+        identifiers_match(exposed, *quoted, &column_name.value, column_name.quote_style.is_some())
+    });
+    if enumerable && !exposed {
+        return Err(LookupError::ColumnNotFound {
+            table_name: declaration.name().to_string(),
+            column_name: column_name.value.clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Sets the options an `ALTER TABLE ... SET (...)` names on a view, leaving
+/// the others as they are.
+///
+/// A materialized view takes storage parameters here, which are not recorded.
+///
+/// # Errors
+///
+/// Returns [`Error::UnrecognizedViewOption`] for a name the view's kind does
+/// not take, [`Error::InvalidViewOptionValue`] for a value PostgreSQL does not
+/// read as the option's type, and [`Error::RepeatedViewOption`] for an option
+/// the list names twice.
+fn set_view_options(
+    mut builder: ParserDBBuilder,
+    name: &ObjectName,
+    kind: ObjectKind,
+    options: &[SqlOption],
+) -> Result<ParserDBBuilder, Error> {
+    if kind == ObjectKind::MaterializedView {
+        refuse_plain_view_options(name, options)?;
+    }
+    if kind == ObjectKind::View
+        && let Some(position) = plain_view_position(&builder, name)
+    {
+        Arc::make_mut(&mut builder.views_mut()[position].0).set_options(name, options)?;
+    }
+    Ok(builder)
+}
+
+/// Turns off the options a `RESET (...)` names on a view, leaving the others
+/// as they are.
+///
+/// PostgreSQL refuses no name here on either kind of view, and the storage
+/// parameters a materialized view resets are not recorded.
+fn reset_view_options<'name>(
+    mut builder: ParserDBBuilder,
+    name: &ObjectName,
+    kind: ObjectKind,
+    names: impl IntoIterator<Item = &'name Ident>,
+) -> ParserDBBuilder {
+    if kind == ObjectKind::View
+        && let Some(position) = plain_view_position(&builder, name)
+    {
+        Arc::make_mut(&mut builder.views_mut()[position].0).reset_options(names);
+    }
+    builder
 }
 
 /// The view kind a written relation name resolves to, if a view holds it.

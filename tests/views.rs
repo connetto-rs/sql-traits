@@ -16,7 +16,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use sql_traits::{
-    errors::{Error, ObjectKind},
+    errors::{Error, LookupError, ObjectKind},
     prelude::*,
     structs::{MaterializedView, ParserDBBuilder, View, ViewMetadata},
     traits::Metadata,
@@ -115,6 +115,10 @@ impl ViewLike for DefaultView {
 
     fn declared_column_names(&self) -> &[(String, bool)] {
         &[]
+    }
+
+    fn owner<'db>(&self, _database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
+        Ok(None)
     }
 }
 
@@ -609,8 +613,7 @@ fn dropping_a_view_frees_its_name() {
 
 #[test]
 fn a_view_can_be_renamed_and_handed_to_a_role() {
-    // `ALTER VIEW` does not parse at all in the pinned parser, and
-    // `ALTER TABLE <view>` is what the server accepts too.
+    // PostgreSQL accepts `ALTER TABLE <view>` for both actions.
     let db = parse(
         "CREATE ROLE r;
          CREATE TABLE t (a INT);
