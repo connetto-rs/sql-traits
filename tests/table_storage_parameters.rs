@@ -86,15 +86,80 @@ fn a_table_without_a_with_clause_has_no_parameters() {
 }
 
 #[test]
-fn an_option_without_a_value_is_no_storage_parameter() {
+fn an_option_named_without_a_value_is_true() {
+    // Measured: PostgreSQL stores `autovacuum_enabled=true` for either form.
+    assert_eq!(
+        parameters_after("CREATE TABLE t (id INT) WITH (autovacuum_enabled);", "t"),
+        pairs(&[("autovacuum_enabled", "true")])
+    );
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE t (id INT) WITH (autovacuum_enabled = false, fillfactor = 70);
+             ALTER TABLE t SET (Autovacuum_Enabled);",
+            "t"
+        ),
+        pairs(&[("fillfactor", "70"), ("autovacuum_enabled", "true")])
+    );
+    // The generic dialect reads MSSQL's `HEAP` into the same bare option.
     let database = ParserDB::parse::<GenericDialect>(
         "CREATE TABLE t (id INT) WITH (HEAP, fillfactor = 70);
          CREATE TABLE s (id INT);
          ALTER TABLE s SET (HEAP, fillfactor = 70);",
     )
     .expect("the generic dialect reads HEAP as a bare option");
-    assert_eq!(parameters_of(&database, "t"), pairs(&[("fillfactor", "70")]));
-    assert_eq!(parameters_of(&database, "s"), pairs(&[("fillfactor", "70")]));
+    assert_eq!(parameters_of(&database, "t"), pairs(&[("heap", "true"), ("fillfactor", "70")]));
+    assert_eq!(parameters_of(&database, "s"), pairs(&[("heap", "true"), ("fillfactor", "70")]));
+}
+
+#[test]
+fn alter_table_reset_removes_the_parameters_it_names() {
+    let schema = "CREATE TABLE t (id INT) WITH (fillfactor = 70, autovacuum_enabled = false);";
+    let after = |reset: &str| parameters_after(&format!("{schema} {reset}"), "t");
+    assert_eq!(
+        after("ALTER TABLE t RESET (FillFactor);"),
+        pairs(&[("autovacuum_enabled", "false")])
+    );
+    assert_eq!(after("ALTER TABLE t RESET (fillfactor, autovacuum_enabled);"), pairs(&[]));
+    // Measured: each of these is accepted and resets nothing.
+    for untouched in [
+        "ALTER TABLE t RESET (\"FillFactor\");",
+        "ALTER TABLE t RESET (toast.fillfactor);",
+        "ALTER TABLE t RESET (vacuum_truncate);",
+        "ALTER TABLE t RESET (no_such_parameter);",
+    ] {
+        assert_eq!(
+            after(untouched),
+            pairs(&[("fillfactor", "70"), ("autovacuum_enabled", "false")]),
+            "{untouched}"
+        );
+    }
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE t (id INT) WITH (autovacuum_enabled);
+             ALTER TABLE t RESET (autovacuum_enabled);",
+            "t"
+        ),
+        pairs(&[])
+    );
+}
+
+#[test]
+fn set_and_reset_in_one_statement_apply_in_order() {
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE t (id INT); ALTER TABLE t SET (fillfactor = 70), RESET (fillfactor);",
+            "t"
+        ),
+        pairs(&[])
+    );
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE t (id INT) WITH (fillfactor = 70, autovacuum_enabled = false);
+             ALTER TABLE t RESET (fillfactor), SET (fillfactor = 50);",
+            "t"
+        ),
+        pairs(&[("autovacuum_enabled", "false"), ("fillfactor", "50")])
+    );
 }
 
 #[test]
@@ -212,6 +277,18 @@ fn alter_table_set_names_a_table_that_exists() {
 }
 
 #[test]
+fn alter_table_reset_names_a_table_that_exists() {
+    let error =
+        parse("ALTER TABLE missing RESET (fillfactor);").expect_err("an absent table is refused");
+    assert!(
+        matches!(&error, Error::AlterTableNotFound { table_name } if table_name == "missing"),
+        "got {error:?}"
+    );
+    parse("ALTER TABLE IF EXISTS missing RESET (fillfactor);")
+        .expect("IF EXISTS skips an absent table");
+}
+
+#[test]
 fn a_partitioned_table_takes_no_parameters() {
     let error = parse(
         "CREATE TABLE root (id INT) PARTITION BY RANGE (id);
@@ -221,5 +298,19 @@ fn a_partitioned_table_takes_no_parameters() {
     assert!(
         matches!(&error, Error::StorageParametersOnPartitionedTable { table_name } if table_name == "root"),
         "got {error:?}"
+    );
+}
+
+#[test]
+fn a_partitioned_table_takes_a_reset() {
+    // Measured: PostgreSQL refuses `SET` on a partitioned table and accepts
+    // `RESET`, which has nothing to remove.
+    assert_eq!(
+        parameters_after(
+            "CREATE TABLE root (id INT) PARTITION BY RANGE (id);
+             ALTER TABLE root RESET (fillfactor);",
+            "root"
+        ),
+        pairs(&[])
     );
 }

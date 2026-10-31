@@ -2545,6 +2545,15 @@ fn idents_match(left: &Ident, right: &Ident) -> bool {
     )
 }
 
+/// The name a storage parameter is written under, with or without a value, or
+/// `None` for an option of another dialect's shape.
+fn storage_parameter_key(option: &SqlOption) -> Option<&Ident> {
+    match option {
+        SqlOption::KeyValue { key, .. } | SqlOption::Ident(key) => Some(key),
+        _ => None,
+    }
+}
+
 /// Returns whether two object names carry the same final identifier under
 /// PostgreSQL folding.
 ///
@@ -5751,14 +5760,53 @@ impl ParserDB {
             for option in options {
                 // PostgreSQL moves a replaced parameter after the others in
                 // `reloptions`.
-                if let SqlOption::KeyValue { key, .. } = &option {
+                if let Some(key) = storage_parameter_key(&option) {
                     parameters.retain(|stored| {
-                        !matches!(stored, SqlOption::KeyValue { key: stored, .. } if idents_match(stored, key))
+                        !storage_parameter_key(stored)
+                            .is_some_and(|stored| idents_match(stored, key))
                     });
                 }
                 parameters.push(option);
             }
             replacement.table_options = CreateTableOptions::With(parameters);
+            Ok(())
+        })
+    }
+
+    /// Applies `ALTER TABLE ... RESET (...)` to the storage parameters of the
+    /// table it names.
+    ///
+    /// PostgreSQL refuses no name here, a partitioned table included, so a
+    /// name the table does not carry resets nothing. A namespaced name such as
+    /// `toast.fillfactor` never matches a parameter of the table itself.
+    fn alter_table_reset_storage_parameters(
+        builder: ParserDBBuilder,
+        table_name: &ObjectName,
+        scope: AlterTableScope,
+        names: &[ObjectName],
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
+            return Ok(builder);
+        };
+        let reset = |option: &SqlOption| {
+            storage_parameter_key(option).is_some_and(|key| {
+                names.iter().any(|name| {
+                    matches!(name.0.as_slice(), [ObjectNamePart::Identifier(written)] if idents_match(written, key))
+                })
+            })
+        };
+        let CreateTableOptions::With(parameters) =
+            &Self::stored_node(&builder, &stored)?.table_options
+        else {
+            return Ok(builder);
+        };
+        if !parameters.iter().any(reset) {
+            return Ok(builder);
+        }
+        Self::replace_table_node(builder, &stored, |_, replacement| {
+            if let CreateTableOptions::With(parameters) = &mut replacement.table_options {
+                parameters.retain(|option| !reset(option));
+            }
             Ok(())
         })
     }
@@ -7489,6 +7537,15 @@ impl ParserDB {
                                     &alter_table.name,
                                     scope,
                                     options,
+                                )?;
+                            }
+
+                            AlterTableOperation::ResetOptions { options } => {
+                                builder = Self::alter_table_reset_storage_parameters(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &options,
                                 )?;
                             }
 
