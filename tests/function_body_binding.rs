@@ -3371,3 +3371,37 @@ fn a_block_body_write_shields_a_factor_its_alias_names_twice() {
         "the rename is restored through the alias column list"
     );
 }
+
+/// A write target or clause factor written with `ONLY` keeps the marker when
+/// a rename reaches it.
+#[test]
+fn a_block_body_keeps_only_markers_through_renames() {
+    let db = parse(
+        "CREATE TABLE o1t (a INT);
+         CREATE FUNCTION f() RETURNS VOID LANGUAGE sql BEGIN ATOMIC
+             UPDATE ONLY o1t SET a = 1 WHERE a > 0;
+         END;
+         ALTER TABLE o1t RENAME TO o1u;
+         ALTER TABLE o1u RENAME COLUMN a TO b;",
+    )
+    .expect("the renames are accepted");
+    assert_eq!(
+        text(&db, "f"),
+        "CREATE FUNCTION f() RETURNS VOID LANGUAGE sql BEGIN ATOMIC UPDATE ONLY o1u SET b = 1 WHERE o1u.b > 0; END"
+    );
+
+    let db = parse(
+        "CREATE TABLE o2t (a INT);
+         CREATE TABLE o2s (a INT);
+         CREATE FUNCTION f() RETURNS VOID LANGUAGE sql BEGIN ATOMIC
+             MERGE INTO ONLY o2t USING ONLY o2s ON o2t.a = o2s.a WHEN MATCHED THEN DELETE;
+         END;
+         ALTER TABLE o2t RENAME TO o2u;
+         ALTER TABLE o2s RENAME TO o2v;",
+    )
+    .expect("the renames are accepted");
+    assert_eq!(
+        text(&db, "f"),
+        "CREATE FUNCTION f() RETURNS VOID LANGUAGE sql BEGIN ATOMIC MERGE INTO ONLY o2u USING ONLY o2v ON o2u.a = o2v.a WHEN MATCHED THEN DELETE; END"
+    );
+}
