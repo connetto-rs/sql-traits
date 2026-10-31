@@ -2474,6 +2474,12 @@ fn option_involves_column(
     }
 }
 
+/// Whether the option is a check the named table keeps from the tables
+/// inheriting it.
+fn is_no_inherit_check(option: &ColumnOptionDef) -> bool {
+    matches!(&option.option, ColumnOption::Check(check) if check.no_inherit)
+}
+
 /// Removes the foreign keys a node declares, in either spelling, that `doomed`
 /// selects.
 fn drop_foreign_keys(node: &mut CreateTable, doomed: impl Fn(&ForeignKeyConstraint) -> bool) {
@@ -6043,7 +6049,7 @@ impl ParserDB {
         builder: ParserDBBuilder,
         table_name: &ObjectName,
         scope: AlterTableScope,
-        column_def: ColumnDef,
+        mut column_def: ColumnDef,
         if_not_exists: bool,
         position: Option<&MySQLColumnPosition>,
         active_collations: ActiveCollations<'_>,
@@ -6071,10 +6077,7 @@ impl ParserDB {
 
         // A check riding the column as `NO INHERIT` stays with the named
         // table, and a partitioned table cannot hold one at all.
-        if column_def
-            .options
-            .iter()
-            .any(|option| matches!(&option.option, ColumnOption::Check(check) if check.no_inherit))
+        if column_def.options.iter().any(is_no_inherit_check)
             && Self::stored_node(&builder, &stored)?.partition_by.is_some()
         {
             return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
@@ -6084,16 +6087,15 @@ impl ParserDB {
         // Named against the schema as it stands, before the column lands.
         let column_sequences =
             sequences::plan_column_sequences(&builder, &stored, core::iter::once(&column_def));
+        sequences::bind_column_defaults(&builder, &stored.name, core::iter::once(&mut column_def))?;
 
-        // PostgreSQL gives the column to every table inheriting this one,
-        // added at the end of each because their own columns already hold
-        // their places. Read before the parent changes, so the list is the
-        // one the statement found.
+        // Read before the parent changes.
         let inheritors = inheritance::descendants(&builder, &stored);
         let mut inherited_def = column_def.clone();
-        inherited_def.options.retain(
-            |option| !matches!(&option.option, ColumnOption::Check(check) if check.no_inherit),
-        );
+        inherited_def.options.retain(|option| !is_no_inherit_check(option));
+        sequences::spell_out_planned_serial(&mut inherited_def, &stored, &column_sequences);
+        let (builder, column_sequences) =
+            sequences::create_column_sequences(builder, &stored, column_sequences)?;
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
         let inherited_metadata = column_metadata_for_collations(
@@ -6160,9 +6162,8 @@ impl ParserDB {
             inheritance::mark_inherited(&mut builder, child, &added.name);
         }
 
-        // The sequence belongs to the named table alone: a table inheriting
-        // the column draws from it rather than from one of its own.
-        sequences::add_column_sequences(builder, &stored, column_sequences)
+        sequences::own_column_sequences(&mut builder, &stored, column_sequences);
+        Ok(builder)
     }
 
     /// Drops columns from a table, taking with them what the real database
@@ -6260,7 +6261,9 @@ impl ParserDB {
             }
         }
 
-        Ok(builder)
+        // Settled per clause, since each `DROP COLUMN` carries its own
+        // `CASCADE`.
+        sequences::settle_dropped_sequences(builder, cascade)
     }
 
     /// Renames a column and carries every mention of it along, the stored
@@ -6459,18 +6462,33 @@ impl ParserDB {
         column_name: &Ident,
         operation: &AlterColumnOperation,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let mut operation = operation.clone();
         let mut identity_sequence = None;
+        let mut serial_default = None;
         if let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? {
             let node = Self::stored_node(&builder, &stored)?;
             let column = NamedColumn::of(column_name, builder.identifier_case());
             if column.declared_by(node) {
-                Self::refuse_alter_column(&builder, &stored, node, &column, operation)?;
+                Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;
+            }
+            let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
+            if let AlterColumnOperation::SetDefault { value } = &mut operation {
+                sequences::bind_default(&builder, &stored.name, &column_name.value, value)?;
+            }
+            if let Some(declared) = declared
+                && matches!(
+                    operation,
+                    AlterColumnOperation::SetDefault { .. }
+                        | AlterColumnOperation::DropDefault
+                        | AlterColumnOperation::SetDataType { .. }
+                )
+            {
+                serial_default = sequences::serial_default(&builder, node, declared);
             }
             // An identity added to a column brings its sequence, named before
             // the identity lands.
             if let AlterColumnOperation::AddGenerated { .. } = operation
-                && let Some(declared) =
-                    node.columns.iter().find(|declared| column.matches(&declared.name))
+                && let Some(declared) = declared
             {
                 let mut identity = declared.clone();
                 Self::apply_alter_column(&mut identity, operation.clone());
@@ -6483,19 +6501,35 @@ impl ParserDB {
             }
         }
 
-        let installs = Self::altered_column_option(operation);
-        let builder = Self::alter_table_column_def(
+        let (builder, identity_sequence) = match identity_sequence {
+            Some((stored, planned)) => {
+                let (builder, created) =
+                    sequences::create_column_sequences(builder, &stored, planned)?;
+                (builder, Some((stored, created)))
+            }
+            None => (builder, None),
+        };
+        // Only a type change keeps a serial column's draw, as an explicit
+        // default.
+        let keeps_drawing = matches!(operation, AlterColumnOperation::SetDataType { .. });
+        let installs = Self::altered_column_option(&operation);
+        let mut builder = Self::alter_table_column_def(
             builder,
             table_name,
             scope,
             column_name,
             &installs,
-            |declared| Self::apply_alter_column(declared, operation.clone()),
+            |declared| {
+                if let Some(drawn) = &serial_default {
+                    sequences::spell_out_serial(declared, keeps_drawing.then(|| drawn.clone()));
+                }
+                Self::apply_alter_column(declared, operation.clone());
+            },
         )?;
-        match identity_sequence {
-            Some((stored, planned)) => sequences::add_column_sequences(builder, &stored, planned),
-            None => Ok(builder),
+        if let Some((stored, created)) = identity_sequence {
+            sequences::own_column_sequences(&mut builder, &stored, created);
         }
+        Ok(builder)
     }
 
     /// Applies an `ALTER COLUMN` operation to a column declaration.
@@ -7818,12 +7852,20 @@ impl ParserDB {
                         });
                     }
 
-                    // PostgreSQL names the sequences of the columns this
-                    // statement declares before it creates anything, so a
-                    // column a `LIKE` or a parent supplies brings none.
+                    // Named before anything is created, so copied columns bring
+                    // none.
                     let stored = StoredTable::of(&create_table);
                     let column_sequences =
                         sequences::plan_column_sequences(&builder, &stored, &create_table.columns);
+                    let (with_sequences, column_sequences) =
+                        sequences::create_column_sequences(builder, &stored, column_sequences)?;
+                    builder = with_sequences;
+                    let table_name = create_table.name.to_string();
+                    sequences::bind_column_defaults(
+                        &builder,
+                        &table_name,
+                        &mut create_table.columns,
+                    )?;
 
                     // A `LIKE` copy becomes the table's own columns, so it
                     // runs before the parents contribute theirs.
@@ -7857,7 +7899,7 @@ impl ParserDB {
                         &inherited.column_metadata,
                         TableOrigin::Declaration(documentation),
                     )?;
-                    builder = sequences::add_column_sequences(builder, &stored, column_sequences)?;
+                    sequences::own_column_sequences(&mut builder, &stored, column_sequences);
                 }
                 Statement::CreateSequence { temporary, if_not_exists, name, sequence_options } => {
                     builder = sequences::create_sequence(

@@ -95,6 +95,9 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     materialized_views: Vec<Identified<P::MaterializedView, RelationIdentity>>,
     /// List of sequences in the database.
     sequences: Vec<Stored<P::Sequence>>,
+    /// Sequences the statement being applied has dropped, kept until the
+    /// column defaults still drawing from them are settled.
+    dropped_sequences: Vec<Arc<P::Sequence>>,
     /// List of columns in the database.
     columns: Vec<Identified<P::Column, ColumnIdentity>>,
     /// List of indices in the database.
@@ -147,6 +150,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             views: self.views.clone(),
             materialized_views: self.materialized_views.clone(),
             sequences: self.sequences.clone(),
+            dropped_sequences: self.dropped_sequences.clone(),
             columns: self.columns.clone(),
             indices: self.indices.clone(),
             unique_indices: self.unique_indices.clone(),
@@ -209,6 +213,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             views: views_named_by(&self.views, keys),
             materialized_views: views_named_by(&self.materialized_views, keys),
             sequences: Vec::new(),
+            dropped_sequences: Vec::new(),
             tables,
             columns,
             indices: Vec::new(),
@@ -269,6 +274,19 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     /// Returns a mutable reference to the sequences list.
     pub(crate) fn sequences_mut(&mut self) -> &mut Vec<Stored<P::Sequence>> {
         &mut self.sequences
+    }
+
+    /// Records sequences the statement being applied dropped.
+    pub(crate) fn record_dropped_sequences(
+        &mut self,
+        dropped: impl IntoIterator<Item = Arc<P::Sequence>>,
+    ) {
+        self.dropped_sequences.extend(dropped);
+    }
+
+    /// Hands over the sequences dropped since the last call.
+    pub(crate) fn take_dropped_sequences(&mut self) -> Vec<Arc<P::Sequence>> {
+        core::mem::take(&mut self.dropped_sequences)
     }
 
     /// Returns how many relations hold a name in some schema's pool: tables,
@@ -484,6 +502,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             views: Vec::new(),
             materialized_views: Vec::new(),
             sequences: Vec::new(),
+            dropped_sequences: Vec::new(),
             columns: Vec::new(),
             indices: Vec::new(),
             unique_indices: Vec::new(),
@@ -980,6 +999,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             views,
             materialized_views,
             sequences,
+            dropped_sequences: Vec::new(),
             columns,
             indices,
             unique_indices,

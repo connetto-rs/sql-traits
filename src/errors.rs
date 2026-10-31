@@ -860,6 +860,54 @@ pub enum Error {
         /// Name of the identity column.
         column_name: String,
     },
+    #[error(
+        "Sequence `{sequence_name}` cannot be dropped: the default of column `{column_name}` of table `{table_name}` draws from it."
+    )]
+    /// Error indicating that a statement without `CASCADE` drops a sequence,
+    /// or the column or relation owning one, while a column default still
+    /// draws from it.
+    ///
+    /// A serial column draws from the sequence it owns, and any default naming
+    /// the sequence as a `regclass` constant draws from it too. `CASCADE`
+    /// removes those defaults instead.
+    SequenceUsedByDefault {
+        /// Name of the sequence.
+        sequence_name: String,
+        /// Name of the table holding the default.
+        table_name: String,
+        /// Name of the column holding the default.
+        column_name: String,
+    },
+    #[error(
+        "Relation `{relation_name}` not found for the default of column `{column_name}` of table `{table_name}`."
+    )]
+    /// Error indicating that a column default names, as a `regclass`
+    /// constant, a relation the search path does not reach.
+    ///
+    /// PostgreSQL resolves such a constant when the default is created, the
+    /// argument of `nextval('s')` included, and refuses one reaching nothing.
+    RelationNotFoundForDefault {
+        /// The name the constant wrote.
+        relation_name: String,
+        /// Name of the table holding the default.
+        table_name: String,
+        /// Name of the column holding the default.
+        column_name: String,
+    },
+    #[error(
+        "Invalid relation name `{relation_name}` in the default of column `{column_name}` of table `{table_name}`."
+    )]
+    /// Error indicating that a `regclass` constant of a column default is not
+    /// a relation name: empty, unterminated, or qualified by more than a
+    /// schema and this database.
+    InvalidRelationNameForDefault {
+        /// The text the constant wrote.
+        relation_name: String,
+        /// Name of the table holding the default.
+        table_name: String,
+        /// Name of the column holding the default.
+        column_name: String,
+    },
     #[error("Invalid index `{index_name}`: {reason}")]
     /// Error indicating that an index definition is invalid.
     InvalidIndex {
