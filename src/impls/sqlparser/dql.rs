@@ -1636,7 +1636,7 @@ const MAX_DERIVED_COLUMNS: usize = 4096;
 /// the expansion. None of those output sets are enumerated here, so a body
 /// projecting such a wildcard stays opaque rather than claiming columns the
 /// relation does not output.
-fn wildcard_reshapes_output(options: &WildcardAdditionalOptions) -> bool {
+pub(crate) fn wildcard_reshapes_output(options: &WildcardAdditionalOptions) -> bool {
     options.opt_ilike.is_some()
         || options.opt_exclude.is_some()
         || options.opt_except.is_some()

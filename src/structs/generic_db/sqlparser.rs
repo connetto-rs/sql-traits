@@ -4682,11 +4682,8 @@ impl ParserDB {
         if let Some(readers) = readers
             && object_name_last_identifier(&target.name).is_some()
         {
-            view_rewrites::follow_renames(
-                &mut builder,
-                readers,
-                &[view_rewrites::Rename::Relation { key, to: target.name.clone() }],
-            );
+            let followed = [view_rewrites::Rename::Relation { key, to: target.name.clone() }];
+            view_rewrites::follow_renames(&mut builder, readers, &followed)?;
         }
 
         Ok(builder)
@@ -6259,6 +6256,10 @@ impl ParserDB {
     /// The mentions outside the table's own node are rewritten first, so that
     /// the indexes detached and rebuilt with the node already carry the new
     /// name and their expressions are recomputed from it.
+    ///
+    /// A function body writing to the table in a statement the model could
+    /// not bind refuses the rename with
+    /// [`crate::errors::Error::FunctionBodyBlocksColumnRename`].
     fn alter_table_rename_column(
         mut builder: ParserDBBuilder,
         table_name: &ObjectName,
@@ -6359,7 +6360,7 @@ impl ParserDB {
         }
 
         if let Some(readers) = readers {
-            view_rewrites::follow_renames(&mut builder, readers, &renames);
+            view_rewrites::follow_renames(&mut builder, readers, &renames)?;
         }
 
         Ok(builder)

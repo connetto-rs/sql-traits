@@ -616,7 +616,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// the session `search_path` in effect at creation, the way PostgreSQL
     /// stores them, so the expression answers the name the store holds for
     /// the relation each name reached. A body written as a string is never
-    /// bound, and its names stay as written.
+    /// bound, and its names stay as written. A body written as a
+    /// `BEGIN ATOMIC` block binds the same way, but it holds a list of
+    /// statements rather than an expression, so it answers [`None`] here and
+    /// in [`body`](FunctionLike::body).
     ///
     /// # Example
     ///

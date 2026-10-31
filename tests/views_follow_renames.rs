@@ -63,6 +63,19 @@ fn a_materialized_view_follows_a_renamed_table() {
     );
 }
 
+/// A bare reference a column rename makes ambiguous is qualified with the
+/// name its `FROM` item is reached by, the way PostgreSQL qualifies it.
+#[test]
+fn a_materialized_view_qualifies_a_bare_reference_a_rename_makes_ambiguous() {
+    assert_definition(
+        "CREATE TABLE t (a INT); CREATE TABLE s (b INT);
+         CREATE MATERIALIZED VIEW m AS SELECT a FROM t, s WHERE s.b = a;
+         ALTER TABLE t RENAME COLUMN a TO b;",
+        "m",
+        "SELECT t.b AS a FROM t, s WHERE s.b = t.b",
+    );
+}
+
 #[test]
 fn a_qualifier_naming_the_renamed_table_follows_it() {
     assert_definition(
