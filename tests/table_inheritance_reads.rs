@@ -120,6 +120,23 @@ fn a_read_of_a_partitioned_table_reaches_every_partition() {
 }
 
 #[test]
+fn a_table_reached_twice_is_read_once() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE a (x INT);
+         CREATE TABLE b () INHERITS (a);
+         CREATE TABLE c () INHERITS (a, b);",
+    )
+    .expect("the schema parses");
+    // `c` inherits from `a` both directly and through `b`. `EXPLAIN` of
+    // `SELECT * FROM a` scans `a`, `b` and `c` once each, and with one row in
+    // each table the read returns three rows.
+    assert_eq!(reached("SELECT * FROM a", &database), ["a", "b", "c"]);
+    // Named before its ancestor, `c` is still one table, and `EXPLAIN` scans
+    // it once on each side of the join.
+    assert_eq!(reached("SELECT * FROM c, a", &database), ["a", "b", "c"]);
+}
+
+#[test]
 fn a_view_carries_the_marker_its_definition_wrote() {
     let database = database();
     // `Append` over the three tables for `all_docs`, `Seq Scan on docs` for
