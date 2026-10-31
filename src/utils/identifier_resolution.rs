@@ -5,7 +5,7 @@
 //! Unicode-NFC-normalized and whitespace-trimmed per
 //! FINGERPRINT_SPEC §7.1.
 
-use alloc::{borrow::Cow, string::String};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use sqlparser::ast::{Function, Ident};
 use unicode_normalization::UnicodeNormalization;
