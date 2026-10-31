@@ -163,6 +163,20 @@ fn set_and_reset_in_one_statement_apply_in_order() {
 }
 
 #[test]
+fn an_option_of_another_dialects_shape_is_no_storage_parameter() {
+    let database = ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE t (id INT) WITH (CLUSTERED COLUMNSTORE INDEX, fillfactor = 70);
+         ALTER TABLE t SET (CLUSTERED COLUMNSTORE INDEX);
+         ALTER TABLE t RESET (fillfactor);
+         CREATE TABLE s (id INT) WITH (CLUSTERED COLUMNSTORE INDEX);
+         ALTER TABLE s RESET (fillfactor);",
+    )
+    .expect("the generic dialect reads MSSQL's CLUSTERED option");
+    assert_eq!(parameters_of(&database, "t"), pairs(&[]));
+    assert_eq!(parameters_of(&database, "s"), pairs(&[]));
+}
+
+#[test]
 fn alter_table_set_is_reported_on_a_table_holding_another_dialects_options() {
     let error = ParserDB::parse::<MySqlDialect>(
         "CREATE TABLE t (id INT) ENGINE = InnoDB;

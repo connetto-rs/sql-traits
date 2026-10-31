@@ -5803,10 +5803,9 @@ impl ParserDB {
         if !parameters.iter().any(reset) {
             return Ok(builder);
         }
+        let kept = parameters.iter().filter(|option| !reset(option)).cloned().collect();
         Self::replace_table_node(builder, &stored, |_, replacement| {
-            if let CreateTableOptions::With(parameters) = &mut replacement.table_options {
-                parameters.retain(|option| !reset(option));
-            }
+            replacement.table_options = CreateTableOptions::With(kept);
             Ok(())
         })
     }
