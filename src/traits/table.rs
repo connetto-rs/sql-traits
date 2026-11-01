@@ -4,9 +4,10 @@ use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use crate::{
-    errors::{Error, LookupError, ObjectKind},
+    errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
-        ColumnDefinition, ColumnScope, IdentifierCase, SchemaFingerprint,
+        ColumnDefinition, ColumnScope, IdentifierCase, RowSecurity, RowStatement,
+        SchemaFingerprint,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
@@ -4389,10 +4390,71 @@ pub trait TableLike:
         }))
     }
 
+    /// What row-level security applies to `statement` on this table when
+    /// `role` runs it, as PostgreSQL's table "Policies Applied by Command
+    /// Type" in `CREATE POLICY` lays it out.
+    ///
+    /// A policy applies when its `TO` list reaches `role` through inheriting
+    /// memberships. An owner the schema never names is taken to be a role
+    /// other than `role`. Where expanding the applied policies loops back into
+    /// a table still being expanded, the answer is
+    /// [`RowSecurity::InfiniteRecursion`], as PostgreSQL refuses the statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RowSecurityError::Lookup`] when the table is not in
+    /// `database`, [`RowSecurityError::UnsettledRole`] when a policy's `TO`
+    /// list cannot be settled for `role` from the schema, and
+    /// [`RowSecurityError::UnsettledViewOwner`] when the policies read a plain
+    /// view whose owner the schema does not name.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// # fn main() -> Result<(), Box<dyn core::error::Error>> {
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE reader NOLOGIN;
+    ///      CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT);
+    ///      ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+    ///      CREATE POLICY own ON docs USING (owner = current_user);",
+    /// )?;
+    /// let docs =
+    ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let reader = db.role("reader").unwrap();
+    ///
+    /// // An UPDATE whose WHERE reads a column checks the updated row against
+    /// // the SELECT policies too, and raises when it would leave them.
+    /// let security = docs.row_security(RowStatement::Update { reads: true }, reader, &db)?;
+    /// let raised =
+    ///     security.gates().unwrap().iter().filter(|gate| {
+    ///         gate.row() == RowVersion::Updated && gate.failure() == GateFailure::Raise
+    ///     });
+    /// let commands: Vec<GatedCommand> = raised.map(RowGate::command).collect();
+    /// assert_eq!(commands, [GatedCommand::Update, GatedCommand::Select]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn row_security<'db>(
+        &'db self,
+        statement: RowStatement,
+        role: &'db <Self::DB as DatabaseLike>::Role,
+        database: &'db Self::DB,
+    ) -> Result<RowSecurity<'db, <Self::DB as DatabaseLike>::Policy>, RowSecurityError>
+    where
+        Self: 'db,
+    {
+        crate::traits::row_security::row_security(self, statement, role, database)
+    }
+
     /// Returns an iterator over the grants that apply to this table.
     ///
     /// This includes both direct table grants (`GRANT ... ON table_name`)
-    /// and schema-wide grants (`GRANT ... ON ALL TABLES IN SCHEMA`).
+    /// and schema-wide grants (`GRANT ... ON ALL TABLES IN SCHEMA`). A
+    /// privilege on some of the table's columns is read from
+    /// [`DatabaseLike::column_grants`] instead.
     ///
     /// # Errors
     ///
@@ -4446,7 +4508,9 @@ pub trait TableLike:
     /// - Names this role, `PUBLIC`, or one of the
     ///   [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of this
     ///   role
-    /// - Includes SELECT privilege or ALL PRIVILEGES
+    /// - Includes SELECT on the whole table, or ALL PRIVILEGES. A SELECT on
+    ///   some of its columns does not count, as PostgreSQL's
+    ///   `has_table_privilege` does not count it either.
     ///
     /// A role also can read when it, or one of its inherited roles, is the
     /// table's [`owner`](Self::owner) and the owner's own entry still holds
@@ -4491,7 +4555,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Select { .. }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Select { columns: None }))
     }
 
     /// Returns whether the given role can insert into this table.
@@ -4529,7 +4593,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Insert { .. }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Insert { columns: None }))
     }
 
     /// Returns whether the given role can update this table.
@@ -4567,7 +4631,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Update { .. }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Update { columns: None }))
     }
 
     /// Returns whether the given role can delete from this table.

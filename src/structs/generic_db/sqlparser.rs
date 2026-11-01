@@ -8197,8 +8197,13 @@ impl ParserDB {
                     )?;
                     builder.bind_access_targets(&mut grant.objects);
 
-                    builder = builder.add_table_grant(Arc::new(grant.clone()), ());
-                    builder = builder.add_column_grant(Arc::new(grant), ());
+                    let (relation_part, column_part) = crate::impls::split_by_column_scope(grant);
+                    if let Some(part) = relation_part {
+                        builder = builder.add_table_grant(Arc::new(part), ());
+                    }
+                    if let Some(part) = column_part {
+                        builder = builder.add_column_grant(Arc::new(part), ());
+                    }
                 }
                 Statement::Revoke(mut revoke) => {
                     require_static_access_names(revoke.objects.as_ref())?;
@@ -11258,7 +11263,7 @@ mod tests {
             let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
             let mut states = Vec::new();
 
-            for grant in db.table_grants() {
+            for grant in db.column_grants() {
                 for action in grant.privileges(&db) {
                     if let Action::Select { columns: Some(columns) } = action {
                         states.extend(
@@ -11449,6 +11454,24 @@ mod tests {
                     REVOKE DELETE ON t FROM r;
                 ",
                 ),
+                // An index shares the relation namespace and holds no
+                // privileges.
+                open_world().parse::<PostgreSqlDialect>(
+                    r"
+                    CREATE TABLE t (id INT);
+                    CREATE INDEX t_idx ON t (id);
+                    GRANT ALL PRIVILEGES ON t_idx TO r;
+                    REVOKE DELETE ON t_idx FROM r;
+                ",
+                ),
+                // A warehouse, a kind the generic dialect reads and PostgreSQL
+                // lacks.
+                open_world().parse::<GenericDialect>(
+                    r"
+                    GRANT ALL PRIVILEGES ON WAREHOUSE w TO ROLE r;
+                    REVOKE USAGE ON WAREHOUSE w FROM ROLE r;
+                ",
+                ),
             ];
 
             for result in cases {
@@ -11461,6 +11484,19 @@ mod tests {
                     "got {result:?}"
                 );
             }
+        }
+
+        #[test]
+        fn test_revoke_of_a_privilege_the_grant_does_not_hold_keeps_the_grant() {
+            let sql = r"
+                CREATE TABLE t (id INT);
+                CREATE ROLE r;
+                GRANT SELECT ON t TO r;
+                REVOKE DELETE ON t FROM r;
+            ";
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
+
+            assert_eq!(held_privileges(&db), without_grant_option(&["SELECT"]));
         }
 
         #[test]
@@ -11525,7 +11561,7 @@ mod tests {
             ";
             let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("Failed to parse SQL");
 
-            let grant = db.table_grants().next().expect("Expected a remaining grant");
+            let grant = db.column_grants().next().expect("Expected a remaining grant");
             let remaining_privileges: Vec<_> = grant.privileges(&db).collect();
 
             assert_eq!(remaining_privileges.len(), 1);
@@ -11884,7 +11920,7 @@ mod tests {
             ";
             let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("parse");
 
-            let grant = db.table_grants().next().expect("grant must remain");
+            let grant = db.column_grants().next().expect("grant must remain");
             let privileges: Vec<_> = grant.privileges(&db).collect();
             assert_eq!(privileges.len(), 1);
             match privileges[0] {

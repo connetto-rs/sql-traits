@@ -13,6 +13,7 @@ mod identifier_case;
 mod identity;
 pub mod metadata;
 mod role_membership;
+mod row_security;
 mod schema;
 mod sequence;
 mod target_name;
@@ -29,6 +30,10 @@ pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
 pub use role_membership::RoleMembership;
+pub use row_security::{
+    GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity, RowSecurityExemption,
+    RowStatement, RowVersion,
+};
 pub use schema::Schema;
 pub use sequence::Sequence;
 pub(crate) use sequence::StoredSequenceOwner;

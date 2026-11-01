@@ -384,6 +384,27 @@ fn action_with_columns(action: &Action, columns: Option<Vec<Ident>>) -> Action {
     }
 }
 
+/// Splits a grant into the part without column lists, `ALL PRIVILEGES`
+/// included, and the part with them, leaving out an empty part.
+pub(crate) fn split_by_column_scope(mut grant: Grant) -> (Option<Grant>, Option<Grant>) {
+    let Privileges::Actions(actions) = &mut grant.privileges else {
+        return (Some(grant), None);
+    };
+    if actions.iter().all(|action| action_columns(action).is_none()) {
+        return (Some(grant), None);
+    }
+    if actions.iter().all(|action| action_columns(action).is_some()) {
+        return (None, Some(grant));
+    }
+
+    let (column_actions, relation_actions): (Vec<Action>, Vec<Action>) =
+        mem::take(actions).into_iter().partition(|action| action_columns(action).is_some());
+    let mut column_part = grant.clone();
+    grant.privileges = Privileges::Actions(relation_actions);
+    column_part.privileges = Privileges::Actions(column_actions);
+    (Some(grant), Some(column_part))
+}
+
 struct ActionRevokeApplication {
     retained: Option<Action>,
     revoked: Option<Action>,
