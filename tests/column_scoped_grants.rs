@@ -90,6 +90,7 @@ fn a_whole_relation_grant_stays_out_of_the_column_store() {
         "CREATE SCHEMA s;
          CREATE ROLE r1;
          CREATE TABLE a (id int, b text);
+         CREATE TABLE s.t (id int);
          CREATE SEQUENCE q;
          GRANT ALL PRIVILEGES ON a TO r1;
          GRANT USAGE ON SEQUENCE q TO r1;

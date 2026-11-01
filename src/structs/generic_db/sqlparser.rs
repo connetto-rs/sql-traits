@@ -84,6 +84,7 @@ mod parsed_source;
 mod postgres_18_collations;
 mod postgres_builtins;
 mod postgres_catalog;
+mod relation_privileges;
 mod role_memberships;
 mod routine_privileges;
 mod rules;
@@ -4325,10 +4326,9 @@ impl ParserDB {
     /// `EXECUTE` privileges its functions carry, the roles its policies apply
     /// to, the granted roles and members of its role memberships, and the
     /// roles whose attributes an `ALTER ROLE` changed before any
-    /// `CREATE ROLE` created them. The grant object shapes the closed world
-    /// never resolved
-    /// either, `ALL TABLES IN SCHEMA` and the sequence and schema forms, are
-    /// left alone here too.
+    /// `CREATE ROLE` created them. The sequence and schema forms, which the
+    /// closed world never resolved either, are left alone here too, and a
+    /// blanket form records only the relations it reached.
     ///
     /// An [`AccessResolution::ClosedWorld`] parse rejects such a reference on
     /// the spot, so one surfaces here because the database was parsed under
@@ -8162,14 +8162,7 @@ impl ParserDB {
                         |key| builder.relation_key_is_held(key, builder.identifier_case()),
                     )?;
                     builder.bind_access_targets(&mut grant.objects);
-
-                    let (relation_part, column_part) = crate::impls::split_by_column_scope(grant);
-                    if let Some(part) = relation_part {
-                        builder = builder.add_table_grant(Arc::new(part), ());
-                    }
-                    if let Some(part) = column_part {
-                        builder = builder.add_column_grant(Arc::new(part), ());
-                    }
+                    relation_privileges::grant(&mut builder, grant)?;
                 }
                 Statement::Revoke(mut revoke) => {
                     require_static_access_names(revoke.objects.as_ref())?;
@@ -8205,19 +8198,7 @@ impl ParserDB {
                         |key| builder.relation_key_is_held(key, builder.identifier_case()),
                     )?;
                     builder.bind_access_targets(&mut revoke.objects);
-
-                    let unsupported =
-                        apply_revoke_to_grant_store(builder.table_grants_mut(), &revoke).or_else(
-                            || apply_revoke_to_grant_store(builder.column_grants_mut(), &revoke),
-                        );
-
-                    if let Some(reason) = unsupported {
-                        return Err(crate::errors::Error::UnsupportedRevoke {
-                            statement: revoke.to_string(),
-                            reason: reason.to_string(),
-                        });
-                    }
-                    table_owner::revoke(&mut builder, &revoke);
+                    relation_privileges::revoke(&mut builder, revoke)?;
                 }
                 Statement::Set(sqlparser::ast::Set::SetTimeZone { local, value }) => {
                     if local {
@@ -11595,9 +11576,8 @@ mod tests {
             );
         }
 
-        /// `tables()` `GrantObjects::AllTablesInSchema` branch: a grant on
-        /// `ALL TABLES IN SCHEMA` should parse and produce one entry in the
-        /// `table_grants` iterator without panicking.
+        /// A grant on `ALL TABLES IN SCHEMA` is recorded on the one table the
+        /// schema holds.
         #[test]
         fn test_grant_all_tables_in_schema_parses_and_is_indexed() {
             let sql = r"
@@ -11727,10 +11707,8 @@ mod tests {
             assert!(table.can_select(r2, &db).expect("can_select"), "r2 should still have SELECT");
         }
 
-        /// `grant_objects_inner_match` schema-list arm: REVOKE on
-        /// `ALL TABLES IN SCHEMA` matching a same-shape GRANT goes
-        /// through the giant merged arm that covers AllSequences/
-        /// AllTables/AllViews/AllMaterializedViews/... InSchema.
+        /// A REVOKE on `ALL TABLES IN SCHEMA` takes from each table the
+        /// earlier GRANT of the same shape was recorded on.
         #[test]
         fn test_revoke_all_tables_in_schema_matches_corresponding_grant() {
             let sql = r"
@@ -11759,9 +11737,8 @@ mod tests {
             assert_eq!(db.table_grants().count(), 0);
         }
 
-        /// `applies_to_table` AllTablesInSchema branch: querying whether
-        /// an `ALL TABLES IN SCHEMA s` grant applies to a specific table
-        /// returns true iff the table's schema matches.
+        /// An `ALL TABLES IN SCHEMA s` grant applies to a table iff the table
+        /// sat in `s` when the grant ran.
         #[test]
         fn test_all_tables_in_schema_grant_applies_to_matching_table() {
             use crate::traits::TableGrantLike;
@@ -11806,7 +11783,8 @@ mod tests {
             assert_eq!(db.table_grants().count(), 0);
         }
 
-        /// `grant_objects_inner_match` All-future-tables-in-schema arm.
+        /// A REVOKE on `ALL SEQUENCES IN SCHEMA` of an empty schema meets the
+        /// equally empty GRANT.
         #[test]
         fn test_revoke_all_sequences_in_schema_matches_grant() {
             let sql = r"

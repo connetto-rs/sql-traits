@@ -251,7 +251,7 @@ fn drop_sequence_removes_the_sequence_and_the_grants_on_it() {
                     )
                 }
                 GrantTarget::Schemas(_) => "schemas".to_string(),
-                _ => "other".to_string(),
+                GrantTarget::Other => "other".to_string(),
             }
         })
         .collect();
@@ -386,25 +386,34 @@ fn a_grant_reaches_the_sequences_it_names_or_sweeps() {
          SET search_path = public;",
     )
     .expect("schema parses");
-    let grants: Vec<_> = db.table_grants().collect();
-    let [by_name, by_schema, by_table_schema] = grants[..] else {
-        panic!("expected three grants, got {}", grants.len());
-    };
+    let relations: Vec<Vec<String>> =
+        db.table_grants().map(|grant| relations_of(&db, grant)).collect();
 
-    assert_eq!(relations_of(&db, by_name), ["sequence app.a", "sequence public.elsewhere"]);
-    assert_eq!(relations_of(&db, by_schema), ["sequence app.a", "sequence app.b"]);
+    // One grant per sequence named, one per sequence the schema held, and one
+    // on the table, since `ALL TABLES` leaves sequences out.
     assert_eq!(
-        relations_of(&db, by_table_schema),
-        ["table app.t"],
-        "`ALL TABLES` leaves sequences out"
+        relations,
+        [
+            ["sequence app.a"],
+            ["sequence public.elsewhere"],
+            ["sequence app.a"],
+            ["sequence app.b"],
+            ["table app.t"],
+        ]
     );
 
     // The names were bound where they reached when the grant ran, so they
     // keep naming those sequences after the path changes.
-    let GrantTarget::Sequences(targets) = by_name.target() else {
-        panic!("expected a sequence target");
-    };
-    let written: Vec<String> = targets.map(|target| target.to_string()).collect();
+    let written: Vec<String> = db
+        .table_grants()
+        .take(2)
+        .flat_map(|grant| {
+            let GrantTarget::Sequences(targets) = grant.target() else {
+                panic!("expected a sequence target");
+            };
+            targets.map(|target| target.to_string()).collect::<Vec<_>>()
+        })
+        .collect();
     assert_eq!(written, ["app.a", "elsewhere"]);
 }
 

@@ -347,25 +347,21 @@ impl<T: GrantLike> GrantLike for &T {
 /// The objects a grant names, tagged with the kind of object they are.
 ///
 /// Each variant is one `ON` form of `GRANT` and `REVOKE`, and holds the names
-/// that form wrote, in order. A blanket form holds the schemas it sweeps, not
-/// the objects inside them, since those are whatever the schema holds when
-/// the statement runs.
+/// that form wrote, in order. A relation grant names one relation, and a
+/// blanket form such as `ON ALL TABLES IN SCHEMA s` is recorded as one grant
+/// on each relation `s` held when the statement ran, as PostgreSQL grants
+/// them.
 #[derive(Debug, Clone)]
 pub enum GrantTarget<I> {
-    /// Tables, views, materialized views or sequences named one by one,
-    /// `ON [TABLE] t`.
+    /// A table, view, materialized view or sequence named by `ON [TABLE] t`,
+    /// or reached by `ON ALL TABLES IN SCHEMA s`.
     Tables(I),
-    /// The schemas of `ON ALL TABLES IN SCHEMA s`, which reaches every table,
-    /// view and materialized view in each.
-    TablesInSchema(I),
     /// Schemas as objects in their own right, `ON SCHEMA s`, carrying the
     /// schema privileges `USAGE` and `CREATE`.
     Schemas(I),
-    /// Sequences named one by one, `ON SEQUENCE s`.
+    /// A sequence named by `ON SEQUENCE s`, or reached by `ON ALL SEQUENCES
+    /// IN SCHEMA s`.
     Sequences(I),
-    /// The schemas of `ON ALL SEQUENCES IN SCHEMA s`, which reaches every
-    /// sequence in each.
-    SequencesInSchema(I),
     /// A form this model does not describe, such as a grant on a database, or
     /// one with no `ON` clause at all.
     Other,
@@ -385,40 +381,15 @@ pub trait TableGrantLike:
 {
     /// Returns an iterator over the tables this grant applies to.
     ///
-    /// This method handles both direct table grants (`GRANT ... ON table1,
-    /// table2`) and schema-wide table grants (`GRANT ... ON ALL TABLES IN
-    /// SCHEMA`). Returns an empty iterator if this grant does not apply to
-    /// tables.
+    /// Returns an empty iterator if this grant does not apply to a table. A
+    /// statement naming several relations, or sweeping schemas with `ALL
+    /// TABLES IN SCHEMA`, is recorded as one grant on each relation it
+    /// reached when it ran, so a table created afterwards is not among them.
     ///
     /// # Example
     ///
-    /// Direct table grant:
-    ///
     /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    ///
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "
-    /// CREATE TABLE users (id INT);
-    /// CREATE TABLE posts (id INT);
-    /// CREATE ROLE reader;
-    /// GRANT SELECT ON users, posts TO reader;
-    /// ",
-    /// )?;
-    /// let grant = db.table_grants().next().unwrap();
-    /// let tables: Vec<_> = grant.tables(&db).collect();
-    /// assert_eq!(tables.len(), 2);
-    /// assert!(tables.iter().any(|t| t.table_name() == "users"));
-    /// assert!(tables.iter().any(|t| t.table_name() == "posts"));
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// Schema-wide table grant:
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
@@ -430,12 +401,14 @@ pub trait TableGrantLike:
     /// CREATE TABLE other_schema.data (id INT);
     /// CREATE ROLE reader;
     /// GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader;
+    /// CREATE TABLE public.comments (id INT);
     /// ",
     /// )?;
-    /// let grant = db.table_grants().next().unwrap();
-    /// let tables: Vec<_> = grant.tables(&db).collect();
-    /// // Only tables in the 'public' schema are included
-    /// assert_eq!(tables.len(), 2);
+    /// let mut granted: Vec<_> =
+    ///     db.table_grants().flat_map(|grant| grant.tables(&db)).map(|t| t.table_name()).collect();
+    /// granted.sort_unstable();
+    /// // The tables `public` held when the grant ran, and no later one.
+    /// assert_eq!(granted, ["posts", "users"]);
     /// # Ok(())
     /// # }
     /// ```
@@ -452,12 +425,13 @@ pub trait TableGrantLike:
     /// "everything this grant reaches" has to ask this one, because a grant on
     /// a view or a sequence is ordinary PostgreSQL and `ALL TABLES IN SCHEMA`
     /// covers views too. `ALL TABLES IN SCHEMA` leaves sequences out, and
-    /// `ALL SEQUENCES IN SCHEMA` reaches every sequence of each schema.
+    /// `ALL SEQUENCES IN SCHEMA` reaches every sequence each schema held when
+    /// it ran.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
     ///
     /// let db = ParserDB::parse::<GenericDialect>(
@@ -469,9 +443,9 @@ pub trait TableGrantLike:
     /// GRANT SELECT ON t, v, s TO reader;
     /// ",
     /// )?;
-    /// let grant = db.table_grants().next().unwrap();
-    /// let kinds: Vec<&str> = grant
-    ///     .relations(&db)
+    /// let kinds: Vec<&str> = db
+    ///     .table_grants()
+    ///     .flat_map(|grant| grant.relations(&db))
     ///     .map(|relation| {
     ///         match relation {
     ///             Relation::Table(_) => "table",
@@ -483,7 +457,7 @@ pub trait TableGrantLike:
     ///     .collect();
     /// assert_eq!(kinds, vec!["table", "view", "sequence"]);
     /// // The narrower question still answers only the table.
-    /// assert_eq!(grant.tables(&db).count(), 1);
+    /// assert_eq!(db.table_grants().flat_map(|grant| grant.tables(&db)).count(), 1);
     /// # Ok(())
     /// # }
     /// ```
@@ -729,7 +703,7 @@ mod tests {
         let target = <&_ as GrantLike>::target(&grant_ref);
         let GrantTarget::Tables(targets) = target else { panic!("not a table grant") };
         let names: Vec<_> = targets.map(|target| target.name().to_owned()).collect();
-        assert_eq!(names, ["my_table", "my_view", "my_materialized"]);
+        assert_eq!(names, ["my_table"]);
 
         let table = db
             .table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)
@@ -739,7 +713,10 @@ mod tests {
         let tables: Vec<_> = <&_ as TableGrantLike>::tables(&grant_ref, &db).collect();
         assert_eq!(tables.len(), 1);
 
-        let relations: Vec<_> = <&_ as TableGrantLike>::relations(&grant_ref, &db).collect();
+        // Each listed relation holds a grant of its own.
+        let grants: Vec<_> = db.table_grants().collect();
+        let relations: Vec<_> =
+            grants.iter().flat_map(|grant| <&_ as TableGrantLike>::relations(grant, &db)).collect();
         assert_eq!(relations.len(), 3);
         let rendered: Vec<_> = relations.iter().map(|relation| format!("{relation:?}")).collect();
         assert!(rendered.iter().any(|relation| relation.starts_with("Table(")));
