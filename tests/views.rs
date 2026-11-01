@@ -818,9 +818,9 @@ fn a_grant_reaches_views_and_says_which_kind_each_target_is() {
          GRANT SELECT ON t, v, m TO r;",
     )
     .expect("a mixed target list is accepted");
-    let grant = db.table_grants().next().expect("one grant");
-    let kinds: Vec<&str> = grant
-        .relations(&db)
+    let kinds: Vec<&str> = db
+        .table_grants()
+        .flat_map(|grant| grant.relations(&db))
         .map(|relation| {
             match relation {
                 Relation::Table(_) => "table",
@@ -831,8 +831,8 @@ fn a_grant_reaches_views_and_says_which_kind_each_target_is() {
         })
         .collect();
     assert_eq!(kinds, vec!["table", "view", "materialized view"]);
-    // The narrower question keeps answering exactly what it always did.
-    assert_eq!(grant.tables(&db).count(), 1);
+    // The narrower question answers only the table.
+    assert_eq!(db.table_grants().flat_map(|grant| grant.tables(&db)).count(), 1);
 
     parse(
         "CREATE ROLE r;
@@ -859,9 +859,9 @@ fn a_schema_wide_grant_covers_every_relation_kind() {
          GRANT SELECT ON ALL TABLES IN SCHEMA s TO r;",
     )
     .expect("the blanket grant is accepted");
-    let grant = db.table_grants().next().expect("one grant");
-    let mut kinds: Vec<&str> = grant
-        .relations(&db)
+    let mut kinds: Vec<&str> = db
+        .table_grants()
+        .flat_map(|grant| grant.relations(&db))
         .map(|relation| {
             match relation {
                 Relation::Table(_) => "table",
@@ -891,17 +891,20 @@ fn a_schema_wide_grant_on_public_covers_unqualified_relations() {
              GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO r;"
         ))
         .expect("the blanket grant is accepted");
-        let grant = db.table_grants().next().expect("one grant");
-        let mut tables: Vec<&str> = grant.tables(&db).map(TableLike::table_name).collect();
+        let mut tables: Vec<&str> = db
+            .table_grants()
+            .flat_map(|grant| grant.tables(&db))
+            .map(TableLike::table_name)
+            .collect();
         tables.sort_unstable();
         assert_eq!(tables, ["t", "u"], "{schema}");
         // The plain and the materialized view are reached as well.
-        assert_eq!(grant.relations(&db).count(), 4, "{schema}");
+        assert_eq!(db.table_grants().flat_map(|grant| grant.relations(&db)).count(), 4, "{schema}");
         let bare = db
             .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
             .expect("the name is well formed")
             .expect("the table is recorded");
-        assert!(grant.applies_to_table(bare, &db), "{schema}");
+        assert!(db.table_grants().any(|grant| grant.applies_to_table(bare, &db)), "{schema}");
     }
 
     // A quoted spelling that keeps its case names another schema.
@@ -912,8 +915,7 @@ fn a_schema_wide_grant_on_public_covers_unqualified_relations() {
          GRANT SELECT ON ALL TABLES IN SCHEMA \"PUBLIC\" TO r;",
     )
     .expect("the blanket grant is accepted");
-    let grant = db.table_grants().next().expect("one grant");
-    assert_eq!(grant.relations(&db).count(), 0);
+    assert_eq!(db.table_grants().count(), 0);
 }
 
 #[test]

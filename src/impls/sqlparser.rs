@@ -29,6 +29,7 @@ pub(crate) use column_def::serial_sequence_type;
 pub use dialect::SqlparserDialect;
 pub use grant::apply_revoke_to_grant;
 pub(crate) use grant::{
-    grantee_is_public, grantee_matches_role, grantees_match, partition_grantees_for_revoke,
-    schema_matches_table, split_by_column_scope, validate_granted_columns,
+    check_granted_columns, grantee_is_public, grantee_matches_role, grantees_match,
+    object_names_match, partition_grantees_for_revoke, schema_matches_sequence,
+    schema_matches_table, schema_matches_view, split_by_column_scope, validate_granted_columns,
 };

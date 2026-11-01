@@ -1958,10 +1958,11 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
 
     /// Iterates over the table grants defined in the database.
     ///
-    /// Table grants apply privileges to entire tables. This includes direct
-    /// table grants (`GRANT ... ON table_name`) and schema-wide table grants
-    /// (`GRANT ... ON ALL TABLES IN SCHEMA`). A privilege written with a
-    /// column list covers those columns only and comes from
+    /// Table grants apply privileges to entire relations. Each names one
+    /// relation, since a statement naming several (`GRANT ... ON a, b`) or
+    /// sweeping schemas (`GRANT ... ON ALL TABLES IN SCHEMA`) is recorded as
+    /// one grant on each relation it reached when it ran. A privilege written
+    /// with a column list covers those columns only and comes from
     /// [`Self::column_grants`] instead, so a statement mixing both kinds
     /// yields its whole-table part here and its column part there.
     ///

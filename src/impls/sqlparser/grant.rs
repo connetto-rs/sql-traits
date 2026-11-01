@@ -31,7 +31,9 @@ use crate::{
     },
 };
 
-fn object_names_match(left: &ObjectName, right: &ObjectName) -> bool {
+/// Whether two names spell the same object, part by part, under PostgreSQL's
+/// identifier folding.
+pub(crate) fn object_names_match(left: &ObjectName, right: &ObjectName) -> bool {
     if left.0.len() != right.0.len() {
         return false;
     }
@@ -128,7 +130,7 @@ pub(crate) fn schema_matches_table<T: TableLike>(schema_name: &ObjectName, table
     )
 }
 
-fn schema_matches_view<V: ViewLike>(schema_name: &ObjectName, view: &V) -> bool {
+pub(crate) fn schema_matches_view<V: ViewLike>(schema_name: &ObjectName, view: &V) -> bool {
     schema_matches_relation(
         schema_name,
         view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())),
@@ -137,7 +139,10 @@ fn schema_matches_view<V: ViewLike>(schema_name: &ObjectName, view: &V) -> bool 
 
 /// Whether the schema a blanket grant names holds a sequence, a sequence
 /// stored without a schema sitting in the default one.
-fn schema_matches_sequence<S: SequenceLike>(schema_name: &ObjectName, sequence: &S) -> bool {
+pub(crate) fn schema_matches_sequence<S: SequenceLike>(
+    schema_name: &ObjectName,
+    sequence: &S,
+) -> bool {
     schema_matches_relation(
         schema_name,
         Some(
@@ -296,11 +301,11 @@ fn action_columns(action: &Action) -> Option<&[Ident]> {
 ///
 /// The database requires the column on every table in the list, and names the
 /// one that lacks it, so this walks them in order and reports the same way.
-/// `ALL TABLES IN SCHEMA` carries no per-table column list to check and the
-/// database accepts a column list beside it, so that form is left alone. A
-/// one-part or two-part name resolves through `search_path`, ending at the
-/// first schema `claimed` answers for, and a shape the strict splitter rejects
-/// keeps the lenient last-two-parts matching.
+/// A blanket form names no table here, and each table it reaches is checked
+/// by [`check_granted_columns`] once the form is expanded. A one-part or
+/// two-part name resolves through `search_path`, ending at the first schema
+/// `claimed` answers for, and a shape the strict splitter rejects keeps the
+/// lenient last-two-parts matching.
 ///
 /// # Errors
 ///
@@ -316,10 +321,7 @@ pub(crate) fn validate_granted_columns(
     case: IdentifierCase,
     claimed: impl Fn(&RelationKey) -> bool,
 ) -> Result<(), crate::errors::Error> {
-    let Privileges::Actions(actions) = privileges else {
-        return Ok(());
-    };
-    let Some(GrantObjects::Tables(names)) = objects else {
+    let (Privileges::Actions(_), Some(GrantObjects::Tables(names))) = (privileges, objects) else {
         return Ok(());
     };
 
@@ -336,31 +338,47 @@ pub(crate) fn validate_granted_columns(
         } else {
             database_tables.iter().copied().find(|table| table_matches_object_name(*table, name))
         };
-        let Some(table) = resolved else {
-            // The table did not resolve, which the open world excuses and the
-            // closed world has already refused, so there is nothing to check
-            // the columns against.
-            continue;
-        };
-
-        for column in actions.iter().filter_map(action_columns).flatten() {
-            let known = table.columns.iter().any(|declared| {
-                case.identifiers_match(
-                    declared.name.value.as_str(),
-                    declared.name.quote_style.is_some(),
-                    column.value.as_str(),
-                    column.quote_style.is_some(),
-                )
-            });
-            if !known {
-                return Err(crate::errors::Error::ColumnNotFoundForGrant {
-                    column_name: column.value.clone(),
-                    table_name: table.name.to_string(),
-                });
-            }
+        // A table that did not resolve is excused by the open world and
+        // already refused by the closed one, so there is nothing to check the
+        // columns against.
+        if let Some(table) = resolved {
+            check_granted_columns(privileges, table, case)?;
         }
     }
 
+    Ok(())
+}
+
+/// Enforces that `table` has every column `privileges` lists.
+///
+/// # Errors
+///
+/// Returns [`crate::errors::Error::ColumnNotFoundForGrant`] for the first
+/// listed column the table does not have.
+pub(crate) fn check_granted_columns(
+    privileges: &Privileges,
+    table: &CreateTable,
+    case: IdentifierCase,
+) -> Result<(), crate::errors::Error> {
+    let Privileges::Actions(actions) = privileges else {
+        return Ok(());
+    };
+    for column in actions.iter().filter_map(action_columns).flatten() {
+        let known = table.columns.iter().any(|declared| {
+            case.identifiers_match(
+                declared.name.value.as_str(),
+                declared.name.quote_style.is_some(),
+                column.value.as_str(),
+                column.quote_style.is_some(),
+            )
+        });
+        if !known {
+            return Err(crate::errors::Error::ColumnNotFoundForGrant {
+                column_name: column.value.clone(),
+                table_name: table.name.to_string(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -652,14 +670,8 @@ impl GrantLike for Grant {
         }
         match &self.objects {
             Some(GrantObjects::Tables(names)) => GrantTarget::Tables(read(names)),
-            Some(GrantObjects::AllTablesInSchema { schemas }) => {
-                GrantTarget::TablesInSchema(read(schemas))
-            }
             Some(GrantObjects::Schemas(names)) => GrantTarget::Schemas(read(names)),
             Some(GrantObjects::Sequences(names)) => GrantTarget::Sequences(read(names)),
-            Some(GrantObjects::AllSequencesInSchema { schemas }) => {
-                GrantTarget::SequencesInSchema(read(schemas))
-            }
             _ => GrantTarget::Other,
         }
     }
@@ -699,14 +711,6 @@ fn granted_tables<'a>(
                 .filter_map(|name| resolve_bound_table(name, database).ok().flatten())
                 .collect()
         }
-        Some(GrantObjects::AllTablesInSchema { schemas }) => {
-            database
-                .tables()
-                .filter(|table| {
-                    schemas.iter().any(|schema_name| schema_matches_table(schema_name, *table))
-                })
-                .collect()
-        }
         _ => Vec::new(),
     }
 }
@@ -714,10 +718,6 @@ fn granted_tables<'a>(
 /// Resolves each relation a grant names, in the order the grant wrote them,
 /// looking for a table first and then each view kind and a sequence, since one
 /// name holds at most one of them.
-///
-/// `ALL TABLES IN SCHEMA` covers views and materialized views as well as
-/// tables, which is what PostgreSQL grants, so all three are walked. It leaves
-/// sequences out, which `ON SEQUENCE` and `ALL SEQUENCES IN SCHEMA` reach.
 fn granted_relations<'a>(grant: &'a Grant, database: &'a ParserDB) -> Vec<Relation<'a, ParserDB>> {
     match &grant.objects {
         Some(GrantObjects::Tables(names)) => {
@@ -736,38 +736,6 @@ fn granted_relations<'a>(grant: &'a Grant, database: &'a ParserDB) -> Vec<Relati
                         .flatten()
                 })
                 .map(Relation::Sequence)
-                .collect()
-        }
-        Some(GrantObjects::AllSequencesInSchema { schemas }) => {
-            database
-                .sequences()
-                .filter(|sequence| {
-                    schemas.iter().any(|schema| schema_matches_sequence(schema, *sequence))
-                })
-                .map(Relation::Sequence)
-                .collect()
-        }
-        Some(GrantObjects::AllTablesInSchema { schemas }) => {
-            database
-                .tables()
-                .filter(|table| schemas.iter().any(|schema| schema_matches_table(schema, *table)))
-                .map(Relation::Table)
-                .chain(
-                    database
-                        .views()
-                        .filter(|view| {
-                            schemas.iter().any(|schema| schema_matches_view(schema, *view))
-                        })
-                        .map(Relation::View),
-                )
-                .chain(
-                    database
-                        .materialized_views()
-                        .filter(|view| {
-                            schemas.iter().any(|schema| schema_matches_view(schema, *view))
-                        })
-                        .map(Relation::MaterializedView),
-                )
                 .collect()
         }
         _ => Vec::new(),
@@ -822,14 +790,7 @@ impl TableGrantLike for Grant {
         table: &<Self::DB as DatabaseLike>::Table,
         database: &Self::DB,
     ) -> bool {
-        match &self.objects {
-            Some(GrantObjects::AllTablesInSchema { schemas }) => {
-                schemas.iter().any(|schema_name| schema_matches_table(schema_name, table))
-            }
-            _ => {
-                granted_tables(self, database).iter().any(|granted| core::ptr::eq(*granted, table))
-            }
-        }
+        granted_tables(self, database).iter().any(|granted| core::ptr::eq(*granted, table))
     }
 }
 

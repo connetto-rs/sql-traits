@@ -4391,9 +4391,10 @@ pub trait TableLike:
 
     /// Returns an iterator over the grants that apply to this table.
     ///
-    /// This includes both direct table grants (`GRANT ... ON table_name`)
-    /// and schema-wide grants (`GRANT ... ON ALL TABLES IN SCHEMA`). A
-    /// privilege on some of the table's columns is read from
+    /// This includes the grants naming the table directly (`GRANT ... ON
+    /// table_name`) and those a schema-wide grant (`GRANT ... ON ALL TABLES IN
+    /// SCHEMA`) recorded on it, which happens only when the table existed as
+    /// that grant ran. A privilege on some of the table's columns is read from
     /// [`DatabaseLike::column_grants`] instead.
     ///
     /// # Errors
@@ -4444,7 +4445,8 @@ pub trait TableLike:
     /// Returns whether the given role can read (SELECT) from this table.
     ///
     /// A role can read if there's a grant that:
-    /// - Applies to this table (directly or via ALL TABLES IN SCHEMA)
+    /// - Applies to this table (directly or via an `ALL TABLES IN SCHEMA` grant
+    ///   that ran while the table existed)
     /// - Names this role, `PUBLIC`, or one of the
     ///   [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of this
     ///   role
