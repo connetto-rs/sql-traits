@@ -453,9 +453,61 @@ struct PrivilegeRevokeApplication {
     unsupported: bool,
 }
 
+impl PrivilegeRevokeApplication {
+    const UNSUPPORTED: Self = Self { retained: None, revoked: None, unsupported: true };
+}
+
+/// A kind of object on which `ALL PRIVILEGES` stands for a fixed set of
+/// privileges in PostgreSQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivilegeKind {
+    /// A table, view or materialized view.
+    Relation,
+    /// A sequence.
+    Sequence,
+    /// A schema.
+    Schema,
+    /// A database.
+    Database,
+}
+
+impl PrivilegeKind {
+    /// The privileges `ALL PRIVILEGES` grants on an object of this kind,
+    /// without `MAINTAIN`, which sqlparser has no action for.
+    pub(crate) fn all_privileges(self) -> Vec<Action> {
+        match self {
+            Self::Relation => {
+                vec![
+                    Action::Select { columns: None },
+                    Action::Insert { columns: None },
+                    Action::Update { columns: None },
+                    Action::Delete,
+                    Action::Truncate,
+                    Action::References { columns: None },
+                    Action::Trigger,
+                ]
+            }
+            Self::Sequence => {
+                vec![
+                    Action::Usage,
+                    Action::Select { columns: None },
+                    Action::Update { columns: None },
+                ]
+            }
+            Self::Schema => vec![Action::Usage, Action::Create { obj_type: None }],
+            Self::Database => {
+                vec![Action::Create { obj_type: None }, Action::Connect, Action::Temporary]
+            }
+        }
+    }
+}
+
+/// Splits `grant` into what a revoke of `revoke` leaves and what it takes,
+/// reading `ALL PRIVILEGES` in `grant` as `all_privileges`.
 fn partition_privileges_for_revoke(
     grant: &Privileges,
     revoke: &Privileges,
+    all_privileges: Option<&[Action]>,
 ) -> PrivilegeRevokeApplication {
     match (grant, revoke) {
         (_, Privileges::All { .. }) => {
@@ -465,49 +517,48 @@ fn partition_privileges_for_revoke(
                 unsupported: false,
             }
         }
-        (Privileges::All { .. }, Privileges::Actions(_)) => {
-            PrivilegeRevokeApplication {
-                retained: Some(grant.clone()),
-                revoked: None,
-                unsupported: true,
-            }
+        (Privileges::All { .. }, Privileges::Actions(revoke_actions)) => {
+            all_privileges.map_or(PrivilegeRevokeApplication::UNSUPPORTED, |grant_actions| {
+                partition_actions_for_revoke(grant_actions, revoke_actions)
+            })
         }
         (Privileges::Actions(grant_actions), Privileges::Actions(revoke_actions)) => {
-            let mut retained_actions = Vec::with_capacity(grant_actions.len());
-            let mut withdrawn_actions = Vec::new();
+            partition_actions_for_revoke(grant_actions, revoke_actions)
+        }
+    }
+}
 
-            for grant_action in grant_actions {
-                let mut current = Some(grant_action.clone());
-                for revoke_action in revoke_actions {
-                    let Some(action) = current.take() else {
-                        break;
-                    };
-                    let application = partition_action_for_revoke(action, revoke_action);
-                    if application.unsupported {
-                        return PrivilegeRevokeApplication {
-                            retained: Some(grant.clone()),
-                            revoked: None,
-                            unsupported: true,
-                        };
-                    }
-                    current = application.retained;
-                    if let Some(withdrawn) = application.revoked {
-                        withdrawn_actions.push(withdrawn);
-                    }
-                }
-                if let Some(retained) = current {
-                    retained_actions.push(retained);
-                }
+fn partition_actions_for_revoke(
+    grant_actions: &[Action],
+    revoke_actions: &[Action],
+) -> PrivilegeRevokeApplication {
+    let mut retained_actions = Vec::with_capacity(grant_actions.len());
+    let mut withdrawn_actions = Vec::new();
+
+    for grant_action in grant_actions {
+        let mut current = Some(grant_action.clone());
+        for revoke_action in revoke_actions {
+            let Some(action) = current.take() else {
+                break;
+            };
+            let application = partition_action_for_revoke(action, revoke_action);
+            if application.unsupported {
+                return PrivilegeRevokeApplication::UNSUPPORTED;
             }
-
-            PrivilegeRevokeApplication {
-                retained: (!retained_actions.is_empty())
-                    .then_some(Privileges::Actions(retained_actions)),
-                revoked: (!withdrawn_actions.is_empty())
-                    .then_some(Privileges::Actions(withdrawn_actions)),
-                unsupported: false,
+            current = application.retained;
+            if let Some(withdrawn) = application.revoked {
+                withdrawn_actions.push(withdrawn);
             }
         }
+        if let Some(retained) = current {
+            retained_actions.push(retained);
+        }
+    }
+
+    PrivilegeRevokeApplication {
+        retained: (!retained_actions.is_empty()).then_some(Privileges::Actions(retained_actions)),
+        revoked: (!withdrawn_actions.is_empty()).then_some(Privileges::Actions(withdrawn_actions)),
+        unsupported: false,
     }
 }
 
@@ -535,29 +586,31 @@ impl RevokeApplication {
     }
 }
 
-/// Applies a `REVOKE` statement to a grant.
+/// Applies a `REVOKE` statement to a grant, reading `ALL PRIVILEGES` as
+/// `all_privileges` and refusing a partial revoke of it when that is [`None`].
 #[must_use]
-pub fn apply_revoke_to_grant(grant: &Grant, revoke: &Revoke) -> RevokeApplication {
+pub fn apply_revoke_to_grant(
+    grant: &Grant,
+    revoke: &Revoke,
+    all_privileges: Option<&[Action]>,
+) -> RevokeApplication {
     if !grant_objects_match(grant.objects.as_ref(), revoke.objects.as_ref())
         || !grantees_overlap(&grant.grantees, &revoke.grantees)
     {
         return RevokeApplication::unmatched(grant);
     }
 
-    let application = partition_privileges_for_revoke(&grant.privileges, &revoke.privileges);
+    let application =
+        partition_privileges_for_revoke(&grant.privileges, &revoke.privileges, all_privileges);
     let matched = application.revoked.is_some() || application.unsupported;
     if !matched {
         return RevokeApplication::unmatched(grant);
     }
     if application.unsupported {
-        let all_minus_actions = matches!(
-            (&grant.privileges, &revoke.privileges),
-            (Privileges::All { .. }, Privileges::Actions(_))
-        );
         return RevokeApplication {
             matched,
             updated_grants: vec![grant.clone()],
-            unsupported: !all_minus_actions || revoke.grant_option_for,
+            unsupported: true,
         };
     }
 

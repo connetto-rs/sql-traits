@@ -37,7 +37,7 @@ use sqlparser::{
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    impls::SqlparserDialect,
+    impls::{PrivilegeKind, SqlparserDialect},
     structs::{
         ColumnIdentity, ColumnMetadata, FunctionKind, GenericDB, IdentifierCase, MaterializedView,
         RelationIdentity, RoleMembership, Schema, SchemaProfile, Sequence, TableAttribute,
@@ -1529,6 +1529,37 @@ impl ParserDBBuilder {
             if let Some(bound) = self.bound_relation(name) {
                 bind_reference(name, bound.qualifier);
             }
+        }
+    }
+
+    /// The kind fixing what `ALL PRIVILEGES` means on every object `objects`
+    /// names, a plain relation list reaching a sequence included, or [`None`]
+    /// outside PostgreSQL's semantics or when the names reach no single kind.
+    fn privilege_kind(&self, objects: Option<&GrantObjects>) -> Option<PrivilegeKind> {
+        if !matches!(self.dialect(), SqlparserDialect::PostgreSql | SqlparserDialect::Generic) {
+            return None;
+        }
+        match objects? {
+            GrantObjects::Tables(names) => {
+                let mut kinds = names.iter().map(|name| {
+                    match self.relation_reached(name)?.0 {
+                        ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView => {
+                            Some(PrivilegeKind::Relation)
+                        }
+                        ObjectKind::Sequence => Some(PrivilegeKind::Sequence),
+                        _ => None,
+                    }
+                });
+                let first = kinds.next()??;
+                kinds.all(|kind| kind == Some(first)).then_some(first)
+            }
+            GrantObjects::AllTablesInSchema { .. } => Some(PrivilegeKind::Relation),
+            GrantObjects::Sequences(_) | GrantObjects::AllSequencesInSchema { .. } => {
+                Some(PrivilegeKind::Sequence)
+            }
+            GrantObjects::Schemas(_) => Some(PrivilegeKind::Schema),
+            GrantObjects::Databases(_) => Some(PrivilegeKind::Database),
+            _ => None,
         }
     }
 
@@ -3895,10 +3926,12 @@ fn apply_role_options(role: &mut CreateRole, options: Vec<RoleOption>) {
     }
 }
 
-/// Subtracts a revoke from a grant store and returns an unsupported shape.
+/// Subtracts a revoke from a grant store and returns an unsupported shape,
+/// reading `ALL PRIVILEGES` in a grant as `all_privileges`.
 fn apply_revoke_to_grant_store(
     grants: &mut Vec<(Arc<Grant>, ())>,
     revoke: &sqlparser::ast::Revoke,
+    all_privileges: Option<&[Action]>,
 ) -> Option<&'static str> {
     let mut unsupported = None;
     let mut updated_grants = Vec::with_capacity(grants.len());
@@ -3915,18 +3948,19 @@ fn apply_revoke_to_grant_store(
 
         let mut targeted_grant = grant.as_ref().clone();
         targeted_grant.grantees = targeted_grantees;
-        let application = crate::impls::apply_revoke_to_grant(&targeted_grant, revoke);
+        let application =
+            crate::impls::apply_revoke_to_grant(&targeted_grant, revoke, all_privileges);
 
         if application.unsupported {
             unsupported.get_or_insert(
-                if revoke.grant_option_for
+                if all_privileges.is_none()
                     && matches!(
                         (&targeted_grant.privileges, &revoke.privileges),
                         (Privileges::All { .. }, Privileges::Actions(_))
                     )
                 {
-                    "grant-option revoke of a subset from ALL PRIVILEGES is not representable in \
-                     this model"
+                    "revoke of a subset from ALL PRIVILEGES on objects whose privilege set this \
+                     model does not know"
                 } else {
                     "column-scoped REVOKE against a table-wide action grant is not representable \
                      in this model"
@@ -8199,12 +8233,23 @@ impl ParserDB {
                         builder.identifier_case(),
                         |key| builder.relation_key_is_held(key, builder.identifier_case()),
                     )?;
+                    let all_privileges = builder
+                        .privilege_kind(revoke.objects.as_ref())
+                        .map(crate::impls::PrivilegeKind::all_privileges);
                     builder.bind_access_targets(&mut revoke.objects);
 
-                    let unsupported =
-                        apply_revoke_to_grant_store(builder.table_grants_mut(), &revoke).or_else(
-                            || apply_revoke_to_grant_store(builder.column_grants_mut(), &revoke),
-                        );
+                    let unsupported = apply_revoke_to_grant_store(
+                        builder.table_grants_mut(),
+                        &revoke,
+                        all_privileges.as_deref(),
+                    )
+                    .or_else(|| {
+                        apply_revoke_to_grant_store(
+                            builder.column_grants_mut(),
+                            &revoke,
+                            all_privileges.as_deref(),
+                        )
+                    });
 
                     if let Some(reason) = unsupported {
                         return Err(crate::errors::Error::UnsupportedRevoke {
@@ -11105,7 +11150,10 @@ mod tests {
     }
 
     mod grant_revoke_semantics {
-        use sqlparser::{ast::Action, dialect::PostgreSqlDialect};
+        use sqlparser::{
+            ast::Action,
+            dialect::{MySqlDialect, PostgreSqlDialect},
+        };
 
         use super::*;
         use crate::traits::{GrantLike, TableLike};
@@ -11241,21 +11289,198 @@ mod tests {
             assert!(!grant.with_grant_option());
         }
 
+        /// Every table privilege the grants in `db` hold, in stored order,
+        /// beside whether each carries the grant option.
+        fn held_privileges(db: &ParserDB) -> Vec<(String, bool)> {
+            db.table_grants()
+                .flat_map(|grant| {
+                    grant
+                        .privileges(db)
+                        .map(|action| (action.to_string(), grant.with_grant_option()))
+                })
+                .collect()
+        }
+
+        fn without_grant_option(names: &[&str]) -> Vec<(String, bool)> {
+            names.iter().map(|name| ((*name).to_string(), false)).collect()
+        }
+
         #[test]
-        fn test_revoke_grant_option_subset_from_all_is_unsupported() {
+        fn test_revoke_subset_from_all_privileges_keeps_the_rest_of_the_table_set() {
+            let sql = r"
+                CREATE TABLE t (id INT);
+                CREATE ROLE r;
+                GRANT ALL PRIVILEGES ON t TO r;
+                REVOKE DELETE ON t FROM r;
+            ";
+            for db in
+                [ParserDB::parse::<PostgreSqlDialect>(sql), ParserDB::parse::<GenericDialect>(sql)]
+            {
+                let db = db.expect("schema parses");
+
+                assert_eq!(
+                    held_privileges(&db),
+                    without_grant_option(&[
+                        "SELECT",
+                        "INSERT",
+                        "UPDATE",
+                        "TRUNCATE",
+                        "REFERENCES",
+                        "TRIGGER"
+                    ])
+                );
+                let role = db.role("r").expect("role exists");
+                let table = db
+                    .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+                    .expect("unambiguous lookup")
+                    .expect("table exists");
+                assert!(!table.can_delete(role, &db).expect("table resolves"));
+                assert!(table.can_update(role, &db).expect("table resolves"));
+            }
+        }
+
+        #[test]
+        fn test_revoke_grant_option_subset_from_all_privileges_splits_the_table_set() {
             let sql = r"
                 CREATE TABLE t (id INT);
                 CREATE ROLE r;
                 GRANT ALL PRIVILEGES ON t TO r WITH GRANT OPTION;
-                REVOKE GRANT OPTION FOR SELECT ON t FROM r;
+                REVOKE GRANT OPTION FOR DELETE, TRIGGER ON t FROM r;
+            ";
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
+
+            let expected: Vec<(String, bool)> = [
+                ("SELECT", true),
+                ("INSERT", true),
+                ("UPDATE", true),
+                ("TRUNCATE", true),
+                ("REFERENCES", true),
+                ("DELETE", false),
+                ("TRIGGER", false),
+            ]
+            .into_iter()
+            .map(|(name, option)| (name.to_string(), option))
+            .collect();
+            assert_eq!(held_privileges(&db), expected);
+        }
+
+        #[test]
+        fn test_revoke_subset_from_all_privileges_on_a_sequence_keeps_the_sequence_set() {
+            for sql in [
+                r"
+                    CREATE SEQUENCE s;
+                    CREATE ROLE r;
+                    GRANT ALL PRIVILEGES ON SEQUENCE s TO r;
+                    REVOKE UPDATE ON SEQUENCE s FROM r;
+                ",
+                r"
+                    CREATE SEQUENCE s;
+                    CREATE ROLE r;
+                    GRANT ALL PRIVILEGES ON s TO r;
+                    REVOKE UPDATE ON s FROM r;
+                ",
+            ] {
+                let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
+
+                assert_eq!(
+                    held_privileges(&db),
+                    without_grant_option(&["USAGE", "SELECT"]),
+                    "{sql}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_revoke_subset_from_all_privileges_on_a_view_keeps_the_rest_of_the_table_set() {
+            let sql = r"
+                CREATE TABLE t (id INT);
+                CREATE VIEW v AS SELECT id FROM t;
+                CREATE ROLE r;
+                GRANT ALL PRIVILEGES ON v TO r;
+                REVOKE SELECT, INSERT, UPDATE, DELETE ON v FROM r;
+            ";
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
+
+            assert_eq!(
+                held_privileges(&db),
+                without_grant_option(&["TRUNCATE", "REFERENCES", "TRIGGER"])
+            );
+        }
+
+        #[test]
+        fn test_revoke_subset_from_all_privileges_on_a_schema_keeps_the_schema_set() {
+            let sql = r"
+                CREATE SCHEMA app;
+                CREATE ROLE r;
+                GRANT ALL PRIVILEGES ON SCHEMA app TO r;
+                REVOKE CREATE ON SCHEMA app FROM r;
+            ";
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
+
+            assert_eq!(held_privileges(&db), without_grant_option(&["USAGE"]));
+        }
+
+        #[test]
+        fn test_revoke_subset_from_all_privileges_of_unknown_meaning_is_unsupported() {
+            let open_world =
+                || ParseOptions::default().with_access_resolution(AccessResolution::OpenWorld);
+            let cases = [
+                // One list naming a table and a sequence, whose `ALL` differ.
+                open_world().parse::<PostgreSqlDialect>(
+                    r"
+                    CREATE TABLE t (id INT);
+                    CREATE SEQUENCE s;
+                    GRANT ALL PRIVILEGES ON t, s TO r;
+                    REVOKE UPDATE ON t, s FROM r;
+                ",
+                ),
+                // A name the schema never creates, so its kind is unknown.
+                open_world().parse::<PostgreSqlDialect>(
+                    r"
+                    GRANT ALL PRIVILEGES ON elsewhere TO r;
+                    REVOKE DELETE ON elsewhere FROM r;
+                ",
+                ),
+                // MySQL's table `ALL` is a different set from PostgreSQL's.
+                open_world().parse::<MySqlDialect>(
+                    r"
+                    CREATE TABLE t (id INT);
+                    GRANT ALL PRIVILEGES ON t TO r;
+                    REVOKE DELETE ON t FROM r;
+                ",
+                ),
+            ];
+
+            for result in cases {
+                assert!(
+                    matches!(
+                        &result,
+                        Err(Error::UnsupportedRevoke { reason, .. })
+                            if reason.contains("subset from ALL PRIVILEGES")
+                    ),
+                    "got {result:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_revoke_column_scoped_against_all_privileges_is_unsupported() {
+            let sql = r"
+                CREATE TABLE t (id INT);
+                CREATE ROLE r;
+                GRANT ALL PRIVILEGES ON t TO r;
+                REVOKE SELECT (id) ON t FROM r;
             ";
             let result = ParserDB::parse::<PostgreSqlDialect>(sql);
 
-            assert!(matches!(
-                result,
-                Err(Error::UnsupportedRevoke { reason, .. })
-                    if reason.contains("subset from ALL PRIVILEGES")
-            ));
+            assert!(
+                matches!(
+                    &result,
+                    Err(Error::UnsupportedRevoke { reason, .. })
+                        if reason.contains("column-scoped REVOKE against a table-wide action grant")
+                ),
+                "got {result:?}"
+            );
         }
 
         #[test]
@@ -11565,30 +11790,6 @@ mod tests {
         // `grant_objects_inner_match`, the per-column accessor branches,
         // and the GrantObjects variants the existing tests don't reach.
         // ----------------------------------------------------------------
-
-        /// `apply_revoke_to_grant` `(Privileges::All, Privileges::Actions)`
-        /// arm: the implementation cannot represent "ALL minus X" in
-        /// its grant model, so a partial revoke against a `GRANT ALL
-        /// PRIVILEGES` is treated as matched-but-no-op — the grant
-        /// stays intact at ALL PRIVILEGES. This is a documented
-        /// limitation in `impls/sqlparser/grant.
-        /// rs::apply_revoke_to_grant`.
-        #[test]
-        fn test_revoke_select_against_all_privileges_is_a_documented_noop() {
-            let sql = r"
-                CREATE TABLE t (id INT);
-                CREATE ROLE my_role;
-                GRANT ALL PRIVILEGES ON t TO my_role;
-                REVOKE SELECT ON t FROM my_role;
-            ";
-            let db = ParserDB::parse::<GenericDialect>(sql).expect("parse");
-
-            let grant = db.table_grants().next().expect("grant must remain");
-            assert!(
-                grant.is_all_privileges(),
-                "grant stays ALL PRIVILEGES; the model cannot represent ALL-minus-Actions",
-            );
-        }
 
         /// `tables()` `GrantObjects::AllTablesInSchema` branch: a grant on
         /// `ALL TABLES IN SCHEMA` should parse and produce one entry in the
