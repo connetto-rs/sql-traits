@@ -395,10 +395,9 @@ fn store_part(builder: &mut ParserDBBuilder, part: &Part, query: Query) {
     let (Slot::Function(position), Some((statement, shape))) = (part.slot, part.statement) else {
         return store_query(builder, part.slot, query);
     };
-    edit_function(builder, position, |function| {
-        if let Some(CreateFunctionBody::BeginAtomic(block)) = &mut function.function_body {
-            block.statements[statement] = statement_with_query_part(shape, query);
-        }
+    edit_function(builder, position, |CreateFunction { function_body, .. }| {
+        let Some(CreateFunctionBody::BeginAtomic(block)) = function_body else { return };
+        block.statements[statement] = statement_with_query_part(shape, query);
     });
 }
 
