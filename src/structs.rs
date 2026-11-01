@@ -1,6 +1,7 @@
 //! Submodule providing general structs for representing database schemas.
 
 mod column_scope;
+mod deployment;
 pub(crate) mod fingerprint;
 pub mod generic_db;
 pub use generic_db::{
@@ -21,6 +22,10 @@ mod view;
 pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
     ColumnScope, QueryOutput, RelationBinding,
+};
+pub use deployment::{
+    Deployment, JsonField, ResolvedDeployment, SessionSetting, SetPacking, SettingContent,
+    SettingPresence, SettingValue,
 };
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use function_kind::FunctionKind;

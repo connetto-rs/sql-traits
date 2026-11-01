@@ -401,6 +401,63 @@ pub enum TargetNameParseError {
     },
 }
 
+/// Why a [`Deployment`](crate::structs::Deployment) description is refused.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum DeploymentError {
+    /// No acting role was named, so a request would run as nothing.
+    #[error("a deployment needs at least one acting role")]
+    NoActingRole,
+    /// The same acting role was named twice.
+    #[error("acting role `{role}` is named twice")]
+    DuplicateActingRole {
+        /// The repeated role.
+        role: String,
+    },
+    /// Two settings share a name, compared without case as PostgreSQL does.
+    #[error("setting `{name}` is declared twice")]
+    DuplicateSetting {
+        /// The second declaration's name.
+        name: String,
+    },
+    /// The name is not a custom setting name, two or more non-empty parts
+    /// joined by dots.
+    #[error("`{name}` is not a custom setting name such as `app.user_id`")]
+    InvalidSettingName {
+        /// The refused name.
+        name: String,
+    },
+    /// A set is split on the empty string, which `string_to_array` reads as
+    /// one field.
+    #[error("setting `{setting}` splits a set on an empty separator")]
+    EmptySeparator {
+        /// The setting holding the set.
+        setting: String,
+    },
+    /// A JSON field was declared with no key.
+    #[error("a JSON field needs at least one key")]
+    EmptyFieldPath,
+    /// A JSON setting was declared with no field.
+    #[error("JSON setting `{setting}` declares no field")]
+    NoJsonFields {
+        /// The setting.
+        setting: String,
+    },
+    /// Two fields of one JSON setting share a path.
+    #[error("JSON setting `{setting}` declares the field {path:?} twice")]
+    DuplicateJsonField {
+        /// The setting.
+        setting: String,
+        /// The repeated path.
+        path: Vec<String>,
+    },
+    /// The database declares no role by this name.
+    #[error("role `{role}` is not declared in the database")]
+    UndeclaredRole {
+        /// The missing role.
+        role: String,
+    },
+}
+
 #[derive(Debug, thiserror::Error)]
 /// Defines the `Error` enum representing various error types
 pub enum Error {
