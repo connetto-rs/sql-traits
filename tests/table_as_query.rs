@@ -113,15 +113,13 @@ fn repeated_output_names_are_refused() {
     );
 }
 
-/// A `CREATE TABLE … AS` statement with `names` written as its column list,
-/// built from the AST since the parser does not yet read the list under
+/// A `CREATE TABLE … AS query` statement with `names` written as its column
+/// list, built from the AST since the parser does not yet read the list under
 /// PostgreSQL.
-fn with_column_list(names: &[&str]) -> Result<ParserDB, Error> {
-    let mut statements = Parser::parse_sql(
-        &PostgreSqlDialect {},
-        &format!("{SOURCE} CREATE TABLE cn AS SELECT id, iv FROM t2;"),
-    )
-    .expect("statements parse");
+fn with_column_list(names: &[&str], query: &str) -> Result<ParserDB, Error> {
+    let mut statements =
+        Parser::parse_sql(&PostgreSqlDialect {}, &format!("{SOURCE} CREATE TABLE cn AS {query};"))
+            .expect("statements parse");
     let Some(Statement::CreateTable(create_table)) = statements.last_mut() else {
         panic!("expected CREATE TABLE")
     };
@@ -140,20 +138,36 @@ fn with_column_list(names: &[&str]) -> Result<ParserDB, Error> {
 
 #[test]
 fn a_column_list_renames_outputs_in_order() {
-    let db = with_column_list(&["a", "b"]).expect("schema builds");
+    let db = with_column_list(&["a", "b"], "SELECT id, iv FROM t2").expect("schema builds");
     assert_eq!(columns(&db, "cn"), pairs(&[("a", "INT"), ("b", "INTERVAL")]));
 }
 
 #[test]
 fn a_short_column_list_leaves_the_rest_named_by_the_query() {
-    let db = with_column_list(&["a"]).expect("schema builds");
+    let db = with_column_list(&["a"], "SELECT id, iv FROM t2").expect("schema builds");
     assert_eq!(columns(&db, "cn"), pairs(&[("a", "INT"), ("iv", "INTERVAL")]));
+}
+
+#[test]
+fn outputs_that_cannot_be_counted_leave_the_declared_names() {
+    let db = with_column_list(&["a"], "SELECT * FROM generate_series(1, 3) AS g")
+        .expect("schema builds");
+    assert_eq!(columns(&db, "cn"), pairs(&[("a", "")]));
+}
+
+#[test]
+fn typed_columns_beside_the_query_are_kept_as_declared() {
+    let db = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+        "CREATE TABLE t2 (id INT); CREATE TABLE m (extra TEXT) AS SELECT id FROM t2;",
+    )
+    .expect("schema parses");
+    assert_eq!(columns(&db, "m"), pairs(&[("extra", "TEXT")]));
 }
 
 #[test]
 fn a_column_list_longer_than_the_outputs_is_refused() {
     assert!(matches!(
-        with_column_list(&["a", "b", "c"]),
+        with_column_list(&["a", "b", "c"], "SELECT id, iv FROM t2"),
         Err(Error::TableColumnListTooLong { table_name }) if table_name == "cn"
     ));
 }
