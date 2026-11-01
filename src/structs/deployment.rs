@@ -209,8 +209,8 @@ impl SessionSetting {
     /// let claims = SessionSetting::json(
     ///     "request.jwt.claims",
     ///     [JsonField::new(["sub"], SettingValue::Caller(DataType::Uuid))?],
-    /// )?
-    /// .may_be_unset();
+    /// )?;
+    /// let claims = claims.may_be_unset();
     ///
     /// assert_eq!(claims.presence(), SettingPresence::MayBeUnset);
     /// let SettingContent::Json(fields) = claims.content() else { unreachable!() };
