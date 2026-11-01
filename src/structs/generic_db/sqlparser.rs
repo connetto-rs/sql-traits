@@ -22,15 +22,15 @@ use sqlparser::{
         AlterFunctionOperation, AlterIndexOperation, AlterPolicy, AlterPolicyOperation,
         AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, ArgMode,
         ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
-        CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction, CreateIndex,
-        CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
-        DataType, DropBehavior, Expr, ForeignKeyConstraint, FunctionDefinitionSetParam,
-        FunctionDesc, FunctionSetValue, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName,
-        GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart,
-        OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
-        RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
-        TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut,
-        Visitor, VisitorMut, visit_relations,
+        CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction,
+        CreateFunctionBody, CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable,
+        CreateTableOptions, CreateTrigger, DataType, DropBehavior, Expr, ForeignKeyConstraint,
+        FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue, GeneratedAs, Grant,
+        GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition,
+        ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner,
+        Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption,
+        Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
+        VisitMut, Visitor, VisitorMut, visit_relations,
     },
     dialect::Dialect,
 };
@@ -963,13 +963,13 @@ fn existing_child_column_collation_conflict(
 }
 
 impl ParserDBBuilder {
-    /// The calls in `expression` and the functions each may run, as of this
+    /// The calls in `node` and the functions each may run, as of this
     /// statement.
-    fn calls_in(&self, expression: &Expr) -> ExpressionCalls<CreateFunction> {
+    fn calls_in<N: Visit + ?Sized>(&self, node: &N) -> ExpressionCalls<CreateFunction> {
         let functions = self.function_arc_vec();
         let search_path: Vec<(&str, bool)> = self.search_path().collect();
-        calls_in_expression::calls_in_expression(
-            expression,
+        calls_in_expression::calls_in(
+            node,
             &calls_in_expression::CallScope {
                 functions: &functions,
                 search_path: &search_path,
@@ -978,8 +978,18 @@ impl ParserDBBuilder {
         )
     }
 
-    /// Re-points every check constraint and policy holding the function node
-    /// `stale` at `fresh`, its new version.
+    /// The calls a body PostgreSQL binds at creation makes, as of this
+    /// statement, and none for a body read again each time it runs.
+    fn bound_body_calls(&self, function: &CreateFunction) -> ExpressionCalls<CreateFunction> {
+        match &function.function_body {
+            Some(CreateFunctionBody::Return(expression)) => self.calls_in(expression),
+            Some(CreateFunctionBody::BeginAtomic(block)) => self.calls_in(&block.statements),
+            _ => ExpressionCalls::default(),
+        }
+    }
+
+    /// Re-points every check constraint, policy and bound function body
+    /// holding the function node `stale` at `fresh`, its new version.
     ///
     /// PostgreSQL keeps the same `pg_proc` entry across `CREATE OR REPLACE`
     /// and `ALTER FUNCTION`, and every dependent sees the new definition.
@@ -990,15 +1000,25 @@ impl ParserDBBuilder {
         for (_, metadata) in self.check_constraints_mut() {
             metadata.replace_function(stale, fresh);
         }
+        for (_, metadata) in self.functions_mut() {
+            metadata.replace_function(stale, fresh);
+        }
     }
 
-    /// Whether a check constraint, a policy or a trigger still reaches the
-    /// stored function `dropped`.
+    /// Whether a check constraint, a policy, a trigger or a bound function
+    /// body still reaches the stored function `dropped`, leaving out the
+    /// functions in `dropping`, which the same statement drops.
     ///
-    /// Checks and policies hold the functions their calls reached when they
-    /// were written, so the comparison is by node. A trigger holds the name
-    /// it was bound to, which reaches a function taking no arguments.
-    fn is_function_used(&self, dropped: &Arc<CreateFunction>) -> bool {
+    /// Checks, policies and bound bodies hold the functions their calls
+    /// reached when they were written, so the comparison is by node, and a
+    /// body calling its own function does not hold it in place. A trigger
+    /// holds the name it was bound to, which reaches a function taking no
+    /// arguments.
+    fn is_function_used(
+        &self,
+        dropped: &Arc<CreateFunction>,
+        dropping: &[Arc<CreateFunction>],
+    ) -> bool {
         let is_dropped = |function: &CreateFunction| core::ptr::eq(function, dropped.as_ref());
         // A bound name left bare is one in the default schema.
         let trigger_scope = calls_in_expression::CallScope {
@@ -1020,6 +1040,11 @@ impl ParserDBBuilder {
                     trigger_scope.reaches(dropped, &body.func_desc.name, 0)
                         && function_argument_types(dropped.args.as_deref()).is_empty()
                 })
+            })
+            || self.functions().iter().any(|(caller, metadata)| {
+                !is_dropped(caller)
+                    && !dropping.iter().any(|other| Arc::ptr_eq(other, caller))
+                    && metadata.body_calls().functions().any(is_dropped)
             })
     }
 
@@ -6839,16 +6864,21 @@ impl ParserDB {
                     // replacement that names an absent relation refuses with
                     // the old function still answering.
                     function_bodies::bind(&builder, &mut create_function)?;
+                    // Calls bind as relations do, so a body calling the
+                    // function it replaces reaches the stored node, which
+                    // the replacement then re-points.
+                    let body_calls = builder.bound_body_calls(&create_function);
                     let replaced =
                         replace_position.map(|position| builder.functions_mut().remove(position));
 
                     // The `pg_proc` entry and its owner survive, the new body
-                    // decides what a `NULL` argument does.
+                    // decides what a `NULL` argument does and what it calls.
                     let (replaced, mut metadata) = match replaced {
                         Some((stale, metadata)) => (Some(stale), metadata),
                         None => (None, FunctionMetadata::default()),
                     };
                     metadata.set_null_returning_arguments(&[]);
+                    metadata.set_body_calls(body_calls);
 
                     let fresh = Arc::new(create_function);
                     builder = builder.add_function(Arc::clone(&fresh), metadata);
@@ -6857,6 +6887,16 @@ impl ParserDB {
                     }
                 }
                 Statement::DropFunction(drop_function) => {
+                    // PostgreSQL drops the listed functions together, so one
+                    // calling another does not hold it in place.
+                    let dropping: Vec<Arc<CreateFunction>> = drop_function
+                        .func_desc
+                        .iter()
+                        .filter_map(|func_desc| {
+                            let position = *Self::functions_named(&builder, func_desc).first()?;
+                            Some(Arc::clone(&builder.functions()[position].0))
+                        })
+                        .collect();
                     for func_desc in &drop_function.func_desc {
                         let function_name = last_str(&func_desc.name);
                         let matching = Self::functions_named(&builder, func_desc);
@@ -6883,7 +6923,7 @@ impl ParserDB {
                                 extension_name: extension.value.clone(),
                             });
                         }
-                        if builder.is_function_used(function) {
+                        if builder.is_function_used(function, &dropping) {
                             return Err(crate::errors::Error::FunctionReferenced {
                                 function_name: function_name.to_string(),
                             });
