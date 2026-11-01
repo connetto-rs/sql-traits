@@ -32,10 +32,8 @@ use crate::{
 /// Returns [`Error::ColumnNotFoundForGrant`] when a table a blanket form
 /// reaches lacks a column the privileges list.
 pub(super) fn grant(builder: &mut ParserDBBuilder, mut grant: Grant) -> Result<(), Error> {
-    let parts = match &grant.objects {
-        Some(objects) => per_relation(builder, objects, &grant.privileges)?,
-        None => None,
-    };
+    let objects = grant.objects.as_ref();
+    let parts = objects.map(|o| per_relation(builder, o, &grant.privileges)).transpose()?.flatten();
     let Some(parts) = parts else {
         record(builder, grant);
         return Ok(());
@@ -61,10 +59,9 @@ pub(super) fn grant(builder: &mut ParserDBBuilder, mut grant: Grant) -> Result<(
 /// [`Error::UnsupportedRevoke`] when the revoke leaves a grant this model
 /// cannot represent.
 pub(super) fn revoke(builder: &mut ParserDBBuilder, mut revoke: Revoke) -> Result<(), Error> {
-    let parts = match &revoke.objects {
-        Some(objects) => per_relation(builder, objects, &revoke.privileges)?,
-        None => None,
-    };
+    let objects = revoke.objects.as_ref();
+    let parts =
+        objects.map(|o| per_relation(builder, o, &revoke.privileges)).transpose()?.flatten();
     let Some(parts) = parts else {
         return take(builder, &revoke).map_err(|reason| unsupported(&revoke, reason));
     };

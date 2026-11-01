@@ -179,6 +179,19 @@ fn a_blanket_column_grant_needs_the_column_on_every_table() {
     ));
 }
 
+/// PostgreSQL grants a relation written twice in one statement once, under
+/// any spelling that folds to the same name.
+#[test]
+fn a_relation_written_twice_is_granted_once() {
+    let database = parse(
+        "CREATE ROLE r1;
+         CREATE TABLE a (id int);
+         GRANT SELECT ON a, A, public.a TO r1;",
+    );
+
+    assert_eq!(database.table_grants().count(), 1);
+}
+
 /// A bare table lives in `public`, so `public`'s blanket grant reaches it
 /// even when a later search path puts a namesake first.
 #[test]
