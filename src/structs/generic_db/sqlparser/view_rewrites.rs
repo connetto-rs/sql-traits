@@ -9,12 +9,13 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AssignmentTarget, ConflictTarget, CreateFunctionBody, Delete, DoUpdate, Expr, FromTable, Ident,
-    Insert, JoinConstraint, JoinOperator, Merge, MergeAction, MergeUpdateExpr, MergeUpdateKind,
-    ObjectName, ObjectNamePart, OnConflict, OnConflictAction, OnInsert, OutputClause, Query,
-    ReturnStatement, ReturnStatementValue, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
-    Statement, TableAlias, TableAliasColumnDef, TableAliasWithoutColumns, TableFactor, TableObject,
-    TableWithJoins, Update, UpdateTableFromKind, Visit, VisitMut, Visitor, VisitorMut,
+    AssignmentTarget, ConflictTarget, CreateFunction, CreateFunctionBody, Delete, DoUpdate, Expr,
+    FromTable, Ident, Insert, JoinConstraint, JoinOperator, Merge, MergeAction, MergeUpdateExpr,
+    MergeUpdateKind, ObjectName, ObjectNamePart, OnConflict, OnConflictAction, OnInsert,
+    OutputClause, Query, ReturnStatement, ReturnStatementValue, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableAlias, TableAliasColumnDef,
+    TableAliasWithoutColumns, TableFactor, TableObject, TableWithJoins, Update,
+    UpdateTableFromKind, Visit, VisitMut, Visitor, VisitorMut,
     helpers::attached_token::AttachedToken,
 };
 
@@ -113,9 +114,27 @@ fn store_query(builder: &mut ParserDBBuilder, slot: Slot, query: Query) {
             *declaration.query_mut() = query;
         }
         Slot::Function(position) => {
-            let function = alloc::sync::Arc::make_mut(&mut builder.functions_mut()[position].0);
-            function_bodies::write_definition(&mut function.function_body, query);
+            edit_function(builder, position, |function| {
+                function_bodies::write_definition(&mut function.function_body, query);
+            });
         }
+    }
+}
+
+/// Applies `edit` to the function stored at `position`, re-pointing every
+/// check constraint and policy holding the node at its edited copy.
+fn edit_function(
+    builder: &mut ParserDBBuilder,
+    position: usize,
+    edit: impl FnOnce(&mut CreateFunction),
+) {
+    let slot = &mut builder.functions_mut()[position].0;
+    // An unshared node is edited in place, with nothing holding it to update.
+    let stale = (alloc::sync::Arc::strong_count(slot) > 1).then(|| alloc::sync::Arc::clone(slot));
+    edit(alloc::sync::Arc::make_mut(slot));
+    let fresh = alloc::sync::Arc::clone(slot);
+    if let Some(stale) = stale {
+        builder.repoint_function(&stale, &fresh);
     }
 }
 
@@ -327,8 +346,9 @@ pub(super) fn follow_renames(
                         factors: part.factors,
                     });
                 }
-                let entry = alloc::sync::Arc::make_mut(&mut builder.functions_mut()[function].0);
-                function_bodies::write_statements(&mut entry.function_body, rewritten);
+                edit_function(builder, function, |entry| {
+                    function_bodies::write_statements(&mut entry.function_body, rewritten);
+                });
             }
         }
     }
@@ -375,10 +395,11 @@ fn store_part(builder: &mut ParserDBBuilder, part: &Part, query: Query) {
     let (Slot::Function(position), Some((statement, shape))) = (part.slot, part.statement) else {
         return store_query(builder, part.slot, query);
     };
-    let body =
-        &mut alloc::sync::Arc::make_mut(&mut builder.functions_mut()[position].0).function_body;
-    let Some(CreateFunctionBody::BeginAtomic(block)) = body else { return };
-    block.statements[statement] = statement_with_query_part(shape, query);
+    edit_function(builder, position, |function| {
+        if let Some(CreateFunctionBody::BeginAtomic(block)) = &mut function.function_body {
+            block.statements[statement] = statement_with_query_part(shape, query);
+        }
+    });
 }
 
 /// A statement holding `query` as the part `shape` spells it.

@@ -366,3 +366,30 @@ fn a_rolled_back_rename_restores_the_view_definitions_it_rewrote() {
         assert!(matches!(&error, Error::RelationHasDependents { .. }), "{error}");
     }
 }
+
+/// A policy or check calling a function whose body a rename rewrote calls the
+/// rewritten function the database holds.
+#[test]
+fn a_policy_and_a_check_call_the_function_a_rename_rewrote() {
+    let database = parse(
+        "CREATE TABLE t (id INT);
+         CREATE FUNCTION counted() RETURNS BIGINT LANGUAGE sql RETURN (SELECT count(*) FROM t);
+         CREATE TABLE docs (id INT, CHECK (counted() >= 0));
+         CREATE POLICY p ON docs USING (counted() > 0);
+         ALTER TABLE t RENAME TO u;",
+    );
+    let held = database
+        .function_by_target(TargetName::new("counted", false), IdentifierCase::AsWritten)
+        .unwrap()
+        .unwrap();
+    let policy = database.policies().next().expect("the policy exists");
+    let called: Vec<_> = policy.using_functions(&database).unwrap().collect();
+    assert!(matches!(called.as_slice(), [called] if core::ptr::eq(*called, held)));
+    let docs = database
+        .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
+        .unwrap()
+        .unwrap();
+    let check = docs.check_constraints(&database).unwrap().next().expect("the check exists");
+    let checked: Vec<_> = database.check_constraint_metadata(check).unwrap().functions().collect();
+    assert!(matches!(checked.as_slice(), [called] if core::ptr::eq(*called, held)));
+}

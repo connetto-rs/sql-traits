@@ -978,6 +978,20 @@ impl ParserDBBuilder {
         )
     }
 
+    /// Re-points every check constraint and policy holding the function node
+    /// `stale` at `fresh`, its new version.
+    ///
+    /// PostgreSQL keeps the same `pg_proc` entry across `CREATE OR REPLACE`
+    /// and `ALTER FUNCTION`, and every dependent sees the new definition.
+    fn repoint_function(&mut self, stale: &Arc<CreateFunction>, fresh: &Arc<CreateFunction>) {
+        for (_, metadata) in self.policies_mut() {
+            metadata.replace_function(stale, fresh);
+        }
+        for (_, metadata) in self.check_constraints_mut() {
+            metadata.replace_function(stale, fresh);
+        }
+    }
+
     /// Whether a check constraint, a policy or a trigger still reaches the
     /// stored function `dropped`.
     ///
@@ -6838,19 +6852,8 @@ impl ParserDB {
 
                     let fresh = Arc::new(create_function);
                     builder = builder.add_function(Arc::clone(&fresh), metadata);
-
-                    // Policies and check constraints cache the function
-                    // nodes their expressions call, so a replacement has to
-                    // reach those caches too. PostgreSQL keeps the same
-                    // pg_proc entry across CREATE OR REPLACE, and dependent
-                    // objects see the new definition.
                     if let Some(stale) = replaced {
-                        for (_, metadata) in builder.policies_mut() {
-                            metadata.replace_function(&stale, &fresh);
-                        }
-                        for (_, metadata) in builder.check_constraints_mut() {
-                            metadata.replace_function(&stale, &fresh);
-                        }
+                        builder.repoint_function(&stale, &fresh);
                     }
                 }
                 Statement::DropFunction(drop_function) => {
@@ -8371,15 +8374,7 @@ impl ParserDB {
                                 }
                             }
                             let fresh = Arc::clone(function_arc);
-
-                            // Policies and check constraints cache function
-                            // nodes.
-                            for (_, metadata) in builder.policies_mut() {
-                                metadata.replace_function(&stale, &fresh);
-                            }
-                            for (_, metadata) in builder.check_constraints_mut() {
-                                metadata.replace_function(&stale, &fresh);
-                            }
+                            builder.repoint_function(&stale, &fresh);
                         }
                         AlterFunctionOperation::RenameTo { .. }
                         | AlterFunctionOperation::SetSchema { .. }
