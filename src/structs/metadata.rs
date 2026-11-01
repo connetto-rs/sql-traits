@@ -2,6 +2,7 @@
 
 mod column_metadata;
 pub use column_metadata::ColumnMetadata;
+pub(crate) use column_metadata::{ColumnCreation, CreatingQuery};
 mod table_metadata;
 pub use table_metadata::TableMetadata;
 mod table_attribute;

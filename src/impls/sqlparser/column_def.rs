@@ -9,7 +9,7 @@ use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ColumnMetadata, ParserDB, TableAttribute},
     traits::{
-        ColumnCollation, ColumnLike, DatabaseLike, IdentityGeneration, Metadata,
+        ColumnCollation, ColumnLike, CreatedFromQuery, DatabaseLike, IdentityGeneration, Metadata,
         NamedColumnCollation,
     },
     utils::{identity_generation, is_identity, object_name::target_name_of_object_name},
@@ -109,6 +109,23 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
         }
 
         Ok(if unknown { ColumnCollation::Unknown } else { ColumnCollation::DatabaseDefault })
+    }
+
+    #[inline]
+    fn created_from_query<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<CreatedFromQuery<'db, Self::DB>> {
+        if self.attribute().data_type != DataType::Unspecified {
+            return None;
+        }
+        let creation = database.column_metadata(self)?.creation()?;
+        Some(CreatedFromQuery::new(
+            creation.query(),
+            creation.output_names(),
+            creation.catalog(),
+            creation.ordinal(),
+        ))
     }
 
     #[inline]

@@ -48,7 +48,7 @@ fn owned(name: Option<(&str, bool)>) -> Name {
 
 fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
     match definition {
-        ColumnDefinition::Base { table, column } => {
+        ColumnDefinition::Base { table, column, .. } => {
             format!("{}.{}", table.table_name(), column.column_name())
         }
         ColumnDefinition::Expression { expression, .. } => format!("expression {expression}"),

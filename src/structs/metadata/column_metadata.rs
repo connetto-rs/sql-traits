@@ -1,13 +1,76 @@
 //! Column metadata that parsed DDL keeps outside the column node.
 
-use alloc::string::String;
+use alloc::{string::String, sync::Arc, vec::Vec};
+use core::fmt;
 
-use crate::traits::MySqlCollationPadding;
+use sqlparser::ast::Query;
+
+use crate::{structs::ParserDB, traits::MySqlCollationPadding};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedCollation {
     DatabaseDefault,
     Named { schema: Option<String>, schema_quoted: bool, name: String, name_quoted: bool },
+}
+
+/// The query of a `CREATE TABLE … AS` statement, with its output names and the
+/// catalog it read, frozen as the statement saw them.
+pub(crate) struct CreatingQuery {
+    query: Query,
+    output_names: Vec<(String, bool)>,
+    catalog: ParserDB,
+}
+
+impl CreatingQuery {
+    pub(crate) fn new(query: Query, output_names: Vec<(String, bool)>, catalog: ParserDB) -> Self {
+        Self { query, output_names, catalog }
+    }
+}
+
+/// The output of a `CREATE TABLE … AS` query a column was created from.
+#[derive(Clone)]
+pub(crate) struct ColumnCreation {
+    query: Arc<CreatingQuery>,
+    ordinal: usize,
+}
+
+impl ColumnCreation {
+    pub(crate) fn new(query: Arc<CreatingQuery>, ordinal: usize) -> Self {
+        Self { query, ordinal }
+    }
+
+    pub(crate) fn query(&self) -> &Query {
+        &self.query.query
+    }
+
+    pub(crate) fn output_names(&self) -> &[(String, bool)] {
+        &self.query.output_names
+    }
+
+    pub(crate) fn catalog(&self) -> &ParserDB {
+        &self.query.catalog
+    }
+
+    pub(crate) fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+}
+
+impl PartialEq for ColumnCreation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.query, &other.query) && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for ColumnCreation {}
+
+impl fmt::Debug for ColumnCreation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColumnCreation")
+            .field("query", &format_args!("{}", self.query.query))
+            .field("ordinal", &self.ordinal)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Metadata attached to a parsed column.
@@ -17,6 +80,7 @@ pub struct ColumnMetadata {
     postgres_collation: Option<ResolvedCollation>,
     mysql_padding: Option<MySqlCollationPadding>,
     documentation: Option<String>,
+    creation: Option<ColumnCreation>,
 }
 
 impl ColumnMetadata {
@@ -58,6 +122,17 @@ impl ColumnMetadata {
             name_quoted: name.1,
         });
         self
+    }
+
+    pub(crate) fn with_creation(mut self, creation: ColumnCreation) -> Self {
+        self.creation = Some(creation);
+        self
+    }
+
+    /// The query output the column was created from, whatever type it has
+    /// been declared since.
+    pub(crate) fn creation(&self) -> Option<&ColumnCreation> {
+        self.creation.as_ref()
     }
 
     pub(crate) fn postgres_collation_matches(&self, other: &Self) -> Option<bool> {

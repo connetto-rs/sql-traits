@@ -170,7 +170,7 @@ fn base_definition_carries_the_table_and_original_column() {
     let SelectItem::UnnamedExpr(reference) = &select.projection[0] else {
         panic!("expected an expression projection")
     };
-    let Some(ColumnDefinition::Base { table, column }) =
+    let Some(ColumnDefinition::Base { table, column, .. }) =
         scope.resolve_column_definition(reference).expect("definition resolves")
     else {
         panic!("expected a base column definition")
@@ -214,7 +214,7 @@ fn table_scope_returns_base_definitions() {
             .expect("table exists");
         let scope = ColumnScope::for_table(table, &db, IdentifierCase::AsWritten);
         for reference_sql in references {
-            let Some(ColumnDefinition::Base { table: resolved_table, column }) = scope
+            let Some(ColumnDefinition::Base { table: resolved_table, column, .. }) = scope
                 .resolve_column_definition(&reference(reference_sql))
                 .expect("definition resolves")
             else {
@@ -276,7 +276,7 @@ fn expression_definition_resolves_its_base_inputs() {
         panic!("expected an expression definition")
     };
     assert_eq!(expression.to_string(), "amount * 2");
-    let Some(ColumnDefinition::Base { table, column }) =
+    let Some(ColumnDefinition::Base { table, column, .. }) =
         defining_scope.resolve_column_definition(&reference("amount")).expect("input resolves")
     else {
         panic!("expected a base input")
@@ -1897,7 +1897,7 @@ fn wildcard_definitions_retain_exact_base_columns() {
         let query = query(sql);
         let scope =
             ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
-        let Some(ColumnDefinition::Base { table, column }) =
+        let Some(ColumnDefinition::Base { table, column, .. }) =
             scope.resolve_column_definition(&reference("d.payload")).expect("definition resolves")
         else {
             panic!("expected a base wildcard definition")
@@ -1925,7 +1925,7 @@ fn three_part_references_return_exact_base_definitions() {
     let unquoted = query("SELECT public.a.payload FROM a");
     let scope =
         ColumnScope::from_query(&unquoted, &db, IdentifierCase::AsWritten).expect("scope builds");
-    let Some(ColumnDefinition::Base { table, column }) = scope
+    let Some(ColumnDefinition::Base { table, column, .. }) = scope
         .resolve_column_definition(&reference("public.a.payload"))
         .expect("definition resolves")
     else {
@@ -1941,7 +1941,7 @@ fn three_part_references_return_exact_base_definitions() {
     let quoted = query("SELECT \"S\".\"T\".\"C\" FROM \"S\".\"T\"");
     let scope = ColumnScope::from_query(&quoted, &quoted_db, IdentifierCase::AsWritten)
         .expect("scope builds");
-    let Some(ColumnDefinition::Base { table, column }) = scope
+    let Some(ColumnDefinition::Base { table, column, .. }) = scope
         .resolve_column_definition(&reference("\"S\".\"T\".\"C\""))
         .expect("definition resolves")
     else {

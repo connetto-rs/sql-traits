@@ -8,12 +8,12 @@
 //! serial column arrives as its integer type, and `WITH NO DATA` changes
 //! nothing about the columns.
 //!
-//! The query is read against the catalog as the statement sees it. An output
-//! that reads a stored column takes that column's declared type. The crate
-//! derives no type for an expression, so any other output is recorded without
-//! one.
+//! An output reading a stored column takes that column's declared type. The
+//! crate derives no type for an expression, so any other output leaves the
+//! column untyped and keeps the output it was created from, with the catalog
+//! the query read frozen, since PostgreSQL keeps no link from the table to it.
 
-use alloc::{borrow::ToOwned, string::ToString, vec::Vec};
+use alloc::{borrow::ToOwned, string::ToString, sync::Arc, vec::Vec};
 
 use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, Ident};
 
@@ -21,7 +21,10 @@ use super::{ParserDBBuilder, view_rewrites, views};
 use crate::{
     errors::Error,
     impls::serial_sequence_type,
-    structs::{ColumnDefinition, ColumnScope, IdentifierCase, QueryOutput},
+    structs::{
+        ColumnDefinition, ColumnScope, IdentifierCase, QueryOutput,
+        metadata::{ColumnCreation, CreatingQuery},
+    },
 };
 
 /// Whether the statement has the shape PostgreSQL's `CREATE TABLE … AS`
@@ -57,7 +60,8 @@ fn copied_column(name: Ident, column: &ColumnDef) -> ColumnDef {
 }
 
 /// Gives the node of a `CREATE TABLE … AS` statement the columns its query
-/// produces.
+/// produces, answering the output each column without a declared type was
+/// created from, by the column's name.
 ///
 /// A query whose outputs cannot all be counted and named, such as a wildcard
 /// over a set-returning function, leaves the node with the names its column
@@ -71,32 +75,43 @@ fn copied_column(name: Ident, column: &ColumnDef) -> ColumnDef {
 pub(super) fn apply_query(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
-) -> Result<(), Error> {
+) -> Result<Vec<(Ident, ColumnCreation)>, Error> {
     let Some(query) = create_table.query.as_deref() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if !takes_query_columns(create_table) {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut bound = query.clone();
     views::bind_definition(builder, &mut bound);
     let read = view_rewrites::catalog(builder, core::iter::once(&bound));
-    let scope = ColumnScope::from_query(&bound, &read, IdentifierCase::AsWritten)?;
-    let Some(outputs) = scope.scope_for_query(&bound) else {
-        return Ok(());
-    };
-
-    let mut columns = Vec::with_capacity(outputs.outputs().len());
-    for output in outputs.outputs() {
-        let QueryOutput::Column { name: Some((name, quoted)), definition } = output else {
-            return Ok(());
+    let mut columns = Vec::new();
+    let mut output_names = Vec::new();
+    let mut computed = Vec::new();
+    {
+        let scope = ColumnScope::from_query(&bound, &read, IdentifierCase::AsWritten)?;
+        let Some(outputs) = scope.scope_for_query(&bound) else {
+            return Ok(Vec::new());
         };
-        let name = if quoted { Ident::with_quote('"', name) } else { Ident::new(name.to_owned()) };
-        columns.push(match definition {
-            ColumnDefinition::Base { column, .. } => copied_column(name, column.attribute()),
-            _ => ColumnDef { name, data_type: DataType::Unspecified, options: Vec::new() },
-        });
+        for (ordinal, output) in outputs.outputs().enumerate() {
+            let QueryOutput::Column { name: Some((name, quoted)), definition } = output else {
+                return Ok(Vec::new());
+            };
+            output_names.push((name.to_owned(), quoted));
+            let name =
+                if quoted { Ident::with_quote('"', name) } else { Ident::new(name.to_owned()) };
+            if let ColumnDefinition::Base { column, .. } = definition {
+                columns.push(copied_column(name, column.attribute()));
+            } else {
+                computed.push(ordinal);
+                columns.push(ColumnDef {
+                    name,
+                    data_type: DataType::Unspecified,
+                    options: Vec::new(),
+                });
+            }
+        }
     }
 
     if create_table.columns.len() > columns.len() {
@@ -105,6 +120,13 @@ pub(super) fn apply_query(
     for (column, declared) in columns.iter_mut().zip(core::mem::take(&mut create_table.columns)) {
         column.name = declared.name;
     }
+    let creating = Arc::new(CreatingQuery::new(bound, output_names, read));
+    let creations = computed
+        .into_iter()
+        .map(|ordinal| {
+            (columns[ordinal].name.clone(), ColumnCreation::new(Arc::clone(&creating), ordinal))
+        })
+        .collect();
     create_table.columns = columns;
-    Ok(())
+    Ok(creations)
 }

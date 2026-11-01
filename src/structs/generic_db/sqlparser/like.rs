@@ -17,11 +17,15 @@
 use alloc::{string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, CreateTableLikeDefaults, CreateTableLikeKind, ObjectName,
+    ColumnDef, ColumnOption, CreateTable, CreateTableLikeDefaults, CreateTableLikeKind, DataType,
+    Ident, ObjectName,
 };
 
 use super::{ParserDBBuilder, column_copy::copy_column, sequences};
-use crate::errors::Error;
+use crate::{
+    errors::Error,
+    structs::{TableAttribute, metadata::ColumnCreation},
+};
 
 /// The table a `LIKE` clause copies from, and whether it asks for defaults.
 fn source(create_table: &CreateTable) -> Option<(&ObjectName, bool)> {
@@ -44,7 +48,28 @@ fn is_copied_option(option: &ColumnOption, with_defaults: bool) -> bool {
     }
 }
 
-/// Gives the node the columns it copies from the table its `LIKE` names.
+/// The output a column of `table` without a declared type was created from.
+fn creation_of(
+    builder: &ParserDBBuilder,
+    table: &CreateTable,
+    column: &ColumnDef,
+) -> Option<ColumnCreation> {
+    if column.data_type != DataType::Unspecified {
+        return None;
+    }
+    builder
+        .columns()
+        .iter()
+        .find(|(held, _, _)| {
+            core::ptr::eq(TableAttribute::table(held.as_ref()), table)
+                && held.attribute().name == column.name
+        })
+        .and_then(|(_, metadata, _)| metadata.creation().cloned())
+}
+
+/// Gives the node the columns it copies from the table its `LIKE` names,
+/// answering by name the query output each copy without a declared type was
+/// created from.
 ///
 /// Runs while the `CREATE TABLE` statement is applied, which is when
 /// PostgreSQL performs the copy. The copied columns become the table's own,
@@ -58,9 +83,9 @@ fn is_copied_option(option: &ColumnOption, with_defaults: bool) -> bool {
 pub(super) fn apply_like(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
-) -> Result<(), Error> {
+) -> Result<Vec<(Ident, ColumnCreation)>, Error> {
     let Some((source_name, with_defaults)) = source(create_table) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     let Some(copied) = builder.resolve_table_object_name(source_name)? else {
@@ -70,6 +95,7 @@ pub(super) fn apply_like(
         });
     };
 
+    let mut creations = Vec::new();
     let mut columns: Vec<ColumnDef> = copied
         .columns
         .iter()
@@ -77,6 +103,9 @@ pub(super) fn apply_like(
             let mut copy = copy_column(column, |option| is_copied_option(option, with_defaults));
             if let Some(drawn) = sequences::serial_default(builder, copied, column) {
                 sequences::spell_out_serial(&mut copy, with_defaults.then_some(drawn));
+            }
+            if let Some(creation) = creation_of(builder, copied, column) {
+                creations.push((copy.name.clone(), creation));
             }
             copy
         })
@@ -89,5 +118,5 @@ pub(super) fn apply_like(
     columns.append(&mut create_table.columns);
     create_table.columns = columns;
 
-    Ok(())
+    Ok(creations)
 }

@@ -33,7 +33,7 @@ fn stored_views_keep_postgres_cte_shadowing() {
         for case in [IdentifierCase::Folded, IdentifierCase::Exact, IdentifierCase::AsWritten] {
             let scope = ColumnScope::from_query(&query, &db, case).expect("scope builds");
             let definition = scope.resolve_column_definition(&reference).expect("lookup succeeds");
-            let Some(ColumnDefinition::Base { table, column }) = definition else {
+            let Some(ColumnDefinition::Base { table, column, .. }) = definition else {
                 panic!("{kind} under {case:?} must bind to t.id, got {definition:?}")
             };
             assert_eq!((table.table_name(), column.column_name()), ("t", "id"));
@@ -103,7 +103,7 @@ fn exact_recursive_ctes_do_not_invent_case_folded_cycles() {
     let reference = Expr::CompoundIdentifier(vec![Ident::new("A"), Ident::new("id")]);
     let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Exact).expect("scope builds");
     let definition = scope.resolve_column_definition(&reference).expect("lookup succeeds");
-    let Some(ColumnDefinition::Base { table, column }) = definition else {
+    let Some(ColumnDefinition::Base { table, column, .. }) = definition else {
         panic!("Exact must bind to b.id, got {definition:?}")
     };
     assert_eq!((table.table_name(), column.column_name()), ("b", "id"));
@@ -156,7 +156,7 @@ fn nested_stored_cte_scopes_use_as_written() {
         else {
             panic!("expected a stored expression")
         };
-        let Some((ColumnDefinition::Base { table, column }, binding)) =
+        let Some((ColumnDefinition::Base { table, column, .. }, binding)) =
             defining.resolve_column_binding(&name("ID", false)).expect("lookup succeeds")
         else {
             panic!("expected a stored column")
@@ -197,7 +197,7 @@ fn stored_set_output_arms_keep_their_own_comparison() {
             let definition =
                 defining.resolve_column_definition(&name("ID", false)).expect("lookup succeeds");
             assert!(
-                matches!(definition, Some(ColumnDefinition::Base { table, column }) if table.table_name() == "t" && column.column_name() == "id")
+                matches!(definition, Some(ColumnDefinition::Base { table, column, .. }) if table.table_name() == "t" && column.column_name() == "id")
             );
             assert!(
                 defining

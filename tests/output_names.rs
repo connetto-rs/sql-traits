@@ -113,7 +113,7 @@ fn distinct_on(sql: &str) -> Result<String, LookupError> {
 fn describe(definition: Option<&ColumnDefinition<'_, '_, '_, ParserDB>>) -> String {
     match definition {
         None => "none".to_owned(),
-        Some(ColumnDefinition::Base { table, column }) => {
+        Some(ColumnDefinition::Base { table, column, .. }) => {
             format!("{}.{}", table.table_name(), column.column_name())
         }
         Some(ColumnDefinition::Expression { expression, .. }) => format!("expression {expression}"),

@@ -52,7 +52,7 @@ fn snapshots_preserve_each_incremental_schema_state() {
     assert!(inspect_definition(&first, |definition| {
         matches!(
             definition,
-            ColumnDefinition::Base { table, column }
+            ColumnDefinition::Base { table, column, .. }
                 if table.table_name() == "a" && column.column_name() == "id"
         )
     }));
@@ -85,7 +85,7 @@ fn snapshots_preserve_each_incremental_schema_state() {
     assert!(inspect_definition(&first, |definition| {
         matches!(
             definition,
-            ColumnDefinition::Base { table, column }
+            ColumnDefinition::Base { table, column, .. }
                 if table.table_name() == "a" && column.column_name() == "id"
         )
     }));
