@@ -30,5 +30,5 @@ pub use dialect::SqlparserDialect;
 pub use grant::apply_revoke_to_grant;
 pub(crate) use grant::{
     grantee_is_public, grantee_matches_role, grantees_match, partition_grantees_for_revoke,
-    schema_matches_table, validate_granted_columns,
+    schema_matches_table, split_by_column_scope, validate_granted_columns,
 };

@@ -4392,7 +4392,9 @@ pub trait TableLike:
     /// Returns an iterator over the grants that apply to this table.
     ///
     /// This includes both direct table grants (`GRANT ... ON table_name`)
-    /// and schema-wide grants (`GRANT ... ON ALL TABLES IN SCHEMA`).
+    /// and schema-wide grants (`GRANT ... ON ALL TABLES IN SCHEMA`). A
+    /// privilege on some of the table's columns is read from
+    /// [`DatabaseLike::column_grants`] instead.
     ///
     /// # Errors
     ///
@@ -4446,7 +4448,9 @@ pub trait TableLike:
     /// - Names this role, `PUBLIC`, or one of the
     ///   [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of this
     ///   role
-    /// - Includes SELECT privilege or ALL PRIVILEGES
+    /// - Includes SELECT on the whole table, or ALL PRIVILEGES. A SELECT on
+    ///   some of its columns does not count, as PostgreSQL's
+    ///   `has_table_privilege` does not count it either.
     ///
     /// A role also can read when it, or one of its inherited roles, is the
     /// table's [`owner`](Self::owner) and the owner's own entry still holds
@@ -4491,7 +4495,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Select { .. }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Select { columns: None }))
     }
 
     /// Returns whether the given role can insert into this table.
@@ -4529,7 +4533,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Insert { .. }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Insert { columns: None }))
     }
 
     /// Returns whether the given role can update this table.
@@ -4567,7 +4571,7 @@ pub trait TableLike:
         database: &Self::DB,
     ) -> Result<bool, LookupError> {
         use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Update { .. }))
+        holds_privilege(self, role, database, |p| matches!(p, Action::Update { columns: None }))
     }
 
     /// Returns whether the given role can delete from this table.
