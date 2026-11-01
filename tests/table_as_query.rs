@@ -150,9 +150,10 @@ fn a_short_column_list_leaves_the_rest_named_by_the_query() {
 
 #[test]
 fn outputs_that_cannot_be_counted_leave_the_declared_names() {
-    let db = with_column_list(&["a"], "SELECT * FROM generate_series(1, 3) AS g")
-        .expect("schema builds");
-    assert_eq!(columns(&db, "cn"), pairs(&[("a", "")]));
+    for query in ["SELECT * FROM generate_series(1, 3) AS g", "TABLE t2"] {
+        let db = with_column_list(&["a"], query).expect("schema builds");
+        assert_eq!(columns(&db, "cn"), pairs(&[("a", "")]), "{query}");
+    }
 }
 
 #[test]
