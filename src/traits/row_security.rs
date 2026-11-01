@@ -182,37 +182,35 @@ pub(crate) fn row_security<'db, T: TableLike>(
     if let Some(exemption) = exemption(table, role, database)? {
         return Ok(RowSecurity::Exempt(exemption));
     }
-    let mut policies = Vec::new();
-    for policy in table.policies(database)? {
-        if applies(policy, role, database)? {
-            policies.push(policy);
-        }
-    }
-    let gates = specs(statement)
-        .into_iter()
-        .map(|(command, reads, row, failure)| {
-            let mut gate =
-                RowGate { command, row, failure, permissive: Vec::new(), restrictive: Vec::new() };
-            for &policy in policies.iter().filter(|policy| covers(**policy, command)) {
-                let using = || policy.using_expression(database).map(|e| (PolicyClause::Using, e));
-                let read = match reads {
-                    Reads::Using => using(),
-                    Reads::Check => {
-                        policy
-                            .check_expression(database)
-                            .map(|e| (PolicyClause::WithCheck, e))
-                            .or_else(using)
-                    }
-                };
-                let Some((clause, expression)) = read else { continue };
-                let term = GateTerm { policy, clause, expression };
-                match policy.policy_type() {
-                    CreatePolicyType::Permissive => gate.permissive.push(term),
-                    CreatePolicyType::Restrictive => gate.restrictive.push(term),
-                }
+    let policies: Vec<_> = table.policies(database)?.collect();
+    let mut gates = Vec::new();
+    for (command, reads, row, failure) in specs(statement) {
+        let mut gate =
+            RowGate { command, row, failure, permissive: Vec::new(), restrictive: Vec::new() };
+        for &policy in &policies {
+            // A policy the gate does not consult is never settled, so its `TO`
+            // list cannot refuse a statement it plays no part in.
+            if !covers(policy, command) || !applies(policy, role, database)? {
+                continue;
             }
-            gate
-        })
-        .collect();
+            let using = || policy.using_expression(database).map(|e| (PolicyClause::Using, e));
+            let read = match reads {
+                Reads::Using => using(),
+                Reads::Check => {
+                    policy
+                        .check_expression(database)
+                        .map(|e| (PolicyClause::WithCheck, e))
+                        .or_else(using)
+                }
+            };
+            let Some((clause, expression)) = read else { continue };
+            let term = GateTerm { policy, clause, expression };
+            match policy.policy_type() {
+                CreatePolicyType::Permissive => gate.permissive.push(term),
+                CreatePolicyType::Restrictive => gate.restrictive.push(term),
+            }
+        }
+        gates.push(gate);
+    }
     Ok(RowSecurity::Gated(gates))
 }

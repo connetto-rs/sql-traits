@@ -291,6 +291,25 @@ fn a_to_role_the_schema_cannot_settle_refuses_the_answer() {
 }
 
 #[test]
+fn an_unsettled_policy_refuses_only_the_statements_it_gates() {
+    let database = ParseOptions::default()
+        .with_access_resolution(AccessResolution::OpenWorld)
+        .parse::<PostgreSqlDialect>(
+            "CREATE ROLE reader NOLOGIN;
+             CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL);
+             ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY own ON t USING (true);
+             CREATE POLICY p ON t FOR DELETE TO CURRENT_USER USING (true);",
+        )
+        .expect("schema builds");
+    assert!(security(&database, "reader", RowStatement::Select).is_ok());
+    assert_eq!(
+        security(&database, "reader", RowStatement::Delete { reads: false }).map(|_| ()),
+        Err(RowSecurityError::UnsettledRole { policy: "p".into(), role: "CURRENT_USER".into() })
+    );
+}
+
+#[test]
 fn owners_superusers_and_bypassers_are_exempt_as_postgresql_exempts_them() {
     let schema = |force: &str| {
         parse(&format!(
