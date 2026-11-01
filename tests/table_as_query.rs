@@ -293,6 +293,14 @@ fn copied_columns_keep_the_defining_expression() {
 }
 
 #[test]
+fn column_metadata_tells_creations_apart() {
+    let db = computed("CREATE TABLE child () INHERITS (ce);");
+    let metadata = |table, name| db.column_metadata(column(&db, table, name)).expect("metadata");
+    assert_eq!(metadata("child", "n"), metadata("ce", "n"));
+    assert_ne!(metadata("ce", "n"), metadata("ce", "?column?"));
+}
+
+#[test]
 fn a_table_scope_resolves_computed_columns() {
     let db = computed("");
     let table = db
