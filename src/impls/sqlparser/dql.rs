@@ -560,7 +560,7 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         table: &'db DB::Table,
         column: &'db DB::Column,
         database: &'db DB,
-    ) -> Result<Self::Definition, LookupError>;
+    ) -> Self::Definition;
     fn expression_definition(
         &mut self,
         expression: AstRef<'query, 'db, Expr>,
@@ -639,8 +639,7 @@ where
         _table: &'db DB::Table,
         _column: &'db DB::Column,
         _database: &'db DB,
-    ) -> Result<Self::Definition, LookupError> {
-        Ok(())
+    ) {
     }
 
     fn expression_definition(
@@ -3943,13 +3942,13 @@ where
     let mut output_columns = table
         .columns(database)?
         .map(|column| {
-            Ok(BaseColumnRef {
+            BaseColumnRef {
                 name: column.column_name().to_string(),
                 quoted: column.column_name_is_quoted(),
-                definition: profile.column_definition(table, column, database)?,
-            })
+                definition: profile.column_definition(table, column, database),
+            }
         })
-        .collect::<Result<Vec<_>, LookupError>>()?;
+        .collect::<Vec<_>>();
     if let Some(table_alias) = alias
         && !table_alias.get().columns.is_empty()
     {

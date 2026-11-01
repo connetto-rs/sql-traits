@@ -591,6 +591,13 @@ impl ColumnLike for MemoryColumn {
         Ok(ColumnCollation::DatabaseDefault)
     }
 
+    fn created_from_query<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<CreatedFromQuery<'db, Self::DB>> {
+        None
+    }
+
     fn identity_generation(&self, _database: &Self::DB) -> Option<IdentityGeneration> {
         None
     }

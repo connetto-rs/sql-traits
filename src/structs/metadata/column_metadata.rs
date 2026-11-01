@@ -1,7 +1,6 @@
 //! Column metadata that parsed DDL keeps outside the column node.
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::fmt;
 
 use sqlparser::ast::Query;
 
@@ -15,6 +14,7 @@ pub(crate) enum ResolvedCollation {
 
 /// The query of a `CREATE TABLE … AS` statement, with its output names and the
 /// catalog it read, frozen as the statement saw them.
+#[derive(Debug)]
 pub(crate) struct CreatingQuery {
     query: Query,
     output_names: Vec<(String, bool)>,
@@ -28,7 +28,7 @@ impl CreatingQuery {
 }
 
 /// The output of a `CREATE TABLE … AS` query a column was created from.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct ColumnCreation {
     query: Arc<CreatingQuery>,
     ordinal: usize,
@@ -63,15 +63,6 @@ impl PartialEq for ColumnCreation {
 }
 
 impl Eq for ColumnCreation {}
-
-impl fmt::Debug for ColumnCreation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ColumnCreation")
-            .field("query", &format_args!("{}", self.query.query))
-            .field("ordinal", &self.ordinal)
-            .finish_non_exhaustive()
-    }
-}
 
 /// Metadata attached to a parsed column.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

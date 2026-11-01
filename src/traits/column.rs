@@ -452,10 +452,7 @@ pub trait ColumnLike:
     fn created_from_query<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Option<CreatedFromQuery<'db, Self::DB>> {
-        let _ = database;
-        None
-    }
+    ) -> Option<CreatedFromQuery<'db, Self::DB>>;
 
     /// Returns which values the database supplies when the column is an
     /// identity column, or `None` when it is not one.
@@ -1788,6 +1785,24 @@ mod tests {
     use super::*;
     use crate::prelude::*;
 
+    /// A database holding `c.next`, a column created from the computed output
+    /// of `CREATE TABLE … AS`.
+    fn created_db() -> ParserDB {
+        ParserDB::parse::<GenericDialect>(
+            "CREATE TABLE t (id INT); CREATE TABLE c AS SELECT id, id + 1 AS next FROM t;",
+        )
+        .expect("Failed to parse SQL")
+    }
+
+    fn created_column(db: &ParserDB) -> &<ParserDB as DatabaseLike>::Column {
+        db.table_by_target(TargetName::new("c", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("Table not found")
+            .column("next", db, IdentifierCase::AsWritten)
+            .expect("table lookup")
+            .expect("Column not found")
+    }
+
     mod reference_impl {
         use super::*;
 
@@ -1819,6 +1834,14 @@ mod tests {
             assert_eq!(
                 <&_ as ColumnLike>::column_doc(&col_ref, &db).expect("column_doc failed"),
                 None
+            );
+
+            let created = created_db();
+            let next = created_column(&created);
+            assert_eq!(
+                <&_ as ColumnLike>::created_from_query(&next, &created)
+                    .map(|output| output.ordinal()),
+                Some(1)
             );
         }
     }
@@ -1856,6 +1879,14 @@ mod tests {
             assert_eq!(
                 <Arc<_> as ColumnLike>::column_doc(&col_arc, &db).expect("column_doc failed"),
                 None
+            );
+
+            let created = created_db();
+            let next = Arc::new(created_column(&created).clone());
+            assert_eq!(
+                <Arc<_> as ColumnLike>::created_from_query(&next, &created)
+                    .map(|output| output.ordinal()),
+                Some(1)
             );
         }
     }

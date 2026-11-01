@@ -335,34 +335,33 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     }
 
     /// The definition of the output a column was created from, derived
-    /// against the catalog its query read.
-    fn created_definition(
-        &mut self,
-        created: &CreatedFromQuery<'db, DB>,
-    ) -> Result<DefinitionId, LookupError> {
+    /// against the catalog its query read, or opaque when it cannot be.
+    fn created_definition(&mut self, created: &CreatedFromQuery<'db, DB>) -> DefinitionId {
         let address = core::ptr::from_ref(created.query()).addr();
         if !self.created.iter().any(|(derived, _)| *derived == address) {
             let deriving = Deriving::of(created.catalog(), IdentifierCase::AsWritten);
             let parent = self.no_parent();
-            let shape = derive_query_shape(
+            // Reading the same query against the same catalog succeeded when
+            // the table was created, so a lookup error cannot arise here.
+            let definitions = derive_query_shape(
                 AstRef::Database(created.query()),
                 &[],
                 Some(OutputNameSource::Declared(created.output_names())),
                 deriving,
                 parent,
                 self,
-            )?;
-            let definitions = shape
-                .map(|shape| shape.columns.iter().map(|column| column.definition).collect())
-                .unwrap_or_default();
+            )
+            .ok()
+            .flatten()
+            .map(|shape| shape.columns.iter().map(|column| column.definition).collect())
+            .unwrap_or_default();
             self.created.push((address, definitions));
         }
-        Ok(self
-            .created
+        self.created
             .iter()
             .find(|(derived, _)| *derived == address)
             .and_then(|(_, definitions)| definitions.get(created.ordinal()).copied())
-            .unwrap_or(DefinitionId(0)))
+            .unwrap_or(DefinitionId(0))
     }
 
     pub(super) fn finish(
@@ -477,10 +476,10 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
         table: &'db DB::Table,
         column: &'db DB::Column,
         database: &'db DB,
-    ) -> Result<Self::Definition, LookupError> {
+    ) -> Self::Definition {
         match column.created_from_query(database) {
             Some(created) => self.created_definition(&created),
-            None => Ok(self.push_definition(DefinitionNode::Base { table, column, database })),
+            None => self.push_definition(DefinitionNode::Base { table, column, database }),
         }
     }
 
@@ -539,8 +538,7 @@ pub(crate) fn table_graph<'db, DB: DatabaseLike>(
     let mut output_columns = Vec::new();
     if let Ok(columns) = table.columns(database) {
         for column in columns {
-            let definition =
-                profile.column_definition(table, column, database).unwrap_or(DefinitionId(0));
+            let definition = profile.column_definition(table, column, database);
             output_columns.push(BaseColumnRef {
                 name: column.column_name().to_owned(),
                 quoted: column.column_name_is_quoted(),
