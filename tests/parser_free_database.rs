@@ -631,6 +631,10 @@ impl ColumnLike for MemoryColumn {
         None
     }
 
+    fn foreign_options(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, str>, &str)> {
+        core::iter::empty()
+    }
+
     fn table<'db>(&'db self, database: &'db Self::DB) -> &'db MemoryTable
     where
         Self: 'db,

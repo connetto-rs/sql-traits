@@ -3129,6 +3129,56 @@ fn refuse_key_constraints_on_foreign_table(
     }
 }
 
+/// The first key an option list repeats, keys compared as PostgreSQL stores
+/// them.
+fn first_repeated_key<K: AsRef<str>>(keys: &[K]) -> Option<&str> {
+    keys.iter().enumerate().find_map(|(at, key)| {
+        keys[..at].iter().any(|earlier| earlier.as_ref() == key.as_ref()).then(|| key.as_ref())
+    })
+}
+
+/// Refuses an `OPTIONS` list the table cannot hold: any on a column of an
+/// ordinary table, and one naming a key twice on a foreign table or on one of
+/// its columns.
+fn refuse_unholdable_foreign_options(
+    create_table: &CreateTable,
+    source: Option<&ForeignTableSource>,
+) -> Result<(), crate::errors::Error> {
+    let Some(source) = source else {
+        return match create_table
+            .columns
+            .iter()
+            .find(|column| crate::impls::foreign_options_of(column).next().is_some())
+        {
+            Some(column) => {
+                Err(crate::errors::Error::ForeignOptionsOnTableColumn {
+                    table_name: create_table.table_name().to_string(),
+                    column_name: column.name.value.clone(),
+                })
+            }
+            None => Ok(()),
+        };
+    };
+    let repeated = |column_name: Option<&Ident>, option_name: &str| {
+        crate::errors::Error::RepeatedForeignOption {
+            table_name: create_table.table_name().to_string(),
+            column_name: column_name.map(|name| name.value.clone()),
+            option_name: option_name.to_string(),
+        }
+    };
+    let table_keys: Vec<&str> = source.options().iter().map(|(key, _)| key.as_str()).collect();
+    if let Some(key) = first_repeated_key(&table_keys) {
+        return Err(repeated(None, key));
+    }
+    for column in &create_table.columns {
+        let keys: Vec<_> = crate::impls::foreign_options_of(column).map(|(key, _)| key).collect();
+        if let Some(key) = first_repeated_key(&keys) {
+            return Err(repeated(Some(&column.name), key));
+        }
+    }
+    Ok(())
+}
+
 /// Whether PostgreSQL refuses `operation` on a foreign table, naming the
 /// action.
 fn foreign_table_refuses(operation: &AlterTableOperation) -> bool {
@@ -5340,6 +5390,7 @@ impl ParserDB {
         if table_metadata.foreign_source().is_some() {
             refuse_key_constraints_on_foreign_table(&create_table)?;
         }
+        refuse_unholdable_foreign_options(&create_table, table_metadata.foreign_source())?;
 
         let (identity, documentation) = match &mut origin {
             TableOrigin::Declaration(documentation) => {
@@ -6316,7 +6367,9 @@ impl ParserDB {
         // Read before the parent changes.
         let inheritors = inheritance::descendants(&builder, &stored);
         let mut inherited_def = column_def.clone();
-        inherited_def.options.retain(|option| !is_no_inherit_check(option));
+        inherited_def
+            .options
+            .retain(|option| !inheritance::stays_with_declaring_column(&option.option));
         sequences::spell_out_planned_serial(&mut inherited_def, &stored, &column_sequences);
         let (builder, column_sequences) =
             sequences::create_column_sequences(builder, &stored, column_sequences)?;

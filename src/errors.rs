@@ -1502,6 +1502,32 @@ pub enum Error {
         constraint: KeyConstraint,
     },
     #[error(
+        "Column `{column_name}` of table `{table_name}` cannot take foreign-data wrapper options, because `{table_name}` is not a foreign table."
+    )]
+    /// Error indicating that a statement gives a column of an ordinary table
+    /// `OPTIONS`, which only a column of a foreign table carries.
+    ForeignOptionsOnTableColumn {
+        /// Name of the ordinary table.
+        table_name: String,
+        /// Name of the column given the options.
+        column_name: String,
+    },
+    #[error(
+        "Option `{option_name}` is written more than once in an option list of foreign table `{table_name}`."
+    )]
+    /// Error indicating that one `OPTIONS` list of a foreign table or of one
+    /// of its columns names a key twice, once both keys are folded as
+    /// PostgreSQL stores them.
+    RepeatedForeignOption {
+        /// Name of the foreign table.
+        table_name: String,
+        /// Name of the column whose list repeats the key, or `None` for the
+        /// table's own list.
+        column_name: Option<String>,
+        /// The repeated key, as PostgreSQL stores it.
+        option_name: String,
+    },
+    #[error(
         "Partitioned table `{table_name}` cannot hold a unique index, because its partition `{partition_name}` is a foreign table."
     )]
     /// Error indicating that a unique index would reach a foreign table through
