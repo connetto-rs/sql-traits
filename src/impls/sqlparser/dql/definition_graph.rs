@@ -338,7 +338,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     /// against the catalog its query read.
     fn created_definition(
         &mut self,
-        created: CreatedFromQuery<'db, DB>,
+        created: &CreatedFromQuery<'db, DB>,
     ) -> Result<DefinitionId, LookupError> {
         let address = core::ptr::from_ref(created.query()).addr();
         if !self.created.iter().any(|(derived, _)| *derived == address) {
@@ -479,7 +479,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
         database: &'db DB,
     ) -> Result<Self::Definition, LookupError> {
         match column.created_from_query(database) {
-            Some(created) => self.created_definition(created),
+            Some(created) => self.created_definition(&created),
             None => Ok(self.push_definition(DefinitionNode::Base { table, column, database })),
         }
     }

@@ -191,14 +191,6 @@ pub struct CreatedFromQuery<'db, DB> {
     ordinal: usize,
 }
 
-impl<DB> Clone for CreatedFromQuery<'_, DB> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<DB> Copy for CreatedFromQuery<'_, DB> {}
-
 impl<'db, DB> CreatedFromQuery<'db, DB> {
     pub(crate) fn new(
         query: &'db Query,
@@ -1743,6 +1735,14 @@ where
         database: &'db Self::DB,
     ) -> Result<ColumnCollation<'db>, LookupError> {
         (**self).collation(database)
+    }
+
+    #[inline]
+    fn created_from_query<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<CreatedFromQuery<'db, Self::DB>> {
+        (**self).created_from_query(database)
     }
 
     #[inline]
