@@ -1,7 +1,10 @@
 //! Submodule implementing the [`ColumnLike`] trait for `sqlparser`'s
 //! [`ColumnDef`] struct.
 
-use alloc::string::{String, ToString};
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+};
 
 use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, ObjectNamePart};
 
@@ -12,7 +15,10 @@ use crate::{
         ColumnCollation, ColumnLike, DatabaseLike, IdentityGeneration, Metadata,
         NamedColumnCollation,
     },
-    utils::{identity_generation, is_identity, object_name::target_name_of_object_name},
+    utils::{
+        identifier_resolution::normalize_identifier, identity_generation, is_identity,
+        object_name::target_name_of_object_name,
+    },
 };
 
 /// PostgreSQL's serial pseudo-types and their aliases, as the catalog spells
@@ -48,6 +54,27 @@ pub(crate) fn serial_sequence_type(data_type: &DataType) -> Option<DataType> {
 /// Whether the declared type names a serial pseudo-type.
 fn is_serial_type(data_type: &DataType) -> bool {
     serial_sequence_type(data_type).is_some()
+}
+
+/// The foreign-data wrapper options a column declares, each key as PostgreSQL
+/// stores it and each value as written.
+pub(crate) fn foreign_options_of(column: &ColumnDef) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
+    column
+        .options
+        .iter()
+        .filter_map(|option| {
+            match &option.option {
+                ColumnOption::GenericOptions(options) => Some(options),
+                _ => None,
+            }
+        })
+        .flatten()
+        .map(|option| {
+            (
+                normalize_identifier(&option.key.value, option.key.quote_style.is_some()),
+                option.value.value.as_str(),
+            )
+        })
 }
 
 impl Metadata for TableAttribute<CreateTable, ColumnDef> {
@@ -151,6 +178,11 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
                 None
             }
         })
+    }
+
+    #[inline]
+    fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
+        foreign_options_of(self.attribute())
     }
 
     #[inline]
@@ -2208,6 +2240,23 @@ mod tests {
             arc.collation(&db).expect("collation metadata"),
             ColumnCollation::Named(_)
         ));
+    }
+
+    #[test]
+    fn foreign_options_forward_through_reference_and_arc() {
+        let db = parse_with::<PostgreSqlDialect>(
+            "CREATE FOREIGN TABLE t (name TEXT OPTIONS (column_name 'remote')) SERVER s;",
+        );
+        let column = db
+            .foreign_table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("foreign table t exists")
+            .column("name", &db, IdentifierCase::AsWritten)
+            .expect("column lookup")
+            .expect("column exists");
+        let expected = [(super::Cow::Borrowed("column_name"), "remote")];
+        assert_eq!((&column).foreign_options().collect::<Vec<_>>(), expected);
+        assert_eq!(Arc::new(column.clone()).foreign_options().collect::<Vec<_>>(), expected);
     }
 
     #[test]

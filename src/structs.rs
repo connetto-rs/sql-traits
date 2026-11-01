@@ -2,6 +2,7 @@
 
 mod column_scope;
 pub(crate) mod fingerprint;
+mod foreign_table_source;
 pub mod generic_db;
 pub use generic_db::{
     AccessResolution, GenericDB, Meta, ParseOptions, ParserDB, ParserDBBuilder, ParserDBIngestor,
@@ -23,6 +24,7 @@ pub use column_scope::{
     ColumnScope, QueryOutput, RelationBinding,
 };
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
+pub use foreign_table_source::ForeignTableSource;
 pub use function_kind::FunctionKind;
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;

@@ -112,6 +112,7 @@ pub(super) fn attach_partition(
         (&root, root_node),
         (&partition, partition_node),
     )?);
+    refuse_foreign_under_unique_index(&builder, (&root, root_node), (&partition, partition_node))?;
     let mut bound_root = root_name.clone();
     bind_reference(&mut bound_root, stored_qualifier(&root_node.name));
     received.edge = Some((bound_root, for_values.clone()));
@@ -143,6 +144,64 @@ pub(super) fn attach_partition(
     }
 
     Ok(builder)
+}
+
+/// Refuses a foreign table reaching a unique index of the root or of one of
+/// its ancestors, either as the partition itself or among its own partitions.
+fn refuse_foreign_under_unique_index(
+    builder: &ParserDBBuilder,
+    (root, root_node): (&StoredTable, &CreateTable),
+    (partition, partition_node): (&StoredTable, &CreateTable),
+) -> Result<(), Error> {
+    if !holds_unique_index_above(builder, root, root_node)? {
+        return Ok(());
+    }
+    if builder.is_foreign_table(partition_node) {
+        return Err(Error::PartitionNotAttachable {
+            table_name: root.name.clone(),
+            partition_name: partition.name.clone(),
+            reason: UnattachablePartition::ForeignTableUnderUniqueIndex,
+        });
+    }
+    ParserDB::refuse_unique_index_over_foreign_partition(builder, partition)
+}
+
+/// Whether `table` or a table it is a partition of holds a unique index, as a
+/// key or as a `CREATE UNIQUE INDEX`.
+fn holds_unique_index_above(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+    node: &CreateTable,
+) -> Result<bool, Error> {
+    let case = builder.identifier_case();
+    let (mut table, mut node) = (table.clone(), node);
+    loop {
+        let keyed = node.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                TableConstraint::PrimaryKey(_)
+                    | TableConstraint::PrimaryKeyUsingIndex(_)
+                    | TableConstraint::Unique(_)
+                    | TableConstraint::UniqueUsingIndex(_)
+            )
+        }) || node.columns.iter().flat_map(|column| &column.options).any(|option| {
+            matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_))
+        }) || builder
+            .indices()
+            .iter()
+            .any(|(index, _)| index.attribute().unique && table.matches(index.table(), case));
+        if keyed {
+            return Ok(true);
+        }
+        let parent = node.partition_of.as_ref();
+        let Some(parent_node) =
+            parent.map(|parent| builder.resolve_table_object_name(parent)).transpose()?.flatten()
+        else {
+            return Ok(false);
+        };
+        table = StoredTable::of(parent_node);
+        node = parent_node;
+    }
 }
 
 /// Refuses a table PostgreSQL will not attach, in the order PostgreSQL checks.

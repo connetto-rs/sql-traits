@@ -9,7 +9,7 @@ use crate::{
     errors::LookupError,
     structs::{
         ColumnIdentity, GenericDB, IdentifierCase, RelationIdentity, SchemaProfile, TargetName,
-        generic_db::RelationSlot,
+        generic_db::{Identified, RelationSlot},
     },
     traits::{DatabaseLike, Relation, TableLike},
     utils::object_name::{
@@ -91,6 +91,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         self.sequences.iter().map(|(sequence, _)| sequence.as_ref())
     }
 
+    #[inline]
+    fn foreign_tables(&self) -> impl Iterator<Item = &Self::Table> {
+        self.foreign_tables.iter().map(|(table, _, _)| table.as_ref())
+    }
+
     fn table_id(&self, table: &Self::Table) -> Option<usize> {
         self.tables
             .binary_search_by_key(&(table.table_schema(), table.table_name()), |(t, _, _)| {
@@ -100,7 +105,14 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     }
 
     fn table_identity(&self, table: &Self::Table) -> Option<Self::RelationId> {
-        self.table_id(table).map(|position| self.tables[position].2)
+        let key = (table.table_schema(), table.table_name());
+        [&self.tables, &self.foreign_tables].into_iter().find_map(|pool| {
+            pool.binary_search_by_key(&key, |(stored, _, _)| {
+                (stored.table_schema(), stored.table_name())
+            })
+            .ok()
+            .map(|position| pool[position].2)
+        })
     }
 
     fn view_identity(&self, view: &Self::View) -> Option<Self::RelationId> {
@@ -136,7 +148,18 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     fn table_by_identity(&self, identity: Self::RelationId) -> Option<&Self::Table> {
         match self.relation_slot(identity)? {
             RelationSlot::Table(position) => Some(self.tables[position].0.as_ref()),
-            RelationSlot::View(_)
+            RelationSlot::ForeignTable(_)
+            | RelationSlot::View(_)
+            | RelationSlot::MaterializedView(_)
+            | RelationSlot::Sequence(_) => None,
+        }
+    }
+
+    fn foreign_table_by_identity(&self, identity: Self::RelationId) -> Option<&Self::Table> {
+        match self.relation_slot(identity)? {
+            RelationSlot::ForeignTable(position) => Some(self.foreign_tables[position].0.as_ref()),
+            RelationSlot::Table(_)
+            | RelationSlot::View(_)
             | RelationSlot::MaterializedView(_)
             | RelationSlot::Sequence(_) => None,
         }
@@ -146,6 +169,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         match self.relation_slot(identity)? {
             RelationSlot::View(position) => Some(self.views[position].0.as_ref()),
             RelationSlot::Table(_)
+            | RelationSlot::ForeignTable(_)
             | RelationSlot::MaterializedView(_)
             | RelationSlot::Sequence(_) => None,
         }
@@ -159,7 +183,10 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
             RelationSlot::MaterializedView(position) => {
                 Some(self.materialized_views[position].0.as_ref())
             }
-            RelationSlot::Table(_) | RelationSlot::View(_) | RelationSlot::Sequence(_) => None,
+            RelationSlot::Table(_)
+            | RelationSlot::ForeignTable(_)
+            | RelationSlot::View(_)
+            | RelationSlot::Sequence(_) => None,
         }
     }
 
@@ -194,6 +221,20 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
             &target,
             || search_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted)),
             case,
+        )
+    }
+
+    fn resolve_target_foreign_table(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Table>, LookupError> {
+        self.resolve_relation_on_path(
+            &target,
+            || self.search_path(),
+            case,
+            Self::probed_foreign_tables,
+            render_table_candidate,
         )
     }
 
@@ -261,6 +302,15 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
         self.resolve_target_table_strict(&target, case)
+    }
+
+    fn foreign_table_by_target(
+        &self,
+        target: TargetName<'_>,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Table>, LookupError> {
+        let probe = IndexProbe::new(&target, case, None);
+        resolve_target_from_candidates(&target, &self.probed_foreign_tables(&probe))
     }
 
     fn view_by_target(
@@ -475,15 +525,39 @@ impl<P: SchemaProfile> GenericDB<P> {
 
     /// Tables a probe accepts, in storage order.
     fn probed_tables<'db>(&'db self, probe: &IndexProbe) -> Vec<&'db P::Table> {
+        self.probed_table_pool(probe, |slot| {
+            match slot {
+                RelationSlot::Table(position) => self.tables.get(position),
+                RelationSlot::ForeignTable(_)
+                | RelationSlot::View(_)
+                | RelationSlot::MaterializedView(_)
+                | RelationSlot::Sequence(_) => None,
+            }
+        })
+    }
+
+    /// Foreign tables a probe accepts, in storage order.
+    fn probed_foreign_tables<'db>(&'db self, probe: &IndexProbe) -> Vec<&'db P::Table> {
+        self.probed_table_pool(probe, |slot| {
+            match slot {
+                RelationSlot::ForeignTable(position) => self.foreign_tables.get(position),
+                RelationSlot::Table(_)
+                | RelationSlot::View(_)
+                | RelationSlot::MaterializedView(_)
+                | RelationSlot::Sequence(_) => None,
+            }
+        })
+    }
+
+    /// The table nodes a probe accepts among the slots `stored` keeps, in
+    /// storage order.
+    fn probed_table_pool<'db>(
+        &'db self,
+        probe: &IndexProbe,
+        stored: impl Fn(RelationSlot) -> Option<&'db Identified<P::Table, RelationIdentity>>,
+    ) -> Vec<&'db P::Table> {
         self.probed_relation_slots(probe)
-            .filter_map(|slot| {
-                match slot {
-                    RelationSlot::Table(position) => self.tables.get(*position),
-                    RelationSlot::View(_)
-                    | RelationSlot::MaterializedView(_)
-                    | RelationSlot::Sequence(_) => None,
-                }
-            })
+            .filter_map(|slot| stored(*slot))
             .map(|(table, _, _)| table.as_ref())
             .filter(|table| probe.accepts(|| stored_table_key(*table, IdentifierCase::Exact)))
             .collect()
@@ -496,6 +570,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                 match slot {
                     RelationSlot::View(position) => self.views.get(*position),
                     RelationSlot::Table(_)
+                    | RelationSlot::ForeignTable(_)
                     | RelationSlot::MaterializedView(_)
                     | RelationSlot::Sequence(_) => None,
                 }
@@ -516,9 +591,10 @@ impl<P: SchemaProfile> GenericDB<P> {
                     RelationSlot::MaterializedView(position) => {
                         self.materialized_views.get(*position)
                     }
-                    RelationSlot::Table(_) | RelationSlot::View(_) | RelationSlot::Sequence(_) => {
-                        None
-                    }
+                    RelationSlot::Table(_)
+                    | RelationSlot::ForeignTable(_)
+                    | RelationSlot::View(_)
+                    | RelationSlot::Sequence(_) => None,
                 }
             })
             .map(|(view, _, _)| view.as_ref())
@@ -533,6 +609,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                 match slot {
                     RelationSlot::Sequence(position) => self.sequences.get(*position),
                     RelationSlot::Table(_)
+                    | RelationSlot::ForeignTable(_)
                     | RelationSlot::View(_)
                     | RelationSlot::MaterializedView(_) => None,
                 }
@@ -546,14 +623,19 @@ impl<P: SchemaProfile> GenericDB<P> {
 
     /// Whether any relation of any kind answers a probe.
     ///
-    /// Tables, views, materialized views and sequences share one pool of
-    /// names, so a schema holding the name under any kind ends a search-path
-    /// walk, as PostgreSQL's own name resolution does.
+    /// Tables, foreign tables, views, materialized views and sequences share
+    /// one pool of names, so a schema holding the name under any kind ends a
+    /// search-path walk, as PostgreSQL's own name resolution does.
     fn probed_name_is_taken(&self, probe: &IndexProbe) -> bool {
         self.probed_relation_slots(probe).any(|slot| {
             match slot {
                 RelationSlot::Table(position) => {
                     self.tables.get(*position).is_some_and(|(table, _, _)| {
+                        probe.accepts(|| stored_table_key(table.as_ref(), IdentifierCase::Exact))
+                    })
+                }
+                RelationSlot::ForeignTable(position) => {
+                    self.foreign_tables.get(*position).is_some_and(|(table, _, _)| {
                         probe.accepts(|| stored_table_key(table.as_ref(), IdentifierCase::Exact))
                     })
                 }
@@ -640,7 +722,8 @@ impl<P: SchemaProfile> GenericDB<P> {
             .filter_map(|slot| {
                 match slot {
                     RelationSlot::Table(position) => self.tables.get(*position),
-                    RelationSlot::View(_)
+                    RelationSlot::ForeignTable(_)
+                    | RelationSlot::View(_)
                     | RelationSlot::MaterializedView(_)
                     | RelationSlot::Sequence(_) => None,
                 }
@@ -749,6 +832,7 @@ impl<P: SchemaProfile> GenericDB<P> {
             .probed_tables(probe)
             .into_iter()
             .map(Relation::Table)
+            .chain(self.probed_foreign_tables(probe).into_iter().map(Relation::ForeignTable))
             .chain(self.probed_views(probe).into_iter().map(Relation::View))
             .chain(
                 self.probed_materialized_views(probe).into_iter().map(Relation::MaterializedView),

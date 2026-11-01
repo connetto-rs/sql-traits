@@ -5,11 +5,7 @@ mod database;
 mod profile;
 mod sqlparser;
 
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::fmt::Debug;
 
 pub use builder::GenericDBBuilder;
@@ -33,14 +29,17 @@ use crate::{
 /// Where the relation holding a shared name lives: which kind it is, and its
 /// position in that kind's collection.
 ///
-/// PostgreSQL keeps tables, views, materialized views and sequences in one
-/// pool of names, so one index answers all four and a lookup for a kind keeps
-/// only the slots of that kind. Crate-private: it names positions inside
-/// private collections, which no caller outside can hold or use.
+/// PostgreSQL keeps tables, foreign tables, views, materialized views and
+/// sequences in one pool of names, so one index answers all five and a lookup
+/// for a kind keeps only the slots of that kind. Crate-private: it names
+/// positions inside private collections, which no caller outside can hold or
+/// use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RelationSlot {
     /// A table, at this position in the table collection.
     Table(usize),
+    /// A foreign table, at this position in the foreign table collection.
+    ForeignTable(usize),
     /// A plain view, at this position in the view collection.
     View(usize),
     /// A materialized view, at this position in its collection.
@@ -59,6 +58,10 @@ pub struct GenericDB<P: SchemaProfile> {
     timezone: Option<String>,
     /// List of tables in the database.
     tables: Vec<Identified<P::Table, RelationIdentity>>,
+    /// List of foreign tables in the database, the same kind of node as a
+    /// table and kept apart so [`tables`](crate::traits::DatabaseLike::tables)
+    /// answers only for relations holding rows of their own.
+    foreign_tables: Vec<Identified<P::Table, RelationIdentity>>,
     /// List of plain views in the database.
     views: Vec<Identified<P::View, RelationIdentity>>,
     /// List of materialized views in the database.
@@ -67,11 +70,11 @@ pub struct GenericDB<P: SchemaProfile> {
     sequences: Vec<Stored<P::Sequence>>,
     /// Relations by normalized `(schema, name)`, values their storage slots.
     ///
-    /// PostgreSQL keeps tables, views, materialized views and sequences in one
-    /// pool of names, so all four share this index and a creation collides with
-    /// whichever kind already holds the name. Lists hold every relation a key
-    /// matched, ascending within a kind, so lookup answers and ambiguity
-    /// reporting agree with scanning the list.
+    /// PostgreSQL keeps tables, foreign tables, views, materialized views and
+    /// sequences in one pool of names, so all five share this index and a
+    /// creation collides with whichever kind already holds the name. Lists
+    /// hold every relation a key matched, ascending within a kind, so lookup
+    /// answers and ambiguity reporting agree with scanning the list.
     relation_index: BTreeMap<RelationKey, Vec<RelationSlot>>,
     /// Folded key to the stored keys reaching it, holding only the keys that
     /// fold to something other than themselves, so an all-lowercase catalog
@@ -140,6 +143,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("catalog_name", &self.catalog_name)
             .field("timezone", &self.timezone)
             .field("tables", &self.tables.len())
+            .field("foreign_tables", &self.foreign_tables.len())
             .field("views", &self.views.len())
             .field("materialized_views", &self.materialized_views.len())
             .field("sequences", &self.sequences.len())
@@ -179,6 +183,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             catalog_name: self.catalog_name.clone(),
             timezone: self.timezone.clone(),
             tables: self.tables.clone(),
+            foreign_tables: self.foreign_tables.clone(),
             views: self.views.clone(),
             materialized_views: self.materialized_views.clone(),
             sequences: self.sequences.clone(),
@@ -248,21 +253,14 @@ impl<P: SchemaProfile> GenericDB<P> {
     /// # }
     /// ```
     pub fn table_metadata(&self, table: &P::Table) -> Option<&Meta<P::Table>> {
-        self.tables
-            .binary_search_by_key(
-                &(
-                    table.table_schema().map(alloc::string::ToString::to_string),
-                    table.table_name().to_string(),
-                ),
-                |(t, _, _)| {
-                    (
-                        t.table_schema().map(alloc::string::ToString::to_string),
-                        t.table_name().to_string(),
-                    )
-                },
-            )
+        let key = (table.table_schema(), table.table_name());
+        [&self.tables, &self.foreign_tables].into_iter().find_map(|pool| {
+            pool.binary_search_by_key(&key, |(stored, _, _)| {
+                (stored.table_schema(), stored.table_name())
+            })
             .ok()
-            .map(|index| &self.tables[index].1)
+            .map(|index| &pool[index].1)
+        })
     }
 
     /// Returns a reference to the metadata of the specified view, if it exists

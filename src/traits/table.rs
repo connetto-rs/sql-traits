@@ -6,7 +6,7 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 use crate::{
     errors::{Error, LookupError, ObjectKind},
     structs::{
-        ColumnDefinition, ColumnScope, IdentifierCase, SchemaFingerprint,
+        ColumnDefinition, ColumnScope, ForeignTableSource, IdentifierCase, SchemaFingerprint,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
@@ -557,6 +557,49 @@ pub trait TableLike:
             .find_map(|(stored, value)| (stored == name).then_some(value))
     }
 
+    /// Returns the server and options this table reads its rows through when
+    /// it is a foreign table, or [`None`] for an ordinary table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when the database does not hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE local (id INT);
+    ///      CREATE FOREIGN TABLE remote (id INT) SERVER warehouse OPTIONS (table_name 'sales');",
+    /// )?;
+    /// let local = db.tables().next().unwrap();
+    /// let remote = db.foreign_tables().next().unwrap();
+    /// assert!(local.foreign_source(&db)?.is_none());
+    /// let source = remote.foreign_source(&db)?.unwrap();
+    /// assert_eq!(source.server_name(), "warehouse");
+    /// assert_eq!(source.options(), &[("table_name".to_string(), "sales".to_string())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn foreign_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db ForeignTableSource>, LookupError>;
+
+    /// Returns whether this table is a foreign table, whose rows live behind a
+    /// foreign server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when the database does not hold this table.
+    #[inline]
+    fn is_foreign(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(self.foreign_source(database)?.is_some())
+    }
+
     /// Returns the table ID according to its position in the database's table
     /// iterator.
     ///
@@ -875,7 +918,7 @@ pub trait TableLike:
         let schema = self.table_schema();
         let name = self.table_name();
         let mut children = Vec::new();
-        for candidate in database.tables() {
+        for candidate in database.tables_and_foreign_tables() {
             let mut parents = candidate.inherits_from(database)?;
             if parents.any(|parent| parent.table_schema() == schema && parent.table_name() == name)
             {
@@ -962,7 +1005,8 @@ pub trait TableLike:
     /// Iterates over the partitions of this table.
     ///
     /// The inverse of [`TableLike::partition_root`], one step deep, so a
-    /// partition that is itself partitioned answers its own.
+    /// partition that is itself partitioned answers its own. A foreign table
+    /// attached as a partition is listed too.
     ///
     /// # Arguments
     ///
@@ -1001,7 +1045,7 @@ pub trait TableLike:
         let schema = self.table_schema();
         let name = self.table_name();
         let mut partitions = Vec::new();
-        for candidate in database.tables() {
+        for candidate in database.tables_and_foreign_tables() {
             if candidate
                 .partition_root(database)?
                 .is_some_and(|root| root.table_schema() == schema && root.table_name() == name)
@@ -4765,6 +4809,13 @@ where
 
     fn toast_storage_parameter(&self, name: &str) -> Option<Cow<'_, str>> {
         T::toast_storage_parameter(self, name)
+    }
+
+    fn foreign_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db ForeignTableSource>, LookupError> {
+        T::foreign_source(self, database)
     }
 
     fn table_id(&self, database: &Self::DB) -> Option<usize> {

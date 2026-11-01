@@ -58,6 +58,7 @@ fn referenced_relation_names<S: DataStatementLike<ParserDB>>(
         .map(|relation| {
             match relation {
                 Relation::Table(table) => format!("table {}", table.table_name()),
+                Relation::ForeignTable(table) => format!("foreign table {}", table.table_name()),
                 Relation::View(view) => format!("view {}", view.view_name()),
                 Relation::MaterializedView(view) => {
                     format!("materialized view {}", view.view_name())

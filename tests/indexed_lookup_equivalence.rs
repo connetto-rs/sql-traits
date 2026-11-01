@@ -312,7 +312,8 @@ fn every_comparison_matches_scan() {
                             relation.and_then(|relation| {
                                 match relation {
                                     Relation::Table(table) => Some(table),
-                                    Relation::View(_)
+                                    Relation::ForeignTable(_)
+                                    | Relation::View(_)
                                     | Relation::MaterializedView(_)
                                     | Relation::Sequence(_) => None,
                                 }

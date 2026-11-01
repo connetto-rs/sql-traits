@@ -22,26 +22,27 @@ use sqlparser::{
         AlterFunctionOperation, AlterIndexOperation, AlterPolicy, AlterPolicyOperation,
         AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, ArgMode,
         ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
-        CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction, CreateIndex,
-        CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
-        DataType, DropBehavior, Expr, ForeignKeyConstraint, FunctionDefinitionSetParam,
-        FunctionDesc, FunctionSetValue, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName,
-        GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart,
-        OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
-        RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
-        TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut,
-        Visitor, VisitorMut, visit_relations,
+        CreateCollation, CreateCollationDefinition, CreateExtension, CreateForeignTable,
+        CreateFunction, CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable,
+        CreateTableOptions, CreateTrigger, DataType, DropBehavior, Expr, ForeignKeyConstraint,
+        FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue, GeneratedAs, Grant,
+        GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition,
+        ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner,
+        Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption,
+        Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
+        VisitMut, Visitor, VisitorMut, helpers::stmt_create_table::CreateTableBuilder,
+        visit_relations,
     },
     dialect::Dialect,
 };
 
 use crate::{
-    errors::{LookupError, ObjectKind},
+    errors::{KeyConstraint, LookupError, ObjectKind},
     impls::SqlparserDialect,
     structs::{
-        ColumnIdentity, ColumnMetadata, FunctionKind, GenericDB, IdentifierCase, MaterializedView,
-        RelationIdentity, RoleMembership, Schema, SchemaProfile, Sequence, TableAttribute,
-        TableMetadata, View,
+        ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
+        IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
+        Sequence, TableAttribute, TableMetadata, View,
         metadata::{
             CheckMetadata, ExpressionCalls, FunctionMetadata, IndexMetadata, PolicyMetadata,
             UniqueIndexMetadata,
@@ -141,6 +142,10 @@ impl SchemaProfile for SqlparserProfile {
             unresolved_function_grants: Vec::new(),
             role_alterations: Vec::new(),
         })
+    }
+
+    fn is_foreign_table(metadata: &TableMetadata<CreateTable>) -> bool {
+        metadata.foreign_source().is_some()
     }
 }
 
@@ -1435,9 +1440,10 @@ impl ParserDBBuilder {
         )
     }
 
-    /// Resolves a table the input has created so far through the session's
-    /// path, the first schema holding the name under any relation kind ending
-    /// the walk, so every statement reaching for a bare name answers alike.
+    /// Resolves a table or foreign table the input has created so far through
+    /// the session's path, the first schema holding the name under any
+    /// relation kind ending the walk, so every statement reaching for a bare
+    /// name answers alike.
     fn resolve_table_object_name(
         &self,
         object_name: &ObjectName,
@@ -1450,6 +1456,35 @@ impl ParserDBBuilder {
             case,
             |key| self.relation_key_is_held(key, case),
         )
+    }
+
+    /// Whether `table`, a node this builder stores, is a foreign table.
+    fn is_foreign_table(&self, table: &CreateTable) -> bool {
+        self.tables().iter().any(|(stored, metadata, _)| {
+            core::ptr::eq(stored.as_ref(), table) && SqlparserProfile::is_foreign_table(metadata)
+        })
+    }
+
+    /// Refuses `table`, which `name` reached, when it is a foreign table and
+    /// the statement needs a table holding its own rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RelationKindMismatch`](crate::errors::Error::RelationKindMismatch)
+    /// for a foreign table.
+    fn refuse_foreign_table(
+        &self,
+        table: &CreateTable,
+        name: &ObjectName,
+    ) -> Result<(), crate::errors::Error> {
+        if self.is_foreign_table(table) {
+            return Err(crate::errors::Error::RelationKindMismatch {
+                object_name: name.to_string(),
+                expected_kind: ObjectKind::Table,
+                actual_kind: ObjectKind::ForeignTable,
+            });
+        }
+        Ok(())
     }
 
     /// Resolves a plain view the input has created so far, walking the path
@@ -3022,6 +3057,148 @@ fn validate_table_schema(
     )
 }
 
+/// Splits a `CREATE FOREIGN TABLE` into the table node it declares and the
+/// server and options PostgreSQL keeps apart in `pg_foreign_table`.
+fn foreign_table_node(foreign_table: CreateForeignTable) -> (CreateTable, ForeignTableSource) {
+    let CreateForeignTable {
+        name,
+        if_not_exists,
+        columns,
+        constraints,
+        inherits,
+        server_name,
+        options,
+    } = foreign_table;
+    let source = ForeignTableSource::new(
+        server_name.value,
+        server_name.quote_style.is_some(),
+        options.iter().flatten().map(|option| {
+            (
+                option.key.value.as_str(),
+                option.key.quote_style.is_some(),
+                option.value.value.as_str(),
+            )
+        }),
+    );
+    let node = CreateTableBuilder::new(name)
+        .if_not_exists(if_not_exists)
+        .columns(columns)
+        .constraints(constraints)
+        .inherits(inherits)
+        .build();
+    (node, source)
+}
+
+/// Refuses the first primary key, unique, exclusion or foreign key constraint
+/// on a foreign table, which stores no rows to enforce one against.
+fn refuse_key_constraints_on_foreign_table(
+    create_table: &CreateTable,
+) -> Result<(), crate::errors::Error> {
+    let on_columns =
+        create_table.columns.iter().flat_map(|column| &column.options).find_map(|option| {
+            match option.option {
+                ColumnOption::PrimaryKey(_) => Some(KeyConstraint::PrimaryKey),
+                ColumnOption::Unique(_) => Some(KeyConstraint::Unique),
+                ColumnOption::ForeignKey(_) => Some(KeyConstraint::ForeignKey),
+                _ => None,
+            }
+        });
+    let on_table = || {
+        create_table.constraints.iter().find_map(|constraint| {
+            match constraint {
+                TableConstraint::PrimaryKey(_) | TableConstraint::PrimaryKeyUsingIndex(_) => {
+                    Some(KeyConstraint::PrimaryKey)
+                }
+                TableConstraint::Unique(_) | TableConstraint::UniqueUsingIndex(_) => {
+                    Some(KeyConstraint::Unique)
+                }
+                TableConstraint::ForeignKey(_) => Some(KeyConstraint::ForeignKey),
+                TableConstraint::Exclude(_) => Some(KeyConstraint::Exclusion),
+                _ => None,
+            }
+        })
+    };
+    match on_columns.or_else(on_table) {
+        Some(constraint) => {
+            Err(crate::errors::Error::ConstraintUnsupportedOnForeignTable {
+                table_name: create_table.table_name().to_string(),
+                constraint,
+            })
+        }
+        None => Ok(()),
+    }
+}
+
+/// The first key an option list repeats, keys compared as PostgreSQL stores
+/// them.
+fn first_repeated_key<K: AsRef<str>>(keys: &[K]) -> Option<&str> {
+    keys.iter().enumerate().find_map(|(at, key)| {
+        keys[..at].iter().any(|earlier| earlier.as_ref() == key.as_ref()).then(|| key.as_ref())
+    })
+}
+
+/// Refuses an `OPTIONS` list the table cannot hold: any on a column of an
+/// ordinary table, and one naming a key twice on a foreign table or on one of
+/// its columns.
+fn refuse_unholdable_foreign_options(
+    create_table: &CreateTable,
+    source: Option<&ForeignTableSource>,
+) -> Result<(), crate::errors::Error> {
+    let Some(source) = source else {
+        return match create_table
+            .columns
+            .iter()
+            .find(|column| crate::impls::foreign_options_of(column).next().is_some())
+        {
+            Some(column) => {
+                Err(crate::errors::Error::ForeignOptionsOnTableColumn {
+                    table_name: create_table.table_name().to_string(),
+                    column_name: column.name.value.clone(),
+                })
+            }
+            None => Ok(()),
+        };
+    };
+    let repeated = |column_name: Option<&Ident>, option_name: &str| {
+        crate::errors::Error::RepeatedForeignOption {
+            table_name: create_table.table_name().to_string(),
+            column_name: column_name.map(|name| name.value.clone()),
+            option_name: option_name.to_string(),
+        }
+    };
+    let table_keys: Vec<&str> = source.options().iter().map(|(key, _)| key.as_str()).collect();
+    if let Some(key) = first_repeated_key(&table_keys) {
+        return Err(repeated(None, key));
+    }
+    for column in &create_table.columns {
+        let keys: Vec<_> = crate::impls::foreign_options_of(column).map(|(key, _)| key).collect();
+        if let Some(key) = first_repeated_key(&keys) {
+            return Err(repeated(Some(&column.name), key));
+        }
+    }
+    Ok(())
+}
+
+/// Whether PostgreSQL refuses `operation` on a foreign table, naming the
+/// action.
+fn foreign_table_refuses(operation: &AlterTableOperation) -> bool {
+    matches!(
+        operation,
+        AlterTableOperation::EnableRowLevelSecurity
+            | AlterTableOperation::DisableRowLevelSecurity
+            | AlterTableOperation::ForceRowLevelSecurity
+            | AlterTableOperation::NoForceRowLevelSecurity
+            | AlterTableOperation::SetLogged
+            | AlterTableOperation::SetUnlogged
+            | AlterTableOperation::ReplicaIdentity { .. }
+            | AlterTableOperation::SetOptionsParens { .. }
+            | AlterTableOperation::EnableRule { .. }
+            | AlterTableOperation::EnableAlwaysRule { .. }
+            | AlterTableOperation::EnableReplicaRule { .. }
+            | AlterTableOperation::DisableRule { .. }
+    )
+}
+
 /// Refuses a `NO INHERIT` check written on a partitioned table.
 ///
 /// PostgreSQL enforces every constraint of a partitioned table on its
@@ -3447,16 +3624,17 @@ fn sequence_name_holder(
 
 /// Returns the kind of relation already holding `name` in `schema`, if any.
 ///
-/// Tables in a schema, views and materialized views over them, sequences, and
-/// indexes on tables all share one pool of names. A relation the caller is
-/// about to replace has to be out of the stores before this is asked.
+/// Tables and foreign tables in a schema, views and materialized views over
+/// them, sequences, and indexes on tables all share one pool of names. A
+/// relation the caller is about to replace has to be out of the stores before
+/// this is asked.
 fn relation_name_holder(
     builder: &ParserDBBuilder,
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
     let case = builder.identifier_case();
-    let table = builder.tables().iter().any(|(table, _, _)| {
+    let table = builder.tables().iter().find(|(table, _, _)| {
         case.identifiers_match(
             table.table_name(),
             table.table_name_is_quoted(),
@@ -3464,8 +3642,12 @@ fn relation_name_holder(
             name.quote_style.is_some(),
         ) && schema_qualifiers_match(table_schema_qualifier(table), schema, case)
     });
-    if table {
-        return Some(ObjectKind::Table);
+    if let Some((_, metadata, _)) = table {
+        return Some(if SqlparserProfile::is_foreign_table(metadata) {
+            ObjectKind::ForeignTable
+        } else {
+            ObjectKind::Table
+        });
     }
     view_name_holder(builder, name, schema)
         .or_else(|| sequence_name_holder(builder, name, schema))
@@ -3476,26 +3658,23 @@ fn relation_name_holder(
 /// node introduces, neither the table name itself nor a constraint-backed index
 /// name, and that the node does not repeat one of its own.
 ///
-/// One table name against another is left to the builder, which refuses it as a
-/// lookup ambiguity and names both spellings, so it is not asked for here.
+/// One table name against another of the same kind is left to the builder,
+/// which refuses it as a lookup ambiguity and names both spellings.
 fn validate_relation_names(
     builder: &ParserDBBuilder,
     create_table: &CreateTable,
+    table_kind: ObjectKind,
 ) -> Result<(), crate::errors::Error> {
     let schema = table_schema_qualifier(create_table);
-    let introduced = relation_names_of(create_table);
+    let introduced: Vec<(ObjectKind, &Ident)> = relation_names_of(create_table)
+        .into_iter()
+        .map(|(kind, name)| (if kind == ObjectKind::Table { table_kind } else { kind }, name))
+        .collect();
 
     for (position, (object_kind, name)) in introduced.iter().enumerate() {
-        let against_stores = match object_kind {
-            // A table name against another table name is left to the builder,
-            // which refuses it as a lookup ambiguity naming both spellings.
-            // Views and indexes are asked for here.
-            ObjectKind::Table => {
-                view_name_holder(builder, name, schema)
-                    .or_else(|| sequence_name_holder(builder, name, schema))
-                    .or_else(|| index_name_holder(builder, name, schema))
-            }
-            _ => relation_name_holder(builder, name, schema),
+        let against_stores = match relation_name_holder(builder, name, schema) {
+            Some(holder) if holder == *object_kind && *object_kind == table_kind => None,
+            holder => holder,
         };
         let conflicting_kind = introduced[..position]
             .iter()
@@ -4639,6 +4818,10 @@ impl ParserDB {
                 index_name: create_index.name.as_ref().map_or("<unnamed>", last_str).to_string(),
             });
         };
+        builder.refuse_foreign_table(table, &create_index.table_name)?;
+        if create_index.unique {
+            Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
+        }
         validate_index_columns(
             &create_index.columns,
             &create_index.include,
@@ -4774,6 +4957,7 @@ impl ParserDB {
         metadata.set_owner(previous_metadata.owner().map(str::to_string));
         metadata.set_owner_privileges(previous_metadata.take_owner_privileges());
         metadata.set_documentation(previous_metadata.take_documentation());
+        metadata.set_foreign_source(previous_metadata.take_foreign_source());
         // Which columns came from a parent is not spelled by the node, so it
         // has to survive the rebuild the way the other unspelled settings do.
         metadata.set_inherited_column_names(previous_metadata.inherited_column_names().to_vec());
@@ -4922,6 +5106,50 @@ impl ParserDB {
         Ok(builder)
     }
 
+    /// Resolves the table a foreign key references, refusing a view or a
+    /// foreign table holding the name, which cannot be referenced.
+    ///
+    /// An unqualified target resolves through the search path, which carries
+    /// `public`, so a bare `parent` reaches `public.parent` as it does in the
+    /// database. The table being created is chained in so a table may
+    /// reference itself.
+    fn foreign_key_target<'a>(
+        builder: &'a ParserDBBuilder,
+        create_table: &'a CreateTable,
+        fk: &ForeignKeyConstraint,
+    ) -> Result<&'a CreateTable, crate::errors::Error> {
+        let case = builder.identifier_case();
+        let referenced_table = resolve_table_object_name_on_search_path_in_iter(
+            builder
+                .tables()
+                .iter()
+                .map(|(t, _, _)| t.as_ref())
+                .chain(core::iter::once(create_table)),
+            &fk.foreign_table,
+            || builder.search_path(),
+            case,
+            |key| builder.relation_key_is_held(key, case),
+        )?;
+        let Some(referenced_table) = referenced_table else {
+            // A view holding the name is a different complaint: the relation
+            // exists and simply cannot be referenced, which is what the
+            // database reports.
+            if let Some(actual_kind) = views::holds_view(builder, &fk.foreign_table) {
+                return Err(crate::errors::Error::RelationKindMismatch {
+                    object_name: fk.foreign_table.to_string(),
+                    expected_kind: ObjectKind::Table,
+                    actual_kind,
+                });
+            }
+            return Err(crate::errors::Error::ReferencedTableNotFoundForForeignKey {
+                referenced_table: fk.foreign_table.to_string(),
+                host_table: create_table.name.to_string(),
+            });
+        };
+        builder.refuse_foreign_table(referenced_table, &fk.foreign_table)?;
+        Ok(referenced_table)
+    }
+
     /// Helper function to process a foreign key table constraint.
     fn process_foreign_key_table_constraint(
         fk: &ForeignKeyConstraint,
@@ -4948,39 +5176,7 @@ impl ParserDB {
         }
 
         let referenced_table_name = fk.foreign_table.to_string();
-
-        // An unqualified target resolves through the search path, which carries
-        // `public`, so a bare `parent` reaches `public.parent` as it does in
-        // the database. The table being created is chained in so a
-        // table may reference itself.
-        let case = builder.identifier_case();
-        let referenced_table = resolve_table_object_name_on_search_path_in_iter(
-            builder
-                .tables()
-                .iter()
-                .map(|(t, _, _)| t.as_ref())
-                .chain(core::iter::once(create_table.as_ref())),
-            &fk.foreign_table,
-            || builder.search_path(),
-            case,
-            |key| builder.relation_key_is_held(key, case),
-        )?;
-        let Some(referenced_table) = referenced_table else {
-            // A view holding the name is a different complaint: the relation
-            // exists and simply cannot be referenced, which is what the
-            // database reports.
-            if let Some(actual_kind) = views::holds_view(&builder, &fk.foreign_table) {
-                return Err(crate::errors::Error::RelationKindMismatch {
-                    object_name: referenced_table_name.clone(),
-                    expected_kind: ObjectKind::Table,
-                    actual_kind,
-                });
-            }
-            return Err(crate::errors::Error::ReferencedTableNotFoundForForeignKey {
-                referenced_table: referenced_table_name.clone(),
-                host_table: create_table.name.to_string(),
-            });
-        };
+        let referenced_table = Self::foreign_key_target(&builder, create_table, fk)?;
         refuse_reference_across_storage(create_table, referenced_table, &referenced_table_name)?;
 
         for ref_col_ident in &fk.referred_columns {
@@ -5185,7 +5381,16 @@ impl ParserDB {
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         validate_table_schema(&builder, &create_table)?;
         validate_distinct_columns(&create_table, builder.identifier_case())?;
-        validate_relation_names(&builder, &create_table)?;
+        let table_kind = if table_metadata.foreign_source().is_some() {
+            ObjectKind::ForeignTable
+        } else {
+            ObjectKind::Table
+        };
+        validate_relation_names(&builder, &create_table, table_kind)?;
+        if table_metadata.foreign_source().is_some() {
+            refuse_key_constraints_on_foreign_table(&create_table)?;
+        }
+        refuse_unholdable_foreign_options(&create_table, table_metadata.foreign_source())?;
 
         let (identity, documentation) = match &mut origin {
             TableOrigin::Declaration(documentation) => {
@@ -5269,6 +5474,15 @@ impl ParserDB {
         scope: AlterTableScope,
         constraint: &TableConstraint,
     ) -> Result<(), crate::errors::Error> {
+        if matches!(
+            constraint,
+            TableConstraint::PrimaryKey(_)
+                | TableConstraint::PrimaryKeyUsingIndex(_)
+                | TableConstraint::Unique(_)
+                | TableConstraint::UniqueUsingIndex(_)
+        ) {
+            Self::refuse_unique_index_over_foreign_partition(builder, stored)?;
+        }
         match constraint {
             TableConstraint::Check(check) if check.no_inherit => {
                 if Self::stored_node(builder, stored)?.partition_by.is_some() {
@@ -5310,6 +5524,23 @@ impl ParserDB {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Refuses a unique index on `stored`, whichever statement creates it, when
+    /// a foreign table sits among its partitions.
+    fn refuse_unique_index_over_foreign_partition(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+    ) -> Result<(), crate::errors::Error> {
+        match inheritance::first_foreign_partition_below(builder, stored) {
+            Some(partition) => {
+                Err(crate::errors::Error::UniqueIndexOverForeignPartition {
+                    table_name: stored.name.clone(),
+                    partition_name: partition.name,
+                })
+            }
+            None => Ok(()),
+        }
     }
 
     /// Adds a constraint to a table and to every table that takes its shape
@@ -6004,7 +6235,12 @@ impl ParserDB {
             views::remove_dependent_views(builder, &key);
             return Ok(());
         }
-        views::refuse_dependent_views(builder, &key, ObjectKind::Table, &dropped.name)
+        let dropped_kind = if builder.is_foreign_table(Self::stored_node(builder, dropped)?) {
+            ObjectKind::ForeignTable
+        } else {
+            ObjectKind::Table
+        };
+        views::refuse_dependent_views(builder, &key, dropped_kind, &dropped.name)
     }
 
     /// Removes tables together with the foreign keys the remaining tables
@@ -6068,6 +6304,29 @@ impl ParserDB {
         Ok(())
     }
 
+    /// Refuses a column option the table cannot take: a `NO INHERIT` check on
+    /// a partitioned table, which would keep it from the partitions, and a key
+    /// whose unique index would reach a foreign partition.
+    fn refuse_unaddable_column_options(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        column_def: &ColumnDef,
+    ) -> Result<(), crate::errors::Error> {
+        if column_def.options.iter().any(is_no_inherit_check)
+            && Self::stored_node(builder, stored)?.partition_by.is_some()
+        {
+            return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
+                table_name: stored.name.clone(),
+            });
+        }
+        if column_def.options.iter().any(|option| {
+            matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_))
+        }) {
+            Self::refuse_unique_index_over_foreign_partition(builder, stored)?;
+        }
+        Ok(())
+    }
+
     /// Adds a column to a table.
     fn alter_table_add_column(
         builder: ParserDBBuilder,
@@ -6099,15 +6358,7 @@ impl ParserDB {
             crate::errors::InheritedChange::AddColumn,
         )?;
 
-        // A check riding the column as `NO INHERIT` stays with the named
-        // table, and a partitioned table cannot hold one at all.
-        if column_def.options.iter().any(is_no_inherit_check)
-            && Self::stored_node(&builder, &stored)?.partition_by.is_some()
-        {
-            return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
-                table_name: stored.name.clone(),
-            });
-        }
+        Self::refuse_unaddable_column_options(&builder, &stored, &column_def)?;
         // Named against the schema as it stands, before the column lands.
         let column_sequences =
             sequences::plan_column_sequences(&builder, &stored, core::iter::once(&column_def));
@@ -6116,7 +6367,9 @@ impl ParserDB {
         // Read before the parent changes.
         let inheritors = inheritance::descendants(&builder, &stored);
         let mut inherited_def = column_def.clone();
-        inherited_def.options.retain(|option| !is_no_inherit_check(option));
+        inherited_def
+            .options
+            .retain(|option| !inheritance::stays_with_declaring_column(&option.option));
         sequences::spell_out_planned_serial(&mut inherited_def, &stored, &column_sequences);
         let (builder, column_sequences) =
             sequences::create_column_sequences(builder, &stored, column_sequences)?;
@@ -6779,6 +7032,15 @@ impl ParserDB {
         } = catalog;
         let dialect = *builder.dialect();
         for statement in statements {
+            // A foreign table takes the table path, so every check on a table's
+            // shape applies.
+            let (statement, foreign_source) = match statement {
+                Statement::CreateForeignTable(foreign_table) => {
+                    let (node, foreign_source) = foreign_table_node(foreign_table);
+                    (Statement::CreateTable(node), Some(foreign_source))
+                }
+                statement => (statement, None),
+            };
             match statement {
                 Statement::CreateFunction(mut create_function) => {
                     // Two functions may share a name as long as they take
@@ -6890,25 +7152,36 @@ impl ParserDB {
                     }
                 }
                 Statement::Drop {
-                    object_type: sqlparser::ast::ObjectType::Table,
+                    object_type:
+                        object_type @ (sqlparser::ast::ObjectType::Table
+                        | sqlparser::ast::ObjectType::ForeignTable),
                     if_exists,
                     names,
                     cascade,
                     ..
                 } => {
+                    let expected_kind = if object_type == sqlparser::ast::ObjectType::Table {
+                        ObjectKind::Table
+                    } else {
+                        ObjectKind::ForeignTable
+                    };
                     // Every name resolves before anything is dropped, so a
                     // table an earlier name takes along still counts as found.
                     let mut targets = Vec::with_capacity(names.len());
                     for name in &names {
-                        // A view or a sequence is refused rather than dropped,
-                        // and named as the wrong kind, as PostgreSQL does.
-                        views::refuse_dropping_relation_as_table(&builder, name)?;
+                        views::refuse_dropping_other_kind(&builder, name, expected_kind)?;
                         match builder.resolve_table_object_name(name)? {
                             Some(table) => targets.push(StoredTable::of(table)),
                             None if if_exists => {}
-                            None => {
+                            None if expected_kind == ObjectKind::Table => {
                                 return Err(crate::errors::Error::DropTableNotFound {
                                     table_name: last_str(name).to_string(),
+                                });
+                            }
+                            None => {
+                                return Err(crate::errors::Error::RelationNotFound {
+                                    object_kind: expected_kind,
+                                    object_name: name.to_string(),
                                 });
                             }
                         }
@@ -7439,6 +7712,17 @@ impl ParserDB {
                                 views::alter_view(builder, &alter_table.name, kind, &operation)?;
                             continue;
                         }
+                        if foreign_table_refuses(&operation)
+                            && let Some(table) =
+                                builder.resolve_table_object_name(&alter_table.name)?
+                            && builder.is_foreign_table(table)
+                        {
+                            return Err(crate::errors::Error::AlterActionUnsupportedOnRelation {
+                                object_kind: ObjectKind::ForeignTable,
+                                relation_name: alter_table.name.to_string(),
+                                operation: operation.to_string(),
+                            });
+                        }
                         match operation {
                             AlterTableOperation::EnableRowLevelSecurity => {
                                 builder = Self::alter_table_metadata(
@@ -7917,6 +8201,7 @@ impl ParserDB {
                     record_implied_not_null(&mut create_table);
                     bind_foreign_key_targets(&builder, &mut create_table);
                     let mut metadata = TableMetadata::default();
+                    metadata.set_foreign_source(foreign_source);
                     metadata.set_inherited_column_names(inherited.columns);
                     metadata.set_inherited_constraints(inherited.constraints);
                     metadata.set_unvalidated_constraints(inherited.unvalidated_constraints);
@@ -7967,7 +8252,7 @@ impl ParserDB {
                     // trigger arm above already did. This is not governed by
                     // the access setting: that excuses an absent role, which a
                     // dump legitimately omits, and never an absent table.
-                    if builder.resolve_table_object_name(&policy.table_name)?.is_none() {
+                    let Some(table) = builder.resolve_table_object_name(&policy.table_name)? else {
                         // A view holding the name is a different complaint:
                         // the relation exists and simply cannot carry a
                         // policy, which is what the database reports.
@@ -7982,7 +8267,8 @@ impl ParserDB {
                             table_name: last_str(&policy.table_name).to_string(),
                             policy_name: policy.name.value.clone(),
                         });
-                    }
+                    };
+                    builder.refuse_foreign_table(table, &policy.table_name)?;
                     builder.bind_table_reference(&mut policy.table_name);
 
                     // A policy name is unique per table, whatever command the

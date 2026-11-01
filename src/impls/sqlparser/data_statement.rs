@@ -187,7 +187,11 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
                 Ok(())
             }
             Relation::View(view) => self.expand_view(view),
-            Relation::MaterializedView(_) | Relation::Sequence(_) => Ok(()),
+            // A foreign table is listed among the relations read, and like
+            // `tables()` the base-table answer leaves it out.
+            Relation::ForeignTable(_) | Relation::MaterializedView(_) | Relation::Sequence(_) => {
+                Ok(())
+            }
         }
     }
 
@@ -210,6 +214,9 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
             }
         }
         for child in reached.into_iter().skip(1) {
+            if child.is_foreign(self.database)? {
+                continue;
+            }
             if !self.reads.tables.iter().any(|seen| core::ptr::eq(*seen, child)) {
                 self.reads.tables.push(child);
             }
@@ -250,7 +257,10 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
 /// database hands back for it.
 fn same_relation<DB: DatabaseLike>(left: &Relation<'_, DB>, right: &Relation<'_, DB>) -> bool {
     match (left, right) {
-        (Relation::Table(left), Relation::Table(right)) => core::ptr::eq(*left, *right),
+        (Relation::Table(left), Relation::Table(right))
+        | (Relation::ForeignTable(left), Relation::ForeignTable(right)) => {
+            core::ptr::eq(*left, *right)
+        }
         (Relation::View(left), Relation::View(right)) => core::ptr::eq(*left, *right),
         (Relation::MaterializedView(left), Relation::MaterializedView(right)) => {
             core::ptr::eq(*left, *right)
@@ -510,6 +520,7 @@ mod tests {
         CREATE VIEW open_high AS SELECT user_id FROM open_orders WHERE total > 100;
         CREATE MATERIALIZED VIEW big_orders AS SELECT user_id, total FROM orders;
         CREATE SEQUENCE ticket_seq;
+        CREATE FOREIGN TABLE remote_orders (id INT) SERVER warehouse;
     ";
 
     fn schema_db() -> ParserDB {
@@ -542,6 +553,9 @@ mod tests {
             .map(|relation| {
                 match relation {
                     Relation::Table(table) => format!("table {}", table.table_name()),
+                    Relation::ForeignTable(table) => {
+                        format!("foreign table {}", table.table_name())
+                    }
                     Relation::View(view) => format!("view {}", view.view_name()),
                     Relation::MaterializedView(view) => {
                         format!("materialized view {}", view.view_name())
@@ -795,11 +809,13 @@ mod tests {
     #[test]
     fn referenced_relations_tag_every_kind_the_statement_reads() {
         let db = schema_db();
-        let statement = parse_one("SELECT * FROM users, open_orders, big_orders, ticket_seq");
+        let statement =
+            parse_one("SELECT * FROM users, remote_orders, open_orders, big_orders, ticket_seq");
         assert_eq!(
             relation_names(as_query(&statement), &db),
             vec![
                 "table users".to_string(),
+                "foreign table remote_orders".to_string(),
                 "view open_orders".to_string(),
                 "materialized view big_orders".to_string(),
                 "sequence ticket_seq".to_string(),
