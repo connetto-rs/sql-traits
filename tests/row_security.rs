@@ -306,7 +306,13 @@ fn owners_superusers_and_bypassers_are_exempt_as_postgresql_exempts_them() {
         ))
     };
     let exemption = |database: &ParserDB, role: &str| {
-        security(database, role, RowStatement::Select).expect("settled").exemption()
+        let security = security(database, role, RowStatement::Select).expect("settled");
+        assert_eq!(
+            security.gates().is_none(),
+            security.exemption().is_some(),
+            "{role}: an exempt role has no gates and a gated one no exemption"
+        );
+        security.exemption()
     };
 
     let unforced = schema("");

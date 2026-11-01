@@ -125,19 +125,11 @@ impl<'db, P> GateTerm<'db, P> {
     }
 }
 
-impl<P> Clone for GateTerm<'_, P> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<P> Copy for GateTerm<'_, P> {}
-
 /// One test a row has to pass.
 ///
 /// The row passes when some permissive term holds and every restrictive term
 /// holds, so a gate with no permissive term admits nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RowGate<'db, P> {
     pub(crate) command: GatedCommand,
     pub(crate) row: RowVersion,
@@ -193,7 +185,7 @@ pub enum RowSecurityExemption {
 }
 
 /// What row-level security applies to one statement for one role.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum RowSecurity<'db, P> {
     /// No policy applies.
     Exempt(RowSecurityExemption),
