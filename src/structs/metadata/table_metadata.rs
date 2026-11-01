@@ -1,10 +1,13 @@
 //! Submodule defining a generic `TableMetadata` struct.
 
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use sqlparser::ast::{Action, Privileges};
 
-use crate::traits::{ColumnLike, DatabaseLike, TableLike};
+use crate::{
+    impls::PrivilegeKind,
+    traits::{ColumnLike, DatabaseLike, TableLike},
+};
 
 #[derive(Debug, Clone)]
 /// Metadata about a database table.
@@ -76,7 +79,8 @@ impl<T: TableLike> Default for TableMetadata<T> {
             rls_enabled: false,
             rls_forced: false,
             owner: None,
-            owner_privileges: every_table_privilege(),
+            // The owner holds every privilege on the table it creates.
+            owner_privileges: PrivilegeKind::Relation.all_privileges(),
             documentation: None,
         }
     }
@@ -431,19 +435,6 @@ impl<T: TableLike> TableMetadata<T> {
             }
         }
     }
-}
-
-/// Every privilege PostgreSQL gives a table's owner when it creates the table.
-fn every_table_privilege() -> Vec<Action> {
-    vec![
-        Action::Select { columns: None },
-        Action::Insert { columns: None },
-        Action::Update { columns: None },
-        Action::Delete,
-        Action::Truncate,
-        Action::References { columns: None },
-        Action::Trigger,
-    ]
 }
 
 /// Returns whether `action` covers the whole table rather than some of its
