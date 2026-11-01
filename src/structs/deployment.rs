@@ -43,8 +43,14 @@ use crate::{errors::DeploymentError, traits::DatabaseLike};
 /// )?;
 ///
 /// let resolved = deployment.resolve(&database)?;
-/// assert_eq!(resolved.login_role().name(), "reader");
-/// assert!(deployment.setting("APP.USER_ID").is_some());
+/// assert_eq!(resolved.login_role().name(), deployment.login_role());
+/// assert_eq!(deployment.acting_roles().collect::<Vec<_>>(), ["anonymous", "member"]);
+///
+/// // A translator finds the caller among the settings, whatever case a policy spells it in.
+/// let caller = deployment.setting("APP.USER_ID").expect("declared");
+/// assert_eq!(caller.content(), &SettingContent::Value(SettingValue::Caller(DataType::Uuid)));
+/// assert_eq!(caller.presence(), SettingPresence::Always);
+/// assert_eq!(deployment.settings().len(), 2);
 /// # Ok(())
 /// # }
 /// ```
@@ -191,6 +197,28 @@ impl SessionSetting {
     /// `fields` is empty, [`DeploymentError::DuplicateJsonField`] when two
     /// fields share a path, and [`DeploymentError::EmptySeparator`] for a
     /// field split on the empty string.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::ast::DataType;
+    ///
+    /// # fn main() -> Result<(), sql_traits::errors::DeploymentError> {
+    /// // PostgREST's token, whose `sub` Supabase's `auth.uid()` reads as the caller.
+    /// let claims = SessionSetting::json(
+    ///     "request.jwt.claims",
+    ///     [JsonField::new(["sub"], SettingValue::Caller(DataType::Uuid))?],
+    /// )?
+    /// .may_be_unset();
+    ///
+    /// assert_eq!(claims.presence(), SettingPresence::MayBeUnset);
+    /// let SettingContent::Json(fields) = claims.content() else { unreachable!() };
+    /// assert_eq!(fields[0].path(), ["sub"]);
+    /// assert_eq!(fields[0].value(), &SettingValue::Caller(DataType::Uuid));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn json(
         name: impl Into<String>,
         fields: impl IntoIterator<Item = JsonField>,

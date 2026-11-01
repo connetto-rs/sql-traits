@@ -108,13 +108,17 @@ fn only_a_custom_setting_name_can_carry_a_request_value() {
 
 #[test]
 fn an_empty_separator_cannot_split_a_set() {
-    let empty = SettingValue::Set {
-        element: DataType::Text,
-        packing: SetPacking::Delimited(String::new()),
+    let empty = || {
+        SettingValue::Set { element: DataType::Text, packing: SetPacking::Delimited(String::new()) }
     };
     assert_eq!(
-        SessionSetting::value("app.subjects", empty).map(|_| ()),
+        SessionSetting::value("app.subjects", empty()).map(|_| ()),
         Err(DeploymentError::EmptySeparator { setting: "app.subjects".into() })
+    );
+    let field = JsonField::new(["groups"], empty()).expect("a path");
+    assert_eq!(
+        SessionSetting::json("request.jwt.claims", [field]).map(|_| ()),
+        Err(DeploymentError::EmptySeparator { setting: "request.jwt.claims".into() })
     );
 }
 
