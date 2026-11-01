@@ -958,6 +958,13 @@ impl FunctionLike for MemoryFunction {
         Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() })
     }
 
+    fn referenced_functions<'db>(
+        &self,
+        _database: &'db Self::DB,
+    ) -> Result<Vec<&'db MemoryFunction>, LookupError> {
+        Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() })
+    }
+
     fn null_input_behavior(&self) -> FunctionCalledOnNull {
         FunctionCalledOnNull::CalledOnNullInput
     }

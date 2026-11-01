@@ -890,6 +890,66 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         database: &'db Self::DB,
     ) -> Result<Vec<Relation<'db, Self::DB>>, LookupError>;
 
+    /// Returns every function the calls the body writes may reach, resolved
+    /// the way PostgreSQL resolves them, and deduplicated in first-reached
+    /// order.
+    ///
+    /// A call in a body written as a string resolves when the function runs,
+    /// under the path [`referenced_tables`](FunctionLike::referenced_tables)
+    /// reads relations under, `pg_catalog` searched first unless that path
+    /// places it, and reaches the functions the database holds. A body
+    /// written `RETURN <expression>` or as a `BEGIN ATOMIC` block was
+    /// [bound at creation](FunctionLike::body_is_bound), so each of its calls
+    /// reaches the functions it reached then, under the path of the statement
+    /// that created it. PostgreSQL picks among overloads by argument type,
+    /// which is not inferred, so every overload accepting the call's argument
+    /// count counts, as
+    /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by)
+    /// counts them. A view the body reads adds none of the calls its
+    /// definition makes.
+    ///
+    /// # Errors
+    ///
+    /// The body-level errors of
+    /// [`referenced_tables`](FunctionLike::referenced_tables), for the same
+    /// bodies, an unqualified call after a `set_config` of `search_path`
+    /// among them ([`LookupError::FunctionBodyUnresolvable`]). Returns
+    /// [`LookupError::ObjectNotInDatabase`] for a bound body of a function
+    /// `database` does not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE members (doc_id TEXT, user_id TEXT);
+    ///      CREATE FUNCTION is_member(d TEXT) RETURNS BOOLEAN LANGUAGE sql
+    ///          AS $$ SELECT EXISTS (SELECT 1 FROM members WHERE doc_id = d) $$;
+    ///      CREATE FUNCTION can_read(d TEXT) RETURNS BOOLEAN LANGUAGE sql
+    ///          AS $$ SELECT is_member(d) $$;",
+    /// )?;
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    /// };
+    /// // `can_read` reads nothing itself, and reaches `members` through its call.
+    /// assert!(function("can_read").referenced_tables(&db)?.is_empty());
+    /// let called = function("can_read").referenced_functions(&db)?;
+    /// assert_eq!(called.iter().map(|called| called.name()).collect::<Vec<_>>(), ["is_member"]);
+    /// let read = called[0].referenced_tables(&db)?;
+    /// assert_eq!(read.iter().map(|table| table.table_name()).collect::<Vec<_>>(), ["members"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn referenced_functions<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Function>, LookupError>;
+
     /// Returns the null-input behavior with PostgreSQL's default folded in.
     fn null_input_behavior(&self) -> FunctionCalledOnNull;
 

@@ -1095,7 +1095,7 @@ pub enum Error {
     #[error("Cannot drop function `{function_name}`: still referenced in the schema.")]
     /// Error indicating that a DROP FUNCTION statement references a function
     /// that is still used by other schema objects (check constraints, policies,
-    /// or triggers).
+    /// triggers, or functions whose `RETURN` or `BEGIN ATOMIC` body calls it).
     FunctionReferenced {
         /// Name of the function being dropped.
         function_name: String,

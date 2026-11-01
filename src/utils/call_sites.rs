@@ -1,4 +1,5 @@
-//! Enumerates the function calls an expression makes, subqueries included.
+//! Enumerates the function calls a node makes, subqueries included, and
+//! decides which functions each may run.
 
 use core::ops::ControlFlow;
 
@@ -7,7 +8,16 @@ use sqlparser::ast::{
     TableFactor, Visit, Visitor,
 };
 
-/// One call an expression makes.
+use crate::{
+    structs::IdentifierCase,
+    traits::FunctionLike,
+    utils::{
+        identifier_resolution::identifiers_match,
+        object_name::{Qualifier, function_search_path, object_name_last_part, qualifier_of},
+    },
+};
+
+/// One call a node makes.
 #[derive(Clone, Copy)]
 pub(crate) struct Call<'a> {
     /// The name the call is written with.
@@ -19,17 +29,55 @@ pub(crate) struct Call<'a> {
     pub(crate) node: Option<&'a Function>,
 }
 
-/// Hands every call in `expression` to `each`, in the order a pre-order walk
-/// meets them, until `each` breaks.
+/// Hands every call in `node` to `each`, in the order a pre-order walk meets
+/// them, until `each` breaks.
 ///
 /// The walk covers every clause of every subquery, so a call reads the same
 /// wherever it is nested. A relation in a `FROM` clause is a call only when it
 /// carries an argument list.
-pub(crate) fn for_each_call<B>(
-    expression: &Expr,
+pub(crate) fn for_each_call<N: Visit + ?Sized, B>(
+    node: &N,
     each: impl FnMut(Call<'_>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
-    expression.visit(&mut Calls { each })
+    node.visit(&mut Calls { each })
+}
+
+/// Whether a call to `called` passing `arguments` arguments may run
+/// `function`, an unqualified name walking the function lookup path
+/// [`function_search_path`] builds from `search_path`.
+///
+/// PostgreSQL picks among the reachable overloads by argument type, which is
+/// not inferred here, so every overload accepting that many arguments counts.
+/// A function stored without a schema is in `public`, and a name built at run
+/// time reaches nothing.
+pub(crate) fn call_reaches<'path, F: FunctionLike, I>(
+    function: &F,
+    called: &ObjectName,
+    arguments: usize,
+    search_path: impl Fn() -> I,
+    case: IdentifierCase,
+) -> bool
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
+    let names_match = object_name_last_part(called).is_some_and(|(called, called_quoted)| {
+        identifiers_match(function.name(), function.name_is_quoted(), called, called_quoted)
+    });
+    if !names_match || !function.accepts_argument_count(arguments) {
+        return false;
+    }
+    let declared_in = function.target_name();
+    let (schema, quoted) = declared_in
+        .schema()
+        .map_or(("public", false), |schema| (schema, declared_in.schema_is_quoted()));
+    let in_schema = |(entry, entry_quoted): (&str, bool)| {
+        case.identifiers_match(schema, quoted, entry, entry_quoted)
+    };
+    match qualifier_of(called) {
+        Qualifier::Named(entry, entry_quoted) => in_schema((entry, entry_quoted)),
+        Qualifier::Absent => function_search_path(search_path).any(in_schema),
+        Qualifier::RunTime => false,
+    }
 }
 
 /// Hands each call the walk meets to `each`.
