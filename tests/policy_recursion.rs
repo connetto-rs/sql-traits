@@ -6,7 +6,10 @@
 //! own the tables.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::RowSecurityError, prelude::*};
+use sql_traits::{
+    errors::{LookupError, RowSecurityError},
+    prelude::*,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 
 const TABLES: &str = "
@@ -197,4 +200,26 @@ fn a_plain_view_whose_owner_the_schema_never_names_refuses_the_answer() {
         t.row_security(SELECT, reader, &database).map(|_| ()),
         Err(RowSecurityError::UnsettledViewOwner { view: "tv".into() })
     );
+}
+
+/// Skipping a name it cannot read would hide a loop through it.
+#[test]
+fn a_subquery_naming_a_malformed_relation_refuses_the_answer() {
+    let database = ParseOptions::default()
+        .with_access_resolution(AccessResolution::OpenWorld)
+        .parse::<PostgreSqlDialect>(&format!(
+            "{TABLES}
+             CREATE POLICY t_sel ON t FOR SELECT
+                 USING (EXISTS (SELECT 1 FROM cluster.db.schema.x WHERE x.id = t.id));"
+        ))
+        .expect("builds");
+    let reader = database.role("reader").expect("the role exists");
+    let t = database
+        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the table exists");
+    assert!(matches!(
+        t.row_security(SELECT, reader, &database),
+        Err(RowSecurityError::Lookup(LookupError::InvalidObjectName { .. }))
+    ));
 }
