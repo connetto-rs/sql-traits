@@ -927,9 +927,10 @@ impl VisitorMut for DefinitionBinder<'_> {
     }
 }
 
-/// Binds every stored relation a view definition reads to the relation it
-/// reaches now, answering the name of the first temporary one.
-fn bind_definition(builder: &ParserDBBuilder, query: &mut Query) -> Option<String> {
+/// Binds every stored relation a stored query reads, a view definition or the
+/// query of `CREATE TABLE … AS`, to the relation it reaches now, answering the
+/// name of the first temporary one.
+pub(super) fn bind_definition(builder: &ParserDBBuilder, query: &mut Query) -> Option<String> {
     let mut binder =
         DefinitionBinder { builder, scopes: WithScopes::default(), temporary_read: None };
     let walk = query.visit(&mut binder);

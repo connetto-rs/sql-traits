@@ -1514,6 +1514,16 @@ pub enum Error {
         /// Name the statement wrote.
         view_name: String,
     },
+    #[error("Table `{table_name}` specifies more column names than its query produces.")]
+    /// Error indicating that the column list of a `CREATE TABLE … AS`
+    /// statement is longer than what its query produces, which PostgreSQL
+    /// refuses as specifying too many column names.
+    ///
+    /// Checked only when the query's output columns can be counted.
+    TableColumnListTooLong {
+        /// Name the statement wrote.
+        table_name: String,
+    },
     #[error("{object_kind} `{view_name}` takes no option `{option_name}`.")]
     /// Error indicating that a view's `WITH (...)` or an `ALTER TABLE ... SET
     /// (...)` naming it writes an option its kind does not take.

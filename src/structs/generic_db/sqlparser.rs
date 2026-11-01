@@ -88,6 +88,7 @@ mod role_memberships;
 mod routine_privileges;
 mod rules;
 mod sequences;
+mod table_as;
 mod table_owner;
 mod transactions;
 mod view_rewrites;
@@ -7882,6 +7883,9 @@ impl ParserDB {
                         });
                     }
 
+                    // The query's columns are the table's own, so they are in
+                    // place before anything below reads the column list.
+                    table_as::apply_query(&builder, &mut create_table)?;
                     // Named before anything is created, so copied columns bring
                     // none.
                     let stored = StoredTable::of(&create_table);
