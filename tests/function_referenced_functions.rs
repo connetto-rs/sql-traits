@@ -6,7 +6,7 @@ use sql_traits::{
     errors::{Error, LookupError},
     prelude::*,
 };
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{BigQueryDialect, MsSqlDialect, PostgreSqlDialect};
 
 fn postgres(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses")
@@ -147,6 +147,41 @@ fn every_overload_accepting_the_argument_count_is_reached() {
         declared_called_by(&database, "nested"),
         ["public.g(INT, INT)", "public.rows_of(INT)", "public.f(INT, INT)"]
     );
+}
+
+#[test]
+fn each_function_is_reported_once_in_the_order_first_reached() {
+    let database = postgres(
+        "CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION g(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION repeated() RETURNS INT LANGUAGE sql AS $$
+             SELECT g(1) + f(1);
+             SELECT g(2);
+         $$;",
+    );
+    assert_eq!(called_by(&database, "repeated").unwrap(), ["public.g(INT)", "public.f(INT)"]);
+}
+
+#[test]
+fn calls_in_bodies_the_input_already_parsed_are_resolved() {
+    let sql_server = ParserDB::parse::<MsSqlDialect>(
+        "CREATE FUNCTION helper() RETURNS INT AS BEGIN RETURN 1; END;
+         CREATE FUNCTION counted() RETURNS INT AS BEGIN RETURN (SELECT helper()); END;
+         CREATE FUNCTION listed() RETURNS TABLE AS RETURN SELECT helper() AS h;",
+    )
+    .unwrap();
+    assert_eq!(declared_called_by(&sql_server, "counted"), ["public.helper()"]);
+    assert_eq!(declared_called_by(&sql_server, "listed"), ["public.helper()"]);
+
+    let big_query = ParserDB::parse::<BigQueryDialect>(
+        "CREATE FUNCTION helper() RETURNS INT64 AS (1);
+         CREATE FUNCTION counted() RETURNS INT64 AS ((SELECT helper()));
+         CREATE FUNCTION described() RETURNS INT64 OPTIONS (description = 'count')
+             AS ((SELECT helper()));",
+    )
+    .unwrap();
+    assert_eq!(declared_called_by(&big_query, "counted"), ["public.helper()"]);
+    assert_eq!(declared_called_by(&big_query, "described"), ["public.helper()"]);
 }
 
 #[test]
