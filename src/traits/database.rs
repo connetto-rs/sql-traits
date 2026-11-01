@@ -1960,25 +1960,29 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     ///
     /// Table grants apply privileges to entire tables. This includes direct
     /// table grants (`GRANT ... ON table_name`) and schema-wide table grants
-    /// (`GRANT ... ON ALL TABLES IN SCHEMA`).
+    /// (`GRANT ... ON ALL TABLES IN SCHEMA`). A privilege written with a
+    /// column list covers those columns only and comes from
+    /// [`Self::column_grants`] instead, so a statement mixing both kinds
+    /// yields its whole-table part here and its column part there.
     ///
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
-    /// CREATE TABLE users (id INT);
+    /// CREATE TABLE users (id INT, name TEXT);
     /// CREATE ROLE app_user;
     /// CREATE ROLE admin;
     /// GRANT SELECT ON users TO app_user;
-    /// GRANT INSERT, UPDATE ON users TO admin;
+    /// GRANT INSERT, UPDATE (name) ON users TO admin;
     /// ",
     /// )?;
-    /// let grants: Vec<_> = db.table_grants().collect();
-    /// assert_eq!(grants.len(), 2);
+    /// let grants: Vec<String> = db.table_grants().map(ToString::to_string).collect();
+    /// assert_eq!(grants, ["GRANT SELECT ON users TO app_user", "GRANT INSERT ON users TO admin"]);
     /// # Ok(())
     /// # }
     /// ```
@@ -2014,12 +2018,15 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// Iterates over the column grants defined in the database.
     ///
     /// Column grants apply privileges to specific columns within tables.
-    /// This allows fine-grained access control at the column level.
+    /// This allows fine-grained access control at the column level. Each
+    /// one holds only the privileges written with a column list, and the
+    /// whole-table privileges of the same statement come from
+    /// [`Self::table_grants`].
     ///
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
@@ -2027,11 +2034,11 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     ///     "
     /// CREATE TABLE users (id INT, name TEXT, secret TEXT);
     /// CREATE ROLE app_user;
-    /// GRANT SELECT (id, name) ON users TO app_user;
+    /// GRANT INSERT, SELECT (id, name) ON users TO app_user;
     /// ",
     /// )?;
-    /// let column_grants: Vec<_> = db.column_grants().collect();
-    /// assert_eq!(column_grants.len(), 1);
+    /// let column_grants: Vec<String> = db.column_grants().map(ToString::to_string).collect();
+    /// assert_eq!(column_grants, ["GRANT SELECT (id, name) ON users TO app_user"]);
     /// # Ok(())
     /// # }
     /// ```

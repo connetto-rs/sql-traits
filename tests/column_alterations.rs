@@ -22,10 +22,11 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
 }
 
-/// The grants each store records, rendered back to SQL.
+/// The grants each store records, rendered back to SQL, whole-table grants
+/// first and column grants second.
 ///
-/// A grant is recorded in both stores, so the two lists have to agree: a stale
-/// copy in one of them names a column the table no longer declares.
+/// Both stores are read, so a stale entry in either one that names a column
+/// the table no longer declares shows up.
 fn rendered_grants(database: &ParserDB) -> (Vec<String>, Vec<String>) {
     (
         database.table_grants().map(ToString::to_string).collect(),
@@ -322,7 +323,7 @@ fn a_permission_on_the_column_goes_with_it() {
     )
     .expect("the permission keeps the surviving column");
     let kept = vec!["GRANT SELECT (b) ON t TO app".to_owned()];
-    assert_eq!(rendered_grants(&shared), (kept.clone(), kept));
+    assert_eq!(rendered_grants(&shared), (Vec::new(), kept));
 
     let table_wide = parse(
         "CREATE ROLE app;
@@ -332,7 +333,7 @@ fn a_permission_on_the_column_goes_with_it() {
     )
     .expect("a permission over the whole table names no column to lose");
     let whole = vec!["GRANT SELECT ON t TO app".to_owned()];
-    assert_eq!(rendered_grants(&table_wide), (whole.clone(), whole));
+    assert_eq!(rendered_grants(&table_wide), (whole, Vec::new()));
 }
 
 /// A grant may name columns under more than one action, so stripping has to
@@ -347,17 +348,17 @@ fn a_permission_naming_columns_under_several_actions_loses_only_the_dropped_one(
     let dropped_second =
         parse(&format!("{declared} ALTER TABLE t DROP COLUMN b;")).expect("b is declared");
     let expected = vec!["GRANT SELECT (a) ON t TO app".to_owned()];
-    assert_eq!(rendered_grants(&dropped_second), (expected.clone(), expected));
+    assert_eq!(rendered_grants(&dropped_second), (Vec::new(), expected));
 
     let dropped_first =
         parse(&format!("{declared} ALTER TABLE t DROP COLUMN a;")).expect("a is declared");
     let expected = vec!["GRANT UPDATE (b) ON t TO app".to_owned()];
-    assert_eq!(rendered_grants(&dropped_first), (expected.clone(), expected));
+    assert_eq!(rendered_grants(&dropped_first), (Vec::new(), expected));
 
     let renamed = parse(&format!("{declared} ALTER TABLE t RENAME COLUMN b TO renamed;"))
         .expect("b is declared");
     let expected = vec!["GRANT SELECT (a), UPDATE (renamed) ON t TO app".to_owned()];
-    assert_eq!(rendered_grants(&renamed), (expected.clone(), expected));
+    assert_eq!(rendered_grants(&renamed), (Vec::new(), expected));
 }
 
 #[test]
