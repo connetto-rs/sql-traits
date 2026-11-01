@@ -1,6 +1,7 @@
 //! Submodule providing implementations of the traits defined in the `traits`
 //! module for the `sqlparser` crate.
 
+mod body_calls;
 mod check_constraint;
 mod column_def;
 mod create_extension;
