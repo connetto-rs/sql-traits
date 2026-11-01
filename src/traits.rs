@@ -4,6 +4,7 @@ pub mod column;
 pub mod data_type;
 pub mod database;
 pub mod dialect;
+mod row_security;
 pub mod table;
 pub mod type_match;
 use core::fmt::Debug;
