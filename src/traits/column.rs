@@ -676,6 +676,38 @@ pub trait ColumnLike:
         self.default_value().is_some()
     }
 
+    /// Returns the options a foreign-data wrapper reads for the column, as
+    /// PostgreSQL stores them in `pg_attribute.attfdwoptions`. Each key is
+    /// folded to lowercase unless quoted and comes with its value as written,
+    /// in the order written.
+    ///
+    /// Only a column of a foreign table carries any, and only the ones it
+    /// declares itself, since an inheriting table takes none of them.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FOREIGN TABLE sales (id INT OPTIONS (Column_Name 'sale_id'), note TEXT)
+    ///      SERVER remote;",
+    /// )?;
+    /// let sales = db
+    ///     .foreign_table_by_target(TargetName::new("sales", false), IdentifierCase::AsWritten)?
+    ///     .expect("the foreign table is recorded");
+    /// let id = sales.column("id", &db, IdentifierCase::AsWritten)?.expect("declared");
+    /// let options: Vec<_> = id.foreign_options().collect();
+    /// assert_eq!(options, [("column_name".into(), "sale_id")]);
+    /// let note = sales.column("note", &db, IdentifierCase::AsWritten)?.expect("declared");
+    /// assert_eq!(note.foreign_options().count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)>;
+
     /// Returns the table that this column belongs to.
     ///
     /// # Arguments
@@ -1590,6 +1622,11 @@ where
     }
 
     #[inline]
+    fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
+        (*self).foreign_options()
+    }
+
+    #[inline]
     fn table<'db>(&'db self, database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
     where
         Self: 'db,
@@ -1662,6 +1699,11 @@ where
     #[inline]
     fn default_value(&self) -> Option<String> {
         (**self).default_value()
+    }
+
+    #[inline]
+    fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
+        (**self).foreign_options()
     }
 
     #[inline]

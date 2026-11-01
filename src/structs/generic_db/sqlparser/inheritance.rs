@@ -241,12 +241,21 @@ fn is_inherited_option(option: &ColumnOption) -> bool {
 /// Whether a parent linked by this spelling writes the option onto the copy.
 ///
 /// A check written `NO INHERIT` stays with the table declaring it, which is
-/// the attribute's entire meaning, so it never joins the copy.
+/// the attribute's entire meaning, so it never joins the copy. Foreign-data
+/// wrapper options stay there too, since PostgreSQL records them for the
+/// declaring column alone.
 pub(super) fn option_passes_down(kind: ParentKind, option: &ColumnOption) -> bool {
-    if matches!(option, ColumnOption::Check(check) if check.no_inherit) {
+    if stays_with_declaring_column(option) {
         return false;
     }
     kind == ParentKind::PartitionOf || is_inherited_option(option)
+}
+
+/// Whether the option stays with the column declaring it whatever links a
+/// child to it: a `NO INHERIT` check, and foreign-data wrapper options.
+pub(super) fn stays_with_declaring_column(option: &ColumnOption) -> bool {
+    matches!(option, ColumnOption::Check(check) if check.no_inherit)
+        || matches!(option, ColumnOption::GenericOptions(_))
 }
 
 /// The option with the name a partition's copy would have been given stripped

@@ -28,7 +28,7 @@ mod sequence;
 mod unique_constraint;
 mod view;
 
-pub(crate) use column_def::serial_sequence_type;
+pub(crate) use column_def::{foreign_options_of, serial_sequence_type};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub use dialect::SqlparserDialect;
 pub use grant::apply_revoke_to_grant;

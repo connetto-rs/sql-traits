@@ -5,7 +5,9 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 use crate::utils::identifier_resolution::normalize_identifier;
 
 /// The `SERVER` and table-level `OPTIONS` of a `CREATE FOREIGN TABLE`, as
-/// PostgreSQL records them in `pg_foreign_table`.
+/// PostgreSQL records them in `pg_foreign_table`. The options of each column
+/// are read with
+/// [`ColumnLike::foreign_options`](crate::traits::ColumnLike::foreign_options).
 ///
 /// # Example
 ///

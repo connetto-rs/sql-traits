@@ -782,3 +782,131 @@ fn a_foreign_table_survives_resumed_ingestion() {
     assert_eq!(remote.grants(&after).expect("held").count(), 1);
     assert_eq!(after.tables().count(), 0);
 }
+
+/// The wrapper options of every column of `table`, by column name, each key
+/// as PostgreSQL stores it.
+fn column_options(db: &ParserDB, table: &CreateTable) -> Vec<(String, Vec<(String, String)>)> {
+    table
+        .columns(db)
+        .expect("held")
+        .map(|column| {
+            let options = column
+                .foreign_options()
+                .map(|(key, value)| (key.into_owned(), value.to_owned()))
+                .collect();
+            (column.column_name().to_owned(), options)
+        })
+        .collect()
+}
+
+fn options(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs.iter().map(|&(key, value)| (key.to_owned(), value.to_owned())).collect()
+}
+
+const OPTIONED: &str = "CREATE FOREIGN TABLE remote (
+         id INT OPTIONS (column_name 'remote_id'),
+         note TEXT OPTIONS (\"column_name\" 'Body'),
+         plain INT
+     ) SERVER warehouse;";
+
+#[test]
+fn a_foreign_table_column_keeps_its_wrapper_options_through_a_rename() {
+    let db = db(&format!(
+        "{OPTIONED}
+         ALTER TABLE remote RENAME COLUMN id TO ident;
+         ALTER TABLE remote ADD COLUMN added INT OPTIONS (COLUMN_NAME 'remote_added');"
+    ));
+    assert_eq!(
+        column_options(&db, foreign(&db, "remote")),
+        [
+            ("ident".to_owned(), options(&[("column_name", "remote_id")])),
+            ("note".to_owned(), options(&[("column_name", "Body")])),
+            ("plain".to_owned(), options(&[])),
+            ("added".to_owned(), options(&[("column_name", "remote_added")])),
+        ]
+    );
+}
+
+#[test]
+fn wrapper_options_stay_with_the_column_that_declares_them() {
+    let db = db(&format!(
+        "{OPTIONED}
+         CREATE TABLE child (extra INT) INHERITS (remote);
+         CREATE FOREIGN TABLE remote_child (note TEXT OPTIONS (column_name 'own'))
+             INHERITS (remote) SERVER warehouse;
+         ALTER TABLE remote ADD COLUMN later INT OPTIONS (column_name 'remote_later');"
+    ));
+    assert_eq!(
+        column_options(&db, table(&db, "child")),
+        [
+            ("id".to_owned(), options(&[])),
+            ("note".to_owned(), options(&[])),
+            ("plain".to_owned(), options(&[])),
+            ("extra".to_owned(), options(&[])),
+            ("later".to_owned(), options(&[])),
+        ]
+    );
+    assert_eq!(
+        column_options(&db, foreign(&db, "remote_child")),
+        [
+            ("id".to_owned(), options(&[])),
+            ("note".to_owned(), options(&[("column_name", "own")])),
+            ("plain".to_owned(), options(&[])),
+            ("later".to_owned(), options(&[])),
+        ]
+    );
+}
+
+#[test]
+fn wrapper_options_are_refused_on_a_column_of_an_ordinary_table() {
+    assert!(matches!(
+        refusal("CREATE TABLE local (id INT OPTIONS (column_name 'x'));"),
+        Error::ForeignOptionsOnTableColumn { table_name, column_name }
+            if table_name == "local" && column_name == "id"
+    ));
+    // A foreign child does not make its ordinary parent take them.
+    assert!(matches!(
+        refusal(
+            "CREATE TABLE local (id INT);
+             CREATE FOREIGN TABLE remote () INHERITS (local) SERVER warehouse;
+             ALTER TABLE local ADD COLUMN c INT OPTIONS (column_name 'x');"
+        ),
+        Error::ForeignOptionsOnTableColumn { table_name, column_name }
+            if table_name == "local" && column_name == "c"
+    ));
+}
+
+#[test]
+fn an_option_list_names_each_folded_key_once() {
+    for (sql, column) in [
+        (
+            "CREATE FOREIGN TABLE h (id INT OPTIONS (column_name 'a', COLUMN_NAME 'b')) SERVER s;",
+            Some("id"),
+        ),
+        (
+            "CREATE FOREIGN TABLE h (id INT OPTIONS (\"column_name\" 'a', column_name 'b'))
+             SERVER s;",
+            Some("id"),
+        ),
+        (
+            "CREATE FOREIGN TABLE h (id INT) SERVER s OPTIONS (TABLE_NAME 'a', table_name 'b');",
+            None,
+        ),
+        (
+            "CREATE FOREIGN TABLE h (id INT) SERVER s;
+             ALTER TABLE h ADD COLUMN e INT OPTIONS (column_name 'a', column_name 'b');",
+            Some("e"),
+        ),
+    ] {
+        let error = refusal(sql);
+        let Error::RepeatedForeignOption { table_name, column_name, option_name } = &error else {
+            panic!("{sql} was refused with {error:?}");
+        };
+        assert_eq!(table_name, "h", "{sql}");
+        assert_eq!(column_name.as_deref(), column, "{sql}");
+        assert_eq!(option_name, column.map_or("table_name", |_| "column_name"), "{sql}");
+    }
+    // A quoted key keeps its case, so it differs from the folded one.
+    db("CREATE FOREIGN TABLE h (id INT OPTIONS (\"Column_Name\" 'a', column_name 'b'))
+        SERVER s;");
+}
