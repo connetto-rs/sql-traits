@@ -9,7 +9,8 @@ pub mod type_match;
 use core::fmt::Debug;
 
 pub use column::{
-    ColumnCollation, ColumnLike, IdentityGeneration, MySqlCollationPadding, NamedColumnCollation,
+    ColumnCollation, ColumnLike, CreatedFromQuery, IdentityGeneration, MySqlCollationPadding,
+    NamedColumnCollation,
 };
 pub use data_type::{DataTypeLike, IntervalFields, VectorKind, VectorType};
 pub mod index;

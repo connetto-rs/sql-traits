@@ -23,6 +23,9 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
         table: &'scope DB::Table,
         /// The declared column.
         column: &'scope DB::Column,
+        /// The database holding the table, which for a column the query of a
+        /// `CREATE TABLE … AS` read is the catalog as that statement saw it.
+        database: &'scope DB,
     },
     /// A projection expression and its defining scope.
     Expression {
@@ -314,7 +317,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
     /// else {
     ///     unreachable!()
     /// };
-    /// let Some(ColumnDefinition::Base { table, column }) =
+    /// let Some(ColumnDefinition::Base { table, column, .. }) =
     ///     defining.resolve_column_definition(&Expr::Identifier(Ident::new("id")))?
     /// else {
     ///     unreachable!()
@@ -363,7 +366,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
     /// };
     /// assert_eq!(outer_binding.relation(), Some(("d", false)));
     /// assert_eq!(outer_binding.exposed(), Some(("doubled", false)));
-    /// let Some((ColumnDefinition::Base { table, column }, inner_binding)) =
+    /// let Some((ColumnDefinition::Base { table, column, .. }, inner_binding)) =
     ///     defining.resolve_column_binding(&Expr::Identifier(Ident::new("id")))?
     /// else {
     ///     unreachable!()
@@ -888,7 +891,7 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     ///     unreachable!()
     /// };
     /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
-    /// let Some(ColumnDefinition::Base { table, column }) =
+    /// let Some(ColumnDefinition::Base { table, column, .. }) =
     ///     scope.resolve_column_definition(&Expr::Identifier(Ident::new("id")))?
     /// else {
     ///     unreachable!()
@@ -964,7 +967,7 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// };
     /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let reference = Expr::CompoundIdentifier(vec![Ident::new("c"), Ident::new("id")]);
-    /// let Some(ColumnDefinition::Base { table, column }) =
+    /// let Some(ColumnDefinition::Base { table, column, .. }) =
     ///     scope.resolve_column_definition(&reference)?
     /// else {
     ///     unreachable!()
