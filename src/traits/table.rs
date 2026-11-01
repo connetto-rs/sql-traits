@@ -4396,13 +4396,17 @@ pub trait TableLike:
     ///
     /// A policy applies when its `TO` list reaches `role` through inheriting
     /// memberships. An owner the schema never names is taken to be a role
-    /// other than `role`.
+    /// other than `role`. Where expanding the applied policies loops back into
+    /// a table still being expanded, the answer is
+    /// [`RowSecurity::InfiniteRecursion`], as PostgreSQL refuses the statement.
     ///
     /// # Errors
     ///
     /// Returns [`RowSecurityError::Lookup`] when the table is not in
-    /// `database`, and [`RowSecurityError::UnsettledRole`] when a policy's `TO`
-    /// list cannot be settled for `role` from the schema.
+    /// `database`, [`RowSecurityError::UnsettledRole`] when a policy's `TO`
+    /// list cannot be settled for `role` from the schema, and
+    /// [`RowSecurityError::UnsettledViewOwner`] when the policies read a plain
+    /// view whose owner the schema does not name.
     ///
     /// # Example
     ///

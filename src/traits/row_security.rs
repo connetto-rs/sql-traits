@@ -1,16 +1,26 @@
 //! The answer behind [`TableLike::row_security`].
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::{ops::ControlFlow, ptr};
 
-use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Owner};
+use sqlparser::ast::{
+    CreatePolicyCommand, CreatePolicyType, Expr, FunctionArguments, InTarget, Owner, Query, Visit,
+    Visitor,
+};
 
 use crate::{
-    errors::RowSecurityError,
+    errors::{LookupError, RowSecurityError},
     structs::{
         GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,
         RowSecurityExemption, RowStatement, RowVersion,
     },
-    traits::{DatabaseLike, PolicyLike, RoleLike, TableLike, role::privilege_holders},
+    traits::{
+        DataStatementLike, DatabaseLike, PolicyLike, Relation, RoleLike, TableLike, ViewLike,
+        role::privilege_holders,
+    },
     utils::identifier_resolution::{is_public_pseudo_role, normalize_identifier},
 };
 
@@ -212,5 +222,157 @@ pub(crate) fn row_security<'db, T: TableLike>(
         }
         gates.push(gate);
     }
+    let expressions = gates
+        .iter()
+        .flat_map(|gate| gate.permissive.iter().chain(&gate.restrictive))
+        .map(GateTerm::expression)
+        .collect();
+    let mut expansion = Expansion { database, stack: Vec::new() };
+    if let Some(relation) = expansion.table(table.borrow(), expressions, role)? {
+        return Ok(RowSecurity::InfiniteRecursion { relation });
+    }
     Ok(RowSecurity::Gated(gates))
+}
+
+/// Collects the relations the outermost subqueries of an expression read.
+///
+/// A subquery inside another is read by the outer one already, and resolving
+/// it alone would lose the `WITH` names the outer one binds.
+struct SubqueryReads<'db, DB: DatabaseLike> {
+    database: &'db DB,
+    depth: usize,
+    reads: Option<Vec<Relation<'db, DB>>>,
+}
+
+impl<DB: DatabaseLike> Visitor for SubqueryReads<'_, DB> {
+    type Break = LookupError;
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if self.depth > 0 {
+            return ControlFlow::Continue(());
+        }
+        let query = match expr {
+            Expr::Exists { subquery, .. }
+            | Expr::In { target: InTarget::Subquery(subquery), .. }
+            | Expr::Subquery(subquery) => subquery,
+            Expr::Function(function) => {
+                match &function.args {
+                    FunctionArguments::Subquery(subquery) => subquery,
+                    _ => return ControlFlow::Continue(()),
+                }
+            }
+            _ => return ControlFlow::Continue(()),
+        };
+        match <Query as DataStatementLike<DB>>::referenced_relations(query, self.database) {
+            Ok(relations) => {
+                self.reads.get_or_insert_with(Vec::new).extend(relations);
+                ControlFlow::Continue(())
+            }
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
+}
+
+/// PostgreSQL's expansion of the policies a statement applies, following
+/// every table their subqueries read into that table's `SELECT` policies.
+///
+/// A table enters the stack while the subqueries of its applied policies are
+/// expanded, and meeting it there again is the recursion PostgreSQL refuses.
+/// A table whose applied policies hold no subquery is never entered, which is
+/// why a write policy may read its own table through an open read policy.
+struct Expansion<'db, DB: DatabaseLike> {
+    database: &'db DB,
+    stack: Vec<&'db DB::Table>,
+}
+
+impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
+    /// Expands `table`'s applied `expressions` as `role`, answering the
+    /// relation PostgreSQL's recursion error names, if it raises one.
+    fn table(
+        &mut self,
+        table: &'db DB::Table,
+        expressions: Vec<&'db Expr>,
+        role: &'db DB::Role,
+    ) -> Result<Option<String>, RowSecurityError> {
+        let mut collector = SubqueryReads { database: self.database, depth: 0, reads: None };
+        for expression in expressions {
+            if let ControlFlow::Break(error) = expression.visit(&mut collector) {
+                return Err(error.into());
+            }
+        }
+        let Some(reads) = collector.reads else { return Ok(None) };
+        if self.stack.iter().any(|entered| ptr::eq(*entered, table)) {
+            return Ok(Some(table.table_name().to_string()));
+        }
+        self.stack.push(table);
+        let mut found = None;
+        for relation in reads {
+            found = self.relation(relation, role)?;
+            if found.is_some() {
+                break;
+            }
+        }
+        self.stack.pop();
+        Ok(found)
+    }
+
+    /// Expands one relation a subquery reads, as `role`.
+    ///
+    /// A plain view reads as its owner and an invoker view as the reader. A
+    /// parent table read without `ONLY` applies its own policies alone.
+    fn relation(
+        &mut self,
+        relation: Relation<'db, DB>,
+        role: &'db DB::Role,
+    ) -> Result<Option<String>, RowSecurityError> {
+        match relation {
+            Relation::Table(table) => {
+                if exemption(table, role, self.database)?.is_some() {
+                    return Ok(None);
+                }
+                let mut expressions = Vec::new();
+                for policy in table.policies(self.database)? {
+                    if covers(policy, GatedCommand::Select) && applies(policy, role, self.database)?
+                    {
+                        expressions.extend(policy.using_expression(self.database));
+                    }
+                }
+                self.table(table, expressions, role)
+            }
+            Relation::View(view) => {
+                let reader = if view.is_security_invoker() {
+                    role
+                } else {
+                    view.owner(self.database)?
+                        .and_then(|owner| self.database.role(owner))
+                        .ok_or_else(|| {
+                            RowSecurityError::UnsettledViewOwner {
+                                view: view.view_name().to_string(),
+                            }
+                        })?
+                };
+                let reads = <Query as DataStatementLike<DB>>::referenced_relations(
+                    view.definition(),
+                    self.database,
+                )?;
+                for relation in reads {
+                    if let Some(found) = self.relation(relation, reader)? {
+                        return Ok(Some(found));
+                    }
+                }
+                Ok(None)
+            }
+            Relation::MaterializedView(_) | Relation::Sequence(_) => Ok(None),
+        }
+    }
 }

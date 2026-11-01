@@ -2,7 +2,7 @@
 //! role, as PostgreSQL's table "Policies Applied by Command Type" in
 //! `CREATE POLICY` lays it out.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use sqlparser::ast::Expr;
 
@@ -191,24 +191,41 @@ pub enum RowSecurity<'db, P> {
     Exempt(RowSecurityExemption),
     /// Every row the statement touches has to pass these gates.
     Gated(Vec<RowGate<'db, P>>),
+    /// Expanding the statement's policies reads back into a table whose
+    /// policies are still being expanded, so PostgreSQL refuses the statement
+    /// with `infinite recursion detected in policy for relation` (`42P17`).
+    InfiniteRecursion {
+        /// The relation PostgreSQL names.
+        relation: String,
+    },
 }
 
 impl<'db, P> RowSecurity<'db, P> {
-    /// The gates, or `None` for an exempt role.
+    /// The gates, or `None` where the statement is exempt or refused.
     #[must_use]
     pub fn gates(&self) -> Option<&[RowGate<'db, P>]> {
         match self {
             Self::Gated(gates) => Some(gates),
-            Self::Exempt(_) => None,
+            Self::Exempt(_) | Self::InfiniteRecursion { .. } => None,
         }
     }
 
-    /// Why no policy applies, or `None` where gates do.
+    /// Why no policy applies, or `None` where policies do.
     #[must_use]
     pub fn exemption(&self) -> Option<RowSecurityExemption> {
         match self {
             Self::Exempt(exemption) => Some(*exemption),
-            Self::Gated(_) => None,
+            Self::Gated(_) | Self::InfiniteRecursion { .. } => None,
+        }
+    }
+
+    /// The relation PostgreSQL's recursion error names, or `None` where the
+    /// statement runs.
+    #[must_use]
+    pub fn infinite_recursion(&self) -> Option<&str> {
+        match self {
+            Self::InfiniteRecursion { relation } => Some(relation),
+            Self::Exempt(_) | Self::Gated(_) => None,
         }
     }
 }

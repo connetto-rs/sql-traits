@@ -419,6 +419,13 @@ pub enum RowSecurityError {
         /// The entry, as written.
         role: String,
     },
+    /// A plain view the policies read runs its reads as its owner, and the
+    /// schema never names the owner.
+    #[error("the policies read view `{view}`, whose owner the schema does not name")]
+    UnsettledViewOwner {
+        /// The view.
+        view: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
