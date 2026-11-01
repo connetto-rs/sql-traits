@@ -206,11 +206,8 @@ impl SessionSetting {
     ///
     /// # fn main() -> Result<(), sql_traits::errors::DeploymentError> {
     /// // PostgREST's token, whose `sub` Supabase's `auth.uid()` reads as the caller.
-    /// let claims = SessionSetting::json(
-    ///     "request.jwt.claims",
-    ///     [JsonField::new(["sub"], SettingValue::Caller(DataType::Uuid))?],
-    /// )?;
-    /// let claims = claims.may_be_unset();
+    /// let sub = JsonField::new(["sub"], SettingValue::Caller(DataType::Uuid))?;
+    /// let claims = SessionSetting::json("request.jwt.claims", [sub])?.may_be_unset();
     ///
     /// assert_eq!(claims.presence(), SettingPresence::MayBeUnset);
     /// let SettingContent::Json(fields) = claims.content() else { unreachable!() };

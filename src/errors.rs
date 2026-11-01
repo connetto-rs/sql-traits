@@ -458,6 +458,33 @@ pub enum DeploymentError {
     },
 }
 
+/// Why [`TableLike::row_security`](crate::traits::TableLike::row_security)
+/// cannot answer.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum RowSecurityError {
+    /// The table is not in the database it was asked about.
+    #[error(transparent)]
+    Lookup(#[from] LookupError),
+    /// A policy's `TO` list reaches the role through no declared role, and one
+    /// entry cannot be settled from the schema: a role the schema never
+    /// declares, or `CURRENT_USER`, `CURRENT_ROLE` or `SESSION_USER`, which
+    /// name whoever ran `CREATE POLICY`.
+    #[error("policy `{policy}` names `{role}`, which the schema cannot settle")]
+    UnsettledRole {
+        /// The policy.
+        policy: String,
+        /// The entry, as written.
+        role: String,
+    },
+    /// A plain view the policies read runs its reads as its owner, and the
+    /// schema never names the owner.
+    #[error("the policies read view `{view}`, whose owner the schema does not name")]
+    UnsettledViewOwner {
+        /// The view.
+        view: String,
+    },
+}
+
 #[derive(Debug, thiserror::Error)]
 /// Defines the `Error` enum representing various error types
 pub enum Error {
