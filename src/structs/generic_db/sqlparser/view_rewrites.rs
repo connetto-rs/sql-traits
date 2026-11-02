@@ -418,15 +418,25 @@ enum PartShape {
     Return,
 }
 
+/// Where a query part sits in the statement holding it.
+#[derive(Clone, Copy)]
+enum Place {
+    /// The statement holds the part the way `shape` spells it.
+    Whole(PartShape),
+    /// The part is the query at this position of a walk over the statement,
+    /// nested in one of the statement's clauses.
+    Embedded(usize),
+}
+
 /// A query part of a stored definition spelled the way PostgreSQL spells it
 /// after the renames, waiting to be checked against the renamed catalog.
 struct Part {
     /// Where the part's definition sits.
     slot: Slot,
     /// The statement sequence the part is a part of, the statement's position
-    /// in it and how it holds the query, which is `None` for a definition
-    /// that is a query of its own.
-    statement: Option<(Block, usize, PartShape)>,
+    /// in it and where the statement holds the query, which is `None` for a
+    /// definition that is a query of its own.
+    statement: Option<(Block, usize, Place)>,
     /// The part before the renames.
     original: Query,
     /// The part `follow_renames` put in place, which the check reads back.
@@ -441,12 +451,36 @@ struct Part {
 struct StatementPart {
     /// The statement the part is a part of.
     statement: usize,
-    /// How the statement holds the part.
-    shape: PartShape,
+    /// Where the statement holds the part.
+    place: Place,
     original: Query,
     stored: Query,
     expected: Vec<SiteOutcome>,
     factors: usize,
+}
+
+/// A respelled query nested in a statement's clauses, awaiting its check.
+struct EmbeddedPart {
+    /// The query's position in a walk over the statement.
+    position: usize,
+    original: Query,
+    stored: Query,
+    expected: Vec<SiteOutcome>,
+    factors: usize,
+}
+
+impl EmbeddedPart {
+    /// The part as one of the statement at `statement` holds.
+    fn in_statement(self, statement: usize) -> StatementPart {
+        StatementPart {
+            statement,
+            place: Place::Embedded(self.position),
+            original: self.original,
+            stored: self.stored,
+            expected: self.expected,
+            factors: self.factors,
+        }
+    }
 }
 
 /// Rewrites every stored definition `readers` found so it keeps reading what
@@ -498,7 +532,7 @@ pub(super) fn follow_renames(
                 for part in statement_parts {
                     parts.push(Part {
                         slot: block.slot(),
-                        statement: Some((block, part.statement, part.shape)),
+                        statement: Some((block, part.statement, part.place)),
                         original: part.original,
                         stored: part.stored,
                         expected: part.expected,
@@ -569,22 +603,60 @@ fn store_statements(builder: &mut ParserDBBuilder, block: Block, statements: Vec
 
 /// Writes a checked query part back into the definition that holds it.
 fn store_part(builder: &mut ParserDBBuilder, part: &Part, query: Query) {
-    let Some((block, statement, shape)) = part.statement else {
+    let Some((block, statement, place)) = part.statement else {
         return store_query(builder, part.slot, query);
     };
-    let replaced = statement_with_query_part(shape, query);
+    let write = |held: &mut Statement| {
+        match place {
+            Place::Whole(shape) => *held = statement_with_query_part(shape, query),
+            Place::Embedded(position) => replace_embedded(held, position, &part.stored, query),
+        }
+    };
     match block {
         Block::Function(position) => {
             edit_function(builder, position, |CreateFunction { function_body, .. }| {
                 let Some(CreateFunctionBody::BeginAtomic(block)) = function_body else { return };
-                block.statements[statement] = replaced;
+                write(&mut block.statements[statement]);
             });
         }
         Block::Rule(position) => {
             let rule = alloc::sync::Arc::make_mut(&mut builder.rules_mut()[position].0);
-            rules::write_action_statement(&mut rule.action, statement, replaced);
+            if let Some(held) = rules::action_statement_mut(&mut rule.action, statement) {
+                write(held);
+            }
         }
     }
+}
+
+/// Replaces the query at `position` of a walk over `statement` with `query`,
+/// provided it still is the `stored` query the respelling put there.
+fn replace_embedded(statement: &mut Statement, position: usize, stored: &Query, query: Query) {
+    struct Replace<'a> {
+        position: usize,
+        seen: usize,
+        stored: &'a Query,
+        query: Option<Query>,
+    }
+
+    impl VisitorMut for Replace<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+            self.seen += 1;
+            if self.seen - 1 != self.position {
+                return ControlFlow::Continue(());
+            }
+            if *query == *self.stored
+                && let Some(replacement) = self.query.take()
+            {
+                *query = replacement;
+            }
+            ControlFlow::Break(())
+        }
+    }
+
+    let mut replace = Replace { position, seen: 0, stored, query: Some(query) };
+    let _: ControlFlow<()> = VisitMut::visit(statement, &mut replace);
 }
 
 /// A statement holding `query` as the part `shape` spells it.
@@ -1434,7 +1506,7 @@ fn respell_statements(
                 Some(references) => {
                     parts.push(StatementPart {
                         statement: position,
-                        shape,
+                        place: Place::Whole(shape),
                         original,
                         stored: respelled.clone(),
                         expected: references.sites.iter().map(|site| site.outcome).collect(),
@@ -1447,7 +1519,8 @@ fn respell_statements(
             // The queries the respelling left untouched, which are the ones
             // nested in data-modifying bodies, respell on their own, and the
             // data-modifying statements respell through their own clauses.
-            respell_embedded(&mut stored, before, renames, true);
+            let embedded = respell_embedded(&mut stored, before, renames, true);
+            parts.extend(embedded.into_iter().map(|part| part.in_statement(position)));
             dml_shell(&mut stored, before, renames, holder_name, rule_context)?;
             rewritten.push(statement_with_query_part(shape, stored));
             continue;
@@ -1455,7 +1528,8 @@ fn respell_statements(
         let mut statement = statement.clone();
         // Every statement's own clauses respell or shield the same way, which
         // a statement without clause factors answers with no edits at all.
-        respell_embedded(&mut statement, before, renames, false);
+        let embedded = respell_embedded(&mut statement, before, renames, false);
+        parts.extend(embedded.into_iter().map(|part| part.in_statement(position)));
         if let Statement::Query(query) = &mut statement
             && dml_ref(&query.body).is_some()
         {
@@ -2992,12 +3066,16 @@ fn exposed_columns(factor: &ShellFactor) -> Option<Vec<(String, bool)>> {
 /// subquery in its clauses, each on its own the way a view's definition is.
 /// A query that cannot be respelled by is left as written, and one the
 /// walk's root already respelled is left as it stands.
+///
+/// Answers every respelled query not nested in another one it respelled,
+/// with what its references reached before the renames, for the check that
+/// qualifies a reference a rename captured.
 fn respell_embedded(
     node: &mut impl VisitMut,
     before: &ParserDB,
     renames: &[Rename],
     root_walked: bool,
-) {
+) -> Vec<EmbeddedPart> {
     struct Embedded<'a> {
         before: &'a ParserDB,
         renames: &'a [Rename],
@@ -3008,6 +3086,36 @@ fn respell_embedded(
         /// own, which the ones outside data-modifying bodies then keep as
         /// respelled.
         root_walked: bool,
+        /// How many queries the walk has entered.
+        entered: usize,
+        /// For each query the walk is inside, whether it is an answered part.
+        open: Vec<bool>,
+        parts: Vec<EmbeddedPart>,
+    }
+
+    impl Embedded<'_> {
+        /// Respells one query, answering whether it becomes a part.
+        fn respell_query(&mut self, query: &mut Query, position: usize) -> bool {
+            if dml_ref(&query.body).is_some() || (self.root_walked && self.dml_depth == 0) {
+                return false;
+            }
+            let original = query.clone();
+            let Some(references) = respell(query, self.before, self.renames) else {
+                *query = shielded(&original, self.renames);
+                return false;
+            };
+            if self.open.contains(&true) {
+                return false;
+            }
+            self.parts.push(EmbeddedPart {
+                position,
+                original,
+                stored: query.clone(),
+                expected: references.sites.iter().map(|site| site.outcome).collect(),
+                factors: references.factors.len(),
+            });
+            true
+        }
     }
 
     impl VisitorMut for Embedded<'_> {
@@ -3028,23 +3136,31 @@ fn respell_embedded(
         }
 
         fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-            if dml_ref(&query.body).is_some() {
-                return ControlFlow::Continue(());
-            }
-            if self.root_walked && self.dml_depth == 0 {
-                return ControlFlow::Continue(());
-            }
-            let original = query.clone();
-            if respell(query, self.before, self.renames).is_none() {
-                *query = shielded(&original, self.renames);
-            }
+            let position = self.entered;
+            self.entered += 1;
+            let part = self.respell_query(query, position);
+            self.open.push(part);
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+            self.open.pop();
             ControlFlow::Continue(())
         }
     }
 
-    let mut embedded = Embedded { before, renames, dml_depth: 0, root_walked };
+    let mut embedded = Embedded {
+        before,
+        renames,
+        dml_depth: 0,
+        root_walked,
+        entered: 0,
+        open: Vec::new(),
+        parts: Vec::new(),
+    };
     let walked = VisitMut::visit(node, &mut embedded);
     debug_assert!(walked.is_continue(), "the walker never breaks");
+    embedded.parts
 }
 
 /// Respells a statement's own clauses the way PostgreSQL respells them after

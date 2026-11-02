@@ -268,6 +268,21 @@ fn a_rule_query_reference_a_rename_captures_is_qualified() {
     assert_eq!(rule_action(only_rule(&database)), "SELECT t.aa AS a FROM t, u");
 }
 
+/// The same qualification reaches the query a rule's `INSERT` reads from.
+#[test]
+fn a_rule_insert_source_reference_a_rename_captures_is_qualified() {
+    let database = parse(
+        "CREATE TABLE s (x INT);
+         CREATE TABLE log (y INT);
+         CREATE TABLE t (a INT);
+         CREATE TABLE u (aa INT);
+         CREATE RULE r AS ON INSERT TO s DO ALSO INSERT INTO log SELECT a FROM t, u;
+         ALTER TABLE t RENAME COLUMN a TO aa;",
+    )
+    .expect("schema builds");
+    assert_eq!(rule_action(only_rule(&database)), "INSERT INTO log (y) SELECT t.aa AS a FROM t, u");
+}
+
 /// The action's names bind under the `search_path` in effect at creation, so
 /// a later change of it leaves the rule reading what it reached.
 #[test]
