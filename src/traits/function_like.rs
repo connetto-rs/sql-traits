@@ -663,9 +663,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// CREATE FUNCTION reads_table() RETURNS INT LANGUAGE sql RETURN (SELECT a FROM t);
     /// ",
     /// )?;
-    /// let reads_table = db
-    ///     .function_by_target(TargetName::new("reads_table", false), IdentifierCase::AsWritten)?
-    ///     .expect("Function should exist");
+    /// // The function lands in `app`, the first schema on the path.
+    /// let in_app = TargetName::new("reads_table", false).with_schema("app", false);
+    /// let reads_table =
+    ///     db.function_by_target(in_app, IdentifierCase::AsWritten)?.expect("Function should exist");
     /// assert_eq!(
     ///     reads_table.body_expression().map(ToString::to_string).as_deref(),
     ///     Some("(SELECT a FROM app.t)"),
@@ -721,7 +722,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///      ALTER FUNCTION unpinned() RESET search_path;",
     /// )?;
     /// let function = |name| {
-    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///     let in_app = TargetName::new(name, false).with_schema("app", false);
+    ///     db.function_by_target(in_app, IdentifierCase::AsWritten)
     ///         .expect("unambiguous lookup")
     ///         .expect("Function should exist")
     /// };

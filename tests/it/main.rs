@@ -42,6 +42,7 @@ mod function_creation_access;
 mod function_kind;
 mod function_null_input;
 mod function_ownership;
+mod function_placement;
 mod function_plpgsql_bodies;
 mod function_privileges;
 mod function_referenced_functions;

@@ -88,10 +88,10 @@ fn from_current_keeps_the_path_of_its_statement() {
     let database = postgres(&format!(
         "{TWO_DOCS}
          SET search_path = app;
-         CREATE FUNCTION created() RETURNS INT LANGUAGE sql SET search_path FROM CURRENT
+         CREATE FUNCTION public.created() RETURNS INT LANGUAGE sql SET search_path FROM CURRENT
              AS 'SELECT count(*) FROM docs';
-         CREATE FUNCTION altered() RETURNS INT LANGUAGE sql AS 'SELECT count(*) FROM docs';
-         ALTER FUNCTION altered() SET search_path FROM CURRENT;
+         CREATE FUNCTION public.altered() RETURNS INT LANGUAGE sql AS 'SELECT count(*) FROM docs';
+         ALTER FUNCTION public.altered() SET search_path FROM CURRENT;
          SET search_path = public;"
     ));
     assert_eq!(read_by(&database, "created").unwrap(), ["app.docs"]);
