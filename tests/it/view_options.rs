@@ -566,6 +566,86 @@ fn alter_view_renames_the_view_and_its_columns() {
     assert_eq!(renamed.definition().to_string(), "SELECT id AS x FROM t");
 }
 
+/// PostgreSQL renames a column of any relation that has columns, whichever
+/// statement names it.
+#[test]
+fn either_view_statement_renames_a_column_of_another_relation_kind() {
+    let schema = "CREATE TABLE t (id INT, a INT);
+         CREATE VIEW v AS SELECT id FROM t;
+         CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+         CREATE SEQUENCE sq;
+         CREATE INDEX ti ON t (a);
+         CREATE FOREIGN TABLE f (a INT) SERVER s;";
+    for statement in [
+        "ALTER VIEW t RENAME COLUMN a TO b;",
+        "ALTER VIEW t RENAME a TO b;",
+        "ALTER MATERIALIZED VIEW t RENAME COLUMN a TO b;",
+    ] {
+        let db = parse(&format!("{schema} {statement}")).expect(statement);
+        let table = db
+            .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("t is recorded");
+        let columns: Vec<String> = table
+            .columns(&db)
+            .expect("t is in this database")
+            .map(|column| column.column_name().to_string())
+            .collect();
+        assert_eq!(columns, ["id", "b"], "{statement}");
+    }
+    let db = parse(&format!("{schema} ALTER MATERIALIZED VIEW f RENAME COLUMN a TO b;"))
+        .expect("a foreign table column renames too");
+    let foreign = db
+        .foreign_table_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("f is recorded");
+    let columns: Vec<&str> =
+        foreign.columns(&db).expect("f is in this database").map(ColumnLike::column_name).collect();
+    assert_eq!(columns, ["b"]);
+
+    let db = parse(&format!(
+        "{schema} ALTER MATERIALIZED VIEW v RENAME COLUMN id TO x; ALTER VIEW m RENAME COLUMN id TO y;"
+    ))
+    .expect("schema");
+    let plain = db
+        .view_by_target(TargetName::new("v", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("v is recorded");
+    assert_eq!(plain.definition().to_string(), "SELECT id AS x FROM t");
+    let materialized = db
+        .materialized_view_by_target(TargetName::new("m", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("m is recorded");
+    assert_eq!(materialized.definition().to_string(), "SELECT id AS y FROM t");
+
+    let error = parse(&format!("{schema} ALTER VIEW t RENAME COLUMN nope TO b;"))
+        .expect_err("t has no such column");
+    assert!(
+        matches!(&error, Error::IdentifierLookupError(LookupError::ColumnNotFound { column_name, .. })
+            if column_name == "nope"),
+        "got {error:?}"
+    );
+    for statement in [
+        "ALTER VIEW sq RENAME COLUMN last_value TO z;",
+        "ALTER MATERIALIZED VIEW sq RENAME COLUMN last_value TO z;",
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::AlterActionUnsupportedOnRelation { object_kind: ObjectKind::Sequence, .. }
+            ),
+            "{statement} got {error:?}"
+        );
+    }
+    let error = parse(&format!("{schema} ALTER VIEW ti RENAME COLUMN a TO z;"))
+        .expect_err("the model carries no index column names");
+    assert!(
+        matches!(&error, Error::UnsupportedAlterTableOperation { table_name, .. } if table_name == "ti"),
+        "got {error:?}"
+    );
+}
+
 #[test]
 fn a_view_column_default_is_accepted_for_a_column_the_view_exposes() {
     // Measured: PostgreSQL takes `SET DEFAULT` and `DROP DEFAULT` on a view

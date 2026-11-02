@@ -36,9 +36,9 @@ use sqlparser::ast::{
 };
 
 use super::{
-    Creator, DefaultKind, ParserDBBuilder, SchemaQualifier, bind_reference, domains,
-    function_bodies, object_name_last_identifier, object_name_matches_resolved_identity,
-    place_relation, require_named_in_catalog,
+    AlterTableScope, Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier,
+    bind_reference, domains, function_bodies, object_name_last_identifier,
+    object_name_matches_resolved_identity, place_relation, require_named_in_catalog,
     rules::{self, RuleHost},
     stored_ident,
     view_rewrites::{self, Rename},
@@ -441,7 +441,8 @@ pub(super) fn alter_view(
 }
 
 /// Applies an `ALTER VIEW` or an `ALTER MATERIALIZED VIEW`, which PostgreSQL
-/// accepts only against a view of the kind the statement spells.
+/// accepts only against a view of the kind the statement spells, except that
+/// either renames a column of any relation.
 ///
 /// `SET SCHEMA` and MySQL's `ALTER VIEW ... AS`, which redefines the view, are
 /// refused, since the model can apply neither and discarding either would
@@ -453,8 +454,9 @@ pub(super) fn alter_view(
 /// the name, [`Error::RelationNotFound`] when nothing does and the statement
 /// wrote no `IF EXISTS`, [`Error::UnsupportedAlterTableOperation`] for the two
 /// operations refused above, [`Error::AlterActionUnsupportedOnRelation`] for
-/// a materialized view's column default, and the errors of [`alter_view`] for
-/// the operations it shares with `ALTER TABLE`.
+/// a materialized view's column default, the errors of [`alter_view`] for the
+/// operations it shares with `ALTER TABLE`, and those of
+/// [`rename_column_of_other_kind`].
 pub(super) fn apply_alter_view(
     builder: ParserDBBuilder,
     statement: &AlterView,
@@ -468,11 +470,24 @@ pub(super) fn apply_alter_view(
     if held.is_none() {
         return match builder.relation_reached(name).map(|(kind, _)| kind) {
             Some(actual_kind) => {
-                Err(Error::RelationKindMismatch {
-                    object_name: rendered_name(name),
-                    expected_kind: kind,
-                    actual_kind,
-                })
+                match operation {
+                    AlterViewOperation::RenameColumn { old_column_name, new_column_name } => {
+                        rename_column_of_other_kind(
+                            builder,
+                            name,
+                            actual_kind,
+                            operation,
+                            (old_column_name, new_column_name),
+                        )
+                    }
+                    _ => {
+                        Err(Error::RelationKindMismatch {
+                            object_name: rendered_name(name),
+                            expected_kind: kind,
+                            actual_kind,
+                        })
+                    }
+                }
             }
             None if *if_exists => Ok(builder),
             None => {
@@ -503,6 +518,52 @@ pub(super) fn apply_alter_view(
             require_view_column(builder, name, column_name)
         }
         AlterViewOperation::SetSchema { .. } | AlterViewOperation::As { .. } => {
+            Err(Error::UnsupportedAlterTableOperation {
+                table_name: rendered_name(name),
+                operation: operation.to_string(),
+            })
+        }
+    }
+}
+
+/// Renames a column of a relation an `ALTER VIEW` or `ALTER MATERIALIZED VIEW`
+/// names although another kind holds it, which PostgreSQL does for every kind
+/// with columns and refuses for a sequence.
+///
+/// # Errors
+///
+/// Returns the errors of renaming a column of a view or of a table,
+/// [`Error::AlterActionUnsupportedOnRelation`] for a sequence, and
+/// [`Error::UnsupportedAlterTableOperation`] for an index, whose column names
+/// the model does not carry.
+fn rename_column_of_other_kind(
+    builder: ParserDBBuilder,
+    name: &ObjectName,
+    actual_kind: ObjectKind,
+    operation: &AlterViewOperation,
+    (old_column_name, new_column_name): (&Ident, &Ident),
+) -> Result<ParserDBBuilder, Error> {
+    match actual_kind {
+        ObjectKind::View | ObjectKind::MaterializedView => {
+            rename_view_column(builder, name, actual_kind, old_column_name, new_column_name)
+        }
+        ObjectKind::Table | ObjectKind::ForeignTable => {
+            ParserDB::alter_table_rename_column(
+                builder,
+                name,
+                AlterTableScope { if_exists: false, only: false },
+                old_column_name,
+                new_column_name,
+            )
+        }
+        ObjectKind::Sequence => {
+            Err(Error::AlterActionUnsupportedOnRelation {
+                object_kind: actual_kind,
+                relation_name: rendered_name(name),
+                operation: operation.to_string(),
+            })
+        }
+        _ => {
             Err(Error::UnsupportedAlterTableOperation {
                 table_name: rendered_name(name),
                 operation: operation.to_string(),
