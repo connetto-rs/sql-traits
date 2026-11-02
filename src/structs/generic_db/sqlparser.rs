@@ -1520,11 +1520,11 @@ impl ParserDBBuilder {
             || role_memberships::granted_by(self, role_ident)
     }
 
-    /// Whether any relation or domain belongs to this schema.
+    /// Whether any relation, domain or function belongs to this schema.
     ///
-    /// A view, a sequence or a domain counts as much as a table: PostgreSQL
-    /// refuses `DROP SCHEMA` without `CASCADE` while a schema holds any of
-    /// them.
+    /// A view, a sequence, a domain or a function counts as much as a table:
+    /// PostgreSQL refuses `DROP SCHEMA` without `CASCADE` while a schema holds
+    /// any of them.
     fn is_schema_non_empty(&self, schema_name: &str, schema_quoted: bool) -> bool {
         let in_schema = |stored: Option<(&str, bool)>| {
             stored.is_some_and(|(stored_schema, stored_quoted)| {
@@ -1545,6 +1545,10 @@ impl ParserDBBuilder {
             )
         }) || extensions::schema_holds_extension(self, schema_name, schema_quoted)
             || domains::schema_holds_domain(self, schema_name, schema_quoted)
+            || self
+                .functions()
+                .iter()
+                .any(|(function, _)| in_schema(qualifier_of(&function.name).named()))
     }
 
     fn resolve_schema_ident(&self, ident: &Ident) -> Option<&Schema> {
@@ -4992,6 +4996,42 @@ impl ParserDB {
         Ok(builder)
     }
 
+    /// Drops every function stored in `schema`, as `DROP SCHEMA ... CASCADE`
+    /// does once the schema's tables, views and domains are gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::Error::FunctionReferenced`] when something
+    /// outside the schema still calls one of them. PostgreSQL drops that caller
+    /// too, which this model does for no function drop.
+    fn drop_functions_in(
+        mut builder: ParserDBBuilder,
+        schema: (&str, bool),
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let case = builder.identifier_case();
+        let doomed: Vec<Arc<CreateFunction>> = builder
+            .functions()
+            .iter()
+            .filter(|(function, _)| {
+                qualifier_of(&function.name).named().is_some_and(|stored| {
+                    case.identifiers_match(stored.0, stored.1, schema.0, schema.1)
+                })
+            })
+            .map(|(function, _)| Arc::clone(function))
+            .collect();
+        if let Some(called) =
+            doomed.iter().find(|function| builder.is_function_used(function, &doomed))
+        {
+            return Err(crate::errors::Error::FunctionReferenced {
+                function_name: last_str(&called.name).to_string(),
+            });
+        }
+        builder
+            .functions_mut()
+            .retain(|(function, _)| !doomed.iter().any(|dropped| Arc::ptr_eq(dropped, function)));
+        Ok(builder)
+    }
+
     /// Moves every function and relation stored in schema `from` to `to`,
     /// carrying every reference to each along, as `ALTER SCHEMA ... RENAME TO`
     /// does.
@@ -7939,9 +7979,9 @@ impl ParserDB {
                             });
                         }
 
-                        // If CASCADE, remove all tables, sequences and
-                        // extensions in the
-                        // schema first
+                        // If CASCADE, remove everything the schema holds
+                        // first, the functions last so nothing else in it
+                        // still calls them.
                         if cascade {
                             use crate::traits::TableLike;
                             let doomed: Vec<StoredTable> = builder
@@ -7961,6 +8001,10 @@ impl ParserDB {
                                 .map(StoredTable::of)
                                 .collect();
                             builder = Self::remove_tables(builder, &doomed)?;
+                            builder = views::drop_views_in(
+                                builder,
+                                (&resolved_schema_name, resolved_schema_quoted),
+                            )?;
                             sequences::drop_sequences_in(
                                 &mut builder,
                                 &resolved_schema_name,
@@ -7975,6 +8019,10 @@ impl ParserDB {
                                 builder,
                                 &resolved_schema_name,
                                 resolved_schema_quoted,
+                            )?;
+                            builder = Self::drop_functions_in(
+                                builder,
+                                (&resolved_schema_name, resolved_schema_quoted),
                             )?;
                         }
 
