@@ -36,7 +36,7 @@ pub use identity::{ColumnIdentity, RelationIdentity};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
 pub use role_membership::RoleMembership;
 pub use row_security::{
-    ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, Requester, RowGate, RowSecurity,
+    ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,
     RowSecurityExemption, RowStatement, RowVersion,
 };
 pub use schema::Schema;

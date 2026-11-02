@@ -59,7 +59,6 @@ pub struct Deployment {
     login_role: String,
     acting_roles: Vec<String>,
     settings: Vec<SessionSetting>,
-    schema_owner: Option<String>,
 }
 
 impl Deployment {
@@ -97,27 +96,7 @@ impl Deployment {
             }
             declared.push(setting);
         }
-        Ok(Self {
-            login_role: login_role.into(),
-            acting_roles: roles,
-            settings: declared,
-            schema_owner: None,
-        })
-    }
-
-    /// Names the role that runs the schema, which owns every table and view
-    /// whose owner the schema never names, as the role running `CREATE TABLE`
-    /// or `CREATE VIEW` owns what it creates.
-    #[must_use]
-    pub fn with_schema_owner(mut self, role: impl Into<String>) -> Self {
-        self.schema_owner = Some(role.into());
-        self
-    }
-
-    /// The role that runs the schema, if the description names it.
-    #[must_use]
-    pub fn schema_owner(&self) -> Option<&str> {
-        self.schema_owner.as_deref()
+        Ok(Self { login_role: login_role.into(), acting_roles: roles, settings: declared })
     }
 
     /// The role every request logs in as, which `session_user` names.
@@ -148,8 +127,7 @@ impl Deployment {
     /// # Errors
     ///
     /// Returns [`DeploymentError::UndeclaredRole`] naming the first role,
-    /// login role first and schema owner last, that `database` does not
-    /// declare.
+    /// login role first, that `database` does not declare.
     pub fn resolve<'db, DB: DatabaseLike>(
         &self,
         database: &'db DB,
@@ -160,8 +138,7 @@ impl Deployment {
         let login_role = declared(&self.login_role)?;
         let acting_roles =
             self.acting_roles.iter().map(|role| declared(role)).collect::<Result<Vec<_>, _>>()?;
-        let schema_owner = self.schema_owner.as_deref().map(declared).transpose()?;
-        Ok(ResolvedDeployment { login_role, acting_roles, schema_owner })
+        Ok(ResolvedDeployment { login_role, acting_roles })
     }
 }
 
@@ -170,7 +147,6 @@ impl Deployment {
 pub struct ResolvedDeployment<'db, DB: DatabaseLike> {
     login_role: &'db DB::Role,
     acting_roles: Vec<&'db DB::Role>,
-    schema_owner: Option<&'db DB::Role>,
 }
 
 impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
@@ -183,12 +159,6 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     /// The roles a request may act as, in declaration order.
     pub fn acting_roles(&self) -> impl Iterator<Item = &'db DB::Role> + '_ {
         self.acting_roles.iter().copied()
-    }
-
-    /// The role that runs the schema, if the description names it.
-    #[must_use]
-    pub fn schema_owner(&self) -> Option<&'db DB::Role> {
-        self.schema_owner
     }
 }
 

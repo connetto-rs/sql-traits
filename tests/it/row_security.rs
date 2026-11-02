@@ -365,47 +365,6 @@ fn a_table_whose_owner_is_never_named_binds_every_declared_role() {
     assert_eq!(security.exemption(), None);
 }
 
-/// The role that ran the schema owns every table whose owner the schema never
-/// names, while a named owner stays the owner.
-#[test]
-fn a_schema_owner_owns_every_table_whose_owner_is_never_named() {
-    let schema = |force: &str| {
-        parse(&format!(
-            "CREATE ROLE migrator NOLOGIN;
-             CREATE ROLE heir NOLOGIN IN ROLE migrator;
-             CREATE ROLE reader NOLOGIN;
-             CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL);
-             CREATE TABLE u (id int PRIMARY KEY, v int NOT NULL);
-             ALTER TABLE u OWNER TO reader;
-             ALTER TABLE t ENABLE ROW LEVEL SECURITY;
-             ALTER TABLE u ENABLE ROW LEVEL SECURITY;
-             {force}"
-        ))
-    };
-    let exemption = |database: &ParserDB, name: &str, role: &str| {
-        let migrator = database.role("migrator").expect("the role exists");
-        let role = database.role(role).expect("the role exists");
-        table(database, name)
-            .row_security(
-                RowStatement::Select,
-                Requester::new(ActingRole::Declared(role), Some(migrator)),
-                database,
-            )
-            .expect("settled")
-            .exemption()
-    };
-
-    let unforced = schema("");
-    assert_eq!(exemption(&unforced, "t", "migrator"), Some(RowSecurityExemption::Owner));
-    assert_eq!(exemption(&unforced, "t", "heir"), Some(RowSecurityExemption::Owner));
-    assert_eq!(exemption(&unforced, "t", "reader"), None);
-    assert_eq!(exemption(&unforced, "u", "migrator"), None);
-    assert_eq!(exemption(&unforced, "u", "reader"), Some(RowSecurityExemption::Owner));
-
-    let forced = schema("ALTER TABLE t FORCE ROW LEVEL SECURITY;");
-    assert_eq!(exemption(&forced, "t", "migrator"), None);
-}
-
 /// A caller known only as `PUBLIC`, as a translation given no role is, holds
 /// no role, owns nothing and bypasses nothing.
 #[test]

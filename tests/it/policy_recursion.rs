@@ -202,35 +202,34 @@ fn a_plain_view_whose_owner_the_schema_never_names_refuses_the_answer() {
     );
 }
 
-/// The role that ran the schema owns every table and view whose owner the
-/// schema never names, so a plain view reads as that role.
+/// A migration run as a session role owns what it creates, so a plain view
+/// it creates without `OWNER TO` reads as that role.
 #[test]
-fn a_plain_view_whose_owner_the_schema_never_names_reads_as_the_schema_owner() {
-    let schema = |force: &str| {
-        ParserDB::parse::<PostgreSqlDialect>(&format!(
-            "{TABLES}{force}
-             CREATE VIEW tv AS SELECT id FROM t;
-             CREATE POLICY t_sel ON t FOR SELECT USING (EXISTS (SELECT 1 FROM tv WHERE tv.id = t.id));"
-        ))
-        .expect("builds")
-    };
-    let recursion = |database: &ParserDB| {
+fn a_plain_view_created_by_the_session_role_reads_as_it() {
+    let recursion = |force: &str| {
+        let database = ParseOptions::default()
+            .with_session_role("other")
+            .parse::<PostgreSqlDialect>(&format!(
+                "{TABLES}{force}
+                 CREATE VIEW tv AS SELECT id FROM t;
+                 CREATE POLICY t_sel ON t FOR SELECT
+                     USING (EXISTS (SELECT 1 FROM tv WHERE tv.id = t.id));"
+            ))
+            .expect("builds");
         let reader = database.role("reader").expect("the role exists");
-        let other = database.role("other").expect("the role exists");
         let t = database
             .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
             .expect("unambiguous lookup")
             .expect("the table exists");
-        let requester = Requester::new(ActingRole::Declared(reader), Some(other));
-        t.row_security(SELECT, requester, database)
+        t.row_security(SELECT, reader, &database)
             .expect("settled")
             .infinite_recursion()
             .map(str::to_string)
     };
-    // The view reads `t` as `other`, which owns it and so is exempt.
-    assert_eq!(recursion(&schema("")), None);
+    // The view reads `t` as `other`, which created it and so is exempt.
+    assert_eq!(recursion(""), None);
     // Under FORCE the owner meets `t`'s policies too, and the loop closes.
-    assert_eq!(recursion(&schema("ALTER TABLE t FORCE ROW LEVEL SECURITY;")).as_deref(), Some("t"));
+    assert_eq!(recursion("ALTER TABLE t FORCE ROW LEVEL SECURITY;").as_deref(), Some("t"));
 }
 
 /// Skipping a name it cannot read would hide a loop through it.
