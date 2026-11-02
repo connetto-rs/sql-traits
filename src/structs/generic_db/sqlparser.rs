@@ -1248,8 +1248,9 @@ impl ParserDBBuilder {
     ///
     /// The indexes and constraints that live on the table are dropped along
     /// with the column, so only a foreign key from another table, a policy that
-    /// reads the column, a trigger that fires on updates to it, and a rule that
-    /// reads it through `NEW` or `OLD` call for `CASCADE`.
+    /// reads the column, a trigger that fires on updates to it or reads it in
+    /// its `WHEN` condition, and a rule that reads it through `NEW` or `OLD`
+    /// call for `CASCADE`.
     fn column_has_outside_dependents(
         &self,
         table: &StoredTable,
@@ -1263,7 +1264,7 @@ impl ParserDBBuilder {
             table.named_by(&policy.table_name)
                 && column.in_expressions(policy.as_ref(), table, declaring)
         }) || self.triggers().iter().any(|(trigger, ())| {
-            table.named_by(&trigger.table_name) && trigger_fires_on_column(trigger, column)
+            table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column)
         }) || self.rules().iter().any(|(rule, ())| {
             table.named_by(&rule.table_name) && rules::reads_row_column(rule, column)
         })
@@ -1311,7 +1312,7 @@ impl ParserDBBuilder {
                 && column.in_expressions(policy.as_ref(), table, declaring))
         });
         self.triggers_mut().retain(|(trigger, ())| {
-            !(table.named_by(&trigger.table_name) && trigger_fires_on_column(trigger, column))
+            !(table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column))
         });
         self.rules_mut().retain(|(rule, ())| {
             !(table.named_by(&rule.table_name) && rules::reads_row_column(rule, column))
@@ -1353,10 +1354,14 @@ impl ParserDBBuilder {
 
         for (trigger, ()) in self.triggers_mut() {
             if table.named_by(&trigger.table_name) {
-                for event in &mut Arc::make_mut(trigger).events {
+                let trigger = Arc::make_mut(trigger);
+                for event in &mut trigger.events {
                     if let TriggerEvent::Update(columns) = event {
                         rename_column_idents(columns, from, to);
                     }
+                }
+                if let Some(condition) = trigger.condition.as_mut() {
+                    rules::rename_row_column_in_expression(condition, from, to);
                 }
             }
         }
@@ -2679,12 +2684,17 @@ fn refers_to_column(node: &CreateTable, target: &StoredTable, column: &NamedColu
     })
 }
 
-/// Whether a trigger fires on updates to a named column.
-fn trigger_fires_on_column(trigger: &CreateTrigger, column: &NamedColumn) -> bool {
+/// Whether a trigger fires on updates to a named column or its `WHEN`
+/// condition reads the column through `NEW` or `OLD`.
+fn trigger_depends_on_column(trigger: &CreateTrigger, column: &NamedColumn) -> bool {
     trigger
         .events
         .iter()
         .any(|event| matches!(event, TriggerEvent::Update(columns) if column.in_idents(columns)))
+        || trigger
+            .condition
+            .as_ref()
+            .is_some_and(|condition| rules::expression_reads_row_column(condition, column))
 }
 
 /// Renames the columns a grant names, and reports whether it still names any.

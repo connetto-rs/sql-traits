@@ -1110,67 +1110,105 @@ fn insert_target(statement: &Statement) -> Option<&ObjectName> {
     }
 }
 
-/// Every view and function reading the relation `key` names, every reader
-/// among those, and every function whose bound body calls one of those
+/// One object a dependency walk reaches.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum Dependent {
+    /// A view, a materialized view or a function, under the key its readers
+    /// and callers name it by.
+    Reader(ObjectKind, RelationKey),
+    /// A rule, which nothing reads, by its name on the relation stored under
+    /// the key.
+    Rule(RelationKey, String),
+}
+
+impl Dependent {
+    /// The kind of object reached.
+    pub(super) const fn kind(&self) -> ObjectKind {
+        match self {
+            Self::Reader(kind, _) => *kind,
+            Self::Rule(..) => ObjectKind::Rule,
+        }
+    }
+
+    /// The name the object is stored under.
+    pub(super) fn name(&self) -> &str {
+        match self {
+            Self::Reader(_, key) => &key.name,
+            Self::Rule(_, name) => name,
+        }
+    }
+}
+
+/// Every view, function and rule reading the relation `key` names, every
+/// reader among those, and every function whose bound body calls one of those
 /// functions, transitively.
 ///
 /// PostgreSQL refuses to drop a relation while anything reads it, and takes
 /// the whole chain with it under `CASCADE`, so the walk closes over the chain
 /// rather than stopping at the first level.
-pub(super) fn dependent_views(
-    builder: &ParserDBBuilder,
-    key: &RelationKey,
-) -> Vec<(ObjectKind, RelationKey)> {
+pub(super) fn dependent_views(builder: &ParserDBBuilder, key: &RelationKey) -> Vec<Dependent> {
     readers_closure(builder, alloc::vec![key.clone()], Vec::new(), Some(key))
 }
 
-/// `readers` with every view and function reading one of them, and every
-/// function whose bound body calls one of those functions, transitively.
+/// `readers` with every view, function and rule reading one of them, and
+/// every function whose bound body calls one of those functions,
+/// transitively.
 ///
 /// This is what a `CASCADE` takes along with the readers themselves.
 pub(super) fn readers_and_dependents(
     builder: &ParserDBBuilder,
-    readers: Vec<(ObjectKind, RelationKey)>,
-) -> Vec<(ObjectKind, RelationKey)> {
-    let frontier = readers.iter().map(|(_, key)| key.clone()).collect();
+    readers: Vec<Dependent>,
+) -> Vec<Dependent> {
+    let frontier = readers
+        .iter()
+        .filter_map(|reader| {
+            match reader {
+                Dependent::Reader(_, key) => Some(key.clone()),
+                Dependent::Rule(..) => None,
+            }
+        })
+        .collect();
     readers_closure(builder, frontier, readers, None)
 }
 
-/// `found` with every view and function reading a key of `frontier` or one
-/// of the readers that walk finds, and every function calling one of the
-/// functions among them, transitively. A view or a materialized view stored
-/// under `dropped` is the relation going away rather than a reader of it.
+/// `found` with every view, function and rule reading a key of `frontier` or
+/// one of the readers that walk finds, and every function calling one of the
+/// functions among them, transitively. An object whose own relation is
+/// `dropped` goes with that relation rather than reading it.
 fn readers_closure(
     builder: &ParserDBBuilder,
     mut frontier: Vec<RelationKey>,
-    mut found: Vec<(ObjectKind, RelationKey)>,
+    mut found: Vec<Dependent>,
     dropped: Option<&RelationKey>,
-) -> Vec<(ObjectKind, RelationKey)> {
-    // Each view's read set is derived once, not once per step of the walk.
-    // Deriving it means visiting a whole definition and normalizing every name
-    // it reads, so re-deriving per step made one drop cost the square of the
-    // number of views.
-    let reads: Vec<(ObjectKind, RelationKey, Vec<RelationKey>)> = builder
+) -> Vec<Dependent> {
+    // Each read set is derived once, not once per step of the walk, with the
+    // relation the object goes away with, which a function has none of.
+    let reads: Vec<(Dependent, Option<RelationKey>, Vec<RelationKey>)> = builder
         .views()
         .iter()
         .map(|(view, _, _)| {
+            let key = stored_view_key(view.as_ref(), IdentifierCase::AsWritten);
             (
-                ObjectKind::View,
-                stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
+                Dependent::Reader(ObjectKind::View, key.clone()),
+                Some(key),
                 relations_read_by(view.as_ref()),
             )
         })
         .chain(builder.materialized_views().iter().map(|(view, _, _)| {
+            let key = stored_view_key(view.as_ref(), IdentifierCase::AsWritten);
             (
-                ObjectKind::MaterializedView,
-                stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
+                Dependent::Reader(ObjectKind::MaterializedView, key.clone()),
+                Some(key),
                 relations_read_by(view.as_ref()),
             )
         }))
         .chain(builder.functions().iter().map(|(function, _)| {
             (
-                ObjectKind::Function,
-                stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
+                Dependent::Reader(
+                    ObjectKind::Function,
+                    stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
+                ),
+                None,
                 function
                     .function_body
                     .as_ref()
@@ -1178,22 +1216,26 @@ fn readers_closure(
                     .unwrap_or_default(),
             )
         }))
+        .chain(builder.rules().iter().map(|(rule, ())| {
+            (
+                rules::dependent(rule),
+                Some(rules::relation_key(rule)),
+                rules::rules_reading(builder, rule),
+            )
+        }))
         .collect();
 
     while let Some(current) = frontier.pop() {
-        for (kind, own_key, read) in &reads {
-            if !read.contains(&current) {
+        for (dependent, own_relation, read) in &reads {
+            if !read.contains(&current) || (dropped.is_some() && own_relation.as_ref() == dropped) {
                 continue;
             }
-            // A function never is the dropped relation, so a name collision
-            // still counts as a dependency.
-            if dropped == Some(own_key) && *kind != ObjectKind::Function {
-                continue;
-            }
-            let reader = (*kind, own_key.clone());
-            if !found.contains(&reader) {
-                frontier.push(own_key.clone());
-                found.push(reader);
+            if !found.contains(dependent) {
+                // Nothing reads a rule, so the walk goes no further from one.
+                if let Dependent::Reader(_, key) = dependent {
+                    frontier.push(key.clone());
+                }
+                found.push(dependent.clone());
             }
         }
     }
@@ -1215,18 +1257,19 @@ fn readers_closure(
         })
         .collect();
     let mut next = 0;
-    while let Some((kind, callee)) = found.get(next) {
+    while let Some(reached) = found.get(next) {
         next += 1;
-        if *kind != ObjectKind::Function {
+        let Dependent::Reader(ObjectKind::Function, callee) = reached else {
             continue;
-        }
+        };
         let joining: Vec<RelationKey> = calls
             .extract_if(.., |(_, callees)| callees.contains(callee))
             .map(|(caller, _)| caller)
             .collect();
-        for caller in joining {
-            if !found.iter().any(|(kind, key)| *kind == ObjectKind::Function && *key == caller) {
-                found.push((ObjectKind::Function, caller));
+        for key in joining {
+            let joined = Dependent::Reader(ObjectKind::Function, key);
+            if !found.contains(&joined) {
+                found.push(joined);
             }
         }
     }
@@ -1246,12 +1289,12 @@ pub(super) fn refuse_dependent_views(
     object_kind: ObjectKind,
     object_name: &str,
 ) -> Result<(), Error> {
-    if let Some((dependent_kind, dependent)) = dependent_views(builder, key).first() {
+    if let Some(dependent) = dependent_views(builder, key).first() {
         return Err(Error::RelationHasDependents {
             object_kind,
             object_name: object_name.to_string(),
-            dependent_kind: *dependent_kind,
-            dependent_name: dependent.name.clone(),
+            dependent_kind: dependent.kind(),
+            dependent_name: dependent.name().to_string(),
         });
     }
     Ok(())
@@ -1264,12 +1307,12 @@ pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &Relati
     remove_readers(builder, &doomed);
 }
 
-/// Removes the views, materialized views and functions `doomed` names, with
-/// the grants on them, the rules on the views, and the sequences they owned.
-pub(super) fn remove_readers(builder: &mut ParserDBBuilder, doomed: &[(ObjectKind, RelationKey)]) {
-    let is_doomed = |kind: ObjectKind, own_key: RelationKey| {
-        doomed.iter().any(|(dead_kind, dead)| *dead_kind == kind && *dead == own_key)
-    };
+/// Removes the views, materialized views, functions and rules `doomed` names,
+/// with the grants on them, the rules on the views, and the sequences they
+/// owned.
+pub(super) fn remove_readers(builder: &mut ParserDBBuilder, doomed: &[Dependent]) {
+    let is_doomed =
+        |kind: ObjectKind, own_key: RelationKey| doomed.contains(&Dependent::Reader(kind, own_key));
     let hosts: Vec<RuleHost> = builder
         .views()
         .iter()
@@ -1319,6 +1362,7 @@ pub(super) fn remove_readers(builder: &mut ParserDBBuilder, doomed: &[(ObjectKin
             stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
         )
     });
+    builder.rules_mut().retain(|(rule, ())| !doomed.contains(&rules::dependent(rule)));
     for host in &hosts {
         rules::drop_rules_on(builder, host);
     }

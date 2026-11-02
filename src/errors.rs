@@ -877,6 +877,38 @@ pub enum Error {
         /// Name of the relation the rule names.
         relation_name: String,
     },
+    #[error("Relation `{relation_name}` not found for rule `{rule_name}`.")]
+    /// Error indicating that a rule's action or condition names a relation
+    /// the database does not hold.
+    ///
+    /// A rule's action and condition bind their relation names at creation
+    /// the way a `BEGIN ATOMIC` function body does, so a statement whose
+    /// action or condition names a relation it cannot reach is refused
+    /// before it records the rule.
+    RelationNotFoundForRuleAction {
+        /// Name of the relation the action or condition names.
+        relation_name: String,
+        /// Name of the rule the statement declares.
+        rule_name: String,
+    },
+    #[error("Column `{column_name}` is ambiguous in the action of rule `{rule_name}`.")]
+    /// Error indicating that a rule's action references a column bare while
+    /// more than one relation in its scope exposes that column, which
+    /// PostgreSQL refuses at creation.
+    RuleActionReferenceAmbiguous {
+        /// Name of the column the action references ambiguously.
+        column_name: String,
+        /// Name of the rule the statement declares.
+        rule_name: String,
+    },
+    #[error("Rule `{rule_name}`'s `INSERT` has more expressions than target columns.")]
+    /// Error indicating that an `INSERT` in a rule's action offers more
+    /// expressions than its target has columns, which PostgreSQL refuses at
+    /// creation.
+    RuleActionInsertTooWide {
+        /// Name of the rule whose action holds the `INSERT`.
+        rule_name: String,
+    },
     #[error("Role `{role_name}` not found for the owner of `{object_name}`.")]
     /// Error indicating that an ownership statement names a role that does not
     /// exist.

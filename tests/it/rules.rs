@@ -3,7 +3,8 @@
 //!
 //! A rule depends on its table or view and on the columns of it the condition
 //! and action read through `NEW` and `OLD`, so those are the references kept
-//! current. Relations the action names are kept as written.
+//! current. The relations the action and condition name bind under the
+//! search path in effect at creation and follow their renames.
 #![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{
@@ -80,7 +81,7 @@ fn a_rule_on_a_table_is_readable() {
     assert!(!rule.is_instead());
     assert_eq!(rule.condition().map(ToString::to_string).as_deref(), Some("new.total > 0"));
     assert!(matches!(rule.action(), CreateRuleAction::Statement(_)));
-    assert_eq!(action_text(rule), "INSERT INTO audit VALUES (new.id)");
+    assert_eq!(action_text(rule), "INSERT INTO audit (id) VALUES (new.id)");
     assert_eq!(rule.target_relation_name().to_string(), "orders");
     assert_eq!(relation_of(&database, rule), ("table", "orders".to_string()));
 
@@ -425,15 +426,17 @@ fn renaming_a_column_rewrites_new_and_old_references() {
     assert_eq!(action_text(rule), "INSERT INTO audit (id) VALUES (new.order_id)");
 }
 
+/// A write target's column list follows the rename of the column it names,
+/// while the `NEW` reference keeps naming the rule's relation row.
 #[test]
-fn renaming_a_column_of_another_table_leaves_the_rule_alone() {
+fn renaming_a_write_target_column_keeps_the_row_reference_alone() {
     let database = parse(&format!(
         "{ORDERS}CREATE RULE r AS ON INSERT TO orders DO ALSO INSERT INTO audit VALUES (new.id);
          ALTER TABLE audit RENAME COLUMN id TO order_id;"
     ))
     .expect("schema builds");
 
-    assert_eq!(action_text(only_rule(&database)), "INSERT INTO audit VALUES (new.id)");
+    assert_eq!(action_text(only_rule(&database)), "INSERT INTO audit (order_id) VALUES (new.id)");
 }
 
 /// A view column rename reaches the rules on that view only, so a rule on the
@@ -451,11 +454,11 @@ fn renaming_a_view_column_rewrites_new_references() {
 
     assert_eq!(
         action_text(rule_named(&database, "on_recent")),
-        "INSERT INTO orders VALUES (new.id, new.amount)"
+        "INSERT INTO orders (id, total) VALUES (new.id, new.amount)"
     );
     assert_eq!(
         action_text(rule_named(&database, "on_orders")),
-        "INSERT INTO audit VALUES (new.total)"
+        "INSERT INTO audit (id) VALUES (new.total)"
     );
 }
 
@@ -471,9 +474,11 @@ fn a_qualified_column_of_another_table_is_not_a_row_reference() {
     ))
     .expect("schema builds");
 
+    // The `FROM` factor binds to the stored spelling of the default-schema
+    // relation, while the clause reference keeps the qualifier it wrote.
     assert_eq!(
         action_text(only_rule(&database)),
-        "INSERT INTO audit (id) SELECT public.audit.id FROM public.audit WHERE public.audit.id = new.order_id"
+        "INSERT INTO audit (id) SELECT public.audit.id FROM audit WHERE public.audit.id = new.order_id"
     );
 }
 
