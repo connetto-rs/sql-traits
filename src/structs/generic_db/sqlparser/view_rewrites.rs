@@ -122,7 +122,8 @@ fn store_query(builder: &mut ParserDBBuilder, slot: Slot, query: Query) {
 }
 
 /// Applies `edit` to the function stored at `position`, re-pointing every
-/// check constraint and policy holding the node at its edited copy.
+/// check constraint, policy and bound body holding the node at its edited
+/// copy.
 fn edit_function(
     builder: &mut ParserDBBuilder,
     position: usize,

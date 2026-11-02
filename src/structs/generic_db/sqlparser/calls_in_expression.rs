@@ -1,19 +1,13 @@
-//! Resolves each call an expression makes to the functions it may reach.
+//! Resolves each call a node makes to the functions it may reach.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{convert::Infallible, ops::ControlFlow};
 
-use sqlparser::ast::{CreateFunction, Expr, ObjectName};
+use sqlparser::ast::{CreateFunction, ObjectName, Visit};
 
-use super::schema_qualifiers_match;
 use crate::{
     structs::{IdentifierCase, metadata::ExpressionCalls},
-    traits::function_like::FunctionLike,
-    utils::{
-        call_sites::for_each_call,
-        identifier_resolution::identifiers_match,
-        object_name::{Qualifier, object_name_last_part, qualifier_of},
-    },
+    utils::call_sites::{call_reaches, for_each_call},
 };
 
 /// The functions a call may reach, and the path an unqualified call walks.
@@ -28,37 +22,14 @@ pub(super) struct CallScope<'a> {
 
 impl CallScope<'_> {
     /// Whether a call to `called` passing `arguments` arguments may run
-    /// `function`.
-    ///
-    /// PostgreSQL picks among the reachable overloads by argument type, which
-    /// is not inferred here, so every overload accepting that many arguments
-    /// counts.
+    /// `function`, as [`call_reaches`] decides it.
     pub(super) fn reaches(
         &self,
         function: &CreateFunction,
         called: &ObjectName,
         arguments: usize,
     ) -> bool {
-        let names_match = object_name_last_part(called).is_some_and(|(called, called_quoted)| {
-            identifiers_match(function.name(), function.name_is_quoted(), called, called_quoted)
-        });
-        let declared_in = qualifier_of(&function.name).named();
-        let schema_reached = match qualifier_of(called) {
-            Qualifier::Named(schema, quoted) => {
-                schema_qualifiers_match(declared_in, Some((schema, quoted)), self.case)
-            }
-            // PostgreSQL searches `pg_catalog` first unless the path names it.
-            Qualifier::Absent => {
-                declared_in.is_some_and(|(schema, quoted)| {
-                    self.case.identifiers_match(schema, quoted, "pg_catalog", false)
-                }) || self
-                    .search_path
-                    .iter()
-                    .any(|&entry| schema_qualifiers_match(declared_in, Some(entry), self.case))
-            }
-            Qualifier::RunTime => false,
-        };
-        names_match && schema_reached && function.accepts_argument_count(arguments)
+        call_reaches(function, called, arguments, || self.search_path.iter().copied(), self.case)
     }
 
     /// The functions a call to `called` passing `arguments` arguments may run.
@@ -71,13 +42,13 @@ impl CallScope<'_> {
     }
 }
 
-/// Resolves every call in `expression`, subqueries included, under `scope`.
-pub(super) fn calls_in_expression(
-    expression: &Expr,
+/// Resolves every call in `node`, subqueries included, under `scope`.
+pub(super) fn calls_in<N: Visit + ?Sized>(
+    node: &N,
     scope: &CallScope<'_>,
 ) -> ExpressionCalls<CreateFunction> {
     let mut sites = Vec::new();
-    let ControlFlow::<Infallible>::Continue(()) = for_each_call(expression, |call| {
+    let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
         sites.push(scope.reached_by(call.name, call.arguments).cloned().collect());
         ControlFlow::Continue(())
     });
@@ -328,7 +299,7 @@ mod tests {
 
     /// The names of the functions the calls in `expression` reach, each once.
     fn reached_names(expression: &Expr, scope: &super::CallScope<'_>) -> Vec<String> {
-        let calls = super::calls_in_expression(expression, scope);
+        let calls = super::calls_in(expression, scope);
         calls.functions().map(|function| function.name().to_owned()).collect()
     }
 

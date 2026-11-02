@@ -6,10 +6,13 @@ use alloc::{borrow::Cow, format, string::ToString, vec::Vec};
 use sqlparser::ast::{
     ArgMode, CreateFunction, CreateFunctionBody, CreateRole, CreateTable, DataType, Expr,
     FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionReturnType,
-    FunctionSecurity, FunctionSetValue, Statement, Value, ValueWithSpan,
+    FunctionSecurity, FunctionSetValue, Select, Statement, Value, ValueWithSpan,
 };
 
-use super::data_statement::{BodyPath, Reads, reads_of_body, reads_on_path};
+use super::{
+    body_calls::{calls_of_body, calls_on_path},
+    data_statement::{BodyPath, Reads, reads_of_body, reads_on_path},
+};
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{FunctionKind, FunctionMetadata, ParserDB, TargetName},
@@ -42,12 +45,27 @@ fn function_metadata<'db>(
         .ok_or_else(|| ObjectKind::Function.not_in_database(&function.name.to_string()))
 }
 
-/// Everything the body of `function` reads, as
-/// [`FunctionLike::referenced_relations`] describes.
-fn body_reads<'db>(
-    function: &CreateFunction,
-    database: &'db ParserDB,
-) -> Result<Reads<'db, ParserDB>, LookupError> {
+/// The SQL a function runs, in the shape its body is written.
+enum SqlBody<'f> {
+    /// Statements read one after another each time the function runs, parsed
+    /// from the body's text or already parsed by the input.
+    Statements(Cow<'f, [Statement]>),
+    /// An expression read each time the function runs.
+    Expression(&'f Expr),
+    /// A query read each time the function runs.
+    Select(&'f Select),
+    /// A `RETURN` expression bound at creation.
+    Return(&'f Expr),
+    /// The statements of a `BEGIN ATOMIC` block bound at creation.
+    Atomic(&'f [Statement]),
+}
+
+/// The SQL body of `function`, refusing one whose reads and calls cannot be
+/// known, as [`FunctionLike::referenced_tables`] describes.
+fn sql_body<'f>(
+    function: &'f CreateFunction,
+    database: &ParserDB,
+) -> Result<SqlBody<'f>, LookupError> {
     if let Some(language) = function.stored_language().filter(|language| language != "sql") {
         return Err(LookupError::FunctionBodyNotSql {
             function: function.name().to_string(),
@@ -59,17 +77,11 @@ fn body_reads<'db>(
     if function.using.is_some() || function.remote_connection.is_some() {
         return Err(unavailable());
     }
-    let hex_strings_may_be_integers = database.dialect().hex_strings_may_be_integers();
-    let path =
-        || function.search_path(database).map(|own| own.map_or(BodyPath::Database, BodyPath::Set));
-    let walk = |statements: &[Statement]| {
-        reads_of_body(function.name(), statements, database, path()?, hex_strings_may_be_integers)
-    };
     match &function.function_body {
         None => Err(unavailable()),
         Some(CreateFunctionBody::AsBeforeOptions { body: expression, .. }) => {
             let Some(text) = function.body() else {
-                return reads_on_path(expression, database, path()?);
+                return Ok(SqlBody::Expression(expression));
             };
             let statements = database.dialect().parse_statements(text).map_err(|error| {
                 LookupError::FunctionBodyUnparsable {
@@ -77,25 +89,79 @@ fn body_reads<'db>(
                     reason: error.to_string(),
                 }
             })?;
-            walk(&statements)
+            Ok(SqlBody::Statements(Cow::Owned(statements)))
         }
         Some(
             CreateFunctionBody::AsAfterOptions(expression)
             | CreateFunctionBody::AsReturnExpr(expression),
-        ) => reads_on_path(expression, database, path()?),
-        // Bound at creation, so the function's own path plays no part.
-        Some(CreateFunctionBody::Return(expression)) => {
-            reads_on_path(expression, database, BodyPath::Bound)
+        ) => Ok(SqlBody::Expression(expression)),
+        Some(CreateFunctionBody::Return(expression)) => Ok(SqlBody::Return(expression)),
+        Some(CreateFunctionBody::BeginAtomic(block)) => Ok(SqlBody::Atomic(&block.statements)),
+        Some(CreateFunctionBody::AsBeginEnd(block)) => {
+            Ok(SqlBody::Statements(Cow::Borrowed(&block.statements)))
         }
+        Some(CreateFunctionBody::AsReturnSelect(select)) => Ok(SqlBody::Select(select)),
+    }
+}
+
+/// The path a body read each time `function` runs starts under.
+fn run_time_path<'f>(
+    function: &'f CreateFunction,
+    database: &'f ParserDB,
+) -> Result<BodyPath<'f>, LookupError> {
+    Ok(function.search_path(database)?.map_or(BodyPath::Database, BodyPath::Set))
+}
+
+/// Everything the body of `function` reads, as
+/// [`FunctionLike::referenced_relations`] describes.
+fn body_reads<'db>(
+    function: &CreateFunction,
+    database: &'db ParserDB,
+) -> Result<Reads<'db, ParserDB>, LookupError> {
+    let hex_strings_may_be_integers = database.dialect().hex_strings_may_be_integers();
+    match sql_body(function, database)? {
+        SqlBody::Statements(statements) => {
+            let path = run_time_path(function, database)?;
+            reads_of_body(function.name(), &statements, database, path, hex_strings_may_be_integers)
+        }
+        SqlBody::Expression(expression) => {
+            reads_on_path(expression, database, Some(run_time_path(function, database)?))
+        }
+        SqlBody::Select(select) => {
+            reads_on_path(select, database, Some(run_time_path(function, database)?))
+        }
+        // Bound at creation, so the function's own path plays no part.
+        SqlBody::Return(expression) => reads_on_path(expression, database, None),
         // A block stores a temporary relation by its bare name, which the
         // default path reaches first.
-        Some(CreateFunctionBody::BeginAtomic(block)) => {
-            let name = function.name();
-            reads_of_body(name, &block.statements, database, BodyPath::default_path(), false)
+        SqlBody::Atomic(statements) => {
+            reads_of_body(function.name(), statements, database, BodyPath::default_path(), false)
         }
-        Some(CreateFunctionBody::AsBeginEnd(block)) => walk(&block.statements),
-        Some(CreateFunctionBody::AsReturnSelect(select)) => {
-            reads_on_path(select, database, path()?)
+    }
+}
+
+/// Every function the calls of the body of `function` may reach, as
+/// [`FunctionLike::referenced_functions`] describes.
+fn body_calls<'db>(
+    function: &CreateFunction,
+    database: &'db ParserDB,
+) -> Result<Vec<&'db CreateFunction>, LookupError> {
+    let hex_strings_may_be_integers = database.dialect().hex_strings_may_be_integers();
+    match sql_body(function, database)? {
+        SqlBody::Statements(statements) => {
+            let path = run_time_path(function, database)?;
+            calls_of_body(function.name(), &statements, database, path, hex_strings_may_be_integers)
+        }
+        SqlBody::Expression(expression) => {
+            calls_on_path(expression, database, run_time_path(function, database)?)
+        }
+        SqlBody::Select(select) => {
+            calls_on_path(select, database, run_time_path(function, database)?)
+        }
+        // Bound at creation, under the session's path of the time and
+        // reaching the functions held then.
+        SqlBody::Return(_) | SqlBody::Atomic(_) => {
+            Ok(function_metadata(function, database)?.body_calls().functions().collect())
         }
     }
 }
@@ -316,6 +382,13 @@ impl FunctionLike for CreateFunction {
         database: &'db Self::DB,
     ) -> Result<Vec<Relation<'db, Self::DB>>, LookupError> {
         Ok(body_reads(self, database)?.relations)
+    }
+
+    fn referenced_functions<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Vec<&'db CreateFunction>, LookupError> {
+        body_calls(self, database)
     }
 
     #[inline]

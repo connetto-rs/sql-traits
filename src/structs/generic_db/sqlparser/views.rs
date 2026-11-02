@@ -17,8 +17,9 @@
 //! read one at all.
 //!
 //! A function whose `RETURN` body reads a relation is a dependent of that
-//! relation as well, so the same drop checks refuse a drop while a body
-//! reads it and a `CASCADE` takes the function along.
+//! relation as well, and so is a function whose bound body calls it, so the
+//! same drop checks refuse a drop while a body reads it and a `CASCADE` takes
+//! the functions along.
 
 use alloc::{
     format,
@@ -1047,8 +1048,9 @@ fn insert_target(statement: &Statement) -> Option<&ObjectName> {
     }
 }
 
-/// Every view and function reading the relation `key` names, and every
-/// reader among those, transitively.
+/// Every view and function reading the relation `key` names, every reader
+/// among those, and every function whose bound body calls one of those
+/// functions, transitively.
 ///
 /// PostgreSQL refuses to drop a relation while anything reads it, and takes
 /// the whole chain with it under `CASCADE`, so the walk closes over the chain
@@ -1108,6 +1110,39 @@ pub(super) fn dependent_views(
             if !found.contains(&reader) {
                 frontier.push(own_key.clone());
                 found.push(reader);
+            }
+        }
+    }
+
+    // PostgreSQL records each call a bound body makes as a dependency, so a
+    // function calling one the chain holds joins it, transitively.
+    let mut calls: Vec<(RelationKey, Vec<RelationKey>)> = builder
+        .functions()
+        .iter()
+        .map(|(function, metadata)| {
+            (
+                stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
+                metadata
+                    .body_calls()
+                    .functions()
+                    .map(|callee| stored_function_key(callee, IdentifierCase::AsWritten))
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut next = 0;
+    while let Some((kind, callee)) = found.get(next) {
+        next += 1;
+        if *kind != ObjectKind::Function {
+            continue;
+        }
+        let joining: Vec<RelationKey> = calls
+            .extract_if(.., |(_, callees)| callees.contains(callee))
+            .map(|(caller, _)| caller)
+            .collect();
+        for caller in joining {
+            if !found.iter().any(|(kind, key)| *kind == ObjectKind::Function && *key == caller) {
+                found.push((ObjectKind::Function, caller));
             }
         }
     }

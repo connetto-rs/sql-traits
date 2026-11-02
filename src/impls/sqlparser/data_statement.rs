@@ -39,13 +39,10 @@ use crate::{
     },
 };
 
-/// The path unqualified names resolve under.
+/// The path unqualified names resolve under in a body read when it runs.
 pub(crate) enum BodyPath<'path> {
     /// The database's own path.
     Database,
-    /// No path, for a body bound at creation, whose names carry the
-    /// qualifier of the relation each reached.
-    Bound,
     /// A path a function's setting or an earlier statement chose.
     Set(SearchPath<'path>),
     /// An earlier statement changed the path while the body runs, so an
@@ -79,7 +76,10 @@ pub(crate) struct Reads<'db, DB: DatabaseLike> {
 /// definition, stopping at the first resolution error.
 struct RelationCollector<'db, 'path, DB: DatabaseLike> {
     database: &'db DB,
-    path: BodyPath<'path>,
+    /// The path unqualified names resolve under, or none for a body bound at
+    /// creation, whose names carry the qualifier of the relation each
+    /// reached.
+    path: Option<BodyPath<'path>>,
     reads: Reads<'db, DB>,
     /// The plain views expanded so far, which a definition reading its view
     /// back cannot re-expand.
@@ -99,7 +99,7 @@ struct RelationCollector<'db, 'path, DB: DatabaseLike> {
 }
 
 impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
-    fn new(database: &'db DB, path: BodyPath<'path>) -> Self {
+    fn new(database: &'db DB, path: Option<BodyPath<'path>>) -> Self {
         Self {
             database,
             path,
@@ -117,10 +117,10 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
     /// body bound at creation, and under the walk's path otherwise.
     fn resolve(&self, object_name: &ObjectName) -> Result<Option<Relation<'db, DB>>, LookupError> {
         let case = IdentifierCase::AsWritten;
-        if self.bound || matches!(self.path, BodyPath::Bound) {
+        let Some(path) = self.path.as_ref().filter(|_| !self.bound) else {
             return resolve_bound_relation_object_name(object_name, self.database);
-        }
-        match &self.path {
+        };
+        match path {
             BodyPath::Set(path) => {
                 resolve_relation_object_name_on_path(object_name, self.database, path, case)
             }
@@ -128,7 +128,7 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
                 Err(error.clone())
             }
             // A qualified name reaches its schema whatever the path holds.
-            BodyPath::Database | BodyPath::Bound | BodyPath::Unknown(_) => {
+            BodyPath::Database | BodyPath::Unknown(_) => {
                 resolve_relation_object_name(object_name, self.database, case)
             }
         }
@@ -318,25 +318,40 @@ fn collect<'db, N: Visit, DB: DatabaseLike>(
     record: impl FnOnce(&mut RelationCollector<'db, '_, DB>),
     listed: &[ObjectName],
 ) -> Result<Reads<'db, DB>, LookupError> {
-    let mut collector = RelationCollector::new(database, BodyPath::Database);
+    let mut collector = RelationCollector::new(database, Some(BodyPath::Database));
     record(&mut collector);
     collector.collect(node, listed)?;
     Ok(collector.reads)
 }
 
-/// Resolves every relation reachable from `node` under `path`.
+/// Resolves every relation reachable from `node` under `path`, or as bound
+/// with no path for a body bound at creation.
 pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
     node: &N,
     database: &'db DB,
-    path: BodyPath<'_>,
+    path: Option<BodyPath<'_>>,
 ) -> Result<Reads<'db, DB>, LookupError> {
     let mut collector = RelationCollector::new(database, path);
     collector.collect(node, &[])?;
     Ok(collector.reads)
 }
 
-/// Resolves every relation the statements of a SQL function body read, one
-/// statement after another, starting under `path`.
+/// What a walk over the statements of a SQL function body gathers, one
+/// statement after another, under the path in force for each.
+pub(crate) trait BodyWalk<'s> {
+    /// Takes up `path` for the statements after the one setting it.
+    fn set_path(&mut self, path: BodyPath<'s>);
+
+    /// Walks one statement that leaves the path alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error resolving a name the statement holds.
+    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError>;
+}
+
+/// Hands the statements of the SQL function body `function` to `walker`,
+/// one after another, together with the path each runs under.
 ///
 /// PostgreSQL 18 analyzes each statement of such a body when it runs, so a
 /// `SET` or `RESET` of `search_path` reaches the statements after it, and a
@@ -347,8 +362,59 @@ pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
 /// # Errors
 ///
 /// Returns [`LookupError::FunctionBodyUnresolvable`] for a statement that
-/// runs code outside the body, or for an unqualified name after a run-time
-/// path change, and any error resolving a name.
+/// runs code outside the body, and any error `walker` returns.
+pub(crate) fn walk_body<'s>(
+    function: &str,
+    statements: &'s [Statement],
+    walker: &mut impl BodyWalk<'s>,
+    hex_strings_may_be_integers: bool,
+) -> Result<(), LookupError> {
+    let unresolvable = |statement: &Statement| {
+        LookupError::FunctionBodyUnresolvable {
+            function: function.to_string(),
+            statement: statement.to_string(),
+        }
+    };
+    for statement in statements {
+        if matches!(statement, Statement::Call(_) | Statement::Execute { .. }) {
+            return Err(unresolvable(statement));
+        }
+        match search_path_change(statement, hex_strings_may_be_integers)? {
+            Some(SearchPathChange::Set(path)) => walker.set_path(BodyPath::Set(path)),
+            Some(SearchPathChange::Reset) => walker.set_path(BodyPath::default_path()),
+            None => {
+                walker.walk(statement)?;
+                if sets_search_path_at_run_time(statement) {
+                    walker.set_path(BodyPath::Unknown(unresolvable(statement)));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
+    fn set_path(&mut self, path: BodyPath<'s>) {
+        self.path = Some(path);
+    }
+
+    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError> {
+        let listed = match statement {
+            Statement::Delete(delete) => delete.tables.as_slice(),
+            _ => &[],
+        };
+        self.collect(statement, listed)
+    }
+}
+
+/// Resolves every relation the statements of a SQL function body read, one
+/// statement after another as [`walk_body`] hands them over, starting under
+/// `path`.
+///
+/// # Errors
+///
+/// Returns the errors of [`walk_body`], an unqualified name after a run-time
+/// path change among them, and any error resolving a name.
 pub(crate) fn reads_of_body<'db, DB: DatabaseLike>(
     function: &str,
     statements: &[Statement],
@@ -356,32 +422,8 @@ pub(crate) fn reads_of_body<'db, DB: DatabaseLike>(
     path: BodyPath<'_>,
     hex_strings_may_be_integers: bool,
 ) -> Result<Reads<'db, DB>, LookupError> {
-    let unresolvable = |statement: &Statement| {
-        LookupError::FunctionBodyUnresolvable {
-            function: function.to_string(),
-            statement: statement.to_string(),
-        }
-    };
-    let mut collector = RelationCollector::new(database, path);
-    for statement in statements {
-        if matches!(statement, Statement::Call(_) | Statement::Execute { .. }) {
-            return Err(unresolvable(statement));
-        }
-        match search_path_change(statement, hex_strings_may_be_integers)? {
-            Some(SearchPathChange::Set(path)) => collector.path = BodyPath::Set(path),
-            Some(SearchPathChange::Reset) => collector.path = BodyPath::default_path(),
-            None => {
-                let listed = match statement {
-                    Statement::Delete(delete) => delete.tables.as_slice(),
-                    _ => &[],
-                };
-                collector.collect(statement, listed)?;
-                if sets_search_path_at_run_time(statement) {
-                    collector.path = BodyPath::Unknown(unresolvable(statement));
-                }
-            }
-        }
-    }
+    let mut collector = RelationCollector::new(database, Some(path));
+    walk_body(function, statements, &mut collector, hex_strings_may_be_integers)?;
     Ok(collector.reads)
 }
 

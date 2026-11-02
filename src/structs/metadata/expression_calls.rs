@@ -7,12 +7,12 @@ use sqlparser::ast::{Expr, Function};
 
 use crate::utils::call_sites::for_each_call;
 
-/// The functions each call of an expression may reach, resolved under the
-/// search path of the statement that wrote it.
+/// The functions each call of an expression or a bound function body may
+/// reach, resolved under the search path of the statement that wrote it.
 ///
 /// A call reaches every overload accepting its argument count, since argument
 /// types are not inferred.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ExpressionCalls<F> {
     /// The functions each call may reach, in the order a pre-order walk of
     /// the expression meets the calls.

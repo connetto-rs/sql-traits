@@ -1,12 +1,12 @@
 //! Submodule defining a `FunctionMetadata` struct.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
-use sqlparser::ast::{CreateRole, Grantee, Ident};
+use sqlparser::ast::{CreateFunction, CreateRole, Grantee, Ident};
 
 use crate::{
     impls::{grantee_is_public, grantee_matches_role, grantees_match},
-    structs::FunctionKind,
+    structs::{FunctionKind, metadata::ExpressionCalls},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,6 +27,9 @@ pub struct FunctionMetadata {
     /// The name of the extension the function belongs to, which creates and
     /// drops it.
     extension: Option<Ident>,
+    /// The calls of a body PostgreSQL binds at creation, with the functions
+    /// each reached then, and none for a body read again each time it runs.
+    body_calls: ExpressionCalls<CreateFunction>,
 }
 
 impl FunctionMetadata {
@@ -106,6 +109,31 @@ impl FunctionMetadata {
     #[inline]
     pub(crate) fn set_extension(&mut self, extension: Ident) {
         self.extension = Some(extension);
+    }
+
+    /// Returns the calls of the function's body if PostgreSQL bound it at
+    /// creation, with the functions each reached then.
+    #[must_use]
+    #[inline]
+    pub(crate) fn body_calls(&self) -> &ExpressionCalls<CreateFunction> {
+        &self.body_calls
+    }
+
+    /// Records the calls of the function's body, bound at creation.
+    #[inline]
+    pub(crate) fn set_body_calls(&mut self, calls: ExpressionCalls<CreateFunction>) {
+        self.body_calls = calls;
+    }
+
+    /// Re-points every call of the body reaching the node `stale` at
+    /// `fresh`.
+    #[inline]
+    pub(crate) fn replace_function(
+        &mut self,
+        stale: &Arc<CreateFunction>,
+        fresh: &Arc<CreateFunction>,
+    ) {
+        self.body_calls.replace_function(stale, fresh);
     }
 
     /// Returns who holds `EXECUTE` on the function.

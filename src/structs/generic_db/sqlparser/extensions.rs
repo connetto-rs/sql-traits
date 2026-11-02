@@ -127,8 +127,9 @@ fn create_extension_functions(
 ///
 /// # Errors
 ///
-/// Returns [`Error::FunctionReferenced`] when a check constraint, a policy or
-/// a trigger still reaches one, as dropping the function itself does.
+/// Returns [`Error::FunctionReferenced`] when a check constraint, a policy, a
+/// trigger or a bound function body still reaches one, as dropping the
+/// function itself does.
 fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Result<(), Error> {
     let case = builder.identifier_case();
     let belongs = |metadata: &FunctionMetadata| {
@@ -137,7 +138,7 @@ fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Resu
     if let Some((function, _)) = builder
         .functions()
         .iter()
-        .find(|(function, metadata)| belongs(metadata) && builder.is_function_used(function))
+        .find(|(function, metadata)| belongs(metadata) && builder.is_function_used(function, &[]))
     {
         return Err(Error::FunctionReferenced {
             function_name: last_str(&function.name).to_string(),
