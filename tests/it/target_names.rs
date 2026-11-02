@@ -207,8 +207,7 @@ fn grant_lists_its_table_targets_as_written() {
          CREATE ROLE reader;
          GRANT SELECT ON users, app.\"Posts\" TO reader;",
     );
-    let grant = db.table_grants().next().expect("the grant exists");
-    let targets = names_in!(grant, Tables);
+    let targets: Vec<_> = db.table_grants().flat_map(|grant| names_in!(grant, Tables)).collect();
 
     assert_eq!(targets.len(), 2);
     assert_eq!(targets[0].name(), "users");
@@ -220,8 +219,7 @@ fn grant_lists_its_table_targets_as_written() {
     assert!(!targets[1].schema_is_quoted());
 }
 
-/// A column grant is the same statement seen through another trait, and it
-/// must not lose the tables past the first the way the resolving reader does.
+/// A column grant names each table it reached, as the relation part does.
 #[test]
 fn column_grant_lists_every_table_target() {
     let db = parse(
@@ -230,26 +228,29 @@ fn column_grant_lists_every_table_target() {
          CREATE ROLE reader;
          GRANT SELECT (id, name) ON users, posts TO reader;",
     );
-    let grant = db.column_grants().next().expect("the grant exists");
-    let targets = names_in!(grant, Tables);
+    let targets: Vec<_> = db.column_grants().flat_map(|grant| names_in!(grant, Tables)).collect();
     let names: Vec<_> = targets.iter().map(TargetName::name).collect();
 
     assert_eq!(names, ["users", "posts"]);
 }
 
+/// A schema-wide grant names each table the schema held, under the name it
+/// is stored by.
 #[test]
-fn schema_wide_grant_names_the_schema_not_the_tables() {
+fn schema_wide_grant_names_each_table_the_schema_held() {
     let db = parse(
-        "CREATE TABLE public.users (id INT);
+        "CREATE SCHEMA app;
+         CREATE TABLE app.\"Users\" (id INT);
          CREATE ROLE reader;
-         GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader;",
+         GRANT SELECT ON ALL TABLES IN SCHEMA app TO reader;",
     );
     let grant = db.table_grants().next().expect("the grant exists");
-    let schemas = names_in!(grant, TablesInSchema);
+    let targets = names_in!(grant, Tables);
 
-    assert_eq!(schemas.len(), 1);
-    assert_eq!(schemas[0].name(), "public");
-    assert_eq!(schemas[0].schema(), None);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].name(), "Users");
+    assert!(targets[0].name_is_quoted());
+    assert_eq!(targets[0].schema(), Some("app"));
 }
 
 #[test]
@@ -283,13 +284,14 @@ fn direct_schema_grant_names_the_schema_apart_from_its_tables() {
     let db = parse(
         "CREATE SCHEMA app;
          CREATE SCHEMA \"Ops\";
+         CREATE TABLE app.t (id INT);
          GRANT ALL ON ALL TABLES IN SCHEMA app TO PUBLIC;
          GRANT CREATE ON SCHEMA app, \"Ops\" TO PUBLIC;",
     );
     let grants: Vec<_> = db.table_grants().collect();
 
-    assert!(matches!(grants[0].target(), GrantTarget::TablesInSchema(_)));
-    let schemas = names_in!(grants[1], Schemas);
+    assert!(matches!(grants[0].target(), GrantTarget::Tables(_)));
+    let schemas: Vec<_> = grants[1..].iter().flat_map(|grant| names_in!(grant, Schemas)).collect();
 
     assert_eq!(schemas.len(), 2);
     assert_eq!(schemas[0].name(), "app");
@@ -315,7 +317,7 @@ fn partial_revoke_of_a_schema_grant_keeps_the_schema_target() {
 }
 
 #[test]
-fn sequence_grants_name_sequences_and_the_schemas_they_sweep() {
+fn sequence_grants_name_each_sequence_they_reach() {
     let db = parse(
         "CREATE SEQUENCE ticket_seq;
          CREATE SCHEMA app;
@@ -323,15 +325,11 @@ fn sequence_grants_name_sequences_and_the_schemas_they_sweep() {
          GRANT USAGE ON SEQUENCE ticket_seq, app.order_seq TO PUBLIC;
          GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO PUBLIC;",
     );
-    let grants: Vec<_> = db.table_grants().collect();
+    let sequences: Vec<_> =
+        db.table_grants().flat_map(|grant| names_in!(grant, Sequences)).collect();
+    let read: Vec<_> = sequences.iter().map(|name| (name.name(), name.schema())).collect();
 
-    let sequences = names_in!(grants[0], Sequences);
-    assert_eq!(sequences.len(), 2);
-    assert_eq!((sequences[0].name(), sequences[0].schema()), ("ticket_seq", None));
-    assert_eq!((sequences[1].name(), sequences[1].schema()), ("order_seq", Some("app")));
-
-    let schemas = names_in!(grants[1], SequencesInSchema);
-    assert_eq!(schemas.iter().map(TargetName::name).collect::<Vec<_>>(), ["public"]);
+    assert_eq!(read, [("ticket_seq", None), ("order_seq", Some("app")), ("ticket_seq", None)]);
 }
 
 #[test]
