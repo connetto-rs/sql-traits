@@ -20,7 +20,7 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
 /// No sequence at all, for comparing against [`sequence_names`].
 const NONE: [&str; 0] = [];
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/sequence_names.rs"));
+use crate::support::sequence_names::sequence_names;
 
 fn sequence<'db>(database: &'db ParserDB, name: &str) -> &'db <ParserDB as DatabaseLike>::Sequence {
     database

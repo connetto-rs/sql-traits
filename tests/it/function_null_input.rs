@@ -9,7 +9,7 @@ fn db(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")
 }
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/function_overloads.rs"));
+use crate::support::function_overloads::overload;
 
 /// What PostgreSQL 18 declares for every builtin this crate registers.
 mod builtins {

@@ -8,16 +8,7 @@
 
 use sql_traits::prelude::*;
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/counting_allocator.rs"));
-
-/// Runs `body` and answers how many times it allocated.
-fn allocations_of<T>(body: impl FnOnce() -> T) -> usize {
-    let before = allocations();
-    let answer = body();
-    let counted = allocations() - before;
-    drop(answer);
-    counted
-}
+use crate::support::counting_allocator::allocations_of;
 
 #[test]
 fn building_the_postgres_18_catalog_allocates_nothing() {

@@ -1,8 +1,10 @@
-// Whether a column of a table accepts nothing. Included textually by the
-// tests that ask the same question.
+//! Whether a column of a table accepts nothing.
+#![expect(clippy::expect_used, reason = "a test helper fails loudly on a broken premise")]
+
+use sql_traits::prelude::*;
 
 /// Answers whether `column_name` of `table_name` accepts nothing.
-fn accepts_nothing(database: &ParserDB, table_name: &str, column_name: &str) -> bool {
+pub(crate) fn accepts_nothing(database: &ParserDB, table_name: &str, column_name: &str) -> bool {
     !database
         .table_by_target(TargetName::new(table_name, false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")

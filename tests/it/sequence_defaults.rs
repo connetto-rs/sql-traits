@@ -13,7 +13,7 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
 }
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/sequence_names.rs"));
+use crate::support::sequence_names::sequence_names;
 
 /// A column as `type nullability default`, the way the catalog would list
 /// it.

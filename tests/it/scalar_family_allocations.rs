@@ -3,10 +3,11 @@
 
 use core::{hint::black_box, sync::atomic::Ordering};
 
-use sql_traits::utils::scalar_family::{ScalarFamily, scalar_family};
+use sql_traits::utils::scalar_family::scalar_family;
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/scalar_family_cases.rs"));
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/counting_allocator.rs"));
+use crate::support::{
+    counting_allocator::allocations, scalar_family_cases::all_scalar_family_cases,
+};
 
 #[test]
 fn scalar_family_classification_does_not_allocate() {

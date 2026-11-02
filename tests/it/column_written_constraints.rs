@@ -13,7 +13,8 @@
 
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::PostgreSqlDialect;
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_nullability.rs"));
+
+use crate::support::column_nullability::accepts_nothing;
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)

@@ -30,6 +30,7 @@ The library is designed around a set of traits that abstract over database schem
 ### Testing Strategy
 - **Doc Tests**: This project relies heavily on documentation tests in `src/main.rs` (via README) and module-level docs to verify behavior.
 - **Unit Tests**: Run `cargo test` to execute both unit and doc tests.
+- **Integration Tests**: All of them build into the single `it` test binary (`autotests = false`). Add a file under `tests/it/` and declare it as a module in `tests/it/main.rs`, since an undeclared file is never compiled. Shared helpers live in `tests/support/`, reached as `crate::support`. Run one file's tests with `cargo test --test it column_scope::`.
 
 ### Build & Linting
 - Comparison with strict lints: The project enables `pedantic` clippy lints and forbids missing docs. Ensure all new public items are documented.

@@ -47,7 +47,7 @@ fn described(database: &ParserDB) -> Vec<String> {
     sequences
 }
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/sequence_names.rs"));
+use crate::support::sequence_names::sequence_names;
 
 const NONE: [&str; 0] = [];
 

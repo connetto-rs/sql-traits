@@ -18,7 +18,8 @@
 
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::PostgreSqlDialect;
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_names.rs"));
+
+use crate::support::column_names::column_names;
 
 /// A source table exercising every column feature a copy might carry.
 const SOURCE: &str = "CREATE TABLE src (

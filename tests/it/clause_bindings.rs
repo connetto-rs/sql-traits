@@ -15,7 +15,8 @@ use sqlparser::{
     },
     dialect::{Dialect, PostgreSqlDialect, SQLiteDialect},
 };
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/query_parsing.rs"));
+
+use crate::support::query_parsing::query_with;
 
 const SCHEMA: &str = "CREATE TABLE docs(id INT, x INT);";
 

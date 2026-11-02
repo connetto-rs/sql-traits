@@ -13,7 +13,8 @@ use sqlparser::{
     },
     dialect::PostgreSqlDialect,
 };
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/query_parsing.rs"));
+
+use crate::support::query_parsing::query_with;
 
 const SCHEMA: &str = "
     CREATE TABLE a(id INT, row_alias INT);

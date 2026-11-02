@@ -1,8 +1,10 @@
-// Looks up a table by name and optional schema. Included textually by the
-// tests that read one.
+//! Looks up a table by name and optional schema.
+#![expect(clippy::expect_used, reason = "a test helper fails loudly on a broken premise")]
+
+use sql_traits::prelude::*;
 
 /// The table `name` in `schema`, or on the search path when `schema` is `None`.
-fn table<'db>(
+pub(crate) fn table<'db>(
     database: &'db ParserDB,
     schema: Option<&str>,
     name: &str,

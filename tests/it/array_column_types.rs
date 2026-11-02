@@ -7,7 +7,8 @@ use sqlparser::{
     dialect::{DatabricksDialect, PostgreSqlDialect},
     parser::Parser,
 };
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_type_probes.rs"));
+
+use crate::support::column_type_probes::{column_types, fingerprint};
 
 #[test]
 fn test_array_column_data_type() {

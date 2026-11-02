@@ -10,7 +10,8 @@ use sqlparser::{
     dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect, SnowflakeDialect},
     parser::Parser,
 };
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_type_probes.rs"));
+
+use crate::support::column_type_probes::{column_types, fingerprint};
 
 /// Builds a database from `ddl` and returns the declared argument types and
 /// return type of its `probe_fn` function.
