@@ -1264,6 +1264,26 @@ pub enum Error {
         /// Name of the column being dropped.
         column_name: String,
     },
+    #[error(
+        "Cannot alter type of column `{column_name}` of table `{table_name}`: {dependent_kind} `{dependent_name}` uses it."
+    )]
+    /// Error indicating that an `ALTER TABLE ... ALTER COLUMN ... TYPE`
+    /// statement names a column a view, a materialized view, a rule, a bound
+    /// function body, a policy or a trigger reads.
+    ///
+    /// PostgreSQL offers no `CASCADE` for a type change and refuses it even
+    /// when the type stays the same. Indexes, checks and foreign keys on the
+    /// column are rebuilt instead and never raise this.
+    ColumnTypeChangeBlocked {
+        /// Name of the table the column belongs to.
+        table_name: String,
+        /// Name of the column whose type the statement changes.
+        column_name: String,
+        /// Kind of the object reading the column.
+        dependent_kind: ObjectKind,
+        /// Name of the object reading the column.
+        dependent_name: String,
+    },
     #[error("Column `{column_name}` already exists on table `{table_name}`.")]
     /// Error indicating that a statement tries to introduce a column name the
     /// table already declares.
