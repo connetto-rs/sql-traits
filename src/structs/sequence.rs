@@ -114,4 +114,11 @@ impl Sequence {
     pub(crate) fn set_owner(&mut self, owner: StoredSequenceOwner) {
         self.owner = Some(owner);
     }
+
+    /// Moves the sequence to `schema`, which a renamed schema does to what it
+    /// holds.
+    pub(crate) fn set_schema(&mut self, schema: String, quoted: bool) {
+        self.schema = Some(schema);
+        self.schema_is_quoted = quoted;
+    }
 }
