@@ -77,7 +77,7 @@ pub(crate) fn grantee_is_public(grantee: &Grantee) -> bool {
 /// Returns whether a grantee names whoever runs the statement, spelled
 /// `CURRENT_USER`, `CURRENT_ROLE` or `SESSION_USER`, rather than a role
 /// somebody declared.
-fn grantee_is_session_principal(grantee: &Grantee) -> Option<SessionPrincipal> {
+pub(crate) fn grantee_is_session_principal(grantee: &Grantee) -> Option<SessionPrincipal> {
     let Some(GranteeName::ObjectName(name)) = &grantee.name else {
         return None;
     };
