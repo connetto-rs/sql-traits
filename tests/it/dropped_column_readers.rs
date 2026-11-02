@@ -109,6 +109,19 @@ fn cascade_drops_the_readers_and_what_reads_them() {
 }
 
 #[test]
+fn cascade_drops_a_function_reading_a_dropped_view() {
+    let database = parse(
+        "CREATE TABLE t (a INT, b INT);
+         CREATE VIEW v AS SELECT a FROM t;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql BEGIN ATOMIC SELECT a FROM v; END;
+         ALTER TABLE t DROP COLUMN a CASCADE;",
+    )
+    .expect("CASCADE drops the view and the function reading it");
+    assert_eq!(database.views().count(), 0);
+    assert!(!function_names(&database).contains(&"f".to_owned()));
+}
+
+#[test]
 fn cascade_drops_a_reading_function_and_its_callers() {
     let database = parse(
         "CREATE TABLE t (a INT, b INT);

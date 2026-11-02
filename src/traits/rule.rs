@@ -206,7 +206,7 @@ pub trait RuleLike: Clone + Debug + Metadata + Send + Sync {
     /// )?;
     /// let action = db.rules().next().unwrap().action();
     /// assert!(matches!(action, CreateRuleAction::Statement(_)));
-    /// assert_eq!(action.to_string(), "INSERT INTO audit VALUES (new.id)");
+    /// assert_eq!(action.to_string(), "INSERT INTO audit (id) VALUES (new.id)");
     /// # Ok(())
     /// # }
     /// ```

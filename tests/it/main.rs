@@ -88,6 +88,7 @@ mod required_column_values;
 mod role_lifecycle;
 mod role_memberships;
 mod row_security;
+mod rule_and_trigger_column_reads;
 mod rules;
 mod run_time_object_names;
 mod scalar_family_allocations;
