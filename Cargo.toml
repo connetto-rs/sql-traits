@@ -26,6 +26,7 @@ std = [
     "sqlparser/recursive-protection",
     "geometric-traits/std",
     "thiserror/std",
+    "sqlparser-plpgsql/std",
 ]
 # Adds git-backed construction: `ParserDB::from_git_url*` clones a remote
 # repository into a temporary directory and parses the SQL it contains.
@@ -45,6 +46,7 @@ serde = ["dep:serde"]
 sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
 geometric-traits = { git = "https://github.com/earth-metabolome-initiative/geometric-traits", branch = "main", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0", default-features = false }
+sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", default-features = false, features = ["body-parse"] }
 git2 = { version = "0.20.3", optional = true }
 tempfile = { version = "3.25", optional = true }
 sha2 = { version = "0.10", default-features = false }

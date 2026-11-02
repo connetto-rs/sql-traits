@@ -12,8 +12,8 @@
 //! through the view's stored definition, which is bound at creation and read
 //! with no search path, and every table a `FROM` or target item without
 //! `ONLY` names into the tables below it through `INHERITS` and
-//! `PARTITION OF`. A SQL function body is walked the same way, one statement
-//! after another, under the path the function runs with.
+//! `PARTITION OF`. A function body read when it runs is walked the same way,
+//! one statement after another, under the path the function runs with.
 
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
@@ -23,7 +23,9 @@ use sqlparser::ast::{
     Query, Statement, TableFactor, TableInheritance, TableObject, Update, Value, ValueWithSpan,
     Visit, Visitor,
 };
+use sqlparser_plpgsql::embedded::Block;
 
+use super::plpgsql_body::walk_block;
 use crate::{
     errors::LookupError,
     structs::IdentifierCase,
@@ -40,6 +42,7 @@ use crate::{
 };
 
 /// The path unqualified names resolve under in a body read when it runs.
+#[derive(Clone)]
 pub(crate) enum BodyPath<'path> {
     /// The database's own path.
     Database,
@@ -336,9 +339,13 @@ pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
     Ok(collector.reads)
 }
 
-/// What a walk over the statements of a SQL function body gathers, one
-/// statement after another, under the path in force for each.
+/// What a walk over the statements of a function body read when it runs
+/// gathers, one statement after another, under the path in force for each.
 pub(crate) trait BodyWalk<'s> {
+    /// The path the next statement runs under, none for a body bound at
+    /// creation.
+    fn path(&self) -> Option<&BodyPath<'s>>;
+
     /// Takes up `path` for the statements after the one setting it.
     fn set_path(&mut self, path: BodyPath<'s>);
 
@@ -350,11 +357,56 @@ pub(crate) trait BodyWalk<'s> {
     fn walk(&mut self, statement: &Statement) -> Result<(), LookupError>;
 }
 
-/// Hands the statements of the SQL function body `function` to `walker`,
-/// one after another, together with the path each runs under.
+/// The statements of a function body read when it runs.
+#[derive(Clone, Copy)]
+pub(crate) enum RunTimeBody<'s> {
+    /// A SQL body, its statements run one after another.
+    Sql(&'s [Statement]),
+    /// A PL/pgSQL body, the SQL it embeds read where its blocks, branches,
+    /// loops and handlers run it.
+    PlPgSql(&'s Block),
+}
+
+/// Hands the statements of the body of `function` to `walker`, one after
+/// another, together with the path each runs under.
 ///
-/// PostgreSQL 18 analyzes each statement of such a body when it runs, so a
-/// `SET` or `RESET` of `search_path` reaches the statements after it, and a
+/// # Errors
+///
+/// Returns the errors of [`walk_statement`], SQL built at run time by a
+/// PL/pgSQL body ([`LookupError::FunctionBodyUnresolvable`]) among them, and
+/// any error `walker` returns.
+pub(crate) fn walk_body<'s>(
+    function: &str,
+    body: RunTimeBody<'s>,
+    walker: &mut impl BodyWalk<'s>,
+    hex_strings_may_be_integers: bool,
+) -> Result<(), LookupError> {
+    match body {
+        RunTimeBody::Sql(statements) => {
+            statements.iter().try_for_each(|statement| {
+                walk_statement(function, statement, walker, hex_strings_may_be_integers)
+            })
+        }
+        RunTimeBody::PlPgSql(block) => {
+            walk_block(function, block, walker, hex_strings_may_be_integers)
+        }
+    }
+}
+
+/// The error a function body answers for `statement`, which hides what the
+/// body reads.
+pub(crate) fn unresolvable(function: &str, statement: &impl ToString) -> LookupError {
+    LookupError::FunctionBodyUnresolvable {
+        function: function.to_string(),
+        statement: statement.to_string(),
+    }
+}
+
+/// Hands one statement of the body of `function` to `walker`, or takes up
+/// the path it sets for the statements after it.
+///
+/// PostgreSQL 18 analyzes each statement of a function body when it runs, so
+/// a `SET` or `RESET` of `search_path` reaches the statements after it, and a
 /// `set_config` of it leaves later unqualified names unknowable. A `SET` reads
 /// its entries as
 /// [`search_path_entry`](crate::utils::object_name::search_path_entry) does.
@@ -363,30 +415,22 @@ pub(crate) trait BodyWalk<'s> {
 ///
 /// Returns [`LookupError::FunctionBodyUnresolvable`] for a statement that
 /// runs code outside the body, and any error `walker` returns.
-pub(crate) fn walk_body<'s>(
+pub(crate) fn walk_statement<'s>(
     function: &str,
-    statements: &'s [Statement],
+    statement: &'s Statement,
     walker: &mut impl BodyWalk<'s>,
     hex_strings_may_be_integers: bool,
 ) -> Result<(), LookupError> {
-    let unresolvable = |statement: &Statement| {
-        LookupError::FunctionBodyUnresolvable {
-            function: function.to_string(),
-            statement: statement.to_string(),
-        }
-    };
-    for statement in statements {
-        if matches!(statement, Statement::Call(_) | Statement::Execute { .. }) {
-            return Err(unresolvable(statement));
-        }
-        match search_path_change(statement, hex_strings_may_be_integers)? {
-            Some(SearchPathChange::Set(path)) => walker.set_path(BodyPath::Set(path)),
-            Some(SearchPathChange::Reset) => walker.set_path(BodyPath::default_path()),
-            None => {
-                walker.walk(statement)?;
-                if sets_search_path_at_run_time(statement) {
-                    walker.set_path(BodyPath::Unknown(unresolvable(statement)));
-                }
+    if matches!(statement, Statement::Call(_) | Statement::Execute { .. }) {
+        return Err(unresolvable(function, statement));
+    }
+    match search_path_change(statement, hex_strings_may_be_integers)? {
+        Some(SearchPathChange::Set(path)) => walker.set_path(BodyPath::Set(path)),
+        Some(SearchPathChange::Reset) => walker.set_path(BodyPath::default_path()),
+        None => {
+            walker.walk(statement)?;
+            if sets_search_path_at_run_time(statement) {
+                walker.set_path(BodyPath::Unknown(unresolvable(function, statement)));
             }
         }
     }
@@ -394,6 +438,10 @@ pub(crate) fn walk_body<'s>(
 }
 
 impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
+    fn path(&self) -> Option<&BodyPath<'s>> {
+        self.path.as_ref()
+    }
+
     fn set_path(&mut self, path: BodyPath<'s>) {
         self.path = Some(path);
     }
@@ -407,7 +455,7 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
     }
 }
 
-/// Resolves every relation the statements of a SQL function body read, one
+/// Resolves every relation the statements of a function body read, one
 /// statement after another as [`walk_body`] hands them over, starting under
 /// `path`.
 ///
@@ -417,19 +465,19 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
 /// path change among them, and any error resolving a name.
 pub(crate) fn reads_of_body<'db, DB: DatabaseLike>(
     function: &str,
-    statements: &[Statement],
+    body: RunTimeBody<'_>,
     database: &'db DB,
     path: BodyPath<'_>,
     hex_strings_may_be_integers: bool,
 ) -> Result<Reads<'db, DB>, LookupError> {
     let mut collector = RelationCollector::new(database, Some(path));
-    walk_body(function, statements, &mut collector, hex_strings_may_be_integers)?;
+    walk_body(function, body, &mut collector, hex_strings_may_be_integers)?;
     Ok(collector.reads)
 }
 
 /// Whether `statement` calls `set_config` on `search_path`, or on a setting
 /// named only when it runs.
-fn sets_search_path_at_run_time(statement: &Statement) -> bool {
+pub(crate) fn sets_search_path_at_run_time(statement: &Statement) -> bool {
     struct SetConfigCalls;
     impl Visitor for SetConfigCalls {
         type Break = ();

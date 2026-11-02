@@ -1,4 +1,4 @@
-//! The functions the calls of a SQL function body may reach when it runs.
+//! The functions the calls of a function body may reach when it runs.
 //!
 //! A call resolves where PostgreSQL resolves it, under the path the body runs
 //! with as [`walk_body`] tracks it, and reaches every overload accepting its
@@ -11,7 +11,7 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{Statement, Visit};
 
-use super::data_statement::{BodyPath, BodyWalk, walk_body};
+use super::data_statement::{BodyPath, BodyWalk, RunTimeBody, walk_body};
 use crate::{
     errors::LookupError,
     structs::IdentifierCase,
@@ -85,6 +85,10 @@ impl<'db, 'path, DB: DatabaseLike> CallCollector<'db, 'path, DB> {
 }
 
 impl<'s, DB: DatabaseLike> BodyWalk<'s> for CallCollector<'_, 's, DB> {
+    fn path(&self) -> Option<&BodyPath<'s>> {
+        Some(&self.path)
+    }
+
     fn set_path(&mut self, path: BodyPath<'s>) {
         self.path = path;
     }
@@ -110,9 +114,9 @@ pub(crate) fn calls_on_path<'db, N: Visit + ?Sized, DB: DatabaseLike>(
     Ok(collector.functions)
 }
 
-/// Resolves every function the calls in the statements of a SQL function
-/// body may reach, one statement after another as [`walk_body`] hands them
-/// over, starting under `path`.
+/// Resolves every function the calls in the statements of a function body
+/// may reach, one statement after another as [`walk_body`] hands them over,
+/// starting under `path`.
 ///
 /// # Errors
 ///
@@ -120,12 +124,12 @@ pub(crate) fn calls_on_path<'db, N: Visit + ?Sized, DB: DatabaseLike>(
 /// path change among them.
 pub(crate) fn calls_of_body<'db, DB: DatabaseLike>(
     function: &str,
-    statements: &[Statement],
+    body: RunTimeBody<'_>,
     database: &'db DB,
     path: BodyPath<'_>,
     hex_strings_may_be_integers: bool,
 ) -> Result<Vec<&'db DB::Function>, LookupError> {
     let mut collector = CallCollector::new(database, path);
-    walk_body(function, statements, &mut collector, hex_strings_may_be_integers)?;
+    walk_body(function, body, &mut collector, hex_strings_may_be_integers)?;
     Ok(collector.functions)
 }

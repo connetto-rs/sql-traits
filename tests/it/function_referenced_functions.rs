@@ -187,8 +187,7 @@ fn calls_in_bodies_the_input_already_parsed_are_resolved() {
 #[test]
 fn a_body_whose_calls_cannot_be_known_fails_as_its_reads_do() {
     let database = postgres(
-        "CREATE FUNCTION procedural() RETURNS INT LANGUAGE plpgsql
-             AS $$ BEGIN RETURN 1; END $$;
+        "CREATE FUNCTION procedural() RETURNS INT LANGUAGE plperl AS $$ return 1; $$;
          CREATE FUNCTION native() RETURNS INT LANGUAGE c AS 'module', 'symbol';
          CREATE FUNCTION calls() RETURNS INT LANGUAGE sql AS 'CALL elsewhere(); SELECT 1';
          CREATE FUNCTION broken() RETURNS INT LANGUAGE sql AS 'SELECT FROM WHERE (';",
@@ -201,7 +200,7 @@ fn a_body_whose_calls_cannot_be_known_fails_as_its_reads_do() {
     }
     assert!(matches!(
         called_by(&database, "procedural"),
-        Err(LookupError::FunctionBodyNotSql { language, .. }) if language == "plpgsql"
+        Err(LookupError::FunctionBodyNotSql { language, .. }) if language == "plperl"
     ));
 }
 
