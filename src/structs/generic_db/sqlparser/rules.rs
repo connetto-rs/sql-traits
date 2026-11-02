@@ -160,6 +160,27 @@ pub(super) fn action_statements_mut(action: &mut CreateRuleAction) -> Option<&mu
     }
 }
 
+/// Writes respelled statements back into a rule's action, one for each
+/// statement it holds.
+pub(super) fn write_action_statements(action: &mut CreateRuleAction, statements: Vec<Statement>) {
+    if let Some(held) = action_statements_mut(action) {
+        for (held, statement) in held.iter_mut().zip(statements) {
+            *held = statement;
+        }
+    }
+}
+
+/// Writes one respelled statement back into a rule's action at `position`.
+pub(super) fn write_action_statement(
+    action: &mut CreateRuleAction,
+    position: usize,
+    statement: Statement,
+) {
+    if let Some(held) = action_statements_mut(action).and_then(|held| held.get_mut(position)) {
+        *held = statement;
+    }
+}
+
 /// The key the rule's relation is stored under, which a rename or drop of
 /// that relation or one of its columns must reach the rule by.
 pub(super) fn relation_key(rule: &CreateRule) -> RelationKey {

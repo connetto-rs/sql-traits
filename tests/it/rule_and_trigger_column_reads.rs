@@ -188,6 +188,86 @@ fn a_rule_naming_an_absent_relation_in_its_condition_is_refused() {
     );
 }
 
+#[test]
+fn a_rule_inserting_more_values_than_target_columns_is_refused() {
+    let error = parse(
+        "CREATE TABLE s (x INT);
+         CREATE TABLE log (y INT);
+         CREATE RULE r AS ON INSERT TO s DO ALSO INSERT INTO log VALUES (new.x, 1);",
+    )
+    .expect_err("PostgreSQL refuses an INSERT wider than its target");
+    assert!(
+        matches!(&error, Error::RuleActionInsertTooWide { rule_name } if rule_name == "r"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn a_rule_reading_an_ambiguous_column_is_refused() {
+    let error = parse(
+        "CREATE TABLE s (x INT);
+         CREATE TABLE log (y INT);
+         CREATE TABLE t (a INT);
+         CREATE TABLE u (a INT);
+         CREATE RULE r AS ON INSERT TO s DO ALSO INSERT INTO log SELECT a FROM t, u;",
+    )
+    .expect_err("two relations expose a");
+    assert!(
+        matches!(
+            &error,
+            Error::RuleActionReferenceAmbiguous { column_name, rule_name }
+                if column_name == "a" && rule_name == "r"
+        ),
+        "got {error:?}"
+    );
+}
+
+/// An `UPDATE` in a rule's action follows a renamed column of its target,
+/// while `NEW` keeps naming the rule's own row.
+#[test]
+fn a_rule_update_follows_a_renamed_target_column() {
+    let database = parse(
+        "CREATE TABLE s (x INT);
+         CREATE TABLE t (a INT, b INT);
+         CREATE RULE r AS ON INSERT TO s DO ALSO UPDATE t SET a = new.x WHERE t.b = new.x;
+         ALTER TABLE t RENAME COLUMN a TO aa;",
+    )
+    .expect("schema builds");
+    assert_eq!(rule_action(only_rule(&database)), "UPDATE t SET aa = new.x WHERE t.b = new.x");
+}
+
+/// Every statement of a parenthesised action follows the rename.
+#[test]
+fn every_statement_of_a_rule_action_follows_a_renamed_column() {
+    let database = parse(
+        "CREATE TABLE s (x INT);
+         CREATE TABLE t (a INT);
+         CREATE RULE r AS ON INSERT TO s DO ALSO
+             (INSERT INTO t (a) VALUES (new.x); DELETE FROM t WHERE a = new.x);
+         ALTER TABLE t RENAME COLUMN a TO aa;",
+    )
+    .expect("schema builds");
+    assert_eq!(
+        rule_action(only_rule(&database)),
+        "(INSERT INTO t (aa) VALUES (new.x); DELETE FROM t WHERE t.aa = new.x)"
+    );
+}
+
+/// A rename making a bare reference in a rule's query ambiguous qualifies it,
+/// so it keeps reading the renamed column.
+#[test]
+fn a_rule_query_reference_a_rename_captures_is_qualified() {
+    let database = parse(
+        "CREATE TABLE s (x INT);
+         CREATE TABLE t (a INT);
+         CREATE TABLE u (aa INT);
+         CREATE RULE r AS ON INSERT TO s DO ALSO SELECT a FROM t, u;
+         ALTER TABLE t RENAME COLUMN a TO aa;",
+    )
+    .expect("schema builds");
+    assert_eq!(rule_action(only_rule(&database)), "SELECT t.aa AS a FROM t, u");
+}
+
 /// The action's names bind under the `search_path` in effect at creation, so
 /// a later change of it leaves the rule reading what it reached.
 #[test]

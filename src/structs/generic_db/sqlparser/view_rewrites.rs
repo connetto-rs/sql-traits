@@ -90,6 +90,51 @@ enum Slot {
     Rule(usize),
 }
 
+impl Slot {
+    /// The statement sequence the slot's object holds, which a view never
+    /// does.
+    const fn block(self) -> Option<Block> {
+        match self {
+            Self::Plain(_) | Self::Materialized(_) => None,
+            Self::Function(position) => Some(Block::Function(position)),
+            Self::Rule(position) => Some(Block::Rule(position)),
+        }
+    }
+}
+
+/// Where a stored statement sequence sits in the builder.
+#[derive(Clone, Copy)]
+enum Block {
+    /// The `BEGIN ATOMIC` body of the function at this position.
+    Function(usize),
+    /// The action of the rule at this position.
+    Rule(usize),
+}
+
+impl Block {
+    /// The slot the sequence's object sits in.
+    const fn slot(self) -> Slot {
+        match self {
+            Self::Function(position) => Slot::Function(position),
+            Self::Rule(position) => Slot::Rule(position),
+        }
+    }
+
+    /// Whether `NEW` and `OLD` name the object's own relation row, which they
+    /// do in a rule's action.
+    const fn rule_context(self) -> bool {
+        matches!(self, Self::Rule(_))
+    }
+
+    /// The name errors and respelling call the sequence's object by.
+    fn holder_name(self, builder: &ParserDBBuilder) -> String {
+        match self {
+            Self::Function(position) => last_str(&builder.functions()[position].0.name).to_string(),
+            Self::Rule(position) => builder.rules()[position].0.name.value.clone(),
+        }
+    }
+}
+
 /// The stored shape of a definition the machinery rewrites, with where it
 /// sits.
 enum Definition {
@@ -97,7 +142,7 @@ enum Definition {
     /// rule's condition is wrapped in.
     Query { slot: Slot, query: alloc::boxed::Box<Query> },
     /// The statements of a `BEGIN ATOMIC` body or a rule's action.
-    Statements { slot: Slot, statements: Vec<Statement> },
+    Statements { block: Block, statements: Vec<Statement> },
 }
 
 /// Writes a rewritten query back into the definition that holds it.
@@ -215,7 +260,10 @@ fn rule_definition_reads(
     let statements = rules::action_statements(&rule.action);
     if !statements.is_empty() {
         definitions.push((
-            Definition::Statements { slot, statements: statements.to_vec() },
+            Definition::Statements {
+                block: Block::Rule(position),
+                statements: statements.to_vec(),
+            },
             statements_read(builder, statements),
         ));
     }
@@ -238,7 +286,7 @@ fn function_definition_reads(
         Some(CreateFunctionBody::BeginAtomic(block)) => {
             Some((
                 Definition::Statements {
-                    slot: Slot::Function(position),
+                    block: Block::Function(position),
                     statements: block.statements.clone(),
                 },
                 statements_read(builder, &block.statements),
@@ -320,13 +368,16 @@ pub(super) fn column_readers(
                     };
                     reads.then(|| slot_reader(builder, *slot))
                 }
-                Definition::Statements { slot, statements } => {
-                    let holder = statement_holder_name(builder, *slot);
-                    let rule_context = matches!(slot, Slot::Rule(_));
-                    let reads =
-                        respell_statements(statements, before, columns, &holder, rule_context)
-                            .map_or(true, |(rewritten, _)| rewritten != *statements);
-                    reads.then(|| slot_reader(builder, *slot))
+                Definition::Statements { block, statements } => {
+                    let reads = respell_statements(
+                        statements,
+                        before,
+                        columns,
+                        &block.holder_name(builder),
+                        block.rule_context(),
+                    )
+                    .map_or(true, |(rewritten, _)| rewritten != *statements);
+                    reads.then(|| slot_reader(builder, block.slot()))
                 }
             }
         })
@@ -358,16 +409,6 @@ fn slot_reader(builder: &ParserDBBuilder, slot: Slot) -> Dependent {
     }
 }
 
-/// The name of the object holding a statements slot, the way errors and
-/// respelling name it.
-fn statement_holder_name(builder: &ParserDBBuilder, slot: Slot) -> String {
-    match slot {
-        Slot::Function(function) => last_str(&builder.functions()[function].0.name).to_string(),
-        Slot::Rule(position) => builder.rules()[position].0.name.value.clone(),
-        _ => String::new(),
-    }
-}
-
 /// How a block statement holds the query part it holds.
 #[derive(Clone, Copy)]
 enum PartShape {
@@ -382,9 +423,10 @@ enum PartShape {
 struct Part {
     /// Where the part's definition sits.
     slot: Slot,
-    /// The statement the part is a part of and how it holds the query, which
-    /// is `None` for a definition that is a query of its own.
-    statement: Option<(usize, PartShape)>,
+    /// The statement sequence the part is a part of, the statement's position
+    /// in it and how it holds the query, which is `None` for a definition
+    /// that is a query of its own.
+    statement: Option<(Block, usize, PartShape)>,
     /// The part before the renames.
     original: Query,
     /// The part `follow_renames` put in place, which the check reads back.
@@ -445,22 +487,25 @@ pub(super) fn follow_renames(
                     None => store_query(builder, slot, shielded(&original, renames)),
                 }
             }
-            Definition::Statements { slot, statements } => {
-                let holder = statement_holder_name(builder, slot);
-                let rule_context = matches!(slot, Slot::Rule(_));
-                let (rewritten, statement_parts) =
-                    respell_statements(&statements, &before, renames, &holder, rule_context)?;
+            Definition::Statements { block, statements } => {
+                let (rewritten, statement_parts) = respell_statements(
+                    &statements,
+                    &before,
+                    renames,
+                    &block.holder_name(builder),
+                    block.rule_context(),
+                )?;
                 for part in statement_parts {
                     parts.push(Part {
-                        slot,
-                        statement: Some((part.statement, part.shape)),
+                        slot: block.slot(),
+                        statement: Some((block, part.statement, part.shape)),
                         original: part.original,
                         stored: part.stored,
                         expected: part.expected,
                         factors: part.factors,
                     });
                 }
-                store_statements(builder, slot, rewritten);
+                store_statements(builder, block, rewritten);
             }
         }
     }
@@ -491,10 +536,14 @@ pub(super) fn follow_renames(
             // The original holds unprocessed data-modifying bodies, which the
             // shield left as written, so the copy shields takes them through
             // their own clauses.
-            if matches!(part.slot, Slot::Function(_) | Slot::Rule(_)) {
-                let holder = statement_holder_name(builder, part.slot);
-                let rule_context = matches!(part.slot, Slot::Rule(_));
-                dml_shell(&mut fallback, &before, renames, &holder, rule_context)?;
+            if let Some(block) = part.slot.block() {
+                dml_shell(
+                    &mut fallback,
+                    &before,
+                    renames,
+                    &block.holder_name(builder),
+                    block.rule_context(),
+                )?;
             }
             fallback
         };
@@ -504,46 +553,37 @@ pub(super) fn follow_renames(
 }
 
 /// Writes respelled statements back into the body or action that holds them.
-fn store_statements(builder: &mut ParserDBBuilder, slot: Slot, statements: Vec<Statement>) {
-    match slot {
-        Slot::Function(position) => {
+fn store_statements(builder: &mut ParserDBBuilder, block: Block, statements: Vec<Statement>) {
+    match block {
+        Block::Function(position) => {
             edit_function(builder, position, |entry| {
                 function_bodies::write_statements(&mut entry.function_body, statements);
             });
         }
-        Slot::Rule(position) => {
+        Block::Rule(position) => {
             let rule = alloc::sync::Arc::make_mut(&mut builder.rules_mut()[position].0);
-            if let Some(action) = rules::action_statements_mut(&mut rule.action) {
-                for (slot, statement) in action.iter_mut().zip(statements) {
-                    *slot = statement;
-                }
-            }
+            rules::write_action_statements(&mut rule.action, statements);
         }
-        _ => {}
     }
 }
 
 /// Writes a checked query part back into the definition that holds it.
 fn store_part(builder: &mut ParserDBBuilder, part: &Part, query: Query) {
-    let Some((statement, shape)) = part.statement else {
+    let Some((block, statement, shape)) = part.statement else {
         return store_query(builder, part.slot, query);
     };
-    match part.slot {
-        Slot::Function(position) => {
-            let replaced = statement_with_query_part(shape, query);
+    let replaced = statement_with_query_part(shape, query);
+    match block {
+        Block::Function(position) => {
             edit_function(builder, position, |CreateFunction { function_body, .. }| {
                 let Some(CreateFunctionBody::BeginAtomic(block)) = function_body else { return };
                 block.statements[statement] = replaced;
             });
         }
-        Slot::Rule(position) => {
-            let replaced = statement_with_query_part(shape, query);
+        Block::Rule(position) => {
             let rule = alloc::sync::Arc::make_mut(&mut builder.rules_mut()[position].0);
-            if let Some(action) = rules::action_statements_mut(&mut rule.action) {
-                action[statement] = replaced;
-            }
+            rules::write_action_statement(&mut rule.action, statement, replaced);
         }
-        _ => store_query(builder, part.slot, query),
     }
 }
 
@@ -2808,15 +2848,14 @@ fn shell_sites(
 /// statement's own clauses scope, which always name the write target's
 /// columns.
 fn is_pseudo_qualifier(qualifier: &Ident) -> bool {
-    qualifier.quote_style.is_none()
-        && (identifiers_match(&qualifier.value, false, "old", false)
-            || identifiers_match(&qualifier.value, false, "new", false)
-            || identifiers_match(&qualifier.value, false, "excluded", false))
+    is_row_qualifier(qualifier)
+        || (qualifier.quote_style.is_none()
+            && identifiers_match(&qualifier.value, false, "excluded", false))
 }
 
-/// Whether a qualifier is the `NEW` or `OLD` a rule's action scopes to its
-/// own relation's row, which a write target's `RETURNING` list never does.
-fn is_rule_row_qualifier(qualifier: &Ident) -> bool {
+/// Whether a qualifier is `NEW` or `OLD`, which a rule's action scopes to its
+/// own relation's row and a write target's `RETURNING` list to the target's.
+fn is_row_qualifier(qualifier: &Ident) -> bool {
     qualifier.quote_style.is_none()
         && (identifiers_match(&qualifier.value, false, "old", false)
             || identifiers_match(&qualifier.value, false, "new", false))
@@ -2883,7 +2922,7 @@ fn shell_outcome(parts: &[Ident], factors: &[ShellFactor], rule_context: bool) -
     {
         // A rule's action scopes `NEW` and `OLD` to its relation's row,
         // which the action's factors do not hold.
-        if rule_context && is_rule_row_qualifier(qualifier) {
+        if rule_context && is_row_qualifier(qualifier) {
             return ShellOutcome::Absent;
         }
         // A pseudo qualifier names the write target's columns, never an
