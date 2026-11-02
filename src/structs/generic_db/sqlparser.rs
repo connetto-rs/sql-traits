@@ -22,15 +22,15 @@ use sqlparser::{
         AlterFunctionOperation, AlterIndexOperation, AlterPolicy, AlterPolicyOperation,
         AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, ArgMode,
         ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
-        CreateCollation, CreateCollationDefinition, CreateExtension, CreateFunction,
+        CreateCollation, CreateCollationDefinition, CreateDomain, CreateExtension, CreateFunction,
         CreateFunctionBody, CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable,
-        CreateTableOptions, CreateTrigger, DataType, DropBehavior, Expr, ForeignKeyConstraint,
-        FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue, GeneratedAs, Grant,
-        GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition,
-        ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner,
-        Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption,
-        Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
-        VisitMut, Visitor, VisitorMut, visit_relations,
+        CreateTableOptions, CreateTrigger, DataType, DropBehavior, DropDomain, Expr,
+        ForeignKeyConstraint, FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue,
+        GeneratedAs, Grant, GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn,
+        MySQLColumnPosition, ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr,
+        OrderByOptions, Owner, Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption,
+        SchemaName, SqlOption, Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value,
+        ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut, visit_relations,
     },
     dialect::Dialect,
 };
@@ -73,6 +73,7 @@ mod calls_in_expression;
 mod column_copy;
 mod constraint_validity;
 mod default_privileges;
+mod domains;
 mod extensions;
 mod function_bodies;
 mod generated_names;
@@ -123,6 +124,7 @@ impl SchemaProfile for SqlparserProfile {
     type Trigger = CreateTrigger;
     type Rule = CreateRule;
     type Extension = CreateExtension;
+    type Domain = CreateDomain;
     type Policy = CreatePolicy;
     type Role = CreateRole;
     type RoleMembership = RoleMembership;
@@ -1455,10 +1457,11 @@ impl ParserDBBuilder {
             || role_memberships::granted_by(self, role_ident)
     }
 
-    /// Whether any relation belongs to this schema.
+    /// Whether any relation or domain belongs to this schema.
     ///
-    /// A view or a sequence counts as much as a table: PostgreSQL refuses
-    /// `DROP SCHEMA` without `CASCADE` while a schema holds any of them.
+    /// A view, a sequence or a domain counts as much as a table: PostgreSQL
+    /// refuses `DROP SCHEMA` without `CASCADE` while a schema holds any of
+    /// them.
     fn is_schema_non_empty(&self, schema_name: &str, schema_quoted: bool) -> bool {
         let in_schema = |stored: Option<(&str, bool)>| {
             stored.is_some_and(|(stored_schema, stored_quoted)| {
@@ -1478,6 +1481,7 @@ impl ParserDBBuilder {
                     .map(|schema| (schema, sequence.sequence_schema_is_quoted())),
             )
         }) || extensions::schema_holds_extension(self, schema_name, schema_quoted)
+            || domains::schema_holds_domain(self, schema_name, schema_quoted)
     }
 
     fn resolve_schema_ident(&self, ident: &Ident) -> Option<&Schema> {
@@ -3665,11 +3669,13 @@ fn validate_relation_names(
         let against_stores = match object_kind {
             // A table name against another table name is left to the builder,
             // which refuses it as a lookup ambiguity naming both spellings.
-            // Views and indexes are asked for here.
+            // Views, indexes and the domains sharing the pool of type names
+            // with the table's row type are asked for here.
             ObjectKind::Table => {
                 view_name_holder(builder, name, schema)
                     .or_else(|| sequence_name_holder(builder, name, schema))
                     .or_else(|| index_name_holder(builder, name, schema))
+                    .or_else(|| domains::domain_name_holder(builder, name, schema))
             }
             _ => relation_name_holder(builder, name, schema),
         };
@@ -6681,6 +6687,9 @@ impl ParserDB {
         defaults: &DefaultPrivileges,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let mut operation = operation.clone();
+        if let AlterColumnOperation::SetDataType { data_type, .. } = &mut operation {
+            domains::bind_type(&builder, data_type);
+        }
         let mut identity_sequence = None;
         let mut serial_default = None;
         if let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? {
@@ -7595,6 +7604,11 @@ impl ParserDB {
                                 &resolved_schema_name,
                                 resolved_schema_quoted,
                             )?;
+                            builder = domains::drop_domains_in(
+                                builder,
+                                &resolved_schema_name,
+                                resolved_schema_quoted,
+                            )?;
                         }
 
                         // Remove the schema
@@ -7768,10 +7782,11 @@ impl ParserDB {
                             }
                             AlterTableOperation::AddColumn {
                                 if_not_exists,
-                                column_def,
+                                mut column_def,
                                 column_position,
                                 ..
                             } => {
+                                domains::bind_type(&builder, &mut column_def.data_type);
                                 for option in &column_def.options {
                                     if let ColumnOption::ForeignKey(foreign_key) = &option.option {
                                         Self::refuse_reference_from_permanent_start(
@@ -8102,6 +8117,9 @@ impl ParserDB {
                         create_table.temporary,
                         ObjectKind::Table,
                     )?;
+                    for column in &mut create_table.columns {
+                        domains::bind_type(&builder, &mut column.data_type);
+                    }
 
                     // Refused before `IF NOT EXISTS`, as PostgreSQL refuses it
                     // while placing the name.
@@ -8217,6 +8235,33 @@ impl ParserDB {
                     ..
                 } => {
                     builder = sequences::drop_sequences(builder, &names, if_exists, cascade)?;
+                }
+                Statement::CreateDomain(create_domain) => {
+                    builder = domains::create_domain(builder, create_domain)?;
+                }
+                Statement::DropDomain(DropDomain { if_exists, name, drop_behavior }) => {
+                    builder = domains::drop_domains(
+                        builder,
+                        core::slice::from_ref(&name),
+                        if_exists,
+                        drop_behavior == Some(DropBehavior::Cascade),
+                        domains::DropSpelling::Domain,
+                    )?;
+                }
+                Statement::Drop {
+                    object_type: sqlparser::ast::ObjectType::Type,
+                    if_exists,
+                    names,
+                    cascade,
+                    ..
+                } => {
+                    builder = domains::drop_domains(
+                        builder,
+                        &names,
+                        if_exists,
+                        cascade,
+                        domains::DropSpelling::Type,
+                    )?;
                 }
                 Statement::CreateView(create_view) => {
                     let creator = Creator::session(&session_roles, &default_privileges);
@@ -8844,6 +8889,11 @@ impl ParserDB {
                                     (&new_schema_name, new_schema_quoted),
                                     builder.identifier_case(),
                                 );
+                                builder = domains::follow_schema_rename(
+                                    builder,
+                                    (&current_schema_name, current_schema_quoted),
+                                    (&new_schema_name, new_schema_quoted),
+                                )?;
                                 current_schema_name = new_schema_name;
                                 current_schema_quoted = new_schema_quoted;
                             }

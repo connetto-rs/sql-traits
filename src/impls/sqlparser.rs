@@ -4,6 +4,7 @@
 mod body_calls;
 mod check_constraint;
 mod column_def;
+mod create_domain;
 mod create_extension;
 mod create_function;
 mod create_index;
@@ -27,6 +28,7 @@ mod unique_constraint;
 mod view;
 
 pub(crate) use column_def::serial_sequence_type;
+pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub use dialect::SqlparserDialect;
 pub use grant::apply_revoke_to_grant;
 pub(crate) use grant::{

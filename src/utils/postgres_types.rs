@@ -6,8 +6,8 @@
 //! accepts for a builtin type (`INT`, `int4`, `integer`, `INT ARRAY`) denotes
 //! the same entry. A name the tables do not hold, an extension's or a schema's
 //! own type, is a type of its own in the user-defined category, equal only to
-//! itself and reached by no implicit cast. Domains are not modelled, so a
-//! domain is such a type rather than its base type.
+//! itself and reached by no implicit cast. These tables do not follow a
+//! domain to its base type, so a domain is such a type of its own.
 
 use alloc::{
     borrow::Cow,
@@ -497,6 +497,15 @@ fn serial_type(name: &str) -> Option<&'static str> {
         "bigserial" | "serial8" => Some("int8"),
         _ => None,
     }
+}
+
+/// Whether an unqualified type name, as PostgreSQL stores it, reaches a type
+/// of `pg_catalog`, which an unqualified name finds before any schema on the
+/// path that does not list `pg_catalog` itself. A `serial` spelling counts,
+/// since `CREATE TABLE` reads it before looking for a type of that name.
+pub(crate) fn names_catalog_type(name: &str) -> bool {
+    catalog_row(serial_type(name).unwrap_or(name)).is_some()
+        || name.strip_prefix('_').and_then(catalog_row).is_some()
 }
 
 /// Reads `name` as a type with the PostgreSQL dialect, refusing trailing text.

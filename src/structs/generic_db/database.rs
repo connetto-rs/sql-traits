@@ -36,6 +36,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type Trigger = P::Trigger;
     type Rule = P::Rule;
     type Extension = P::Extension;
+    type Domain = P::Domain;
     type Policy = P::Policy;
     type Role = P::Role;
     type RoleMembership = P::RoleMembership;
@@ -325,6 +326,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     #[inline]
     fn extensions(&self) -> impl Iterator<Item = &Self::Extension> {
         self.extensions.iter().map(|(extension, _)| extension.as_ref())
+    }
+
+    #[inline]
+    fn domains(&self) -> impl Iterator<Item = &Self::Domain> {
+        self.domains.iter().map(|(domain, _)| domain.as_ref())
     }
 
     #[inline]

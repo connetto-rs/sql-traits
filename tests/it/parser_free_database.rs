@@ -47,6 +47,7 @@ struct MemoryCatalog {
     triggers: Vec<MemoryTrigger>,
     rules: Vec<MemoryRule>,
     extensions: Vec<MemoryExtension>,
+    domains: Vec<MemoryDomain>,
     policies: Vec<MemoryPolicy>,
     roles: Vec<MemoryRole>,
     role_memberships: Vec<MemoryRoleMembership>,
@@ -168,6 +169,13 @@ struct MemoryExtension {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct MemoryDomain {
+    name: String,
+    schema: Option<String>,
+    data_type: MemoryDataType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryPolicy {
     name: String,
     table_name: String,
@@ -224,6 +232,7 @@ plain_metadata!(
     MemoryTrigger,
     MemoryRule,
     MemoryExtension,
+    MemoryDomain,
     MemoryPolicy,
     MemoryRole,
     MemoryRoleMembership,
@@ -246,6 +255,7 @@ impl DatabaseLike for MemoryCatalog {
     type Trigger = MemoryTrigger;
     type Rule = MemoryRule;
     type Extension = MemoryExtension;
+    type Domain = MemoryDomain;
     type Policy = MemoryPolicy;
     type Role = MemoryRole;
     type RoleMembership = MemoryRoleMembership;
@@ -295,6 +305,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn extensions(&self) -> impl Iterator<Item = &Self::Extension> {
         self.extensions.iter()
+    }
+
+    fn domains(&self) -> impl Iterator<Item = &Self::Domain> {
+        self.domains.iter()
     }
 
     fn indexes(&self) -> impl Iterator<Item = &Self::Index> {
@@ -1062,6 +1076,22 @@ impl ExtensionLike for MemoryExtension {
     }
 }
 
+impl DomainLike for MemoryDomain {
+    type DB = MemoryCatalog;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
+    fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db MemoryDataType {
+        &self.data_type
+    }
+}
+
 impl RuleLike for MemoryRule {
     type DB = MemoryCatalog;
 
@@ -1674,6 +1704,20 @@ fn extensions_without_quoting_records_store_folded_names() {
     assert_eq!(extension.stored_schema().as_deref(), Some("lab"));
 }
 
+/// A domain that keeps no quoting reads as unquoted, so its stored name and
+/// schema fold to lowercase.
+#[test]
+fn domains_without_quoting_records_store_folded_names() {
+    let domain = MemoryDomain {
+        name: String::from("Span"),
+        schema: Some(String::from("Units")),
+        data_type: MemoryDataType(String::from("interval")),
+    };
+
+    assert_eq!(domain.stored_name(), "span");
+    assert_eq!(domain.stored_schema().as_deref(), Some("units"));
+}
+
 /// A catalog that keeps no `NOT VALID` state reports every constraint
 /// validated.
 #[test]
@@ -2035,6 +2079,7 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
     assert_eq!(first_type.vector(&catalog), None);
     assert!(first_type.array_element(&catalog).is_none());
     assert_eq!(first_type.array_dimensions(&catalog), None);
+    assert!(first_type.base_type(&catalog).is_none());
 
     Ok(())
 }

@@ -39,3 +39,7 @@
 //!   MATERIALIZED VIEW ... WITH NO DATA` do not parse, and the parser accepts
 //!   `CREATE VIEW IF NOT EXISTS` and `CREATE OR REPLACE MATERIALIZED VIEW`,
 //!   both of which PostgreSQL refuses, so this crate refuses them itself.
+//! - `ALTER DOMAIN` does not parse, so a schema carrying one fails to parse,
+//!   and no domain is renamed or moved to another schema here. `DROP DOMAIN`
+//!   takes one name where PostgreSQL takes a list, and `CREATE DOMAIN` refuses
+//!   the `NOT NULL` and `NULL` constraints PostgreSQL accepts.

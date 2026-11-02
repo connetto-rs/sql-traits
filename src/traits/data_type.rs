@@ -170,6 +170,7 @@ pub trait DataTypeLike: Debug + Send + Sync {
 
     /// Returns the builtin scalar family of the type, or `None` for a type
     /// outside every family, such as an enumeration, a domain or an array.
+    /// The family of a domain's type is that of its [`Self::base_type`].
     ///
     /// # Example
     ///
@@ -545,6 +546,54 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// ```
     #[inline]
     fn array_dimensions(&self, _database: &Self::DB) -> Option<NonZeroU32> {
+        None
+    }
+
+    /// Returns the type a domain is defined over, followed through every
+    /// domain in between, or `None` for a type that names no domain.
+    ///
+    /// PostgreSQL compares, sorts and indexes a value of a domain as a value
+    /// of this base type, so a key over a domain over `interval` treats
+    /// `'1 day'` and `'24 hours'` as one value as an `interval` key does. The
+    /// base type answers every fact this trait answers for a column type. It
+    /// is never itself a domain, and it may be an array, whose
+    /// [`Self::array_element`] may name a domain in turn. An array of a domain
+    /// names no domain, so it answers `None` here while its element answers
+    /// the domain's base type.
+    ///
+    /// The default answers `None`, so an implementation over a backend with
+    /// domains must override it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::{prelude::*, utils::scalar_family::ScalarFamily};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE DOMAIN span AS interval;
+    /// CREATE DOMAIN short_span AS span;
+    /// CREATE TABLE t (took short_span, spans span[], n INT);
+    /// ",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let took = table.column("took", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// let spans = table.column("spans", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// let n = table.column("n", &db, IdentifierCase::AsWritten)?.unwrap();
+    ///
+    /// let base = took.data_type(&db).base_type(&db).unwrap();
+    /// assert_eq!(base.scalar_family(&db), Some(ScalarFamily::Interval));
+    /// let element = spans.data_type(&db).array_element(&db).unwrap();
+    /// assert_eq!(element.base_type(&db).unwrap().name(&db), "INTERVAL");
+    /// assert!(n.data_type(&db).base_type(&db).is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn base_type<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
         None
     }
 }

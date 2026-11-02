@@ -7,6 +7,7 @@ use core::num::NonZeroU32;
 use sqlparser::ast::{ArrayElemTypeDef, DataType, TypeModifier};
 
 use crate::{
+    impls::sqlparser::bound_domain,
     structs::ParserDB,
     traits::{DataTypeLike, DatabaseLike, ExtensionLike, IntervalFields, VectorKind, VectorType},
     utils::{
@@ -163,5 +164,25 @@ impl DataTypeLike for DataType {
             current = written_element(definition);
         }
         NonZeroU32::new(dimensions)
+    }
+
+    fn base_type<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self> {
+        let case = database.identifier_case();
+        let mut current = self;
+        let mut reached = None;
+        // A chain through every domain ends one step after the last of them,
+        // so a walk lasting longer has met a domain declared over a type of
+        // its own name, which PostgreSQL refuses and which reaches no base.
+        for _ in 0..=database.domains().count() {
+            let Self::Custom(name, _) = current else {
+                return reached;
+            };
+            let Some(domain) = bound_domain(database.domains(), name, case) else {
+                return reached;
+            };
+            current = &domain.data_type;
+            reached = Some(current);
+        }
+        None
     }
 }
