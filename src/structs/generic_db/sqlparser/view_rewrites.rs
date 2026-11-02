@@ -24,7 +24,7 @@ use super::{
     views::{relations_read_in, statements_read},
 };
 use crate::{
-    errors::Error,
+    errors::{Error, ObjectKind},
     impls::dql::{
         definition_graph::reference_sites::{QueryReferences, SiteOutcome, query_references},
         join_constraint, join_operator_constraint, query_output_names, wildcard_reshapes_output,
@@ -36,8 +36,8 @@ use crate::{
         last_str,
         object_name::{
             RelationKey, TEMPORARY_SCHEMA, overqualified_object_name, relation_name_is_claimed,
-            resolve_view_on_search_path_in_iter, stored_table_key, stored_view_key,
-            table_matches_key, target_key, target_name_from_object_name,
+            resolve_view_on_search_path_in_iter, stored_function_key, stored_table_key,
+            stored_view_key, table_matches_key, target_key, target_name_from_object_name,
             target_name_of_object_name, view_matches_key,
         },
         with_scopes::WithScopes,
@@ -254,6 +254,62 @@ pub(super) fn readers(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Optio
         return None;
     }
     Some(Readers { definitions, before: catalog_reads(builder, reads) })
+}
+
+/// The stored definitions among `readers` naming a column `columns` renames,
+/// each as the kind of object holding it and its key.
+///
+/// A definition names the column exactly when following the rename would
+/// respell it, and one the model cannot fully bind counts as naming it.
+pub(super) fn column_readers(
+    builder: &ParserDBBuilder,
+    readers: &Readers,
+    columns: &[Rename],
+) -> Vec<(ObjectKind, RelationKey)> {
+    let Readers { definitions, before } = readers;
+    definitions
+        .iter()
+        .filter_map(|definition| {
+            match definition {
+                Definition::Query { slot, query } => {
+                    let mut respelled = (**query).clone();
+                    let reads = match respell(&mut respelled, before, columns) {
+                        Some(_) => respelled != **query,
+                        None => shielded(query, columns) != **query,
+                    };
+                    reads.then(|| slot_reader(builder, *slot))
+                }
+                Definition::Statements { function, statements } => {
+                    let function_name =
+                        last_str(&builder.functions()[*function].0.name).to_string();
+                    let reads = respell_statements(statements, before, columns, &function_name)
+                        .map_or(true, |(rewritten, _)| rewritten != *statements);
+                    reads.then(|| slot_reader(builder, Slot::Function(*function)))
+                }
+            }
+        })
+        .collect()
+}
+
+/// The kind and key of the object a definition slot holds.
+fn slot_reader(builder: &ParserDBBuilder, slot: Slot) -> (ObjectKind, RelationKey) {
+    match slot {
+        Slot::Plain(position) => {
+            (ObjectKind::View, stored_view_key(builder.views()[position].0.as_ref(), CASE))
+        }
+        Slot::Materialized(position) => {
+            (
+                ObjectKind::MaterializedView,
+                stored_view_key(builder.materialized_views()[position].0.as_ref(), CASE),
+            )
+        }
+        Slot::Function(position) => {
+            (
+                ObjectKind::Function,
+                stored_function_key(builder.functions()[position].0.as_ref(), CASE),
+            )
+        }
+    }
 }
 
 /// How a block statement holds the query part it holds.
