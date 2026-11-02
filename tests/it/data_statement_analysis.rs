@@ -10,6 +10,8 @@ use sqlparser::{
     parser::Parser,
 };
 
+use crate::support::relation_labels::relation_label;
+
 const SCHEMA: &str = "
     CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL);
     CREATE TABLE orders (
@@ -55,16 +57,8 @@ fn referenced_relation_names<S: DataStatementLike<ParserDB>>(
     stmt.referenced_relations(db)
         .expect("referenced_relations succeeds")
         .iter()
-        .map(|relation| {
-            match relation {
-                Relation::Table(table) => format!("table {}", table.table_name()),
-                Relation::View(view) => format!("view {}", view.view_name()),
-                Relation::MaterializedView(view) => {
-                    format!("materialized view {}", view.view_name())
-                }
-                Relation::Sequence(sequence) => format!("sequence {}", sequence.sequence_name()),
-            }
-        })
+        .copied()
+        .map(relation_label)
         .collect()
 }
 
