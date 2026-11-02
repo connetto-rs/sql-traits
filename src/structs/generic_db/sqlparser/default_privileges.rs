@@ -705,7 +705,8 @@ impl DefaultPrivileges {
 
     /// The items a new object of `kind` in `schema`, created by `owner`,
     /// starts with, which are the global row or the built-in default widened
-    /// by the row of its schema.
+    /// by the row of its schema. PostgreSQL stores an empty merge as no list
+    /// at all, which reads as the built-in default.
     fn items(
         &self,
         owner: Option<&str>,
@@ -729,6 +730,9 @@ impl DefaultPrivileges {
             for item in &row.items {
                 merge(&mut items, item);
             }
+        }
+        if items.is_empty() {
+            return kind.start(false);
         }
         items
     }

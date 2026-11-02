@@ -807,3 +807,40 @@ fn revoking_only_the_grant_option_keeps_the_privilege() {
     assert!(can_execute(&db, "f", "anon"));
     assert_eq!(function(&db, "f").can_grant_execute(role(&db, "anon"), &db), Ok(false));
 }
+
+/// A default revoking everything leaves an empty list, which PostgreSQL
+/// stores as no list at all, so the object takes the built-in privileges.
+#[test]
+fn a_default_revoking_everything_falls_back_to_the_builtin_privileges() {
+    let db = parse(
+        "CREATE ROLE r;
+         ALTER DEFAULT PRIVILEGES FOR ROLE r REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC, r;
+         ALTER DEFAULT PRIVILEGES FOR ROLE r REVOKE ALL ON TABLES FROM r;
+         SET ROLE r;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE TABLE t (id INT);",
+    )
+    .expect("schema parses");
+
+    assert!(executable_by_public(&db, "f"));
+    assert!(can_execute(&db, "f", "r"));
+    assert_eq!(table(&db, "t").can_delete(role(&db, "r"), &db), Ok(true));
+}
+
+/// An empty global default still gives way to a schema's, which then stands
+/// alone.
+#[test]
+fn an_empty_global_default_leaves_the_schema_default_alone() {
+    let db = parse(
+        "CREATE ROLE r; CREATE ROLE reader;
+         ALTER DEFAULT PRIVILEGES FOR ROLE r REVOKE ALL ON TABLES FROM r;
+         ALTER DEFAULT PRIVILEGES FOR ROLE r IN SCHEMA public GRANT SELECT ON TABLES TO reader;
+         SET ROLE r;
+         CREATE TABLE t (id INT);",
+    )
+    .expect("schema parses");
+    let t = table(&db, "t");
+
+    assert_eq!(t.can_select(role(&db, "reader"), &db), Ok(true));
+    assert_eq!(t.can_select(role(&db, "r"), &db), Ok(false));
+}
