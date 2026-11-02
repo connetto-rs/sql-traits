@@ -1,7 +1,6 @@
-// A global allocator that counts the allocations of the thread asking, for the
-// test binaries that pin allocation behaviour. Included textually, since a
-// global allocator is per binary, so it names every path in full and leaves the
-// including file's imports alone.
+//! The test binary's global allocator, which counts the allocations of the
+//! thread asking so the modules that pin allocation behaviour can measure their
+//! own thread alone.
 
 struct CountingAllocator;
 
@@ -20,8 +19,17 @@ fn record_allocation() {
 }
 
 /// Allocations the current thread has asked for so far.
-fn allocations() -> usize {
+pub(crate) fn allocations() -> usize {
     ALLOCATIONS.with(core::cell::Cell::get)
+}
+
+/// Runs `body` and answers how many times it allocated.
+pub(crate) fn allocations_of<T>(body: impl FnOnce() -> T) -> usize {
+    let before = allocations();
+    let answer = body();
+    let counted = allocations() - before;
+    drop(answer);
+    counted
 }
 
 // SAFETY: The wrapper preserves `System` allocation contracts and adds
@@ -47,12 +55,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
         unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
     }
 
-    unsafe fn realloc(
-        &self,
-        ptr: *mut u8,
-        layout: std::alloc::Layout,
-        new_size: usize,
-    ) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         record_allocation();
         // SAFETY: The caller provides the reallocation contract required by
         // `System`.

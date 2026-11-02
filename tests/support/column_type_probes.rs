@@ -1,13 +1,14 @@
-// The declared column types and the schema fingerprint of a one-table
-// database built from `ddl`. Included textually, so it names every sqlparser
-// path in full and leaves the including file's imports alone.
+//! The declared column types and the schema fingerprint of a one-table
+//! database built from `ddl`.
+#![expect(clippy::expect_used, reason = "a test helper fails loudly on a broken premise")]
+
+use sql_traits::prelude::*;
+use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
 /// Builds a one-table database from `ddl` and returns the declared type of
 /// every one of its columns, in declaration order.
-fn column_types(ddl: &str) -> Vec<String> {
-    let statements =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, ddl)
-            .expect("SQL parses");
+pub(crate) fn column_types(ddl: &str) -> Vec<String> {
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, ddl).expect("SQL parses");
     let database =
         ParserDB::from_statements(statements, "test".to_string()).expect("schema builds");
     let table = database.tables().next().expect("input declares a table");
@@ -20,10 +21,8 @@ fn column_types(ddl: &str) -> Vec<String> {
 }
 
 /// Builds a one-table database from `ddl` and answers its schema fingerprint.
-fn fingerprint(ddl: &str) -> SchemaFingerprint {
-    let statements =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, ddl)
-            .expect("parses");
+pub(crate) fn fingerprint(ddl: &str) -> SchemaFingerprint {
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, ddl).expect("parses");
     let database =
         ParserDB::from_statements(statements, "test".to_string()).expect("schema builds");
     let table = database.tables().next().expect("input declares a table");

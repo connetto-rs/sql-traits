@@ -171,7 +171,7 @@ const REJECTED_CASES: &[ScalarFamilyCase] = &[
     ("TIMESTAMP WITH LOCAL TIME ZONE", None),
 ];
 
-fn all_scalar_family_cases() -> impl Iterator<Item = ScalarFamilyCase> {
+pub(crate) fn all_scalar_family_cases() -> impl Iterator<Item = ScalarFamilyCase> {
     FAMILY_CASES
         .iter()
         .chain(DECORATED_CASES.iter())

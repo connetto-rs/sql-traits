@@ -6,7 +6,8 @@
 
 use sql_traits::{prelude::*, traits::grant::GrantTarget};
 use sqlparser::dialect::PostgreSqlDialect;
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/table_lookup.rs"));
+
+use crate::support::table_lookup::table;
 
 fn parse(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")

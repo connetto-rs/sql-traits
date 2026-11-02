@@ -11,7 +11,8 @@ use sqlparser::{
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/query_parsing.rs"));
+
+use crate::support::query_parsing::query_with;
 
 const SCHEMA: &str = "
     CREATE TABLE halves(h halfvec(3));

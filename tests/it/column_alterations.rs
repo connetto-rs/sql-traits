@@ -16,7 +16,8 @@ use sql_traits::{
     prelude::*,
 };
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/column_names.rs"));
+
+use crate::support::column_names::column_names;
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)

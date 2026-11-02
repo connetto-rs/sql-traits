@@ -19,7 +19,7 @@ fn volatility<DB: DatabaseLike>(database: &DB, name: &str) -> FunctionBehavior {
         .volatility()
 }
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/function_overloads.rs"));
+use crate::support::function_overloads::overload;
 
 #[test]
 fn declarations_expose_effective_volatility_to_generic_consumers() {

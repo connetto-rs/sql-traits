@@ -11,16 +11,7 @@
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::PostgreSqlDialect;
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/counting_allocator.rs"));
-
-/// Runs `body` and answers how many times it allocated.
-fn allocations_of<T>(body: impl FnOnce() -> T) -> usize {
-    let before = allocations();
-    let answer = body();
-    let counted = allocations() - before;
-    drop(answer);
-    counted
-}
+use crate::support::counting_allocator::allocations_of;
 
 #[test]
 fn the_key_ordinal_cost_does_not_grow_with_the_key_width() -> Result<(), Error> {

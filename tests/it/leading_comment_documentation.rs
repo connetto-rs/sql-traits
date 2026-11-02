@@ -10,7 +10,8 @@ use sqlparser::{
     },
     parser::Parser,
 };
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/table_lookup.rs"));
+
+use crate::support::table_lookup::table;
 
 fn table_doc<'db>(db: &'db ParserDB, schema: Option<&str>, name: &str) -> Option<&'db str> {
     table(db, schema, name).table_doc(db).expect("the table is in this database")

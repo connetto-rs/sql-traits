@@ -17,16 +17,7 @@ use sql_traits::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/counting_allocator.rs"));
-
-/// Runs `body` and answers how many times it allocated.
-fn allocations_of<T>(body: impl FnOnce() -> T) -> usize {
-    let before = allocations();
-    let answer = body();
-    let counted = allocations() - before;
-    drop(answer);
-    counted
-}
+use crate::support::counting_allocator::allocations_of;
 
 /// Resolves the qualified collation of a column, owned so the catalog and the
 /// SQL text behind it are gone by the time the name is read.
