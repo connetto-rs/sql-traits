@@ -6399,6 +6399,70 @@ impl ParserDB {
         Ok(builder)
     }
 
+    /// The views, materialized views, bound function bodies and rules naming
+    /// `column` of any of `tables`.
+    fn column_readers(
+        builder: &ParserDBBuilder,
+        tables: &[&StoredTable],
+        column: &NamedColumn,
+    ) -> Result<Vec<views::Dependent>, crate::errors::Error> {
+        // A zero-length quoted name is one no definition can hold.
+        let probe = Ident::with_quote('"', "");
+        let mut probes = Vec::with_capacity(tables.len());
+        for table in tables {
+            probes.extend(column_rename(Self::stored_node(builder, table)?, column, &probe));
+        }
+        let keys: Vec<&RelationKey> = probes.iter().map(view_rewrites::Rename::key).collect();
+        Ok(view_rewrites::readers(builder, &keys)
+            .map(|readers| view_rewrites::column_readers(builder, &readers, &probes))
+            .unwrap_or_default())
+    }
+
+    /// Refuses changing the type of a column of `stored`, or of a table
+    /// inheriting it, that something outside the table reads, which
+    /// PostgreSQL refuses with no `CASCADE` form.
+    fn refuse_type_change_under_dependents(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        scope: AlterTableScope,
+        column: &NamedColumn,
+    ) -> Result<(), crate::errors::Error> {
+        let inheritors =
+            if scope.only { Vec::new() } else { inheritance::descendants(builder, stored) };
+        let tables: Vec<&StoredTable> = core::iter::once(stored).chain(&inheritors).collect();
+        let blocked = |dependent_kind, dependent_name: &str| {
+            crate::errors::Error::ColumnTypeChangeBlocked {
+                table_name: stored.name.clone(),
+                column_name: column.name.clone(),
+                dependent_kind,
+                dependent_name: dependent_name.to_string(),
+            }
+        };
+        if let Some(reader) = Self::column_readers(builder, &tables, column)?.first() {
+            return Err(blocked(reader.kind(), reader.name()));
+        }
+        for table in tables {
+            let declaring = tables_declaring_column(builder, table, column);
+            if let Some((policy, _)) = builder.policies().iter().find(|(policy, _)| {
+                table.named_by(&policy.table_name)
+                    && column.in_expressions(policy.as_ref(), table, &declaring)
+            }) {
+                return Err(blocked(ObjectKind::Policy, &policy.name.value));
+            }
+            if let Some((trigger, ())) = builder.triggers().iter().find(|(trigger, ())| {
+                table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column)
+            }) {
+                return Err(blocked(ObjectKind::Trigger, last_str(&trigger.name)));
+            }
+            if let Some((rule, ())) = builder.rules().iter().find(|(rule, ())| {
+                table.named_by(&rule.table_name) && rules::reads_row_column(rule, column)
+            }) {
+                return Err(blocked(ObjectKind::Rule, &rule.name.value));
+            }
+        }
+        Ok(())
+    }
+
     /// Drops columns from a table, taking with them what the real database
     /// takes: the indexes and constraints on the table itself go along with the
     /// column, and anything outside the table calls for `CASCADE`.
@@ -6452,16 +6516,8 @@ impl ParserDB {
             // anything moves.
             let declaring = tables_declaring_column(&builder, &stored, &column);
 
-            // A zero-length quoted name is one no definition can hold.
-            let probe = Ident::with_quote('"', "");
-            let mut probes = Vec::with_capacity(inheritors.len() + 1);
-            for table in core::iter::once(&stored).chain(&inheritors) {
-                probes.extend(column_rename(Self::stored_node(&builder, table)?, &column, &probe));
-            }
-            let keys: Vec<&RelationKey> = probes.iter().map(view_rewrites::Rename::key).collect();
-            let readers = view_rewrites::readers(&builder, &keys)
-                .map(|readers| view_rewrites::column_readers(&builder, &readers, &probes))
-                .unwrap_or_default();
+            let tables: Vec<&StoredTable> = core::iter::once(&stored).chain(&inheritors).collect();
+            let readers = Self::column_readers(&builder, &tables, &column)?;
 
             if !cascade
                 && (!readers.is_empty()
@@ -6725,6 +6781,9 @@ impl ParserDB {
             let column = NamedColumn::of(column_name, builder.identifier_case());
             if column.declared_by(node) {
                 Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;
+                if matches!(operation, AlterColumnOperation::SetDataType { .. }) {
+                    Self::refuse_type_change_under_dependents(&builder, &stored, scope, &column)?;
+                }
             }
             let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
             if let AlterColumnOperation::SetDefault { value } = &mut operation {
