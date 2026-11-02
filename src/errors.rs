@@ -476,6 +476,13 @@ pub enum RowSecurityError {
         /// The entry, as written.
         role: String,
     },
+    /// A policy gating the statement is scoped to a role, and the caller holds
+    /// none.
+    #[error("policy `{policy}` is scoped to a role, and the caller holds none")]
+    RoleRequired {
+        /// The policy.
+        policy: String,
+    },
     /// A plain view the policies read runs its reads as its owner, and the
     /// schema never names the owner.
     #[error("the policies read view `{view}`, whose owner the schema does not name")]

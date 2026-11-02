@@ -6,7 +6,7 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
-        ColumnDefinition, ColumnScope, IdentifierCase, RowSecurity, RowStatement,
+        ActingRole, ColumnDefinition, ColumnScope, IdentifierCase, RowSecurity, RowStatement,
         SchemaFingerprint,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
@@ -4394,17 +4394,20 @@ pub trait TableLike:
     /// `role` runs it, as PostgreSQL's table "Policies Applied by Command
     /// Type" in `CREATE POLICY` lays it out.
     ///
-    /// A policy applies when its `TO` list reaches `role` through inheriting
-    /// memberships. An owner the schema never names is taken to be a role
-    /// other than `role`. Where expanding the applied policies loops back into
-    /// a table still being expanded, the answer is
+    /// `role` is a declared role, or [`ActingRole::Public`] for a caller
+    /// holding none. A policy applies when its `TO` list reaches `role` through
+    /// inheriting memberships. An owner the schema never names is taken to be
+    /// a role other than `role`. Where expanding the applied policies loops
+    /// back into a table still being expanded, the answer is
     /// [`RowSecurity::InfiniteRecursion`], as PostgreSQL refuses the statement.
     ///
     /// # Errors
     ///
     /// Returns [`RowSecurityError::Lookup`] when the table is not in
-    /// `database`, [`RowSecurityError::UnsettledRole`] when a policy's `TO`
-    /// list cannot be settled for `role` from the schema, and
+    /// `database`, [`RowSecurityError::RoleRequired`] when a policy gating the
+    /// statement is scoped to a role and `role` is [`ActingRole::Public`],
+    /// [`RowSecurityError::UnsettledRole`] when a policy's `TO` list cannot be
+    /// settled for `role` from the schema, and
     /// [`RowSecurityError::UnsettledViewOwner`] when the policies read a plain
     /// view whose owner the schema does not name.
     ///
@@ -4440,13 +4443,13 @@ pub trait TableLike:
     fn row_security<'db>(
         &'db self,
         statement: RowStatement,
-        role: &'db <Self::DB as DatabaseLike>::Role,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
         database: &'db Self::DB,
     ) -> Result<RowSecurity<'db, <Self::DB as DatabaseLike>::Policy>, RowSecurityError>
     where
         Self: 'db,
     {
-        crate::traits::row_security::row_security(self, statement, role, database)
+        crate::traits::row_security::row_security(self, statement, &role.into(), database)
     }
 
     /// Returns an iterator over the grants that apply to this table.

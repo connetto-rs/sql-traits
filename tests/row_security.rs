@@ -364,3 +364,37 @@ fn a_table_whose_owner_is_never_named_binds_every_declared_role() {
     let security = security(&database, "reader", RowStatement::Select).expect("settled");
     assert_eq!(security.exemption(), None);
 }
+
+/// A caller known only as `PUBLIC`, as a translation given no role is, holds
+/// no role, owns nothing and bypasses nothing.
+#[test]
+fn a_caller_holding_no_role_gets_the_public_policies_and_refuses_a_scoped_one() {
+    let database = parse(
+        "CREATE ROLE owner_r NOLOGIN;
+         CREATE ROLE staff NOLOGIN;
+         CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL);
+         ALTER TABLE t OWNER TO owner_r;
+         ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY open ON t FOR SELECT USING (v = 1);
+         CREATE POLICY staff_writes ON t FOR UPDATE TO staff USING (true);",
+    );
+    let t = table(&database, "t");
+    let security =
+        t.row_security(RowStatement::Select, ActingRole::Public, &database).expect("settled");
+    let gate = &security.gates().expect("a caller holding no role is not exempt")[0];
+    let permissive: Vec<String> =
+        gate.permissive().iter().map(|term| term.expression().to_string()).collect();
+    assert_eq!(permissive, ["v = 1"]);
+
+    assert_eq!(
+        t.row_security(RowStatement::Update { reads: false }, ActingRole::Public, &database)
+            .map(|_| ()),
+        Err(RowSecurityError::RoleRequired { policy: "staff_writes".into() })
+    );
+
+    let disabled = parse("CREATE TABLE t (id int PRIMARY KEY);");
+    let security = table(&disabled, "t")
+        .row_security(RowStatement::Select, ActingRole::Public, &disabled)
+        .expect("settled");
+    assert_eq!(security.exemption(), Some(RowSecurityExemption::Disabled));
+}
