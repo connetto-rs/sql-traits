@@ -26,6 +26,7 @@ mod constraint_validation;
 mod creation_identifier_case;
 mod data_statement_analysis;
 mod declared_type_names;
+mod default_privileges;
 mod deployment;
 mod descendant_drops;
 mod dropped_policies;

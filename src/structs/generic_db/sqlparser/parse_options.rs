@@ -68,6 +68,7 @@ pub struct ParseOptions {
     access_resolution: AccessResolution,
     postgres_catalog: PostgresCatalog,
     identifier_case: IdentifierCase,
+    session_role: Option<String>,
 }
 
 impl Default for ParseOptions {
@@ -76,6 +77,7 @@ impl Default for ParseOptions {
             access_resolution: AccessResolution::ClosedWorld,
             postgres_catalog: PostgresCatalog::default(),
             identifier_case: IdentifierCase::AsWritten,
+            session_role: None,
         }
     }
 }
@@ -133,6 +135,41 @@ impl ParseOptions {
         self
     }
 
+    /// Sets the role the input runs as, by the name it is stored under.
+    ///
+    /// Migrations are applied as a role no statement names, so this states
+    /// it. Every object created before a `SET ROLE` or `SET SESSION
+    /// AUTHORIZATION` moves away from it is owned by this role and takes the
+    /// defaults `ALTER DEFAULT PRIVILEGES FOR ROLE` gives it, and
+    /// `RESET SESSION AUTHORIZATION` comes back to it. Without one, that role
+    /// is unnamed and what it creates has no owner.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let sql = "CREATE ROLE postgres;
+    ///            CREATE ROLE anon;
+    ///            ALTER DEFAULT PRIVILEGES FOR ROLE postgres GRANT SELECT ON TABLES TO anon;
+    ///            CREATE TABLE docs (id INT);";
+    ///
+    /// let db =
+    ///     ParseOptions::default().with_session_role("postgres").parse::<PostgreSqlDialect>(sql)?;
+    /// let docs =
+    ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
+    /// assert_eq!(docs.owner(&db)?, Some("postgres"));
+    /// assert_eq!(docs.can_select(db.role("anon").unwrap(), &db), Ok(true));
+    /// # Ok::<(), Box<dyn core::error::Error>>(())
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn with_session_role(mut self, role: impl Into<String>) -> Self {
+        self.session_role = Some(role.into());
+        self
+    }
+
     /// Returns the comparison a creation takes a name under.
     #[must_use]
     #[inline]
@@ -155,8 +192,10 @@ impl ParseOptions {
     }
 
     /// Returns the owned settings used during ingestion.
-    pub(super) fn into_parts(self) -> (AccessResolution, PostgresCatalog, IdentifierCase) {
-        (self.access_resolution, self.postgres_catalog, self.identifier_case)
+    pub(super) fn into_parts(
+        self,
+    ) -> (AccessResolution, PostgresCatalog, IdentifierCase, Option<String>) {
+        (self.access_resolution, self.postgres_catalog, self.identifier_case, self.session_role)
     }
 
     /// Starts statement-by-statement ingestion under these options.

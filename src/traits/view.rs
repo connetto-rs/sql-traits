@@ -324,9 +324,11 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// the relations underneath against unless the view
     /// [runs with its reader's rights](Self::is_security_invoker).
     ///
-    /// Only `ALTER VIEW` or `ALTER TABLE ... OWNER TO <role>` names an owner.
-    /// A view no such statement altered has none, and neither has one handed
-    /// to `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`, which name whoever
+    /// The owner is the role the view was created under, as `SET ROLE` and
+    /// `SET SESSION AUTHORIZATION` leave it, until `ALTER VIEW` or `ALTER
+    /// TABLE ... OWNER TO <role>` hands it to another. A view created while the
+    /// input had set no role has none, and neither has one handed to
+    /// `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`, which name whoever
     /// runs the statement rather than a role the input declares. A
     /// replacement keeps the owner.
     ///
@@ -352,13 +354,17 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE ROLE app_owner;
+    ///      CREATE ROLE app_writer;
     ///      CREATE TABLE docs (id INT);
     ///      CREATE VIEW owned AS SELECT id FROM docs;
     ///      CREATE VIEW unowned AS SELECT id FROM docs;
-    ///      ALTER TABLE owned OWNER TO app_owner;",
+    ///      ALTER TABLE owned OWNER TO app_owner;
+    ///      SET ROLE app_writer;
+    ///      CREATE VIEW written AS SELECT id FROM docs;",
     /// )?;
     /// let view = |name| db.view_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
     /// assert_eq!(view("owned")?.expect("recorded").owner(&db)?, Some("app_owner"));
+    /// assert_eq!(view("written")?.expect("recorded").owner(&db)?, Some("app_writer"));
     /// assert_eq!(view("unowned")?.expect("recorded").owner(&db)?, None);
     /// # Ok(())
     /// # }

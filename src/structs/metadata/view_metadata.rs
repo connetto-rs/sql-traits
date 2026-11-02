@@ -6,7 +6,7 @@ use alloc::string::String;
 /// Metadata about a database view.
 ///
 /// Holds what the input says about a view that the view's own declaration
-/// cannot carry, which today is the role a later statement hands it to.
+/// cannot carry, which is the role owning it.
 pub struct ViewMetadata {
     /// The role the input names as the view's owner, if it names one.
     owner: Option<String>,

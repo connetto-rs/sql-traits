@@ -48,9 +48,9 @@ use sqlparser::{
 };
 
 use super::{
-    ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, object_name_last_identifier,
-    object_name_matches_resolved_identity, place_relation, relation_name_holder,
-    require_named_in_catalog, schema_qualifiers_match, views,
+    Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable,
+    object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
+    relation_name_holder, require_named_in_catalog, schema_qualifiers_match, stored_ident, views,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -69,7 +69,8 @@ use crate::{
     },
 };
 
-/// Records a `CREATE SEQUENCE`.
+/// Records a `CREATE SEQUENCE`, under the defaults of the role `creator`
+/// names.
 ///
 /// # Errors
 ///
@@ -83,6 +84,7 @@ pub(super) fn create_sequence(
     if_not_exists: bool,
     mut name: ObjectName,
     options: Vec<SequenceOptions>,
+    creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, ObjectKind::Sequence, builder.catalog_name())?;
     place_relation(&builder, &mut name, temporary, ObjectKind::Sequence)?;
@@ -122,7 +124,8 @@ pub(super) fn create_sequence(
         owner,
         SequenceOrigin::Declared,
     );
-    Ok(builder.add_sequence(Arc::new(sequence), ()))
+    let builder = builder.add_sequence(Arc::new(sequence), ());
+    Ok(creator.grant(builder, DefaultKind::Sequences, &GrantObjects::Sequences(vec![name])))
 }
 
 /// Resolves the column an `OWNED BY` names, through the search path, into the
@@ -535,8 +538,8 @@ pub(super) fn spell_out_planned_serial(
 pub(super) struct UnownedSequences(Vec<(Ident, *const Sequence)>);
 
 /// Records the sequences [`plan_column_sequences`] named, before the columns
-/// they serve land, handing each back beside its column for
-/// [`own_column_sequences`].
+/// they serve land, under the defaults of the role `creator` names, handing
+/// each back beside its column for [`own_column_sequences`].
 ///
 /// # Errors
 ///
@@ -546,6 +549,7 @@ pub(super) fn create_column_sequences(
     mut builder: ParserDBBuilder,
     table: &StoredTable,
     planned: Vec<ColumnSequence>,
+    creator: Creator<'_>,
 ) -> Result<(ParserDBBuilder, UnownedSequences), Error> {
     let schema = table.schema.as_ref().map(|schema| (schema.clone(), table.schema_quoted));
     let mut created = Vec::with_capacity(planned.len());
@@ -561,10 +565,19 @@ pub(super) fn create_column_sequences(
             });
         }
         let quoted = normalize_identifier(&name, false) != name.as_str();
+        let granted = ObjectName::from(
+            schema
+                .iter()
+                .map(|(schema, quoted)| stored_ident(schema, *quoted))
+                .chain([stored_ident(&name, quoted)])
+                .collect::<Vec<_>>(),
+        );
         let sequence =
             Arc::new(Sequence::new((name, quoted), schema.clone(), options, None, origin));
         created.push((column, Arc::as_ptr(&sequence)));
         builder = builder.add_sequence(sequence, ());
+        builder =
+            creator.grant(builder, DefaultKind::Sequences, &GrantObjects::Sequences(vec![granted]));
     }
     Ok((builder, UnownedSequences(created)))
 }

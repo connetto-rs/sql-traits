@@ -70,7 +70,9 @@ pub trait SchemaLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
     /// Returns the authorization owner of the schema, if specified.
     ///
     /// In PostgreSQL, schemas can have an owner specified via the
-    /// `AUTHORIZATION` clause.
+    /// `AUTHORIZATION` clause. Without one the schema belongs to the role it
+    /// was created under, as `SET ROLE` and `SET SESSION AUTHORIZATION` leave
+    /// it, and to none when the input had set no role.
     ///
     /// # Example
     ///
