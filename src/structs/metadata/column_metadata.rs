@@ -1,7 +1,10 @@
 //! Column metadata that parsed DDL keeps outside the column node.
 
-use alloc::string::String;
+use alloc::{string::String, sync::Arc};
 
+use sqlparser::ast::CreateFunction;
+
+use super::ExpressionCalls;
 use crate::traits::MySqlCollationPadding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +20,7 @@ pub struct ColumnMetadata {
     postgres_collation: Option<ResolvedCollation>,
     mysql_padding: Option<MySqlCollationPadding>,
     documentation: Option<String>,
+    calls: ExpressionCalls<CreateFunction>,
 }
 
 impl ColumnMetadata {
@@ -80,5 +84,26 @@ impl ColumnMetadata {
     #[must_use]
     pub fn documentation(&self) -> Option<&str> {
         self.documentation.as_deref()
+    }
+
+    /// Stores the calls the column's declaration makes, its default and
+    /// generation expression among them.
+    pub(crate) fn with_calls(mut self, calls: ExpressionCalls<CreateFunction>) -> Self {
+        self.calls = calls;
+        self
+    }
+
+    /// Returns the calls the column's declaration makes.
+    pub(crate) fn calls(&self) -> &ExpressionCalls<CreateFunction> {
+        &self.calls
+    }
+
+    /// Re-points every call reaching the function node `stale` at `fresh`.
+    pub(crate) fn replace_function(
+        &mut self,
+        stale: &Arc<CreateFunction>,
+        fresh: &Arc<CreateFunction>,
+    ) {
+        self.calls.replace_function(stale, fresh);
     }
 }

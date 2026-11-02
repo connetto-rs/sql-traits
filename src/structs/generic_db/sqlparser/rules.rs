@@ -118,7 +118,7 @@ pub(super) fn create_rule(
     function_bodies::bind_rule_parts(&builder, statements, rule.condition.as_mut(), missing)?;
 
     let case = builder.identifier_case();
-    let existing = builder.rules().iter().position(|(existing, ())| {
+    let existing = builder.rules().iter().position(|(existing, _)| {
         case_idents_match(&existing.name, &rule.name, case)
             && target_tables_match(&existing.table_name, &rule.table_name, case)
     });
@@ -135,7 +135,8 @@ pub(super) fn create_rule(
         (None, _) => {}
     }
 
-    Ok(builder.add_rule(Arc::new(rule), ()))
+    let calls = builder.calls_in(&rule);
+    Ok(builder.add_rule(Arc::new(rule), calls))
 }
 
 /// The statements a rule's action holds, which is empty for `DO NOTHING`.
@@ -235,7 +236,7 @@ impl RuleHost {
 
 /// Drops the rules defined on a relation that is going away.
 pub(super) fn drop_rules_on(builder: &mut ParserDBBuilder, host: &RuleHost) {
-    builder.rules_mut().retain(|(rule, ())| !host.carries(rule));
+    builder.rules_mut().retain(|(rule, _)| !host.carries(rule));
 }
 
 /// Points the rules on a renamed or moved relation at its stored name
@@ -245,7 +246,7 @@ pub(super) fn follow_relation_rename(
     host: &RuleHost,
     new_name: &ObjectName,
 ) {
-    for (rule, ()) in builder.rules_mut() {
+    for (rule, _) in builder.rules_mut() {
         if host.carries(rule) {
             Arc::make_mut(rule).table_name = new_name.clone();
         }
@@ -261,7 +262,7 @@ pub(super) fn follow_column_rename(
     to: &Ident,
 ) {
     let from = NamedColumn::of(from, builder.identifier_case());
-    for (rule, ()) in builder.rules_mut() {
+    for (rule, _) in builder.rules_mut() {
         if host.carries(rule) {
             rename_row_column(Arc::make_mut(rule), &from, to);
         }

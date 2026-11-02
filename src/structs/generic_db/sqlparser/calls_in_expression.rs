@@ -42,17 +42,66 @@ impl CallScope<'_> {
     }
 }
 
-/// Resolves every call in `node`, subqueries included, under `scope`.
+/// Resolves every call in `node`, subqueries included, under `scope`, except
+/// a call `carried` holds a binding for, which keeps that binding.
 pub(super) fn calls_in<N: Visit + ?Sized>(
     node: &N,
     scope: &CallScope<'_>,
+    carried: &mut CarriedCalls,
 ) -> ExpressionCalls<CreateFunction> {
     let mut sites = Vec::new();
     let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
-        sites.push(scope.reached_by(call.name, call.arguments).cloned().collect());
+        sites.push(
+            carried
+                .take(call.name, call.arguments)
+                .unwrap_or_else(|| scope.reached_by(call.name, call.arguments).cloned().collect()),
+        );
         ControlFlow::Continue(())
     });
     ExpressionCalls::new(sites)
+}
+
+/// The bindings the calls of a table's derived objects held before the table
+/// was rebuilt.
+///
+/// PostgreSQL binds a call once, when it is written, so a call a rebuild
+/// leaves written as it was keeps its function whatever search path the
+/// rebuilding statement runs under. Each recorded binding is taken once, by
+/// the first call written with the same name and argument count.
+#[derive(Default)]
+pub(super) struct CarriedCalls {
+    /// Each call's written name and argument count, with the functions it
+    /// was bound to.
+    sites: Vec<(ObjectName, usize, Vec<Arc<CreateFunction>>)>,
+}
+
+impl CarriedCalls {
+    /// Records the bindings `calls` holds for the calls of `node`, the node
+    /// they were resolved from.
+    pub(super) fn record<N: Visit + ?Sized>(
+        &mut self,
+        node: &N,
+        calls: &ExpressionCalls<CreateFunction>,
+    ) {
+        let mut bound = calls.sites().iter();
+        let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
+            let site = bound
+                .next()
+                .map(|functions| (call.name.clone(), call.arguments, functions.clone()));
+            self.sites.extend(site);
+            ControlFlow::Continue(())
+        });
+    }
+
+    /// Takes the first recorded binding of a call written `name` passing
+    /// `arguments` arguments.
+    fn take(&mut self, name: &ObjectName, arguments: usize) -> Option<Vec<Arc<CreateFunction>>> {
+        let position = self
+            .sites
+            .iter()
+            .position(|(recorded, count, _)| *count == arguments && recorded == name)?;
+        Some(self.sites.remove(position).2)
+    }
 }
 
 #[cfg(test)]
@@ -299,7 +348,7 @@ mod tests {
 
     /// The names of the functions the calls in `expression` reach, each once.
     fn reached_names(expression: &Expr, scope: &super::CallScope<'_>) -> Vec<String> {
-        let calls = super::calls_in(expression, scope);
+        let calls = super::calls_in(expression, scope, &mut super::CarriedCalls::default());
         calls.functions().map(|function| function.name().to_owned()).collect()
     }
 

@@ -127,3 +127,119 @@ fn a_trigger_reports_the_function_it_runs() {
     let trigger = spelled_public.triggers().next().expect("the trigger exists");
     assert!(trigger.function(&spelled_public).is_some(), "public.f is the f a bare name reaches");
 }
+
+/// The functions `f` and `trg` and the table `t` every dependent below is
+/// written against.
+const CALLED: &str = "CREATE FUNCTION f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+     CREATE FUNCTION trg() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+     CREATE TABLE t (a INT);";
+
+/// A statement writing a call to `f` into each object PostgreSQL binds the
+/// call of at creation.
+const DEPENDENTS: [&str; 13] = [
+    "CREATE TABLE d (a INT DEFAULT f());",
+    "CREATE TABLE d (a INT GENERATED ALWAYS AS (f()) STORED);",
+    "ALTER TABLE t ALTER COLUMN a SET DEFAULT f();",
+    "ALTER TABLE t ADD COLUMN b INT DEFAULT f();",
+    "CREATE INDEX i ON t ((f() + a));",
+    "CREATE INDEX i ON t (a) WHERE f() > 0;",
+    "CREATE VIEW v AS SELECT f() AS one;",
+    "CREATE MATERIALIZED VIEW v AS SELECT f() AS one;",
+    "CREATE RULE r AS ON INSERT TO t WHERE f() > 0 DO INSTEAD NOTHING;",
+    "CREATE RULE r AS ON INSERT TO t DO INSTEAD SELECT f();",
+    "CREATE DOMAIN d AS INT CHECK (VALUE > f());",
+    "CREATE DOMAIN d AS INT DEFAULT f();",
+    "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN (f() > 0) EXECUTE FUNCTION trg();",
+];
+
+/// Each object a call is bound into holds the function, so dropping it is
+/// refused while the object remains.
+#[test]
+fn every_bound_call_holds_its_function() {
+    for dependent in DEPENDENTS {
+        parse(&format!("{CALLED} {dependent}")).expect(dependent);
+        let result = parse(&format!("{CALLED} {dependent} DROP FUNCTION f();"));
+        assert!(
+            matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "f"),
+            "{dependent} got {result:?}"
+        );
+    }
+}
+
+/// Replacing or altering the function keeps it the one each object calls.
+#[test]
+fn a_replaced_function_stays_held() {
+    for dependent in DEPENDENTS {
+        for change in [
+            "CREATE OR REPLACE FUNCTION f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 2';",
+            "ALTER FUNCTION f() STABLE;",
+        ] {
+            let result = parse(&format!("{CALLED} {dependent} {change} DROP FUNCTION f();"));
+            assert!(
+                matches!(&result, Err(Error::FunctionReferenced { .. })),
+                "{dependent} {change} got {result:?}"
+            );
+        }
+    }
+}
+
+/// A call binds under the search path of the statement writing it, and keeps
+/// that function when the path changes and another function of the name
+/// appears.
+#[test]
+fn a_bound_call_keeps_the_function_its_path_reached() {
+    let bound = "CREATE SCHEMA app;
+         CREATE FUNCTION app.f() RETURNS INT AS 'SELECT 1';
+         SET search_path TO app, public;
+         CREATE TABLE d (a INT DEFAULT f());
+         CREATE VIEW v AS SELECT f() AS one;
+         CREATE DOMAIN dd AS INT DEFAULT f();
+         RESET search_path;
+         CREATE FUNCTION f() RETURNS INT AS 'SELECT 2';";
+    parse(&format!("{bound} DROP FUNCTION public.f();")).expect("every call reached app.f");
+    assert_in_use(&parse(&format!("{bound} DROP FUNCTION app.f();")));
+}
+
+/// Removing the call, or the object holding it, frees the function.
+#[test]
+fn removing_the_call_frees_the_function() {
+    for (dependent, release) in [
+        ("CREATE TABLE d (a INT DEFAULT f());", "ALTER TABLE d ALTER COLUMN a DROP DEFAULT;"),
+        ("CREATE TABLE d (a INT DEFAULT f());", "DROP TABLE d;"),
+        ("CREATE INDEX i ON t ((f() + a));", "DROP INDEX i;"),
+        ("CREATE VIEW v AS SELECT f() AS one;", "CREATE OR REPLACE VIEW v AS SELECT 1 AS one;"),
+        ("CREATE MATERIALIZED VIEW v AS SELECT f() AS one;", "DROP MATERIALIZED VIEW v;"),
+        ("CREATE DOMAIN d AS INT DEFAULT f();", "DROP DOMAIN d;"),
+        (
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN (f() > 0) EXECUTE FUNCTION trg();",
+            "DROP TRIGGER tr ON t;",
+        ),
+    ] {
+        let result = parse(&format!("{CALLED} {dependent} {release} DROP FUNCTION f();"));
+        assert!(result.is_ok(), "{dependent} {release} got {result:?}");
+    }
+}
+
+/// A table rebuilt under another search path keeps the functions its checks,
+/// defaults and indexes were bound to, and a call it writes anew binds under
+/// the path in force.
+#[test]
+fn a_rebuilt_table_keeps_its_bound_calls() {
+    let bound = "CREATE SCHEMA app;
+         CREATE FUNCTION app.f() RETURNS INT AS 'SELECT 1';
+         SET search_path TO app, public;
+         CREATE TABLE d (a INT DEFAULT f(), b INT CHECK (b > f()), c INT, CHECK (c > f()));
+         CREATE INDEX i ON d ((f() + a));
+         RESET search_path;
+         CREATE FUNCTION f() RETURNS INT AS 'SELECT 2';";
+    for rebuild in [
+        "ALTER TABLE app.d ADD COLUMN e INT;",
+        "ALTER TABLE app.d RENAME COLUMN a TO z;",
+        "ALTER TABLE app.d ALTER COLUMN c SET DEFAULT f();",
+    ] {
+        let rebuilt = format!("{bound} {rebuild}");
+        assert_in_use(&parse(&format!("{rebuilt} DROP FUNCTION app.f();")));
+        let public = parse(&format!("{rebuilt} DROP FUNCTION public.f();"));
+        assert_eq!(public.is_ok(), !rebuild.contains("SET DEFAULT"), "{rebuild} got {public:?}");
+    }
+}

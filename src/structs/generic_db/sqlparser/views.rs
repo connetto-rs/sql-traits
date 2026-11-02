@@ -128,8 +128,9 @@ pub(super) fn create_view(
     if node.or_replace
         && let Some(position) = stored_view_position(&builder, &node.name)
     {
-        let (existing, metadata, identity) = builder.views_mut().remove(position);
+        let (existing, mut metadata, identity) = builder.views_mut().remove(position);
         check_replacement_columns(existing.as_ref(), &node)?;
+        metadata.set_calls(builder.calls_in(&node.query));
         let mut view = View::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
@@ -153,6 +154,7 @@ pub(super) fn create_view(
 
     let mut metadata = ViewMetadata::default();
     metadata.set_owner(creator.owner());
+    metadata.set_calls(builder.calls_in(&node.query));
     let builder = if node.materialized {
         let mut view = MaterializedView::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
@@ -1291,7 +1293,7 @@ fn readers_closure(
                     .unwrap_or_default(),
             )
         }))
-        .chain(builder.rules().iter().map(|(rule, ())| {
+        .chain(builder.rules().iter().map(|(rule, _)| {
             (
                 rules::dependent(rule),
                 Some(rules::relation_key(rule)),
@@ -1437,7 +1439,7 @@ pub(super) fn remove_readers(builder: &mut ParserDBBuilder, doomed: &[Dependent]
             stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
         )
     });
-    builder.rules_mut().retain(|(rule, ())| !doomed.contains(&rules::dependent(rule)));
+    builder.rules_mut().retain(|(rule, _)| !doomed.contains(&rules::dependent(rule)));
     for host in &hosts {
         rules::drop_rules_on(builder, host);
     }

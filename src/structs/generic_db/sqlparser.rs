@@ -70,6 +70,7 @@ use crate::{
 
 mod attach_partition;
 mod calls_in_expression;
+use calls_in_expression::CarriedCalls;
 mod column_copy;
 mod constraint_validity;
 mod default_privileges;
@@ -183,7 +184,9 @@ impl UndeclaredRoleAlteration {
 
 enum TableOrigin {
     Declaration(TableDocumentation),
-    Replacement(RelationIdentity),
+    /// A rebuild of a stored table, keeping its identity and the bindings
+    /// its calls held.
+    Replacement(RelationIdentity, CarriedCalls),
 }
 
 /// The continuation state the parser carries inside every built database so
@@ -981,6 +984,17 @@ impl ParserDBBuilder {
     /// The calls in `node` and the functions each may run, as of this
     /// statement.
     fn calls_in<N: Visit + ?Sized>(&self, node: &N) -> ExpressionCalls<CreateFunction> {
+        self.calls_carried(node, &mut CarriedCalls::default())
+    }
+
+    /// The calls in `node` and the functions each may run, a call `carried`
+    /// holds a binding for keeping it and any other resolved as of this
+    /// statement.
+    fn calls_carried<N: Visit + ?Sized>(
+        &self,
+        node: &N,
+        carried: &mut CarriedCalls,
+    ) -> ExpressionCalls<CreateFunction> {
         let functions = self.function_arc_vec();
         let search_path: Vec<(&str, bool)> = self.search_path().collect();
         calls_in_expression::calls_in(
@@ -990,6 +1004,7 @@ impl ParserDBBuilder {
                 search_path: &search_path,
                 case: self.identifier_case(),
             },
+            carried,
         )
     }
 
@@ -1003,8 +1018,8 @@ impl ParserDBBuilder {
         }
     }
 
-    /// Re-points every check constraint, policy and bound function body
-    /// holding the function node `stale` at `fresh`, its new version.
+    /// Re-points every object holding the function node `stale` at `fresh`,
+    /// its new version.
     ///
     /// PostgreSQL keeps the same `pg_proc` entry across `CREATE OR REPLACE`
     /// and `ALTER FUNCTION`, and every dependent sees the new definition.
@@ -1018,23 +1033,44 @@ impl ParserDBBuilder {
         for (_, metadata) in self.functions_mut() {
             metadata.replace_function(stale, fresh);
         }
+        for (_, metadata, _) in self.columns_mut() {
+            metadata.replace_function(stale, fresh);
+        }
+        for (_, metadata) in self.indices_mut() {
+            metadata.replace_function(stale, fresh);
+        }
+        for (_, metadata, _) in self.views_mut() {
+            metadata.replace_function(stale, fresh);
+        }
+        for (_, metadata, _) in self.materialized_views_mut() {
+            metadata.replace_function(stale, fresh);
+        }
+        for (_, calls) in self.rules_mut() {
+            calls.replace_function(stale, fresh);
+        }
+        for (_, calls) in self.domains_mut() {
+            calls.replace_function(stale, fresh);
+        }
+        for (_, calls) in self.triggers_mut() {
+            calls.replace_function(stale, fresh);
+        }
     }
 
-    /// Whether a check constraint, a policy, a trigger or a bound function
-    /// body still reaches the stored function `dropped`, leaving out the
-    /// functions in `dropping`, which the same statement drops.
+    /// Whether an object still calls the stored function `dropped`, leaving
+    /// out the functions in `dropping`, which the same statement drops.
     ///
-    /// Checks, policies and bound bodies hold the functions their calls
-    /// reached when they were written, so the comparison is by node, and a
-    /// body calling its own function does not hold it in place. A trigger
-    /// holds the name it was bound to, which reaches a function taking no
-    /// arguments.
+    /// Every call PostgreSQL binds holds the function it reached when it was
+    /// written, so the comparison is by node, and a body calling its own
+    /// function does not hold it in place. A trigger holds the name of the
+    /// function it runs, which reaches a function taking no arguments.
     fn is_function_used(
         &self,
         dropped: &Arc<CreateFunction>,
         dropping: &[Arc<CreateFunction>],
     ) -> bool {
         let is_dropped = |function: &CreateFunction| core::ptr::eq(function, dropped.as_ref());
+        let calls_dropped =
+            |calls: &ExpressionCalls<CreateFunction>| calls.functions().any(is_dropped);
         // A bound name left bare is one in the default schema.
         let trigger_scope = calls_in_expression::CallScope {
             functions: &[],
@@ -1044,23 +1080,29 @@ impl ParserDBBuilder {
 
         self.check_constraints().iter().any(|(_, metadata)| metadata.functions().any(is_dropped))
             || self.policies().iter().any(|(_, metadata)| {
-                metadata
-                    .using_calls()
-                    .functions()
-                    .chain(metadata.check_calls().functions())
-                    .any(is_dropped)
+                calls_dropped(metadata.using_calls()) || calls_dropped(metadata.check_calls())
             })
-            || self.triggers().iter().any(|(trigger, ())| {
-                trigger.exec_body.as_ref().is_some_and(|body| {
-                    trigger_scope.reaches(dropped, &body.func_desc.name, 0)
-                        && function_argument_types(dropped.args.as_deref()).is_empty()
-                })
+            || self.triggers().iter().any(|(trigger, calls)| {
+                calls_dropped(calls)
+                    || trigger.exec_body.as_ref().is_some_and(|body| {
+                        trigger_scope.reaches(dropped, &body.func_desc.name, 0)
+                            && function_argument_types(dropped.args.as_deref()).is_empty()
+                    })
             })
             || self.functions().iter().any(|(caller, metadata)| {
                 !is_dropped(caller)
                     && !dropping.iter().any(|other| Arc::ptr_eq(other, caller))
-                    && metadata.body_calls().functions().any(is_dropped)
+                    && calls_dropped(metadata.body_calls())
             })
+            || self.columns().iter().any(|(_, metadata, _)| calls_dropped(metadata.calls()))
+            || self.indices().iter().any(|(_, metadata)| calls_dropped(metadata.calls()))
+            || self.views().iter().any(|(_, metadata, _)| calls_dropped(metadata.calls()))
+            || self
+                .materialized_views()
+                .iter()
+                .any(|(_, metadata, _)| calls_dropped(metadata.calls()))
+            || self.rules().iter().any(|(_, calls)| calls_dropped(calls))
+            || self.domains().iter().any(|(_, calls)| calls_dropped(calls))
     }
 
     /// The function a trigger written to run `called` runs, as of this
@@ -1158,7 +1200,7 @@ impl ParserDBBuilder {
             .retain(|(constraint, _)| !is_target(TableAttribute::table(constraint)));
 
         // Remove triggers on this table
-        self.triggers_mut().retain(|(t, ())| {
+        self.triggers_mut().retain(|(t, _)| {
             !object_name_matches_resolved_identity(
                 &t.table_name,
                 table_name,
@@ -1179,7 +1221,7 @@ impl ParserDBBuilder {
             )
         });
 
-        self.rules_mut().retain(|(rule, ())| {
+        self.rules_mut().retain(|(rule, _)| {
             !object_name_matches_resolved_identity(
                 &rule.table_name,
                 table_name,
@@ -1217,13 +1259,13 @@ impl ParserDBBuilder {
     /// wrap the node instead of naming it are rebuilt from the replacement
     /// node, so they are not touched here.
     fn rewrite_table_references(&mut self, renamed: &StoredTable, target: &RenameTarget) {
-        for (trigger, ()) in self.triggers_mut() {
+        for (trigger, _) in self.triggers_mut() {
             if renamed.named_by(&trigger.table_name) {
                 target.rewrite(&mut Arc::make_mut(trigger).table_name);
             }
         }
 
-        for (rule, ()) in self.rules_mut() {
+        for (rule, _) in self.rules_mut() {
             if renamed.named_by(&rule.table_name) {
                 target.rewrite(&mut Arc::make_mut(rule).table_name);
             }
@@ -1263,9 +1305,9 @@ impl ParserDBBuilder {
         }) || self.policies().iter().any(|(policy, _)| {
             table.named_by(&policy.table_name)
                 && column.in_expressions(policy.as_ref(), table, declaring)
-        }) || self.triggers().iter().any(|(trigger, ())| {
+        }) || self.triggers().iter().any(|(trigger, _)| {
             table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column)
-        }) || self.rules().iter().any(|(rule, ())| {
+        }) || self.rules().iter().any(|(rule, _)| {
             table.named_by(&rule.table_name) && rules::reads_row_column(rule, column)
         })
     }
@@ -1311,10 +1353,10 @@ impl ParserDBBuilder {
             !(table.named_by(&policy.table_name)
                 && column.in_expressions(policy.as_ref(), table, declaring))
         });
-        self.triggers_mut().retain(|(trigger, ())| {
+        self.triggers_mut().retain(|(trigger, _)| {
             !(table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column))
         });
-        self.rules_mut().retain(|(rule, ())| {
+        self.rules_mut().retain(|(rule, _)| {
             !(table.named_by(&rule.table_name) && rules::reads_row_column(rule, column))
         });
 
@@ -1352,7 +1394,7 @@ impl ParserDBBuilder {
             }
         }
 
-        for (trigger, ()) in self.triggers_mut() {
+        for (trigger, _) in self.triggers_mut() {
             if table.named_by(&trigger.table_name) {
                 let trigger = Arc::make_mut(trigger);
                 for event in &mut trigger.events {
@@ -1366,7 +1408,7 @@ impl ParserDBBuilder {
             }
         }
 
-        for (rule, ()) in self.rules_mut() {
+        for (rule, _) in self.rules_mut() {
             if table.named_by(&rule.table_name) {
                 rules::rename_row_column(Arc::make_mut(rule), from, to);
             }
@@ -1391,14 +1433,15 @@ impl ParserDBBuilder {
     /// edits the node has to rebuild them. Columns and constraint-implied
     /// objects follow from the node and are recomputed, while `CREATE INDEX`
     /// indexes do not and are returned with their expressions so the caller can
-    /// re-attach them.
+    /// re-attach them. The calls of the columns, checks and indexes are
+    /// returned with the bindings they held, which the rebuilt objects keep.
     fn take_table_derived_objects(
         &mut self,
         table_name: &str,
         table_name_quoted: bool,
         schema_name: Option<&str>,
         schema_quoted: bool,
-    ) -> Vec<(CreateIndex, Expr)> {
+    ) -> (Vec<(CreateIndex, Expr)>, CarriedCalls) {
         let case = self.identifier_case();
         let belongs_to = |table: &CreateTable| {
             table_matches_resolved_identity(
@@ -1411,21 +1454,35 @@ impl ParserDBBuilder {
             )
         };
 
+        let mut carried = CarriedCalls::default();
         let mut detached_indices = Vec::new();
         self.indices_mut().retain(|(index, metadata)| {
             if belongs_to(TableAttribute::table(index)) {
+                carried.record(index.attribute(), metadata.calls());
                 detached_indices.push((index.attribute().clone(), metadata.expression().clone()));
                 return false;
             }
             true
         });
 
-        self.columns_mut().retain(|(column, _, _)| !belongs_to(TableAttribute::table(column)));
+        self.columns_mut().retain(|(column, metadata, _)| {
+            let detached = belongs_to(TableAttribute::table(column));
+            if detached {
+                carried.record(column.attribute(), metadata.calls());
+            }
+            !detached
+        });
         self.unique_indices_mut().retain(|(index, _)| !belongs_to(TableAttribute::table(index)));
         self.foreign_keys_mut().retain(|(fk, ())| !belongs_to(TableAttribute::table(fk)));
-        self.check_constraints_mut().retain(|(check, _)| !belongs_to(TableAttribute::table(check)));
+        self.check_constraints_mut().retain(|(check, metadata)| {
+            let detached = belongs_to(TableAttribute::table(check));
+            if detached {
+                carried.record(metadata.expression(), metadata.calls());
+            }
+            !detached
+        });
 
-        detached_indices
+        (detached_indices, carried)
     }
 
     /// Returns whether a modeled blocking dependency names the role.
@@ -4753,6 +4810,7 @@ impl ParserDB {
         create_table: &Arc<CreateTable>,
         table_metadata: &TableMetadata<CreateTable>,
         builder: &ParserDBBuilder,
+        carried: &mut CarriedCalls,
     ) -> Result<CheckConstraintResult, crate::errors::Error> {
         let columns_in_expression =
             columns_in_expression::<Arc<TableAttribute<CreateTable, ColumnDef>>>(
@@ -4761,22 +4819,29 @@ impl ParserDB {
                 &target_name_of_object_name(&create_table.name),
                 table_metadata.column_arc_slice(),
             )?;
-        let calls = builder.calls_in(check_expr);
+        let calls = builder.calls_carried(check_expr, carried);
         Ok((columns_in_expression, calls))
     }
 
     /// Registers `check` on the table and the builder, with the columns and
-    /// functions its expression reads.
+    /// functions its expression reads, a call `carried` holds a binding for
+    /// keeping it.
     fn add_check_constraint(
         check: &CheckConstraint,
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         builder: ParserDBBuilder,
+        carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let check_arc = Arc::new(TableAttribute::new(create_table.clone(), check.clone()));
         table_metadata.add_check_constraint(check_arc.clone());
-        let (columns_in_expression, calls) =
-            Self::process_check_constraint(&check.expr, create_table, table_metadata, &builder)?;
+        let (columns_in_expression, calls) = Self::process_check_constraint(
+            &check.expr,
+            create_table,
+            table_metadata,
+            &builder,
+            carried,
+        )?;
         Ok(builder.add_check_constraint(
             check_arc,
             CheckMetadata::new(
@@ -4855,7 +4920,8 @@ impl ParserDB {
                 reason: "index has no columns".to_string(),
             });
         };
-        let metadata = IndexMetadata::new(expression, Arc::new(table.clone()));
+        let metadata = IndexMetadata::new(expression, Arc::new(table.clone()))
+            .with_calls(builder.calls_in(index_arc.attribute()));
         Ok((index_arc, metadata))
     }
 
@@ -5033,7 +5099,7 @@ impl ParserDB {
             preserved_column_metadata_for_table(&builder, &previous_node);
         preserve(&mut preserved_collations);
 
-        let detached_indices = builder.take_table_derived_objects(
+        let (detached_indices, mut carried) = builder.take_table_derived_objects(
             &stored.name,
             stored.name_quoted,
             stored.schema.as_deref(),
@@ -5052,7 +5118,11 @@ impl ParserDB {
             let expression = Self::create_index_expression(&index.columns).unwrap_or(expression);
             let index = Arc::new(TableAttribute::new(replacement.clone(), index));
             metadata.add_index(index.clone());
-            builder = builder.add_index(index, IndexMetadata::new(expression, replacement.clone()));
+            let calls = builder.calls_carried(index.attribute(), &mut carried);
+            builder = builder.add_index(
+                index,
+                IndexMetadata::new(expression, replacement.clone()).with_calls(calls),
+            );
         }
 
         builder = Self::ingest_table_node_with_collations(
@@ -5062,7 +5132,7 @@ impl ParserDB {
             collations,
             catalog,
             &preserved_collations,
-            TableOrigin::Replacement(identity),
+            TableOrigin::Replacement(identity, carried),
         )?;
         builder.tables_mut().sort_by(|(a, _, _), (b, _, _)| {
             (a.table_schema(), a.table_name()).cmp(&(b.table_schema(), b.table_name()))
@@ -5081,6 +5151,7 @@ impl ParserDB {
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         mut builder: ParserDBBuilder,
+        carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         for option in &column.attribute().options {
             match option.option.clone() {
@@ -5090,6 +5161,7 @@ impl ParserDB {
                         create_table,
                         table_metadata,
                         builder,
+                        carried,
                     )?;
                 }
                 // The same constraint written inline on the column rather than
@@ -5301,6 +5373,7 @@ impl ParserDB {
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         mut builder: ParserDBBuilder,
+        carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         for constraint in constraints {
             match constraint {
@@ -5323,8 +5396,13 @@ impl ParserDB {
                     )?;
                 }
                 TableConstraint::Check(check) => {
-                    builder =
-                        Self::add_check_constraint(check, create_table, table_metadata, builder)?;
+                    builder = Self::add_check_constraint(
+                        check,
+                        create_table,
+                        table_metadata,
+                        builder,
+                        carried,
+                    )?;
                 }
                 TableConstraint::PrimaryKey(pk) => {
                     Self::validate_constraint_columns(&pk.columns, create_table, table_metadata)?;
@@ -5428,11 +5506,17 @@ impl ParserDB {
         validate_distinct_columns(&create_table, builder.identifier_case())?;
         validate_relation_names(&builder, &create_table)?;
 
-        let (identity, documentation) = match &mut origin {
+        let (identity, documentation, mut carried) = match &mut origin {
             TableOrigin::Declaration(documentation) => {
-                (builder.draw_relation_identity(), documentation.table.take())
+                (
+                    builder.draw_relation_identity(),
+                    documentation.table.take(),
+                    CarriedCalls::default(),
+                )
             }
-            TableOrigin::Replacement(identity) => (*identity, table_metadata.take_documentation()),
+            TableOrigin::Replacement(identity, carried) => {
+                (*identity, table_metadata.take_documentation(), core::mem::take(carried))
+            }
         };
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
@@ -5443,8 +5527,13 @@ impl ParserDB {
         }
 
         for column in table_metadata.clone().column_arcs() {
-            builder =
-                Self::process_column_options(column, &create_table, &mut table_metadata, builder)?;
+            builder = Self::process_column_options(
+                column,
+                &create_table,
+                &mut table_metadata,
+                builder,
+                &mut carried,
+            )?;
             let metadata = column_metadata_for_collations(
                 column.attribute(),
                 collations,
@@ -5452,12 +5541,13 @@ impl ParserDB {
                 &search_path,
                 preserved,
                 validate_missing,
-            )?;
+            )?
+            .with_calls(builder.calls_carried(column.attribute(), &mut carried));
             let metadata = match &mut origin {
                 TableOrigin::Declaration(documentation) => {
                     metadata.with_documentation(documentation.take_column(&column.attribute().name))
                 }
-                TableOrigin::Replacement(_) => metadata,
+                TableOrigin::Replacement(..) => metadata,
             };
             let column_identity = preserved_column_identity(column.attribute(), preserved)
                 .unwrap_or_else(|| builder.draw_column_identity());
@@ -5469,6 +5559,7 @@ impl ParserDB {
             &create_table,
             &mut table_metadata,
             builder,
+            &mut carried,
         )?;
         table_metadata.set_documentation(documentation);
 
@@ -6493,12 +6584,12 @@ impl ParserDB {
             }) {
                 return Err(blocked(ObjectKind::Policy, &policy.name.value));
             }
-            if let Some((trigger, ())) = builder.triggers().iter().find(|(trigger, ())| {
+            if let Some((trigger, _)) = builder.triggers().iter().find(|(trigger, _)| {
                 table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column)
             }) {
                 return Err(blocked(ObjectKind::Trigger, last_str(&trigger.name)));
             }
-            if let Some((rule, ())) = builder.rules().iter().find(|(rule, ())| {
+            if let Some((rule, _)) = builder.rules().iter().find(|(rule, _)| {
                 table.named_by(&rule.table_name) && rules::reads_row_column(rule, column)
             }) {
                 return Err(blocked(ObjectKind::Rule, &rule.name.value));
@@ -7452,7 +7543,7 @@ impl ParserDB {
                     // appending a second one, which would leave the stale node
                     // answering every lookup.
                     let case = builder.identifier_case();
-                    let existing = builder.triggers().iter().position(|(existing, ())| {
+                    let existing = builder.triggers().iter().position(|(existing, _)| {
                         object_names_match(&existing.name, &create_trigger.name, case)
                             && target_tables_match(
                                 &existing.table_name,
@@ -7473,7 +7564,8 @@ impl ParserDB {
                         (None, _) => {}
                     }
 
-                    builder = builder.add_trigger(Arc::new(create_trigger), ());
+                    let calls = builder.calls_in(&create_trigger.condition);
+                    builder = builder.add_trigger(Arc::new(create_trigger), calls);
                 }
                 Statement::CreateRule(create_rule) => {
                     builder = rules::create_rule(builder, create_rule)?;
@@ -7497,7 +7589,7 @@ impl ParserDB {
                     };
 
                     let Some(position) =
-                        builder.triggers().iter().position(|(trigger, ())| matches(trigger))
+                        builder.triggers().iter().position(|(trigger, _)| matches(trigger))
                     else {
                         if drop_trigger.if_exists {
                             continue;

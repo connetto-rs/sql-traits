@@ -25,7 +25,9 @@ fn in_schema(schema: Option<(&str, bool)>) -> Cow<'_, str> {
 }
 
 impl Metadata for CreateTrigger {
-    type Meta = ();
+    /// The calls of the trigger's `WHEN` condition, bound when it was
+    /// written.
+    type Meta = crate::structs::metadata::ExpressionCalls<sqlparser::ast::CreateFunction>;
 }
 
 impl TriggerLike for CreateTrigger {
