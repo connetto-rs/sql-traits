@@ -166,6 +166,33 @@ fn refuse_foreign_under_unique_index(
     ParserDB::refuse_unique_index_over_foreign_partition(builder, partition)
 }
 
+/// Refuses `CREATE FOREIGN TABLE ... PARTITION OF` a table that holds a unique
+/// index, or whose ancestors do, as PostgreSQL refuses to create a foreign
+/// partition there. A parent that resolves to nothing is left to the parent
+/// resolution that names it.
+pub(super) fn refuse_foreign_partition_under_unique_index(
+    builder: &ParserDBBuilder,
+    partition: &CreateTable,
+) -> Result<(), Error> {
+    let Some(root_node) = partition
+        .partition_of
+        .as_ref()
+        .map(|root| builder.resolve_table_object_name(root))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let root = StoredTable::of(root_node);
+    if holds_unique_index_above(builder, &root, root_node)? {
+        return Err(Error::UniqueIndexOverForeignPartition {
+            table_name: root.name,
+            partition_name: partition.table_name().to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Whether `table` or a table it is a partition of holds a unique index, as a
 /// key or as a `CREATE UNIQUE INDEX`.
 fn holds_unique_index_above(

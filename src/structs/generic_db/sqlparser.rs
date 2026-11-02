@@ -3343,6 +3343,8 @@ fn foreign_table_node(foreign_table: CreateForeignTable) -> (CreateTable, Foreig
         columns,
         constraints,
         inherits,
+        partition_of,
+        for_values,
         server_name,
         options,
     } = foreign_table;
@@ -3362,6 +3364,8 @@ fn foreign_table_node(foreign_table: CreateForeignTable) -> (CreateTable, Foreig
         .columns(columns)
         .constraints(constraints)
         .inherits(inherits)
+        .partition_of(partition_of)
+        .for_values(for_values)
         .build();
     (node, source)
 }
@@ -9035,6 +9039,15 @@ impl ParserDB {
                     // A `LIKE` copy becomes the table's own columns, so it
                     // runs before the parents contribute theirs.
                     like::apply_like(&builder, &mut create_table)?;
+
+                    // A foreign partition is refused under a unique index
+                    // before it takes the keys a partition receives.
+                    if foreign_source.is_some() {
+                        attach_partition::refuse_foreign_partition_under_unique_index(
+                            &builder,
+                            &create_table,
+                        )?;
+                    }
 
                     // PostgreSQL copies the parent's shape into the child
                     // while running this statement, so the node carries the

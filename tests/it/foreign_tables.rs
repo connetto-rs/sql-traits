@@ -1103,3 +1103,130 @@ fn alter_column_options_refuse_what_postgresql_refuses() {
         Error::AlterActionUnsupportedOnRelation { object_kind: ObjectKind::Table, .. }
     ));
 }
+
+const RANGE_ROOT: &str = "CREATE TABLE orders (
+         id INT NOT NULL,
+         note TEXT DEFAULT 'x',
+         CONSTRAINT positive CHECK (id >= 0)
+     ) PARTITION BY RANGE (id);";
+
+#[test]
+fn a_foreign_table_is_created_as_a_partition() {
+    let db = db(&format!(
+        "{RANGE_ROOT}
+         CREATE FOREIGN TABLE o1 PARTITION OF orders FOR VALUES FROM (0) TO (10)
+             SERVER warehouse OPTIONS (table_name 'r1');
+         CREATE FOREIGN TABLE o2 PARTITION OF orders (note NOT NULL, CONSTRAINT small CHECK (id < 100))
+             FOR VALUES FROM (10) TO (20) SERVER warehouse;
+         CREATE FOREIGN TABLE od PARTITION OF orders DEFAULT SERVER warehouse;
+         CREATE FOREIGN TABLE IF NOT EXISTS o1 PARTITION OF orders FOR VALUES FROM (90) TO (99)
+             SERVER warehouse;"
+    ));
+    let orders = table(&db, "orders");
+    let partitions = [foreign(&db, "o1"), foreign(&db, "o2"), foreign(&db, "od")];
+    assert_eq!(orders.partitions(&db).expect("held").collect::<Vec<_>>(), partitions);
+    assert_eq!(db.tables().count(), 1);
+
+    let o1 = partitions[0];
+    assert!(o1.is_foreign(&db).expect("held"));
+    assert_eq!(o1.partition_root(&db).expect("held"), Some(orders));
+    let columns: Vec<_> = o1
+        .columns(&db)
+        .expect("held")
+        .map(|column| {
+            (column.column_name(), column.is_nullable(&db).expect("held"), column.default_value())
+        })
+        .collect();
+    assert_eq!(columns, [("id", false, None), ("note", true, Some("'x'".to_owned()))]);
+    assert_eq!(o1.check_constraints(&db).expect("held").count(), 1);
+    assert_eq!(source_options(&db, "o1"), options(&[("table_name", "r1")]));
+
+    let o2 = partitions[1];
+    let note = o2.column("note", &db, IdentifierCase::AsWritten).expect("lookup").expect("copied");
+    assert!(!note.is_nullable(&db).expect("held"));
+    assert_eq!(o2.check_constraints(&db).expect("held").count(), 2);
+
+    // A unique index on the root would reach the foreign partitions.
+    assert!(matches!(
+        parse(&format!(
+            "{RANGE_ROOT}
+             CREATE FOREIGN TABLE o1 PARTITION OF orders FOR VALUES FROM (0) TO (10) SERVER s;
+             CREATE UNIQUE INDEX orders_id ON orders (id);"
+        )),
+        Err(Error::UniqueIndexOverForeignPartition { partition_name, .. }) if partition_name == "o1"
+    ));
+    // The partitions go with the partitioned table.
+    let dropped = self::db(&format!(
+        "{RANGE_ROOT}
+         CREATE FOREIGN TABLE o1 PARTITION OF orders FOR VALUES FROM (0) TO (10) SERVER s;
+         DROP TABLE orders;"
+    ));
+    assert_eq!(dropped.foreign_tables().count(), 0);
+}
+
+#[test]
+fn a_foreign_partition_is_refused_where_postgresql_refuses_it() {
+    for (sql, table_name) in [
+        (
+            "CREATE TABLE keyed (id INT PRIMARY KEY) PARTITION BY RANGE (id);
+             CREATE FOREIGN TABLE f PARTITION OF keyed FOR VALUES FROM (0) TO (10) SERVER s;",
+            "keyed",
+        ),
+        (
+            "CREATE TABLE keyed (id INT NOT NULL) PARTITION BY RANGE (id);
+             CREATE UNIQUE INDEX keyed_id ON keyed (id);
+             CREATE FOREIGN TABLE f PARTITION OF keyed FOR VALUES FROM (0) TO (10) SERVER s;",
+            "keyed",
+        ),
+        (
+            "CREATE TABLE keyed (id INT NOT NULL) PARTITION BY RANGE (id);
+             CREATE UNIQUE INDEX keyed_id ON keyed (id);
+             CREATE TABLE middle PARTITION OF keyed FOR VALUES FROM (0) TO (100)
+                 PARTITION BY RANGE (id);
+             CREATE FOREIGN TABLE f PARTITION OF middle FOR VALUES FROM (0) TO (10) SERVER s;",
+            "middle",
+        ),
+    ] {
+        let error = refusal(sql);
+        assert!(
+            matches!(
+                &error,
+                Error::UniqueIndexOverForeignPartition { table_name: refused, partition_name }
+                    if refused == table_name && partition_name == "f"
+            ),
+            "{sql}: {error:?}"
+        );
+    }
+
+    for (sql, constraint) in [
+        (
+            "CREATE TABLE target (id INT PRIMARY KEY);
+             CREATE TABLE referencing (id INT REFERENCES target (id)) PARTITION BY RANGE (id);
+             CREATE FOREIGN TABLE f PARTITION OF referencing FOR VALUES FROM (0) TO (10) SERVER s;",
+            KeyConstraint::ForeignKey,
+        ),
+        (
+            &format!(
+                "{RANGE_ROOT} CREATE FOREIGN TABLE f PARTITION OF orders (PRIMARY KEY (id))
+                     FOR VALUES FROM (0) TO (10) SERVER s;"
+            ),
+            KeyConstraint::PrimaryKey,
+        ),
+    ] {
+        let error = refusal(sql);
+        assert!(
+            matches!(
+                &error,
+                Error::ConstraintUnsupportedOnForeignTable { table_name, constraint: refused }
+                    if table_name == "f" && *refused == constraint
+            ),
+            "{sql}: {error:?}"
+        );
+    }
+
+    assert!(
+        parse("CREATE FOREIGN TABLE f PARTITION OF missing FOR VALUES FROM (0) TO (1) SERVER s;")
+            .is_err(),
+        "an absent parent was accepted"
+    );
+}
