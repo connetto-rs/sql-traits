@@ -329,9 +329,13 @@ fn code_outside_the_schema_cannot_be_read() {
             Err(LookupError::FunctionBodyUnavailable { function: function.to_string() })
         );
     };
-    let declared =
-        ParserDB::parse::<GenericDialect>("CREATE FUNCTION declared() RETURNS INT;").unwrap();
+    let declared = ParserDB::parse::<GenericDialect>(
+        "CREATE FUNCTION declared() RETURNS INT;
+         CREATE FUNCTION procedural() RETURNS INT LANGUAGE plpgsql;",
+    )
+    .unwrap();
     unavailable(&declared, "declared");
+    unavailable(&declared, "procedural");
 
     let remote = ParserDB::parse::<BigQueryDialect>(
         "CREATE FUNCTION remote() RETURNS INT64 REMOTE WITH CONNECTION us.c

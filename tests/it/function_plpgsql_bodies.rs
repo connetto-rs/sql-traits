@@ -104,6 +104,38 @@ fn expressions_holding_sublinks_are_read() {
     );
 }
 
+/// `CASE`, every kind of loop and a block with a handler each run their
+/// SQL where the body reaches them, nested here inside an outer loop.
+#[test]
+fn every_control_structure_is_read_in_body_order() {
+    let tables = [
+        "subject", "matched", "other", "guarded", "caught", "bound", "upper", "step", "argument",
+        "cursored", "items", "exits",
+    ];
+    let schema = tables.map(|table| format!("CREATE TABLE {table} (id INT);")).join("\n");
+    let database = postgres(&format!(
+        "{schema}
+         CREATE FUNCTION structured() RETURNS VOID LANGUAGE plpgsql AS $$
+         DECLARE c CURSOR (k INT) FOR SELECT id FROM cursored WHERE id = k; r RECORD; x INT; n INT := 0;
+         BEGIN
+           FOR i IN 1..2 LOOP
+             CASE (SELECT count(*) FROM subject)
+               WHEN 0 THEN PERFORM 1 FROM matched;
+               ELSE PERFORM 1 FROM other;
+             END CASE;
+             BEGIN PERFORM 1 FROM guarded; EXCEPTION WHEN others THEN PERFORM 1 FROM caught; END;
+             WHILE n < (SELECT count(*) FROM bound) LOOP n := n + 1; END LOOP;
+             FOR j IN 1..(SELECT count(*) FROM upper) BY (SELECT count(*) FROM step) LOOP NULL; END LOOP;
+             FOR r IN c((SELECT max(id) FROM argument)) LOOP NULL; END LOOP;
+             FOREACH x IN ARRAY (SELECT array_agg(id) FROM items) LOOP NULL; END LOOP;
+             LOOP EXIT WHEN (SELECT count(*) FROM exits) >= 0; END LOOP;
+           END LOOP;
+         END $$;"
+    ));
+    let expected: Vec<String> = tables.iter().map(|table| format!("public.{table}")).collect();
+    assert_eq!(read_by(&database, "structured").unwrap(), expected);
+}
+
 #[test]
 fn unqualified_names_resolve_under_the_function_path() {
     let database = postgres(
@@ -193,6 +225,65 @@ fn a_path_set_off_the_straight_line_hides_the_names_it_may_reach() {
         );
     }
     assert_eq!(read_by(&database, "qualified").unwrap(), ["public.docs", "app.docs"]);
+}
+
+/// A `SET` buried in nested structures still hides what it may reach, a
+/// `WHILE` condition runs again after its loop's `SET`, and a `CASE` branch
+/// sets its path for only some runs.
+#[test]
+fn a_nested_or_repeated_path_change_hides_later_names() {
+    let database = postgres(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.docs (id INT);
+         CREATE TABLE public.docs (id INT);
+         CREATE FUNCTION buried(p BOOLEAN) RETURNS VOID LANGUAGE plpgsql AS $$
+         BEGIN
+           FOR i IN 1..2 LOOP
+             PERFORM 1 FROM docs;
+             IF p THEN
+               CASE WHEN p THEN
+                 WHILE p LOOP BEGIN PERFORM set_config('search_path', 'app', true); END; END LOOP;
+               END CASE;
+             END IF;
+           END LOOP;
+         END $$;
+         CREATE FUNCTION conditioned() RETURNS VOID LANGUAGE plpgsql AS $$
+         BEGIN
+           WHILE EXISTS (SELECT 1 FROM docs) LOOP SET LOCAL search_path = app; END LOOP;
+         END $$;
+         CREATE FUNCTION cased(n INT) RETURNS BIGINT LANGUAGE plpgsql AS $$
+         BEGIN
+           CASE n WHEN 1 THEN SET LOCAL search_path = app; ELSE NULL; END CASE;
+           RETURN (SELECT count(*) FROM docs);
+         END $$;",
+    );
+    assert_eq!(
+        read_by(&database, "buried"),
+        Err(LookupError::FunctionBodyUnresolvable {
+            function: "buried".to_string(),
+            statement: "SELECT set_config('search_path', 'app', true)".to_string(),
+        })
+    );
+    for name in ["conditioned", "cased"] {
+        assert_eq!(
+            read_by(&database, name),
+            Err(LookupError::FunctionBodyUnresolvable {
+                function: name.to_string(),
+                statement: "SET LOCAL search_path = app".to_string(),
+            }),
+            "{name}"
+        );
+    }
+}
+
+/// A `SET` PostgreSQL refuses is reported wherever it sits.
+#[test]
+fn an_invalid_path_in_a_branch_is_reported() {
+    let database = postgres(
+        "CREATE FUNCTION refused(p BOOLEAN) RETURNS VOID LANGUAGE plpgsql AS $$
+         BEGIN IF p THEN SET search_path = a.b; END IF; END $$;",
+    );
+    assert!(matches!(read_by(&database, "refused"), Err(LookupError::InvalidObjectName { .. })));
 }
 
 /// An `ELSIF` is tried only once the branch before it was not taken, so a
@@ -292,27 +383,50 @@ fn sql_built_at_run_time_cannot_be_read() {
              BEGIN OPEN c FOR EXECUTE 'SELECT id FROM ' || quote_ident(t); CLOSE c; END $$;
          CREATE FUNCTION looped(t TEXT) RETURNS VOID LANGUAGE plpgsql AS $$
              DECLARE r RECORD;
-             BEGIN FOR r IN EXECUTE 'SELECT id FROM ' || quote_ident(t) LOOP END LOOP; END $$;",
+             BEGIN FOR r IN EXECUTE 'SELECT id FROM ' || quote_ident(t) LOOP END LOOP; END $$;
+         CREATE FUNCTION branched(p BOOLEAN, t TEXT) RETURNS VOID LANGUAGE plpgsql AS $$
+             BEGIN PERFORM 1 FROM docs; IF p THEN EXECUTE t; END IF; END $$;
+         CREATE FUNCTION nested(p BOOLEAN, t TEXT) RETURNS VOID LANGUAGE plpgsql AS $$
+             DECLARE r RECORD;
+             BEGIN IF p THEN FOR r IN EXECUTE t LOOP END LOOP; END IF; END $$;
+         CREATE FUNCTION selected() RETURNS VOID LANGUAGE plpgsql
+             AS $$ BEGIN EXECUTE command FROM commands; END $$;",
     );
-    for name in ["executed", "returned", "opened", "looped"] {
-        assert!(
-            matches!(
-                read_by(&database, name),
-                Err(LookupError::FunctionBodyUnresolvable { function, .. }) if function == name
-            ),
-            "{name}"
-        );
-    }
+    let hidden_by = |name: &str| {
+        match read_by(&database, name) {
+            Err(LookupError::FunctionBodyUnresolvable { function, statement })
+                if function == name =>
+            {
+                statement
+            }
+            other => panic!("{name} answered {other:?}"),
+        }
+    };
+    assert_eq!(hidden_by("executed"), "EXECUTE 'DELETE FROM ' || quote_ident(t)");
+    assert_eq!(hidden_by("returned"), "EXECUTE 'SELECT id FROM ' || quote_ident(t)");
+    assert_eq!(hidden_by("opened"), "EXECUTE 'SELECT id FROM ' || quote_ident(t)");
+    assert_eq!(hidden_by("looped"), "EXECUTE 'SELECT id FROM ' || quote_ident(t)");
+    assert_eq!(hidden_by("branched"), "EXECUTE t");
+    assert_eq!(hidden_by("nested"), "EXECUTE t");
+    // A command read from rows shows the whole query that reads it.
+    assert_eq!(hidden_by("selected"), "EXECUTE (SELECT command FROM commands)");
 }
 
 #[test]
 fn a_malformed_body_is_reported() {
-    let database =
-        postgres("CREATE FUNCTION broken() RETURNS INT LANGUAGE plpgsql AS $$ BEGIN RETURN; $$;");
-    assert!(matches!(
-        read_by(&database, "broken"),
-        Err(LookupError::FunctionBodyUnparsable { function, .. }) if function == "broken"
-    ));
+    let database = postgres(
+        "CREATE FUNCTION broken() RETURNS INT LANGUAGE plpgsql AS $$ BEGIN RETURN; $$;
+         CREATE FUNCTION unquoted() RETURNS INT LANGUAGE plpgsql RETURN 1;",
+    );
+    for name in ["broken", "unquoted"] {
+        assert!(
+            matches!(
+                read_by(&database, name),
+                Err(LookupError::FunctionBodyUnparsable { function, .. }) if function == name
+            ),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -334,9 +448,27 @@ fn calls_in_embedded_statements_are_resolved() {
          CREATE FUNCTION app.helper() RETURNS INT LANGUAGE sql AS 'SELECT 1';
          CREATE FUNCTION helper() RETURNS INT LANGUAGE sql AS 'SELECT 2';
          CREATE FUNCTION caller() RETURNS INT LANGUAGE plpgsql SET search_path = app
-             AS $$ BEGIN PERFORM helper(); RETURN 1; END $$;",
+             AS $$ BEGIN PERFORM helper(); RETURN 1; END $$;
+         CREATE FUNCTION guarded() RETURNS VOID LANGUAGE plpgsql AS $$
+         BEGIN
+           SET LOCAL search_path = app;
+           PERFORM helper();
+         EXCEPTION WHEN others THEN
+           PERFORM helper();
+         END $$;
+         CREATE FUNCTION looped() RETURNS VOID LANGUAGE plpgsql AS $$
+         BEGIN
+           LOOP PERFORM helper(); SET LOCAL search_path = app; END LOOP;
+         END $$;",
     );
     assert_eq!(declared_called_by(&database, "caller").unwrap(), ["app.helper"]);
+    // The handler calls under the path the block started with.
+    assert_eq!(declared_called_by(&database, "guarded").unwrap(), ["app.helper", "public.helper"]);
+    assert!(matches!(
+        declared_called_by(&database, "looped"),
+        Err(LookupError::FunctionBodyUnresolvable { statement, .. })
+            if statement == "SET LOCAL search_path = app"
+    ));
 }
 
 #[test]
