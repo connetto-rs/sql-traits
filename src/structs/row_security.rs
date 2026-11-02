@@ -6,6 +6,23 @@ use alloc::{string::String, vec::Vec};
 
 use sqlparser::ast::Expr;
 
+/// Who a statement runs as.
+#[derive(Debug)]
+pub enum ActingRole<'db, R> {
+    /// A role the schema declares.
+    Declared(&'db R),
+    /// A caller holding no role, known only as `PUBLIC`. It owns nothing and
+    /// bypasses nothing, and a policy scoped to a role cannot be settled for
+    /// it.
+    Public,
+}
+
+impl<'db, R> From<&'db R> for ActingRole<'db, R> {
+    fn from(role: &'db R) -> Self {
+        Self::Declared(role)
+    }
+}
+
 /// The shape of a statement, as far as row-level security tells shapes apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowStatement {

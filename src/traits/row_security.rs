@@ -14,7 +14,7 @@ use sqlparser::ast::{
 use crate::{
     errors::{LookupError, RowSecurityError},
     structs::{
-        GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,
+        ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,
         RowSecurityExemption, RowStatement, RowVersion,
     },
     traits::{
@@ -123,15 +123,23 @@ fn covers<P: PolicyLike>(policy: &P, command: GatedCommand) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`RowSecurityError::UnsettledRole`] when no entry reaches `role`
-/// and one names a role the schema does not declare, or `CURRENT_USER`,
-/// `CURRENT_ROLE` or `SESSION_USER`, which name whoever ran `CREATE POLICY`.
+/// Returns [`RowSecurityError::RoleRequired`] when a caller holding no role
+/// meets a policy scoped to a role, and [`RowSecurityError::UnsettledRole`]
+/// when no entry reaches a declared `role` and one names a role the schema
+/// does not declare, or `CURRENT_USER`, `CURRENT_ROLE` or `SESSION_USER`,
+/// which name whoever ran `CREATE POLICY`.
 fn applies<DB: DatabaseLike>(
     policy: &DB::Policy,
-    role: &DB::Role,
+    role: &ActingRole<'_, DB::Role>,
     database: &DB,
 ) -> Result<bool, RowSecurityError> {
-    if policy.applies_to_public() || policy.applies_to_role(role, database) {
+    if policy.applies_to_public() {
+        return Ok(true);
+    }
+    let ActingRole::Declared(role) = role else {
+        return Err(RowSecurityError::RoleRequired { policy: policy.name().to_string() });
+    };
+    if policy.applies_to_role(role, database) {
         return Ok(true);
     }
     let unsettled = policy.roles(database).find_map(|owner| {
@@ -161,12 +169,13 @@ fn applies<DB: DatabaseLike>(
 /// Why `role` is exempt from `table`'s policies, if it is.
 fn exemption<T: TableLike>(
     table: &T,
-    role: &<T::DB as DatabaseLike>::Role,
+    role: &ActingRole<'_, <T::DB as DatabaseLike>::Role>,
     database: &T::DB,
 ) -> Result<Option<RowSecurityExemption>, RowSecurityError> {
     if !table.has_row_level_security(database)? {
         return Ok(Some(RowSecurityExemption::Disabled));
     }
+    let &ActingRole::Declared(role) = role else { return Ok(None) };
     if role.is_superuser() {
         return Ok(Some(RowSecurityExemption::Superuser));
     }
@@ -186,7 +195,7 @@ fn exemption<T: TableLike>(
 pub(crate) fn row_security<'db, T: TableLike>(
     table: &'db T,
     statement: RowStatement,
-    role: &'db <T::DB as DatabaseLike>::Role,
+    role: &ActingRole<'db, <T::DB as DatabaseLike>::Role>,
     database: &'db T::DB,
 ) -> Result<RowSecurity<'db, <T::DB as DatabaseLike>::Policy>, RowSecurityError> {
     if let Some(exemption) = exemption(table, role, database)? {
@@ -302,7 +311,7 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
         &mut self,
         table: &'db DB::Table,
         expressions: Vec<&'db Expr>,
-        role: &'db DB::Role,
+        role: &ActingRole<'db, DB::Role>,
     ) -> Result<Option<String>, RowSecurityError> {
         let mut collector = SubqueryReads { database: self.database, depth: 0, reads: None };
         for expression in expressions {
@@ -333,7 +342,7 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
     fn relation(
         &mut self,
         relation: Relation<'db, DB>,
-        role: &'db DB::Role,
+        role: &ActingRole<'db, DB::Role>,
     ) -> Result<Option<String>, RowSecurityError> {
         match relation {
             Relation::Table(table) => {
@@ -350,16 +359,20 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
                 self.table(table, expressions, role)
             }
             Relation::View(view) => {
+                let owner;
                 let reader = if view.is_security_invoker() {
                     role
                 } else {
-                    view.owner(self.database)?
+                    owner = view
+                        .owner(self.database)?
                         .and_then(|owner| self.database.role(owner))
+                        .map(ActingRole::Declared)
                         .ok_or_else(|| {
                             RowSecurityError::UnsettledViewOwner {
                                 view: view.view_name().to_string(),
                             }
-                        })?
+                        })?;
+                    &owner
                 };
                 let reads = <Query as DataStatementLike<DB>>::referenced_relations(
                     view.definition(),
