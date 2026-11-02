@@ -621,9 +621,7 @@ fn store_part(builder: &mut ParserDBBuilder, part: &Part, query: Query) {
         }
         Block::Rule(position) => {
             let rule = alloc::sync::Arc::make_mut(&mut builder.rules_mut()[position].0);
-            if let Some(held) = rules::action_statement_mut(&mut rule.action, statement) {
-                write(held);
-            }
+            write(&mut rules::action_statements_mut(&mut rule.action)[statement]);
         }
     }
 }

@@ -89,26 +89,19 @@ pub(super) fn create_rule(
     // The action and condition bind the relations they name the way a
     // `BEGIN ATOMIC` body does, under the search path in effect now.
     let rule_name = rule.name.value.clone();
-    let statements: &mut [Statement] = match action_statements_mut(&mut rule.action) {
-        Some(statements) => {
-            super::view_rewrites::normalize_block_references(&builder, statements)?;
-            let too_wide = || Error::RuleActionInsertTooWide { rule_name: rule_name.clone() };
-            for statement in statements.iter_mut() {
-                let ambiguous = |column: Ident| {
-                    Error::RuleActionReferenceAmbiguous {
-                        column_name: column.value,
-                        rule_name: rule_name.clone(),
-                    }
-                };
-                super::view_rewrites::refuse_ambiguous_block_reference(
-                    &builder, statement, ambiguous,
-                )?;
-                super::view_rewrites::spell_block_statement(&builder, statement, &too_wide)?;
+    let statements = action_statements_mut(&mut rule.action);
+    super::view_rewrites::normalize_block_references(&builder, statements)?;
+    let too_wide = || Error::RuleActionInsertTooWide { rule_name: rule_name.clone() };
+    for statement in statements.iter_mut() {
+        let ambiguous = |column: Ident| {
+            Error::RuleActionReferenceAmbiguous {
+                column_name: column.value,
+                rule_name: rule_name.clone(),
             }
-            statements
-        }
-        None => &mut [],
-    };
+        };
+        super::view_rewrites::refuse_ambiguous_block_reference(&builder, statement, ambiguous)?;
+        super::view_rewrites::spell_block_statement(&builder, statement, &too_wide)?;
+    }
     let missing = |name: &sqlparser::ast::ObjectName| {
         Error::RelationNotFoundForRuleAction {
             relation_name: name.to_string(),
@@ -149,34 +142,21 @@ pub(super) fn action_statements(action: &CreateRuleAction) -> &[Statement] {
 }
 
 /// The statements a rule's action holds, held for their rewrites, which is
-/// `None` for `DO NOTHING`.
-pub(super) fn action_statements_mut(action: &mut CreateRuleAction) -> Option<&mut [Statement]> {
+/// empty for `DO NOTHING`.
+pub(super) fn action_statements_mut(action: &mut CreateRuleAction) -> &mut [Statement] {
     match action {
-        CreateRuleAction::Nothing => None,
-        CreateRuleAction::Statement(statement) => {
-            let inner: &mut Statement = statement;
-            Some(core::slice::from_mut(inner))
-        }
-        CreateRuleAction::Statements(statements) => Some(statements),
+        CreateRuleAction::Nothing => &mut [],
+        CreateRuleAction::Statement(statement) => core::slice::from_mut(statement.as_mut()),
+        CreateRuleAction::Statements(statements) => statements,
     }
 }
 
 /// Writes respelled statements back into a rule's action, one for each
 /// statement it holds.
 pub(super) fn write_action_statements(action: &mut CreateRuleAction, statements: Vec<Statement>) {
-    if let Some(held) = action_statements_mut(action) {
-        for (held, statement) in held.iter_mut().zip(statements) {
-            *held = statement;
-        }
+    for (held, statement) in action_statements_mut(action).iter_mut().zip(statements) {
+        *held = statement;
     }
-}
-
-/// The statement at `position` of a rule's action, held for its rewrites.
-pub(super) fn action_statement_mut(
-    action: &mut CreateRuleAction,
-    position: usize,
-) -> Option<&mut Statement> {
-    action_statements_mut(action).and_then(|held| held.get_mut(position))
 }
 
 /// The key the rule's relation is stored under, which a rename or drop of
