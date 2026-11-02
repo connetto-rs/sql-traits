@@ -251,7 +251,12 @@ fn grant_objects_inner_match(left: &GrantObjects, right: &GrantObjects) -> bool 
     }
 }
 
-fn grant_objects_match(left: Option<&GrantObjects>, right: Option<&GrantObjects>) -> bool {
+/// Whether two object lists name the same objects of the same kind, in order,
+/// under PostgreSQL's identifier folding.
+pub(crate) fn grant_objects_match(
+    left: Option<&GrantObjects>,
+    right: Option<&GrantObjects>,
+) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left_objects), Some(right_objects)) => {

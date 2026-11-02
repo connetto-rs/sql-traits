@@ -33,7 +33,7 @@ pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub use dialect::SqlparserDialect;
 pub use grant::apply_revoke_to_grant;
 pub(crate) use grant::{
-    PrivilegeKind, grantee_is_public, grantee_is_session_principal, grantee_matches_role,
-    grantees_match, partition_grantees_for_revoke, schema_matches_table, split_by_column_scope,
-    validate_granted_columns,
+    PrivilegeKind, grant_objects_match, grantee_is_public, grantee_is_session_principal,
+    grantee_matches_role, grantees_match, partition_grantees_for_revoke, schema_matches_table,
+    split_by_column_scope, validate_granted_columns,
 };

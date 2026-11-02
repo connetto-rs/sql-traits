@@ -216,3 +216,19 @@ fn view_grants_follow_the_view() {
 
     assert_eq!(reached(&db), ["s.b", "s.renamed"]);
 }
+
+/// An object written twice in one statement, under any spelling that reaches
+/// it, holds one privilege list entry, as PostgreSQL writes the grant into it
+/// once.
+#[test]
+fn an_object_written_twice_is_granted_once() {
+    let db = parse(
+        "SET search_path = s;
+         GRANT SELECT ON a, A, s.a TO reader;
+         GRANT USAGE ON SCHEMA s, S TO reader;",
+    )
+    .expect("schema parses");
+
+    let granted: Vec<String> = db.table_grants().map(ToString::to_string).collect();
+    assert_eq!(granted, ["GRANT SELECT ON s.a TO reader", "GRANT USAGE ON SCHEMA s TO reader"]);
+}
