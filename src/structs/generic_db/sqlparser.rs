@@ -7036,6 +7036,21 @@ impl ParserDB {
             if column.declared_by(node) {
                 Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;
                 if matches!(operation, AlterColumnOperation::SetDataType { .. }) {
+                    // A column keeps one type across its inheritance tree,
+                    // which only the table it comes from may change, for all of
+                    // it.
+                    if inheritance::is_inherited_column(&builder, node, column_name) {
+                        return Err(crate::errors::Error::InheritedColumnTypeNotAlterable {
+                            table_name: stored.name.clone(),
+                            column_name: column.name.clone(),
+                        });
+                    }
+                    Self::refuse_only_with_children(
+                        &builder,
+                        &stored,
+                        scope,
+                        crate::errors::InheritedChange::AlterColumnType,
+                    )?;
                     Self::refuse_type_change_under_dependents(&builder, &stored, scope, &column)?;
                 }
             }

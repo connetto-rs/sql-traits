@@ -84,6 +84,8 @@ pub enum InheritedChange {
     RenameColumn,
     /// `ALTER TABLE ONLY ... VALIDATE CONSTRAINT`.
     ValidateConstraint,
+    /// `ALTER TABLE ONLY ... ALTER COLUMN ... TYPE`.
+    AlterColumnType,
 }
 
 impl core::fmt::Display for InheritedChange {
@@ -93,6 +95,7 @@ impl core::fmt::Display for InheritedChange {
             Self::AddColumn => "add a column to",
             Self::RenameColumn => "rename a column of",
             Self::ValidateConstraint => "validate a constraint of",
+            Self::AlterColumnType => "change a column type of",
         })
     }
 }
@@ -564,6 +567,18 @@ pub enum Error {
     /// Error indicating that a table tried to drop a column it receives from
     /// a parent, which only the parent can drop.
     InheritedColumnNotDroppable {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the inherited column.
+        column_name: String,
+    },
+    #[error(
+        "Cannot alter type of column `{column_name}` of table `{table_name}` because it is inherited."
+    )]
+    /// Error indicating that a table tried to change the type of a column it
+    /// receives from a parent, which only the parent can change, for every
+    /// table below it at once.
+    InheritedColumnTypeNotAlterable {
         /// Name of the table the statement names.
         table_name: String,
         /// Name of the inherited column.

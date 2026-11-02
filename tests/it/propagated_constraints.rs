@@ -433,6 +433,87 @@ fn only_refuses_to_add_or_rename_a_column_when_tables_inherit() {
     ));
 }
 
+/// A column keeps one type across an inheritance tree, so `ONLY` cannot
+/// change it on the named table alone, whatever the new type is.
+#[test]
+fn only_refuses_to_change_a_column_type_when_tables_inherit() {
+    for sql in [
+        "CREATE TABLE par (id INT);
+         CREATE TABLE chi () INHERITS (par);
+         ALTER TABLE ONLY par ALTER COLUMN id TYPE BIGINT;",
+        "CREATE TABLE par (id INT);
+         CREATE TABLE chi () INHERITS (par);
+         ALTER TABLE ONLY par ALTER COLUMN id SET DATA TYPE INT;",
+        "CREATE TABLE par (id INT, k INT) PARTITION BY RANGE (k);
+         CREATE TABLE p1 PARTITION OF par FOR VALUES FROM (0) TO (10);
+         ALTER TABLE ONLY par ALTER COLUMN id TYPE BIGINT;",
+    ] {
+        let error = parse(sql).expect_err(sql);
+        assert!(
+            matches!(
+                error,
+                Error::OnlyRefusedWithChildren { change: InheritedChange::AlterColumnType, .. }
+            ),
+            "{sql}: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "`ONLY` cannot be used to change a column type of table `par`, because other tables inherit from it."
+        );
+    }
+
+    // A partitioned table with no partitions yet and a table with no
+    // children have nothing to keep in step.
+    database(
+        "CREATE TABLE par (id INT, k INT) PARTITION BY RANGE (k);
+         CREATE TABLE solo (id INT);
+         ALTER TABLE ONLY par ALTER COLUMN id TYPE BIGINT;
+         ALTER TABLE ONLY solo ALTER COLUMN id TYPE BIGINT;",
+    );
+}
+
+/// Only the table a column comes from may change its type, so a table
+/// receiving it, a partition included, is refused even when it also
+/// declares the column itself.
+#[test]
+fn an_inherited_column_type_is_changed_only_on_its_parent() {
+    for (sql, table) in [
+        (
+            "CREATE TABLE par (id INT);
+             CREATE TABLE chi () INHERITS (par);
+             ALTER TABLE chi ALTER COLUMN id TYPE BIGINT;",
+            "chi",
+        ),
+        (
+            "CREATE TABLE par (id INT);
+             CREATE TABLE chi (id INT) INHERITS (par);
+             ALTER TABLE chi ALTER COLUMN id TYPE BIGINT;",
+            "chi",
+        ),
+        (
+            "CREATE TABLE par (id INT, k INT) PARTITION BY RANGE (k);
+             CREATE TABLE p1 PARTITION OF par FOR VALUES FROM (0) TO (10);
+             ALTER TABLE p1 ALTER COLUMN id TYPE BIGINT;",
+            "p1",
+        ),
+    ] {
+        assert!(
+            matches!(
+                parse(sql),
+                Err(Error::InheritedColumnTypeNotAlterable { ref table_name, ref column_name })
+                    if table_name == table && column_name == "id"
+            ),
+            "{sql}"
+        );
+    }
+
+    database(
+        "CREATE TABLE par (id INT);
+         CREATE TABLE chi (own INT) INHERITS (par);
+         ALTER TABLE chi ALTER COLUMN own TYPE BIGINT;",
+    );
+}
+
 #[test]
 fn only_drops_a_column_from_the_named_table_and_leaves_the_copies() {
     let detached = database(
