@@ -20,8 +20,8 @@ use sqlparser::{
     ast::{
         Action, AlterColumnOperation, AlterFunction, AlterFunctionAction, AlterFunctionKind,
         AlterFunctionOperation, AlterIndexOperation, AlterPolicy, AlterPolicyOperation,
-        AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, ArgMode,
-        ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
+        AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, AlterTableType,
+        ArgMode, ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
         CreateCollation, CreateCollationDefinition, CreateDomain, CreateExtension, CreateFunction,
         CreateFunctionBody, CreateIndex, CreatePolicy, CreateRole, CreateRule, CreateTable,
         CreateTableOptions, CreateTrigger, DataType, DropBehavior, DropDomain, Expr,
@@ -8166,6 +8166,20 @@ impl ParserDB {
                     builder = views::apply_alter_view(builder, &alter_view)?;
                 }
                 Statement::AlterTable(alter_table) => {
+                    // The model records no foreign table, as it skips `CREATE
+                    // FOREIGN TABLE`, so it skips altering one too. A name it
+                    // holds is no foreign table, which PostgreSQL refuses.
+                    if alter_table.table_type == Some(AlterTableType::Foreign) {
+                        if let Some((object_kind, _)) = builder.relation_reached(&alter_table.name)
+                        {
+                            return Err(crate::errors::Error::AlterActionUnsupportedOnRelation {
+                                object_kind,
+                                relation_name: last_str(&alter_table.name).to_string(),
+                                operation: "ALTER FOREIGN TABLE".to_string(),
+                            });
+                        }
+                        continue;
+                    }
                     let scope = AlterTableScope {
                         if_exists: alter_table.if_exists,
                         only: alter_table.only,

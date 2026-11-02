@@ -786,3 +786,32 @@ fn wrapper_options_are_refused_on_a_table() {
             .expect("IF EXISTS skips an absent table");
     }
 }
+
+/// The model skips `CREATE FOREIGN TABLE`, so it skips altering one, and
+/// refuses `ALTER FOREIGN TABLE` against a table, as PostgreSQL 18.6 answers
+/// `"t" is not a foreign table`.
+#[test]
+fn alter_foreign_table_is_skipped_and_refused_on_a_table() {
+    let db = parse(
+        "CREATE TABLE t (c INT);
+         CREATE SERVER srv FOREIGN DATA WRAPPER postgres_fdw;
+         CREATE FOREIGN TABLE ft (c INT) SERVER srv;
+         ALTER FOREIGN TABLE ft ADD COLUMN t INT;
+         ALTER FOREIGN TABLE ft OPTIONS (ADD a 'b');",
+    )
+    .expect("a foreign table's changes are skipped");
+    assert_eq!(column_names(&db, "t"), ["c"]);
+
+    let refused = parse("CREATE TABLE t (c INT); ALTER FOREIGN TABLE t ADD COLUMN d INT;");
+    assert!(
+        matches!(
+            &refused,
+            Err(Error::AlterActionUnsupportedOnRelation {
+                object_kind: ObjectKind::Table,
+                relation_name,
+                ..
+            }) if relation_name == "t"
+        ),
+        "answered {refused:?}"
+    );
+}
