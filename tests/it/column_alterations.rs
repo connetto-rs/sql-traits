@@ -12,7 +12,7 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::{
-    errors::{Error, LookupError},
+    errors::{Error, LookupError, ObjectKind},
     prelude::*,
 };
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
@@ -759,5 +759,30 @@ fn a_column_operation_on_an_absent_table_is_refused() {
              ALTER TABLE IF EXISTS absent {tail};"
         );
         parse(&tolerated).expect("IF EXISTS asks for the statement to be tolerated");
+    }
+}
+
+/// Wrapper `OPTIONS` belong to a foreign table, so PostgreSQL 18.6 refuses
+/// them on a table, `ALTER action ALTER COLUMN ... OPTIONS cannot be performed
+/// on relation "t"` for a column and `ALTER action OPTIONS ...` for the table,
+/// and skips them under `IF EXISTS` on an absent one.
+#[test]
+fn wrapper_options_are_refused_on_a_table() {
+    for tail in ["ALTER COLUMN c OPTIONS (ADD a 'b')", "OPTIONS (ADD a 'b')"] {
+        let sql = format!("CREATE TABLE t (c INT); ALTER TABLE t {tail};");
+        let refused = parse(&sql);
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::AlterActionUnsupportedOnRelation {
+                    object_kind: ObjectKind::Table,
+                    relation_name,
+                    ..
+                }) if relation_name == "t"
+            ),
+            "{sql} answered {refused:?}"
+        );
+        parse(&format!("CREATE TABLE t (c INT); ALTER TABLE IF EXISTS absent {tail};"))
+            .expect("IF EXISTS skips an absent table");
     }
 }

@@ -533,6 +533,71 @@ fn alter_view_names_a_plain_view() {
 }
 
 #[test]
+fn alter_materialized_view_names_a_materialized_view() {
+    // Measured on PostgreSQL 18.6: `ALTER MATERIALIZED VIEW` refuses any
+    // other relation as "is not a materialized view", and an absent one
+    // unless `IF EXISTS` excuses it.
+    let schema = "CREATE TABLE t (id INT);
+                  CREATE VIEW v AS SELECT id FROM t;
+                  CREATE MATERIALIZED VIEW m AS SELECT id FROM t;";
+    for (statement, actual) in [
+        ("ALTER MATERIALIZED VIEW v OWNER TO CURRENT_USER;", ObjectKind::View),
+        ("ALTER MATERIALIZED VIEW t RENAME TO x;", ObjectKind::Table),
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(&error, Error::RelationKindMismatch {
+                expected_kind: ObjectKind::MaterializedView, actual_kind, ..
+            } if *actual_kind == actual),
+            "{statement} got {error:?}"
+        );
+    }
+    let error = parse("ALTER MATERIALIZED VIEW nope OWNER TO CURRENT_USER;").expect_err("absent");
+    assert!(
+        matches!(&error, Error::RelationNotFound { object_kind: ObjectKind::MaterializedView, .. }),
+        "got {error:?}"
+    );
+    parse("ALTER MATERIALIZED VIEW IF EXISTS nope OWNER TO CURRENT_USER;")
+        .expect("IF EXISTS skips");
+}
+
+#[test]
+fn alter_materialized_view_renames_owns_and_sets_storage_parameters() {
+    // Measured on PostgreSQL 18.6: a materialized view takes a rename, a
+    // column rename, an owner and storage parameters, and refuses a plain
+    // view's option.
+    let db = parse(
+        "CREATE ROLE r;
+         CREATE TABLE t (id INT);
+         CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+         ALTER MATERIALIZED VIEW m SET (fillfactor = 50);
+         ALTER MATERIALIZED VIEW m RENAME COLUMN id TO x;
+         ALTER MATERIALIZED VIEW m RENAME TO m2;
+         ALTER MATERIALIZED VIEW m2 OWNER TO r;",
+    )
+    .expect("schema");
+    let target = |name| TargetName::new(name, false);
+    assert!(
+        db.materialized_view_by_target(target("m"), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .is_none()
+    );
+    let renamed = db
+        .materialized_view_by_target(target("m2"), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("renamed");
+    assert_eq!(renamed.definition().to_string(), "SELECT id AS x FROM t");
+    assert_eq!(renamed.owner(&db), Ok(Some("r")));
+
+    parse(
+        "CREATE TABLE t (id INT);
+         CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+         ALTER MATERIALIZED VIEW m SET (security_invoker = true);",
+    )
+    .expect_err("a materialized view takes no security_invoker");
+}
+
+#[test]
 fn alter_view_renames_the_view_and_its_columns() {
     let error = parse(
         "CREATE TABLE t (id INT);

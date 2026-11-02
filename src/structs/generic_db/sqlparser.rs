@@ -7107,6 +7107,20 @@ impl ParserDB {
         operation: &AlterColumnOperation,
         defaults: &DefaultPrivileges,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        // Column OPTIONS belong to a foreign table's wrapper, which no table
+        // has, so PostgreSQL refuses them on a table.
+        if let AlterColumnOperation::GenericOptions { .. } = operation {
+            return match Self::alter_table_target(&builder, table_name, scope)? {
+                Some(stored) => {
+                    Err(crate::errors::Error::AlterActionUnsupportedOnRelation {
+                        object_kind: ObjectKind::Table,
+                        relation_name: stored.name,
+                        operation: "ALTER COLUMN ... OPTIONS".to_string(),
+                    })
+                }
+                None => Ok(builder),
+            };
+        }
         let mut operation = operation.clone();
         if let AlterColumnOperation::SetDataType { data_type, .. } = &mut operation {
             domains::bind_type(&builder, data_type);
@@ -7251,6 +7265,8 @@ impl ParserDB {
                     },
                 );
             }
+            // Refused before it reaches a table's column.
+            AlterColumnOperation::GenericOptions { .. } => {}
         }
     }
 
@@ -7278,6 +7294,8 @@ impl ParserDB {
                     generated_keyword: generated_as.is_some(),
                 }
             }
+            // Refused before it reaches a table's column.
+            AlterColumnOperation::GenericOptions { .. } => ColumnOption::GenericOptions(Vec::new()),
         }
     }
 
@@ -8478,6 +8496,22 @@ impl ParserDB {
                                     scope,
                                     options,
                                 )?;
+                            }
+
+                            // A foreign table's wrapper options, which no
+                            // table has, so PostgreSQL refuses them on one.
+                            AlterTableOperation::GenericOptions { .. } => {
+                                if let Some(stored) =
+                                    Self::alter_table_target(&builder, &alter_table.name, scope)?
+                                {
+                                    return Err(
+                                        crate::errors::Error::AlterActionUnsupportedOnRelation {
+                                            object_kind: ObjectKind::Table,
+                                            relation_name: stored.name,
+                                            operation: "OPTIONS".to_string(),
+                                        },
+                                    );
+                                }
                             }
 
                             // Ignored: each of these changes something the
