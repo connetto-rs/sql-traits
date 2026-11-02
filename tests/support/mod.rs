@@ -7,6 +7,7 @@ pub(crate) mod column_type_probes;
 pub(crate) mod counting_allocator;
 pub(crate) mod function_overloads;
 pub(crate) mod query_parsing;
+pub(crate) mod relation_labels;
 pub(crate) mod sequence_names;
 pub(crate) mod table_lookup;
 

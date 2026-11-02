@@ -9,6 +9,8 @@ use sqlparser::{
     parser::Parser,
 };
 
+use crate::support::relation_labels::relation_label;
+
 fn postgres(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses")
 }
@@ -501,20 +503,7 @@ fn named_by(database: &ParserDB, function: &str) -> Result<Vec<String>, LookupEr
         .function_by_target(TargetName::new(function, false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("function exists");
-    Ok(function
-        .referenced_relations(database)?
-        .into_iter()
-        .map(|relation| {
-            match relation {
-                Relation::Table(table) => format!("table {}", table.table_name()),
-                Relation::View(view) => format!("view {}", view.view_name()),
-                Relation::MaterializedView(view) => {
-                    format!("materialized view {}", view.view_name())
-                }
-                Relation::Sequence(sequence) => format!("sequence {}", sequence.sequence_name()),
-            }
-        })
-        .collect())
+    Ok(function.referenced_relations(database)?.into_iter().map(relation_label).collect())
 }
 
 /// A body reading a view reads the view's base tables, while a materialized
