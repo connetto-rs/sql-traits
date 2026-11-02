@@ -98,6 +98,7 @@ mod scalar_family_allocations;
 mod schema_rename;
 mod scope_identifier_context;
 mod search_path;
+mod search_path_creation;
 mod sequence_defaults;
 mod sequences;
 mod set_returning_functions;

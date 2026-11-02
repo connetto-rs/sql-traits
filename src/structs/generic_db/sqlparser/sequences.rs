@@ -87,7 +87,7 @@ pub(super) fn create_sequence(
     creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, ObjectKind::Sequence, builder.catalog_name())?;
-    place_relation(&builder, &mut name, temporary, ObjectKind::Sequence)?;
+    place_relation(&builder, &mut name, temporary, ObjectKind::Sequence, creator.role())?;
     // The name is known to be static and non-empty here, so it ends in an
     // identifier.
     let name_ident = object_name_last_identifier(&name)

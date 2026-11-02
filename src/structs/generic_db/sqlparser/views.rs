@@ -116,7 +116,8 @@ pub(super) fn create_view(
             relation_name,
         });
     }
-    node.temporary = place_relation(&builder, &mut node.name, node.temporary || promoted, kind)?;
+    let temporary = node.temporary || promoted;
+    node.temporary = place_relation(&builder, &mut node.name, temporary, kind, creator.role())?;
 
     let schema = view_schema_qualifier(&node.name);
     let Some(name_ident) = object_name_last_identifier(&node.name) else {
