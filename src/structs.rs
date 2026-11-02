@@ -10,6 +10,7 @@ pub use generic_db::{
     SqlparserProfile, UnresolvedAccessReference,
 };
 mod function_kind;
+mod helper_set;
 mod identifier_case;
 mod identity;
 pub mod metadata;
@@ -30,6 +31,7 @@ pub use deployment::{
 };
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use function_kind::FunctionKind;
+pub use helper_set::{GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm};
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};

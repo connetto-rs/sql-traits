@@ -15,8 +15,8 @@ use super::{
     data_statement::{BodyPath, Reads, RunTimeBody, reads_of_body, reads_on_path},
 };
 use crate::{
-    errors::{LookupError, ObjectKind},
-    structs::{FunctionKind, FunctionMetadata, ParserDB, TargetName},
+    errors::{HelperSetError, LookupError, ObjectKind},
+    structs::{Deployment, FunctionKind, FunctionMetadata, HelperSet, ParserDB, TargetName},
     traits::{DatabaseLike, FunctionLike, Metadata, Relation, role::privilege_holders},
     utils::{
         identifier_resolution::SearchPath,
@@ -47,7 +47,7 @@ fn function_metadata<'db>(
 }
 
 /// The SQL a function runs, in the shape its body is written.
-enum SqlBody<'f> {
+pub(super) enum SqlBody<'f> {
     /// Statements read one after another each time the function runs, parsed
     /// from the body's text or already parsed by the input.
     Statements(Cow<'f, [Statement]>),
@@ -65,7 +65,7 @@ enum SqlBody<'f> {
 
 /// The SQL body of `function`, refusing one whose reads and calls cannot be
 /// known, as [`FunctionLike::referenced_tables`] describes.
-fn sql_body<'f>(
+pub(super) fn sql_body<'f>(
     function: &'f CreateFunction,
     database: &ParserDB,
 ) -> Result<SqlBody<'f>, LookupError> {
@@ -482,6 +482,15 @@ impl FunctionLike for CreateFunction {
     ) -> Result<bool, LookupError> {
         let metadata = function_metadata(self, database)?;
         Ok(privilege_holders(role, database).any(|holder| metadata.can_grant_execute(holder)))
+    }
+
+    fn helper_set<'db>(
+        &'db self,
+        arguments: &[Value],
+        deployment: &'db Deployment,
+        database: &'db Self::DB,
+    ) -> Result<HelperSet<'db, Self::DB>, HelperSetError> {
+        super::helper_set::helper_set(self, arguments, deployment, database)
     }
 }
 

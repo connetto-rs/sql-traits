@@ -2,7 +2,7 @@
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 
-use sqlparser::parser::ParserError;
+use sqlparser::{ast::FunctionBehavior, parser::ParserError};
 
 use crate::structs::{FunctionKind, IdentifierCase};
 
@@ -496,6 +496,180 @@ pub enum RowSecurityError {
     UnsettledViewOwner {
         /// The view.
         view: String,
+    },
+}
+
+/// Why [`FunctionLike::helper_set`](crate::traits::FunctionLike::helper_set)
+/// refuses to answer what a helper returns.
+///
+/// Each refusal names the helper it is met in, a helper a parent arm calls
+/// where it is met there.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum HelperSetError {
+    /// A table, function or column of the body cannot be looked up.
+    #[error(transparent)]
+    Lookup(#[from] LookupError),
+    /// The helper is not written in `sql`.
+    #[error("helper `{function}` is written in {}, not sql", language.as_deref().unwrap_or("no language"))]
+    Language {
+        /// The helper.
+        function: String,
+        /// The language it names, if any.
+        language: Option<String>,
+    },
+    /// The helper is not `STABLE`.
+    #[error("helper `{function}` is {volatility}, not STABLE")]
+    Volatility {
+        /// The helper.
+        function: String,
+        /// Its volatility.
+        volatility: FunctionBehavior,
+    },
+    /// The helper runs as its caller, so its body reads through the caller's
+    /// policies.
+    #[error("helper `{function}` is not SECURITY DEFINER")]
+    SecurityInvoker {
+        /// The helper.
+        function: String,
+    },
+    /// The helper does not return `SETOF` one scalar type.
+    #[error("helper `{function}` does not return SETOF a scalar type")]
+    ReturnType {
+        /// The helper.
+        function: String,
+    },
+    /// The helper does not set its own `search_path`, so its names resolve
+    /// under whatever path the caller set.
+    #[error("helper `{function}` does not pin its search_path")]
+    UnpinnedSearchPath {
+        /// The helper.
+        function: String,
+    },
+    /// The argument list does not match the helper's input parameters.
+    #[error("helper `{function}` takes {expected} arguments, not {given}")]
+    ArgumentCount {
+        /// The helper.
+        function: String,
+        /// Its input parameters.
+        expected: usize,
+        /// The arguments passed.
+        given: usize,
+    },
+    /// An argument is not a string, number, boolean or `NULL` literal.
+    #[error("helper `{function}` is passed `{argument}`, which is not a comparable literal")]
+    UnsupportedArgument {
+        /// The helper.
+        function: String,
+        /// The argument.
+        argument: String,
+    },
+    /// The schema records no owner for the helper.
+    #[error("the schema records no owner for helper `{function}`")]
+    UnsettledOwner {
+        /// The helper.
+        function: String,
+    },
+    /// The helper's owner is a role the schema does not declare.
+    #[error("helper `{function}` is owned by `{owner}`, which the schema does not declare")]
+    UndeclaredOwner {
+        /// The helper.
+        function: String,
+        /// The owner.
+        owner: String,
+    },
+    /// The owner is not exempt from the row-level security of a table the
+    /// body reads.
+    #[error("owner `{owner}` of helper `{function}` reads `{table}` through its policies")]
+    NotExempt {
+        /// The helper.
+        function: String,
+        /// The owner.
+        owner: String,
+        /// The table.
+        table: String,
+    },
+    /// The owner lacks `SELECT` on a table the body reads, so every call
+    /// raises `42501`.
+    #[error("owner `{owner}` of helper `{function}` lacks SELECT on `{table}`")]
+    MissingSelect {
+        /// The helper.
+        function: String,
+        /// The owner.
+        owner: String,
+        /// The table.
+        table: String,
+    },
+    /// The owner lacks `EXECUTE` on a helper the body calls, so every call
+    /// raises `42501`.
+    #[error("owner `{owner}` of helper `{function}` lacks EXECUTE on `{called}`")]
+    MissingExecute {
+        /// The helper.
+        function: String,
+        /// The owner.
+        owner: String,
+        /// The helper called.
+        called: String,
+    },
+    /// The body reads a setting the deployment does not declare.
+    #[error("helper `{function}` reads setting `{setting}`, which the deployment does not declare")]
+    UndeclaredSetting {
+        /// The helper.
+        function: String,
+        /// The setting, as written.
+        setting: String,
+    },
+    /// The body compares a column to a setting the deployment declares as
+    /// something other than the caller.
+    #[error(
+        "helper `{function}` compares a column to setting `{setting}`, which is not the caller"
+    )]
+    SettingNotCaller {
+        /// The helper.
+        function: String,
+        /// The setting.
+        setting: String,
+    },
+    /// A grant arm compares a column to a parameter where it would compare it
+    /// to the caller, so whoever calls the helper chooses whose grants it
+    /// returns.
+    #[error("helper `{function}` takes its caller from parameter `{parameter}`")]
+    CallerFromParameter {
+        /// The helper.
+        function: String,
+        /// The parameter.
+        parameter: String,
+    },
+    /// A grant arm's condition, its arguments substituted, reduces to
+    /// neither `TRUE` nor a set of literal values of one column.
+    #[error("helper `{function}` filters by `{condition}`, which reduces to no literal set")]
+    Irreducible {
+        /// The helper.
+        function: String,
+        /// The condition, as written.
+        condition: String,
+    },
+    /// The body is not a `UNION` of grant arms and parent arms.
+    #[error("helper `{function}` returns `{arm}`, which is neither a grant arm nor a parent arm")]
+    ArmShape {
+        /// The helper.
+        function: String,
+        /// The query that has neither shape, as written.
+        arm: String,
+    },
+    /// A parent arm's call reaches no function or several.
+    #[error("helper `{function}` calls `{call}`, which reaches no single function")]
+    UnresolvedCall {
+        /// The helper.
+        function: String,
+        /// The call, as written.
+        call: String,
+    },
+    /// The parent arms reach a helper already being answered, which PostgreSQL
+    /// calls until the stack runs out (`54001`).
+    #[error("helper `{function}` reaches itself through its parent arms")]
+    CallCycle {
+        /// The helper reached again.
+        function: String,
     },
 }
 

@@ -5,12 +5,12 @@ use core::{fmt::Debug, hash::Hash};
 
 use sqlparser::ast::{
     ArgMode, Expr, Function, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam,
-    FunctionSecurity,
+    FunctionSecurity, Value,
 };
 
 use crate::{
-    errors::LookupError,
-    structs::{FunctionKind, TargetName},
+    errors::{HelperSetError, LookupError},
+    structs::{Deployment, FunctionKind, HelperSet, TargetName},
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
         call_typing::{
@@ -1280,6 +1280,93 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         role: &<Self::DB as DatabaseLike>::Role,
         database: &Self::DB,
     ) -> Result<bool, LookupError>;
+
+    /// What this helper returns for a caller of `deployment`, called with
+    /// `arguments`, as a union of grant arms and parent arms.
+    ///
+    /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
+    /// function returning `SETOF` one scalar type with a pinned
+    /// `search_path`, owned by a declared role holding `SELECT` on every
+    /// table it reads and exempt from their row-level security, and when
+    /// its body is a `UNION` of arms of two shapes.
+    ///
+    /// - A grant arm, `SELECT <column> FROM <table> WHERE <caller column> =
+    ///   current_setting('<setting>'[, true]) [AND <condition>]`, where the
+    ///   deployment declares the setting as the caller and the condition, the
+    ///   arguments substituted, reduces to `TRUE`, to `FALSE` or `NULL`, or to
+    ///   the literal values one column has to hold.
+    /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <foreign key
+    ///   column> IN (SELECT <helper>(<arguments>))`, the foreign key a
+    ///   single-column one and each argument a parameter or a literal, the
+    ///   helper called answered in turn for the arguments it receives.
+    ///
+    /// A grant arm whose condition reduces to `FALSE` or `NULL` keeps no row
+    /// and is left out. A column named like a parameter is the column, as
+    /// PostgreSQL resolves names in a SQL function.
+    ///
+    /// The owner's `USAGE` on the schemas the helper and what it reads live
+    /// in is not checked, and a `SELECT` granted on columns alone is not
+    /// counted.
+    ///
+    /// # Arguments
+    ///
+    /// * `arguments` - One literal per input parameter.
+    /// * `deployment` - The deployment declaring the caller setting.
+    /// * `database` - The database the helper belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`HelperSetError`] naming why the helper, or a helper a
+    /// parent arm calls, refuses to answer.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::{errors::HelperSetError, prelude::*};
+    /// use sqlparser::{
+    ///     ast::{DataType, Value},
+    ///     dialect::PostgreSqlDialect,
+    /// };
+    ///
+    /// # fn main() -> Result<(), HelperSetError> {
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+    ///      CREATE TABLE grants (doc_id TEXT, principal_id TEXT, role TEXT);
+    ///      CREATE FUNCTION docs_with(min_role TEXT) RETURNS SETOF TEXT
+    ///      LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+    ///        SELECT doc_id FROM grants
+    ///        WHERE principal_id = current_setting('app.user_id', true)
+    ///          AND (role = 'admin' OR role = min_role)
+    ///      $$;
+    ///      ALTER FUNCTION docs_with(TEXT) OWNER TO authz_owner;
+    ///      GRANT SELECT ON grants TO authz_owner;",
+    /// )
+    /// .expect("the schema parses");
+    /// let caller = SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))
+    ///     .expect("a custom setting name");
+    /// let deployment = Deployment::new("app", ["app"], [caller]).expect("a valid deployment");
+    /// let docs_with = db
+    ///     .function_by_target(TargetName::new("docs_with", false), IdentifierCase::AsWritten)?
+    ///     .expect("the helper exists");
+    ///
+    /// let set =
+    ///     docs_with.helper_set(&[Value::SingleQuotedString("write".into())], &deployment, &db)?;
+    /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
+    /// assert_eq!(grant.column().column_name(), "doc_id");
+    /// assert_eq!(grant.caller_column().column_name(), "principal_id");
+    /// let roles = grant.restriction().expect("the condition keeps two roles");
+    /// let admin = Value::SingleQuotedString("admin".into());
+    /// let write = Value::SingleQuotedString("write".into());
+    /// assert_eq!(roles.values(), [admin, write]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn helper_set<'db>(
+        &'db self,
+        arguments: &[Value],
+        deployment: &'db Deployment,
+        database: &'db Self::DB,
+    ) -> Result<HelperSet<'db, Self::DB>, HelperSetError>;
 
     /// Returns the normalized return type name of the function as a string.
     ///
