@@ -8840,7 +8840,8 @@ impl ParserDB {
                     }
 
                     // One grant per object, as PostgreSQL writes one privilege
-                    // list per object, each checked before any is stored.
+                    // list per object, each checked before any is stored. An
+                    // object written twice gets its entry once.
                     let parts = {
                         // Ungated: a column list is checked whenever its table
                         // resolved, since a dump omits roles and never the
@@ -8860,7 +8861,14 @@ impl ParserDB {
                                 |key| builder.relation_key_is_held(key, builder.identifier_case()),
                             )?;
                             builder.bind_access_targets(&mut part.objects);
-                            parts.push(part);
+                            if !parts.iter().any(|kept: &Grant| {
+                                crate::impls::grant_objects_match(
+                                    kept.objects.as_ref(),
+                                    part.objects.as_ref(),
+                                )
+                            }) {
+                                parts.push(part);
+                            }
                         }
                         parts
                     };
