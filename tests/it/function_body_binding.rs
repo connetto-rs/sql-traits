@@ -3405,3 +3405,47 @@ fn a_block_body_keeps_only_markers_through_renames() {
         "CREATE FUNCTION f() RETURNS VOID LANGUAGE sql BEGIN ATOMIC MERGE INTO ONLY o2u USING ONLY o2v ON o2u.a = o2v.a WHEN MATCHED THEN DELETE; END"
     );
 }
+
+/// A rename that makes a bare reference ambiguous qualifies it in a query a
+/// data-modifying statement holds, as PostgreSQL does, wherever the
+/// statement holds the query.
+#[test]
+fn a_reference_a_rename_captures_in_an_embedded_query_is_qualified() {
+    for (body, expected) in [
+        ("INSERT INTO log SELECT a FROM t, u;", "INSERT INTO log (y) SELECT t.aa AS a FROM t, u;"),
+        (
+            "DELETE FROM log WHERE y IN (SELECT a FROM t, u);",
+            "DELETE FROM log WHERE y IN (SELECT t.aa AS a FROM t, u);",
+        ),
+        (
+            "UPDATE log SET y = (SELECT a FROM t, u LIMIT 1);",
+            "UPDATE log SET y = (SELECT t.aa AS a FROM t, u LIMIT 1);",
+        ),
+        (
+            "INSERT INTO log SELECT a FROM t, u WHERE EXISTS (SELECT 1 FROM t AS t2);",
+            "INSERT INTO log (y) SELECT t.aa AS a FROM t, u WHERE EXISTS (SELECT 1 FROM t AS t2);",
+        ),
+        (
+            "DELETE FROM log WHERE y IN (SELECT a FROM t, u WHERE u.aa = log.y);",
+            "DELETE FROM log WHERE y IN (SELECT t.aa AS a FROM t, u WHERE u.aa = log.y);",
+        ),
+        (
+            "WITH w AS (INSERT INTO log SELECT a FROM t, u RETURNING y) SELECT y FROM w;",
+            "WITH w AS (INSERT INTO log SELECT t.aa AS a FROM t, u RETURNING y) SELECT y FROM w;",
+        ),
+    ] {
+        let db = parse(&format!(
+            "CREATE TABLE log (y INT);
+             CREATE TABLE t (a INT);
+             CREATE TABLE u (aa INT);
+             CREATE FUNCTION f() RETURNS VOID LANGUAGE sql BEGIN ATOMIC {body} END;
+             ALTER TABLE t RENAME COLUMN a TO aa;"
+        ))
+        .expect(body);
+        assert_eq!(
+            text(&db, "f"),
+            format!("CREATE FUNCTION f() RETURNS VOID LANGUAGE sql BEGIN ATOMIC {expected} END"),
+            "{body}"
+        );
+    }
+}

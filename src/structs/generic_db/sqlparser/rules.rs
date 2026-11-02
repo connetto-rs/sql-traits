@@ -170,15 +170,12 @@ pub(super) fn write_action_statements(action: &mut CreateRuleAction, statements:
     }
 }
 
-/// Writes one respelled statement back into a rule's action at `position`.
-pub(super) fn write_action_statement(
+/// The statement at `position` of a rule's action, held for its rewrites.
+pub(super) fn action_statement_mut(
     action: &mut CreateRuleAction,
     position: usize,
-    statement: Statement,
-) {
-    if let Some(held) = action_statements_mut(action).and_then(|held| held.get_mut(position)) {
-        *held = statement;
-    }
+) -> Option<&mut Statement> {
+    action_statements_mut(action).and_then(|held| held.get_mut(position))
 }
 
 /// The key the rule's relation is stored under, which a rename or drop of
