@@ -413,6 +413,7 @@ dependencies = [
  "geometric-traits",
  "sha2",
  "sqlparser",
+ "sqlparser-plpgsql",
  "thiserror",
  "unicode-normalization",
 ]
@@ -429,7 +430,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ce12f1f63e0a50259d646cd587d0643e415646b3"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1071d75faddd239341a69ff997caa003690e5cae"
 dependencies = [
  "log",
  "recursive",
@@ -437,9 +438,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlparser-plpgsql"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#657a7dff12df8ae92bf226218e73a9ec1087dc79"
+dependencies = [
+ "sqlparser",
+ "thiserror",
+]
+
+[[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ce12f1f63e0a50259d646cd587d0643e415646b3"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1071d75faddd239341a69ff997caa003690e5cae"
 dependencies = [
  "proc-macro2",
  "quote",

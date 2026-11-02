@@ -673,6 +673,13 @@ fn describe(relation: &Relation<'_, ParserDB>) -> String {
         Relation::Table(table) => {
             format!("table {}.{}", table.table_schema().unwrap_or("public"), table.table_name())
         }
+        Relation::ForeignTable(table) => {
+            format!(
+                "foreign table {}.{}",
+                table.table_schema().unwrap_or("public"),
+                table.table_name()
+            )
+        }
         Relation::View(view) => {
             format!("view {}.{}", view.view_schema().unwrap_or("public"), view.view_name())
         }

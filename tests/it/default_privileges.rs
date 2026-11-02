@@ -66,7 +66,7 @@ fn relation_privileges(db: &ParserDB, relation: &str, role_name: &str) -> Vec<St
         .filter(|grant| {
             grant.relations(db).any(|reached| {
                 let name = match reached {
-                    Relation::Table(table) => table.table_name(),
+                    Relation::Table(table) | Relation::ForeignTable(table) => table.table_name(),
                     Relation::View(view) => view.view_name(),
                     Relation::MaterializedView(view) => view.view_name(),
                     Relation::Sequence(sequence) => sequence.sequence_name(),

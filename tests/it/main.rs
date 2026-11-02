@@ -37,6 +37,7 @@ mod duplicate_object_names;
 mod exhaustive_alter_table;
 mod expression_truth;
 mod extensions;
+mod foreign_tables;
 mod function_body_binding;
 mod function_creation_access;
 mod function_kind;

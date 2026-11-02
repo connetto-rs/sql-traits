@@ -154,6 +154,7 @@ fn grants_follow_the_move() {
         .map(|relation| {
             match relation {
                 Relation::Table(table) => format!("table {}", table.table_name()),
+                Relation::ForeignTable(table) => format!("foreign table {}", table.table_name()),
                 Relation::View(view) => {
                     format!("view {}.{}", view.view_schema().unwrap_or("public"), view.view_name())
                 }

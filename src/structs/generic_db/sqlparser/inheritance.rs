@@ -131,6 +131,31 @@ pub(super) fn first_inheritor_below(
     None
 }
 
+/// The first foreign table among the partitions below `table`, at any depth,
+/// which a unique index on `table` would have to reach.
+pub(super) fn first_foreign_partition_below(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+) -> Option<StoredTable> {
+    let case = builder.identifier_case();
+    let mut frontier = alloc::vec![table.clone()];
+    while let Some(current) = frontier.pop() {
+        for (kind, child) in direct_children(builder, &current) {
+            if kind != ParentKind::PartitionOf {
+                continue;
+            }
+            let foreign = builder.tables().iter().any(|(stored, metadata, _)| {
+                child.matches(stored, case) && metadata.foreign_source().is_some()
+            });
+            if foreign {
+                return Some(child);
+            }
+            frontier.push(child);
+        }
+    }
+    None
+}
+
 /// The tables linked directly to `parent`, each under the spelling that links
 /// it.
 ///
@@ -216,12 +241,21 @@ fn is_inherited_option(option: &ColumnOption) -> bool {
 /// Whether a parent linked by this spelling writes the option onto the copy.
 ///
 /// A check written `NO INHERIT` stays with the table declaring it, which is
-/// the attribute's entire meaning, so it never joins the copy.
+/// the attribute's entire meaning, so it never joins the copy. Foreign-data
+/// wrapper options stay there too, since PostgreSQL records them for the
+/// declaring column alone.
 pub(super) fn option_passes_down(kind: ParentKind, option: &ColumnOption) -> bool {
-    if matches!(option, ColumnOption::Check(check) if check.no_inherit) {
+    if stays_with_declaring_column(option) {
         return false;
     }
     kind == ParentKind::PartitionOf || is_inherited_option(option)
+}
+
+/// Whether the option stays with the column declaring it whatever links a
+/// child to it: a `NO INHERIT` check, and foreign-data wrapper options.
+pub(super) fn stays_with_declaring_column(option: &ColumnOption) -> bool {
+    matches!(option, ColumnOption::Check(check) if check.no_inherit)
+        || matches!(option, ColumnOption::GenericOptions(_))
 }
 
 /// The option with the name a partition's copy would have been given stripped

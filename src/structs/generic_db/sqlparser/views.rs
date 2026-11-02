@@ -340,24 +340,30 @@ fn materialized_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> O
         .position(|(view, _, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == key)
 }
 
-/// Refuses a `DROP TABLE` naming a view or a sequence, as PostgreSQL does.
+/// Refuses a `DROP TABLE` or `DROP FOREIGN TABLE` naming another relation kind
+/// than `expected_kind`, as PostgreSQL does.
 ///
 /// # Errors
 ///
-/// Returns [`Error::RelationKindMismatch`] when the name is held by either
-/// view kind or by a sequence.
-pub(super) fn refuse_dropping_relation_as_table(
+/// Returns [`Error::RelationKindMismatch`] when a table, foreign table, view
+/// or sequence of another kind holds the name.
+pub(super) fn refuse_dropping_other_kind(
     builder: &ParserDBBuilder,
     name: &ObjectName,
+    expected_kind: ObjectKind,
 ) -> Result<(), Error> {
     match builder.relation_reached(name) {
         Some((
-            actual_kind @ (ObjectKind::View | ObjectKind::MaterializedView | ObjectKind::Sequence),
+            actual_kind @ (ObjectKind::Table
+            | ObjectKind::ForeignTable
+            | ObjectKind::View
+            | ObjectKind::MaterializedView
+            | ObjectKind::Sequence),
             _,
-        )) => {
+        )) if actual_kind != expected_kind => {
             Err(Error::RelationKindMismatch {
                 object_name: rendered_name(name),
-                expected_kind: ObjectKind::Table,
+                expected_kind,
                 actual_kind,
             })
         }
@@ -434,8 +440,8 @@ pub(super) fn alter_view(
     }
 }
 
-/// Applies an `ALTER VIEW`, which PostgreSQL accepts only against a plain
-/// view.
+/// Applies an `ALTER VIEW` or an `ALTER MATERIALIZED VIEW`, which PostgreSQL
+/// accepts only against a view of the kind the statement spells.
 ///
 /// `SET SCHEMA` and MySQL's `ALTER VIEW ... AS`, which redefines the view, are
 /// refused, since the model can apply neither and discarding either would
@@ -452,26 +458,27 @@ pub(super) fn apply_alter_view(
     builder: ParserDBBuilder,
     statement: &AlterView,
 ) -> Result<ParserDBBuilder, Error> {
-    let AlterView { name, if_exists, operation } = statement;
-    if plain_view_position(&builder, name).is_none() {
+    let AlterView { materialized, name, if_exists, operation } = statement;
+    let (kind, held) = if *materialized {
+        (ObjectKind::MaterializedView, materialized_view_position(&builder, name))
+    } else {
+        (ObjectKind::View, plain_view_position(&builder, name))
+    };
+    if held.is_none() {
         return match builder.relation_reached(name).map(|(kind, _)| kind) {
             Some(actual_kind) => {
                 Err(Error::RelationKindMismatch {
                     object_name: rendered_name(name),
-                    expected_kind: ObjectKind::View,
+                    expected_kind: kind,
                     actual_kind,
                 })
             }
             None if *if_exists => Ok(builder),
             None => {
-                Err(Error::RelationNotFound {
-                    object_kind: ObjectKind::View,
-                    object_name: rendered_name(name),
-                })
+                Err(Error::RelationNotFound { object_kind: kind, object_name: rendered_name(name) })
             }
         };
     }
-    let kind = ObjectKind::View;
     match operation {
         AlterViewOperation::OwnerTo(owner) => Ok(set_view_owner(builder, name, kind, owner)),
         AlterViewOperation::SetOptions { options } => {

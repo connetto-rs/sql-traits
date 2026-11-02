@@ -734,8 +734,8 @@ fn granted_tables<'a>(
 }
 
 /// Resolves each relation a grant names, in the order the grant wrote them,
-/// looking for a table first and then each view kind and a sequence, since one
-/// name holds at most one of them.
+/// looking for a table, then a foreign table, then each view kind and a
+/// sequence, since one name holds at most one of them.
 fn granted_relations<'a>(grant: &'a Grant, database: &'a ParserDB) -> Vec<Relation<'a, ParserDB>> {
     match &grant.objects {
         Some(GrantObjects::Tables(names)) => {
@@ -769,6 +769,11 @@ fn resolve_relation_name<'a>(
         return Some(Relation::Table(table));
     }
     let target = target_name_from_object_name(name)?;
+    if let Some(table) =
+        database.foreign_table_by_target(target.clone(), IdentifierCase::AsWritten).ok().flatten()
+    {
+        return Some(Relation::ForeignTable(table));
+    }
     if let Some(view) =
         database.view_by_target(target.clone(), IdentifierCase::AsWritten).ok().flatten()
     {
@@ -808,7 +813,15 @@ impl TableGrantLike for Grant {
         table: &<Self::DB as DatabaseLike>::Table,
         database: &Self::DB,
     ) -> bool {
-        granted_tables(self, database).iter().any(|granted| core::ptr::eq(*granted, table))
+        // A foreign table shares the table node type, so a grant naming one
+        // applies to it.
+        granted_relations(self, database).iter().any(|granted| {
+            matches!(
+                granted,
+                Relation::Table(granted) | Relation::ForeignTable(granted)
+                    if core::ptr::eq(*granted, table)
+            )
+        })
     }
 }
 

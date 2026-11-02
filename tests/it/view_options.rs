@@ -617,3 +617,45 @@ fn alter_view_refuses_what_the_model_cannot_apply() {
         "got {error:?}"
     );
 }
+
+#[test]
+fn alter_materialized_view_names_a_materialized_view() {
+    // Measured on PostgreSQL 17 and 18: `ALTER MATERIALIZED VIEW` changes a
+    // materialized view as `ALTER TABLE` does, and refuses any other relation
+    // as "is not a materialized view".
+    let db = parse(
+        "CREATE ROLE r1;
+         CREATE MATERIALIZED VIEW m AS SELECT 1 AS x;
+         ALTER MATERIALIZED VIEW m OWNER TO r1;
+         ALTER MATERIALIZED VIEW m RENAME COLUMN x TO y;
+         ALTER MATERIALIZED VIEW m RENAME TO m2;
+         ALTER MATERIALIZED VIEW IF EXISTS missing RENAME TO m3;",
+    )
+    .expect("schema");
+    let renamed = db
+        .materialized_view_by_target(TargetName::new("m2", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the materialized view is renamed");
+    assert_eq!(renamed.owner(&db).expect("held"), Some("r1"));
+    assert_eq!(renamed.definition().to_string(), "SELECT 1 AS y");
+
+    let schema = "CREATE VIEW v AS SELECT 1 AS x;";
+    let error = parse(&format!("{schema} ALTER MATERIALIZED VIEW v RENAME TO w;"))
+        .expect_err("a plain view");
+    assert!(
+        matches!(
+            &error,
+            Error::RelationKindMismatch {
+                expected_kind: ObjectKind::MaterializedView,
+                actual_kind: ObjectKind::View,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let error = parse("ALTER MATERIALIZED VIEW missing RENAME TO w;").expect_err("an absent view");
+    assert!(
+        matches!(&error, Error::RelationNotFound { object_kind: ObjectKind::MaterializedView, .. }),
+        "{error:?}"
+    );
+}
