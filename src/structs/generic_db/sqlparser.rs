@@ -1584,6 +1584,94 @@ impl ParserDBBuilder {
         }
     }
 
+    /// Splits what a grant or revoke names into one object each, the way
+    /// PostgreSQL writes one privilege list per object.
+    ///
+    /// A list of tables, sequences or schemas yields each name alone. `ALL
+    /// TABLES IN SCHEMA` yields every table, view and materialized view each
+    /// schema holds now, and `ALL SEQUENCES IN SCHEMA` every sequence, each
+    /// under its stored name, so neither reaches a relation created later.
+    /// Any other form is kept whole.
+    fn per_object_targets(&self, objects: Option<GrantObjects>) -> Vec<Option<GrantObjects>> {
+        fn view_name<V: ViewLike>(view: &V) -> (SchemaQualifier<'_>, &str, bool) {
+            (
+                view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())),
+                view.view_name(),
+                view.view_name_is_quoted(),
+            )
+        }
+        let case = self.identifier_case();
+        let in_schemas = |schemas: &[ObjectName], qualifier: SchemaQualifier<'_>| {
+            schemas
+                .iter()
+                .filter_map(object_name_last_part)
+                .any(|schema| schema_qualifiers_match(qualifier, Some(schema), case))
+        };
+        let stored_name = |qualifier: SchemaQualifier<'_>, name: &str, quoted: bool| {
+            ObjectName::from(
+                qualifier
+                    .map(|(schema, quoted)| stored_ident(schema, quoted))
+                    .into_iter()
+                    .chain([stored_ident(name, quoted)])
+                    .collect::<Vec<_>>(),
+            )
+        };
+        match objects {
+            Some(GrantObjects::Tables(names)) => {
+                names.into_iter().map(|name| Some(GrantObjects::Tables(vec![name]))).collect()
+            }
+            Some(GrantObjects::Sequences(names)) => {
+                names.into_iter().map(|name| Some(GrantObjects::Sequences(vec![name]))).collect()
+            }
+            Some(GrantObjects::Schemas(names)) => {
+                names.into_iter().map(|name| Some(GrantObjects::Schemas(vec![name]))).collect()
+            }
+            Some(GrantObjects::AllTablesInSchema { schemas }) => {
+                let tables = self
+                    .tables()
+                    .iter()
+                    .map(|(table, _, _)| table.as_ref())
+                    .filter(|table| in_schemas(&schemas, table_schema_qualifier(table)))
+                    .map(|table| table.name.clone());
+                let views = self
+                    .views()
+                    .iter()
+                    .map(|(view, _, _)| view_name(view.as_ref()))
+                    .chain(
+                        self.materialized_views()
+                            .iter()
+                            .map(|(view, _, _)| view_name(view.as_ref())),
+                    )
+                    .filter(|(qualifier, _, _)| in_schemas(&schemas, *qualifier))
+                    .map(|(qualifier, name, quoted)| stored_name(qualifier, name, quoted));
+                tables.chain(views).map(|name| Some(GrantObjects::Tables(vec![name]))).collect()
+            }
+            Some(GrantObjects::AllSequencesInSchema { schemas }) => {
+                self.sequences()
+                    .iter()
+                    .map(|(sequence, ())| sequence.as_ref())
+                    .map(|sequence| {
+                        (
+                            sequence
+                                .sequence_schema()
+                                .map(|schema| (schema, sequence.sequence_schema_is_quoted())),
+                            sequence,
+                        )
+                    })
+                    .filter(|(qualifier, _)| in_schemas(&schemas, *qualifier))
+                    .map(|(qualifier, sequence)| {
+                        Some(GrantObjects::Sequences(vec![stored_name(
+                            qualifier,
+                            sequence.sequence_name(),
+                            sequence.sequence_name_is_quoted(),
+                        )]))
+                    })
+                    .collect()
+            }
+            other => vec![other],
+        }
+    }
+
     /// The kind fixing what `ALL PRIVILEGES` means on every object `objects`
     /// names, a plain relation list reaching a sequence included, or [`None`]
     /// outside PostgreSQL's semantics or when the names reach no single kind.
@@ -4420,9 +4508,8 @@ impl ParserDB {
     /// to, the granted roles and members of its role memberships, and the
     /// roles whose attributes an `ALTER ROLE` changed before any
     /// `CREATE ROLE` created them. The grant object shapes the closed world
-    /// never resolved
-    /// either, `ALL TABLES IN SCHEMA` and the sequence and schema forms, are
-    /// left alone here too.
+    /// never resolved either, the sequence and schema forms, are left alone
+    /// here too.
     ///
     /// An [`AccessResolution::ClosedWorld`] parse rejects such a reference on
     /// the spot, so one surfaces here because the database was parsed under
@@ -8340,28 +8427,40 @@ impl ParserDB {
                         )?;
                     }
 
-                    // Ungated: a column list is checked whenever its table
-                    // resolved, since a dump omits roles and never the table
-                    // it grants on.
-                    let tables: Vec<&CreateTable> =
-                        builder.tables().iter().map(|(table, _, _)| table.as_ref()).collect();
-                    let path: Vec<(&str, bool)> = builder.search_path().collect();
-                    crate::impls::validate_granted_columns(
-                        &grant.privileges,
-                        grant.objects.as_ref(),
-                        &tables,
-                        &path,
-                        builder.identifier_case(),
-                        |key| builder.relation_key_is_held(key, builder.identifier_case()),
-                    )?;
-                    builder.bind_access_targets(&mut grant.objects);
-
-                    let (relation_part, column_part) = crate::impls::split_by_column_scope(grant);
-                    if let Some(part) = relation_part {
-                        builder = builder.add_table_grant(Arc::new(part), ());
-                    }
-                    if let Some(part) = column_part {
-                        builder = builder.add_column_grant(Arc::new(part), ());
+                    // One grant per object, as PostgreSQL writes one privilege
+                    // list per object, each checked before any is stored.
+                    let parts = {
+                        // Ungated: a column list is checked whenever its table
+                        // resolved, since a dump omits roles and never the
+                        // table it grants on.
+                        let tables: Vec<&CreateTable> =
+                            builder.tables().iter().map(|(table, _, _)| table.as_ref()).collect();
+                        let path: Vec<(&str, bool)> = builder.search_path().collect();
+                        let mut parts = Vec::new();
+                        for objects in builder.per_object_targets(grant.objects.take()) {
+                            let mut part = Grant { objects, ..grant.clone() };
+                            crate::impls::validate_granted_columns(
+                                &part.privileges,
+                                part.objects.as_ref(),
+                                &tables,
+                                &path,
+                                builder.identifier_case(),
+                                |key| builder.relation_key_is_held(key, builder.identifier_case()),
+                            )?;
+                            builder.bind_access_targets(&mut part.objects);
+                            parts.push(part);
+                        }
+                        parts
+                    };
+                    for part in parts {
+                        let (relation_part, column_part) =
+                            crate::impls::split_by_column_scope(part);
+                        if let Some(part) = relation_part {
+                            builder = builder.add_table_grant(Arc::new(part), ());
+                        }
+                        if let Some(part) = column_part {
+                            builder = builder.add_column_grant(Arc::new(part), ());
+                        }
                     }
                 }
                 Statement::Revoke(mut revoke) => {
@@ -8386,40 +8485,50 @@ impl ParserDB {
                         )?;
                     }
 
-                    let tables: Vec<&CreateTable> =
-                        builder.tables().iter().map(|(table, _, _)| table.as_ref()).collect();
-                    let path: Vec<(&str, bool)> = builder.search_path().collect();
-                    crate::impls::validate_granted_columns(
-                        &revoke.privileges,
-                        revoke.objects.as_ref(),
-                        &tables,
-                        &path,
-                        builder.identifier_case(),
-                        |key| builder.relation_key_is_held(key, builder.identifier_case()),
-                    )?;
-                    let all_privileges = builder
-                        .privilege_kind(revoke.objects.as_ref())
-                        .map(crate::impls::PrivilegeKind::all_privileges);
                     builder.bind_access_targets(&mut revoke.objects);
-
-                    let unsupported = apply_revoke_to_grant_store(
-                        builder.table_grants_mut(),
-                        &revoke,
-                        all_privileges.as_deref(),
-                    )
-                    .or_else(|| {
-                        apply_revoke_to_grant_store(
-                            builder.column_grants_mut(),
-                            &revoke,
+                    // Each object loses the privilege on its own, whatever
+                    // form granted it there.
+                    let parts = {
+                        let tables: Vec<&CreateTable> =
+                            builder.tables().iter().map(|(table, _, _)| table.as_ref()).collect();
+                        let path: Vec<(&str, bool)> = builder.search_path().collect();
+                        let mut parts = Vec::new();
+                        for objects in builder.per_object_targets(revoke.objects.clone()) {
+                            let part = sqlparser::ast::Revoke { objects, ..revoke.clone() };
+                            crate::impls::validate_granted_columns(
+                                &part.privileges,
+                                part.objects.as_ref(),
+                                &tables,
+                                &path,
+                                builder.identifier_case(),
+                                |key| builder.relation_key_is_held(key, builder.identifier_case()),
+                            )?;
+                            let all_privileges = builder
+                                .privilege_kind(part.objects.as_ref())
+                                .map(crate::impls::PrivilegeKind::all_privileges);
+                            parts.push((part, all_privileges));
+                        }
+                        parts
+                    };
+                    for (part, all_privileges) in parts {
+                        let unsupported = apply_revoke_to_grant_store(
+                            builder.table_grants_mut(),
+                            &part,
                             all_privileges.as_deref(),
                         )
-                    });
-
-                    if let Some(reason) = unsupported {
-                        return Err(crate::errors::Error::UnsupportedRevoke {
-                            statement: revoke.to_string(),
-                            reason: reason.to_string(),
+                        .or_else(|| {
+                            apply_revoke_to_grant_store(
+                                builder.column_grants_mut(),
+                                &part,
+                                all_privileges.as_deref(),
+                            )
                         });
+                        if let Some(reason) = unsupported {
+                            return Err(crate::errors::Error::UnsupportedRevoke {
+                                statement: revoke.to_string(),
+                                reason: reason.to_string(),
+                            });
+                        }
                     }
                     table_owner::revoke(&mut builder, &revoke);
                 }
@@ -11596,15 +11705,6 @@ mod tests {
             let open_world =
                 || ParseOptions::default().with_access_resolution(AccessResolution::OpenWorld);
             let cases = [
-                // One list naming a table and a sequence, whose `ALL` differ.
-                open_world().parse::<PostgreSqlDialect>(
-                    r"
-                    CREATE TABLE t (id INT);
-                    CREATE SEQUENCE s;
-                    GRANT ALL PRIVILEGES ON t, s TO r;
-                    REVOKE UPDATE ON t, s FROM r;
-                ",
-                ),
                 // A name the schema never creates, so its kind is unknown.
                 open_world().parse::<PostgreSqlDialect>(
                     r"

@@ -9,10 +9,7 @@ use sqlparser::ast::{
 };
 
 use super::{ParserDBBuilder, StoredTable, grantee_role_ident, stored_role_name};
-use crate::{
-    impls::{grantees_match, schema_matches_table},
-    structs::IdentifierCase,
-};
+use crate::impls::{grantees_match, schema_matches_table};
 
 /// Takes the privileges `revoke` names from the owner's entry on each table it
 /// reaches that one of its grantees owns.
@@ -59,25 +56,15 @@ pub(super) fn revoke(builder: &mut ParserDBBuilder, revoke: &Revoke) {
 }
 
 /// Hands every grant on `handed` naming `previous`, as grantee or grantor, to
-/// `next`, splitting a schema-wide grant into explicit ones since a stored
-/// schema-wide grant cannot leave one table out.
+/// `next`.
 pub(super) fn change_owner(
     builder: &mut ParserDBBuilder,
     handed: &CreateTable,
     previous: &str,
     next: &Owner,
 ) {
-    let tables: Vec<Arc<CreateTable>> =
-        builder.tables().iter().map(|(table, _, _)| Arc::clone(table)).collect();
     let table = StoredTable::of(handed);
-    let handover = Handover {
-        table: &table,
-        handed,
-        tables: &tables,
-        previous,
-        next: owner_ident(next),
-        case: builder.identifier_case(),
-    };
+    let handover = Handover { table: &table, previous, next: owner_ident(next) };
     handover.apply(builder.table_grants_mut());
     handover.apply(builder.column_grants_mut());
 }
@@ -86,85 +73,35 @@ pub(super) fn change_owner(
 struct Handover<'a> {
     /// The table changing hands.
     table: &'a StoredTable,
-    /// The stored node of that table.
-    handed: &'a CreateTable,
-    /// Every table the builder holds as the owner changes.
-    tables: &'a [Arc<CreateTable>],
     /// The canonical name of the old owner.
     previous: &'a str,
     /// The new owner, as a grant would spell it.
     next: Ident,
-    /// The comparison stored names follow.
-    case: IdentifierCase,
 }
 
 impl Handover<'_> {
-    /// Rewrites one grant store.
-    fn apply(&self, grants: &mut Vec<(Arc<Grant>, ())>) {
-        let mut rewritten = Vec::with_capacity(grants.len());
-        for (grant, ()) in core::mem::take(grants) {
-            match self.split(&grant) {
-                Some(parts) => rewritten.extend(parts.into_iter().map(|part| (Arc::new(part), ()))),
-                None => rewritten.push((grant, ())),
+    /// Rewrites each grant of one store on the table changing hands that
+    /// names the old owner. Every stored grant names one object.
+    fn apply(&self, grants: &mut [(Arc<Grant>, ())]) {
+        for (grant, ()) in grants {
+            let on_table = matches!(
+                &grant.objects,
+                Some(GrantObjects::Tables(names)) if names.iter().any(|name| self.table.named_by(name))
+            );
+            let names_previous =
+                grant.grantees.iter().any(|grantee| names_role(grantee, self.previous))
+                    || grant
+                        .granted_by
+                        .as_ref()
+                        .is_some_and(|grantor| stored_role_name(grantor) == self.previous);
+            if on_table && names_previous {
+                *grant = Arc::new(self.handed_over(grant));
             }
         }
-        *grants = rewritten;
     }
 
-    /// Returns the grants `grant` becomes, or `None` when it keeps its shape.
-    fn split(&self, grant: &Grant) -> Option<Vec<Grant>> {
-        let names_previous =
-            grant.grantees.iter().any(|grantee| names_role(grantee, self.previous))
-                || grant
-                    .granted_by
-                    .as_ref()
-                    .is_some_and(|grantor| stored_role_name(grantor) == self.previous);
-        if !names_previous {
-            return None;
-        }
-
-        let (on_table, elsewhere): (Vec<ObjectName>, Vec<ObjectName>) = match &grant.objects {
-            Some(GrantObjects::Tables(names)) => {
-                names.iter().cloned().partition(|name| self.table.named_by(name))
-            }
-            Some(GrantObjects::AllTablesInSchema { schemas })
-                if schemas.iter().any(|schema| schema_matches_table(schema, self.handed)) =>
-            {
-                let elsewhere = self
-                    .tables
-                    .iter()
-                    .filter(|candidate| !self.table.matches(candidate, self.case))
-                    .filter(|candidate| {
-                        schemas
-                            .iter()
-                            .any(|schema| schema_matches_table(schema, candidate.as_ref()))
-                    })
-                    .map(|candidate| candidate.name.clone())
-                    .collect();
-                (vec![self.handed.name.clone()], elsewhere)
-            }
-            _ => return None,
-        };
-        if on_table.is_empty() {
-            return None;
-        }
-
-        let mut parts = Vec::with_capacity(2);
-        if !elsewhere.is_empty() {
-            parts.push(on_tables(
-                grant,
-                elsewhere,
-                grant.grantees.clone(),
-                grant.granted_by.clone(),
-            ));
-        }
-        parts.push(self.handed_over(grant, on_table));
-        Some(parts)
-    }
-
-    /// The part of `grant` on the table changing hands, with the old owner
-    /// renamed to the new one.
-    fn handed_over(&self, grant: &Grant, on_table: Vec<ObjectName>) -> Grant {
+    /// `grant` with the old owner renamed to the new one.
+    fn handed_over(&self, grant: &Grant) -> Grant {
         let mut grantees: Vec<Grantee> = Vec::with_capacity(grant.grantees.len());
         for grantee in &grant.grantees {
             let grantee = if names_role(grantee, self.previous) {
@@ -188,25 +125,7 @@ impl Handover<'_> {
                 grantor.clone()
             }
         });
-        on_tables(grant, on_table, grantees, granted_by)
-    }
-}
-
-/// Copies `grant` onto `tables` with the given grantees and grantor.
-fn on_tables(
-    grant: &Grant,
-    tables: Vec<ObjectName>,
-    grantees: Vec<Grantee>,
-    granted_by: Option<Ident>,
-) -> Grant {
-    Grant {
-        privileges: grant.privileges.clone(),
-        objects: Some(GrantObjects::Tables(tables)),
-        grantees,
-        with_grant_option: grant.with_grant_option,
-        as_grantor: grant.as_grantor.clone(),
-        granted_by,
-        current_grants: grant.current_grants.clone(),
+        Grant { grantees, granted_by, ..grant.clone() }
     }
 }
 

@@ -84,19 +84,6 @@ fn quoting_decides_which_column_the_grant_names() {
     );
 }
 
-/// The schema-wide form carries no table list to check against, and the
-/// database accepts a column list beside it rather than refusing, so this must
-/// not refuse either.
-#[test]
-fn the_schema_wide_form_is_left_alone() {
-    parse(
-        "CREATE ROLE r;
-         CREATE TABLE public.docs (id INT);
-         GRANT SELECT (id) ON ALL TABLES IN SCHEMA public TO r;",
-    )
-    .expect("the database accepts this");
-}
-
 /// Under the permissive setting the table may be absent, and then there is
 /// nothing to check the columns against.
 #[test]

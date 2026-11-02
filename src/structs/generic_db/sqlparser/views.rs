@@ -31,14 +31,16 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, AlterView, AlterViewOperation, CreateView, Expr,
-    GrantObjects, Ident, ObjectName, ObjectNamePart, Owner, Query, RenameTableNameKind, SelectItem,
-    SetExpr, SqlOption, Statement, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    Grant, GrantObjects, Ident, ObjectName, ObjectNamePart, Owner, Query, RenameTableNameKind,
+    SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use super::{
     Creator, DefaultKind, ParserDBBuilder, SchemaQualifier, bind_reference, function_bodies,
-    object_name_last_identifier, place_relation, relation_name_holder, require_named_in_catalog,
+    object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
+    relation_name_holder, require_named_in_catalog,
     rules::{self, RuleHost},
+    stored_ident,
     view_rewrites::{self, Rename},
 };
 use crate::{
@@ -284,12 +286,15 @@ pub(super) fn drop_views(
                 plain_view_position(&builder, name)
             };
             if let Some(position) = position {
-                if materialized {
-                    builder.materialized_views_mut().remove(position);
+                let dropped = if materialized {
+                    let (view, _, _) = builder.materialized_views_mut().remove(position);
+                    GrantedView::of(view.as_ref())
                 } else {
                     let (view, _, _) = builder.views_mut().remove(position);
                     rules::drop_rules_on(&mut builder, &RuleHost::of_view(view.as_ref()));
-                }
+                    GrantedView::of(view.as_ref())
+                };
+                dropped.forget_grants(&mut builder);
             }
             // A sequence the view owned goes with it.
             super::sequences::drop_orphaned_sequences(&mut builder);
@@ -617,22 +622,12 @@ fn rename_view(
         return Ok(builder);
     };
 
-    let (current_name, current_quoted, schema, key) = if kind == ObjectKind::MaterializedView {
+    let (granted, key) = if kind == ObjectKind::MaterializedView {
         let view = builder.materialized_views()[position].0.as_ref();
-        (
-            view.view_name().to_string(),
-            view.view_name_is_quoted(),
-            stored_schema_of(view),
-            stored_view_key(view, IdentifierCase::AsWritten),
-        )
+        (GrantedView::of(view), stored_view_key(view, IdentifierCase::AsWritten))
     } else {
         let view = builder.views()[position].0.as_ref();
-        (
-            view.view_name().to_string(),
-            view.view_name_is_quoted(),
-            stored_schema_of(view),
-            stored_view_key(view, IdentifierCase::AsWritten),
-        )
+        (GrantedView::of(view), stored_view_key(view, IdentifierCase::AsWritten))
     };
     // Only a plain view carries rules.
     let host =
@@ -641,14 +636,14 @@ fn rename_view(
     // A rename to the name it already answers to changes nothing, and asking
     // the name pool first would report the view colliding with itself.
     if !crate::utils::identifier_resolution::identifiers_match(
-        current_name.as_str(),
-        current_quoted,
+        granted.name.as_str(),
+        granted.quoted,
         new_ident.value.as_str(),
         new_ident.quote_style.is_some(),
     ) && let Some(conflicting_kind) = relation_name_holder(
         &builder,
         new_ident,
-        schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted)),
+        granted.schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted)),
     ) {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: kind,
@@ -679,6 +674,7 @@ fn rename_view(
     if let Some(host) = &host {
         rules::follow_relation_rename(&mut builder, host, new_ident);
     }
+    granted.rename_grants(&mut builder, new_ident);
     Ok(builder)
 }
 
@@ -860,6 +856,67 @@ fn output_item(body: &mut SetExpr, ordinal: usize) -> Option<&mut SelectItem> {
 /// The schema a stored view sits in, with its quote state.
 fn stored_schema_of<V: ViewLike>(view: &V) -> Option<(String, bool)> {
     view.view_schema().map(|schema| (schema.to_string(), view.view_schema_is_quoted()))
+}
+
+/// The name a grant reaches a view by: its schema, its name and the name's
+/// quote state.
+struct GrantedView {
+    schema: Option<(String, bool)>,
+    name: String,
+    quoted: bool,
+}
+
+impl GrantedView {
+    fn of<V: ViewLike>(view: &V) -> Self {
+        Self {
+            schema: stored_schema_of(view),
+            name: view.view_name().to_string(),
+            quoted: view.view_name_is_quoted(),
+        }
+    }
+
+    /// Whether `grant` names this view.
+    fn named_by(&self, grant: &Grant) -> bool {
+        matches!(&grant.objects, Some(GrantObjects::Tables(names)) if names.iter().any(|name| {
+            object_name_matches_resolved_identity(
+                name,
+                &self.name,
+                self.quoted,
+                self.schema.as_ref().map(|(schema, _)| schema.as_str()),
+                self.schema.as_ref().is_some_and(|(_, quoted)| *quoted),
+            )
+        }))
+    }
+
+    /// Drops the grants naming this view, which PostgreSQL drops with it.
+    fn forget_grants(&self, builder: &mut ParserDBBuilder) {
+        builder.table_grants_mut().retain(|(grant, ())| !self.named_by(grant));
+        builder.column_grants_mut().retain(|(grant, ())| !self.named_by(grant));
+    }
+
+    /// Points the grants naming this view at `renamed`, which PostgreSQL
+    /// keeps on the view.
+    fn rename_grants(&self, builder: &mut ParserDBBuilder, renamed: &Ident) {
+        self.rename_in(builder.table_grants_mut(), renamed);
+        self.rename_in(builder.column_grants_mut(), renamed);
+    }
+
+    /// Points each grant naming this view at `renamed`. A grant names one
+    /// object, so one naming this view names it alone.
+    fn rename_in(&self, grants: &mut [(Arc<Grant>, ())], renamed: &Ident) {
+        for (grant, ()) in grants {
+            if self.named_by(grant) {
+                let name = self
+                    .schema
+                    .iter()
+                    .map(|(schema, quoted)| stored_ident(schema, *quoted))
+                    .chain([renamed.clone()])
+                    .collect::<Vec<_>>();
+                Arc::make_mut(grant).objects =
+                    Some(GrantObjects::Tables(vec![ObjectName::from(name)]));
+            }
+        }
+    }
 }
 
 /// Records the role a view is handed to.
@@ -1194,6 +1251,28 @@ pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &Relati
         })
         .map(RuleHost::of_view)
         .collect();
+    let granted: Vec<GrantedView> = builder
+        .views()
+        .iter()
+        .map(|(view, _, _)| view.as_ref())
+        .filter(|view| {
+            is_doomed(ObjectKind::View, stored_view_key(*view, IdentifierCase::AsWritten))
+        })
+        .map(GrantedView::of)
+        .chain(
+            builder
+                .materialized_views()
+                .iter()
+                .map(|(view, _, _)| view.as_ref())
+                .filter(|view| {
+                    is_doomed(
+                        ObjectKind::MaterializedView,
+                        stored_view_key(*view, IdentifierCase::AsWritten),
+                    )
+                })
+                .map(GrantedView::of),
+        )
+        .collect();
     builder.views_mut().retain(|(view, _, _)| {
         !is_doomed(ObjectKind::View, stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
     });
@@ -1203,6 +1282,9 @@ pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &Relati
             stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
         )
     });
+    for view in &granted {
+        view.forget_grants(builder);
+    }
     builder.functions_mut().retain(|(function, _)| {
         !is_doomed(
             ObjectKind::Function,
