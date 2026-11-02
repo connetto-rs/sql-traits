@@ -1717,6 +1717,22 @@ mod tests {
     }
 
     #[test]
+    fn test_alter_function_depends_on_extension_names_a_held_function() {
+        // PostgreSQL 16 refuses `function missing() does not exist`, and a bare
+        // name covering two overloads as not unique.
+        let held = "CREATE FUNCTION f() RETURNS INT AS 'SELECT 1';
+                    CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT x';";
+        let parse = |statement: &str| {
+            ParserDB::parse::<PostgreSqlDialect>(&alloc::format!("{held} {statement}"))
+        };
+        parse("ALTER FUNCTION f() DEPENDS ON EXTENSION plpgsql;").expect("f() is held");
+        let missing = parse("ALTER FUNCTION missing() DEPENDS ON EXTENSION plpgsql;");
+        assert!(matches!(missing, Err(Error::AlterFunctionNotFound { .. })), "got {missing:?}");
+        let bare = parse("ALTER FUNCTION f DEPENDS ON EXTENSION plpgsql;");
+        assert!(matches!(bare, Err(Error::AmbiguousAlterFunction { .. })), "got {bare:?}");
+    }
+
+    #[test]
     fn test_create_or_replace_replaces_security() {
         // The replacement node carries no clause, so the default applies:
         // CREATE OR REPLACE resets the mode rather than merging.
