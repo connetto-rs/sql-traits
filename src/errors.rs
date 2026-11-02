@@ -1788,6 +1788,22 @@ pub enum Error {
         function_name: String,
     },
     #[error(
+        "Permission denied for function `{function_name}`: role `{role_name}` creating it may not execute it."
+    )]
+    /// Error indicating that `CREATE FUNCTION` leaves the role running it
+    /// without `EXECUTE` on the function, which PostgreSQL's `sql` and
+    /// `plpgsql` validators refuse.
+    ///
+    /// Raised only for a role the input names and declares as no superuser,
+    /// since the validator lets a superuser through and an unnamed or
+    /// undeclared role may be one.
+    FunctionNotExecutableByCreator {
+        /// Name of the function.
+        function_name: String,
+        /// The role running the statement, as stored.
+        role_name: String,
+    },
+    #[error(
         "Cannot change routine kind: `{function_name}` is an aggregate or window function, which `CREATE OR REPLACE FUNCTION` cannot replace."
     )]
     /// Error indicating that a `CREATE OR REPLACE FUNCTION` statement would

@@ -35,6 +35,7 @@ mod exhaustive_alter_table;
 mod expression_truth;
 mod extensions;
 mod function_body_binding;
+mod function_creation_access;
 mod function_kind;
 mod function_null_input;
 mod function_ownership;
