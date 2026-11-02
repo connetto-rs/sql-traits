@@ -13,6 +13,7 @@ use sqlparser::ast::{CreateExtension, CreateFunction, DropExtension, Ident, Obje
 
 use super::{
     Creator, ParserDBBuilder, case_idents_match, declared_schema, function_signatures_match,
+    object_name_last_identifier,
     postgres_builtins::{
         BuiltinType::{self, Text, Uuid},
         Volatility::{self, Immutable, Volatile},
@@ -130,17 +131,22 @@ fn create_extension_functions(
     Ok(builder)
 }
 
-/// Drops the functions belonging to the extension called `name`.
+/// Drops the functions belonging to the extension called `name` and those
+/// made to depend on it, which PostgreSQL drops with it whatever the
+/// statement says about `CASCADE`.
 ///
 /// # Errors
 ///
-/// Returns [`Error::FunctionReferenced`] when a check constraint, a policy, a
-/// trigger or a bound function body still reaches one, as dropping the
-/// function itself does.
+/// Returns [`Error::FunctionReferenced`] when something still calls one, as
+/// dropping the function itself does.
 fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Result<(), Error> {
     let case = builder.identifier_case();
     let belongs = |metadata: &FunctionMetadata| {
-        metadata.extension().is_some_and(|extension| case_idents_match(extension, name, case))
+        metadata
+            .extension()
+            .into_iter()
+            .chain(metadata.extension_dependencies())
+            .any(|extension| case_idents_match(extension, name, case))
     };
     if let Some((function, _)) = builder
         .functions()
@@ -228,6 +234,43 @@ pub(super) fn drop_extensions(
         }
     }
     Ok(builder)
+}
+
+/// Makes the stored function at `position` depend on the extension
+/// `extension_name` names, or stop depending on it when `depends` is `false`,
+/// as `ALTER FUNCTION ... [NO] DEPENDS ON EXTENSION` does.
+///
+/// # Errors
+///
+/// Returns [`Error::AlterFunctionExtensionNotFound`] for an extension the
+/// database does not hold, which PostgreSQL refuses for both forms.
+pub(super) fn set_function_dependency(
+    builder: &mut ParserDBBuilder,
+    position: usize,
+    extension_name: &ObjectName,
+    depends: bool,
+) -> Result<(), Error> {
+    let case = builder.identifier_case();
+    let extension = builder
+        .extensions()
+        .iter()
+        .map(|(extension, ())| &extension.name)
+        .find(|held| {
+            object_name_last_identifier(extension_name)
+                .is_some_and(|named| case_idents_match(held, named, case))
+        })
+        .cloned();
+    let (function, metadata) = &mut builder.functions_mut()[position];
+    let Some(extension) = extension else {
+        return Err(Error::AlterFunctionExtensionNotFound {
+            extension_name: last_str(extension_name).to_string(),
+            function_name: last_str(&function.name).to_string(),
+        });
+    };
+    metadata.set_extension_dependency(&extension, depends, |held, named| {
+        case_idents_match(held, named, case)
+    });
+    Ok(())
 }
 
 /// Whether the extension was created in this schema.

@@ -9166,9 +9166,14 @@ impl ParserDB {
                             moved.0.extend(function.name.0.last().cloned());
                             builder = Self::move_function(builder, function, moved)?;
                         }
-                        // The extension dependency is not modelled.
-                        AlterFunctionOperation::DependsOnExtension { .. } => {
-                            Self::alter_function_target(&builder, &func_desc)?;
+                        AlterFunctionOperation::DependsOnExtension { no, extension_name } => {
+                            let position = Self::alter_function_target(&builder, &func_desc)?;
+                            extensions::set_function_dependency(
+                                &mut builder,
+                                position,
+                                &extension_name,
+                                !no,
+                            )?;
                         }
                     }
                 }
