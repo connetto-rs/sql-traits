@@ -452,8 +452,9 @@ pub(super) fn alter_view(
 /// Returns [`Error::RelationKindMismatch`] when another kind of relation holds
 /// the name, [`Error::RelationNotFound`] when nothing does and the statement
 /// wrote no `IF EXISTS`, [`Error::UnsupportedAlterTableOperation`] for the two
-/// operations refused above, and the errors of [`alter_view`] for the
-/// operations it shares with `ALTER TABLE`.
+/// operations refused above, [`Error::AlterActionUnsupportedOnRelation`] for
+/// a materialized view's column default, and the errors of [`alter_view`] for
+/// the operations it shares with `ALTER TABLE`.
 pub(super) fn apply_alter_view(
     builder: ParserDBBuilder,
     statement: &AlterView,
@@ -490,6 +491,13 @@ pub(super) fn apply_alter_view(
         AlterViewOperation::RenameTo { new_name } => rename_view(builder, name, kind, new_name),
         AlterViewOperation::RenameColumn { old_column_name, new_column_name } => {
             rename_view_column(builder, name, kind, old_column_name, new_column_name)
+        }
+        AlterViewOperation::AlterColumn { .. } if *materialized => {
+            Err(Error::AlterActionUnsupportedOnRelation {
+                object_kind: kind,
+                relation_name: rendered_name(name),
+                operation: operation.to_string(),
+            })
         }
         AlterViewOperation::AlterColumn { column_name, .. } => {
             require_view_column(builder, name, column_name)

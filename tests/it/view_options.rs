@@ -659,3 +659,34 @@ fn alter_materialized_view_names_a_materialized_view() {
         "{error:?}"
     );
 }
+
+#[test]
+fn alter_materialized_view_refuses_a_view_option_and_a_column_default() {
+    let schema = "CREATE TABLE t (id INT); CREATE MATERIALIZED VIEW m AS SELECT id FROM t;";
+    let error =
+        parse(&format!("{schema} ALTER MATERIALIZED VIEW m SET (security_invoker = true);"))
+            .expect_err("a materialized view takes no view option");
+    assert!(
+        matches!(
+            &error,
+            Error::UnrecognizedViewOption { object_kind: ObjectKind::MaterializedView, .. }
+        ),
+        "got {error:?}"
+    );
+    for statement in [
+        "ALTER MATERIALIZED VIEW m ALTER COLUMN id SET DEFAULT 1;",
+        "ALTER MATERIALIZED VIEW m ALTER COLUMN id DROP DEFAULT;",
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::AlterActionUnsupportedOnRelation {
+                    object_kind: ObjectKind::MaterializedView,
+                    ..
+                }
+            ),
+            "{statement} got {error:?}"
+        );
+    }
+}

@@ -20,10 +20,6 @@
 //!   `ALTER DEFAULT PRIVILEGES` does not parse, so a schema carrying one fails
 //!   to parse, and the `EXECUTE` a function receives on creation is always
 //!   PostgreSQL's built-in default rather than the one such a statement set.
-//! - [`sqlparser#2776`](https://github.com/apache/datafusion-sqlparser-rs/pull/2776),
-//!   `ALTER MATERIALIZED VIEW` does not parse, so a schema carrying one fails
-//!   to parse, and only `ALTER TABLE <materialized view> OWNER TO` and `RENAME
-//!   TO` reach a materialized view.
 //!
 //! Found and written up, not yet filed:
 //!
