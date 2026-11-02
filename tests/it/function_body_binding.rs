@@ -3422,6 +3422,10 @@ fn a_reference_a_rename_captures_in_an_embedded_query_is_qualified() {
             "UPDATE log SET y = (SELECT t.aa AS a FROM t, u LIMIT 1);",
         ),
         (
+            "INSERT INTO log SELECT a FROM t, u WHERE EXISTS (SELECT 1 FROM t AS t2);",
+            "INSERT INTO log (y) SELECT t.aa AS a FROM t, u WHERE EXISTS (SELECT 1 FROM t AS t2);",
+        ),
+        (
             "DELETE FROM log WHERE y IN (SELECT a FROM t, u WHERE u.aa = log.y);",
             "DELETE FROM log WHERE y IN (SELECT t.aa AS a FROM t, u WHERE u.aa = log.y);",
         ),

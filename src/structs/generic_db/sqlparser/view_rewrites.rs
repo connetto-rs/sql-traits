@@ -628,14 +628,14 @@ fn store_part(builder: &mut ParserDBBuilder, part: &Part, query: Query) {
     }
 }
 
-/// Replaces the query at `position` of a walk over `statement` with `query`,
-/// provided it still is the `stored` query the respelling put there.
+/// Replaces the query at `position` of a walk over `statement`, which is the
+/// `stored` query the respelling put there, with `query`.
 fn replace_embedded(statement: &mut Statement, position: usize, stored: &Query, query: Query) {
     struct Replace<'a> {
         position: usize,
         seen: usize,
         stored: &'a Query,
-        query: Option<Query>,
+        query: Query,
     }
 
     impl VisitorMut for Replace<'_> {
@@ -646,16 +646,15 @@ fn replace_embedded(statement: &mut Statement, position: usize, stored: &Query, 
             if self.seen - 1 != self.position {
                 return ControlFlow::Continue(());
             }
-            if *query == *self.stored
-                && let Some(replacement) = self.query.take()
-            {
-                *query = replacement;
-            }
+            // Respelling a statement's clauses leaves its nested queries in
+            // place, so the walk reaches the same query it did then.
+            debug_assert!(*query == *self.stored, "the walk reaches the respelled query");
+            core::mem::swap(query, &mut self.query);
             ControlFlow::Break(())
         }
     }
 
-    let mut replace = Replace { position, seen: 0, stored, query: Some(query) };
+    let mut replace = Replace { position, seen: 0, stored, query };
     let _: ControlFlow<()> = VisitMut::visit(statement, &mut replace);
 }
 
