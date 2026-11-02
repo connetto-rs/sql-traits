@@ -688,6 +688,38 @@ pub(super) fn move_views(
     Ok(builder)
 }
 
+/// Drops every view and materialized view stored in `schema`, with the views
+/// reading them, as `DROP SCHEMA ... CASCADE` does.
+///
+/// # Errors
+///
+/// Returns the refusals [`drop_views`] meets.
+pub(super) fn drop_views_in(
+    builder: ParserDBBuilder,
+    schema: (&str, bool),
+) -> Result<ParserDBBuilder, Error> {
+    let case = builder.identifier_case();
+    let plain: Vec<ObjectName> = builder
+        .views()
+        .iter()
+        .filter(|(view, _, _)| stored_in(view.as_ref(), schema, case))
+        .map(|(view, _, _)| qualified_in(view.as_ref(), schema))
+        .collect();
+    let materialized: Vec<ObjectName> = builder
+        .materialized_views()
+        .iter()
+        .filter(|(view, _, _)| stored_in(view.as_ref(), schema, case))
+        .map(|(view, _, _)| qualified_in(view.as_ref(), schema))
+        .collect();
+    let builder = drop_views(builder, &plain, false, true, true)?;
+    drop_views(builder, &materialized, true, true, true)
+}
+
+/// The name of a stored view written out with `schema`, the one it sits in.
+fn qualified_in<V: ViewLike>(view: &V, schema: (&str, bool)) -> ObjectName {
+    ObjectName::from(vec![stored_ident(schema.0, schema.1), view_ident(view)])
+}
+
 /// Whether a stored view sits in `schema`, a view stored without one sitting
 /// in `public`.
 fn stored_in<V: ViewLike>(view: &V, schema: (&str, bool), case: IdentifierCase) -> bool {
