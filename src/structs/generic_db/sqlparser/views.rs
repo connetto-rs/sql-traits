@@ -1121,6 +1121,31 @@ pub(super) fn dependent_views(
     builder: &ParserDBBuilder,
     key: &RelationKey,
 ) -> Vec<(ObjectKind, RelationKey)> {
+    readers_closure(builder, alloc::vec![key.clone()], Vec::new(), Some(key))
+}
+
+/// `readers` with every view and function reading one of them, and every
+/// function whose bound body calls one of those functions, transitively.
+///
+/// This is what a `CASCADE` takes along with the readers themselves.
+pub(super) fn readers_and_dependents(
+    builder: &ParserDBBuilder,
+    readers: Vec<(ObjectKind, RelationKey)>,
+) -> Vec<(ObjectKind, RelationKey)> {
+    let frontier = readers.iter().map(|(_, key)| key.clone()).collect();
+    readers_closure(builder, frontier, readers, None)
+}
+
+/// `found` with every view and function reading a key of `frontier` or one
+/// of the readers that walk finds, and every function calling one of the
+/// functions among them, transitively. A view or a materialized view stored
+/// under `dropped` is the relation going away rather than a reader of it.
+fn readers_closure(
+    builder: &ParserDBBuilder,
+    mut frontier: Vec<RelationKey>,
+    mut found: Vec<(ObjectKind, RelationKey)>,
+    dropped: Option<&RelationKey>,
+) -> Vec<(ObjectKind, RelationKey)> {
     // Each view's read set is derived once, not once per step of the walk.
     // Deriving it means visiting a whole definition and normalizing every name
     // it reads, so re-deriving per step made one drop cost the square of the
@@ -1155,9 +1180,6 @@ pub(super) fn dependent_views(
         }))
         .collect();
 
-    let mut frontier = alloc::vec![key.clone()];
-    let mut found: Vec<(ObjectKind, RelationKey)> = Vec::new();
-
     while let Some(current) = frontier.pop() {
         for (kind, own_key, read) in &reads {
             if !read.contains(&current) {
@@ -1165,7 +1187,7 @@ pub(super) fn dependent_views(
             }
             // A function never is the dropped relation, so a name collision
             // still counts as a dependency.
-            if *own_key == *key && *kind != ObjectKind::Function {
+            if dropped == Some(own_key) && *kind != ObjectKind::Function {
                 continue;
             }
             let reader = (*kind, own_key.clone());
@@ -1239,6 +1261,12 @@ pub(super) fn refuse_dependent_views(
 /// `key` names.
 pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &RelationKey) {
     let doomed = dependent_views(builder, key);
+    remove_readers(builder, &doomed);
+}
+
+/// Removes the views, materialized views and functions `doomed` names, with
+/// the grants on them, the rules on the views, and the sequences they owned.
+pub(super) fn remove_readers(builder: &mut ParserDBBuilder, doomed: &[(ObjectKind, RelationKey)]) {
     let is_doomed = |kind: ObjectKind, own_key: RelationKey| {
         doomed.iter().any(|(dead_kind, dead)| *dead_kind == kind && *dead == own_key)
     };

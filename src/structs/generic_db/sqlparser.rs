@@ -6442,11 +6442,29 @@ impl ParserDB {
             // anything moves.
             let declaring = tables_declaring_column(&builder, &stored, &column);
 
-            if !cascade && builder.column_has_outside_dependents(&stored, &declaring, &column) {
+            // A zero-length quoted name is one no definition can hold.
+            let probe = Ident::with_quote('"', "");
+            let mut probes = Vec::with_capacity(inheritors.len() + 1);
+            for table in core::iter::once(&stored).chain(&inheritors) {
+                probes.extend(column_rename(Self::stored_node(&builder, table)?, &column, &probe));
+            }
+            let keys: Vec<&RelationKey> = probes.iter().map(view_rewrites::Rename::key).collect();
+            let readers = view_rewrites::readers(&builder, &keys)
+                .map(|readers| view_rewrites::column_readers(&builder, &readers, &probes))
+                .unwrap_or_default();
+
+            if !cascade
+                && (!readers.is_empty()
+                    || builder.column_has_outside_dependents(&stored, &declaring, &column))
+            {
                 return Err(crate::errors::Error::ColumnReferenced {
                     table_name: stored.name.clone(),
                     column_name: column.name.clone(),
                 });
+            }
+            if !readers.is_empty() {
+                let doomed = views::readers_and_dependents(&builder, readers);
+                views::remove_readers(&mut builder, &doomed);
             }
 
             // The referencing tables lose their foreign key before the column
