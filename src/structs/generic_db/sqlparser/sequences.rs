@@ -340,19 +340,16 @@ pub(super) fn drop_sequences_in(
     schema_name: &str,
     schema_quoted: bool,
 ) {
+    let case = builder.identifier_case();
     let doomed: Vec<Arc<Sequence>> = builder
         .sequences()
         .iter()
         .map(|(sequence, ())| sequence)
         .filter(|sequence| {
-            sequence.sequence_schema().is_some_and(|stored| {
-                identifiers_match(
-                    stored,
-                    sequence.sequence_schema_is_quoted(),
-                    schema_name,
-                    schema_quoted,
-                )
-            })
+            let stored = sequence
+                .sequence_schema()
+                .map(|stored| (stored, sequence.sequence_schema_is_quoted()));
+            schema_qualifiers_match(stored, Some((schema_name, schema_quoted)), case)
         })
         .cloned()
         .collect();

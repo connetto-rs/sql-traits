@@ -80,6 +80,7 @@ mod policy_recursion;
 mod postgres_catalog_cost;
 mod propagated_constraints;
 mod public_principals;
+mod public_schema;
 mod query_outputs;
 mod reader_identifier_rules;
 mod recursive_cte_identifier_context;

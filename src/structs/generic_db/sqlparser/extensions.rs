@@ -273,11 +273,14 @@ pub(super) fn set_function_dependency(
     Ok(())
 }
 
-/// Whether the extension was created in this schema.
+/// Whether the extension was created in this schema, one created without a
+/// schema sitting in `public`.
 fn created_in(extension: &CreateExtension, schema_name: &str, schema_quoted: bool) -> bool {
-    extension.schema.as_ref().is_some_and(|schema| {
-        identifiers_match(&schema.value, schema.quote_style.is_some(), schema_name, schema_quoted)
-    })
+    let (stored, stored_quoted) = extension
+        .schema
+        .as_ref()
+        .map_or(("public", false), |schema| (schema.value.as_str(), schema.quote_style.is_some()));
+    identifiers_match(stored, stored_quoted, schema_name, schema_quoted)
 }
 
 /// Whether any extension was created in this schema, which keeps a `DROP
@@ -339,7 +342,7 @@ fn named_schema(
     extension_name: &Ident,
 ) -> Result<Ident, Error> {
     let (name, quoted) = (schema.value.as_str(), schema.quote_style.is_some());
-    if identifiers_match(name, quoted, "public", false)
+    if (identifiers_match(name, quoted, "public", false) && builder.has_public_schema())
         || identifiers_match(name, quoted, PG_CATALOG, false)
         || declared_schema(builder, name, quoted).is_some()
     {
@@ -362,7 +365,10 @@ fn search_path_schema(
 ) -> Result<Option<Ident>, Error> {
     for (entry, quoted) in builder.search_path().filter(|(entry, _)| !entry.is_empty()) {
         if identifiers_match(entry, quoted, "public", false) {
-            return Ok(None);
+            if builder.has_public_schema() {
+                return Ok(None);
+            }
+            continue;
         }
         if is_temporary_schema(entry, quoted) {
             return Ok(Some(Ident::new(TEMPORARY_SCHEMA)));
