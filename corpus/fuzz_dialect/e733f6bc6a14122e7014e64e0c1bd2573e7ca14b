@@ -1,0 +1,2 @@
+CREATE ROLE E ROLE only;
+GRANT S TO  p,l,u,p,,

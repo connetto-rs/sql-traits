@@ -1,0 +1,2 @@
+CREATE ROLE @only;
+GRANT Spc TO ROLE currenOLEier

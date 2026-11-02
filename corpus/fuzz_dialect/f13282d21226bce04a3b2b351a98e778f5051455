@@ -1,0 +1,2 @@
+CREATE TABLE #ata5(a JSONB NOT NULL
+);

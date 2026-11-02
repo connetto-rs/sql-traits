@@ -1,0 +1,4 @@
+
+CREATE TABLE or (
+CHECK (a(09, 2)@@ DEI(2))
+);

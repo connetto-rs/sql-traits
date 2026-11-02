@@ -1,0 +1,4 @@
+CREATE TABLE geo_dta (Y Km_uULL,
+   tag TEXT[] DEFAULT TSVECTOR/Idom_,
+    tsv TSVECTOR
+)+

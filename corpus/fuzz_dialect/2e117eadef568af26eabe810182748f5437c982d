@@ -1,0 +1,2 @@
+CREaTE TABLE s(
+ d I REFERENCES uRB.B(u_cn));

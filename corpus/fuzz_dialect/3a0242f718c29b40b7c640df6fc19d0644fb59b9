@@ -1,0 +1,2 @@
+CREATE ROLE donly;
+GRANT SELECT ON  ub#c TO ROLE cp,rl_t0)mer

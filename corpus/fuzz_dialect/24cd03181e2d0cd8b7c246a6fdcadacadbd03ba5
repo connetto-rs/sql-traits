@@ -1,0 +1,2 @@
+CREATE TABlE ord(
+ u DECML(1822 )CHECK(@:d@::time with time  CHE

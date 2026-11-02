@@ -1,0 +1,3 @@
+CREATE TaBLE ord(
+ amou DEC CHECK (@@(@@@:@geond_at ), CHECK (@@AD@@:a_att ), CHECK (float:d_=_), CHECK (@@@:@g4eonde@:a_at)
+)

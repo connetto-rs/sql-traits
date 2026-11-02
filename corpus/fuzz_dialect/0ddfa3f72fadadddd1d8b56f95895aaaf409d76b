@@ -1,0 +1,3 @@
+CREATE TRIGGER ORE UPDATE ON u333CREATE ROLE donly;
+GRANT SELECT TO ROLE currenOLEier
+CRE

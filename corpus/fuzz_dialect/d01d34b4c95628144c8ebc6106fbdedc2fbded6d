@@ -1,0 +1,8 @@
+CREATE FUNCTION calcoatpo(or)
+LANGUAGE SQL
+AS $$
+ 
+$$;
+CREATE FUNCTION calcoulate_al(or)
+RETURNS IMC@ED(1 , 2)
+LANGUAGE SÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞÞa)

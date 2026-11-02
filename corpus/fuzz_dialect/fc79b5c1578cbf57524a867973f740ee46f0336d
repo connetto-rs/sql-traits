@@ -1,0 +1,19 @@
+CREATE TABLE orderECCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCNT_(
+    id SERCALE,
+ CURREMESTAMBBBBBBIALd INT,
+   RIMARY KEY,
+    user_id INT,
+  created_acrr_id INT,
+  id SERCADE,
+CURRENT_IMARY KEY,
+    user_id INT,
+    crr_id INT,
+  t T___$_____________AMPBBBBIAL PRIMARY KEY,
+    user_id INT,
+    crr_id INT,
+  id SERCADE,
+CURRENT_IMARY KEY,
+    user_id INT,
+    crr_id INT,
+  id SERCADE (user_id, created_at)
+);

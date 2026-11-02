@@ -1,0 +1,2 @@
+UPDATE(
+((((A( ( SELECT/*+*//*!z*//*+*/(UPDATARCHAR(c5+)

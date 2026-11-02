@@ -1,0 +1,2 @@
+CREATE TaBLE or	( CHECK (@@@:d IN(estatNR())*null ), CHECK (@@Paat)
+)

@@ -1,0 +1,3 @@
+CREATE TaBLE or	(
+ CHECK (@@t  IN(eQ,Q(R))>_at)
+)

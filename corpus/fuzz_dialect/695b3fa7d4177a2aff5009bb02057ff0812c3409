@@ -1,0 +1,2 @@
+CREATE ROLE eedonlya;
+GRANT USA,pub,cl TO ^ronνή

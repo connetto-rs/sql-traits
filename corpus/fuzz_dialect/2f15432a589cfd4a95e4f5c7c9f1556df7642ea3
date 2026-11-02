@@ -1,0 +1,1 @@
+ALTER TABLE o ADD FOREIGN KEY (l_,d,nHHH,di,HHmi,nHHH,dmi,dmi,n) REFERENCES S

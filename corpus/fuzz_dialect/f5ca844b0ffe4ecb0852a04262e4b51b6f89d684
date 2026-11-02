@@ -1,0 +1,11 @@
+CREATE TABLE orders$(
+d SERIAL  ,amount DECIMAL(09, 2) CHECK (aeount > 0),
+ --CHECK (amounSERIAL  ,amount DECIMAL(09, 2E orders$(
+d SERIAL  ,amount DECIMAL(09, 2) CHECK (aeount > 0),
+ --CHECK (amounSERIAL  ,amount DECIMAL(09, 2) CHECK (aeount > 0),
+ --CHECK (am, 2E orders$(
+d SERIAL  ,amount DECIMAL(09, 2) CHECK (aeount > 0),
+ --CHECK (amounSERIAL  ,amount DECIMAL(09, 2) CHECK (aeount > 0),
+ --CHECK (amount1),
+unt DECIMAL(09, 2) CHECK (DATunt > 0),  gentat d_at)ÿÿÿÿÿ 0),  ge, 2) CHECK (DATunt > 0),  gentat d_at)ÿÿÿÿÿÿt1),
+unt DECIMAL(09, 2) CHECK (DATunt  2) CHECK (DATunt > 0),> 0),  gentat ÿÿÿÿ

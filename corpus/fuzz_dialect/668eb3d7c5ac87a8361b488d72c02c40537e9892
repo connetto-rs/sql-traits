@@ -1,0 +1,2 @@
+CREATE ROLE donly;
+GRANT Sc TO ROLE subsumer

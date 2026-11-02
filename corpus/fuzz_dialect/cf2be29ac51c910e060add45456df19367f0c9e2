@@ -1,0 +1,4 @@
+CREATE TABLE order$(
+d SERIAL  ,amount DIECMAL(10, 2) CHECK (a),
+ --CHECK (ao.nt0),
+t unDECIMAL(09, 2) CHECK (DATunt > 0),    t#at d_at)ÿÿÿÿÿÿÿ

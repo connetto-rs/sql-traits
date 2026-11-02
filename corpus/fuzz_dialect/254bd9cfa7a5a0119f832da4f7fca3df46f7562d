@@ -1,0 +1,2 @@
+CREATE TABLE orders (
+    idsubstringS knullEGER NOT NULL REFERENCES usevsULL REFERENCES unullEGEevs(id) ONDELETE CASCADE,   NOT NULL RETABLE useÀrá‘œxxxRExNCES unullREATE TA

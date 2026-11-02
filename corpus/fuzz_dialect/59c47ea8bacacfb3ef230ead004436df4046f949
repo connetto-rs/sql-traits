@@ -1,0 +1,4 @@
+CREATE TABLE us (id I1AR KEY,
+ m NOT NULL,
+ ail TEXT UNIQUE
+);

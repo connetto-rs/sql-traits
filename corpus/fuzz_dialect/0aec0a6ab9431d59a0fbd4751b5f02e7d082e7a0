@@ -1,0 +1,2 @@
+CREATE TABLE rnows (
+   tus VARCHAR(20) DEFAULT 'pending',lo PRIMSTsessIMARY KEY DEFAULT olo PRIMARY KEY );

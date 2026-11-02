@@ -1,0 +1,3 @@
+CREATE ROLE ad;
+CREATE ROLE rea;
+GRANT SEL TO reloDA

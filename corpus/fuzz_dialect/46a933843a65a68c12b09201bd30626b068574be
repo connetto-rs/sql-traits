@@ -1,0 +1,5 @@
+CREATE TABLE a (
+  id  Y DEFAULT om_uuid(),
+   IMARY TKEY DEFAULT gen_uid(),
+   int PzI
+);

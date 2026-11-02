@@ -1,0 +1,5 @@
+
+CREATE ROLE re, p,l,C,d, p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA pc TO  p,l,C,d,only;
+GRANT SELEcT ON ALL TABLES IN SCHEMA p,KEC,lC,REC,lCREC,l,lCREK,KElREC,lCREC,l,lCREC,KEC,oC,loNlwcK,KElREC,KE,CCl,cCREC,KElREc TO l,C,d,only;
+GRANT SELEcT ON ALL TABLESES IN SCHEMCREACREATE current_( p,l.Cÿÿÿÿÿÿÿ,re,33TE _T3

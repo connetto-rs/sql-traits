@@ -1,0 +1,4 @@
+CREATe TABLE ordeps (
+    id SEENTEG NULL REFERENCES users(id) ON DELETE CASCADE,
+ amount DECIMAL(020, 2) CHECK (at)
+);ù)

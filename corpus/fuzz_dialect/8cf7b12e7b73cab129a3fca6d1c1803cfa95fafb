@@ -1,0 +1,1 @@
+COPY(UPDATE V SET  s =ON:s#) cal(s)  ` v  `k
