@@ -1059,3 +1059,112 @@ pub(super) fn settle_dropped_sequences(
     }
     Ok(builder)
 }
+
+/// Moves every sequence stored in schema `from` to `to`, carrying along the
+/// column defaults drawing from each, the grants on each and the definitions
+/// reading each, as a schema rename does.
+///
+/// # Errors
+///
+/// Returns the refusals rebuilding a table or rewriting a definition meets.
+pub(super) fn move_sequences(
+    mut builder: ParserDBBuilder,
+    from: (&str, bool),
+    to: (&str, bool),
+) -> Result<ParserDBBuilder, Error> {
+    let case = builder.identifier_case();
+    let moving: Vec<usize> = builder
+        .sequences()
+        .iter()
+        .enumerate()
+        .filter(|(_, (sequence, ()))| {
+            let stored = sequence
+                .sequence_schema()
+                .map(|schema| (schema, sequence.sequence_schema_is_quoted()));
+            schema_qualifiers_match(stored, Some(from), case)
+        })
+        .map(|(position, _)| position)
+        .collect();
+    for position in moving {
+        let previous = Arc::clone(&builder.sequences()[position].0);
+        let key = stored_sequence_key(previous.as_ref(), IdentifierCase::AsWritten);
+        let readers = super::view_rewrites::readers(&builder, &[&key]);
+        let mut moved = (*previous).clone();
+        moved.set_schema(to.0.to_string(), to.1);
+        let bound = bound_regclass(&moved);
+        let name = ObjectName::from(alloc::vec![
+            stored_ident(to.0, to.1),
+            stored_ident(moved.sequence_name(), moved.sequence_name_is_quoted()),
+        ]);
+        builder.sequences_mut()[position].0 = Arc::new(moved);
+
+        let drawing: Vec<StoredTable> = builder
+            .tables()
+            .iter()
+            .map(|(table, _, _)| table.as_ref())
+            .filter(|table| {
+                table.columns.iter().any(|column| {
+                    column.options.iter().any(|option| {
+                        matches!(&option.option, ColumnOption::Default(default)
+                            if drawn_by_default(default, core::slice::from_ref(&previous)).is_some())
+                    })
+                })
+            })
+            .map(StoredTable::of)
+            .collect();
+        for table in &drawing {
+            builder = ParserDB::replace_table_node(builder, table, |_, node| {
+                for column in &mut node.columns {
+                    for option in &mut column.options {
+                        if let ColumnOption::Default(default) = &mut option.option {
+                            redirect_regclass(default, &previous, &bound);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        redirect_grants(builder.table_grants_mut(), &previous, &name);
+        redirect_grants(builder.column_grants_mut(), &previous, &name);
+        if let Some(readers) = readers {
+            super::view_rewrites::follow_renames(
+                &mut builder,
+                readers,
+                &[super::view_rewrites::Rename::Relation { key, to: name }],
+            )?;
+        }
+    }
+    Ok(builder)
+}
+
+/// Points every `regclass` constant in `default` naming `previous` at
+/// `bound`.
+fn redirect_regclass(default: &mut Expr, previous: &Sequence, bound: &str) {
+    let _ = visit_expressions_mut(default, |node| {
+        if let Some(text) = regclass_constant_mut(node)
+            && TargetName::parse(text).is_ok_and(|target| names_by_target(&target, previous))
+        {
+            *text = bound.to_string();
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Points every grant naming `previous` at `name`. A grant names one object.
+fn redirect_grants(grants: &mut [(Arc<Grant>, ())], previous: &Sequence, name: &ObjectName) {
+    let names_previous =
+        |names: &[ObjectName]| names.iter().any(|named| names_sequence_identity(named, previous));
+    for (grant, ()) in grants {
+        let redirected = match &grant.objects {
+            Some(GrantObjects::Sequences(names)) if names_previous(names) => {
+                GrantObjects::Sequences(alloc::vec![name.clone()])
+            }
+            Some(GrantObjects::Tables(names)) if names_previous(names) => {
+                GrantObjects::Tables(alloc::vec![name.clone()])
+            }
+            _ => continue,
+        };
+        Arc::make_mut(grant).objects = Some(redirected);
+    }
+}

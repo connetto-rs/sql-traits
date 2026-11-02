@@ -605,7 +605,7 @@ pub(super) fn holds_view(builder: &ParserDBBuilder, name: &ObjectName) -> Option
 /// sits in, which for a view the search path placed is not the schema the
 /// statement wrote.
 fn rename_view(
-    mut builder: ParserDBBuilder,
+    builder: ParserDBBuilder,
     name: &ObjectName,
     kind: ObjectKind,
     new_name: &ObjectName,
@@ -622,7 +622,94 @@ fn rename_view(
         return Ok(builder);
     };
 
-    let (granted, key) = if kind == ObjectKind::MaterializedView {
+    let current = if kind == ObjectKind::MaterializedView {
+        GrantedView::of(builder.materialized_views()[position].0.as_ref())
+    } else {
+        GrantedView::of(builder.views()[position].0.as_ref())
+    };
+
+    // A rename to the name it already answers to changes nothing, and asking
+    // the name pool first would report the view colliding with itself.
+    if !crate::utils::identifier_resolution::identifiers_match(
+        current.name.as_str(),
+        current.quoted,
+        new_ident.value.as_str(),
+        new_ident.quote_style.is_some(),
+    ) && let Some(conflicting_kind) = domains::relation_or_domain_holder(
+        &builder,
+        new_ident,
+        current.schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted)),
+    ) {
+        return Err(Error::RelationNameAlreadyTaken {
+            object_kind: kind,
+            conflicting_kind,
+            object_name: new_ident.value.clone(),
+        });
+    }
+
+    retarget_view(builder, kind, position, None, new_ident)
+}
+
+/// Moves every view and materialized view stored in schema `from` to `to`,
+/// carrying every reference to each along, as a schema rename does.
+///
+/// # Errors
+///
+/// Returns the refusals rewriting a view reading a moved one meets.
+pub(super) fn move_views(
+    mut builder: ParserDBBuilder,
+    from: (&str, bool),
+    to: (&str, bool),
+) -> Result<ParserDBBuilder, Error> {
+    let case = builder.identifier_case();
+    let plain: Vec<(usize, Ident)> = builder
+        .views()
+        .iter()
+        .enumerate()
+        .filter(|(_, (view, _, _))| stored_in(view.as_ref(), from, case))
+        .map(|(position, (view, _, _))| (position, view_ident(view.as_ref())))
+        .collect();
+    let materialized: Vec<(usize, Ident)> = builder
+        .materialized_views()
+        .iter()
+        .enumerate()
+        .filter(|(_, (view, _, _))| stored_in(view.as_ref(), from, case))
+        .map(|(position, (view, _, _))| (position, view_ident(view.as_ref())))
+        .collect();
+    for (position, ident) in plain {
+        builder = retarget_view(builder, ObjectKind::View, position, Some(to), &ident)?;
+    }
+    for (position, ident) in materialized {
+        builder = retarget_view(builder, ObjectKind::MaterializedView, position, Some(to), &ident)?;
+    }
+    Ok(builder)
+}
+
+/// Whether a stored view sits in `schema`, a view stored without one sitting
+/// in `public`.
+fn stored_in<V: ViewLike>(view: &V, schema: (&str, bool), case: IdentifierCase) -> bool {
+    super::schema_qualifiers_match(
+        view.view_schema().map(|stored| (stored, view.view_schema_is_quoted())),
+        Some(schema),
+        case,
+    )
+}
+
+/// The identifier a stored view is named by.
+fn view_ident<V: ViewLike>(view: &V) -> Ident {
+    stored_ident(view.view_name(), view.view_name_is_quoted())
+}
+
+/// Gives the view stored at `position` the name `ident`, in `schema` when the
+/// view moves, and carries every view, body, rule and grant naming it along.
+fn retarget_view(
+    mut builder: ParserDBBuilder,
+    kind: ObjectKind,
+    position: usize,
+    schema: Option<(&str, bool)>,
+    ident: &Ident,
+) -> Result<ParserDBBuilder, Error> {
+    let (current, key) = if kind == ObjectKind::MaterializedView {
         let view = builder.materialized_views()[position].0.as_ref();
         (GrantedView::of(view), stored_view_key(view, IdentifierCase::AsWritten))
     } else {
@@ -633,48 +720,43 @@ fn rename_view(
     let host =
         (kind == ObjectKind::View).then(|| RuleHost::of_view(builder.views()[position].0.as_ref()));
 
-    // A rename to the name it already answers to changes nothing, and asking
-    // the name pool first would report the view colliding with itself.
-    if !crate::utils::identifier_resolution::identifiers_match(
-        granted.name.as_str(),
-        granted.quoted,
-        new_ident.value.as_str(),
-        new_ident.quote_style.is_some(),
-    ) && let Some(conflicting_kind) = domains::relation_or_domain_holder(
-        &builder,
-        new_ident,
-        granted.schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted)),
-    ) {
-        return Err(Error::RelationNameAlreadyTaken {
-            object_kind: kind,
-            conflicting_kind,
-            object_name: new_ident.value.clone(),
-        });
+    let readers = view_rewrites::readers(&builder, &[&key]);
+
+    let edit = |declaration: &mut ViewDeclaration| {
+        declaration.set_name(ident.value.clone(), ident.quote_style.is_some());
+        if let Some((schema, quoted)) = schema {
+            declaration.set_schema(schema.to_string(), quoted);
+        }
+    };
+    if kind == ObjectKind::MaterializedView {
+        edit(Arc::make_mut(&mut builder.materialized_views_mut()[position].0).declaration_mut());
+    } else {
+        edit(Arc::make_mut(&mut builder.views_mut()[position].0).declaration_mut());
     }
 
-    let readers = view_rewrites::readers(&builder, &[&key]);
-    let renamed = (new_ident.value.clone(), new_ident.quote_style.is_some());
-    if kind == ObjectKind::MaterializedView {
-        let (view, _, _) = &mut builder.materialized_views_mut()[position];
-        Arc::make_mut(view).declaration_mut().set_name(renamed.0, renamed.1);
-    } else {
-        let (view, _, _) = &mut builder.views_mut()[position];
-        Arc::make_mut(view).declaration_mut().set_name(renamed.0, renamed.1);
-    }
+    let stored_schema =
+        schema.or_else(|| current.schema.as_ref().map(|(name, quoted)| (name.as_str(), *quoted)));
+    let stored_name = ObjectName::from(
+        stored_schema
+            .map(|(schema, quoted)| stored_ident(schema, quoted))
+            .into_iter()
+            .chain([ident.clone()])
+            .collect::<Vec<_>>(),
+    );
     if let Some(readers) = readers {
-        view_rewrites::follow_renames(
-            &mut builder,
-            readers,
-            &[Rename::Relation {
-                key,
-                to: ObjectName(vec![ObjectNamePart::Identifier(new_ident.clone())]),
-            }],
-        )?;
+        // Within the schema every spelling keeps its qualifier, a move needs
+        // the new one.
+        let to = if schema.is_some() {
+            stored_name.clone()
+        } else {
+            ObjectName(vec![ObjectNamePart::Identifier(ident.clone())])
+        };
+        view_rewrites::follow_renames(&mut builder, readers, &[Rename::Relation { key, to }])?;
     }
     if let Some(host) = &host {
-        rules::follow_relation_rename(&mut builder, host, new_ident);
+        rules::follow_relation_rename(&mut builder, host, &stored_name);
     }
-    granted.rename_grants(&mut builder, new_ident);
+    current.rename_grants(&mut builder, &stored_name);
     Ok(builder)
 }
 
@@ -894,26 +976,19 @@ impl GrantedView {
         builder.column_grants_mut().retain(|(grant, ())| !self.named_by(grant));
     }
 
-    /// Points the grants naming this view at `renamed`, which PostgreSQL
-    /// keeps on the view.
-    fn rename_grants(&self, builder: &mut ParserDBBuilder, renamed: &Ident) {
+    /// Points the grants naming this view at its stored name `renamed`, which
+    /// PostgreSQL keeps on the view.
+    fn rename_grants(&self, builder: &mut ParserDBBuilder, renamed: &ObjectName) {
         self.rename_in(builder.table_grants_mut(), renamed);
         self.rename_in(builder.column_grants_mut(), renamed);
     }
 
     /// Points each grant naming this view at `renamed`. A grant names one
     /// object, so one naming this view names it alone.
-    fn rename_in(&self, grants: &mut [(Arc<Grant>, ())], renamed: &Ident) {
+    fn rename_in(&self, grants: &mut [(Arc<Grant>, ())], renamed: &ObjectName) {
         for (grant, ()) in grants {
             if self.named_by(grant) {
-                let name = self
-                    .schema
-                    .iter()
-                    .map(|(schema, quoted)| stored_ident(schema, *quoted))
-                    .chain([renamed.clone()])
-                    .collect::<Vec<_>>();
-                Arc::make_mut(grant).objects =
-                    Some(GrantObjects::Tables(vec![ObjectName::from(name)]));
+                Arc::make_mut(grant).objects = Some(GrantObjects::Tables(vec![renamed.clone()]));
             }
         }
     }

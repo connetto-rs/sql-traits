@@ -161,6 +161,13 @@ impl ViewDeclaration {
         self.name_is_quoted = quoted;
     }
 
+    /// Moves the view to `schema`, which a renamed schema does to what it
+    /// holds, under the same restriction as [`Self::set_name`].
+    pub(crate) fn set_schema(&mut self, schema: String, quoted: bool) {
+        self.schema = Some(schema);
+        self.schema_is_quoted = quoted;
+    }
+
     /// Returns the query the view is defined by, so a statement that rewrites
     /// it leaves the view reading what it read.
     pub(crate) fn query_mut(&mut self) -> &mut Query {

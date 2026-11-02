@@ -2142,6 +2142,18 @@ pub enum Error {
         /// Name of the schema that was not found.
         schema_name: String,
     },
+    #[error(
+        "Schema `{schema_name}` cannot be renamed while it holds function `{function_name}`, which this model does not move."
+    )]
+    /// Error indicating that `ALTER SCHEMA ... RENAME TO` names a schema
+    /// holding a function. PostgreSQL moves the function with the schema and
+    /// every call naming it follows, which this model does not represent yet.
+    UnsupportedSchemaRename {
+        /// Name of the schema, as stored.
+        schema_name: String,
+        /// Name of the first function it holds.
+        function_name: String,
+    },
     #[error("Failed to build the table dependency graph of database `{catalog_name}`: {reason}")]
     /// Error indicating that the foreign key graph of a database could not be
     /// assembled.

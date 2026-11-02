@@ -4925,6 +4925,50 @@ impl ParserDB {
         Ok(builder)
     }
 
+    /// Moves every relation stored in schema `from` to `to`, carrying every
+    /// reference to each along, as `ALTER SCHEMA ... RENAME TO` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::Error::UnsupportedSchemaRename`] when the
+    /// schema holds a function, which this model does not move, and the
+    /// refusals moving a relation meets.
+    fn move_schema_contents(
+        mut builder: ParserDBBuilder,
+        from: (&str, bool),
+        to: (&str, bool),
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let case = builder.identifier_case();
+        let in_from =
+            |qualifier: SchemaQualifier<'_>| schema_qualifiers_match(qualifier, Some(from), case);
+        if let Some((function, _)) = builder
+            .functions()
+            .iter()
+            .find(|(function, _)| in_from(qualifier_of(&function.name).named()))
+        {
+            return Err(crate::errors::Error::UnsupportedSchemaRename {
+                schema_name: from.0.to_string(),
+                function_name: last_str(&function.name).to_string(),
+            });
+        }
+
+        builder = sequences::move_sequences(builder, from, to)?;
+        let tables: Vec<(ObjectName, Ident)> = builder
+            .tables()
+            .iter()
+            .map(|(table, _, _)| table.as_ref())
+            .filter(|table| in_from(table_schema_qualifier(table)))
+            .filter_map(|table| {
+                Some((table.name.clone(), object_name_last_identifier(&table.name)?.clone()))
+            })
+            .collect();
+        for (name, ident) in tables {
+            let moved = ObjectName::from(vec![stored_ident(to.0, to.1), ident]);
+            builder = Self::rename_table_checked(builder, &name, moved, false)?;
+        }
+        views::move_views(builder, from, to)
+    }
+
     /// Replaces the stored node of a table with the one `edit` produces and
     /// recomputes every model object derived from it.
     ///
@@ -8941,6 +8985,7 @@ impl ParserDB {
                                     });
                                 }
 
+                                let schemas = builder.schemas_mut();
                                 let (old_schema, ()) = schemas.remove(idx);
                                 let new_schema = if let Some(auth) = old_schema.authorization() {
                                     Schema::with_authorization_and_quoted(
@@ -8976,6 +9021,11 @@ impl ParserDB {
                                     (&new_schema_name, new_schema_quoted),
                                     builder.identifier_case(),
                                 );
+                                builder = Self::move_schema_contents(
+                                    builder,
+                                    (&current_schema_name, current_schema_quoted),
+                                    (&new_schema_name, new_schema_quoted),
+                                )?;
                                 builder = domains::follow_schema_rename(
                                     builder,
                                     (&current_schema_name, current_schema_quoted),

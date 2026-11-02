@@ -15,7 +15,7 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CreateRule, CreateRuleAction, CreateRuleEvent, Expr, Ident, ObjectNamePart, Statement, Visit,
+    CreateRule, CreateRuleAction, CreateRuleEvent, Expr, Ident, ObjectName, Statement, Visit,
     VisitMut, Visitor, VisitorMut,
 };
 
@@ -241,18 +241,16 @@ pub(super) fn drop_rules_on(builder: &mut ParserDBBuilder, host: &RuleHost) {
     builder.rules_mut().retain(|(rule, ())| !host.carries(rule));
 }
 
-/// Points the rules on a renamed relation at its new name, which stays in the
-/// same schema.
+/// Points the rules on a renamed or moved relation at its stored name
+/// `new_name`.
 pub(super) fn follow_relation_rename(
     builder: &mut ParserDBBuilder,
     host: &RuleHost,
-    new_name: &Ident,
+    new_name: &ObjectName,
 ) {
     for (rule, ()) in builder.rules_mut() {
-        if host.carries(rule)
-            && let Some(last) = Arc::make_mut(rule).table_name.0.last_mut()
-        {
-            *last = ObjectNamePart::Identifier(new_name.clone());
+        if host.carries(rule) {
+            Arc::make_mut(rule).table_name = new_name.clone();
         }
     }
 }
