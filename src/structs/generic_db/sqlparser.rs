@@ -307,7 +307,10 @@ fn qualify_created_collation_name(
     }
     for (schema, schema_quoted) in builder.search_path().filter(|(schema, _)| !schema.is_empty()) {
         if identifiers_match("public", false, schema, schema_quoted) {
-            return Ok(name.clone());
+            if builder.has_public_schema() {
+                return Ok(name.clone());
+            }
+            continue;
         }
         if identifiers_match("pg_catalog", false, schema, schema_quoted) {
             return Ok(ObjectName(vec![
@@ -1527,10 +1530,13 @@ impl ParserDBBuilder {
     /// PostgreSQL refuses `DROP SCHEMA` without `CASCADE` while a schema holds
     /// any of them.
     fn is_schema_non_empty(&self, schema_name: &str, schema_quoted: bool) -> bool {
+        // An object stored without a schema sits in `public`.
         let in_schema = |stored: Option<(&str, bool)>| {
-            stored.is_some_and(|(stored_schema, stored_quoted)| {
-                identifiers_match(stored_schema, stored_quoted, schema_name, schema_quoted)
-            })
+            schema_qualifiers_match(
+                stored,
+                Some((schema_name, schema_quoted)),
+                self.identifier_case(),
+            )
         };
         self.tables().iter().any(|(table, _, _)| {
             in_schema(table.table_schema().map(|schema| (schema, table.table_schema_is_quoted())))
@@ -1557,6 +1563,22 @@ impl ParserDBBuilder {
             self.schemas().iter().map(|(schema, ())| schema.as_ref()),
             ident,
         )
+    }
+
+    /// Lists `public` among the declared schemas when `name` names it while
+    /// it still exists undeclared, so a statement altering or dropping it
+    /// finds it like any other schema.
+    fn declare_public_schema(&mut self, name: &ObjectName) {
+        let names_public = object_name_last_identifier(name).is_some_and(|ident| {
+            identifiers_match(&ident.value, ident.quote_style.is_some(), "public", false)
+        });
+        if names_public
+            && self.has_public_schema()
+            && declared_schema(self, "public", false).is_none()
+        {
+            self.schemas_mut()
+                .push((Arc::new(Schema::with_quoted("public".to_string(), false)), ()));
+        }
     }
 
     /// Resolves a table the input has created so far through the session's
@@ -3208,13 +3230,13 @@ fn declared_schema<'builder>(
 
 /// Returns whether a schema by this name is one a relation may be created in.
 ///
-/// The default schema is exempt from being declared, since no dump emits a
-/// statement creating it, which is the same allowance
+/// The default schema needs no declaration while it exists, since no dump
+/// emits a statement creating it, which is the same allowance
 /// [`ParserDB::resolve_table_object_name_on_search_path`] makes when resolving
 /// a name against it. So is the session's temporary schema, which always
 /// exists and which no statement can create.
 fn schema_is_declared(builder: &ParserDBBuilder, name: &str, quoted: bool) -> bool {
-    identifiers_match(name, quoted, "public", false)
+    (identifiers_match(name, quoted, "public", false) && builder.has_public_schema())
         || is_temporary_schema(name, quoted)
         || declared_schema(builder, name, quoted).is_some()
 }
@@ -3475,7 +3497,10 @@ fn search_path_qualifier(
 ) -> Result<Option<Ident>, crate::errors::Error> {
     for (entry, quoted) in builder.search_path().filter(|(entry, _)| !entry.is_empty()) {
         if identifiers_match(entry, quoted, "public", false) {
-            return Ok(None);
+            if builder.has_public_schema() {
+                return Ok(None);
+            }
+            continue;
         }
         if is_temporary_schema(entry, quoted) {
             return Ok(Some(Ident::new(TEMPORARY_SCHEMA)));
@@ -5033,9 +5058,7 @@ impl ParserDB {
             .functions()
             .iter()
             .filter(|(function, _)| {
-                qualifier_of(&function.name).named().is_some_and(|stored| {
-                    case.identifiers_match(stored.0, stored.1, schema.0, schema.1)
-                })
+                schema_qualifiers_match(qualifier_of(&function.name).named(), Some(schema), case)
             })
             .map(|(function, _)| Arc::clone(function))
             .collect();
@@ -7975,6 +7998,7 @@ impl ParserDB {
                 } => {
                     for name in names {
                         let schema_name = last_str(&name);
+                        builder.declare_public_schema(&name);
                         let maybe_schema = object_name_last_identifier(&name)
                             .and_then(|ident| builder.resolve_schema_ident(ident));
 
@@ -8004,20 +8028,16 @@ impl ParserDB {
                         // first, the functions last so nothing else in it
                         // still calls them.
                         if cascade {
-                            use crate::traits::TableLike;
                             let doomed: Vec<StoredTable> = builder
                                 .tables()
                                 .iter()
                                 .map(|(t, _, _)| t.as_ref())
                                 .filter(|t| {
-                                    t.table_schema().is_some_and(|table_schema| {
-                                        identifiers_match(
-                                            table_schema,
-                                            t.table_schema_is_quoted(),
-                                            &resolved_schema_name,
-                                            resolved_schema_quoted,
-                                        )
-                                    })
+                                    schema_qualifiers_match(
+                                        table_schema_qualifier(t),
+                                        Some((&resolved_schema_name, resolved_schema_quoted)),
+                                        builder.identifier_case(),
+                                    )
                                 })
                                 .map(StoredTable::of)
                                 .collect();
@@ -8060,6 +8080,14 @@ impl ParserDB {
                             (&resolved_schema_name, resolved_schema_quoted),
                             builder.identifier_case(),
                         );
+                        if identifiers_match(
+                            &resolved_schema_name,
+                            resolved_schema_quoted,
+                            "public",
+                            false,
+                        ) {
+                            builder.set_public_schema(false);
+                        }
                     }
                 }
                 Statement::CreateIndex(mut create_index) => {
@@ -8859,7 +8887,13 @@ impl ParserDB {
                         }
                     }
 
-                    // Check if schema already exists
+                    let is_public = identifiers_match(&name, quoted, "public", false);
+                    // `public` exists undeclared until something renames or
+                    // drops it, and `pg_dump -n public` writes its creation,
+                    // so creating it while it exists changes nothing.
+                    if is_public && builder.has_public_schema() {
+                        continue;
+                    }
                     let schema_exists = builder
                         .schemas()
                         .iter()
@@ -8883,6 +8917,9 @@ impl ParserDB {
                             None => Schema::with_quoted(name, quoted),
                         };
                         builder = builder.add_schema(Arc::new(schema), ());
+                        if is_public {
+                            builder.set_public_schema(true);
+                        }
                         builder = creator.grant(
                             builder,
                             DefaultKind::Schemas,
@@ -9289,6 +9326,7 @@ impl ParserDB {
                     let schema_name = last_str(&name);
 
                     // Check if schema exists
+                    builder.declare_public_schema(&name);
                     let resolved_schema = object_name_last_identifier(&name)
                         .and_then(|ident| builder.resolve_schema_ident(ident));
 
@@ -9337,7 +9375,15 @@ impl ParserDB {
                                             )
                                     },
                                 );
-                                if duplicate_exists {
+                                // `public` exists undeclared until something
+                                // renames or drops it.
+                                let onto_public = identifiers_match(
+                                    &new_schema_name,
+                                    new_schema_quoted,
+                                    "public",
+                                    false,
+                                ) && builder.has_public_schema();
+                                if duplicate_exists || onto_public {
                                     return Err(crate::errors::Error::SchemaAlreadyExists {
                                         schema_name: new_schema_name.clone(),
                                     });
@@ -9389,6 +9435,15 @@ impl ParserDB {
                                     (&current_schema_name, current_schema_quoted),
                                     (&new_schema_name, new_schema_quoted),
                                 )?;
+                                let is_public = |name: &str, quoted| {
+                                    identifiers_match(name, quoted, "public", false)
+                                };
+                                if is_public(&current_schema_name, current_schema_quoted) {
+                                    builder.set_public_schema(false);
+                                }
+                                if is_public(&new_schema_name, new_schema_quoted) {
+                                    builder.set_public_schema(true);
+                                }
                                 current_schema_name = new_schema_name;
                                 current_schema_quoted = new_schema_quoted;
                             }
