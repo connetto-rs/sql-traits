@@ -1999,6 +1999,15 @@ pub enum Error {
         /// Name of the extension that was not found.
         extension_name: String,
     },
+    #[error("Extension `{extension_name}` not found for function `{function_name}` to depend on.")]
+    /// Error indicating that `ALTER FUNCTION ... [NO] DEPENDS ON EXTENSION`
+    /// names an extension the database does not hold.
+    AlterFunctionExtensionNotFound {
+        /// Name of the extension that was not found.
+        extension_name: String,
+        /// Name of the function the statement alters.
+        function_name: String,
+    },
     #[error("Cannot drop schema `{schema_name}`: still contains objects.")]
     /// Error indicating that a DROP SCHEMA statement references a schema
     /// that still contains objects (tables, functions, etc.).

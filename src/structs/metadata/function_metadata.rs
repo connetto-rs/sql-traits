@@ -27,6 +27,9 @@ pub struct FunctionMetadata {
     /// The name of the extension the function belongs to, which creates and
     /// drops it.
     extension: Option<Ident>,
+    /// The extensions `ALTER FUNCTION ... DEPENDS ON EXTENSION` made the
+    /// function depend on, each dropping it when it is dropped.
+    extension_dependencies: Vec<Ident>,
     /// The calls of a body PostgreSQL binds at creation, with the functions
     /// each reached then, and none for a body read again each time it runs.
     body_calls: ExpressionCalls<CreateFunction>,
@@ -109,6 +112,25 @@ impl FunctionMetadata {
     #[inline]
     pub(crate) fn set_extension(&mut self, extension: Ident) {
         self.extension = Some(extension);
+    }
+
+    /// Returns the extensions the function was made to depend on.
+    pub(crate) fn extension_dependencies(&self) -> &[Ident] {
+        &self.extension_dependencies
+    }
+
+    /// Makes the function depend on `extension`, or stop depending on it when
+    /// `depends` is `false`. `matches` compares two extension names.
+    pub(crate) fn set_extension_dependency(
+        &mut self,
+        extension: &Ident,
+        depends: bool,
+        matches: impl Fn(&Ident, &Ident) -> bool,
+    ) {
+        self.extension_dependencies.retain(|held| !matches(held, extension));
+        if depends {
+            self.extension_dependencies.push(extension.clone());
+        }
     }
 
     /// Returns the calls of the function's body if PostgreSQL bound it at

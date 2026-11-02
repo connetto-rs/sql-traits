@@ -400,3 +400,70 @@ fn a_stored_extension_keeps_whether_with_was_written() {
         ]
     );
 }
+
+/// The function `g` marked as depending on the extension `pg_trgm`.
+const DEPENDENT: &str = "CREATE EXTENSION pg_trgm;
+     CREATE FUNCTION g() RETURNS INT AS 'SELECT 1';
+     ALTER FUNCTION g() DEPENDS ON EXTENSION pg_trgm;";
+
+fn holds_g(database: &ParserDB) -> bool {
+    database.functions().any(|function| function.name() == "g")
+}
+
+/// PostgreSQL 16 drops a function depending on an extension with the
+/// extension, `RESTRICT` included, and keeps one whose dependency was lifted.
+#[test]
+fn a_dependent_function_goes_with_its_extension() {
+    for drop in ["DROP EXTENSION pg_trgm;", "DROP EXTENSION pg_trgm RESTRICT;"] {
+        let dropped = parse(&format!("{DEPENDENT} {drop}")).expect("the drop is accepted");
+        assert!(!holds_g(&dropped), "{drop}");
+    }
+    let repeated = parse(&format!(
+        "{DEPENDENT} ALTER FUNCTION g() DEPENDS ON EXTENSION pg_trgm; DROP EXTENSION pg_trgm;"
+    ))
+    .expect("a repeated dependency is accepted");
+    assert!(!holds_g(&repeated));
+
+    let lifted = parse(&format!(
+        "{DEPENDENT}
+         ALTER FUNCTION g() NO DEPENDS ON EXTENSION pg_trgm;
+         ALTER FUNCTION g() NO DEPENDS ON EXTENSION pg_trgm;
+         DROP EXTENSION pg_trgm;"
+    ))
+    .expect("lifting an absent dependency is accepted");
+    assert!(holds_g(&lifted));
+
+    let alone = parse(&format!("{DEPENDENT} DROP FUNCTION g(); DROP EXTENSION pg_trgm;"))
+        .expect("a dependent function may be dropped on its own");
+    assert!(!holds_g(&alone));
+}
+
+/// What calls a dependent function holds the extension in place, as it holds
+/// the function.
+#[test]
+fn a_call_to_a_dependent_function_keeps_its_extension() {
+    let result =
+        parse(&format!("{DEPENDENT} CREATE VIEW gv AS SELECT g() AS one; DROP EXTENSION pg_trgm;"));
+    assert!(
+        matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "g"),
+        "got {result:?}"
+    );
+}
+
+#[test]
+fn a_dependency_on_a_missing_extension_is_refused() {
+    for statement in [
+        "ALTER FUNCTION g() DEPENDS ON EXTENSION nope;",
+        "ALTER FUNCTION g() NO DEPENDS ON EXTENSION nope;",
+    ] {
+        let result = parse(&format!("CREATE FUNCTION g() RETURNS INT AS 'SELECT 1'; {statement}"));
+        assert!(
+            matches!(
+                &result,
+                Err(Error::AlterFunctionExtensionNotFound { extension_name, function_name })
+                    if extension_name == "nope" && function_name == "g"
+            ),
+            "{statement} got {result:?}"
+        );
+    }
+}
