@@ -95,12 +95,29 @@ impl CarriedCalls {
 
     /// Takes the first recorded binding of a call written `name` passing
     /// `arguments` arguments.
-    fn take(&mut self, name: &ObjectName, arguments: usize) -> Option<Vec<Arc<CreateFunction>>> {
+    pub(super) fn take(
+        &mut self,
+        name: &ObjectName,
+        arguments: usize,
+    ) -> Option<Vec<Arc<CreateFunction>>> {
         let position = self
             .sites
             .iter()
             .position(|(recorded, count, _)| *count == arguments && recorded == name)?;
         Some(self.sites.remove(position).2)
+    }
+
+    /// Respells each recorded call to the name `renamed` gives its binding,
+    /// leaving a call it gives none as written.
+    pub(super) fn rename(
+        &mut self,
+        renamed: impl Fn(&[Arc<CreateFunction>]) -> Option<ObjectName>,
+    ) {
+        for (name, _, binding) in &mut self.sites {
+            if let Some(respelled) = renamed(binding) {
+                *name = respelled;
+            }
+        }
     }
 }
 

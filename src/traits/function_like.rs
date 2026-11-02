@@ -1706,7 +1706,6 @@ mod tests {
             CREATE FUNCTION my_func() RETURNS INT AS 'SELECT 1;';
             ALTER FUNCTION my_func() IMMUTABLE;
             ALTER FUNCTION missing_func() COST 100;
-            ALTER FUNCTION missing_func() RENAME TO other_func;
         ";
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let f = db
@@ -1715,6 +1714,22 @@ mod tests {
             .expect("function should exist");
 
         assert_eq!(f.security_mode(), FunctionSecurity::Invoker);
+    }
+
+    #[test]
+    fn test_alter_function_depends_on_extension_names_a_held_function() {
+        // PostgreSQL 16 refuses `function missing() does not exist`, and a bare
+        // name covering two overloads as not unique.
+        let held = "CREATE FUNCTION f() RETURNS INT AS 'SELECT 1';
+                    CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT x';";
+        let parse = |statement: &str| {
+            ParserDB::parse::<PostgreSqlDialect>(&alloc::format!("{held} {statement}"))
+        };
+        parse("ALTER FUNCTION f() DEPENDS ON EXTENSION plpgsql;").expect("f() is held");
+        let missing = parse("ALTER FUNCTION missing() DEPENDS ON EXTENSION plpgsql;");
+        assert!(matches!(missing, Err(Error::AlterFunctionNotFound { .. })), "got {missing:?}");
+        let bare = parse("ALTER FUNCTION f DEPENDS ON EXTENSION plpgsql;");
+        assert!(matches!(bare, Err(Error::AmbiguousAlterFunction { .. })), "got {bare:?}");
     }
 
     #[test]

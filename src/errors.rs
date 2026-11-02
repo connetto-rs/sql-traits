@@ -2143,16 +2143,39 @@ pub enum Error {
         schema_name: String,
     },
     #[error(
-        "Schema `{schema_name}` cannot be renamed while it holds function `{function_name}`, which this model does not move."
+        "Function `{function_name}` cannot be moved or renamed while the call `{call}` may also reach a function that stays, since which one PostgreSQL bound is not known."
     )]
-    /// Error indicating that `ALTER SCHEMA ... RENAME TO` names a schema
-    /// holding a function. PostgreSQL moves the function with the schema and
-    /// every call naming it follows, which this model does not represent yet.
-    UnsupportedSchemaRename {
-        /// Name of the schema, as stored.
-        schema_name: String,
-        /// Name of the first function it holds.
+    /// Error indicating that `ALTER FUNCTION ... RENAME TO`, `ALTER FUNCTION
+    /// ... SET SCHEMA` or `ALTER SCHEMA ... RENAME TO` moves a function a
+    /// stored call may reach while another function that call may reach stays.
+    /// Calls are bound by name and argument count, so the model cannot tell
+    /// which of them PostgreSQL bound the call to, and respelling the call
+    /// either way could point it at the wrong one.
+    MovedFunctionCallAmbiguous {
+        /// Name of the function being moved or renamed.
         function_name: String,
+        /// The call as written.
+        call: String,
+    },
+    #[error("Schema `{schema_name}` not found for moving function `{function_name}`.")]
+    /// Error indicating that `ALTER FUNCTION ... SET SCHEMA` names a schema
+    /// that does not exist.
+    AlterFunctionSchemaNotFound {
+        /// Name of the schema that was not found.
+        schema_name: String,
+        /// Name of the function being moved.
+        function_name: String,
+    },
+    #[error(
+        "Aggregate `{aggregate_name}` cannot be renamed or moved, as this model holds no aggregate."
+    )]
+    /// Error indicating that `ALTER AGGREGATE ... RENAME TO` or `SET SCHEMA`
+    /// names an aggregate. No user aggregate can be in this model, and
+    /// PostgreSQL refuses to reach a function through `ALTER AGGREGATE`, so
+    /// the statement is refused rather than read as naming a function.
+    AggregateAlterationUnsupported {
+        /// Name of the aggregate the statement names.
+        aggregate_name: String,
     },
     #[error("Failed to build the table dependency graph of database `{catalog_name}`: {reason}")]
     /// Error indicating that the foreign key graph of a database could not be
