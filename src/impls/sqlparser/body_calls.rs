@@ -85,8 +85,14 @@ impl<'db, 'path, DB: DatabaseLike> CallCollector<'db, 'path, DB> {
 }
 
 impl<'s, DB: DatabaseLike> BodyWalk<'s> for CallCollector<'_, 's, DB> {
-    fn path(&self) -> Option<&BodyPath<'s>> {
-        Some(&self.path)
+    type SavedPath = BodyPath<'s>;
+
+    fn save_path(&self) -> Self::SavedPath {
+        self.path.clone()
+    }
+
+    fn restore_path(&mut self, saved: Self::SavedPath) {
+        self.path = saved;
     }
 
     fn set_path(&mut self, path: BodyPath<'s>) {

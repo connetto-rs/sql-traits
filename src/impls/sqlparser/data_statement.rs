@@ -342,9 +342,15 @@ pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
 /// What a walk over the statements of a function body read when it runs
 /// gathers, one statement after another, under the path in force for each.
 pub(crate) trait BodyWalk<'s> {
-    /// The path the next statement runs under, none for a body bound at
-    /// creation.
-    fn path(&self) -> Option<&BodyPath<'s>>;
+    /// The path a statement may need to start from again, as the walker
+    /// holds it.
+    type SavedPath: Clone;
+
+    /// Copies the path the next statement runs under.
+    fn save_path(&self) -> Self::SavedPath;
+
+    /// Returns to a path [`save_path`](BodyWalk::save_path) copied.
+    fn restore_path(&mut self, saved: Self::SavedPath);
 
     /// Takes up `path` for the statements after the one setting it.
     fn set_path(&mut self, path: BodyPath<'s>);
@@ -438,8 +444,14 @@ pub(crate) fn walk_statement<'s>(
 }
 
 impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
-    fn path(&self) -> Option<&BodyPath<'s>> {
-        self.path.as_ref()
+    type SavedPath = Option<BodyPath<'s>>;
+
+    fn save_path(&self) -> Self::SavedPath {
+        self.path.clone()
+    }
+
+    fn restore_path(&mut self, saved: Self::SavedPath) {
+        self.path = saved;
     }
 
     fn set_path(&mut self, path: BodyPath<'s>) {

@@ -104,13 +104,14 @@ fn expressions_holding_sublinks_are_read() {
     );
 }
 
-/// `CASE`, every kind of loop and a block with a handler each run their
-/// SQL where the body reaches them, nested here inside an outer loop.
+/// `CASE` with and without a subject, every kind of loop and a block with a
+/// handler each run their SQL where the body reaches them, nested here inside
+/// an outer loop.
 #[test]
 fn every_control_structure_is_read_in_body_order() {
     let tables = [
-        "subject", "matched", "other", "guarded", "caught", "bound", "upper", "step", "argument",
-        "cursored", "items", "exits",
+        "subject", "matched", "other", "searched", "guarded", "caught", "bound", "upper", "step",
+        "ranged", "argument", "cursored", "items", "exits",
     ];
     let schema = tables.map(|table| format!("CREATE TABLE {table} (id INT);")).join("\n");
     let database = postgres(&format!(
@@ -123,9 +124,11 @@ fn every_control_structure_is_read_in_body_order() {
                WHEN 0 THEN PERFORM 1 FROM matched;
                ELSE PERFORM 1 FROM other;
              END CASE;
+             CASE WHEN EXISTS (SELECT 1 FROM searched) THEN NULL; ELSE NULL; END CASE;
              BEGIN PERFORM 1 FROM guarded; EXCEPTION WHEN others THEN PERFORM 1 FROM caught; END;
              WHILE n < (SELECT count(*) FROM bound) LOOP n := n + 1; END LOOP;
              FOR j IN 1..(SELECT count(*) FROM upper) BY (SELECT count(*) FROM step) LOOP NULL; END LOOP;
+             FOR j IN 1..(SELECT count(*) FROM ranged) LOOP NULL; END LOOP;
              FOR r IN c((SELECT max(id) FROM argument)) LOOP NULL; END LOOP;
              FOREACH x IN ARRAY (SELECT array_agg(id) FROM items) LOOP NULL; END LOOP;
              LOOP EXIT WHEN (SELECT count(*) FROM exits) >= 0; END LOOP;

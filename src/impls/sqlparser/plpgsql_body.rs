@@ -84,11 +84,11 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
             }
         }
         // Only a path some part of the block changes needs restoring.
-        let entry = change.and_then(|_| self.walker.path().cloned());
+        let entry = change.map(|_| self.walker.save_path());
         self.nodes(&block.statements)?;
         for handler in &block.handlers {
             if let Some(entry) = &entry {
-                self.walker.set_path(entry.clone());
+                self.walker.restore_path(entry.clone());
             }
             self.nodes(handler)?;
         }
@@ -113,11 +113,9 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 self.nodes(&branch.statements)?;
                 continue;
             };
-            let entry = self.walker.path().cloned();
+            let entry = self.walker.save_path();
             self.nodes(&branch.statements)?;
-            if let Some(entry) = entry {
-                self.walker.set_path(entry);
-            }
+            self.walker.restore_path(entry);
             change.get_or_insert(found);
         }
         self.nodes(otherwise)?;
