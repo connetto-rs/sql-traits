@@ -617,3 +617,158 @@ fn alter_view_refuses_what_the_model_cannot_apply() {
         "got {error:?}"
     );
 }
+
+/// The owner of materialized view `m`.
+fn materialized_owner(db: &ParserDB) -> Option<String> {
+    db.materialized_view_by_target(TargetName::new("m", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the view is recorded")
+        .owner(db)
+        .expect("held")
+        .map(str::to_string)
+}
+
+const MATERIALIZED: &str = "CREATE ROLE r1;
+     CREATE TABLE t (id INT, b INT);
+     CREATE MATERIALIZED VIEW m AS SELECT id, b FROM t;";
+
+#[test]
+fn alter_materialized_view_hands_the_view_to_a_role() {
+    let db =
+        parse(&format!("{MATERIALIZED} ALTER MATERIALIZED VIEW m OWNER TO r1;")).expect("schema");
+    assert_eq!(materialized_owner(&db).as_deref(), Some("r1"));
+    let db = parse(&format!(
+        "{MATERIALIZED} ALTER MATERIALIZED VIEW m OWNER TO r1;
+         ALTER MATERIALIZED VIEW IF EXISTS m OWNER TO CURRENT_USER;"
+    ))
+    .expect("schema");
+    assert_eq!(materialized_owner(&db), None);
+}
+
+#[test]
+fn alter_materialized_view_renames_the_view_and_its_readers_follow() {
+    // Measured: a view reading the materialized view follows both renames.
+    let db = parse(&format!(
+        "{MATERIALIZED}
+         CREATE VIEW v AS SELECT id FROM m;
+         ALTER MATERIALIZED VIEW m RENAME TO m2;
+         ALTER MATERIALIZED VIEW m2 RENAME COLUMN id TO x;"
+    ))
+    .expect("schema");
+    assert!(
+        db.materialized_view_by_target(TargetName::new("m", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .is_none()
+    );
+    let renamed = db
+        .materialized_view_by_target(TargetName::new("m2", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("renamed");
+    assert_eq!(renamed.definition().to_string(), "SELECT id AS x, b FROM t");
+    let reader = db
+        .view_by_target(TargetName::new("v", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the reader is recorded");
+    assert_eq!(reader.definition().to_string(), "SELECT x AS id FROM m2");
+
+    for (statement, refused) in [
+        ("ALTER MATERIALIZED VIEW m RENAME TO t;", "the table holds the name"),
+        ("ALTER MATERIALIZED VIEW m RENAME COLUMN nope TO x;", "no such column"),
+        ("ALTER MATERIALIZED VIEW m RENAME id TO b;", "b is taken"),
+    ] {
+        let error = parse(&format!("{MATERIALIZED} {statement}")).expect_err(refused);
+        assert!(
+            matches!(
+                &error,
+                Error::RelationNameAlreadyTaken { .. }
+                    | Error::ColumnAlreadyExists { .. }
+                    | Error::IdentifierLookupError(LookupError::ColumnNotFound { .. })
+            ),
+            "{statement} got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn alter_materialized_view_takes_storage_parameters_and_no_view_option() {
+    // Measured: storage parameters are set and reset, a view option is
+    // refused, and `RESET` refuses no name.
+    for statement in [
+        "ALTER MATERIALIZED VIEW m SET (fillfactor = 70);",
+        "ALTER MATERIALIZED VIEW m SET (autovacuum_enabled);",
+        "ALTER MATERIALIZED VIEW m RESET (fillfactor, security_invoker, bogus);",
+    ] {
+        parse(&format!("{MATERIALIZED} {statement}")).expect(statement);
+    }
+    for statement in [
+        "ALTER MATERIALIZED VIEW m SET (security_invoker);",
+        "ALTER MATERIALIZED VIEW m SET (check_option = local);",
+    ] {
+        let error = parse(&format!("{MATERIALIZED} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::UnrecognizedViewOption { object_kind: ObjectKind::MaterializedView, .. }
+            ),
+            "{statement} got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn alter_materialized_view_names_a_materialized_view() {
+    // Measured: PostgreSQL refuses any other relation as "is not a
+    // materialized view", even under `IF EXISTS`.
+    let schema = "CREATE TABLE t (id INT); CREATE VIEW v AS SELECT id FROM t;";
+    for (statement, actual) in [
+        ("ALTER MATERIALIZED VIEW v OWNER TO CURRENT_USER;", ObjectKind::View),
+        ("ALTER MATERIALIZED VIEW IF EXISTS v RENAME TO w;", ObjectKind::View),
+        ("ALTER MATERIALIZED VIEW t SET (fillfactor = 70);", ObjectKind::Table),
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(&error, Error::RelationKindMismatch {
+                expected_kind: ObjectKind::MaterializedView, actual_kind, ..
+            } if *actual_kind == actual),
+            "{statement} got {error:?}"
+        );
+    }
+    let error = parse("ALTER MATERIALIZED VIEW nope OWNER TO CURRENT_USER;").expect_err("absent");
+    assert!(
+        matches!(&error, Error::RelationNotFound { object_kind: ObjectKind::MaterializedView, .. }),
+        "got {error:?}"
+    );
+    parse("ALTER MATERIALIZED VIEW IF EXISTS nope OWNER TO CURRENT_USER;")
+        .expect("IF EXISTS skips");
+}
+
+#[test]
+fn alter_materialized_view_refuses_what_postgres_or_the_model_cannot_apply() {
+    // Measured: PostgreSQL refuses a column default on a materialized view.
+    for statement in [
+        "ALTER MATERIALIZED VIEW m ALTER COLUMN id SET DEFAULT 1;",
+        "ALTER MATERIALIZED VIEW m ALTER id DROP DEFAULT;",
+    ] {
+        let error = parse(&format!("{MATERIALIZED} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::AlterActionUnsupportedOnRelation {
+                    object_kind: ObjectKind::MaterializedView,
+                    ..
+                }
+            ),
+            "{statement} got {error:?}"
+        );
+    }
+    for statement in [
+        "CREATE SCHEMA s; ALTER MATERIALIZED VIEW m SET SCHEMA s;",
+        "ALTER MATERIALIZED VIEW m AS SELECT id FROM t;",
+    ] {
+        let error = parse(&format!("{MATERIALIZED} {statement}")).expect_err(statement);
+        assert!(
+            matches!(&error, Error::UnsupportedAlterTableOperation { .. }),
+            "{statement} got {error:?}"
+        );
+    }
+}

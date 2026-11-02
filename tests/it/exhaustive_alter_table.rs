@@ -13,7 +13,10 @@
 //! build until it is placed.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, ObjectKind},
+    prelude::*,
+};
 use sqlparser::dialect::{ClickHouseDialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
 
 const TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT);";
@@ -83,6 +86,33 @@ fn the_report_names_the_operation() {
             if operation.contains("PRIMARY KEY")),
         "the report names the operation: {error:?}"
     );
+}
+
+/// Measured on PostgreSQL 17 and 18: only a foreign table takes foreign-data
+/// wrapper options, so every relation this model holds refuses them, while an
+/// absent one is still reported first and `IF EXISTS` excuses it.
+#[test]
+fn foreign_data_wrapper_options_are_refused_on_every_relation_held() {
+    for (tail, relation, kind) in [
+        ("ALTER TABLE t OPTIONS (ADD x '1')", "t", ObjectKind::Table),
+        ("ALTER TABLE t ALTER COLUMN a OPTIONS (SET x '1')", "t", ObjectKind::Table),
+        ("CREATE VIEW v AS SELECT a FROM t; ALTER TABLE v OPTIONS (DROP x)", "v", ObjectKind::View),
+        (
+            "CREATE MATERIALIZED VIEW m AS SELECT a FROM t; ALTER TABLE m OPTIONS (ADD x '1')",
+            "m",
+            ObjectKind::MaterializedView,
+        ),
+    ] {
+        let error = parse(tail).expect_err(tail);
+        assert!(
+            matches!(&error, Error::AlterActionUnsupportedOnRelation { object_kind, relation_name, .. }
+                if *object_kind == kind && relation_name == relation),
+            "{tail} reported {error:?}"
+        );
+    }
+    let error = parse("ALTER TABLE missing OPTIONS (ADD x '1')").expect_err("absent");
+    assert!(matches!(&error, Error::AlterTableNotFound { .. }), "got {error:?}");
+    parse("ALTER TABLE IF EXISTS missing OPTIONS (ADD x '1')").expect("IF EXISTS skips");
 }
 
 /// The owner is recorded rather than discarded. The role has to exist, as the

@@ -20,10 +20,10 @@
 //!   `ALTER DEFAULT PRIVILEGES` does not parse, so a schema carrying one fails
 //!   to parse, and the `EXECUTE` a function receives on creation is always
 //!   PostgreSQL's built-in default rather than the one such a statement set.
-//! - [`sqlparser#2776`](https://github.com/apache/datafusion-sqlparser-rs/pull/2776),
-//!   `ALTER MATERIALIZED VIEW` does not parse, so a schema carrying one fails
-//!   to parse, and only `ALTER TABLE <materialized view> OWNER TO` and `RENAME
-//!   TO` reach a materialized view.
+//! - [`sqlparser#2785`](https://github.com/apache/datafusion-sqlparser-rs/pull/2785),
+//!   `ALTER [MATERIALIZED] VIEW ... SET` and `RESET` do not parse a `toast.`
+//!   option, so a schema carrying one fails to parse, though PostgreSQL accepts
+//!   it.
 //!
 //! Found and written up, not yet filed:
 //!

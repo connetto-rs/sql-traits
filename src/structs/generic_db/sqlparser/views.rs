@@ -434,44 +434,49 @@ pub(super) fn alter_view(
     }
 }
 
-/// Applies an `ALTER VIEW`, which PostgreSQL accepts only against a plain
-/// view.
+/// Applies an `ALTER VIEW` or `ALTER MATERIALIZED VIEW`, which PostgreSQL
+/// accepts only against a view of the kind it names.
 ///
-/// `SET SCHEMA` and MySQL's `ALTER VIEW ... AS`, which redefines the view, are
-/// refused, since the model can apply neither and discarding either would
-/// leave it wrong.
+/// `SET SCHEMA` and `AS`, which redefines the view, are refused, since the
+/// model can apply neither and discarding either would leave it wrong.
+/// PostgreSQL refuses a column default on a materialized view. A materialized
+/// view's storage parameters are checked against the view options and not
+/// recorded, as `ALTER TABLE` treats them.
 ///
 /// # Errors
 ///
 /// Returns [`Error::RelationKindMismatch`] when another kind of relation holds
 /// the name, [`Error::RelationNotFound`] when nothing does and the statement
 /// wrote no `IF EXISTS`, [`Error::UnsupportedAlterTableOperation`] for the two
-/// operations refused above, and the errors of [`alter_view`] for the
-/// operations it shares with `ALTER TABLE`.
+/// operations refused above, [`Error::AlterActionUnsupportedOnRelation`] for
+/// a column default on a materialized view, and the errors of [`alter_view`]
+/// for the operations it shares with `ALTER TABLE`.
 pub(super) fn apply_alter_view(
     builder: ParserDBBuilder,
     statement: &AlterView,
 ) -> Result<ParserDBBuilder, Error> {
-    let AlterView { name, if_exists, operation } = statement;
-    if plain_view_position(&builder, name).is_none() {
-        return match builder.relation_reached(name).map(|(kind, _)| kind) {
+    let AlterView { materialized, name, if_exists, operation } = statement;
+    let kind = if *materialized { ObjectKind::MaterializedView } else { ObjectKind::View };
+    let position = if *materialized {
+        materialized_view_position(&builder, name)
+    } else {
+        plain_view_position(&builder, name)
+    };
+    if position.is_none() {
+        return match builder.relation_reached(name).map(|(held, _)| held) {
             Some(actual_kind) => {
                 Err(Error::RelationKindMismatch {
                     object_name: rendered_name(name),
-                    expected_kind: ObjectKind::View,
+                    expected_kind: kind,
                     actual_kind,
                 })
             }
             None if *if_exists => Ok(builder),
             None => {
-                Err(Error::RelationNotFound {
-                    object_kind: ObjectKind::View,
-                    object_name: rendered_name(name),
-                })
+                Err(Error::RelationNotFound { object_kind: kind, object_name: rendered_name(name) })
             }
         };
     }
-    let kind = ObjectKind::View;
     match operation {
         AlterViewOperation::OwnerTo(owner) => Ok(set_view_owner(builder, name, kind, owner)),
         AlterViewOperation::SetOptions { options } => {
@@ -483,6 +488,13 @@ pub(super) fn apply_alter_view(
         AlterViewOperation::RenameTo { new_name } => rename_view(builder, name, kind, new_name),
         AlterViewOperation::RenameColumn { old_column_name, new_column_name } => {
             rename_view_column(builder, name, kind, old_column_name, new_column_name)
+        }
+        AlterViewOperation::AlterColumn { .. } if *materialized => {
+            Err(Error::AlterActionUnsupportedOnRelation {
+                object_kind: kind,
+                relation_name: rendered_name(name),
+                operation: operation.to_string(),
+            })
         }
         AlterViewOperation::AlterColumn { column_name, .. } => {
             require_view_column(builder, name, column_name)

@@ -1,5 +1,5 @@
-//! The options a view's `WITH (...)` and an `ALTER VIEW` or `ALTER TABLE ...
-//! SET (...)` or `RESET (...)` naming a view write.
+//! The options a view's `WITH (...)` and an `ALTER [MATERIALIZED] VIEW` or
+//! `ALTER TABLE ... SET (...)` or `RESET (...)` naming a view write.
 //!
 //! Every rule here was measured against PostgreSQL 18.6 in Docker. A plain view
 //! takes exactly three options and refuses any other name. A materialized view

@@ -325,9 +325,9 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// [runs with its reader's rights](Self::is_security_invoker).
     ///
     /// The owner is the role the view was created under, as `SET ROLE` and
-    /// `SET SESSION AUTHORIZATION` leave it, until `ALTER VIEW` or `ALTER
-    /// TABLE ... OWNER TO <role>` hands it to another. A view created while the
-    /// input had set no role has none, and neither has one handed to
+    /// `SET SESSION AUTHORIZATION` leave it, until `ALTER [MATERIALIZED] VIEW`
+    /// or `ALTER TABLE ... OWNER TO <role>` hands it to another. A view created
+    /// while the input had set no role has none, and neither has one handed to
     /// `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`, which name whoever
     /// runs the statement rather than a role the input declares. A
     /// replacement keeps the owner.

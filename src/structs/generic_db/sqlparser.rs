@@ -7228,6 +7228,8 @@ impl ParserDB {
                     },
                 );
             }
+            // The caller refuses these, since no relation held takes them.
+            AlterColumnOperation::GenericOptions { .. } => {}
         }
     }
 
@@ -7245,7 +7247,8 @@ impl ParserDB {
             AlterColumnOperation::DropDefault => {
                 ColumnOption::Default(Expr::Value(sqlparser::ast::Value::Null.with_empty_span()))
             }
-            AlterColumnOperation::SetDataType { .. } => ColumnOption::NotNull,
+            AlterColumnOperation::SetDataType { .. }
+            | AlterColumnOperation::GenericOptions { .. } => ColumnOption::NotNull,
             AlterColumnOperation::AddGenerated { generated_as, sequence_options } => {
                 ColumnOption::Generated {
                     generated_as: generated_as.unwrap_or(GeneratedAs::ByDefault),
@@ -8273,6 +8276,24 @@ impl ParserDB {
                                     &old_column_name,
                                     &new_column_name,
                                 )?;
+                            }
+                            // Only a foreign table takes these, and the model holds none.
+                            operation @ (AlterTableOperation::GenericOptions { .. }
+                            | AlterTableOperation::AlterColumn {
+                                op: AlterColumnOperation::GenericOptions { .. },
+                                ..
+                            }) => {
+                                if Self::alter_table_target(&builder, &alter_table.name, scope)?
+                                    .is_some()
+                                {
+                                    return Err(
+                                        crate::errors::Error::AlterActionUnsupportedOnRelation {
+                                            object_kind: ObjectKind::Table,
+                                            relation_name: last_str(&alter_table.name).to_string(),
+                                            operation: operation.to_string(),
+                                        },
+                                    );
+                                }
                             }
                             AlterTableOperation::AlterColumn { column_name, op } => {
                                 builder = Self::alter_table_alter_column(
