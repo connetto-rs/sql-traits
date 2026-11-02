@@ -6974,6 +6974,12 @@ impl ParserDB {
                     };
                     metadata.set_null_returning_arguments(&[]);
                     metadata.set_body_calls(body_calls);
+                    default_privileges::require_creator_executes(
+                        &builder,
+                        &session_roles,
+                        &create_function,
+                        &metadata,
+                    )?;
 
                     let fresh = Arc::new(create_function);
                     builder = builder.add_function(Arc::clone(&fresh), metadata);
