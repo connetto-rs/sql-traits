@@ -48,7 +48,7 @@ use sqlparser::{
 };
 
 use super::{
-    Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable,
+    Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, domains,
     object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
     relation_name_holder, require_named_in_catalog, schema_qualifiers_match, stored_ident, views,
 };
@@ -94,10 +94,15 @@ pub(super) fn create_sequence(
         .ok_or(Error::UnnamedObject { object_kind: ObjectKind::Sequence })?;
     let schema = qualifier_of(&name).named();
 
-    if let Some(conflicting_kind) = relation_name_holder(&builder, name_ident, schema) {
-        if if_not_exists {
-            return Ok(builder);
-        }
+    let relation = relation_name_holder(&builder, name_ident, schema);
+    if relation.is_some() && if_not_exists {
+        return Ok(builder);
+    }
+    // A sequence has no row type, yet PostgreSQL refuses it a name a domain
+    // holds whatever `IF NOT EXISTS` says.
+    if let Some(conflicting_kind) =
+        relation.or_else(|| domains::domain_name_holder(&builder, name_ident, schema))
+    {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Sequence,
             conflicting_kind,
@@ -544,7 +549,8 @@ pub(super) struct UnownedSequences(Vec<(Ident, *const Sequence)>);
 /// # Errors
 ///
 /// Returns [`Error::RelationNameAlreadyTaken`] when a relation took a planned
-/// name meanwhile, another sequence of the same statement included.
+/// name meanwhile, another sequence of the same statement included, or when a
+/// domain holds it, which PostgreSQL refuses rather than numbering past.
 pub(super) fn create_column_sequences(
     mut builder: ParserDBBuilder,
     table: &StoredTable,
@@ -555,9 +561,11 @@ pub(super) fn create_column_sequences(
     let mut created = Vec::with_capacity(planned.len());
     for ColumnSequence { column, origin, options, name } in planned {
         let qualifier = schema.as_ref().map(|(schema, quoted)| (schema.as_str(), *quoted));
-        if let Some(conflicting_kind) =
-            relation_name_holder(&builder, &Ident::with_quote('"', name.as_str()), qualifier)
-        {
+        if let Some(conflicting_kind) = domains::relation_or_domain_holder(
+            &builder,
+            &Ident::with_quote('"', name.as_str()),
+            qualifier,
+        ) {
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Sequence,
                 conflicting_kind,

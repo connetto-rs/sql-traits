@@ -14,10 +14,10 @@ use crate::{
     errors::{Error, LookupError},
     structs::{IdentifierCase, TargetName},
     traits::{
-        CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, ExtensionLike,
-        ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike, RoleMembershipLike,
-        RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike, TriggerLike,
-        UniqueIndexLike, ViewLike,
+        CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, DomainLike,
+        ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike,
+        RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike,
+        TriggerLike, UniqueIndexLike, ViewLike,
     },
     utils::{
         call_typing::{Selection, reached_functions, resolve_call},
@@ -60,6 +60,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type Rule: RuleLike<DB = Self>;
     /// Type of the extensions in the database.
     type Extension: ExtensionLike<DB = Self>;
+    /// Type of the domains in the schema.
+    type Domain: DomainLike<DB = Self>;
     /// Type of the unique indexes in the schema.
     type UniqueIndex: UniqueIndexLike<DB = Self>;
     /// Type of the check constraints in the schema.
@@ -241,6 +243,29 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # }
     /// ```
     fn extensions(&self) -> impl Iterator<Item = &Self::Extension>;
+
+    /// Iterates over the domains defined in the schema.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE DOMAIN span AS interval;
+    /// CREATE DOMAIN ratio AS real CHECK (VALUE BETWEEN 0 AND 1);
+    /// ",
+    /// )?;
+    /// let mut domains: Vec<&str> = db.domains().map(|domain| domain.name()).collect();
+    /// domains.sort_unstable();
+    /// assert_eq!(domains, vec!["ratio", "span"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn domains(&self) -> impl Iterator<Item = &Self::Domain>;
 
     /// Iterates over the indexes defined in the schema.
     ///

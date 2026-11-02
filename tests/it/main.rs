@@ -29,6 +29,7 @@ mod declared_type_names;
 mod default_privileges;
 mod deployment;
 mod descendant_drops;
+mod domains;
 mod dropped_policies;
 mod duplicate_object_names;
 mod exhaustive_alter_table;

@@ -36,9 +36,9 @@ use sqlparser::ast::{
 };
 
 use super::{
-    Creator, DefaultKind, ParserDBBuilder, SchemaQualifier, bind_reference, function_bodies,
-    object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
-    relation_name_holder, require_named_in_catalog,
+    Creator, DefaultKind, ParserDBBuilder, SchemaQualifier, bind_reference, domains,
+    function_bodies, object_name_last_identifier, object_name_matches_resolved_identity,
+    place_relation, require_named_in_catalog,
     rules::{self, RuleHost},
     stored_ident,
     view_rewrites::{self, Rename},
@@ -135,7 +135,7 @@ pub(super) fn create_view(
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
     }
 
-    let holder = relation_name_holder(&builder, name_ident, schema);
+    let holder = domains::relation_or_domain_holder(&builder, name_ident, schema);
 
     if let Some(conflicting_kind) = holder {
         // `CREATE MATERIALIZED VIEW ... IF NOT EXISTS` skips silently when a
@@ -640,7 +640,7 @@ fn rename_view(
         granted.quoted,
         new_ident.value.as_str(),
         new_ident.quote_style.is_some(),
-    ) && let Some(conflicting_kind) = relation_name_holder(
+    ) && let Some(conflicting_kind) = domains::relation_or_domain_holder(
         &builder,
         new_ident,
         granted.schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted)),

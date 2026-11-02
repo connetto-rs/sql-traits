@@ -39,6 +39,8 @@ pub enum ObjectKind {
     Schema,
     /// A sequence declared by a `CREATE SEQUENCE` statement.
     Sequence,
+    /// A domain declared by a `CREATE DOMAIN` statement.
+    Domain,
 }
 
 impl core::fmt::Display for ObjectKind {
@@ -59,6 +61,7 @@ impl core::fmt::Display for ObjectKind {
             Self::Role => "Role",
             Self::Schema => "Schema",
             Self::Sequence => "Sequence",
+            Self::Domain => "Domain",
         })
     }
 }
@@ -1567,12 +1570,15 @@ pub enum Error {
     #[error(
         "{object_kind} `{object_name}` cannot be created: {conflicting_kind} `{object_name}` already uses that name in the same schema."
     )]
-    /// Error indicating that a statement names a relation with a name
-    /// something else in the same schema already holds.
+    /// Error indicating that a statement names a relation or a domain with a
+    /// name something else in the same schema already holds.
     ///
     /// PostgreSQL keeps tables, views, materialized views, sequences and index
     /// names in one pool per schema, and a named `UNIQUE` or `PRIMARY KEY`
-    /// constraint puts the name of the index behind it in that pool too.
+    /// constraint puts the name of the index behind it in that pool too. Types
+    /// share a second pool, which holds every domain and the row type of every
+    /// table, view and materialized view, and which a new sequence may not
+    /// take a name from either.
     RelationNameAlreadyTaken {
         /// Kind of object the statement tried to create.
         object_kind: ObjectKind,
@@ -1590,13 +1596,38 @@ pub enum Error {
         /// Name the statement wrote.
         object_name: String,
     },
+    #[error("Domain `{domain_name}` not found for DROP DOMAIN statement.")]
+    /// Error indicating that a `DROP DOMAIN` statement without `IF EXISTS`
+    /// names a domain the input never creates.
+    DropDomainNotFound {
+        /// Name the statement wrote.
+        domain_name: String,
+    },
+    #[error(
+        "Domain `{domain_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
+    )]
+    /// Error indicating that a statement drops a domain a column or another
+    /// domain is declared with.
+    ///
+    /// PostgreSQL refuses without `CASCADE`, and `CASCADE` drops the columns
+    /// and the domains along with it. A column of an array of the domain uses
+    /// it too.
+    DomainHasDependents {
+        /// Name of the domain the statement drops.
+        domain_name: String,
+        /// [`ObjectKind::Column`] or [`ObjectKind::Domain`].
+        dependent_kind: ObjectKind,
+        /// The column as `table.column`, or the name of the domain.
+        dependent_name: String,
+    },
     #[error("`{object_name}` is a {actual_kind}, not a {expected_kind}.")]
     /// Error indicating that a statement names an existing relation of the
     /// wrong kind, which PostgreSQL refuses rather than treating the spellings
     /// as interchangeable: `DROP TABLE` will not drop a view or a sequence,
     /// `DROP VIEW` will not drop a table or a materialized view, `DROP
-    /// MATERIALIZED VIEW` will not drop a plain view, and `DROP SEQUENCE` will
-    /// drop nothing but a sequence.
+    /// MATERIALIZED VIEW` will not drop a plain view, `DROP SEQUENCE` will
+    /// drop nothing but a sequence, and `DROP DOMAIN` will not drop the row
+    /// type of a table or a view.
     RelationKindMismatch {
         /// Name the statement wrote.
         object_name: String,

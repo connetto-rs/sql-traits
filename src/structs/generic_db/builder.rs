@@ -15,8 +15,8 @@ use crate::{
         generic_db::{Identified, RelationSlot, Stored},
     },
     traits::{
-        ExtensionLike, FunctionLike, PolicyLike, RoleLike, RuleLike, SchemaLike, TableLike,
-        TriggerLike, ViewLike,
+        DomainLike, ExtensionLike, FunctionLike, PolicyLike, RoleLike, RuleLike, SchemaLike,
+        TableLike, TriggerLike, ViewLike,
     },
     utils::object_name::{
         RelationKey, render_table_candidate, stored_function_key, stored_sequence_key,
@@ -114,6 +114,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     rules: Vec<Stored<P::Rule>>,
     /// List of extensions installed in the database.
     extensions: Vec<Stored<P::Extension>>,
+    /// List of domains created in the database.
+    domains: Vec<Stored<P::Domain>>,
     /// List of policies created in the database.
     policies: Vec<Stored<P::Policy>>,
     /// List of check constraints in the database.
@@ -159,6 +161,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             triggers: self.triggers.clone(),
             rules: self.rules.clone(),
             extensions: self.extensions.clone(),
+            domains: self.domains.clone(),
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),
@@ -223,6 +226,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers: Vec::new(),
             rules: Vec::new(),
             extensions: Vec::new(),
+            domains: Vec::new(),
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
@@ -387,6 +391,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &self.extensions
     }
 
+    /// Returns a slice of domain Arc references with their metadata.
+    pub(crate) fn domains(&self) -> &[Stored<P::Domain>] {
+        &self.domains
+    }
+
     /// Returns a slice of foreign key Arc references with their metadata.
     pub(crate) fn foreign_keys(&self) -> &[Stored<P::ForeignKey>] {
         &self.foreign_keys
@@ -462,6 +471,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &mut self.extensions
     }
 
+    /// Returns a mutable reference to the domains list.
+    pub(crate) fn domains_mut(&mut self) -> &mut Vec<Stored<P::Domain>> {
+        &mut self.domains
+    }
+
     /// Returns a mutable reference to the policies list.
     pub(crate) fn policies_mut(&mut self) -> &mut Vec<Stored<P::Policy>> {
         &mut self.policies
@@ -514,6 +528,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers: Vec::new(),
             rules: Vec::new(),
             extensions: Vec::new(),
+            domains: Vec::new(),
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
@@ -744,6 +759,14 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         metadata: Meta<P::Extension>,
     ) -> Self {
         self.extensions.push((extension, metadata));
+        self
+    }
+
+    /// Adds a domain with its metadata to the builder.
+    #[must_use]
+    #[inline]
+    pub fn add_domain(mut self, domain: Arc<P::Domain>, metadata: Meta<P::Domain>) -> Self {
+        self.domains.push((domain, metadata));
         self
     }
 
@@ -983,6 +1006,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers,
             rules,
             extensions,
+            domains,
             policies,
             check_constraints,
             roles,
@@ -1011,6 +1035,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers,
             rules,
             extensions,
+            domains,
             policies,
             check_constraints,
             roles,
@@ -1053,6 +1078,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         });
         // An extension name is unique in the database.
         self.extensions.sort_unstable_by(|(a, _), (b, _)| a.stored_name().cmp(&b.stored_name()));
+        // A domain name is unique in its schema.
+        self.domains.sort_unstable_by(|(a, _), (b, _)| {
+            (a.stored_schema(), a.stored_name()).cmp(&(b.stored_schema(), b.stored_name()))
+        });
         self.policies.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
         self.check_constraints.sort_unstable_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
         self.roles
@@ -1158,6 +1187,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers: self.triggers,
             rules: self.rules,
             extensions: self.extensions,
+            domains: self.domains,
             policies: self.policies,
             check_constraints: self.check_constraints,
             roles: self.roles,

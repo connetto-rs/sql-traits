@@ -33,6 +33,8 @@ pub mod rule;
 pub use rule::RuleLike;
 pub mod extension;
 pub use extension::ExtensionLike;
+pub mod domain;
+pub use domain::DomainLike;
 pub mod policy;
 pub use policy::PolicyLike;
 pub mod role;
