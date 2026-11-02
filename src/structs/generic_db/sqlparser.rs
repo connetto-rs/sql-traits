@@ -55,11 +55,12 @@ use crate::{
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
         object_name::{
-            Qualifier, RelationKey, SearchPathChange, TEMPORARY_SCHEMA, is_search_path_parameter,
-            object_name_identifiers, object_name_last_part, overqualified_object_name,
-            qualifier_of, relation_search_path, require_local_object_name,
-            require_static_object_name, resolve_sequence_on_search_path_in_iter,
-            resolve_table_object_name_in_iter, resolve_table_object_name_on_search_path_in_iter,
+            PG_CATALOG, Qualifier, RelationKey, SearchPathChange, TEMPORARY_SCHEMA,
+            is_search_path_parameter, object_name_identifiers, object_name_last_part,
+            overqualified_object_name, qualifier_of, relation_search_path,
+            require_local_object_name, require_static_object_name,
+            resolve_sequence_on_search_path_in_iter, resolve_table_object_name_in_iter,
+            resolve_table_object_name_on_search_path_in_iter,
             resolve_target_on_search_path_in_iter, resolve_view_on_search_path_in_iter,
             search_path_change, search_path_entry, sequence_matches_key, stored_table_key,
             table_matches_key, table_matches_object_name, target_name_of_idents,
@@ -3324,12 +3325,14 @@ fn refuse_reference_across_storage(
 }
 
 /// Qualifies the name of a relation being created with the schema it lands in,
-/// answering whether that is the temporary schema.
+/// answering whether that is the temporary schema. `role` is the role the
+/// statement runs as, which `"$user"` on the search path names.
 fn place_relation(
     builder: &ParserDBBuilder,
     name: &mut ObjectName,
     temporary: bool,
     object_kind: ObjectKind,
+    role: Option<&str>,
 ) -> Result<bool, crate::errors::Error> {
     // A hand-assembled node may carry no name part, which names nothing to
     // place.
@@ -3338,6 +3341,12 @@ fn place_relation(
     };
     match qualifier_of(name) {
         Qualifier::Named(schema, quoted) if is_temporary_schema(schema, quoted) => {}
+        Qualifier::Named(schema, quoted)
+            if identifiers_match(schema, quoted, PG_CATALOG, false) =>
+        {
+            refuse_system_schema_relation(object_kind, relation_name)?;
+            return Ok(false);
+        }
         Qualifier::Named(schema, quoted) => {
             validate_relation_schema(builder, Some((schema, quoted)), object_kind, relation_name)?;
             if temporary {
@@ -3352,7 +3361,7 @@ fn place_relation(
         Qualifier::RunTime => return Ok(temporary),
         Qualifier::Absent if temporary => {}
         Qualifier::Absent => {
-            let qualifier = search_path_qualifier(builder, object_kind, relation_name)?;
+            let qualifier = search_path_qualifier(builder, object_kind, relation_name, role)?;
             let Some(qualifier) = qualifier else {
                 return Ok(false);
             };
@@ -3435,7 +3444,7 @@ fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
     }
 }
 
-/// The schema qualifier the search path selects for a relation name written
+/// The schema qualifier the search path selects for an object name written
 /// without one, or [`None`] when the path selects the default schema, which
 /// this model leaves unwritten.
 ///
@@ -3443,21 +3452,23 @@ fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
 /// passes an entry naming nothing and takes the next. An entry spelled empty
 /// names no schema, so it is passed over like one naming a schema the input
 /// never creates. The temporary schema always exists, so an entry naming it
-/// selects it.
+/// selects it, and so does `pg_catalog`. `"$user"` names the schema called
+/// after `role`, the role the statement runs as, and nothing while that role
+/// is unnamed.
 ///
 /// # Errors
 ///
 /// Returns
-/// [`SchemaNotFoundForRelation`](crate::errors::Error::SchemaNotFoundForRelation)
-/// when the path names only schemas the input never creates, and
 /// [`NoSchemaSelectedForRelation`](crate::errors::Error::NoSchemaSelectedForRelation)
-/// when the path names none at all.
+/// when no entry selects a schema, and
+/// [`SystemSchemaRelationRefused`](crate::errors::Error::SystemSchemaRelationRefused)
+/// when `pg_catalog` is selected for a relation.
 fn search_path_qualifier(
     builder: &ParserDBBuilder,
     object_kind: crate::errors::ObjectKind,
     relation_name: &str,
+    role: Option<&str>,
 ) -> Result<Option<Ident>, crate::errors::Error> {
-    let mut named = None;
     for (entry, quoted) in builder.search_path().filter(|(entry, _)| !entry.is_empty()) {
         if identifiers_match(entry, quoted, "public", false) {
             return Ok(None);
@@ -3465,7 +3476,15 @@ fn search_path_qualifier(
         if is_temporary_schema(entry, quoted) {
             return Ok(Some(Ident::new(TEMPORARY_SCHEMA)));
         }
-
+        if identifiers_match(entry, quoted, PG_CATALOG, false) {
+            refuse_system_schema_relation(object_kind, relation_name)?;
+            return Ok(Some(Ident::new(PG_CATALOG)));
+        }
+        let (entry, quoted) = match (entry, role) {
+            ("$user", Some(role)) => (role, true),
+            ("$user", None) => continue,
+            named => (named.0, quoted),
+        };
         if let Some(schema) = declared_schema(builder, entry, quoted) {
             // The catalog spelling wins over the one the path used, since the
             // two only differ where quoting makes them the same name anyway.
@@ -3475,25 +3494,26 @@ fn search_path_qualifier(
                 Ident::new(schema.name())
             }));
         }
-
-        named.get_or_insert(entry);
     }
+    Err(crate::errors::Error::NoSchemaSelectedForRelation {
+        object_kind,
+        relation_name: relation_name.to_string(),
+    })
+}
 
-    match named {
-        Some(schema_name) => {
-            Err(crate::errors::Error::SchemaNotFoundForRelation {
-                schema_name: schema_name.to_string(),
-                object_kind,
-                relation_name: relation_name.to_string(),
-            })
-        }
-        None => {
-            Err(crate::errors::Error::NoSchemaSelectedForRelation {
-                object_kind,
-                relation_name: relation_name.to_string(),
-            })
-        }
+/// Refuses a relation created in `pg_catalog`, which PostgreSQL refuses to
+/// every role while it lets a superuser create a function or a domain there.
+fn refuse_system_schema_relation(
+    object_kind: crate::errors::ObjectKind,
+    relation_name: &str,
+) -> Result<(), crate::errors::Error> {
+    if matches!(object_kind, ObjectKind::Function | ObjectKind::Domain) {
+        return Ok(());
     }
+    Err(crate::errors::Error::SystemSchemaRelationRefused {
+        object_kind,
+        relation_name: relation_name.to_string(),
+    })
 }
 
 /// Checks that a table declares no column name twice.
@@ -7379,6 +7399,7 @@ impl ParserDB {
                             &builder,
                             crate::errors::ObjectKind::Function,
                             last_str(&create_function.name),
+                            session_roles.creating_role(),
                         )?;
                         bind_reference(&mut create_function.name, qualifier);
                     }
@@ -8483,6 +8504,7 @@ impl ParserDB {
                         &mut create_table.name,
                         create_table.temporary,
                         ObjectKind::Table,
+                        session_roles.creating_role(),
                     )?;
                     for column in &mut create_table.columns {
                         domains::bind_type(&builder, &mut column.data_type);
@@ -8604,7 +8626,11 @@ impl ParserDB {
                     builder = sequences::drop_sequences(builder, &names, if_exists, cascade)?;
                 }
                 Statement::CreateDomain(create_domain) => {
-                    builder = domains::create_domain(builder, create_domain)?;
+                    builder = domains::create_domain(
+                        builder,
+                        create_domain,
+                        session_roles.creating_role(),
+                    )?;
                 }
                 Statement::DropDomain(DropDomain { if_exists, name, drop_behavior }) => {
                     builder = domains::drop_domains(

@@ -337,7 +337,7 @@ fn the_search_path_decides_which_schema_a_view_lands_in() {
     let refused = parse("SET search_path TO nope; CREATE VIEW v AS SELECT 1;")
         .expect_err("the path names no creatable schema");
     assert!(
-        matches!(&refused, Error::SchemaNotFoundForRelation { object_kind, relation_name, .. }
+        matches!(&refused, Error::NoSchemaSelectedForRelation { object_kind, relation_name }
             if *object_kind == ObjectKind::View && relation_name == "v"),
         "got {refused:?}"
     );

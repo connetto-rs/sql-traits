@@ -80,9 +80,10 @@ enum Reached {
 pub(super) fn create_domain(
     builder: ParserDBBuilder,
     mut domain: CreateDomain,
+    role: Option<&str>,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut domain.name, ObjectKind::Domain, builder.catalog_name())?;
-    place_relation(&builder, &mut domain.name, false, ObjectKind::Domain)?;
+    place_relation(&builder, &mut domain.name, false, ObjectKind::Domain, role)?;
     let name = object_name_last_identifier(&domain.name)
         .ok_or(Error::UnnamedObject { object_kind: ObjectKind::Domain })?;
     let schema = qualifier_of(&domain.name).named();

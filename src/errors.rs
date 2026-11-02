@@ -1366,13 +1366,23 @@ pub enum Error {
         extension_name: String,
     },
     #[error("No schema has been selected to create {object_kind} `{relation_name}` in.")]
-    /// Error indicating that a statement creating a relation names no schema at
-    /// a point where the search path selects none either, because `SET
-    /// search_path TO ''` emptied it.
+    /// Error indicating that a statement creating an object names no schema
+    /// and the search path selects none either, because every schema it names
+    /// is missing or it is empty.
     NoSchemaSelectedForRelation {
-        /// Kind of relation that named no schema.
+        /// Kind of object that named no schema.
         object_kind: ObjectKind,
-        /// Name of the relation that named no schema.
+        /// Name of the object that named no schema.
+        relation_name: String,
+    },
+    #[error("Permission denied to create {object_kind} `pg_catalog.{relation_name}`.")]
+    /// Error indicating that a statement creates a table, view, materialized
+    /// view or sequence in `pg_catalog`, by name or as the first schema on the
+    /// search path, which PostgreSQL refuses to every role.
+    SystemSchemaRelationRefused {
+        /// Kind of relation the statement creates.
+        object_kind: ObjectKind,
+        /// Name of the relation.
         relation_name: String,
     },
     #[error(

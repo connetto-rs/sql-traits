@@ -881,6 +881,12 @@ impl<'a> Creator<'a> {
         self.owner.map(ToString::to_string)
     }
 
+    /// The role the statement runs as, which `"$user"` on the search path
+    /// names.
+    pub(super) fn role(&self) -> Option<&'a str> {
+        self.owner
+    }
+
     fn items(
         &self,
         kind: DefaultKind,
