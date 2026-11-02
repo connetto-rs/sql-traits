@@ -23,6 +23,52 @@ impl<'db, R> From<&'db R> for ActingRole<'db, R> {
     }
 }
 
+/// Who a statement runs as, and the role that ran the schema.
+///
+/// The role running `CREATE TABLE` or `CREATE VIEW` owns what it creates, so
+/// the schema's text names no owner unless it says `OWNER TO`. The schema
+/// owner stands for that role: it owns every table and view whose owner the
+/// schema never names. Without one, such a table belongs to a role other than
+/// the acting role, and such a view cannot be read.
+#[derive(Debug)]
+pub struct Requester<'db, R> {
+    role: ActingRole<'db, R>,
+    schema_owner: Option<&'db R>,
+}
+
+impl<'db, R> Requester<'db, R> {
+    /// A statement run as `role` against a schema run as `schema_owner`.
+    #[must_use]
+    pub const fn new(role: ActingRole<'db, R>, schema_owner: Option<&'db R>) -> Self {
+        Self { role, schema_owner }
+    }
+
+    /// Who the statement runs as.
+    #[must_use]
+    pub const fn role(&self) -> &ActingRole<'db, R> {
+        &self.role
+    }
+
+    /// The role owning every table and view whose owner the schema never
+    /// names.
+    #[must_use]
+    pub const fn schema_owner(&self) -> Option<&'db R> {
+        self.schema_owner
+    }
+}
+
+impl<'db, R> From<ActingRole<'db, R>> for Requester<'db, R> {
+    fn from(role: ActingRole<'db, R>) -> Self {
+        Self::new(role, None)
+    }
+}
+
+impl<'db, R> From<&'db R> for Requester<'db, R> {
+    fn from(role: &'db R) -> Self {
+        Self::new(ActingRole::Declared(role), None)
+    }
+}
+
 /// The shape of a statement, as far as row-level security tells shapes apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowStatement {

@@ -65,6 +65,25 @@ fn a_pooled_deployment_acts_as_its_login_role() {
 }
 
 #[test]
+fn a_schema_owner_resolves_after_the_roles_a_request_runs_as() {
+    let database = parse(&format!("{KINDS} CREATE ROLE migrator NOLOGIN;"));
+    let base = Deployment::new("reader", ["member"], [caller()]).expect("a valid description");
+    let unowned = base.resolve(&database).expect("every role is declared");
+    assert!(unowned.schema_owner().is_none());
+
+    let owned = base.clone().with_schema_owner("migrator");
+    assert_eq!(owned.schema_owner(), Some("migrator"));
+    let resolved = owned.resolve(&database).expect("every role is declared");
+    assert_eq!(resolved.schema_owner().map(RoleLike::name), Some("migrator"));
+
+    let unknown = base.with_schema_owner("postgres");
+    assert_eq!(
+        unknown.resolve(&database).map(|_| ()),
+        Err(DeploymentError::UndeclaredRole { role: "postgres".into() })
+    );
+}
+
+#[test]
 fn a_request_has_to_act_as_some_role_and_each_only_once() {
     assert_eq!(
         Deployment::new("reader", Vec::<String>::new(), [caller()]),

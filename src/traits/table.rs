@@ -6,7 +6,7 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
-        ActingRole, ColumnDefinition, ColumnScope, IdentifierCase, RowSecurity, RowStatement,
+        ColumnDefinition, ColumnScope, IdentifierCase, Requester, RowSecurity, RowStatement,
         SchemaFingerprint,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
@@ -4391,25 +4391,30 @@ pub trait TableLike:
     }
 
     /// What row-level security applies to `statement` on this table when
-    /// `role` runs it, as PostgreSQL's table "Policies Applied by Command
+    /// `requester` runs it, as PostgreSQL's table "Policies Applied by Command
     /// Type" in `CREATE POLICY` lays it out.
     ///
-    /// `role` is a declared role, or [`ActingRole::Public`] for a caller
-    /// holding none. A policy applies when its `TO` list reaches `role` through
-    /// inheriting memberships. An owner the schema never names is taken to be
-    /// a role other than `role`. Where expanding the applied policies loops
-    /// back into a table still being expanded, the answer is
-    /// [`RowSecurity::InfiniteRecursion`], as PostgreSQL refuses the statement.
+    /// The requester's role is a declared role, or
+    /// [`ActingRole::Public`](crate::structs::ActingRole::Public) for
+    /// a caller holding none, and a declared role converts into a
+    /// [`Requester`] by itself. A policy applies when its `TO` list reaches
+    /// the role through inheriting memberships. A table or view whose owner
+    /// the schema never names belongs to the requester's schema owner, and
+    /// without one such a table belongs to a role other than the requester's.
+    /// Where expanding the applied policies loops back into a table still
+    /// being expanded, the answer is [`RowSecurity::InfiniteRecursion`], as
+    /// PostgreSQL refuses the statement.
     ///
     /// # Errors
     ///
     /// Returns [`RowSecurityError::Lookup`] when the table is not in
     /// `database`, [`RowSecurityError::RoleRequired`] when a policy gating the
-    /// statement is scoped to a role and `role` is [`ActingRole::Public`],
+    /// statement is scoped to a role and the role is
+    /// [`ActingRole::Public`](crate::structs::ActingRole::Public),
     /// [`RowSecurityError::UnsettledRole`] when a policy's `TO` list cannot be
-    /// settled for `role` from the schema, and
+    /// settled for the role from the schema, and
     /// [`RowSecurityError::UnsettledViewOwner`] when the policies read a plain
-    /// view whose owner the schema does not name.
+    /// view whose owner neither the schema nor the requester names.
     ///
     /// # Example
     ///
@@ -4443,13 +4448,13 @@ pub trait TableLike:
     fn row_security<'db>(
         &'db self,
         statement: RowStatement,
-        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        requester: impl Into<Requester<'db, <Self::DB as DatabaseLike>::Role>>,
         database: &'db Self::DB,
     ) -> Result<RowSecurity<'db, <Self::DB as DatabaseLike>::Policy>, RowSecurityError>
     where
         Self: 'db,
     {
-        crate::traits::row_security::row_security(self, statement, &role.into(), database)
+        crate::traits::row_security::row_security(self, statement, &requester.into(), database)
     }
 
     /// Returns an iterator over the grants that apply to this table.
