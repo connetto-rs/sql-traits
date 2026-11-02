@@ -805,7 +805,7 @@ fn options(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 
 const OPTIONED: &str = "CREATE FOREIGN TABLE remote (
          id INT OPTIONS (column_name 'remote_id'),
-         note TEXT OPTIONS (\"column_name\" 'Body'),
+         note TEXT OPTIONS (\"column_name\" 'Body') NOT NULL,
          plain INT
      ) SERVER warehouse;";
 
@@ -909,4 +909,197 @@ fn an_option_list_names_each_folded_key_once() {
     // A quoted key keeps its case, so it differs from the folded one.
     db("CREATE FOREIGN TABLE h (id INT OPTIONS (\"Column_Name\" 'a', column_name 'b'))
         SERVER s;");
+}
+
+#[test]
+fn alter_foreign_table_changes_a_foreign_table_as_alter_table_does() {
+    let db = db(&format!(
+        "{REMOTE}
+         ALTER FOREIGN TABLE remote ADD COLUMN note TEXT;
+         ALTER FOREIGN TABLE remote RENAME COLUMN amount TO total;
+         ALTER FOREIGN TABLE remote ADD CONSTRAINT positive_id CHECK (id > 0);
+         ALTER FOREIGN TABLE remote OWNER TO app;
+         ALTER FOREIGN TABLE IF EXISTS missing ADD COLUMN c INT;
+         ALTER FOREIGN TABLE remote RENAME TO archive;"
+    ));
+    let archive = foreign(&db, "archive");
+    let columns: Vec<_> =
+        archive.columns(&db).expect("held").map(ColumnLike::column_name).collect();
+    assert_eq!(columns, ["id", "total", "note"]);
+    assert_eq!(archive.check_constraints(&db).expect("held").count(), 2);
+    assert_eq!(archive.owner(&db).expect("held"), Some("app"));
+
+    assert!(matches!(
+        refusal(&format!("{REMOTE} ALTER FOREIGN TABLE remote ENABLE ROW LEVEL SECURITY;")),
+        Error::AlterActionUnsupportedOnRelation { object_kind: ObjectKind::ForeignTable, .. }
+    ));
+    assert!(matches!(
+        refusal("ALTER FOREIGN TABLE missing ADD COLUMN c INT;"),
+        Error::AlterTableNotFound { .. }
+    ));
+}
+
+#[test]
+fn alter_foreign_table_refuses_a_relation_of_another_kind() {
+    const OTHERS: &str = "CREATE TABLE t (id INT);
+         CREATE VIEW v AS SELECT 1 AS x;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS x;
+         CREATE SEQUENCE s;";
+    for (statement, actual) in [
+        ("ALTER FOREIGN TABLE t ADD COLUMN c INT;", ObjectKind::Table),
+        ("ALTER FOREIGN TABLE IF EXISTS t ADD COLUMN c INT;", ObjectKind::Table),
+        ("ALTER FOREIGN TABLE t RENAME TO t2;", ObjectKind::Table),
+        ("ALTER FOREIGN TABLE t OWNER TO CURRENT_USER;", ObjectKind::Table),
+        ("ALTER FOREIGN TABLE v ADD COLUMN c INT;", ObjectKind::View),
+        ("ALTER FOREIGN TABLE mv RENAME TO mv2;", ObjectKind::MaterializedView),
+        ("ALTER FOREIGN TABLE s OWNER TO CURRENT_USER;", ObjectKind::Sequence),
+    ] {
+        let error = refusal(&format!("{OTHERS} {statement}"));
+        assert!(
+            matches!(
+                &error,
+                Error::RelationKindMismatch { expected_kind: ObjectKind::ForeignTable, actual_kind, .. }
+                    if *actual_kind == actual
+            ),
+            "{statement} was refused with {error:?}"
+        );
+    }
+
+    // PostgreSQL renames a column under this spelling as under `ALTER TABLE`,
+    // whatever relation holds it.
+    let renamed = db(&format!(
+        "{OTHERS}
+         ALTER FOREIGN TABLE t RENAME COLUMN id TO ident;
+         ALTER FOREIGN TABLE v RENAME COLUMN x TO y;
+         ALTER FOREIGN TABLE mv RENAME COLUMN x TO y;"
+    ));
+    let names: Vec<_> = table(&renamed, "t")
+        .columns(&renamed)
+        .expect("held")
+        .map(ColumnLike::column_name)
+        .collect();
+    assert_eq!(names, ["ident"]);
+    let outcome = |spelling: &str, name: &str| {
+        parse(&format!(
+            "{OTHERS} CREATE INDEX ti ON t (id); {spelling} {name} RENAME COLUMN id TO z;"
+        ))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    };
+    for name in ["ti", "s"] {
+        assert_eq!(outcome("ALTER FOREIGN TABLE", name), outcome("ALTER TABLE", name), "{name}");
+    }
+}
+
+fn source_options(db: &ParserDB, name: &str) -> Vec<(String, String)> {
+    foreign(db, name)
+        .foreign_source(db)
+        .expect("held")
+        .expect("a foreign table names a server")
+        .options()
+        .to_vec()
+}
+
+const OPTIONED_SOURCE: &str = "CREATE FOREIGN TABLE remote (id INT) SERVER warehouse OPTIONS (table_name 'r', schema_name 's');";
+
+#[test]
+fn alter_foreign_table_options_apply_in_order() {
+    let db = db(&format!(
+        "{OPTIONED_SOURCE}
+         ALTER FOREIGN TABLE remote OPTIONS (fetch_size '10', SET table_name 'r2', DROP schema_name);
+         ALTER FOREIGN TABLE remote OPTIONS (ADD batch_size '1', DROP batch_size);
+         ALTER FOREIGN TABLE remote OPTIONS (DROP fetch_size, ADD fetch_size '20');
+         ALTER TABLE remote OPTIONS (SET FETCH_SIZE '30', SET fetch_size '40', ADD updatable 'false');"
+    ));
+    assert_eq!(
+        source_options(&db, "remote"),
+        options(&[("table_name", "r2"), ("fetch_size", "40"), ("updatable", "false")])
+    );
+}
+
+#[test]
+fn alter_foreign_table_options_refuse_what_postgresql_refuses() {
+    let refused = |statement: &str| refusal(&format!("{OPTIONED_SOURCE} {statement}"));
+    assert!(matches!(
+        refused("ALTER FOREIGN TABLE remote OPTIONS (ADD TABLE_NAME 'x');"),
+        Error::RepeatedForeignOption { column_name: None, option_name, .. } if option_name == "table_name"
+    ));
+    for statement in [
+        "ALTER FOREIGN TABLE remote OPTIONS (SET fetch_size '1');",
+        "ALTER FOREIGN TABLE remote OPTIONS (DROP fetch_size);",
+        "ALTER FOREIGN TABLE remote OPTIONS (ADD fetch_size '1', DROP fetch_size, DROP fetch_size);",
+    ] {
+        let error = refused(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::ForeignOptionNotFound { table_name, column_name: None, option_name }
+                    if table_name == "remote" && option_name == "fetch_size"
+            ),
+            "{statement} was refused with {error:?}"
+        );
+    }
+    assert!(matches!(
+        refused("CREATE TABLE t (id INT); ALTER TABLE t OPTIONS (ADD a 'b');"),
+        Error::AlterActionUnsupportedOnRelation { object_kind: ObjectKind::Table, .. }
+    ));
+    // A refused list changes nothing, since the statement fails whole.
+    assert_eq!(
+        source_options(&db(OPTIONED_SOURCE), "remote"),
+        options(&[("table_name", "r"), ("schema_name", "s")])
+    );
+}
+
+#[test]
+fn alter_column_options_change_only_the_named_column() {
+    let db = db(&format!(
+        "{OPTIONED}
+         CREATE FOREIGN TABLE remote_child () INHERITS (remote) SERVER warehouse;
+         ALTER FOREIGN TABLE remote ALTER COLUMN id OPTIONS (SET column_name 'rid2');
+         ALTER FOREIGN TABLE remote ALTER COLUMN plain OPTIONS (ADD column_name 'p');
+         ALTER FOREIGN TABLE ONLY remote ALTER COLUMN note OPTIONS (DROP column_name);
+         ALTER TABLE remote_child ALTER COLUMN note OPTIONS (column_name 'child_note');"
+    ));
+    assert_eq!(
+        column_options(&db, foreign(&db, "remote")),
+        [
+            ("id".to_owned(), options(&[("column_name", "rid2")])),
+            ("note".to_owned(), options(&[])),
+            ("plain".to_owned(), options(&[("column_name", "p")])),
+        ]
+    );
+    assert_eq!(
+        column_options(&db, foreign(&db, "remote_child")),
+        [
+            ("id".to_owned(), options(&[])),
+            ("note".to_owned(), options(&[("column_name", "child_note")])),
+            ("plain".to_owned(), options(&[])),
+        ]
+    );
+}
+
+#[test]
+fn alter_column_options_refuse_what_postgresql_refuses() {
+    let refused = |statement: &str| refusal(&format!("{OPTIONED} {statement}"));
+    assert!(matches!(
+        refused("ALTER FOREIGN TABLE remote ALTER COLUMN plain OPTIONS (SET column_name 'x');"),
+        Error::ForeignOptionNotFound { column_name: Some(column), option_name, .. }
+            if column == "plain" && option_name == "column_name"
+    ));
+    assert!(matches!(
+        refused(
+            "ALTER FOREIGN TABLE remote ALTER COLUMN plain OPTIONS (ADD Column_Name 'a'),
+                 ALTER COLUMN plain OPTIONS (ADD \"column_name\" 'b');"
+        ),
+        Error::RepeatedForeignOption { column_name: Some(column), .. } if column == "plain"
+    ));
+    assert!(
+        refused("ALTER FOREIGN TABLE remote ALTER COLUMN missing OPTIONS (a 'b');")
+            .to_string()
+            .contains("missing")
+    );
+    assert!(matches!(
+        refused("CREATE TABLE t (id INT); ALTER TABLE t ALTER COLUMN id OPTIONS (ADD a 'b');"),
+        Error::AlterActionUnsupportedOnRelation { object_kind: ObjectKind::Table, .. }
+    ));
 }

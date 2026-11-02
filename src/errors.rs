@@ -1765,12 +1765,10 @@ pub enum Error {
         /// Name of the column given the options.
         column_name: String,
     },
-    #[error(
-        "Option `{option_name}` is written more than once in an option list of foreign table `{table_name}`."
-    )]
-    /// Error indicating that one `OPTIONS` list of a foreign table or of one
-    /// of its columns names a key twice, once both keys are folded as
-    /// PostgreSQL stores them.
+    #[error("Option `{option_name}` is given more than once to foreign table `{table_name}`.")]
+    /// Error indicating that an `OPTIONS` list of a foreign table or of one of
+    /// its columns names a key twice, or that an `ALTER` adds a key the list
+    /// already holds, keys compared as PostgreSQL stores them.
     RepeatedForeignOption {
         /// Name of the foreign table.
         table_name: String,
@@ -1778,6 +1776,18 @@ pub enum Error {
         /// table's own list.
         column_name: Option<String>,
         /// The repeated key, as PostgreSQL stores it.
+        option_name: String,
+    },
+    #[error("Option `{option_name}` is not set on foreign table `{table_name}`.")]
+    /// Error indicating that an `ALTER` sets or drops an option the list of a
+    /// foreign table or of one of its columns does not hold.
+    ForeignOptionNotFound {
+        /// Name of the foreign table.
+        table_name: String,
+        /// Name of the column whose list lacks the key, or `None` for the
+        /// table's own list.
+        column_name: Option<String>,
+        /// The missing key, as PostgreSQL stores it.
         option_name: String,
     },
     #[error(

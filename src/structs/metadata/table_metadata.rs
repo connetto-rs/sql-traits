@@ -370,6 +370,12 @@ impl<T: TableLike> TableMetadata<T> {
         self.foreign_source.take()
     }
 
+    /// The foreign source, for an `ALTER` changing its options.
+    #[inline]
+    pub(crate) fn foreign_source_mut(&mut self) -> Option<&mut ForeignTableSource> {
+        self.foreign_source.as_mut()
+    }
+
     /// Adds a column to the table metadata.
     ///
     /// # Arguments

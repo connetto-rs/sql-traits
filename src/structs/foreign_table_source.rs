@@ -88,4 +88,9 @@ impl ForeignTableSource {
     pub fn options(&self) -> &[(String, String)] {
         &self.options
     }
+
+    /// The table-level options, for an `ALTER` changing them.
+    pub(crate) fn options_mut(&mut self) -> &mut Vec<(String, String)> {
+        &mut self.options
+    }
 }

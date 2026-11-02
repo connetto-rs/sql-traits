@@ -19,13 +19,13 @@ use sqlparser::parser::ParserError;
 use sqlparser::{
     ast::{
         Action, AlterColumnOperation, AlterFunction, AlterFunctionAction, AlterFunctionKind,
-        AlterFunctionOperation, AlterIndexOperation, AlterPolicy, AlterPolicyOperation,
-        AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTableOperation, ArgMode,
-        ArrayElemTypeDef, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
-        CreateCollation, CreateCollationDefinition, CreateDomain, CreateExtension,
-        CreateForeignTable, CreateFunction, CreateFunctionBody, CreateIndex, CreatePolicy,
-        CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger, DataType,
-        DropBehavior, DropDomain, Expr, ForeignKeyConstraint, FunctionDefinitionSetParam,
+        AlterFunctionOperation, AlterGenericOption, AlterIndexOperation, AlterPolicy,
+        AlterPolicyOperation, AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTable,
+        AlterTableOperation, AlterTableType, ArgMode, ArrayElemTypeDef, CheckConstraint, ColumnDef,
+        ColumnOption, ColumnOptionDef, CreateCollation, CreateCollationDefinition, CreateDomain,
+        CreateExtension, CreateForeignTable, CreateFunction, CreateFunctionBody, CreateIndex,
+        CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
+        DataType, DropBehavior, DropDomain, Expr, ForeignKeyConstraint, FunctionDefinitionSetParam,
         FunctionDesc, FunctionSetValue, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName,
         GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart,
         OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
@@ -78,6 +78,7 @@ mod constraint_validity;
 mod default_privileges;
 mod domains;
 mod extensions;
+mod foreign_options;
 mod function_bodies;
 mod function_moves;
 mod generated_names;
@@ -3475,6 +3476,46 @@ fn foreign_table_refuses(operation: &AlterTableOperation) -> bool {
     )
 }
 
+/// Whether `operation` changes foreign-data wrapper options, which only a
+/// foreign table and its columns hold.
+fn needs_foreign_table(operation: &AlterTableOperation) -> bool {
+    matches!(
+        operation,
+        AlterTableOperation::GenericOptions { .. }
+            | AlterTableOperation::AlterColumn {
+                op: AlterColumnOperation::GenericOptions { .. },
+                ..
+            }
+    )
+}
+
+/// Refuses `ALTER FOREIGN TABLE` naming a relation of another kind, as
+/// PostgreSQL does before any action runs.
+///
+/// A lone `RENAME COLUMN` is the exception: PostgreSQL treats it under this
+/// spelling as under `ALTER TABLE`, whatever kind of relation holds the name,
+/// so the `ALTER TABLE` path decides it. A name holding nothing is left to the
+/// table path too, which honours `IF EXISTS`.
+fn refuse_alter_foreign_table_of_other_kind(
+    builder: &ParserDBBuilder,
+    alter_table: &AlterTable,
+) -> Result<(), crate::errors::Error> {
+    if matches!(alter_table.operations.as_slice(), [AlterTableOperation::RenameColumn { .. }]) {
+        return Ok(());
+    }
+    let Some((actual_kind, _)) = builder.relation_reached(&alter_table.name) else {
+        return Ok(());
+    };
+    if actual_kind == ObjectKind::ForeignTable {
+        return Ok(());
+    }
+    Err(crate::errors::Error::RelationKindMismatch {
+        object_name: alter_table.name.to_string(),
+        expected_kind: ObjectKind::ForeignTable,
+        actual_kind,
+    })
+}
+
 /// Refuses a `NO INHERIT` check written on a partitioned table.
 ///
 /// PostgreSQL enforces every constraint of a partitioned table on its
@@ -6410,6 +6451,32 @@ impl ParserDB {
         }
     }
 
+    /// Applies `OPTIONS ( [ ADD | SET | DROP ] ... )` to the table-level
+    /// options of a foreign table, whole or not at all.
+    fn alter_foreign_table_options(
+        mut builder: ParserDBBuilder,
+        table_name: &ObjectName,
+        scope: AlterTableScope,
+        changes: &[AlterGenericOption],
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
+            return Ok(builder);
+        };
+        let case = builder.identifier_case();
+        if let Some(source) = builder
+            .tables_mut()
+            .iter_mut()
+            .find(|(table, _, _)| stored.matches(table, case))
+            .and_then(|(_, metadata, _)| metadata.foreign_source_mut())
+        {
+            let mut options = source.options().to_vec();
+            foreign_options::change_table(&mut options, changes)
+                .map_err(|refusal| refusal.into_error(stored.name.clone(), None))?;
+            *source.options_mut() = options;
+        }
+        Ok(builder)
+    }
+
     /// The positions of the stored functions `func_desc` names.
     ///
     /// A statement that spells the argument list names one function, and one
@@ -7509,6 +7576,11 @@ impl ParserDB {
                     },
                 );
             }
+            // `refuse_alter_column` stops a refused list first, and a refusal
+            // leaves the column untouched all the same.
+            AlterColumnOperation::GenericOptions { options } => {
+                foreign_options::change_column(declared, &options).ok();
+            }
         }
     }
 
@@ -7536,6 +7608,9 @@ impl ParserDB {
                     generated_keyword: generated_as.is_some(),
                 }
             }
+            // Options stay with the column declaring them, so the change
+            // reaches no table below.
+            AlterColumnOperation::GenericOptions { .. } => ColumnOption::GenericOptions(Vec::new()),
         }
     }
 
@@ -7592,6 +7667,16 @@ impl ParserDB {
                         table_name: stored.name.clone(),
                         column_name: column.name.clone(),
                     });
+                }
+            }
+            // Tried on a copy, so a refused list leaves the column as it was.
+            AlterColumnOperation::GenericOptions { options } => {
+                if let Some(declared) = declared {
+                    foreign_options::change_column(&mut declared.clone(), options).map_err(
+                        |refusal| {
+                            refusal.into_error(stored.name.clone(), Some(column.name.clone()))
+                        },
+                    )?;
                 }
             }
             _ => {}
@@ -8433,6 +8518,9 @@ impl ParserDB {
                     // The persistence the table had before a clause of this
                     // statement changed it.
                     let mut persistence_before_change = None;
+                    if alter_table.table_type == Some(AlterTableType::Foreign) {
+                        refuse_alter_foreign_table_of_other_kind(&builder, &alter_table)?;
+                    }
                     for operation in alter_table.operations {
                         // `ALTER TABLE` names a relation, and PostgreSQL
                         // accepts it against a view for the actions a view
@@ -8443,16 +8531,26 @@ impl ParserDB {
                                 views::alter_view(builder, &alter_table.name, kind, &operation)?;
                             continue;
                         }
-                        if foreign_table_refuses(&operation)
-                            && let Some(table) =
-                                builder.resolve_table_object_name(&alter_table.name)?
-                            && builder.is_foreign_table(table)
-                        {
-                            return Err(crate::errors::Error::AlterActionUnsupportedOnRelation {
-                                object_kind: ObjectKind::ForeignTable,
-                                relation_name: alter_table.name.to_string(),
-                                operation: operation.to_string(),
-                            });
+                        if let Some(table) = builder.resolve_table_object_name(&alter_table.name)? {
+                            let foreign = builder.is_foreign_table(table);
+                            let refused = if foreign {
+                                foreign_table_refuses(&operation)
+                            } else {
+                                needs_foreign_table(&operation)
+                            };
+                            if refused {
+                                return Err(
+                                    crate::errors::Error::AlterActionUnsupportedOnRelation {
+                                        object_kind: if foreign {
+                                            ObjectKind::ForeignTable
+                                        } else {
+                                            ObjectKind::Table
+                                        },
+                                        relation_name: alter_table.name.to_string(),
+                                        operation: operation.to_string(),
+                                    },
+                                );
+                            }
                         }
                         match operation {
                             AlterTableOperation::EnableRowLevelSecurity => {
@@ -8766,6 +8864,15 @@ impl ParserDB {
                                     &alter_table.name,
                                     scope,
                                     options,
+                                )?;
+                            }
+
+                            AlterTableOperation::GenericOptions { options } => {
+                                builder = Self::alter_foreign_table_options(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &options,
                                 )?;
                             }
 
