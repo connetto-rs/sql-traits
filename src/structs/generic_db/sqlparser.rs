@@ -77,6 +77,7 @@ mod default_privileges;
 mod domains;
 mod extensions;
 mod function_bodies;
+mod function_moves;
 mod generated_names;
 mod inheritance;
 mod leading_comments;
@@ -4991,14 +4992,15 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// Moves every relation stored in schema `from` to `to`, carrying every
-    /// reference to each along, as `ALTER SCHEMA ... RENAME TO` does.
+    /// Moves every function and relation stored in schema `from` to `to`,
+    /// carrying every reference to each along, as `ALTER SCHEMA ... RENAME TO`
+    /// does.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::errors::Error::UnsupportedSchemaRename`] when the
-    /// schema holds a function, which this model does not move, and the
-    /// refusals moving a relation meets.
+    /// Returns [`crate::errors::Error::MovedFunctionCallAmbiguous`] when a
+    /// stored call may reach both a function of the schema and one elsewhere,
+    /// and the refusals moving a relation meets.
     fn move_schema_contents(
         mut builder: ParserDBBuilder,
         from: (&str, bool),
@@ -5007,16 +5009,19 @@ impl ParserDB {
         let case = builder.identifier_case();
         let in_from =
             |qualifier: SchemaQualifier<'_>| schema_qualifiers_match(qualifier, Some(from), case);
-        if let Some((function, _)) = builder
+        let functions = builder
             .functions()
             .iter()
-            .find(|(function, _)| in_from(qualifier_of(&function.name).named()))
-        {
-            return Err(crate::errors::Error::UnsupportedSchemaRename {
-                schema_name: from.0.to_string(),
-                function_name: last_str(&function.name).to_string(),
-            });
-        }
+            .filter(|(function, _)| in_from(qualifier_of(&function.name).named()))
+            .filter_map(|(function, _)| {
+                let ident = object_name_last_identifier(&function.name)?.clone();
+                Some((
+                    Arc::clone(function),
+                    ObjectName::from(vec![stored_ident(to.0, to.1), ident]),
+                ))
+            })
+            .collect();
+        builder = function_moves::move_functions(builder, &function_moves::Moves::new(functions))?;
 
         builder = sequences::move_sequences(builder, from, to)?;
         let tables: Vec<(ObjectName, Ident)> = builder
@@ -5048,15 +5053,42 @@ impl ParserDB {
         stored: &StoredTable,
         edit: impl FnOnce(&CreateTable, &mut CreateTable) -> Result<(), crate::errors::Error>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        Self::replace_table_node_with_collations(builder, stored, &[], None, |_| {}, edit)
+        Self::replace_table_node_carrying(builder, stored, |_| {}, edit)
+    }
+
+    /// Replaces the stored node of a table as [`Self::replace_table_node`]
+    /// does, letting `carry` adjust the bindings the rebuilt objects keep
+    /// before they are rebuilt.
+    fn replace_table_node_carrying(
+        builder: ParserDBBuilder,
+        stored: &StoredTable,
+        carry: impl FnOnce(&mut CarriedCalls),
+        edit: impl FnOnce(&CreateTable, &mut CreateTable) -> Result<(), crate::errors::Error>,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        Self::rebuild_table_node(builder, stored, &[], None, |_| {}, carry, edit)
     }
 
     fn replace_table_node_with_collations(
+        builder: ParserDBBuilder,
+        stored: &StoredTable,
+        collations: &[CreatedCollationMetadata],
+        catalog: Option<&PostgresCatalog>,
+        preserve: impl FnOnce(&mut Vec<PreservedColumnMetadata>),
+        edit: impl FnOnce(&CreateTable, &mut CreateTable) -> Result<(), crate::errors::Error>,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        Self::rebuild_table_node(builder, stored, collations, catalog, preserve, |_| {}, edit)
+    }
+
+    /// Rebuilds a table from the node `edit` makes of its stored one,
+    /// `preserve` adjusting the column metadata the rebuild keeps and `carry`
+    /// the call bindings.
+    fn rebuild_table_node(
         mut builder: ParserDBBuilder,
         stored: &StoredTable,
         collations: &[CreatedCollationMetadata],
         catalog: Option<&PostgresCatalog>,
         preserve: impl FnOnce(&mut Vec<PreservedColumnMetadata>),
+        carry: impl FnOnce(&mut CarriedCalls),
         edit: impl FnOnce(&CreateTable, &mut CreateTable) -> Result<(), crate::errors::Error>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(position) = builder
@@ -5105,6 +5137,7 @@ impl ParserDB {
             stored.schema.as_deref(),
             stored.schema_quoted,
         );
+        carry(&mut carried);
 
         let replacement = Arc::new(replacement);
 
@@ -6107,6 +6140,55 @@ impl ParserDB {
         }
 
         Ok(position)
+    }
+
+    /// Refuses `ALTER AGGREGATE ... RENAME TO` and `SET SCHEMA`, since this
+    /// model holds no aggregate and PostgreSQL refuses to reach a function
+    /// through the statement.
+    fn refuse_aggregate_alteration(
+        kind: &AlterFunctionKind,
+        func_desc: &FunctionDesc,
+    ) -> Result<(), crate::errors::Error> {
+        if matches!(kind, AlterFunctionKind::Aggregate) {
+            return Err(crate::errors::Error::AggregateAlterationUnsupported {
+                aggregate_name: last_str(&func_desc.name).to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Moves the stored function `function` to `moved`, its new name, as
+    /// `ALTER FUNCTION ... RENAME TO` and `SET SCHEMA` do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::Error::FunctionAlreadyExists`] when a function
+    /// with the new name and the same arguments is held, the function itself
+    /// included, as PostgreSQL refuses a rename to the name a function has,
+    /// and the refusals moving the function meets.
+    fn move_function(
+        builder: ParserDBBuilder,
+        function: Arc<CreateFunction>,
+        moved: ObjectName,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let case = builder.identifier_case();
+        if builder.functions().iter().any(|(held, _)| {
+            function_signatures_match(
+                &held.name,
+                held.args.as_deref(),
+                &moved,
+                function.args.as_deref(),
+                case,
+            )
+        }) {
+            return Err(crate::errors::Error::FunctionAlreadyExists {
+                function_name: last_str(&moved).to_string(),
+            });
+        }
+        function_moves::move_functions(
+            builder,
+            &function_moves::Moves::new(vec![(function, moved)]),
+        )
     }
 
     /// Returns the stored node of a table whose identity is known to be
@@ -8954,9 +9036,41 @@ impl ParserDB {
                             let fresh = Arc::clone(function_arc);
                             builder.repoint_function(&stale, &fresh);
                         }
-                        AlterFunctionOperation::RenameTo { .. }
-                        | AlterFunctionOperation::SetSchema { .. }
-                        | AlterFunctionOperation::DependsOnExtension { .. } => {}
+                        AlterFunctionOperation::RenameTo { new_name } => {
+                            Self::refuse_aggregate_alteration(&kind, &func_desc)?;
+                            let position = Self::alter_function_target(&builder, &func_desc)?;
+                            let function = Arc::clone(&builder.functions()[position].0);
+                            let mut renamed = function.name.clone();
+                            renamed.0.pop();
+                            renamed.0.push(ObjectNamePart::Identifier(new_name));
+                            builder = Self::move_function(builder, function, renamed)?;
+                        }
+                        AlterFunctionOperation::SetSchema { schema_name } => {
+                            Self::refuse_aggregate_alteration(&kind, &func_desc)?;
+                            let position = Self::alter_function_target(&builder, &func_desc)?;
+                            let function = Arc::clone(&builder.functions()[position].0);
+                            let schema = last_str(&schema_name);
+                            let quoted = object_name_last_identifier(&schema_name)
+                                .is_some_and(|ident| ident.quote_style.is_some());
+                            if !schema_is_declared(&builder, schema, quoted) {
+                                return Err(crate::errors::Error::AlterFunctionSchemaNotFound {
+                                    schema_name: schema.to_string(),
+                                    function_name: last_str(&function.name).to_string(),
+                                });
+                            }
+                            // A function set into the schema it is in stays.
+                            if schema_qualifiers_match(
+                                qualifier_of(&function.name).named(),
+                                Some((schema, quoted)),
+                                builder.identifier_case(),
+                            ) {
+                                continue;
+                            }
+                            let mut moved = schema_name.clone();
+                            moved.0.extend(function.name.0.last().cloned());
+                            builder = Self::move_function(builder, function, moved)?;
+                        }
+                        AlterFunctionOperation::DependsOnExtension { .. } => {}
                     }
                 }
                 Statement::AlterPolicy(AlterPolicy { name, mut table_name, operation }) => {

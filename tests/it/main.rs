@@ -40,6 +40,7 @@ mod extensions;
 mod function_body_binding;
 mod function_creation_access;
 mod function_kind;
+mod function_moves;
 mod function_null_input;
 mod function_ownership;
 mod function_plpgsql_bodies;

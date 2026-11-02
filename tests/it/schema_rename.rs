@@ -190,17 +190,3 @@ fn the_search_path_keeps_its_text() {
     assert!(table(&db, "s2.parent").is_some());
     assert!(table(&db, "public.parent").is_some());
 }
-
-/// Moving functions with their schema is not modelled yet, so a schema
-/// holding one is refused rather than left behind.
-#[test]
-fn a_schema_holding_a_function_is_refused() {
-    let error = parse(
-        "CREATE SCHEMA s;
-         CREATE FUNCTION s.f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
-         ALTER SCHEMA s RENAME TO s2;",
-    )
-    .expect_err("functions do not move yet");
-
-    assert!(matches!(error, Error::UnsupportedSchemaRename { .. }), "{error:?}");
-}

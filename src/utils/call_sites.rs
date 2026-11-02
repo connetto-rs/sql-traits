@@ -5,7 +5,7 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName,
-    TableFactor, Visit, Visitor,
+    TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use crate::{
@@ -40,6 +40,16 @@ pub(crate) fn for_each_call<N: Visit + ?Sized, B>(
     each: impl FnMut(Call<'_>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
     node.visit(&mut Calls { each })
+}
+
+/// Hands the written name and the argument count of every call in `node` to
+/// `each`, in the order [`for_each_call`] meets the calls, until `each`
+/// breaks.
+pub(crate) fn for_each_call_name_mut<N: VisitMut + ?Sized, B>(
+    node: &mut N,
+    each: impl FnMut(&mut ObjectName, usize) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    node.visit(&mut CallNames { each })
 }
 
 /// Whether a call to `called` passing `arguments` arguments may run
@@ -91,20 +101,7 @@ impl<B, F: FnMut(Call<'_>) -> ControlFlow<B>> Visitor for Calls<F> {
     fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<B> {
         match expression {
             Expr::Function(function) => {
-                let arguments = match &function.args {
-                    FunctionArguments::None => 0,
-                    FunctionArguments::Subquery(_) => 1,
-                    // PostgreSQL reads `count(*)` as a call passing nothing.
-                    FunctionArguments::List(list)
-                        if matches!(
-                            list.args.as_slice(),
-                            [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
-                        ) =>
-                    {
-                        0
-                    }
-                    FunctionArguments::List(list) => list.args.len(),
-                };
+                let arguments = argument_count(&function.args);
                 (self.each)(Call { name: &function.name, arguments, node: Some(function) })
             }
             Expr::In { target: InTarget::Table { name, args: Some(args) }, .. } => {
@@ -124,5 +121,99 @@ impl<B, F: FnMut(Call<'_>) -> ControlFlow<B>> Visitor for Calls<F> {
             }
             _ => ControlFlow::Continue(()),
         }
+    }
+}
+
+/// How many arguments a function expression passes.
+fn argument_count(arguments: &FunctionArguments) -> usize {
+    match arguments {
+        FunctionArguments::None => 0,
+        FunctionArguments::Subquery(_) => 1,
+        // PostgreSQL reads `count(*)` as a call passing nothing.
+        FunctionArguments::List(list)
+            if matches!(
+                list.args.as_slice(),
+                [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+            ) =>
+        {
+            0
+        }
+        FunctionArguments::List(list) => list.args.len(),
+    }
+}
+
+/// Hands the name and argument count of each call the walk meets to `each`.
+struct CallNames<F> {
+    each: F,
+}
+
+impl<B, F: FnMut(&mut ObjectName, usize) -> ControlFlow<B>> VisitorMut for CallNames<F> {
+    type Break = B;
+
+    fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<B> {
+        match expression {
+            Expr::Function(function) => {
+                let arguments = argument_count(&function.args);
+                (self.each)(&mut function.name, arguments)
+            }
+            Expr::In { target: InTarget::Table { name, args: Some(args) }, .. } => {
+                let arguments = args.len();
+                (self.each)(name, arguments)
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<B> {
+        match factor {
+            TableFactor::Table { name, args: Some(args), .. } => {
+                let arguments = args.args.len();
+                (self.each)(name, arguments)
+            }
+            TableFactor::Function { name, args, .. } => {
+                let arguments = args.len();
+                (self.each)(name, arguments)
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The bindings one walk records are applied by the other, so both have
+    //! to meet the same calls in the same order.
+
+    use alloc::{
+        string::{String, ToString},
+        vec::Vec,
+    };
+    use core::{convert::Infallible, ops::ControlFlow};
+
+    use sqlparser::{dialect::GenericDialect, parser::Parser};
+
+    use super::{for_each_call, for_each_call_name_mut};
+
+    #[test]
+    fn both_walks_meet_every_call_in_the_same_order() {
+        let sql = "SELECT f(a, g()) FROM t(2) AS r, LATERAL lf(4, 5) \
+                   WHERE a IN tf(3) AND count(*) > (SELECT h() FROM u)";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("the query parses");
+
+        let mut read: Vec<(String, usize)> = Vec::new();
+        let ControlFlow::<Infallible>::Continue(()) = for_each_call(&statements, |call| {
+            read.push((call.name.to_string(), call.arguments));
+            ControlFlow::Continue(())
+        });
+        let mut written: Vec<(String, usize)> = Vec::new();
+        let ControlFlow::<Infallible>::Continue(()) =
+            for_each_call_name_mut(&mut statements, |name, arguments| {
+                written.push((name.to_string(), arguments));
+                ControlFlow::Continue(())
+            });
+
+        assert_eq!(read, written);
+        let names: Vec<&str> = read.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["f", "g", "t", "lf", "tf", "count", "h"]);
     }
 }

@@ -1706,7 +1706,6 @@ mod tests {
             CREATE FUNCTION my_func() RETURNS INT AS 'SELECT 1;';
             ALTER FUNCTION my_func() IMMUTABLE;
             ALTER FUNCTION missing_func() COST 100;
-            ALTER FUNCTION missing_func() RENAME TO other_func;
         ";
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let f = db
