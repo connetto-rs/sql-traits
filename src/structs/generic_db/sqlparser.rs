@@ -6095,29 +6095,66 @@ impl ParserDB {
     ///
     /// A statement that spells the argument list names one function, and one
     /// that omits it names whichever function carries the name in the schema it
-    /// names, so long as only one does.
+    /// names, so long as only one does. An unqualified name walks the search
+    /// path, a function earlier on it hiding a later one taking the same
+    /// arguments, so the earliest comes first. The built-ins of the implicit
+    /// `pg_catalog` are left out, as a statement naming one has always been
+    /// refused as naming nothing here, and functions are never looked for in
+    /// `pg_temp`.
     fn functions_named(builder: &ParserDBBuilder, func_desc: &FunctionDesc) -> Vec<usize> {
         let case = builder.identifier_case();
-        builder
-            .functions()
-            .iter()
-            .enumerate()
-            .filter(|(_, (function, _))| {
-                match &func_desc.args {
-                    Some(args) => {
-                        function_signatures_match(
-                            &function.name,
-                            function.args.as_deref(),
-                            &func_desc.name,
-                            Some(args),
-                            case,
-                        )
-                    }
-                    None => function_names_match(&function.name, &func_desc.name, case),
+        let named = |function: &CreateFunction, name: &ObjectName| {
+            match &func_desc.args {
+                Some(args) => {
+                    function_signatures_match(
+                        &function.name,
+                        function.args.as_deref(),
+                        name,
+                        Some(args),
+                        case,
+                    )
                 }
-            })
-            .map(|(position, _)| position)
-            .collect()
+                None => function_names_match(&function.name, name, case),
+            }
+        };
+        let positions = |name: &ObjectName| {
+            builder
+                .functions()
+                .iter()
+                .enumerate()
+                .filter(|(_, (function, _))| named(function, name))
+                .map(|(position, _)| position)
+                .collect::<Vec<_>>()
+        };
+        if !matches!(qualifier_of(&func_desc.name), Qualifier::Absent) {
+            return positions(&func_desc.name);
+        }
+
+        let arguments_of = |position: usize| {
+            function_argument_types(builder.functions()[position].0.args.as_deref())
+        };
+        let mut found: Vec<usize> = Vec::new();
+        for (schema, quoted) in builder
+            .search_path()
+            .filter(|&(schema, quoted)| !schema.is_empty() && !is_temporary_schema(schema, quoted))
+        {
+            let mut qualified = func_desc.name.clone();
+            bind_reference(&mut qualified, Some(stored_ident(schema, quoted)));
+            for position in positions(&qualified) {
+                let arguments = arguments_of(position);
+                if !found.iter().any(|&earlier| {
+                    let hiding = arguments_of(earlier);
+                    hiding.len() == arguments.len()
+                        && hiding
+                            .iter()
+                            .zip(&arguments)
+                            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+                }) {
+                    found.push(position);
+                }
+            }
+        }
+        found
     }
 
     /// Resolves the stored function an `ALTER FUNCTION` names.
@@ -7320,6 +7357,16 @@ impl ParserDB {
                         crate::errors::ObjectKind::Function,
                         builder.catalog_name(),
                     )?;
+                    // An unqualified function lands in the first schema on the
+                    // path that exists, kept bare when that is `public`.
+                    if matches!(qualifier_of(&create_function.name), Qualifier::Absent) {
+                        let qualifier = search_path_qualifier(
+                            &builder,
+                            crate::errors::ObjectKind::Function,
+                            last_str(&create_function.name),
+                        )?;
+                        bind_reference(&mut create_function.name, qualifier);
+                    }
                     for parameter in &mut create_function.set_params {
                         settle_search_path_parameter(parameter, &builder)?;
                     }

@@ -555,7 +555,10 @@ mod tests {
 
     fn own_path(database: &ParserDB, name: &str) -> Option<Vec<(String, bool)>> {
         database
-            .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .function_by_target(
+                TargetName::new(name, false).with_schema("admin", false),
+                IdentifierCase::AsWritten,
+            )
             .expect("unambiguous lookup")
             .expect("function exists")
             .search_path(database)

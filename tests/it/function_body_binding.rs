@@ -50,7 +50,7 @@ fn a_block_body_resolves_under_the_creation_search_path() {
          CREATE TABLE u (a INT);
          CREATE TABLE app.w (a INT);
          SET search_path = app, public;
-         CREATE FUNCTION f() RETURNS INT LANGUAGE sql BEGIN ATOMIC
+         CREATE FUNCTION public.f() RETURNS INT LANGUAGE sql BEGIN ATOMIC
              INSERT INTO t (a) SELECT a FROM u;
              UPDATE t SET b = a WHERE a IN (SELECT a FROM w);
              DELETE FROM t WHERE a = 0;
@@ -60,7 +60,7 @@ fn a_block_body_resolves_under_the_creation_search_path() {
     .expect("every statement binds under the session path");
     assert_eq!(
         text(&db, "f"),
-        "CREATE FUNCTION f() RETURNS INT LANGUAGE sql BEGIN ATOMIC \
+        "CREATE FUNCTION public.f() RETURNS INT LANGUAGE sql BEGIN ATOMIC \
          INSERT INTO t (a) SELECT a FROM u; \
          UPDATE t SET b = a WHERE a IN (SELECT a FROM app.w); \
          DELETE FROM t WHERE a = 0; \
