@@ -1,4 +1,0 @@
-CREATE POLICY Usn1 ON reSss USING (
-( SELECT SL,
-INTO-N,O-N,
-l(s) WHERE lG ((ls)o

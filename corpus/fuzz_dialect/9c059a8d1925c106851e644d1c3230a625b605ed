@@ -1,4 +1,0 @@
-CREATE FUNCTION e(rE)
-LANGUAGE SL
-AS 
-$$E $$`> 

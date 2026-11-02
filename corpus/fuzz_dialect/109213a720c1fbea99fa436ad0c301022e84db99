@@ -1,1 +1,0 @@
-CREATE TABLE orders(   id AL(60, 2) CHECK (amom?#ount > 2),    r_at TI);

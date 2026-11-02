@@ -1,5 +1,0 @@
-CREAtE TABLE rder(
-T ULL REFERENCES ue
-    ON DELETE 
-    
- dK

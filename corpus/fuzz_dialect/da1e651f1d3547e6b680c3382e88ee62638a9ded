@@ -1,13 +1,0 @@
-CREATE TABLE ot(
- t P DEFAULT CBB$(P,HH,HAL.*,
-L,
-H,HHH,HAL.HAL.*,
-L,
-mHHH,HHHH,HAL.*,
-L,
-H,HHH,HAL.HAL.*,
-L,
-mHHH,HHH,L,
-
-mNUat)
-);

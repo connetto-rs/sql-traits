@@ -1,3 +1,0 @@
-
-CREATE ROLE p,l,@,,d,y;
-GRANT CREATE ON ALL TABLES IN SCHEMA pc TO  p,l,C.d, p,l¬

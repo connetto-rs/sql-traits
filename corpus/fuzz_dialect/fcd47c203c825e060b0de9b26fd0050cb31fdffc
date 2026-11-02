@@ -1,1 +1,0 @@
-CREATE POLICY User ON r USING (unuzG (l(s) WHERE
