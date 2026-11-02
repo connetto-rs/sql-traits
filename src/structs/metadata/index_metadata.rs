@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 
 use sqlparser::ast::Expr;
 
+use super::ExpressionCalls;
 use crate::traits::{DatabaseLike, IndexLike};
 
 #[derive(Debug, Clone)]
@@ -13,13 +14,39 @@ pub struct IndexMetadata<I: IndexLike> {
     expression: Expr,
     /// The table on which the index is defined.
     table: Arc<<I::DB as DatabaseLike>::Table>,
+    /// The calls of the index's expressions and predicate.
+    calls: ExpressionCalls<<I::DB as DatabaseLike>::Function>,
 }
 
 impl<I: IndexLike> IndexMetadata<I> {
     /// Creates a new `IndexMetadata` instance.
     #[inline]
     pub fn new(expression: Expr, table: Arc<<I::DB as DatabaseLike>::Table>) -> Self {
-        Self { expression, table }
+        Self { expression, table, calls: ExpressionCalls::default() }
+    }
+
+    /// Stores the calls of the index's expressions and predicate.
+    #[must_use]
+    pub(crate) fn with_calls(
+        mut self,
+        calls: ExpressionCalls<<I::DB as DatabaseLike>::Function>,
+    ) -> Self {
+        self.calls = calls;
+        self
+    }
+
+    /// Returns the calls of the index's expressions and predicate.
+    pub(crate) fn calls(&self) -> &ExpressionCalls<<I::DB as DatabaseLike>::Function> {
+        &self.calls
+    }
+
+    /// Re-points every call reaching the function node `stale` at `fresh`.
+    pub(crate) fn replace_function(
+        &mut self,
+        stale: &Arc<<I::DB as DatabaseLike>::Function>,
+        fresh: &Arc<<I::DB as DatabaseLike>::Function>,
+    ) {
+        self.calls.replace_function(stale, fresh);
     }
 
     /// Returns a reference to the expression defining the index.

@@ -41,6 +41,12 @@ impl<F> ExpressionCalls<F> {
         self.functions.iter().map(AsRef::as_ref)
     }
 
+    /// Returns the functions each call may reach, in the order a pre-order
+    /// walk of the expression meets the calls.
+    pub(crate) fn sites(&self) -> &[Vec<Arc<F>>] {
+        &self.sites
+    }
+
     /// Returns the functions `call` may reach, or `None` when `call` is not a
     /// node of `expression`, the expression this record was built from.
     ///

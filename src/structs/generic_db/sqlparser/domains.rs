@@ -97,7 +97,8 @@ pub(super) fn create_domain(
         });
     }
     bind_type(&builder, &mut domain.data_type);
-    Ok(builder.add_domain(Arc::new(domain), ()))
+    let calls = builder.calls_in(&domain);
+    Ok(builder.add_domain(Arc::new(domain), calls))
 }
 
 /// Returns [`ObjectKind::Domain`] when a domain holds `name` in `schema`.
@@ -111,7 +112,7 @@ pub(super) fn domain_name_holder(
     builder
         .domains()
         .iter()
-        .any(|(domain, ())| {
+        .any(|(domain, _)| {
             domain_named(domain, ident_parts(name), case) && domain_in_schema(domain, schema, case)
         })
         .then_some(ObjectKind::Domain)
@@ -179,7 +180,7 @@ fn reach_in_schema(
     } else {
         (schema, schema_quoted)
     };
-    if let Some(position) = builder.domains().iter().position(|(domain, ())| {
+    if let Some(position) = builder.domains().iter().position(|(domain, _)| {
         domain_named(domain, ident_parts(name), case) && domain_in_schema(domain, schema, case)
     }) {
         return Some(Reached::Domain(position));
@@ -253,11 +254,11 @@ pub(super) fn bind_type(builder: &ParserDBBuilder, data_type: &mut DataType) {
 fn named_domain(builder: &ParserDBBuilder, data_type: &DataType) -> Option<usize> {
     let name = custom_name(data_type)?;
     let domain = bound_domain(
-        builder.domains().iter().map(|(domain, ())| domain.as_ref()),
+        builder.domains().iter().map(|(domain, _)| domain.as_ref()),
         name,
         builder.identifier_case(),
     )?;
-    builder.domains().iter().position(|(stored, ())| core::ptr::eq(stored.as_ref(), domain))
+    builder.domains().iter().position(|(stored, _)| core::ptr::eq(stored.as_ref(), domain))
 }
 
 /// Applies a `DROP DOMAIN` or a `DROP TYPE`.
@@ -312,7 +313,7 @@ pub(super) fn schema_holds_domain(
     builder
         .domains()
         .iter()
-        .any(|(domain, ())| domain_in_schema(domain, (schema_name, schema_quoted), case))
+        .any(|(domain, _)| domain_in_schema(domain, (schema_name, schema_quoted), case))
 }
 
 /// Drops every domain of a schema `DROP SCHEMA ... CASCADE` removes, with what
@@ -331,7 +332,7 @@ pub(super) fn drop_domains_in(
         .domains()
         .iter()
         .enumerate()
-        .filter(|(_, (domain, ()))| domain_in_schema(domain, (schema_name, schema_quoted), case))
+        .filter(|(_, (domain, _))| domain_in_schema(domain, (schema_name, schema_quoted), case))
         .map(|(position, _)| position)
         .collect();
     drop_positions(builder, doomed, true)
@@ -355,7 +356,7 @@ fn drop_positions(
     let mut grew = true;
     while grew {
         grew = false;
-        for (position, (domain, ())) in builder.domains().iter().enumerate() {
+        for (position, (domain, _)) in builder.domains().iter().enumerate() {
             if doomed.contains(&position) {
                 continue;
             }
@@ -457,8 +458,8 @@ pub(super) fn follow_schema_rename(
     let moved: Vec<(alloc::string::String, bool)> = builder
         .domains()
         .iter()
-        .filter(|(domain, ())| domain_in_schema(domain, (from, from_quoted), case))
-        .map(|(domain, ())| (domain.name().to_string(), domain.name_is_quoted()))
+        .filter(|(domain, _)| domain_in_schema(domain, (from, from_quoted), case))
+        .map(|(domain, _)| (domain.name().to_string(), domain.name_is_quoted()))
         .collect();
     if moved.is_empty() {
         return Ok(builder);
@@ -485,7 +486,7 @@ pub(super) fn follow_schema_rename(
         }
     };
 
-    for (domain, ()) in builder.domains_mut() {
+    for (domain, _) in builder.domains_mut() {
         let renamed = reaches_moved(&domain.name)
             || custom_name(&domain.data_type).is_some_and(reaches_moved);
         if !renamed {

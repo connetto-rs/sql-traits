@@ -231,7 +231,7 @@ fn definitions_reading(
             reads.extend(read);
         }
     }
-    for (position, (rule, ())) in builder.rules().iter().enumerate() {
+    for (position, (rule, _)) in builder.rules().iter().enumerate() {
         for (definition, read) in rule_definition_reads(builder, position, rule) {
             if names(&read) {
                 definitions.push(definition);

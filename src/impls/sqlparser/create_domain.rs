@@ -17,7 +17,9 @@ use crate::{
 const DEFAULT_SCHEMA: &str = "public";
 
 impl Metadata for CreateDomain {
-    type Meta = ();
+    /// The calls of the domain's default and checks, bound when it was
+    /// written.
+    type Meta = crate::structs::metadata::ExpressionCalls<sqlparser::ast::CreateFunction>;
 }
 
 /// Ingestion qualifies `name` with the schema the domain landed in, leaving
