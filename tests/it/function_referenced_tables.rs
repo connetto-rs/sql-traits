@@ -230,15 +230,14 @@ fn a_body_without_a_language_clause_reads_as_sql() {
 fn a_body_in_another_language_cannot_be_read() {
     let database = postgres(
         "CREATE TABLE docs (id INT);
-         CREATE FUNCTION procedural() RETURNS INT LANGUAGE plpgsql
-             AS $$ BEGIN RETURN (SELECT count(*) FROM docs); END $$;
+         CREATE FUNCTION procedural() RETURNS INT LANGUAGE plperl AS $$ return 1; $$;
          CREATE FUNCTION native() RETURNS INT LANGUAGE c AS 'module', 'symbol';",
     );
     assert_eq!(
         read_by(&database, "procedural"),
         Err(LookupError::FunctionBodyNotSql {
             function: "procedural".to_string(),
-            language: "plpgsql".to_string(),
+            language: "plperl".to_string(),
         })
     );
     assert!(matches!(
@@ -330,9 +329,13 @@ fn code_outside_the_schema_cannot_be_read() {
             Err(LookupError::FunctionBodyUnavailable { function: function.to_string() })
         );
     };
-    let declared =
-        ParserDB::parse::<GenericDialect>("CREATE FUNCTION declared() RETURNS INT;").unwrap();
+    let declared = ParserDB::parse::<GenericDialect>(
+        "CREATE FUNCTION declared() RETURNS INT;
+         CREATE FUNCTION procedural() RETURNS INT LANGUAGE plpgsql;",
+    )
+    .unwrap();
     unavailable(&declared, "declared");
+    unavailable(&declared, "procedural");
 
     let remote = ParserDB::parse::<BigQueryDialect>(
         "CREATE FUNCTION remote() RETURNS INT64 REMOTE WITH CONNECTION us.c
@@ -546,11 +549,10 @@ fn relations_resolve_under_the_path_the_body_runs_with() {
 
 #[test]
 fn relations_report_the_same_unknowable_bodies() {
-    let database = postgres(
-        "CREATE FUNCTION procedural() RETURNS INT LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
-    );
+    let database =
+        postgres("CREATE FUNCTION procedural() RETURNS INT LANGUAGE plperl AS $$ return 1; $$;");
     assert!(matches!(
         named_by(&database, "procedural"),
-        Err(LookupError::FunctionBodyNotSql { language, .. }) if language == "plpgsql"
+        Err(LookupError::FunctionBodyNotSql { language, .. }) if language == "plperl"
     ));
 }

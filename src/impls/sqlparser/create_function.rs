@@ -8,10 +8,11 @@ use sqlparser::ast::{
     FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionReturnType,
     FunctionSecurity, FunctionSetValue, Select, Statement, Value, ValueWithSpan,
 };
+use sqlparser_plpgsql::{embedded::Block, embedded_sql};
 
 use super::{
     body_calls::{calls_of_body, calls_on_path},
-    data_statement::{BodyPath, Reads, reads_of_body, reads_on_path},
+    data_statement::{BodyPath, Reads, RunTimeBody, reads_of_body, reads_on_path},
 };
 use crate::{
     errors::{LookupError, ObjectKind},
@@ -50,6 +51,8 @@ enum SqlBody<'f> {
     /// Statements read one after another each time the function runs, parsed
     /// from the body's text or already parsed by the input.
     Statements(Cow<'f, [Statement]>),
+    /// The SQL a PL/pgSQL body embeds, read each time the function runs.
+    PlPgSql(Block),
     /// An expression read each time the function runs.
     Expression(&'f Expr),
     /// A query read each time the function runs.
@@ -66,7 +69,9 @@ fn sql_body<'f>(
     function: &'f CreateFunction,
     database: &ParserDB,
 ) -> Result<SqlBody<'f>, LookupError> {
-    if let Some(language) = function.stored_language().filter(|language| language != "sql") {
+    let language = function.stored_language();
+    let procedural = language.as_deref() == Some("plpgsql");
+    if let Some(language) = language.filter(|language| language != "sql" && !procedural) {
         return Err(LookupError::FunctionBodyNotSql {
             function: function.name().to_string(),
             language: language.into_owned(),
@@ -77,18 +82,29 @@ fn sql_body<'f>(
     if function.using.is_some() || function.remote_connection.is_some() {
         return Err(unavailable());
     }
+    let unparsable = |reason: &dyn ToString| {
+        LookupError::FunctionBodyUnparsable {
+            function: function.name().to_string(),
+            reason: reason.to_string(),
+        }
+    };
+    if procedural {
+        let Some(text) = function.body() else {
+            return Err(match function.function_body {
+                None => unavailable(),
+                Some(_) => unparsable(&"a PL/pgSQL body is written as a string"),
+            });
+        };
+        return Ok(SqlBody::PlPgSql(embedded_sql(text).map_err(|error| unparsable(&error))?));
+    }
     match &function.function_body {
         None => Err(unavailable()),
         Some(CreateFunctionBody::AsBeforeOptions { body: expression, .. }) => {
             let Some(text) = function.body() else {
                 return Ok(SqlBody::Expression(expression));
             };
-            let statements = database.dialect().parse_statements(text).map_err(|error| {
-                LookupError::FunctionBodyUnparsable {
-                    function: function.name().to_string(),
-                    reason: error.to_string(),
-                }
-            })?;
+            let statements =
+                database.dialect().parse_statements(text).map_err(|error| unparsable(&error))?;
             Ok(SqlBody::Statements(Cow::Owned(statements)))
         }
         Some(
@@ -122,7 +138,13 @@ fn body_reads<'db>(
     match sql_body(function, database)? {
         SqlBody::Statements(statements) => {
             let path = run_time_path(function, database)?;
-            reads_of_body(function.name(), &statements, database, path, hex_strings_may_be_integers)
+            let body = RunTimeBody::Sql(&statements);
+            reads_of_body(function.name(), body, database, path, hex_strings_may_be_integers)
+        }
+        SqlBody::PlPgSql(block) => {
+            let path = run_time_path(function, database)?;
+            let body = RunTimeBody::PlPgSql(&block);
+            reads_of_body(function.name(), body, database, path, hex_strings_may_be_integers)
         }
         SqlBody::Expression(expression) => {
             reads_on_path(expression, database, Some(run_time_path(function, database)?))
@@ -135,7 +157,8 @@ fn body_reads<'db>(
         // A block stores a temporary relation by its bare name, which the
         // default path reaches first.
         SqlBody::Atomic(statements) => {
-            reads_of_body(function.name(), statements, database, BodyPath::default_path(), false)
+            let body = RunTimeBody::Sql(statements);
+            reads_of_body(function.name(), body, database, BodyPath::default_path(), false)
         }
     }
 }
@@ -150,7 +173,13 @@ fn body_calls<'db>(
     match sql_body(function, database)? {
         SqlBody::Statements(statements) => {
             let path = run_time_path(function, database)?;
-            calls_of_body(function.name(), &statements, database, path, hex_strings_may_be_integers)
+            let body = RunTimeBody::Sql(&statements);
+            calls_of_body(function.name(), body, database, path, hex_strings_may_be_integers)
+        }
+        SqlBody::PlPgSql(block) => {
+            let path = run_time_path(function, database)?;
+            let body = RunTimeBody::PlPgSql(&block);
+            calls_of_body(function.name(), body, database, path, hex_strings_may_be_integers)
         }
         SqlBody::Expression(expression) => {
             calls_on_path(expression, database, run_time_path(function, database)?)

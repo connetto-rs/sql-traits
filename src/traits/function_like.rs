@@ -798,22 +798,29 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// [`DataStatementLike::referenced_tables`](crate::traits::DataStatementLike::referenced_tables).
     /// A body of several statements is read one statement after another, as
     /// PostgreSQL 18 runs it, so a `SET` or `RESET` of `search_path` in it
-    /// reaches the statements after it. A function without a `LANGUAGE`
+    /// reaches the statements after it. A `LANGUAGE plpgsql` body is read
+    /// through every SQL statement and expression it embeds, in body order,
+    /// and never reads a name it declares or a parameter as a relation. A
+    /// `SET` of `search_path` there reaches what follows it on the straight
+    /// line only. An unqualified name such a `SET` may reach from a branch, a
+    /// loop or a block with an exception handler cannot be resolved, and a
+    /// handler starts under the path its block started with, since
+    /// PostgreSQL rolls the block back first. A function without a `LANGUAGE`
     /// clause is read as SQL, which is what PostgreSQL assumes for a `RETURN`
     /// body and what dialects without the clause mean.
     ///
     /// # Errors
     ///
-    /// Which tables the body reads cannot be known when it is written in
-    /// another language ([`LookupError::FunctionBodyNotSql`]), when the
-    /// function's code lives outside the schema
-    /// ([`LookupError::FunctionBodyUnavailable`]), or when the body runs code
-    /// outside it, through `CALL`, `EXECUTE` or a `set_config` of
-    /// `search_path` before an unqualified name
+    /// Which tables the body reads cannot be known when it is written in a
+    /// language other than SQL or PL/pgSQL
+    /// ([`LookupError::FunctionBodyNotSql`]), when the function's code lives
+    /// outside the schema ([`LookupError::FunctionBodyUnavailable`]), or when
+    /// the body runs code outside it, through `CALL`, `EXECUTE` or a
+    /// `set_config` of `search_path` before an unqualified name
     /// ([`LookupError::FunctionBodyUnresolvable`]). Returns
     /// [`LookupError::FunctionBodyUnparsable`] when the body text does not
-    /// parse under the database's dialect, and any error resolving a name the
-    /// body reads.
+    /// parse, under the database's dialect for SQL, and any error resolving a
+    /// name the body reads.
     ///
     /// # Example
     ///

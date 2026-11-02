@@ -895,6 +895,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlparser",
+ "sqlparser-plpgsql",
  "tempfile",
  "thiserror",
  "unicode-normalization",
@@ -908,6 +909,15 @@ dependencies = [
  "log",
  "recursive",
  "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser-plpgsql"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#657a7dff12df8ae92bf226218e73a9ec1087dc79"
+dependencies = [
+ "sqlparser",
+ "thiserror",
 ]
 
 [[package]]

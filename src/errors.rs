@@ -331,7 +331,7 @@ pub enum LookupError {
         /// How many argument types were given.
         types: usize,
     },
-    /// A function body is written in a language other than SQL.
+    /// A function body is written in a language other than SQL or PL/pgSQL.
     #[error("Function `{function}` is written in `{language}`, which is not read as SQL.")]
     FunctionBodyNotSql {
         /// Name of the function, as written.
@@ -357,7 +357,8 @@ pub enum LookupError {
         /// The statement that hides what the body reads.
         statement: String,
     },
-    /// A SQL function body does not parse under the database's dialect.
+    /// A SQL function body does not parse under the database's dialect, or a
+    /// PL/pgSQL body or the SQL it embeds does not parse.
     #[error("The body of function `{function}` does not parse: {reason}")]
     FunctionBodyUnparsable {
         /// Name of the function, as written.
