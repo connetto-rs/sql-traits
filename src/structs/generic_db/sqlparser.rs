@@ -90,6 +90,7 @@ mod parsed_source;
 mod postgres_18_collations;
 mod postgres_builtins;
 mod postgres_catalog;
+mod revocations;
 mod role_memberships;
 mod routine_privileges;
 mod rules;
@@ -1348,6 +1349,11 @@ impl ParserDBBuilder {
         self.column_grants_mut().retain_mut(|(grant, ())| {
             !grant_names_table(grant, table) || drop_grant_column(Arc::make_mut(grant), column)
         });
+        if let Some((_, metadata, _)) =
+            self.tables_mut().iter_mut().find(|(host, _, _)| table.matches(host, case))
+        {
+            revocations::drop_column(metadata, column);
+        }
     }
 
     /// Removes the objects outside the table that depend on one of its columns,
@@ -1434,6 +1440,11 @@ impl ParserDBBuilder {
             if grant_names_table(grant, table) {
                 rename_grant_columns(Arc::make_mut(grant), from, to);
             }
+        }
+        if let Some((_, metadata, _)) =
+            self.tables_mut().iter_mut().find(|(host, _, _)| table.matches(host, case))
+        {
+            revocations::rename_column(metadata, from, to);
         }
     }
 
@@ -5428,6 +5439,7 @@ impl ParserDB {
         metadata.set_rls_forced(previous_metadata.rls_forced());
         metadata.set_owner(previous_metadata.owner().map(str::to_string));
         metadata.set_owner_privileges(previous_metadata.take_owner_privileges());
+        metadata.set_revocations(previous_metadata.take_revocations());
         metadata.set_documentation(previous_metadata.take_documentation());
         metadata.set_foreign_source(previous_metadata.take_foreign_source());
         // Which columns came from a parent is not spelled by the node, so it
@@ -8260,6 +8272,7 @@ impl ParserDB {
                         }
 
                         role_memberships::drop_role(&mut builder, role_ident);
+                        revocations::drop_role(&mut builder, role_ident);
                         builder
                             .roles_mut()
                             .retain(|(role, ())| !role_matches_lookup_ident(role, role_ident));
@@ -8307,6 +8320,7 @@ impl ParserDB {
                     rename_role_references(&mut builder, &name, &new_name);
                     rename_grantee_role(builder.table_grants_mut(), &name, &new_name);
                     rename_grantee_role(builder.column_grants_mut(), &name, &new_name);
+                    revocations::rename_role(&mut builder, &name, &new_name);
                     rename_execute_grantees(&mut builder, &name, &new_name);
                     default_privileges.rename_role(&name, &new_name);
                 }
@@ -9395,6 +9409,7 @@ impl ParserDB {
                         parts
                     };
                     for part in parts {
+                        revocations::hand_back(&mut builder, &part);
                         let (relation_part, column_part) =
                             crate::impls::split_by_column_scope(part);
                         if let Some(part) = relation_part {
@@ -9417,8 +9432,8 @@ impl ParserDB {
                         )?;
                         continue;
                     }
-                    // A revoke naming no recorded grant is a no-op, as it is in
-                    // the database.
+                    // A revoke naming no recorded grant takes nothing, as in
+                    // the database, and is still kept as a revocation.
                     if access_resolution == AccessResolution::ClosedWorld {
                         validate_access_targets_against_builder(
                             &builder,
@@ -9471,6 +9486,7 @@ impl ParserDB {
                                 reason: reason.to_string(),
                             });
                         }
+                        revocations::record(&mut builder, &part);
                     }
                     table_owner::revoke(&mut builder, &revoke);
                 }

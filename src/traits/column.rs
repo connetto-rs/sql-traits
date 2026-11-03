@@ -5,7 +5,7 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use crate::{
     errors::LookupError,
-    structs::TargetName,
+    structs::{RevokedPrivilege, TargetName},
     traits::{
         CheckConstraintLike, DataTypeLike, DatabaseLike, ForeignKeyLike, IndexLike, Metadata,
         TableLike, check_constraint::non_tautological,
@@ -291,6 +291,50 @@ pub trait ColumnLike:
     /// # }
     /// ```
     fn column_doc<'db>(&'db self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError>
+    where
+        Self: 'db;
+
+    /// Iterates over the privileges a `REVOKE` took on this column from a
+    /// grantee and no later `GRANT` on this column handed back.
+    ///
+    /// A table-level `REVOKE` is read with
+    /// [`TableLike::revoked_privileges`], and a table-level `GRANT` hands
+    /// back none of the revocations on a column.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table this column belongs to.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE app_user;
+    /// CREATE TABLE profiles (id TEXT, is_admin BOOL);
+    /// REVOKE SELECT (is_admin), UPDATE (is_admin) ON profiles FROM app_user;
+    /// GRANT SELECT ON profiles TO app_user;
+    /// ",
+    /// )?;
+    /// let profiles =
+    ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let is_admin = profiles.column("is_admin", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// let revoked: Vec<String> =
+    ///     is_admin.revoked_privileges(&db)?.map(|revoked| revoked.privilege().to_string()).collect();
+    /// assert_eq!(revoked, ["SELECT", "UPDATE"]);
+    /// assert_eq!(profiles.revoked_privileges(&db)?.count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn revoked_privileges<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError>
     where
         Self: 'db;
 
@@ -1581,6 +1625,17 @@ where
     }
 
     #[inline]
+    fn revoked_privileges<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError>
+    where
+        Self: 'db,
+    {
+        (*self).revoked_privileges(database)
+    }
+
+    #[inline]
     fn data_type<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -1658,6 +1713,17 @@ where
         Self: 'db,
     {
         (**self).column_doc(database)
+    }
+
+    #[inline]
+    fn revoked_privileges<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError>
+    where
+        Self: 'db,
+    {
+        (**self).revoked_privileges(database)
     }
 
     #[inline]
