@@ -1044,8 +1044,8 @@ pub trait CheckConstraintLike:
     /// - `CHECK (1 = 0)` - unequal constant comparisons
     /// - `CHECK (NOT TRUE)` - negated true
     /// - `CHECK (column IS NULL)` for `NOT NULL` columns
-    /// - `CHECK (len(col) < X AND len(col) > Y)` where X <= Y (contradictory
-    ///   length constraints)
+    /// - `CHECK (len(col) < X AND len(col) > Y)` on one column where X <= Y,
+    ///   since length limits on different columns are not a contradiction
     ///
     /// # Errors
     ///
@@ -1098,14 +1098,36 @@ pub trait CheckConstraintLike:
             return Ok(true);
         }
 
-        // Check for contradicting length constraints
-        if let (Some(upper), Some(lower)) = (
-            self.is_upper_bounded_text_constraint(database)?,
-            self.is_lower_bounded_text_constraint(database)?,
-        ) {
-            // upper is exclusive upper bound, lower is inclusive lower bound
-            // if lower >= upper, then impossible
-            if lower >= upper {
+        // A contradiction between length limits is a negation only when both
+        // bounds belong to one column, since the lengths of different
+        // columns are unrelated.
+        let expression = self.expression(database);
+        for column in self.columns(database)? {
+            let name = column.column_name();
+            let mut visited_cols = Vec::new();
+            let upper = check_text_length_bound_recursive(
+                database,
+                expression,
+                self,
+                Some(name),
+                &mut visited_cols,
+                BoundDirection::Upper,
+            )?;
+            let Some(upper) = upper else {
+                continue;
+            };
+            let mut visited_cols = Vec::new();
+            let lower = check_text_length_bound_recursive(
+                database,
+                expression,
+                self,
+                Some(name),
+                &mut visited_cols,
+                BoundDirection::Lower,
+            )?;
+            // upper is the exclusive upper bound and lower the inclusive
+            // lower bound, so lower >= upper leaves no accepted length
+            if lower.is_some_and(|lower| lower >= upper) {
                 return Ok(true);
             }
         }

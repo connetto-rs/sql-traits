@@ -66,6 +66,7 @@ mod key_ordinal_cost;
 mod keyword_grantees;
 mod leading_comment_documentation;
 mod names_outside_this_catalog;
+mod negated_length_checks;
 mod object_kind_reporting;
 mod open_world_access;
 mod ordered_index_columns;
