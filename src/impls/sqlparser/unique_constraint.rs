@@ -1,7 +1,9 @@
 //! Implement the [`UniqueConstraint`] trait for the `sqlparser` crate's
 //! [`TableAttribute`] wrapper.
 
-use sqlparser::ast::{ColumnDef, CreateTable, Expr, IndexType, UniqueConstraint};
+use sqlparser::ast::{
+    ColumnDef, CreateTable, Expr, IndexType, NullsDistinctOption, UniqueConstraint,
+};
 
 use super::index_clauses::{included_columns, written_access_method};
 use crate::{
@@ -103,5 +105,10 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     {
         self.metadata(database)?;
         included_columns(&self.attribute().include, self.table(), database)
+    }
+
+    #[inline]
+    fn nulls_distinct(&self) -> bool {
+        self.attribute().nulls_distinct != NullsDistinctOption::NotDistinct
     }
 }

@@ -347,4 +347,39 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     fn predicate(&self) -> Option<&Expr> {
         None
     }
+
+    /// Returns whether the index treats null values as distinct from one
+    /// another, so that a unique index admits any number of rows holding
+    /// `NULL` in its key.
+    ///
+    /// `NULLS NOT DISTINCT`, which PostgreSQL accepts from version 15, answers
+    /// `false`, and any other index answers `true`, as
+    /// `pg_index.indnullsnotdistinct` records it. A primary key cannot write
+    /// the clause and answers `true`, which never matters because its columns
+    /// are `NOT NULL`.
+    ///
+    /// Defaults to `true`, which is what every index not spelling
+    /// `NULLS NOT DISTINCT` means.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (email text, phone text);
+    ///      CREATE UNIQUE INDEX users_email ON users (email) NULLS NOT DISTINCT;
+    ///      CREATE UNIQUE INDEX users_phone ON users (phone);",
+    /// )?;
+    /// let distinct: Vec<_> = db.indexes().map(|index| index.nulls_distinct()).collect();
+    /// assert_eq!(distinct, [false, true]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn nulls_distinct(&self) -> bool {
+        true
+    }
 }

@@ -1,5 +1,6 @@
 //! Tests that an index reports the uniqueness, the access method, the
-//! `INCLUDE` columns and the partial-index predicate its statement wrote.
+//! `INCLUDE` columns, the partial-index predicate and the `NULLS [NOT]
+//! DISTINCT` clause its statement wrote.
 #![allow(clippy::expect_used)]
 
 use sql_traits::prelude::*;
@@ -117,6 +118,47 @@ fn a_key_constraint_reports_the_method_it_wrote() {
     assert_eq!(unique_index(&database, "before").access_method(), Some(&IndexType::Hash));
     assert_eq!(unique_index(&database, "after").access_method(), Some(&IndexType::BTree));
     assert_eq!(unique_index(&database, "unwritten").access_method(), None);
+}
+
+/// PostgreSQL keeps the clause on every index, a non-unique one included, and
+/// treats nulls as distinct unless `NULLS NOT DISTINCT` was written.
+#[test]
+fn an_index_reports_whether_it_treats_nulls_as_distinct() {
+    let database = build(
+        &PostgreSqlDialect {},
+        "CREATE TABLE t (id INT, a INT);
+         CREATE UNIQUE INDEX unwritten ON t (a);
+         CREATE UNIQUE INDEX distinct_nulls ON t (a) NULLS DISTINCT;
+         CREATE UNIQUE INDEX one_null ON t (a) NULLS NOT DISTINCT;
+         CREATE INDEX plain ON t (a) NULLS NOT DISTINCT;",
+    );
+    assert!(index(&database, "unwritten").nulls_distinct());
+    assert!(index(&database, "distinct_nulls").nulls_distinct());
+    assert!(!index(&database, "one_null").nulls_distinct());
+    assert!(!index(&database, "plain").nulls_distinct());
+}
+
+/// A unique constraint reads the clause from wherever it was written, on the
+/// column, among the table constraints or in a later `ALTER TABLE`. A primary
+/// key cannot write it and treats nulls as distinct, as `pg_index` records.
+#[test]
+fn a_key_constraint_reports_whether_it_treats_nulls_as_distinct() {
+    let database = build(
+        &PostgreSqlDialect {},
+        "CREATE TABLE t (id INT CONSTRAINT pk PRIMARY KEY,
+             a INT CONSTRAINT on_column UNIQUE NULLS NOT DISTINCT,
+             b INT, c INT, d INT,
+             CONSTRAINT unwritten UNIQUE (b),
+             CONSTRAINT distinct_nulls UNIQUE NULLS DISTINCT (c),
+             CONSTRAINT on_table UNIQUE NULLS NOT DISTINCT (b, c));
+         ALTER TABLE t ADD CONSTRAINT altered UNIQUE NULLS NOT DISTINCT (d);",
+    );
+    assert!(unique_index(&database, "pk").nulls_distinct());
+    assert!(!unique_index(&database, "on_column").nulls_distinct());
+    assert!(unique_index(&database, "unwritten").nulls_distinct());
+    assert!(unique_index(&database, "distinct_nulls").nulls_distinct());
+    assert!(!unique_index(&database, "on_table").nulls_distinct());
+    assert!(!unique_index(&database, "altered").nulls_distinct());
 }
 
 /// The `INCLUDE` list resolves to the table's columns in the order it was
