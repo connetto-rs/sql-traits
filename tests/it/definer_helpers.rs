@@ -497,6 +497,14 @@ fn a_set_covers_the_one_table_whose_primary_key_every_arm_returns() {
              CREATE TABLE slug_members (slug TEXT REFERENCES slugs (slug), user_id TEXT, role TEXT);
              GRANT SELECT ON slugs, slug_members TO owner;",
         ),
+        (
+            "SELECT code FROM code_members \
+             WHERE user_id = current_setting('app.user_id', true) AND role = min_role"
+                .to_string(),
+            "CREATE TABLE codes (code TEXT UNIQUE);
+             CREATE TABLE code_members (code TEXT REFERENCES codes (code), user_id TEXT, role TEXT);
+             GRANT SELECT ON codes, code_members TO owner;",
+        ),
     ] {
         let database = postgres(&helper(DEFINER, &body, after));
         let set = answer(&database, &deployment, "public", "docs_with", &[text("read")])
