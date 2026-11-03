@@ -163,17 +163,29 @@ fn a_grant_keeps_its_table_across_a_later_path_change() {
     assert_eq!(db.unresolved_access_references().expect("targets are well formed").count(), 0);
 }
 
+/// The revoke matches no grant and names a role the input never creates, so it
+/// takes nothing, and the revocation it leaves opens nothing that could dangle.
 #[test]
-fn open_world_ignores_a_revoke_matching_no_recorded_grant() {
+fn open_world_keeps_a_revoke_matching_no_recorded_grant_as_a_revocation() {
     let db = open_world()
         .parse::<PostgreSqlDialect>(
             "CREATE TABLE docs (id uuid PRIMARY KEY);
              REVOKE SELECT ON docs FROM app;",
         )
         .expect("schema parses");
+    let docs = db
+        .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the table exists");
+    let revoked: Vec<String> = docs
+        .revoked_privileges(&db)
+        .expect("the table is in the database")
+        .map(|revoked| format!("{} FROM {}", revoked.privilege(), revoked.grantee()))
+        .collect();
 
     assert_eq!(db.table_grants().count(), 0);
-    assert!(db.validate_access_targets().is_ok(), "a dropped revoke leaves nothing unresolved");
+    assert_eq!(revoked, ["SELECT FROM app"]);
+    assert!(db.validate_access_targets().is_ok(), "a revocation leaves nothing unresolved");
 }
 
 /// `pg_dump` emits this for every function whose default execute privilege

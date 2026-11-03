@@ -36,6 +36,7 @@ mod dropped_column_readers;
 mod dropped_policies;
 mod duplicate_object_names;
 mod exhaustive_alter_table;
+mod explicit_revokes;
 mod expression_truth;
 mod extensions;
 mod foreign_tables;

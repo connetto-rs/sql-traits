@@ -96,6 +96,10 @@ fn a_column_reports_its_absent_table() {
         .expect("anon declares name");
 
     assert_eq!(column.column_doc(&other).err(), Some(ObjectKind::Table.not_in_database("anon")));
+    assert_eq!(
+        column.revoked_privileges(&other).err(),
+        Some(ObjectKind::Table.not_in_database("anon"))
+    );
 }
 
 #[test]

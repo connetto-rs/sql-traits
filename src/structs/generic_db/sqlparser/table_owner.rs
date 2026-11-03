@@ -8,8 +8,11 @@ use sqlparser::ast::{
     Owner, Revoke,
 };
 
-use super::{ParserDBBuilder, StoredTable, grantee_role_ident, stored_role_name};
-use crate::impls::{grantees_match, schema_matches_table};
+use super::{ParserDBBuilder, StoredTable, grantee_role_ident, rename_grantee, stored_role_name};
+use crate::{
+    impls::{grantees_match, schema_matches_table},
+    structs::RevokedPrivilege,
+};
 
 /// Takes the privileges `revoke` names from the owner's entry on each table it
 /// reaches that one of its grantees owns.
@@ -67,6 +70,27 @@ pub(super) fn change_owner(
     let handover = Handover { table: &table, previous, next: owner_ident(next) };
     handover.apply(builder.table_grants_mut());
     handover.apply(builder.column_grants_mut());
+}
+
+/// Hands every revocation on a table naming its old owner `previous`, as
+/// grantee or grantor, to `next`.
+pub(super) fn hand_over_revocations(
+    revocations: &mut Vec<RevokedPrivilege>,
+    previous: &str,
+    next: &Owner,
+) {
+    let next = owner_ident(next);
+    let next_name = stored_role_name(&next);
+    for revoked in revocations.iter_mut() {
+        if names_role(revoked.grantee(), previous) {
+            rename_grantee(revoked.grantee_mut(), &next);
+        }
+        let granted_by = revoked.granted_by_mut();
+        if granted_by.as_deref() == Some(previous) {
+            *granted_by = Some(next_name.clone());
+        }
+    }
+    super::revocations::deduplicate(revocations);
 }
 
 /// One owner change of one table.

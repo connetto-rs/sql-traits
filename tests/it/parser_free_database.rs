@@ -598,6 +598,14 @@ impl TableLike for MemoryTable {
     ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
         Ok(core::iter::empty())
     }
+
+    /// This catalog records no `REVOKE`.
+    fn revoked_privileges<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError> {
+        Ok(core::iter::empty())
+    }
 }
 
 impl ColumnLike for MemoryColumn {
@@ -616,6 +624,17 @@ impl ColumnLike for MemoryColumn {
         Self: 'db,
     {
         Ok(None)
+    }
+
+    /// This catalog records no `REVOKE`.
+    fn revoked_privileges<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(core::iter::empty())
     }
 
     fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db MemoryDataType {

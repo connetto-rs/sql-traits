@@ -14,6 +14,7 @@ mod function_kind;
 mod identifier_case;
 mod identity;
 pub mod metadata;
+mod revoked_privilege;
 mod role_membership;
 mod row_security;
 mod schema;
@@ -36,6 +37,7 @@ pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
+pub use revoked_privilege::RevokedPrivilege;
 pub use role_membership::RoleMembership;
 pub use row_security::{
     ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,

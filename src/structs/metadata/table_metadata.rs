@@ -6,7 +6,7 @@ use sqlparser::ast::{Action, Privileges};
 
 use crate::{
     impls::PrivilegeKind,
-    structs::ForeignTableSource,
+    structs::{ForeignTableSource, RevokedPrivilege},
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 
@@ -61,6 +61,9 @@ pub struct TableMetadata<T: TableLike> {
     /// Mirrors the owner's item in `pg_class.relacl`, which starts with every
     /// table privilege and loses the ones a `REVOKE` naming the owner takes.
     owner_privileges: Vec<Action>,
+    /// The privileges a `REVOKE` took on the table or one of its columns and
+    /// no later `GRANT` at that level handed back, in the order revoked.
+    revoked_privileges: Vec<RevokedPrivilege>,
     /// The comment block written above the table.
     documentation: Option<String>,
     /// The server and options a foreign table reads its rows through, absent
@@ -85,6 +88,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             owner: None,
             // The owner holds every privilege on the table it creates.
             owner_privileges: PrivilegeKind::Relation.all_privileges(),
+            revoked_privileges: Vec::new(),
             documentation: None,
             foreign_source: None,
         }
@@ -177,6 +181,33 @@ impl<T: TableLike> TableMetadata<T> {
                 });
             }
         }
+    }
+
+    /// Returns the table-level privileges a `REVOKE` took and no later
+    /// table-level `GRANT` handed back, in the order revoked.
+    pub fn revoked_privileges(&self) -> impl Iterator<Item = &RevokedPrivilege> {
+        self.revoked_privileges.iter().filter(|revoked| revoked.column().is_none())
+    }
+
+    /// Every revocation on the table and its columns.
+    pub(crate) fn revocations(&self) -> &[RevokedPrivilege] {
+        &self.revoked_privileges
+    }
+
+    /// Every revocation on the table and its columns, for a statement to
+    /// change.
+    pub(crate) fn revocations_mut(&mut self) -> &mut Vec<RevokedPrivilege> {
+        &mut self.revoked_privileges
+    }
+
+    /// Takes every revocation, for a rebuilt table to carry it over.
+    pub(crate) fn take_revocations(&mut self) -> Vec<RevokedPrivilege> {
+        core::mem::take(&mut self.revoked_privileges)
+    }
+
+    /// Replaces every revocation.
+    pub(crate) fn set_revocations(&mut self, revocations: Vec<RevokedPrivilege>) {
+        self.revoked_privileges = revocations;
     }
 
     /// Returns an iterator over the references of columns of the table.
