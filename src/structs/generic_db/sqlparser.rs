@@ -7280,6 +7280,15 @@ impl ParserDB {
             }
             .into());
         }
+        // Only the parent renames a column it passes down, for every table
+        // below it at once, so PostgreSQL refuses the rename here even under
+        // `ONLY` and for a column the child also declares.
+        if inheritance::is_inherited_column(&builder, node, old_column_name) {
+            return Err(crate::errors::Error::InheritedColumnNotRenamable {
+                table_name: stored.name.clone(),
+                column_name: from.name.clone(),
+            });
+        }
         if !from.matches(new_column_name) && to.declared_by(node) {
             return Err(crate::errors::Error::ColumnAlreadyExists {
                 table_name: stored.name.clone(),

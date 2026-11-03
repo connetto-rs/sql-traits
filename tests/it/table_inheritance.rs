@@ -754,6 +754,39 @@ fn a_renamed_inherited_column_is_still_the_parents() {
 }
 
 #[test]
+fn a_child_cannot_rename_a_column_it_inherits() {
+    // Measured on PostgreSQL 17 and 18: "cannot rename inherited column", with
+    // or without `ONLY`, for a column the child redeclares and merges, for a
+    // column of a second parent, and for a partition's column. A column the
+    // child adds itself renames freely.
+    let schema = "CREATE TABLE parent (id INT, note TEXT);
+         CREATE TABLE other (a INT);
+         CREATE TABLE child (extra INT) INHERITS (parent);
+         CREATE TABLE merged (note TEXT, a INT) INHERITS (parent, other);
+         CREATE TABLE orders (id INT, note TEXT) PARTITION BY RANGE (id);
+         CREATE TABLE part PARTITION OF orders FOR VALUES FROM (0) TO (10);";
+    for (statement, table, column) in [
+        ("ALTER TABLE child RENAME COLUMN note TO n;", "child", "note"),
+        ("ALTER TABLE ONLY child RENAME COLUMN note TO n;", "child", "note"),
+        ("ALTER TABLE merged RENAME COLUMN note TO n;", "merged", "note"),
+        ("ALTER TABLE merged RENAME COLUMN a TO b;", "merged", "a"),
+        ("ALTER TABLE part RENAME COLUMN note TO n;", "part", "note"),
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::InheritedColumnNotRenamable { table_name, column_name }
+                    if table_name == table && column_name == column
+            ),
+            "{statement}: {error:?}"
+        );
+    }
+    let renamed = database(&format!("{schema} ALTER TABLE child RENAME COLUMN extra TO e;"));
+    assert_eq!(column_names(&renamed, "child"), ["id", "note", "e"]);
+}
+
+#[test]
 fn types_that_differ_only_in_width_or_precision_are_a_conflict() {
     // Each pair names two different PostgreSQL types, so redeclaring is
     // refused rather than merged.
