@@ -10,14 +10,14 @@ use alloc::{
 
 use sqlparser::ast::{
     ArgMode, BinaryOperator, CreateFunction, CreateRole, DataType, Distinct, Expr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, FunctionBehavior, FunctionReturnType,
-    FunctionSecurity, GroupByExpr, Ident, InTarget, Query, Select, SelectFlavor, SelectItem,
-    SetExpr, SetOperator, Statement, TableFactor, Value,
+    FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior,
+    FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, InTarget, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, SetOperator, Statement, TableFactor, Value,
 };
 
 use super::create_function::{SqlBody, sql_body};
 use crate::{
-    errors::{HelperSetError, LookupError, RowSecurityError},
+    errors::{HelperSetError, LookupError},
     structs::{
         Deployment, GrantArm, HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm,
         ParserDB, RowSecurity, RowStatement, SessionSetting, SettingContent, SettingValue,
@@ -186,8 +186,7 @@ impl<'db> ArmTable<'_, 'db> {
         expression: &Expr,
         database: &'db ParserDB,
     ) -> Result<Option<&'db Column>, LookupError> {
-        let ident = match expression {
-            Expr::Nested(inner) => return self.column(inner, database),
+        let ident = match unnest(expression) {
             Expr::Identifier(ident) => ident,
             Expr::CompoundIdentifier(parts) => {
                 let [qualifier, ident] = parts.as_slice() else { return Ok(None) };
@@ -259,10 +258,10 @@ impl<'db> Kept<'db> {
 }
 
 /// One side of a comparison in a grant arm.
-enum Operand<'q, 'db> {
+enum Operand<'db> {
     Column(&'db Column),
     Passed(Passed),
-    Setting { name: &'q str, raises_when_unset: bool },
+    Setting { name: String, raises_when_unset: bool },
     Other,
 }
 
@@ -318,22 +317,12 @@ impl<'db> Reader<'db> {
         };
         let scope = Scope { function, name, path, parameters, owner };
 
+        // A body bound at creation resolves its names with no path, so it is
+        // not read as one written to run under the pinned path.
         let body = sql_body(function, database)?;
-        let statements = match &body {
-            SqlBody::Statements(statements) => statements.as_ref(),
-            // A body bound at creation resolves its names with no path, so
-            // it is not read as one written to run under the pinned path.
-            SqlBody::Atomic(statements) => return Err(scope.arm_shape(&render_all(statements))),
-            SqlBody::Return(expression) | SqlBody::Expression(expression) => {
-                return Err(scope.arm_shape(expression));
-            }
-            SqlBody::Select(select) => return Err(scope.arm_shape(select)),
-            SqlBody::PlPgSql(_) => {
-                return Err(scope.arm_shape(&function.body().unwrap_or_default()));
-            }
-        };
-        let [Statement::Query(query)] = statements else {
-            return Err(scope.arm_shape(&render_all(statements)));
+        let SqlBody::Statements(statements) = &body else { return Err(scope.arm_shape(function)) };
+        let [Statement::Query(query)] = statements.as_ref() else {
+            return Err(scope.arm_shape(function));
         };
         let mut selects = Vec::new();
         union_arms(query, &mut selects).map_err(|arm| scope.arm_shape(&arm))?;
@@ -435,14 +424,15 @@ impl<'db> Reader<'db> {
                 HelperSetError::MissingSelect { function, owner, table }
             }));
         }
-        match table.row_security(RowStatement::Select, scope.owner, database) {
-            Ok(RowSecurity::Exempt(_)) => {}
-            Err(RowSecurityError::Lookup(error)) => return Err(error.into()),
-            Ok(_) | Err(_) => {
-                return Err(refuse(|function, owner, table| {
-                    HelperSetError::NotExempt { function, owner, table }
-                }));
-            }
+        // `Lookup` is not met for a table the database resolved itself, and
+        // every other answer leaves the owner bound by some policy.
+        if !matches!(
+            table.row_security(RowStatement::Select, scope.owner, database),
+            Ok(RowSecurity::Exempt(_))
+        ) {
+            return Err(refuse(|function, owner, table| {
+                HelperSetError::NotExempt { function, owner, table }
+            }));
         }
         let qualifier = match alias {
             Some(alias) => Cow::Borrowed(&alias.name),
@@ -483,20 +473,18 @@ impl<'db> Reader<'db> {
         }
         let [foreign_key] = foreign_keys.as_slice() else { return Err(shape()) };
         let call = called_helper(subquery).ok_or_else(shape)?;
-        let FunctionArguments::List(list) = &call.args else { return Err(shape()) };
+        let list = plain_arguments(call).ok_or_else(shape)?;
         let mut arguments = Vec::new();
         for argument in &list.args {
             let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else {
                 return Err(shape());
             };
-            let passed = match argument {
-                Expr::Value(value) => {
-                    Literal::of(&value.value)
-                        .map(|literal| Passed { literal, value: value.value.clone() })
-                }
-                parameter => scope.parameter(parameter).map(|(passed, _)| passed.clone()),
+            let passed = scope.parameter(argument).map(|(passed, _)| passed.value.clone());
+            let literal = || {
+                let Expr::Value(value) = argument else { return None };
+                Literal::of(&value.value).map(|_| value.value.clone())
             };
-            arguments.push(passed.ok_or_else(shape)?.value);
+            arguments.push(passed.or_else(literal).ok_or_else(shape)?);
         }
         let callee = self.called(scope, call, arguments.len())?;
         if !scope.owner.is_superuser() && !callee.can_execute(scope.owner, database)? {
@@ -627,10 +615,10 @@ impl<'db> Reader<'db> {
         else {
             return Ok(None);
         };
-        let Some(setting) = self.deployment.setting(name) else {
+        let Some(setting) = self.deployment.setting(&name) else {
             return Err(HelperSetError::UndeclaredSetting {
                 function: scope.name.clone(),
-                setting: name.to_string(),
+                setting: name,
             });
         };
         if !matches!(setting.content(), SettingContent::Value(SettingValue::Caller(_))) {
@@ -642,12 +630,12 @@ impl<'db> Reader<'db> {
         Ok(Some(Caller { column, setting, raises_when_unset }))
     }
 
-    fn operand<'q>(
+    fn operand(
         &self,
         scope: &Scope<'_, 'db>,
         table: &ArmTable<'_, 'db>,
-        expression: &'q Expr,
-    ) -> Result<Operand<'q, 'db>, HelperSetError> {
+        expression: &Expr,
+    ) -> Result<Operand<'db>, HelperSetError> {
         let expression = unnest(expression);
         if let Some(column) = table.column(expression, self.database)? {
             return Ok(Operand::Column(column));
@@ -668,33 +656,19 @@ impl<'db> Reader<'db> {
 
     /// `current_setting('<name>'[, <missing_ok>])`, resolved to PostgreSQL's
     /// own function.
-    fn setting_read<'q>(
-        &self,
-        scope: &Scope<'_, 'db>,
-        call: &'q Function,
-    ) -> Option<Operand<'q, 'db>> {
-        let (name, quoted) = object_name_last_part(&call.name)?;
+    fn setting_read(&self, scope: &Scope<'_, 'db>, call: &Function) -> Option<Operand<'db>> {
+        // A qualifier built when the statement runs names no schema.
         let catalog = match qualifier_of(&call.name) {
-            Qualifier::Absent => true,
-            Qualifier::Named(schema, schema_quoted) => {
-                identifiers_match(schema, schema_quoted, "pg_catalog", false)
+            Qualifier::Named(schema, quoted) => {
+                identifiers_match(schema, quoted, "pg_catalog", false)
             }
-            Qualifier::RunTime => false,
+            qualifier => qualifier == Qualifier::Absent,
         };
-        if !catalog
-            || !identifiers_match(name, quoted, "current_setting", false)
-            || call.filter.is_some()
-            || call.over.is_some()
-            || call.null_treatment.is_some()
-            || !call.within_group.is_empty()
-            || !matches!(call.parameters, FunctionArguments::None)
-        {
+        let (name, quoted) = object_name_last_part(&call.name)?;
+        if !catalog || !identifiers_match(name, quoted, "current_setting", false) {
             return None;
         }
-        let FunctionArguments::List(list) = &call.args else { return None };
-        if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
-            return None;
-        }
+        let list = plain_arguments(call)?;
         // PostgreSQL's own `current_setting` is in `pg_catalog`, and an
         // overload declared elsewhere that the call may reach is refused.
         let path = || scope.path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
@@ -710,26 +684,15 @@ impl<'db> Reader<'db> {
             };
             Literal::of(&value.value)
         };
-        let raises_when_unset = match list.args.as_slice() {
-            [_] => true,
-            [_, missing_ok] => {
-                match literal(missing_ok)? {
-                    Literal::Boolean(missing_ok) => !missing_ok,
-                    _ => return None,
-                }
+        let (name, raises_when_unset) = match list.args.as_slice() {
+            [name] => (literal(name)?, true),
+            [name, missing_ok] => {
+                let Literal::Boolean(missing_ok) = literal(missing_ok)? else { return None };
+                (literal(name)?, !missing_ok)
             }
             _ => return None,
         };
-        let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(name))) = list.args.first()?
-        else {
-            return None;
-        };
-        let (Value::SingleQuotedString(name)
-        | Value::DollarQuotedString(sqlparser::ast::DollarQuotedString { value: name, .. })) =
-            &name.value
-        else {
-            return None;
-        };
+        let Literal::Text(name) = name else { return None };
         Some(Operand::Setting { name, raises_when_unset })
     }
 
@@ -782,16 +745,15 @@ impl<'db> Reader<'db> {
                 }
                 match self.operand(scope, table, expr)? {
                     Operand::Column(column) => {
-                        let mut kept = Kept::Nothing;
-                        for passed in
-                            values.into_iter().filter(|passed| passed.literal != Literal::Null)
-                        {
-                            let Some(next) = kept.or(Kept::In(column, vec![passed])) else {
-                                return Ok(None);
-                            };
-                            kept = next;
+                        let mut kept: Vec<Passed> = Vec::new();
+                        for passed in values {
+                            if passed.literal != Literal::Null
+                                && !kept.iter().any(|seen| seen.literal == passed.literal)
+                            {
+                                kept.push(passed);
+                            }
                         }
-                        Ok(Some(kept))
+                        Ok(Some(Kept::values(column, kept)))
                     }
                     Operand::Passed(passed) => {
                         let mut found = Equality::Fails;
@@ -860,15 +822,9 @@ fn parameters<'f>(
 
 /// Whether a `SETOF` type is a row rather than one scalar.
 fn is_row(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Table(_) | DataType::NamedTable { .. } => true,
-        DataType::Custom(name, modifiers) => {
-            modifiers.is_empty()
-                && object_name_last_part(name)
-                    .is_some_and(|(name, quoted)| identifiers_match(name, quoted, "record", false))
-        }
-        _ => false,
-    }
+    matches!(data_type, DataType::Custom(name, modifiers) if modifiers.is_empty()
+        && object_name_last_part(name)
+            .is_some_and(|(name, quoted)| identifiers_match(name, quoted, "record", false)))
 }
 
 /// Collects the `SELECT`s of a `UNION`, rendering the query that is not one
@@ -933,29 +889,28 @@ fn plain_select(select: &Select) -> bool {
 /// The helper call of `(SELECT <helper>(<arguments>))`.
 fn called_helper(query: &Query) -> Option<&Function> {
     let SetExpr::Select(select) = query.body.as_ref() else { return None };
-    if !plain_query(query)
-        || !plain_select(select)
-        || !select.from.is_empty()
-        || select.selection.is_some()
-    {
-        return None;
-    }
     let [SelectItem::UnnamedExpr(Expr::Function(call))] = select.projection.as_slice() else {
         return None;
     };
-    let plain_call = call.filter.is_none()
+    (plain_query(query)
+        && plain_select(select)
+        && select.from.is_empty()
+        && select.selection.is_none())
+    .then_some(call)
+}
+
+/// The arguments of `call`, where it is a plain call writing nothing but its
+/// argument list.
+fn plain_arguments(call: &Function) -> Option<&FunctionArgumentList> {
+    let FunctionArguments::List(list) = &call.args else { return None };
+    let plain = call.filter.is_none()
         && call.over.is_none()
         && call.null_treatment.is_none()
         && call.within_group.is_empty()
         && matches!(call.parameters, FunctionArguments::None)
-        && matches!(&call.args, FunctionArguments::List(list) if list.duplicate_treatment.is_none() && list.clauses.is_empty());
-    plain_call.then_some(call)
-}
-
-/// Statements as written, joined by `; `.
-fn render_all(statements: &[Statement]) -> String {
-    let written: Vec<String> = statements.iter().map(ToString::to_string).collect();
-    written.join("; ")
+        && list.duplicate_treatment.is_none()
+        && list.clauses.is_empty();
+    plain.then_some(list)
 }
 
 /// `expression` without the parentheses around it.

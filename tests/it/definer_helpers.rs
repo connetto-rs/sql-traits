@@ -712,3 +712,314 @@ fn a_helper_reaching_itself_refuses_the_answer() {
         HelperSetError::CallCycle { function } if function == "docs_with"
     ));
 }
+
+/// The helper `docs_with(<parameters>)` over the fixture of [`helper`], its
+/// body `body`.
+fn helper_taking(parameters: &str, types: &str, body: &str, after: &str) -> String {
+    helper(DEFINER, body, after)
+        .replace("docs_with(min_role TEXT)", &format!("docs_with({parameters})"))
+        .replace("docs_with(TEXT)", &format!("docs_with({types})"))
+}
+
+/// What `docs_with` answers for `arguments`, rendered, with `condition`
+/// filtering the grant arm after the caller.
+fn kept(
+    parameters: &str,
+    types: &str,
+    condition: &str,
+    arguments: &[Value],
+) -> Result<String, HelperSetError> {
+    let body = format!(
+        "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) AND ({condition})"
+    );
+    let database = postgres(&helper_taking(parameters, types, &body, ""));
+    let deployment = deployment();
+    answer(&database, &deployment, "public", "docs_with", arguments).map(|set| render(&set))
+}
+
+const ROLES: &str = "members.doc_id WHERE user_id = app.user_id";
+
+fn number(value: &str) -> Value {
+    Value::Number(value.to_string(), false)
+}
+
+#[test]
+fn an_in_list_keeps_the_literals_it_lists_and_decides_one_over_parameters() {
+    let text_kept =
+        |condition: &str, argument: Value| kept("min_role TEXT", "TEXT", condition, &[argument]);
+    assert_eq!(
+        text_kept("role IN ('admin', min_role)", text("write")).expect("answered"),
+        format!("{ROLES} AND role IN ('admin', 'write')")
+    );
+    assert_eq!(
+        text_kept("role IN ('admin', NULL, min_role)", Value::Null).expect("answered"),
+        format!("{ROLES} AND role IN ('admin')"),
+        "a NULL in the list matches no row"
+    );
+    assert_eq!(
+        text_kept("(role = 'admin' OR role IN ('admin', min_role))", text("admin"))
+            .expect("answered"),
+        format!("{ROLES} AND role IN ('admin')"),
+        "a value the union already holds is kept once"
+    );
+    let parenthesised = helper(DEFINER, &GRANT_ARM.replace("SELECT doc_id", "SELECT (doc_id)"), "");
+    let database = postgres(&parenthesised);
+    let deployment = deployment();
+    let set =
+        answer(&database, &deployment, "public", "docs_with", &[text("read")]).expect("answered");
+    assert_eq!(render(&set), format!("{ROLES} AND role IN ('read')"));
+    assert_eq!(text_kept("min_role IN ('read', 'write')", text("read")).expect("answered"), ROLES);
+    assert_eq!(text_kept("min_role IN ('read', 'write')", text("admin")).expect("answered"), "");
+    assert_eq!(text_kept("min_role IN ('read', NULL)", text("admin")).expect("answered"), "");
+    assert_eq!(text_kept("min_role IN ('read')", Value::Null).expect("answered"), "");
+    for irreducible in [
+        "role IN ('admin', doc_id)",
+        "upper(role) IN ('ADMIN')",
+        "min_role IN (1, 2)",
+        "(role IN ('admin') OR doc_id IN ('d'))",
+    ] {
+        assert!(
+            matches!(text_kept(irreducible, text("read")), Err(HelperSetError::Irreducible { .. })),
+            "{irreducible}"
+        );
+    }
+}
+
+#[test]
+fn two_conditions_on_one_column_keep_the_values_both_allow() {
+    let both = |argument: &str| {
+        kept(
+            "min_role TEXT",
+            "TEXT",
+            "role IN ('admin', 'write') AND role = min_role",
+            &[text(argument)],
+        )
+    };
+    assert_eq!(both("write").expect("answered"), format!("{ROLES} AND role IN ('write')"));
+    assert_eq!(both("read").expect("answered"), "", "no value is allowed by both");
+    assert!(matches!(
+        kept("min_role TEXT", "TEXT", "role = min_role AND doc_id = 'd'", &[text("read")]),
+        Err(HelperSetError::Irreducible { .. })
+    ));
+}
+
+#[test]
+fn a_boolean_or_null_condition_keeps_every_row_or_none() {
+    let flag =
+        |condition: &str, argument: Value| kept("wide BOOLEAN", "BOOLEAN", condition, &[argument]);
+    assert_eq!(flag("wide", Value::Boolean(true)).expect("answered"), ROLES);
+    assert_eq!(flag("wide", Value::Boolean(false)).expect("answered"), "");
+    assert_eq!(flag("wide", Value::Null).expect("answered"), "");
+    assert_eq!(
+        flag("(wide = TRUE OR role = 'admin')", Value::Boolean(true)).expect("answered"),
+        ROLES
+    );
+    assert_eq!(flag("NULL", Value::Boolean(true)).expect("answered"), "");
+    for irreducible in ["role", "'yes'", "wide = 'yes'"] {
+        assert!(
+            matches!(
+                flag(irreducible, Value::Boolean(true)),
+                Err(HelperSetError::Irreducible { .. })
+            ),
+            "{irreducible}"
+        );
+    }
+}
+
+#[test]
+fn numbers_compare_as_integers_and_refuse_what_needs_a_type() {
+    let level =
+        |condition: &str, argument: &str| kept("level INT", "INT", condition, &[number(argument)]);
+    assert_eq!(level("level = 2", "2").expect("answered"), ROLES);
+    assert_eq!(level("level = 02", "2").expect("answered"), ROLES, "02 and 2 are one integer");
+    assert_eq!(level("level = 2", "3").expect("answered"), "");
+    for irreducible in ["level = 2.0", "level = '2'"] {
+        assert!(
+            matches!(level(irreducible, "2"), Err(HelperSetError::Irreducible { .. })),
+            "{irreducible}"
+        );
+    }
+}
+
+#[test]
+fn literals_columns_and_parameters_are_read_in_every_spelling() {
+    let text_kept = |condition: &str| kept("min_role TEXT", "TEXT", condition, &[text("write")]);
+    assert_eq!(
+        text_kept("role = $q$admin$q$").expect("answered"),
+        format!("{ROLES} AND role IN ($q$admin$q$)")
+    );
+    assert_eq!(
+        text_kept("role = docs_with.min_role").expect("answered"),
+        format!("{ROLES} AND role IN ('write')")
+    );
+    assert_eq!(
+        text_kept("(role) = (min_role)").expect("answered"),
+        format!("{ROLES} AND role IN ('write')")
+    );
+    assert_eq!(
+        kept("TEXT", "TEXT", "role = $1", &[text("write")]).expect("answered"),
+        format!("{ROLES} AND role IN ('write')")
+    );
+    for irreducible in [
+        "other.role = min_role",
+        "role = doc_id",
+        "(role = 'a' AND role LIKE 'b') OR role = 'c'",
+        "role LIKE 'b' OR role = 'c'",
+    ] {
+        assert!(
+            matches!(text_kept(irreducible), Err(HelperSetError::Irreducible { .. })),
+            "{irreducible}"
+        );
+    }
+}
+
+#[test]
+fn only_postgres_own_current_setting_with_a_literal_name_reads_the_caller() {
+    let caller = |read: &str, after: &str| {
+        let body = format!("SELECT doc_id FROM members WHERE user_id = {read}");
+        let database = postgres(&helper(DEFINER, &body, after));
+        let deployment = deployment();
+        answer(&database, &deployment, "public", "docs_with", &[text("read")])
+            .map(|set| render(&set))
+    };
+    assert_eq!(
+        caller("pg_catalog.current_setting('app.user_id', true)", "").expect("answered"),
+        ROLES
+    );
+    assert_eq!(caller("current_setting($s$app.user_id$s$)", "").expect("answered"), ROLES);
+    let shadow = "CREATE FUNCTION current_setting(name TEXT, missing BOOLEAN) RETURNS TEXT
+                  LANGUAGE sql AS $$ SELECT 'x' $$;";
+    for read in [
+        "other.current_setting('app.user_id', true)",
+        "current_setting('app.user_id', 'yes')",
+        "current_setting(min_role, true)",
+        "current_setting(1)",
+        "current_setting('app.user_id', true, true)",
+        "current_setting(DISTINCT 'app.user_id')",
+    ] {
+        assert!(matches!(caller(read, ""), Err(HelperSetError::ArmShape { .. })), "{read}");
+    }
+    assert!(
+        matches!(
+            caller("current_setting('app.user_id', true)", shadow),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "a declared current_setting the call may reach is not PostgreSQL's"
+    );
+    assert!(matches!(
+        caller(
+            "current_setting('app.user_id', true) AND doc_id = current_setting('app.user_id', true)",
+            ""
+        ),
+        Err(HelperSetError::ArmShape { .. })
+    ));
+    assert!(matches!(
+        caller("doc_id AND role = 'admin'", ""),
+        Err(HelperSetError::ArmShape { .. })
+    ));
+}
+
+#[test]
+fn a_body_or_arm_outside_the_two_shapes_refuses_the_answer() {
+    let shape = |sql: &str| matches!(refusal(sql), HelperSetError::ArmShape { .. });
+    let atomic = helper(DEFINER, GRANT_ARM, "")
+        .replace(&format!("AS $$ {GRANT_ARM} $$"), &format!("BEGIN ATOMIC {GRANT_ARM}; END"));
+    assert!(shape(&atomic), "a body bound at creation");
+    assert!(shape(&helper(DEFINER, &format!("{GRANT_ARM}; {GRANT_ARM}"), "")));
+    let view =
+        "CREATE VIEW member_view AS SELECT * FROM members; GRANT SELECT ON member_view TO owner;";
+    for body in [
+        format!("WITH g AS (SELECT 1) {GRANT_ARM}"),
+        GRANT_ARM.replace("SELECT doc_id", "SELECT *"),
+        GRANT_ARM.replace("SELECT doc_id", "SELECT 'd'"),
+        "SELECT doc_id FROM members WHERE role IN ('admin')".into(),
+        GRANT_ARM.replace("FROM members", "FROM ONLY members"),
+        GRANT_ARM.replace("FROM members", "FROM members AS m (a, b, c)"),
+        GRANT_ARM.replace("FROM members", "FROM member_view"),
+        "SELECT id FROM docs WHERE upper(parent_id) IN (SELECT docs_with(min_role))".into(),
+        "SELECT id FROM docs WHERE id IN (SELECT docs_with(min_role))".into(),
+        "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(min_role) FROM docs)".into(),
+        "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(min_role) AS x)".into(),
+        "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(DISTINCT min_role))".into(),
+        "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(min_role => min_role))".into(),
+        "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(upper(min_role)))".into(),
+    ] {
+        assert!(shape(&helper(DEFINER, &body, view)), "{body}");
+    }
+    let parenthesised = format!("({GRANT_ARM}) UNION ({GRANT_ARM})");
+    let database = postgres(&helper(DEFINER, &parenthesised, ""));
+    let deployment = deployment();
+    let set =
+        answer(&database, &deployment, "public", "docs_with", &[text("read")]).expect("answered");
+    assert_eq!(set.arms().len(), 2);
+}
+
+/// A tree of folders under teams, each folder's helper calling `teams_with`.
+fn folders(call: &str, after: &str) -> String {
+    format!(
+        "CREATE ROLE owner NOLOGIN BYPASSRLS;
+         CREATE TABLE teams (id TEXT PRIMARY KEY);
+         CREATE TABLE team_members (team_id TEXT REFERENCES teams (id), user_id TEXT, role TEXT);
+         CREATE TABLE folders (
+           id TEXT PRIMARY KEY,
+           parent_id TEXT REFERENCES folders (id),
+           team_id TEXT REFERENCES teams (id)
+         );
+         CREATE FUNCTION teams_with(min_role TEXT) RETURNS SETOF TEXT
+         {DEFINER} AS $$
+           SELECT team_id FROM team_members
+           WHERE user_id = current_setting('app.user_id', true) AND role = min_role
+         $$;
+         CREATE FUNCTION folders_with(TEXT) RETURNS SETOF TEXT
+         {DEFINER} AS $$ SELECT id FROM folders WHERE team_id IN (SELECT {call}) $$;
+         ALTER FUNCTION teams_with(TEXT) OWNER TO owner;
+         ALTER FUNCTION folders_with(TEXT) OWNER TO owner;
+         GRANT SELECT ON teams, team_members, folders TO owner;
+         {after}"
+    )
+}
+
+fn folders_with(sql: &str, argument: Value) -> Result<String, HelperSetError> {
+    let database = postgres(sql);
+    let deployment = deployment();
+    answer(&database, &deployment, "public", "folders_with", &[argument]).map(|set| render(&set))
+}
+
+#[test]
+fn a_parent_arm_passes_positional_parameters_and_literals_through() {
+    let team = "team_members.team_id WHERE user_id = app.user_id AND role IN";
+    assert_eq!(
+        folders_with(&folders("teams_with($1)", ""), text("write")).expect("answered"),
+        format!("folders.id WHERE team_id -> teams IN teams_with('write') {{{team} ('write')}}"),
+        "the foreign key on parent_id is not the one the arm follows"
+    );
+    assert_eq!(
+        folders_with(&folders("teams_with('admin')", ""), text("write")).expect("answered"),
+        format!("folders.id WHERE team_id -> teams IN teams_with('admin') {{{team} ('admin')}}")
+    );
+}
+
+#[test]
+fn a_call_reaching_no_single_helper_refuses_the_answer() {
+    assert!(matches!(
+        folders_with(&folders("missing_with($1)", ""), text("read")),
+        Err(HelperSetError::UnresolvedCall { call, .. }) if call == "missing_with"
+    ));
+    let overloaded = "CREATE FUNCTION teams_with(min_level INT) RETURNS SETOF TEXT
+                      LANGUAGE sql STABLE AS $$ SELECT 'x' $$;";
+    assert!(matches!(
+        folders_with(&folders("teams_with($1)", overloaded), text("read")),
+        Err(HelperSetError::UnresolvedCall { call, .. }) if call == "teams_with"
+    ));
+}
+
+#[test]
+fn an_argument_or_return_type_the_reader_cannot_compare_refuses_the_answer() {
+    assert!(matches!(
+        folders_with(&folders("teams_with($1)", ""), Value::Placeholder("$1".into())),
+        Err(HelperSetError::UnsupportedArgument { argument, .. }) if argument == "$1"
+    ));
+    let record =
+        helper(DEFINER, GRANT_ARM, "").replace("RETURNS SETOF TEXT", "RETURNS SETOF record");
+    assert!(matches!(refusal(&record), HelperSetError::ReturnType { .. }));
+}
