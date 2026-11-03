@@ -68,6 +68,7 @@ mod keyword_grantees;
 mod leading_comment_documentation;
 mod literal_list_text_checks;
 mod names_outside_this_catalog;
+mod negated_length_checks;
 mod object_kind_reporting;
 mod open_world_access;
 mod ordered_index_columns;
