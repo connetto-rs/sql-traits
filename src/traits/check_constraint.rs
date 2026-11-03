@@ -8,15 +8,16 @@ use alloc::{
 use core::{borrow::Borrow, fmt::Debug};
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Value,
+    ArrayElemTypeDef, BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, Ident, InTarget, Value,
 };
 
 use crate::{
     errors::LookupError,
     structs::IdentifierCase,
     traits::{
-        DataTypeLike, DatabaseLike, Metadata, TableLike, column::ColumnLike,
-        function_like::FunctionLike,
+        ColumnCollation, DataTypeLike, DatabaseLike, Metadata, MySqlCollationPadding, TableLike,
+        column::ColumnLike, function_like::FunctionLike,
     },
 };
 
@@ -139,6 +140,165 @@ fn swap_cmp_op(op: &BinaryOperator) -> BinaryOperator {
         BinaryOperator::GtEq => BinaryOperator::LtEq,
         _ => op.clone(),
     }
+}
+
+/// The character lengths of the shortest and longest literal a check lists.
+#[derive(Clone, Copy)]
+struct ListedLengths {
+    shortest: usize,
+    longest: usize,
+}
+
+impl ListedLengths {
+    fn of(literal: &str) -> Self {
+        let length = literal.chars().count();
+        Self { shortest: length, longest: length }
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            shortest: core::cmp::min(self.shortest, other.shortest),
+            longest: core::cmp::max(self.longest, other.longest),
+        }
+    }
+}
+
+/// Whether a cast to `data_type` keeps every character of a string.
+fn keeps_characters(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Text
+            | DataType::Varchar(None)
+            | DataType::CharacterVarying(None)
+            | DataType::CharVarying(None)
+    )
+}
+
+/// The operand of `expr` when it is a cast keeping every character of a
+/// string, or of a string array when `array` is set.
+fn character_keeping_cast(expr: &Expr, array: bool) -> Option<&Expr> {
+    let Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, expr, data_type, format: None } =
+        expr
+    else {
+        return None;
+    };
+    let keeps = if array {
+        matches!(
+            data_type,
+            DataType::Array(
+                ArrayElemTypeDef::SquareBracket(element, _)
+                    | ArrayElemTypeDef::Qualified(element, _)
+            ) if keeps_characters(element)
+        )
+    } else {
+        keeps_characters(data_type)
+    };
+    keeps.then_some(expr)
+}
+
+/// The column `expr` reads, seen through casts keeping its characters.
+fn listed_column(expr: &Expr) -> Option<&Ident> {
+    match unnested(expr) {
+        Expr::Identifier(ident) => Some(ident),
+        cast => listed_column(character_keeping_cast(cast, false)?),
+    }
+}
+
+/// The string `expr` spells, seen through casts keeping its characters.
+fn text_literal(expr: &Expr) -> Option<&str> {
+    match unnested(expr) {
+        Expr::Value(value) => {
+            match &value.value {
+                Value::SingleQuotedString(literal) => Some(literal),
+                _ => None,
+            }
+        }
+        cast => text_literal(character_keeping_cast(cast, false)?),
+    }
+}
+
+/// The elements of the array `expr` builds, seen through casts keeping their
+/// characters.
+fn array_elements(expr: &Expr) -> Option<&[Expr]> {
+    match unnested(expr) {
+        Expr::Array(array) => Some(&array.elem),
+        cast => array_elements(character_keeping_cast(cast, true)?),
+    }
+}
+
+/// The lengths of `literals` when every one of them is a string literal.
+fn literal_lengths(literals: &[Expr]) -> Option<ListedLengths> {
+    let (first, rest) = literals.split_first()?;
+    rest.iter().try_fold(ListedLengths::of(text_literal(first)?), |lengths, literal| {
+        Some(lengths.union(ListedLengths::of(text_literal(literal)?)))
+    })
+}
+
+/// The column `expr` holds to listed string literals, with their lengths,
+/// when `expr` is `col IN (...)`, `col = ANY (ARRAY[...])` or an `OR` of
+/// equalities between the column and a literal.
+fn listed_literal_lengths(expr: &Expr) -> Option<(&Ident, ListedLengths)> {
+    match unnested(expr) {
+        Expr::In { expr, target: InTarget::List(list), negated: false, .. } => {
+            Some((listed_column(expr)?, literal_lengths(list)?))
+        }
+        Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
+            Some((listed_column(left)?, literal_lengths(array_elements(right)?)?))
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let (column, literal) = listed_column(left)
+                .zip(text_literal(right))
+                .or_else(|| listed_column(right).zip(text_literal(left)))?;
+            Some((column, ListedLengths::of(literal)))
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+            let (column, left) = listed_literal_lengths(left)?;
+            let (other, right) = listed_literal_lengths(right)?;
+            (column == other).then(|| (column, left.union(right)))
+        }
+        _ => None,
+    }
+}
+
+/// Whether equality under `collation` holds only between identical strings,
+/// so a listed literal fixes the characters of the value equal to it.
+fn equality_is_identity(collation: &ColumnCollation<'_>) -> bool {
+    match collation {
+        ColumnCollation::DatabaseDefault => true,
+        ColumnCollation::Named(named) => {
+            named.postgres_deterministic() != Some(false)
+                && named.mysql_padding() != Some(MySqlCollationPadding::PadSpace)
+        }
+        ColumnCollation::Unknown => false,
+    }
+}
+
+/// The lengths of the string literals `expr` holds a textual column of
+/// `check_constraint` to, when it admits no other string for that column,
+/// limited to `target_col` when given.
+fn admitted_literal_lengths<C>(
+    database: &C::DB,
+    expr: &Expr,
+    check_constraint: &C,
+    target_col: Option<&str>,
+) -> Result<Option<ListedLengths>, LookupError>
+where
+    C: CheckConstraintLike,
+{
+    let Some((column, lengths)) = listed_literal_lengths(expr) else {
+        return Ok(None);
+    };
+    if target_col.is_some_and(|target| column.value != target) {
+        return Ok(None);
+    }
+    let Some(column) =
+        check_constraint.column(database, &column.value, IdentifierCase::AsWritten)?
+    else {
+        return Ok(None);
+    };
+    Ok((column.data_type(database).is_textual(database)
+        && equality_is_identity(&column.collation(database)?))
+    .then_some(lengths))
 }
 
 /// The direction of the length bound we are checking for.
@@ -318,6 +478,12 @@ fn check_text_length_bound_recursive<C>(
 where
     C: CheckConstraintLike,
 {
+    if let Some(lengths) = admitted_literal_lengths(database, expr, check_constraint, target_col)? {
+        return Ok(Some(match direction {
+            BoundDirection::Upper => lengths.longest + 1,
+            BoundDirection::Lower => lengths.shortest,
+        }));
+    }
     match expr {
         Expr::BinaryOp { left, op, right } => {
             // Check direct comparison: func(col) <op> right
@@ -428,6 +594,11 @@ fn check_not_empty_text_recursive<C>(
 where
     C: CheckConstraintLike,
 {
+    if admitted_literal_lengths(database, expr, check_constraint, None)?
+        .is_some_and(|lengths| lengths.shortest > 0)
+    {
+        return Ok(true);
+    }
     match expr {
         Expr::BinaryOp { left, op, right } => {
             if matches!(op, BinaryOperator::NotEq) {
@@ -1180,7 +1351,16 @@ pub trait CheckConstraintLike:
     }
 
     /// Returns whether the check constraint checks that a textual column is not
-    /// empty (i.e., `col <> ''` or `col != ''`).
+    /// empty (i.e., `col <> ''` or `col != ''`), or holds it to listed string
+    /// literals none of which is `''`.
+    ///
+    /// The listed forms are `col IN ('x', ...)`, `col = ANY (ARRAY['x', ...])`
+    /// and an `OR` of `col = 'x'` equalities, read through casts to `TEXT` or
+    /// to a `VARCHAR` without a length, and without a `COLLATE`. They count
+    /// only when the column's collation equates identical strings alone, so not
+    /// under a PostgreSQL collation known to be nondeterministic, a MySQL
+    /// `PAD SPACE` collation, or a comparison rule the column changes without
+    /// naming it.
     ///
     /// # Arguments
     ///
@@ -1204,20 +1384,24 @@ pub trait CheckConstraintLike:
     ///         int_col INT CHECK (int_col <> 0),
     ///         desc TEXT CHECK (desc != ''),
     ///         chained TEXT CHECK (chained <> '' AND chained IS NOT NULL),
-    ///         chained_or TEXT CHECK (chained_or <> '' OR chained_or = 'default')
+    ///         chained_or TEXT CHECK (chained_or <> '' OR chained_or = 'default'),
+    ///         listed TEXT CHECK (listed IN ('read', 'write')),
+    ///         listed_empty TEXT CHECK (listed_empty IN ('read', ''))
     ///     );",
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
     /// let check_constraints: Vec<_> = table.check_constraints(&db)?.collect();
-    /// let [cc1, cc2, cc3, cc4, cc5] = &check_constraints.as_slice() else {
-    ///     panic!("Expected five check constraints");
+    /// let [cc1, cc2, cc3, cc4, cc5, cc6, cc7] = &check_constraints.as_slice() else {
+    ///     panic!("Expected seven check constraints");
     /// };
     /// assert!(cc1.is_not_empty_text_constraint(&db)?);
     /// assert!(!cc2.is_not_empty_text_constraint(&db)?);
     /// assert!(cc3.is_not_empty_text_constraint(&db)?);
     /// assert!(cc4.is_not_empty_text_constraint(&db)?);
     /// assert!(!cc5.is_not_empty_text_constraint(&db)?);
+    /// assert!(cc6.is_not_empty_text_constraint(&db)?);
+    /// assert!(!cc7.is_not_empty_text_constraint(&db)?);
     /// # Ok(())
     /// # }
     /// ```
@@ -1233,6 +1417,9 @@ pub trait CheckConstraintLike:
     /// upper bound).
     /// - `length(col) < N` returns `Some(N)`
     /// - `length(col) <= N` returns `Some(N + 1)`
+    /// - `col IN ('ab', 'abc')` returns `Some(4)`, one past the longest listed
+    ///   literal in characters, under the forms and collations
+    ///   [`Self::is_not_empty_text_constraint`] reads
     ///
     /// # Arguments
     ///
@@ -1312,6 +1499,9 @@ pub trait CheckConstraintLike:
     /// accepted length).
     /// - `length(col) > N` returns `Some(N + 1)`
     /// - `length(col) >= N` returns `Some(N)`
+    /// - `col IN ('ab', 'abc')` returns `Some(2)`, the shortest listed literal
+    ///   in characters, under the forms and collations
+    ///   [`Self::is_not_empty_text_constraint`] reads
     ///
     /// # Arguments
     ///
