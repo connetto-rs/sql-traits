@@ -461,6 +461,42 @@ fn no_table_inherits_from_a_partitioned_table() {
 }
 
 #[test]
+fn a_partition_receives_every_column_it_redeclares() {
+    // Measured on PostgreSQL 17 and 18: `attislocal` is false for every column
+    // of a partition, options written on it included, and the partition cannot
+    // drop one.
+    let schema = "CREATE TABLE orders (id INT NOT NULL, note TEXT) PARTITION BY RANGE (id);
+         CREATE TABLE p PARTITION OF orders (note DEFAULT 'x') FOR VALUES FROM (0) TO (10);";
+    let db = database(schema);
+    assert_eq!(local_column_names(&db, "p"), Vec::<String>::new());
+    assert!(matches!(
+        parse(&format!("{schema} ALTER TABLE p DROP COLUMN note;")),
+        Err(Error::InheritedColumnNotDroppable { ref table_name, ref column_name })
+            if table_name == "p" && column_name == "note"
+    ));
+}
+
+#[test]
+fn no_table_inherits_from_a_partition() {
+    // Measured on PostgreSQL 17 and 18: "cannot inherit from partition "p"",
+    // also as one parent among several.
+    let schema = "CREATE TABLE plain (id INT);
+         CREATE TABLE orders (id INT) PARTITION BY RANGE (id);
+         CREATE TABLE p PARTITION OF orders FOR VALUES FROM (0) TO (10);";
+    for statement in ["CREATE TABLE c () INHERITS (p);", "CREATE TABLE c () INHERITS (plain, p);"] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::InheritsFromPartition { table_name, parent_name }
+                    if table_name == "c" && parent_name == "p"
+            ),
+            "{statement}: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn redeclaring_an_inherited_column_with_another_type_is_refused() {
     assert!(matches!(
         parse(

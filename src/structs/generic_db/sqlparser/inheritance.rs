@@ -917,7 +917,7 @@ pub(super) fn apply_parents(
         .map(|column| column.name.clone())
         .collect();
 
-    let local: Vec<Ident> = create_table.columns.iter().map(|column| column.name.clone()).collect();
+    let local = locally_declared(create_table);
     // The child is not in the stores yet, so the names it introduces itself
     // have to be spoken for before a generated one is built beside them.
     let mut taken: Vec<Ident> =
@@ -1026,6 +1026,18 @@ pub(super) fn apply_parents(
     Ok(inherited)
 }
 
+/// The columns a table being created declares itself rather than receives.
+///
+/// Every column of a partition comes from its root, even one the partition
+/// writes options on, as `pg_attribute.attislocal` records, so a partition
+/// declares none.
+fn locally_declared(create_table: &CreateTable) -> Vec<Ident> {
+    if create_table.partition_of.is_some() {
+        return Vec::new();
+    }
+    create_table.columns.iter().map(|column| column.name.clone()).collect()
+}
+
 /// Whether the option is one a column may state only once.
 ///
 /// A check may be written any number of times, each becoming a constraint of
@@ -1077,7 +1089,8 @@ fn parent_owning(
 /// Binds every parent a table being created names to the table it reaches
 /// through the session's path, refusing an absent one, one PostgreSQL will
 /// not link across temporary and permanent storage, a `PARTITION OF` parent
-/// without a partition key and an `INHERITS` parent with one.
+/// without a partition key, and an `INHERITS` parent that has one or is
+/// itself a partition.
 fn bind_parents(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
@@ -1116,6 +1129,12 @@ fn bind_parents(
             }
             ParentKind::Inherits if parent.partition_by.is_some() => {
                 return Err(Error::InheritsFromPartitionedTable {
+                    table_name: child_name.to_string(),
+                    parent_name: parent_name.to_string(),
+                });
+            }
+            ParentKind::Inherits if parent.partition_of.is_some() => {
+                return Err(Error::InheritsFromPartition {
                     table_name: child_name.to_string(),
                     parent_name: parent_name.to_string(),
                 });
