@@ -2,15 +2,24 @@
 //! only listed string literals.
 
 use sql_traits::{errors::Error, prelude::*};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect};
 
 /// The upper bound, lower bound and empty-string rejection a check answers.
 type TextFacts = (Option<usize>, Option<usize>, bool);
 
 /// Asserts the facts of each check of the first table `sql` declares, in
-/// declaration order.
+/// declaration order, parsing under PostgreSQL.
 fn assert_facts(sql: &str, expected: &[TextFacts]) -> Result<(), Error> {
-    let db = ParserDB::parse::<PostgreSqlDialect>(sql)?;
+    assert_facts_in::<PostgreSqlDialect>(sql, expected)
+}
+
+/// Asserts the facts of each check of the first table `sql` declares, in
+/// declaration order, parsing under `D`.
+fn assert_facts_in<D: Dialect + Default + 'static>(
+    sql: &str,
+    expected: &[TextFacts],
+) -> Result<(), Error> {
+    let db = ParserDB::parse::<D>(sql)?;
     let table = db.tables().next().ok_or_else(|| std::io::Error::other("no table"))?;
     let checks: Vec<_> = table.check_constraints(&db)?.collect();
     assert_eq!(checks.len(), expected.len());
@@ -108,6 +117,28 @@ fn comparison_rules_that_equate_longer_strings_keep_no_bound() -> Result<(), Err
             (Some(6), Some(4), true),
             (Some(6), Some(4), true),
         ],
+    )
+}
+
+#[test]
+fn a_quoted_column_name_is_matched_with_its_quoting() -> Result<(), Error> {
+    assert_facts(
+        r#"CREATE TABLE labels (
+            "Kind" TEXT CHECK ("Kind" IN ('read', 'write')),
+            "kind" TEXT CHECK (KIND = ANY (ARRAY['read']))
+        );"#,
+        &[(Some(6), Some(4), true), (Some(5), Some(4), true)],
+    )
+}
+
+#[test]
+fn a_character_set_that_changes_the_comparison_rule_keeps_no_bound() -> Result<(), Error> {
+    assert_facts_in::<MySqlDialect>(
+        "CREATE TABLE labels (
+            a TEXT CHARACTER SET utf8mb4 CHECK (a IN ('read', 'write')),
+            b TEXT CHECK (b IN ('read', 'write'))
+        );",
+        &[(None, None, false), (Some(6), Some(4), true)],
     )
 }
 

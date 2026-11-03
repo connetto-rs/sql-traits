@@ -291,14 +291,21 @@ where
     if target_col.is_some_and(|target| column.value != target) {
         return Ok(None);
     }
-    let Some(column) =
-        check_constraint.column(database, &column.value, IdentifierCase::AsWritten)?
+    let Some(column) = check_constraint
+        .columns(database)?
+        .find(|candidate| {
+            IdentifierCase::AsWritten.identifiers_match(
+                candidate.column_name(),
+                candidate.column_name_is_quoted(),
+                &column.value,
+                column.quote_style.is_some(),
+            )
+        })
+        .filter(|column| column.data_type(database).is_textual(database))
     else {
         return Ok(None);
     };
-    Ok((column.data_type(database).is_textual(database)
-        && equality_is_identity(&column.collation(database)?))
-    .then_some(lengths))
+    Ok(equality_is_identity(&column.collation(database)?).then_some(lengths))
 }
 
 /// The direction of the length bound we are checking for.
