@@ -1742,6 +1742,15 @@ pub enum Error {
         /// Partitioned parent it names, as written.
         parent_name: String,
     },
+    #[error("Table `{table_name}` cannot inherit from partition `{parent_name}`.")]
+    /// Error indicating that `INHERITS` names a partition, whose columns
+    /// belong to the partitioned table it is part of.
+    InheritsFromPartition {
+        /// Table the statement creates.
+        table_name: String,
+        /// Partition it names, as written.
+        parent_name: String,
+    },
     #[error(
         "Table `{partition_name}` cannot be attached as a partition of `{table_name}` because {reason}."
     )]
