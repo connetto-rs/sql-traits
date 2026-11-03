@@ -108,4 +108,9 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
     fn predicate(&self) -> Option<&Expr> {
         self.attribute().predicate.as_ref()
     }
+
+    #[inline]
+    fn nulls_distinct(&self) -> bool {
+        self.attribute().nulls_distinct != Some(false)
+    }
 }
