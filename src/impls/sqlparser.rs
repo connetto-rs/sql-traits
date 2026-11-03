@@ -20,6 +20,7 @@ mod dml;
 pub(crate) mod dql;
 mod foreign_key_constraint;
 mod grant;
+mod helper_set;
 mod index_clauses;
 mod plpgsql_body;
 mod role_membership;

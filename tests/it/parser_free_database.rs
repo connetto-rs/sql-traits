@@ -12,7 +12,7 @@
 use std::borrow::Cow;
 
 use sql_traits::{
-    errors::LookupError,
+    errors::{HelperSetError, LookupError},
     prelude::*,
     structs::{ForeignTableSource, TargetName},
     traits::{ColumnCollation, TypeMatch, grant::GrantTarget},
@@ -23,7 +23,7 @@ use sqlparser::{
         Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
         CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, ReferentialAction,
-        SequenceOptions, Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
+        SequenceOptions, Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod, Value,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -1058,6 +1058,15 @@ impl FunctionLike for MemoryFunction {
         _database: &Self::DB,
     ) -> Result<bool, LookupError> {
         Ok(false)
+    }
+
+    fn helper_set<'db>(
+        &'db self,
+        _arguments: &[Value],
+        _deployment: &'db Deployment,
+        _database: &'db Self::DB,
+    ) -> Result<HelperSet<'db, Self::DB>, HelperSetError> {
+        Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() }.into())
     }
 }
 
