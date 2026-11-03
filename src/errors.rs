@@ -1778,6 +1778,55 @@ pub enum Error {
         parent_name: String,
     },
     #[error(
+        "Column `{column_name}` named in the partition key of table `{table_name}` does not exist."
+    )]
+    /// Error indicating that a `PARTITION BY` key names a column its table does
+    /// not declare or receive.
+    PartitionKeyColumnNotFound {
+        /// Table the statement partitions.
+        table_name: String,
+        /// Column the key names, as written.
+        column_name: String,
+    },
+    #[error(
+        "Generated column `{column_name}` cannot be part of the partition key of table `{table_name}`."
+    )]
+    /// Error indicating that a `PARTITION BY` key reads a stored generated
+    /// column, which PostgreSQL refuses.
+    GeneratedColumnInPartitionKey {
+        /// Table the statement partitions.
+        table_name: String,
+        /// Generated column the key reads.
+        column_name: String,
+    },
+    #[error(
+        "Table `{table_name}` cannot use the list partition strategy with more than one key column."
+    )]
+    /// Error indicating that `PARTITION BY LIST` names more than one key.
+    ListPartitionKeyHasManyColumns {
+        /// Table the statement partitions.
+        table_name: String,
+    },
+    #[error(
+        "A unique constraint on partitioned table `{table_name}` must include every partitioning column."
+    )]
+    /// Error indicating that a primary key, unique or exclusion constraint, or
+    /// a unique index, on a partitioned table leaves out a column of its
+    /// partition key, so the partitions could not enforce it on their own.
+    UniqueConstraintMissesPartitionKey {
+        /// Partitioned table the constraint or index is on.
+        table_name: String,
+    },
+    #[error(
+        "Partitioned table `{table_name}` cannot hold a unique constraint, because its partition key has an expression."
+    )]
+    /// Error indicating that a unique constraint or index is put on a table
+    /// partitioned by an expression, which PostgreSQL does not support.
+    UniqueConstraintOverExpressionPartitionKey {
+        /// Partitioned table the constraint or index is on.
+        table_name: String,
+    },
+    #[error(
         "Table `{partition_name}` cannot be attached as a partition of `{table_name}` because {reason}."
     )]
     /// Error indicating that `ALTER TABLE ... ATTACH PARTITION` names a table
