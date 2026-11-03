@@ -5341,6 +5341,11 @@ mod tests {
                     .expect("owner_privileges on &T")
                     .eq(table.owner_privileges(&db).expect("owner_privileges"))
             );
+            assert!(
+                <&_ as TableLike>::revoked_privileges(table_ref, &db)
+                    .expect("revoked_privileges on &T")
+                    .eq(table.revoked_privileges(&db).expect("revoked_privileges"))
+            );
         }
 
         #[test]

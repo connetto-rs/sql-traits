@@ -70,12 +70,27 @@ pub(super) fn change_owner(
     let handover = Handover { table: &table, previous, next: owner_ident(next) };
     handover.apply(builder.table_grants_mut());
     handover.apply(builder.column_grants_mut());
-    let case = builder.identifier_case();
-    if let Some((_, metadata, _)) =
-        builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
-    {
-        handover.apply_to_revocations(metadata.revocations_mut());
+}
+
+/// Hands every revocation on a table naming its old owner `previous`, as
+/// grantee or grantor, to `next`.
+pub(super) fn hand_over_revocations(
+    revocations: &mut Vec<RevokedPrivilege>,
+    previous: &str,
+    next: &Owner,
+) {
+    let next = owner_ident(next);
+    let next_name = stored_role_name(&next);
+    for revoked in revocations.iter_mut() {
+        if names_role(revoked.grantee(), previous) {
+            rename_grantee(revoked.grantee_mut(), &next);
+        }
+        let granted_by = revoked.granted_by_mut();
+        if granted_by.as_deref() == Some(previous) {
+            *granted_by = Some(next_name.clone());
+        }
     }
+    super::revocations::deduplicate(revocations);
 }
 
 /// One owner change of one table.
@@ -107,22 +122,6 @@ impl Handover<'_> {
                 *grant = Arc::new(self.handed_over(grant));
             }
         }
-    }
-
-    /// Rewrites each revocation on the table changing hands that names the
-    /// old owner, as grantee or as grantor.
-    fn apply_to_revocations(&self, revocations: &mut Vec<RevokedPrivilege>) {
-        let next_name = stored_role_name(&self.next);
-        for revoked in revocations.iter_mut() {
-            if names_role(revoked.grantee(), self.previous) {
-                rename_grantee(revoked.grantee_mut(), &self.next);
-            }
-            let granted_by = revoked.granted_by_mut();
-            if granted_by.as_deref() == Some(self.previous) {
-                *granted_by = Some(next_name.clone());
-            }
-        }
-        super::revocations::deduplicate(revocations);
     }
 
     /// `grant` with the old owner renamed to the new one.

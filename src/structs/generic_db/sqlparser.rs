@@ -1349,11 +1349,7 @@ impl ParserDBBuilder {
         self.column_grants_mut().retain_mut(|(grant, ())| {
             !grant_names_table(grant, table) || drop_grant_column(Arc::make_mut(grant), column)
         });
-        if let Some((_, metadata, _)) =
-            self.tables_mut().iter_mut().find(|(host, _, _)| table.matches(host, case))
-        {
-            revocations::drop_column(metadata, column);
-        }
+        revocations::drop_column(self, table, column);
     }
 
     /// Removes the objects outside the table that depend on one of its columns,
@@ -1441,11 +1437,7 @@ impl ParserDBBuilder {
                 rename_grant_columns(Arc::make_mut(grant), from, to);
             }
         }
-        if let Some((_, metadata, _)) =
-            self.tables_mut().iter_mut().find(|(host, _, _)| table.matches(host, case))
-        {
-            revocations::rename_column(metadata, from, to);
-        }
+        revocations::rename_column(self, table, from, to);
     }
 
     /// Detaches every model object derived from the stored node of a table,
@@ -8830,6 +8822,13 @@ impl ParserDB {
                                             .owner()
                                             .filter(|previous| owner.as_deref() != Some(*previous))
                                             .map(|previous| (Arc::clone(table), previous.to_string()));
+                                        if let Some((_, previous)) = &handover {
+                                            table_owner::hand_over_revocations(
+                                                metadata.revocations_mut(),
+                                                previous,
+                                                &new_owner,
+                                            );
+                                        }
                                         metadata.set_owner(owner);
                                     },
                                 )?;

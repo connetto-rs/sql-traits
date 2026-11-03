@@ -180,6 +180,7 @@ fn revocations_follow_renames_of_the_role_the_table_and_the_column() {
          CREATE ROLE admins;
          REVOKE UPDATE ON profiles FROM app_user GRANTED BY admins;
          REVOKE UPDATE (is_admin) ON profiles FROM app_user;
+         GRANT SELECT (is_admin) ON profiles TO app_user;
          ALTER ROLE app_user RENAME TO members;
          ALTER ROLE admins RENAME TO keepers;
          ALTER TABLE profiles RENAME TO accounts;
@@ -196,6 +197,10 @@ fn revocations_follow_renames_of_the_role_the_table_and_the_column() {
     assert_eq!(revoked_on_table(&database, "accounts", "members"), ["UPDATE"]);
     assert_eq!(granted_by, [Some("keepers")]);
     assert_eq!(revoked_on_column(&database, "accounts", "is_staff", "members"), ["UPDATE"]);
+    assert_eq!(
+        database.column_grants().map(ToString::to_string).collect::<Vec<_>>(),
+        ["GRANT SELECT (is_staff) ON accounts TO members"]
+    );
 }
 
 #[test]
@@ -229,9 +234,36 @@ fn revocations_go_with_the_column_the_table_and_the_role() {
     assert_eq!(revoked_on_table(&recreated, "profiles", "app_user"), NONE);
 }
 
+#[test]
+fn a_revocation_is_kept_once_and_handed_back_only_to_the_grantee() {
+    let database = parse(&format!(
+        "{PROFILES}
+         CREATE ROLE other;
+         REVOKE UPDATE ON profiles FROM app_user, other;
+         REVOKE UPDATE ON profiles FROM app_user;
+         GRANT UPDATE ON profiles TO other;"
+    ));
+
+    assert_eq!(revoked_on_table(&database, "profiles", "app_user"), ["UPDATE"]);
+    assert_eq!(revoked_on_table(&database, "profiles", "other"), NONE);
+}
+
+#[test]
+fn grant_all_hands_back_every_table_revocation_and_no_column_one() {
+    let database = parse(&format!(
+        "{PROFILES}
+         REVOKE INSERT, UPDATE ON profiles FROM app_user;
+         REVOKE UPDATE (is_admin) ON profiles FROM app_user;
+         GRANT ALL ON profiles TO app_user;"
+    ));
+
+    assert_eq!(revoked_on_table(&database, "profiles", "app_user"), NONE);
+    assert_eq!(revoked_on_column(&database, "profiles", "is_admin", "app_user"), ["UPDATE"]);
+}
+
 /// PostgreSQL's `aclnewowner` renames the old owner in the table's privilege
 /// entries, so a revocation naming it, as grantee or as grantor, moves to the
-/// new owner on that table.
+/// new owner on that table, folding into one the new owner already had.
 #[test]
 fn an_owner_change_hands_the_revocations_naming_the_old_owner_over() {
     let database = parse(
@@ -244,6 +276,7 @@ fn an_owner_change_hands_the_revocations_naming_the_old_owner_over() {
          ALTER TABLE u OWNER TO previous;
          REVOKE TRUNCATE ON t, u FROM previous;
          REVOKE UPDATE ON t, u FROM app_user GRANTED BY previous;
+         REVOKE TRUNCATE ON t FROM next;
          ALTER TABLE t OWNER TO next;",
     );
     let grantors = |name: &str| -> Vec<Option<String>> {

@@ -1822,6 +1822,12 @@ mod tests {
                 <&_ as ColumnLike>::column_doc(&col_ref, &db).expect("column_doc failed"),
                 None
             );
+            assert_eq!(
+                <&_ as ColumnLike>::revoked_privileges(&col_ref, &db)
+                    .expect("revoked_privileges failed")
+                    .count(),
+                0
+            );
         }
     }
 
@@ -1858,6 +1864,12 @@ mod tests {
             assert_eq!(
                 <Arc<_> as ColumnLike>::column_doc(&col_arc, &db).expect("column_doc failed"),
                 None
+            );
+            assert_eq!(
+                <Arc<_> as ColumnLike>::revoked_privileges(&col_arc, &db)
+                    .expect("revoked_privileges failed")
+                    .count(),
+                0
             );
         }
     }

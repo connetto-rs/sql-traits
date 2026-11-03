@@ -4,7 +4,7 @@
 
 use alloc::vec::Vec;
 
-use sqlparser::ast::{Action, Grant, GrantObjects, Ident, ObjectName, Privileges, Revoke};
+use sqlparser::ast::{Action, CreateTable, Grant, GrantObjects, Ident, Privileges, Revoke};
 
 use super::{
     NamedColumn, ParserDBBuilder, StoredTable, action_columns, grantee_names, rename_grantee,
@@ -21,14 +21,9 @@ pub(super) fn record(builder: &mut ParserDBBuilder, part: &Revoke) {
     if part.grant_option_for {
         return;
     }
-    let Some(table) = reached_table(builder, part.objects.as_ref()) else {
-        return;
-    };
     let case = builder.identifier_case();
     let granted_by = part.granted_by.as_ref().map(stored_role_name);
-    let Some((node, metadata, _)) =
-        builder.tables_mut().iter_mut().find(|(node, _, _)| table.matches(node, case))
-    else {
+    let Some((node, metadata)) = reached_table(builder, part.objects.as_ref()) else {
         return;
     };
 
@@ -71,13 +66,8 @@ pub(super) fn record(builder: &mut ParserDBBuilder, part: &Revoke) {
 /// grants to each of its grantees at the level it grants it. `part` names one
 /// object, bound to the relation it reaches.
 pub(super) fn hand_back(builder: &mut ParserDBBuilder, part: &Grant) {
-    let Some(table) = reached_table(builder, part.objects.as_ref()) else {
-        return;
-    };
     let case = builder.identifier_case();
-    let Some((_, metadata, _)) =
-        builder.tables_mut().iter_mut().find(|(node, _, _)| table.matches(node, case))
-    else {
+    let Some((_, metadata)) = reached_table(builder, part.objects.as_ref()) else {
         return;
     };
 
@@ -136,13 +126,14 @@ pub(super) fn drop_role(builder: &mut ParserDBBuilder, role: &Ident) {
     }
 }
 
-/// Renames the column `from` to `to` in the revocations on its table.
+/// Renames the column `from` to `to` in the revocations on `table`.
 pub(super) fn rename_column(
-    metadata: &mut TableMetadata<sqlparser::ast::CreateTable>,
+    builder: &mut ParserDBBuilder,
+    table: &StoredTable,
     from: &NamedColumn,
     to: &Ident,
 ) {
-    for revoked in metadata.revocations_mut() {
+    for revoked in revocations_on(builder, table) {
         if let Some(column) = revoked.column_mut()
             && from.matches(column)
         {
@@ -151,14 +142,33 @@ pub(super) fn rename_column(
     }
 }
 
-/// Forgets the revocations on the dropped column `column`.
+/// Forgets the revocations on `column`, which `table` is dropping.
 pub(super) fn drop_column(
-    metadata: &mut TableMetadata<sqlparser::ast::CreateTable>,
+    builder: &mut ParserDBBuilder,
+    table: &StoredTable,
     column: &NamedColumn,
 ) {
-    metadata
-        .revocations_mut()
-        .retain(|revoked| revoked.column().is_none_or(|held| !column.matches(held)));
+    let case = builder.identifier_case();
+    for (_, metadata, _) in
+        builder.tables_mut().iter_mut().filter(|(node, _, _)| table.matches(node, case))
+    {
+        metadata
+            .revocations_mut()
+            .retain(|revoked| revoked.column().is_none_or(|held| !column.matches(held)));
+    }
+}
+
+/// Every revocation on `table`, for a statement to change.
+fn revocations_on<'b>(
+    builder: &'b mut ParserDBBuilder,
+    table: &StoredTable,
+) -> impl Iterator<Item = &'b mut RevokedPrivilege> {
+    let case = builder.identifier_case();
+    builder
+        .tables_mut()
+        .iter_mut()
+        .filter(move |(node, _, _)| table.matches(node, case))
+        .flat_map(|(_, metadata, _)| metadata.revocations_mut().iter_mut())
 }
 
 /// Folds away the revocations an owner change made identical, keeping the
@@ -173,16 +183,24 @@ pub(super) fn deduplicate(revocations: &mut Vec<RevokedPrivilege>) {
     *revocations = kept;
 }
 
-/// The table one object of a grant or a revoke names, or `None` when it names
-/// a view, a sequence or anything else that is no table the input created.
-fn reached_table(builder: &ParserDBBuilder, objects: Option<&GrantObjects>) -> Option<StoredTable> {
-    let Some(GrantObjects::Tables(names)) = objects else {
-        return None;
+/// The table one object of a grant or a revoke names, with its metadata, or
+/// `None` when it names a view, a sequence or anything else that is no table
+/// the input created.
+fn reached_table<'b>(
+    builder: &'b mut ParserDBBuilder,
+    objects: Option<&GrantObjects>,
+) -> Option<(&'b CreateTable, &'b mut TableMetadata<CreateTable>)> {
+    let name = match objects {
+        Some(GrantObjects::Tables(names)) => names.first()?,
+        _ => return None,
     };
-    let [name]: &[ObjectName] = names.as_slice() else {
-        return None;
-    };
-    builder.resolve_table_object_name(name).ok().flatten().map(StoredTable::of)
+    let table = StoredTable::of(builder.resolve_table_object_name(name).ok()??);
+    let case = builder.identifier_case();
+    builder
+        .tables_mut()
+        .iter_mut()
+        .find(|(node, _, _)| table.matches(node, case))
+        .map(|(node, metadata, _)| (&**node, metadata))
 }
 
 /// Each table privilege `privileges` names, without its columns, with the
