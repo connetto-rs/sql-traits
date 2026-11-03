@@ -45,6 +45,8 @@ CREATE TABLE project_grants (
   role TEXT NOT NULL CHECK (role IN ('read', 'write', 'admin')),
   PRIMARY KEY (project_id, principal_id)
 );
+CREATE TABLE connetto_installations (
+  id TEXT PRIMARY KEY, bot TEXT NOT NULL, owner TEXT NOT NULL, accepted_version INT NOT NULL);
 CREATE SCHEMA authz;
 CREATE FUNCTION authz.organizations_with(min_role TEXT) RETURNS SETOF TEXT
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
@@ -76,12 +78,24 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   UNION SELECT authz.teams_with(min_role)
   UNION SELECT authz.projects_with(min_role)
 $$;
+CREATE FUNCTION authz.installations_administered() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT i.id FROM public.connetto_installations i
+  WHERE i.owner IN (SELECT authz.organizations_with('admin'))
+  UNION
+  SELECT i.id FROM public.connetto_installations i
+  WHERE i.owner IN (SELECT authz.teams_with('admin'))
+  UNION
+  SELECT i.id FROM public.connetto_installations i
+  WHERE i.owner IN (SELECT authz.projects_with('admin'))
+$$;
 ALTER FUNCTION authz.organizations_with(TEXT) OWNER TO authz_owner;
 ALTER FUNCTION authz.teams_with(TEXT) OWNER TO authz_owner;
 ALTER FUNCTION authz.projects_with(TEXT) OWNER TO authz_owner;
 ALTER FUNCTION authz.owners_with(TEXT) OWNER TO authz_owner;
+ALTER FUNCTION authz.installations_administered() OWNER TO authz_owner;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
-GRANT SELECT ON organizations, teams, projects, organization_grants, team_grants, project_grants TO authz_owner;
+GRANT SELECT ON organizations, teams, projects, organization_grants, team_grants, project_grants, connetto_installations TO authz_owner;
 GRANT USAGE ON SCHEMA authz TO authz_owner;
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
@@ -89,12 +103,14 @@ ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE organization_grants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE team_grants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE project_grants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE connetto_installations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE organizations FORCE ROW LEVEL SECURITY;
 ALTER TABLE teams FORCE ROW LEVEL SECURITY;
 ALTER TABLE projects FORCE ROW LEVEL SECURITY;
 ALTER TABLE organization_grants FORCE ROW LEVEL SECURITY;
 ALTER TABLE team_grants FORCE ROW LEVEL SECURITY;
 ALTER TABLE project_grants FORCE ROW LEVEL SECURITY;
+ALTER TABLE connetto_installations FORCE ROW LEVEL SECURITY;
 ";
 
 /// The rows of R100's behaviour matrix, as `(table, [(column, value)])`.
@@ -121,6 +137,12 @@ const ROWS: &[(&str, &[(&str, &str)])] = &[
     ("team_grants", &[("team_id", "U"), ("principal_id", "uma"), ("role", "read")]),
     ("team_grants", &[("team_id", "T"), ("principal_id", "inst-T"), ("role", "write")]),
     ("project_grants", &[("project_id", "Q"), ("principal_id", "quinn"), ("role", "read")]),
+    ("connetto_installations", &[("id", "inst-org"), ("owner", "org")]),
+    ("connetto_installations", &[("id", "inst-T"), ("owner", "T")]),
+    ("connetto_installations", &[("id", "inst-U"), ("owner", "U")]),
+    ("connetto_installations", &[("id", "inst-P"), ("owner", "P")]),
+    ("connetto_installations", &[("id", "inst-Q"), ("owner", "Q")]),
+    ("connetto_installations", &[("id", "inst-x"), ("owner", "x")]),
 ];
 
 /// What PostgreSQL 17.11 returns for `(caller, helper, minimum role)`, the
@@ -209,6 +231,20 @@ const MEASURED: &[(&str, &str, &str, &[&str])] = &[
     ("zed", "organizations_with", "admin", &[]),
 ];
 
+/// What PostgreSQL 17.11 returns for `authz.installations_administered()`,
+/// called by each caller over [`ROWS`].
+const INSTALLATIONS_MEASURED: &[(&str, &[&str])] = &[
+    ("alice", &["inst-P", "inst-Q", "inst-T", "inst-U", "inst-org"]),
+    ("olga", &[]),
+    ("owen", &[]),
+    ("tom", &["inst-P", "inst-T"]),
+    ("bob", &[]),
+    ("uma", &[]),
+    ("quinn", &[]),
+    ("inst-T", &[]),
+    ("zed", &[]),
+];
+
 fn postgres(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses")
 }
@@ -274,12 +310,13 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                 HelperArm::Parent(parent) => {
                     let arguments: Vec<String> =
                         parent.arguments().iter().map(ToString::to_string).collect();
+                    let typed = if parent.foreign_key().is_some() { "->" } else { "as" };
                     format!(
-                        "{}.{} WHERE {} -> {} IN {}({}) {{{}}}",
+                        "{}.{} WHERE {} {typed} {} IN {}({}) {{{}}}",
                         parent.table().table_name(),
                         parent.key().column_name(),
-                        parent.foreign_key_column().column_name(),
-                        parent.referenced_table().table_name(),
+                        parent.column().column_name(),
+                        parent.parent_table().table_name(),
                         parent.function().target_name(),
                         arguments.join(", "),
                         render(parent.set()),
@@ -334,7 +371,7 @@ fn evaluate(set: &HelperSet<'_, ParserDB>, caller: &str) -> BTreeSet<&'static st
             HelperArm::Parent(parent) => {
                 let parents = evaluate(parent.set(), caller);
                 for row in rows(parent.table().table_name()) {
-                    if parents.contains(cell(row, parent.foreign_key_column().column_name())) {
+                    if parents.contains(cell(row, parent.column().column_name())) {
                         returned.insert(cell(row, parent.key().column_name()));
                     }
                 }
@@ -384,9 +421,15 @@ fn a_parent_arm_answers_the_helper_it_calls_for_the_same_role() {
         panic!("the second arm is a parent arm")
     };
     assert_eq!(
-        parent.foreign_key().referenced_table(&database).expect("resolves").table_name(),
+        parent
+            .foreign_key()
+            .expect("typed by a foreign key")
+            .referenced_table(&database)
+            .expect("resolves")
+            .table_name(),
         "teams"
     );
+    assert_eq!(parent.parent_table().table_name(), "teams");
     assert_eq!(parent.function().name(), "teams_with");
 }
 
@@ -399,6 +442,152 @@ fn every_helper_at_every_role_returns_what_postgres_returns_for_every_caller() {
         let returned: Vec<_> = evaluate(&set, caller).into_iter().collect();
         assert_eq!(returned, expected, "{caller} calling {helper}('{role}')");
     }
+}
+
+/// The name of the table `set` covers.
+fn covered<'db>(set: &HelperSet<'db, ParserDB>) -> Option<&'db str> {
+    set.covered_table().map(TableLike::table_name)
+}
+
+#[test]
+fn a_set_covers_the_one_table_whose_primary_key_every_arm_returns() {
+    let database = postgres(R100);
+    let deployment = deployment();
+    for (helper, table) in [
+        ("organizations_with", "organizations"),
+        ("teams_with", "teams"),
+        ("projects_with", "projects"),
+    ] {
+        for role in ["read", "write", "admin"] {
+            let set =
+                answer(&database, &deployment, "authz", helper, &[text(role)]).expect("answered");
+            assert_eq!(covered(&set), Some(table), "{helper}('{role}')");
+        }
+    }
+    let set = answer(&database, &deployment, "authz", "installations_administered", &[])
+        .expect("answered");
+    assert_eq!(covered(&set), Some("connetto_installations"));
+
+    let none = format!("{GRANT_ARM} AND min_role = 'any'");
+    let database = postgres(&helper(DEFINER, &none, ""));
+    let set =
+        answer(&database, &deployment, "public", "docs_with", &[text("none")]).expect("answered");
+    assert!(set.arms().is_empty());
+    assert_eq!(covered(&set), Some("docs"), "an arm keeping no row still returns keys of docs");
+
+    let database = postgres(MEMBERSHIP);
+    let set = answer(&database, &deployment, "public", "docs_for", &[]).expect("answered");
+    assert_eq!(covered(&set), None, "members.doc_id references nothing");
+
+    for (body, after) in [
+        (
+            format!(
+                "{GRANT_ARM} UNION SELECT folder_id FROM folder_members \
+                 WHERE user_id = current_setting('app.user_id', true) AND role = min_role"
+            ),
+            "CREATE TABLE folders (id TEXT PRIMARY KEY);
+             CREATE TABLE folder_members (folder_id TEXT REFERENCES folders (id), user_id TEXT, role TEXT);
+             GRANT SELECT ON folders, folder_members TO owner;",
+        ),
+        (
+            "SELECT slug FROM slug_members \
+             WHERE user_id = current_setting('app.user_id', true) AND role = min_role"
+                .to_string(),
+            "CREATE TABLE slugs (id TEXT PRIMARY KEY, slug TEXT UNIQUE);
+             CREATE TABLE slug_members (slug TEXT REFERENCES slugs (slug), user_id TEXT, role TEXT);
+             GRANT SELECT ON slugs, slug_members TO owner;",
+        ),
+        (
+            "SELECT code FROM code_members \
+             WHERE user_id = current_setting('app.user_id', true) AND role = min_role"
+                .to_string(),
+            "CREATE TABLE codes (code TEXT UNIQUE);
+             CREATE TABLE code_members (code TEXT REFERENCES codes (code), user_id TEXT, role TEXT);
+             GRANT SELECT ON codes, code_members TO owner;",
+        ),
+    ] {
+        let database = postgres(&helper(DEFINER, &body, after));
+        let set = answer(&database, &deployment, "public", "docs_with", &[text("read")])
+            .expect("answered");
+        assert_eq!(covered(&set), None, "{body}");
+    }
+}
+
+#[test]
+fn a_column_without_a_foreign_key_is_typed_by_the_table_the_called_set_covers() {
+    let database = postgres(R100);
+    let deployment = deployment();
+    let set = answer(&database, &deployment, "authz", "installations_administered", &[])
+        .expect("answered");
+    let parents: Vec<_> = set
+        .arms()
+        .iter()
+        .map(|arm| {
+            let HelperArm::Parent(parent) = arm else { panic!("a parent arm") };
+            assert!(parent.foreign_key().is_none(), "owner references nothing");
+            (
+                parent.table().table_name(),
+                parent.key().column_name(),
+                parent.column().column_name(),
+                parent.parent_table().table_name(),
+                parent.function().name(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        parents,
+        [
+            ("connetto_installations", "id", "owner", "organizations", "organizations_with"),
+            ("connetto_installations", "id", "owner", "teams", "teams_with"),
+            ("connetto_installations", "id", "owner", "projects", "projects_with"),
+        ]
+    );
+    for &(caller, expected) in INSTALLATIONS_MEASURED {
+        let returned: Vec<_> = evaluate(&set, caller).into_iter().collect();
+        assert_eq!(returned, expected, "{caller} calling installations_administered()");
+    }
+}
+
+/// `notes_with`, whose one arm compares `notes.target`, a column with no
+/// foreign key, to `docs_with`, its body `body`.
+fn notes(body: &str, arm: &str) -> Result<String, HelperSetError> {
+    let after = format!(
+        "CREATE TABLE folders (id TEXT PRIMARY KEY);
+         CREATE TABLE folder_members (folder_id TEXT REFERENCES folders (id), user_id TEXT, role TEXT);
+         CREATE TABLE notes (id TEXT PRIMARY KEY, target TEXT);
+         CREATE FUNCTION notes_with(min_role TEXT) RETURNS SETOF TEXT {DEFINER} AS $$ {arm} $$;
+         ALTER FUNCTION notes_with(TEXT) OWNER TO owner;
+         GRANT SELECT ON folders, folder_members, notes TO owner;"
+    );
+    let database = postgres(&helper(DEFINER, body, &after));
+    let deployment = deployment();
+    answer(&database, &deployment, "public", "notes_with", &[text("read")]).map(|set| render(&set))
+}
+
+#[test]
+fn a_column_without_a_foreign_key_compared_to_a_set_covering_no_table_refuses_the_answer() {
+    let typed = "SELECT id FROM notes WHERE target IN (SELECT docs_with(min_role))";
+    assert_eq!(
+        notes(GRANT_ARM, typed).expect("answered"),
+        "notes.id WHERE target as docs IN docs_with('read') \
+         {members.doc_id WHERE user_id = app.user_id AND role IN ('read')}"
+    );
+    let mixed = format!(
+        "{GRANT_ARM} UNION SELECT folder_id FROM folder_members \
+         WHERE user_id = current_setting('app.user_id', true) AND role = min_role"
+    );
+    assert!(matches!(
+        notes(&mixed, typed),
+        Err(HelperSetError::UncoveredParent { function, column, called })
+            if function == "notes_with" && column == "target" && called == "docs_with"
+    ));
+    assert!(
+        matches!(
+            notes(GRANT_ARM, "SELECT id FROM notes WHERE id IN (SELECT docs_with(min_role))"),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "the key the arm returns is no parent"
+    );
 }
 
 #[test]

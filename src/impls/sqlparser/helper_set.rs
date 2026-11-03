@@ -22,7 +22,9 @@ use crate::{
         Deployment, GrantArm, HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm,
         ParserDB, RowSecurity, RowStatement, SessionSetting, SettingContent, SettingValue,
     },
-    traits::{DatabaseLike, ForeignKeyLike, FunctionLike, Relation, RoleLike, TableLike},
+    traits::{
+        ColumnLike, DatabaseLike, ForeignKeyLike, FunctionLike, Relation, RoleLike, TableLike,
+    },
     utils::{
         call_sites::call_reaches,
         identifier_resolution::{SearchPath, identifiers_match},
@@ -35,6 +37,7 @@ use crate::{
 
 type Table = <ParserDB as DatabaseLike>::Table;
 type Column = <ParserDB as DatabaseLike>::Column;
+type ForeignKey = <ParserDB as DatabaseLike>::ForeignKey;
 
 /// See [`FunctionLike::helper_set`].
 pub(super) fn helper_set<'db>(
@@ -328,21 +331,28 @@ impl<'db> Reader<'db> {
         union_arms(query, &mut selects).map_err(|arm| scope.arm_shape(&arm))?;
 
         self.answering.push(function);
-        let arms = selects
+        let read = selects
             .into_iter()
             .map(|select| self.arm(&scope, select))
-            .filter_map(Result::transpose)
             .collect::<Result<Vec<_>, _>>();
         self.answering.pop();
-        Ok(HelperSet { arms: arms? })
+        let read = read?;
+        let mut keyed = read.iter().map(|(keyed, _)| *keyed);
+        let covered_table = keyed.next().flatten().filter(|first| {
+            keyed.all(|other| other.is_some_and(|other| core::ptr::eq(other, *first)))
+        });
+        let arms = read.into_iter().filter_map(|(_, arm)| arm).collect();
+        Ok(HelperSet { arms, covered_table })
     }
 
-    /// Reads one arm, `None` where its condition keeps no row.
+    /// Reads one arm, answering the table whose primary key it returns,
+    /// where it returns one, and the arm, `None` where its condition keeps
+    /// no row.
     fn arm(
         &mut self,
         scope: &Scope<'_, 'db>,
         select: &Select,
-    ) -> Result<Option<HelperArm<'db, ParserDB>>, HelperSetError> {
+    ) -> Result<(Option<&'db Table>, Option<HelperArm<'db, ParserDB>>), HelperSetError> {
         if !plain_select(select) {
             return Err(scope.arm_shape(select));
         }
@@ -360,12 +370,41 @@ impl<'db> Reader<'db> {
         let Some(column) = table.column(returned, self.database)? else {
             return Err(scope.arm_shape(select));
         };
+        let keyed = self.keyed_table(table.table, column)?;
         if let Expr::In { expr, target: InTarget::Subquery(called), negated: false, .. } =
             unnest(selection)
         {
-            return self.parent_arm(scope, select, &table, column, expr, called).map(Some);
+            let arm = self.parent_arm(scope, select, &table, column, expr, called)?;
+            return Ok((keyed, Some(arm)));
         }
-        self.grant_arm(scope, select, &table, column, selection)
+        Ok((keyed, self.grant_arm(scope, select, &table, column, selection)?))
+    }
+
+    /// The table whose primary key `column` of `table` holds, `table` itself
+    /// where `column` is its primary key, else the table its one
+    /// single-column foreign key references, where that key references the
+    /// primary key.
+    fn keyed_table(
+        &self,
+        table: &'db Table,
+        column: &'db Column,
+    ) -> Result<Option<&'db Table>, LookupError> {
+        let database = self.database;
+        if table.primary_key_column(database)?.is_some_and(|primary| core::ptr::eq(primary, column))
+        {
+            return Ok(Some(table));
+        }
+        let [foreign_key] = single_column_foreign_keys(table, column, database)?[..] else {
+            return Ok(None);
+        };
+        let referenced = foreign_key.referenced_table(database)?;
+        let (Some(primary), Some(referenced_column)) = (
+            referenced.primary_key_column(database)?,
+            foreign_key.referenced_columns(database)?.next(),
+        ) else {
+            return Ok(None);
+        };
+        Ok(core::ptr::eq(primary, referenced_column).then_some(referenced))
     }
 
     /// Resolves the one table an arm reads, and checks the owner reads all
@@ -447,7 +486,7 @@ impl<'db> Reader<'db> {
         select: &Select,
         table: &ArmTable<'_, 'db>,
         key: &'db Column,
-        foreign_key_column: &Expr,
+        compared: &Expr,
         subquery: &Query,
     ) -> Result<HelperArm<'db, ParserDB>, HelperSetError> {
         let database = self.database;
@@ -459,19 +498,16 @@ impl<'db> Reader<'db> {
         {
             return Err(shape());
         }
-        let Some(foreign_key_column) = table.column(foreign_key_column, database)? else {
+        let Some(column) = table.column(compared, database)? else {
             return Err(shape());
         };
-        let mut foreign_keys = Vec::new();
-        for foreign_key in table.table.foreign_keys(database)? {
-            let mut host = foreign_key.host_columns(database)?;
-            if host.next().is_some_and(|host| core::ptr::eq(host, foreign_key_column))
-                && host.next().is_none()
-            {
-                foreign_keys.push(foreign_key);
-            }
-        }
-        let [foreign_key] = foreign_keys.as_slice() else { return Err(shape()) };
+        let foreign_key = match single_column_foreign_keys(table.table, column, database)?[..] {
+            [foreign_key] => Some(foreign_key),
+            // Without a foreign key the set names the parent, and the key the
+            // arm returns names no row but its own.
+            [] if !core::ptr::eq(column, key) => None,
+            _ => return Err(shape()),
+        };
         let call = called_helper(subquery).ok_or_else(shape)?;
         let list = plain_arguments(call).ok_or_else(shape)?;
         let mut arguments = Vec::new();
@@ -495,12 +531,24 @@ impl<'db> Reader<'db> {
             });
         }
         let set = self.answer(callee, &arguments)?;
+        let parent_table = match foreign_key {
+            Some(foreign_key) => foreign_key.referenced_table(database)?,
+            None => {
+                set.covered_table().ok_or_else(|| {
+                    HelperSetError::UncoveredParent {
+                        function: scope.name.clone(),
+                        column: column.column_name().to_string(),
+                        called: callee.target_name().to_string(),
+                    }
+                })?
+            }
+        };
         Ok(HelperArm::Parent(ParentArm {
             table: table.table,
             key,
+            column,
             foreign_key,
-            foreign_key_column,
-            referenced_table: foreign_key.referenced_table(database)?,
+            parent_table,
             function: callee,
             arguments,
             set: Box::new(set),
@@ -930,4 +978,20 @@ fn conjunction<'q>(expression: &'q Expr, terms: &mut Vec<&'q Expr>) {
         }
         term => terms.push(term),
     }
+}
+
+/// The foreign keys of `table` whose one host column is `column`.
+fn single_column_foreign_keys<'db>(
+    table: &'db Table,
+    column: &'db Column,
+    database: &'db ParserDB,
+) -> Result<Vec<&'db ForeignKey>, LookupError> {
+    let mut foreign_keys = Vec::new();
+    for foreign_key in table.foreign_keys(database)? {
+        let mut host = foreign_key.host_columns(database)?;
+        if host.next().is_some_and(|host| core::ptr::eq(host, column)) && host.next().is_none() {
+            foreign_keys.push(foreign_key);
+        }
+    }
+    Ok(foreign_keys)
 }
