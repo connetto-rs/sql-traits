@@ -18,7 +18,10 @@
 //! does not inherit from its root.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, LookupError},
+    prelude::*,
+};
 use sqlparser::dialect::{BigQueryDialect, PostgreSqlDialect};
 
 use crate::support::column_names::column_names;
@@ -384,6 +387,77 @@ fn a_parent_named_before_it_is_created_is_refused() {
         parse("CREATE TABLE t (x INT) INHERITS (t);"),
         Err(Error::ParentTableNotFound { ref parent_table, .. }) if parent_table == "t"
     ));
+}
+
+#[test]
+fn a_partition_names_only_columns_its_parent_declares() {
+    // Measured on PostgreSQL 17 and 18: "column "missing" does not exist",
+    // whichever option the partition writes on it.
+    let root = "CREATE TABLE orders (id INT NOT NULL, note TEXT) PARTITION BY RANGE (id);";
+    for written in ["missing NOT NULL", "missing DEFAULT 1", "note DEFAULT 'x', missing NOT NULL"] {
+        let error = parse(&format!(
+            "{root} CREATE TABLE p PARTITION OF orders ({written}) FOR VALUES FROM (0) TO (10);"
+        ))
+        .expect_err(written);
+        assert!(
+            matches!(
+                &error,
+                Error::IdentifierLookupError(LookupError::ColumnNotFound { table_name, column_name })
+                    if table_name == "orders" && column_name == "missing"
+            ),
+            "{written}: {error:?}"
+        );
+    }
+    let db = database(&format!(
+        "{root} CREATE TABLE p PARTITION OF orders (note DEFAULT 'x') FOR VALUES FROM (0) TO (10);"
+    ));
+    assert_eq!(column_names(&db, "p"), ["id", "note"]);
+}
+
+#[test]
+fn a_partition_names_a_partitioned_parent() {
+    // Measured on PostgreSQL 17 and 18: ""plain" is not partitioned", for a
+    // bound and for `DEFAULT` alike, and for a partition that is not itself
+    // partitioned.
+    let schema = "CREATE TABLE plain (id INT);
+         CREATE TABLE orders (id INT) PARTITION BY RANGE (id);
+         CREATE TABLE leaf PARTITION OF orders FOR VALUES FROM (0) TO (10);";
+    for (statement, parent) in [
+        ("CREATE TABLE p PARTITION OF plain FOR VALUES FROM (0) TO (10);", "plain"),
+        ("CREATE TABLE p PARTITION OF plain DEFAULT;", "plain"),
+        ("CREATE TABLE p PARTITION OF leaf FOR VALUES FROM (0) TO (5);", "leaf"),
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::ParentNotPartitioned { table_name, parent_name }
+                    if table_name == "p" && parent_name == parent
+            ),
+            "{statement}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn no_table_inherits_from_a_partitioned_table() {
+    // Measured on PostgreSQL 17 and 18: "cannot inherit from partitioned
+    // table "orders"", also as one parent among several.
+    let schema = "CREATE TABLE plain (id INT);
+         CREATE TABLE orders (id INT) PARTITION BY RANGE (id);";
+    for statement in
+        ["CREATE TABLE c () INHERITS (orders);", "CREATE TABLE c () INHERITS (plain, orders);"]
+    {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::InheritsFromPartitionedTable { table_name, parent_name }
+                    if table_name == "c" && parent_name == "orders"
+            ),
+            "{statement}: {error:?}"
+        );
+    }
 }
 
 #[test]

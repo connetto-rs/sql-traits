@@ -1549,6 +1549,26 @@ pub enum Error {
         parent_name: String,
     },
     #[error(
+        "Table `{table_name}` cannot be a partition of `{parent_name}`, which is not partitioned."
+    )]
+    /// Error indicating that a table is declared `PARTITION OF` a table that
+    /// has no partition key, which PostgreSQL refuses as "is not partitioned".
+    ParentNotPartitioned {
+        /// Table the statement creates.
+        table_name: String,
+        /// Parent it names, as written.
+        parent_name: String,
+    },
+    #[error("Table `{table_name}` cannot inherit from partitioned table `{parent_name}`.")]
+    /// Error indicating that `INHERITS` names a partitioned table, which only
+    /// takes partitions through `PARTITION OF`.
+    InheritsFromPartitionedTable {
+        /// Table the statement creates.
+        table_name: String,
+        /// Partitioned parent it names, as written.
+        parent_name: String,
+    },
+    #[error(
         "Table `{partition_name}` cannot be attached as a partition of `{table_name}` because {reason}."
     )]
     /// Error indicating that `ALTER TABLE ... ATTACH PARTITION` names a table
