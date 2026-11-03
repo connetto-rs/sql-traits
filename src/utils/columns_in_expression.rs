@@ -656,6 +656,8 @@ mod tests {
             ("position('x' IN b) > a", &["b", "a"]),
             ("substring(b FROM a FOR c) = 'x'", &["b", "a", "c"]),
             ("ARRAY[a, b] && ARRAY[c]", &["a", "b", "c"]),
+            ("b[a] = 'x'", &["b", "a"]),
+            ("(b).field[c] = 'x'", &["b", "c"]),
         ] {
             assert_eq!(names_in(&postgres, sql).expect("columns resolve"), expected, "{sql}");
         }
@@ -672,11 +674,13 @@ mod tests {
         ] {
             assert_eq!(names_in(&postgres, sql).expect("columns resolve"), expected, "{sql}");
         }
-        assert_eq!(
-            names_in(&sqlparser::dialect::DuckDbDialect {}, "list_transform(b, x -> x || a)")
-                .expect("columns resolve"),
-            ["b", "a"]
-        );
+        let duckdb = sqlparser::dialect::DuckDbDialect {};
+        for (sql, expected) in [
+            ("list_transform(b, x -> x || a)", &["b", "a"][..]),
+            ("list_transform(b, x -> x.field || a)", &["b", "a"]),
+        ] {
+            assert_eq!(names_in(&duckdb, sql).expect("columns resolve"), expected, "{sql}");
+        }
     }
 
     #[test]
