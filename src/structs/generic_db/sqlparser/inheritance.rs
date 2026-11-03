@@ -850,6 +850,18 @@ fn merge_local_columns(
                 return Err(error);
             }
             columns[position] = merge_declarations(&columns[position], column);
+        } else if let Some((_, root)) =
+            context.parents.iter().find(|(kind, _)| *kind == ParentKind::PartitionOf)
+        {
+            // A partition declares no column of its own, only options on the
+            // columns its root passes down.
+            return Err(crate::errors::LookupError::ColumnNotFound {
+                table_name: resolve_parent(context.builder, root, context.child_name)?
+                    .table_name()
+                    .to_string(),
+                column_name: column.name.value.clone(),
+            }
+            .into());
         } else {
             columns.push(column.clone());
         }
@@ -1063,8 +1075,9 @@ fn parent_owning(
 }
 
 /// Binds every parent a table being created names to the table it reaches
-/// through the session's path, refusing an absent one and one PostgreSQL will
-/// not link across temporary and permanent storage.
+/// through the session's path, refusing an absent one, one PostgreSQL will
+/// not link across temporary and permanent storage, a `PARTITION OF` parent
+/// without a partition key and an `INHERITS` parent with one.
 fn bind_parents(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
@@ -1093,6 +1106,21 @@ fn bind_parents(
                 table_name: child_name.to_string(),
                 parent_name: parent_name.to_string(),
             });
+        }
+        match kind {
+            ParentKind::PartitionOf if parent.partition_by.is_none() => {
+                return Err(Error::ParentNotPartitioned {
+                    table_name: child_name.to_string(),
+                    parent_name: parent_name.to_string(),
+                });
+            }
+            ParentKind::Inherits if parent.partition_by.is_some() => {
+                return Err(Error::InheritsFromPartitionedTable {
+                    table_name: child_name.to_string(),
+                    parent_name: parent_name.to_string(),
+                });
+            }
+            ParentKind::PartitionOf | ParentKind::Inherits => {}
         }
         let qualifier = super::stored_qualifier(&parent.name);
         super::bind_reference(parent_name, qualifier);
