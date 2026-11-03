@@ -1295,10 +1295,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   deployment declares the setting as the caller and the condition, the
     ///   arguments substituted, reduces to `TRUE`, to `FALSE` or `NULL`, or to
     ///   the literal values one column has to hold.
-    /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <foreign key
-    ///   column> IN (SELECT <helper>(<arguments>))`, the foreign key a
-    ///   single-column one and each argument a parameter or a literal, the
-    ///   helper called answered in turn for the arguments it receives.
+    /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
+    ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
+    ///   literal, the helper called answered in turn for the arguments it
+    ///   receives. The column names its parent through its one single-column
+    ///   foreign key or, where it has none, through the table the called
+    ///   helper's set covers.
     ///
     /// A grant arm whose condition reduces to `FALSE` or `NULL` keeps no row
     /// and is left out. A column named like a parameter is the column, as

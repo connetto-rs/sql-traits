@@ -16,6 +16,7 @@ use crate::{structs::SessionSetting, traits::DatabaseLike};
 #[derive(Debug)]
 pub struct HelperSet<'db, DB: DatabaseLike> {
     pub(crate) arms: Vec<HelperArm<'db, DB>>,
+    pub(crate) covered_table: Option<&'db DB::Table>,
 }
 
 impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
@@ -23,6 +24,19 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
     #[must_use]
     pub fn arms(&self) -> &[HelperArm<'db, DB>] {
         &self.arms
+    }
+
+    /// The one table whose primary key every arm the body writes returns,
+    /// as its own primary key or through a single-column foreign key
+    /// referencing it, so that every value of the set is a key of that
+    /// table.
+    ///
+    /// `None` where two arms return keys of different tables, or an arm
+    /// returns a column that is neither. Arms left out for the arguments
+    /// count, so the answer does not depend on them.
+    #[must_use]
+    pub fn covered_table(&self) -> Option<&'db DB::Table> {
+        self.covered_table
     }
 }
 
@@ -109,15 +123,20 @@ impl<'db, DB: DatabaseLike> LiteralSet<'db, DB> {
     }
 }
 
-/// `SELECT <key> FROM <table> WHERE <foreign key column> IN (SELECT
-/// <function>(<arguments>))`.
+/// `SELECT <key> FROM <table> WHERE <column> IN (SELECT
+/// <function>(<arguments>))`, the column naming a row of the parent table.
+///
+/// The column names the parent through its single-column foreign key, or,
+/// where it has none, through the set it is compared to, which then covers
+/// the parent table (see [`HelperSet::covered_table`]). A column whose
+/// parent may be one of several tables is read by one arm per table.
 #[derive(Debug)]
 pub struct ParentArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
     pub(crate) key: &'db DB::Column,
-    pub(crate) foreign_key: &'db DB::ForeignKey,
-    pub(crate) foreign_key_column: &'db DB::Column,
-    pub(crate) referenced_table: &'db DB::Table,
+    pub(crate) column: &'db DB::Column,
+    pub(crate) foreign_key: Option<&'db DB::ForeignKey>,
+    pub(crate) parent_table: &'db DB::Table,
     pub(crate) function: &'db DB::Function,
     pub(crate) arguments: Vec<Value>,
     pub(crate) set: Box<HelperSet<'db, DB>>,
@@ -136,22 +155,25 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
         self.key
     }
 
-    /// The single-column foreign key from the table to its parent.
+    /// The column naming the parent.
     #[must_use]
-    pub fn foreign_key(&self) -> &'db DB::ForeignKey {
+    pub fn column(&self) -> &'db DB::Column {
+        self.column
+    }
+
+    /// The single-column foreign key of [`column`](Self::column), or `None`
+    /// where the column has none and [`set`](Self::set) names the parent
+    /// table.
+    #[must_use]
+    pub fn foreign_key(&self) -> Option<&'db DB::ForeignKey> {
         self.foreign_key
     }
 
-    /// The column of [`foreign_key`](Self::foreign_key).
+    /// The parent table, the one [`foreign_key`](Self::foreign_key)
+    /// references or, without one, the one [`set`](Self::set) covers.
     #[must_use]
-    pub fn foreign_key_column(&self) -> &'db DB::Column {
-        self.foreign_key_column
-    }
-
-    /// The table [`foreign_key`](Self::foreign_key) references.
-    #[must_use]
-    pub fn referenced_table(&self) -> &'db DB::Table {
-        self.referenced_table
+    pub fn parent_table(&self) -> &'db DB::Table {
+        self.parent_table
     }
 
     /// The helper returning the parents.

@@ -691,6 +691,20 @@ pub enum HelperSetError {
         /// The query that has neither shape, as written.
         arm: String,
     },
+    /// A parent arm compares a column with no single-column foreign key to a
+    /// helper whose set covers no one table, so nothing names the parent
+    /// table.
+    #[error(
+        "helper `{function}` compares `{column}`, which has no single-column foreign key, to `{called}`, whose set covers no single table"
+    )]
+    UncoveredParent {
+        /// The helper.
+        function: String,
+        /// The column.
+        column: String,
+        /// The helper called.
+        called: String,
+    },
     /// A parent arm's call reaches no function or several.
     #[error("helper `{function}` calls `{call}`, which reaches no single function")]
     UnresolvedCall {
