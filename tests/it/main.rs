@@ -14,6 +14,7 @@ mod array_vector_interval_types;
 mod call_resolution;
 mod call_result_types;
 mod catalog_navigation;
+mod check_constraint_columns;
 mod clause_bindings;
 mod collation_name_cost;
 mod column_alterations;
