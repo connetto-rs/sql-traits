@@ -73,7 +73,8 @@ fn test_custom_column_types_keep_modifiers() {
         ("shape(Point, 4326)", "shape(Point, 4326)"),
         ("custom_type(1, two, 3)", "custom_type(1, two, 3)"),
         (r#"custom_type("Point", 'it''s', 3)"#, r#"custom_type("Point", 'it''s', 3)"#),
-        (r#""Geometry"(Point, 3857)"#, "Geometry(Point, 3857)"),
+        (r#""Geometry"(Point, 3857)"#, r#""Geometry"(Point, 3857)"#),
+        (r#""geometry"(Point, 3857)"#, "geometry(Point, 3857)"),
         ("geometry(Point, 3857)[]", "geometry(Point, 3857)[]"),
         ("geometry", "geometry"),
         ("geography", "geography"),
@@ -99,8 +100,8 @@ fn test_schema_qualified_column_type_keeps_its_schema() {
 /// rather than silently reporting the type as unqualified.
 #[test]
 fn test_empty_schema_part_keeps_its_separator() {
-    assert_eq!(column_types(r#"CREATE TABLE t (value "".foo);"#), vec![".foo"]);
-    assert_eq!(column_types(r#"CREATE TABLE t (value ""."");"#), vec!["."]);
+    assert_eq!(column_types(r#"CREATE TABLE t (value "".foo);"#), vec![r#""".foo"#]);
+    assert_eq!(column_types(r#"CREATE TABLE t (value ""."");"#), vec!["\"\".\"\""]);
 }
 
 /// SQLite lets a column declare no type at all, which the parser records as a

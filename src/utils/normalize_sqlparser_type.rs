@@ -3,9 +3,11 @@
 use alloc::{borrow::Cow, format, string::String};
 use core::fmt::Write;
 
-use sqlparser::ast::{ArrayElemTypeDef, DataType, GeometricTypeKind, ObjectName, TimezoneInfo};
+use sqlparser::ast::{
+    ArrayElemTypeDef, DataType, GeometricTypeKind, ObjectName, ObjectNamePart, TimezoneInfo,
+};
 
-use crate::utils::object_name::object_name_part_value;
+use crate::utils::normalize_postgres_type::{push_quoted, quoting_matters};
 
 /// Normalizes `SQLParser` data types to a standard representation.
 ///
@@ -14,7 +16,9 @@ use crate::utils::object_name::object_name_part_value;
 /// that introduces a type stops this crate from building until the type is
 /// classified, rather than reaching a caller as a runtime failure.
 ///
-/// One-part custom types retain modifiers, and arrays retain element types.
+/// One-part custom types retain modifiers, and arrays retain element types. A
+/// custom type name part written in quotes keeps them when they decide which
+/// type is named, so `"MyType"` stays apart from `MyType`.
 ///
 /// Built-in parameters and MySQL's `ZEROFILL` decoration are omitted.
 ///
@@ -308,11 +312,11 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
                 [only] => {
                     // A part built at run time names no type here, which is
                     // the same position an empty name leaves the reader in.
-                    let Some(name) = object_name_part_value(only) else {
+                    let Some(name) = type_name_part(only, true) else {
                         return "UNSPECIFIED".into();
                     };
                     if segments.is_empty() {
-                        name.into()
+                        name
                     } else {
                         let mut normalized = format!("{name}(");
                         for (index, segment) in segments.iter().enumerate() {
@@ -328,18 +332,34 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
                 qualified => {
                     let mut joined = String::new();
                     for (index, part) in qualified.iter().enumerate() {
-                        let Some(value) = object_name_part_value(part) else {
+                        let Some(value) = type_name_part(part, false) else {
                             return "UNSPECIFIED".into();
                         };
                         if index > 0 {
                             joined.push('.');
                         }
-                        joined.push_str(value);
+                        joined.push_str(&value);
                     }
                     joined.into()
                 }
             }
         }
+    }
+}
+
+/// Returns one part of a custom type name, quoted when the writer quoted it
+/// and the quotes decide which type it names, or `None` for a part built at
+/// run time. `unqualified` says whether the part is the whole name.
+fn type_name_part(part: &ObjectNamePart, unqualified: bool) -> Option<Cow<'_, str>> {
+    let ObjectNamePart::Identifier(ident) = part else {
+        return None;
+    };
+    if ident.quote_style.is_some() && quoting_matters(&ident.value, unqualified) {
+        let mut quoted = String::with_capacity(ident.value.len() + 2);
+        push_quoted(&mut quoted, &ident.value);
+        Some(Cow::Owned(quoted))
+    } else {
+        Some(Cow::Borrowed(&ident.value))
     }
 }
 
@@ -442,8 +462,8 @@ mod tests {
             "db.app.my_type"
         );
 
-        // A quoted part contributes its value, matching how an unqualified
-        // custom type already reports itself.
+        // A quoted part keeps its quotes where they decide the type, so it
+        // stays apart from the unquoted name that folds to lower case.
         let quoted = DataType::Custom(
             ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::with_quote('"', "App")),
@@ -451,7 +471,8 @@ mod tests {
             ]),
             vec![],
         );
-        assert_eq!(normalize_sqlparser_type(&quoted), "App.My Type");
+        assert_eq!(normalize_sqlparser_type(&quoted), "\"App\".\"My Type\"");
+        assert_eq!(normalize_sqlparser_type(&qualified(&["App", "My_Type"])), "App.My_Type");
 
         // Qualified custom types report only their qualified name.
         let qualified_geography = DataType::Custom(
@@ -488,9 +509,9 @@ mod tests {
             )
         };
 
-        assert_eq!(normalize_sqlparser_type(&custom(&["", "foo"])), ".foo");
-        assert_eq!(normalize_sqlparser_type(&custom(&["a", "", "c"])), "a..c");
-        assert_eq!(normalize_sqlparser_type(&custom(&["", ""])), ".");
+        assert_eq!(normalize_sqlparser_type(&custom(&["", "foo"])), "\"\".foo");
+        assert_eq!(normalize_sqlparser_type(&custom(&["a", "", "c"])), "a.\"\".c");
+        assert_eq!(normalize_sqlparser_type(&custom(&["", ""])), "\"\".\"\"");
         assert_eq!(normalize_sqlparser_type(&custom(&[])), "UNSPECIFIED");
     }
 
