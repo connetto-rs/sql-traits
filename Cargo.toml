@@ -65,7 +65,7 @@ unreachable_patterns = "forbid"
 unused_import_braces = "forbid"
 unused_must_use = "forbid"
 deprecated = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(coverage_nightly)"] }
 
 [lints.rustdoc]
 broken_intra_doc_links = "forbid"

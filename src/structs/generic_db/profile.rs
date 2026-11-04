@@ -43,7 +43,8 @@ pub(crate) type Identified<K, I> = (Arc<K>, Meta<K>, I);
 /// [`ParserDB`](crate::structs::ParserDB) alias.
 ///
 /// Each associated type is bound to the database it belongs to, so an
-/// implementation cannot mix kinds from two different databases.
+/// implementation cannot mix kinds from two different databases. A kind the
+/// engine does not have is named as [`Absent`](crate::structs::Absent).
 pub trait SchemaProfile: Sized {
     /// The tables the schema holds.
     type Table: TableLike<DB = GenericDB<Self>>;
