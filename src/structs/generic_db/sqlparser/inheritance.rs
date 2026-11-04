@@ -457,6 +457,10 @@ pub(super) fn receives_column_constraint(
                         && declared.options.iter().any(|held| is_copy_of_option(option, held))
                 })
             })
+    }) || super::constraint_names::slots(child).into_iter().any(|slot| {
+        matches!(slot, super::constraint_names::Slot::Column { def, held, .. }
+            if same_column(&def.name, written_on) && held == option)
+            && super::constraint_names::receives_check(builder, child, slot)
     })
 }
 
@@ -778,6 +782,9 @@ pub(super) fn receives_constraint(
                 .iter()
                 .any(|passed| passes_down(kind, passed) && is_copy_of(held, passed))
         })
+    }) || super::constraint_names::slots(child).into_iter().any(|slot| {
+        matches!(slot, super::constraint_names::Slot::Table(_, constraint) if constraint == held)
+            && super::constraint_names::receives_check(builder, child, slot)
     })
 }
 

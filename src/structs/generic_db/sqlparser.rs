@@ -9384,12 +9384,14 @@ impl ParserDB {
                     // What the child requires a value of itself stays its own,
                     // whatever a parent requires.
                     let own_not_null = required_columns(&create_table);
-                    let inherited = inheritance::apply_parents(
+                    let mut inherited = inheritance::apply_parents(
                         &builder,
                         &mut create_table,
                         &collation_metadata,
                         &active_postgres_catalog,
                     )?;
+                    let merged = constraint_names::merge_named_copies(&builder, &mut create_table);
+                    inherited.constraints.retain(|rendering| !merged.contains(rendering));
                     // The bound is checked against the partitions the root
                     // already has, which the parents just resolved.
                     if let (Some(root), Some(bound)) =

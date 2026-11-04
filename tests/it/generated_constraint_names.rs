@@ -363,3 +363,44 @@ fn outside_postgresql_an_unnamed_parent_check_is_matched_by_its_expression() {
             .is_err()
     );
 }
+
+#[test]
+fn a_child_writing_its_parents_generated_name_holds_the_parents_copy() {
+    for (parent, child) in [
+        (
+            "CREATE TABLE p (a INT CHECK (a > 0));",
+            "CREATE TABLE c (a INT, CONSTRAINT p_a_check CHECK (a > 0)) INHERITS (p);",
+        ),
+        (
+            "CREATE TABLE p (a INT, CHECK (a > 0));",
+            "CREATE TABLE c (a INT, CONSTRAINT p_a_check CHECK (a > 0)) INHERITS (p);",
+        ),
+        (
+            "CREATE TABLE p (a INT CHECK (a > 0));",
+            "CREATE TABLE c (a INT CONSTRAINT p_a_check CHECK (a > 0)) INHERITS (p);",
+        ),
+    ] {
+        let db = accepted(&format!("{parent} {child}"));
+        let checks: Vec<_> = table(&db, "c")
+            .check_constraints(&db)
+            .expect("held")
+            .map(|check| owned(check.constraint_name(&db)))
+            .collect();
+        assert_eq!(checks, names(&[Some("p_a_check")]), "{child}");
+        assert!(
+            matches!(
+                parse(&format!("{parent} {child} ALTER TABLE c DROP CONSTRAINT p_a_check;")),
+                Err(Error::InheritedConstraintNotDroppable { .. })
+            ),
+            "{child}"
+        );
+    }
+    // Under another name, the child's check is its own beside the copy.
+    let other = "CREATE TABLE p (a INT CHECK (a > 0));
+                 CREATE TABLE c (a INT, CONSTRAINT k CHECK (a > 0)) INHERITS (p);";
+    accepted(&format!("{other} ALTER TABLE c DROP CONSTRAINT k;"));
+    assert!(matches!(
+        parse(&format!("{other} ALTER TABLE c DROP CONSTRAINT p_a_check;")),
+        Err(Error::InheritedConstraintNotDroppable { .. })
+    ));
+}
