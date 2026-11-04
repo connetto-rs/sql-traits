@@ -6928,6 +6928,68 @@ impl ParserDB {
         Ok(())
     }
 
+    /// Refuses a change `ONLY` would withhold from the partitions of a
+    /// partitioned table, which PostgreSQL grants plain inheritance but not
+    /// partitions, since a partition holds exactly its root's columns and
+    /// requirements.
+    fn refuse_only_with_partitions(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        scope: AlterTableScope,
+        change: crate::errors::InheritedChange,
+    ) -> Result<(), crate::errors::Error> {
+        let has_partitions = inheritance::direct_children(builder, stored)
+            .iter()
+            .any(|(kind, _)| *kind == inheritance::ParentKind::PartitionOf);
+        if scope.only && has_partitions {
+            return Err(crate::errors::Error::OnlyRefusedWithChildren {
+                table_name: stored.name.clone(),
+                change,
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses adding an identity to a column of a partition, which only its
+    /// root may do for all of them, and under `ONLY` to a column of a
+    /// partitioned table, even one without partitions yet.
+    fn refuse_partition_identity(
+        stored: &StoredTable,
+        node: &CreateTable,
+        scope: AlterTableScope,
+        column: &NamedColumn,
+    ) -> Result<(), crate::errors::Error> {
+        if node.partition_of.is_some() {
+            return Err(crate::errors::Error::IdentityAddedToPartitionColumn {
+                table_name: stored.name.clone(),
+                column_name: column.name.clone(),
+            });
+        }
+        if scope.only && node.partition_strategy().is_some() {
+            return Err(crate::errors::Error::IdentityAddedToOnlyPartitionedTable {
+                table_name: stored.name.clone(),
+                column_name: column.name.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses adding a column to a partition, whose columns are all its
+    /// root's. PostgreSQL checks this before `IF NOT EXISTS` is looked at.
+    fn refuse_column_on_partition(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        added: &NamedColumn,
+    ) -> Result<(), crate::errors::Error> {
+        if Self::stored_node(builder, stored)?.partition_of.is_some() {
+            return Err(crate::errors::Error::ColumnAddedToPartition {
+                table_name: stored.name.clone(),
+                column_name: added.name.clone(),
+            });
+        }
+        Ok(())
+    }
+
     /// Refuses a column option the table cannot take: a `NO INHERIT` check on
     /// a partitioned table, which would keep it from the partitions, and a key
     /// whose unique index would reach a foreign partition.
@@ -6965,6 +7027,7 @@ impl ParserDB {
             return Ok(builder);
         };
         let added = NamedColumn::of(&column_def.name, builder.identifier_case());
+        Self::refuse_column_on_partition(&builder, &stored, &added)?;
 
         if added.declared_by(Self::stored_node(&builder, &stored)?) {
             if if_not_exists {
@@ -7174,6 +7237,12 @@ impl ParserDB {
                     column_name: column.name.clone(),
                 });
             }
+            Self::refuse_only_with_partitions(
+                &builder,
+                &stored,
+                scope,
+                crate::errors::InheritedChange::DropColumn,
+            )?;
 
             // The column leaves every table inheriting this one along with it,
             // unless `ONLY` asked for the named table, which leaves each
@@ -7459,6 +7528,25 @@ impl ParserDB {
             let node = Self::stored_node(&builder, &stored)?;
             let column = NamedColumn::of(column_name, builder.identifier_case());
             if column.declared_by(node) {
+                if matches!(operation, AlterColumnOperation::AddGenerated { .. }) {
+                    Self::refuse_partition_identity(&stored, node, scope, &column)?;
+                }
+                // Requiring a value the column already requires changes
+                // nothing, so only a new requirement has to reach the
+                // partitions.
+                if matches!(operation, AlterColumnOperation::SetNotNull)
+                    && !node
+                        .columns
+                        .iter()
+                        .any(|declared| column.matches(&declared.name) && states_not_null(declared))
+                {
+                    Self::refuse_only_with_partitions(
+                        &builder,
+                        &stored,
+                        scope,
+                        crate::errors::InheritedChange::SetNotNull,
+                    )?;
+                }
                 Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;
                 if matches!(operation, AlterColumnOperation::SetDataType { .. }) {
                     // A column keeps one type across its inheritance tree,

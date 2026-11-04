@@ -115,6 +115,12 @@ pub enum InheritedChange {
     ValidateConstraint,
     /// `ALTER TABLE ONLY ... ALTER COLUMN ... TYPE`.
     AlterColumnType,
+    /// `ALTER TABLE ONLY ... DROP COLUMN` on a partitioned table with
+    /// partitions, which hold every column of their root.
+    DropColumn,
+    /// `ALTER TABLE ONLY ... ALTER COLUMN ... SET NOT NULL` on a partitioned
+    /// table with partitions.
+    SetNotNull,
 }
 
 impl core::fmt::Display for InheritedChange {
@@ -125,6 +131,8 @@ impl core::fmt::Display for InheritedChange {
             Self::RenameColumn => "rename a column of",
             Self::ValidateConstraint => "validate a constraint of",
             Self::AlterColumnType => "change a column type of",
+            Self::DropColumn => "drop a column of",
+            Self::SetNotNull => "require a value in a column of",
         })
     }
 }
@@ -805,6 +813,40 @@ pub enum Error {
         /// Name of the table the statement names.
         table_name: String,
         /// Name of the inherited column.
+        column_name: String,
+    },
+    #[error("Cannot add column `{column_name}` to table `{table_name}` because it is a partition.")]
+    /// Error indicating that `ALTER TABLE ... ADD COLUMN` names a partition,
+    /// whose columns are all its root's, even when `IF NOT EXISTS` would skip
+    /// the column.
+    ColumnAddedToPartition {
+        /// Name of the partition the statement names.
+        table_name: String,
+        /// Name of the column the statement adds.
+        column_name: String,
+    },
+    #[error(
+        "Cannot add an identity to column `{column_name}` of table `{table_name}` because it is a partition."
+    )]
+    /// Error indicating that `ALTER COLUMN ... ADD GENERATED ... AS IDENTITY`
+    /// names a column of a partition, which only its root may make an
+    /// identity.
+    IdentityAddedToPartitionColumn {
+        /// Name of the partition the statement names.
+        table_name: String,
+        /// Name of the column.
+        column_name: String,
+    },
+    #[error(
+        "Cannot add an identity to column `{column_name}` of only the partitioned table `{table_name}`."
+    )]
+    /// Error indicating that `ALTER TABLE ONLY ... ADD GENERATED ... AS
+    /// IDENTITY` names a partitioned table, whose partitions would then lack
+    /// the identity, which PostgreSQL refuses even before any partition exists.
+    IdentityAddedToOnlyPartitionedTable {
+        /// Name of the partitioned table the statement names.
+        table_name: String,
+        /// Name of the column.
         column_name: String,
     },
     #[error(
