@@ -60,7 +60,7 @@ fn a_created_sequence_is_recorded_and_reached_by_the_grants_on_it() {
     let ticket = sequence(&db, "ticket_seq");
     assert_eq!(ticket.sequence_schema(), None);
     assert!(!ticket.is_temporary());
-    assert_eq!(ticket.options(), []);
+    assert_eq!(ticket.written_options(), []);
     for grant in db.table_grants() {
         assert_eq!(relations_of(&db, grant), ["sequence public.ticket_seq"]);
     }
@@ -76,7 +76,7 @@ fn the_written_options_are_kept_in_order() {
     .expect("schema parses");
 
     let options: Vec<String> =
-        sequence(&db, "s").options().iter().map(ToString::to_string).collect();
+        sequence(&db, "s").written_options().iter().map(ToString::to_string).collect();
     assert_eq!(
         options,
         [
@@ -211,9 +211,7 @@ fn if_not_exists_skips_whatever_relation_holds_the_name() {
     .expect("every repeated name is skipped");
 
     assert_eq!(sequence_names(&db), ["public.s"]);
-    let options: Vec<String> =
-        sequence(&db, "s").options().iter().map(ToString::to_string).collect();
-    assert_eq!(options, [" INCREMENT BY 2"]);
+    assert_eq!(sequence(&db, "s").parameters().increment(), 2);
 }
 
 #[test]
@@ -427,7 +425,7 @@ fn owned_by_ties_the_sequence_to_its_column() {
 
     assert_eq!(owner_of(&db, "s"), Some(("t".to_string(), "id".to_string())));
     assert_eq!(owner_of(&db, "free"), None);
-    assert_eq!(sequence(&db, "s").options(), []);
+    assert_eq!(sequence(&db, "s").written_options(), []);
 }
 
 #[test]

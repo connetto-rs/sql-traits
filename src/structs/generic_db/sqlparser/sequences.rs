@@ -56,7 +56,8 @@ use crate::{
     errors::{Error, ObjectKind},
     impls::{SqlparserDialect, serial_sequence_type},
     structs::{
-        ColumnIdentity, IdentifierCase, Sequence, StoredSequenceOwner, TableAttribute, TargetName,
+        ColumnIdentity, IdentifierCase, Sequence, SequenceParameters, StoredSequenceOwner,
+        TableAttribute, TargetName,
     },
     traits::{ColumnLike, SequenceLike, SequenceOrigin, TableLike},
     utils::{
@@ -76,8 +77,9 @@ use crate::{
 ///
 /// Refuses a name another relation in the schema already holds unless the
 /// statement wrote `IF NOT EXISTS`, a schema the input never creates, a
-/// temporary sequence outside the temporary schema, and every `OWNED BY` the
-/// errors of [`resolve_owner`] name.
+/// temporary sequence outside the temporary schema, parameters PostgreSQL
+/// refuses with [`Error::InvalidSequenceParameters`], and every `OWNED BY`
+/// the errors of [`resolve_owner`] name.
 pub(super) fn create_sequence(
     builder: ParserDBBuilder,
     temporary: bool,
@@ -98,6 +100,11 @@ pub(super) fn create_sequence(
     if relation.is_some() && if_not_exists {
         return Ok(builder);
     }
+    // PostgreSQL reads the options before it creates the relation, so their
+    // refusal comes ahead of a name another relation holds.
+    let parameters = SequenceParameters::from_options(&options).map_err(|reason| {
+        Error::InvalidSequenceParameters { sequence_name: name_ident.value.clone(), reason }
+    })?;
     // A sequence has no row type, yet PostgreSQL refuses it a name a domain
     // holds whatever `IF NOT EXISTS` says.
     if let Some(conflicting_kind) =
@@ -126,6 +133,7 @@ pub(super) fn create_sequence(
         (name_ident.value.clone(), name_ident.quote_style.is_some()),
         schema.map(|(value, quoted)| (value.to_string(), quoted)),
         kept,
+        parameters,
         owner,
         SequenceOrigin::Declared,
     );
@@ -547,7 +555,9 @@ pub(super) struct UnownedSequences(Vec<(Ident, *const Sequence)>);
 ///
 /// Returns [`Error::RelationNameAlreadyTaken`] when a relation took a planned
 /// name meanwhile, another sequence of the same statement included, or when a
-/// domain holds it, which PostgreSQL refuses rather than numbering past.
+/// domain holds it, which PostgreSQL refuses rather than numbering past, and
+/// [`Error::InvalidSequenceParameters`] for an identity whose column type or
+/// options PostgreSQL refuses.
 pub(super) fn create_column_sequences(
     mut builder: ParserDBBuilder,
     table: &StoredTable,
@@ -577,8 +587,17 @@ pub(super) fn create_column_sequences(
                 .chain([stored_ident(&name, quoted)])
                 .collect::<Vec<_>>(),
         );
-        let sequence =
-            Arc::new(Sequence::new((name, quoted), schema.clone(), options, None, origin));
+        let parameters = SequenceParameters::from_options(&options).map_err(|reason| {
+            Error::InvalidSequenceParameters { sequence_name: name.clone(), reason }
+        })?;
+        let sequence = Arc::new(Sequence::new(
+            (name, quoted),
+            schema.clone(),
+            options,
+            parameters,
+            None,
+            origin,
+        ));
         created.push((column, Arc::as_ptr(&sequence)));
         builder = builder.add_sequence(sequence, ());
         builder =
@@ -629,13 +648,18 @@ pub(super) fn own_column_sequences(
 /// PostgreSQL carries over whenever the column's type changes.
 ///
 /// A serial sequence keeps the type it was created with.
-pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) {
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSequenceParameters`] when the new type is not one
+/// a sequence counts in, or cannot hold a value the sequence keeps.
+pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) -> Result<(), Error> {
     if builder
         .sequences()
         .iter()
         .all(|(sequence, ())| sequence.origin() != SequenceOrigin::Identity)
     {
-        return;
+        return Ok(());
     }
     let types: BTreeMap<_, _> = builder
         .columns()
@@ -655,15 +679,22 @@ pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) {
             let data_type = *types.get(&identity)?;
             // An identity sequence is created with its `AS` type first.
             let current = matches!(
-                sequence.options().first(),
+                sequence.written_options().first(),
                 Some(SequenceOptions::DataType(current)) if current == data_type
             );
             (!current).then(|| (position, data_type.clone()))
         })
         .collect();
     for (position, data_type) in changed {
-        Arc::make_mut(&mut builder.sequences_mut()[position].0).set_data_type(data_type);
+        let sequence = Arc::make_mut(&mut builder.sequences_mut()[position].0);
+        sequence.set_data_type(data_type).map_err(|reason| {
+            Error::InvalidSequenceParameters {
+                sequence_name: sequence.sequence_name().to_string(),
+                reason,
+            }
+        })?;
     }
+    Ok(())
 }
 
 /// Removes the `doomed` sequences and takes them out of every grant naming

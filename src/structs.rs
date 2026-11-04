@@ -21,6 +21,7 @@ mod role_membership;
 mod row_security;
 mod schema;
 mod sequence;
+mod sequence_parameters;
 mod target_name;
 mod view;
 
@@ -50,5 +51,6 @@ pub use row_security::{
 pub use schema::Schema;
 pub use sequence::Sequence;
 pub(crate) use sequence::StoredSequenceOwner;
+pub use sequence_parameters::{SequenceParameters, SequenceType};
 pub use target_name::TargetName;
 pub use view::{MaterializedView, View, ViewDeclaration};

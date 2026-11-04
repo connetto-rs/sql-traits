@@ -5,7 +5,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use sqlparser::{ast::FunctionBehavior, parser::ParserError};
 
 use crate::{
-    structs::{FunctionKind, IdentifierCase},
+    structs::{FunctionKind, IdentifierCase, SequenceType},
     traits::PartitionStrategy,
 };
 
@@ -707,6 +707,75 @@ pub enum RowSecurityError {
     UnsettledViewOwner {
         /// The view.
         view: String,
+    },
+}
+
+/// Why PostgreSQL refuses the parameters of a sequence.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum SequenceParameterError {
+    /// `AS` names a type other than `smallint`, `integer` and `bigint`, or an
+    /// identity is declared on a column of such a type.
+    #[error("sequence type must be smallint, integer, or bigint, not {data_type}")]
+    UnsupportedType {
+        /// The type, as written.
+        data_type: String,
+    },
+    /// An option's value is not an integer literal a `bigint` holds.
+    #[error("{option} value `{value}` is not a bigint")]
+    NotABigint {
+        /// The option's keyword.
+        option: &'static str,
+        /// The value, as written.
+        value: String,
+    },
+    /// `INCREMENT` is zero.
+    #[error("INCREMENT must not be zero")]
+    ZeroIncrement,
+    /// `MAXVALUE` falls outside the sequence's type.
+    #[error("MAXVALUE ({max_value}) is out of range for sequence data type {data_type}")]
+    MaxValueOutOfRange {
+        /// The largest value.
+        max_value: i64,
+        /// The sequence's type.
+        data_type: SequenceType,
+    },
+    /// `MINVALUE` falls outside the sequence's type.
+    #[error("MINVALUE ({min_value}) is out of range for sequence data type {data_type}")]
+    MinValueOutOfRange {
+        /// The smallest value.
+        min_value: i64,
+        /// The sequence's type.
+        data_type: SequenceType,
+    },
+    /// `MINVALUE` is not below `MAXVALUE`.
+    #[error("MINVALUE ({min_value}) must be less than MAXVALUE ({max_value})")]
+    MinValueNotBelowMaxValue {
+        /// The smallest value.
+        min_value: i64,
+        /// The largest value.
+        max_value: i64,
+    },
+    /// `START` is below `MINVALUE`.
+    #[error("START value ({start}) cannot be less than MINVALUE ({min_value})")]
+    StartBelowMinValue {
+        /// The first value.
+        start: i64,
+        /// The smallest value.
+        min_value: i64,
+    },
+    /// `START` is above `MAXVALUE`.
+    #[error("START value ({start}) cannot be greater than MAXVALUE ({max_value})")]
+    StartAboveMaxValue {
+        /// The first value.
+        start: i64,
+        /// The largest value.
+        max_value: i64,
+    },
+    /// `CACHE` is not positive.
+    #[error("CACHE ({cache}) must be greater than zero")]
+    CacheNotPositive {
+        /// The number of values drawn ahead.
+        cache: i64,
     },
 }
 
@@ -1503,6 +1572,16 @@ pub enum Error {
         table_name: String,
         /// Name of the column holding the default.
         column_name: String,
+    },
+    #[error("Sequence `{sequence_name}` is refused: {reason}.")]
+    /// Error indicating that a sequence a statement declares, or one created
+    /// for an identity column, has parameters PostgreSQL refuses, including
+    /// after a type change of its identity column.
+    InvalidSequenceParameters {
+        /// Name of the sequence.
+        sequence_name: String,
+        /// Why the parameters are refused.
+        reason: SequenceParameterError,
     },
     #[error(
         "Relation `{relation_name}` not found for the default of column `{column_name}` of table `{table_name}`."

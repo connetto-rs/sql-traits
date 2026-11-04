@@ -177,9 +177,10 @@ fn open_world_keeps_a_revoke_matching_no_recorded_grant_as_a_revocation() {
         .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("the table exists");
-    let revoked: Vec<String> = docs
-        .revoked_privileges(&db)
+    let revoked: Vec<String> = db
+        .table_metadata(docs)
         .expect("the table is in the database")
+        .revoked_privileges()
         .map(|revoked| format!("{} FROM {}", revoked.privilege(), revoked.grantee()))
         .collect();
 

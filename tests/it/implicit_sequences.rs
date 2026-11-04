@@ -15,13 +15,13 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
 }
 
-/// Every sequence as `schema.name origin options owner`, sorted.
+/// Every sequence as `schema.name origin type start increment owner`,
+/// sorted.
 fn described(database: &ParserDB) -> Vec<String> {
     let mut sequences: Vec<String> = database
         .sequences()
         .map(|sequence| {
-            let options: String =
-                sequence.options().iter().map(ToString::to_string).collect::<String>();
+            let parameters = sequence.parameters();
             let owner = match sequence.owner(database) {
                 Some(SequenceOwner::Column(column)) => {
                     format!(
@@ -36,10 +36,13 @@ fn described(database: &ParserDB) -> Vec<String> {
                 None => "none".to_string(),
             };
             format!(
-                "{}.{} {:?}{options} owned by {owner}",
+                "{}.{} {:?} {} start {} by {} owned by {owner}",
                 sequence.sequence_schema().unwrap_or("public"),
                 sequence.sequence_name(),
                 sequence.origin(),
+                parameters.data_type(),
+                parameters.start(),
+                parameters.increment(),
             )
         })
         .collect();
@@ -60,12 +63,12 @@ fn each_serial_kind_brings_a_sequence_of_its_width() {
     assert_eq!(
         described(&db),
         [
-            "public.t_a_seq Serial AS INTEGER owned by t.a",
-            "public.t_b_seq Serial AS BIGINT owned by t.b",
-            "public.t_c_seq Serial AS SMALLINT owned by t.c",
-            "public.t_d_seq Serial AS INTEGER owned by t.d",
-            "public.t_e_seq Serial AS BIGINT owned by t.e",
-            "public.t_f_seq Serial AS SMALLINT owned by t.f",
+            "public.t_a_seq Serial integer start 1 by 1 owned by t.a",
+            "public.t_b_seq Serial bigint start 1 by 1 owned by t.b",
+            "public.t_c_seq Serial smallint start 1 by 1 owned by t.c",
+            "public.t_d_seq Serial integer start 1 by 1 owned by t.d",
+            "public.t_e_seq Serial bigint start 1 by 1 owned by t.e",
+            "public.t_f_seq Serial smallint start 1 by 1 owned by t.f",
         ]
     );
 }
@@ -82,8 +85,8 @@ fn an_identity_column_brings_a_sequence_with_its_options() {
     assert_eq!(
         described(&db),
         [
-            "public.t_a_seq Identity AS INT owned by t.a",
-            "public.t_b_seq Identity AS BIGINT START WITH 5 INCREMENT BY 2 owned by t.b",
+            "public.t_a_seq Identity integer start 1 by 1 owned by t.a",
+            "public.t_b_seq Identity bigint start 5 by 2 owned by t.b",
         ]
     );
 }
@@ -91,7 +94,7 @@ fn an_identity_column_brings_a_sequence_with_its_options() {
 #[test]
 fn a_declared_sequence_says_so() {
     let db = parse("CREATE SEQUENCE s;").expect("schema parses");
-    assert_eq!(described(&db), ["public.s Declared owned by none"]);
+    assert_eq!(described(&db), ["public.s Declared bigint start 1 by 1 owned by none"]);
 }
 
 #[test]
@@ -176,9 +179,9 @@ fn adding_a_column_or_an_identity_brings_a_sequence() {
     assert_eq!(
         described(&db),
         [
-            "public.t_a_seq Serial AS INTEGER owned by t.a",
-            "public.t_b_seq Identity AS BIGINT owned by t.b",
-            "public.t_y_seq Identity AS INT owned by t.y",
+            "public.t_a_seq Serial integer start 1 by 1 owned by t.a",
+            "public.t_b_seq Identity bigint start 1 by 1 owned by t.b",
+            "public.t_y_seq Identity integer start 1 by 1 owned by t.y",
         ]
     );
 }
@@ -208,8 +211,8 @@ fn the_sequence_keeps_its_name_and_leaves_with_its_column() {
     assert_eq!(
         described(&db),
         [
-            "public.t_id_seq Serial AS INTEGER owned by u.renamed",
-            "public.t_k_seq Identity AS INT owned by u.k",
+            "public.t_id_seq Serial integer start 1 by 1 owned by u.renamed",
+            "public.t_k_seq Identity integer start 1 by 1 owned by u.k",
         ]
     );
 
@@ -242,8 +245,8 @@ fn an_identity_sequence_follows_its_column_type() {
     assert_eq!(
         described(&db),
         [
-            "public.t_id_seq Identity AS BIGINT START WITH 3 owned by t.id",
-            "public.t_s_seq Serial AS INTEGER owned by t.s",
+            "public.t_id_seq Identity bigint start 3 by 1 owned by t.id",
+            "public.t_s_seq Serial integer start 1 by 1 owned by t.s",
         ]
     );
 }
