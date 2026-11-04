@@ -5,8 +5,8 @@ use alloc::{string::ToString, vec, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateIndex, CreateTable, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, IndexColumn, TableConstraint, Visit, Visitor,
+    ColumnDef, ColumnOption, CreateIndex, CreateTable, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, Ident, IndexColumn, TableConstraint, Visit, Visitor,
 };
 
 use crate::{
@@ -26,12 +26,12 @@ enum KeyItem<'a> {
 /// The strategy and the entries of the key `table` partitions by, or `None`
 /// for a table that is not partitioned.
 fn partition_key(table: &CreateTable) -> Option<(PartitionStrategy, Vec<KeyItem<'_>>)> {
-    let strategy = table.partition_strategy()?;
-    let Some(Expr::Function(function)) = table.partition_by.as_deref() else {
+    let (
+        Some(strategy),
+        Some(Expr::Function(Function { args: FunctionArguments::List(list), .. })),
+    ) = (table.partition_strategy(), table.partition_by.as_deref())
+    else {
         return None;
-    };
-    let FunctionArguments::List(list) = &function.args else {
-        return Some((strategy, Vec::new()));
     };
     let items = list
         .args

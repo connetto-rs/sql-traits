@@ -26,6 +26,7 @@ fn a_partition_key_names_a_column_of_its_table() {
         // A quoted name keeps its case, so it reaches no folded column.
         ("CREATE TABLE k (a INT) PARTITION BY RANGE (\"A\");", "A"),
         ("CREATE TABLE k (a INT) PARTITION BY RANGE ((a + nope));", "nope"),
+        ("CREATE TABLE k (a TEXT) PARTITION BY RANGE (lower(nope));", "nope"),
     ] {
         let error = refusal(sql);
         assert!(
@@ -41,6 +42,7 @@ fn a_partition_key_names_a_column_of_its_table() {
         "CREATE TABLE k (a INT) PARTITION BY RANGE (A);",
         "CREATE TABLE k (a INT, b INT) PARTITION BY RANGE ((a + b));",
         "CREATE TABLE k (a INT) PARTITION BY RANGE (a, a);",
+        "CREATE TABLE k (a TEXT) PARTITION BY RANGE (lower(a));",
     ] {
         parse(sql).unwrap_or_else(|error| panic!("{sql} was refused: {error:?}"));
     }
@@ -52,6 +54,8 @@ fn a_partition_key_takes_no_generated_column() {
         "CREATE TABLE k (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED) PARTITION BY RANGE (b);",
         "CREATE TABLE k (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)
              PARTITION BY RANGE ((b + 1));",
+        "CREATE TABLE k (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)
+             PARTITION BY RANGE (abs(b));",
     ] {
         let error = refusal(sql);
         assert!(
@@ -83,6 +87,8 @@ fn a_unique_constraint_on_a_partitioned_table_covers_its_key() {
         ("CREATE TABLE k (a INT, b INT, PRIMARY KEY (a)) PARTITION BY RANGE (a, b);", "k"),
         ("CREATE TABLE k (a INT, b INT, UNIQUE (b)) PARTITION BY HASH (a);", "k"),
         ("CREATE TABLE k (a INT, b INT, EXCLUDE USING btree (b WITH =)) PARTITION BY RANGE (a);", "k"),
+        // An expression entry covers no key column.
+        ("CREATE TABLE k (a INT, b INT, EXCLUDE USING btree ((a + 1) WITH =)) PARTITION BY RANGE (a);", "k"),
         (&format!("{partitioned} ALTER TABLE r ADD PRIMARY KEY (b);"), "r"),
         (&format!("{partitioned} ALTER TABLE r ADD COLUMN c INT UNIQUE;"), "r"),
         (&format!("{partitioned} CREATE UNIQUE INDEX ON r (b);"), "r"),
@@ -104,16 +110,26 @@ fn a_unique_constraint_on_a_partitioned_table_covers_its_key() {
             "{sql}: {error:?}"
         );
     }
-    assert!(matches!(
-        refusal("CREATE TABLE k (a INT, b INT, UNIQUE (a)) PARTITION BY RANGE ((a + b));"),
-        Error::UniqueConstraintOverExpressionPartitionKey { table_name } if table_name == "k"
-    ));
+    for sql in [
+        "CREATE TABLE k (a INT, b INT, UNIQUE (a)) PARTITION BY RANGE ((a + b));",
+        "CREATE TABLE k (a INT, b INT, UNIQUE (a)) PARTITION BY RANGE (abs(a));",
+    ] {
+        assert!(
+            matches!(
+                refusal(sql),
+                Error::UniqueConstraintOverExpressionPartitionKey { table_name } if table_name == "k"
+            ),
+            "{sql}"
+        );
+    }
 
     for sql in [
         "CREATE TABLE k (a INT, b INT, UNIQUE (a, b)) PARTITION BY RANGE (a);",
         "CREATE TABLE k (a INT, b INT, PRIMARY KEY (b, a)) PARTITION BY RANGE (a, b);",
         "CREATE TABLE k (a INT PRIMARY KEY, b INT) PARTITION BY LIST (a);",
         "CREATE TABLE k (a INT, b INT, EXCLUDE USING btree (a WITH =)) PARTITION BY RANGE (a);",
+        "CREATE TABLE k (a INT, b INT, EXCLUDE USING btree (a WITH =, (b + 1) WITH =))
+             PARTITION BY RANGE (a);",
         &format!("{partitioned} CREATE UNIQUE INDEX ON rp (b);"),
         &format!("{partitioned} CREATE UNIQUE INDEX ON r (a, b);"),
         &format!("{partitioned} CREATE UNIQUE INDEX ON r (a) WHERE b > 0;"),
