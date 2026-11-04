@@ -238,8 +238,12 @@ pub trait PolicyLike:
     /// ```
     fn policy_type(&self) -> CreatePolicyType;
 
-    /// Returns the roles the policy applies to.
-    /// If empty, it applies to all roles (PUBLIC).
+    /// Returns the roles the policy names.
+    ///
+    /// A policy that applies to every role names none, as
+    /// [`Self::applies_to_public`] reports. PostgreSQL stores only the public
+    /// pseudo-role for it, and keeps that alone when the `TO` list also names
+    /// other roles.
     ///
     /// # Example
     ///
@@ -263,7 +267,8 @@ pub trait PolicyLike:
     /// assert_eq!(policy.roles(&db).count(), 2);
     ///
     /// let public_policy = table.policies(&db)?.find(|p| p.name() == "public_policy").unwrap();
-    /// assert_eq!(public_policy.roles(&db).count(), 1);
+    /// assert_eq!(public_policy.roles(&db).count(), 0);
+    /// assert!(public_policy.applies_to_public());
     /// # Ok(())
     /// # }
     /// ```
@@ -273,12 +278,10 @@ pub trait PolicyLike:
 
     /// Returns whether the policy applies to every role.
     ///
-    /// A policy says so in two ways, and this reader folds both: writing
-    /// `TO PUBLIC`, and writing no `TO` clause at all, which PostgreSQL
-    /// defaults to `PUBLIC`. Neither is visible in [`Self::roles`], where
-    /// `PUBLIC` arrives as an ordinary unquoted name and an absent clause
-    /// arrives as an empty iterator, so a caller reading roles alone cannot
-    /// tell "everyone" from a role somebody created called `public`.
+    /// A policy says so by writing `TO PUBLIC`, alone or beside named roles,
+    /// or by writing no `TO` clause at all, which PostgreSQL defaults to
+    /// `PUBLIC`. [`Self::roles`] names no role for such a policy, and a quoted
+    /// `"PUBLIC"` is a role of that exact name, not the pseudo-role.
     ///
     /// # Example
     ///
@@ -633,12 +636,13 @@ mod tests {
     #[test]
     fn test_policy_ref_implementation() {
         let sql = r"
+            CREATE ROLE reader;
             CREATE TABLE my_table (id INT);
             CREATE FUNCTION my_func() RETURNS BOOLEAN AS 'SELECT true';
             CREATE FUNCTION check_func() RETURNS BOOLEAN AS 'SELECT true';
             CREATE POLICY my_policy ON my_table
                 FOR SELECT
-                TO PUBLIC
+                TO reader
                 USING (id > 0 AND my_func())
                 WITH CHECK (id < 10 AND check_func());
         ";
@@ -660,9 +664,9 @@ mod tests {
         assert_eq!(policy_ref.command(), CreatePolicyCommand::Select);
         assert_eq!(policy_ref.policy_type(), CreatePolicyType::Permissive);
 
-        let roles: Vec<_> = policy_ref.roles(&db).collect();
-        assert_eq!(roles.len(), 1);
-        assert_eq!(roles[0].to_string(), "PUBLIC");
+        let roles: Vec<_> = policy_ref.roles(&db).map(ToString::to_string).collect();
+        assert_eq!(roles, ["reader"]);
+        assert!(!policy_ref.applies_to_public());
 
         let using_expr = policy_ref.using_expression(&db);
         assert!(using_expr.is_some());
