@@ -2662,6 +2662,8 @@ mod tests {
         assert_eq!(InheritedChange::AddColumn.to_string(), "add a column to");
         assert_eq!(InheritedChange::RenameColumn.to_string(), "rename a column of");
         assert_eq!(InheritedChange::ValidateConstraint.to_string(), "validate a constraint of");
+        assert_eq!(InheritedChange::DropColumn.to_string(), "drop a column of");
+        assert_eq!(InheritedChange::SetNotNull.to_string(), "require a value in a column of");
         assert_eq!(RequiredValue::CoveredByKey.to_string(), "a key covers it");
         assert_eq!(RequiredValue::EnforcedByParent.to_string(), "a parent requires it");
         assert_eq!(FixedPersistence::Temporary.to_string(), "it is temporary");
