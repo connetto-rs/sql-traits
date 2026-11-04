@@ -15,17 +15,23 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CharacterLength, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType,
-    ExactNumberInfo, Ident, ObjectName, TableConstraint, TimezoneInfo,
+    ArrayElemTypeDef, CharacterLength, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
+    CreateTable, DataType, ExactNumberInfo, Expr, Ident, ObjectName, TableConstraint, TimezoneInfo,
+    Value, visit_expressions_mut,
 };
 
 use super::{
     ParserDBBuilder, StoredTable, column_copy::copy_column,
     constraint_validity::unvalidated_copies, generated_names,
 };
-use crate::{errors::Error, traits::TableLike, utils::is_identity};
+use crate::{
+    errors::Error,
+    traits::TableLike,
+    utils::{identifier_resolution::stored_ident_name, is_identity},
+};
 
 /// Which spelling links a child to a table it takes its shape from.
 ///
@@ -131,6 +137,31 @@ pub(super) fn first_inheritor_below(
     None
 }
 
+/// The first foreign table among the partitions below `table`, at any depth,
+/// which a unique index on `table` would have to reach.
+pub(super) fn first_foreign_partition_below(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+) -> Option<StoredTable> {
+    let case = builder.identifier_case();
+    let mut frontier = alloc::vec![table.clone()];
+    while let Some(current) = frontier.pop() {
+        for (kind, child) in direct_children(builder, &current) {
+            if kind != ParentKind::PartitionOf {
+                continue;
+            }
+            let foreign = builder.tables().iter().any(|(stored, metadata, _)| {
+                child.matches(stored, case) && metadata.foreign_source().is_some()
+            });
+            if foreign {
+                return Some(child);
+            }
+            frontier.push(child);
+        }
+    }
+    None
+}
+
 /// The tables linked directly to `parent`, each under the spelling that links
 /// it.
 ///
@@ -150,6 +181,110 @@ pub(super) fn direct_children(
                 .map(|(kind, _)| (kind, StoredTable::of(table)))
         })
         .collect()
+}
+
+/// The tables below `dropped` that lose `column` when it drops it.
+///
+/// A table keeps its copy when it declared the column itself or a parent that
+/// keeps the column still passes it, which PostgreSQL records by lowering
+/// `attinhcount` instead of dropping, and a table keeping its copy passes
+/// nothing further down.
+pub(super) fn losing_column(
+    builder: &ParserDBBuilder,
+    dropped: &StoredTable,
+    column: &super::NamedColumn,
+) -> Vec<StoredTable> {
+    losing_tables(
+        builder,
+        dropped,
+        |metadata| metadata.inherited_column_names().contains(&column.name),
+        |parent| column.declared_by(parent),
+    )
+}
+
+/// The tables below `dropped` that lose the `NOT NULL` of `column` when it
+/// drops its own, by the rule [`losing_column`] follows: a table that states
+/// it itself, or still receives it from a parent keeping it, keeps it.
+pub(super) fn losing_not_null(
+    builder: &ParserDBBuilder,
+    dropped: &StoredTable,
+    column: &super::NamedColumn,
+) -> Vec<StoredTable> {
+    losing_tables(
+        builder,
+        dropped,
+        |metadata| metadata.inherited_not_null().contains(&column.name),
+        |parent| {
+            parent
+                .columns
+                .iter()
+                .any(|declared| column.matches(&declared.name) && super::states_not_null(declared))
+        },
+    )
+}
+
+/// The tables below `dropped` that lose what `dropped` drops: of those that
+/// only `receive` it, the ones no parent outside the losing set still `holds`
+/// it for. Solved as the largest set closed under that rule, so a table reached
+/// through two losing parents loses it whichever path is walked first.
+fn losing_tables(
+    builder: &ParserDBBuilder,
+    dropped: &StoredTable,
+    receives: impl Fn(&super::TableMetadata<CreateTable>) -> bool,
+    holds: impl Fn(&CreateTable) -> bool,
+) -> Vec<StoredTable> {
+    let case = builder.identifier_case();
+    let mut losing: Vec<StoredTable> = descendants(builder, dropped)
+        .into_iter()
+        .filter(|table| {
+            builder
+                .tables()
+                .iter()
+                .any(|(stored, metadata, _)| table.matches(stored, case) && receives(metadata))
+        })
+        .collect();
+    loop {
+        let kept: Vec<StoredTable> = losing
+            .iter()
+            .filter(|table| {
+                super::ParserDB::stored_node(builder, table).is_ok_and(|node| {
+                    parent_names(node)
+                        .filter_map(|name| builder.resolve_bound_table_name(name).ok().flatten())
+                        .any(|parent| {
+                            !dropped.matches(parent, case)
+                                && !losing.iter().any(|lost| lost.matches(parent, case))
+                                && holds(parent)
+                        })
+                })
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            return losing;
+        }
+        losing.retain(|table| !kept.contains(table));
+    }
+}
+
+/// Records whether the table receives the `NOT NULL` of `column` rather than
+/// stating it itself.
+pub(super) fn mark_inherited_not_null(
+    builder: &mut ParserDBBuilder,
+    table: &StoredTable,
+    column: &str,
+    received: bool,
+) {
+    let case = builder.identifier_case();
+    for (_, metadata, _) in
+        builder.tables_mut().iter_mut().filter(|(stored, _, _)| table.matches(stored, case))
+    {
+        let mut columns: Vec<String> =
+            metadata.inherited_not_null().iter().filter(|name| *name != column).cloned().collect();
+        if received {
+            columns.push(column.to_string());
+        }
+        metadata.set_inherited_not_null(columns);
+    }
 }
 
 /// Marks a column a table has just received from a parent as inherited.
@@ -178,6 +313,9 @@ pub(super) fn unmark_inherited(builder: &mut ParserDBBuilder, table: &StoredTabl
             .cloned()
             .collect();
         metadata.set_inherited_column_names(names);
+        let not_null: Vec<String> =
+            metadata.inherited_not_null().iter().filter(|name| *name != column).cloned().collect();
+        metadata.set_inherited_not_null(not_null);
     }
 }
 
@@ -192,12 +330,16 @@ pub(super) fn rename_inherited(
     if let Some((_, metadata, _)) =
         builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
     {
-        let names = metadata
-            .inherited_column_names()
-            .iter()
-            .map(|name| if name == from { to.value.clone() } else { name.clone() })
-            .collect();
+        let rename = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .map(|name| if name == from { to.value.clone() } else { name.clone() })
+                .collect()
+        };
+        let names = rename(metadata.inherited_column_names());
         metadata.set_inherited_column_names(names);
+        let not_null = rename(metadata.inherited_not_null());
+        metadata.set_inherited_not_null(not_null);
     }
 }
 
@@ -216,12 +358,21 @@ fn is_inherited_option(option: &ColumnOption) -> bool {
 /// Whether a parent linked by this spelling writes the option onto the copy.
 ///
 /// A check written `NO INHERIT` stays with the table declaring it, which is
-/// the attribute's entire meaning, so it never joins the copy.
+/// the attribute's entire meaning, so it never joins the copy. Foreign-data
+/// wrapper options stay there too, since PostgreSQL records them for the
+/// declaring column alone.
 pub(super) fn option_passes_down(kind: ParentKind, option: &ColumnOption) -> bool {
-    if matches!(option, ColumnOption::Check(check) if check.no_inherit) {
+    if stays_with_declaring_column(option) {
         return false;
     }
     kind == ParentKind::PartitionOf || is_inherited_option(option)
+}
+
+/// Whether the option stays with the column declaring it whatever links a
+/// child to it: a `NO INHERIT` check, and foreign-data wrapper options.
+pub(super) fn stays_with_declaring_column(option: &ColumnOption) -> bool {
+    matches!(option, ColumnOption::Check(check) if check.no_inherit)
+        || matches!(option, ColumnOption::GenericOptions(_))
 }
 
 /// The option with the name a partition's copy would have been given stripped
@@ -232,10 +383,53 @@ pub(super) fn option_passes_down(kind: ParentKind, option: &ColumnOption) -> boo
 /// has to look past it.
 fn without_generated_option_name(option: &ColumnOptionDef) -> ColumnOptionDef {
     let mut bare = option.clone();
-    if matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_)) {
-        bare.name = None;
+    match &mut bare.option {
+        ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_) => bare.name = None,
+        ColumnOption::Check(check) => {
+            stored_check(check);
+            bare.name = bare.name.as_ref().map(stored_name);
+        }
+        _ => {}
     }
     bare
+}
+
+/// The name as PostgreSQL stores it, spelled so that two spellings storing the
+/// same name compare equal.
+fn stored_name(name: &Ident) -> Ident {
+    Ident::with_quote('"', stored_ident_name(name).into_owned())
+}
+
+/// Rewrites a check into the form PostgreSQL compares: its name as stored and
+/// its expression as [`stored_expr`] gives it.
+fn stored_check(check: &mut CheckConstraint) {
+    check.name = check.name.as_ref().map(stored_name);
+    *check.expr = stored_expr(&check.expr);
+}
+
+/// The expression as PostgreSQL stores it, which keeps no parentheses the tree
+/// already implies and holds every column folded and without the table a check
+/// can only qualify it with.
+///
+/// Two checks are the same check when these agree, so moving parentheses that
+/// change the tree still tells them apart.
+pub(super) fn stored_expr(expr: &Expr) -> Expr {
+    let mut stored = expr.clone();
+    let _: ControlFlow<()> = visit_expressions_mut(&mut stored, |expr| {
+        match expr {
+            Expr::Nested(inner) => {
+                let placeholder = Expr::Value(Value::Null.into());
+                *expr = core::mem::replace(inner.as_mut(), placeholder);
+            }
+            Expr::Identifier(ident) => *ident = stored_name(ident),
+            Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+                *expr = Expr::Identifier(stored_name(&parts[parts.len() - 1]));
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    });
+    stored
 }
 
 /// Whether the option a table holds is its copy of the one a parent writes.
@@ -263,6 +457,10 @@ pub(super) fn receives_column_constraint(
                         && declared.options.iter().any(|held| is_copy_of_option(option, held))
                 })
             })
+    }) || super::constraint_names::slots(child).into_iter().any(|slot| {
+        matches!(slot, super::constraint_names::Slot::Column { def, held, .. }
+            if same_column(&def.name, written_on) && held == option)
+            && super::constraint_names::receives_check(builder, child, slot)
     })
 }
 
@@ -306,15 +504,11 @@ pub(super) fn requires_a_value(
 fn inherited_column(
     builder: &ParserDBBuilder,
     kind: ParentKind,
-    parent: &CreateTable,
     child: &CreateTable,
     column: &ColumnDef,
     taken: &mut Vec<Ident>,
 ) -> ColumnDef {
     let mut copy = copy_column(column, |option| option_passes_down(kind, option));
-    if let Some(drawn) = super::sequences::serial_default(builder, parent, column) {
-        super::sequences::spell_out_serial(&mut copy, Some(drawn));
-    }
 
     if kind == ParentKind::PartitionOf {
         for option in &mut copy.options {
@@ -350,7 +544,7 @@ pub(super) fn name_partition_key(
 /// different type. An unplaceable spelling answers [`None`] and is accepted,
 /// because wrongly refusing a legal schema costs more than missing a conflict
 /// the parser cannot see.
-fn type_identity(data_type: &DataType) -> Option<String> {
+fn type_identity(builder: &ParserDBBuilder, data_type: &DataType) -> Option<String> {
     let exact = |name: &str, info: &ExactNumberInfo| {
         match info {
             ExactNumberInfo::None => name.to_string(),
@@ -398,6 +592,26 @@ fn type_identity(data_type: &DataType) -> Option<String> {
             };
             sized(base, *precision)
         }
+        // An array type is its element's whatever the dimensions written.
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(element)
+            | ArrayElemTypeDef::SquareBracket(element, _)
+            | ArrayElemTypeDef::Parenthesis(element),
+        ) => {
+            let mut element = element.as_ref();
+            while let DataType::Array(
+                ArrayElemTypeDef::AngleBracket(inner)
+                | ArrayElemTypeDef::SquareBracket(inner, _)
+                | ArrayElemTypeDef::Parenthesis(inner),
+            ) = element
+            {
+                element = inner;
+            }
+            format!("{}[]", type_identity(builder, element)?)
+        }
+        DataType::Custom(..) => {
+            format!("domain {}", super::domains::named_domain(builder, data_type)?)
+        }
         _ => return None,
     })
 }
@@ -406,8 +620,12 @@ fn type_identity(data_type: &DataType) -> Option<String> {
 ///
 /// Answers `false` whenever either spelling cannot be placed, so an unfamiliar
 /// type never blocks a schema PostgreSQL accepts.
-pub(super) fn types_conflict(parent: &DataType, child: &DataType) -> bool {
-    match (type_identity(parent), type_identity(child)) {
+pub(super) fn types_conflict(
+    builder: &ParserDBBuilder,
+    parent: &DataType,
+    child: &DataType,
+) -> bool {
+    match (type_identity(builder, parent), type_identity(builder, child)) {
         (Some(parent), Some(child)) => parent != child,
         _ => false,
     }
@@ -502,8 +720,8 @@ pub(super) fn partition_copy(
 /// The constraint with the name a copy would have been given stripped away.
 ///
 /// A partition's copy of a key differs from the root's only in that name, so
-/// recognising the copy has to look past it. Every other kind keeps the
-/// parent's name and is compared whole.
+/// recognising the copy has to look past it. A check is compared in the form
+/// PostgreSQL stores it, and every other kind is compared whole.
 fn without_generated_name(constraint: &TableConstraint) -> TableConstraint {
     let mut bare = constraint.clone();
     match &mut bare {
@@ -515,6 +733,7 @@ fn without_generated_name(constraint: &TableConstraint) -> TableConstraint {
             unique.name = None;
             unique.index_name = None;
         }
+        TableConstraint::Check(check) => stored_check(check),
         _ => {}
     }
     bare
@@ -559,6 +778,9 @@ pub(super) fn receives_constraint(
                 .iter()
                 .any(|passed| passes_down(kind, passed) && is_copy_of(held, passed))
         })
+    }) || super::constraint_names::slots(child).into_iter().any(|slot| {
+        matches!(slot, super::constraint_names::Slot::Table(_, constraint) if constraint == held)
+            && super::constraint_names::receives_check(builder, child, slot)
     })
 }
 
@@ -795,11 +1017,19 @@ fn merge_local_columns(
     columns: &mut Vec<ColumnDef>,
     column_metadata: &[super::PreservedColumnMetadata],
 ) -> Result<(), Error> {
-    for column in local_columns {
+    for (index, column) in local_columns.iter().enumerate() {
+        // Merging would fold a repeated entry into one column, which
+        // PostgreSQL refuses before it reaches any parent.
+        if local_columns[..index].iter().any(|earlier| same_column(&earlier.name, &column.name)) {
+            return Err(Error::ColumnAlreadyExists {
+                table_name: context.child_name.to_string(),
+                column_name: column.name.value.clone(),
+            });
+        }
         if let Some(position) =
             columns.iter().position(|held| same_column(&held.name, &column.name))
         {
-            if types_conflict(&columns[position].data_type, &column.data_type) {
+            if types_conflict(context.builder, &columns[position].data_type, &column.data_type) {
                 return Err(Error::InheritedColumnTypeConflict {
                     column_name: column.name.value.clone(),
                     child_table: context.child_name.to_string(),
@@ -809,16 +1039,54 @@ fn merge_local_columns(
                     parent_type: columns[position].data_type.to_string(),
                 });
             }
-            if let Some(inherited_metadata) =
-                inherited_column_metadata_for(&column.name, column_metadata)
+            if !is_options_only(column)
+                && let Some(inherited_metadata) =
+                    inherited_column_metadata_for(&column.name, column_metadata)
                 && let Some(error) = local_collation_conflict(context, column, inherited_metadata)?
             {
                 return Err(error);
             }
+            refuse_default_on_generated(context, &columns[position], column)?;
             columns[position] = merge_declarations(&columns[position], column);
+        } else if let Some((_, root)) =
+            context.parents.iter().find(|(kind, _)| *kind == ParentKind::PartitionOf)
+        {
+            // A partition declares no column of its own, only options on the
+            // columns its root passes down.
+            return Err(crate::errors::LookupError::ColumnNotFound {
+                table_name: resolve_parent(context.builder, root, context.child_name)?
+                    .table_name()
+                    .to_string(),
+                column_name: column.name.value.clone(),
+            }
+            .into());
         } else {
             columns.push(column.clone());
         }
+    }
+    Ok(())
+}
+
+/// Refuses a `DEFAULT` written on a column the table receives as a stored
+/// generated column, unless the table gives it a generation expression of its
+/// own instead.
+fn refuse_default_on_generated(
+    context: &ParentApplication<'_>,
+    received: &ColumnDef,
+    written: &ColumnDef,
+) -> Result<(), Error> {
+    let generated = |column: &ColumnDef| {
+        column.options.iter().any(|option| {
+            matches!(option.option, ColumnOption::Generated { generation_expr: Some(_), .. })
+        })
+    };
+    let defaulted =
+        written.options.iter().any(|option| matches!(option.option, ColumnOption::Default(_)));
+    if generated(received) && defaulted && !generated(written) {
+        return Err(Error::DefaultOnInheritedGeneratedColumn {
+            table_name: context.child_name.to_string(),
+            column_name: written.name.value.clone(),
+        });
     }
     Ok(())
 }
@@ -864,14 +1132,9 @@ pub(super) fn apply_parents(
         return Ok(Inherited::default());
     }
 
-    let local_collations: Vec<Ident> = create_table
-        .columns
-        .iter()
-        .filter(|column| super::stored_column_collation_name(column).is_some())
-        .map(|column| column.name.clone())
-        .collect();
+    let local_collations = locally_collated(create_table);
 
-    let local: Vec<Ident> = create_table.columns.iter().map(|column| column.name.clone()).collect();
+    let local = locally_declared(create_table);
     // The child is not in the stores yet, so the names it introduces itself
     // have to be spoken for before a generated one is built beside them.
     let mut taken: Vec<Ident> =
@@ -893,8 +1156,7 @@ pub(super) fn apply_parents(
             // A second parent declaring the same column merges into the one
             // already taken, keeping the position the first parent gave it.
             if !columns.iter().any(|held| same_column(&held.name, &column.name)) {
-                let inherited =
-                    inherited_column(builder, *kind, parent, create_table, column, &mut taken);
+                let inherited = inherited_column(builder, *kind, create_table, column, &mut taken);
                 if let Some(metadata) =
                     inherited_column_metadata(builder, parent, column, &inherited)
                 {
@@ -980,6 +1242,33 @@ pub(super) fn apply_parents(
     Ok(inherited)
 }
 
+/// The columns a table being created declares itself rather than receives.
+///
+/// Every column of a partition comes from its root, even one the partition
+/// writes options on, as `pg_attribute.attislocal` records, so a partition
+/// declares none.
+fn locally_declared(create_table: &CreateTable) -> Vec<Ident> {
+    if create_table.partition_of.is_some() {
+        return Vec::new();
+    }
+    create_table.columns.iter().map(|column| column.name.clone()).collect()
+}
+
+/// The columns of a table being created that carry a collation of their own.
+///
+/// A `COLLATE` on an entry that names no type is ignored, so only a typed
+/// column keeps one.
+fn locally_collated(create_table: &CreateTable) -> Vec<Ident> {
+    create_table
+        .columns
+        .iter()
+        .filter(|column| {
+            !is_options_only(column) && super::stored_column_collation_name(column).is_some()
+        })
+        .map(|column| column.name.clone())
+        .collect()
+}
+
 /// Whether the option is one a column may state only once.
 ///
 /// A check may be written any number of times, each becoming a constraint of
@@ -996,8 +1285,16 @@ fn stated_once(option: &ColumnOption) -> bool {
 /// The child's declaration wins on anything that can be stated only once, which
 /// is what PostgreSQL leaves: a parent's default gives way to the child's,
 /// while both checks stand under their own names.
+///
+/// An entry naming no type, as a `PARTITION OF` column entry does, keeps the
+/// type and collation it receives, and PostgreSQL ignores a `COLLATE` written
+/// on it.
 fn merge_declarations(received: &ColumnDef, child: &ColumnDef) -> ColumnDef {
     let mut merged = child.clone();
+    if is_options_only(child) {
+        merged.data_type = received.data_type.clone();
+        merged.options.retain(|option| !matches!(option.option, ColumnOption::Collation(_)));
+    }
 
     for option in &received.options {
         let already_stated = if stated_once(&option.option) {
@@ -1015,6 +1312,12 @@ fn merge_declarations(received: &ColumnDef, child: &ColumnDef) -> ColumnDef {
     merged
 }
 
+/// Whether a column entry names no type, so it only adds options to a column
+/// it receives, as the column entries of `PARTITION OF` do.
+fn is_options_only(column: &ColumnDef) -> bool {
+    matches!(column.data_type, DataType::Unspecified)
+}
+
 /// Names the parent a column reaches the child from, for the conflict message.
 fn parent_owning(
     builder: &ParserDBBuilder,
@@ -1029,23 +1332,44 @@ fn parent_owning(
 }
 
 /// Binds every parent a table being created names to the table it reaches
-/// through the session's path, refusing an absent one and one PostgreSQL will
-/// not link across temporary and permanent storage.
+/// through the session's path, refusing an absent one, one PostgreSQL will
+/// not link across temporary and permanent storage, a `PARTITION OF` parent
+/// without a partition key, an `INHERITS` parent that has one or is itself a
+/// partition, and one named twice. A partitioned table takes no `INHERITS`
+/// parent at all.
 fn bind_parents(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
     child_name: &str,
 ) -> Result<(), Error> {
+    if create_table.partition_by.is_some()
+        && create_table.inherits.iter().flatten().next().is_some()
+    {
+        return Err(Error::PartitionedTableInherits { table_name: child_name.to_string() });
+    }
     let child_temporary = create_table.is_temporary();
+    let case = builder.identifier_case();
+    let mut bound: Vec<StoredTable> = Vec::new();
     let parents =
         create_table.inherits.iter_mut().flatten().map(|name| (ParentKind::Inherits, name)).chain(
             create_table.partition_of.iter_mut().map(|name| (ParentKind::PartitionOf, name)),
         );
     for (kind, parent_name) in parents {
         let Some(parent) = builder.resolve_table_object_name(parent_name)? else {
-            return Err(Error::ParentTableNotFound {
-                parent_table: parent_name.to_string(),
-                child_table: child_name.to_string(),
+            return Err(match builder.relation_reached(parent_name) {
+                Some((object_kind, _)) => {
+                    Error::InheritsFromNonTable {
+                        table_name: child_name.to_string(),
+                        parent_name: parent_name.to_string(),
+                        object_kind,
+                    }
+                }
+                None => {
+                    Error::ParentTableNotFound {
+                        parent_table: parent_name.to_string(),
+                        child_table: child_name.to_string(),
+                    }
+                }
             });
         };
         if parent.is_temporary() && !child_temporary {
@@ -1060,6 +1384,34 @@ fn bind_parents(
                 parent_name: parent_name.to_string(),
             });
         }
+        match kind {
+            ParentKind::PartitionOf if parent.partition_by.is_none() => {
+                return Err(Error::ParentNotPartitioned {
+                    table_name: child_name.to_string(),
+                    parent_name: parent_name.to_string(),
+                });
+            }
+            ParentKind::Inherits if parent.partition_by.is_some() => {
+                return Err(Error::InheritsFromPartitionedTable {
+                    table_name: child_name.to_string(),
+                    parent_name: parent_name.to_string(),
+                });
+            }
+            ParentKind::Inherits if parent.partition_of.is_some() => {
+                return Err(Error::InheritsFromPartition {
+                    table_name: child_name.to_string(),
+                    parent_name: parent_name.to_string(),
+                });
+            }
+            ParentKind::PartitionOf | ParentKind::Inherits => {}
+        }
+        if bound.iter().any(|earlier| earlier.matches(parent, case)) {
+            return Err(Error::ParentRepeated {
+                table_name: child_name.to_string(),
+                parent_name: parent.table_name().to_string(),
+            });
+        }
+        bound.push(StoredTable::of(parent));
         let qualifier = super::stored_qualifier(&parent.name);
         super::bind_reference(parent_name, qualifier);
     }

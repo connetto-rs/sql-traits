@@ -25,8 +25,8 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     ArgMode, CreateFunction, CreateFunctionBody, DataType, Expr, FunctionReturnType, GroupByExpr,
-    Insert, ObjectName, OperateFunctionArg, Query, Select, SelectFlavor, SelectItem, SetExpr,
-    Statement, TableFactor, TableObject, VisitMut, VisitorMut,
+    Ident, Insert, ObjectName, OperateFunctionArg, Query, Select, SelectFlavor, SelectItem,
+    SetExpr, Statement, TableFactor, TableObject, VisitMut, VisitorMut,
     helpers::attached_token::AttachedToken,
 };
 
@@ -64,23 +64,22 @@ use crate::{
 /// [`Error::IdentifierLookupError`] for a reference or a factor name it will
 /// not analyze.
 pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> Result<(), Error> {
+    let function_name = last_str(&function.name).to_string();
     let Some(body) = function.function_body.as_mut() else {
         return Ok(());
     };
-    match body {
-        CreateFunctionBody::Return(expression) => {
-            let mut binder =
-                BodyBinder { builder, bare_temporary: false, scopes: WithScopes::default() };
-            match expression.visit(&mut binder) {
-                ControlFlow::Continue(()) => Ok(()),
-                ControlFlow::Break(missing) => missing_relation(&missing, function),
-            }
+    let missing = |missing: &ObjectName| {
+        Error::RelationNotFoundForFunctionBody {
+            relation_name: missing.to_string(),
+            function_name: function_name.clone(),
         }
+    };
+    match body {
+        CreateFunctionBody::Return(expression) => bind_node(builder, false, expression, &missing),
         CreateFunctionBody::BeginAtomic(block) => {
             super::view_rewrites::normalize_block_references(builder, &mut block.statements)?;
-            let function_name = last_str(&function.name).to_string();
-            let mut binder =
-                BodyBinder { builder, bare_temporary: true, scopes: WithScopes::default() };
+            let too_wide =
+                || Error::FunctionBodyInsertTooWide { function_name: function_name.clone() };
             for statement in &mut block.statements {
                 if !matches!(
                     statement,
@@ -93,20 +92,21 @@ pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> 
                 ) {
                     return Err(Error::FunctionBodyStatementUnsupported {
                         statement: statement.to_string(),
-                        function_name,
+                        function_name: function_name.clone(),
                     });
                 }
                 super::view_rewrites::shape_of_block_statement(statement, &function_name)?;
+                let ambiguous = |column: Ident| {
+                    Error::FunctionBodyReferenceAmbiguous {
+                        column_name: column.value,
+                        function_name: function_name.clone(),
+                    }
+                };
                 super::view_rewrites::refuse_ambiguous_block_reference(
-                    builder,
-                    statement,
-                    &function_name,
+                    builder, statement, ambiguous,
                 )?;
-                super::view_rewrites::spell_block_statement(builder, statement, &function_name)?;
-                match statement.visit(&mut binder) {
-                    ControlFlow::Continue(()) => {}
-                    ControlFlow::Break(missing) => return missing_relation(&missing, function),
-                }
+                super::view_rewrites::spell_block_statement(builder, statement, &too_wide)?;
+                bind_node(builder, true, statement, &missing)?;
             }
             let declares_result =
                 function_declares_result(function.args.as_deref(), function.return_type.as_ref());
@@ -173,12 +173,44 @@ fn returning_is_empty(returning: Option<&[SelectItem]>) -> bool {
     returning.is_none_or(<[SelectItem]>::is_empty)
 }
 
-/// The refusal a body's unresolvable relation names.
-fn missing_relation(missing: &ObjectName, function: &CreateFunction) -> Result<(), Error> {
-    Err(Error::RelationNotFoundForFunctionBody {
-        relation_name: missing.to_string(),
-        function_name: last_str(&function.name).to_string(),
-    })
+/// Runs the relation binder over one body node, translating a `Break` naming
+/// a relation it cannot reach into the caller's error.
+fn bind_node<N: VisitMut>(
+    builder: &ParserDBBuilder,
+    bare_temporary: bool,
+    node: &mut N,
+    missing: &impl Fn(&ObjectName) -> Error,
+) -> Result<(), Error> {
+    let mut binder = BodyBinder { builder, bare_temporary, scopes: WithScopes::default() };
+    match node.visit(&mut binder) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(name) => Err(missing(&name)),
+    }
+}
+
+/// Binds every relation a rule's action statements and condition read,
+/// refusing the `CREATE RULE` when one of them is not held.
+///
+/// The action statements bind with the block scoping `BEGIN ATOMIC` bodies
+/// use, since both hold a statement sequence, while the condition binds as a
+/// bare query.
+///
+/// # Errors
+/// When one of the statements or the condition names a relation the database
+/// does not hold, in which case `missing` yields the error.
+pub(super) fn bind_rule_parts(
+    builder: &ParserDBBuilder,
+    statements: &mut [Statement],
+    condition: Option<&mut Expr>,
+    missing: impl Fn(&ObjectName) -> Error,
+) -> Result<(), Error> {
+    for statement in statements.iter_mut() {
+        bind_node(builder, true, statement, &missing)?;
+    }
+    if let Some(condition) = condition {
+        bind_node(builder, false, condition, &missing)?;
+    }
+    Ok(())
 }
 
 /// The query a `RETURN` body's expression is wrapped in, the shape the
@@ -244,6 +276,18 @@ pub(super) fn write_definition(body: &mut Option<CreateFunctionBody>, query: Que
 pub(super) fn write_statements(body: &mut Option<CreateFunctionBody>, statements: Vec<Statement>) {
     if let Some(CreateFunctionBody::BeginAtomic(block)) = body {
         block.statements = statements;
+    }
+}
+
+/// Writes a rewritten condition back into the rule's condition, which
+/// `definition` wrapped in the query it came out of.
+pub(super) fn write_condition(condition: &mut Option<Expr>, query: Query) {
+    // `definition` built `query`, so the shape below always matches.
+    if let Some(expr) = condition
+        && let SetExpr::Select(select) = *query.body
+        && let Some(SelectItem::UnnamedExpr(rewritten)) = select.projection.into_iter().next()
+    {
+        *expr = rewritten;
     }
 }
 

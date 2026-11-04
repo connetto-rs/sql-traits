@@ -1,6 +1,6 @@
 //! Implement the `IndexLike` trait for `sqlparser`'s `CreateIndex`.
 
-use alloc::string::ToString;
+use alloc::{borrow::Cow, string::ToString};
 
 use sqlparser::ast::{ColumnDef, CreateIndex, CreateTable, Expr, IndexType};
 
@@ -40,6 +40,15 @@ impl TableAttribute<CreateTable, CreateIndex> {
 
 impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
     type DB = ParserDB;
+
+    /// Always `None`: `CREATE INDEX` builds an index backing no constraint.
+    #[inline]
+    fn constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(None)
+    }
 
     #[inline]
     fn table<'db>(&'db self, _database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
@@ -107,5 +116,10 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
     #[inline]
     fn predicate(&self) -> Option<&Expr> {
         self.attribute().predicate.as_ref()
+    }
+
+    #[inline]
+    fn nulls_distinct(&self) -> bool {
+        self.attribute().nulls_distinct != Some(false)
     }
 }

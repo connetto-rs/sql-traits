@@ -1,6 +1,6 @@
 //! Submodule defining the `IndexLike` trait for SQL indices.
 
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use core::fmt::Debug;
 
 use sqlparser::ast::{Expr, IndexType};
@@ -83,6 +83,43 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     fn schema_is_quoted(&self) -> bool {
         false
     }
+
+    /// Returns the name of the constraint the index backs, a primary key or
+    /// unique constraint: the one written, or on PostgreSQL the one it was
+    /// given when it was created, which renaming the table or a column later
+    /// leaves alone. A written name is returned as PostgreSQL stores it.
+    ///
+    /// [`None`] for an index backing no constraint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table of this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let names = table
+    ///     .unique_indices(&db)?
+    ///     .map(|key| Ok(key.constraint_name(&db)?.map(|name| name.into_owned())))
+    ///     .collect::<Result<Vec<_>, LookupError>>()?;
+    /// assert_eq!(names, [Some("users_pkey".to_owned()), Some("users_email_key".to_owned())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError>;
 
     /// Returns the expression of the index as an SQL AST node.
     ///
@@ -346,5 +383,40 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     #[inline]
     fn predicate(&self) -> Option<&Expr> {
         None
+    }
+
+    /// Returns whether the index treats null values as distinct from one
+    /// another, so that a unique index admits any number of rows holding
+    /// `NULL` in its key.
+    ///
+    /// `NULLS NOT DISTINCT`, which PostgreSQL accepts from version 15, answers
+    /// `false`, and any other index answers `true`, as
+    /// `pg_index.indnullsnotdistinct` records it. A primary key cannot write
+    /// the clause and answers `true`, which never matters because its columns
+    /// are `NOT NULL`.
+    ///
+    /// Defaults to `true`, which is what every index not spelling
+    /// `NULLS NOT DISTINCT` means.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (email text, phone text);
+    ///      CREATE UNIQUE INDEX users_email ON users (email) NULLS NOT DISTINCT;
+    ///      CREATE UNIQUE INDEX users_phone ON users (phone);",
+    /// )?;
+    /// let distinct: Vec<_> = db.indexes().map(|index| index.nulls_distinct()).collect();
+    /// assert_eq!(distinct, [false, true]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn nulls_distinct(&self) -> bool {
+        true
     }
 }

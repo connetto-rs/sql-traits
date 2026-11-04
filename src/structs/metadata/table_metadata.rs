@@ -1,10 +1,27 @@
 //! Submodule defining a generic `TableMetadata` struct.
 
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
-use sqlparser::ast::{Action, Privileges};
+use sqlparser::ast::{Action, ColumnDef, CreateTable, Privileges};
 
-use crate::traits::{ColumnLike, DatabaseLike, TableLike};
+use crate::{
+    impls::PrivilegeKind,
+    structs::{ForeignTableSource, RevokedPrivilege, TableAttribute},
+    traits::{ColumnLike, DatabaseLike, TableLike},
+};
+
+/// The name PostgreSQL gave a constraint written without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedConstraintName {
+    /// Which constraint of the table node it names, as its rendering numbered
+    /// among equal renderings.
+    pub(crate) slot: String,
+    /// The name as PostgreSQL stores it.
+    pub(crate) name: String,
+    /// Whether the name is also the name of the constraint's index, which no
+    /// other relation of the schema may then take.
+    pub(crate) names_index: bool,
+}
 
 #[derive(Debug, Clone)]
 /// Metadata about a database table.
@@ -29,6 +46,13 @@ pub struct TableMetadata<T: TableLike> {
     /// as names rather than handles because replacing the table node rebuilds
     /// every column, and the distinction has to survive that.
     inherited_column_names: Vec<String>,
+    /// The names of the columns whose `NOT NULL` the table receives from a
+    /// parent rather than stating itself.
+    ///
+    /// Mirrors `pg_constraint.conislocal` of a PostgreSQL 18 not-null
+    /// constraint: a column that states `NOT NULL` itself keeps it when the
+    /// parent drops its own.
+    inherited_not_null: Vec<String>,
     /// The rendering of each table constraint the table receives from a parent
     /// rather than declaring itself.
     ///
@@ -45,6 +69,11 @@ pub struct TableMetadata<T: TableLike> {
     /// CONSTRAINT ... NOT VALID` leaves until `VALIDATE CONSTRAINT` runs. Held
     /// as renderings for the same reason as the inherited constraints above.
     unvalidated_constraints: Vec<String>,
+    /// The name PostgreSQL gave each constraint the table holds without one,
+    /// fixed when the constraint arrived and kept through every later rename.
+    generated_constraint_names: Vec<GeneratedConstraintName>,
+    /// Whether a constraint may have arrived since the names were last given.
+    constraint_names_pending: bool,
     /// Whether Row Level Security is enabled for the table.
     rls_enabled: bool,
     /// Whether Row Level Security is forced for the table (applies to table
@@ -57,8 +86,14 @@ pub struct TableMetadata<T: TableLike> {
     /// Mirrors the owner's item in `pg_class.relacl`, which starts with every
     /// table privilege and loses the ones a `REVOKE` naming the owner takes.
     owner_privileges: Vec<Action>,
+    /// The privileges a `REVOKE` took on the table or one of its columns and
+    /// no later `GRANT` at that level handed back, in the order revoked.
+    revoked_privileges: Vec<RevokedPrivilege>,
     /// The comment block written above the table.
     documentation: Option<String>,
+    /// The server and options a foreign table reads its rows through, absent
+    /// for an ordinary table.
+    foreign_source: Option<ForeignTableSource>,
 }
 
 impl<T: TableLike> Default for TableMetadata<T> {
@@ -71,13 +106,19 @@ impl<T: TableLike> Default for TableMetadata<T> {
             foreign_keys: Vec::new(),
             primary_key: Vec::new(),
             inherited_column_names: Vec::new(),
+            inherited_not_null: Vec::new(),
             inherited_constraints: Vec::new(),
             unvalidated_constraints: Vec::new(),
+            generated_constraint_names: Vec::new(),
+            constraint_names_pending: false,
             rls_enabled: false,
             rls_forced: false,
             owner: None,
-            owner_privileges: every_table_privilege(),
+            // The owner holds every privilege on the table it creates.
+            owner_privileges: PrivilegeKind::Relation.all_privileges(),
+            revoked_privileges: Vec::new(),
             documentation: None,
+            foreign_source: None,
         }
     }
 }
@@ -170,6 +211,71 @@ impl<T: TableLike> TableMetadata<T> {
         }
     }
 
+    /// Iterates over the table-level privileges a `REVOKE` took from a
+    /// grantee and no later table-level `GRANT` handed back, in the order
+    /// revoked.
+    ///
+    /// This is the statement history of a parsed schema. The revocation is
+    /// kept whether or not the `REVOKE` matched a grant the input recorded,
+    /// since a schema rarely carries every privilege a role holds. Each entry
+    /// names one privilege and one grantee, and `REVOKE ALL` yields one for
+    /// each table privilege. A column-level `GRANT` hands back none of them,
+    /// and the privileges revoked on one column are read with
+    /// [`TableMetadata::column_revoked_privileges`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE app_user;
+    /// CREATE TABLE profiles (id TEXT, display_name TEXT, is_admin BOOL);
+    /// REVOKE INSERT, UPDATE ON profiles FROM app_user;
+    /// GRANT UPDATE (display_name) ON profiles TO app_user;
+    /// GRANT INSERT ON profiles TO app_user;
+    /// ",
+    /// )?;
+    /// let profiles =
+    ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let revoked: Vec<String> = db
+    ///     .table_metadata(profiles)
+    ///     .unwrap()
+    ///     .revoked_privileges()
+    ///     .map(|revoked| revoked.privilege().to_string())
+    ///     .collect();
+    /// assert_eq!(revoked, ["UPDATE"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn revoked_privileges(&self) -> impl Iterator<Item = &RevokedPrivilege> {
+        self.revoked_privileges.iter().filter(|revoked| revoked.column().is_none())
+    }
+
+    /// Every revocation on the table and its columns.
+    pub(crate) fn revocations(&self) -> &[RevokedPrivilege] {
+        &self.revoked_privileges
+    }
+
+    /// Every revocation on the table and its columns, for a statement to
+    /// change.
+    pub(crate) fn revocations_mut(&mut self) -> &mut Vec<RevokedPrivilege> {
+        &mut self.revoked_privileges
+    }
+
+    /// Takes every revocation, for a rebuilt table to carry it over.
+    pub(crate) fn take_revocations(&mut self) -> Vec<RevokedPrivilege> {
+        core::mem::take(&mut self.revoked_privileges)
+    }
+
+    /// Replaces every revocation.
+    pub(crate) fn set_revocations(&mut self, revocations: Vec<RevokedPrivilege>) {
+        self.revoked_privileges = revocations;
+    }
+
     /// Returns an iterator over the references of columns of the table.
     #[inline]
     pub fn columns(&self) -> impl Iterator<Item = &<T::DB as DatabaseLike>::Column> {
@@ -258,6 +364,44 @@ impl<T: TableLike> TableMetadata<T> {
         }
     }
 
+    /// Returns the names of the columns whose `NOT NULL` the table receives
+    /// from a parent rather than stating itself.
+    #[inline]
+    pub(crate) fn inherited_not_null(&self) -> &[String] {
+        &self.inherited_not_null
+    }
+
+    /// Records the names of the columns whose `NOT NULL` the table receives
+    /// from a parent rather than stating itself.
+    #[inline]
+    pub(crate) fn set_inherited_not_null(&mut self, columns: Vec<String>) {
+        self.inherited_not_null = columns;
+    }
+
+    /// Returns the name PostgreSQL gave each constraint written without one.
+    #[inline]
+    pub(crate) fn generated_constraint_names(&self) -> &[GeneratedConstraintName] {
+        &self.generated_constraint_names
+    }
+
+    /// Records the name PostgreSQL gave each constraint written without one.
+    #[inline]
+    pub(crate) fn set_generated_constraint_names(&mut self, names: Vec<GeneratedConstraintName>) {
+        self.generated_constraint_names = names;
+    }
+
+    /// Returns whether a constraint may still be waiting for its name.
+    #[inline]
+    pub(crate) fn constraint_names_pending(&self) -> bool {
+        self.constraint_names_pending
+    }
+
+    /// Records whether a constraint may still be waiting for its name.
+    #[inline]
+    pub(crate) fn set_constraint_names_pending(&mut self, pending: bool) {
+        self.constraint_names_pending = pending;
+    }
+
     /// Returns an iterator over the check constraints of the table.
     #[inline]
     pub fn check_constraints(
@@ -338,6 +482,33 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub(crate) fn take_documentation(&mut self) -> Option<String> {
         self.documentation.take()
+    }
+
+    /// Returns the server and options a foreign table reads its rows through,
+    /// or [`None`] for an ordinary table.
+    #[inline]
+    #[must_use]
+    pub fn foreign_source(&self) -> Option<&ForeignTableSource> {
+        self.foreign_source.as_ref()
+    }
+
+    /// Marks the table as a foreign table reading its rows through `source`,
+    /// or as an ordinary table when [`None`].
+    #[inline]
+    pub fn set_foreign_source(&mut self, source: Option<ForeignTableSource>) {
+        self.foreign_source = source;
+    }
+
+    /// Moves the foreign source out, for a rebuild that carries it over.
+    #[inline]
+    pub(crate) fn take_foreign_source(&mut self) -> Option<ForeignTableSource> {
+        self.foreign_source.take()
+    }
+
+    /// The foreign source, for an `ALTER` changing its options.
+    #[inline]
+    pub(crate) fn foreign_source_mut(&mut self) -> Option<&mut ForeignTableSource> {
+        self.foreign_source.as_mut()
     }
 
     /// Adds a column to the table metadata.
@@ -433,17 +604,50 @@ impl<T: TableLike> TableMetadata<T> {
     }
 }
 
-/// Every privilege PostgreSQL gives a table's owner when it creates the table.
-fn every_table_privilege() -> Vec<Action> {
-    vec![
-        Action::Select { columns: None },
-        Action::Insert { columns: None },
-        Action::Update { columns: None },
-        Action::Delete,
-        Action::Truncate,
-        Action::References { columns: None },
-        Action::Trigger,
-    ]
+impl TableMetadata<CreateTable> {
+    /// Iterates over the privileges a `REVOKE` took on `column`, one of this
+    /// table's columns, from a grantee and no later `GRANT` on that column
+    /// handed back.
+    ///
+    /// A table-level `REVOKE` is read with
+    /// [`TableMetadata::revoked_privileges`], and a table-level `GRANT` hands
+    /// back none of the revocations on a column.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE app_user;
+    /// CREATE TABLE profiles (id TEXT, is_admin BOOL);
+    /// REVOKE SELECT (is_admin), UPDATE (is_admin) ON profiles FROM app_user;
+    /// GRANT SELECT ON profiles TO app_user;
+    /// ",
+    /// )?;
+    /// let profiles =
+    ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let is_admin = profiles.column("is_admin", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// let metadata = db.table_metadata(profiles).unwrap();
+    /// let revoked: Vec<String> = metadata
+    ///     .column_revoked_privileges(is_admin)
+    ///     .map(|revoked| revoked.privilege().to_string())
+    ///     .collect();
+    /// assert_eq!(revoked, ["SELECT", "UPDATE"]);
+    /// assert_eq!(metadata.revoked_privileges().count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn column_revoked_privileges<'a>(
+        &'a self,
+        column: &'a TableAttribute<CreateTable, ColumnDef>,
+    ) -> impl Iterator<Item = &'a RevokedPrivilege> {
+        let name = &column.attribute().name;
+        self.revoked_privileges.iter().filter(move |revoked| revoked.column() == Some(name))
+    }
 }
 
 /// Returns whether `action` covers the whole table rather than some of its

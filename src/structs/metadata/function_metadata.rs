@@ -1,12 +1,12 @@
 //! Submodule defining a `FunctionMetadata` struct.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
-use sqlparser::ast::{CreateRole, Grantee, Ident};
+use sqlparser::ast::{CreateFunction, CreateRole, Grantee, Ident};
 
 use crate::{
     impls::{grantee_is_public, grantee_matches_role, grantees_match},
-    structs::FunctionKind,
+    structs::{FunctionKind, metadata::ExpressionCalls},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,6 +27,12 @@ pub struct FunctionMetadata {
     /// The name of the extension the function belongs to, which creates and
     /// drops it.
     extension: Option<Ident>,
+    /// The extensions `ALTER FUNCTION ... DEPENDS ON EXTENSION` made the
+    /// function depend on, each dropping it when it is dropped.
+    extension_dependencies: Vec<Ident>,
+    /// The calls of a body PostgreSQL binds at creation, with the functions
+    /// each reached then, and none for a body read again each time it runs.
+    body_calls: ExpressionCalls<CreateFunction>,
 }
 
 impl FunctionMetadata {
@@ -108,6 +114,50 @@ impl FunctionMetadata {
         self.extension = Some(extension);
     }
 
+    /// Returns the extensions the function was made to depend on.
+    pub(crate) fn extension_dependencies(&self) -> &[Ident] {
+        &self.extension_dependencies
+    }
+
+    /// Makes the function depend on `extension`, or stop depending on it when
+    /// `depends` is `false`. `matches` compares two extension names.
+    pub(crate) fn set_extension_dependency(
+        &mut self,
+        extension: &Ident,
+        depends: bool,
+        matches: impl Fn(&Ident, &Ident) -> bool,
+    ) {
+        self.extension_dependencies.retain(|held| !matches(held, extension));
+        if depends {
+            self.extension_dependencies.push(extension.clone());
+        }
+    }
+
+    /// Returns the calls of the function's body if PostgreSQL bound it at
+    /// creation, with the functions each reached then.
+    #[must_use]
+    #[inline]
+    pub(crate) fn body_calls(&self) -> &ExpressionCalls<CreateFunction> {
+        &self.body_calls
+    }
+
+    /// Records the calls of the function's body, bound at creation.
+    #[inline]
+    pub(crate) fn set_body_calls(&mut self, calls: ExpressionCalls<CreateFunction>) {
+        self.body_calls = calls;
+    }
+
+    /// Re-points every call of the body reaching the node `stale` at
+    /// `fresh`.
+    #[inline]
+    pub(crate) fn replace_function(
+        &mut self,
+        stale: &Arc<CreateFunction>,
+        fresh: &Arc<CreateFunction>,
+    ) {
+        self.body_calls.replace_function(stale, fresh);
+    }
+
     /// Returns who holds `EXECUTE` on the function.
     #[must_use]
     pub(crate) fn execute_privileges(&self) -> &ExecutePrivileges {
@@ -117,6 +167,21 @@ impl FunctionMetadata {
     /// Returns who holds `EXECUTE` on the function, for a statement to change.
     pub(crate) fn execute_privileges_mut(&mut self) -> &mut ExecutePrivileges {
         &mut self.execute
+    }
+
+    /// Sets who holds `EXECUTE` on a new function, with `PUBLIC` and the
+    /// owner holding it as `public` and `owner` say, and each grantee of
+    /// `grants` holding it with whether it may grant the privilege on.
+    pub(crate) fn set_execute_defaults(
+        &mut self,
+        public: bool,
+        owner: bool,
+        grants: &[(Grantee, bool)],
+    ) {
+        self.execute = ExecutePrivileges { public, owner, grants: Vec::new() };
+        for (grantee, with_grant_option) in grants {
+            self.execute.grant(core::slice::from_ref(grantee), *with_grant_option);
+        }
     }
 
     /// Returns whether `role` is the role the input names as the owner.

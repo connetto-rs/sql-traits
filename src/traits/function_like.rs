@@ -5,12 +5,13 @@ use core::{fmt::Debug, hash::Hash};
 
 use sqlparser::ast::{
     ArgMode, Expr, Function, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam,
-    FunctionSecurity,
+    FunctionSecurity, Value,
 };
 
 use crate::{
-    errors::LookupError,
-    structs::{FunctionKind, TargetName},
+    errors::{HelperSetError, LookupError},
+    impls::{body_calls, body_expression, body_reads, helper_set},
+    structs::{Deployment, FunctionBody, FunctionKind, HelperSet, TargetName},
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
         call_typing::{
@@ -578,6 +579,50 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         self.language().map(|language| normalize_identifier(language, self.language_is_quoted()))
     }
 
+    /// Returns the body as it is written, or [`None`] for a function whose
+    /// code lives outside the schema or that has no body.
+    ///
+    /// [`body`](FunctionLike::body),
+    /// [`body_expression`](FunctionLike::body_expression),
+    /// [`body_is_bound`](FunctionLike::body_is_bound),
+    /// [`referenced_tables`](FunctionLike::referenced_tables),
+    /// [`referenced_relations`](FunctionLike::referenced_relations),
+    /// [`referenced_functions`](FunctionLike::referenced_functions) and
+    /// [`helper_set`](FunctionLike::helper_set) all read the body from here,
+    /// so an implementation handing over the body a catalog stores answers
+    /// them as a parsed script does. A body bound at creation answers the
+    /// bound form, each relation it names written as the store holds the
+    /// relation it reached. A catalog that stores a bound body only as a node
+    /// tree hands over the definition it prints instead,
+    /// [`FunctionBody::BoundDefinition`], which those readers parse when they
+    /// need the body.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION quoted() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+    ///      CREATE FUNCTION returned() RETURNS INT LANGUAGE sql RETURN 1;
+    ///      CREATE FUNCTION linked() RETURNS INT LANGUAGE c AS 'library', 'symbol';",
+    /// )?;
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    /// };
+    /// assert_eq!(function("quoted").written_body(), Some(FunctionBody::Text("SELECT 1")));
+    /// assert!(matches!(function("returned").written_body(), Some(FunctionBody::Return(_))));
+    /// // Text in another language is still text, which its language reads.
+    /// assert_eq!(function("linked").written_body(), Some(FunctionBody::Text("library")));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn written_body(&self) -> Option<FunctionBody<'_>>;
+
     /// Returns the body text of the function, for the spellings that write the
     /// body as a string.
     ///
@@ -601,7 +646,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
-    fn body(&self) -> Option<&str>;
+    #[inline]
+    fn body(&self) -> Option<&str> {
+        match self.written_body()? {
+            FunctionBody::Text(text) => Some(text),
+            _ => None,
+        }
+    }
 
     /// Returns the expression of a function written `RETURN <expression>`.
     ///
@@ -610,7 +661,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// function whose body is written as a string answers [`None`] here and
     /// answers [`body`](FunctionLike::body) instead, so a caller wanting the
     /// body in either spelling asks this first and falls back to parsing the
-    /// text.
+    /// text. A bound body handed over as the definition a catalog prints,
+    /// [`FunctionBody::BoundDefinition`], is parsed here under the dialect of
+    /// `database`.
     ///
     /// The relation names a body writes are bound at `CREATE FUNCTION` under
     /// the session `search_path` in effect at creation, the way PostgreSQL
@@ -622,6 +675,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// in [`body`](FunctionLike::body), and
     /// [`body_is_bound`](FunctionLike::body_is_bound) tells it apart from a
     /// function with no body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyUnparsable`] when the printed
+    /// definition of a bound body does not parse, or holds no body bound at
+    /// creation.
     ///
     /// # Example
     ///
@@ -640,13 +699,16 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     .function_by_target(TargetName::new("added", false), IdentifierCase::AsWritten)?
     ///     .expect("Function should exist");
     /// assert_eq!(added.body(), None);
-    /// assert_eq!(added.body_expression().map(ToString::to_string).as_deref(), Some("a + b"));
+    /// assert_eq!(
+    ///     added.body_expression(&db)?.map(|expression| expression.to_string()).as_deref(),
+    ///     Some("a + b"),
+    /// );
     ///
     /// let quoted = db
     ///     .function_by_target(TargetName::new("quoted", false), IdentifierCase::AsWritten)?
     ///     .expect("Function should exist");
     /// assert_eq!(quoted.body(), Some("SELECT a"));
-    /// assert_eq!(quoted.body_expression(), None);
+    /// assert_eq!(quoted.body_expression(&db)?, None);
     /// # Ok(())
     /// # }
     /// ```
@@ -663,17 +725,24 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// CREATE FUNCTION reads_table() RETURNS INT LANGUAGE sql RETURN (SELECT a FROM t);
     /// ",
     /// )?;
-    /// let reads_table = db
-    ///     .function_by_target(TargetName::new("reads_table", false), IdentifierCase::AsWritten)?
-    ///     .expect("Function should exist");
+    /// // The function lands in `app`, the first schema on the path.
+    /// let in_app = TargetName::new("reads_table", false).with_schema("app", false);
+    /// let reads_table =
+    ///     db.function_by_target(in_app, IdentifierCase::AsWritten)?.expect("Function should exist");
     /// assert_eq!(
-    ///     reads_table.body_expression().map(ToString::to_string).as_deref(),
+    ///     reads_table.body_expression(&db)?.map(|expression| expression.to_string()).as_deref(),
     ///     Some("(SELECT a FROM app.t)"),
     /// );
     /// # Ok(())
     /// # }
     /// ```
-    fn body_expression(&self) -> Option<&Expr>;
+    #[inline]
+    fn body_expression<'f>(
+        &'f self,
+        database: &Self::DB,
+    ) -> Result<Option<Cow<'f, Expr>>, LookupError> {
+        body_expression(self, database)
+    }
 
     /// Returns the function-local configuration after later alterations.
     fn configuration_parameters(&self) -> &[FunctionDefinitionSetParam];
@@ -721,7 +790,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///      ALTER FUNCTION unpinned() RESET search_path;",
     /// )?;
     /// let function = |name| {
-    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///     let in_app = TargetName::new(name, false).with_schema("app", false);
+    ///     db.function_by_target(in_app, IdentifierCase::AsWritten)
     ///         .expect("unambiguous lookup")
     ///         .expect("Function should exist")
     /// };
@@ -781,7 +851,56 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
-    fn body_is_bound(&self) -> bool;
+    #[inline]
+    fn body_is_bound(&self) -> bool {
+        self.written_body().is_some_and(|body| body.is_bound())
+    }
+
+    /// Returns every function the calls of a body
+    /// [bound at creation](FunctionLike::body_is_bound) reached when it was
+    /// bound, each once, and none for a body read again each time the
+    /// function runs.
+    ///
+    /// PostgreSQL records these when it binds the body, so the body text
+    /// alone does not decide them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] for a function `database`
+    /// does not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE SCHEMA app;
+    ///      CREATE FUNCTION app.one() RETURNS INT LANGUAGE sql RETURN 1;
+    ///      SET search_path = app;
+    ///      CREATE FUNCTION public.two() RETURNS INT LANGUAGE sql RETURN one() + one();
+    ///      RESET search_path;",
+    /// )?;
+    /// let two = db
+    ///     .function_by_target(TargetName::new("two", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// // `app` was on the path when `two` was created, and is no longer.
+    /// let reached: Vec<_> = two.bound_body_functions(&db)?.map(FunctionLike::target_name).collect();
+    /// assert_eq!(reached, [TargetName::new("one", false).with_schema("app", false)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn bound_body_functions<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<
+        impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + use<'db, Self>,
+        LookupError,
+    >
+    where
+        Self: 'db;
 
     /// Returns every base table the body reads or writes, plain views
     /// expanded to the base tables they read, resolved the way PostgreSQL
@@ -798,22 +917,30 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// [`DataStatementLike::referenced_tables`](crate::traits::DataStatementLike::referenced_tables).
     /// A body of several statements is read one statement after another, as
     /// PostgreSQL 18 runs it, so a `SET` or `RESET` of `search_path` in it
-    /// reaches the statements after it. A function without a `LANGUAGE`
+    /// reaches the statements after it. A `LANGUAGE plpgsql` body is read
+    /// through every SQL statement and expression it embeds, in body order,
+    /// and never reads a name it declares or a parameter as a relation. A
+    /// `SET` of `search_path` there reaches what follows it on the straight
+    /// line only. An unqualified name such a `SET` may reach from a branch, a
+    /// loop or a block with an exception handler cannot be resolved, and a
+    /// handler starts under the path its block started with, since
+    /// PostgreSQL rolls the block back first. A function without a `LANGUAGE`
     /// clause is read as SQL, which is what PostgreSQL assumes for a `RETURN`
     /// body and what dialects without the clause mean.
     ///
     /// # Errors
     ///
-    /// Which tables the body reads cannot be known when it is written in
-    /// another language ([`LookupError::FunctionBodyNotSql`]), when the
-    /// function's code lives outside the schema
-    /// ([`LookupError::FunctionBodyUnavailable`]), or when the body runs code
-    /// outside it, through `CALL`, `EXECUTE` or a `set_config` of
-    /// `search_path` before an unqualified name
+    /// Which tables the body reads cannot be known when it is written in a
+    /// language other than SQL or PL/pgSQL
+    /// ([`LookupError::FunctionBodyNotSql`]), when the function's code lives
+    /// outside the schema ([`LookupError::FunctionBodyUnavailable`]), or when
+    /// the body runs code outside it, through `CALL`, `EXECUTE` or a
+    /// `set_config` of `search_path` before an unqualified name
     /// ([`LookupError::FunctionBodyUnresolvable`]). Returns
     /// [`LookupError::FunctionBodyUnparsable`] when the body text does not
-    /// parse under the database's dialect, and any error resolving a name the
-    /// body reads.
+    /// parse, under the database's dialect for SQL, or when the printed
+    /// definition of a bound body does not parse or holds no body bound at
+    /// creation, and any error resolving a name the body reads.
     ///
     /// # Example
     ///
@@ -844,10 +971,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     fn referenced_tables<'db>(
         &self,
         database: &'db Self::DB,
-    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Table>, LookupError>;
+    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Table>, LookupError> {
+        Ok(body_reads(self, database)?.tables)
+    }
 
     /// Returns every relation the body names, whether table, plain view or
     /// materialized view, resolved and deduplicated as
@@ -885,10 +1015,79 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     fn referenced_relations<'db>(
         &self,
         database: &'db Self::DB,
-    ) -> Result<Vec<Relation<'db, Self::DB>>, LookupError>;
+    ) -> Result<Vec<Relation<'db, Self::DB>>, LookupError> {
+        Ok(body_reads(self, database)?.relations)
+    }
+
+    /// Returns every function the calls the body writes may reach, resolved
+    /// the way PostgreSQL resolves them, and deduplicated in first-reached
+    /// order.
+    ///
+    /// A call in a body written as a string resolves when the function runs,
+    /// under the path [`referenced_tables`](FunctionLike::referenced_tables)
+    /// reads relations under, `pg_catalog` searched first unless that path
+    /// places it, and reaches the functions the database holds. A body
+    /// written `RETURN <expression>` or as a `BEGIN ATOMIC` block was
+    /// [bound at creation](FunctionLike::body_is_bound), so each of its calls
+    /// reaches the functions it reached then, under the path of the statement
+    /// that created it. PostgreSQL picks among overloads by argument type,
+    /// which is not inferred, so every overload accepting the call's argument
+    /// count counts, as
+    /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by)
+    /// counts them. A view the body reads adds none of the calls its
+    /// definition makes.
+    ///
+    /// # Errors
+    ///
+    /// The body-level errors of
+    /// [`referenced_tables`](FunctionLike::referenced_tables), for the bodies
+    /// read each time the function runs, an unqualified call after a
+    /// `set_config` of `search_path` among them
+    /// ([`LookupError::FunctionBodyUnresolvable`]). A bound body answers the
+    /// functions [`bound_body_functions`](FunctionLike::bound_body_functions)
+    /// records, so a printed definition is never parsed here, and returns
+    /// [`LookupError::ObjectNotInDatabase`] for a function `database` does
+    /// not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE members (doc_id TEXT, user_id TEXT);
+    ///      CREATE FUNCTION is_member(d TEXT) RETURNS BOOLEAN LANGUAGE sql
+    ///          AS $$ SELECT EXISTS (SELECT 1 FROM members WHERE doc_id = d) $$;
+    ///      CREATE FUNCTION can_read(d TEXT) RETURNS BOOLEAN LANGUAGE sql
+    ///          AS $$ SELECT is_member(d) $$;",
+    /// )?;
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    /// };
+    /// // `can_read` reads nothing itself, and reaches `members` through its call.
+    /// assert!(function("can_read").referenced_tables(&db)?.is_empty());
+    /// let called = function("can_read").referenced_functions(&db)?;
+    /// assert_eq!(called.iter().map(|called| called.name()).collect::<Vec<_>>(), ["is_member"]);
+    /// let read = called[0].referenced_tables(&db)?;
+    /// assert_eq!(read.iter().map(|table| table.table_name()).collect::<Vec<_>>(), ["members"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn referenced_functions<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Function>, LookupError> {
+        body_calls(self, database)
+    }
 
     /// Returns the null-input behavior with PostgreSQL's default folded in.
     fn null_input_behavior(&self) -> FunctionCalledOnNull;
@@ -1004,10 +1203,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// [`security_mode`](FunctionLike::security_mode) leaves open: that reader
     /// says the body runs as its definer, and this one says who the definer is.
     ///
-    /// Only `ALTER FUNCTION ... OWNER TO <role>` names an owner. A function no
-    /// such statement altered has none, and neither has one handed to
-    /// `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`, which name whoever
-    /// runs the statement rather than a role the input declares.
+    /// The owner is the role the function was created under, as `SET ROLE` and
+    /// `SET SESSION AUTHORIZATION` leave it, until `ALTER FUNCTION ... OWNER
+    /// TO <role>` hands it to another. A function created while the input had
+    /// set no role has none, and neither has one handed to `CURRENT_ROLE`,
+    /// `CURRENT_USER` or `SESSION_USER`, which name whoever runs the statement
+    /// rather than a role the input declares.
     ///
     /// The role is reported as the statement spelled it, with no case folding,
     /// which is how [`DatabaseLike::role`] stores the names it matches against.
@@ -1032,21 +1233,24 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
     /// CREATE ROLE app_reader;
+    /// CREATE ROLE app_writer;
     /// CREATE FUNCTION reassigned() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
     /// ALTER FUNCTION reassigned() OWNER TO app_reader;
     /// CREATE FUNCTION untouched() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+    /// SET ROLE app_writer;
+    /// CREATE FUNCTION written() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
     /// ",
     /// )?;
-    /// let reassigned = db
-    ///     .function_by_target(TargetName::new("reassigned", false), IdentifierCase::AsWritten)?
-    ///     .expect("Function should exist");
-    /// assert_eq!(reassigned.owner(&db)?, Some("app_reader"));
-    ///
-    /// // Nobody reassigned this one, so the schema names no owner for it.
-    /// let untouched = db
-    ///     .function_by_target(TargetName::new("untouched", false), IdentifierCase::AsWritten)?
-    ///     .expect("Function should exist");
-    /// assert_eq!(untouched.owner(&db)?, None);
+    /// let owner = |name: &str| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    ///         .owner(&db)
+    /// };
+    /// assert_eq!(owner("reassigned")?, Some("app_reader"));
+    /// assert_eq!(owner("written")?, Some("app_writer"));
+    /// // Created before any role was set and never reassigned.
+    /// assert_eq!(owner("untouched")?, None);
     /// # Ok(())
     /// # }
     /// ```
@@ -1055,11 +1259,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// Returns whether every role may execute the function, which is what
     /// `PUBLIC` holding `EXECUTE` on it means.
     ///
-    /// PostgreSQL gives `PUBLIC` `EXECUTE` on every new function, so this
-    /// answers `true` until a `REVOKE` takes it away, and again once a
-    /// `GRANT ... TO PUBLIC` restores it. Every spelling reaches it, whether a
-    /// signature, a name that covers one function alone, or `ALL FUNCTIONS IN
-    /// SCHEMA`, which covers the functions the schema holds when it runs.
+    /// PostgreSQL gives `PUBLIC` `EXECUTE` on every new function unless an
+    /// `ALTER DEFAULT PRIVILEGES` of the role creating it takes it away first.
+    /// A `REVOKE` takes it away later and a `GRANT ... TO PUBLIC` restores it.
+    /// Every spelling reaches it, whether a signature, a name that covers one
+    /// function alone, or `ALL FUNCTIONS IN SCHEMA`, which covers the
+    /// functions the schema holds when it runs.
     ///
     /// # Arguments
     ///
@@ -1205,6 +1410,98 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         role: &<Self::DB as DatabaseLike>::Role,
         database: &Self::DB,
     ) -> Result<bool, LookupError>;
+
+    /// What this helper returns for a caller of `deployment`, called with
+    /// `arguments`, as a union of grant arms and parent arms.
+    ///
+    /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
+    /// function returning `SETOF` one scalar type with a pinned
+    /// `search_path`, owned by a declared role holding `SELECT` on every
+    /// table it reads and exempt from their row-level security, and when
+    /// its body is a `UNION` of arms of two shapes.
+    ///
+    /// - A grant arm, `SELECT <column> FROM <table> WHERE <caller column> =
+    ///   current_setting('<setting>'[, true]) [AND <condition>]`, where the
+    ///   deployment declares the setting as the caller and the condition, the
+    ///   arguments substituted, reduces to `TRUE`, to `FALSE` or `NULL`, or to
+    ///   the literal values one column has to hold.
+    /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
+    ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
+    ///   literal, the helper called answered in turn for the arguments it
+    ///   receives. The column names its parent through its one single-column
+    ///   foreign key or, where it has none, through the table the called
+    ///   helper's set covers.
+    ///
+    /// A grant arm whose condition reduces to `FALSE` or `NULL` keeps no row
+    /// and is left out. A column named like a parameter is the column, as
+    /// PostgreSQL resolves names in a SQL function.
+    ///
+    /// The owner's `USAGE` on the schemas the helper and what it reads live
+    /// in is not checked, and a `SELECT` granted on columns alone is not
+    /// counted.
+    ///
+    /// # Arguments
+    ///
+    /// * `arguments` - One literal per input parameter.
+    /// * `deployment` - The deployment declaring the caller setting.
+    /// * `database` - The database the helper belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`HelperSetError`] naming why the helper, or a helper a
+    /// parent arm calls, refuses to answer.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::{errors::HelperSetError, prelude::*};
+    /// use sqlparser::{
+    ///     ast::{DataType, Value},
+    ///     dialect::PostgreSqlDialect,
+    /// };
+    ///
+    /// # fn main() -> Result<(), HelperSetError> {
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+    ///      CREATE TABLE grants (doc_id TEXT, principal_id TEXT, role TEXT);
+    ///      CREATE FUNCTION docs_with(min_role TEXT) RETURNS SETOF TEXT
+    ///      LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+    ///        SELECT doc_id FROM grants
+    ///        WHERE principal_id = current_setting('app.user_id', true)
+    ///          AND (role = 'admin' OR role = min_role)
+    ///      $$;
+    ///      ALTER FUNCTION docs_with(TEXT) OWNER TO authz_owner;
+    ///      GRANT SELECT ON grants TO authz_owner;",
+    /// )
+    /// .expect("the schema parses");
+    /// let caller = SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))
+    ///     .expect("a custom setting name");
+    /// let deployment = Deployment::new("app", ["app"], [caller]).expect("a valid deployment");
+    /// let docs_with = db
+    ///     .function_by_target(TargetName::new("docs_with", false), IdentifierCase::AsWritten)?
+    ///     .expect("the helper exists");
+    ///
+    /// let set =
+    ///     docs_with.helper_set(&[Value::SingleQuotedString("write".into())], &deployment, &db)?;
+    /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
+    /// assert_eq!(grant.column().column_name(), "doc_id");
+    /// assert_eq!(grant.caller_column().column_name(), "principal_id");
+    /// let roles = grant.restriction().expect("the condition keeps two roles");
+    /// let admin = Value::SingleQuotedString("admin".into());
+    /// let write = Value::SingleQuotedString("write".into());
+    /// assert_eq!(roles.values(), [admin, write]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn helper_set<'db>(
+        &'db self,
+        arguments: &[Value],
+        deployment: &'db Deployment,
+        database: &'db Self::DB,
+    ) -> Result<HelperSet<'db, Self::DB>, HelperSetError> {
+        helper_set(self, arguments, deployment, database)
+    }
 
     /// Returns the normalized return type name of the function as a string.
     ///
@@ -1633,7 +1930,6 @@ mod tests {
             CREATE FUNCTION my_func() RETURNS INT AS 'SELECT 1;';
             ALTER FUNCTION my_func() IMMUTABLE;
             ALTER FUNCTION missing_func() COST 100;
-            ALTER FUNCTION missing_func() RENAME TO other_func;
         ";
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let f = db
@@ -1642,6 +1938,22 @@ mod tests {
             .expect("function should exist");
 
         assert_eq!(f.security_mode(), FunctionSecurity::Invoker);
+    }
+
+    #[test]
+    fn test_alter_function_depends_on_extension_names_a_held_function() {
+        // PostgreSQL 16 refuses `function missing() does not exist`, and a bare
+        // name covering two overloads as not unique.
+        let held = "CREATE FUNCTION f() RETURNS INT AS 'SELECT 1';
+                    CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT x';";
+        let parse = |statement: &str| {
+            ParserDB::parse::<PostgreSqlDialect>(&alloc::format!("{held} {statement}"))
+        };
+        parse("ALTER FUNCTION f() DEPENDS ON EXTENSION plpgsql;").expect("f() is held");
+        let missing = parse("ALTER FUNCTION missing() DEPENDS ON EXTENSION plpgsql;");
+        assert!(matches!(missing, Err(Error::AlterFunctionNotFound { .. })), "got {missing:?}");
+        let bare = parse("ALTER FUNCTION f DEPENDS ON EXTENSION plpgsql;");
+        assert!(matches!(bare, Err(Error::AmbiguousAlterFunction { .. })), "got {bare:?}");
     }
 
     #[test]

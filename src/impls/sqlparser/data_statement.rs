@@ -12,8 +12,8 @@
 //! through the view's stored definition, which is bound at creation and read
 //! with no search path, and every table a `FROM` or target item without
 //! `ONLY` names into the tables below it through `INHERITS` and
-//! `PARTITION OF`. A SQL function body is walked the same way, one statement
-//! after another, under the path the function runs with.
+//! `PARTITION OF`. A function body read when it runs is walked the same way,
+//! one statement after another, under the path the function runs with.
 
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
@@ -23,7 +23,9 @@ use sqlparser::ast::{
     Query, Statement, TableFactor, TableInheritance, TableObject, Update, Value, ValueWithSpan,
     Visit, Visitor,
 };
+use sqlparser_plpgsql::embedded::Block;
 
+use super::plpgsql_body::walk_block;
 use crate::{
     errors::LookupError,
     structs::IdentifierCase,
@@ -39,13 +41,11 @@ use crate::{
     },
 };
 
-/// The path unqualified names resolve under.
+/// The path unqualified names resolve under in a body read when it runs.
+#[derive(Clone)]
 pub(crate) enum BodyPath<'path> {
     /// The database's own path.
     Database,
-    /// No path, for a body bound at creation, whose names carry the
-    /// qualifier of the relation each reached.
-    Bound,
     /// A path a function's setting or an earlier statement chose.
     Set(SearchPath<'path>),
     /// An earlier statement changed the path while the body runs, so an
@@ -79,7 +79,10 @@ pub(crate) struct Reads<'db, DB: DatabaseLike> {
 /// definition, stopping at the first resolution error.
 struct RelationCollector<'db, 'path, DB: DatabaseLike> {
     database: &'db DB,
-    path: BodyPath<'path>,
+    /// The path unqualified names resolve under, or none for a body bound at
+    /// creation, whose names carry the qualifier of the relation each
+    /// reached.
+    path: Option<BodyPath<'path>>,
     reads: Reads<'db, DB>,
     /// The plain views expanded so far, which a definition reading its view
     /// back cannot re-expand.
@@ -99,7 +102,7 @@ struct RelationCollector<'db, 'path, DB: DatabaseLike> {
 }
 
 impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
-    fn new(database: &'db DB, path: BodyPath<'path>) -> Self {
+    fn new(database: &'db DB, path: Option<BodyPath<'path>>) -> Self {
         Self {
             database,
             path,
@@ -117,10 +120,10 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
     /// body bound at creation, and under the walk's path otherwise.
     fn resolve(&self, object_name: &ObjectName) -> Result<Option<Relation<'db, DB>>, LookupError> {
         let case = IdentifierCase::AsWritten;
-        if self.bound || matches!(self.path, BodyPath::Bound) {
+        let Some(path) = self.path.as_ref().filter(|_| !self.bound) else {
             return resolve_bound_relation_object_name(object_name, self.database);
-        }
-        match &self.path {
+        };
+        match path {
             BodyPath::Set(path) => {
                 resolve_relation_object_name_on_path(object_name, self.database, path, case)
             }
@@ -128,7 +131,7 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
                 Err(error.clone())
             }
             // A qualified name reaches its schema whatever the path holds.
-            BodyPath::Database | BodyPath::Bound | BodyPath::Unknown(_) => {
+            BodyPath::Database | BodyPath::Unknown(_) => {
                 resolve_relation_object_name(object_name, self.database, case)
             }
         }
@@ -187,7 +190,11 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
                 Ok(())
             }
             Relation::View(view) => self.expand_view(view),
-            Relation::MaterializedView(_) | Relation::Sequence(_) => Ok(()),
+            // A foreign table is listed among the relations read, and like
+            // `tables()` the base-table answer leaves it out.
+            Relation::ForeignTable(_) | Relation::MaterializedView(_) | Relation::Sequence(_) => {
+                Ok(())
+            }
         }
     }
 
@@ -210,6 +217,9 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
             }
         }
         for child in reached.into_iter().skip(1) {
+            if child.is_foreign(self.database)? {
+                continue;
+            }
             if !self.reads.tables.iter().any(|seen| core::ptr::eq(*seen, child)) {
                 self.reads.tables.push(child);
             }
@@ -250,7 +260,10 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
 /// database hands back for it.
 fn same_relation<DB: DatabaseLike>(left: &Relation<'_, DB>, right: &Relation<'_, DB>) -> bool {
     match (left, right) {
-        (Relation::Table(left), Relation::Table(right)) => core::ptr::eq(*left, *right),
+        (Relation::Table(left), Relation::Table(right))
+        | (Relation::ForeignTable(left), Relation::ForeignTable(right)) => {
+            core::ptr::eq(*left, *right)
+        }
         (Relation::View(left), Relation::View(right)) => core::ptr::eq(*left, *right),
         (Relation::MaterializedView(left), Relation::MaterializedView(right)) => {
             core::ptr::eq(*left, *right)
@@ -318,28 +331,98 @@ fn collect<'db, N: Visit, DB: DatabaseLike>(
     record: impl FnOnce(&mut RelationCollector<'db, '_, DB>),
     listed: &[ObjectName],
 ) -> Result<Reads<'db, DB>, LookupError> {
-    let mut collector = RelationCollector::new(database, BodyPath::Database);
+    let mut collector = RelationCollector::new(database, Some(BodyPath::Database));
     record(&mut collector);
     collector.collect(node, listed)?;
     Ok(collector.reads)
 }
 
-/// Resolves every relation reachable from `node` under `path`.
+/// Resolves every relation reachable from `node` under `path`, or as bound
+/// with no path for a body bound at creation.
 pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
     node: &N,
     database: &'db DB,
-    path: BodyPath<'_>,
+    path: Option<BodyPath<'_>>,
 ) -> Result<Reads<'db, DB>, LookupError> {
     let mut collector = RelationCollector::new(database, path);
     collector.collect(node, &[])?;
     Ok(collector.reads)
 }
 
-/// Resolves every relation the statements of a SQL function body read, one
-/// statement after another, starting under `path`.
+/// What a walk over the statements of a function body read when it runs
+/// gathers, one statement after another, under the path in force for each.
+pub(crate) trait BodyWalk<'s> {
+    /// The path a statement may need to start from again, as the walker
+    /// holds it.
+    type SavedPath: Clone;
+
+    /// Copies the path the next statement runs under.
+    fn save_path(&self) -> Self::SavedPath;
+
+    /// Returns to a path [`save_path`](BodyWalk::save_path) copied.
+    fn restore_path(&mut self, saved: Self::SavedPath);
+
+    /// Takes up `path` for the statements after the one setting it.
+    fn set_path(&mut self, path: BodyPath<'s>);
+
+    /// Walks one statement that leaves the path alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error resolving a name the statement holds.
+    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError>;
+}
+
+/// The statements of a function body read when it runs.
+#[derive(Clone, Copy)]
+pub(crate) enum RunTimeBody<'s> {
+    /// A SQL body, its statements run one after another.
+    Sql(&'s [Statement]),
+    /// A PL/pgSQL body, the SQL it embeds read where its blocks, branches,
+    /// loops and handlers run it.
+    PlPgSql(&'s Block),
+}
+
+/// Hands the statements of the body of `function` to `walker`, one after
+/// another, together with the path each runs under.
 ///
-/// PostgreSQL 18 analyzes each statement of such a body when it runs, so a
-/// `SET` or `RESET` of `search_path` reaches the statements after it, and a
+/// # Errors
+///
+/// Returns the errors of [`walk_statement`], SQL built at run time by a
+/// PL/pgSQL body ([`LookupError::FunctionBodyUnresolvable`]) among them, and
+/// any error `walker` returns.
+pub(crate) fn walk_body<'s>(
+    function: &str,
+    body: RunTimeBody<'s>,
+    walker: &mut impl BodyWalk<'s>,
+    hex_strings_may_be_integers: bool,
+) -> Result<(), LookupError> {
+    match body {
+        RunTimeBody::Sql(statements) => {
+            statements.iter().try_for_each(|statement| {
+                walk_statement(function, statement, walker, hex_strings_may_be_integers)
+            })
+        }
+        RunTimeBody::PlPgSql(block) => {
+            walk_block(function, block, walker, hex_strings_may_be_integers)
+        }
+    }
+}
+
+/// The error a function body answers for `statement`, which hides what the
+/// body reads.
+pub(crate) fn unresolvable(function: &str, statement: &impl ToString) -> LookupError {
+    LookupError::FunctionBodyUnresolvable {
+        function: function.to_string(),
+        statement: statement.to_string(),
+    }
+}
+
+/// Hands one statement of the body of `function` to `walker`, or takes up
+/// the path it sets for the statements after it.
+///
+/// PostgreSQL 18 analyzes each statement of a function body when it runs, so
+/// a `SET` or `RESET` of `search_path` reaches the statements after it, and a
 /// `set_config` of it leaves later unqualified names unknowable. A `SET` reads
 /// its entries as
 /// [`search_path_entry`](crate::utils::object_name::search_path_entry) does.
@@ -347,47 +430,76 @@ pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
 /// # Errors
 ///
 /// Returns [`LookupError::FunctionBodyUnresolvable`] for a statement that
-/// runs code outside the body, or for an unqualified name after a run-time
-/// path change, and any error resolving a name.
+/// runs code outside the body, and any error `walker` returns.
+pub(crate) fn walk_statement<'s>(
+    function: &str,
+    statement: &'s Statement,
+    walker: &mut impl BodyWalk<'s>,
+    hex_strings_may_be_integers: bool,
+) -> Result<(), LookupError> {
+    if matches!(statement, Statement::Call(_) | Statement::Execute { .. }) {
+        return Err(unresolvable(function, statement));
+    }
+    match search_path_change(statement, hex_strings_may_be_integers)? {
+        Some(SearchPathChange::Set(path)) => walker.set_path(BodyPath::Set(path)),
+        Some(SearchPathChange::Reset) => walker.set_path(BodyPath::default_path()),
+        None => {
+            walker.walk(statement)?;
+            if sets_search_path_at_run_time(statement) {
+                walker.set_path(BodyPath::Unknown(unresolvable(function, statement)));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
+    type SavedPath = Option<BodyPath<'s>>;
+
+    fn save_path(&self) -> Self::SavedPath {
+        self.path.clone()
+    }
+
+    fn restore_path(&mut self, saved: Self::SavedPath) {
+        self.path = saved;
+    }
+
+    fn set_path(&mut self, path: BodyPath<'s>) {
+        self.path = Some(path);
+    }
+
+    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError> {
+        let listed = match statement {
+            Statement::Delete(delete) => delete.tables.as_slice(),
+            _ => &[],
+        };
+        self.collect(statement, listed)
+    }
+}
+
+/// Resolves every relation the statements of a function body read, one
+/// statement after another as [`walk_body`] hands them over, starting under
+/// `path`.
+///
+/// # Errors
+///
+/// Returns the errors of [`walk_body`], an unqualified name after a run-time
+/// path change among them, and any error resolving a name.
 pub(crate) fn reads_of_body<'db, DB: DatabaseLike>(
     function: &str,
-    statements: &[Statement],
+    body: RunTimeBody<'_>,
     database: &'db DB,
     path: BodyPath<'_>,
     hex_strings_may_be_integers: bool,
 ) -> Result<Reads<'db, DB>, LookupError> {
-    let unresolvable = |statement: &Statement| {
-        LookupError::FunctionBodyUnresolvable {
-            function: function.to_string(),
-            statement: statement.to_string(),
-        }
-    };
-    let mut collector = RelationCollector::new(database, path);
-    for statement in statements {
-        if matches!(statement, Statement::Call(_) | Statement::Execute { .. }) {
-            return Err(unresolvable(statement));
-        }
-        match search_path_change(statement, hex_strings_may_be_integers)? {
-            Some(SearchPathChange::Set(path)) => collector.path = BodyPath::Set(path),
-            Some(SearchPathChange::Reset) => collector.path = BodyPath::default_path(),
-            None => {
-                let listed = match statement {
-                    Statement::Delete(delete) => delete.tables.as_slice(),
-                    _ => &[],
-                };
-                collector.collect(statement, listed)?;
-                if sets_search_path_at_run_time(statement) {
-                    collector.path = BodyPath::Unknown(unresolvable(statement));
-                }
-            }
-        }
-    }
+    let mut collector = RelationCollector::new(database, Some(path));
+    walk_body(function, body, &mut collector, hex_strings_may_be_integers)?;
     Ok(collector.reads)
 }
 
 /// Whether `statement` calls `set_config` on `search_path`, or on a setting
 /// named only when it runs.
-fn sets_search_path_at_run_time(statement: &Statement) -> bool {
+pub(crate) fn sets_search_path_at_run_time(statement: &Statement) -> bool {
     struct SetConfigCalls;
     impl Visitor for SetConfigCalls {
         type Break = ();
@@ -510,6 +622,7 @@ mod tests {
         CREATE VIEW open_high AS SELECT user_id FROM open_orders WHERE total > 100;
         CREATE MATERIALIZED VIEW big_orders AS SELECT user_id, total FROM orders;
         CREATE SEQUENCE ticket_seq;
+        CREATE FOREIGN TABLE remote_orders (id INT) SERVER warehouse;
     ";
 
     fn schema_db() -> ParserDB {
@@ -542,6 +655,9 @@ mod tests {
             .map(|relation| {
                 match relation {
                     Relation::Table(table) => format!("table {}", table.table_name()),
+                    Relation::ForeignTable(table) => {
+                        format!("foreign table {}", table.table_name())
+                    }
                     Relation::View(view) => format!("view {}", view.view_name()),
                     Relation::MaterializedView(view) => {
                         format!("materialized view {}", view.view_name())
@@ -795,11 +911,13 @@ mod tests {
     #[test]
     fn referenced_relations_tag_every_kind_the_statement_reads() {
         let db = schema_db();
-        let statement = parse_one("SELECT * FROM users, open_orders, big_orders, ticket_seq");
+        let statement =
+            parse_one("SELECT * FROM users, remote_orders, open_orders, big_orders, ticket_seq");
         assert_eq!(
             relation_names(as_query(&statement), &db),
             vec![
                 "table users".to_string(),
+                "foreign table remote_orders".to_string(),
                 "view open_orders".to_string(),
                 "materialized view big_orders".to_string(),
                 "sequence ticket_seq".to_string(),

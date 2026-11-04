@@ -285,15 +285,6 @@ pub(crate) fn require_local_object_name(object_name: &ObjectName) -> Result<(), 
     Ok(())
 }
 
-/// Returns the written identifier of a single object name part, and [`None`]
-/// when the part is a call producing the name at run time.
-pub(crate) fn object_name_part_value(part: &ObjectNamePart) -> Option<&str> {
-    match part {
-        ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
-        ObjectNamePart::Function(_) => None,
-    }
-}
-
 /// Returns the last identifier part of an object name as `(value, quoted)`.
 ///
 /// A part built at run time yields [`None`], the same answer as an empty name:
@@ -860,15 +851,15 @@ where
 
 /// Whether any relation of any kind in `database` is stored under `key`.
 ///
-/// Tables, views, materialized views and sequences share one pool of names,
-/// so this is what ends a search-path walk: a schema holding the name under
-/// another kind is not looked past.
+/// Tables, foreign tables, views, materialized views and sequences share one
+/// pool of names, so this is what ends a search-path walk: a schema holding
+/// the name under another kind is not looked past.
 pub(crate) fn relation_name_is_claimed<DB: DatabaseLike>(
     database: &DB,
     key: &RelationKey,
     case: IdentifierCase,
 ) -> bool {
-    database.tables().any(|table| stored_table_key(table, case) == *key)
+    database.tables_and_foreign_tables().any(|table| stored_table_key(table, case) == *key)
         || database.views().any(|view| stored_view_key(view, case) == *key)
         || database.materialized_views().any(|view| stored_view_key(view, case) == *key)
         || database.sequences().any(|sequence| stored_sequence_key(sequence, case) == *key)
@@ -1222,13 +1213,48 @@ pub(crate) fn resolve_bound_relation_object_name<'db, DB: DatabaseLike>(
 /// quoting parts that were originally quoted.
 pub(crate) fn render_relation<DB: DatabaseLike>(relation: &Relation<'_, DB>) -> String {
     match relation {
-        Relation::Table(table) => render_table_candidate(table),
+        Relation::Table(table) | Relation::ForeignTable(table) => render_table_candidate(table),
         Relation::View(view) => render_view_candidate(*view),
         Relation::MaterializedView(view) => render_view_candidate(*view),
         Relation::Sequence(sequence) => render_sequence_candidate(*sequence),
     }
 }
 
+/// Resolves a reference a stored object carries to the table or foreign table
+/// it names, on the terms of [`resolve_bound_table`], for an inheritance
+/// parent.
+///
+/// # Errors
+///
+/// Returns an error when the object name is malformed for table lookup, or when
+/// the lookup is ambiguous.
+pub(crate) fn resolve_bound_table_or_foreign_table<'db, DB: DatabaseLike>(
+    object_name: &ObjectName,
+    database: &'db DB,
+) -> Result<Option<&'db DB::Table>, LookupError> {
+    let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
+    let target = || target_name_of_idents(schema_ident, table_ident);
+    match database.table_by_target(target(), IdentifierCase::AsWritten)? {
+        Some(table) => Ok(Some(table)),
+        None => database.foreign_table_by_target(target(), IdentifierCase::AsWritten),
+    }
+}
+
+/// Resolves a reference a stored object carries to the table or foreign table
+/// it cannot exist without, such as the one a trigger fires on.
+///
+/// # Errors
+///
+/// Returns [`LookupError::TableNotFound`] when neither kind matches, and an
+/// error when the object name is malformed for table lookup or the lookup is
+/// ambiguous.
+pub(crate) fn resolve_required_bound_table_or_foreign_table<'db, DB: DatabaseLike>(
+    object_name: &ObjectName,
+    database: &'db DB,
+) -> Result<&'db DB::Table, LookupError> {
+    resolve_bound_table_or_foreign_table(object_name, database)?
+        .ok_or_else(|| LookupError::TableNotFound { object_name: object_name.to_string() })
+}
 #[cfg(test)]
 mod tests {
     use sqlparser::{

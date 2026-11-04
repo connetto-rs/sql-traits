@@ -100,18 +100,28 @@ pub trait ExtensionLike: Clone + Debug + Metadata + Send + Sync {
         self.schema().map(|schema| normalize_identifier(schema, self.schema_is_quoted()))
     }
 
-    /// Returns the version `VERSION` asked for, if the statement named one.
+    /// Returns the version of the extension installed, or `None` when the
+    /// source does not say which.
+    ///
+    /// A live catalog always knows the version installed. A parsed schema
+    /// knows it only when `CREATE EXTENSION` names one with `VERSION`, since
+    /// otherwise the extension's control file on the server picks it, so
+    /// `None` means the version is unknown and says nothing about which one
+    /// a server would install.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
     ///
     /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "CREATE EXTENSION hstore WITH SCHEMA public VERSION '1.4';",
+    ///     "CREATE EXTENSION hstore WITH SCHEMA public VERSION '1.4';
+    ///      CREATE EXTENSION citext;",
     /// )?;
-    /// assert_eq!(db.extensions().next().unwrap().version(), Some("1.4"));
+    /// let version_of = |name: &str| db.extensions().find(|e| e.name() == name).unwrap().version();
+    /// assert_eq!(version_of("hstore"), Some("1.4"));
+    /// assert_eq!(version_of("citext"), None);
     /// # Ok(())
     /// # }
     /// ```

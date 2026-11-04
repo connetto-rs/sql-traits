@@ -4,9 +4,10 @@ use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use crate::{
-    errors::{Error, LookupError, ObjectKind},
+    errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
-        ColumnDefinition, ColumnScope, IdentifierCase, SchemaFingerprint,
+        ActingRole, ColumnDefinition, ColumnScope, ForeignTableSource, IdentifierCase,
+        PartitionBound, RowSecurity, RowStatement, SchemaFingerprint,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
@@ -23,7 +24,7 @@ use crate::{
 /// PostgreSQL requires one of these three words after `PARTITION BY`. A table
 /// that declares one holds no rows of its own, even before a partition is
 /// attached to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PartitionStrategy {
     /// Each partition takes a contiguous span of the key.
     Range,
@@ -557,6 +558,49 @@ pub trait TableLike:
             .find_map(|(stored, value)| (stored == name).then_some(value))
     }
 
+    /// Returns the server and options this table reads its rows through when
+    /// it is a foreign table, or [`None`] for an ordinary table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when the database does not hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE local (id INT);
+    ///      CREATE FOREIGN TABLE remote (id INT) SERVER warehouse OPTIONS (table_name 'sales');",
+    /// )?;
+    /// let local = db.tables().next().unwrap();
+    /// let remote = db.foreign_tables().next().unwrap();
+    /// assert!(local.foreign_source(&db)?.is_none());
+    /// let source = remote.foreign_source(&db)?.unwrap();
+    /// assert_eq!(source.server_name(), "warehouse");
+    /// assert_eq!(source.options(), &[("table_name".to_string(), "sales".to_string())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn foreign_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db ForeignTableSource>, LookupError>;
+
+    /// Returns whether this table is a foreign table, whose rows live behind a
+    /// foreign server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when the database does not hold this table.
+    #[inline]
+    fn is_foreign(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(self.foreign_source(database)?.is_some())
+    }
+
     /// Returns the table ID according to its position in the database's table
     /// iterator.
     ///
@@ -875,7 +919,7 @@ pub trait TableLike:
         let schema = self.table_schema();
         let name = self.table_name();
         let mut children = Vec::new();
-        for candidate in database.tables() {
+        for candidate in database.tables_and_foreign_tables() {
             let mut parents = candidate.inherits_from(database)?;
             if parents.any(|parent| parent.table_schema() == schema && parent.table_name() == name)
             {
@@ -959,10 +1003,43 @@ pub trait TableLike:
     /// ```
     fn partition_strategy(&self) -> Option<PartitionStrategy>;
 
+    /// Returns the bound this table takes as a partition, or [`None`] when it
+    /// is not a partition.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE evt (id INT, region TEXT) PARTITION BY LIST (region);
+    ///      CREATE TABLE evt_eu PARTITION OF evt FOR VALUES IN ('eu', NULL);
+    ///      CREATE TABLE evt_rest PARTITION OF evt DEFAULT;",
+    /// )?;
+    /// let bound = |name| {
+    ///     db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .map(|table| table.and_then(TableLike::partition_bound))
+    /// };
+    /// assert_eq!(
+    ///     bound("evt_eu")?,
+    ///     Some(PartitionBound::List {
+    ///         values: vec![ListDatum::Value("'eu'".to_string()), ListDatum::Null],
+    ///     })
+    /// );
+    /// assert_eq!(bound("evt_rest")?, Some(PartitionBound::Default));
+    /// assert_eq!(bound("evt")?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn partition_bound(&self) -> Option<PartitionBound>;
+
     /// Iterates over the partitions of this table.
     ///
     /// The inverse of [`TableLike::partition_root`], one step deep, so a
-    /// partition that is itself partitioned answers its own.
+    /// partition that is itself partitioned answers its own. A foreign table
+    /// attached as a partition is listed too.
     ///
     /// # Arguments
     ///
@@ -1001,7 +1078,7 @@ pub trait TableLike:
         let schema = self.table_schema();
         let name = self.table_name();
         let mut partitions = Vec::new();
-        for candidate in database.tables() {
+        for candidate in database.tables_and_foreign_tables() {
             if candidate
                 .partition_root(database)?
                 .is_some_and(|root| root.table_schema() == schema && root.table_name() == name)
@@ -4235,10 +4312,12 @@ pub trait TableLike:
     /// has forced Row Level Security, so a caller reporting that exemption
     /// needs the role's name to say who is exempt.
     ///
-    /// Only `ALTER TABLE ... OWNER TO <role>` names an owner. A table no such
-    /// statement altered has none, and neither has one handed to
-    /// `CURRENT_ROLE`, `CURRENT_USER` or `SESSION_USER`, which name whoever
-    /// runs the statement rather than a role the input declares.
+    /// The owner is the role the table was created under, as `SET ROLE` and
+    /// `SET SESSION AUTHORIZATION` leave it, until `ALTER TABLE ... OWNER TO
+    /// <role>` hands it to another. A table created while the input had set no
+    /// role has none, and neither has one handed to `CURRENT_ROLE`,
+    /// `CURRENT_USER` or `SESSION_USER`, which name whoever runs the statement
+    /// rather than a role the input declares.
     ///
     /// The role is reported as the statement spelled it, with no case folding,
     /// which is how [`DatabaseLike::role`] stores the names it matches against.
@@ -4263,14 +4342,21 @@ pub trait TableLike:
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
     /// CREATE ROLE app_owner;
+    /// CREATE ROLE app_writer;
     /// CREATE TABLE docs (id INT);
     /// ALTER TABLE docs OWNER TO app_owner;
     /// CREATE TABLE notes (id INT);
+    /// SET ROLE app_writer;
+    /// CREATE TABLE drafts (id INT);
     /// ",
     /// )?;
     /// let docs =
     ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
     /// assert_eq!(docs.owner(&db)?, Some("app_owner"));
+    ///
+    /// let drafts =
+    ///     db.table_by_target(TargetName::new("drafts", false), IdentifierCase::AsWritten)?.unwrap();
+    /// assert_eq!(drafts.owner(&db)?, Some("app_writer"));
     ///
     /// let notes =
     ///     db.table_by_target(TargetName::new("notes", false), IdentifierCase::AsWritten)?.unwrap();
@@ -4389,12 +4475,77 @@ pub trait TableLike:
         }))
     }
 
+    /// What row-level security applies to `statement` on this table when
+    /// `role` runs it, as PostgreSQL's table "Policies Applied by Command
+    /// Type" in `CREATE POLICY` lays it out.
+    ///
+    /// `role` is a declared role, or [`ActingRole::Public`] for a caller
+    /// holding none. A policy applies when its `TO` list reaches `role` through
+    /// inheriting memberships. A table or view is owned by the role `OWNER TO`
+    /// names, else by the role that created it, which
+    /// [`ParseOptions::with_session_role`](crate::structs::ParseOptions::with_session_role)
+    /// names for a migration. One with no owner at all is taken to be owned by
+    /// a role other than `role`. Where expanding the applied policies loops
+    /// back into a table still being expanded, the answer is
+    /// [`RowSecurity::InfiniteRecursion`], as PostgreSQL refuses the statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RowSecurityError::Lookup`] when the table is not in
+    /// `database`, [`RowSecurityError::RoleRequired`] when a policy gating the
+    /// statement is scoped to a role and `role` is [`ActingRole::Public`],
+    /// [`RowSecurityError::UnsettledRole`] when a policy's `TO` list cannot be
+    /// settled for `role` from the schema, and
+    /// [`RowSecurityError::UnsettledViewOwner`] when the policies read a plain
+    /// view with no owner.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// # fn main() -> Result<(), Box<dyn core::error::Error>> {
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE reader NOLOGIN;
+    ///      CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT);
+    ///      ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+    ///      CREATE POLICY own ON docs USING (owner = current_user);",
+    /// )?;
+    /// let docs =
+    ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let reader = db.role("reader").unwrap();
+    ///
+    /// // An UPDATE whose WHERE reads a column checks the updated row against
+    /// // the SELECT policies too, and raises when it would leave them.
+    /// let security = docs.row_security(RowStatement::Update { reads: true }, reader, &db)?;
+    /// let raised =
+    ///     security.gates().unwrap().iter().filter(|gate| {
+    ///         gate.row() == RowVersion::Updated && gate.failure() == GateFailure::Raise
+    ///     });
+    /// let commands: Vec<GatedCommand> = raised.map(RowGate::command).collect();
+    /// assert_eq!(commands, [GatedCommand::Update, GatedCommand::Select]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn row_security<'db>(
+        &'db self,
+        statement: RowStatement,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> Result<RowSecurity<'db, <Self::DB as DatabaseLike>::Policy>, RowSecurityError>
+    where
+        Self: 'db,
+    {
+        crate::traits::row_security::row_security(self, statement, &role.into(), database)
+    }
+
     /// Returns an iterator over the grants that apply to this table.
     ///
-    /// This includes both direct table grants (`GRANT ... ON table_name`)
-    /// and schema-wide grants (`GRANT ... ON ALL TABLES IN SCHEMA`). A
-    /// privilege on some of the table's columns is read from
-    /// [`DatabaseLike::column_grants`] instead.
+    /// This includes grants naming the table (`GRANT ... ON table_name`) and
+    /// those sweeping its schema (`GRANT ... ON ALL TABLES IN SCHEMA`) while
+    /// the table existed. A privilege on some of the table's columns is read
+    /// from [`DatabaseLike::column_grants`] instead.
     ///
     /// # Errors
     ///
@@ -4444,7 +4595,8 @@ pub trait TableLike:
     /// Returns whether the given role can read (SELECT) from this table.
     ///
     /// A role can read if there's a grant that:
-    /// - Applies to this table (directly or via ALL TABLES IN SCHEMA)
+    /// - Applies to this table (naming it, or sweeping its schema while it
+    ///   existed)
     /// - Names this role, `PUBLIC`, or one of the
     ///   [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of this
     ///   role
@@ -4771,6 +4923,13 @@ where
         T::toast_storage_parameter(self, name)
     }
 
+    fn foreign_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db ForeignTableSource>, LookupError> {
+        T::foreign_source(self, database)
+    }
+
     fn table_id(&self, database: &Self::DB) -> Option<usize> {
         T::table_id(self, database)
     }
@@ -4827,6 +4986,10 @@ where
 
     fn partition_strategy(&self) -> Option<PartitionStrategy> {
         T::partition_strategy(self)
+    }
+
+    fn partition_bound(&self) -> Option<PartitionBound> {
+        T::partition_bound(self)
     }
 
     fn partitions<'db>(

@@ -1,19 +1,18 @@
 //! Implementation of the `FunctionLike` trait for sqlparser's `CreateFunction`
 //! type.
 
-use alloc::{borrow::Cow, format, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, format, string::ToString};
 
 use sqlparser::ast::{
-    ArgMode, CreateFunction, CreateFunctionBody, CreateRole, CreateTable, DataType, Expr,
-    FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionReturnType,
-    FunctionSecurity, FunctionSetValue, Statement, Value, ValueWithSpan,
+    ArgMode, CreateFunction, CreateFunctionBody, CreateRole, DataType, Expr, FunctionBehavior,
+    FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionReturnType, FunctionSecurity,
+    FunctionSetValue, Value, ValueWithSpan,
 };
 
-use super::data_statement::{BodyPath, Reads, reads_of_body, reads_on_path};
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{FunctionKind, FunctionMetadata, ParserDB, TargetName},
-    traits::{DatabaseLike, FunctionLike, Metadata, Relation, role::privilege_holders},
+    structs::{FunctionBody, FunctionKind, FunctionMetadata, ParserDB, TargetName},
+    traits::{DatabaseLike, FunctionLike, Metadata, role::privilege_holders},
     utils::{
         identifier_resolution::SearchPath,
         last_str, normalize_sqlparser_type,
@@ -40,64 +39,6 @@ fn function_metadata<'db>(
     database
         .function_metadata(function)
         .ok_or_else(|| ObjectKind::Function.not_in_database(&function.name.to_string()))
-}
-
-/// Everything the body of `function` reads, as
-/// [`FunctionLike::referenced_relations`] describes.
-fn body_reads<'db>(
-    function: &CreateFunction,
-    database: &'db ParserDB,
-) -> Result<Reads<'db, ParserDB>, LookupError> {
-    if let Some(language) = function.stored_language().filter(|language| language != "sql") {
-        return Err(LookupError::FunctionBodyNotSql {
-            function: function.name().to_string(),
-            language: language.into_owned(),
-        });
-    }
-    let unavailable =
-        || LookupError::FunctionBodyUnavailable { function: function.name().to_string() };
-    if function.using.is_some() || function.remote_connection.is_some() {
-        return Err(unavailable());
-    }
-    let hex_strings_may_be_integers = database.dialect().hex_strings_may_be_integers();
-    let path =
-        || function.search_path(database).map(|own| own.map_or(BodyPath::Database, BodyPath::Set));
-    let walk = |statements: &[Statement]| {
-        reads_of_body(function.name(), statements, database, path()?, hex_strings_may_be_integers)
-    };
-    match &function.function_body {
-        None => Err(unavailable()),
-        Some(CreateFunctionBody::AsBeforeOptions { body: expression, .. }) => {
-            let Some(text) = function.body() else {
-                return reads_on_path(expression, database, path()?);
-            };
-            let statements = database.dialect().parse_statements(text).map_err(|error| {
-                LookupError::FunctionBodyUnparsable {
-                    function: function.name().to_string(),
-                    reason: error.to_string(),
-                }
-            })?;
-            walk(&statements)
-        }
-        Some(
-            CreateFunctionBody::AsAfterOptions(expression)
-            | CreateFunctionBody::AsReturnExpr(expression),
-        ) => reads_on_path(expression, database, path()?),
-        // Bound at creation, so the function's own path plays no part.
-        Some(CreateFunctionBody::Return(expression)) => {
-            reads_on_path(expression, database, BodyPath::Bound)
-        }
-        // A block stores a temporary relation by its bare name, which the
-        // default path reaches first.
-        Some(CreateFunctionBody::BeginAtomic(block)) => {
-            let name = function.name();
-            reads_of_body(name, &block.statements, database, BodyPath::default_path(), false)
-        }
-        Some(CreateFunctionBody::AsBeginEnd(block)) => walk(&block.statements),
-        Some(CreateFunctionBody::AsReturnSelect(select)) => {
-            reads_on_path(select, database, path()?)
-        }
-    }
 }
 
 impl FunctionLike for CreateFunction {
@@ -231,28 +172,31 @@ impl FunctionLike for CreateFunction {
         Ok(function_metadata(self, database)?.kind())
     }
 
-    #[inline]
-    fn body(&self) -> Option<&str> {
-        let Some(CreateFunctionBody::AsBeforeOptions { body: body_expr, .. }) = &self.function_body
-        else {
+    fn written_body(&self) -> Option<FunctionBody<'_>> {
+        // Code a `USING` clause or a remote connection names lives outside
+        // the schema, whatever text the statement carries beside it.
+        if self.using.is_some() || self.remote_connection.is_some() {
             return None;
-        };
-
-        match body_expr {
-            Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s),
-            Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(s), .. }) => {
-                Some(&s.value)
+        }
+        Some(match self.function_body.as_ref()? {
+            CreateFunctionBody::AsBeforeOptions { body, .. } => {
+                match body {
+                    Expr::Value(ValueWithSpan {
+                        value: Value::SingleQuotedString(text), ..
+                    }) => FunctionBody::Text(text),
+                    Expr::Value(ValueWithSpan {
+                        value: Value::DollarQuotedString(text), ..
+                    }) => FunctionBody::Text(&text.value),
+                    expression => FunctionBody::Expression(expression),
+                }
             }
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn body_expression(&self) -> Option<&Expr> {
-        match &self.function_body {
-            Some(CreateFunctionBody::Return(expr)) => Some(expr),
-            _ => None,
-        }
+            CreateFunctionBody::AsAfterOptions(expression)
+            | CreateFunctionBody::AsReturnExpr(expression) => FunctionBody::Expression(expression),
+            CreateFunctionBody::AsReturnSelect(select) => FunctionBody::Select(select),
+            CreateFunctionBody::AsBeginEnd(block) => FunctionBody::Statements(&block.statements),
+            CreateFunctionBody::Return(expression) => FunctionBody::Return(expression),
+            CreateFunctionBody::BeginAtomic(block) => FunctionBody::Atomic(&block.statements),
+        })
     }
 
     #[inline]
@@ -296,26 +240,14 @@ impl FunctionLike for CreateFunction {
         }
     }
 
-    #[inline]
-    fn body_is_bound(&self) -> bool {
-        matches!(
-            self.function_body,
-            Some(CreateFunctionBody::Return(_) | CreateFunctionBody::BeginAtomic(_))
-        )
-    }
-
-    fn referenced_tables<'db>(
+    fn bound_body_functions<'db>(
         &self,
         database: &'db Self::DB,
-    ) -> Result<Vec<&'db CreateTable>, LookupError> {
-        Ok(body_reads(self, database)?.tables)
-    }
-
-    fn referenced_relations<'db>(
-        &self,
-        database: &'db Self::DB,
-    ) -> Result<Vec<Relation<'db, Self::DB>>, LookupError> {
-        Ok(body_reads(self, database)?.relations)
+    ) -> Result<impl Iterator<Item = &'db CreateFunction> + use<'db>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(function_metadata(self, database)?.body_calls().functions())
     }
 
     #[inline]
@@ -393,7 +325,7 @@ mod tests {
     use crate::{
         prelude::ParserDB,
         structs::{IdentifierCase, TargetName},
-        traits::{DatabaseLike, FunctionLike},
+        traits::{DatabaseLike, DialectLike, FunctionLike},
     };
 
     #[test]
@@ -453,7 +385,10 @@ mod tests {
 
     fn own_path(database: &ParserDB, name: &str) -> Option<Vec<(String, bool)>> {
         database
-            .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .function_by_target(
+                TargetName::new(name, false).with_schema("admin", false),
+                IdentifierCase::AsWritten,
+            )
             .expect("unambiguous lookup")
             .expect("function exists")
             .search_path(database)
@@ -503,10 +438,10 @@ mod tests {
     #[test]
     fn from_current_on_a_node_never_ingested_reads_the_database_path() {
         let database = ParserDB::parse::<PostgreSqlDialect>(DEFINERS).expect("schema parses");
-        let Ok(sqlparser::ast::Statement::CreateFunction(function)) =
-            database.dialect().parse_statements(
-                "CREATE FUNCTION loose() RETURNS INT LANGUAGE sql SET search_path FROM CURRENT AS 'SELECT 1'",
-            ).map(|mut statements| statements.remove(0))
+        let Ok(sqlparser::ast::Statement::CreateFunction(function)) = sqlparser::parser::Parser::parse_sql(
+            database.dialect().sqlparser_dialect(),
+            "CREATE FUNCTION loose() RETURNS INT LANGUAGE sql SET search_path FROM CURRENT AS 'SELECT 1'",
+        ).map(|mut statements| statements.remove(0))
         else {
             panic!("statement parses into a function");
         };

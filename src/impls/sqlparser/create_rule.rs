@@ -15,7 +15,9 @@ use crate::{
 };
 
 impl Metadata for CreateRule {
-    type Meta = ();
+    /// The calls of the rule's condition and actions, bound when it was
+    /// written.
+    type Meta = crate::structs::metadata::ExpressionCalls<sqlparser::ast::CreateFunction>;
 }
 
 impl RuleLike for CreateRule {

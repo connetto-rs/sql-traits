@@ -10,6 +10,7 @@ description = "Rust traits describing SQL-like objects"
 readme = "README.md"
 keywords = ["sql", "traits", "parser", "geometry"]
 categories = ["database", "parsing", "geometry"]
+autotests = false
 
 [features]
 default = ["std"]
@@ -25,6 +26,7 @@ std = [
     "sqlparser/recursive-protection",
     "geometric-traits/std",
     "thiserror/std",
+    "sqlparser-plpgsql/std",
 ]
 # Adds git-backed construction: `ParserDB::from_git_url*` clones a remote
 # repository into a temporary directory and parses the SQL it contains.
@@ -41,9 +43,10 @@ git = [
 serde = ["dep:serde"]
 
 [dependencies]
-sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
+sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
 geometric-traits = { git = "https://github.com/earth-metabolome-initiative/geometric-traits", branch = "main", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0", default-features = false }
+sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", default-features = false, features = ["body-parse"] }
 git2 = { version = "0.20.3", optional = true }
 tempfile = { version = "3.25", optional = true }
 sha2 = { version = "0.10", default-features = false }
@@ -62,7 +65,7 @@ unreachable_patterns = "forbid"
 unused_import_braces = "forbid"
 unused_must_use = "forbid"
 deprecated = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(coverage_nightly)"] }
 
 [lints.rustdoc]
 broken_intra_doc_links = "forbid"
@@ -94,6 +97,11 @@ pedantic = { level = "deny", priority = -1 }
 arbitrary = "1.4"
 proptest = "1.7"
 serde_json = "1.0"
+
+# Every integration test is a module of this one binary, see tests/it/main.rs.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
 
 [workspace]
 exclude = ["fuzz"]

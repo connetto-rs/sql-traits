@@ -17,7 +17,7 @@ use crate::{
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{
         ColumnGrantLike, ColumnLike, DatabaseLike, GrantLike, Metadata, Relation, RoleLike,
-        SequenceLike, TableGrantLike, TableLike, ViewLike, grant::GrantTarget,
+        TableGrantLike, TableLike, grant::GrantTarget,
     },
     utils::{
         identifier_resolution::{
@@ -77,7 +77,7 @@ pub(crate) fn grantee_is_public(grantee: &Grantee) -> bool {
 /// Returns whether a grantee names whoever runs the statement, spelled
 /// `CURRENT_USER`, `CURRENT_ROLE` or `SESSION_USER`, rather than a role
 /// somebody declared.
-fn grantee_is_session_principal(grantee: &Grantee) -> Option<SessionPrincipal> {
+pub(crate) fn grantee_is_session_principal(grantee: &Grantee) -> Option<SessionPrincipal> {
     let Some(GranteeName::ObjectName(name)) = &grantee.name else {
         return None;
     };
@@ -125,26 +125,6 @@ pub(crate) fn schema_matches_table<T: TableLike>(schema_name: &ObjectName, table
     schema_matches_relation(
         schema_name,
         table.table_schema().map(|schema| (schema, table.table_schema_is_quoted())),
-    )
-}
-
-fn schema_matches_view<V: ViewLike>(schema_name: &ObjectName, view: &V) -> bool {
-    schema_matches_relation(
-        schema_name,
-        view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())),
-    )
-}
-
-/// Whether the schema a blanket grant names holds a sequence, a sequence
-/// stored without a schema sitting in the default one.
-fn schema_matches_sequence<S: SequenceLike>(schema_name: &ObjectName, sequence: &S) -> bool {
-    schema_matches_relation(
-        schema_name,
-        Some(
-            sequence
-                .sequence_schema()
-                .map_or(("public", false), |schema| (schema, sequence.sequence_schema_is_quoted())),
-        ),
     )
 }
 
@@ -271,7 +251,12 @@ fn grant_objects_inner_match(left: &GrantObjects, right: &GrantObjects) -> bool 
     }
 }
 
-fn grant_objects_match(left: Option<&GrantObjects>, right: Option<&GrantObjects>) -> bool {
+/// Whether two object lists name the same objects of the same kind, in order,
+/// under PostgreSQL's identifier folding.
+pub(crate) fn grant_objects_match(
+    left: Option<&GrantObjects>,
+    right: Option<&GrantObjects>,
+) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left_objects), Some(right_objects)) => {
@@ -296,9 +281,7 @@ fn action_columns(action: &Action) -> Option<&[Ident]> {
 ///
 /// The database requires the column on every table in the list, and names the
 /// one that lacks it, so this walks them in order and reports the same way.
-/// `ALL TABLES IN SCHEMA` carries no per-table column list to check and the
-/// database accepts a column list beside it, so that form is left alone. A
-/// one-part or two-part name resolves through `search_path`, ending at the
+/// A one-part or two-part name resolves through `search_path`, ending at the
 /// first schema `claimed` answers for, and a shape the strict splitter rejects
 /// keeps the lenient last-two-parts matching.
 ///
@@ -474,9 +457,61 @@ struct PrivilegeRevokeApplication {
     unsupported: bool,
 }
 
+impl PrivilegeRevokeApplication {
+    const UNSUPPORTED: Self = Self { retained: None, revoked: None, unsupported: true };
+}
+
+/// A kind of object on which `ALL PRIVILEGES` stands for a fixed set of
+/// privileges in PostgreSQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivilegeKind {
+    /// A table, view or materialized view.
+    Relation,
+    /// A sequence.
+    Sequence,
+    /// A schema.
+    Schema,
+    /// A database.
+    Database,
+}
+
+impl PrivilegeKind {
+    /// The privileges `ALL PRIVILEGES` grants on an object of this kind,
+    /// without `MAINTAIN`, which sqlparser has no action for.
+    pub(crate) fn all_privileges(self) -> Vec<Action> {
+        match self {
+            Self::Relation => {
+                vec![
+                    Action::Select { columns: None },
+                    Action::Insert { columns: None },
+                    Action::Update { columns: None },
+                    Action::Delete,
+                    Action::Truncate,
+                    Action::References { columns: None },
+                    Action::Trigger,
+                ]
+            }
+            Self::Sequence => {
+                vec![
+                    Action::Usage,
+                    Action::Select { columns: None },
+                    Action::Update { columns: None },
+                ]
+            }
+            Self::Schema => vec![Action::Usage, Action::Create { obj_type: None }],
+            Self::Database => {
+                vec![Action::Create { obj_type: None }, Action::Connect, Action::Temporary]
+            }
+        }
+    }
+}
+
+/// Splits `grant` into what a revoke of `revoke` leaves and what it takes,
+/// reading `ALL PRIVILEGES` in `grant` as `all_privileges`.
 fn partition_privileges_for_revoke(
     grant: &Privileges,
     revoke: &Privileges,
+    all_privileges: Option<&[Action]>,
 ) -> PrivilegeRevokeApplication {
     match (grant, revoke) {
         (_, Privileges::All { .. }) => {
@@ -486,49 +521,48 @@ fn partition_privileges_for_revoke(
                 unsupported: false,
             }
         }
-        (Privileges::All { .. }, Privileges::Actions(_)) => {
-            PrivilegeRevokeApplication {
-                retained: Some(grant.clone()),
-                revoked: None,
-                unsupported: true,
-            }
+        (Privileges::All { .. }, Privileges::Actions(revoke_actions)) => {
+            all_privileges.map_or(PrivilegeRevokeApplication::UNSUPPORTED, |grant_actions| {
+                partition_actions_for_revoke(grant_actions, revoke_actions)
+            })
         }
         (Privileges::Actions(grant_actions), Privileges::Actions(revoke_actions)) => {
-            let mut retained_actions = Vec::with_capacity(grant_actions.len());
-            let mut withdrawn_actions = Vec::new();
+            partition_actions_for_revoke(grant_actions, revoke_actions)
+        }
+    }
+}
 
-            for grant_action in grant_actions {
-                let mut current = Some(grant_action.clone());
-                for revoke_action in revoke_actions {
-                    let Some(action) = current.take() else {
-                        break;
-                    };
-                    let application = partition_action_for_revoke(action, revoke_action);
-                    if application.unsupported {
-                        return PrivilegeRevokeApplication {
-                            retained: Some(grant.clone()),
-                            revoked: None,
-                            unsupported: true,
-                        };
-                    }
-                    current = application.retained;
-                    if let Some(withdrawn) = application.revoked {
-                        withdrawn_actions.push(withdrawn);
-                    }
-                }
-                if let Some(retained) = current {
-                    retained_actions.push(retained);
-                }
+fn partition_actions_for_revoke(
+    grant_actions: &[Action],
+    revoke_actions: &[Action],
+) -> PrivilegeRevokeApplication {
+    let mut retained_actions = Vec::with_capacity(grant_actions.len());
+    let mut withdrawn_actions = Vec::new();
+
+    for grant_action in grant_actions {
+        let mut current = Some(grant_action.clone());
+        for revoke_action in revoke_actions {
+            let Some(action) = current.take() else {
+                break;
+            };
+            let application = partition_action_for_revoke(action, revoke_action);
+            if application.unsupported {
+                return PrivilegeRevokeApplication::UNSUPPORTED;
             }
-
-            PrivilegeRevokeApplication {
-                retained: (!retained_actions.is_empty())
-                    .then_some(Privileges::Actions(retained_actions)),
-                revoked: (!withdrawn_actions.is_empty())
-                    .then_some(Privileges::Actions(withdrawn_actions)),
-                unsupported: false,
+            current = application.retained;
+            if let Some(withdrawn) = application.revoked {
+                withdrawn_actions.push(withdrawn);
             }
         }
+        if let Some(retained) = current {
+            retained_actions.push(retained);
+        }
+    }
+
+    PrivilegeRevokeApplication {
+        retained: (!retained_actions.is_empty()).then_some(Privileges::Actions(retained_actions)),
+        revoked: (!withdrawn_actions.is_empty()).then_some(Privileges::Actions(withdrawn_actions)),
+        unsupported: false,
     }
 }
 
@@ -556,29 +590,31 @@ impl RevokeApplication {
     }
 }
 
-/// Applies a `REVOKE` statement to a grant.
+/// Applies a `REVOKE` statement to a grant, reading `ALL PRIVILEGES` as
+/// `all_privileges` and refusing a partial revoke of it when that is [`None`].
 #[must_use]
-pub fn apply_revoke_to_grant(grant: &Grant, revoke: &Revoke) -> RevokeApplication {
+pub fn apply_revoke_to_grant(
+    grant: &Grant,
+    revoke: &Revoke,
+    all_privileges: Option<&[Action]>,
+) -> RevokeApplication {
     if !grant_objects_match(grant.objects.as_ref(), revoke.objects.as_ref())
         || !grantees_overlap(&grant.grantees, &revoke.grantees)
     {
         return RevokeApplication::unmatched(grant);
     }
 
-    let application = partition_privileges_for_revoke(&grant.privileges, &revoke.privileges);
+    let application =
+        partition_privileges_for_revoke(&grant.privileges, &revoke.privileges, all_privileges);
     let matched = application.revoked.is_some() || application.unsupported;
     if !matched {
         return RevokeApplication::unmatched(grant);
     }
     if application.unsupported {
-        let all_minus_actions = matches!(
-            (&grant.privileges, &revoke.privileges),
-            (Privileges::All { .. }, Privileges::Actions(_))
-        );
         return RevokeApplication {
             matched,
             updated_grants: vec![grant.clone()],
-            unsupported: !all_minus_actions || revoke.grant_option_for,
+            unsupported: true,
         };
     }
 
@@ -652,14 +688,8 @@ impl GrantLike for Grant {
         }
         match &self.objects {
             Some(GrantObjects::Tables(names)) => GrantTarget::Tables(read(names)),
-            Some(GrantObjects::AllTablesInSchema { schemas }) => {
-                GrantTarget::TablesInSchema(read(schemas))
-            }
             Some(GrantObjects::Schemas(names)) => GrantTarget::Schemas(read(names)),
             Some(GrantObjects::Sequences(names)) => GrantTarget::Sequences(read(names)),
-            Some(GrantObjects::AllSequencesInSchema { schemas }) => {
-                GrantTarget::SequencesInSchema(read(schemas))
-            }
             _ => GrantTarget::Other,
         }
     }
@@ -699,25 +729,13 @@ fn granted_tables<'a>(
                 .filter_map(|name| resolve_bound_table(name, database).ok().flatten())
                 .collect()
         }
-        Some(GrantObjects::AllTablesInSchema { schemas }) => {
-            database
-                .tables()
-                .filter(|table| {
-                    schemas.iter().any(|schema_name| schema_matches_table(schema_name, *table))
-                })
-                .collect()
-        }
         _ => Vec::new(),
     }
 }
 
 /// Resolves each relation a grant names, in the order the grant wrote them,
-/// looking for a table first and then each view kind and a sequence, since one
-/// name holds at most one of them.
-///
-/// `ALL TABLES IN SCHEMA` covers views and materialized views as well as
-/// tables, which is what PostgreSQL grants, so all three are walked. It leaves
-/// sequences out, which `ON SEQUENCE` and `ALL SEQUENCES IN SCHEMA` reach.
+/// looking for a table, then a foreign table, then each view kind and a
+/// sequence, since one name holds at most one of them.
 fn granted_relations<'a>(grant: &'a Grant, database: &'a ParserDB) -> Vec<Relation<'a, ParserDB>> {
     match &grant.objects {
         Some(GrantObjects::Tables(names)) => {
@@ -738,38 +756,6 @@ fn granted_relations<'a>(grant: &'a Grant, database: &'a ParserDB) -> Vec<Relati
                 .map(Relation::Sequence)
                 .collect()
         }
-        Some(GrantObjects::AllSequencesInSchema { schemas }) => {
-            database
-                .sequences()
-                .filter(|sequence| {
-                    schemas.iter().any(|schema| schema_matches_sequence(schema, *sequence))
-                })
-                .map(Relation::Sequence)
-                .collect()
-        }
-        Some(GrantObjects::AllTablesInSchema { schemas }) => {
-            database
-                .tables()
-                .filter(|table| schemas.iter().any(|schema| schema_matches_table(schema, *table)))
-                .map(Relation::Table)
-                .chain(
-                    database
-                        .views()
-                        .filter(|view| {
-                            schemas.iter().any(|schema| schema_matches_view(schema, *view))
-                        })
-                        .map(Relation::View),
-                )
-                .chain(
-                    database
-                        .materialized_views()
-                        .filter(|view| {
-                            schemas.iter().any(|schema| schema_matches_view(schema, *view))
-                        })
-                        .map(Relation::MaterializedView),
-                )
-                .collect()
-        }
         _ => Vec::new(),
     }
 }
@@ -783,6 +769,11 @@ fn resolve_relation_name<'a>(
         return Some(Relation::Table(table));
     }
     let target = target_name_from_object_name(name)?;
+    if let Some(table) =
+        database.foreign_table_by_target(target.clone(), IdentifierCase::AsWritten).ok().flatten()
+    {
+        return Some(Relation::ForeignTable(table));
+    }
     if let Some(view) =
         database.view_by_target(target.clone(), IdentifierCase::AsWritten).ok().flatten()
     {
@@ -822,14 +813,15 @@ impl TableGrantLike for Grant {
         table: &<Self::DB as DatabaseLike>::Table,
         database: &Self::DB,
     ) -> bool {
-        match &self.objects {
-            Some(GrantObjects::AllTablesInSchema { schemas }) => {
-                schemas.iter().any(|schema_name| schema_matches_table(schema_name, table))
-            }
-            _ => {
-                granted_tables(self, database).iter().any(|granted| core::ptr::eq(*granted, table))
-            }
-        }
+        // A foreign table shares the table node type, so a grant naming one
+        // applies to it.
+        granted_relations(self, database).iter().any(|granted| {
+            matches!(
+                granted,
+                Relation::Table(granted) | Relation::ForeignTable(granted)
+                    if core::ptr::eq(*granted, table)
+            )
+        })
     }
 }
 

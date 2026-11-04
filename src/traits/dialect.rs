@@ -17,6 +17,8 @@
 
 use core::{fmt::Debug, hash::Hash};
 
+use sqlparser::dialect::Dialect;
+
 use crate::traits::{DatabaseLike, TypeMatchLike};
 
 /// Dialect-scoped type classification for a database backend.
@@ -127,4 +129,25 @@ pub trait DialectLike: Debug + Clone + Default + Send + Sync + Hash + Eq + Ord +
         database: &Self::DB,
         column: &<Self::DB as DatabaseLike>::Column,
     ) -> Self::Match;
+
+    /// Returns the sqlparser dialect a body written as text is parsed under.
+    ///
+    /// [`FunctionLike::referenced_tables`](crate::traits::FunctionLike::referenced_tables)
+    /// and the analyses beside it parse a body written as a string with it,
+    /// so a backend answers the dialect its function bodies are written in.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT);")?;
+    /// assert!(db.dialect().sqlparser_dialect().is::<PostgreSqlDialect>());
+    /// assert!(!db.dialect().sqlparser_dialect().is::<SQLiteDialect>());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn sqlparser_dialect(&self) -> &dyn Dialect;
 }

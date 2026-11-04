@@ -1,7 +1,7 @@
 //! Implement the [`ForeignKeyConstraint`] trait for the `sqlparser` crate's
 //! [`TableAttribute`] wrapper.
 
-use alloc::string::ToString;
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
     ConstraintReferenceMatchKind, CreateTable, ForeignKeyConstraint, ReferentialAction,
@@ -9,7 +9,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::{ParserDB, TableAttribute, TargetName},
+    structs::{ConstraintObject, ParserDB, TableAttribute, TargetName},
     traits::{ForeignKeyLike, Metadata, database::DatabaseLike, table::TableLike},
     utils::object_name::{resolve_required_bound_table, target_name_of_object_name},
 };
@@ -24,6 +24,17 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     #[inline]
     fn foreign_key_name(&self) -> Option<&str> {
         self.attribute().name.as_ref().map(|s| s.value.as_str())
+    }
+
+    fn constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        let table = self.table();
+        let held: Vec<_> = table.foreign_keys(database)?.collect();
+        Ok(super::create_table::position_among(&held, self).and_then(|position| {
+            database.constraint_object_name(table, ConstraintObject::ForeignKey, position)
+        }))
     }
 
     #[inline]

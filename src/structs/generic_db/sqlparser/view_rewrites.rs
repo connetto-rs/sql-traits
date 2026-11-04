@@ -9,21 +9,22 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AssignmentTarget, ConflictTarget, CreateFunctionBody, Delete, DoUpdate, Expr, FromTable, Ident,
-    Insert, JoinConstraint, JoinOperator, Merge, MergeAction, MergeUpdateExpr, MergeUpdateKind,
-    ObjectName, ObjectNamePart, OnConflict, OnConflictAction, OnInsert, OutputClause, Query,
-    ReturnStatement, ReturnStatementValue, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
-    Statement, TableAlias, TableAliasColumnDef, TableAliasWithoutColumns, TableFactor, TableObject,
-    TableWithJoins, Update, UpdateTableFromKind, Visit, VisitMut, Visitor, VisitorMut,
+    AssignmentTarget, ConflictTarget, CreateFunction, CreateFunctionBody, CreateRule, Delete,
+    DoUpdate, Expr, FromTable, Ident, Insert, JoinConstraint, JoinOperator, Merge, MergeAction,
+    MergeUpdateExpr, MergeUpdateKind, ObjectName, ObjectNamePart, OnConflict, OnConflictAction,
+    OnInsert, OutputClause, Query, ReturnStatement, ReturnStatementValue, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableAlias, TableAliasColumnDef,
+    TableAliasWithoutColumns, TableFactor, TableObject, TableWithJoins, Update,
+    UpdateTableFromKind, Visit, VisitMut, Visitor, VisitorMut,
     helpers::attached_token::AttachedToken,
 };
 
 use super::{
-    BoundRelation, ParserDBBuilder, function_bodies,
-    views::{relations_read_in, statements_read},
+    BoundRelation, ParserDBBuilder, function_bodies, rules,
+    views::{Dependent, relations_read_in, statements_read},
 };
 use crate::{
-    errors::Error,
+    errors::{Error, ObjectKind},
     impls::dql::{
         definition_graph::reference_sites::{QueryReferences, SiteOutcome, query_references},
         join_constraint, join_operator_constraint, query_output_names, wildcard_reshapes_output,
@@ -35,8 +36,8 @@ use crate::{
         last_str,
         object_name::{
             RelationKey, TEMPORARY_SCHEMA, overqualified_object_name, relation_name_is_claimed,
-            resolve_view_on_search_path_in_iter, stored_table_key, stored_view_key,
-            table_matches_key, target_key, target_name_from_object_name,
+            resolve_view_on_search_path_in_iter, stored_function_key, stored_table_key,
+            stored_view_key, table_matches_key, target_key, target_name_from_object_name,
             target_name_of_object_name, view_matches_key,
         },
         with_scopes::WithScopes,
@@ -86,16 +87,62 @@ enum Slot {
     Plain(usize),
     Materialized(usize),
     Function(usize),
+    Rule(usize),
+}
+
+impl Slot {
+    /// The statement sequence the slot's object holds, which a view never
+    /// does.
+    const fn block(self) -> Option<Block> {
+        match self {
+            Self::Plain(_) | Self::Materialized(_) => None,
+            Self::Function(position) => Some(Block::Function(position)),
+            Self::Rule(position) => Some(Block::Rule(position)),
+        }
+    }
+}
+
+/// Where a stored statement sequence sits in the builder.
+#[derive(Clone, Copy)]
+enum Block {
+    /// The `BEGIN ATOMIC` body of the function at this position.
+    Function(usize),
+    /// The action of the rule at this position.
+    Rule(usize),
+}
+
+impl Block {
+    /// The slot the sequence's object sits in.
+    const fn slot(self) -> Slot {
+        match self {
+            Self::Function(position) => Slot::Function(position),
+            Self::Rule(position) => Slot::Rule(position),
+        }
+    }
+
+    /// Whether `NEW` and `OLD` name the object's own relation row, which they
+    /// do in a rule's action.
+    const fn rule_context(self) -> bool {
+        matches!(self, Self::Rule(_))
+    }
+
+    /// The name errors and respelling call the sequence's object by.
+    fn holder_name(self, builder: &ParserDBBuilder) -> String {
+        match self {
+            Self::Function(position) => last_str(&builder.functions()[position].0.name).to_string(),
+            Self::Rule(position) => builder.rules()[position].0.name.value.clone(),
+        }
+    }
 }
 
 /// The stored shape of a definition the machinery rewrites, with where it
 /// sits.
 enum Definition {
-    /// A view's definition, or the query a `RETURN` body's expression is
-    /// wrapped in.
+    /// A view's definition, or the query a `RETURN` body's expression or a
+    /// rule's condition is wrapped in.
     Query { slot: Slot, query: alloc::boxed::Box<Query> },
-    /// The statements of a `BEGIN ATOMIC` body.
-    Statements { function: usize, statements: Vec<Statement> },
+    /// The statements of a `BEGIN ATOMIC` body or a rule's action.
+    Statements { block: Block, statements: Vec<Statement> },
 }
 
 /// Writes a rewritten query back into the definition that holds it.
@@ -113,9 +160,32 @@ fn store_query(builder: &mut ParserDBBuilder, slot: Slot, query: Query) {
             *declaration.query_mut() = query;
         }
         Slot::Function(position) => {
-            let function = alloc::sync::Arc::make_mut(&mut builder.functions_mut()[position].0);
-            function_bodies::write_definition(&mut function.function_body, query);
+            edit_function(builder, position, |function| {
+                function_bodies::write_definition(&mut function.function_body, query);
+            });
         }
+        Slot::Rule(position) => {
+            let rule = alloc::sync::Arc::make_mut(&mut builder.rules_mut()[position].0);
+            function_bodies::write_condition(&mut rule.condition, query);
+        }
+    }
+}
+
+/// Applies `edit` to the function stored at `position`, re-pointing every
+/// check constraint, policy and bound body holding the node at its edited
+/// copy.
+fn edit_function(
+    builder: &mut ParserDBBuilder,
+    position: usize,
+    edit: impl FnOnce(&mut CreateFunction),
+) {
+    let slot = &mut builder.functions_mut()[position].0;
+    // An unshared node is edited in place, with nothing holding it to update.
+    let stale = (alloc::sync::Arc::strong_count(slot) > 1).then(|| alloc::sync::Arc::clone(slot));
+    edit(alloc::sync::Arc::make_mut(slot));
+    let fresh = alloc::sync::Arc::clone(slot);
+    if let Some(stale) = stale {
+        builder.repoint_function(&stale, &fresh);
     }
 }
 
@@ -161,7 +231,43 @@ fn definitions_reading(
             reads.extend(read);
         }
     }
+    for (position, (rule, _)) in builder.rules().iter().enumerate() {
+        for (definition, read) in rule_definition_reads(builder, position, rule) {
+            if names(&read) {
+                definitions.push(definition);
+                reads.extend(read);
+            }
+        }
+    }
     (definitions, reads)
+}
+
+/// The stored forms of the parts of one rule the machinery rewrites, the
+/// condition wrapped as a query and the action's statements when it is not
+/// `DO NOTHING`, each with every relation the part reads.
+fn rule_definition_reads(
+    builder: &ParserDBBuilder,
+    position: usize,
+    rule: &CreateRule,
+) -> Vec<(Definition, Vec<RelationKey>)> {
+    let slot = Slot::Rule(position);
+    let mut definitions = Vec::new();
+    if let Some(expr) = rule.condition.as_ref() {
+        let query = alloc::boxed::Box::new(function_bodies::definition(expr));
+        let read = relations_read_in(&query);
+        definitions.push((Definition::Query { slot, query }, read));
+    }
+    let statements = rules::action_statements(&rule.action);
+    if !statements.is_empty() {
+        definitions.push((
+            Definition::Statements {
+                block: Block::Rule(position),
+                statements: statements.to_vec(),
+            },
+            statements_read(builder, statements),
+        ));
+    }
+    definitions
 }
 
 /// The stored form of one function's body with every relation it reads,
@@ -179,7 +285,10 @@ fn function_definition_reads(
         }
         Some(CreateFunctionBody::BeginAtomic(block)) => {
             Some((
-                Definition::Statements { function: position, statements: block.statements.clone() },
+                Definition::Statements {
+                    block: Block::Function(position),
+                    statements: block.statements.clone(),
+                },
                 statements_read(builder, &block.statements),
             ))
         }
@@ -236,6 +345,70 @@ pub(super) fn readers(builder: &ParserDBBuilder, keys: &[&RelationKey]) -> Optio
     Some(Readers { definitions, before: catalog_reads(builder, reads) })
 }
 
+/// The stored definitions among `readers` naming a column `columns` renames,
+/// each as the object holding it.
+///
+/// A definition names the column exactly when following the rename would
+/// respell it, and one the model cannot fully bind counts as naming it.
+pub(super) fn column_readers(
+    builder: &ParserDBBuilder,
+    readers: &Readers,
+    columns: &[Rename],
+) -> Vec<Dependent> {
+    let Readers { definitions, before } = readers;
+    definitions
+        .iter()
+        .filter_map(|definition| {
+            match definition {
+                Definition::Query { slot, query } => {
+                    let mut respelled = (**query).clone();
+                    let reads = match respell(&mut respelled, before, columns) {
+                        Some(_) => respelled != **query,
+                        None => shielded(query, columns) != **query,
+                    };
+                    reads.then(|| slot_reader(builder, *slot))
+                }
+                Definition::Statements { block, statements } => {
+                    let reads = respell_statements(
+                        statements,
+                        before,
+                        columns,
+                        &block.holder_name(builder),
+                        block.rule_context(),
+                    )
+                    .map_or(true, |(rewritten, _)| rewritten != *statements);
+                    reads.then(|| slot_reader(builder, block.slot()))
+                }
+            }
+        })
+        .collect()
+}
+
+/// The object a definition slot holds.
+fn slot_reader(builder: &ParserDBBuilder, slot: Slot) -> Dependent {
+    match slot {
+        Slot::Plain(position) => {
+            Dependent::Reader(
+                ObjectKind::View,
+                stored_view_key(builder.views()[position].0.as_ref(), CASE),
+            )
+        }
+        Slot::Materialized(position) => {
+            Dependent::Reader(
+                ObjectKind::MaterializedView,
+                stored_view_key(builder.materialized_views()[position].0.as_ref(), CASE),
+            )
+        }
+        Slot::Function(position) => {
+            Dependent::Reader(
+                ObjectKind::Function,
+                stored_function_key(builder.functions()[position].0.as_ref(), CASE),
+            )
+        }
+        Slot::Rule(position) => rules::dependent(&builder.rules()[position].0),
+    }
+}
+
 /// How a block statement holds the query part it holds.
 #[derive(Clone, Copy)]
 enum PartShape {
@@ -245,14 +418,25 @@ enum PartShape {
     Return,
 }
 
+/// Where a query part sits in the statement holding it.
+#[derive(Clone, Copy)]
+enum Place {
+    /// The statement holds the part the way `shape` spells it.
+    Whole(PartShape),
+    /// The part is the query at this position of a walk over the statement,
+    /// nested in one of the statement's clauses.
+    Embedded(usize),
+}
+
 /// A query part of a stored definition spelled the way PostgreSQL spells it
 /// after the renames, waiting to be checked against the renamed catalog.
 struct Part {
     /// Where the part's definition sits.
     slot: Slot,
-    /// The statement the part is a part of and how it holds the query, which
-    /// is `None` for a definition that is a query of its own.
-    statement: Option<(usize, PartShape)>,
+    /// The statement sequence the part is a part of, the statement's position
+    /// in it and where the statement holds the query, which is `None` for a
+    /// definition that is a query of its own.
+    statement: Option<(Block, usize, Place)>,
     /// The part before the renames.
     original: Query,
     /// The part `follow_renames` put in place, which the check reads back.
@@ -267,12 +451,36 @@ struct Part {
 struct StatementPart {
     /// The statement the part is a part of.
     statement: usize,
-    /// How the statement holds the part.
-    shape: PartShape,
+    /// Where the statement holds the part.
+    place: Place,
     original: Query,
     stored: Query,
     expected: Vec<SiteOutcome>,
     factors: usize,
+}
+
+/// A respelled query nested in a statement's clauses, awaiting its check.
+struct EmbeddedPart {
+    /// The query's position in a walk over the statement.
+    position: usize,
+    original: Query,
+    stored: Query,
+    expected: Vec<SiteOutcome>,
+    factors: usize,
+}
+
+impl EmbeddedPart {
+    /// The part as one of the statement at `statement` holds.
+    fn in_statement(self, statement: usize) -> StatementPart {
+        StatementPart {
+            statement,
+            place: Place::Embedded(self.position),
+            original: self.original,
+            stored: self.stored,
+            expected: self.expected,
+            factors: self.factors,
+        }
+    }
 }
 
 /// Rewrites every stored definition `readers` found so it keeps reading what
@@ -313,22 +521,25 @@ pub(super) fn follow_renames(
                     None => store_query(builder, slot, shielded(&original, renames)),
                 }
             }
-            Definition::Statements { function, statements } => {
-                let function_name = last_str(&builder.functions()[function].0.name).to_string();
-                let (rewritten, statement_parts) =
-                    respell_statements(&statements, &before, renames, &function_name)?;
+            Definition::Statements { block, statements } => {
+                let (rewritten, statement_parts) = respell_statements(
+                    &statements,
+                    &before,
+                    renames,
+                    &block.holder_name(builder),
+                    block.rule_context(),
+                )?;
                 for part in statement_parts {
                     parts.push(Part {
-                        slot: Slot::Function(function),
-                        statement: Some((part.statement, part.shape)),
+                        slot: block.slot(),
+                        statement: Some((block, part.statement, part.place)),
                         original: part.original,
                         stored: part.stored,
                         expected: part.expected,
                         factors: part.factors,
                     });
                 }
-                let entry = alloc::sync::Arc::make_mut(&mut builder.functions_mut()[function].0);
-                function_bodies::write_statements(&mut entry.function_body, rewritten);
+                store_statements(builder, block, rewritten);
             }
         }
     }
@@ -359,9 +570,14 @@ pub(super) fn follow_renames(
             // The original holds unprocessed data-modifying bodies, which the
             // shield left as written, so the copy shields takes them through
             // their own clauses.
-            if let Slot::Function(function) = part.slot {
-                let function_name = last_str(&builder.functions()[function].0.name).to_string();
-                dml_shell(&mut fallback, &before, renames, &function_name)?;
+            if let Some(block) = part.slot.block() {
+                dml_shell(
+                    &mut fallback,
+                    &before,
+                    renames,
+                    &block.holder_name(builder),
+                    block.rule_context(),
+                )?;
             }
             fallback
         };
@@ -370,15 +586,74 @@ pub(super) fn follow_renames(
     Ok(())
 }
 
+/// Writes respelled statements back into the body or action that holds them.
+fn store_statements(builder: &mut ParserDBBuilder, block: Block, statements: Vec<Statement>) {
+    match block {
+        Block::Function(position) => {
+            edit_function(builder, position, |entry| {
+                function_bodies::write_statements(&mut entry.function_body, statements);
+            });
+        }
+        Block::Rule(position) => {
+            let rule = alloc::sync::Arc::make_mut(&mut builder.rules_mut()[position].0);
+            rules::write_action_statements(&mut rule.action, statements);
+        }
+    }
+}
+
 /// Writes a checked query part back into the definition that holds it.
 fn store_part(builder: &mut ParserDBBuilder, part: &Part, query: Query) {
-    let (Slot::Function(position), Some((statement, shape))) = (part.slot, part.statement) else {
+    let Some((block, statement, place)) = part.statement else {
         return store_query(builder, part.slot, query);
     };
-    let body =
-        &mut alloc::sync::Arc::make_mut(&mut builder.functions_mut()[position].0).function_body;
-    let Some(CreateFunctionBody::BeginAtomic(block)) = body else { return };
-    block.statements[statement] = statement_with_query_part(shape, query);
+    let write = |held: &mut Statement| {
+        match place {
+            Place::Whole(shape) => *held = statement_with_query_part(shape, query),
+            Place::Embedded(position) => replace_embedded(held, position, &part.stored, query),
+        }
+    };
+    match block {
+        Block::Function(position) => {
+            edit_function(builder, position, |CreateFunction { function_body, .. }| {
+                let Some(CreateFunctionBody::BeginAtomic(block)) = function_body else { return };
+                write(&mut block.statements[statement]);
+            });
+        }
+        Block::Rule(position) => {
+            let rule = alloc::sync::Arc::make_mut(&mut builder.rules_mut()[position].0);
+            write(&mut rules::action_statements_mut(&mut rule.action)[statement]);
+        }
+    }
+}
+
+/// Replaces the query at `position` of a walk over `statement`, which is the
+/// `stored` query the respelling put there, with `query`.
+fn replace_embedded(statement: &mut Statement, position: usize, stored: &Query, query: Query) {
+    struct Replace<'a> {
+        position: usize,
+        seen: usize,
+        stored: &'a Query,
+        query: Query,
+    }
+
+    impl VisitorMut for Replace<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+            self.seen += 1;
+            if self.seen - 1 != self.position {
+                return ControlFlow::Continue(());
+            }
+            // Respelling a statement's clauses leaves its nested queries in
+            // place, so the walk reaches the same query it did then.
+            debug_assert!(*query == *self.stored, "the walk reaches the respelled query");
+            core::mem::swap(query, &mut self.query);
+            ControlFlow::Break(())
+        }
+    }
+
+    let mut replace = Replace { position, seen: 0, stored, query };
+    let _: ControlFlow<()> = VisitMut::visit(statement, &mut replace);
 }
 
 /// A statement holding `query` as the part `shape` spells it.
@@ -1113,6 +1388,10 @@ fn shielded(original: &Query, renames: &[Rename]) -> Query {
 /// own clauses under the `WITH` items it sees, and shields one the
 /// respelling cannot take on.
 ///
+/// `rule_context` holds the statements of a rule's action, where the
+/// `NEW` and `OLD` qualifiers name the rule's relation row, which holds no
+/// `RETURNING` list to respell.
+///
 /// # Errors
 ///
 /// Returns [`Error::FunctionBodyBlocksColumnRename`] when a column rename
@@ -1122,12 +1401,14 @@ fn dml_shell(
     query: &mut Query,
     before: &ParserDB,
     renames: &[Rename],
-    function_name: &str,
+    holder_name: &str,
+    rule_context: bool,
 ) -> Result<(), Error> {
     struct Shells<'a> {
         before: &'a ParserDB,
         renames: &'a [Rename],
-        function_name: &'a str,
+        holder_name: &'a str,
+        rule_context: bool,
         scopes: CteScopes,
     }
 
@@ -1164,16 +1445,23 @@ fn dml_shell(
         /// rename reaches the statement's write target.
         fn shell_dml(&mut self, statement: &mut Statement) -> Result<(), Error> {
             let ctes = self.scopes.visible();
-            let respelled =
-                respell_shell(statement, &ctes, self.before, self.renames, self.function_name)?;
+            let respelled = respell_shell(
+                statement,
+                &ctes,
+                self.before,
+                self.renames,
+                self.holder_name,
+                self.rule_context,
+            )?;
             if respelled.is_none() {
-                shield_shell(statement, &ctes, self.before, self.renames, self.function_name)?;
+                shield_shell(statement, &ctes, self.before, self.renames, self.holder_name)?;
             }
             Ok(())
         }
     }
 
-    let mut shells = Shells { before, renames, function_name, scopes: CteScopes::default() };
+    let mut shells =
+        Shells { before, renames, holder_name, rule_context, scopes: CteScopes::default() };
     match query.visit(&mut shells) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(error) => Err(error),
@@ -1196,7 +1484,8 @@ fn respell_statements(
     statements: &[Statement],
     before: &ParserDB,
     renames: &[Rename],
-    function_name: &str,
+    holder_name: &str,
+    rule_context: bool,
 ) -> Result<(Vec<Statement>, Vec<StatementPart>), Error> {
     let mut rewritten: Vec<Statement> = Vec::with_capacity(statements.len());
     let mut parts: Vec<StatementPart> = Vec::new();
@@ -1214,7 +1503,7 @@ fn respell_statements(
                 Some(references) => {
                     parts.push(StatementPart {
                         statement: position,
-                        shape,
+                        place: Place::Whole(shape),
                         original,
                         stored: respelled.clone(),
                         expected: references.sites.iter().map(|site| site.outcome).collect(),
@@ -1227,21 +1516,25 @@ fn respell_statements(
             // The queries the respelling left untouched, which are the ones
             // nested in data-modifying bodies, respell on their own, and the
             // data-modifying statements respell through their own clauses.
-            respell_embedded(&mut stored, before, renames, true);
-            dml_shell(&mut stored, before, renames, function_name)?;
+            let embedded = respell_embedded(&mut stored, before, renames, true);
+            parts.extend(embedded.into_iter().map(|part| part.in_statement(position)));
+            dml_shell(&mut stored, before, renames, holder_name, rule_context)?;
             rewritten.push(statement_with_query_part(shape, stored));
             continue;
         }
         let mut statement = statement.clone();
         // Every statement's own clauses respell or shield the same way, which
         // a statement without clause factors answers with no edits at all.
-        respell_embedded(&mut statement, before, renames, false);
+        let embedded = respell_embedded(&mut statement, before, renames, false);
+        parts.extend(embedded.into_iter().map(|part| part.in_statement(position)));
         if let Statement::Query(query) = &mut statement
             && dml_ref(&query.body).is_some()
         {
-            dml_shell(query, before, renames, function_name)?;
-        } else if respell_shell(&mut statement, &[], before, renames, function_name)?.is_none() {
-            shield_shell(&mut statement, &[], before, renames, function_name)?;
+            dml_shell(query, before, renames, holder_name, rule_context)?;
+        } else if respell_shell(&mut statement, &[], before, renames, holder_name, rule_context)?
+            .is_none()
+        {
+            shield_shell(&mut statement, &[], before, renames, holder_name)?;
         }
         rewritten.push(statement);
     }
@@ -1545,18 +1838,18 @@ struct ScopeFactor {
     columns: Option<Vec<(String, bool)>>,
 }
 
-/// The refusal PostgreSQL gives a bare column reference that more than one
-/// relation in the same scope exposes, which it refuses at `CREATE FUNCTION`
-/// time.
+/// The refusal a bare column reference that more than one relation in the
+/// same scope exposes gets at creation, which PostgreSQL refuses at
+/// `CREATE FUNCTION` and `CREATE RULE` time alike.
 ///
 /// # Errors
 ///
-/// Returns [`Error::FunctionBodyReferenceAmbiguous`] naming the first
-/// reference that two relations expose.
+/// When `ambiguous` is the caller's refusal for the first reference two
+/// relations expose.
 pub(super) fn refuse_ambiguous_block_reference(
     builder: &ParserDBBuilder,
     statement: &Statement,
-    function_name: &str,
+    ambiguous: impl FnOnce(Ident) -> Error,
 ) -> Result<(), Error> {
     struct Scopes<'a> {
         slice: &'a ParserDB,
@@ -1632,15 +1925,10 @@ pub(super) fn refuse_ambiguous_block_reference(
     let walked = statement.visit(&mut scopes);
     debug_assert!(walked.is_continue(), "the walker never breaks");
     let Scopes { scopes, .. } = scopes;
-    let mut ambiguous = Ambiguous { slice: &slice, scopes, chain: Vec::new() };
-    match statement.visit(&mut ambiguous) {
+    let mut checker = Ambiguous { slice: &slice, scopes, chain: Vec::new() };
+    match statement.visit(&mut checker) {
         ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(column) => {
-            Err(Error::FunctionBodyReferenceAmbiguous {
-                column_name: column.value,
-                function_name: function_name.to_string(),
-            })
-        }
+        ControlFlow::Break(column) => Err(ambiguous(column)),
     }
 }
 
@@ -1837,15 +2125,18 @@ impl<'a> DmlMut<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::FunctionBodyInsertTooWide`] when the `INSERT` offers
-    /// more expressions than its target has columns.
-    fn spell(self, slice: &ParserDB, function_name: &str) -> Result<(), Error> {
+    /// Returns `too_wide`'s error when an `INSERT` offers more expressions
+    /// than its target has columns.
+    fn spell<F>(self, slice: &ParserDB, too_wide: &F) -> Result<(), Error>
+    where
+        F: Fn() -> Error,
+    {
         let factors = self.scope_factors(slice, &[]);
         match self {
             DmlMut::Insert(insert) => {
                 let wildcard: &[ScopeFactor] = factors.first().map_or(&[], alloc::slice::from_ref);
                 spell_returning_items(insert.returning.as_mut(), wildcard, &factors);
-                spell_insert_columns(insert, slice, function_name)
+                spell_insert_columns(insert, slice, too_wide)
             }
             DmlMut::Update(update) => {
                 spell_returning_items(update.returning.as_mut(), &factors[..], &factors);
@@ -2149,12 +2440,12 @@ fn reference_is_ambiguous(column: &Ident, chain: &[Vec<ScopeFactor>]) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`Error::FunctionBodyInsertTooWide`] when an `INSERT` offers more
-/// expressions than its target has columns.
+/// Returns `too_wide`'s error when an `INSERT` offers more expressions than
+/// its target has columns.
 pub(super) fn spell_block_statement(
     builder: &ParserDBBuilder,
     statement: &mut Statement,
-    function_name: &str,
+    too_wide: &impl Fn() -> Error,
 ) -> Result<(), Error> {
     struct Wildcards<'a> {
         builder: &'a ParserDBBuilder,
@@ -2175,9 +2466,9 @@ pub(super) fn spell_block_statement(
 
     let reads = statements_read(builder, core::iter::once(&*statement));
     let slice = catalog_reads(builder, reads);
-    let mut returning = ReturningSpeller { slice: &slice, function_name };
+    let mut returning = ReturningSpeller { slice: &slice, too_wide };
     match statement_dml_mut(statement) {
-        Some(dml) => dml.spell(&slice, function_name),
+        Some(dml) => dml.spell(&slice, too_wide),
         None => {
             match statement.visit(&mut returning) {
                 ControlFlow::Continue(()) => Ok(()),
@@ -2189,17 +2480,20 @@ pub(super) fn spell_block_statement(
 
 /// The `RETURNING` wildcards and the missing `INSERT` column list one
 /// data-modifying statement spells at creation.
-struct ReturningSpeller<'a> {
+struct ReturningSpeller<'a, F> {
     slice: &'a ParserDB,
-    function_name: &'a str,
+    too_wide: &'a F,
 }
 
-impl VisitorMut for ReturningSpeller<'_> {
+impl<F> VisitorMut for ReturningSpeller<'_, F>
+where
+    F: Fn() -> Error,
+{
     type Break = Error;
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
         if let Some(dml) = dml_ref_mut(&mut query.body)
-            && let Err(error) = dml.spell(self.slice, self.function_name)
+            && let Err(error) = dml.spell(self.slice, self.too_wide)
         {
             return ControlFlow::Break(error);
         }
@@ -2301,20 +2595,19 @@ fn quoted_identifier(name: &str, quoted: bool) -> Ident {
 ///
 /// # Errors
 ///
-/// Returns [`Error::FunctionBodyInsertTooWide`] when the `INSERT` offers more
-/// expressions than its target has columns.
-fn spell_insert_columns(
-    insert: &mut Insert,
-    slice: &ParserDB,
-    function_name: &str,
-) -> Result<(), Error> {
+/// Returns `too_wide`'s error when the `INSERT` offers more expressions than
+/// its target has columns.
+fn spell_insert_columns<F>(insert: &mut Insert, slice: &ParserDB, too_wide: &F) -> Result<(), Error>
+where
+    F: Fn() -> Error,
+{
     let TableObject::TableName(name) = &insert.table else { return Ok(()) };
     let width = insert_source_width(insert);
     let Some(columns) = relation_columns(slice, &resolved_factor_key(slice, name)) else {
         return Ok(());
     };
     if width.is_some_and(|width| width > columns.len()) {
-        return Err(Error::FunctionBodyInsertTooWide { function_name: function_name.to_string() });
+        return Err(too_wide());
     }
     if !insert.columns.is_empty() || insert.by_name {
         return Ok(());
@@ -2594,7 +2887,15 @@ struct ShellSite {
 
 /// Every column reference of a statement's own clauses, the queries nested
 /// in it excluded, with what each reached before the renames.
-fn shell_sites(statement: &Statement, factors: &[ShellFactor]) -> Vec<ShellSite> {
+///
+/// In a rule's action `rule_context` holds, and the `NEW` and `OLD`
+/// qualifiers name the rule's relation row, which is not among the
+/// statement's factors and so reaches nothing here.
+fn shell_sites(
+    statement: &Statement,
+    factors: &[ShellFactor],
+    rule_context: bool,
+) -> Vec<ShellSite> {
     clause_references(statement)
         .into_iter()
         .map(|(at, parts)| {
@@ -2608,7 +2909,7 @@ fn shell_sites(statement: &Statement, factors: &[ShellFactor]) -> Vec<ShellSite>
                 name,
                 column,
                 pseudo: qualifier.as_ref().is_some_and(is_pseudo_qualifier),
-                outcome: shell_outcome(&parts, factors),
+                outcome: shell_outcome(&parts, factors, rule_context),
             }
         })
         .collect()
@@ -2618,10 +2919,17 @@ fn shell_sites(statement: &Statement, factors: &[ShellFactor]) -> Vec<ShellSite>
 /// statement's own clauses scope, which always name the write target's
 /// columns.
 fn is_pseudo_qualifier(qualifier: &Ident) -> bool {
+    is_row_qualifier(qualifier)
+        || (qualifier.quote_style.is_none()
+            && identifiers_match(&qualifier.value, false, "excluded", false))
+}
+
+/// Whether a qualifier is `NEW` or `OLD`, which a rule's action scopes to its
+/// own relation's row and a write target's `RETURNING` list to the target's.
+fn is_row_qualifier(qualifier: &Ident) -> bool {
     qualifier.quote_style.is_none()
         && (identifiers_match(&qualifier.value, false, "old", false)
-            || identifiers_match(&qualifier.value, false, "new", false)
-            || identifiers_match(&qualifier.value, false, "excluded", false))
+            || identifiers_match(&qualifier.value, false, "new", false))
 }
 
 /// Every reference of a statement's own clauses, the queries nested in it
@@ -2674,7 +2982,7 @@ fn clause_references(statement: &Statement) -> Vec<(usize, Vec<Ident>)> {
 /// A reference held at ingestion names its column in its last part and its
 /// relation in the part before, so its first part is the relation's name
 /// when it carries one.
-fn shell_outcome(parts: &[Ident], factors: &[ShellFactor]) -> ShellOutcome {
+fn shell_outcome(parts: &[Ident], factors: &[ShellFactor], rule_context: bool) -> ShellOutcome {
     let (qualifier, column) = if parts.len() == 1 {
         (None, &parts[0])
     } else {
@@ -2683,6 +2991,11 @@ fn shell_outcome(parts: &[Ident], factors: &[ShellFactor]) -> ShellOutcome {
     if let Some(qualifier) = qualifier
         && is_pseudo_qualifier(qualifier)
     {
+        // A rule's action scopes `NEW` and `OLD` to its relation's row,
+        // which the action's factors do not hold.
+        if rule_context && is_row_qualifier(qualifier) {
+            return ShellOutcome::Absent;
+        }
         // A pseudo qualifier names the write target's columns, never an
         // alias list's outputs.
         return pseudo_outcome(column, factors);
@@ -2750,12 +3063,16 @@ fn exposed_columns(factor: &ShellFactor) -> Option<Vec<(String, bool)>> {
 /// subquery in its clauses, each on its own the way a view's definition is.
 /// A query that cannot be respelled by is left as written, and one the
 /// walk's root already respelled is left as it stands.
+///
+/// Answers every respelled query not nested in another one it respelled,
+/// with what its references reached before the renames, for the check that
+/// qualifies a reference a rename captured.
 fn respell_embedded(
     node: &mut impl VisitMut,
     before: &ParserDB,
     renames: &[Rename],
     root_walked: bool,
-) {
+) -> Vec<EmbeddedPart> {
     struct Embedded<'a> {
         before: &'a ParserDB,
         renames: &'a [Rename],
@@ -2766,6 +3083,36 @@ fn respell_embedded(
         /// own, which the ones outside data-modifying bodies then keep as
         /// respelled.
         root_walked: bool,
+        /// How many queries the walk has entered.
+        entered: usize,
+        /// For each query the walk is inside, whether it is an answered part.
+        open: Vec<bool>,
+        parts: Vec<EmbeddedPart>,
+    }
+
+    impl Embedded<'_> {
+        /// Respells one query, answering whether it becomes a part.
+        fn respell_query(&mut self, query: &mut Query, position: usize) -> bool {
+            if dml_ref(&query.body).is_some() || (self.root_walked && self.dml_depth == 0) {
+                return false;
+            }
+            let original = query.clone();
+            let Some(references) = respell(query, self.before, self.renames) else {
+                *query = shielded(&original, self.renames);
+                return false;
+            };
+            if self.open.contains(&true) {
+                return false;
+            }
+            self.parts.push(EmbeddedPart {
+                position,
+                original,
+                stored: query.clone(),
+                expected: references.sites.iter().map(|site| site.outcome).collect(),
+                factors: references.factors.len(),
+            });
+            true
+        }
     }
 
     impl VisitorMut for Embedded<'_> {
@@ -2786,23 +3133,31 @@ fn respell_embedded(
         }
 
         fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-            if dml_ref(&query.body).is_some() {
-                return ControlFlow::Continue(());
-            }
-            if self.root_walked && self.dml_depth == 0 {
-                return ControlFlow::Continue(());
-            }
-            let original = query.clone();
-            if respell(query, self.before, self.renames).is_none() {
-                *query = shielded(&original, self.renames);
-            }
+            let position = self.entered;
+            self.entered += 1;
+            let part = self.respell_query(query, position);
+            self.open.push(part);
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+            self.open.pop();
             ControlFlow::Continue(())
         }
     }
 
-    let mut embedded = Embedded { before, renames, dml_depth: 0, root_walked };
+    let mut embedded = Embedded {
+        before,
+        renames,
+        dml_depth: 0,
+        root_walked,
+        entered: 0,
+        open: Vec::new(),
+        parts: Vec::new(),
+    };
     let walked = VisitMut::visit(node, &mut embedded);
     debug_assert!(walked.is_continue(), "the walker never breaks");
+    embedded.parts
 }
 
 /// Respells a statement's own clauses the way PostgreSQL respells them after
@@ -2820,10 +3175,11 @@ fn respell_shell(
     ctes: &[ScopeFactor],
     before: &ParserDB,
     renames: &[Rename],
-    function_name: &str,
+    holder_name: &str,
+    rule_context: bool,
 ) -> Result<Option<()>, Error> {
     let factors = shell_factors(statement, ctes, before);
-    let sites = shell_sites(statement, &factors);
+    let sites = shell_sites(statement, &factors, rule_context);
     if sites.iter().any(|site| site.outcome == ShellOutcome::Unknown) {
         return Ok(None);
     }
@@ -2833,10 +3189,10 @@ fn respell_shell(
     if let Some(mut dml) = statement_dml_mut(statement) {
         rename_lists(&mut dml, &factors, renames);
     }
-    if whole_row_outcomes(&mut edits, &factors, &sites, renames, &returning, function_name)? {
+    if whole_row_outcomes(&mut edits, &factors, &sites, renames, &returning, holder_name)? {
         return Ok(None);
     }
-    captured_sites(&mut edits, &sites, &factors, renames, function_name);
+    captured_sites(&mut edits, &sites, &factors, renames, holder_name);
     let walked = VisitMut::visit(statement, &mut edits);
     debug_assert!(walked.is_continue(), "the edits never break");
     if let Some(dml) = statement_dml_mut(statement) {
@@ -2859,7 +3215,7 @@ fn whole_row_outcomes(
     sites: &[ShellSite],
     renames: &[Rename],
     returning: &BTreeSet<usize>,
-    function_name: &str,
+    holder_name: &str,
 ) -> Result<bool, Error> {
     for (index, factor) in factors.iter().enumerate() {
         let whole_row_sites = sites
@@ -2903,7 +3259,7 @@ fn whole_row_outcomes(
                 return Err(Error::FunctionBodyBlocksColumnRename {
                     column_name: columns[*ordinal].value.clone(),
                     relation_name: key.name.clone(),
-                    function_name: function_name.to_string(),
+                    function_name: holder_name.to_string(),
                 });
             }
             for site in &whole_row_sites {
@@ -2924,7 +3280,7 @@ fn captured_sites(
     sites: &[ShellSite],
     factors: &[ShellFactor],
     renames: &[Rename],
-    function_name: &str,
+    holder_name: &str,
 ) {
     for site in sites {
         let Some(written) = &site.name else {
@@ -2952,7 +3308,7 @@ fn captured_sites(
             {
                 edits
                     .captured
-                    .insert(site.address, (Ident::new(function_name.to_string()), written.clone()));
+                    .insert(site.address, (Ident::new(holder_name.to_string()), written.clone()));
             }
         }
     }
@@ -3179,7 +3535,7 @@ fn shield_shell(
     ctes: &[ScopeFactor],
     before: &ParserDB,
     renames: &[Rename],
-    function_name: &str,
+    holder_name: &str,
 ) -> Result<(), Error> {
     let factors = shell_factors(statement, ctes, before);
     let mut edits = ShellEdits::default();
@@ -3215,7 +3571,7 @@ fn shield_shell(
                         return Err(Error::FunctionBodyBlocksColumnRename {
                             column_name: columns[*ordinal].value.clone(),
                             relation_name: key.name.clone(),
-                            function_name: function_name.to_string(),
+                            function_name: holder_name.to_string(),
                         });
                     }
                     if factor.renames_column(*ordinal) {

@@ -169,7 +169,7 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.2.3"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#72c9e5f6fcc40127549813725c1849c5ddf4cf86"
+source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#2f2a39d9534bfeb115b0e489c7ba614e29fa3c48"
 dependencies = [
  "barnes-hut-tree",
  "hashbrown",
@@ -413,6 +413,7 @@ dependencies = [
  "geometric-traits",
  "sha2",
  "sqlparser",
+ "sqlparser-plpgsql",
  "thiserror",
  "unicode-normalization",
 ]
@@ -428,8 +429,8 @@ dependencies = [
 
 [[package]]
 name = "sqlparser"
-version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#45fe354cde1d338052418c4e873f69d5b4120ca4"
+version = "0.64.0"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#23f188212cf837e380d7b765e80435fe0e79f181"
 dependencies = [
  "log",
  "recursive",
@@ -437,9 +438,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlparser-plpgsql"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#2b697edc4dfa03f4a328f680277916279211f12c"
+dependencies = [
+ "sqlparser",
+ "thiserror",
+]
+
+[[package]]
 name = "sqlparser_derive"
-version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#45fe354cde1d338052418c4e873f69d5b4120ca4"
+version = "0.7.0"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#23f188212cf837e380d7b765e80435fe0e79f181"
 dependencies = [
  "proc-macro2",
  "quote",

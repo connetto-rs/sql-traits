@@ -13,7 +13,7 @@ use crate::{
         identifier_resolution::normalize_identifier,
         last_str,
         object_name::{
-            object_name_last_part, qualifier_of, resolve_required_bound_table,
+            object_name_last_part, qualifier_of, resolve_required_bound_table_or_foreign_table,
             target_name_of_object_name,
         },
     },
@@ -25,7 +25,9 @@ fn in_schema(schema: Option<(&str, bool)>) -> Cow<'_, str> {
 }
 
 impl Metadata for CreateTrigger {
-    type Meta = ();
+    /// The calls of the trigger's `WHEN` condition, bound when it was
+    /// written.
+    type Meta = crate::structs::metadata::ExpressionCalls<sqlparser::ast::CreateFunction>;
 }
 
 impl TriggerLike for CreateTrigger {
@@ -44,7 +46,8 @@ impl TriggerLike for CreateTrigger {
     where
         Self: 'db,
     {
-        resolve_required_bound_table(&self.table_name, database)
+        // A foreign table carries triggers as a table does.
+        resolve_required_bound_table_or_foreign_table(&self.table_name, database)
     }
 
     #[inline]

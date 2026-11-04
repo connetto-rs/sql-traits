@@ -4,8 +4,11 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, InTarget};
+use sqlparser::ast::{
+    AccessExpr, Expr, FunctionArg, FunctionArguments, Ident, InTarget, Query, Visit, Visitor,
+};
 
 use crate::{
     structs::TargetName, traits::column::ColumnLike,
@@ -68,29 +71,151 @@ fn rendered_reference(idents: &[Ident]) -> String {
     rendered
 }
 
-fn columns_in_arguments<C: ColumnLike + Clone>(
-    arguments: &[FunctionArg],
-    catalog_name: &str,
-    table: &TargetName<'_>,
-    columns: &[C],
-    result: &mut Vec<C>,
-) -> Result<(), crate::errors::Error> {
-    for argument in arguments {
-        let argument = match argument {
-            FunctionArg::Named { arg, .. }
-            | FunctionArg::ExprNamed { arg, .. }
-            | FunctionArg::Unnamed(arg) => arg,
+/// The labels among `arguments`, which name a parameter rather than read a
+/// value.
+fn argument_labels(arguments: &[FunctionArg]) -> impl Iterator<Item = &Expr> {
+    arguments.iter().filter_map(|argument| {
+        match argument {
+            FunctionArg::ExprNamed { name, .. } => Some(name),
+            FunctionArg::Named { .. } | FunctionArg::Unnamed(_) => None,
+        }
+    })
+}
+
+/// Collects the columns of one table an expression reads, in the order it
+/// first reads them.
+struct ColumnsRead<'a, 't, C> {
+    catalog_name: &'a str,
+    table: &'a TargetName<'t>,
+    columns: &'a [C],
+    read: Vec<C>,
+    /// How many subqueries enclose the visited expression, which read the
+    /// tables of their own `FROM` rather than this one.
+    subqueries: usize,
+    /// The expressions standing in a name position, a named argument's label
+    /// or a field after a dot, which read no column.
+    labels: Vec<*const Expr>,
+    /// The parameters of the lambdas enclosing the visited expression, which
+    /// hide a column of the same name.
+    parameters: Vec<Ident>,
+}
+
+impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
+    fn is_label(&self, expr: &Expr) -> bool {
+        self.labels.iter().any(|label| core::ptr::eq(*label, expr))
+    }
+
+    fn is_parameter(&self, ident: &Ident) -> bool {
+        self.parameters.iter().any(|parameter| {
+            identifiers_match(
+                parameter.value.as_str(),
+                parameter.quote_style.is_some(),
+                ident.value.as_str(),
+                ident.quote_style.is_some(),
+            )
+        })
+    }
+
+    fn column(&mut self, ident: &Ident) -> Result<(), crate::errors::Error> {
+        let Some(column) = self.columns.iter().find(|column| column_named_by(*column, ident))
+        else {
+            return Err(crate::errors::Error::UnknownColumnInCheckConstraint {
+                column_name: ident.value.clone(),
+                table_name: self.table.name().to_string(),
+            });
         };
-        if let FunctionArgExpr::Expr(expression) = argument {
-            result.extend(columns_in_expression(expression, catalog_name, table, columns)?);
+        if !self.read.contains(column) {
+            self.read.push(column.clone());
+        }
+        Ok(())
+    }
+
+    fn reference(&mut self, expr: &Expr) -> Result<(), crate::errors::Error> {
+        match expr {
+            Expr::Identifier(ident) if !self.is_parameter(ident) => self.column(ident),
+            Expr::CompoundIdentifier(idents) => {
+                let Some((column, qualifier)) = idents.split_last() else {
+                    return Ok(());
+                };
+                if qualifier.first().is_some_and(|first| self.is_parameter(first)) {
+                    return Ok(());
+                }
+                if !qualifier_names_table(qualifier, self.catalog_name, self.table) {
+                    return Err(crate::errors::Error::ForeignColumnReference {
+                        reference: rendered_reference(idents),
+                        table_name: self.table.name().to_string(),
+                    });
+                }
+                self.column(column)
+            }
+            _ => Ok(()),
         }
     }
-    Ok(())
+}
+
+impl<C: ColumnLike + Clone> Visitor for ColumnsRead<'_, '_, C> {
+    type Break = crate::errors::Error;
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.subqueries += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.subqueries -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if self.subqueries > 0 || self.is_label(expr) {
+            return ControlFlow::Continue(());
+        }
+        match expr {
+            Expr::Function(function) => {
+                for arguments in [&function.parameters, &function.args] {
+                    if let FunctionArguments::List(list) = arguments {
+                        self.labels.extend(argument_labels(&list.args).map(core::ptr::from_ref));
+                    }
+                }
+            }
+            Expr::In { target: InTarget::Table { args: Some(arguments), .. }, .. } => {
+                self.labels.extend(argument_labels(arguments).map(core::ptr::from_ref));
+            }
+            Expr::CompoundFieldAccess { access_chain, .. } => {
+                self.labels.extend(access_chain.iter().filter_map(|access| {
+                    match access {
+                        AccessExpr::Dot(field) => Some(core::ptr::from_ref(field)),
+                        AccessExpr::Subscript(_) => None,
+                    }
+                }));
+            }
+            Expr::Lambda(lambda) => {
+                self.parameters
+                    .extend(lambda.params.iter().map(|parameter| parameter.name.clone()));
+            }
+            _ => {}
+        }
+        match self.reference(expr) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
+
+    fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if self.subqueries == 0
+            && let Expr::Lambda(lambda) = expr
+        {
+            self.parameters.truncate(self.parameters.len() - lambda.params.len());
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Extracts columns from a SQL expression.
 ///
-/// `IN` table targets read local operands and table-function arguments.
+/// Every expression nested in `expr` is read, except inside the subqueries it
+/// holds, whose names belong to the tables they read. A named argument's
+/// label, a field named after a dot and a lambda's parameter read no column.
 ///
 /// # Arguments
 ///
@@ -103,7 +228,8 @@ fn columns_in_arguments<C: ColumnLike + Clone>(
 ///
 /// # Returns
 ///
-/// * A vector of columns found in the expression.
+/// * The columns found in the expression, each once, in the order it first
+///   reads them.
 ///
 /// # Errors
 ///
@@ -118,97 +244,19 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
     table: &TargetName<'_>,
     columns: &[C],
 ) -> Result<Vec<C>, crate::errors::Error> {
-    let mut result = Vec::new();
-
-    match expr {
-        Expr::Identifier(ident) => {
-            if let Some(col) = columns.iter().find(|col| column_named_by(*col, ident)) {
-                result.push(col.clone());
-            } else {
-                return Err(crate::errors::Error::UnknownColumnInCheckConstraint {
-                    column_name: ident.value.clone(),
-                    table_name: table.name().to_string(),
-                });
-            }
-        }
-        Expr::CompoundIdentifier(idents) => {
-            let Some((column, qualifier)) = idents.split_last() else {
-                return Ok(result);
-            };
-            if !qualifier_names_table(qualifier, catalog_name, table) {
-                return Err(crate::errors::Error::ForeignColumnReference {
-                    reference: rendered_reference(idents),
-                    table_name: table.name().to_string(),
-                });
-            }
-            if let Some(col) = columns.iter().find(|candidate| column_named_by(*candidate, column))
-            {
-                result.push(col.clone());
-            } else {
-                return Err(crate::errors::Error::UnknownColumnInCheckConstraint {
-                    column_name: column.value.clone(),
-                    table_name: table.name().to_string(),
-                });
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            result.extend(columns_in_expression(left, catalog_name, table, columns)?);
-            result.extend(columns_in_expression(right, catalog_name, table, columns)?);
-        }
-        Expr::Nested(nested_expr) => {
-            result.extend(columns_in_expression(nested_expr, catalog_name, table, columns)?);
-        }
-        Expr::Between { expr, negated: _, low, high } => {
-            result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
-            result.extend(columns_in_expression(low, catalog_name, table, columns)?);
-            result.extend(columns_in_expression(high, catalog_name, table, columns)?);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr) => {
-            result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
-        }
-        Expr::Function(func) => {
-            if let sqlparser::ast::FunctionArguments::List(args) = &func.args {
-                columns_in_arguments(&args.args, catalog_name, table, columns, &mut result)?;
-            }
-        }
-        Expr::In { expr, target, .. } => {
-            result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
-            match target {
-                InTarget::List(list) => {
-                    for expression in list {
-                        result.extend(columns_in_expression(
-                            expression,
-                            catalog_name,
-                            table,
-                            columns,
-                        )?);
-                    }
-                }
-                InTarget::Subquery(_) => {}
-                InTarget::Unnest(expression) => {
-                    result.extend(columns_in_expression(expression, catalog_name, table, columns)?);
-                }
-                InTarget::Table { name: _, args } => {
-                    if let Some(arguments) = args {
-                        columns_in_arguments(arguments, catalog_name, table, columns, &mut result)?;
-                    }
-                }
-            }
-        }
-        Expr::Tuple(exprs) => {
-            for expr in exprs {
-                result.extend(columns_in_expression(expr, catalog_name, table, columns)?);
-            }
-        }
-        _ => {}
+    let mut visitor = ColumnsRead {
+        catalog_name,
+        table,
+        columns,
+        read: Vec::new(),
+        subqueries: 0,
+        labels: Vec::new(),
+        parameters: Vec::new(),
+    };
+    match expr.visit(&mut visitor) {
+        ControlFlow::Continue(()) => Ok(visitor.read),
+        ControlFlow::Break(error) => Err(error),
     }
-
-    // Remove duplicates while preserving order
-    let mut seen: alloc::collections::BTreeSet<_> = alloc::collections::BTreeSet::new();
-    Ok(result.into_iter().filter(|col| seen.insert(col.clone())).collect())
 }
 
 #[cfg(test)]
@@ -573,5 +621,87 @@ mod tests {
         .expect("argument values resolve");
         let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
         assert_eq!(names, ["a", "b"]);
+    }
+
+    /// The names `columns_in_expression` finds in `sql`, parsed under
+    /// `dialect`, against a table holding the columns `a`, `b` and `c`.
+    fn names_in(
+        dialect: &dyn sqlparser::dialect::Dialect,
+        sql: &str,
+    ) -> Result<Vec<String>, crate::errors::Error> {
+        let expression = Parser::new(dialect)
+            .try_with_sql(sql)
+            .expect("expression tokenizes")
+            .parse_expr()
+            .expect("expression parses");
+        let columns = [create_column("a"), create_column("b"), create_column("c")];
+        Ok(columns_in_expression(&expression, "catalog", &TargetName::new("t", false), &columns)?
+            .iter()
+            .map(|column| ColumnLike::column_name(column).to_owned())
+            .collect())
+    }
+
+    #[test]
+    fn every_expression_form_reads_the_columns_inside_it() {
+        let postgres = sqlparser::dialect::PostgreSqlDialect {};
+        for (sql, expected) in [
+            ("b = ANY (ARRAY['x', 'y'])", &["b"][..]),
+            ("b = ALL (ARRAY[a, c])", &["b", "a", "c"]),
+            ("(b)::text = ANY ((ARRAY['x'::varchar])::text[])", &["b"]),
+            ("b COLLATE \"C\" = 'x'", &["b"]),
+            ("b LIKE 'x%' OR c ILIKE a", &["b", "c", "a"]),
+            ("CASE WHEN a > 0 THEN b ELSE c END = 'x'", &["a", "b", "c"]),
+            ("a IS DISTINCT FROM c", &["a", "c"]),
+            ("b IS TRUE", &["b"]),
+            ("position('x' IN b) > a", &["b", "a"]),
+            ("substring(b FROM a FOR c) = 'x'", &["b", "a", "c"]),
+            ("ARRAY[a, b] && ARRAY[c]", &["a", "b", "c"]),
+            ("b[a] = 'x'", &["b", "a"]),
+            ("(b).field[c] = 'x'", &["b", "c"]),
+        ] {
+            assert_eq!(names_in(&postgres, sql).expect("columns resolve"), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn names_that_are_not_columns_are_not_read() {
+        let postgres = sqlparser::dialect::PostgreSqlDialect {};
+        for (sql, expected) in [
+            ("f(label => b) > a", &["b", "a"][..]),
+            ("(b).field = 'x'", &["b"]),
+            ("b = ANY (SELECT missing)", &["b"]),
+            ("EXISTS (SELECT missing) OR a > 0", &["a"]),
+        ] {
+            assert_eq!(names_in(&postgres, sql).expect("columns resolve"), expected, "{sql}");
+        }
+        let duckdb = sqlparser::dialect::DuckDbDialect {};
+        for (sql, expected) in [
+            ("list_transform(b, x -> x || a)", &["b", "a"][..]),
+            ("list_transform(b, x -> x.field || a)", &["b", "a"]),
+        ] {
+            assert_eq!(names_in(&duckdb, sql).expect("columns resolve"), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_column_inside_any_expression_form_is_refused() {
+        let postgres = sqlparser::dialect::PostgreSqlDialect {};
+        for sql in [
+            "b = ANY (ARRAY[missing])",
+            "CASE WHEN missing THEN a END",
+            "b COLLATE \"C\" = missing",
+            "list_transform(b, x -> missing)",
+        ] {
+            let dialect: &dyn sqlparser::dialect::Dialect =
+                if sql.contains("->") { &sqlparser::dialect::DuckDbDialect {} } else { &postgres };
+            assert!(
+                matches!(
+                    names_in(dialect, sql),
+                    Err(crate::errors::Error::UnknownColumnInCheckConstraint { column_name, .. })
+                        if column_name == "missing"
+                ),
+                "{sql}"
+            );
+        }
     }
 }

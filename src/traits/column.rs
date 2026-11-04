@@ -264,6 +264,45 @@ pub trait ColumnLike:
     /// ```
     fn column_name(&self) -> &str;
 
+    /// Returns the name of the `NOT NULL` constraint the column holds: the one
+    /// written, or on PostgreSQL 18 the one it was given when it arrived,
+    /// which renaming the table or the column later leaves alone. A written
+    /// name is returned as PostgreSQL stores it. [`None`] for a column without
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table of this column.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id INT PRIMARY KEY, email TEXT NOT NULL, bio TEXT);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let names = table
+    ///     .columns(&db)?
+    ///     .map(|column| Ok(column.not_null_constraint_name(&db)?.map(|name| name.into_owned())))
+    ///     .collect::<Result<Vec<_>, LookupError>>()?;
+    /// assert_eq!(
+    ///     names,
+    ///     [Some("users_id_not_null".to_owned()), Some("users_email_not_null".to_owned()), None]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn not_null_constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError>;
+
     /// Returns whether the column identifier was quoted in SQL.
     ///
     /// Quoted identifiers are resolved case-sensitively in PostgreSQL.
@@ -498,13 +537,22 @@ pub trait ColumnLike:
     /// ```
     fn identity_generation(&self, database: &Self::DB) -> Option<IdentityGeneration>;
 
-    /// Returns whether the column was declared with one of PostgreSQL's
-    /// serial pseudo-types, `smallserial`, `serial` or `bigserial`, or their
-    /// aliases `serial2`, `serial4` and `serial8`.
+    /// Returns whether the column is serial, an integer column whose default
+    /// draws from a sequence the column owns.
     ///
-    /// The declared type reads as the integer type the pseudo-type stands
-    /// for (see [`DataTypeLike::normalized_name`]), and this reader keeps the
-    /// declaration apart from a plain integer column.
+    /// That is what PostgreSQL stores for a column declared with one of its
+    /// serial pseudo-types, `smallserial`, `serial` or `bigserial`, or their
+    /// aliases `serial2`, `serial4` and `serial8`. A catalog cannot tell such
+    /// a declaration from the expansion PostgreSQL documents for it, a `NOT
+    /// NULL` integer column defaulting to `nextval` of a sequence owned by the
+    /// column, so both read as serial. A dialect creating no sequence for a
+    /// serial pseudo-type, as MySQL's `SERIAL` gets its values from
+    /// `AUTO_INCREMENT`, answers from the declared type instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance the column belongs
+    ///   to.
     ///
     /// # Example
     ///
@@ -514,22 +562,25 @@ pub trait ColumnLike:
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TABLE t (id serial, big BIGSERIAL, plain INT);",
+    ///     "CREATE TABLE t (id serial, big BIGSERIAL, plain INT, spelled INT NOT NULL);
+    ///      CREATE SEQUENCE t_spelled_seq OWNED BY t.spelled;
+    ///      ALTER TABLE t ALTER COLUMN spelled SET DEFAULT nextval('t_spelled_seq');",
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
     /// let serial = |name| {
     ///     table
     ///         .column(name, &db, IdentifierCase::AsWritten)
-    ///         .map(|column| column.expect("column exists").is_serial())
+    ///         .map(|column| column.expect("column exists").is_serial(&db))
     /// };
     /// assert!(serial("id")?);
     /// assert!(serial("big")?);
+    /// assert!(serial("spelled")?);
     /// assert!(!serial("plain")?);
     /// # Ok(())
     /// # }
     /// ```
-    fn is_serial(&self) -> bool;
+    fn is_serial(&self, database: &Self::DB) -> bool;
 
     /// Returns whether the database supplies the values of the column, which
     /// it does for a serial column and for an identity column.
@@ -573,7 +624,7 @@ pub trait ColumnLike:
     /// ```
     #[inline]
     fn is_generated(&self, database: &Self::DB) -> bool {
-        self.is_serial() || self.identity_generation(database).is_some()
+        self.is_serial(database) || self.identity_generation(database).is_some()
     }
 
     /// Returns whether the column is the primary key of its table (not just
@@ -762,6 +813,38 @@ pub trait ColumnLike:
     fn has_default(&self) -> bool {
         self.default_value().is_some()
     }
+
+    /// Returns the options a foreign-data wrapper reads for the column, as
+    /// PostgreSQL stores them in `pg_attribute.attfdwoptions`. Each key is
+    /// folded to lowercase unless quoted and comes with its value as written,
+    /// in the order written.
+    ///
+    /// Only a column of a foreign table carries any, and only the ones it
+    /// declares itself, since an inheriting table takes none of them.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FOREIGN TABLE sales (id INT OPTIONS (Column_Name 'sale_id'), note TEXT)
+    ///      SERVER remote;",
+    /// )?;
+    /// let sales = db
+    ///     .foreign_table_by_target(TargetName::new("sales", false), IdentifierCase::AsWritten)?
+    ///     .expect("the foreign table is recorded");
+    /// let id = sales.column("id", &db, IdentifierCase::AsWritten)?.expect("declared");
+    /// let options: Vec<_> = id.foreign_options().collect();
+    /// assert_eq!(options, [("column_name".into(), "sale_id")]);
+    /// let note = sales.column("note", &db, IdentifierCase::AsWritten)?.expect("declared");
+    /// assert_eq!(note.foreign_options().count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)>;
 
     /// Returns the table that this column belongs to.
     ///
@@ -1665,8 +1748,8 @@ where
     }
 
     #[inline]
-    fn is_serial(&self) -> bool {
-        (*self).is_serial()
+    fn is_serial(&self, database: &Self::DB) -> bool {
+        (*self).is_serial(database)
     }
 
     #[inline]
@@ -1680,8 +1763,21 @@ where
     }
 
     #[inline]
+    fn not_null_constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        (*self).not_null_constraint_name(database)
+    }
+
+    #[inline]
     fn default_value(&self) -> Option<String> {
         (*self).default_value()
+    }
+
+    #[inline]
+    fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
+        (*self).foreign_options()
     }
 
     #[inline]
@@ -1748,8 +1844,8 @@ where
     }
 
     #[inline]
-    fn is_serial(&self) -> bool {
-        (**self).is_serial()
+    fn is_serial(&self, database: &Self::DB) -> bool {
+        (**self).is_serial(database)
     }
 
     #[inline]
@@ -1763,8 +1859,21 @@ where
     }
 
     #[inline]
+    fn not_null_constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        (**self).not_null_constraint_name(database)
+    }
+
+    #[inline]
     fn default_value(&self) -> Option<String> {
         (**self).default_value()
+    }
+
+    #[inline]
+    fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
+        (**self).foreign_options()
     }
 
     #[inline]

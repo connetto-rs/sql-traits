@@ -17,8 +17,9 @@
 //! read one at all.
 //!
 //! A function whose `RETURN` body reads a relation is a dependent of that
-//! relation as well, so the same drop checks refuse a drop while a body
-//! reads it and a `CASCADE` takes the function along.
+//! relation as well, and so is a function whose bound body calls it, so the
+//! same drop checks refuse a drop while a body reads it and a `CASCADE` takes
+//! the functions along.
 
 use alloc::{
     format,
@@ -30,14 +31,16 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, AlterView, AlterViewOperation, CreateView, Expr,
-    Ident, ObjectName, ObjectNamePart, Owner, Query, RenameTableNameKind, SelectItem, SetExpr,
-    SqlOption, Statement, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    Grant, GrantObjects, Ident, ObjectName, ObjectNamePart, Owner, Query, RenameTableNameKind,
+    SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use super::{
-    ParserDBBuilder, SchemaQualifier, bind_reference, function_bodies, object_name_last_identifier,
-    place_relation, relation_name_holder, require_named_in_catalog,
+    AlterTableScope, Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier,
+    bind_reference, domains, function_bodies, object_name_last_identifier,
+    object_name_matches_resolved_identity, place_relation, require_named_in_catalog,
     rules::{self, RuleHost},
+    stored_ident,
     view_rewrites::{self, Rename},
 };
 use crate::{
@@ -69,7 +72,8 @@ fn view_schema_qualifier(name: &ObjectName) -> SchemaQualifier<'_> {
     qualifier_of(name).named()
 }
 
-/// Records a `CREATE VIEW` or `CREATE MATERIALIZED VIEW`.
+/// Records a `CREATE VIEW` or `CREATE MATERIALIZED VIEW`, a new one owned by
+/// the role `creator` names and under its defaults.
 ///
 /// # Errors
 ///
@@ -81,6 +85,7 @@ fn view_schema_qualifier(name: &ObjectName) -> SchemaQualifier<'_> {
 pub(super) fn create_view(
     mut builder: ParserDBBuilder,
     mut node: CreateView,
+    creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     let kind = declared_kind(&node);
     require_named_in_catalog(&mut node.name, kind, builder.catalog_name())?;
@@ -111,7 +116,8 @@ pub(super) fn create_view(
             relation_name,
         });
     }
-    node.temporary = place_relation(&builder, &mut node.name, node.temporary || promoted, kind)?;
+    let temporary = node.temporary || promoted;
+    node.temporary = place_relation(&builder, &mut node.name, temporary, kind, creator.role())?;
 
     let schema = view_schema_qualifier(&node.name);
     let Some(name_ident) = object_name_last_identifier(&node.name) else {
@@ -123,14 +129,15 @@ pub(super) fn create_view(
     if node.or_replace
         && let Some(position) = stored_view_position(&builder, &node.name)
     {
-        let (existing, metadata, identity) = builder.views_mut().remove(position);
+        let (existing, mut metadata, identity) = builder.views_mut().remove(position);
         check_replacement_columns(existing.as_ref(), &node)?;
+        metadata.set_calls(builder.calls_in(&node.query));
         let mut view = View::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
     }
 
-    let holder = relation_name_holder(&builder, name_ident, schema);
+    let holder = domains::relation_or_domain_holder(&builder, name_ident, schema);
 
     if let Some(conflicting_kind) = holder {
         // `CREATE MATERIALIZED VIEW ... IF NOT EXISTS` skips silently when a
@@ -146,15 +153,19 @@ pub(super) fn create_view(
         });
     }
 
-    if node.materialized {
+    let mut metadata = ViewMetadata::default();
+    metadata.set_owner(creator.owner());
+    metadata.set_calls(builder.calls_in(&node.query));
+    let builder = if node.materialized {
         let mut view = MaterializedView::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
-        Ok(builder.add_materialized_view(Arc::new(view), ViewMetadata::default()))
+        builder.add_materialized_view(Arc::new(view), metadata)
     } else {
         let mut view = View::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
-        Ok(builder.add_view(Arc::new(view), ViewMetadata::default()))
-    }
+        builder.add_view(Arc::new(view), metadata)
+    };
+    Ok(creator.grant(builder, DefaultKind::Relations, &GrantObjects::Tables(vec![node.name])))
 }
 
 /// Checks the two rules a replacement has to keep: it may not rename an output
@@ -278,12 +289,15 @@ pub(super) fn drop_views(
                 plain_view_position(&builder, name)
             };
             if let Some(position) = position {
-                if materialized {
-                    builder.materialized_views_mut().remove(position);
+                let dropped = if materialized {
+                    let (view, _, _) = builder.materialized_views_mut().remove(position);
+                    GrantedView::of(view.as_ref())
                 } else {
                     let (view, _, _) = builder.views_mut().remove(position);
                     rules::drop_rules_on(&mut builder, &RuleHost::of_view(view.as_ref()));
-                }
+                    GrantedView::of(view.as_ref())
+                };
+                dropped.forget_grants(&mut builder);
             }
             // A sequence the view owned goes with it.
             super::sequences::drop_orphaned_sequences(&mut builder);
@@ -326,24 +340,30 @@ fn materialized_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> O
         .position(|(view, _, _)| stored_view_key(view.as_ref(), IdentifierCase::AsWritten) == key)
 }
 
-/// Refuses a `DROP TABLE` naming a view or a sequence, as PostgreSQL does.
+/// Refuses a `DROP TABLE` or `DROP FOREIGN TABLE` naming another relation kind
+/// than `expected_kind`, as PostgreSQL does.
 ///
 /// # Errors
 ///
-/// Returns [`Error::RelationKindMismatch`] when the name is held by either
-/// view kind or by a sequence.
-pub(super) fn refuse_dropping_relation_as_table(
+/// Returns [`Error::RelationKindMismatch`] when a table, foreign table, view
+/// or sequence of another kind holds the name.
+pub(super) fn refuse_dropping_other_kind(
     builder: &ParserDBBuilder,
     name: &ObjectName,
+    expected_kind: ObjectKind,
 ) -> Result<(), Error> {
     match builder.relation_reached(name) {
         Some((
-            actual_kind @ (ObjectKind::View | ObjectKind::MaterializedView | ObjectKind::Sequence),
+            actual_kind @ (ObjectKind::Table
+            | ObjectKind::ForeignTable
+            | ObjectKind::View
+            | ObjectKind::MaterializedView
+            | ObjectKind::Sequence),
             _,
-        )) => {
+        )) if actual_kind != expected_kind => {
             Err(Error::RelationKindMismatch {
                 object_name: rendered_name(name),
-                expected_kind: ObjectKind::Table,
+                expected_kind,
                 actual_kind,
             })
         }
@@ -420,8 +440,9 @@ pub(super) fn alter_view(
     }
 }
 
-/// Applies an `ALTER VIEW`, which PostgreSQL accepts only against a plain
-/// view.
+/// Applies an `ALTER VIEW` or an `ALTER MATERIALIZED VIEW`, which PostgreSQL
+/// accepts only against a view of the kind the statement spells, except that
+/// either renames a column of any relation.
 ///
 /// `SET SCHEMA` and MySQL's `ALTER VIEW ... AS`, which redefines the view, are
 /// refused, since the model can apply neither and discarding either would
@@ -432,32 +453,48 @@ pub(super) fn alter_view(
 /// Returns [`Error::RelationKindMismatch`] when another kind of relation holds
 /// the name, [`Error::RelationNotFound`] when nothing does and the statement
 /// wrote no `IF EXISTS`, [`Error::UnsupportedAlterTableOperation`] for the two
-/// operations refused above, and the errors of [`alter_view`] for the
-/// operations it shares with `ALTER TABLE`.
+/// operations refused above, [`Error::AlterActionUnsupportedOnRelation`] for
+/// a materialized view's column default, the errors of [`alter_view`] for the
+/// operations it shares with `ALTER TABLE`, and those of
+/// [`rename_column_of_other_kind`].
 pub(super) fn apply_alter_view(
     builder: ParserDBBuilder,
     statement: &AlterView,
 ) -> Result<ParserDBBuilder, Error> {
-    let AlterView { name, if_exists, operation } = statement;
-    if plain_view_position(&builder, name).is_none() {
+    let AlterView { materialized, name, if_exists, operation } = statement;
+    let (kind, held) = if *materialized {
+        (ObjectKind::MaterializedView, materialized_view_position(&builder, name))
+    } else {
+        (ObjectKind::View, plain_view_position(&builder, name))
+    };
+    if held.is_none() {
         return match builder.relation_reached(name).map(|(kind, _)| kind) {
             Some(actual_kind) => {
-                Err(Error::RelationKindMismatch {
-                    object_name: rendered_name(name),
-                    expected_kind: ObjectKind::View,
-                    actual_kind,
-                })
+                match operation {
+                    AlterViewOperation::RenameColumn { old_column_name, new_column_name } => {
+                        rename_column_of_other_kind(
+                            builder,
+                            name,
+                            actual_kind,
+                            operation,
+                            (old_column_name, new_column_name),
+                        )
+                    }
+                    _ => {
+                        Err(Error::RelationKindMismatch {
+                            object_name: rendered_name(name),
+                            expected_kind: kind,
+                            actual_kind,
+                        })
+                    }
+                }
             }
             None if *if_exists => Ok(builder),
             None => {
-                Err(Error::RelationNotFound {
-                    object_kind: ObjectKind::View,
-                    object_name: rendered_name(name),
-                })
+                Err(Error::RelationNotFound { object_kind: kind, object_name: rendered_name(name) })
             }
         };
     }
-    let kind = ObjectKind::View;
     match operation {
         AlterViewOperation::OwnerTo(owner) => Ok(set_view_owner(builder, name, kind, owner)),
         AlterViewOperation::SetOptions { options } => {
@@ -470,10 +507,63 @@ pub(super) fn apply_alter_view(
         AlterViewOperation::RenameColumn { old_column_name, new_column_name } => {
             rename_view_column(builder, name, kind, old_column_name, new_column_name)
         }
+        AlterViewOperation::AlterColumn { .. } if *materialized => {
+            Err(Error::AlterActionUnsupportedOnRelation {
+                object_kind: kind,
+                relation_name: rendered_name(name),
+                operation: operation.to_string(),
+            })
+        }
         AlterViewOperation::AlterColumn { column_name, .. } => {
             require_view_column(builder, name, column_name)
         }
         AlterViewOperation::SetSchema { .. } | AlterViewOperation::As { .. } => {
+            Err(Error::UnsupportedAlterTableOperation {
+                table_name: rendered_name(name),
+                operation: operation.to_string(),
+            })
+        }
+    }
+}
+
+/// Renames a column of a relation an `ALTER VIEW` or `ALTER MATERIALIZED VIEW`
+/// names although another kind holds it, which PostgreSQL does for every kind
+/// with columns and refuses for a sequence.
+///
+/// # Errors
+///
+/// Returns the errors of renaming a column of a view or of a table,
+/// [`Error::AlterActionUnsupportedOnRelation`] for a sequence, and
+/// [`Error::UnsupportedAlterTableOperation`] for an index, whose column names
+/// the model does not carry.
+fn rename_column_of_other_kind(
+    builder: ParserDBBuilder,
+    name: &ObjectName,
+    actual_kind: ObjectKind,
+    operation: &AlterViewOperation,
+    (old_column_name, new_column_name): (&Ident, &Ident),
+) -> Result<ParserDBBuilder, Error> {
+    match actual_kind {
+        ObjectKind::View | ObjectKind::MaterializedView => {
+            rename_view_column(builder, name, actual_kind, old_column_name, new_column_name)
+        }
+        ObjectKind::Table | ObjectKind::ForeignTable => {
+            ParserDB::alter_table_rename_column(
+                builder,
+                name,
+                AlterTableScope { if_exists: false, only: false },
+                old_column_name,
+                new_column_name,
+            )
+        }
+        ObjectKind::Sequence => {
+            Err(Error::AlterActionUnsupportedOnRelation {
+                object_kind: actual_kind,
+                relation_name: rendered_name(name),
+                operation: operation.to_string(),
+            })
+        }
+        _ => {
             Err(Error::UnsupportedAlterTableOperation {
                 table_name: rendered_name(name),
                 operation: operation.to_string(),
@@ -594,7 +684,7 @@ pub(super) fn holds_view(builder: &ParserDBBuilder, name: &ObjectName) -> Option
 /// sits in, which for a view the search path placed is not the schema the
 /// statement wrote.
 fn rename_view(
-    mut builder: ParserDBBuilder,
+    builder: ParserDBBuilder,
     name: &ObjectName,
     kind: ObjectKind,
     new_name: &ObjectName,
@@ -611,38 +701,23 @@ fn rename_view(
         return Ok(builder);
     };
 
-    let (current_name, current_quoted, schema, key) = if kind == ObjectKind::MaterializedView {
-        let view = builder.materialized_views()[position].0.as_ref();
-        (
-            view.view_name().to_string(),
-            view.view_name_is_quoted(),
-            stored_schema_of(view),
-            stored_view_key(view, IdentifierCase::AsWritten),
-        )
+    let current = if kind == ObjectKind::MaterializedView {
+        GrantedView::of(builder.materialized_views()[position].0.as_ref())
     } else {
-        let view = builder.views()[position].0.as_ref();
-        (
-            view.view_name().to_string(),
-            view.view_name_is_quoted(),
-            stored_schema_of(view),
-            stored_view_key(view, IdentifierCase::AsWritten),
-        )
+        GrantedView::of(builder.views()[position].0.as_ref())
     };
-    // Only a plain view carries rules.
-    let host =
-        (kind == ObjectKind::View).then(|| RuleHost::of_view(builder.views()[position].0.as_ref()));
 
     // A rename to the name it already answers to changes nothing, and asking
     // the name pool first would report the view colliding with itself.
     if !crate::utils::identifier_resolution::identifiers_match(
-        current_name.as_str(),
-        current_quoted,
+        current.name.as_str(),
+        current.quoted,
         new_ident.value.as_str(),
         new_ident.quote_style.is_some(),
-    ) && let Some(conflicting_kind) = relation_name_holder(
+    ) && let Some(conflicting_kind) = domains::relation_or_domain_holder(
         &builder,
         new_ident,
-        schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted)),
+        current.schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted)),
     ) {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: kind,
@@ -651,28 +726,148 @@ fn rename_view(
         });
     }
 
-    let readers = view_rewrites::readers(&builder, &[&key]);
-    let renamed = (new_ident.value.clone(), new_ident.quote_style.is_some());
-    if kind == ObjectKind::MaterializedView {
-        let (view, _, _) = &mut builder.materialized_views_mut()[position];
-        Arc::make_mut(view).declaration_mut().set_name(renamed.0, renamed.1);
-    } else {
-        let (view, _, _) = &mut builder.views_mut()[position];
-        Arc::make_mut(view).declaration_mut().set_name(renamed.0, renamed.1);
+    retarget_view(builder, kind, position, None, new_ident)
+}
+
+/// Moves every view and materialized view stored in schema `from` to `to`,
+/// carrying every reference to each along, as a schema rename does.
+///
+/// # Errors
+///
+/// Returns the refusals rewriting a view reading a moved one meets.
+pub(super) fn move_views(
+    mut builder: ParserDBBuilder,
+    from: (&str, bool),
+    to: (&str, bool),
+) -> Result<ParserDBBuilder, Error> {
+    let case = builder.identifier_case();
+    let plain: Vec<(usize, Ident)> = builder
+        .views()
+        .iter()
+        .enumerate()
+        .filter(|(_, (view, _, _))| stored_in(view.as_ref(), from, case))
+        .map(|(position, (view, _, _))| (position, view_ident(view.as_ref())))
+        .collect();
+    let materialized: Vec<(usize, Ident)> = builder
+        .materialized_views()
+        .iter()
+        .enumerate()
+        .filter(|(_, (view, _, _))| stored_in(view.as_ref(), from, case))
+        .map(|(position, (view, _, _))| (position, view_ident(view.as_ref())))
+        .collect();
+    for (position, ident) in plain {
+        builder = retarget_view(builder, ObjectKind::View, position, Some(to), &ident)?;
     }
+    for (position, ident) in materialized {
+        builder = retarget_view(builder, ObjectKind::MaterializedView, position, Some(to), &ident)?;
+    }
+    Ok(builder)
+}
+
+/// Drops every view and materialized view stored in `schema`, with the views
+/// reading them, as `DROP SCHEMA ... CASCADE` does.
+///
+/// # Errors
+///
+/// Returns the refusals [`drop_views`] meets.
+pub(super) fn drop_views_in(
+    builder: ParserDBBuilder,
+    schema: (&str, bool),
+) -> Result<ParserDBBuilder, Error> {
+    let case = builder.identifier_case();
+    let plain: Vec<ObjectName> = builder
+        .views()
+        .iter()
+        .filter(|(view, _, _)| stored_in(view.as_ref(), schema, case))
+        .map(|(view, _, _)| qualified_in(view.as_ref(), schema))
+        .collect();
+    let materialized: Vec<ObjectName> = builder
+        .materialized_views()
+        .iter()
+        .filter(|(view, _, _)| stored_in(view.as_ref(), schema, case))
+        .map(|(view, _, _)| qualified_in(view.as_ref(), schema))
+        .collect();
+    let builder = drop_views(builder, &plain, false, true, true)?;
+    drop_views(builder, &materialized, true, true, true)
+}
+
+/// The name of a stored view written out with `schema`, the one it sits in.
+fn qualified_in<V: ViewLike>(view: &V, schema: (&str, bool)) -> ObjectName {
+    ObjectName::from(vec![stored_ident(schema.0, schema.1), view_ident(view)])
+}
+
+/// Whether a stored view sits in `schema`, a view stored without one sitting
+/// in `public`.
+fn stored_in<V: ViewLike>(view: &V, schema: (&str, bool), case: IdentifierCase) -> bool {
+    super::schema_qualifiers_match(
+        view.view_schema().map(|stored| (stored, view.view_schema_is_quoted())),
+        Some(schema),
+        case,
+    )
+}
+
+/// The identifier a stored view is named by.
+fn view_ident<V: ViewLike>(view: &V) -> Ident {
+    stored_ident(view.view_name(), view.view_name_is_quoted())
+}
+
+/// Gives the view stored at `position` the name `ident`, in `schema` when the
+/// view moves, and carries every view, body, rule and grant naming it along.
+fn retarget_view(
+    mut builder: ParserDBBuilder,
+    kind: ObjectKind,
+    position: usize,
+    schema: Option<(&str, bool)>,
+    ident: &Ident,
+) -> Result<ParserDBBuilder, Error> {
+    let (current, key) = if kind == ObjectKind::MaterializedView {
+        let view = builder.materialized_views()[position].0.as_ref();
+        (GrantedView::of(view), stored_view_key(view, IdentifierCase::AsWritten))
+    } else {
+        let view = builder.views()[position].0.as_ref();
+        (GrantedView::of(view), stored_view_key(view, IdentifierCase::AsWritten))
+    };
+    // Only a plain view carries rules.
+    let host =
+        (kind == ObjectKind::View).then(|| RuleHost::of_view(builder.views()[position].0.as_ref()));
+
+    let readers = view_rewrites::readers(&builder, &[&key]);
+
+    let edit = |declaration: &mut ViewDeclaration| {
+        declaration.set_name(ident.value.clone(), ident.quote_style.is_some());
+        if let Some((schema, quoted)) = schema {
+            declaration.set_schema(schema.to_string(), quoted);
+        }
+    };
+    if kind == ObjectKind::MaterializedView {
+        edit(Arc::make_mut(&mut builder.materialized_views_mut()[position].0).declaration_mut());
+    } else {
+        edit(Arc::make_mut(&mut builder.views_mut()[position].0).declaration_mut());
+    }
+
+    let stored_schema =
+        schema.or_else(|| current.schema.as_ref().map(|(name, quoted)| (name.as_str(), *quoted)));
+    let stored_name = ObjectName::from(
+        stored_schema
+            .map(|(schema, quoted)| stored_ident(schema, quoted))
+            .into_iter()
+            .chain([ident.clone()])
+            .collect::<Vec<_>>(),
+    );
     if let Some(readers) = readers {
-        view_rewrites::follow_renames(
-            &mut builder,
-            readers,
-            &[Rename::Relation {
-                key,
-                to: ObjectName(vec![ObjectNamePart::Identifier(new_ident.clone())]),
-            }],
-        )?;
+        // Within the schema every spelling keeps its qualifier, a move needs
+        // the new one.
+        let to = if schema.is_some() {
+            stored_name.clone()
+        } else {
+            ObjectName(vec![ObjectNamePart::Identifier(ident.clone())])
+        };
+        view_rewrites::follow_renames(&mut builder, readers, &[Rename::Relation { key, to }])?;
     }
     if let Some(host) = &host {
-        rules::follow_relation_rename(&mut builder, host, new_ident);
+        rules::follow_relation_rename(&mut builder, host, &stored_name);
     }
+    current.rename_grants(&mut builder, &stored_name);
     Ok(builder)
 }
 
@@ -854,6 +1049,60 @@ fn output_item(body: &mut SetExpr, ordinal: usize) -> Option<&mut SelectItem> {
 /// The schema a stored view sits in, with its quote state.
 fn stored_schema_of<V: ViewLike>(view: &V) -> Option<(String, bool)> {
     view.view_schema().map(|schema| (schema.to_string(), view.view_schema_is_quoted()))
+}
+
+/// The name a grant reaches a view by: its schema, its name and the name's
+/// quote state.
+struct GrantedView {
+    schema: Option<(String, bool)>,
+    name: String,
+    quoted: bool,
+}
+
+impl GrantedView {
+    fn of<V: ViewLike>(view: &V) -> Self {
+        Self {
+            schema: stored_schema_of(view),
+            name: view.view_name().to_string(),
+            quoted: view.view_name_is_quoted(),
+        }
+    }
+
+    /// Whether `grant` names this view.
+    fn named_by(&self, grant: &Grant) -> bool {
+        matches!(&grant.objects, Some(GrantObjects::Tables(names)) if names.iter().any(|name| {
+            object_name_matches_resolved_identity(
+                name,
+                &self.name,
+                self.quoted,
+                self.schema.as_ref().map(|(schema, _)| schema.as_str()),
+                self.schema.as_ref().is_some_and(|(_, quoted)| *quoted),
+            )
+        }))
+    }
+
+    /// Drops the grants naming this view, which PostgreSQL drops with it.
+    fn forget_grants(&self, builder: &mut ParserDBBuilder) {
+        builder.table_grants_mut().retain(|(grant, ())| !self.named_by(grant));
+        builder.column_grants_mut().retain(|(grant, ())| !self.named_by(grant));
+    }
+
+    /// Points the grants naming this view at its stored name `renamed`, which
+    /// PostgreSQL keeps on the view.
+    fn rename_grants(&self, builder: &mut ParserDBBuilder, renamed: &ObjectName) {
+        self.rename_in(builder.table_grants_mut(), renamed);
+        self.rename_in(builder.column_grants_mut(), renamed);
+    }
+
+    /// Points each grant naming this view at `renamed`. A grant names one
+    /// object, so one naming this view names it alone.
+    fn rename_in(&self, grants: &mut [(Arc<Grant>, ())], renamed: &ObjectName) {
+        for (grant, ()) in grants {
+            if self.named_by(grant) {
+                Arc::make_mut(grant).objects = Some(GrantObjects::Tables(vec![renamed.clone()]));
+            }
+        }
+    }
 }
 
 /// Records the role a view is handed to.
@@ -1048,41 +1297,105 @@ fn insert_target(statement: &Statement) -> Option<&ObjectName> {
     }
 }
 
-/// Every view and function reading the relation `key` names, and every
-/// reader among those, transitively.
+/// One object a dependency walk reaches.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum Dependent {
+    /// A view, a materialized view or a function, under the key its readers
+    /// and callers name it by.
+    Reader(ObjectKind, RelationKey),
+    /// A rule, which nothing reads, by its name on the relation stored under
+    /// the key.
+    Rule(RelationKey, String),
+}
+
+impl Dependent {
+    /// The kind of object reached.
+    pub(super) const fn kind(&self) -> ObjectKind {
+        match self {
+            Self::Reader(kind, _) => *kind,
+            Self::Rule(..) => ObjectKind::Rule,
+        }
+    }
+
+    /// The name the object is stored under.
+    pub(super) fn name(&self) -> &str {
+        match self {
+            Self::Reader(_, key) => &key.name,
+            Self::Rule(_, name) => name,
+        }
+    }
+}
+
+/// Every view, function and rule reading the relation `key` names, every
+/// reader among those, and every function whose bound body calls one of those
+/// functions, transitively.
 ///
 /// PostgreSQL refuses to drop a relation while anything reads it, and takes
 /// the whole chain with it under `CASCADE`, so the walk closes over the chain
 /// rather than stopping at the first level.
-pub(super) fn dependent_views(
+pub(super) fn dependent_views(builder: &ParserDBBuilder, key: &RelationKey) -> Vec<Dependent> {
+    readers_closure(builder, alloc::vec![key.clone()], Vec::new(), Some(key))
+}
+
+/// `readers` with every view, function and rule reading one of them, and
+/// every function whose bound body calls one of those functions,
+/// transitively.
+///
+/// This is what a `CASCADE` takes along with the readers themselves.
+pub(super) fn readers_and_dependents(
     builder: &ParserDBBuilder,
-    key: &RelationKey,
-) -> Vec<(ObjectKind, RelationKey)> {
-    // Each view's read set is derived once, not once per step of the walk.
-    // Deriving it means visiting a whole definition and normalizing every name
-    // it reads, so re-deriving per step made one drop cost the square of the
-    // number of views.
-    let reads: Vec<(ObjectKind, RelationKey, Vec<RelationKey>)> = builder
+    readers: Vec<Dependent>,
+) -> Vec<Dependent> {
+    let frontier = readers
+        .iter()
+        .filter_map(|reader| {
+            match reader {
+                Dependent::Reader(_, key) => Some(key.clone()),
+                Dependent::Rule(..) => None,
+            }
+        })
+        .collect();
+    readers_closure(builder, frontier, readers, None)
+}
+
+/// `found` with every view, function and rule reading a key of `frontier` or
+/// one of the readers that walk finds, and every function calling one of the
+/// functions among them, transitively. An object whose own relation is
+/// `dropped` goes with that relation rather than reading it.
+fn readers_closure(
+    builder: &ParserDBBuilder,
+    mut frontier: Vec<RelationKey>,
+    mut found: Vec<Dependent>,
+    dropped: Option<&RelationKey>,
+) -> Vec<Dependent> {
+    // Each read set is derived once, not once per step of the walk, with the
+    // relation the object goes away with, which a function has none of.
+    let reads: Vec<(Dependent, Option<RelationKey>, Vec<RelationKey>)> = builder
         .views()
         .iter()
         .map(|(view, _, _)| {
+            let key = stored_view_key(view.as_ref(), IdentifierCase::AsWritten);
             (
-                ObjectKind::View,
-                stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
+                Dependent::Reader(ObjectKind::View, key.clone()),
+                Some(key),
                 relations_read_by(view.as_ref()),
             )
         })
         .chain(builder.materialized_views().iter().map(|(view, _, _)| {
+            let key = stored_view_key(view.as_ref(), IdentifierCase::AsWritten);
             (
-                ObjectKind::MaterializedView,
-                stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
+                Dependent::Reader(ObjectKind::MaterializedView, key.clone()),
+                Some(key),
                 relations_read_by(view.as_ref()),
             )
         }))
         .chain(builder.functions().iter().map(|(function, _)| {
             (
-                ObjectKind::Function,
-                stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
+                Dependent::Reader(
+                    ObjectKind::Function,
+                    stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
+                ),
+                None,
                 function
                     .function_body
                     .as_ref()
@@ -1090,25 +1403,60 @@ pub(super) fn dependent_views(
                     .unwrap_or_default(),
             )
         }))
+        .chain(builder.rules().iter().map(|(rule, _)| {
+            (
+                rules::dependent(rule),
+                Some(rules::relation_key(rule)),
+                rules::rules_reading(builder, rule),
+            )
+        }))
         .collect();
 
-    let mut frontier = alloc::vec![key.clone()];
-    let mut found: Vec<(ObjectKind, RelationKey)> = Vec::new();
-
     while let Some(current) = frontier.pop() {
-        for (kind, own_key, read) in &reads {
-            if !read.contains(&current) {
+        for (dependent, own_relation, read) in &reads {
+            if !read.contains(&current) || (dropped.is_some() && own_relation.as_ref() == dropped) {
                 continue;
             }
-            // A function never is the dropped relation, so a name collision
-            // still counts as a dependency.
-            if *own_key == *key && *kind != ObjectKind::Function {
-                continue;
+            if !found.contains(dependent) {
+                // Nothing reads a rule, so the walk goes no further from one.
+                if let Dependent::Reader(_, key) = dependent {
+                    frontier.push(key.clone());
+                }
+                found.push(dependent.clone());
             }
-            let reader = (*kind, own_key.clone());
-            if !found.contains(&reader) {
-                frontier.push(own_key.clone());
-                found.push(reader);
+        }
+    }
+
+    // PostgreSQL records each call a bound body makes as a dependency, so a
+    // function calling one the chain holds joins it, transitively.
+    let mut calls: Vec<(RelationKey, Vec<RelationKey>)> = builder
+        .functions()
+        .iter()
+        .map(|(function, metadata)| {
+            (
+                stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
+                metadata
+                    .body_calls()
+                    .functions()
+                    .map(|callee| stored_function_key(callee, IdentifierCase::AsWritten))
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut next = 0;
+    while let Some(reached) = found.get(next) {
+        next += 1;
+        let Dependent::Reader(ObjectKind::Function, callee) = reached else {
+            continue;
+        };
+        let joining: Vec<RelationKey> = calls
+            .extract_if(.., |(_, callees)| callees.contains(callee))
+            .map(|(caller, _)| caller)
+            .collect();
+        for key in joining {
+            let joined = Dependent::Reader(ObjectKind::Function, key);
+            if !found.contains(&joined) {
+                found.push(joined);
             }
         }
     }
@@ -1128,12 +1476,12 @@ pub(super) fn refuse_dependent_views(
     object_kind: ObjectKind,
     object_name: &str,
 ) -> Result<(), Error> {
-    if let Some((dependent_kind, dependent)) = dependent_views(builder, key).first() {
+    if let Some(dependent) = dependent_views(builder, key).first() {
         return Err(Error::RelationHasDependents {
             object_kind,
             object_name: object_name.to_string(),
-            dependent_kind: *dependent_kind,
-            dependent_name: dependent.name.clone(),
+            dependent_kind: dependent.kind(),
+            dependent_name: dependent.name().to_string(),
         });
     }
     Ok(())
@@ -1143,9 +1491,15 @@ pub(super) fn refuse_dependent_views(
 /// `key` names.
 pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &RelationKey) {
     let doomed = dependent_views(builder, key);
-    let is_doomed = |kind: ObjectKind, own_key: RelationKey| {
-        doomed.iter().any(|(dead_kind, dead)| *dead_kind == kind && *dead == own_key)
-    };
+    remove_readers(builder, &doomed);
+}
+
+/// Removes the views, materialized views, functions and rules `doomed` names,
+/// with the grants on them, the rules on the views, and the sequences they
+/// owned.
+pub(super) fn remove_readers(builder: &mut ParserDBBuilder, doomed: &[Dependent]) {
+    let is_doomed =
+        |kind: ObjectKind, own_key: RelationKey| doomed.contains(&Dependent::Reader(kind, own_key));
     let hosts: Vec<RuleHost> = builder
         .views()
         .iter()
@@ -1154,6 +1508,28 @@ pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &Relati
             is_doomed(ObjectKind::View, stored_view_key(*view, IdentifierCase::AsWritten))
         })
         .map(RuleHost::of_view)
+        .collect();
+    let granted: Vec<GrantedView> = builder
+        .views()
+        .iter()
+        .map(|(view, _, _)| view.as_ref())
+        .filter(|view| {
+            is_doomed(ObjectKind::View, stored_view_key(*view, IdentifierCase::AsWritten))
+        })
+        .map(GrantedView::of)
+        .chain(
+            builder
+                .materialized_views()
+                .iter()
+                .map(|(view, _, _)| view.as_ref())
+                .filter(|view| {
+                    is_doomed(
+                        ObjectKind::MaterializedView,
+                        stored_view_key(*view, IdentifierCase::AsWritten),
+                    )
+                })
+                .map(GrantedView::of),
+        )
         .collect();
     builder.views_mut().retain(|(view, _, _)| {
         !is_doomed(ObjectKind::View, stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
@@ -1164,12 +1540,16 @@ pub(super) fn remove_dependent_views(builder: &mut ParserDBBuilder, key: &Relati
             stored_view_key(view.as_ref(), IdentifierCase::AsWritten),
         )
     });
+    for view in &granted {
+        view.forget_grants(builder);
+    }
     builder.functions_mut().retain(|(function, _)| {
         !is_doomed(
             ObjectKind::Function,
             stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
         )
     });
+    builder.rules_mut().retain(|(rule, _)| !doomed.contains(&rules::dependent(rule)));
     for host in &hosts {
         rules::drop_rules_on(builder, host);
     }

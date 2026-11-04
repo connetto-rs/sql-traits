@@ -20,10 +20,6 @@
 //!   `ALTER DEFAULT PRIVILEGES` does not parse, so a schema carrying one fails
 //!   to parse, and the `EXECUTE` a function receives on creation is always
 //!   PostgreSQL's built-in default rather than the one such a statement set.
-//! - [`sqlparser#2776`](https://github.com/apache/datafusion-sqlparser-rs/pull/2776),
-//!   `ALTER MATERIALIZED VIEW` does not parse, so a schema carrying one fails
-//!   to parse, and only `ALTER TABLE <materialized view> OWNER TO` and `RENAME
-//!   TO` reach a materialized view.
 //!
 //! Found and written up, not yet filed:
 //!
@@ -39,3 +35,7 @@
 //!   MATERIALIZED VIEW ... WITH NO DATA` do not parse, and the parser accepts
 //!   `CREATE VIEW IF NOT EXISTS` and `CREATE OR REPLACE MATERIALIZED VIEW`,
 //!   both of which PostgreSQL refuses, so this crate refuses them itself.
+//! - `ALTER DOMAIN` does not parse, so a schema carrying one fails to parse,
+//!   and no domain is renamed or moved to another schema here. `DROP DOMAIN`
+//!   takes one name where PostgreSQL takes a list, and `CREATE DOMAIN` refuses
+//!   the `NOT NULL` and `NULL` constraints PostgreSQL accepts.

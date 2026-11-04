@@ -15,8 +15,8 @@ use crate::{
         generic_db::{Identified, RelationSlot, Stored},
     },
     traits::{
-        ExtensionLike, FunctionLike, PolicyLike, RoleLike, RuleLike, SchemaLike, TableLike,
-        TriggerLike, ViewLike,
+        DomainLike, ExtensionLike, FunctionLike, PolicyLike, RoleLike, RuleLike, SchemaLike,
+        TableLike, TriggerLike, ViewLike,
     },
     utils::object_name::{
         RelationKey, render_table_candidate, stored_function_key, stored_sequence_key,
@@ -114,6 +114,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     rules: Vec<Stored<P::Rule>>,
     /// List of extensions installed in the database.
     extensions: Vec<Stored<P::Extension>>,
+    /// List of domains created in the database.
+    domains: Vec<Stored<P::Domain>>,
     /// List of policies created in the database.
     policies: Vec<Stored<P::Policy>>,
     /// List of check constraints in the database.
@@ -159,6 +161,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             triggers: self.triggers.clone(),
             rules: self.rules.clone(),
             extensions: self.extensions.clone(),
+            domains: self.domains.clone(),
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),
@@ -223,6 +226,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers: Vec::new(),
             rules: Vec::new(),
             extensions: Vec::new(),
+            domains: Vec::new(),
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
@@ -387,6 +391,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &self.extensions
     }
 
+    /// Returns a slice of domain Arc references with their metadata.
+    pub(crate) fn domains(&self) -> &[Stored<P::Domain>] {
+        &self.domains
+    }
+
     /// Returns a slice of foreign key Arc references with their metadata.
     pub(crate) fn foreign_keys(&self) -> &[Stored<P::ForeignKey>] {
         &self.foreign_keys
@@ -462,6 +471,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &mut self.extensions
     }
 
+    /// Returns a mutable reference to the domains list.
+    pub(crate) fn domains_mut(&mut self) -> &mut Vec<Stored<P::Domain>> {
+        &mut self.domains
+    }
+
     /// Returns a mutable reference to the policies list.
     pub(crate) fn policies_mut(&mut self) -> &mut Vec<Stored<P::Policy>> {
         &mut self.policies
@@ -514,11 +528,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers: Vec::new(),
             rules: Vec::new(),
             extensions: Vec::new(),
+            domains: Vec::new(),
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
             role_memberships: Vec::new(),
-            schemas: Vec::new(),
+            schemas: P::initial_schemas().into_iter().collect(),
             table_grants: Vec::new(),
             column_grants: Vec::new(),
             search_path: Self::default_search_path(),
@@ -747,6 +762,14 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self
     }
 
+    /// Adds a domain with its metadata to the builder.
+    #[must_use]
+    #[inline]
+    pub fn add_domain(mut self, domain: Arc<P::Domain>, metadata: Meta<P::Domain>) -> Self {
+        self.domains.push((domain, metadata));
+        self
+    }
+
     /// Adds a policy with its metadata to the builder.
     #[must_use]
     #[inline]
@@ -964,7 +987,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             dialect,
             catalog_name,
             timezone,
-            tables,
+            mut tables,
+            foreign_tables,
             views,
             materialized_views,
             sequences,
@@ -983,6 +1007,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers,
             rules,
             extensions,
+            domains,
             policies,
             check_constraints,
             roles,
@@ -994,6 +1019,9 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             identifier_case,
             ingestion,
         } = database;
+        // Ingestion keeps both kinds of table in one store, since most
+        // statements treat them alike.
+        tables.extend(foreign_tables);
         let builder = Self {
             dialect,
             catalog_name,
@@ -1011,6 +1039,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers,
             rules,
             extensions,
+            domains,
             policies,
             check_constraints,
             roles,
@@ -1053,6 +1082,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         });
         // An extension name is unique in the database.
         self.extensions.sort_unstable_by(|(a, _), (b, _)| a.stored_name().cmp(&b.stored_name()));
+        // A domain name is unique in its schema.
+        self.domains.sort_unstable_by(|(a, _), (b, _)| {
+            (a.stored_schema(), a.stored_name()).cmp(&(b.stored_schema(), b.stored_name()))
+        });
         self.policies.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
         self.check_constraints.sort_unstable_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
         self.roles
@@ -1078,20 +1111,29 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     pub(crate) fn into_database(mut self, ingestion: P::Ingestion) -> GenericDB<P> {
         self.sort_stores();
         let catalog_name = self.catalog_name;
+        let (foreign_tables, tables): (Vec<_>, Vec<_>) =
+            self.tables.into_iter().partition(|(_, metadata, _)| P::is_foreign_table(metadata));
 
-        // Tables, views, materialized views and sequences share one pool of
-        // names, so one index answers all four. Slots of a kind stay ascending
-        // because each kind is walked in storage order.
+        // Tables, foreign tables, views, materialized views and sequences share
+        // one pool of names, so one index answers all five. Slots of a kind
+        // stay ascending because each kind is walked in storage order.
         let mut relation_index: BTreeMap<_, Vec<RelationSlot>> = BTreeMap::new();
         let mut relation_identities = Vec::with_capacity(
-            self.tables.len() + self.views.len() + self.materialized_views.len(),
+            tables.len() + foreign_tables.len() + self.views.len() + self.materialized_views.len(),
         );
-        for (position, (table, _, identity)) in self.tables.iter().enumerate() {
+        for (position, (table, _, identity)) in tables.iter().enumerate() {
             relation_index
                 .entry(stored_table_key(table.as_ref(), IdentifierCase::AsWritten))
                 .or_default()
                 .push(RelationSlot::Table(position));
             relation_identities.push((*identity, RelationSlot::Table(position)));
+        }
+        for (position, (table, _, identity)) in foreign_tables.iter().enumerate() {
+            relation_index
+                .entry(stored_table_key(table.as_ref(), IdentifierCase::AsWritten))
+                .or_default()
+                .push(RelationSlot::ForeignTable(position));
+            relation_identities.push((*identity, RelationSlot::ForeignTable(position)));
         }
         for (position, (view, _, identity)) in self.views.iter().enumerate() {
             relation_index
@@ -1139,7 +1181,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             dialect: self.dialect,
             catalog_name,
             timezone: self.timezone,
-            tables: self.tables,
+            tables,
+            foreign_tables,
             views: self.views,
             materialized_views: self.materialized_views,
             sequences: self.sequences,
@@ -1158,6 +1201,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             triggers: self.triggers,
             rules: self.rules,
             extensions: self.extensions,
+            domains: self.domains,
             policies: self.policies,
             check_constraints: self.check_constraints,
             roles: self.roles,

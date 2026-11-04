@@ -1,9 +1,7 @@
 //! Implementation of the `SequenceLike` trait for the stored sequence.
 
-use sqlparser::ast::SequenceOptions;
-
 use crate::{
-    structs::{ParserDB, Sequence, StoredSequenceOwner},
+    structs::{ParserDB, Sequence, SequenceParameters, StoredSequenceOwner},
     traits::{DatabaseLike, Metadata, SequenceLike, SequenceOrigin, SequenceOwner},
 };
 
@@ -30,8 +28,8 @@ impl SequenceLike for Sequence {
         self.schema_is_quoted()
     }
 
-    fn options(&self) -> &[SequenceOptions] {
-        Sequence::options(self)
+    fn parameters(&self) -> SequenceParameters {
+        Sequence::parameters(self)
     }
 
     fn owner<'db>(&'db self, database: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>

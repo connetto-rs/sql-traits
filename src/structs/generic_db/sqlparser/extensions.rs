@@ -12,12 +12,14 @@ use alloc::{string::ToString, sync::Arc, vec::Vec};
 use sqlparser::ast::{CreateExtension, CreateFunction, DropExtension, Ident, ObjectName};
 
 use super::{
-    ParserDBBuilder, case_idents_match, declared_schema, function_signatures_match,
+    Creator, ParserDBBuilder, case_idents_match, declared_schema, function_signatures_match,
+    object_name_last_identifier,
     postgres_builtins::{
         BuiltinType::{self, Text, Uuid},
         Volatility::{self, Immutable, Volatile},
         declaration, parameter,
     },
+    stored_ident,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -91,7 +93,8 @@ fn extension_functions(name: &Ident) -> &'static [ExtensionFunction] {
     }
 }
 
-/// Registers the functions `extension` creates, in the schema it landed in.
+/// Registers the functions `extension` creates, in the schema it landed in,
+/// under the defaults of the role `creator` names.
 ///
 /// # Errors
 ///
@@ -100,8 +103,13 @@ fn extension_functions(name: &Ident) -> &'static [ExtensionFunction] {
 fn create_extension_functions(
     mut builder: ParserDBBuilder,
     extension: &CreateExtension,
+    creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     let case = builder.identifier_case();
+    let schema = extension
+        .schema
+        .as_ref()
+        .map(|schema| (schema.value.as_str(), schema.quote_style.is_some()));
     for member in extension_functions(&extension.name) {
         let function = member.function(extension.schema.as_ref());
         let taken = builder.functions().iter().any(|(existing, _)| {
@@ -116,28 +124,34 @@ fn create_extension_functions(
         if taken {
             return Err(Error::FunctionAlreadyExists { function_name: member.0.to_string() });
         }
-        let mut metadata = FunctionMetadata::default();
+        let mut metadata = creator.function_metadata(schema, case);
         metadata.set_extension(extension.name.clone());
         builder = builder.add_function(Arc::new(function), metadata);
     }
     Ok(builder)
 }
 
-/// Drops the functions belonging to the extension called `name`.
+/// Drops the functions belonging to the extension called `name` and those
+/// made to depend on it, which PostgreSQL drops with it whatever the
+/// statement says about `CASCADE`.
 ///
 /// # Errors
 ///
-/// Returns [`Error::FunctionReferenced`] when a check constraint, a policy or
-/// a trigger still reaches one, as dropping the function itself does.
+/// Returns [`Error::FunctionReferenced`] when something still calls one, as
+/// dropping the function itself does.
 fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Result<(), Error> {
     let case = builder.identifier_case();
     let belongs = |metadata: &FunctionMetadata| {
-        metadata.extension().is_some_and(|extension| case_idents_match(extension, name, case))
+        metadata
+            .extension()
+            .into_iter()
+            .chain(metadata.extension_dependencies())
+            .any(|extension| case_idents_match(extension, name, case))
     };
     if let Some((function, _)) = builder
         .functions()
         .iter()
-        .find(|(function, metadata)| belongs(metadata) && builder.is_function_used(function))
+        .find(|(function, metadata)| belongs(metadata) && builder.is_function_used(function, &[]))
     {
         return Err(Error::FunctionReferenced {
             function_name: last_str(&function.name).to_string(),
@@ -162,6 +176,7 @@ fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Resu
 pub(super) fn create_extension(
     builder: ParserDBBuilder,
     mut extension: CreateExtension,
+    creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     if extension.name.value.is_empty() {
         return Err(Error::UnnamedObject { object_kind: ObjectKind::Extension });
@@ -183,7 +198,7 @@ pub(super) fn create_extension(
         Some(schema) => Some(named_schema(&builder, schema, &extension.name)?),
         None => search_path_schema(&builder, &extension.name)?,
     };
-    let builder = create_extension_functions(builder, &extension)?;
+    let builder = create_extension_functions(builder, &extension, creator)?;
     Ok(builder.add_extension(Arc::new(extension), ()))
 }
 
@@ -221,11 +236,51 @@ pub(super) fn drop_extensions(
     Ok(builder)
 }
 
-/// Whether the extension was created in this schema.
+/// Makes the stored function at `position` depend on the extension
+/// `extension_name` names, or stop depending on it when `depends` is `false`,
+/// as `ALTER FUNCTION ... [NO] DEPENDS ON EXTENSION` does.
+///
+/// # Errors
+///
+/// Returns [`Error::AlterFunctionExtensionNotFound`] for an extension the
+/// database does not hold, which PostgreSQL refuses for both forms.
+pub(super) fn set_function_dependency(
+    builder: &mut ParserDBBuilder,
+    position: usize,
+    extension_name: &ObjectName,
+    depends: bool,
+) -> Result<(), Error> {
+    let case = builder.identifier_case();
+    let extension = builder
+        .extensions()
+        .iter()
+        .map(|(extension, ())| &extension.name)
+        .find(|held| {
+            object_name_last_identifier(extension_name)
+                .is_some_and(|named| case_idents_match(held, named, case))
+        })
+        .cloned();
+    let (function, metadata) = &mut builder.functions_mut()[position];
+    let Some(extension) = extension else {
+        return Err(Error::AlterFunctionExtensionNotFound {
+            extension_name: last_str(extension_name).to_string(),
+            function_name: last_str(&function.name).to_string(),
+        });
+    };
+    metadata.set_extension_dependency(&extension, depends, |held, named| {
+        case_idents_match(held, named, case)
+    });
+    Ok(())
+}
+
+/// Whether the extension was created in this schema, one created without a
+/// schema sitting in `public`.
 fn created_in(extension: &CreateExtension, schema_name: &str, schema_quoted: bool) -> bool {
-    extension.schema.as_ref().is_some_and(|schema| {
-        identifiers_match(&schema.value, schema.quote_style.is_some(), schema_name, schema_quoted)
-    })
+    let (stored, stored_quoted) = extension
+        .schema
+        .as_ref()
+        .map_or(("public", false), |schema| (schema.value.as_str(), schema.quote_style.is_some()));
+    identifiers_match(stored, stored_quoted, schema_name, schema_quoted)
 }
 
 /// Whether any extension was created in this schema, which keeps a `DROP
@@ -272,28 +327,22 @@ pub(super) fn follow_schema_rename(
 ) {
     for (extension, ()) in builder.extensions_mut() {
         if created_in(extension, from, from_quoted) {
-            Arc::make_mut(extension).schema = Some(schema_ident(to, to_quoted));
+            Arc::make_mut(extension).schema = Some(stored_ident(to, to_quoted));
         }
     }
 }
 
-/// The identifier a stored schema name is written with.
-fn schema_ident(name: &str, quoted: bool) -> Ident {
-    if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
-}
-
 /// Checks the schema `WITH SCHEMA` names, keeping it as written.
 ///
-/// `public` and `pg_catalog` exist in every database. `pg_temp` is refused,
-/// since PostgreSQL resolves the spelling to no schema here.
+/// `pg_catalog` exists in every database. `pg_temp` is refused, since
+/// PostgreSQL resolves the spelling to no schema here.
 fn named_schema(
     builder: &ParserDBBuilder,
     schema: Ident,
     extension_name: &Ident,
 ) -> Result<Ident, Error> {
     let (name, quoted) = (schema.value.as_str(), schema.quote_style.is_some());
-    if identifiers_match(name, quoted, "public", false)
-        || identifiers_match(name, quoted, PG_CATALOG, false)
+    if identifiers_match(name, quoted, PG_CATALOG, false)
         || declared_schema(builder, name, quoted).is_some()
     {
         return Ok(schema);
@@ -315,7 +364,10 @@ fn search_path_schema(
 ) -> Result<Option<Ident>, Error> {
     for (entry, quoted) in builder.search_path().filter(|(entry, _)| !entry.is_empty()) {
         if identifiers_match(entry, quoted, "public", false) {
-            return Ok(None);
+            if builder.has_public_schema() {
+                return Ok(None);
+            }
+            continue;
         }
         if is_temporary_schema(entry, quoted) {
             return Ok(Some(Ident::new(TEMPORARY_SCHEMA)));
@@ -326,7 +378,7 @@ fn search_path_schema(
         // The catalog spelling wins over the one the path used, since the two
         // only differ where quoting makes them the same name anyway.
         if let Some(schema) = declared_schema(builder, entry, quoted) {
-            return Ok(Some(schema_ident(schema.name(), schema.is_quoted())));
+            return Ok(Some(stored_ident(schema.name(), schema.is_quoted())));
         }
     }
     Err(Error::NoSchemaSelectedForExtension { extension_name: extension_name.value.clone() })

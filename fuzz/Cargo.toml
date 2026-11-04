@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 sql-traits = { path = ".." }
-sqlparser = "0.63"
+sqlparser = "0.64"
 
 [[bin]]
 name = "fuzz_dialect"

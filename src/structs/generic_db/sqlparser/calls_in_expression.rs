@@ -1,19 +1,13 @@
-//! Resolves each call an expression makes to the functions it may reach.
+//! Resolves each call a node makes to the functions it may reach.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{convert::Infallible, ops::ControlFlow};
 
-use sqlparser::ast::{CreateFunction, Expr, ObjectName};
+use sqlparser::ast::{CreateFunction, ObjectName, Visit};
 
-use super::schema_qualifiers_match;
 use crate::{
     structs::{IdentifierCase, metadata::ExpressionCalls},
-    traits::function_like::FunctionLike,
-    utils::{
-        call_sites::for_each_call,
-        identifier_resolution::identifiers_match,
-        object_name::{Qualifier, object_name_last_part, qualifier_of},
-    },
+    utils::call_sites::{call_reaches, for_each_call},
 };
 
 /// The functions a call may reach, and the path an unqualified call walks.
@@ -28,60 +22,91 @@ pub(super) struct CallScope<'a> {
 
 impl CallScope<'_> {
     /// Whether a call to `called` passing `arguments` arguments may run
-    /// `function`.
-    ///
-    /// PostgreSQL picks among the reachable overloads by argument type, which
-    /// is not inferred here, so every overload accepting that many arguments
-    /// counts.
+    /// `function`, as [`call_reaches`] decides it.
     pub(super) fn reaches(
         &self,
         function: &CreateFunction,
         called: &ObjectName,
         arguments: usize,
     ) -> bool {
-        let names_match = object_name_last_part(called).is_some_and(|(called, called_quoted)| {
-            identifiers_match(function.name(), function.name_is_quoted(), called, called_quoted)
-        });
-        let declared_in = qualifier_of(&function.name).named();
-        let schema_reached = match qualifier_of(called) {
-            Qualifier::Named(schema, quoted) => {
-                schema_qualifiers_match(declared_in, Some((schema, quoted)), self.case)
-            }
-            // PostgreSQL searches `pg_catalog` first unless the path names it.
-            Qualifier::Absent => {
-                declared_in.is_some_and(|(schema, quoted)| {
-                    self.case.identifiers_match(schema, quoted, "pg_catalog", false)
-                }) || self
-                    .search_path
-                    .iter()
-                    .any(|&entry| schema_qualifiers_match(declared_in, Some(entry), self.case))
-            }
-            Qualifier::RunTime => false,
-        };
-        names_match && schema_reached && function.accepts_argument_count(arguments)
-    }
-
-    /// The functions a call to `called` passing `arguments` arguments may run.
-    fn reached_by<'s>(
-        &'s self,
-        called: &'s ObjectName,
-        arguments: usize,
-    ) -> impl Iterator<Item = &'s Arc<CreateFunction>> {
-        self.functions.iter().filter(move |function| self.reaches(function, called, arguments))
+        call_reaches(function, called, arguments, || self.search_path.iter().copied(), self.case)
     }
 }
 
-/// Resolves every call in `expression`, subqueries included, under `scope`.
-pub(super) fn calls_in_expression(
-    expression: &Expr,
+/// Resolves every call in `node`, subqueries included, under `scope`, except
+/// a call `carried` holds a binding for, which keeps that binding.
+pub(super) fn calls_in<N: Visit + ?Sized>(
+    node: &N,
     scope: &CallScope<'_>,
+    carried: &mut CarriedCalls,
 ) -> ExpressionCalls<CreateFunction> {
-    let mut sites = Vec::new();
-    let ControlFlow::<Infallible>::Continue(()) = for_each_call(expression, |call| {
-        sites.push(scope.reached_by(call.name, call.arguments).cloned().collect());
-        ControlFlow::Continue(())
-    });
-    ExpressionCalls::new(sites)
+    ExpressionCalls::resolve_carrying(
+        node,
+        scope.functions,
+        scope.search_path,
+        scope.case,
+        |name, arguments| carried.take(name, arguments),
+    )
+}
+
+/// The bindings the calls of a table's derived objects held before the table
+/// was rebuilt.
+///
+/// PostgreSQL binds a call once, when it is written, so a call a rebuild
+/// leaves written as it was keeps its function whatever search path the
+/// rebuilding statement runs under. Each recorded binding is taken once, by
+/// the first call written with the same name and argument count.
+#[derive(Default)]
+pub(super) struct CarriedCalls {
+    /// Each call's written name and argument count, with the functions it
+    /// was bound to.
+    sites: Vec<(ObjectName, usize, Vec<Arc<CreateFunction>>)>,
+}
+
+impl CarriedCalls {
+    /// Records the bindings `calls` holds for the calls of `node`, the node
+    /// they were resolved from.
+    pub(super) fn record<N: Visit + ?Sized>(
+        &mut self,
+        node: &N,
+        calls: &ExpressionCalls<CreateFunction>,
+    ) {
+        let mut bound = calls.sites().iter();
+        let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
+            let site = bound
+                .next()
+                .map(|functions| (call.name.clone(), call.arguments, functions.clone()));
+            self.sites.extend(site);
+            ControlFlow::Continue(())
+        });
+    }
+
+    /// Takes the first recorded binding of a call written `name` passing
+    /// `arguments` arguments.
+    pub(super) fn take(
+        &mut self,
+        name: &ObjectName,
+        arguments: usize,
+    ) -> Option<Vec<Arc<CreateFunction>>> {
+        let position = self
+            .sites
+            .iter()
+            .position(|(recorded, count, _)| *count == arguments && recorded == name)?;
+        Some(self.sites.remove(position).2)
+    }
+
+    /// Respells each recorded call to the name `renamed` gives its binding,
+    /// leaving a call it gives none as written.
+    pub(super) fn rename(
+        &mut self,
+        renamed: impl Fn(&[Arc<CreateFunction>]) -> Option<ObjectName>,
+    ) {
+        for (name, _, binding) in &mut self.sites {
+            if let Some(respelled) = renamed(binding) {
+                *name = respelled;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -328,7 +353,7 @@ mod tests {
 
     /// The names of the functions the calls in `expression` reach, each once.
     fn reached_names(expression: &Expr, scope: &super::CallScope<'_>) -> Vec<String> {
-        let calls = super::calls_in_expression(expression, scope);
+        let calls = super::calls_in(expression, scope, &mut super::CarriedCalls::default());
         calls.functions().map(|function| function.name().to_owned()).collect()
     }
 

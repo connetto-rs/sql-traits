@@ -11,8 +11,8 @@ use alloc::sync::Arc;
 use crate::{
     structs::GenericDB,
     traits::{
-        CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, ExtensionLike,
-        ForeignKeyLike, FunctionLike, IndexLike, Metadata, PolicyLike, RoleLike,
+        CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, DomainLike,
+        ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, Metadata, PolicyLike, RoleLike,
         RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike,
         TriggerLike, UniqueIndexLike, ViewLike,
     },
@@ -43,7 +43,8 @@ pub(crate) type Identified<K, I> = (Arc<K>, Meta<K>, I);
 /// [`ParserDB`](crate::structs::ParserDB) alias.
 ///
 /// Each associated type is bound to the database it belongs to, so an
-/// implementation cannot mix kinds from two different databases.
+/// implementation cannot mix kinds from two different databases. A kind the
+/// engine does not have is named as [`Absent`](crate::structs::Absent).
 pub trait SchemaProfile: Sized {
     /// The tables the schema holds.
     type Table: TableLike<DB = GenericDB<Self>>;
@@ -73,6 +74,8 @@ pub trait SchemaProfile: Sized {
     type Rule: RuleLike<DB = GenericDB<Self>>;
     /// The extensions the database holds.
     type Extension: ExtensionLike<DB = GenericDB<Self>>;
+    /// The domains the schema holds.
+    type Domain: DomainLike<DB = GenericDB<Self>>;
     /// The row-security policies the schema holds.
     type Policy: PolicyLike<DB = GenericDB<Self>>;
     /// The roles the schema holds.
@@ -103,4 +106,12 @@ pub trait SchemaProfile: Sized {
     /// dialect's defaults: the parser profile answers PostgreSQL with the
     /// full default catalog and every other dialect with an empty one.
     fn default_ingestion(dialect: &Self::Dialect) -> Self::Ingestion;
+
+    /// Returns the schemas a database of this profile starts with, before any
+    /// object is added, such as `public` for the parser profile.
+    fn initial_schemas() -> impl IntoIterator<Item = (Arc<Self::Schema>, Meta<Self::Schema>)>;
+
+    /// Returns whether the table `metadata` describes is a foreign table, which
+    /// the built database lists apart from ordinary tables.
+    fn is_foreign_table(metadata: &Meta<Self::Table>) -> bool;
 }

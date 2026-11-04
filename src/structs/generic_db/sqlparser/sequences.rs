@@ -20,11 +20,12 @@
 //! identity sequence follows its column's type and cannot be dropped on its
 //! own.
 //!
-//! A column default naming a sequence as a `regclass` constant, such as
-//! `nextval('s')`, is bound to the sequence when created and draws from it, as
-//! does a serial column from its own. Dropping the sequence, or whatever owns
-//! it, is refused while such a default remains, and `CASCADE` removes the
-//! default, leaving a serial column as its integer type kept `NOT NULL`.
+//! A serial column is stored the way PostgreSQL stores it, as its integer type
+//! kept `NOT NULL` with a default drawing from its sequence. A column default
+//! naming a sequence as a `regclass` constant, such as `nextval('s')`, is
+//! bound to the sequence when created and draws from it. Dropping the
+//! sequence, or whatever owns it, is refused while such a default remains,
+//! and `CASCADE` removes the default.
 
 use alloc::{
     boxed::Box,
@@ -48,17 +49,18 @@ use sqlparser::{
 };
 
 use super::{
-    ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, object_name_last_identifier,
-    object_name_matches_resolved_identity, place_relation, relation_name_holder,
-    require_named_in_catalog, schema_qualifiers_match, views,
+    Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, domains,
+    object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
+    relation_name_holder, require_named_in_catalog, schema_qualifiers_match, stored_ident, views,
 };
 use crate::{
     errors::{Error, ObjectKind},
     impls::{SqlparserDialect, serial_sequence_type},
     structs::{
-        ColumnIdentity, IdentifierCase, Sequence, StoredSequenceOwner, TableAttribute, TargetName,
+        ColumnIdentity, IdentifierCase, Sequence, SequenceParameters, SequenceType,
+        StoredSequenceOwner, TableAttribute, TargetName,
     },
-    traits::{ColumnLike, SequenceLike, SequenceOrigin, TableLike},
+    traits::{ColumnLike, DatabaseLike, SequenceLike, SequenceOrigin, TableLike},
     utils::{
         identifier_resolution::{identifiers_match, normalize_identifier},
         last_str,
@@ -69,33 +71,46 @@ use crate::{
     },
 };
 
-/// Records a `CREATE SEQUENCE`.
+/// Records a `CREATE SEQUENCE`, under the defaults of the role `creator`
+/// names.
 ///
 /// # Errors
 ///
 /// Refuses a name another relation in the schema already holds unless the
 /// statement wrote `IF NOT EXISTS`, a schema the input never creates, a
-/// temporary sequence outside the temporary schema, and every `OWNED BY` the
-/// errors of [`resolve_owner`] name.
+/// temporary sequence outside the temporary schema, parameters PostgreSQL
+/// refuses with [`Error::InvalidSequenceParameters`], and every `OWNED BY`
+/// the errors of [`resolve_owner`] name.
 pub(super) fn create_sequence(
     builder: ParserDBBuilder,
     temporary: bool,
     if_not_exists: bool,
     mut name: ObjectName,
     options: Vec<SequenceOptions>,
+    creator: Creator<'_>,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, ObjectKind::Sequence, builder.catalog_name())?;
-    place_relation(&builder, &mut name, temporary, ObjectKind::Sequence)?;
+    place_relation(&builder, &mut name, temporary, ObjectKind::Sequence, creator.role())?;
     // The name is known to be static and non-empty here, so it ends in an
     // identifier.
     let name_ident = object_name_last_identifier(&name)
         .ok_or(Error::UnnamedObject { object_kind: ObjectKind::Sequence })?;
     let schema = qualifier_of(&name).named();
 
-    if let Some(conflicting_kind) = relation_name_holder(&builder, name_ident, schema) {
-        if if_not_exists {
-            return Ok(builder);
-        }
+    let relation = relation_name_holder(&builder, name_ident, schema);
+    if relation.is_some() && if_not_exists {
+        return Ok(builder);
+    }
+    // PostgreSQL reads the options before it creates the relation, so their
+    // refusal comes ahead of a name another relation holds.
+    let parameters = SequenceParameters::from_options(&options).map_err(|reason| {
+        Error::InvalidSequenceParameters { sequence_name: name_ident.value.clone(), reason }
+    })?;
+    // A sequence has no row type, yet PostgreSQL refuses it a name a domain
+    // holds whatever `IF NOT EXISTS` says.
+    if let Some(conflicting_kind) =
+        relation.or_else(|| domains::domain_name_holder(&builder, name_ident, schema))
+    {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Sequence,
             conflicting_kind,
@@ -119,10 +134,12 @@ pub(super) fn create_sequence(
         (name_ident.value.clone(), name_ident.quote_style.is_some()),
         schema.map(|(value, quoted)| (value.to_string(), quoted)),
         kept,
+        parameters,
         owner,
         SequenceOrigin::Declared,
     );
-    Ok(builder.add_sequence(Arc::new(sequence), ()))
+    let builder = builder.add_sequence(Arc::new(sequence), ());
+    Ok(creator.grant(builder, DefaultKind::Sequences, &GrantObjects::Sequences(vec![name])))
 }
 
 /// Resolves the column an `OWNED BY` names, through the search path, into the
@@ -332,19 +349,16 @@ pub(super) fn drop_sequences_in(
     schema_name: &str,
     schema_quoted: bool,
 ) {
+    let case = builder.identifier_case();
     let doomed: Vec<Arc<Sequence>> = builder
         .sequences()
         .iter()
         .map(|(sequence, ())| sequence)
         .filter(|sequence| {
-            sequence.sequence_schema().is_some_and(|stored| {
-                identifiers_match(
-                    stored,
-                    sequence.sequence_schema_is_quoted(),
-                    schema_name,
-                    schema_quoted,
-                )
-            })
+            let stored = sequence
+                .sequence_schema()
+                .map(|stored| (stored, sequence.sequence_schema_is_quoted()));
+            schema_qualifiers_match(stored, Some((schema_name, schema_quoted)), case)
         })
         .cloned()
         .collect();
@@ -511,23 +525,26 @@ pub(super) fn plan_column_sequences<'column>(
         .collect()
 }
 
-/// Spells out a serial `column` a table inheriting it receives, drawing from
-/// the sequence `planned` for the original.
-pub(super) fn spell_out_planned_serial(
-    column: &mut ColumnDef,
-    table: &StoredTable,
+/// Spells out each serial column among `columns` that `planned` names a
+/// sequence of `table` for, drawing from that sequence.
+pub(super) fn spell_out_serials<'column>(
     planned: &[ColumnSequence],
+    table: &StoredTable,
+    columns: impl IntoIterator<Item = &'column mut ColumnDef>,
 ) {
-    let Some(planned) = planned.iter().find(|planned| planned.origin == SequenceOrigin::Serial)
-    else {
-        return;
-    };
-    let quoted = normalize_identifier(&planned.name, false) != planned.name.as_str();
-    let mut target = TargetName::new(&planned.name, quoted);
-    if let Some(schema) = table.schema.as_deref() {
-        target = target.with_schema(schema, table.schema_quoted);
+    for column in columns {
+        let Some(planned) = planned.iter().find(|planned| {
+            planned.origin == SequenceOrigin::Serial && planned.column == column.name
+        }) else {
+            continue;
+        };
+        let quoted = normalize_identifier(&planned.name, false) != planned.name.as_str();
+        let mut target = TargetName::new(&planned.name, quoted);
+        if let Some(schema) = table.schema.as_deref() {
+            target = target.with_schema(schema, table.schema_quoted);
+        }
+        spell_out_serial(column, nextval(target.to_string()));
     }
-    spell_out_serial(column, Some(nextval(target.to_string())));
 }
 
 /// Sequences created for columns of a table not stored yet, each beside its
@@ -535,25 +552,31 @@ pub(super) fn spell_out_planned_serial(
 pub(super) struct UnownedSequences(Vec<(Ident, *const Sequence)>);
 
 /// Records the sequences [`plan_column_sequences`] named, before the columns
-/// they serve land, handing each back beside its column for
-/// [`own_column_sequences`].
+/// they serve land, under the defaults of the role `creator` names, handing
+/// each back beside its column for [`own_column_sequences`].
 ///
 /// # Errors
 ///
 /// Returns [`Error::RelationNameAlreadyTaken`] when a relation took a planned
-/// name meanwhile, another sequence of the same statement included.
+/// name meanwhile, another sequence of the same statement included, or when a
+/// domain holds it, which PostgreSQL refuses rather than numbering past, and
+/// [`Error::InvalidSequenceParameters`] for an identity whose column type or
+/// options PostgreSQL refuses.
 pub(super) fn create_column_sequences(
     mut builder: ParserDBBuilder,
     table: &StoredTable,
     planned: Vec<ColumnSequence>,
+    creator: Creator<'_>,
 ) -> Result<(ParserDBBuilder, UnownedSequences), Error> {
     let schema = table.schema.as_ref().map(|schema| (schema.clone(), table.schema_quoted));
     let mut created = Vec::with_capacity(planned.len());
     for ColumnSequence { column, origin, options, name } in planned {
         let qualifier = schema.as_ref().map(|(schema, quoted)| (schema.as_str(), *quoted));
-        if let Some(conflicting_kind) =
-            relation_name_holder(&builder, &Ident::with_quote('"', name.as_str()), qualifier)
-        {
+        if let Some(conflicting_kind) = domains::relation_or_domain_holder(
+            &builder,
+            &Ident::with_quote('"', name.as_str()),
+            qualifier,
+        ) {
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Sequence,
                 conflicting_kind,
@@ -561,10 +584,28 @@ pub(super) fn create_column_sequences(
             });
         }
         let quoted = normalize_identifier(&name, false) != name.as_str();
-        let sequence =
-            Arc::new(Sequence::new((name, quoted), schema.clone(), options, None, origin));
+        let granted = ObjectName::from(
+            schema
+                .iter()
+                .map(|(schema, quoted)| stored_ident(schema, *quoted))
+                .chain([stored_ident(&name, quoted)])
+                .collect::<Vec<_>>(),
+        );
+        let parameters = SequenceParameters::from_options(&options).map_err(|reason| {
+            Error::InvalidSequenceParameters { sequence_name: name.clone(), reason }
+        })?;
+        let sequence = Arc::new(Sequence::new(
+            (name, quoted),
+            schema.clone(),
+            options,
+            parameters,
+            None,
+            origin,
+        ));
         created.push((column, Arc::as_ptr(&sequence)));
         builder = builder.add_sequence(sequence, ());
+        builder =
+            creator.grant(builder, DefaultKind::Sequences, &GrantObjects::Sequences(vec![granted]));
     }
     Ok((builder, UnownedSequences(created)))
 }
@@ -611,13 +652,18 @@ pub(super) fn own_column_sequences(
 /// PostgreSQL carries over whenever the column's type changes.
 ///
 /// A serial sequence keeps the type it was created with.
-pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) {
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSequenceParameters`] when the new type is not one
+/// a sequence counts in, or cannot hold a value the sequence keeps.
+pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) -> Result<(), Error> {
     if builder
         .sequences()
         .iter()
         .all(|(sequence, ())| sequence.origin() != SequenceOrigin::Identity)
     {
-        return;
+        return Ok(());
     }
     let types: BTreeMap<_, _> = builder
         .columns()
@@ -637,15 +683,22 @@ pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) {
             let data_type = *types.get(&identity)?;
             // An identity sequence is created with its `AS` type first.
             let current = matches!(
-                sequence.options().first(),
+                sequence.written_options().first(),
                 Some(SequenceOptions::DataType(current)) if current == data_type
             );
             (!current).then(|| (position, data_type.clone()))
         })
         .collect();
     for (position, data_type) in changed {
-        Arc::make_mut(&mut builder.sequences_mut()[position].0).set_data_type(data_type);
+        let sequence = Arc::make_mut(&mut builder.sequences_mut()[position].0);
+        sequence.set_data_type(data_type).map_err(|reason| {
+            Error::InvalidSequenceParameters {
+                sequence_name: sequence.sequence_name().to_string(),
+                reason,
+            }
+        })?;
     }
+    Ok(())
 }
 
 /// Removes the `doomed` sequences and takes them out of every grant naming
@@ -922,25 +975,11 @@ fn names_by_target(target: &TargetName<'_>, sequence: &Sequence) -> bool {
     }
 }
 
-/// The sequence among `sequences` the column with `identity` draws from: the
-/// serial sequence it owns while its type is still serial, or one its default
-/// names.
+/// The sequence among `sequences` a default of `column` names.
 fn drawn_by_column<'sequence>(
     column: &ColumnDef,
-    identity: ColumnIdentity,
     sequences: &'sequence [Arc<Sequence>],
 ) -> Option<&'sequence Sequence> {
-    let owned = || {
-        sequences.iter().map(AsRef::as_ref).find(|sequence| {
-            sequence.origin() == SequenceOrigin::Serial
-                && sequence.stored_owner() == Some(StoredSequenceOwner::Column(identity))
-        })
-    };
-    if serial_sequence_type(&column.data_type).is_some()
-        && let Some(sequence) = owned()
-    {
-        return Some(sequence);
-    }
     column.options.iter().find_map(|option| {
         match &option.option {
             ColumnOption::Default(default) => drawn_by_default(default, sequences),
@@ -951,7 +990,7 @@ fn drawn_by_column<'sequence>(
 
 /// Gives a serial column the integer type and `NOT NULL` PostgreSQL stores it
 /// as, with `default` drawing in place of the type.
-pub(super) fn spell_out_serial(column: &mut ColumnDef, default: Option<Expr>) {
+fn spell_out_serial(column: &mut ColumnDef, default: Expr) {
     let Some(integer) = serial_sequence_type(&column.data_type) else {
         return;
     };
@@ -959,32 +998,46 @@ pub(super) fn spell_out_serial(column: &mut ColumnDef, default: Option<Expr>) {
     if !column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull)) {
         column.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
     }
-    if let Some(default) = default {
-        column.options.push(ColumnOptionDef { name: None, option: ColumnOption::Default(default) });
-    }
+    column.options.push(ColumnOptionDef { name: None, option: ColumnOption::Default(default) });
 }
 
-/// The default drawing from the sequence a serial `column` of `table` owns,
-/// [`None`] wherever no sequence was created for it.
-pub(super) fn serial_default(
-    builder: &ParserDBBuilder,
-    table: &CreateTable,
-    column: &ColumnDef,
-) -> Option<Expr> {
-    serial_sequence_type(&column.data_type)?;
-    let identity = builder.columns().iter().find_map(|(held, _, identity)| {
-        (core::ptr::eq(TableAttribute::table(held.as_ref()), table)
-            && held.attribute().name == column.name)
-            .then_some(*identity)
-    })?;
-    builder
-        .sequences()
-        .iter()
-        .find(|(sequence, ())| {
-            sequence.origin() == SequenceOrigin::Serial
-                && sequence.stored_owner() == Some(StoredSequenceOwner::Column(identity))
+impl ParserDB {
+    /// Whether `column` holds an integer type and a default drawing from a
+    /// sequence `column` owns, the shape PostgreSQL stores a serial column in.
+    pub(crate) fn draws_from_owned_sequence(
+        &self,
+        column: &TableAttribute<CreateTable, ColumnDef>,
+    ) -> bool {
+        let declared = column.attribute();
+        if SequenceType::of(&declared.data_type).is_none() {
+            return false;
+        }
+        let Some(identity) = self.column_identity(column) else {
+            return false;
+        };
+        let owned = |target: &TargetName<'_>| {
+            self.sequences().any(|sequence| {
+                sequence.stored_owner() == Some(StoredSequenceOwner::Column(identity))
+                    && names_by_target(target, sequence)
+            })
+        };
+        declared.options.iter().any(|option| {
+            let ColumnOption::Default(default) = &option.option else {
+                return false;
+            };
+            visit_expressions(default, |node| {
+                if regclass_constant(node)
+                    .and_then(|text| TargetName::parse(text).ok())
+                    .is_some_and(|target| owned(&target))
+                {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_break()
         })
-        .map(|(sequence, ())| nextval(bound_regclass(sequence)))
+    }
 }
 
 /// Refuses, or under `cascade` removes, the column defaults left drawing from
@@ -1004,8 +1057,8 @@ pub(super) fn settle_dropped_sequences(
     }
     let case = builder.identifier_case();
     let mut drawing: Vec<(StoredTable, Vec<Ident>)> = Vec::new();
-    for (column, _, identity) in builder.columns() {
-        let Some(sequence) = drawn_by_column(column.attribute(), *identity, &dropped) else {
+    for (column, _, _) in builder.columns() {
+        let Some(sequence) = drawn_by_column(column.attribute(), &dropped) else {
             continue;
         };
         let table = TableAttribute::table(column.as_ref());
@@ -1031,10 +1084,118 @@ pub(super) fn settle_dropped_sequences(
                         ColumnOption::Default(default) if drawn_by_default(default, &dropped).is_some()
                     )
                 });
-                spell_out_serial(column, None);
             }
             Ok(())
         })?;
     }
     Ok(builder)
+}
+
+/// Moves every sequence stored in schema `from` to `to`, carrying along the
+/// column defaults drawing from each, the grants on each and the definitions
+/// reading each, as a schema rename does.
+///
+/// # Errors
+///
+/// Returns the refusals rebuilding a table or rewriting a definition meets.
+pub(super) fn move_sequences(
+    mut builder: ParserDBBuilder,
+    from: (&str, bool),
+    to: (&str, bool),
+) -> Result<ParserDBBuilder, Error> {
+    let case = builder.identifier_case();
+    let moving: Vec<usize> = builder
+        .sequences()
+        .iter()
+        .enumerate()
+        .filter(|(_, (sequence, ()))| {
+            let stored = sequence
+                .sequence_schema()
+                .map(|schema| (schema, sequence.sequence_schema_is_quoted()));
+            schema_qualifiers_match(stored, Some(from), case)
+        })
+        .map(|(position, _)| position)
+        .collect();
+    for position in moving {
+        let previous = Arc::clone(&builder.sequences()[position].0);
+        let key = stored_sequence_key(previous.as_ref(), IdentifierCase::AsWritten);
+        let readers = super::view_rewrites::readers(&builder, &[&key]);
+        let mut moved = (*previous).clone();
+        moved.set_schema(to.0.to_string(), to.1);
+        let bound = bound_regclass(&moved);
+        let name = ObjectName::from(alloc::vec![
+            stored_ident(to.0, to.1),
+            stored_ident(moved.sequence_name(), moved.sequence_name_is_quoted()),
+        ]);
+        builder.sequences_mut()[position].0 = Arc::new(moved);
+
+        let drawing: Vec<StoredTable> = builder
+            .tables()
+            .iter()
+            .map(|(table, _, _)| table.as_ref())
+            .filter(|table| {
+                table.columns.iter().any(|column| {
+                    column.options.iter().any(|option| {
+                        matches!(&option.option, ColumnOption::Default(default)
+                            if drawn_by_default(default, core::slice::from_ref(&previous)).is_some())
+                    })
+                })
+            })
+            .map(StoredTable::of)
+            .collect();
+        for table in &drawing {
+            builder = ParserDB::replace_table_node(builder, table, |_, node| {
+                for column in &mut node.columns {
+                    for option in &mut column.options {
+                        if let ColumnOption::Default(default) = &mut option.option {
+                            redirect_regclass(default, &previous, &bound);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        redirect_grants(builder.table_grants_mut(), &previous, &name);
+        redirect_grants(builder.column_grants_mut(), &previous, &name);
+        if let Some(readers) = readers {
+            super::view_rewrites::follow_renames(
+                &mut builder,
+                readers,
+                &[super::view_rewrites::Rename::Relation { key, to: name }],
+            )?;
+        }
+    }
+    Ok(builder)
+}
+
+/// Points every `regclass` constant in `default` naming `previous` at
+/// `bound`.
+fn redirect_regclass(default: &mut Expr, previous: &Sequence, bound: &str) {
+    let _ = visit_expressions_mut(default, |node| {
+        if let Some(text) = regclass_constant_mut(node)
+            && TargetName::parse(text).is_ok_and(|target| names_by_target(&target, previous))
+        {
+            *text = bound.to_string();
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Points every grant naming `previous` at `name`. A grant names one object.
+fn redirect_grants(grants: &mut [(Arc<Grant>, ())], previous: &Sequence, name: &ObjectName) {
+    let names_previous =
+        |names: &[ObjectName]| names.iter().any(|named| names_sequence_identity(named, previous));
+    for (grant, ()) in grants {
+        let redirected = match &grant.objects {
+            Some(GrantObjects::Sequences(names)) if names_previous(names) => {
+                GrantObjects::Sequences(alloc::vec![name.clone()])
+            }
+            Some(GrantObjects::Tables(names)) if names_previous(names) => {
+                GrantObjects::Tables(alloc::vec![name.clone()])
+            }
+            _ => continue,
+        };
+        Arc::make_mut(grant).objects = Some(redirected);
+    }
 }

@@ -21,7 +21,7 @@ use sqlparser::ast::{
     Ident, ObjectName,
 };
 
-use super::{ParserDBBuilder, column_copy::copy_column, sequences};
+use super::{ParserDBBuilder, column_copy::copy_column};
 use crate::{
     errors::Error,
     structs::{TableAttribute, metadata::ColumnCreation},
@@ -100,10 +100,7 @@ pub(super) fn apply_like(
         .columns
         .iter()
         .map(|column| {
-            let mut copy = copy_column(column, |option| is_copied_option(option, with_defaults));
-            if let Some(drawn) = sequences::serial_default(builder, copied, column) {
-                sequences::spell_out_serial(&mut copy, with_defaults.then_some(drawn));
-            }
+            let copy = copy_column(column, |option| is_copied_option(option, with_defaults));
             if let Some(creation) = creation_of(builder, copied, column) {
                 creations.push((copy.name.clone(), creation));
             }
