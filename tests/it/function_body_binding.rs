@@ -22,7 +22,8 @@ fn function<'db>(db: &'db ParserDB, name: &str) -> &'db CreateFunction {
 }
 
 fn body(db: &ParserDB, name: &str) -> String {
-    function(db, name).body_expression().expect("a RETURN body").to_string()
+    let function = function(db, name);
+    function.body_expression(db).expect("a parsed body").expect("a RETURN body").to_string()
 }
 
 /// The stored function as the parser would spell it, body included.
@@ -626,7 +627,7 @@ fn a_string_body_is_never_bound() {
     )
     .expect("string bodies are never bound");
     assert_eq!(function(&db, "q").body(), Some("SELECT a FROM t"));
-    assert!(function(&db, "q").body_expression().is_none());
+    assert!(function(&db, "q").body_expression(&db).expect("a parsed body").is_none());
     assert_eq!(function(&db, "w").body(), Some("SELECT a FROM nope"));
 
     // Nothing a string body names blocks a drop.

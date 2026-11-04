@@ -571,8 +571,10 @@ pub enum LookupError {
         /// The statement that hides what the body reads.
         statement: String,
     },
-    /// A SQL function body does not parse under the database's dialect, or a
-    /// PL/pgSQL body or the SQL it embeds does not parse.
+    /// A SQL function body does not parse under the database's dialect, a
+    /// PL/pgSQL body or the SQL it embeds does not parse, or the definition a
+    /// catalog prints for a bound body does not parse or holds no body bound
+    /// at creation.
     #[error("The body of function `{function}` does not parse: {reason}")]
     FunctionBodyUnparsable {
         /// Name of the function, as written.
