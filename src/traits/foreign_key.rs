@@ -796,7 +796,8 @@ pub trait ForeignKeyLike:
     }
 
     /// Returns an iterator over the columns in the referenced table that are
-    /// part of the foreign key.
+    /// part of the foreign key, the referenced table's primary key in key
+    /// order when the key was declared without a column list.
     ///
     /// # Arguments
     ///

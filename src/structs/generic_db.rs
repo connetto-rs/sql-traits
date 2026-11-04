@@ -131,8 +131,6 @@ pub struct GenericDB<P: SchemaProfile> {
     schemas: Vec<Stored<P::Schema>>,
     /// Schemas an unqualified name resolves against, in order.
     search_path: Vec<(String, bool)>,
-    /// Whether the `public` schema every database starts with still exists.
-    public_schema: bool,
     /// Comparison the creations in this catalog were taken under, which each
     /// engine answers its own way. A lookup takes its own comparison.
     identifier_case: IdentifierCase,
@@ -170,7 +168,6 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("column_grants", &self.column_grants.len())
             .field("schemas", &self.schemas.len())
             .field("search_path", &self.search_path)
-            .field("public_schema", &self.public_schema)
             .field("identifier_case", &self.identifier_case)
             .field("ingestion", &self.ingestion)
             .field("relation_index", &self.relation_index.len())
@@ -213,7 +210,6 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             column_grants: self.column_grants.clone(),
             schemas: self.schemas.clone(),
             search_path: self.search_path.clone(),
-            public_schema: self.public_schema,
             identifier_case: self.identifier_case,
             ingestion: self.ingestion.clone(),
             relation_index: self.relation_index.clone(),
@@ -818,7 +814,8 @@ impl<P: SchemaProfile> GenericDB<P> {
             .map(|index| &self.schemas[index].1)
     }
 
-    /// Iterates over the schemas and their metadata.
+    /// Iterates over the schemas and their metadata, `public` among them while
+    /// it exists.
     ///
     /// # Example
     ///
@@ -828,7 +825,7 @@ impl<P: SchemaProfile> GenericDB<P> {
     ///
     /// let db = ParserDB::parse::<GenericDialect>("CREATE SCHEMA a; CREATE SCHEMA b;")?;
     /// let names: Vec<&str> = db.schemas().map(|(s, _)| s.name()).collect();
-    /// assert_eq!(names.len(), 2);
+    /// assert_eq!(names, ["a", "b", "public"]);
     /// # Ok(())
     /// # }
     /// ```

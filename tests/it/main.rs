@@ -61,6 +61,7 @@ mod generated_index_names;
 mod golden_fingerprints;
 mod granted_columns;
 mod implicit_sequences;
+mod implied_referenced_columns;
 mod incremental_schema_ingestion;
 mod indexed_lookup_equivalence;
 mod inheritance_changes;

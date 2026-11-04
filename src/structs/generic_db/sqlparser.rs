@@ -160,6 +160,10 @@ impl SchemaProfile for SqlparserProfile {
         })
     }
 
+    fn initial_schemas() -> impl IntoIterator<Item = (Arc<Schema>, ())> {
+        [(Arc::new(Schema::with_quoted("public".to_string(), false)), ())]
+    }
+
     fn is_foreign_table(metadata: &TableMetadata<CreateTable>) -> bool {
         metadata.foreign_source().is_some()
     }
@@ -1578,20 +1582,9 @@ impl ParserDBBuilder {
         )
     }
 
-    /// Lists `public` among the declared schemas when `name` names it while
-    /// it still exists undeclared, so a statement altering or dropping it
-    /// finds it like any other schema.
-    fn declare_public_schema(&mut self, name: &ObjectName) {
-        let names_public = object_name_last_identifier(name).is_some_and(|ident| {
-            identifiers_match(&ident.value, ident.quote_style.is_some(), "public", false)
-        });
-        if names_public
-            && self.has_public_schema()
-            && declared_schema(self, "public", false).is_none()
-        {
-            self.schemas_mut()
-                .push((Arc::new(Schema::with_quoted("public".to_string(), false)), ()));
-        }
+    /// Whether `public`, the schema every database starts with, still exists.
+    fn has_public_schema(&self) -> bool {
+        declared_schema(self, "public", false).is_some()
     }
 
     /// Resolves a table or foreign table the input has created so far through
@@ -1847,6 +1840,23 @@ impl ParserDBBuilder {
         if let Ok(Some(table)) = self.resolve_table_object_name(reference) {
             let qualifier = stored_qualifier(&table.name);
             bind_reference(reference, qualifier);
+        }
+    }
+
+    /// Binds a foreign key to the table it reaches through the session's path,
+    /// leaving one that reaches none as written.
+    fn bind_foreign_key(&self, foreign_key: &mut ForeignKeyConstraint) {
+        if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
+            ForeignKeyBinding::of(table, foreign_key).apply(foreign_key);
+        }
+    }
+
+    /// Binds every foreign key `column` declares inline.
+    fn bind_column_foreign_keys(&self, column: &mut ColumnDef) {
+        for option in &mut column.options {
+            if let ColumnOption::ForeignKey(foreign_key) = &mut option.option {
+                self.bind_foreign_key(foreign_key);
+            }
         }
     }
 
@@ -3213,22 +3223,32 @@ fn declared_candidate_keys(table: &CreateTable) -> Vec<Vec<&Ident>> {
     keys
 }
 
-/// Returns the number of columns in the primary key of `table`, which is
-/// what a foreign key naming no columns points at, or `None` when the table
-/// has no primary key.
-fn primary_key_width(table: &CreateTable) -> Option<usize> {
-    let inline = table.columns.iter().any(|column| {
+/// Returns the columns of the primary key of `table` in key order, spelled as
+/// the table declares them, which is what a foreign key naming no columns
+/// references, or `None` when the table has no primary key.
+fn primary_key_columns(table: &CreateTable) -> Option<Vec<Ident>> {
+    if let Some(column) = table.columns.iter().find(|column| {
         column.options.iter().any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
-    });
-    if inline {
-        return Some(1);
+    }) {
+        return Some(vec![column.name.clone()]);
     }
-    table.constraints.iter().find_map(|constraint| {
+    let key = table.constraints.iter().find_map(|constraint| {
         match constraint {
-            TableConstraint::PrimaryKey(primary_key) => Some(primary_key.columns.len()),
+            TableConstraint::PrimaryKey(primary_key) => plain_key_columns(&primary_key.columns),
             _ => None,
         }
-    })
+    })?;
+    Some(
+        key.into_iter()
+            .map(|written| {
+                table
+                    .columns
+                    .iter()
+                    .find(|column| idents_match(&column.name, written))
+                    .map_or_else(|| written.clone(), |column| column.name.clone())
+            })
+            .collect(),
+    )
 }
 
 /// Returns whether two table references name the same table.
@@ -3272,17 +3292,10 @@ fn declared_schema<'builder>(
         .find(|schema| identifiers_match(schema.name(), schema.is_quoted(), name, quoted))
 }
 
-/// Returns whether a schema by this name is one a relation may be created in.
-///
-/// The default schema needs no declaration while it exists, since no dump
-/// emits a statement creating it, which is the same allowance
-/// [`ParserDB::resolve_table_object_name_on_search_path`] makes when resolving
-/// a name against it. So is the session's temporary schema, which always
-/// exists and which no statement can create.
+/// Returns whether a schema by this name is one a relation may be created in,
+/// the session's temporary schema included, which no statement can create.
 fn schema_is_declared(builder: &ParserDBBuilder, name: &str, quoted: bool) -> bool {
-    (identifiers_match(name, quoted, "public", false) && builder.has_public_schema())
-        || is_temporary_schema(name, quoted)
-        || declared_schema(builder, name, quoted).is_some()
+    is_temporary_schema(name, quoted) || declared_schema(builder, name, quoted).is_some()
 }
 
 fn collation_schema_is_declared(builder: &ParserDBBuilder, name: &str, quoted: bool) -> bool {
@@ -3670,12 +3683,43 @@ struct BoundRelation {
     temporary: bool,
 }
 
-/// Binds every foreign key target in `node` to the table it reaches now, the
-/// node itself included, leaving one reaching nothing for the key check to
-/// refuse.
+/// What a foreign key keeps of the table its target reaches when the key is
+/// declared.
+struct ForeignKeyBinding {
+    /// Qualifier that table is stored under.
+    qualifier: Option<Ident>,
+    /// The table's primary key columns, read only for a key naming none.
+    referred_columns: Option<Vec<Ident>>,
+}
+
+impl ForeignKeyBinding {
+    /// Reads what `foreign_key` keeps of `target`, the table it reaches.
+    fn of(target: &CreateTable, foreign_key: &ForeignKeyConstraint) -> Self {
+        Self {
+            qualifier: stored_qualifier(&target.name),
+            referred_columns: if foreign_key.referred_columns.is_empty() {
+                primary_key_columns(target)
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Writes the binding into `foreign_key`, fixing its columns the way
+    /// `confkey` does.
+    fn apply(self, foreign_key: &mut ForeignKeyConstraint) {
+        bind_reference(&mut foreign_key.foreign_table, self.qualifier);
+        if let Some(referred_columns) = self.referred_columns {
+            foreign_key.referred_columns = referred_columns;
+        }
+    }
+}
+
+/// Binds every foreign key in `node` to the table it reaches now, the node
+/// itself included, leaving one reaching nothing for the key check to refuse.
 fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
     let case = builder.identifier_case();
-    let qualifiers: Vec<Option<Option<Ident>>> = foreign_keys_of(node)
+    let bindings: Vec<Option<ForeignKeyBinding>> = foreign_keys_of(node)
         .map(|foreign_key| {
             resolve_table_object_name_on_search_path_in_iter(
                 builder
@@ -3690,12 +3734,12 @@ fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
             )
             .ok()
             .flatten()
-            .map(|table| stored_qualifier(&table.name))
+            .map(|table| ForeignKeyBinding::of(table, foreign_key))
         })
         .collect();
-    for (foreign_key, qualifier) in foreign_keys_of_mut(node).zip(qualifiers) {
-        if let Some(qualifier) = qualifier {
-            bind_reference(&mut foreign_key.foreign_table, qualifier);
+    for (foreign_key, binding) in foreign_keys_of_mut(node).zip(bindings) {
+        if let Some(binding) = binding {
+            binding.apply(foreign_key);
         }
     }
 }
@@ -5686,13 +5730,12 @@ impl ParserDB {
             }
         }
 
-        // Without a unique key on the far side a child row could match more
-        // than one parent, so PostgreSQL, MySQL and SQLite all refuse it. A
-        // `CREATE UNIQUE INDEX` counts and lives in the builder rather than on
-        // the node, so both sources are gathered.
+        // A `CREATE UNIQUE INDEX` counts and lives in the builder, not the
+        // node. A key still naming no columns was bound to a target holding no
+        // primary key.
         let referred: Vec<&Ident> = fk.referred_columns.iter().collect();
         let referenced_width = if referred.is_empty() {
-            primary_key_width(referenced_table)
+            None
         } else {
             let mut candidates = declared_candidate_keys(referenced_table);
             candidates.extend(builder.indices().iter().filter_map(|(index, _)| {
@@ -6078,7 +6121,7 @@ impl ParserDB {
         };
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
         if let TableConstraint::ForeignKey(foreign_key) = &mut constraint {
-            builder.bind_table_reference(&mut foreign_key.foreign_table);
+            builder.bind_foreign_key(foreign_key);
         }
 
         let mut builder = Self::alter_table_constraints(builder, &stored, |_, constraints| {
@@ -7056,6 +7099,7 @@ impl ParserDB {
         let column_sequences =
             sequences::plan_column_sequences(&builder, &stored, core::iter::once(&column_def));
         sequences::bind_column_defaults(&builder, &stored.name, core::iter::once(&mut column_def))?;
+        builder.bind_column_foreign_keys(&mut column_def);
 
         // Read before the parent changes.
         let inheritors = inheritance::descendants(&builder, &stored);
@@ -8474,7 +8518,6 @@ impl ParserDB {
                 } => {
                     for name in names {
                         let schema_name = last_str(&name);
-                        builder.declare_public_schema(&name);
                         let maybe_schema = object_name_last_identifier(&name)
                             .and_then(|ident| builder.resolve_schema_ident(ident));
 
@@ -8556,14 +8599,6 @@ impl ParserDB {
                             (&resolved_schema_name, resolved_schema_quoted),
                             builder.identifier_case(),
                         );
-                        if identifiers_match(
-                            &resolved_schema_name,
-                            resolved_schema_quoted,
-                            "public",
-                            false,
-                        ) {
-                            builder.set_public_schema(false);
-                        }
                     }
                 }
                 Statement::CreateIndex(mut create_index) => {
@@ -9471,11 +9506,11 @@ impl ParserDB {
                         }
                     }
 
-                    let is_public = identifiers_match(&name, quoted, "public", false);
-                    // `public` exists undeclared until something renames or
-                    // drops it, and `pg_dump -n public` writes its creation,
-                    // so creating it while it exists changes nothing.
-                    if is_public && builder.has_public_schema() {
+                    // `pg_dump -n public` writes this, so it changes nothing
+                    // while `public` exists.
+                    if identifiers_match(&name, quoted, "public", false)
+                        && builder.has_public_schema()
+                    {
                         continue;
                     }
                     let schema_exists = builder
@@ -9501,9 +9536,6 @@ impl ParserDB {
                             None => Schema::with_quoted(name, quoted),
                         };
                         builder = builder.add_schema(Arc::new(schema), ());
-                        if is_public {
-                            builder.set_public_schema(true);
-                        }
                         builder = creator.grant(
                             builder,
                             DefaultKind::Schemas,
@@ -9912,7 +9944,6 @@ impl ParserDB {
                     let schema_name = last_str(&name);
 
                     // Check if schema exists
-                    builder.declare_public_schema(&name);
                     let resolved_schema = object_name_last_identifier(&name)
                         .and_then(|ident| builder.resolve_schema_ident(ident));
 
@@ -9961,15 +9992,7 @@ impl ParserDB {
                                             )
                                     },
                                 );
-                                // `public` exists undeclared until something
-                                // renames or drops it.
-                                let onto_public = identifiers_match(
-                                    &new_schema_name,
-                                    new_schema_quoted,
-                                    "public",
-                                    false,
-                                ) && builder.has_public_schema();
-                                if duplicate_exists || onto_public {
+                                if duplicate_exists {
                                     return Err(crate::errors::Error::SchemaAlreadyExists {
                                         schema_name: new_schema_name.clone(),
                                     });
@@ -10021,15 +10044,6 @@ impl ParserDB {
                                     (&current_schema_name, current_schema_quoted),
                                     (&new_schema_name, new_schema_quoted),
                                 )?;
-                                let is_public = |name: &str, quoted| {
-                                    identifiers_match(name, quoted, "public", false)
-                                };
-                                if is_public(&current_schema_name, current_schema_quoted) {
-                                    builder.set_public_schema(false);
-                                }
-                                if is_public(&new_schema_name, new_schema_quoted) {
-                                    builder.set_public_schema(true);
-                                }
                                 current_schema_name = new_schema_name;
                                 current_schema_quoted = new_schema_quoted;
                             }

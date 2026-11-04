@@ -2207,7 +2207,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         self.column_grants().next().is_some()
     }
 
-    /// Iterates over the schemas defined in the database.
+    /// Iterates over the schemas the database holds, `public` among them while
+    /// it exists.
     ///
     /// # Example
     ///
@@ -2222,8 +2223,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// CREATE SCHEMA other_schema AUTHORIZATION admin;
     /// ",
     /// )?;
-    /// let schemas: Vec<_> = db.schemas().collect();
-    /// assert_eq!(schemas.len(), 2);
+    /// let names: Vec<&str> = DatabaseLike::schemas(&db).map(SchemaLike::name).collect();
+    /// assert_eq!(names, ["my_schema", "other_schema", "public"]);
     /// # Ok(())
     /// # }
     /// ```
@@ -2316,7 +2317,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             .find(|s| stored_identifier_matches_lookup(s.name(), s.name_is_quoted(), name))
     }
 
-    /// Returns whether the database has any schemas defined.
+    /// Returns whether the database holds any schema.
     #[inline]
     fn has_schemas(&self) -> bool {
         self.schemas().next().is_some()
