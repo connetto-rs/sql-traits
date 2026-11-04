@@ -61,7 +61,8 @@ impl PolicyLike for CreatePolicy {
     where
         Self: 'db,
     {
-        self.to.iter().flat_map(|roles| roles.iter())
+        let named = if self.applies_to_public() { None } else { self.to.as_deref() };
+        named.into_iter().flatten()
     }
 
     fn applies_to_public(&self) -> bool {

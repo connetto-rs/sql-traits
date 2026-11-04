@@ -94,7 +94,7 @@ fn a_clause_the_statement_omits_survives_untouched() {
     let database = altered("ALTER POLICY docs_sel ON docs WITH CHECK (false);");
 
     assert_eq!(using(&database, "docs_sel").as_deref(), Some("owner_id = current_user"));
-    assert_eq!(roles(&database, "docs_sel"), ["PUBLIC"]);
+    assert_eq!(roles(&database, "docs_sel"), Vec::<String>::new());
 }
 
 #[test]

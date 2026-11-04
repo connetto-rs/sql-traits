@@ -21,7 +21,7 @@ use crate::{
         DataStatementLike, DatabaseLike, PolicyLike, Relation, RoleLike, TableLike, ViewLike,
         role::privilege_holders,
     },
-    utils::identifier_resolution::{is_public_pseudo_role, normalize_identifier},
+    utils::identifier_resolution::normalize_identifier,
 };
 
 /// Which clause a gate reads: `USING` alone, or `WITH CHECK` falling back to
@@ -146,9 +146,7 @@ fn applies<DB: DatabaseLike>(
         match owner {
             Owner::Ident(ident) => {
                 let stored = normalize_identifier(&ident.value, ident.quote_style.is_some());
-                let known = is_public_pseudo_role(&ident.value, ident.quote_style.is_some())
-                    || database.role(&stored).is_some();
-                (!known).then(|| ident.value.clone())
+                database.role(&stored).is_none().then(|| ident.value.clone())
             }
             Owner::CurrentRole => Some("CURRENT_ROLE".to_string()),
             Owner::CurrentUser => Some("CURRENT_USER".to_string()),

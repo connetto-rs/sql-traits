@@ -10,9 +10,7 @@ use crate::{
     structs::ParserDB,
     traits::{DatabaseLike, Metadata, PolicyLike, RoleLike},
     utils::{
-        identifier_resolution::{identifiers_match, is_public_pseudo_role},
-        last_str,
-        object_name::object_name_last_part,
+        identifier_resolution::identifiers_match, last_str, object_name::object_name_last_part,
     },
 };
 
@@ -79,9 +77,7 @@ impl RoleLike for CreateRole {
 /// Returns whether an owner identifier names the role.
 fn owner_matches_role(owner: &sqlparser::ast::Owner, role: &CreateRole) -> bool {
     match owner {
-        sqlparser::ast::Owner::Ident(owner_ident)
-            if !is_public_pseudo_role(&owner_ident.value, owner_ident.quote_style.is_some()) =>
-        {
+        sqlparser::ast::Owner::Ident(owner_ident) => {
             role.names.iter().any(|role_name| {
                 object_name_last_part(role_name).is_some_and(|(role_name, role_quoted)| {
                     identifiers_match(
@@ -93,8 +89,7 @@ fn owner_matches_role(owner: &sqlparser::ast::Owner, role: &CreateRole) -> bool 
                 })
             })
         }
-        sqlparser::ast::Owner::Ident(_)
-        | sqlparser::ast::Owner::CurrentUser
+        sqlparser::ast::Owner::CurrentUser
         | sqlparser::ast::Owner::CurrentRole
         | sqlparser::ast::Owner::SessionUser => false,
     }

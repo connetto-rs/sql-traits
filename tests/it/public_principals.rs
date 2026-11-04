@@ -45,10 +45,11 @@ fn a_policy_naming_a_role_does_not_say_everyone() {
     );
 }
 
-/// The distinction the reader exists for: both policies below yield exactly one
-/// role, and reading that role alone cannot tell them apart.
+/// A policy that applies to every role names none, as `pg_policy.polroles`
+/// stores only the public pseudo-role for it. PostgreSQL keeps that alone even
+/// when the `TO` list names other roles beside `PUBLIC`.
 #[test]
-fn the_role_iterator_cannot_answer_this() {
+fn a_policy_applying_to_everyone_names_no_role() {
     let db = ParserDB::parse::<PostgreSqlDialect>(POLICIES).expect("schema builds");
     let roles = |name: &str| {
         db.policies()
@@ -59,9 +60,23 @@ fn the_role_iterator_cannot_answer_this() {
             .collect::<Vec<_>>()
     };
 
-    assert_eq!(roles("spelled"), ["PUBLIC"]);
+    let none: Vec<String> = Vec::new();
+    assert_eq!(roles("spelled"), none);
+    assert_eq!(roles("implied"), none);
+    assert_eq!(roles("mixed"), none, "PostgreSQL drops the roles listed beside PUBLIC");
+    assert_eq!(roles("named"), ["reader"]);
     assert_eq!(roles("quoted"), ["\"PUBLIC\""]);
-    assert!(roles("implied").is_empty(), "an absent TO clause is an empty iterator");
+}
+
+/// A role's policies are the ones naming it, so a policy whose named roles
+/// PostgreSQL dropped for `PUBLIC` is not among them.
+#[test]
+fn a_role_listed_beside_public_is_not_named_by_the_policy() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(POLICIES).expect("schema builds");
+    let reader = db.role("reader").expect("the role exists");
+
+    let names: Vec<_> = reader.policies(&db).map(PolicyLike::name).collect();
+    assert_eq!(names, ["named"]);
 }
 
 #[test]
