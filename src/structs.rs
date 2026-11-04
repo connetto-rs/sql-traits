@@ -5,6 +5,7 @@ mod deployment;
 pub(crate) mod fingerprint;
 mod foreign_table_source;
 pub mod generic_db;
+pub(crate) use generic_db::ConstraintObject;
 pub use generic_db::{
     AccessResolution, GenericDB, Meta, ParseOptions, ParserDB, ParserDBBuilder, ParserDBIngestor,
     ParserIngestion, PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType, SchemaProfile,

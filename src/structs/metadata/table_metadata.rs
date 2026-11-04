@@ -10,6 +10,19 @@ use crate::{
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 
+/// The name PostgreSQL gave a constraint written without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedConstraintName {
+    /// Which constraint of the table node it names, as its rendering numbered
+    /// among equal renderings.
+    pub(crate) slot: String,
+    /// The name as PostgreSQL stores it.
+    pub(crate) name: String,
+    /// Whether the name is also the name of the constraint's index, which no
+    /// other relation of the schema may then take.
+    pub(crate) names_index: bool,
+}
+
 #[derive(Debug, Clone)]
 /// Metadata about a database table.
 pub struct TableMetadata<T: TableLike> {
@@ -33,6 +46,13 @@ pub struct TableMetadata<T: TableLike> {
     /// as names rather than handles because replacing the table node rebuilds
     /// every column, and the distinction has to survive that.
     inherited_column_names: Vec<String>,
+    /// The names of the columns whose `NOT NULL` the table receives from a
+    /// parent rather than stating itself.
+    ///
+    /// Mirrors `pg_constraint.conislocal` of a PostgreSQL 18 not-null
+    /// constraint: a column that states `NOT NULL` itself keeps it when the
+    /// parent drops its own.
+    inherited_not_null: Vec<String>,
     /// The rendering of each table constraint the table receives from a parent
     /// rather than declaring itself.
     ///
@@ -49,6 +69,11 @@ pub struct TableMetadata<T: TableLike> {
     /// CONSTRAINT ... NOT VALID` leaves until `VALIDATE CONSTRAINT` runs. Held
     /// as renderings for the same reason as the inherited constraints above.
     unvalidated_constraints: Vec<String>,
+    /// The name PostgreSQL gave each constraint the table holds without one,
+    /// fixed when the constraint arrived and kept through every later rename.
+    generated_constraint_names: Vec<GeneratedConstraintName>,
+    /// Whether a constraint may have arrived since the names were last given.
+    constraint_names_pending: bool,
     /// Whether Row Level Security is enabled for the table.
     rls_enabled: bool,
     /// Whether Row Level Security is forced for the table (applies to table
@@ -81,8 +106,11 @@ impl<T: TableLike> Default for TableMetadata<T> {
             foreign_keys: Vec::new(),
             primary_key: Vec::new(),
             inherited_column_names: Vec::new(),
+            inherited_not_null: Vec::new(),
             inherited_constraints: Vec::new(),
             unvalidated_constraints: Vec::new(),
+            generated_constraint_names: Vec::new(),
+            constraint_names_pending: false,
             rls_enabled: false,
             rls_forced: false,
             owner: None,
@@ -296,6 +324,44 @@ impl<T: TableLike> TableMetadata<T> {
         if !validated {
             self.unvalidated_constraints.push(rendering);
         }
+    }
+
+    /// Returns the names of the columns whose `NOT NULL` the table receives
+    /// from a parent rather than stating itself.
+    #[inline]
+    pub(crate) fn inherited_not_null(&self) -> &[String] {
+        &self.inherited_not_null
+    }
+
+    /// Records the names of the columns whose `NOT NULL` the table receives
+    /// from a parent rather than stating itself.
+    #[inline]
+    pub(crate) fn set_inherited_not_null(&mut self, columns: Vec<String>) {
+        self.inherited_not_null = columns;
+    }
+
+    /// Returns the name PostgreSQL gave each constraint written without one.
+    #[inline]
+    pub(crate) fn generated_constraint_names(&self) -> &[GeneratedConstraintName] {
+        &self.generated_constraint_names
+    }
+
+    /// Records the name PostgreSQL gave each constraint written without one.
+    #[inline]
+    pub(crate) fn set_generated_constraint_names(&mut self, names: Vec<GeneratedConstraintName>) {
+        self.generated_constraint_names = names;
+    }
+
+    /// Returns whether a constraint may still be waiting for its name.
+    #[inline]
+    pub(crate) fn constraint_names_pending(&self) -> bool {
+        self.constraint_names_pending
+    }
+
+    /// Records whether a constraint may still be waiting for its name.
+    #[inline]
+    pub(crate) fn set_constraint_names_pending(&mut self, pending: bool) {
+        self.constraint_names_pending = pending;
     }
 
     /// Returns an iterator over the check constraints of the table.

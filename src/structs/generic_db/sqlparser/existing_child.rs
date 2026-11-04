@@ -2,12 +2,18 @@
 //! `ALTER TABLE ... INHERIT` or `ATTACH PARTITION`, following
 //! `MergeAttributesIntoExisting` and `MergeConstraintsIntoExisting`.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use sqlparser::ast::{CheckConstraint, ColumnDef, ColumnOption, CreateTable, TableConstraint};
 
 use super::{
-    ParserDBBuilder, StoredTable, constraint_validity, idents_match, inheritance, states_not_null,
+    ParserDBBuilder, StoredTable,
+    constraint_names::{self, Slot},
+    constraint_validity, inheritance, states_not_null,
 };
 use crate::errors::ChildMismatch;
 
@@ -66,37 +72,54 @@ fn is_stored_generated(column: &ColumnDef) -> bool {
     })
 }
 
-/// Every check the table holds, whether written on a column or on its own, with
-/// whether it is held validated.
-fn checks_of(
-    builder: &ParserDBBuilder,
-    table: &StoredTable,
-    node: &CreateTable,
-) -> Vec<(CheckConstraint, bool)> {
-    let written_on_columns =
-        node.columns.iter().flat_map(|column| &column.options).filter_map(|option| {
-            let ColumnOption::Check(check) = &option.option else {
-                return None;
-            };
-            let mut check = check.clone();
-            check.name = check.name.or_else(|| option.name.clone());
-            Some((check, true))
-        });
-    let written_alone = node.constraints.iter().filter_map(|constraint| {
-        let TableConstraint::Check(check) = constraint else {
-            return None;
-        };
-        Some((check.clone(), constraint_validity::is_validated(builder, table, constraint)))
-    });
-    written_on_columns.chain(written_alone).collect()
+/// A check a table holds, written on a column or on its own.
+struct HeldCheck {
+    check: CheckConstraint,
+    /// Whether the rows held when it arrived were checked.
+    validated: bool,
+    /// The name it answers to, written or given by PostgreSQL.
+    name: Option<String>,
+    /// Whether it sits in the table's constraint list.
+    in_constraint_list: bool,
+}
+
+/// Every check the table holds.
+fn checks_of(builder: &ParserDBBuilder, table: &StoredTable, node: &CreateTable) -> Vec<HeldCheck> {
+    constraint_names::names(node, super::generated_constraint_names(builder, table))
+        .into_iter()
+        .filter_map(|(slot, name)| {
+            let name = name.map(Cow::into_owned);
+            match slot {
+                Slot::Column { held, .. } => {
+                    let ColumnOption::Check(check) = &held.option else {
+                        return None;
+                    };
+                    let mut check = check.clone();
+                    check.name = check.name.or_else(|| held.name.clone());
+                    Some(HeldCheck { check, validated: true, name, in_constraint_list: false })
+                }
+                Slot::Table(_, constraint) => {
+                    let TableConstraint::Check(check) = constraint else {
+                        return None;
+                    };
+                    Some(HeldCheck {
+                        check: check.clone(),
+                        validated: constraint_validity::is_validated(builder, table, constraint),
+                        name,
+                        in_constraint_list: true,
+                    })
+                }
+            }
+        })
+        .collect()
 }
 
 /// Finds the child's own copy of each check the parent passes down, refusing a
 /// missing one and one that cannot merge with the parent's.
 ///
-/// PostgreSQL matches by name. A check the parent left unnamed is matched by
-/// its expression, because the model does not hold the name PostgreSQL gives
-/// it.
+/// PostgreSQL matches by name, the one PostgreSQL gave a check written without
+/// one included. Only where no name is known, outside PostgreSQL, is a check
+/// matched by its expression.
 fn merged_checks(
     builder: &ParserDBBuilder,
     (parent, parent_node): (&StoredTable, &CreateTable),
@@ -105,44 +128,38 @@ fn merged_checks(
     let held = checks_of(builder, child, child_node);
     let mut merged = Vec::new();
 
-    for (check, validated) in checks_of(builder, parent, parent_node) {
-        if check.no_inherit {
+    for passed in checks_of(builder, parent, parent_node) {
+        if passed.check.no_inherit {
             continue;
         }
         let same_expr = |own: &CheckConstraint| {
-            inheritance::stored_expr(&own.expr) == inheritance::stored_expr(&check.expr)
+            inheritance::stored_expr(&own.expr) == inheritance::stored_expr(&passed.check.expr)
         };
-        let found = held.iter().find(|(own, _)| {
-            match &check.name {
-                Some(name) => own.name.as_ref().is_some_and(|own| idents_match(own, name)),
-                None => same_expr(own),
+        let found = held.iter().find(|own| {
+            match &passed.name {
+                Some(name) => own.name.as_ref() == Some(name),
+                None => same_expr(&own.check),
             }
         });
-        let Some((own, own_validated)) = found else {
+        let Some(own) = found else {
             return Err(ChildMismatch::MissingConstraint {
-                constraint_name: check
-                    .name
-                    .as_ref()
-                    .map_or_else(|| check.to_string(), |name| name.value.clone()),
+                constraint_name: passed.name.clone().unwrap_or_else(|| passed.check.to_string()),
             });
         };
-        let constraint_name =
-            || own.name.as_ref().map_or_else(|| own.to_string(), |name| name.value.clone());
-        if !same_expr(own) {
+        let constraint_name = || own.name.clone().unwrap_or_else(|| own.check.to_string());
+        if !same_expr(&own.check) {
             return Err(ChildMismatch::ConstraintDiffers { constraint_name: constraint_name() });
         }
-        if own.no_inherit {
+        if own.check.no_inherit {
             return Err(ChildMismatch::ConstraintNotInherited {
                 constraint_name: constraint_name(),
             });
         }
-        if validated && !own_validated {
+        if passed.validated && !own.validated {
             return Err(ChildMismatch::ConstraintNotValid { constraint_name: constraint_name() });
         }
-
-        let own = TableConstraint::Check(own.clone());
-        if child_node.constraints.contains(&own) {
-            merged.push((own, *own_validated));
+        if own.in_constraint_list {
+            merged.push((TableConstraint::Check(own.check.clone()), own.validated));
         }
     }
 

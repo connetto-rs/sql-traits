@@ -215,6 +215,50 @@ pub trait ColumnLike:
     /// ```
     fn column_name(&self) -> &str;
 
+    /// Returns the name of the `NOT NULL` constraint the column holds: the one
+    /// written, or on PostgreSQL 18 the one it was given when it arrived,
+    /// which renaming the table or the column later leaves alone. A written
+    /// name is returned as PostgreSQL stores it. [`None`] for a column without
+    /// one.
+    ///
+    /// Defaults to [`None`], for a database that does not know the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table of this column.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id INT PRIMARY KEY, email TEXT NOT NULL, bio TEXT);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let names = table
+    ///     .columns(&db)?
+    ///     .map(|column| Ok(column.not_null_constraint_name(&db)?.map(|name| name.into_owned())))
+    ///     .collect::<Result<Vec<_>, LookupError>>()?;
+    /// assert_eq!(
+    ///     names,
+    ///     [Some("users_id_not_null".to_owned()), Some("users_email_not_null".to_owned()), None]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn not_null_constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(None)
+    }
+
     /// Returns whether the column identifier was quoted in SQL.
     ///
     /// Quoted identifiers are resolved case-sensitively in PostgreSQL.

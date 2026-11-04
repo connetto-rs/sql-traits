@@ -57,6 +57,7 @@ mod function_resolution;
 mod function_signature;
 mod function_volatility;
 mod fuzz_crashes;
+mod generated_constraint_names;
 mod generated_index_names;
 mod golden_fingerprints;
 mod granted_columns;

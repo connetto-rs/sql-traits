@@ -13,7 +13,7 @@ use crate::{
     structs::{ColumnMetadata, ParserDB, RevokedPrivilege, TableAttribute},
     traits::{
         ColumnCollation, ColumnLike, DatabaseLike, IdentityGeneration, Metadata,
-        NamedColumnCollation,
+        NamedColumnCollation, TableLike,
     },
     utils::{
         identifier_resolution::normalize_identifier, identity_generation, is_identity,
@@ -92,6 +92,17 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     #[inline]
     fn column_name_is_quoted(&self) -> bool {
         self.attribute().name.quote_style.is_some()
+    }
+
+    fn not_null_constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        let table = self.table();
+        if database.table_metadata(table).is_none() {
+            return Err(ObjectKind::Table.not_in_database(table.table_name()));
+        }
+        Ok(database.not_null_constraint_name(table, &self.attribute().name))
     }
 
     #[inline]

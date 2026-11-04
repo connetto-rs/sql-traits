@@ -57,6 +57,14 @@ pub(super) fn holds_validated(
     Ok(!table_metadata(table, database)?.unvalidated_constraints().contains(&rendered))
 }
 
+/// Where `wanted` sits among the constraint objects `held` a table exposes,
+/// found by identity, or for a value not taken from the database by equality.
+pub(super) fn position_among<T: PartialEq>(held: &[&T], wanted: &T) -> Option<usize> {
+    held.iter()
+        .position(|candidate| core::ptr::eq(*candidate, wanted))
+        .or_else(|| held.iter().position(|candidate| *candidate == wanted))
+}
+
 /// Reads the strategy off a `PARTITION BY` clause.
 ///
 /// PostgreSQL takes one of three words there and parses the clause as a call,

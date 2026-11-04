@@ -142,17 +142,6 @@ fn validating_a_name_the_table_does_not_hold_is_refused() {
             if table_name == "t" && constraint_name == "absent"
     ));
 
-    // PostgreSQL names an unnamed constraint `t_a_check`, a name the model
-    // never generates, so the validation cannot find it.
-    assert!(matches!(
-        parse(
-            "CREATE TABLE t (a INT);
-             ALTER TABLE t ADD CHECK (a > 0) NOT VALID;
-             ALTER TABLE t VALIDATE CONSTRAINT t_a_check;"
-        ),
-        Err(Error::ValidateConstraintNotFound { .. })
-    ));
-
     assert!(
         parse("ALTER TABLE IF EXISTS absent VALIDATE CONSTRAINT ck;").is_ok(),
         "IF EXISTS excuses an absent table"

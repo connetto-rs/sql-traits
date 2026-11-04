@@ -2,6 +2,7 @@
 //! constraints.
 
 use alloc::{
+    borrow::Cow,
     string::{String, ToString},
     vec::Vec,
 };
@@ -765,6 +766,48 @@ pub trait CheckConstraintLike:
     #[inline]
     fn is_validated(&self, _database: &Self::DB) -> Result<bool, LookupError> {
         Ok(true)
+    }
+
+    /// Returns the name the check answers to: the one written, or on
+    /// PostgreSQL the one it was given when it was created, which renaming
+    /// the table or a column later leaves alone. A written name is returned as
+    /// PostgreSQL stores it.
+    ///
+    /// Defaults to [`None`], for a database that does not know the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table of this check constraint.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (amount INT CHECK (amount > 0), CONSTRAINT Capped CHECK (amount < 99));
+    ///      ALTER TABLE orders RENAME TO purchases;",
+    /// )?;
+    /// let table = db
+    ///     .table_by_target(TargetName::new("purchases", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// let names = table
+    ///     .check_constraints(&db)?
+    ///     .map(|check| Ok(check.constraint_name(&db)?.map(|name| name.into_owned())))
+    ///     .collect::<Result<Vec<_>, LookupError>>()?;
+    /// assert_eq!(names, [Some("orders_amount_check".to_owned()), Some("capped".to_owned())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(None)
     }
 
     /// Returns a reference to the table that the check constraint is defined

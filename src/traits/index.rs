@@ -1,6 +1,6 @@
 //! Submodule defining the `IndexLike` trait for SQL indices.
 
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use core::fmt::Debug;
 
 use sqlparser::ast::{Expr, IndexType};
@@ -82,6 +82,47 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     #[inline]
     fn schema_is_quoted(&self) -> bool {
         false
+    }
+
+    /// Returns the name of the constraint the index backs, a primary key or
+    /// unique constraint: the one written, or on PostgreSQL the one it was
+    /// given when it was created, which renaming the table or a column later
+    /// leaves alone. A written name is returned as PostgreSQL stores it.
+    ///
+    /// Defaults to [`None`], for an index backing no constraint and for a
+    /// database that does not know the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table of this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let names = table
+    ///     .unique_indices(&db)?
+    ///     .map(|key| Ok(key.constraint_name(&db)?.map(|name| name.into_owned())))
+    ///     .collect::<Result<Vec<_>, LookupError>>()?;
+    /// assert_eq!(names, [Some("users_pkey".to_owned()), Some("users_email_key".to_owned())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(None)
     }
 
     /// Returns the expression of the index as an SQL AST node.

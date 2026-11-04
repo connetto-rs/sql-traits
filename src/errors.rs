@@ -2555,6 +2555,15 @@ pub enum Error {
         /// The action, rendered by the parser.
         operation: String,
     },
+    #[error("Constraint `{constraint_name}` already exists on table `{table_name}`.")]
+    /// Error indicating that `ADD CONSTRAINT` names a constraint the table
+    /// already holds under that name, written or given by PostgreSQL.
+    ConstraintAlreadyExists {
+        /// Name of the table.
+        table_name: String,
+        /// Name the statement gives the constraint.
+        constraint_name: String,
+    },
     #[error("Policy `{policy_name}` already exists on table `{table_name}`.")]
     /// Error indicating that a `CREATE POLICY` statement names a policy the
     /// table already carries. A policy name is unique per table, whatever
