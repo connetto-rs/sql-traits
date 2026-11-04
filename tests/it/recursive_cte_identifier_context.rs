@@ -73,7 +73,7 @@ fn stored_recursive_cte_scopes_keep_the_postgres_comparison() {
     let direct =
         query("WITH RECURSIVE A AS (SELECT id FROM b), B AS (SELECT id FROM a) SELECT A.id FROM A");
     let scope = ColumnScope::from_query(&direct, &db, IdentifierCase::Exact).expect("scope builds");
-    let Some(ColumnDefinition::Base { table, column }) =
+    let Some(ColumnDefinition::Base { table, column, .. }) =
         scope.resolve_column_definition(&reference("A", "id")).expect("definition resolves")
     else {
         panic!("the caller's Exact read must bind to b.id")

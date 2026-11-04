@@ -44,7 +44,8 @@ use crate::{
         IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
         Sequence, TableAttribute, TableMetadata, View,
         metadata::{
-            CheckMetadata, ExpressionCalls, IndexMetadata, PolicyMetadata, UniqueIndexMetadata,
+            CheckMetadata, ColumnCreation, ExpressionCalls, IndexMetadata, PolicyMetadata,
+            UniqueIndexMetadata,
         },
     },
     traits::{ColumnLike, IndexLike, SequenceLike, TableLike, ViewLike},
@@ -203,7 +204,9 @@ impl UndeclaredRoleAlteration {
 }
 
 enum TableOrigin {
-    Declaration(TableDocumentation),
+    /// A `CREATE TABLE` statement, with the comments written above it and the
+    /// query output each column without a declared type was created from.
+    Declaration(TableDocumentation, Vec<(Ident, ColumnCreation)>),
     /// A rebuild of a stored table, keeping its identity and the bindings
     /// its calls held.
     Replacement(RelationIdentity, CarriedCalls),
@@ -5999,7 +6002,7 @@ impl ParserDB {
         preserved: &[PreservedColumnMetadata],
         mut origin: TableOrigin,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        if matches!(origin, TableOrigin::Declaration(_)) {
+        if matches!(origin, TableOrigin::Declaration(..)) {
             validate_table_schema(&builder, &create_table)?;
         }
         validate_distinct_columns(&create_table, builder.identifier_case())?;
@@ -6016,7 +6019,7 @@ impl ParserDB {
         partition_keys::validate_partitioned_table(&create_table, builder.identifier_case())?;
 
         let (identity, documentation, mut carried) = match &mut origin {
-            TableOrigin::Declaration(documentation) => {
+            TableOrigin::Declaration(documentation, _) => {
                 (
                     builder.draw_relation_identity(),
                     documentation.table.take(),
@@ -6053,8 +6056,13 @@ impl ParserDB {
             )?
             .with_calls(builder.calls_carried(column.attribute(), &mut carried));
             let metadata = match &mut origin {
-                TableOrigin::Declaration(documentation) => {
-                    metadata.with_documentation(documentation.take_column(&column.attribute().name))
+                TableOrigin::Declaration(documentation, creations) => {
+                    let name = &column.attribute().name;
+                    let metadata = metadata.with_documentation(documentation.take_column(name));
+                    match creations.iter().position(|(created, _)| created == name) {
+                        Some(position) => metadata.with_creation(creations.swap_remove(position).1),
+                        None => metadata,
+                    }
                 }
                 TableOrigin::Replacement(..) => metadata,
             };
@@ -9382,7 +9390,7 @@ impl ParserDB {
 
                     // The query's columns are the table's own, so they are in
                     // place before anything below reads the column list.
-                    table_as::apply_query(&builder, &mut create_table)?;
+                    let mut creations = table_as::apply_query(&builder, &mut create_table)?;
                     // Named before anything is created, so copied columns bring
                     // none.
                     let stored = StoredTable::of(&create_table);
@@ -9410,7 +9418,7 @@ impl ParserDB {
 
                     // A `LIKE` copy becomes the table's own columns, so it
                     // runs before the parents contribute theirs.
-                    like::apply_like(&builder, &mut create_table)?;
+                    creations.extend(like::apply_like(&builder, &mut create_table)?);
 
                     // A foreign partition is refused under a unique index
                     // before it takes the keys a partition receives.
@@ -9490,7 +9498,7 @@ impl ParserDB {
                         &collation_metadata,
                         &active_postgres_catalog,
                         &inherited.column_metadata,
-                        TableOrigin::Declaration(documentation),
+                        TableOrigin::Declaration(documentation, creations),
                     )?;
                     sequences::own_column_sequences(&mut builder, &stored, column_sequences);
                     builder = creator.grant(

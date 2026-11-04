@@ -553,10 +553,13 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         owner: Self::Cursor,
     );
     fn opaque_definition(&self) -> Self::Definition;
-    fn base_definition(
+    /// The definition of a stored column, which for a column created from the
+    /// query of `CREATE TABLE … AS` is that query's output.
+    fn column_definition(
         &mut self,
         table: &'db DB::Table,
         column: &'db DB::Column,
+        database: &'db DB,
     ) -> Self::Definition;
     fn expression_definition(
         &mut self,
@@ -631,7 +634,13 @@ where
 
     fn opaque_definition(&self) {}
 
-    fn base_definition(&mut self, _table: &'db DB::Table, _column: &'db DB::Column) {}
+    fn column_definition(
+        &mut self,
+        _table: &'db DB::Table,
+        _column: &'db DB::Column,
+        _database: &'db DB,
+    ) {
+    }
 
     fn expression_definition(
         &mut self,
@@ -3936,7 +3945,7 @@ where
             BaseColumnRef {
                 name: column.column_name().to_string(),
                 quoted: column.column_name_is_quoted(),
-                definition: profile.base_definition(table, column),
+                definition: profile.column_definition(table, column, database),
             }
         })
         .collect::<Vec<_>>();
@@ -5141,7 +5150,7 @@ mod tests {
             scope.resolve_column_definition(&compound(parts)).expect("lookup succeeds");
         definition.map(|definition| {
             match definition {
-                ColumnDefinition::Base { table, column } => {
+                ColumnDefinition::Base { table, column, .. } => {
                     format!("{}.{}", table.table_name(), column.column_name())
                 }
                 ColumnDefinition::Opaque => "opaque".to_string(),

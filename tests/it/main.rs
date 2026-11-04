@@ -122,6 +122,7 @@ mod sequences;
 mod set_returning_functions;
 mod stored_identifier_names;
 mod stored_identity_lookup;
+mod table_as_query;
 mod table_inheritance;
 mod table_inheritance_reads;
 mod table_like;
