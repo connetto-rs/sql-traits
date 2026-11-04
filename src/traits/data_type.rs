@@ -123,7 +123,9 @@ pub trait DataTypeLike: Debug + Send + Sync {
     ///
     /// The name is a borrowed canonical token whenever the implementation can
     /// name one literally. An array type has to be assembled from its element
-    /// type, so it is owned.
+    /// type, so it is owned. A name part PostgreSQL reads case-sensitively, or
+    /// one that would otherwise read as a type keyword, is double-quoted, as
+    /// `format_type` prints it.
     ///
     /// # Example
     ///
@@ -143,8 +145,11 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// ```
     fn name<'db>(&'db self, database: &'db Self::DB) -> Cow<'db, str>;
 
-    /// Returns the name of the type with PostgreSQL's aliases folded, so
-    /// `SERIAL` answers `INT` and `BIGSERIAL` answers `BIGINT`.
+    /// Returns the name of the type normalized by
+    /// [`normalize_postgres_type`](crate::utils::normalize_postgres_type), so
+    /// every spelling of one type answers one name. `SERIAL` answers `INT`,
+    /// `BIGSERIAL` answers `BIGINT`, and PostgreSQL's print `integer[]`
+    /// answers `INT[]` as a declared `INT4[]` does.
     ///
     /// # Example
     ///

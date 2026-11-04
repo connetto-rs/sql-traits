@@ -285,15 +285,6 @@ pub(crate) fn require_local_object_name(object_name: &ObjectName) -> Result<(), 
     Ok(())
 }
 
-/// Returns the written identifier of a single object name part, and [`None`]
-/// when the part is a call producing the name at run time.
-pub(crate) fn object_name_part_value(part: &ObjectNamePart) -> Option<&str> {
-    match part {
-        ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
-        ObjectNamePart::Function(_) => None,
-    }
-}
-
 /// Returns the last identifier part of an object name as `(value, quoted)`.
 ///
 /// A part built at run time yields [`None`], the same answer as an empty name:

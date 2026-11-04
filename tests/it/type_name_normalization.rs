@@ -1,0 +1,143 @@
+//! Tests that a normalized type name depends on the type rather than on how
+//! it was spelled, so a parsed declaration and PostgreSQL's own print of the
+//! same type normalize to one name.
+#![allow(clippy::expect_used)]
+
+use core::fmt::Write;
+
+use sql_traits::{prelude::*, utils::normalize_postgres_type};
+use sqlparser::dialect::PostgreSqlDialect;
+
+/// Each row is a return type as DDL may write it, beside `format_type`'s print
+/// of the same type, which is how a catalog-backed profile names it.
+const SPELLINGS: &[(&str, &str)] = &[
+    ("VOID", "void"),
+    ("TRIGGER", "trigger"),
+    ("SETOF int4", "SETOF integer"),
+    ("setof Text", "SETOF text"),
+    ("int4[]", "integer[]"),
+    ("INT[][]", "integer[]"),
+    ("VARCHAR(3)[]", "character varying[]"),
+    ("timestamptz", "timestamp with time zone"),
+    ("bit varying", "bit varying"),
+    ("bool", "boolean"),
+    ("float8", "double precision"),
+    ("DECIMAL(10, 2)", "numeric"),
+    ("MyType", "mytype"),
+    ("\"mytype\"", "mytype"),
+    ("\"MyType\"", "\"MyType\""),
+    ("\"char\"", "\"char\""),
+    ("pg_catalog.int4", "integer"),
+    ("App.Points", "app.points"),
+    ("app.\"Points\"[]", "app.\"Points\"[]"),
+];
+
+/// Parses one function per row and returns each one's normalized return and
+/// argument type, in row order.
+fn parsed_normalized_names() -> Vec<(String, String)> {
+    let mut ddl = String::new();
+    for (index, (written, _)) in SPELLINGS.iter().enumerate() {
+        // An argument cannot be a set, so it declares the element.
+        let argument = match written.split_at_checked(6) {
+            Some((keyword, element)) if keyword.eq_ignore_ascii_case("SETOF ") => element,
+            _ => written,
+        };
+        write!(
+            ddl,
+            "CREATE FUNCTION f{index}(a {argument}) RETURNS {written} \
+             LANGUAGE sql AS 'SELECT NULL';"
+        )
+        .expect("writing to a String cannot fail");
+    }
+    let database = ParserDB::parse::<PostgreSqlDialect>(&ddl).expect("every spelling parses");
+
+    (0..SPELLINGS.len())
+        .map(|index| {
+            let function = database
+                .function_by_target(
+                    TargetName::new(&format!("f{index}"), false),
+                    IdentifierCase::AsWritten,
+                )
+                .expect("unambiguous lookup")
+                .expect("the DDL declares the function");
+            let returned = function
+                .normalized_return_type_name(&database)
+                .expect("the function declares a return type")
+                .into_owned();
+            let [argument] = <[_; 1]>::try_from(function.normalized_argument_type_names(&database))
+                .expect("the function declares one argument");
+            (returned, argument.into_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn test_parsed_and_printed_spellings_normalize_alike() {
+    for ((written, printed), (returned, argument)) in
+        SPELLINGS.iter().zip(parsed_normalized_names())
+    {
+        let printed = normalize_postgres_type(printed);
+        assert_eq!(returned, printed, "RETURNS {written}");
+        let element = printed.strip_prefix("SETOF ").unwrap_or(&printed);
+        assert_eq!(argument, element, "argument {written}");
+    }
+}
+
+/// Folding never merges two types PostgreSQL keeps apart: a quoted name with
+/// an upper-case letter, and the internal `"char"` beside `character`.
+#[test]
+fn test_quoting_keeps_distinct_types_apart() {
+    for (left, right) in [
+        ("\"MyType\"", "mytype"),
+        ("\"MYTYPE\"", "mytype"),
+        ("\"char\"", "char"),
+        ("\"integer\"", "integer"),
+        ("SETOF \"MyType\"", "SETOF mytype"),
+        ("\"MyType\"[]", "mytype[]"),
+    ] {
+        assert_ne!(normalize_postgres_type(left), normalize_postgres_type(right), "{left}");
+    }
+}
+
+/// Function identity runs through the same normalization, so an overload
+/// differing only by spelling is a redeclaration, and one differing by a
+/// quoted name is a second function.
+#[test]
+fn test_function_identity_follows_the_type() {
+    let dropped = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION f(a int4[]) RETURNS INT LANGUAGE sql AS 'SELECT 1'; \
+         DROP FUNCTION f(integer[]);",
+    )
+    .expect("the drop names the array type the create declared");
+    assert_eq!(dropped.functions().filter(|function| function.name() == "f").count(), 0);
+
+    let overloaded = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION f(a \"MyType\") RETURNS INT LANGUAGE sql AS 'SELECT 1'; \
+         CREATE FUNCTION f(a MyType) RETURNS INT LANGUAGE sql AS 'SELECT 1';",
+    )
+    .expect("a quoted and an unquoted name are two types");
+    assert_eq!(overloaded.functions().filter(|function| function.name() == "f").count(), 2);
+}
+
+/// A column's normalized type follows the same rule as a function's.
+#[test]
+fn test_column_type_normalizes_like_its_print() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE t (a int4[], b \"MyType\", c MyType, d timestamptz);",
+    )
+    .expect("the table parses");
+    let table = database
+        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the DDL declares the table");
+    let names: Vec<String> = table
+        .columns(&database)
+        .expect("the table has columns")
+        .map(|column| column.data_type(&database).normalized_name(&database).into_owned())
+        .collect();
+    let printed: Vec<String> = ["integer[]", "\"MyType\"", "mytype", "timestamp with time zone"]
+        .into_iter()
+        .map(|print| normalize_postgres_type(print).into_owned())
+        .collect();
+    assert_eq!(names, printed);
+}

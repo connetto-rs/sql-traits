@@ -129,6 +129,7 @@ mod target_names;
 mod temporary_namespace;
 mod thread_safety;
 mod transactional_ingestion;
+mod type_name_normalization;
 mod view_options;
 mod views;
 mod views_follow_renames;
