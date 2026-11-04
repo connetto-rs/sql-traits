@@ -497,6 +497,106 @@ fn no_table_inherits_from_a_partition() {
 }
 
 #[test]
+fn a_partitioned_table_inherits_from_nothing() {
+    // Measured on PostgreSQL 17 and 18: "cannot create partitioned table as
+    // inheritance child".
+    for statement in [
+        "CREATE TABLE pt (id INT) INHERITS (plain) PARTITION BY RANGE (id);",
+        "CREATE TABLE pt () INHERITS (plain) PARTITION BY LIST (id);",
+    ] {
+        let error =
+            parse(&format!("CREATE TABLE plain (id INT); {statement}")).expect_err(statement);
+        assert!(
+            matches!(&error, Error::PartitionedTableInherits { table_name } if table_name == "pt"),
+            "{statement}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_table_names_each_column_and_each_parent_once() {
+    // Measured on PostgreSQL 17 and 18: "column specified more than once",
+    // also when the column is received, and "would be inherited from more
+    // than once" however the parent is spelled. The table is named as placed
+    // on the search path, as the other parent refusals name it.
+    let schema = "CREATE SCHEMA app; SET search_path = app;
+         CREATE TABLE plain (id INT);
+         CREATE TABLE orders (id INT NOT NULL, note TEXT) PARTITION BY RANGE (id);";
+    for (statement, column) in [
+        (
+            "CREATE TABLE p PARTITION OF orders (note DEFAULT 'x', note NOT NULL)
+                 FOR VALUES FROM (0) TO (10);",
+            "note",
+        ),
+        (
+            "CREATE TABLE p PARTITION OF orders (note NOT NULL, NOTE DEFAULT 'x')
+                 FOR VALUES FROM (0) TO (10);",
+            "NOTE",
+        ),
+        ("CREATE TABLE p (x INT, x INT) INHERITS (plain);", "x"),
+        ("CREATE TABLE p (id INT, id INT) INHERITS (plain);", "id"),
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::ColumnAlreadyExists { table_name, column_name }
+                    if table_name == "app.p" && column_name == column
+            ),
+            "{statement}: {error:?}"
+        );
+    }
+    for statement in [
+        "CREATE TABLE c () INHERITS (plain, plain);",
+        "CREATE TABLE c () INHERITS (plain, app.plain);",
+        "CREATE TABLE c () INHERITS (plain, \"plain\");",
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::ParentRepeated { table_name, parent_name }
+                    if table_name == "app.c" && parent_name == "plain"
+            ),
+            "{statement}: {error:?}"
+        );
+    }
+    database(&format!(
+        "{schema} CREATE SCHEMA other; CREATE TABLE other.plain (id INT);
+         CREATE TABLE c () INHERITS (plain, other.plain);"
+    ));
+}
+
+#[test]
+fn a_received_generated_column_takes_no_default() {
+    // Measured on PostgreSQL 17 and 18: "column inherits from generated
+    // column but specifies default", for a partition and an inheriting child,
+    // while redeclaring the column with an expression of its own is accepted.
+    let schema = "CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)
+             PARTITION BY RANGE (a);
+         CREATE TABLE gp (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED);";
+    for (statement, table) in [
+        ("CREATE TABLE g1 PARTITION OF g (b DEFAULT 1) FOR VALUES FROM (0) TO (10);", "g1"),
+        ("CREATE TABLE gc (b INT DEFAULT 1) INHERITS (gp);", "gc"),
+    ] {
+        let error = parse(&format!("{schema} {statement}")).expect_err(statement);
+        assert!(
+            matches!(
+                &error,
+                Error::DefaultOnInheritedGeneratedColumn { table_name, column_name }
+                    if table_name == table && column_name == "b"
+            ),
+            "{statement}: {error:?}"
+        );
+    }
+    database(&format!(
+        "{schema}
+         CREATE TABLE g2 PARTITION OF g (b NOT NULL) FOR VALUES FROM (10) TO (20);
+         CREATE TABLE gc3 (b INT GENERATED ALWAYS AS (a * 3) STORED) INHERITS (gp);"
+    ));
+}
+
+#[test]
 fn redeclaring_an_inherited_column_with_another_type_is_refused() {
     assert!(matches!(
         parse(

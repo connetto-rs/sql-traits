@@ -829,7 +829,15 @@ fn merge_local_columns(
     columns: &mut Vec<ColumnDef>,
     column_metadata: &[super::PreservedColumnMetadata],
 ) -> Result<(), Error> {
-    for column in local_columns {
+    for (index, column) in local_columns.iter().enumerate() {
+        // Merging would fold a repeated entry into one column, which
+        // PostgreSQL refuses before it reaches any parent.
+        if local_columns[..index].iter().any(|earlier| same_column(&earlier.name, &column.name)) {
+            return Err(Error::ColumnAlreadyExists {
+                table_name: context.child_name.to_string(),
+                column_name: column.name.value.clone(),
+            });
+        }
         if let Some(position) =
             columns.iter().position(|held| same_column(&held.name, &column.name))
         {
@@ -849,6 +857,7 @@ fn merge_local_columns(
             {
                 return Err(error);
             }
+            refuse_default_on_generated(context, &columns[position], column)?;
             columns[position] = merge_declarations(&columns[position], column);
         } else if let Some((_, root)) =
             context.parents.iter().find(|(kind, _)| *kind == ParentKind::PartitionOf)
@@ -865,6 +874,30 @@ fn merge_local_columns(
         } else {
             columns.push(column.clone());
         }
+    }
+    Ok(())
+}
+
+/// Refuses a `DEFAULT` written on a column the table receives as a stored
+/// generated column, unless the table gives it a generation expression of its
+/// own instead.
+fn refuse_default_on_generated(
+    context: &ParentApplication<'_>,
+    received: &ColumnDef,
+    written: &ColumnDef,
+) -> Result<(), Error> {
+    let generated = |column: &ColumnDef| {
+        column.options.iter().any(|option| {
+            matches!(option.option, ColumnOption::Generated { generation_expr: Some(_), .. })
+        })
+    };
+    let defaulted =
+        written.options.iter().any(|option| matches!(option.option, ColumnOption::Default(_)));
+    if generated(received) && defaulted && !generated(written) {
+        return Err(Error::DefaultOnInheritedGeneratedColumn {
+            table_name: context.child_name.to_string(),
+            column_name: written.name.value.clone(),
+        });
     }
     Ok(())
 }
@@ -1089,14 +1122,22 @@ fn parent_owning(
 /// Binds every parent a table being created names to the table it reaches
 /// through the session's path, refusing an absent one, one PostgreSQL will
 /// not link across temporary and permanent storage, a `PARTITION OF` parent
-/// without a partition key, and an `INHERITS` parent that has one or is
-/// itself a partition.
+/// without a partition key, an `INHERITS` parent that has one or is itself a
+/// partition, and one named twice. A partitioned table takes no `INHERITS`
+/// parent at all.
 fn bind_parents(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
     child_name: &str,
 ) -> Result<(), Error> {
+    if create_table.partition_by.is_some()
+        && create_table.inherits.iter().flatten().next().is_some()
+    {
+        return Err(Error::PartitionedTableInherits { table_name: child_name.to_string() });
+    }
     let child_temporary = create_table.is_temporary();
+    let case = builder.identifier_case();
+    let mut bound: Vec<StoredTable> = Vec::new();
     let parents =
         create_table.inherits.iter_mut().flatten().map(|name| (ParentKind::Inherits, name)).chain(
             create_table.partition_of.iter_mut().map(|name| (ParentKind::PartitionOf, name)),
@@ -1141,6 +1182,13 @@ fn bind_parents(
             }
             ParentKind::PartitionOf | ParentKind::Inherits => {}
         }
+        if bound.iter().any(|earlier| earlier.matches(parent, case)) {
+            return Err(Error::ParentRepeated {
+                table_name: child_name.to_string(),
+                parent_name: parent.table_name().to_string(),
+            });
+        }
+        bound.push(StoredTable::of(parent));
         let qualifier = super::stored_qualifier(&parent.name);
         super::bind_reference(parent_name, qualifier);
     }
