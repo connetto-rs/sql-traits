@@ -78,6 +78,7 @@ mod output_names;
 mod owned_collations;
 mod parsed_name_resolution_rules;
 mod parser_free_database;
+mod partition_alterations;
 mod partition_attachment;
 mod partition_keys;
 mod per_object_grants;
