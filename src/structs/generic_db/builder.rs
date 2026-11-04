@@ -865,6 +865,31 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self
     }
 
+    /// Adds a role membership with its metadata to the builder, after the
+    /// memberships already granted.
+    #[must_use]
+    #[inline]
+    pub fn add_role_membership(
+        mut self,
+        membership: Arc<P::RoleMembership>,
+        metadata: Meta<P::RoleMembership>,
+    ) -> Self {
+        self.role_memberships.push((membership, metadata));
+        self
+    }
+
+    /// Adds multiple role memberships with their metadata to the builder, in
+    /// the order given.
+    #[must_use]
+    #[inline]
+    pub fn add_role_memberships(
+        mut self,
+        memberships: impl IntoIterator<Item = (Arc<P::RoleMembership>, Meta<P::RoleMembership>)>,
+    ) -> Self {
+        self.role_memberships.extend(memberships);
+        self
+    }
+
     /// Adds a schema with its metadata to the builder.
     #[must_use]
     #[inline]
@@ -1263,11 +1288,47 @@ impl<P: SchemaProfile> From<GenericDBBuilder<P>> for GenericDB<P> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{sync::Arc, vec, vec::Vec};
+
+    use sqlparser::{ast::Ident, dialect::PostgreSqlDialect};
 
     use crate::{
         impls::SqlparserDialect,
-        structs::{ParserDBBuilder, SqlparserProfile},
+        structs::{
+            ParserDB, ParserDBBuilder, SqlparserProfile,
+            role_membership::{MembershipGrant, RoleMembership},
+        },
+        traits::RoleLike,
     };
+
+    /// A membership of `member` in `role` under one grant without a
+    /// grantor, inheriting and settable.
+    fn membership(role: &str, member: &str) -> Arc<RoleMembership> {
+        Arc::new(RoleMembership {
+            role: Ident::new(role),
+            member: Ident::new(member),
+            grants: vec![MembershipGrant { grantor: None, admin: false, inherit: true, set: true }],
+        })
+    }
+
+    /// The memberships a builder is handed reach the roles of the database
+    /// it builds, in the order they were added.
+    #[test]
+    fn added_role_memberships_reach_the_member_role() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE ROLE reader; CREATE ROLE auditor; CREATE ROLE app_user;",
+        )
+        .expect("the roles parse");
+        let (builder, ingestion) = ParserDBBuilder::from_database(database);
+        let database = builder
+            .add_role_membership(membership("reader", "app_user"), ())
+            .add_role_memberships([(membership("auditor", "app_user"), ())])
+            .into_database(ingestion);
+
+        let app_user = database.role("app_user").expect("the member role is held");
+        let parents: Vec<_> = app_user.member_of(&database).map(RoleLike::name).collect();
+        assert_eq!(parents, ["reader", "auditor"]);
+    }
 
     #[test]
     fn empty_bulk_additions_preserve_every_collection() {
@@ -1281,6 +1342,7 @@ mod tests {
             .add_policies(core::iter::empty())
             .add_functions(core::iter::empty())
             .add_roles(core::iter::empty())
+            .add_role_memberships(core::iter::empty())
             .add_schemas(core::iter::empty())
             .add_table_grants(core::iter::empty())
             .add_column_grants(core::iter::empty());
