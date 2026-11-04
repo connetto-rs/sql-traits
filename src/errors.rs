@@ -1930,6 +1930,57 @@ pub enum Error {
         /// Partitioned parent it names, as written.
         parent_name: String,
     },
+    #[error("Relation `{partition_name}` is not a partition of table `{table_name}`.")]
+    /// Error indicating that `DETACH PARTITION` names a relation that is not
+    /// one of the table's partitions.
+    NotAPartitionOf {
+        /// Partitioned table the statement alters.
+        table_name: String,
+        /// Relation the statement detaches, as written.
+        partition_name: String,
+    },
+    #[error(
+        "Partition `{partition_name}` of table `{table_name}` cannot be detached concurrently inside a transaction block."
+    )]
+    /// Error indicating that `DETACH PARTITION ... CONCURRENTLY` runs inside
+    /// `BEGIN`, which PostgreSQL refuses.
+    DetachConcurrentlyInTransaction {
+        /// Partitioned table the statement alters.
+        table_name: String,
+        /// Partition the statement detaches.
+        partition_name: String,
+    },
+    #[error(
+        "Partition `{partition_name}` of table `{table_name}` cannot be detached concurrently while the table has a default partition."
+    )]
+    /// Error indicating that `DETACH PARTITION ... CONCURRENTLY` names a table
+    /// with a default partition, the detached one included.
+    DetachConcurrentlyWithDefault {
+        /// Partitioned table the statement alters.
+        table_name: String,
+        /// Partition the statement detaches.
+        partition_name: String,
+    },
+    #[error("No detach of partition `{partition_name}` of table `{table_name}` is pending.")]
+    /// Error indicating that `DETACH PARTITION ... FINALIZE` names a partition
+    /// no interrupted `CONCURRENTLY` left pending, which an ingested schema
+    /// never holds.
+    NoDetachPending {
+        /// Partitioned table the statement alters.
+        table_name: String,
+        /// Partition the statement names.
+        partition_name: String,
+    },
+    #[error(
+        "`ATTACH PARTITION` and `DETACH PARTITION` on table `{table_name}` must be the only action of their statement."
+    )]
+    /// Error indicating that an `ALTER TABLE` writes `ATTACH PARTITION` or
+    /// `DETACH PARTITION` beside another action, which PostgreSQL's grammar
+    /// does not accept.
+    PartitionCommandNotAlone {
+        /// Table the statement alters.
+        table_name: String,
+    },
     #[error("Table `{table_name}` cannot inherit from partition `{parent_name}`.")]
     /// Error indicating that `INHERITS` names a partition, whose columns
     /// belong to the partitioned table it is part of.

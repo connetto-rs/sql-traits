@@ -76,6 +76,7 @@ use calls_in_expression::CarriedCalls;
 mod column_copy;
 mod constraint_validity;
 mod default_privileges;
+mod detach_partition;
 mod domains;
 mod extensions;
 mod foreign_options;
@@ -8632,6 +8633,21 @@ impl ParserDB {
                     if alter_table.table_type == Some(AlterTableType::Foreign) {
                         refuse_alter_foreign_table_of_other_kind(&builder, &alter_table)?;
                     }
+                    // PostgreSQL's grammar takes a partition command only as
+                    // the whole of its statement.
+                    if alter_table.operations.len() > 1
+                        && alter_table.operations.iter().any(|operation| {
+                            matches!(
+                                operation,
+                                AlterTableOperation::AttachPartitionOf { .. }
+                                    | AlterTableOperation::DetachPartitionOf { .. }
+                            )
+                        })
+                    {
+                        return Err(crate::errors::Error::PartitionCommandNotAlone {
+                            table_name: alter_table.name.to_string(),
+                        });
+                    }
                     for operation in alter_table.operations {
                         // `ALTER TABLE` names a relation, and PostgreSQL
                         // accepts it against a view for the actions a view
@@ -8868,6 +8884,17 @@ impl ParserDB {
                                     scope,
                                     &partition,
                                     &for_values,
+                                )?;
+                            }
+
+                            AlterTableOperation::DetachPartitionOf { partition, mode } => {
+                                builder = detach_partition::detach_partition(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &partition,
+                                    mode,
+                                    in_transaction,
                                 )?;
                             }
 
