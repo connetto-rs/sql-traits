@@ -463,6 +463,17 @@ mod tests {
     fn test_normalize_postgres_type_keeps_modifiers() {
         assert_eq!(normalize_postgres_type("geometry(Point, 3857)"), "GEOMETRY(Point, 3857)");
         assert_eq!(normalize_postgres_type("geometry(Point, 3857)[]"), "GEOMETRY(Point, 3857)[]");
+        assert_eq!(normalize_postgres_type("\"Geo(x\"(Point)"), "\"Geo(x\"(Point)");
+        assert_eq!(normalize_postgres_type("\"geo\"(Point)"), "GEO(Point)");
+    }
+
+    /// A name of several words outside the alias table folds word by word,
+    /// and so does a spelling that is not a well-formed name.
+    #[test]
+    fn test_normalize_postgres_type_folds_words() {
+        assert_eq!(normalize_postgres_type("any \t type"), "ANY TYPE");
+        assert_eq!(normalize_postgres_type("app.my  type"), "APP.MY TYPE");
+        assert_eq!(normalize_postgres_type("APP.MY TYPE"), "APP.MY TYPE");
     }
 
     /// Normalizing a normalized name changes nothing.
@@ -497,14 +508,10 @@ mod tests {
 
         let array = "TEXT[]".to_owned();
         let pointer = array.as_ptr();
-        match normalize_postgres_type_cow(Cow::Owned(array)) {
-            Cow::Owned(owned) => {
-                assert_eq!(owned, "TEXT[]");
-                assert_eq!(owned.as_ptr(), pointer, "a normalized type must not be reallocated");
-            }
-            Cow::Borrowed(borrowed) => {
-                panic!("an owned normalized type must stay owned: {borrowed}")
-            }
-        }
+        let normalized = normalize_postgres_type_cow(Cow::Owned(array));
+        assert!(
+            matches!(&normalized, Cow::Owned(owned) if owned.as_ptr() == pointer),
+            "a normalized owned type must stay owned and in place: {normalized:?}"
+        );
     }
 }
