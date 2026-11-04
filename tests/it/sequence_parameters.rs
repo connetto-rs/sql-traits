@@ -9,7 +9,11 @@ use sql_traits::{
     errors::{Error, SequenceParameterError},
     prelude::*,
 };
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::{
+    ast::{Expr, SequenceOptions, Statement, UnaryOperator, Value},
+    dialect::PostgreSqlDialect,
+    parser::Parser,
+};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -85,16 +89,24 @@ fn every_integer_spelling_postgresql_reads_is_accepted() {
     let db = parse(
         "CREATE SEQUENCE underscored START 1_000;
          CREATE SEQUENCE hexadecimal START 0x10;
+         CREATE SEQUENCE octal START 0o17;
+         CREATE SEQUENCE binary_ START 0b101;
+         CREATE SEQUENCE prefixed START 0x_1F;
          CREATE SEQUENCE signed START +7;
          CREATE SEQUENCE catalog_named AS pg_catalog.int8;
+         CREATE SEQUENCE quoted AS \"int8\";
          CREATE SEQUENCE widest MAXVALUE 9223372036854775807 MINVALUE -9223372036854775808;",
     )
     .expect("PostgreSQL accepts every declaration");
 
     assert_eq!(row(&db, "underscored"), "bigint 1000 1 1 9223372036854775807 1 f");
     assert_eq!(row(&db, "hexadecimal"), "bigint 16 1 1 9223372036854775807 1 f");
+    assert_eq!(row(&db, "octal"), "bigint 15 1 1 9223372036854775807 1 f");
+    assert_eq!(row(&db, "binary_"), "bigint 5 1 1 9223372036854775807 1 f");
+    assert_eq!(row(&db, "prefixed"), "bigint 31 1 1 9223372036854775807 1 f");
     assert_eq!(row(&db, "signed"), "bigint 7 1 1 9223372036854775807 1 f");
     assert_eq!(row(&db, "catalog_named"), "bigint 1 1 1 9223372036854775807 1 f");
+    assert_eq!(row(&db, "quoted"), "bigint 1 1 1 9223372036854775807 1 f");
     assert_eq!(
         row(&db, "widest"),
         "bigint -9223372036854775808 1 -9223372036854775808 9223372036854775807 1 f"
@@ -147,6 +159,43 @@ fn parameters_postgresql_refuses_are_refused() {
         refused("CREATE SEQUENCE s START 1e3;"),
         NotABigint { option: "START", value: "1e3".to_string() }
     );
+    assert_eq!(
+        refused("CREATE SEQUENCE s START $1;"),
+        NotABigint { option: "START", value: "$1".to_string() }
+    );
+    for misnamed in ["\"INT8\"", "public.int8"] {
+        assert_eq!(
+            refused(&format!("CREATE SEQUENCE s AS {misnamed};")),
+            SequenceParameterError::UnsupportedType { data_type: misnamed.to_string() }
+        );
+    }
+}
+
+/// A statement built in code can hold a number the SQL tokenizer never
+/// produces, which PostgreSQL's `bigint` input would refuse.
+#[test]
+fn a_built_statement_with_a_malformed_number_is_refused() {
+    let number = |digits: &str| Expr::value(Value::Number(digits.to_string(), false));
+    let negated = |expr: Expr| Expr::UnaryOp { op: UnaryOperator::Minus, expr: Box::new(expr) };
+    for start in [number("1__0"), number("10_"), number("0x"), negated(negated(number("5")))] {
+        let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, "CREATE SEQUENCE s START 1;")
+            .expect("the template parses");
+        let Statement::CreateSequence { sequence_options, .. } = &mut statements[0] else {
+            panic!("the template is a CREATE SEQUENCE");
+        };
+        let written = start.to_string();
+        sequence_options[0] = SequenceOptions::StartWith(start, true);
+        match ParserDB::from_statements(statements, "test".to_string()) {
+            Err(Error::InvalidSequenceParameters { sequence_name, reason }) => {
+                assert_eq!(sequence_name, "s");
+                assert_eq!(
+                    reason,
+                    SequenceParameterError::NotABigint { option: "START", value: written }
+                );
+            }
+            other => panic!("expected refused sequence parameters, got {other:?}"),
+        }
+    }
 }
 
 /// PostgreSQL reads the options before it creates the relation, so a name

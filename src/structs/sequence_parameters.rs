@@ -3,7 +3,9 @@
 use alloc::string::ToString;
 use core::fmt;
 
-use sqlparser::ast::{DataType, Expr, ObjectNamePart, SequenceOptions, UnaryOperator, Value};
+use sqlparser::ast::{
+    DataType, Expr, ObjectNamePart, SequenceOptions, UnaryOperator, Value, ValueWithSpan,
+};
 
 use crate::errors::SequenceParameterError;
 
@@ -281,22 +283,11 @@ impl SequenceParameters {
 fn bigint(option: &'static str, value: &Expr) -> Result<i64, SequenceParameterError> {
     let refused = || SequenceParameterError::NotABigint { option, value: value.to_string() };
     let (negative, literal) = match value {
-        Expr::Value(literal) => (false, &literal.value),
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => {
-            match expr.as_ref() {
-                Expr::Value(literal) => (false, &literal.value),
-                _ => return Err(refused()),
-            }
-        }
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
-            match expr.as_ref() {
-                Expr::Value(literal) => (true, &literal.value),
-                _ => return Err(refused()),
-            }
-        }
-        _ => return Err(refused()),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (true, expr.as_ref()),
+        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => (false, expr.as_ref()),
+        literal => (false, literal),
     };
-    let Value::Number(digits, _) = literal else {
+    let Expr::Value(ValueWithSpan { value: Value::Number(digits, _), .. }) = literal else {
         return Err(refused());
     };
     parse_integer(digits, negative).ok_or_else(refused)
