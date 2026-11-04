@@ -5497,6 +5497,15 @@ impl ParserDB {
         let mut replacement = (*previous_node).clone();
         edit(&previous_node, &mut replacement)?;
         record_implied_not_null(&mut replacement);
+        // A table keeping its schema stays where it was declared even while a
+        // schema rename has taken the old name, so only a move is checked.
+        if !schema_qualifiers_match(
+            table_schema_qualifier(&previous_node),
+            table_schema_qualifier(&replacement),
+            builder.identifier_case(),
+        ) {
+            validate_table_schema(&builder, &replacement)?;
+        }
 
         let mut metadata: TableMetadata<CreateTable> = TableMetadata::default();
         metadata.set_rls_enabled(previous_metadata.rls_enabled());
@@ -5946,7 +5955,9 @@ impl ParserDB {
         preserved: &[PreservedColumnMetadata],
         mut origin: TableOrigin,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        validate_table_schema(&builder, &create_table)?;
+        if matches!(origin, TableOrigin::Declaration(_)) {
+            validate_table_schema(&builder, &create_table)?;
+        }
         validate_distinct_columns(&create_table, builder.identifier_case())?;
         let table_kind = if table_metadata.foreign_source().is_some() {
             ObjectKind::ForeignTable
