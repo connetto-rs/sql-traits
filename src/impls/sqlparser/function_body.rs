@@ -48,6 +48,14 @@ pub(super) fn sql_body<'f, F: FunctionLike>(
     function: &'f F,
     database: &F::DB,
 ) -> Result<SqlBody<'f>, LookupError> {
+    Ok(written_sql_body(function, database)?.1)
+}
+
+/// The body of `function` as written, with the SQL [`sql_body`] reads from it.
+pub(super) fn written_sql_body<'f, F: FunctionLike>(
+    function: &'f F,
+    database: &F::DB,
+) -> Result<(FunctionBody<'f>, SqlBody<'f>), LookupError> {
     let language = function.stored_language();
     let procedural = language.as_deref() == Some("plpgsql");
     if let Some(language) = language.filter(|language| language != "sql" && !procedural) {
@@ -69,9 +77,10 @@ pub(super) fn sql_body<'f, F: FunctionLike>(
         let FunctionBody::Text(text) = body else {
             return Err(unparsable(&"a PL/pgSQL body is written as a string"));
         };
-        return Ok(SqlBody::PlPgSql(embedded_sql(text).map_err(|error| unparsable(&error))?));
+        let block = embedded_sql(text).map_err(|error| unparsable(&error))?;
+        return Ok((body, SqlBody::PlPgSql(block)));
     }
-    Ok(match body {
+    let sql = match body {
         FunctionBody::Text(text) => {
             let dialect = database.dialect().sqlparser_dialect();
             let statements =
@@ -83,7 +92,8 @@ pub(super) fn sql_body<'f, F: FunctionLike>(
         FunctionBody::Statements(statements) => SqlBody::Statements(Cow::Borrowed(statements)),
         FunctionBody::Return(expression) => SqlBody::Return(expression),
         FunctionBody::Atomic(statements) => SqlBody::Atomic(statements),
-    })
+    };
+    Ok((body, sql))
 }
 
 /// The path a body read each time `function` runs starts under.

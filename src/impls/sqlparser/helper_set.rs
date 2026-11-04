@@ -18,7 +18,7 @@ use sqlparser::{
     parser::Parser,
 };
 
-use super::function_body::{SqlBody, sql_body};
+use super::function_body::{SqlBody, written_sql_body};
 use crate::{
     errors::{HelperSetError, LookupError},
     structs::{
@@ -325,12 +325,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
 
         // A body bound at creation resolves its names with no path, so it is
         // not read as one written to run under the pinned path.
-        let body = sql_body(function, database)?;
+        let (written_body, body) = written_sql_body(function, database)?;
         let SqlBody::Statements(statements) = &body else {
-            return Err(scope.arm_shape(&written(function)));
+            return Err(scope.arm_shape(&written(written_body)));
         };
         let [Statement::Query(query)] = statements.as_ref() else {
-            return Err(scope.arm_shape(&written(function)));
+            return Err(scope.arm_shape(&written(written_body)));
         };
         let mut selects = Vec::new();
         union_arms(query, &mut selects).map_err(|arm| scope.arm_shape(&arm))?;
@@ -894,21 +894,17 @@ fn is_row(data_type: &DataType) -> bool {
             .is_some_and(|(name, quoted)| identifiers_match(name, quoted, "record", false)))
 }
 
-/// The body of `function` as it is written, for an error naming it.
-fn written<F: FunctionLike>(function: &F) -> String {
-    let statements = |statements: &[Statement]| {
-        statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
-    };
-    match function.written_body() {
-        Some(FunctionBody::Text(text)) => text.to_string(),
-        Some(FunctionBody::Expression(expression) | FunctionBody::Return(expression)) => {
+/// The body as it is written, for an error naming it.
+fn written(body: FunctionBody<'_>) -> String {
+    match body {
+        FunctionBody::Text(text) => text.to_string(),
+        FunctionBody::Expression(expression) | FunctionBody::Return(expression) => {
             expression.to_string()
         }
-        Some(FunctionBody::Select(select)) => select.to_string(),
-        Some(FunctionBody::Statements(written) | FunctionBody::Atomic(written)) => {
-            statements(written)
+        FunctionBody::Select(select) => select.to_string(),
+        FunctionBody::Statements(statements) | FunctionBody::Atomic(statements) => {
+            statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
         }
-        None => String::new(),
     }
 }
 

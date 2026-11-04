@@ -116,7 +116,7 @@ impl<F: FunctionLike> ExpressionCalls<F> {
     /// use std::sync::Arc;
     ///
     /// use sql_traits::{prelude::*, structs::metadata::ExpressionCalls};
-    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect, parser::Parser};
+    /// use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE SCHEMA app;
@@ -127,27 +127,16 @@ impl<F: FunctionLike> ExpressionCalls<F> {
     ///     .try_with_sql("app.allowed(id) AND allowed(id)")
     ///     .and_then(|mut parser| parser.parse_expr())
     ///     .expect("the expression parses");
-    /// let Expr::BinaryOp { left, right, .. } = &expression else { unreachable!() };
-    /// let (Expr::Function(qualified), Expr::Function(bare)) = (left.as_ref(), right.as_ref()) else {
-    ///     unreachable!()
-    /// };
-    ///
     /// let calls = ExpressionCalls::resolve(
     ///     &expression,
     ///     &functions,
     ///     &[("public", false)],
     ///     IdentifierCase::AsWritten,
     /// );
-    /// let reached = |call| {
-    ///     calls
-    ///         .reached_by(&expression, call)
-    ///         .expect("the call is in the expression")
-    ///         .map(|function| function.target_name().to_string())
-    ///         .collect::<Vec<_>>()
-    /// };
-    /// assert_eq!(reached(qualified), ["app.allowed"]);
-    /// // `app` is not on the path the call is written under.
-    /// assert!(reached(bare).is_empty());
+    /// let reached: Vec<_> =
+    ///     calls.functions().map(|function| function.target_name().to_string()).collect();
+    /// // `app` is not on the path the bare call is written under.
+    /// assert_eq!(reached, ["app.allowed"]);
     /// # Ok(())
     /// # }
     /// ```

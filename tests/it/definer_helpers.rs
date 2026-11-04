@@ -1114,6 +1114,9 @@ fn a_body_or_arm_outside_the_two_shapes_refuses_the_answer() {
     let atomic = helper(DEFINER, GRANT_ARM, "")
         .replace(&format!("AS $$ {GRANT_ARM} $$"), &format!("BEGIN ATOMIC {GRANT_ARM}; END"));
     assert!(shape(&atomic), "a body bound at creation");
+    let returned =
+        helper(DEFINER, GRANT_ARM, "").replace(&format!("AS $$ {GRANT_ARM} $$"), "RETURN 'd'");
+    assert!(shape(&returned), "a RETURN body, bound at creation too");
     assert!(shape(&helper(DEFINER, &format!("{GRANT_ARM}; {GRANT_ARM}"), "")));
     let view =
         "CREATE VIEW member_view AS SELECT * FROM members; GRANT SELECT ON member_view TO owner;";
