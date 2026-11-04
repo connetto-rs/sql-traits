@@ -113,6 +113,7 @@ mod scope_identifier_context;
 mod search_path;
 mod search_path_creation;
 mod sequence_defaults;
+mod sequence_parameters;
 mod sequences;
 mod set_returning_functions;
 mod stored_identifier_names;

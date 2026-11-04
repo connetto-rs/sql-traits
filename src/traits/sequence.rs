@@ -3,10 +3,8 @@
 use alloc::borrow::Cow;
 use core::{fmt::Debug, hash::Hash};
 
-use sqlparser::ast::SequenceOptions;
-
 use crate::{
-    structs::TargetName,
+    structs::{SequenceParameters, TargetName},
     traits::{DatabaseLike, Metadata},
     utils::identifier_resolution::{is_temporary_schema, normalize_identifier},
 };
@@ -189,35 +187,40 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
         }
     }
 
-    /// Returns the options the sequence was created with, in order.
+    /// Returns the values the sequence counts with, as `pg_sequence` records
+    /// them.
     ///
-    /// For a declared sequence these are the ones the declaration wrote, and
-    /// `OWNED BY` is not among them, since [`Self::owner`] answers the column
-    /// it names and follows that column through renames. A sequence created
-    /// for a column carries the `AS` type PostgreSQL gives it, followed by the
-    /// options an identity wrote. An option left out takes PostgreSQL's
-    /// default, which this does not spell out.
+    /// Every option a declaration leaves out takes PostgreSQL's default for
+    /// the type and direction, so two declarations that differ only in
+    /// spelling a default out answer alike. A sequence created for a column
+    /// counts in the column's type, which an identity sequence follows through
+    /// every type change of its column.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
-    /// use sqlparser::{ast::SequenceOptions, dialect::PostgreSqlDialect};
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TABLE tickets (id BIGINT);
-    ///      CREATE SEQUENCE ticket_seq AS BIGINT START WITH 100 OWNED BY tickets.id;",
+    ///     "CREATE SEQUENCE implicit;
+    ///      CREATE SEQUENCE spelled START WITH 1 INCREMENT BY 1;
+    ///      CREATE SEQUENCE countdown AS integer INCREMENT -1;",
     /// )?;
-    /// let sequence = db.sequences().next().expect("the sequence is recorded");
-    /// assert!(matches!(
-    ///     sequence.options(),
-    ///     [SequenceOptions::DataType(_), SequenceOptions::StartWith(_, true)]
-    /// ));
+    /// let parameters = |name| {
+    ///     db.sequence_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .map(|sequence| sequence.map(SequenceLike::parameters))
+    /// };
+    /// assert_eq!(parameters("implicit")?, parameters("spelled")?);
+    /// let countdown = parameters("countdown")?.unwrap();
+    /// assert_eq!(countdown.data_type(), SequenceType::Integer);
+    /// assert_eq!((countdown.start(), countdown.max_value()), (-1, -1));
+    /// assert_eq!(countdown.min_value(), i64::from(i32::MIN));
     /// # Ok(())
     /// # }
     /// ```
-    fn options(&self) -> &[SequenceOptions];
+    fn parameters(&self) -> SequenceParameters;
 
     /// Returns the column owning this sequence, if one does.
     ///

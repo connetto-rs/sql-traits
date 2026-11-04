@@ -23,7 +23,7 @@ use sqlparser::{
         Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
         CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, ReferentialAction,
-        SequenceOptions, Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod, Value,
+        Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod, Value,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -602,14 +602,6 @@ impl TableLike for MemoryTable {
     ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
         Ok(core::iter::empty())
     }
-
-    /// This catalog records no `REVOKE`.
-    fn revoked_privileges<'db>(
-        &'db self,
-        _database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError> {
-        Ok(core::iter::empty())
-    }
 }
 
 impl ColumnLike for MemoryColumn {
@@ -628,17 +620,6 @@ impl ColumnLike for MemoryColumn {
         Self: 'db,
     {
         Ok(None)
-    }
-
-    /// This catalog records no `REVOKE`.
-    fn revoked_privileges<'db>(
-        &'db self,
-        _database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError>
-    where
-        Self: 'db,
-    {
-        Ok(core::iter::empty())
     }
 
     fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db MemoryDataType {
@@ -739,8 +720,10 @@ impl SequenceLike for MemorySequence {
         self.schema.as_deref()
     }
 
-    fn options(&self) -> &[SequenceOptions] {
-        &[]
+    /// Every sequence this catalog holds counts with PostgreSQL's defaults.
+    fn parameters(&self) -> SequenceParameters {
+        SequenceParameters::new(SequenceType::BigInt, 1, 1, i64::MAX, 1, 1, false)
+            .expect("PostgreSQL's defaults are valid parameters")
     }
 
     fn owner<'db>(&'db self, _database: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>

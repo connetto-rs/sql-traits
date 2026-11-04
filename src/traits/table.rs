@@ -7,7 +7,7 @@ use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
         ActingRole, ColumnDefinition, ColumnScope, ForeignTableSource, IdentifierCase,
-        PartitionBound, RevokedPrivilege, RowSecurity, RowStatement, SchemaFingerprint,
+        PartitionBound, RowSecurity, RowStatement, SchemaFingerprint,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
@@ -4408,50 +4408,6 @@ pub trait TableLike:
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError>;
 
-    /// Iterates over the table-level privileges a `REVOKE` took from a
-    /// grantee and no later table-level `GRANT` handed back.
-    ///
-    /// The revocation is kept whether or not the `REVOKE` matched a grant the
-    /// input recorded, since a schema rarely carries every privilege a role
-    /// holds. Each entry names one privilege and one grantee, and `REVOKE ALL`
-    /// yields one for each table privilege. A column-level `GRANT` hands back
-    /// none of them, and the privileges revoked on one column are read with
-    /// [`ColumnLike::revoked_privileges`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this table.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), sql_traits::errors::Error> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "
-    /// CREATE ROLE app_user;
-    /// CREATE TABLE profiles (id TEXT, display_name TEXT, is_admin BOOL);
-    /// REVOKE INSERT, UPDATE ON profiles FROM app_user;
-    /// GRANT UPDATE (display_name) ON profiles TO app_user;
-    /// GRANT INSERT ON profiles TO app_user;
-    /// ",
-    /// )?;
-    /// let profiles =
-    ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let revoked: Vec<String> =
-    ///     profiles.revoked_privileges(&db)?.map(|revoked| revoked.privilege().to_string()).collect();
-    /// assert_eq!(revoked, ["UPDATE"]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn revoked_privileges<'db>(
-        &'db self,
-        database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError>;
-
     /// Iterates over the policies associated with the table.
     ///
     /// # Arguments
@@ -5104,13 +5060,6 @@ where
         T::owner_privileges(self, database)
     }
 
-    fn revoked_privileges<'db>(
-        &'db self,
-        database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError> {
-        T::revoked_privileges(self, database)
-    }
-
     fn primary_key_columns<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -5376,11 +5325,6 @@ mod tests {
                 <&_ as TableLike>::owner_privileges(table_ref, &db)
                     .expect("owner_privileges on &T")
                     .eq(table.owner_privileges(&db).expect("owner_privileges"))
-            );
-            assert!(
-                <&_ as TableLike>::revoked_privileges(table_ref, &db)
-                    .expect("revoked_privileges on &T")
-                    .eq(table.revoked_privileges(&db).expect("revoked_privileges"))
             );
         }
 

@@ -42,8 +42,10 @@ use crate::impls::{grantee_is_public, grantee_matches_role};
 /// let app_user = db.role("app_user").unwrap();
 /// let profiles =
 ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
-/// let revoked: Vec<String> = profiles
-///     .revoked_privileges(&db)?
+/// let revoked: Vec<String> = db
+///     .table_metadata(profiles)
+///     .unwrap()
+///     .revoked_privileges()
 ///     .filter(|revoked| revoked.applies_to_role(app_user))
 ///     .map(|revoked| revoked.privilege().to_string())
 ///     .collect();

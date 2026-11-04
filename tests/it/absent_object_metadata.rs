@@ -75,7 +75,6 @@ fn every_table_metadata_accessor_reports_the_absent_table() {
     assert_eq!(stale.has_row_level_security(&database).err(), absent_table("t"));
     assert_eq!(stale.has_forced_row_level_security(&database).err(), absent_table("t"));
     assert_eq!(stale.owner(&database).err(), absent_table("t"));
-    assert_eq!(stale.revoked_privileges(&database).err(), absent_table("t"));
 }
 
 #[test]

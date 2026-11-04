@@ -5500,7 +5500,7 @@ impl ParserDB {
         // A sequence owned by a column the rebuild left out goes with it, and
         // an identity sequence takes its column's type.
         sequences::drop_orphaned_sequences(&mut builder);
-        sequences::follow_identity_types(&mut builder);
+        sequences::follow_identity_types(&mut builder)?;
         Ok(builder)
     }
 

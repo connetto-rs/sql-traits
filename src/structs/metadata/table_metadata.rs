@@ -2,11 +2,11 @@
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use sqlparser::ast::{Action, Privileges};
+use sqlparser::ast::{Action, ColumnDef, CreateTable, Privileges};
 
 use crate::{
     impls::PrivilegeKind,
-    structs::{ForeignTableSource, RevokedPrivilege},
+    structs::{ForeignTableSource, RevokedPrivilege, TableAttribute},
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 
@@ -183,8 +183,46 @@ impl<T: TableLike> TableMetadata<T> {
         }
     }
 
-    /// Returns the table-level privileges a `REVOKE` took and no later
-    /// table-level `GRANT` handed back, in the order revoked.
+    /// Iterates over the table-level privileges a `REVOKE` took from a
+    /// grantee and no later table-level `GRANT` handed back, in the order
+    /// revoked.
+    ///
+    /// This is the statement history of a parsed schema. The revocation is
+    /// kept whether or not the `REVOKE` matched a grant the input recorded,
+    /// since a schema rarely carries every privilege a role holds. Each entry
+    /// names one privilege and one grantee, and `REVOKE ALL` yields one for
+    /// each table privilege. A column-level `GRANT` hands back none of them,
+    /// and the privileges revoked on one column are read with
+    /// [`TableMetadata::column_revoked_privileges`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE app_user;
+    /// CREATE TABLE profiles (id TEXT, display_name TEXT, is_admin BOOL);
+    /// REVOKE INSERT, UPDATE ON profiles FROM app_user;
+    /// GRANT UPDATE (display_name) ON profiles TO app_user;
+    /// GRANT INSERT ON profiles TO app_user;
+    /// ",
+    /// )?;
+    /// let profiles =
+    ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let revoked: Vec<String> = db
+    ///     .table_metadata(profiles)
+    ///     .unwrap()
+    ///     .revoked_privileges()
+    ///     .map(|revoked| revoked.privilege().to_string())
+    ///     .collect();
+    /// assert_eq!(revoked, ["UPDATE"]);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn revoked_privileges(&self) -> impl Iterator<Item = &RevokedPrivilege> {
         self.revoked_privileges.iter().filter(|revoked| revoked.column().is_none())
     }
@@ -497,6 +535,52 @@ impl<T: TableLike> TableMetadata<T> {
                 *index = replacement.clone();
             }
         }
+    }
+}
+
+impl TableMetadata<CreateTable> {
+    /// Iterates over the privileges a `REVOKE` took on `column`, one of this
+    /// table's columns, from a grantee and no later `GRANT` on that column
+    /// handed back.
+    ///
+    /// A table-level `REVOKE` is read with
+    /// [`TableMetadata::revoked_privileges`], and a table-level `GRANT` hands
+    /// back none of the revocations on a column.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE app_user;
+    /// CREATE TABLE profiles (id TEXT, is_admin BOOL);
+    /// REVOKE SELECT (is_admin), UPDATE (is_admin) ON profiles FROM app_user;
+    /// GRANT SELECT ON profiles TO app_user;
+    /// ",
+    /// )?;
+    /// let profiles =
+    ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let is_admin = profiles.column("is_admin", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// let metadata = db.table_metadata(profiles).unwrap();
+    /// let revoked: Vec<String> = metadata
+    ///     .column_revoked_privileges(is_admin)
+    ///     .map(|revoked| revoked.privilege().to_string())
+    ///     .collect();
+    /// assert_eq!(revoked, ["SELECT", "UPDATE"]);
+    /// assert_eq!(metadata.revoked_privileges().count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn column_revoked_privileges<'a>(
+        &'a self,
+        column: &'a TableAttribute<CreateTable, ColumnDef>,
+    ) -> impl Iterator<Item = &'a RevokedPrivilege> {
+        let name = &column.attribute().name;
+        self.revoked_privileges.iter().filter(move |revoked| revoked.column() == Some(name))
     }
 }
 

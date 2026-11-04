@@ -10,10 +10,7 @@ use ::sqlparser::ast::{
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{
-        ForeignTableSource, ListDatum, ParserDB, PartitionBound, RangeDatum, RevokedPrivilege,
-        TableMetadata,
-    },
+    structs::{ForeignTableSource, ListDatum, ParserDB, PartitionBound, RangeDatum, TableMetadata},
     traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
     utils::{
         identifier_resolution::{identifiers_match, stored_ident_name},
@@ -377,14 +374,6 @@ impl TableLike for CreateTable {
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
         Ok(table_metadata(self, database)?.owner_privileges())
-    }
-
-    #[inline]
-    fn revoked_privileges<'db>(
-        &'db self,
-        database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError> {
-        Ok(table_metadata(self, database)?.revoked_privileges())
     }
 }
 

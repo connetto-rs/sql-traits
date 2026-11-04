@@ -3,7 +3,7 @@
 //! until a `GRANT` of the same privilege at the same level hands it back.
 #![allow(clippy::expect_used)]
 
-use sql_traits::prelude::*;
+use sql_traits::{prelude::*, structs::RevokedPrivilege};
 use sqlparser::dialect::PostgreSqlDialect;
 
 use crate::support::table_lookup::table;
@@ -12,12 +12,21 @@ fn parse(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")
 }
 
+/// Every table-level revocation on `name`, in the order revoked.
+fn revocations<'db>(
+    database: &'db ParserDB,
+    name: &str,
+) -> impl Iterator<Item = &'db RevokedPrivilege> {
+    database
+        .table_metadata(table(database, None, name))
+        .expect("the table is in the database")
+        .revoked_privileges()
+}
+
 /// The table-level privileges revoked from `role` on `name`, as written.
 fn revoked_on_table(database: &ParserDB, name: &str, role: &str) -> Vec<String> {
     let role = database.role(role).expect("the role exists");
-    table(database, None, name)
-        .revoked_privileges(database)
-        .expect("the table is in the database")
+    revocations(database, name)
         .filter(|revoked| revoked.applies_to_role(role))
         .map(|revoked| revoked.privilege().to_string())
         .collect()
@@ -26,12 +35,15 @@ fn revoked_on_table(database: &ParserDB, name: &str, role: &str) -> Vec<String> 
 /// The privileges revoked from `role` on the column `column` of `name`.
 fn revoked_on_column(database: &ParserDB, name: &str, column: &str, role: &str) -> Vec<String> {
     let role = database.role(role).expect("the role exists");
-    table(database, None, name)
+    let table = table(database, None, name);
+    let column = table
         .column(column, database, IdentifierCase::AsWritten)
         .expect("the table is in the database")
-        .expect("the column exists")
-        .revoked_privileges(database)
-        .expect("the column is in the database")
+        .expect("the column exists");
+    database
+        .table_metadata(table)
+        .expect("the table is in the database")
+        .column_revoked_privileges(column)
         .filter(|revoked| revoked.applies_to_role(role))
         .map(|revoked| revoked.privilege().to_string())
         .collect()
@@ -118,9 +130,7 @@ fn a_revoke_from_public_reaches_every_role() {
          REVOKE SELECT ON profiles FROM PUBLIC;
          REVOKE DELETE ON profiles FROM other;"
     ));
-    let profiles = table(&database, None, "profiles");
-    let revoked: Vec<_> =
-        profiles.revoked_privileges(&database).expect("the table is in the database").collect();
+    let revoked: Vec<_> = revocations(&database, "profiles").collect();
 
     assert_eq!(revoked.iter().filter(|revoked| revoked.applies_to_public()).count(), 1);
     assert_eq!(revoked_on_table(&database, "profiles", "app_user"), ["SELECT"]);
@@ -144,9 +154,7 @@ fn the_grantor_a_revoke_names_is_kept_by_its_stored_name() {
          REVOKE INSERT ON profiles FROM app_user GRANTED BY OWNERS;
          REVOKE DELETE ON profiles FROM app_user;"
     ));
-    let grantors: Vec<(String, Option<&str>)> = table(&database, None, "profiles")
-        .revoked_privileges(&database)
-        .expect("the table is in the database")
+    let grantors: Vec<(String, Option<&str>)> = revocations(&database, "profiles")
         .map(|revoked| (revoked.privilege().to_string(), revoked.granted_by()))
         .collect();
 
@@ -187,12 +195,8 @@ fn revocations_follow_renames_of_the_role_the_table_and_the_column() {
          ALTER TABLE accounts RENAME COLUMN is_admin TO is_staff;
          ALTER TABLE accounts ADD COLUMN bio TEXT;"
     ));
-    let accounts = table(&database, None, "accounts");
-    let granted_by: Vec<_> = accounts
-        .revoked_privileges(&database)
-        .expect("the table is in the database")
-        .map(sql_traits::structs::RevokedPrivilege::granted_by)
-        .collect();
+    let granted_by: Vec<_> =
+        revocations(&database, "accounts").map(RevokedPrivilege::granted_by).collect();
 
     assert_eq!(revoked_on_table(&database, "accounts", "members"), ["UPDATE"]);
     assert_eq!(granted_by, [Some("keepers")]);
@@ -216,12 +220,7 @@ fn revocations_go_with_the_column_the_table_and_the_role() {
          ALTER TABLE profiles DROP COLUMN is_admin;
          ALTER TABLE profiles ADD COLUMN is_admin BOOL;"
     ));
-    let profiles = table(&database, None, "profiles");
-
-    assert_eq!(
-        profiles.revoked_privileges(&database).expect("the table is in the database").count(),
-        1
-    );
+    assert_eq!(revocations(&database, "profiles").count(), 1);
     assert_eq!(revoked_on_table(&database, "profiles", "app_user"), ["SELECT"]);
     assert_eq!(revoked_on_column(&database, "profiles", "is_admin", "app_user"), NONE);
 
@@ -280,9 +279,7 @@ fn an_owner_change_hands_the_revocations_naming_the_old_owner_over() {
          ALTER TABLE t OWNER TO next;",
     );
     let grantors = |name: &str| -> Vec<Option<String>> {
-        table(&database, None, name)
-            .revoked_privileges(&database)
-            .expect("the table is in the database")
+        revocations(&database, name)
             .map(|revoked| revoked.granted_by().map(str::to_string))
             .collect()
     };

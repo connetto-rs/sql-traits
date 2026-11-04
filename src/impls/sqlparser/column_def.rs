@@ -10,7 +10,7 @@ use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, ObjectNameP
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ColumnMetadata, ParserDB, RevokedPrivilege, TableAttribute},
+    structs::{ColumnMetadata, ParserDB, TableAttribute},
     traits::{
         ColumnCollation, ColumnLike, DatabaseLike, IdentityGeneration, Metadata,
         NamedColumnCollation,
@@ -103,23 +103,6 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
             .column_metadata(self)
             .ok_or_else(|| ObjectKind::Table.not_in_database(&self.table().name.to_string()))?
             .documentation())
-    }
-
-    #[inline]
-    fn revoked_privileges<'db>(
-        &'db self,
-        database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db RevokedPrivilege>, LookupError>
-    where
-        Self: 'db,
-    {
-        let column = &self.attribute().name;
-        Ok(database
-            .table_metadata(self.table())
-            .ok_or_else(|| ObjectKind::Table.not_in_database(&self.table().name.to_string()))?
-            .revocations()
-            .iter()
-            .filter(move |revoked| revoked.column() == Some(column)))
     }
 
     #[inline]
