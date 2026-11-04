@@ -1,5 +1,6 @@
 //! Submodule providing general structs for representing database schemas.
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod absent;
 mod column_scope;
 mod deployment;

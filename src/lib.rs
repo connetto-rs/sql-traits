@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 // Test and doctest helpers legitimately use `unwrap`/`expect`/`panic` for
 // conciseness; the panic-family restriction lints are enforced only on the
 // non-test build so production code stays panic-audited.
