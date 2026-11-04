@@ -1,5 +1,6 @@
 //! Submodule providing general structs for representing database schemas.
 
+mod absent;
 mod column_scope;
 mod deployment;
 pub(crate) mod fingerprint;
@@ -27,6 +28,7 @@ mod sequence_parameters;
 mod target_name;
 mod view;
 
+pub use absent::Absent;
 pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
     ColumnScope, QueryOutput, RelationBinding,
