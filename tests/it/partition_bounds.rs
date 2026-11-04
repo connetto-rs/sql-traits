@@ -535,3 +535,84 @@ fn literal_edges_read_as_postgresql_reads_them() {
         CREATE TABLE f PARTITION OF dt FOR VALUES FROM ('2024-01-01 10:00') TO ('2024-02-01');
         CREATE TABLE g PARTITION OF dt FOR VALUES FROM ('2024/03/01') TO ('2024-04-01');");
 }
+
+#[test]
+fn booleans_and_numbers_read_only_as_postgresql_casts_them() {
+    for (schema, bound) in [
+        ("CREATE TABLE k (x INT) PARTITION BY RANGE (x);", "FROM (true) TO (false)"),
+        ("CREATE TABLE k (x NUMERIC) PARTITION BY LIST (x);", "IN (true)"),
+        ("CREATE TABLE k (x DATE) PARTITION BY LIST (x);", "IN (true)"),
+        ("CREATE TABLE k (x DATE) PARTITION BY LIST (x);", "IN (20240101)"),
+        ("CREATE TABLE k (x TIMESTAMP) PARTITION BY LIST (x);", "IN (false)"),
+        ("CREATE TABLE k (x TIMESTAMP) PARTITION BY LIST (x);", "IN (1)"),
+    ] {
+        let sql = format!("{schema} CREATE TABLE p PARTITION OF k FOR VALUES {bound};");
+        assert!(matches!(invalid(&sql, "k", "p"), InvalidBound::ValueNotOfKeyType { .. }), "{sql}");
+    }
+    // A text key reads a number as PostgreSQL prints it, and a boolean as its
+    // name.
+    let text = "CREATE TABLE t (s TEXT COLLATE \"C\") PARTITION BY LIST (s);";
+    for (number, spelled) in [
+        ("007", "'7'"),
+        (".5", "'0.5'"),
+        ("-1", "'-1'"),
+        ("1.50e1", "'15.0'"),
+        ("1e-2", "'0.01'"),
+        ("-0.0", "'0.0'"),
+        ("false", "'false'"),
+    ] {
+        overlaps(
+            &format!(
+                "{text} CREATE TABLE a PARTITION OF t FOR VALUES IN ({number});
+                 CREATE TABLE b PARTITION OF t FOR VALUES IN ({spelled});"
+            ),
+            "b",
+            "a",
+        );
+    }
+    // An exponent too large to spell out is not compared.
+    db(&format!(
+        "{text} CREATE TABLE a PARTITION OF t FOR VALUES IN (1e2000);
+         CREATE TABLE b PARTITION OF t FOR VALUES IN ('1');"
+    ));
+    // Other string spellings are not read.
+    db("CREATE TABLE i (x INT) PARTITION BY RANGE (x);
+        CREATE TABLE i1 PARTITION OF i FOR VALUES FROM ($$1$$) TO ($$5$$);
+        CREATE TABLE i2 PARTITION OF i FOR VALUES FROM (5) TO (6);");
+}
+
+#[test]
+fn ranges_on_either_side_of_zero_are_kept_apart() {
+    db("CREATE TABLE n (v NUMERIC) PARTITION BY RANGE (v);
+        CREATE TABLE n1 PARTITION OF n FOR VALUES FROM (-3) TO (0);
+        CREATE TABLE n2 PARTITION OF n FOR VALUES FROM (5) TO (10);");
+}
+
+#[test]
+fn time_of_day_spellings_the_model_does_not_read_are_accepted() {
+    db("CREATE TABLE ts (t TIMESTAMP) PARTITION BY RANGE (t);
+        CREATE TABLE t1 PARTITION OF ts FOR VALUES FROM ('2024-01-01 allballs') TO ('2024-01-02');
+        CREATE TABLE t2 PARTITION OF ts FOR VALUES FROM ('2024-02-01 10:00:5') TO ('2024-02-02');
+        CREATE TABLE t3 PARTITION OF ts
+            FOR VALUES FROM ('2024-03-01 10:00:00.5+02') TO ('2024-03-02');");
+}
+
+#[test]
+fn checks_needing_no_value_order_hold_for_every_key_type() {
+    overlaps(
+        "CREATE TABLE b (f BOOLEAN) PARTITION BY LIST (f);
+         CREATE TABLE b1 PARTITION OF b FOR VALUES IN (NULL);
+         CREATE TABLE b2 PARTITION OF b FOR VALUES IN (true, NULL);",
+        "b2",
+        "b1",
+    );
+    assert_eq!(
+        invalid(
+            "CREATE TABLE z (t TIMESTAMPTZ) PARTITION BY RANGE (t);
+             CREATE TABLE z1 PARTITION OF z FOR VALUES FROM (NULL) TO ('2024-01-01');",
+            "z",
+            "z1"
+        ),
+        InvalidBound::NullInRange
+    );
+}

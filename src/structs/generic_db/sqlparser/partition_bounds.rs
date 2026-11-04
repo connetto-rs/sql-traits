@@ -192,10 +192,8 @@ fn key_kind(column: &ColumnDef) -> Option<KeyKind> {
         DataType::Timestamp(None, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             Some(KeyKind::Timestamp)
         }
-        DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None)
-            if orders_by_byte(column) =>
-        {
-            Some(KeyKind::Text)
+        DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None) => {
+            orders_by_byte(column).then_some(KeyKind::Text)
         }
         _ => None,
     }
@@ -222,10 +220,9 @@ fn literal(expr: &Expr) -> Option<(bool, &Value)> {
     match expr {
         Expr::Value(ValueWithSpan { value, .. }) => Some((false, value)),
         Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
-            match literal(expr)? {
-                (negated, value @ Value::Number(..)) => Some((!negated, value)),
-                _ => None,
-            }
+            literal(expr)
+                .filter(|(_, value)| matches!(value, Value::Number(..)))
+                .map(|(negated, value)| (!negated, value))
         }
         Expr::UnaryOp { op: UnaryOperator::Plus, expr } => {
             literal(expr).filter(|(_, value)| matches!(value, Value::Number(..)))
@@ -274,14 +271,66 @@ fn read(kind: KeyKind, expr: &Expr) -> Reading {
         (KeyKind::Date | KeyKind::Timestamp, Value::SingleQuotedString(text)) => {
             read_moment(kind, text.trim())
         }
+        // PostgreSQL casts neither a boolean nor a number to these types.
+        (
+            KeyKind::Integer { .. } | KeyKind::Numeric | KeyKind::Date | KeyKind::Timestamp,
+            Value::Boolean(_),
+        )
+        | (KeyKind::Date | KeyKind::Timestamp, Value::Number(..)) => Reading::Invalid,
         (KeyKind::Text, Value::SingleQuotedString(text)) => {
             Reading::Known(Datum::Text(text.clone()))
         }
-        (KeyKind::Text, Value::Number(text, _)) if !negated => {
-            Reading::Known(Datum::Text(text.clone()))
+        (KeyKind::Text, Value::Boolean(flag)) => {
+            Reading::Known(Datum::Text(if *flag { "true" } else { "false" }.to_string()))
+        }
+        (KeyKind::Text, Value::Number(text, _)) => {
+            numeric_text(negated, text)
+                .map_or(Reading::Undecided, |text| Reading::Known(Datum::Text(text)))
         }
         _ => Reading::Undecided,
     }
+}
+
+/// The text PostgreSQL casts a numeric literal to: no leading zeros, the
+/// scale the literal writes after its exponent is applied, and a sign only
+/// on a value other than zero. The tokenizer hands over digits only, and an
+/// exponent too large to spell out is left undecided.
+fn numeric_text(negated: bool, text: &str) -> Option<String> {
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(at) => (&text[..at], text[at + 1..].parse::<i64>().ok()?),
+        None => (text, 0),
+    };
+    if exponent.unsigned_abs() > 1000 {
+        return None;
+    }
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits: String = whole.chars().chain(fraction.chars()).collect();
+    let length = i64::try_from(digits.len()).ok()?;
+    let point = i64::try_from(whole.len()).ok()? + exponent;
+    let integer: String = if point <= 0 {
+        String::new()
+    } else if point >= length {
+        digits.clone() + &"0".repeat(usize::try_from(point - length).ok()?)
+    } else {
+        digits[..usize::try_from(point).ok()?].to_string()
+    };
+    let fraction: String = if point >= length {
+        String::new()
+    } else if point <= 0 {
+        "0".repeat(usize::try_from(-point).ok()?) + &digits
+    } else {
+        digits[usize::try_from(point).ok()?..].to_string()
+    };
+    let integer = integer.trim_start_matches('0');
+    let mut rendered = if integer.is_empty() { "0".to_string() } else { integer.to_string() };
+    if !fraction.is_empty() {
+        rendered.push('.');
+        rendered.push_str(&fraction);
+    }
+    if negated && digits.bytes().any(|byte| byte != b'0') {
+        rendered.insert(0, '-');
+    }
+    Some(rendered)
 }
 
 /// Whether `text` names one of the numeric values without digits.
@@ -595,17 +644,31 @@ fn clash(new: &ReadBound, sibling: &ReadBound) -> Option<Clash> {
 }
 
 /// Refuses the bound `partition_name` would take in `root` when PostgreSQL
-/// refuses it, alone or against a partition `root` already has.
+/// refuses it, alone or against a partition `root` already has. A root whose
+/// partition clause names no PostgreSQL strategy has no key to check against.
 pub(super) fn validate_bound(
     builder: &ParserDBBuilder,
     root: &CreateTable,
     partition_name: &str,
     bound: &ForValues,
 ) -> Result<(), Error> {
-    let Some((strategy, columns)) = partition_keys::key_columns(root, builder.identifier_case())
-    else {
-        return Ok(());
-    };
+    partition_keys::key_columns(root, builder.identifier_case()).map_or(
+        Ok(()),
+        |(strategy, columns)| {
+            validate_against_key(builder, root, partition_name, bound, strategy, &columns)
+        },
+    )
+}
+
+/// Refuses the bound against the key `root` partitions by.
+fn validate_against_key(
+    builder: &ParserDBBuilder,
+    root: &CreateTable,
+    partition_name: &str,
+    bound: &ForValues,
+    strategy: PartitionStrategy,
+    columns: &[Option<&ColumnDef>],
+) -> Result<(), Error> {
     let invalid = |reason| {
         Error::PartitionBoundInvalid {
             table_name: root.table_name().to_string(),
@@ -613,7 +676,7 @@ pub(super) fn validate_bound(
             reason,
         }
     };
-    let new = read_bound(strategy, &columns, bound).map_err(invalid)?;
+    let new = read_bound(strategy, columns, bound).map_err(invalid)?;
     let partitions = inheritance::direct_children(builder, &StoredTable::of(root))
         .into_iter()
         .filter(|(kind, _)| *kind == inheritance::ParentKind::PartitionOf);
@@ -623,7 +686,7 @@ pub(super) fn validate_bound(
         let sibling_read = sibling_node
             .for_values
             .as_ref()
-            .and_then(|sibling_bound| read_bound(strategy, &columns, sibling_bound).ok());
+            .and_then(|sibling_bound| read_bound(strategy, columns, sibling_bound).ok());
         let other_partition = sibling_node.table_name().to_string();
         match sibling_read.and_then(|sibling_read| clash(&new, &sibling_read)) {
             Some(Clash::Overlap) => {
@@ -645,4 +708,22 @@ pub(super) fn validate_bound(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Decimal;
+
+    #[test]
+    fn decimals_order_as_the_numbers_they_spell() {
+        let number = |text: &str| Decimal::parse(text).expect("a numeric literal");
+        let ascending =
+            ["-12.5", "-1.5", "-1", "-0.25", "0", "1e-2", "0.25", "1", "1.5", "15", "1e3"];
+        for pair in ascending.windows(2) {
+            assert!(number(pair[0]) < number(pair[1]), "{} < {}", pair[0], pair[1]);
+        }
+        for (left, right) in [("1.50", "1.5"), ("-0", "0.000"), ("150e-2", "1.5"), ("+7", "007")] {
+            assert!(number(left) == number(right), "{left} = {right}");
+        }
+    }
 }
