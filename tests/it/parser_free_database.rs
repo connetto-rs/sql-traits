@@ -9,7 +9,9 @@
 //! everything else.
 #![allow(clippy::expect_used)]
 
-use std::borrow::Cow;
+extern crate alloc;
+
+use alloc::borrow::Cow;
 
 use sql_traits::{
     errors::LookupError,
@@ -654,6 +656,14 @@ impl ColumnLike for MemoryColumn {
         Ok(self.nullable)
     }
 
+    /// This catalog keeps no names for its `NOT NULL` constraints.
+    fn not_null_constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(None)
+    }
+
     fn default_value(&self) -> Option<String> {
         None
     }
@@ -754,6 +764,14 @@ impl IndexLike for MemoryIndex {
         self.name.as_deref()
     }
 
+    /// A plain index backs no constraint.
+    fn constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(None)
+    }
+
     fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
     }
@@ -788,6 +806,13 @@ impl IndexLike for MemoryUniqueIndex {
         self.0.name.as_deref()
     }
 
+    fn constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(self.0.name.as_deref().map(Cow::Borrowed))
+    }
+
     fn schema(&self) -> Option<&str> {
         self.0.schema.as_deref()
     }
@@ -816,6 +841,13 @@ impl ForeignKeyLike for MemoryForeignKey {
 
     fn foreign_key_name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    fn constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(self.name.as_deref().map(Cow::Borrowed))
     }
 
     fn on_delete(&self, _database: &Self::DB) -> ReferentialAction {
@@ -879,6 +911,14 @@ impl ForeignKeyLike for MemoryForeignKey {
 
 impl CheckConstraintLike for MemoryCheckConstraint {
     type DB = MemoryCatalog;
+
+    /// This catalog keeps no names for its checks.
+    fn constraint_name<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        Ok(None)
+    }
 
     fn expression<'db>(&'db self, _database: &'db Self::DB) -> &'db Expr {
         &self.expression

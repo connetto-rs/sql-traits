@@ -124,6 +124,9 @@ pub enum InheritedChange {
     /// `ALTER TABLE ONLY ... ALTER COLUMN ... SET NOT NULL` on a partitioned
     /// table with partitions.
     SetNotNull,
+    /// `ALTER TABLE ONLY ... RENAME CONSTRAINT` of a constraint the tables
+    /// below hold copies of.
+    RenameConstraint,
 }
 
 impl core::fmt::Display for InheritedChange {
@@ -136,6 +139,7 @@ impl core::fmt::Display for InheritedChange {
             Self::AlterColumnType => "change a column type of",
             Self::DropColumn => "drop a column of",
             Self::SetNotNull => "require a value in a column of",
+            Self::RenameConstraint => "rename a constraint of",
         })
     }
 }
@@ -2633,6 +2637,38 @@ pub enum Error {
         relation_name: String,
         /// The action, rendered by the parser.
         operation: String,
+    },
+    #[error(
+        "Constraint `{constraint_name}` not found on table `{table_name}` for ALTER TABLE RENAME CONSTRAINT statement."
+    )]
+    /// Error indicating that `RENAME CONSTRAINT` names a constraint the table
+    /// holds under no such name, written or given by PostgreSQL.
+    RenameConstraintNotFound {
+        /// Name of the table.
+        table_name: String,
+        /// Name the statement renames.
+        constraint_name: String,
+    },
+    #[error(
+        "Cannot rename constraint `{constraint_name}` of table `{table_name}` because it is inherited."
+    )]
+    /// Error indicating that a table tried to rename a constraint it receives
+    /// from a parent, which only the parent can rename, for every table below
+    /// it at once.
+    InheritedConstraintNotRenamable {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the inherited constraint.
+        constraint_name: String,
+    },
+    #[error("Constraint `{constraint_name}` already exists on table `{table_name}`.")]
+    /// Error indicating that `ADD CONSTRAINT` names a constraint the table
+    /// already holds under that name, written or given by PostgreSQL.
+    ConstraintAlreadyExists {
+        /// Name of the table.
+        table_name: String,
+        /// Name the statement gives the constraint.
+        constraint_name: String,
     },
     #[error("Policy `{policy_name}` already exists on table `{table_name}`.")]
     /// Error indicating that a `CREATE POLICY` statement names a policy the

@@ -1,6 +1,8 @@
 //! Implement the [`UniqueConstraint`] trait for the `sqlparser` crate's
 //! [`TableAttribute`] wrapper.
 
+use alloc::{borrow::Cow, vec::Vec};
+
 use sqlparser::ast::{
     ColumnDef, CreateTable, Expr, IndexType, NullsDistinctOption, UniqueConstraint,
 };
@@ -8,7 +10,7 @@ use sqlparser::ast::{
 use super::index_clauses::{included_columns, written_access_method};
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ParserDB, TableAttribute, metadata::UniqueIndexMetadata},
+    structs::{ConstraintObject, ParserDB, TableAttribute, metadata::UniqueIndexMetadata},
     traits::{DatabaseLike, IndexLike, Metadata, TableLike},
 };
 
@@ -79,6 +81,17 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     #[inline]
     fn schema(&self) -> Option<&str> {
         None
+    }
+
+    fn constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        let table = self.table();
+        let held: Vec<_> = table.unique_indices(database)?.collect();
+        Ok(super::create_table::position_among(&held, self).and_then(|position| {
+            database.constraint_object_name(table, ConstraintObject::UniqueKey, position)
+        }))
     }
 
     #[inline]

@@ -151,6 +151,12 @@ pub(super) fn no_inherit(
         .filter(|constraint| inheritance::receives_constraint(&builder, node, constraint))
         .map(TableConstraint::to_string)
         .collect();
+    let still_required: Vec<String> = node
+        .columns
+        .iter()
+        .filter(|column| inheritance::requires_a_value(&builder, node, &column.name.value))
+        .map(|column| column.name.value.clone())
+        .collect();
     let case = builder.identifier_case();
     for (_, metadata, _) in
         builder.tables_mut().iter_mut().filter(|(stored, _, _)| child.matches(stored, case))
@@ -172,6 +178,13 @@ pub(super) fn no_inherit(
             .cloned()
             .collect();
         metadata.set_inherited_constraints(constraints);
+        let not_null = metadata
+            .inherited_not_null()
+            .iter()
+            .filter(|column| still_required.contains(column))
+            .cloned()
+            .collect();
+        metadata.set_inherited_not_null(not_null);
     }
     Ok(builder)
 }

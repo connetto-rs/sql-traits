@@ -42,10 +42,7 @@ fn shape(database: &ParserDB) -> (usize, usize, usize, usize, usize, bool) {
 /// discarding it would leave the model wrong rather than merely coarse.
 #[test]
 fn an_operation_that_would_leave_the_model_wrong_is_reported() {
-    let postgres = [
-        "ALTER TABLE t DROP CONSTRAINT IF EXISTS nothing, RENAME CONSTRAINT c TO d",
-        "ALTER TABLE t SWAP WITH other",
-    ];
+    let postgres = ["ALTER TABLE t SWAP WITH other"];
     for tail in postgres {
         let error = parse(tail).expect_err("the operation is not applied");
         assert!(

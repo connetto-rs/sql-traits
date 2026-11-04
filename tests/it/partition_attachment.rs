@@ -611,7 +611,7 @@ fn the_roots_checks_have_to_be_held_already() {
             "CREATE TABLE p (id INT CHECK (id > 0)) PARTITION BY LIST (id);
              CREATE TABLE c (id INT CHECK (id < 9)); {attach}"
         )),
-        check(ChildMismatch::MissingConstraint { constraint_name: "CHECK (id > 0)".to_owned() })
+        check(ChildMismatch::MissingConstraint { constraint_name: "p_id_check".to_owned() })
     );
 }
 

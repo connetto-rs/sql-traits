@@ -1,13 +1,13 @@
 //! Implement the [`CheckConstraint`] trait for the `sqlparser` crate's
 //! [`TableAttribute`] wrapper.
 
-use alloc::string::ToString;
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use sqlparser::ast::{CheckConstraint, CreateTable, Expr, Function};
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ParserDB, TableAttribute, metadata::CheckMetadata},
+    structs::{ConstraintObject, ParserDB, TableAttribute, metadata::CheckMetadata},
     traits::{CheckConstraintLike, DatabaseLike, Metadata, TableLike},
 };
 
@@ -46,6 +46,17 @@ impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
 
     fn is_validated(&self, database: &Self::DB) -> Result<bool, LookupError> {
         super::create_table::holds_validated(self.table(), self.attribute(), database)
+    }
+
+    fn constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        let table = CheckConstraintLike::table(self, database)?;
+        let held: Vec<_> = table.check_constraints(database)?.collect();
+        Ok(super::create_table::position_among(&held, self).and_then(|position| {
+            database.constraint_object_name(table, ConstraintObject::Check, position)
+        }))
     }
 
     #[inline]

@@ -196,7 +196,8 @@ fn inherit_refuses_a_child_without_the_parents_shape() {
         "{generated} CREATE TABLE c (id INT, g INT GENERATED ALWAYS AS (id * 3) STORED);
          ALTER TABLE c INHERIT p;"
     ));
-    // An unnamed parent column check is met by a check with its expression.
+    // An unnamed parent column check is met only under the name PostgreSQL
+    // gave it.
     accepted(
         "CREATE TABLE p (id INT CHECK (id > 0));
         CREATE TABLE c (id INT CONSTRAINT p_id_check CHECK (id > 0));
@@ -207,7 +208,7 @@ fn inherit_refuses_a_child_without_the_parents_shape() {
             "CREATE TABLE p (id INT CHECK (id > 0)); CREATE TABLE c (id INT);
              ALTER TABLE c INHERIT p;"
         ),
-        ChildMismatch::MissingConstraint { constraint_name: "CHECK (id > 0)".to_owned() }
+        ChildMismatch::MissingConstraint { constraint_name: "p_id_check".to_owned() }
     );
 }
 

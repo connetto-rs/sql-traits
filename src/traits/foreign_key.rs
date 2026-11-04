@@ -1,6 +1,6 @@
 //! Submodule definining the `ForeignKeyLike` trait for SQL referenced keys.
 
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug};
 
 use sqlparser::ast::{ConstraintReferenceMatchKind, ReferentialAction};
@@ -57,6 +57,42 @@ pub trait ForeignKeyLike:
     /// # }
     /// ```
     fn foreign_key_name(&self) -> Option<&str>;
+
+    /// Returns the name the foreign key answers to: the one written, or on
+    /// PostgreSQL the one it was given when it was created, which renaming
+    /// the table or a column later leaves alone. A written name is returned as
+    /// PostgreSQL stores it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table of this foreign key.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id INT PRIMARY KEY);
+    ///      CREATE TABLE posts (author INT REFERENCES users, editor INT, FOREIGN KEY (editor) REFERENCES users);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("posts", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let names = table
+    ///     .foreign_keys(&db)?
+    ///     .map(|key| Ok(key.constraint_name(&db)?.map(|name| name.into_owned())))
+    ///     .collect::<Result<Vec<_>, LookupError>>()?;
+    /// assert_eq!(names, [Some("posts_author_fkey".to_owned()), Some("posts_editor_fkey".to_owned())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn constraint_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError>;
 
     /// Returns the action the foreign key takes on its referencing rows when
     /// a referenced row is deleted, [`ReferentialAction::NoAction`] when the

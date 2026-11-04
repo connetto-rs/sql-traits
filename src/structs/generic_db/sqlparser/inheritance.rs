@@ -188,22 +188,61 @@ pub(super) fn direct_children(
 /// A table keeps its copy when it declared the column itself or a parent that
 /// keeps the column still passes it, which PostgreSQL records by lowering
 /// `attinhcount` instead of dropping, and a table keeping its copy passes
-/// nothing further down. Solved as the largest set closed under that rule, so
-/// a table reached through two losing parents loses the column whichever path
-/// is walked first.
+/// nothing further down.
 pub(super) fn losing_column(
     builder: &ParserDBBuilder,
     dropped: &StoredTable,
     column: &super::NamedColumn,
 ) -> Vec<StoredTable> {
+    losing_tables(
+        builder,
+        dropped,
+        |metadata| metadata.inherited_column_names().contains(&column.name),
+        |parent| column.declared_by(parent),
+    )
+}
+
+/// The tables below `dropped` that lose the `NOT NULL` of `column` when it
+/// drops its own, by the rule [`losing_column`] follows: a table that states
+/// it itself, or still receives it from a parent keeping it, keeps it.
+pub(super) fn losing_not_null(
+    builder: &ParserDBBuilder,
+    dropped: &StoredTable,
+    column: &super::NamedColumn,
+) -> Vec<StoredTable> {
+    losing_tables(
+        builder,
+        dropped,
+        |metadata| metadata.inherited_not_null().contains(&column.name),
+        |parent| {
+            parent
+                .columns
+                .iter()
+                .any(|declared| column.matches(&declared.name) && super::states_not_null(declared))
+        },
+    )
+}
+
+/// The tables below `dropped` that lose what `dropped` drops: of those that
+/// only `receive` it, the ones no parent outside the losing set still `holds`
+/// it for. Solved as the largest set closed under that rule, so a table reached
+/// through two losing parents loses it whichever path is walked first.
+fn losing_tables(
+    builder: &ParserDBBuilder,
+    dropped: &StoredTable,
+    receives: impl Fn(&super::TableMetadata<CreateTable>) -> bool,
+    holds: impl Fn(&CreateTable) -> bool,
+) -> Vec<StoredTable> {
     let case = builder.identifier_case();
-    let receives = |table: &StoredTable| {
-        builder.tables().iter().any(|(stored, metadata, _)| {
-            table.matches(stored, case) && metadata.inherited_column_names().contains(&column.name)
+    let mut losing: Vec<StoredTable> = descendants(builder, dropped)
+        .into_iter()
+        .filter(|table| {
+            builder
+                .tables()
+                .iter()
+                .any(|(stored, metadata, _)| table.matches(stored, case) && receives(metadata))
         })
-    };
-    let mut losing: Vec<StoredTable> =
-        descendants(builder, dropped).into_iter().filter(|table| receives(table)).collect();
+        .collect();
     loop {
         let kept: Vec<StoredTable> = losing
             .iter()
@@ -214,7 +253,7 @@ pub(super) fn losing_column(
                         .any(|parent| {
                             !dropped.matches(parent, case)
                                 && !losing.iter().any(|lost| lost.matches(parent, case))
-                                && column.declared_by(parent)
+                                && holds(parent)
                         })
                 })
             })
@@ -224,6 +263,27 @@ pub(super) fn losing_column(
             return losing;
         }
         losing.retain(|table| !kept.contains(table));
+    }
+}
+
+/// Records whether the table receives the `NOT NULL` of `column` rather than
+/// stating it itself.
+pub(super) fn mark_inherited_not_null(
+    builder: &mut ParserDBBuilder,
+    table: &StoredTable,
+    column: &str,
+    received: bool,
+) {
+    let case = builder.identifier_case();
+    for (_, metadata, _) in
+        builder.tables_mut().iter_mut().filter(|(stored, _, _)| table.matches(stored, case))
+    {
+        let mut columns: Vec<String> =
+            metadata.inherited_not_null().iter().filter(|name| *name != column).cloned().collect();
+        if received {
+            columns.push(column.to_string());
+        }
+        metadata.set_inherited_not_null(columns);
     }
 }
 
@@ -253,6 +313,9 @@ pub(super) fn unmark_inherited(builder: &mut ParserDBBuilder, table: &StoredTabl
             .cloned()
             .collect();
         metadata.set_inherited_column_names(names);
+        let not_null: Vec<String> =
+            metadata.inherited_not_null().iter().filter(|name| *name != column).cloned().collect();
+        metadata.set_inherited_not_null(not_null);
     }
 }
 
@@ -267,12 +330,16 @@ pub(super) fn rename_inherited(
     if let Some((_, metadata, _)) =
         builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
     {
-        let names = metadata
-            .inherited_column_names()
-            .iter()
-            .map(|name| if name == from { to.value.clone() } else { name.clone() })
-            .collect();
+        let rename = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .map(|name| if name == from { to.value.clone() } else { name.clone() })
+                .collect()
+        };
+        let names = rename(metadata.inherited_column_names());
         metadata.set_inherited_column_names(names);
+        let not_null = rename(metadata.inherited_not_null());
+        metadata.set_inherited_not_null(not_null);
     }
 }
 
@@ -390,6 +457,10 @@ pub(super) fn receives_column_constraint(
                         && declared.options.iter().any(|held| is_copy_of_option(option, held))
                 })
             })
+    }) || super::constraint_names::slots(child).into_iter().any(|slot| {
+        matches!(slot, super::constraint_names::Slot::Column { def, held, .. }
+            if same_column(&def.name, written_on) && held == option)
+            && super::constraint_names::receives_check(builder, child, slot)
     })
 }
 
@@ -711,6 +782,9 @@ pub(super) fn receives_constraint(
                 .iter()
                 .any(|passed| passes_down(kind, passed) && is_copy_of(held, passed))
         })
+    }) || super::constraint_names::slots(child).into_iter().any(|slot| {
+        matches!(slot, super::constraint_names::Slot::Table(_, constraint) if constraint == held)
+            && super::constraint_names::receives_check(builder, child, slot)
     })
 }
 

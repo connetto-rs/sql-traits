@@ -21,9 +21,10 @@ use alloc::{
 use sqlparser::ast::{ColumnOption, Ident, ObjectName, TableConstraint};
 
 use super::{
-    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, column_constraint_position,
+    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable,
+    constraint_names::{self, Position},
     inheritance::{self, ParentKind},
-    last_str, table_constraint_has_name,
+    last_str,
 };
 use crate::errors::{Error, InheritedChange};
 
@@ -165,7 +166,10 @@ pub(super) fn validate_constraint(
         }
     };
 
-    if let Some(held) = node.constraints.iter().find(|held| table_constraint_has_name(held, name)) {
+    let located =
+        constraint_names::locate(node, super::generated_constraint_names(&builder, &stored), name);
+    if let Some(Position::Table(position)) = located {
+        let held = &node.constraints[position];
         if !takes_validation(held) {
             return Err(not_validatable());
         }
@@ -188,7 +192,7 @@ pub(super) fn validate_constraint(
         return Ok(validate_down(builder, stored, &held));
     }
 
-    if let Some((column, option)) = column_constraint_position(node, name) {
+    if let Some(Position::Column(column, option)) = located {
         return match node.columns[column].options[option].option {
             ColumnOption::Check(_) | ColumnOption::ForeignKey(_) | ColumnOption::NotNull => {
                 Ok(builder)

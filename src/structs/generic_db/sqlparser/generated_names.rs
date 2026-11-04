@@ -1,6 +1,6 @@
-//! The names PostgreSQL gives indexes it is not told a name for, following
-//! `ChooseIndexColumnNames`, `ChooseIndexNameAddition`, `makeObjectName` and
-//! `ChooseRelationName`.
+//! The names PostgreSQL gives indexes and constraints it is not told a name
+//! for, following `ChooseIndexColumnNames`, `ChooseIndexNameAddition`,
+//! `makeObjectName`, `ChooseRelationName` and `ChooseConstraintName`.
 
 use alloc::{
     borrow::ToOwned,
@@ -143,6 +143,29 @@ pub(super) fn index_name_on(
             spelled(object_name(&table_name, columns, &format!("{label}{pass}")))
         };
         if relation_name_holder(builder, &candidate, schema).is_none() && !also_taken(&candidate) {
+            return candidate;
+        }
+        pass += 1;
+    }
+}
+
+/// The first name for a constraint on `table` that `taken` does not report,
+/// numbering the label the way `ChooseConstraintName` does.
+pub(super) fn constraint_name_on(
+    table: &CreateTable,
+    columns: Option<&str>,
+    label: &str,
+    mut taken: impl FnMut(&str) -> bool,
+) -> String {
+    let table_name = stored(table.table_name(), table.table_name_is_quoted());
+    let mut pass = 0u32;
+    loop {
+        let candidate = if pass == 0 {
+            object_name(&table_name, columns, label)
+        } else {
+            object_name(&table_name, columns, &format!("{label}{pass}"))
+        };
+        if !taken(&candidate) {
             return candidate;
         }
         pass += 1;
