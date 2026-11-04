@@ -70,6 +70,7 @@ use crate::{
     },
 };
 
+mod alter_inheritance;
 mod attach_partition;
 mod calls_in_expression;
 use calls_in_expression::CarriedCalls;
@@ -8884,6 +8885,24 @@ impl ParserDB {
                                     scope,
                                     &partition,
                                     &for_values,
+                                )?;
+                            }
+
+                            AlterTableOperation::Inherit { parent } => {
+                                builder = alter_inheritance::inherit(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &parent,
+                                )?;
+                            }
+
+                            AlterTableOperation::NoInherit { parent } => {
+                                builder = alter_inheritance::no_inherit(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &parent,
                                 )?;
                             }
 
