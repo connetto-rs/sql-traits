@@ -170,7 +170,7 @@ fn a_key_the_attached_table_already_holds_is_kept_rather_than_doubled() {
     // constraint below.
     let database = database(
         "CREATE TABLE r (id INT PRIMARY KEY);
-         CREATE TABLE p (id INT PRIMARY KEY, code TEXT UNIQUE, rid INT REFERENCES r (id))
+         CREATE TABLE p (id INT PRIMARY KEY, code TEXT, rid INT REFERENCES r (id), UNIQUE (id, code))
              PARTITION BY LIST (id);
          CREATE TABLE c (
              id INT NOT NULL,
@@ -183,7 +183,7 @@ fn a_key_the_attached_table_already_holds_is_kept_rather_than_doubled() {
     );
 
     assert_eq!(primary_key(&database, "c"), ["id"]);
-    assert_eq!(unique_index_names(&database, "c"), ["c_code_key", "mine"]);
+    assert_eq!(unique_index_names(&database, "c"), ["c_id_code_key", "mine"]);
     assert_eq!(foreign_key_names(&database, "c"), ["theirs"]);
 }
 

@@ -87,6 +87,7 @@ mod leading_comments;
 mod like;
 mod parse_options;
 mod parsed_source;
+mod partition_keys;
 mod postgres_18_collations;
 mod postgres_builtins;
 mod postgres_catalog;
@@ -5193,6 +5194,7 @@ impl ParserDB {
             table,
             builder.identifier_case(),
         )?;
+        partition_keys::validate_unique_index(&create_index, table, builder.identifier_case())?;
 
         let index_arc = Arc::new(TableAttribute::new(Arc::new(table.clone()), create_index));
         let Some(expression) = Self::create_index_expression(&index_arc.attribute().columns) else {
@@ -5880,6 +5882,7 @@ impl ParserDB {
             refuse_key_constraints_on_foreign_table(&create_table)?;
         }
         refuse_unholdable_foreign_options(&create_table, table_metadata.foreign_source())?;
+        partition_keys::validate_partitioned_table(&create_table, builder.identifier_case())?;
 
         let (identity, documentation, mut carried) = match &mut origin {
             TableOrigin::Declaration(documentation) => {
