@@ -24,6 +24,7 @@ mod column_scope;
 mod column_scoped_grants;
 mod column_type_change_dependents;
 mod column_written_constraints;
+mod constraint_renames;
 mod constraint_validation;
 mod creation_identifier_case;
 mod data_statement_analysis;

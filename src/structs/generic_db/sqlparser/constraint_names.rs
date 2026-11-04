@@ -16,14 +16,15 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, Expr, Ident,
-    TableConstraint, visit_expressions,
+    ObjectName, TableConstraint, visit_expressions,
 };
 
 use super::{
-    ParserDBBuilder, SqlparserDialect, StoredTable, generated_names, inheritance,
-    schema_qualifiers_match, table_schema_qualifier,
+    AlterTableScope, ParserDB, ParserDBBuilder, SqlparserDialect, StoredTable, generated_names,
+    inheritance, schema_qualifiers_match, table_schema_qualifier,
 };
 use crate::{
+    errors::{Error, InheritedChange, ObjectKind},
     structs::{TableMetadata, metadata::GeneratedConstraintName},
     utils::identifier_resolution::stored_ident_name,
 };
@@ -590,4 +591,204 @@ pub(super) fn merge_named_copies(builder: &ParserDBBuilder, node: &mut CreateTab
         !copy
     });
     removed
+}
+
+/// The slot at `position` of the node.
+fn slot_at(node: &CreateTable, position: Position) -> Option<(Slot<'_>, String)> {
+    let slots = slots(node);
+    let keys = keys(&slots);
+    slots.into_iter().zip(keys).find(|(slot, _)| slot.position() == position)
+}
+
+/// Whether the table receives the constraint in `slot` from a parent, which
+/// then alone may rename it.
+fn received_from_parent(builder: &ParserDBBuilder, node: &CreateTable, slot: Slot<'_>) -> bool {
+    match slot {
+        Slot::Column {
+            def, held: ColumnOptionDef { option: ColumnOption::NotNull, .. }, ..
+        } => inheritance::requires_a_value(builder, node, &def.name.value),
+        Slot::Column { def, held, .. } => {
+            inheritance::receives_column_constraint(builder, node, &def.name, held)
+        }
+        Slot::Table(_, constraint) => inheritance::receives_constraint(builder, node, constraint),
+    }
+}
+
+/// Whether the tables below hold copies of the constraint in `slot`.
+fn passes_down(slot: Slot<'_>) -> bool {
+    match slot {
+        Slot::Column { held, .. } => {
+            matches!(&held.option, ColumnOption::NotNull)
+                || matches!(&held.option, ColumnOption::Check(check) if !check.no_inherit)
+        }
+        Slot::Table(_, constraint) => {
+            matches!(constraint, TableConstraint::Check(check) if !check.no_inherit)
+        }
+    }
+}
+
+/// Whether the constraint in `slot` is backed by an index, whose name it
+/// shares.
+fn backed_by_index(slot: Slot<'_>) -> bool {
+    match slot {
+        Slot::Column { held, .. } => {
+            matches!(held.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_))
+        }
+        Slot::Table(_, constraint) => {
+            matches!(
+                constraint,
+                TableConstraint::PrimaryKey(_)
+                    | TableConstraint::Unique(_)
+                    | TableConstraint::Exclude(_)
+                    | TableConstraint::PrimaryKeyUsingIndex(_)
+                    | TableConstraint::UniqueUsingIndex(_)
+            )
+        }
+    }
+}
+
+/// Applies `ALTER TABLE ... RENAME CONSTRAINT old TO new`.
+///
+/// The constraint is found by the name it answers to, written or generated,
+/// and renamed on the table and on every copy below it, which carries the
+/// same name. A written name is rewritten where it is written, and a
+/// generated one in the record holding it.
+///
+/// # Errors
+///
+/// Returns [`Error::RenameConstraintNotFound`] for a name the table does not
+/// hold, [`Error::InheritedConstraintNotRenamable`] for a constraint received
+/// from a parent, [`Error::OnlyRefusedWithChildren`] when `ONLY` would leave
+/// copies below under the old name, [`Error::ConstraintAlreadyExists`] for a
+/// name another constraint of the table holds, and
+/// [`Error::RelationNameAlreadyTaken`] when a key's new name, which its index
+/// takes too, belongs to another relation of the schema.
+pub(super) fn rename_constraint(
+    builder: ParserDBBuilder,
+    table_name: &ObjectName,
+    scope: AlterTableScope,
+    old: &Ident,
+    new: &Ident,
+) -> Result<ParserDBBuilder, Error> {
+    let Some(stored) = ParserDB::alter_table_target(&builder, table_name, scope)? else {
+        return Ok(builder);
+    };
+    let node = ParserDB::stored_node(&builder, &stored)?;
+    let recorded = super::generated_constraint_names(&builder, &stored);
+    let Some((slot, _)) = locate(node, recorded, old).and_then(|position| slot_at(node, position))
+    else {
+        return Err(Error::RenameConstraintNotFound {
+            table_name: stored.name.clone(),
+            constraint_name: old.value.clone(),
+        });
+    };
+    if received_from_parent(&builder, node, slot) {
+        return Err(Error::InheritedConstraintNotRenamable {
+            table_name: stored.name.clone(),
+            constraint_name: old.value.clone(),
+        });
+    }
+    if passes_down(slot) {
+        ParserDB::refuse_only_with_children(
+            &builder,
+            &stored,
+            scope,
+            InheritedChange::RenameConstraint,
+        )?;
+    }
+    if locate(node, recorded, new).is_some() {
+        return Err(Error::ConstraintAlreadyExists {
+            table_name: stored.name.clone(),
+            constraint_name: new.value.clone(),
+        });
+    }
+    if backed_by_index(slot)
+        && let Some(conflicting_kind) =
+            super::relation_name_holder(&builder, new, table_schema_qualifier(node))
+    {
+        return Err(Error::RelationNameAlreadyTaken {
+            object_kind: ObjectKind::UniqueIndex,
+            conflicting_kind,
+            object_name: new.value.clone(),
+        });
+    }
+
+    let below = if scope.only { Vec::new() } else { inheritance::descendants(&builder, &stored) };
+    let mut builder = builder;
+    for table in core::iter::once(stored).chain(below) {
+        builder = rename_on(builder, &table, old, new)?;
+    }
+    Ok(builder)
+}
+
+/// Renames the constraint of `table` answering to `old`, if it holds one.
+fn rename_on(
+    builder: ParserDBBuilder,
+    table: &StoredTable,
+    old: &Ident,
+    new: &Ident,
+) -> Result<ParserDBBuilder, Error> {
+    let node = ParserDB::stored_node(&builder, table)?;
+    let recorded = super::generated_constraint_names(&builder, table);
+    let Some((slot, key)) =
+        locate(node, recorded, old).and_then(|position| slot_at(node, position))
+    else {
+        return Ok(builder);
+    };
+    if slot.declared_name().is_some() {
+        let position = slot.position();
+        return ParserDB::replace_table_node(builder, table, |_, node| {
+            rename_declared(node, position, new);
+            Ok(())
+        });
+    }
+    let mut builder = builder;
+    let case = builder.identifier_case();
+    let name = stored_ident_name(new).into_owned();
+    for (_, metadata, _) in
+        builder.tables_mut().iter_mut().filter(|(stored, _, _)| table.matches(stored, case))
+    {
+        let names = metadata
+            .generated_constraint_names()
+            .iter()
+            .map(|generated| {
+                if generated.slot == key {
+                    GeneratedConstraintName { name: name.clone(), ..generated.clone() }
+                } else {
+                    generated.clone()
+                }
+            })
+            .collect();
+        metadata.set_generated_constraint_names(names);
+    }
+    Ok(builder)
+}
+
+/// Rewrites the written name of the constraint at `position`, in the field
+/// its written name is read from first.
+fn rename_declared(node: &mut CreateTable, position: Position, new: &Ident) {
+    let new = Some(new.clone());
+    match position {
+        Position::Column(column, option) => node.columns[column].options[option].name = new,
+        // An index entry is no constraint, and ingestion keeps none in the
+        // list.
+        Position::Table(index) => {
+            let constraint = &mut node.constraints[index];
+            if let TableConstraint::Check(check) = constraint {
+                check.name = new;
+            } else if let TableConstraint::Unique(unique) = constraint {
+                unique.name = new;
+            } else if let TableConstraint::PrimaryKey(key) = constraint {
+                key.name = new;
+            } else if let TableConstraint::ForeignKey(foreign_key) = constraint {
+                foreign_key.name = new;
+            } else if let TableConstraint::Exclude(exclude) = constraint {
+                exclude.name = new;
+            } else if let TableConstraint::PrimaryKeyUsingIndex(using_index)
+            | TableConstraint::UniqueUsingIndex(using_index) = constraint
+            {
+                using_index.name = new;
+            }
+        }
+    }
 }

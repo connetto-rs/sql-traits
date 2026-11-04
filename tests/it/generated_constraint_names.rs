@@ -5,7 +5,9 @@
 //! 18, where `NOT NULL` is named too.
 #![allow(clippy::expect_used, clippy::panic)]
 
-use std::borrow::Cow;
+extern crate alloc;
+
+use alloc::borrow::Cow;
 
 use sql_traits::{
     errors::{Error, LookupError},
@@ -344,7 +346,7 @@ fn a_name_is_asked_of_the_database_holding_the_constraint() {
         owned(ColumnLike::not_null_constraint_name(&column, &db)),
         Some("p_a_not_null".to_owned())
     );
-    let shared = std::sync::Arc::new(column.clone());
+    let shared = alloc::sync::Arc::new(column.clone());
     assert_eq!(owned(shared.not_null_constraint_name(&db)), Some("p_a_not_null".to_owned()));
     let other = accepted("CREATE TABLE q (b INT);");
     assert!(column.not_null_constraint_name(&other).is_err());

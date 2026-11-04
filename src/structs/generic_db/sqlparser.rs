@@ -8908,6 +8908,15 @@ impl ParserDB {
                                     !not_valid,
                                 )?;
                             }
+                            AlterTableOperation::RenameConstraint { old_name, new_name } => {
+                                builder = constraint_names::rename_constraint(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &old_name,
+                                    &new_name,
+                                )?;
+                            }
                             AlterTableOperation::ValidateConstraint { name } => {
                                 builder = constraint_validity::validate_constraint(
                                     builder,
@@ -9092,7 +9101,6 @@ impl ParserDB {
                             operation @ (AlterTableOperation::DropPrimaryKey { .. }
                             | AlterTableOperation::DropForeignKey { .. }
                             | AlterTableOperation::DropIndex { .. }
-                            | AlterTableOperation::RenameConstraint { .. }
                             | AlterTableOperation::SwapWith { .. }) => {
                                 if Self::alter_table_target(
                                     &builder,
