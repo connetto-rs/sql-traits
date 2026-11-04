@@ -68,6 +68,11 @@ fn each_kind_of_constraint_answers_to_its_generated_name() {
         ("CREATE TABLE p (a INT); ALTER TABLE p ADD CHECK (a > 0);", "p_a_check"),
         ("CREATE TABLE p (a INT); ALTER TABLE p ADD COLUMN b INT CHECK (b > 0);", "p_b_check"),
         ("CREATE TABLE p (a INT); ALTER TABLE p ALTER COLUMN a SET NOT NULL;", "p_a_not_null"),
+        (
+            "CREATE TABLE p (a INT); CREATE UNIQUE INDEX i ON p (a);
+             ALTER TABLE p ADD PRIMARY KEY USING INDEX i;",
+            "i",
+        ),
     ] {
         assert!(drops(setup, name), "{setup} {name}");
         assert!(!drops(setup, "p_other"), "{setup}");
@@ -196,6 +201,14 @@ fn a_copy_keeps_its_parents_name() {
             parse(&format!("{parent} {child} ALTER TABLE c DROP CONSTRAINT c_a_check;")).is_err()
         );
     }
+    // A check written on its own is copied under its name too.
+    assert!(matches!(
+        parse(
+            "CREATE TABLE p (a INT, CHECK (a > 0)); CREATE TABLE c () INHERITS (p);
+             ALTER TABLE c DROP CONSTRAINT p_a_check;"
+        ),
+        Err(Error::InheritedConstraintNotDroppable { .. })
+    ));
     // A child declaring its own NOT NULL names it after itself.
     accepted(
         "CREATE TABLE p (a INT NOT NULL); CREATE TABLE c (a INT NOT NULL) INHERITS (p);
@@ -326,6 +339,13 @@ fn a_name_is_asked_of_the_database_holding_the_constraint() {
     let check = p.check_constraints(&db).expect("held").next().expect("one check").clone();
     assert_eq!(owned(check.constraint_name(&db)), Some("p_a_check".to_owned()));
     let column = p.columns(&db).expect("held").next().expect("one column");
+    // Through a reference or an `Arc` the column answers alike.
+    assert_eq!(
+        owned(ColumnLike::not_null_constraint_name(&column, &db)),
+        Some("p_a_not_null".to_owned())
+    );
+    let shared = std::sync::Arc::new(column.clone());
+    assert_eq!(owned(shared.not_null_constraint_name(&db)), Some("p_a_not_null".to_owned()));
     let other = accepted("CREATE TABLE q (b INT);");
     assert!(column.not_null_constraint_name(&other).is_err());
 }

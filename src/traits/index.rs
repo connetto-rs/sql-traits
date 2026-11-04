@@ -89,8 +89,7 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// given when it was created, which renaming the table or a column later
     /// leaves alone. A written name is returned as PostgreSQL stores it.
     ///
-    /// Defaults to [`None`], for an index backing no constraint and for a
-    /// database that does not know the name.
+    /// [`None`] for an index backing no constraint.
     ///
     /// # Errors
     ///
@@ -117,13 +116,10 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    #[inline]
     fn constraint_name<'db>(
         &'db self,
-        _database: &'db Self::DB,
-    ) -> Result<Option<Cow<'db, str>>, LookupError> {
-        Ok(None)
-    }
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError>;
 
     /// Returns the expression of the index as an SQL AST node.
     ///

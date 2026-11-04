@@ -4182,8 +4182,11 @@ fn table_constraint_name(constraint: &TableConstraint) -> Option<&Ident> {
         TableConstraint::Check(check) => check.name.as_ref(),
         TableConstraint::Index(index) => index.name.as_ref(),
         TableConstraint::FulltextOrSpatial(index) => index.opt_index_name.as_ref(),
+        // Written without a name, it takes the name of the index it adopts.
         TableConstraint::PrimaryKeyUsingIndex(using_index)
-        | TableConstraint::UniqueUsingIndex(using_index) => using_index.name.as_ref(),
+        | TableConstraint::UniqueUsingIndex(using_index) => {
+            Some(using_index.name.as_ref().unwrap_or(&using_index.index_name))
+        }
         TableConstraint::Exclude(exclude) => exclude.name.as_ref(),
     }
 }

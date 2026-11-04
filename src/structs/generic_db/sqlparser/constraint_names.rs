@@ -143,11 +143,12 @@ impl<'node> Slot<'node> {
                 let column = || Some(generated_names::column_part(&def.name));
                 match &held.option {
                     ColumnOption::Check(check) => constraint(only_column(&check.expr), "check"),
-                    ColumnOption::NotNull => constraint(column(), "not_null"),
                     ColumnOption::ForeignKey(_) => constraint(column(), "fkey"),
                     ColumnOption::PrimaryKey(_) => index(None, "pkey"),
                     ColumnOption::Unique(_) => index(column(), "key"),
-                    _ => None,
+                    // A slot on a column holds a constraint, and `NOT NULL` is
+                    // the one left.
+                    _ => constraint(column(), "not_null"),
                 }
             }
             Self::Table(_, table_constraint) => {
@@ -410,9 +411,17 @@ pub(super) fn name_pending(builder: &mut ParserDBBuilder) {
         else {
             return;
         };
-        let names = new_names(builder, next);
-        if let Some((_, metadata, _)) =
-            builder.tables_mut().iter_mut().find(|(table, _, _)| next.matches(table, case))
+        let names: Vec<Vec<GeneratedConstraintName>> = builder
+            .tables()
+            .iter()
+            .filter(|(table, _, _)| next.matches(table, case))
+            .map(|(table, metadata, _)| new_names(builder, table, metadata))
+            .collect();
+        for ((_, metadata, _), names) in builder
+            .tables_mut()
+            .iter_mut()
+            .filter(|(table, _, _)| next.matches(table, case))
+            .zip(names)
         {
             metadata.set_generated_constraint_names(names);
             metadata.set_constraint_names_pending(false);
@@ -421,22 +430,18 @@ pub(super) fn name_pending(builder: &mut ParserDBBuilder) {
 }
 
 /// The table's generated names once every constraint without one has one.
-fn new_names(builder: &ParserDBBuilder, table: &StoredTable) -> Vec<GeneratedConstraintName> {
-    let case = builder.identifier_case();
-    let Some((node, metadata, _)) =
-        builder.tables().iter().find(|(node, _, _)| table.matches(node, case))
-    else {
-        return Vec::new();
-    };
+fn new_names(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    metadata: &TableMetadata<CreateTable>,
+) -> Vec<GeneratedConstraintName> {
     let mut recorded = metadata.generated_constraint_names().to_vec();
     let slots = slots(node);
     let keys = keys(&slots);
     for (slot, key) in slots.into_iter().zip(keys) {
-        if slot.declared_name().is_some() || recorded.iter().any(|generated| generated.slot == key)
-        {
-            continue;
-        }
-        let Some(naming) = slot.naming() else {
+        let unnamed = slot.declared_name().is_none()
+            && !recorded.iter().any(|generated| generated.slot == key);
+        let Some(naming) = unnamed.then(|| slot.naming()).flatten() else {
             continue;
         };
         let received =

@@ -63,8 +63,6 @@ pub trait ForeignKeyLike:
     /// the table or a column later leaves alone. A written name is returned as
     /// PostgreSQL stores it.
     ///
-    /// Defaults to [`None`], for a database that does not know the name.
-    ///
     /// # Errors
     ///
     /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
@@ -91,13 +89,10 @@ pub trait ForeignKeyLike:
     /// # Ok(())
     /// # }
     /// ```
-    #[inline]
     fn constraint_name<'db>(
         &'db self,
-        _database: &'db Self::DB,
-    ) -> Result<Option<Cow<'db, str>>, LookupError> {
-        Ok(None)
-    }
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError>;
 
     /// Returns the action the foreign key takes on its referencing rows when
     /// a referenced row is deleted, [`ReferentialAction::NoAction`] when the
