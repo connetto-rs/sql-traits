@@ -355,10 +355,8 @@ pub(super) fn stored_expr(expr: &Expr) -> Expr {
                 *expr = core::mem::replace(inner.as_mut(), placeholder);
             }
             Expr::Identifier(ident) => *ident = stored_name(ident),
-            Expr::CompoundIdentifier(parts) => {
-                if let Some(column) = parts.last() {
-                    *expr = Expr::Identifier(stored_name(column));
-                }
+            Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+                *expr = Expr::Identifier(stored_name(&parts[parts.len() - 1]));
             }
             _ => {}
         }
