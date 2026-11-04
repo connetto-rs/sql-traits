@@ -179,6 +179,82 @@ impl core::fmt::Display for FixedPersistence {
     }
 }
 
+/// What a table lacks to become a child of a parent through `ALTER TABLE ...
+/// INHERIT`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ChildMismatch {
+    /// The table lacks a column of the parent.
+    MissingColumn {
+        /// The parent's column.
+        column_name: String,
+    },
+    /// The column has another type than the parent's.
+    ColumnType {
+        /// The column.
+        column_name: String,
+    },
+    /// The column has another collation than the parent's.
+    ColumnCollation {
+        /// The column.
+        column_name: String,
+    },
+    /// The parent requires the column to hold a value and the table does not.
+    ColumnNullable {
+        /// The column.
+        column_name: String,
+    },
+    /// The parent generates the column and the table does not.
+    MustBeGenerated {
+        /// The column.
+        column_name: String,
+    },
+    /// The table generates the column and the parent does not.
+    MustNotBeGenerated {
+        /// The column.
+        column_name: String,
+    },
+    /// The table lacks a check the parent passes down, named as the parent
+    /// names it or, for an unnamed check, written as the check.
+    MissingConstraint {
+        /// The check's name, or the check itself.
+        constraint_name: String,
+    },
+    /// The table holds a check of the parent's name with another expression.
+    ConstraintDiffers {
+        /// The check's name.
+        constraint_name: String,
+    },
+}
+
+impl core::fmt::Display for ChildMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingColumn { column_name } => write!(f, "it lacks column `{column_name}`"),
+            Self::ColumnType { column_name } => {
+                write!(f, "column `{column_name}` has another type")
+            }
+            Self::ColumnCollation { column_name } => {
+                write!(f, "column `{column_name}` has another collation")
+            }
+            Self::ColumnNullable { column_name } => {
+                write!(f, "column `{column_name}` must be marked `NOT NULL`")
+            }
+            Self::MustBeGenerated { column_name } => {
+                write!(f, "column `{column_name}` must be a generated column")
+            }
+            Self::MustNotBeGenerated { column_name } => {
+                write!(f, "column `{column_name}` must not be a generated column")
+            }
+            Self::MissingConstraint { constraint_name } => {
+                write!(f, "it lacks check `{constraint_name}`")
+            }
+            Self::ConstraintDiffers { constraint_name } => {
+                write!(f, "its check `{constraint_name}` differs from the parent's")
+            }
+        }
+    }
+}
+
 /// Why PostgreSQL refuses the bound a partition is given.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InvalidBound {
@@ -1928,6 +2004,49 @@ pub enum Error {
         /// Table the statement creates.
         table_name: String,
         /// Partitioned parent it names, as written.
+        parent_name: String,
+    },
+    #[error("Table `{table_name}` cannot inherit from `{parent_name}` because {reason}.")]
+    /// Error indicating that `ALTER TABLE ... INHERIT` names a parent whose
+    /// shape the table does not already have.
+    InheritanceChildMismatch {
+        /// Table the statement alters.
+        table_name: String,
+        /// Parent it names, as written.
+        parent_name: String,
+        /// What the table lacks.
+        reason: ChildMismatch,
+    },
+    #[error("Cannot change the parents of table `{table_name}` because it is a partition.")]
+    /// Error indicating that `INHERIT` or `NO INHERIT` names a partition, whose
+    /// only parent is its partitioned table.
+    InheritanceChangeOnPartition {
+        /// Table the statement alters.
+        table_name: String,
+    },
+    #[error("Cannot change the parents of partitioned table `{table_name}`.")]
+    /// Error indicating that `INHERIT` names a partitioned table, which takes
+    /// no `INHERITS` parent.
+    InheritanceChangeOnPartitioned {
+        /// Table the statement alters.
+        table_name: String,
+    },
+    #[error("Table `{table_name}` cannot inherit from `{parent_name}`, which inherits from it.")]
+    /// Error indicating that `INHERIT` names the table itself or one of the
+    /// tables inheriting from it.
+    CircularInheritance {
+        /// Table the statement alters.
+        table_name: String,
+        /// Parent it names, as written.
+        parent_name: String,
+    },
+    #[error("Table `{parent_name}` is not a parent of table `{table_name}`.")]
+    /// Error indicating that `NO INHERIT` names a table the table does not
+    /// inherit from.
+    NotAParentOf {
+        /// Table the statement alters.
+        table_name: String,
+        /// Parent it names, as written.
         parent_name: String,
     },
     #[error("Relation `{partition_name}` is not a partition of table `{table_name}`.")]
