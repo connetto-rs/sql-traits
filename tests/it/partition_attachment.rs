@@ -3,7 +3,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{
-    errors::{Error, ObjectKind, UnattachablePartition},
+    errors::{ChildMismatch, Error, ObjectKind, UnattachablePartition},
     prelude::*,
 };
 use sqlparser::dialect::PostgreSqlDialect;
@@ -483,30 +483,31 @@ fn temporary_and_permanent_tables_do_not_mix() {
 fn the_columns_have_to_match_the_roots() {
     let attach = "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);";
     let column = |name: &str| name.to_owned();
+    let shape = UnattachablePartition::Shape;
     let cases = [
         ("CREATE TABLE p (id INT) PARTITION BY LIST (id); CREATE TABLE c (id INT, x INT);",
          UnattachablePartition::ExtraColumn { column_name: column("x") }),
         ("CREATE TABLE p (id INT, y INT) PARTITION BY LIST (id); CREATE TABLE c (id INT);",
-         UnattachablePartition::MissingColumn { column_name: column("y") }),
+         shape(ChildMismatch::MissingColumn { column_name: column("y") })),
         ("CREATE TABLE p (id INT) PARTITION BY LIST (id);
           CREATE TABLE c (id INT GENERATED ALWAYS AS IDENTITY);",
          UnattachablePartition::IdentityColumn { column_name: column("id") }),
+        ("CREATE TABLE p (id INT) PARTITION BY LIST (id); CREATE TABLE c (id BIGINT);",
+         shape(ChildMismatch::ColumnType { column_name: column("id") })),
+        ("CREATE TABLE p (id INT[]) PARTITION BY LIST (id); CREATE TABLE c (id INT);",
+         shape(ChildMismatch::ColumnType { column_name: column("id") })),
+        ("CREATE TABLE p (a TEXT COLLATE \"C\") PARTITION BY LIST (a); CREATE TABLE c (a TEXT);",
+         shape(ChildMismatch::ColumnCollation { column_name: column("a") })),
         ("CREATE TABLE p (id INT NOT NULL) PARTITION BY LIST (id); CREATE TABLE c (id INT);",
-         UnattachablePartition::NullableColumn { column_name: column("id") }),
+         shape(ChildMismatch::ColumnNullable { column_name: column("id") })),
         ("CREATE TABLE p (id INT PRIMARY KEY) PARTITION BY LIST (id); CREATE TABLE c (id INT);",
-         UnattachablePartition::NullableColumn { column_name: column("id") }),
+         shape(ChildMismatch::ColumnNullable { column_name: column("id") })),
         ("CREATE TABLE p (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED) PARTITION BY LIST (a);
           CREATE TABLE c (a INT, b INT);",
-         UnattachablePartition::GenerationMismatch {
-             column_name: column("b"),
-             generated_in_root: true,
-         }),
+         shape(ChildMismatch::MustBeGenerated { column_name: column("b") })),
         ("CREATE TABLE p (a INT, b INT) PARTITION BY LIST (a);
           CREATE TABLE c (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED);",
-         UnattachablePartition::GenerationMismatch {
-             column_name: column("b"),
-             generated_in_root: false,
-         }),
+         shape(ChildMismatch::MustNotBeGenerated { column_name: column("b") })),
         ("CREATE TABLE p (id INT, b INT, PRIMARY KEY (id)) PARTITION BY LIST (id);
           CREATE TABLE c (id INT NOT NULL, b INT PRIMARY KEY);",
          UnattachablePartition::OtherPrimaryKey),
@@ -516,36 +517,39 @@ fn the_columns_have_to_match_the_roots() {
         let message = parse(&sql).expect_err("the table is refused").to_string();
         let named = match &expected {
             UnattachablePartition::ExtraColumn { column_name }
-            | UnattachablePartition::MissingColumn { column_name }
             | UnattachablePartition::IdentityColumn { column_name }
-            | UnattachablePartition::NullableColumn { column_name }
-            | UnattachablePartition::GenerationMismatch { column_name, .. } => {
-                format!("`{column_name}`")
-            }
+            | UnattachablePartition::Shape(
+                ChildMismatch::MissingColumn { column_name }
+                | ChildMismatch::ColumnType { column_name }
+                | ChildMismatch::ColumnCollation { column_name }
+                | ChildMismatch::ColumnNullable { column_name }
+                | ChildMismatch::MustBeGenerated { column_name }
+                | ChildMismatch::MustNotBeGenerated { column_name },
+            ) => format!("`{column_name}`"),
             _ => "`c`".to_owned(),
         };
         assert!(message.contains(&named), "{message} does not name {named}");
         assert_eq!(refusal(&sql), expected, "{setup}");
     }
 
-    assert!(matches!(
-        parse(&format!(
-            "CREATE TABLE p (id INT) PARTITION BY LIST (id); CREATE TABLE c (id BIGINT); {attach}"
-        )),
-        Err(Error::InheritedColumnTypeConflict { column_name, child_table, .. })
-            if column_name == "id" && child_table == "c"
-    ));
-    assert!(matches!(
-        parse(&format!(
-            "CREATE TABLE p (a TEXT COLLATE \"C\") PARTITION BY LIST (a);
-             CREATE TABLE c (a TEXT); {attach}"
-        )),
-        Err(Error::InheritedColumnCollationConflict { .. })
-    ));
-    // A generated column may compute its value its own way.
+    // A generated column may compute its value its own way, and an explicit
+    // default collation is the default.
     database(&format!(
         "CREATE TABLE p (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED) PARTITION BY LIST (a);
          CREATE TABLE c (a INT, b INT GENERATED ALWAYS AS (a * 3) STORED); {attach}"
+    ));
+    database(&format!(
+        "CREATE TABLE p (a INT, t TEXT) PARTITION BY LIST (a);
+         CREATE TABLE c (a INT, t TEXT COLLATE \"default\"); {attach}"
+    ));
+    // The bound is checked before the columns are compared.
+    assert!(matches!(
+        parse(&format!(
+            "CREATE TABLE p (id INT, b INT) PARTITION BY LIST (id);
+             CREATE TABLE q PARTITION OF p FOR VALUES IN (1);
+             CREATE TABLE c (id INT, b BIGINT); {attach}"
+        )),
+        Err(Error::PartitionBoundOverlaps { .. })
     ));
 }
 
@@ -553,55 +557,61 @@ fn the_columns_have_to_match_the_roots() {
 fn the_roots_checks_have_to_be_held_already() {
     let attach = "ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);";
     let root = "CREATE TABLE p (id INT, CONSTRAINT ck CHECK (id > 0)) PARTITION BY LIST (id);";
+    let check = |reason| UnattachablePartition::Shape(reason);
+    let ck = || "ck".to_owned();
 
     assert_eq!(
         refusal(&format!("{root} CREATE TABLE c (id INT); {attach}")),
-        UnattachablePartition::MissingCheck {
-            constraint: "CONSTRAINT ck CHECK (id > 0)".to_owned()
-        }
+        check(ChildMismatch::MissingConstraint { constraint_name: ck() })
     );
     assert_eq!(
         refusal(&format!(
             "{root} CREATE TABLE c (id INT, CONSTRAINT other CHECK (id > 0)); {attach}"
         )),
-        UnattachablePartition::MissingCheck {
-            constraint: "CONSTRAINT ck CHECK (id > 0)".to_owned()
-        }
+        check(ChildMismatch::MissingConstraint { constraint_name: ck() })
     );
-    for held in ["CONSTRAINT ck CHECK (id > 1)", "CONSTRAINT ck CHECK (id > 0) NO INHERIT"] {
-        assert!(
-            matches!(
-                parse(&format!("{root} CREATE TABLE c (id INT, {held}); {attach}")),
-                Err(Error::InheritedConstraintConflict { table_name, constraint_name })
-                    if table_name == "c" && constraint_name == "ck"
-            ),
+    for (held, reason) in [
+        (
+            "CONSTRAINT ck CHECK (id > 1)",
+            ChildMismatch::ConstraintDiffers { constraint_name: ck() },
+        ),
+        (
+            "CONSTRAINT ck CHECK (id > 0) NO INHERIT",
+            ChildMismatch::ConstraintNotInherited { constraint_name: ck() },
+        ),
+    ] {
+        assert_eq!(
+            refusal(&format!("{root} CREATE TABLE c (id INT, {held}); {attach}")),
+            check(reason),
             "{held}"
         );
     }
-    assert!(matches!(
-        parse(&format!(
+    assert_eq!(
+        refusal(&format!(
             "{root} CREATE TABLE c (id INT);
              ALTER TABLE c ADD CONSTRAINT ck CHECK (id > 0) NOT VALID; {attach}"
         )),
-        Err(Error::NotValidConstraintConflict { .. })
-    ));
+        check(ChildMismatch::ConstraintNotValid { constraint_name: ck() })
+    );
     database(&format!(
         "CREATE TABLE p (id INT) PARTITION BY LIST (id);
          ALTER TABLE p ADD CONSTRAINT ck CHECK (id > 0) NOT VALID;
          CREATE TABLE c (id INT, CONSTRAINT ck CHECK (id > 0)); {attach}"
     ));
-    // A check is held whichever way either table writes it.
+    // A check is held whichever way either table writes it, and however many
+    // parentheses it is written with.
     database(&format!(
         "CREATE TABLE p (id INT CONSTRAINT ck CHECK (id > 0)) PARTITION BY LIST (id);
          CREATE TABLE c (id INT, CONSTRAINT ck CHECK (id > 0)); {attach}"
     ));
     database(&format!("{root} CREATE TABLE c (id INT CONSTRAINT ck CHECK (id > 0)); {attach}"));
+    database(&format!("{root} CREATE TABLE c (id INT, CONSTRAINT ck CHECK ((id > 0))); {attach}"));
     assert_eq!(
         refusal(&format!(
             "CREATE TABLE p (id INT CHECK (id > 0)) PARTITION BY LIST (id);
              CREATE TABLE c (id INT CHECK (id < 9)); {attach}"
         )),
-        UnattachablePartition::MissingCheck { constraint: "CHECK (id > 0)".to_owned() }
+        check(ChildMismatch::MissingConstraint { constraint_name: "CHECK (id > 0)".to_owned() })
     );
 }
 

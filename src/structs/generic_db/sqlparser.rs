@@ -79,6 +79,7 @@ mod constraint_validity;
 mod default_privileges;
 mod detach_partition;
 mod domains;
+mod existing_child;
 mod extensions;
 mod foreign_options;
 mod function_bodies;
@@ -968,7 +969,9 @@ fn column_metadata_for_collations(
     Ok(metadata)
 }
 
-fn existing_child_column_collation_conflict(
+/// The refusal of a column a parent adds where the child already declares one
+/// of its name, which PostgreSQL merges only when type and collation agree.
+fn existing_child_column_conflict(
     builder: &ParserDBBuilder,
     parent: &StoredTable,
     child: &StoredTable,
@@ -980,6 +983,16 @@ fn existing_child_column_collation_conflict(
         child.matches(TableAttribute::table(column), builder.identifier_case())
             && added.matches(&column.attribute().name)
     })?;
+    let own_type = &child_column.attribute().data_type;
+    if inheritance::types_conflict(builder, &inherited_def.data_type, own_type) {
+        return Some(crate::errors::Error::InheritedColumnTypeConflict {
+            column_name: added.name.clone(),
+            child_table: child.name.clone(),
+            child_type: own_type.to_string(),
+            parent_table: parent.name.clone(),
+            parent_type: inherited_def.data_type.to_string(),
+        });
+    }
     if child_metadata.postgres_collation_matches(inherited_metadata) != Some(false) {
         return None;
     }
@@ -7107,7 +7120,7 @@ impl ParserDB {
             // A child already declaring the name keeps its own, the way
             // PostgreSQL merges the two rather than adding a second.
             if added.declared_by(Self::stored_node(&builder, child)?) {
-                if let Some(error) = existing_child_column_collation_conflict(
+                if let Some(error) = existing_child_column_conflict(
                     &builder,
                     &stored,
                     child,
@@ -7253,8 +7266,11 @@ impl ParserDB {
             // The column leaves every table inheriting this one along with it,
             // unless `ONLY` asked for the named table, which leaves each
             // direct child holding the column as its own.
-            let inheritors =
-                if scope.only { Vec::new() } else { inheritance::descendants(&builder, &stored) };
+            let inheritors = if scope.only {
+                Vec::new()
+            } else {
+                inheritance::losing_column(&builder, &stored, &column)
+            };
 
             // Which other tables declare a column of this name decides who a
             // mention inside a nested query belongs to, so it is read before

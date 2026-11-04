@@ -15,17 +15,23 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CharacterLength, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType,
-    ExactNumberInfo, Ident, ObjectName, TableConstraint, TimezoneInfo,
+    ArrayElemTypeDef, CharacterLength, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
+    CreateTable, DataType, ExactNumberInfo, Expr, Ident, ObjectName, TableConstraint, TimezoneInfo,
+    Value, visit_expressions_mut,
 };
 
 use super::{
     ParserDBBuilder, StoredTable, column_copy::copy_column,
     constraint_validity::unvalidated_copies, generated_names,
 };
-use crate::{errors::Error, traits::TableLike, utils::is_identity};
+use crate::{
+    errors::Error,
+    traits::TableLike,
+    utils::{identifier_resolution::stored_ident_name, is_identity},
+};
 
 /// Which spelling links a child to a table it takes its shape from.
 ///
@@ -177,6 +183,50 @@ pub(super) fn direct_children(
         .collect()
 }
 
+/// The tables below `dropped` that lose `column` when it drops it.
+///
+/// A table keeps its copy when it declared the column itself or a parent that
+/// keeps the column still passes it, which PostgreSQL records by lowering
+/// `attinhcount` instead of dropping, and a table keeping its copy passes
+/// nothing further down. Solved as the largest set closed under that rule, so
+/// a table reached through two losing parents loses the column whichever path
+/// is walked first.
+pub(super) fn losing_column(
+    builder: &ParserDBBuilder,
+    dropped: &StoredTable,
+    column: &super::NamedColumn,
+) -> Vec<StoredTable> {
+    let case = builder.identifier_case();
+    let receives = |table: &StoredTable| {
+        builder.tables().iter().any(|(stored, metadata, _)| {
+            table.matches(stored, case) && metadata.inherited_column_names().contains(&column.name)
+        })
+    };
+    let mut losing: Vec<StoredTable> =
+        descendants(builder, dropped).into_iter().filter(|table| receives(table)).collect();
+    loop {
+        let kept: Vec<StoredTable> = losing
+            .iter()
+            .filter(|table| {
+                super::ParserDB::stored_node(builder, table).is_ok_and(|node| {
+                    parent_names(node)
+                        .filter_map(|name| builder.resolve_bound_table_name(name).ok().flatten())
+                        .any(|parent| {
+                            !dropped.matches(parent, case)
+                                && !losing.iter().any(|lost| lost.matches(parent, case))
+                                && column.declared_by(parent)
+                        })
+                })
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            return losing;
+        }
+        losing.retain(|table| !kept.contains(table));
+    }
+}
+
 /// Marks a column a table has just received from a parent as inherited.
 pub(super) fn mark_inherited(builder: &mut ParserDBBuilder, table: &StoredTable, column: &str) {
     let case = builder.identifier_case();
@@ -266,10 +316,55 @@ pub(super) fn stays_with_declaring_column(option: &ColumnOption) -> bool {
 /// has to look past it.
 fn without_generated_option_name(option: &ColumnOptionDef) -> ColumnOptionDef {
     let mut bare = option.clone();
-    if matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_)) {
-        bare.name = None;
+    match &mut bare.option {
+        ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_) => bare.name = None,
+        ColumnOption::Check(check) => {
+            stored_check(check);
+            bare.name = bare.name.as_ref().map(stored_name);
+        }
+        _ => {}
     }
     bare
+}
+
+/// The name as PostgreSQL stores it, spelled so that two spellings storing the
+/// same name compare equal.
+fn stored_name(name: &Ident) -> Ident {
+    Ident::with_quote('"', stored_ident_name(name).into_owned())
+}
+
+/// Rewrites a check into the form PostgreSQL compares: its name as stored and
+/// its expression as [`stored_expr`] gives it.
+fn stored_check(check: &mut CheckConstraint) {
+    check.name = check.name.as_ref().map(stored_name);
+    *check.expr = stored_expr(&check.expr);
+}
+
+/// The expression as PostgreSQL stores it, which keeps no parentheses the tree
+/// already implies and holds every column folded and without the table a check
+/// can only qualify it with.
+///
+/// Two checks are the same check when these agree, so moving parentheses that
+/// change the tree still tells them apart.
+pub(super) fn stored_expr(expr: &Expr) -> Expr {
+    let mut stored = expr.clone();
+    let _: ControlFlow<()> = visit_expressions_mut(&mut stored, |expr| {
+        match expr {
+            Expr::Nested(inner) => {
+                let placeholder = Expr::Value(Value::Null.into());
+                *expr = core::mem::replace(inner.as_mut(), placeholder);
+            }
+            Expr::Identifier(ident) => *ident = stored_name(ident),
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(column) = parts.last() {
+                    *expr = Expr::Identifier(stored_name(column));
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    });
+    stored
 }
 
 /// Whether the option a table holds is its copy of the one a parent writes.
@@ -384,7 +479,7 @@ pub(super) fn name_partition_key(
 /// different type. An unplaceable spelling answers [`None`] and is accepted,
 /// because wrongly refusing a legal schema costs more than missing a conflict
 /// the parser cannot see.
-fn type_identity(data_type: &DataType) -> Option<String> {
+fn type_identity(builder: &ParserDBBuilder, data_type: &DataType) -> Option<String> {
     let exact = |name: &str, info: &ExactNumberInfo| {
         match info {
             ExactNumberInfo::None => name.to_string(),
@@ -432,6 +527,26 @@ fn type_identity(data_type: &DataType) -> Option<String> {
             };
             sized(base, *precision)
         }
+        // An array type is its element's whatever the dimensions written.
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(element)
+            | ArrayElemTypeDef::SquareBracket(element, _)
+            | ArrayElemTypeDef::Parenthesis(element),
+        ) => {
+            let mut element = element.as_ref();
+            while let DataType::Array(
+                ArrayElemTypeDef::AngleBracket(inner)
+                | ArrayElemTypeDef::SquareBracket(inner, _)
+                | ArrayElemTypeDef::Parenthesis(inner),
+            ) = element
+            {
+                element = inner;
+            }
+            format!("{}[]", type_identity(builder, element)?)
+        }
+        DataType::Custom(..) => {
+            format!("domain {}", super::domains::named_domain(builder, data_type)?)
+        }
         _ => return None,
     })
 }
@@ -440,8 +555,12 @@ fn type_identity(data_type: &DataType) -> Option<String> {
 ///
 /// Answers `false` whenever either spelling cannot be placed, so an unfamiliar
 /// type never blocks a schema PostgreSQL accepts.
-pub(super) fn types_conflict(parent: &DataType, child: &DataType) -> bool {
-    match (type_identity(parent), type_identity(child)) {
+pub(super) fn types_conflict(
+    builder: &ParserDBBuilder,
+    parent: &DataType,
+    child: &DataType,
+) -> bool {
+    match (type_identity(builder, parent), type_identity(builder, child)) {
         (Some(parent), Some(child)) => parent != child,
         _ => false,
     }
@@ -536,8 +655,8 @@ pub(super) fn partition_copy(
 /// The constraint with the name a copy would have been given stripped away.
 ///
 /// A partition's copy of a key differs from the root's only in that name, so
-/// recognising the copy has to look past it. Every other kind keeps the
-/// parent's name and is compared whole.
+/// recognising the copy has to look past it. A check is compared in the form
+/// PostgreSQL stores it, and every other kind is compared whole.
 fn without_generated_name(constraint: &TableConstraint) -> TableConstraint {
     let mut bare = constraint.clone();
     match &mut bare {
@@ -549,6 +668,7 @@ fn without_generated_name(constraint: &TableConstraint) -> TableConstraint {
             unique.name = None;
             unique.index_name = None;
         }
+        TableConstraint::Check(check) => stored_check(check),
         _ => {}
     }
     bare
@@ -841,7 +961,7 @@ fn merge_local_columns(
         if let Some(position) =
             columns.iter().position(|held| same_column(&held.name, &column.name))
         {
-            if types_conflict(&columns[position].data_type, &column.data_type) {
+            if types_conflict(context.builder, &columns[position].data_type, &column.data_type) {
                 return Err(Error::InheritedColumnTypeConflict {
                     column_name: column.name.value.clone(),
                     child_table: context.child_name.to_string(),
@@ -1169,9 +1289,20 @@ fn bind_parents(
         );
     for (kind, parent_name) in parents {
         let Some(parent) = builder.resolve_table_object_name(parent_name)? else {
-            return Err(Error::ParentTableNotFound {
-                parent_table: parent_name.to_string(),
-                child_table: child_name.to_string(),
+            return Err(match builder.relation_reached(parent_name) {
+                Some((object_kind, _)) => {
+                    Error::InheritsFromNonTable {
+                        table_name: child_name.to_string(),
+                        parent_name: parent_name.to_string(),
+                        object_kind,
+                    }
+                }
+                None => {
+                    Error::ParentTableNotFound {
+                        parent_table: parent_name.to_string(),
+                        child_table: child_name.to_string(),
+                    }
+                }
             });
         };
         if parent.is_temporary() && !child_temporary {

@@ -12,16 +12,16 @@ use alloc::{
 };
 
 use sqlparser::ast::{
-    AlterTableOperation, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable,
-    Expr, ForValues, ForeignKeyConstraint, Ident, IndexColumn, ObjectName, OrderByExpr,
-    OrderByOptions, TableConstraint,
+    AlterTableOperation, ColumnOption, ColumnOptionDef, CreateTable, Expr, ForValues,
+    ForeignKeyConstraint, Ident, IndexColumn, ObjectName, OrderByExpr, OrderByOptions,
+    TableConstraint,
 };
 
 use super::{
     AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference, constraint_validity,
-    idents_match,
+    existing_child, idents_match,
     inheritance::{self, ParentKind},
-    partition_bounds, states_not_null, stored_column_collation_name, stored_qualifier, views,
+    partition_bounds, stored_qualifier, views,
 };
 use crate::{
     errors::{Error, ObjectKind, UnattachablePartition},
@@ -104,15 +104,23 @@ pub(super) fn attach_partition(
 
     refuse_unattachable(&builder, (&root, root_node), (&partition, partition_node))?;
     partition_bounds::validate_bound(&builder, root_node, &partition.name, for_values)?;
+    let merged_checks = existing_child::merge_into_existing(
+        &builder,
+        (&root, root_node),
+        (&partition, partition_node),
+    )
+    .map_err(|mismatch| {
+        Error::PartitionNotAttachable {
+            table_name: root.name.clone(),
+            partition_name: partition.name.clone(),
+            reason: UnattachablePartition::Shape(mismatch),
+        }
+    })?;
 
     let passed = passed_keys(&builder, &root, root_node);
     let mut received = receive(&builder, root_node, &partition, partition_node, &passed)?;
     received.options.extend(identities_of(root_node, partition_node));
-    received.merged.extend(held_checks(
-        &builder,
-        (&root, root_node),
-        (&partition, partition_node),
-    )?);
+    received.merged.extend(merged_checks);
     refuse_foreign_under_unique_index(&builder, (&root, root_node), (&partition, partition_node))?;
     let mut bound_root = root_name.clone();
     bind_reference(&mut bound_root, stored_qualifier(&root_node.name));
@@ -291,138 +299,7 @@ fn refuse_unattachable(
         }
     }
 
-    for root_column in &root_node.columns {
-        let Some(column) = partition_node
-            .columns
-            .iter()
-            .find(|held| inheritance::same_column(&held.name, &root_column.name))
-        else {
-            return refuse(UnattachablePartition::MissingColumn {
-                column_name: root_column.name.value.clone(),
-            });
-        };
-        if inheritance::types_conflict(&root_column.data_type, &column.data_type) {
-            return Err(Error::InheritedColumnTypeConflict {
-                column_name: column.name.value.clone(),
-                child_table: partition.name.clone(),
-                child_type: column.data_type.to_string(),
-                parent_table: root.name.clone(),
-                parent_type: root_column.data_type.to_string(),
-            });
-        }
-        if inheritance::collations_conflict(
-            builder,
-            (root_node, root_column),
-            (partition_node, column),
-        ) {
-            let collation = |column: &ColumnDef| {
-                stored_column_collation_name(column)
-                    .map_or_else(|| "default".to_string(), ObjectName::to_string)
-                    .into_boxed_str()
-            };
-            return Err(Error::InheritedColumnCollationConflict {
-                column_name: column.name.value.clone().into_boxed_str(),
-                child_table: partition.name.clone().into_boxed_str(),
-                child_collation: collation(column),
-                parent_table: root.name.clone().into_boxed_str(),
-                parent_collation: collation(root_column),
-            });
-        }
-        if states_not_null(root_column) && !states_not_null(column) {
-            return refuse(UnattachablePartition::NullableColumn {
-                column_name: column.name.value.clone(),
-            });
-        }
-        let generated_in_root = is_stored_generated(root_column);
-        if generated_in_root != is_stored_generated(column) {
-            return refuse(UnattachablePartition::GenerationMismatch {
-                column_name: column.name.value.clone(),
-                generated_in_root,
-            });
-        }
-    }
-
     Ok(())
-}
-
-fn is_stored_generated(column: &ColumnDef) -> bool {
-    column.options.iter().any(|option| {
-        matches!(option.option, ColumnOption::Generated { generation_expr: Some(_), .. })
-    })
-}
-
-/// Every check the table holds, whether written on a column or on its own, with
-/// whether it is held validated.
-fn checks_of(
-    builder: &ParserDBBuilder,
-    table: &StoredTable,
-    node: &CreateTable,
-) -> Vec<(CheckConstraint, bool)> {
-    let written_on_columns =
-        node.columns.iter().flat_map(|column| &column.options).filter_map(|option| {
-            let ColumnOption::Check(check) = &option.option else {
-                return None;
-            };
-            let mut check = check.clone();
-            check.name = check.name.or_else(|| option.name.clone());
-            Some((check, true))
-        });
-    let written_alone = node.constraints.iter().filter_map(|constraint| {
-        let TableConstraint::Check(check) = constraint else {
-            return None;
-        };
-        Some((check.clone(), constraint_validity::is_validated(builder, table, constraint)))
-    });
-    written_on_columns.chain(written_alone).collect()
-}
-
-/// Finds the partition's own copy of each check the root passes down, refusing
-/// a missing one and one that cannot merge with the root's.
-///
-/// PostgreSQL matches by name. A check the root left unnamed is matched by its
-/// expression, because the model does not hold the name PostgreSQL would give
-/// it.
-fn held_checks(
-    builder: &ParserDBBuilder,
-    (root, root_node): (&StoredTable, &CreateTable),
-    (partition, partition_node): (&StoredTable, &CreateTable),
-) -> Result<Vec<(TableConstraint, bool)>, Error> {
-    let held = checks_of(builder, partition, partition_node);
-    let mut merged = Vec::new();
-
-    for (check, validated) in checks_of(builder, root, root_node) {
-        let found = held.iter().find(|(own, _)| {
-            match &check.name {
-                Some(name) => own.name.as_ref().is_some_and(|own| idents_match(own, name)),
-                None => own.expr == check.expr,
-            }
-        });
-        let Some((own, _)) = found else {
-            return Err(Error::PartitionNotAttachable {
-                table_name: root.name.clone(),
-                partition_name: partition.name.clone(),
-                reason: UnattachablePartition::MissingCheck { constraint: check.to_string() },
-            });
-        };
-        if own.expr != check.expr || own.no_inherit {
-            return Err(Error::InheritedConstraintConflict {
-                table_name: partition.name.clone(),
-                constraint_name: own
-                    .name
-                    .as_ref()
-                    .map_or_else(|| own.to_string(), |name| name.value.clone()),
-            });
-        }
-
-        let own = TableConstraint::Check(own.clone());
-        if partition_node.constraints.contains(&own) {
-            let validated =
-                constraint_validity::merged_copy_validated(builder, partition, &own, validated)?;
-            merged.push((own, validated));
-        }
-    }
-
-    Ok(merged)
 }
 
 /// The root's identities, which PostgreSQL gives the attached table alone and

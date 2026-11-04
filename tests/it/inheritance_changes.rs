@@ -6,7 +6,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{
-    errors::{ChildMismatch, Error},
+    errors::{ChildMismatch, Error, ObjectKind},
     prelude::*,
 };
 use sqlparser::{ast::CreateTable, dialect::PostgreSqlDialect};
@@ -65,7 +65,9 @@ fn mismatch(sql: &str) -> ChildMismatch {
                 | ChildMismatch::MustBeGenerated { column_name }
                 | ChildMismatch::MustNotBeGenerated { column_name } => column_name,
                 ChildMismatch::MissingConstraint { constraint_name }
-                | ChildMismatch::ConstraintDiffers { constraint_name } => constraint_name,
+                | ChildMismatch::ConstraintDiffers { constraint_name }
+                | ChildMismatch::ConstraintNotInherited { constraint_name }
+                | ChildMismatch::ConstraintNotValid { constraint_name } => constraint_name,
             };
             assert!(
                 message.contains("`c`")
@@ -132,6 +134,15 @@ fn inherit_refuses_a_child_without_the_parents_shape() {
             "CREATE TABLE c (id INT NOT NULL, note TEXT COLLATE \"C\", CONSTRAINT pos CHECK (id > 0));",
             ChildMismatch::ConstraintDiffers { constraint_name: "pos".to_owned() },
         ),
+        (
+            "CREATE TABLE c (id INT NOT NULL, note TEXT COLLATE \"C\", CONSTRAINT pos CHECK (id >= 0) NO INHERIT);",
+            ChildMismatch::ConstraintNotInherited { constraint_name: "pos".to_owned() },
+        ),
+        (
+            "CREATE TABLE c (id INT NOT NULL, note TEXT COLLATE \"C\");
+             ALTER TABLE c ADD CONSTRAINT pos CHECK (id >= 0) NOT VALID;",
+            ChildMismatch::ConstraintNotValid { constraint_name: "pos".to_owned() },
+        ),
     ] {
         assert_eq!(
             mismatch(&format!("{PARENT} {child} ALTER TABLE c INHERIT p;")),
@@ -145,6 +156,28 @@ fn inherit_refuses_a_child_without_the_parents_shape() {
              ALTER TABLE c INHERIT p;"
         )),
         ChildMismatch::ColumnType { column_name: "id".to_owned() }
+    );
+    for (parent, child) in [
+        ("CREATE TABLE p (a INT[]);", "CREATE TABLE c (a INT);"),
+        ("CREATE DOMAIN d AS INT; CREATE TABLE p (a d);", "CREATE TABLE c (a INT);"),
+    ] {
+        assert_eq!(
+            mismatch(&format!("{parent} {child} ALTER TABLE c INHERIT p;")),
+            ChildMismatch::ColumnType { column_name: "a".to_owned() },
+            "{parent}"
+        );
+    }
+    // What PostgreSQL stores the same way is the same: array dimensions, an
+    // explicit default collation, parentheses, and a quoted name folding alike.
+    accepted(
+        "CREATE TABLE p (a INT[], t TEXT, CONSTRAINT \"k\" CHECK ((a IS NOT NULL) AND (t > '')));
+         CREATE TABLE c (a INT[][], t TEXT COLLATE \"default\", CONSTRAINT k CHECK (a IS NOT NULL AND t > ''));
+         ALTER TABLE c INHERIT p;",
+    );
+    // A parent's unvalidated check is met by a validated one.
+    accepted(
+        "CREATE TABLE p (a INT); ALTER TABLE p ADD CONSTRAINT k CHECK (a > 0) NOT VALID;
+         CREATE TABLE c (a INT, CONSTRAINT k CHECK (a > 0)); ALTER TABLE c INHERIT p;",
     );
     let generated = "CREATE TABLE p (id INT, g INT GENERATED ALWAYS AS (id * 2) STORED);";
     assert_eq!(
@@ -194,13 +227,44 @@ fn inherit_refuses_a_parent_postgresql_refuses() {
             "{statement}"
         );
     }
-    assert!(matches!(
-        parse(&format!("{base} ALTER TABLE c INHERIT missing;")),
-        Err(Error::ParentTableNotFound { .. })
-    ));
+    for operation in ["INHERIT", "NO INHERIT"] {
+        assert!(
+            matches!(
+                parse(&format!("{base} ALTER TABLE c {operation} missing;")),
+                Err(Error::ParentTableNotFound { .. })
+            ),
+            "{operation}"
+        );
+    }
     assert!(matches!(
         parse(&format!("{base} CREATE VIEW v AS SELECT 1 AS id; ALTER TABLE c INHERIT v;")),
-        Err(Error::AlterActionUnsupportedOnRelation { .. })
+        Err(Error::AlterActionUnsupportedOnRelation { object_kind: ObjectKind::View, .. })
+    ));
+    assert!(matches!(
+        parse(&format!("{base} CREATE SEQUENCE s; ALTER TABLE c INHERIT s;")),
+        Err(Error::AlterActionUnsupportedOnRelation { object_kind: ObjectKind::Sequence, .. })
+    ));
+    // NO INHERIT names whatever it reaches as no parent.
+    for other in [
+        "CREATE VIEW v AS SELECT 1 AS id;",
+        "CREATE MATERIALIZED VIEW v AS SELECT 1 AS id;",
+        "CREATE SEQUENCE v;",
+    ] {
+        assert!(
+            matches!(
+                parse(&format!("{base} {other} ALTER TABLE c NO INHERIT v;")),
+                Err(Error::NotAParentOf { table_name, parent_name }) if table_name == "c" && parent_name == "v"
+            ),
+            "{other}"
+        );
+    }
+    // A partitioned table is named as having no such partition.
+    assert!(matches!(
+        parse(&format!(
+            "{base} CREATE TABLE pt (id INT) PARTITION BY LIST (id); ALTER TABLE c NO INHERIT pt;"
+        )),
+        Err(Error::NotAPartitionOf { table_name, partition_name })
+            if table_name == "pt" && partition_name == "c"
     ));
     let partitioned = "CREATE TABLE pt (id INT) PARTITION BY RANGE (id);
          CREATE TABLE pp PARTITION OF pt FOR VALUES FROM (0) TO (1);
