@@ -140,6 +140,29 @@ fn every_reference_follows_the_move() {
     assert_eq!(rule.table_name.to_string(), "s2.v");
 }
 
+/// Every table of the schema moves, so one referencing a sibling still
+/// stands in the old schema whenever the sibling moves first.
+#[test]
+fn a_table_referencing_a_sibling_moves_whichever_moves_first() {
+    for child in [
+        "CREATE TABLE s.child (id INT DEFAULT 1, p INT REFERENCES s.parent (id));",
+        "CREATE TABLE s.child (id INT PRIMARY KEY, p INT REFERENCES s.parent (id));",
+    ] {
+        let db = parse(&format!(
+            "CREATE SCHEMA s;
+             CREATE TABLE s.parent (id INT PRIMARY KEY);
+             {child}
+             ALTER SCHEMA s RENAME TO s2;"
+        ))
+        .expect("schema parses");
+        let child = table(&db, "s2.child").expect("child moved");
+        for key in child.foreign_keys(&db).expect("child is held") {
+            let target = key.referenced_table_name();
+            assert_eq!((target.schema(), target.name()), (Some("s2"), "parent"));
+        }
+    }
+}
+
 #[test]
 fn grants_follow_the_move() {
     let db = parse(&format!("{SCHEMA} ALTER SCHEMA s RENAME TO s2;")).expect("schema parses");
