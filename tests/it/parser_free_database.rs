@@ -9,7 +9,9 @@
 //! everything else.
 #![allow(clippy::expect_used)]
 
-use std::borrow::Cow;
+extern crate alloc;
+
+use alloc::borrow::Cow;
 
 use sql_traits::{
     errors::{HelperSetError, LookupError},
