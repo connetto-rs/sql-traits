@@ -10,7 +10,8 @@ use sqlparser::ast::{
 
 use crate::{
     errors::{HelperSetError, LookupError},
-    structs::{Deployment, FunctionKind, HelperSet, TargetName},
+    impls::{body_calls, body_reads, helper_set},
+    structs::{Deployment, FunctionBody, FunctionKind, HelperSet, TargetName},
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
         call_typing::{
@@ -578,6 +579,47 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         self.language().map(|language| normalize_identifier(language, self.language_is_quoted()))
     }
 
+    /// Returns the body as it is written, or [`None`] for a function whose
+    /// code lives outside the schema or that has no body.
+    ///
+    /// [`body`](FunctionLike::body),
+    /// [`body_expression`](FunctionLike::body_expression),
+    /// [`body_is_bound`](FunctionLike::body_is_bound),
+    /// [`referenced_tables`](FunctionLike::referenced_tables),
+    /// [`referenced_relations`](FunctionLike::referenced_relations),
+    /// [`referenced_functions`](FunctionLike::referenced_functions) and
+    /// [`helper_set`](FunctionLike::helper_set) all read the body from here,
+    /// so an implementation handing over the body a catalog stores answers
+    /// them as a parsed script does. A body bound at creation answers the
+    /// bound form, each relation it names written as the store holds the
+    /// relation it reached.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION quoted() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+    ///      CREATE FUNCTION returned() RETURNS INT LANGUAGE sql RETURN 1;
+    ///      CREATE FUNCTION linked() RETURNS INT LANGUAGE c AS 'library', 'symbol';",
+    /// )?;
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    /// };
+    /// assert_eq!(function("quoted").written_body(), Some(FunctionBody::Text("SELECT 1")));
+    /// assert!(matches!(function("returned").written_body(), Some(FunctionBody::Return(_))));
+    /// // Text in another language is still text, which its language reads.
+    /// assert_eq!(function("linked").written_body(), Some(FunctionBody::Text("library")));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn written_body(&self) -> Option<FunctionBody<'_>>;
+
     /// Returns the body text of the function, for the spellings that write the
     /// body as a string.
     ///
@@ -601,7 +643,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
-    fn body(&self) -> Option<&str>;
+    #[inline]
+    fn body(&self) -> Option<&str> {
+        match self.written_body()? {
+            FunctionBody::Text(text) => Some(text),
+            _ => None,
+        }
+    }
 
     /// Returns the expression of a function written `RETURN <expression>`.
     ///
@@ -674,7 +722,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
-    fn body_expression(&self) -> Option<&Expr>;
+    #[inline]
+    fn body_expression(&self) -> Option<&Expr> {
+        match self.written_body()? {
+            FunctionBody::Return(expression) => Some(expression),
+            _ => None,
+        }
+    }
 
     /// Returns the function-local configuration after later alterations.
     fn configuration_parameters(&self) -> &[FunctionDefinitionSetParam];
@@ -783,7 +837,56 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
-    fn body_is_bound(&self) -> bool;
+    #[inline]
+    fn body_is_bound(&self) -> bool {
+        self.written_body().is_some_and(|body| body.is_bound())
+    }
+
+    /// Returns every function the calls of a body
+    /// [bound at creation](FunctionLike::body_is_bound) reached when it was
+    /// bound, each once, and none for a body read again each time the
+    /// function runs.
+    ///
+    /// PostgreSQL records these when it binds the body, so the body text
+    /// alone does not decide them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] for a function `database`
+    /// does not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE SCHEMA app;
+    ///      CREATE FUNCTION app.one() RETURNS INT LANGUAGE sql RETURN 1;
+    ///      SET search_path = app;
+    ///      CREATE FUNCTION public.two() RETURNS INT LANGUAGE sql RETURN one() + one();
+    ///      RESET search_path;",
+    /// )?;
+    /// let two = db
+    ///     .function_by_target(TargetName::new("two", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// // `app` was on the path when `two` was created, and is no longer.
+    /// let reached: Vec<_> = two.bound_body_functions(&db)?.map(FunctionLike::target_name).collect();
+    /// assert_eq!(reached, [TargetName::new("one", false).with_schema("app", false)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn bound_body_functions<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<
+        impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + use<'db, Self>,
+        LookupError,
+    >
+    where
+        Self: 'db;
 
     /// Returns every base table the body reads or writes, plain views
     /// expanded to the base tables they read, resolved the way PostgreSQL
@@ -853,10 +956,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     fn referenced_tables<'db>(
         &self,
         database: &'db Self::DB,
-    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Table>, LookupError>;
+    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Table>, LookupError> {
+        Ok(body_reads(self, database)?.tables)
+    }
 
     /// Returns every relation the body names, whether table, plain view or
     /// materialized view, resolved and deduplicated as
@@ -894,10 +1000,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     fn referenced_relations<'db>(
         &self,
         database: &'db Self::DB,
-    ) -> Result<Vec<Relation<'db, Self::DB>>, LookupError>;
+    ) -> Result<Vec<Relation<'db, Self::DB>>, LookupError> {
+        Ok(body_reads(self, database)?.relations)
+    }
 
     /// Returns every function the calls the body writes may reach, resolved
     /// the way PostgreSQL resolves them, and deduplicated in first-reached
@@ -954,10 +1063,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     fn referenced_functions<'db>(
         &self,
         database: &'db Self::DB,
-    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Function>, LookupError>;
+    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Function>, LookupError> {
+        body_calls(self, database)
+    }
 
     /// Returns the null-input behavior with PostgreSQL's default folded in.
     fn null_input_behavior(&self) -> FunctionCalledOnNull;
@@ -1363,12 +1475,15 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     fn helper_set<'db>(
         &'db self,
         arguments: &[Value],
         deployment: &'db Deployment,
         database: &'db Self::DB,
-    ) -> Result<HelperSet<'db, Self::DB>, HelperSetError>;
+    ) -> Result<HelperSet<'db, Self::DB>, HelperSetError> {
+        helper_set(self, arguments, deployment, database)
+    }
 
     /// Returns the normalized return type name of the function as a string.
     ///

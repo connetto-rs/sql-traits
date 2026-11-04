@@ -10,6 +10,7 @@ pub use generic_db::{
     ParserIngestion, PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType, SchemaProfile,
     SqlparserProfile, UnresolvedAccessReference,
 };
+mod function_body;
 mod function_kind;
 mod helper_set;
 mod identifier_case;
@@ -35,6 +36,7 @@ pub use deployment::{
 };
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
+pub use function_body::FunctionBody;
 pub use function_kind::FunctionKind;
 pub use helper_set::{GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm};
 pub use identifier_case::IdentifierCase;

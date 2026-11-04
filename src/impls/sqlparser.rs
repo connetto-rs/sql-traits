@@ -19,6 +19,7 @@ mod dialect;
 mod dml;
 pub(crate) mod dql;
 mod foreign_key_constraint;
+mod function_body;
 mod grant;
 mod helper_set;
 mod index_clauses;
@@ -32,9 +33,11 @@ mod view;
 pub(crate) use column_def::{foreign_options_of, serial_sequence_type};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub use dialect::SqlparserDialect;
+pub(crate) use function_body::{body_calls, body_reads};
 pub use grant::apply_revoke_to_grant;
 pub(crate) use grant::{
     PrivilegeKind, grant_objects_match, grantee_is_public, grantee_is_session_principal,
     grantee_matches_role, grantees_match, partition_grantees_for_revoke, schema_matches_table,
     split_by_column_scope, validate_granted_columns,
 };
+pub(crate) use helper_set::helper_set;

@@ -12,7 +12,7 @@
 use std::borrow::Cow;
 
 use sql_traits::{
-    errors::{HelperSetError, LookupError},
+    errors::LookupError,
     prelude::*,
     structs::{ForeignTableSource, TargetName},
     traits::{ColumnCollation, TypeMatch, grant::GrantTarget},
@@ -23,9 +23,9 @@ use sqlparser::{
         Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
         CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, ReferentialAction,
-        Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod, Value,
+        Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
-    dialect::GenericDialect,
+    dialect::{Dialect, GenericDialect},
     parser::Parser,
 };
 
@@ -151,6 +151,11 @@ struct MemoryFunction {
     name: String,
     schema: Option<String>,
     argument_types: Vec<String>,
+    language: Option<String>,
+    /// The body text, where the catalog stores one.
+    body: Option<String>,
+    /// The path the function pins for its body, as `proconfig` holds it.
+    search_path: Option<Vec<(String, bool)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -416,6 +421,10 @@ impl DialectLike for MemoryDialect {
         } else {
             TypeMatch::No
         }
+    }
+
+    fn sqlparser_dialect(&self) -> &dyn Dialect {
+        &GenericDialect {}
     }
 }
 
@@ -961,19 +970,15 @@ impl FunctionLike for MemoryFunction {
     }
 
     fn language(&self) -> Option<&str> {
-        None
+        self.language.as_deref()
     }
 
     fn language_is_quoted(&self) -> bool {
         false
     }
 
-    fn body(&self) -> Option<&str> {
-        None
-    }
-
-    fn body_expression(&self) -> Option<&Expr> {
-        None
+    fn written_body(&self) -> Option<FunctionBody<'_>> {
+        self.body.as_deref().map(FunctionBody::Text)
     }
 
     fn configuration_parameters(&self) -> &[FunctionDefinitionSetParam] {
@@ -984,33 +989,20 @@ impl FunctionLike for MemoryFunction {
         &'db self,
         _database: &'db Self::DB,
     ) -> Result<Option<SearchPath<'db>>, LookupError> {
-        Ok(None)
+        Ok(self.search_path.as_ref().map(|path| {
+            path.iter().map(|(schema, quoted)| (Cow::Borrowed(schema.as_str()), *quoted)).collect()
+        }))
     }
 
-    fn body_is_bound(&self) -> bool {
-        false
-    }
-
-    fn referenced_tables<'db>(
+    /// This catalog stores bodies as text, which is never bound.
+    fn bound_body_functions<'db>(
         &self,
         _database: &'db Self::DB,
-    ) -> Result<Vec<&'db MemoryTable>, LookupError> {
-        // This catalog holds no function bodies.
-        Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() })
-    }
-
-    fn referenced_relations<'db>(
-        &self,
-        _database: &'db Self::DB,
-    ) -> Result<Vec<Relation<'db, MemoryCatalog>>, LookupError> {
-        Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() })
-    }
-
-    fn referenced_functions<'db>(
-        &self,
-        _database: &'db Self::DB,
-    ) -> Result<Vec<&'db MemoryFunction>, LookupError> {
-        Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() })
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + use<'db>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(core::iter::empty())
     }
 
     fn null_input_behavior(&self) -> FunctionCalledOnNull {
@@ -1045,15 +1037,6 @@ impl FunctionLike for MemoryFunction {
         _database: &Self::DB,
     ) -> Result<bool, LookupError> {
         Ok(false)
-    }
-
-    fn helper_set<'db>(
-        &'db self,
-        _arguments: &[Value],
-        _deployment: &'db Deployment,
-        _database: &'db Self::DB,
-    ) -> Result<HelperSet<'db, Self::DB>, HelperSetError> {
-        Err(LookupError::FunctionBodyUnavailable { function: self.name.clone() }.into())
     }
 }
 
@@ -1479,6 +1462,9 @@ fn function(schema: Option<&str>, name: &str, argument_types: &[&str]) -> Memory
         name: String::from(name),
         schema: schema.map(String::from),
         argument_types: argument_types.iter().map(|declared| String::from(*declared)).collect(),
+        language: None,
+        body: None,
+        search_path: None,
     }
 }
 
@@ -1737,6 +1723,65 @@ fn functions_without_volatility_metadata_report_volatile() -> Result<(), LookupE
         .expect("the default schema holds one");
 
     assert_eq!(function.volatility(), FunctionBehavior::Volatile);
+    Ok(())
+}
+
+/// A body the catalog stores as text is parsed under the catalog's dialect
+/// and read under the path the function pins, as a parsed script reads it.
+#[test]
+fn the_inherited_body_analysis_reads_a_stored_text_body() -> Result<(), LookupError> {
+    let mut catalog = catalog();
+    let mut pinned = function(None, "pinned", &[]);
+    pinned.language = Some(String::from("sql"));
+    pinned.search_path = Some(vec![(String::from("app"), false)]);
+    pinned.body = Some(String::from("SELECT touch() FROM docs; SELECT id FROM app.notes"));
+    let mut unpinned = pinned.clone();
+    unpinned.name = String::from("unpinned");
+    unpinned.search_path = None;
+    let mut linked = function(None, "linked", &[]);
+    linked.language = Some(String::from("c"));
+    linked.body = Some(String::from("library"));
+    catalog.functions.extend([pinned, unpinned, linked]);
+
+    let function = |name| {
+        catalog
+            .resolve_target_function(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("the function exists")
+    };
+    let qualified = |schema: Option<&str>, name: &str| {
+        schema.map_or_else(|| name.to_string(), |schema| format!("{schema}.{name}"))
+    };
+    let read = |name| -> Result<Vec<String>, LookupError> {
+        Ok(function(name)
+            .referenced_tables(&catalog)?
+            .iter()
+            .map(|table| qualified(table.table_schema(), table.table_name()))
+            .collect())
+    };
+    let called = |name| -> Result<Vec<String>, LookupError> {
+        Ok(function(name)
+            .referenced_functions(&catalog)?
+            .iter()
+            .map(|called| qualified(called.target_name().schema(), called.name()))
+            .collect())
+    };
+
+    // The pinned path reaches `app` first, and `pg_catalog` holds no `touch`.
+    assert_eq!(read("pinned")?, ["app.docs", "app.notes"]);
+    assert_eq!(called("pinned")?, ["app.touch"]);
+    // Without one, the body runs under the catalog's own path.
+    assert_eq!(read("unpinned")?, ["docs", "app.notes"]);
+    assert_eq!(called("unpinned")?, ["touch"]);
+
+    assert!(matches!(
+        function("linked").referenced_tables(&catalog),
+        Err(LookupError::FunctionBodyNotSql { language, .. }) if language == "c"
+    ));
+    assert!(matches!(
+        function("touch").referenced_functions(&catalog),
+        Err(LookupError::FunctionBodyUnavailable { .. })
+    ));
     Ok(())
 }
 
