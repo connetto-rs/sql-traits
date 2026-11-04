@@ -390,6 +390,36 @@ fn a_parent_named_before_it_is_created_is_refused() {
 }
 
 #[test]
+fn a_partition_column_entry_keeps_the_roots_type_and_collation() {
+    // Measured on PostgreSQL 17 and 18: a column entry of `PARTITION OF` takes
+    // the root's type and collation, and a `COLLATE` written on it is ignored,
+    // even on a column whose type takes no collation.
+    let db = database(
+        "CREATE TABLE orders (id INT NOT NULL, note TEXT COLLATE \"C\") PARTITION BY RANGE (id);
+         CREATE TABLE p PARTITION OF orders (note NOT NULL) FOR VALUES FROM (0) TO (10);
+         CREATE TABLE q PARTITION OF orders (note COLLATE \"POSIX\") FOR VALUES FROM (10) TO (20);
+         CREATE TABLE r PARTITION OF orders (id COLLATE \"C\") FOR VALUES FROM (20) TO (30);",
+    );
+    let note = |table: &str| {
+        let note = db
+            .table_by_target(TargetName::new(table, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("table exists")
+            .column("note", &db, IdentifierCase::AsWritten)
+            .expect("lookup")
+            .expect("received");
+        let collation = match note.collation(&db).expect("held") {
+            ColumnCollation::Named(named) => named.name().name().to_string(),
+            other => format!("{other:?}"),
+        };
+        (note.data_type(&db).to_string(), collation, note.is_nullable(&db).expect("held"))
+    };
+    assert_eq!(note("p"), ("TEXT".to_string(), "C".to_string(), false));
+    assert_eq!(note("q"), ("TEXT".to_string(), "C".to_string(), true));
+    assert_eq!(note("r"), ("TEXT".to_string(), "C".to_string(), true));
+}
+
+#[test]
 fn a_partition_names_only_columns_its_parent_declares() {
     // Measured on PostgreSQL 17 and 18: "column "missing" does not exist",
     // whichever option the partition writes on it.

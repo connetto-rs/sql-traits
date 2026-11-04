@@ -851,8 +851,9 @@ fn merge_local_columns(
                     parent_type: columns[position].data_type.to_string(),
                 });
             }
-            if let Some(inherited_metadata) =
-                inherited_column_metadata_for(&column.name, column_metadata)
+            if !is_options_only(column)
+                && let Some(inherited_metadata) =
+                    inherited_column_metadata_for(&column.name, column_metadata)
                 && let Some(error) = local_collation_conflict(context, column, inherited_metadata)?
             {
                 return Err(error);
@@ -943,12 +944,7 @@ pub(super) fn apply_parents(
         return Ok(Inherited::default());
     }
 
-    let local_collations: Vec<Ident> = create_table
-        .columns
-        .iter()
-        .filter(|column| super::stored_column_collation_name(column).is_some())
-        .map(|column| column.name.clone())
-        .collect();
+    let local_collations = locally_collated(create_table);
 
     let local = locally_declared(create_table);
     // The child is not in the stores yet, so the names it introduces itself
@@ -1071,6 +1067,21 @@ fn locally_declared(create_table: &CreateTable) -> Vec<Ident> {
     create_table.columns.iter().map(|column| column.name.clone()).collect()
 }
 
+/// The columns of a table being created that carry a collation of their own.
+///
+/// A `COLLATE` on an entry that names no type is ignored, so only a typed
+/// column keeps one.
+fn locally_collated(create_table: &CreateTable) -> Vec<Ident> {
+    create_table
+        .columns
+        .iter()
+        .filter(|column| {
+            !is_options_only(column) && super::stored_column_collation_name(column).is_some()
+        })
+        .map(|column| column.name.clone())
+        .collect()
+}
+
 /// Whether the option is one a column may state only once.
 ///
 /// A check may be written any number of times, each becoming a constraint of
@@ -1087,8 +1098,16 @@ fn stated_once(option: &ColumnOption) -> bool {
 /// The child's declaration wins on anything that can be stated only once, which
 /// is what PostgreSQL leaves: a parent's default gives way to the child's,
 /// while both checks stand under their own names.
+///
+/// An entry naming no type, as a `PARTITION OF` column entry does, keeps the
+/// type and collation it receives, and PostgreSQL ignores a `COLLATE` written
+/// on it.
 fn merge_declarations(received: &ColumnDef, child: &ColumnDef) -> ColumnDef {
     let mut merged = child.clone();
+    if is_options_only(child) {
+        merged.data_type = received.data_type.clone();
+        merged.options.retain(|option| !matches!(option.option, ColumnOption::Collation(_)));
+    }
 
     for option in &received.options {
         let already_stated = if stated_once(&option.option) {
@@ -1104,6 +1123,12 @@ fn merge_declarations(received: &ColumnDef, child: &ColumnDef) -> ColumnDef {
     }
 
     merged
+}
+
+/// Whether a column entry names no type, so it only adds options to a column
+/// it receives, as the column entries of `PARTITION OF` do.
+fn is_options_only(column: &ColumnDef) -> bool {
+    matches!(column.data_type, DataType::Unspecified)
 }
 
 /// Names the parent a column reaches the child from, for the conflict message.
