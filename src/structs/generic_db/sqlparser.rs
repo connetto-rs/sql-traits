@@ -7200,6 +7200,11 @@ impl ParserDB {
         // Named against the schema as it stands, before the column lands.
         let column_sequences =
             sequences::plan_column_sequences(&builder, &stored, core::iter::once(&column_def));
+        sequences::spell_out_serials(&column_sequences, &stored, [&mut column_def]);
+        let owner = Self::stored_owner(&builder, &stored);
+        let creator = Creator::new(owner.as_deref(), context.defaults);
+        let (builder, column_sequences) =
+            sequences::create_column_sequences(builder, &stored, column_sequences, creator)?;
         sequences::bind_column_defaults(&builder, &stored.name, core::iter::once(&mut column_def))?;
         builder.bind_column_foreign_keys(&mut column_def);
 
@@ -7209,11 +7214,6 @@ impl ParserDB {
         inherited_def
             .options
             .retain(|option| !inheritance::stays_with_declaring_column(&option.option));
-        sequences::spell_out_planned_serial(&mut inherited_def, &stored, &column_sequences);
-        let owner = Self::stored_owner(&builder, &stored);
-        let creator = Creator::new(owner.as_deref(), context.defaults);
-        let (builder, column_sequences) =
-            sequences::create_column_sequences(builder, &stored, column_sequences, creator)?;
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
         let inherited_metadata = column_metadata_for_collations(
@@ -7683,7 +7683,6 @@ impl ParserDB {
             domains::bind_type(&builder, data_type);
         }
         let mut identity_sequence = None;
-        let mut serial_default = None;
         if let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? {
             let node = Self::stored_node(&builder, &stored)?;
             let column = NamedColumn::of(column_name, builder.identifier_case());
@@ -7714,16 +7713,6 @@ impl ParserDB {
             let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
             if let AlterColumnOperation::SetDefault { value } = &mut operation {
                 sequences::bind_default(&builder, &stored.name, &column_name.value, value)?;
-            }
-            if let Some(declared) = declared
-                && matches!(
-                    operation,
-                    AlterColumnOperation::SetDefault { .. }
-                        | AlterColumnOperation::DropDefault
-                        | AlterColumnOperation::SetDataType { .. }
-                )
-            {
-                serial_default = sequences::serial_default(&builder, node, declared);
             }
             // An identity added to a column brings its sequence, named before
             // the identity lands.
@@ -7756,9 +7745,6 @@ impl ParserDB {
             }
             None => (builder, None),
         };
-        // Only a type change keeps a serial column's draw, as an explicit
-        // default.
-        let keeps_drawing = matches!(operation, AlterColumnOperation::SetDataType { .. });
         let installs = Self::altered_column_option(&operation);
         let mut builder = Self::alter_table_column_def(
             builder,
@@ -7767,9 +7753,6 @@ impl ParserDB {
             column_name,
             &installs,
             |declared| {
-                if let Some(drawn) = &serial_default {
-                    sequences::spell_out_serial(declared, keeps_drawing.then(|| drawn.clone()));
-                }
                 Self::apply_alter_column(declared, operation.clone());
             },
         )?;
@@ -9402,6 +9385,11 @@ impl ParserDB {
                     let creator = Creator::session(&session_roles, &default_privileges);
                     let column_sequences =
                         sequences::plan_column_sequences(&builder, &stored, &create_table.columns);
+                    sequences::spell_out_serials(
+                        &column_sequences,
+                        &stored,
+                        &mut create_table.columns,
+                    );
                     let (with_sequences, column_sequences) = sequences::create_column_sequences(
                         builder,
                         &stored,

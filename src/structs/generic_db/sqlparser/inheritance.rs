@@ -504,15 +504,11 @@ pub(super) fn requires_a_value(
 fn inherited_column(
     builder: &ParserDBBuilder,
     kind: ParentKind,
-    parent: &CreateTable,
     child: &CreateTable,
     column: &ColumnDef,
     taken: &mut Vec<Ident>,
 ) -> ColumnDef {
     let mut copy = copy_column(column, |option| option_passes_down(kind, option));
-    if let Some(drawn) = super::sequences::serial_default(builder, parent, column) {
-        super::sequences::spell_out_serial(&mut copy, Some(drawn));
-    }
 
     if kind == ParentKind::PartitionOf {
         for option in &mut copy.options {
@@ -1160,8 +1156,7 @@ pub(super) fn apply_parents(
             // A second parent declaring the same column merges into the one
             // already taken, keeping the position the first parent gave it.
             if !columns.iter().any(|held| same_column(&held.name, &column.name)) {
-                let inherited =
-                    inherited_column(builder, *kind, parent, create_table, column, &mut taken);
+                let inherited = inherited_column(builder, *kind, create_table, column, &mut taken);
                 if let Some(metadata) =
                     inherited_column_metadata(builder, parent, column, &inherited)
                 {
