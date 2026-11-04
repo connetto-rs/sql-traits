@@ -500,6 +500,10 @@ impl TableLike for MemoryTable {
         None
     }
 
+    fn partition_bound(&self) -> Option<PartitionBound> {
+        None
+    }
+
     fn is_unlogged(&self) -> bool {
         false
     }

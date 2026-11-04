@@ -87,6 +87,7 @@ mod leading_comments;
 mod like;
 mod parse_options;
 mod parsed_source;
+mod partition_bounds;
 mod partition_keys;
 mod postgres_18_collations;
 mod postgres_builtins;
@@ -9086,6 +9087,19 @@ impl ParserDB {
                         &collation_metadata,
                         &active_postgres_catalog,
                     )?;
+                    // The bound is checked against the partitions the root
+                    // already has, which the parents just resolved.
+                    if let (Some(root), Some(bound)) =
+                        (&create_table.partition_of, &create_table.for_values)
+                        && let Some(root) = builder.resolve_bound_table_name(root)?
+                    {
+                        partition_bounds::validate_bound(
+                            &builder,
+                            root,
+                            create_table.table_name(),
+                            bound,
+                        )?;
+                    }
                     refuse_no_inherit_check_on_partitioned(&create_table)?;
                     record_implied_not_null(&mut create_table);
                     bind_foreign_key_targets(&builder, &mut create_table);

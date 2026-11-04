@@ -15,6 +15,7 @@ mod helper_set;
 mod identifier_case;
 mod identity;
 pub mod metadata;
+mod partition_bound;
 mod revoked_privilege;
 mod role_membership;
 mod row_security;
@@ -39,6 +40,7 @@ pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
+pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
 pub use revoked_privilege::RevokedPrivilege;
 pub use role_membership::RoleMembership;
 pub use row_security::{

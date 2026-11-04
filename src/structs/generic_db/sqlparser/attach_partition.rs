@@ -21,7 +21,7 @@ use super::{
     AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference, constraint_validity,
     idents_match,
     inheritance::{self, ParentKind},
-    states_not_null, stored_column_collation_name, stored_qualifier, views,
+    partition_bounds, states_not_null, stored_column_collation_name, stored_qualifier, views,
 };
 use crate::{
     errors::{Error, ObjectKind, UnattachablePartition},
@@ -103,6 +103,7 @@ pub(super) fn attach_partition(
     let partition = StoredTable::of(partition_node);
 
     refuse_unattachable(&builder, (&root, root_node), (&partition, partition_node))?;
+    partition_bounds::validate_bound(&builder, root_node, &partition.name, for_values)?;
 
     let passed = passed_keys(&builder, &root, root_node);
     let mut received = receive(&builder, root_node, &partition, partition_node, &passed)?;
