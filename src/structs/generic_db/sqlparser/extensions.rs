@@ -334,16 +334,15 @@ pub(super) fn follow_schema_rename(
 
 /// Checks the schema `WITH SCHEMA` names, keeping it as written.
 ///
-/// `public` and `pg_catalog` exist in every database. `pg_temp` is refused,
-/// since PostgreSQL resolves the spelling to no schema here.
+/// `pg_catalog` exists in every database. `pg_temp` is refused, since
+/// PostgreSQL resolves the spelling to no schema here.
 fn named_schema(
     builder: &ParserDBBuilder,
     schema: Ident,
     extension_name: &Ident,
 ) -> Result<Ident, Error> {
     let (name, quoted) = (schema.value.as_str(), schema.quote_style.is_some());
-    if (identifiers_match(name, quoted, "public", false) && builder.has_public_schema())
-        || identifiers_match(name, quoted, PG_CATALOG, false)
+    if identifiers_match(name, quoted, PG_CATALOG, false)
         || declared_schema(builder, name, quoted).is_some()
     {
         return Ok(schema);

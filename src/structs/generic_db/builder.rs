@@ -135,9 +135,6 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     /// Defaults to `public` alone, and `SET search_path` replaces it wholesale
     /// rather than extending it, which is what the database does.
     search_path: Vec<(String, bool)>,
-    /// Whether the `public` schema every database starts with still exists,
-    /// which `ALTER SCHEMA public RENAME` and `DROP SCHEMA public` end.
-    public_schema: bool,
     /// Comparison deciding whether a creation takes a name something already
     /// holds, which each engine answers its own way.
     identifier_case: IdentifierCase,
@@ -173,7 +170,6 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             table_grants: self.table_grants.clone(),
             column_grants: self.column_grants.clone(),
             search_path: self.search_path.clone(),
-            public_schema: self.public_schema,
             identifier_case: self.identifier_case,
             identities: self.identities,
         }
@@ -239,7 +235,6 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             table_grants: Vec::new(),
             column_grants: Vec::new(),
             search_path: self.search_path.clone(),
-            public_schema: self.public_schema,
             identifier_case: self.identifier_case,
             identities: self.identities,
         }
@@ -335,16 +330,6 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     /// Replaces the schemas an unqualified name resolves against.
     pub(crate) fn set_search_path(&mut self, search_path: Vec<(String, bool)>) {
         self.search_path = search_path;
-    }
-
-    /// Whether the `public` schema still exists.
-    pub(crate) fn has_public_schema(&self) -> bool {
-        self.public_schema
-    }
-
-    /// Records whether the `public` schema exists.
-    pub(crate) fn set_public_schema(&mut self, exists: bool) {
-        self.public_schema = exists;
     }
 
     /// Returns the SQL dialect recorded for this builder.
@@ -548,11 +533,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             check_constraints: Vec::new(),
             roles: Vec::new(),
             role_memberships: Vec::new(),
-            schemas: Vec::new(),
+            schemas: P::initial_schemas().into_iter().collect(),
             table_grants: Vec::new(),
             column_grants: Vec::new(),
             search_path: Self::default_search_path(),
-            public_schema: true,
             identifier_case: IdentifierCase::AsWritten,
             identities: IdentityCounter::default(),
         }
@@ -1032,7 +1016,6 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             column_grants,
             schemas,
             search_path,
-            public_schema,
             identifier_case,
             ingestion,
         } = database;
@@ -1065,7 +1048,6 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             table_grants,
             column_grants,
             search_path,
-            public_schema,
             identifier_case,
             identities,
         };
@@ -1228,7 +1210,6 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             table_grants: self.table_grants,
             column_grants: self.column_grants,
             search_path: self.search_path,
-            public_schema: self.public_schema,
             identifier_case: self.identifier_case,
             ingestion,
         }

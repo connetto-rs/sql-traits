@@ -163,7 +163,7 @@ mod tests {
         .unwrap();
 
         let schemas: Vec<_> = db.schemas().collect();
-        assert_eq!(schemas.len(), 3);
+        assert_eq!(schemas.len(), 4, "public and the three created");
 
         let schema_a = db.schema("schema_a").expect("schema_a should exist");
         assert_eq!(schema_a.authorization(), None);
@@ -186,7 +186,7 @@ mod tests {
         .unwrap();
 
         let schemas: Vec<_> = db.schemas().collect();
-        assert_eq!(schemas.len(), 1, "Should not create duplicate schema");
+        assert_eq!(schemas.len(), 2, "Should not create duplicate schema");
     }
 
     #[test]
@@ -251,7 +251,7 @@ mod tests {
         let db_with_schemas = parse_postgres("CREATE SCHEMA my_schema;").unwrap();
         assert!(db_with_schemas.has_schemas());
 
-        let db_without_schemas = parse_postgres("CREATE TABLE t (id INT);").unwrap();
+        let db_without_schemas = parse_postgres("DROP SCHEMA public;").unwrap();
         assert!(!db_without_schemas.has_schemas());
     }
 
@@ -270,7 +270,7 @@ mod tests {
         .unwrap();
 
         assert!(db.schema("my_schema").is_none());
-        assert!(!db.has_schemas());
+        assert_eq!(db.schemas().map(|(schema, ())| schema.name()).collect::<Vec<_>>(), ["public"]);
     }
 
     #[test]

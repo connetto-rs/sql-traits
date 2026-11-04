@@ -11,7 +11,7 @@ use sql_traits::{
     errors::{Error, ObjectKind},
     prelude::*,
 };
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -133,6 +133,28 @@ fn public_can_be_given_an_owner() {
     let (public, ()) =
         db.schemas().find(|(schema, ())| schema.name() == "public").expect("public is listed");
     assert_eq!(public.authorization(), Some("pub_owner"));
+}
+
+/// The catalog lists `public` from the start, under every dialect, and stops
+/// listing it once it is dropped or renamed.
+#[test]
+fn public_is_listed_while_it_exists() {
+    let listed = |db: &ParserDB| -> Vec<String> {
+        DatabaseLike::schemas(db).map(|schema| schema.name().to_owned()).collect()
+    };
+
+    let db = parse("CREATE TABLE t (id INT);").expect("t lands in public");
+    assert_eq!(listed(&db), ["public"]);
+    let db =
+        ParserDB::parse::<GenericDialect>("CREATE TABLE t (id INT);").expect("t lands in public");
+    assert_eq!(listed(&db), ["public"]);
+
+    let db = parse("CREATE SCHEMA app; DROP SCHEMA public;").expect("public can be dropped");
+    assert_eq!(listed(&db), ["app"]);
+    let db = parse("ALTER SCHEMA public RENAME TO main;").expect("public can be renamed");
+    assert_eq!(listed(&db), ["main"]);
+    let db = parse("DROP SCHEMA public; CREATE SCHEMA public;").expect("public can be created");
+    assert_eq!(listed(&db), ["public"]);
 }
 
 #[test]
