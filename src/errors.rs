@@ -1759,6 +1759,34 @@ pub enum Error {
         /// Parent it names, as written.
         parent_name: String,
     },
+    #[error("Partitioned table `{table_name}` cannot inherit from another table.")]
+    /// Error indicating that a table declared `PARTITION BY` also names
+    /// `INHERITS` parents, which PostgreSQL refuses as "cannot create
+    /// partitioned table as inheritance child".
+    PartitionedTableInherits {
+        /// Table the statement creates.
+        table_name: String,
+    },
+    #[error("Table `{table_name}` names parent `{parent_name}` more than once.")]
+    /// Error indicating that `INHERITS` reaches the same table twice, however
+    /// the two names are spelled.
+    ParentRepeated {
+        /// Table the statement creates.
+        table_name: String,
+        /// Repeated parent, as stored.
+        parent_name: String,
+    },
+    #[error(
+        "Column `{column_name}` of table `{table_name}` receives a generated column and cannot specify a default."
+    )]
+    /// Error indicating that a table redeclares a stored generated column it
+    /// receives with a `DEFAULT`, which PostgreSQL refuses.
+    DefaultOnInheritedGeneratedColumn {
+        /// Table the statement creates.
+        table_name: String,
+        /// The generated column.
+        column_name: String,
+    },
     #[error("Table `{table_name}` cannot inherit from partitioned table `{parent_name}`.")]
     /// Error indicating that `INHERITS` names a partitioned table, which only
     /// takes partitions through `PARTITION OF`.
