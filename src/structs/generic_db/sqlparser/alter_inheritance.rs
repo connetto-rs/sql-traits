@@ -122,33 +122,21 @@ pub(super) fn no_inherit(
     }
 
     let mut builder = ParserDB::replace_table_node(builder, &child, |_, node| {
-        if let Some(parents) = &mut node.inherits {
-            parents.retain(|name| !parent.named_by(name));
-        }
-        if node.inherits.as_ref().is_some_and(Vec::is_empty) {
-            node.inherits = None;
-        }
+        let kept: Vec<ObjectName> = node
+            .inherits
+            .take()
+            .into_iter()
+            .flatten()
+            .filter(|name| !parent.named_by(name))
+            .collect();
+        node.inherits = (!kept.is_empty()).then_some(kept);
         Ok(())
     })?;
     // What no remaining parent passes is now the table's own.
     let node = ParserDB::stored_node(&builder, &child)?;
-    let case = builder.identifier_case();
-    let Some((_, metadata, _)) =
-        builder.tables().iter().find(|(stored, _, _)| child.matches(stored, case))
-    else {
-        return Ok(builder);
-    };
-    let columns: Vec<String> = metadata
-        .inherited_column_names()
-        .iter()
-        .filter(|column| {
-            inheritance::is_inherited_column(
-                &builder,
-                node,
-                &Ident::with_quote('"', column.as_str()),
-            )
-        })
-        .cloned()
+    let passed_columns: Vec<Ident> = inheritance::parent_names(node)
+        .filter_map(|name| builder.resolve_bound_table_name(name).ok().flatten())
+        .flat_map(|remaining| remaining.columns.iter().map(|column| column.name.clone()))
         .collect();
     let still_received: Vec<String> = node
         .constraints
@@ -156,16 +144,26 @@ pub(super) fn no_inherit(
         .filter(|constraint| inheritance::receives_constraint(&builder, node, constraint))
         .map(TableConstraint::to_string)
         .collect();
-    let constraints: Vec<String> = metadata
-        .inherited_constraints()
-        .iter()
-        .filter(|recorded| still_received.contains(recorded))
-        .cloned()
-        .collect();
-    if let Some((_, metadata, _)) =
-        builder.tables_mut().iter_mut().find(|(stored, _, _)| child.matches(stored, case))
+    let case = builder.identifier_case();
+    for (_, metadata, _) in
+        builder.tables_mut().iter_mut().filter(|(stored, _, _)| child.matches(stored, case))
     {
+        let columns = metadata
+            .inherited_column_names()
+            .iter()
+            .filter(|column| {
+                let column = Ident::with_quote('"', column.as_str());
+                passed_columns.iter().any(|passed| inheritance::same_column(passed, &column))
+            })
+            .cloned()
+            .collect();
         metadata.set_inherited_column_names(columns);
+        let constraints = metadata
+            .inherited_constraints()
+            .iter()
+            .filter(|recorded| still_received.contains(recorded))
+            .cloned()
+            .collect();
         metadata.set_inherited_constraints(constraints);
     }
     Ok(builder)

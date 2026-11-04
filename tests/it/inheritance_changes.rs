@@ -48,11 +48,31 @@ fn local_columns(db: &ParserDB, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// The reason a refusal gives, after checking the report names both tables
+/// and the column or check at fault.
 fn mismatch(sql: &str) -> ChildMismatch {
-    match parse(sql) {
-        Err(Error::InheritanceChildMismatch { table_name, parent_name, reason })
+    let error = parse(sql).expect_err("the link is refused");
+    let message = error.to_string();
+    match error {
+        Error::InheritanceChildMismatch { table_name, parent_name, reason }
             if table_name == "c" && parent_name == "p" =>
         {
+            let culprit = match &reason {
+                ChildMismatch::MissingColumn { column_name }
+                | ChildMismatch::ColumnType { column_name }
+                | ChildMismatch::ColumnCollation { column_name }
+                | ChildMismatch::ColumnNullable { column_name }
+                | ChildMismatch::MustBeGenerated { column_name }
+                | ChildMismatch::MustNotBeGenerated { column_name } => column_name,
+                ChildMismatch::MissingConstraint { constraint_name }
+                | ChildMismatch::ConstraintDiffers { constraint_name } => constraint_name,
+            };
+            assert!(
+                message.contains("`c`")
+                    && message.contains("`p`")
+                    && message.contains(&format!("`{culprit}`")),
+                "{message}"
+            );
             reason
         }
         other => panic!("{sql}: {other:?}"),
@@ -236,8 +256,40 @@ fn no_inherit_makes_what_the_child_received_its_own() {
          CREATE TABLE rc () INHERITS (r1, r2); ALTER TABLE rc NO INHERIT r1; ALTER TABLE rc DROP COLUMN a;"
     )
     .is_err());
+    // A check received from the unlinked parent alone becomes droppable, one
+    // another parent still passes does not.
+    let checks = "CREATE TABLE r1 (a INT, CONSTRAINT k CHECK (a > 0));
+         CREATE TABLE r2 (a INT, CONSTRAINT k CHECK (a > 0));";
+    assert!(
+        parse(&format!(
+            "{checks} CREATE TABLE one () INHERITS (r1); ALTER TABLE one DROP CONSTRAINT k;"
+        ))
+        .is_err()
+    );
+    accepted(&format!(
+        "{checks} CREATE TABLE one () INHERITS (r1); ALTER TABLE one NO INHERIT r1;
+         ALTER TABLE one DROP CONSTRAINT k;"
+    ));
+    let two =
+        format!("{checks} CREATE TABLE two () INHERITS (r1, r2); ALTER TABLE two NO INHERIT r1;");
+    assert!(parse(&format!("{two} ALTER TABLE two DROP CONSTRAINT k;")).is_err());
+    accepted(&format!("{two} ALTER TABLE two NO INHERIT r2; ALTER TABLE two DROP CONSTRAINT k;"));
+    // An unlinked check stays the child's own when the parent is linked again,
+    // so dropping it from the parent leaves the child's.
+    let db = accepted(&format!(
+        "{checks} CREATE TABLE one () INHERITS (r1); ALTER TABLE one NO INHERIT r1;
+         ALTER TABLE one INHERIT r1; ALTER TABLE r1 DROP CONSTRAINT k;"
+    ));
+    assert_eq!(table(&db, "one").constraints.len(), 1);
     assert!(matches!(
         parse(&format!("{PARENT} {CHILD} ALTER TABLE c NO INHERIT p;")),
         Err(Error::NotAParentOf { table_name, parent_name }) if table_name == "c" && parent_name == "p"
     ));
+}
+
+#[test]
+fn if_exists_skips_an_absent_table() {
+    for operation in ["INHERIT", "NO INHERIT"] {
+        accepted(&format!("CREATE TABLE p (a INT); ALTER TABLE IF EXISTS missing {operation} p;"));
+    }
 }
