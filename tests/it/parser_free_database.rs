@@ -156,6 +156,12 @@ struct MemoryFunction {
     language: Option<String>,
     /// The body text, where the catalog stores one.
     body: Option<String>,
+    /// The `CREATE FUNCTION` statement the catalog prints for a body bound at
+    /// creation, as `pg_get_functiondef` prints it.
+    bound_definition: Option<String>,
+    /// The names of the functions in the default schema a bound body reached,
+    /// as `pg_depend` records them.
+    bound_calls: Vec<String>,
     /// The path the function pins for its body, as `proconfig` holds it.
     search_path: Option<Vec<(String, bool)>>,
 }
@@ -1018,6 +1024,9 @@ impl FunctionLike for MemoryFunction {
     }
 
     fn written_body(&self) -> Option<FunctionBody<'_>> {
+        if let Some(definition) = &self.bound_definition {
+            return Some(FunctionBody::BoundDefinition(definition));
+        }
         self.body.as_deref().map(FunctionBody::Text)
     }
 
@@ -1034,15 +1043,22 @@ impl FunctionLike for MemoryFunction {
         }))
     }
 
-    /// This catalog stores bodies as text, which is never bound.
+    /// The functions `bound_calls` names, in the default schema.
     fn bound_body_functions<'db>(
         &self,
-        _database: &'db Self::DB,
+        database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction> + use<'db>, LookupError>
     where
         Self: 'db,
     {
-        Ok(core::iter::empty())
+        let reached: Vec<_> = database
+            .functions
+            .iter()
+            .filter(|function| {
+                function.schema.is_none() && self.bound_calls.contains(&function.name)
+            })
+            .collect();
+        Ok(reached.into_iter())
     }
 
     fn null_input_behavior(&self) -> FunctionCalledOnNull {
@@ -1504,6 +1520,8 @@ fn function(schema: Option<&str>, name: &str, argument_types: &[&str]) -> Memory
         argument_types: argument_types.iter().map(|declared| String::from(*declared)).collect(),
         language: None,
         body: None,
+        bound_definition: None,
+        bound_calls: Vec::new(),
         search_path: None,
     }
 }
@@ -1822,6 +1840,91 @@ fn the_inherited_body_analysis_reads_a_stored_text_body() -> Result<(), LookupEr
         function("touch").referenced_functions(&catalog),
         Err(LookupError::FunctionBodyUnavailable { .. })
     ));
+    Ok(())
+}
+
+/// A body bound at creation that the catalog holds only as the definition it
+/// prints is parsed when a reader needs it, so a definition the parser cannot
+/// read fails those readers for that function alone.
+#[test]
+fn the_inherited_body_analysis_reads_a_printed_bound_definition() -> Result<(), LookupError> {
+    let mut catalog = catalog();
+    let printed = |name: &str, definition: &str| {
+        let mut printed = function(None, name, &[]);
+        printed.language = Some(String::from("sql"));
+        printed.bound_definition = Some(definition.to_string());
+        printed.bound_calls = vec![String::from("touch")];
+        printed
+    };
+    catalog.functions.extend([
+        printed(
+            "returned",
+            "CREATE OR REPLACE FUNCTION public.returned()\n RETURNS bigint\n LANGUAGE sql\n\
+             RETURN (SELECT count(*) AS count FROM app.notes)\n",
+        ),
+        printed(
+            "atomic",
+            "CREATE OR REPLACE FUNCTION public.atomic()\n RETURNS bigint\n LANGUAGE sql\n\
+             BEGIN ATOMIC\n SELECT count(*) AS count\n    FROM app.docs;\nEND\n",
+        ),
+        printed(
+            "broken",
+            "CREATE OR REPLACE FUNCTION public.broken()\n RETURNS integer\n LANGUAGE sql\nRETURN 1 +\n",
+        ),
+        printed(
+            "unbound",
+            "CREATE OR REPLACE FUNCTION public.unbound()\n RETURNS integer\n LANGUAGE sql\n\
+             AS $function$SELECT 1$function$\n",
+        ),
+        printed("select", "SELECT 1"),
+    ]);
+
+    let function = |name| {
+        catalog
+            .resolve_target_function(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("the function exists")
+    };
+    let read = |name| -> Result<Vec<String>, LookupError> {
+        Ok(function(name)
+            .referenced_tables(&catalog)?
+            .iter()
+            .map(|table| format!("{}.{}", table.table_schema().unwrap_or(""), table.table_name()))
+            .collect())
+    };
+    let called = |name| -> Result<Vec<String>, LookupError> {
+        Ok(function(name)
+            .referenced_functions(&catalog)?
+            .iter()
+            .map(|called| called.name().to_string())
+            .collect())
+    };
+    let unparsable = |error: Option<LookupError>, name: &str| matches!(error, Some(LookupError::FunctionBodyUnparsable { function, .. }) if function == name);
+
+    assert!(function("returned").body_is_bound());
+    assert_eq!(function("returned").body(), None);
+    assert_eq!(
+        function("returned").body_expression(&catalog)?.map(|expression| expression.to_string()),
+        Some(String::from("(SELECT count(*) AS count FROM app.notes)")),
+    );
+    assert_eq!(read("returned")?, ["app.notes"]);
+    assert_eq!(called("returned")?, ["touch"]);
+
+    assert!(function("atomic").body_is_bound());
+    assert_eq!(function("atomic").body_expression(&catalog)?, None);
+    assert_eq!(read("atomic")?, ["app.docs"]);
+
+    // The catalog answers the calls of a bound body without the parse.
+    assert!(function("broken").body_is_bound());
+    assert!(unparsable(read("broken").err(), "broken"));
+    assert!(unparsable(function("broken").body_expression(&catalog).err(), "broken"));
+    assert_eq!(called("broken")?, ["touch"]);
+
+    // A definition holding no bound body is not the body it claims to be.
+    for name in ["unbound", "select"] {
+        assert!(unparsable(read(name).err(), name), "{name}");
+        assert!(unparsable(function(name).body_expression(&catalog).err(), name), "{name}");
+    }
     Ok(())
 }
 

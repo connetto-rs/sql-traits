@@ -2,8 +2,8 @@
 
 use sqlparser::ast::{Expr, Select, Statement};
 
-/// The body of a function as it is written, before the text of a body
-/// written as a string is parsed.
+/// The body of a function as it is written, before any text it is handed
+/// over in is parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionBody<'f> {
     /// Text read again each time the function runs, as `AS '<body>'` and
@@ -25,6 +25,19 @@ pub enum FunctionBody<'f> {
     /// The statements of a `BEGIN ATOMIC ... END` block, which PostgreSQL
     /// binds when the function is created.
     Atomic(&'f [Statement]),
+    /// The `CREATE FUNCTION` statement a catalog prints for a body PostgreSQL
+    /// bound when the function was created, as `pg_get_functiondef` prints
+    /// the `RETURN <expression>` or `BEGIN ATOMIC` body `pg_proc.prosqlbody`
+    /// stores as a node tree.
+    ///
+    /// The readers parse the statement under the database's dialect when they
+    /// need the body, and read it as [`Return`](Self::Return) or
+    /// [`Atomic`](Self::Atomic) from there, so a statement the parser cannot
+    /// read fails only the readers that parse it, for this function alone.
+    /// Each relation the body names is resolved as
+    /// [`DatabaseLike::resolve_bound_relation`](crate::traits::DatabaseLike::resolve_bound_relation)
+    /// resolves a stored definition's names.
+    BoundDefinition(&'f str),
 }
 
 impl FunctionBody<'_> {
@@ -33,6 +46,6 @@ impl FunctionBody<'_> {
     #[must_use]
     #[inline]
     pub fn is_bound(&self) -> bool {
-        matches!(self, Self::Return(_) | Self::Atomic(_))
+        matches!(self, Self::Return(_) | Self::Atomic(_) | Self::BoundDefinition(_))
     }
 }

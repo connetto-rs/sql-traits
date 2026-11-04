@@ -897,7 +897,7 @@ fn is_row(data_type: &DataType) -> bool {
 /// The body as it is written, for an error naming it.
 fn written(body: FunctionBody<'_>) -> String {
     match body {
-        FunctionBody::Text(text) => text.to_string(),
+        FunctionBody::Text(text) | FunctionBody::BoundDefinition(text) => text.to_string(),
         FunctionBody::Expression(expression) | FunctionBody::Return(expression) => {
             expression.to_string()
         }

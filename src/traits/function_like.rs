@@ -10,7 +10,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::{HelperSetError, LookupError},
-    impls::{body_calls, body_reads, helper_set},
+    impls::{body_calls, body_expression, body_reads, helper_set},
     structs::{Deployment, FunctionBody, FunctionKind, HelperSet, TargetName},
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
@@ -592,7 +592,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// so an implementation handing over the body a catalog stores answers
     /// them as a parsed script does. A body bound at creation answers the
     /// bound form, each relation it names written as the store holds the
-    /// relation it reached.
+    /// relation it reached. A catalog that stores a bound body only as a node
+    /// tree hands over the definition it prints instead,
+    /// [`FunctionBody::BoundDefinition`], which those readers parse when they
+    /// need the body.
     ///
     /// # Example
     ///
@@ -658,7 +661,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// function whose body is written as a string answers [`None`] here and
     /// answers [`body`](FunctionLike::body) instead, so a caller wanting the
     /// body in either spelling asks this first and falls back to parsing the
-    /// text.
+    /// text. A bound body handed over as the definition a catalog prints,
+    /// [`FunctionBody::BoundDefinition`], is parsed here under the dialect of
+    /// `database`.
     ///
     /// The relation names a body writes are bound at `CREATE FUNCTION` under
     /// the session `search_path` in effect at creation, the way PostgreSQL
@@ -670,6 +675,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// in [`body`](FunctionLike::body), and
     /// [`body_is_bound`](FunctionLike::body_is_bound) tells it apart from a
     /// function with no body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyUnparsable`] when the printed
+    /// definition of a bound body does not parse, or holds no body bound at
+    /// creation.
     ///
     /// # Example
     ///
@@ -688,13 +699,16 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     .function_by_target(TargetName::new("added", false), IdentifierCase::AsWritten)?
     ///     .expect("Function should exist");
     /// assert_eq!(added.body(), None);
-    /// assert_eq!(added.body_expression().map(ToString::to_string).as_deref(), Some("a + b"));
+    /// assert_eq!(
+    ///     added.body_expression(&db)?.map(|expression| expression.to_string()).as_deref(),
+    ///     Some("a + b"),
+    /// );
     ///
     /// let quoted = db
     ///     .function_by_target(TargetName::new("quoted", false), IdentifierCase::AsWritten)?
     ///     .expect("Function should exist");
     /// assert_eq!(quoted.body(), Some("SELECT a"));
-    /// assert_eq!(quoted.body_expression(), None);
+    /// assert_eq!(quoted.body_expression(&db)?, None);
     /// # Ok(())
     /// # }
     /// ```
@@ -716,18 +730,18 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// let reads_table =
     ///     db.function_by_target(in_app, IdentifierCase::AsWritten)?.expect("Function should exist");
     /// assert_eq!(
-    ///     reads_table.body_expression().map(ToString::to_string).as_deref(),
+    ///     reads_table.body_expression(&db)?.map(|expression| expression.to_string()).as_deref(),
     ///     Some("(SELECT a FROM app.t)"),
     /// );
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    fn body_expression(&self) -> Option<&Expr> {
-        match self.written_body()? {
-            FunctionBody::Return(expression) => Some(expression),
-            _ => None,
-        }
+    fn body_expression<'f>(
+        &'f self,
+        database: &Self::DB,
+    ) -> Result<Option<Cow<'f, Expr>>, LookupError> {
+        body_expression(self, database)
     }
 
     /// Returns the function-local configuration after later alterations.
@@ -924,8 +938,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// `set_config` of `search_path` before an unqualified name
     /// ([`LookupError::FunctionBodyUnresolvable`]). Returns
     /// [`LookupError::FunctionBodyUnparsable`] when the body text does not
-    /// parse, under the database's dialect for SQL, and any error resolving a
-    /// name the body reads.
+    /// parse, under the database's dialect for SQL, or when the printed
+    /// definition of a bound body does not parse or holds no body bound at
+    /// creation, and any error resolving a name the body reads.
     ///
     /// # Example
     ///
@@ -1029,11 +1044,14 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Errors
     ///
     /// The body-level errors of
-    /// [`referenced_tables`](FunctionLike::referenced_tables), for the same
-    /// bodies, an unqualified call after a `set_config` of `search_path`
-    /// among them ([`LookupError::FunctionBodyUnresolvable`]). Returns
-    /// [`LookupError::ObjectNotInDatabase`] for a bound body of a function
-    /// `database` does not hold.
+    /// [`referenced_tables`](FunctionLike::referenced_tables), for the bodies
+    /// read each time the function runs, an unqualified call after a
+    /// `set_config` of `search_path` among them
+    /// ([`LookupError::FunctionBodyUnresolvable`]). A bound body answers the
+    /// functions [`bound_body_functions`](FunctionLike::bound_body_functions)
+    /// records, so a printed definition is never parsed here, and returns
+    /// [`LookupError::ObjectNotInDatabase`] for a function `database` does
+    /// not hold.
     ///
     /// # Example
     ///

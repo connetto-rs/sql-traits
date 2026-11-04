@@ -8,7 +8,10 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::prelude::*;
-use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
+use sqlparser::{
+    ast::CreateFunction,
+    dialect::{GenericDialect, PostgreSqlDialect},
+};
 
 fn db(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")
@@ -210,27 +213,30 @@ fn a_return_body_is_an_expression_and_a_string_body_is_text() {
          CREATE FUNCTION quoted(a INT) RETURNS INT LANGUAGE sql AS 'SELECT a';
          CREATE FUNCTION dollar(a INT) RETURNS INT LANGUAGE sql AS $$SELECT a$$;
          CREATE FUNCTION constant() RETURNS TEXT LANGUAGE sql RETURN 'text';");
+    let expression = |function: &CreateFunction| {
+        function.body_expression(&database).expect("a parsed body").map(|body| body.to_string())
+    };
 
     let added = database
         .function_by_target(TargetName::new("added", false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("added exists");
     assert_eq!(added.body(), None);
-    assert_eq!(added.body_expression().map(ToString::to_string).as_deref(), Some("a + b"));
+    assert_eq!(expression(added).as_deref(), Some("a + b"));
 
     let quoted = database
         .function_by_target(TargetName::new("quoted", false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("quoted exists");
     assert_eq!(quoted.body(), Some("SELECT a"));
-    assert_eq!(quoted.body_expression(), None);
+    assert_eq!(expression(quoted), None);
 
     let dollar = database
         .function_by_target(TargetName::new("dollar", false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("dollar exists");
     assert_eq!(dollar.body(), Some("SELECT a"));
-    assert_eq!(dollar.body_expression(), None);
+    assert_eq!(expression(dollar), None);
 
     // A returned string constant is the expression, not body text to parse.
     let constant = database
@@ -238,7 +244,7 @@ fn a_return_body_is_an_expression_and_a_string_body_is_text() {
         .expect("unambiguous lookup")
         .expect("constant exists");
     assert_eq!(constant.body(), None);
-    assert_eq!(constant.body_expression().map(ToString::to_string).as_deref(), Some("'text'"));
+    assert_eq!(expression(constant).as_deref(), Some("'text'"));
 }
 
 /// An `OUT` argument occupies a position like any other, and the two readers
