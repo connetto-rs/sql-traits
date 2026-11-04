@@ -4,7 +4,10 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 
 use sqlparser::{ast::FunctionBehavior, parser::ParserError};
 
-use crate::structs::{FunctionKind, IdentifierCase};
+use crate::{
+    structs::{FunctionKind, IdentifierCase},
+    traits::PartitionStrategy,
+};
 
 /// Kind of database object a metadata lookup was made for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,6 +176,95 @@ impl core::fmt::Display for FixedPersistence {
             Self::Temporary => "it is temporary",
             Self::Partitioned => "it is partitioned",
         })
+    }
+}
+
+/// Why PostgreSQL refuses the bound a partition is given.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InvalidBound {
+    /// The bound has the form of another strategy than its table's.
+    StrategyMismatch {
+        /// The strategy the partitioned table routes rows by.
+        strategy: PartitionStrategy,
+    },
+    /// A side of a range bound lists another number of values than the key
+    /// has columns.
+    ValueCount {
+        /// The number of key columns.
+        expected: usize,
+        /// The number of values written.
+        found: usize,
+    },
+    /// A range bound lists `NULL`.
+    NullInRange,
+    /// A value follows `MINVALUE` or `MAXVALUE` in a range bound, which takes
+    /// only more of the same infinity there.
+    ValueAfterInfinity,
+    /// A bound value reads a column.
+    ColumnReference,
+    /// The partition is the default of a hash-partitioned table.
+    DefaultOnHash,
+    /// The partitioned table already has a default partition.
+    DefaultExists {
+        /// The existing default partition.
+        default_partition: String,
+    },
+    /// The hash modulus is zero.
+    ModulusNotPositive,
+    /// The hash remainder is not below the modulus.
+    RemainderNotBelowModulus,
+    /// The hash modulus and the modulus of a sibling partition do not divide
+    /// one another.
+    ModulusNotFactor {
+        /// The sibling partition.
+        other_partition: String,
+    },
+    /// The range takes no value, its lower bound not being below its upper.
+    EmptyRange,
+    /// A value cannot be read as the type of its key column.
+    ValueNotOfKeyType {
+        /// The value, as written.
+        value: String,
+        /// The key column's type.
+        type_name: String,
+    },
+}
+
+impl core::fmt::Display for InvalidBound {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::StrategyMismatch { strategy } => {
+                let name = match strategy {
+                    PartitionStrategy::Range => "range",
+                    PartitionStrategy::List => "list",
+                    PartitionStrategy::Hash => "hash",
+                };
+                write!(f, "it is not a {name} bound")
+            }
+            Self::ValueCount { expected, found } => {
+                write!(f, "it lists {found} values for {expected} key columns")
+            }
+            Self::NullInRange => f.write_str("a range bound cannot list NULL"),
+            Self::ValueAfterInfinity => {
+                f.write_str("every value after MINVALUE or MAXVALUE must be the same")
+            }
+            Self::ColumnReference => f.write_str("a bound cannot read a column"),
+            Self::DefaultOnHash => f.write_str("a hash-partitioned table takes no default"),
+            Self::DefaultExists { default_partition } => {
+                write!(f, "`{default_partition}` already is the default partition")
+            }
+            Self::ModulusNotPositive => f.write_str("the modulus must be greater than zero"),
+            Self::RemainderNotBelowModulus => {
+                f.write_str("the remainder must be less than the modulus")
+            }
+            Self::ModulusNotFactor { other_partition } => {
+                write!(f, "its modulus and that of `{other_partition}` do not divide one another")
+            }
+            Self::EmptyRange => f.write_str("its range is empty"),
+            Self::ValueNotOfKeyType { value, type_name } => {
+                write!(f, "`{value}` is not a value of type `{type_name}`")
+            }
+        }
     }
 }
 
@@ -1897,6 +1989,32 @@ pub enum Error {
         table_name: String,
     },
     #[error(
+        "Partition `{partition_name}` of table `{table_name}` cannot take its bound because {reason}."
+    )]
+    /// Error indicating that `CREATE TABLE ... PARTITION OF` or `ATTACH
+    /// PARTITION` gives a partition a bound PostgreSQL refuses.
+    PartitionBoundInvalid {
+        /// Name of the partitioned table.
+        table_name: String,
+        /// Name of the partition.
+        partition_name: String,
+        /// What makes the bound invalid.
+        reason: InvalidBound,
+    },
+    #[error(
+        "Partition `{partition_name}` of table `{table_name}` would overlap partition `{other_partition}`."
+    )]
+    /// Error indicating that a partition's bound takes rows a sibling
+    /// partition already takes.
+    PartitionBoundOverlaps {
+        /// Name of the partitioned table.
+        table_name: String,
+        /// Name of the partition.
+        partition_name: String,
+        /// The sibling partition the bound overlaps.
+        other_partition: String,
+    },
+    #[error(
         "Table `{partition_name}` cannot be attached as a partition of `{table_name}` because {reason}."
     )]
     /// Error indicating that `ALTER TABLE ... ATTACH PARTITION` names a table
@@ -2754,6 +2872,48 @@ mod tests {
             UnattachablePartition::ForeignTableUnderUniqueIndex.to_string(),
             "it is a foreign table and the partitioned table holds a unique index"
         );
+        for (reason, text) in [
+            (
+                InvalidBound::StrategyMismatch { strategy: PartitionStrategy::Range },
+                "it is not a range bound",
+            ),
+            (
+                InvalidBound::StrategyMismatch { strategy: PartitionStrategy::List },
+                "it is not a list bound",
+            ),
+            (
+                InvalidBound::StrategyMismatch { strategy: PartitionStrategy::Hash },
+                "it is not a hash bound",
+            ),
+            (
+                InvalidBound::ValueCount { expected: 1, found: 2 },
+                "it lists 2 values for 1 key columns",
+            ),
+            (InvalidBound::NullInRange, "a range bound cannot list NULL"),
+            (
+                InvalidBound::ValueAfterInfinity,
+                "every value after MINVALUE or MAXVALUE must be the same",
+            ),
+            (InvalidBound::ColumnReference, "a bound cannot read a column"),
+            (InvalidBound::DefaultOnHash, "a hash-partitioned table takes no default"),
+            (
+                InvalidBound::DefaultExists { default_partition: "d".into() },
+                "`d` already is the default partition",
+            ),
+            (InvalidBound::ModulusNotPositive, "the modulus must be greater than zero"),
+            (InvalidBound::RemainderNotBelowModulus, "the remainder must be less than the modulus"),
+            (
+                InvalidBound::ModulusNotFactor { other_partition: "h".into() },
+                "its modulus and that of `h` do not divide one another",
+            ),
+            (InvalidBound::EmptyRange, "its range is empty"),
+            (
+                InvalidBound::ValueNotOfKeyType { value: "'x'".into(), type_name: "INT".into() },
+                "`'x'` is not a value of type `INT`",
+            ),
+        ] {
+            assert_eq!(reason.to_string(), text);
+        }
     }
 
     #[test]

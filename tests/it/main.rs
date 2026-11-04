@@ -80,6 +80,7 @@ mod parsed_name_resolution_rules;
 mod parser_free_database;
 mod partition_alterations;
 mod partition_attachment;
+mod partition_bounds;
 mod partition_keys;
 mod per_object_grants;
 mod persisted_names_and_collations;

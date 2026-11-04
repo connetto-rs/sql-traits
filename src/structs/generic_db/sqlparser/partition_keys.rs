@@ -62,6 +62,26 @@ fn column_named<'a>(
     table.columns.iter().find(|column| same_name(&column.name, ident, case))
 }
 
+/// The strategy of a partitioned table and, for each entry of its key, the
+/// column it names, or `None` for an expression entry or a column the table
+/// does not hold.
+pub(super) fn key_columns(
+    table: &CreateTable,
+    case: IdentifierCase,
+) -> Option<(PartitionStrategy, Vec<Option<&ColumnDef>>)> {
+    let (strategy, items) = partition_key(table)?;
+    let columns = items
+        .iter()
+        .map(|item| {
+            match item {
+                KeyItem::Column(ident) => column_named(table, ident, case),
+                KeyItem::Expression(_) => None,
+            }
+        })
+        .collect();
+    Some((strategy, columns))
+}
+
 /// Whether two identifiers name the same column under `case`.
 fn same_name(left: &Ident, right: &Ident, case: IdentifierCase) -> bool {
     case.identifiers_match(

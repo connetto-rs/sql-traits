@@ -4,12 +4,16 @@
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use ::sqlparser::ast::{
-    CreateTable, CreateTableOptions, Expr, ObjectNamePart, SqlOption, Value, ValueWithSpan,
+    CreateTable, CreateTableOptions, Expr, ForValues, ObjectNamePart, PartitionBoundValue,
+    SqlOption, Value, ValueWithSpan,
 };
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ForeignTableSource, ParserDB, RevokedPrivilege, TableMetadata},
+    structs::{
+        ForeignTableSource, ListDatum, ParserDB, PartitionBound, RangeDatum, RevokedPrivilege,
+        TableMetadata,
+    },
     traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
     utils::{
         identifier_resolution::{identifiers_match, stored_ident_name},
@@ -78,6 +82,20 @@ fn declared_strategy(clause: &Expr) -> Option<PartitionStrategy> {
     } else {
         None
     }
+}
+
+/// The entries of one side of a range bound, each value as written.
+fn range_data(values: &[PartitionBoundValue]) -> Vec<RangeDatum> {
+    values
+        .iter()
+        .map(|value| {
+            match value {
+                PartitionBoundValue::MinValue => RangeDatum::MinValue,
+                PartitionBoundValue::MaxValue => RangeDatum::MaxValue,
+                PartitionBoundValue::Expr(expr) => RangeDatum::Value(expr.to_string()),
+            }
+        })
+        .collect()
 }
 
 /// Reads the text PostgreSQL keeps for a storage parameter's value.
@@ -258,6 +276,34 @@ impl TableLike for CreateTable {
     #[inline]
     fn partition_strategy(&self) -> Option<PartitionStrategy> {
         declared_strategy(self.partition_by.as_deref()?)
+    }
+
+    fn partition_bound(&self) -> Option<PartitionBound> {
+        self.partition_of.as_ref()?;
+        Some(match self.for_values.as_ref()? {
+            ForValues::Default => PartitionBound::Default,
+            ForValues::From { from, to } => {
+                PartitionBound::Range { from: range_data(from), to: range_data(to) }
+            }
+            ForValues::In(values) => {
+                PartitionBound::List {
+                    values: values
+                        .iter()
+                        .map(|value| {
+                            match value {
+                                Expr::Value(ValueWithSpan { value: Value::Null, .. }) => {
+                                    ListDatum::Null
+                                }
+                                other => ListDatum::Value(other.to_string()),
+                            }
+                        })
+                        .collect(),
+                }
+            }
+            ForValues::With { modulus, remainder } => {
+                PartitionBound::Hash { modulus: *modulus, remainder: *remainder }
+            }
+        })
     }
 
     fn primary_key_columns<'db>(

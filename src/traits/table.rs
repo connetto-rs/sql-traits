@@ -7,7 +7,7 @@ use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
         ActingRole, ColumnDefinition, ColumnScope, ForeignTableSource, IdentifierCase,
-        RevokedPrivilege, RowSecurity, RowStatement, SchemaFingerprint,
+        PartitionBound, RevokedPrivilege, RowSecurity, RowStatement, SchemaFingerprint,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
@@ -24,7 +24,7 @@ use crate::{
 /// PostgreSQL requires one of these three words after `PARTITION BY`. A table
 /// that declares one holds no rows of its own, even before a partition is
 /// attached to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PartitionStrategy {
     /// Each partition takes a contiguous span of the key.
     Range,
@@ -1002,6 +1002,38 @@ pub trait TableLike:
     /// # }
     /// ```
     fn partition_strategy(&self) -> Option<PartitionStrategy>;
+
+    /// Returns the bound this table takes as a partition, or [`None`] when it
+    /// is not a partition.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE evt (id INT, region TEXT) PARTITION BY LIST (region);
+    ///      CREATE TABLE evt_eu PARTITION OF evt FOR VALUES IN ('eu', NULL);
+    ///      CREATE TABLE evt_rest PARTITION OF evt DEFAULT;",
+    /// )?;
+    /// let bound = |name| {
+    ///     db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .map(|table| table.and_then(TableLike::partition_bound))
+    /// };
+    /// assert_eq!(
+    ///     bound("evt_eu")?,
+    ///     Some(PartitionBound::List {
+    ///         values: vec![ListDatum::Value("'eu'".to_string()), ListDatum::Null],
+    ///     })
+    /// );
+    /// assert_eq!(bound("evt_rest")?, Some(PartitionBound::Default));
+    /// assert_eq!(bound("evt")?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn partition_bound(&self) -> Option<PartitionBound>;
 
     /// Iterates over the partitions of this table.
     ///
@@ -4998,6 +5030,10 @@ where
 
     fn partition_strategy(&self) -> Option<PartitionStrategy> {
         T::partition_strategy(self)
+    }
+
+    fn partition_bound(&self) -> Option<PartitionBound> {
+        T::partition_bound(self)
     }
 
     fn partitions<'db>(
