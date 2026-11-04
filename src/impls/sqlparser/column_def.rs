@@ -10,6 +10,7 @@ use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, ObjectNameP
 
 use crate::{
     errors::{LookupError, ObjectKind},
+    impls::SqlparserDialect,
     structs::{ColumnMetadata, ParserDB, TableAttribute},
     traits::{
         ColumnCollation, ColumnLike, DatabaseLike, IdentityGeneration, Metadata,
@@ -157,9 +158,16 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
             .find_map(|option| identity_generation(&option.option, *database.dialect()))
     }
 
+    /// PostgreSQL stores a serial column spelled out, so there the column's
+    /// default and the sequences answer. Every other dialect keeps the
+    /// declared pseudo-type.
     #[inline]
-    fn is_serial(&self) -> bool {
-        is_serial_type(&self.attribute().data_type)
+    fn is_serial(&self, database: &Self::DB) -> bool {
+        if *database.dialect() == SqlparserDialect::PostgreSql {
+            database.draws_from_owned_sequence(self)
+        } else {
+            is_serial_type(&self.attribute().data_type)
+        }
     }
 
     /// # Errors
@@ -918,7 +926,7 @@ mod tests {
             names: [&str; N],
         ) -> [bool; N] {
             let db = parse_with::<D>(&format!("CREATE TABLE t ({columns});"));
-            names.map(|name| column_named(&db, name).is_serial())
+            names.map(|name| column_named(&db, name).is_serial(&db))
         }
 
         #[test]
@@ -1051,8 +1059,8 @@ mod tests {
                 Arc::new(id.clone()).identity_generation(&db),
                 Some(IdentityGeneration::ByDefault)
             );
-            assert!(<&_ as ColumnLike>::is_serial(&seq));
-            assert!(Arc::new(seq.clone()).is_serial());
+            assert!(<&_ as ColumnLike>::is_serial(&seq, &db));
+            assert!(Arc::new(seq.clone()).is_serial(&db));
         }
     }
 

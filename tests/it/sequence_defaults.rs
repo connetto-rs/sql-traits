@@ -3,7 +3,7 @@
 //! refused while such a default remains, and `CASCADE` takes the default
 //! along.
 //!
-//! Every expectation was measured against PostgreSQL 18.4.
+//! Every expectation was measured against PostgreSQL 18.4 or 18.6.
 #![allow(clippy::expect_used, clippy::panic)]
 
 use sql_traits::{errors::Error, prelude::*};
@@ -32,6 +32,18 @@ fn column(database: &ParserDB, table: &str, column: &str) -> String {
         if nullable { "null" } else { "not null" },
         column.default_value().unwrap_or_else(|| "no default".to_string())
     )
+}
+
+/// Whether the column reads as serial.
+fn serial(database: &ParserDB, table: &str, column: &str) -> bool {
+    database
+        .table_by_target(TargetName::new(table, false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("table exists")
+        .column(column, database, IdentifierCase::AsWritten)
+        .expect("lookup succeeds")
+        .expect("column exists")
+        .is_serial(database)
 }
 
 /// The default a drop was refused for, as `sequence <- table.column`.
@@ -178,6 +190,80 @@ fn a_serial_column_written_not_null_keeps_one_not_null() {
 }
 
 #[test]
+fn a_serial_column_is_stored_as_its_expansion() {
+    let db = parse("CREATE TABLE child (h INT, s SERIAL, b BIGSERIAL, m smallserial, e serial8);")
+        .expect("parses");
+    assert_eq!(column(&db, "child", "s"), "INTEGER not null nextval('child_s_seq'::REGCLASS)");
+    assert_eq!(column(&db, "child", "b"), "BIGINT not null nextval('child_b_seq'::REGCLASS)");
+    assert_eq!(column(&db, "child", "m"), "SMALLINT not null nextval('child_m_seq'::REGCLASS)");
+    assert_eq!(column(&db, "child", "e"), "BIGINT not null nextval('child_e_seq'::REGCLASS)");
+    assert_eq!(column(&db, "child", "h"), "INT null no default");
+    assert_eq!(
+        ["h", "s", "b", "m", "e"].map(|name| serial(&db, "child", name)),
+        [false, true, true, true, true]
+    );
+}
+
+#[test]
+fn a_serial_column_added_later_is_stored_as_its_expansion() {
+    let db = parse("CREATE TABLE t (x INT); ALTER TABLE t ADD COLUMN id serial;").expect("parses");
+    assert_eq!(column(&db, "t", "id"), "INTEGER not null nextval('t_id_seq'::REGCLASS)");
+    assert!(serial(&db, "t", "id"));
+}
+
+#[test]
+fn a_serial_column_in_a_schema_draws_from_the_sequence_there() {
+    let db = parse("CREATE SCHEMA app; CREATE TABLE app.t (id serial);").expect("parses");
+    let id = db
+        .table_by_target(
+            TargetName::new("t", false).with_schema("app", false),
+            IdentifierCase::AsWritten,
+        )
+        .expect("unambiguous lookup")
+        .expect("table exists")
+        .column("id", &db, IdentifierCase::AsWritten)
+        .expect("lookup succeeds")
+        .expect("column exists");
+    assert_eq!(id.default_value().as_deref(), Some("nextval('app.t_id_seq'::REGCLASS)"));
+    assert!(id.is_serial(&db));
+}
+
+/// The catalog holds the same thing for a serial column and for the expansion
+/// PostgreSQL documents for it.
+#[test]
+fn the_written_out_expansion_is_serial() {
+    let db = parse(
+        "CREATE TABLE t (id INT NOT NULL);
+         CREATE SEQUENCE t_id_seq OWNED BY t.id;
+         ALTER TABLE t ALTER COLUMN id SET DEFAULT nextval('t_id_seq');",
+    )
+    .expect("parses");
+    assert!(serial(&db, "t", "id"));
+}
+
+#[test]
+fn a_column_drawing_from_a_sequence_it_does_not_own_is_not_serial() {
+    for sql in [
+        "CREATE SEQUENCE s; CREATE TABLE t (id INT NOT NULL DEFAULT nextval('s'));",
+        "CREATE TABLE u (k INT);
+         CREATE SEQUENCE s OWNED BY u.k;
+         CREATE TABLE t (id INT NOT NULL DEFAULT nextval('s'));",
+        "CREATE TABLE t (id INT, other serial);
+         ALTER TABLE t ALTER COLUMN id SET DEFAULT nextval('t_other_seq');",
+    ] {
+        let db = parse(sql).expect("parses");
+        assert!(!serial(&db, "t", "id"), "{sql}");
+    }
+}
+
+#[test]
+fn a_column_owning_a_sequence_it_does_not_draw_from_is_not_serial() {
+    let db = parse("CREATE TABLE t (id INT NOT NULL); CREATE SEQUENCE t_id_seq OWNED BY t.id;")
+        .expect("parses");
+    assert!(!serial(&db, "t", "id"));
+}
+
+#[test]
 fn a_serial_column_draws_from_its_sequence() {
     assert_eq!(
         refused_by_default(parse("CREATE TABLE t (id serial); DROP SEQUENCE t_id_seq;")),
@@ -186,16 +272,7 @@ fn a_serial_column_draws_from_its_sequence() {
 
     let db = parse("CREATE TABLE t (id serial); DROP SEQUENCE t_id_seq CASCADE;").expect("parses");
     assert_eq!(column(&db, "t", "id"), "INTEGER not null no default");
-    assert!(
-        !db.tables()
-            .next()
-            .expect("t")
-            .columns(&db)
-            .expect("columns")
-            .next()
-            .expect("id")
-            .is_serial()
-    );
+    assert!(!serial(&db, "t", "id"));
 }
 
 #[test]
@@ -212,6 +289,7 @@ fn a_serial_column_losing_its_default_leaves_the_sequence_free() {
     let db = parse("CREATE TABLE t (id serial); ALTER TABLE t ALTER COLUMN id SET DEFAULT 5;")
         .expect("parses");
     assert_eq!(column(&db, "t", "id"), "INTEGER not null 5");
+    assert!(!serial(&db, "t", "id"), "the column no longer draws from it");
     assert_eq!(sequence_names(&db), ["public.t_id_seq"], "the sequence stays owned");
 }
 
@@ -220,6 +298,7 @@ fn a_serial_column_changing_type_keeps_drawing() {
     let db = parse("CREATE TABLE t (id serial); ALTER TABLE t ALTER COLUMN id TYPE BIGINT;")
         .expect("parses");
     assert_eq!(column(&db, "t", "id"), "BIGINT not null nextval('t_id_seq'::REGCLASS)");
+    assert!(serial(&db, "t", "id"));
     assert_eq!(
         refused_by_default(parse(
             "CREATE TABLE t (id serial); ALTER TABLE t ALTER COLUMN id TYPE BIGINT; DROP SEQUENCE t_id_seq;"

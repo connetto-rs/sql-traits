@@ -119,6 +119,13 @@ fn every_reference_follows_the_move() {
         (owning.table_schema(), owning.table_name(), owner.column_name()),
         (Some("s2"), "child", "id")
     );
+    let id = table(&db, "s2.child")
+        .expect("child moved")
+        .column("id", &db, IdentifierCase::AsWritten)
+        .expect("child is held")
+        .expect("id survives");
+    assert_eq!(id.default_value().as_deref(), Some("nextval('s2.child_id_seq'::REGCLASS)"));
+    assert!(id.is_serial(&db));
 
     let pv = db.views().find(|view| view.view_name() == "pv").expect("pv stays");
     assert!(pv.definition().to_string().contains("s2.v"), "{}", pv.definition());

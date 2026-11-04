@@ -20,7 +20,7 @@ use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateTable, CreateTableLikeDefaults, CreateTableLikeKind, ObjectName,
 };
 
-use super::{ParserDBBuilder, column_copy::copy_column, sequences};
+use super::{ParserDBBuilder, column_copy::copy_column};
 use crate::errors::Error;
 
 /// The table a `LIKE` clause copies from, and whether it asks for defaults.
@@ -73,13 +73,7 @@ pub(super) fn apply_like(
     let mut columns: Vec<ColumnDef> = copied
         .columns
         .iter()
-        .map(|column| {
-            let mut copy = copy_column(column, |option| is_copied_option(option, with_defaults));
-            if let Some(drawn) = sequences::serial_default(builder, copied, column) {
-                sequences::spell_out_serial(&mut copy, with_defaults.then_some(drawn));
-            }
-            copy
-        })
+        .map(|column| copy_column(column, |option| is_copied_option(option, with_defaults)))
         .collect();
 
     // The clause sits among the column list, so anything written beside it

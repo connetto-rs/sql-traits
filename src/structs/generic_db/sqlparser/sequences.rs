@@ -20,11 +20,12 @@
 //! identity sequence follows its column's type and cannot be dropped on its
 //! own.
 //!
-//! A column default naming a sequence as a `regclass` constant, such as
-//! `nextval('s')`, is bound to the sequence when created and draws from it, as
-//! does a serial column from its own. Dropping the sequence, or whatever owns
-//! it, is refused while such a default remains, and `CASCADE` removes the
-//! default, leaving a serial column as its integer type kept `NOT NULL`.
+//! A serial column is stored the way PostgreSQL stores it, as its integer type
+//! kept `NOT NULL` with a default drawing from its sequence. A column default
+//! naming a sequence as a `regclass` constant, such as `nextval('s')`, is
+//! bound to the sequence when created and draws from it. Dropping the
+//! sequence, or whatever owns it, is refused while such a default remains,
+//! and `CASCADE` removes the default.
 
 use alloc::{
     boxed::Box,
@@ -56,10 +57,10 @@ use crate::{
     errors::{Error, ObjectKind},
     impls::{SqlparserDialect, serial_sequence_type},
     structs::{
-        ColumnIdentity, IdentifierCase, Sequence, SequenceParameters, StoredSequenceOwner,
-        TableAttribute, TargetName,
+        ColumnIdentity, IdentifierCase, Sequence, SequenceParameters, SequenceType,
+        StoredSequenceOwner, TableAttribute, TargetName,
     },
-    traits::{ColumnLike, SequenceLike, SequenceOrigin, TableLike},
+    traits::{ColumnLike, DatabaseLike, SequenceLike, SequenceOrigin, TableLike},
     utils::{
         identifier_resolution::{identifiers_match, normalize_identifier},
         last_str,
@@ -524,23 +525,26 @@ pub(super) fn plan_column_sequences<'column>(
         .collect()
 }
 
-/// Spells out a serial `column` a table inheriting it receives, drawing from
-/// the sequence `planned` for the original.
-pub(super) fn spell_out_planned_serial(
-    column: &mut ColumnDef,
-    table: &StoredTable,
+/// Spells out each serial column among `columns` that `planned` names a
+/// sequence of `table` for, drawing from that sequence.
+pub(super) fn spell_out_serials<'column>(
     planned: &[ColumnSequence],
+    table: &StoredTable,
+    columns: impl IntoIterator<Item = &'column mut ColumnDef>,
 ) {
-    let Some(planned) = planned.iter().find(|planned| planned.origin == SequenceOrigin::Serial)
-    else {
-        return;
-    };
-    let quoted = normalize_identifier(&planned.name, false) != planned.name.as_str();
-    let mut target = TargetName::new(&planned.name, quoted);
-    if let Some(schema) = table.schema.as_deref() {
-        target = target.with_schema(schema, table.schema_quoted);
+    for column in columns {
+        let Some(planned) = planned.iter().find(|planned| {
+            planned.origin == SequenceOrigin::Serial && planned.column == column.name
+        }) else {
+            continue;
+        };
+        let quoted = normalize_identifier(&planned.name, false) != planned.name.as_str();
+        let mut target = TargetName::new(&planned.name, quoted);
+        if let Some(schema) = table.schema.as_deref() {
+            target = target.with_schema(schema, table.schema_quoted);
+        }
+        spell_out_serial(column, nextval(target.to_string()));
     }
-    spell_out_serial(column, Some(nextval(target.to_string())));
 }
 
 /// Sequences created for columns of a table not stored yet, each beside its
@@ -971,25 +975,11 @@ fn names_by_target(target: &TargetName<'_>, sequence: &Sequence) -> bool {
     }
 }
 
-/// The sequence among `sequences` the column with `identity` draws from: the
-/// serial sequence it owns while its type is still serial, or one its default
-/// names.
+/// The sequence among `sequences` a default of `column` names.
 fn drawn_by_column<'sequence>(
     column: &ColumnDef,
-    identity: ColumnIdentity,
     sequences: &'sequence [Arc<Sequence>],
 ) -> Option<&'sequence Sequence> {
-    let owned = || {
-        sequences.iter().map(AsRef::as_ref).find(|sequence| {
-            sequence.origin() == SequenceOrigin::Serial
-                && sequence.stored_owner() == Some(StoredSequenceOwner::Column(identity))
-        })
-    };
-    if serial_sequence_type(&column.data_type).is_some()
-        && let Some(sequence) = owned()
-    {
-        return Some(sequence);
-    }
     column.options.iter().find_map(|option| {
         match &option.option {
             ColumnOption::Default(default) => drawn_by_default(default, sequences),
@@ -1000,7 +990,7 @@ fn drawn_by_column<'sequence>(
 
 /// Gives a serial column the integer type and `NOT NULL` PostgreSQL stores it
 /// as, with `default` drawing in place of the type.
-pub(super) fn spell_out_serial(column: &mut ColumnDef, default: Option<Expr>) {
+fn spell_out_serial(column: &mut ColumnDef, default: Expr) {
     let Some(integer) = serial_sequence_type(&column.data_type) else {
         return;
     };
@@ -1008,32 +998,46 @@ pub(super) fn spell_out_serial(column: &mut ColumnDef, default: Option<Expr>) {
     if !column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull)) {
         column.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
     }
-    if let Some(default) = default {
-        column.options.push(ColumnOptionDef { name: None, option: ColumnOption::Default(default) });
-    }
+    column.options.push(ColumnOptionDef { name: None, option: ColumnOption::Default(default) });
 }
 
-/// The default drawing from the sequence a serial `column` of `table` owns,
-/// [`None`] wherever no sequence was created for it.
-pub(super) fn serial_default(
-    builder: &ParserDBBuilder,
-    table: &CreateTable,
-    column: &ColumnDef,
-) -> Option<Expr> {
-    serial_sequence_type(&column.data_type)?;
-    let identity = builder.columns().iter().find_map(|(held, _, identity)| {
-        (core::ptr::eq(TableAttribute::table(held.as_ref()), table)
-            && held.attribute().name == column.name)
-            .then_some(*identity)
-    })?;
-    builder
-        .sequences()
-        .iter()
-        .find(|(sequence, ())| {
-            sequence.origin() == SequenceOrigin::Serial
-                && sequence.stored_owner() == Some(StoredSequenceOwner::Column(identity))
+impl ParserDB {
+    /// Whether `column` holds an integer type and a default drawing from a
+    /// sequence `column` owns, the shape PostgreSQL stores a serial column in.
+    pub(crate) fn draws_from_owned_sequence(
+        &self,
+        column: &TableAttribute<CreateTable, ColumnDef>,
+    ) -> bool {
+        let declared = column.attribute();
+        if SequenceType::of(&declared.data_type).is_none() {
+            return false;
+        }
+        let Some(identity) = self.column_identity(column) else {
+            return false;
+        };
+        let owned = |target: &TargetName<'_>| {
+            self.sequences().any(|sequence| {
+                sequence.stored_owner() == Some(StoredSequenceOwner::Column(identity))
+                    && names_by_target(target, sequence)
+            })
+        };
+        declared.options.iter().any(|option| {
+            let ColumnOption::Default(default) = &option.option else {
+                return false;
+            };
+            visit_expressions(default, |node| {
+                if regclass_constant(node)
+                    .and_then(|text| TargetName::parse(text).ok())
+                    .is_some_and(|target| owned(&target))
+                {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_break()
         })
-        .map(|(sequence, ())| nextval(bound_regclass(sequence)))
+    }
 }
 
 /// Refuses, or under `cascade` removes, the column defaults left drawing from
@@ -1053,8 +1057,8 @@ pub(super) fn settle_dropped_sequences(
     }
     let case = builder.identifier_case();
     let mut drawing: Vec<(StoredTable, Vec<Ident>)> = Vec::new();
-    for (column, _, identity) in builder.columns() {
-        let Some(sequence) = drawn_by_column(column.attribute(), *identity, &dropped) else {
+    for (column, _, _) in builder.columns() {
+        let Some(sequence) = drawn_by_column(column.attribute(), &dropped) else {
             continue;
         };
         let table = TableAttribute::table(column.as_ref());
@@ -1080,7 +1084,6 @@ pub(super) fn settle_dropped_sequences(
                         ColumnOption::Default(default) if drawn_by_default(default, &dropped).is_some()
                     )
                 });
-                spell_out_serial(column, None);
             }
             Ok(())
         })?;

@@ -654,7 +654,7 @@ impl ColumnLike for MemoryColumn {
         None
     }
 
-    fn is_serial(&self) -> bool {
+    fn is_serial(&self, _database: &Self::DB) -> bool {
         false
     }
 
