@@ -7,25 +7,17 @@
 //! table received from that parent its own.
 
 use alloc::{
-    format,
     string::{String, ToString},
     vec::Vec,
 };
 
-use sqlparser::ast::{
-    AlterTableOperation, CheckConstraint, ColumnDef, ColumnOption, CreateTable, Ident, ObjectName,
-    TableConstraint,
-};
+use sqlparser::ast::{AlterTableOperation, CreateTable, Ident, ObjectName, TableConstraint};
 
 use super::{
-    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference, inheritance,
-    states_not_null, stored_column_collation_name, stored_qualifier, views,
+    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference, existing_child,
+    inheritance, stored_qualifier,
 };
-use crate::{
-    errors::{ChildMismatch, Error},
-    traits::TableLike,
-    utils::identifier_resolution::stored_ident_name,
-};
+use crate::{errors::Error, traits::TableLike};
 
 /// Applies `ALTER TABLE child INHERIT parent`.
 ///
@@ -79,13 +71,10 @@ pub(super) fn inherit(
     {
         return Err(Error::CircularInheritance { table_name, parent_name: parent_text });
     }
-    if let Some(reason) = shape_mismatch(child_node, parent_node) {
-        return Err(Error::InheritanceChildMismatch {
-            table_name,
-            parent_name: parent_text,
-            reason,
-        });
-    }
+    existing_child::merge_into_existing(&builder, (&parent, parent_node), (&child, child_node))
+        .map_err(|reason| {
+            Error::InheritanceChildMismatch { table_name, parent_name: parent_text, reason }
+        })?;
 
     let mut bound = parent_name.clone();
     bind_reference(&mut bound, stored_qualifier(&parent_node.name));
@@ -100,8 +89,10 @@ pub(super) fn inherit(
 /// # Errors
 ///
 /// Returns [`Error::InheritanceChangeOnPartition`] for a partition,
-/// [`Error::ParentTableNotFound`] for an absent parent and
-/// [`Error::NotAParentOf`] for a table the child does not inherit from.
+/// [`Error::ParentTableNotFound`] for an absent parent,
+/// [`Error::NotAPartitionOf`] for a partitioned table and
+/// [`Error::NotAParentOf`] for any other relation the child does not inherit
+/// from.
 pub(super) fn no_inherit(
     builder: ParserDBBuilder,
     child_name: &ObjectName,
@@ -112,13 +103,29 @@ pub(super) fn no_inherit(
         return Ok(builder);
     };
     refuse_partition_child(ParserDB::stored_node(&builder, &child)?, child_name)?;
-    let parent = StoredTable::of(resolve_parent(&builder, child_name, parent_name)?);
-    let child_node = ParserDB::stored_node(&builder, &child)?;
-    if !child_node.inherits.iter().flatten().any(|name| parent.named_by(name)) {
-        return Err(Error::NotAParentOf {
+    let not_a_parent = || {
+        Error::NotAParentOf {
             table_name: child_name.to_string(),
             parent_name: parent_name.to_string(),
+        }
+    };
+    let Some(parent_node) = builder.resolve_table_object_name(parent_name)? else {
+        return Err(if builder.relation_reached(parent_name).is_some() {
+            not_a_parent()
+        } else {
+            absent_parent(child_name, parent_name)
         });
+    };
+    if parent_node.partition_by.is_some() {
+        return Err(Error::NotAPartitionOf {
+            table_name: parent_name.to_string(),
+            partition_name: child_name.to_string(),
+        });
+    }
+    let parent = StoredTable::of(parent_node);
+    let child_node = ParserDB::stored_node(&builder, &child)?;
+    if !child_node.inherits.iter().flatten().any(|name| parent.named_by(name)) {
+        return Err(not_a_parent());
     }
 
     let mut builder = ParserDB::replace_table_node(builder, &child, |_, node| {
@@ -187,137 +194,21 @@ fn resolve_parent<'builder>(
     if let Some(parent) = builder.resolve_table_object_name(parent_name)? {
         return Ok(parent);
     }
-    if let Some(object_kind) = views::holds_view(builder, parent_name) {
-        return Err(Error::AlterActionUnsupportedOnRelation {
-            object_kind,
-            relation_name: parent_name.to_string(),
-            operation: AlterTableOperation::Inherit { parent: parent_name.clone() }.to_string(),
-        });
+    match builder.relation_reached(parent_name) {
+        Some((object_kind, _)) => {
+            Err(Error::AlterActionUnsupportedOnRelation {
+                object_kind,
+                relation_name: parent_name.to_string(),
+                operation: AlterTableOperation::Inherit { parent: parent_name.clone() }.to_string(),
+            })
+        }
+        None => Err(absent_parent(child_name, parent_name)),
     }
-    Err(Error::ParentTableNotFound {
+}
+
+fn absent_parent(child_name: &ObjectName, parent_name: &ObjectName) -> Error {
+    Error::ParentTableNotFound {
         parent_table: parent_name.to_string(),
         child_table: child_name.to_string(),
-    })
-}
-
-/// Whether the column is a stored generated column.
-fn is_generated(column: &ColumnDef) -> bool {
-    column.options.iter().any(|option| {
-        matches!(option.option, ColumnOption::Generated { generation_expr: Some(_), .. })
-    })
-}
-
-/// The collation a column writes, as PostgreSQL stores its name.
-fn collation(column: &ColumnDef) -> Option<Vec<String>> {
-    stored_column_collation_name(column).map(|name| {
-        name.0
-            .iter()
-            .filter_map(|part| part.as_ident())
-            .map(|ident| stored_ident_name(ident).into_owned())
-            .collect()
-    })
-}
-
-/// A check the parent passes down, with its name when it has one.
-struct PassedCheck {
-    name: Option<String>,
-    expr: String,
-}
-
-/// The checks a table holds or passes down: its table checks and the checks
-/// written on its columns, each with its name and expression. `inheritable`
-/// keeps only those a child receives.
-fn checks(table: &CreateTable, inheritable: bool) -> Vec<PassedCheck> {
-    let wanted = |check: &CheckConstraint| !inheritable || !check.no_inherit;
-    let table_checks = table.constraints.iter().filter_map(|constraint| {
-        match constraint {
-            TableConstraint::Check(check) if wanted(check) => {
-                Some(PassedCheck {
-                    name: check.name.as_ref().map(|name| stored_ident_name(name).into_owned()),
-                    expr: check.expr.to_string(),
-                })
-            }
-            _ => None,
-        }
-    });
-    let column_checks =
-        table.columns.iter().flat_map(|column| &column.options).filter_map(|option| {
-            match &option.option {
-                ColumnOption::Check(check) if wanted(check) => {
-                    Some(PassedCheck {
-                        name: option
-                            .name
-                            .as_ref()
-                            .or(check.name.as_ref())
-                            .map(|name| stored_ident_name(name).into_owned()),
-                        expr: check.expr.to_string(),
-                    })
-                }
-                _ => None,
-            }
-        });
-    table_checks.chain(column_checks).collect()
-}
-
-/// What the child lacks of the parent's shape, checked the way PostgreSQL
-/// checks it: every column with its type, collation, `NOT NULL` and
-/// generation, then every check the parent passes down.
-fn shape_mismatch(child: &CreateTable, parent: &CreateTable) -> Option<ChildMismatch> {
-    for parent_column in &parent.columns {
-        let column_name = || parent_column.name.value.clone();
-        let Some(column) = child
-            .columns
-            .iter()
-            .find(|held| inheritance::same_column(&held.name, &parent_column.name))
-        else {
-            return Some(ChildMismatch::MissingColumn { column_name: column_name() });
-        };
-        if inheritance::types_conflict(&parent_column.data_type, &column.data_type) {
-            return Some(ChildMismatch::ColumnType { column_name: column_name() });
-        }
-        if collation(parent_column) != collation(column) {
-            return Some(ChildMismatch::ColumnCollation { column_name: column_name() });
-        }
-        if states_not_null(parent_column) && !states_not_null(column) {
-            return Some(ChildMismatch::ColumnNullable { column_name: column_name() });
-        }
-        match (is_generated(parent_column), is_generated(column)) {
-            (true, false) => {
-                return Some(ChildMismatch::MustBeGenerated { column_name: column_name() });
-            }
-            (false, true) => {
-                return Some(ChildMismatch::MustNotBeGenerated { column_name: column_name() });
-            }
-            _ => {}
-        }
     }
-    let held = checks(child, false);
-    for passed in checks(parent, true) {
-        match &passed.name {
-            Some(name) => {
-                let Some(found) = held.iter().find(|check| check.name.as_ref() == Some(name))
-                else {
-                    return Some(ChildMismatch::MissingConstraint {
-                        constraint_name: name.clone(),
-                    });
-                };
-                if found.expr != passed.expr {
-                    return Some(ChildMismatch::ConstraintDiffers {
-                        constraint_name: name.clone(),
-                    });
-                }
-            }
-            // PostgreSQL names an unnamed check after the parent, a name the
-            // model does not spell, so any check of the same expression meets
-            // it.
-            None => {
-                if !held.iter().any(|check| check.expr == passed.expr) {
-                    return Some(ChildMismatch::MissingConstraint {
-                        constraint_name: format!("CHECK ({})", passed.expr),
-                    });
-                }
-            }
-        }
-    }
-    None
 }

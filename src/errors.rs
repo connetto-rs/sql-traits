@@ -179,8 +179,8 @@ impl core::fmt::Display for FixedPersistence {
     }
 }
 
-/// What a table lacks to become a child of a parent through `ALTER TABLE ...
-/// INHERIT`.
+/// What an existing table lacks of the shape of the table it is made a child
+/// of, by `ALTER TABLE ... INHERIT` or `ATTACH PARTITION`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChildMismatch {
     /// The table lacks a column of the parent.
@@ -224,6 +224,16 @@ pub enum ChildMismatch {
         /// The check's name.
         constraint_name: String,
     },
+    /// The table's check of the parent's name is marked `NO INHERIT`.
+    ConstraintNotInherited {
+        /// The check's name.
+        constraint_name: String,
+    },
+    /// The table holds the parent's validated check `NOT VALID`.
+    ConstraintNotValid {
+        /// The check's name.
+        constraint_name: String,
+    },
 }
 
 impl core::fmt::Display for ChildMismatch {
@@ -250,6 +260,12 @@ impl core::fmt::Display for ChildMismatch {
             }
             Self::ConstraintDiffers { constraint_name } => {
                 write!(f, "its check `{constraint_name}` differs from the parent's")
+            }
+            Self::ConstraintNotInherited { constraint_name } => {
+                write!(f, "its check `{constraint_name}` is marked `NO INHERIT`")
+            }
+            Self::ConstraintNotValid { constraint_name } => {
+                write!(f, "its check `{constraint_name}` is `NOT VALID` and the parent's is not")
             }
         }
     }
@@ -360,34 +376,13 @@ pub enum UnattachablePartition {
         /// Name of the column.
         column_name: String,
     },
-    /// The table lacks a column the partitioned table declares.
-    MissingColumn {
-        /// Name of the column.
-        column_name: String,
-    },
     /// The table declares an identity column of its own.
     IdentityColumn {
         /// Name of the column.
         column_name: String,
     },
-    /// The column may hold nothing where the partitioned table requires a
-    /// value.
-    NullableColumn {
-        /// Name of the column.
-        column_name: String,
-    },
-    /// The column is a stored generated column on one side only.
-    GenerationMismatch {
-        /// Name of the column.
-        column_name: String,
-        /// Whether the partitioned table is the side generating it.
-        generated_in_root: bool,
-    },
-    /// The table lacks a check the partitioned table passes down.
-    MissingCheck {
-        /// The check as the partitioned table holds it.
-        constraint: String,
-    },
+    /// The table lacks the partitioned table's shape.
+    Shape(ChildMismatch),
     /// The table holds a primary key on other columns than the partitioned
     /// table's.
     OtherPrimaryKey,
@@ -406,20 +401,10 @@ impl core::fmt::Display for UnattachablePartition {
             Self::ExtraColumn { column_name } => {
                 write!(f, "column `{column_name}` is not found in the partitioned table")
             }
-            Self::MissingColumn { column_name } => write!(f, "it lacks column `{column_name}`"),
             Self::IdentityColumn { column_name } => {
                 write!(f, "column `{column_name}` is an identity column")
             }
-            Self::NullableColumn { column_name } => {
-                write!(f, "column `{column_name}` must be marked `NOT NULL`")
-            }
-            Self::GenerationMismatch { column_name, generated_in_root: true } => {
-                write!(f, "column `{column_name}` must be a generated column")
-            }
-            Self::GenerationMismatch { column_name, generated_in_root: false } => {
-                write!(f, "column `{column_name}` must not be a generated column")
-            }
-            Self::MissingCheck { constraint } => write!(f, "it lacks check `{constraint}`"),
+            Self::Shape(mismatch) => mismatch.fmt(f),
             Self::OtherPrimaryKey => f.write_str("it holds a primary key of its own"),
             Self::ForeignTableUnderUniqueIndex => {
                 f.write_str("it is a foreign table and the partitioned table holds a unique index")
@@ -1021,6 +1006,19 @@ pub enum Error {
         parent_table: String,
         /// Name of the table naming the parent.
         child_table: String,
+    },
+    #[error(
+        "{object_kind} `{parent_name}` cannot be inherited from by table `{table_name}`, since only a table or foreign table can."
+    )]
+    /// Error indicating that `INHERITS` names a view, materialized view or
+    /// sequence.
+    InheritsFromNonTable {
+        /// Table naming the parent.
+        table_name: String,
+        /// Parent it names, as written.
+        parent_name: String,
+        /// What the name reaches.
+        object_kind: ObjectKind,
     },
     #[error("Table `{copied_table}` not found for the `LIKE` in table `{table_name}`.")]
     /// Error indicating that a table copies its columns from a table that
@@ -2119,8 +2117,8 @@ pub enum Error {
         /// Parent it names, as written.
         parent_name: String,
     },
-    #[error("Table `{parent_name}` is not a parent of table `{table_name}`.")]
-    /// Error indicating that `NO INHERIT` names a table the table does not
+    #[error("Relation `{parent_name}` is not a parent of table `{table_name}`.")]
+    /// Error indicating that `NO INHERIT` names a relation the table does not
     /// inherit from.
     NotAParentOf {
         /// Table the statement alters.

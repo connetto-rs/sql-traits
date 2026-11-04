@@ -252,7 +252,7 @@ pub(super) fn bind_type(builder: &ParserDBBuilder, data_type: &mut DataType) {
 
 /// The position among the stored domains of the domain a declared type names,
 /// directly or as the element of an array.
-fn named_domain(builder: &ParserDBBuilder, data_type: &DataType) -> Option<usize> {
+pub(super) fn named_domain(builder: &ParserDBBuilder, data_type: &DataType) -> Option<usize> {
     let name = custom_name(data_type)?;
     let domain = bound_domain(
         builder.domains().iter().map(|(domain, _)| domain.as_ref()),
