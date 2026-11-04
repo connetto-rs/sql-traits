@@ -18,7 +18,9 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 ///   answers a single `[]`, since PostgreSQL does not enforce dimensions.
 /// - Each part of a schema-qualified name is read the same way, and a
 ///   `pg_catalog` qualifier is dropped.
-/// - A type modifier list is kept as written.
+/// - `float(p)` answers `REAL` up to 24 bits of precision and `DOUBLE
+///   PRECISION` beyond, and a bare `float` is double precision, as PostgreSQL
+///   reads both. Any other type modifier list is kept as written.
 ///
 /// # Examples
 ///
@@ -67,6 +69,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("float4", "REAL"),
     ("real", "REAL"),
     ("float8", "DOUBLE PRECISION"),
+    ("float", "DOUBLE PRECISION"),
     ("double precision", "DOUBLE PRECISION"),
     ("numeric", "NUMERIC"),
     ("decimal", "NUMERIC"),
@@ -142,11 +145,25 @@ fn push_normalized(out: &mut String, pg_type: &str) {
         return;
     }
     let (name, modifiers) = split_modifiers(pg_type);
+    if let Some(token) = float_with_precision(name, modifiers) {
+        out.push_str(token);
+        return;
+    }
     match parse_parts(name) {
         Some(parts) => push_name(out, &parts),
         None => out.push_str(&fold_words(name)),
     }
     out.push_str(modifiers);
+}
+
+/// Returns the type `float(p)` selects, `p` counting binary digits of
+/// precision.
+fn float_with_precision(name: &str, modifiers: &str) -> Option<&'static str> {
+    if !name.eq_ignore_ascii_case("float") {
+        return None;
+    }
+    let bits: u64 = modifiers.strip_prefix('(')?.strip_suffix(')')?.trim().parse().ok()?;
+    Some(if bits <= 24 { "REAL" } else { "DOUBLE PRECISION" })
 }
 
 /// Whether `pg_type` is one unquoted, unqualified name with no wrapper or
@@ -400,6 +417,19 @@ mod tests {
         assert_eq!(normalize_postgres_type("double   precision"), "DOUBLE PRECISION");
         assert_eq!(normalize_postgres_type("numeric"), "NUMERIC");
         assert_eq!(normalize_postgres_type("decimal"), "NUMERIC");
+    }
+
+    /// `float` names double precision, and a binary precision picks the
+    /// single-precision type up to 24 bits.
+    #[test]
+    fn test_normalize_postgres_type_float_precision() {
+        assert_eq!(normalize_postgres_type("float"), "DOUBLE PRECISION");
+        assert_eq!(normalize_postgres_type("FLOAT(24)"), "REAL");
+        assert_eq!(normalize_postgres_type("float ( 10 )[]"), "REAL[]");
+        assert_eq!(normalize_postgres_type("float(25)"), "DOUBLE PRECISION");
+        assert_eq!(normalize_postgres_type("\"float\""), "\"float\"");
+        assert_eq!(normalize_postgres_type("\"float\"(10)"), "\"float\"(10)");
+        assert_eq!(normalize_postgres_type("app.float(10)"), "APP.FLOAT(10)");
     }
 
     #[test]

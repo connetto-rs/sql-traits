@@ -4,7 +4,8 @@ use alloc::{borrow::Cow, format, string::String};
 use core::fmt::Write;
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, DataType, GeometricTypeKind, ObjectName, ObjectNamePart, TimezoneInfo,
+    ArrayElemTypeDef, DataType, ExactNumberInfo, GeometricTypeKind, ObjectName, ObjectNamePart,
+    TimezoneInfo,
 };
 
 use crate::utils::normalize_postgres_type::{push_quoted, quoting_matters};
@@ -38,6 +39,13 @@ use crate::utils::normalize_postgres_type::{push_quoted, quoting_matters};
 /// assert_eq!(normalize_sqlparser_type(&DataType::JSON), "JSON");
 /// assert_eq!(normalize_sqlparser_type(&DataType::Bytea), "BYTEA");
 /// assert_eq!(normalize_sqlparser_type(&DataType::Decimal(ExactNumberInfo::None)), "DECIMAL",);
+///
+/// // A binary precision picks the single or the double precision type.
+/// assert_eq!(normalize_sqlparser_type(&DataType::Float(ExactNumberInfo::Precision(10))), "REAL");
+/// assert_eq!(
+///     normalize_sqlparser_type(&DataType::Float(ExactNumberInfo::Precision(53))),
+///     "DOUBLE PRECISION"
+/// );
 ///
 /// // `CHARACTER VARYING` is the same type as `VARCHAR`, spelled the long way.
 /// assert_eq!(normalize_sqlparser_type(&DataType::CharacterVarying(None)), "VARCHAR");
@@ -177,7 +185,16 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
         DataType::UInt256 => "UINT256".into(),
         // FLOAT family
         DataType::Real | DataType::RealUnsigned => "REAL".into(),
-        DataType::Float(_) | DataType::FloatUnsigned(_) => "FLOAT".into(),
+        DataType::Float(precision) | DataType::FloatUnsigned(precision) => {
+            match precision {
+                ExactNumberInfo::None => "FLOAT".into(),
+                ExactNumberInfo::Precision(bits) if *bits <= 24 => "REAL".into(),
+                ExactNumberInfo::Precision(_) => "DOUBLE PRECISION".into(),
+                // MySQL's `FLOAT(M,D)` counts decimal digits and stays single
+                // precision.
+                ExactNumberInfo::PrecisionAndScale(..) => "REAL".into(),
+            }
+        }
         DataType::Float4 => "FLOAT4".into(),
         DataType::Float8 => "FLOAT8".into(),
         DataType::Float32 => "FLOAT32".into(),
@@ -579,12 +596,32 @@ mod tests {
         use sqlparser::ast::ExactNumberInfo;
         assert_eq!(normalize_sqlparser_type(&DataType::Real), "REAL");
         assert_eq!(normalize_sqlparser_type(&DataType::Float(ExactNumberInfo::None)), "FLOAT");
-        assert_eq!(
-            normalize_sqlparser_type(&DataType::Float(ExactNumberInfo::Precision(24))),
-            "FLOAT"
-        );
         assert_eq!(normalize_sqlparser_type(&DataType::Double(ExactNumberInfo::None)), "DOUBLE");
         assert_eq!(normalize_sqlparser_type(&DataType::DoublePrecision), "DOUBLE PRECISION");
+    }
+
+    /// A binary precision picks the single-precision type up to 24 bits and
+    /// the double-precision one beyond, and MySQL's digit-count form is
+    /// always single precision.
+    #[test]
+    fn test_normalize_sqlparser_type_float_precision() {
+        use sqlparser::ast::ExactNumberInfo;
+        for (precision, expected) in [
+            (0, "REAL"),
+            (1, "REAL"),
+            (24, "REAL"),
+            (25, "DOUBLE PRECISION"),
+            (53, "DOUBLE PRECISION"),
+        ] {
+            let float = DataType::Float(ExactNumberInfo::Precision(precision));
+            assert_eq!(normalize_sqlparser_type(&float), expected);
+            let unsigned = DataType::FloatUnsigned(ExactNumberInfo::Precision(precision));
+            assert_eq!(normalize_sqlparser_type(&unsigned), expected);
+        }
+        assert_eq!(
+            normalize_sqlparser_type(&DataType::Float(ExactNumberInfo::PrecisionAndScale(10, 2))),
+            "REAL"
+        );
     }
 
     #[test]
