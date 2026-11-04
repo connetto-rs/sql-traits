@@ -9,20 +9,18 @@
 //! `INTEGER` used as a boolean by convention, MySQL `CHAR(36)` used to hold
 //! a UUID).
 
-use alloc::vec::Vec;
 use core::any::TypeId;
 
 use sqlparser::{
     ast::{
         CharacterLength, ColumnDef, CreateTable, DataType, ExactNumberInfo, ObjectName,
-        ObjectNamePart, Statement, TimezoneInfo, TypeModifier,
+        ObjectNamePart, TimezoneInfo, TypeModifier,
     },
     dialect::{
         AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
         GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect,
         RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect, SparkSqlDialect, TeradataDialect,
     },
-    parser::{Parser, ParserError},
 };
 
 use super::data_type::interval_fields;
@@ -141,11 +139,6 @@ impl SqlparserDialect {
     #[inline]
     pub fn is_sqlite(self) -> bool {
         matches!(self, Self::SQLite)
-    }
-
-    /// Parses `sql` under the stock dialect this variant names.
-    pub(crate) fn parse_statements(self, sql: &str) -> Result<Vec<Statement>, ParserError> {
-        Parser::parse_sql(self.stock(), sql)
     }
 
     /// Whether this dialect parses `0x1F` into the hex string variant `X'1F'`
@@ -641,6 +634,11 @@ impl DialectLike for SqlparserDialect {
     ) -> TypeMatch {
         classify_uuid(*self, &column.attribute().data_type)
     }
+
+    #[inline]
+    fn sqlparser_dialect(&self) -> &dyn Dialect {
+        self.stock()
+    }
 }
 
 #[cfg(test)]
@@ -648,6 +646,7 @@ mod tests {
     use sqlparser::{
         ast::{CharacterLength, ExactNumberInfo},
         dialect::GenericDialect,
+        parser::Parser,
     };
 
     use super::*;
@@ -680,7 +679,7 @@ mod tests {
     /// Each variant parses as the dialect it classifies, over inputs on which
     /// the stock dialects disagree.
     #[test]
-    fn parse_statements_uses_the_classified_dialect() {
+    fn sqlparser_dialect_parses_as_the_classified_dialect() {
         fn agrees<D: Dialect + Default + 'static>() {
             for sql in [
                 "SELECT `a` FROM t",
@@ -691,7 +690,7 @@ mod tests {
                 "SELECT a FROM t LIMIT 1, 2",
             ] {
                 assert_eq!(
-                    SqlparserDialect::of::<D>().parse_statements(sql),
+                    Parser::parse_sql(SqlparserDialect::of::<D>().sqlparser_dialect(), sql),
                     Parser::parse_sql(&D::default(), sql),
                     "{sql} under {}",
                     core::any::type_name::<D>()

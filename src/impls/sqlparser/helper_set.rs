@@ -1,5 +1,5 @@
-//! The answer behind [`FunctionLike::helper_set`] for a parsed `CREATE
-//! FUNCTION`.
+//! The answer behind [`FunctionLike::helper_set`], read from the body
+//! [`FunctionLike::written_body`] hands over.
 
 use alloc::{
     borrow::Cow,
@@ -8,22 +8,27 @@ use alloc::{
     vec::Vec,
 };
 
-use sqlparser::ast::{
-    ArgMode, BinaryOperator, CreateFunction, CreateRole, DataType, Distinct, Expr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior,
-    FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, InTarget, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, SetOperator, Statement, TableFactor, Value,
+use sqlparser::{
+    ast::{
+        ArgMode, BinaryOperator, DataType, Distinct, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArgumentList, FunctionArguments, FunctionBehavior, FunctionSecurity, GroupByExpr,
+        Ident, InTarget, Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator, Statement,
+        TableFactor, Value,
+    },
+    parser::Parser,
 };
 
-use super::create_function::{SqlBody, sql_body};
+use super::function_body::{SqlBody, sql_body};
 use crate::{
     errors::{HelperSetError, LookupError},
     structs::{
-        Deployment, GrantArm, HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm,
-        ParserDB, RowSecurity, RowStatement, SessionSetting, SettingContent, SettingValue,
+        Deployment, FunctionBody, GrantArm, HelperArm, HelperSet, IdentifierCase, LiteralSet,
+        ParentArm, RowSecurity, RowStatement, SessionSetting, SettingContent, SettingValue,
+        TargetName,
     },
     traits::{
-        ColumnLike, DatabaseLike, ForeignKeyLike, FunctionLike, Relation, RoleLike, TableLike,
+        ColumnLike, DatabaseLike, DialectLike, ForeignKeyLike, FunctionLike, Relation, RoleLike,
+        TableLike,
     },
     utils::{
         call_sites::call_reaches,
@@ -35,17 +40,13 @@ use crate::{
     },
 };
 
-type Table = <ParserDB as DatabaseLike>::Table;
-type Column = <ParserDB as DatabaseLike>::Column;
-type ForeignKey = <ParserDB as DatabaseLike>::ForeignKey;
-
 /// See [`FunctionLike::helper_set`].
-pub(super) fn helper_set<'db>(
-    function: &'db CreateFunction,
+pub(crate) fn helper_set<'db, DB: DatabaseLike>(
+    function: &'db DB::Function,
     arguments: &[Value],
     deployment: &'db Deployment,
-    database: &'db ParserDB,
-) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    database: &'db DB,
+) -> Result<HelperSet<'db, DB>, HelperSetError> {
     Reader { deployment, database, answering: Vec::new() }.answer(function, arguments)
 }
 
@@ -98,8 +99,8 @@ enum Equality {
 }
 
 /// A grant arm's comparison of a column to the caller.
-struct Caller<'db> {
-    column: &'db Column,
+struct Caller<'db, DB: DatabaseLike> {
+    column: &'db DB::Column,
     setting: &'db SessionSetting,
     /// Whether the body reads the setting without `missing_ok`.
     raises_when_unset: bool,
@@ -115,20 +116,20 @@ struct Passed {
 
 /// One input parameter of the helper being read, bound to its argument.
 struct Parameter<'f> {
-    name: Option<&'f Ident>,
+    name: Option<TargetName<'f>>,
     passed: Passed,
 }
 
 /// The helper whose arm is being read, with what its body's names resolve to.
-struct Scope<'f, 'db> {
-    function: &'f CreateFunction,
+struct Scope<'db, DB: DatabaseLike> {
+    function: &'db DB::Function,
     name: String,
     path: SearchPath<'db>,
-    parameters: Vec<Parameter<'f>>,
-    owner: &'db CreateRole,
+    parameters: Vec<Parameter<'db>>,
+    owner: &'db DB::Role,
 }
 
-impl Scope<'_, '_> {
+impl<DB: DatabaseLike> Scope<'_, DB> {
     fn arm_shape(&self, arm: &impl ToString) -> HelperSetError {
         HelperSetError::ArmShape { function: self.name.clone(), arm: arm.to_string() }
     }
@@ -139,10 +140,9 @@ impl Scope<'_, '_> {
             Expr::Identifier(ident) => self.parameter_named(ident),
             Expr::CompoundIdentifier(parts) => {
                 let [qualifier, name] = parts.as_slice() else { return None };
-                let function = object_name_last_part(&self.function.name)?;
                 identifiers_match(
-                    function.0,
-                    function.1,
+                    self.function.name(),
+                    self.function.name_is_quoted(),
                     &qualifier.value,
                     qualifier.quote_style.is_some(),
                 )
@@ -163,10 +163,10 @@ impl Scope<'_, '_> {
         self.parameters
             .iter()
             .find(|parameter| {
-                parameter.name.is_some_and(|name| {
+                parameter.name.as_ref().is_some_and(|name| {
                     identifiers_match(
-                        &name.value,
-                        name.quote_style.is_some(),
+                        name.name(),
+                        name.name_is_quoted(),
                         &ident.value,
                         ident.quote_style.is_some(),
                     )
@@ -177,18 +177,18 @@ impl Scope<'_, '_> {
 }
 
 /// The table an arm reads, with the name its columns are qualified by.
-struct ArmTable<'q, 'db> {
-    table: &'db Table,
+struct ArmTable<'q, 'db, DB: DatabaseLike> {
+    table: &'db DB::Table,
     qualifier: Cow<'q, Ident>,
 }
 
-impl<'db> ArmTable<'_, 'db> {
+impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
     /// The column `expression` names, if it names one of the table's.
     fn column(
         &self,
         expression: &Expr,
-        database: &'db ParserDB,
-    ) -> Result<Option<&'db Column>, LookupError> {
+        database: &'db DB,
+    ) -> Result<Option<&'db DB::Column>, LookupError> {
         let ident = match unnest(expression) {
             Expr::Identifier(ident) => ident,
             Expr::CompoundIdentifier(parts) => {
@@ -210,21 +210,21 @@ impl<'db> ArmTable<'_, 'db> {
 }
 
 /// What a grant arm's condition keeps.
-enum Kept<'db> {
+enum Kept<'db, DB: DatabaseLike> {
     /// Every row.
     All,
     /// No row, the condition being `FALSE` or `NULL`.
     Nothing,
     /// The rows whose column holds one of the values.
-    In(&'db Column, Vec<Passed>),
+    In(&'db DB::Column, Vec<Passed>),
 }
 
-impl<'db> Kept<'db> {
+impl<'db, DB: DatabaseLike> Kept<'db, DB> {
     fn of(equality: Equality) -> Self {
         if equality == Equality::Holds { Self::All } else { Self::Nothing }
     }
 
-    fn values(column: &'db Column, values: Vec<Passed>) -> Self {
+    fn values(column: &'db DB::Column, values: Vec<Passed>) -> Self {
         if values.is_empty() { Self::Nothing } else { Self::In(column, values) }
     }
 
@@ -261,27 +261,31 @@ impl<'db> Kept<'db> {
 }
 
 /// One side of a comparison in a grant arm.
-enum Operand<'db> {
-    Column(&'db Column),
+enum Operand<'db, DB: DatabaseLike> {
+    Column(&'db DB::Column),
     Passed(Passed),
     Setting { name: String, raises_when_unset: bool },
     Other,
 }
 
+/// One arm as read, the table whose primary key it returns, where it returns
+/// one, beside the arm, `None` where its condition keeps no row.
+type ReadArm<'db, DB> = (Option<&'db <DB as DatabaseLike>::Table>, Option<HelperArm<'db, DB>>);
+
 /// Answers helpers, following parent arms into the helpers they call.
-struct Reader<'db> {
+struct Reader<'db, DB: DatabaseLike> {
     deployment: &'db Deployment,
-    database: &'db ParserDB,
+    database: &'db DB,
     /// The helpers being answered, outermost first.
-    answering: Vec<&'db CreateFunction>,
+    answering: Vec<&'db DB::Function>,
 }
 
-impl<'db> Reader<'db> {
+impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     fn answer(
         &mut self,
-        function: &'db CreateFunction,
+        function: &'db DB::Function,
         arguments: &[Value],
-    ) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    ) -> Result<HelperSet<'db, DB>, HelperSetError> {
         let database = self.database;
         let name = function.target_name().to_string();
         if self.answering.iter().any(|seen| core::ptr::eq(*seen, function)) {
@@ -301,14 +305,13 @@ impl<'db> Reader<'db> {
         if function.security_mode() != FunctionSecurity::Definer {
             return Err(HelperSetError::SecurityInvoker { function: name });
         }
-        if !matches!(&function.return_type, Some(FunctionReturnType::SetOf(data_type)) if !is_row(data_type))
-        {
+        if !returns_scalar_set(function, database) {
             return Err(HelperSetError::ReturnType { function: name });
         }
         let Some(path) = function.search_path(database)? else {
             return Err(HelperSetError::UnpinnedSearchPath { function: name });
         };
-        let parameters = parameters(function, arguments, &name)?;
+        let parameters = parameters(function, arguments, &name, database)?;
         let Some(owner) = function.owner(database)? else {
             return Err(HelperSetError::UnsettledOwner { function: name });
         };
@@ -323,9 +326,11 @@ impl<'db> Reader<'db> {
         // A body bound at creation resolves its names with no path, so it is
         // not read as one written to run under the pinned path.
         let body = sql_body(function, database)?;
-        let SqlBody::Statements(statements) = &body else { return Err(scope.arm_shape(function)) };
+        let SqlBody::Statements(statements) = &body else {
+            return Err(scope.arm_shape(&written(function)));
+        };
         let [Statement::Query(query)] = statements.as_ref() else {
-            return Err(scope.arm_shape(function));
+            return Err(scope.arm_shape(&written(function)));
         };
         let mut selects = Vec::new();
         union_arms(query, &mut selects).map_err(|arm| scope.arm_shape(&arm))?;
@@ -350,9 +355,9 @@ impl<'db> Reader<'db> {
     /// no row.
     fn arm(
         &mut self,
-        scope: &Scope<'_, 'db>,
+        scope: &Scope<'db, DB>,
         select: &Select,
-    ) -> Result<(Option<&'db Table>, Option<HelperArm<'db, ParserDB>>), HelperSetError> {
+    ) -> Result<ReadArm<'db, DB>, HelperSetError> {
         if !plain_select(select) {
             return Err(scope.arm_shape(select));
         }
@@ -386,9 +391,9 @@ impl<'db> Reader<'db> {
     /// primary key.
     fn keyed_table(
         &self,
-        table: &'db Table,
-        column: &'db Column,
-    ) -> Result<Option<&'db Table>, LookupError> {
+        table: &'db DB::Table,
+        column: &'db DB::Column,
+    ) -> Result<Option<&'db DB::Table>, LookupError> {
         let database = self.database;
         if table.primary_key_column(database)?.is_some_and(|primary| core::ptr::eq(primary, column))
         {
@@ -411,11 +416,11 @@ impl<'db> Reader<'db> {
     /// of it.
     fn arm_table<'q>(
         &self,
-        scope: &Scope<'_, 'db>,
+        scope: &Scope<'db, DB>,
         select: &Select,
         relation: &'q TableFactor,
         unjoined: bool,
-    ) -> Result<ArmTable<'q, 'db>, HelperSetError> {
+    ) -> Result<ArmTable<'q, 'db, DB>, HelperSetError> {
         let database = self.database;
         let TableFactor::Table {
             name,
@@ -482,13 +487,13 @@ impl<'db> Reader<'db> {
 
     fn parent_arm(
         &mut self,
-        scope: &Scope<'_, 'db>,
+        scope: &Scope<'db, DB>,
         select: &Select,
-        table: &ArmTable<'_, 'db>,
-        key: &'db Column,
+        table: &ArmTable<'_, 'db, DB>,
+        key: &'db DB::Column,
         compared: &Expr,
         subquery: &Query,
-    ) -> Result<HelperArm<'db, ParserDB>, HelperSetError> {
+    ) -> Result<HelperArm<'db, DB>, HelperSetError> {
         let database = self.database;
         let shape = || scope.arm_shape(select);
         if table
@@ -559,10 +564,10 @@ impl<'db> Reader<'db> {
     /// runs with.
     fn called(
         &self,
-        scope: &Scope<'_, 'db>,
+        scope: &Scope<'db, DB>,
         call: &Function,
         arguments: usize,
-    ) -> Result<&'db CreateFunction, HelperSetError> {
+    ) -> Result<&'db DB::Function, HelperSetError> {
         let path = || scope.path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
         let mut reached = self.database.functions().filter(|function| {
             call_reaches(*function, &call.name, arguments, path, IdentifierCase::AsWritten)
@@ -580,12 +585,12 @@ impl<'db> Reader<'db> {
 
     fn grant_arm(
         &self,
-        scope: &Scope<'_, 'db>,
+        scope: &Scope<'db, DB>,
         select: &Select,
-        table: &ArmTable<'_, 'db>,
-        column: &'db Column,
+        table: &ArmTable<'_, 'db, DB>,
+        column: &'db DB::Column,
         selection: &Expr,
-    ) -> Result<Option<HelperArm<'db, ParserDB>>, HelperSetError> {
+    ) -> Result<Option<HelperArm<'db, DB>>, HelperSetError> {
         let mut conjuncts = Vec::new();
         conjunction(selection, &mut conjuncts);
         let mut caller = None;
@@ -650,10 +655,10 @@ impl<'db> Reader<'db> {
     /// The caller a grant arm compares a column to, where `conjunct` does.
     fn caller(
         &self,
-        scope: &Scope<'_, 'db>,
-        table: &ArmTable<'_, 'db>,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
         conjunct: &Expr,
-    ) -> Result<Option<Caller<'db>>, HelperSetError> {
+    ) -> Result<Option<Caller<'db, DB>>, HelperSetError> {
         let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = unnest(conjunct) else {
             return Ok(None);
         };
@@ -680,10 +685,10 @@ impl<'db> Reader<'db> {
 
     fn operand(
         &self,
-        scope: &Scope<'_, 'db>,
-        table: &ArmTable<'_, 'db>,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
         expression: &Expr,
-    ) -> Result<Operand<'db>, HelperSetError> {
+    ) -> Result<Operand<'db, DB>, HelperSetError> {
         let expression = unnest(expression);
         if let Some(column) = table.column(expression, self.database)? {
             return Ok(Operand::Column(column));
@@ -704,7 +709,7 @@ impl<'db> Reader<'db> {
 
     /// `current_setting('<name>'[, <missing_ok>])`, resolved to PostgreSQL's
     /// own function.
-    fn setting_read(&self, scope: &Scope<'_, 'db>, call: &Function) -> Option<Operand<'db>> {
+    fn setting_read(&self, scope: &Scope<'db, DB>, call: &Function) -> Option<Operand<'db, DB>> {
         // A qualifier built when the statement runs names no schema.
         let catalog = match qualifier_of(&call.name) {
             Qualifier::Named(schema, quoted) => {
@@ -747,10 +752,10 @@ impl<'db> Reader<'db> {
     /// What `condition` keeps, `None` where it reduces to no literal set.
     fn reduce(
         &self,
-        scope: &Scope<'_, 'db>,
-        table: &ArmTable<'_, 'db>,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
         condition: &Expr,
-    ) -> Result<Option<Kept<'db>>, HelperSetError> {
+    ) -> Result<Option<Kept<'db, DB>>, HelperSetError> {
         match unnest(condition) {
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
                 let (Some(left), Some(right)) =
@@ -832,16 +837,18 @@ impl<'db> Reader<'db> {
 }
 
 /// Binds each input parameter of `function` to its argument.
-fn parameters<'f>(
-    function: &'f CreateFunction,
+fn parameters<'db, F: FunctionLike>(
+    function: &'db F,
     arguments: &[Value],
     name: &str,
-) -> Result<Vec<Parameter<'f>>, HelperSetError> {
+    database: &'db F::DB,
+) -> Result<Vec<Parameter<'db>>, HelperSetError> {
+    let mut names = function.argument_names(database);
     let inputs: Vec<_> = function
-        .args
-        .iter()
-        .flatten()
-        .filter(|argument| !matches!(argument.mode, Some(ArgMode::Out)))
+        .argument_modes()
+        .map(|mode| (mode, names.next().flatten()))
+        .filter(|(mode, _)| *mode != ArgMode::Out)
+        .map(|(_, name)| name)
         .collect();
     if inputs.len() != arguments.len() {
         return Err(HelperSetError::ArgumentCount {
@@ -860,12 +867,24 @@ fn parameters<'f>(
                     argument: value.to_string(),
                 }
             })?;
-            Ok(Parameter {
-                name: input.name.as_ref(),
-                passed: Passed { literal, value: value.clone() },
-            })
+            Ok(Parameter { name: input, passed: Passed { literal, value: value.clone() } })
         })
         .collect()
+}
+
+/// Whether `function` is declared `RETURNS SETOF` one scalar type, which a
+/// `record` is not.
+fn returns_scalar_set<F: FunctionLike>(function: &F, database: &F::DB) -> bool {
+    if !function.return_type_name(database).is_some_and(|declared| declared.starts_with("SETOF ")) {
+        return false;
+    }
+    let Some(element) = function.result_type_name(database) else { return false };
+    // The element is read back as written, so a quoted `"RECORD"` names a
+    // type of its own rather than `record`.
+    let element = Parser::new(database.dialect().sqlparser_dialect())
+        .try_with_sql(&element)
+        .and_then(|mut parser| parser.parse_data_type());
+    !element.is_ok_and(|element| is_row(&element))
 }
 
 /// Whether a `SETOF` type is a row rather than one scalar.
@@ -873,6 +892,24 @@ fn is_row(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Custom(name, modifiers) if modifiers.is_empty()
         && object_name_last_part(name)
             .is_some_and(|(name, quoted)| identifiers_match(name, quoted, "record", false)))
+}
+
+/// The body of `function` as it is written, for an error naming it.
+fn written<F: FunctionLike>(function: &F) -> String {
+    let statements = |statements: &[Statement]| {
+        statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+    };
+    match function.written_body() {
+        Some(FunctionBody::Text(text)) => text.to_string(),
+        Some(FunctionBody::Expression(expression) | FunctionBody::Return(expression)) => {
+            expression.to_string()
+        }
+        Some(FunctionBody::Select(select)) => select.to_string(),
+        Some(FunctionBody::Statements(written) | FunctionBody::Atomic(written)) => {
+            statements(written)
+        }
+        None => String::new(),
+    }
 }
 
 /// Collects the `SELECT`s of a `UNION`, rendering the query that is not one
@@ -981,11 +1018,11 @@ fn conjunction<'q>(expression: &'q Expr, terms: &mut Vec<&'q Expr>) {
 }
 
 /// The foreign keys of `table` whose one host column is `column`.
-fn single_column_foreign_keys<'db>(
-    table: &'db Table,
-    column: &'db Column,
-    database: &'db ParserDB,
-) -> Result<Vec<&'db ForeignKey>, LookupError> {
+fn single_column_foreign_keys<'db, DB: DatabaseLike>(
+    table: &'db DB::Table,
+    column: &'db DB::Column,
+    database: &'db DB,
+) -> Result<Vec<&'db DB::ForeignKey>, LookupError> {
     let mut foreign_keys = Vec::new();
     for foreign_key in table.foreign_keys(database)? {
         let mut host = foreign_key.host_columns(database)?;

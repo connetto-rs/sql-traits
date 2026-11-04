@@ -31,15 +31,6 @@ impl CallScope<'_> {
     ) -> bool {
         call_reaches(function, called, arguments, || self.search_path.iter().copied(), self.case)
     }
-
-    /// The functions a call to `called` passing `arguments` arguments may run.
-    fn reached_by<'s>(
-        &'s self,
-        called: &'s ObjectName,
-        arguments: usize,
-    ) -> impl Iterator<Item = &'s Arc<CreateFunction>> {
-        self.functions.iter().filter(move |function| self.reaches(function, called, arguments))
-    }
 }
 
 /// Resolves every call in `node`, subqueries included, under `scope`, except
@@ -49,16 +40,13 @@ pub(super) fn calls_in<N: Visit + ?Sized>(
     scope: &CallScope<'_>,
     carried: &mut CarriedCalls,
 ) -> ExpressionCalls<CreateFunction> {
-    let mut sites = Vec::new();
-    let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
-        sites.push(
-            carried
-                .take(call.name, call.arguments)
-                .unwrap_or_else(|| scope.reached_by(call.name, call.arguments).cloned().collect()),
-        );
-        ControlFlow::Continue(())
-    });
-    ExpressionCalls::new(sites)
+    ExpressionCalls::resolve_carrying(
+        node,
+        scope.functions,
+        scope.search_path,
+        scope.case,
+        |name, arguments| carried.take(name, arguments),
+    )
 }
 
 /// The bindings the calls of a table's derived objects held before the table

@@ -1,11 +1,15 @@
 //! Submodule defining the functions each call of an expression may reach.
 
 use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
-use core::ops::ControlFlow;
+use core::{convert::Infallible, ops::ControlFlow};
 
-use sqlparser::ast::{Expr, Function};
+use sqlparser::ast::{Expr, Function, ObjectName, Visit};
 
-use crate::utils::call_sites::for_each_call;
+use crate::{
+    structs::IdentifierCase,
+    traits::FunctionLike,
+    utils::call_sites::{call_reaches, for_each_call},
+};
 
 /// The functions each call of an expression or a bound function body may
 /// reach, resolved under the search path of the statement that wrote it.
@@ -90,5 +94,97 @@ impl<F> Default for ExpressionCalls<F> {
 impl<F> Clone for ExpressionCalls<F> {
     fn clone(&self) -> Self {
         Self { sites: self.sites.clone(), functions: self.functions.clone() }
+    }
+}
+
+impl<F: FunctionLike> ExpressionCalls<F> {
+    /// Resolves every call in `node`, subqueries included, to the functions
+    /// among `functions` it may reach, in the order a pre-order walk meets the
+    /// calls.
+    ///
+    /// An unqualified call walks `search_path`, the path in force where the
+    /// call is written, as
+    /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by)
+    /// describes, and every overload accepting the call's argument count
+    /// counts. `case` decides how schema names compare. A parsed script
+    /// records the calls of its checks, policies and bound bodies this way.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use std::sync::Arc;
+    ///
+    /// use sql_traits::{prelude::*, structs::metadata::ExpressionCalls};
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect, parser::Parser};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE SCHEMA app;
+    ///      CREATE FUNCTION app.allowed(id INT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';",
+    /// )?;
+    /// let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
+    /// let expression = Parser::new(&PostgreSqlDialect {})
+    ///     .try_with_sql("app.allowed(id) AND allowed(id)")
+    ///     .and_then(|mut parser| parser.parse_expr())
+    ///     .expect("the expression parses");
+    /// let Expr::BinaryOp { left, right, .. } = &expression else { unreachable!() };
+    /// let (Expr::Function(qualified), Expr::Function(bare)) = (left.as_ref(), right.as_ref()) else {
+    ///     unreachable!()
+    /// };
+    ///
+    /// let calls = ExpressionCalls::resolve(
+    ///     &expression,
+    ///     &functions,
+    ///     &[("public", false)],
+    ///     IdentifierCase::AsWritten,
+    /// );
+    /// let reached = |call| {
+    ///     calls
+    ///         .reached_by(&expression, call)
+    ///         .expect("the call is in the expression")
+    ///         .map(|function| function.target_name().to_string())
+    ///         .collect::<Vec<_>>()
+    /// };
+    /// assert_eq!(reached(qualified), ["app.allowed"]);
+    /// // `app` is not on the path the call is written under.
+    /// assert!(reached(bare).is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn resolve<N: Visit + ?Sized>(
+        node: &N,
+        functions: &[Arc<F>],
+        search_path: &[(&str, bool)],
+        case: IdentifierCase,
+    ) -> Self {
+        Self::resolve_carrying(node, functions, search_path, case, |_, _| None)
+    }
+
+    /// Resolves every call in `node` as [`resolve`](Self::resolve) does,
+    /// except a call `carried` answers a binding for, which keeps it.
+    pub(crate) fn resolve_carrying<N: Visit + ?Sized>(
+        node: &N,
+        functions: &[Arc<F>],
+        search_path: &[(&str, bool)],
+        case: IdentifierCase,
+        mut carried: impl FnMut(&ObjectName, usize) -> Option<Vec<Arc<F>>>,
+    ) -> Self {
+        let path = || search_path.iter().copied();
+        let mut sites = Vec::new();
+        let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
+            let site = carried(call.name, call.arguments).unwrap_or_else(|| {
+                functions
+                    .iter()
+                    .filter(|function| {
+                        call_reaches(function.as_ref(), call.name, call.arguments, path, case)
+                    })
+                    .cloned()
+                    .collect()
+            });
+            sites.push(site);
+            ControlFlow::Continue(())
+        });
+        Self::new(sites)
     }
 }
