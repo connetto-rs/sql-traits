@@ -1,6 +1,7 @@
 //! Generic database schema representations and utilities.
 
 mod builder;
+pub(crate) mod builtin_functions;
 mod database;
 mod profile;
 mod sqlparser;
@@ -108,6 +109,9 @@ pub struct GenericDB<P: SchemaProfile> {
     /// Folded key to the stored function keys reaching it, on the terms of
     /// [`Self::folded_relation_index`].
     folded_function_index: BTreeMap<RelationKey, Vec<RelationKey>>,
+    /// The functions the engine provides without a declaration, less those
+    /// [`Self::functions`] took over or the input dropped.
+    builtins: builtin_functions::Builtins<P::Function>,
     /// List of triggers created in the database.
     triggers: Vec<Stored<P::Trigger>>,
     /// List of rewrite rules created in the database.
@@ -159,6 +163,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("unique_indices", &self.unique_indices.len())
             .field("foreign_keys", &self.foreign_keys.len())
             .field("functions", &self.functions.len())
+            .field("builtins", &self.builtins.len())
             .field("triggers", &self.triggers.len())
             .field("rules", &self.rules.len())
             .field("extensions", &self.extensions.len())
@@ -221,6 +226,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             function_index: self.function_index.clone(),
             folded_relation_index: self.folded_relation_index.clone(),
             folded_function_index: self.folded_function_index.clone(),
+            builtins: self.builtins.clone(),
         }
     }
 }
@@ -492,6 +498,7 @@ impl<P: SchemaProfile> GenericDB<P> {
         self.functions
             .iter()
             .find_map(|(candidate, metadata)| (candidate.as_ref() == function).then_some(metadata))
+            .or_else(|| self.builtins.metadata(function))
     }
 
     /// Returns a reference of the trigger by name.

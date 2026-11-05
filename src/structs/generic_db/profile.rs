@@ -64,8 +64,9 @@ pub trait SchemaProfile: Sized {
     type UniqueIndex: UniqueIndexLike<DB = GenericDB<Self>>;
     /// The foreign keys the schema holds.
     type ForeignKey: ForeignKeyLike<DB = GenericDB<Self>>;
-    /// The functions the schema holds.
-    type Function: FunctionLike<DB = GenericDB<Self>>;
+    /// The functions the schema holds, owned so the functions an engine
+    /// provides can be shared by every database of the process.
+    type Function: FunctionLike<DB = GenericDB<Self>> + 'static;
     /// The check constraints the schema holds.
     type CheckConstraint: CheckConstraintLike<DB = GenericDB<Self>>;
     /// The triggers the schema holds.

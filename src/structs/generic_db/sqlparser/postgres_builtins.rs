@@ -1,126 +1,45 @@
-//! The PostgreSQL functions a schema calls without declaring them.
+//! The functions PostgreSQL 18 provides in `pg_catalog`, which a schema calls
+//! without declaring them.
 
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use core::ops::Range;
 
+use once_cell::race::OnceBox;
 use sqlparser::{
     ast::{
-        ArgMode, ArrayElemTypeDef, CreateFunction, CreateFunctionBody, DataType, ExactNumberInfo,
-        Expr, FunctionBehavior, FunctionCalledOnNull, FunctionReturnType, Ident, ObjectName,
-        ObjectNamePart, OperateFunctionArg, TimezoneInfo, Value, ValueWithSpan,
+        CreateFunction, CreateFunctionBody, DataType, Expr, FunctionBehavior, FunctionCalledOnNull,
+        FunctionReturnType, Ident, ObjectName, ObjectNamePart, OperateFunctionArg, Statement,
+        Value, ValueWithSpan,
     },
+    dialect::PostgreSqlDialect,
+    parser::Parser,
     tokenizer::Span,
 };
 
-use crate::structs::{FunctionKind, metadata::FunctionMetadata};
+use super::postgres_18_functions::POSTGRES_18_FUNCTIONS;
+use crate::{
+    structs::{
+        FunctionKind,
+        generic_db::{Stored, builtin_functions::BuiltinTable},
+        metadata::FunctionMetadata,
+    },
+    utils::{null_returning_positions, object_name::PG_CATALOG},
+};
 
-/// The type of a builtin's argument or result.
+/// `pg_proc.proisstrict`.
 #[derive(Clone, Copy)]
-pub(super) enum BuiltinType {
-    /// The `"any"` pseudo-type, which accepts a value of any type and decides
-    /// nothing about the result.
-    Any,
-    /// A `VARIADIC "any"` parameter, which gathers the remaining arguments.
-    VariadicAny,
-    /// `anyelement`, bound to the type of its argument.
-    AnyElement,
-    /// `anynonarray`, bound like `anyelement` to a type that is not an array.
-    AnyNonArray,
-    /// `anyarray`, an array of the type `anyelement` binds.
-    AnyArray,
-    /// `anycompatible`, the common type of its arguments.
-    AnyCompatible,
-    /// A `VARIADIC anycompatiblearray` parameter, whose arguments each bind
-    /// `anycompatible`.
-    VariadicAnyCompatible,
-    Text,
-    TextArray,
-    Boolean,
-    SmallInt,
-    Int,
-    BigInt,
-    Real,
-    Money,
-    Numeric,
-    DoublePrecision,
-    Bytea,
-    Uuid,
-    Date,
-    Interval,
-    Time,
-    TimeTz,
-    Timestamp,
-    TimestampTz,
-}
-
-/// A type PostgreSQL names by a plain identifier rather than a keyword.
-fn named_type(name: &'static str) -> DataType {
-    DataType::Custom(ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]), vec![])
-}
-
-impl BuiltinType {
-    fn data_type(self) -> DataType {
-        match self {
-            Self::Any | Self::VariadicAny => {
-                DataType::Custom(
-                    ObjectName(vec![ObjectNamePart::Identifier(Ident::with_quote('"', "any"))]),
-                    vec![],
-                )
-            }
-            Self::AnyElement => named_type("anyelement"),
-            Self::AnyNonArray => named_type("anynonarray"),
-            Self::AnyArray => named_type("anyarray"),
-            Self::AnyCompatible => named_type("anycompatible"),
-            Self::VariadicAnyCompatible => named_type("anycompatiblearray"),
-            Self::Text => DataType::Text,
-            Self::TextArray => {
-                DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(DataType::Text), None))
-            }
-            Self::Boolean => DataType::Boolean,
-            Self::SmallInt => DataType::SmallInt(None),
-            Self::Int => DataType::Int(None),
-            Self::BigInt => DataType::BigInt(None),
-            Self::Real => DataType::Real,
-            Self::Money => named_type("money"),
-            Self::Numeric => DataType::Numeric(ExactNumberInfo::None),
-            Self::DoublePrecision => DataType::DoublePrecision,
-            Self::Bytea => DataType::Bytea,
-            Self::Uuid => DataType::Uuid,
-            Self::Date => DataType::Date,
-            Self::Interval => DataType::Interval { fields: None, precision: None },
-            Self::Time => DataType::Time(None, TimezoneInfo::None),
-            Self::TimeTz => DataType::Time(None, TimezoneInfo::WithTimeZone),
-            Self::Timestamp => DataType::Timestamp(None, TimezoneInfo::None),
-            Self::TimestampTz => DataType::Timestamp(None, TimezoneInfo::WithTimeZone),
-        }
-    }
-
-    /// Whether a parameter of this type gathers the remaining arguments.
-    fn is_variadic(self) -> bool {
-        matches!(self, Self::VariadicAny | Self::VariadicAnyCompatible)
-    }
-}
-
-/// What a `NULL` argument does to a builtin's call.
-#[derive(Clone, Copy)]
-enum NullInput {
-    /// `pg_proc.proisstrict` is true, so any `NULL` argument makes the call
-    /// `NULL`.
+pub(super) enum NullInput {
+    /// Any `NULL` argument makes the call `NULL`.
     Strict,
-    /// Not strict, a name without a `pg_proc` row included.
+    /// The function runs on `NULL` arguments.
     CalledOnNull,
-    /// Not strict, yet `NULL` at these argument positions makes the call
-    /// `NULL`.
-    NullAt(&'static [usize]),
 }
 
-/// `pg_proc.provolatile`, a `Copy` stand-in for [`FunctionBehavior`] so a row
-/// can be read out of the static table.
+/// `pg_proc.provolatile`.
 #[derive(Clone, Copy)]
 pub(super) enum Volatility {
     Immutable,
     Stable,
-    /// Also the answer for a name without a `pg_proc` row, as for a
-    /// `CREATE FUNCTION` that states none.
     Volatile,
 }
 
@@ -134,68 +53,114 @@ impl Volatility {
     }
 }
 
-/// One builtin overload: its name, arguments, result, null-input behavior,
-/// volatility and `pg_proc.prokind`.
+/// `pg_proc.prolang`, among the languages `pg_catalog` functions are written
+/// in.
 #[derive(Clone, Copy)]
-pub(super) struct PostgresBuiltin(
-    &'static str,
-    &'static [BuiltinType],
-    BuiltinType,
-    NullInput,
-    Volatility,
-    FunctionKind,
-);
+pub(super) enum Language {
+    Internal,
+    C,
+    Sql,
+}
+
+impl Language {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::C => "c",
+            Self::Sql => "sql",
+        }
+    }
+}
+
+/// One `pg_proc` row: the function's name, its parameters as
+/// `pg_get_function_arguments` spells them, its result as
+/// `pg_get_function_result` does, its strictness, volatility, kind and
+/// language.
+pub(super) struct PostgresBuiltin {
+    name: &'static str,
+    arguments: &'static str,
+    result: &'static str,
+    null_input: NullInput,
+    volatility: Volatility,
+    kind: FunctionKind,
+    language: Language,
+}
+
+/// A row of [`POSTGRES_18_FUNCTIONS`].
+pub(super) const fn builtin(
+    name: &'static str,
+    arguments: &'static str,
+    result: &'static str,
+    null_input: NullInput,
+    volatility: Volatility,
+    kind: FunctionKind,
+    language: Language,
+) -> PostgresBuiltin {
+    PostgresBuiltin { name, arguments, result, null_input, volatility, kind, language }
+}
 
 impl PostgresBuiltin {
-    /// The declaration, qualified by `pg_catalog` so a user function may
-    /// shadow it the way the server allows.
-    pub(super) fn function(&self) -> CreateFunction {
-        let Self(name, arguments, returns, null_input, volatility, _) = *self;
+    /// The declaration in `pg_catalog`, so a user function may shadow it the
+    /// way the server allows.
+    fn function(&self) -> Option<CreateFunction> {
+        let name = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new(PG_CATALOG)),
+            ObjectNamePart::Identifier(stored_ident(self.name)),
+        ]);
         declaration(
-            ObjectName(vec![
-                ObjectNamePart::Identifier(Ident::new("pg_catalog")),
-                ObjectNamePart::Identifier(Ident::new(name)),
-            ]),
-            arguments.iter().map(|argument| parameter(None, *argument)).collect(),
-            returns,
-            matches!(null_input, NullInput::Strict),
-            volatility,
-            "internal",
+            name,
+            self.arguments,
+            self.result,
+            matches!(self.null_input, NullInput::Strict),
+            self.volatility,
+            self.language,
         )
     }
 
-    pub(super) fn metadata(&self) -> FunctionMetadata {
+    fn metadata(&self) -> FunctionMetadata {
         let mut metadata = FunctionMetadata::default();
-        if let NullInput::NullAt(positions) = self.3 {
+        if let Some(positions) = null_returning_positions(self.name, |types| {
+            self.arguments.split(", ").eq(types.iter().copied())
+        }) {
             metadata.set_null_returning_arguments(positions);
         }
-        metadata.set_kind(self.5);
+        metadata.set_kind(self.kind);
         metadata
     }
 }
 
-/// A parameter of type `data_type`, called `name` when it has one.
-pub(super) fn parameter(name: Option<&'static str>, data_type: BuiltinType) -> OperateFunctionArg {
-    OperateFunctionArg {
-        // A mode, since `VARIADIC` as a name would invent such an argument.
-        mode: data_type.is_variadic().then_some(ArgMode::Variadic),
-        name: name.map(Ident::new),
-        data_type: data_type.data_type(),
-        default_expr: None,
+/// An identifier holding `name` as `pg_proc` stores it, quoted when folding
+/// would change it.
+fn stored_ident(name: &str) -> Ident {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Ident::with_quote('"', name)
+    } else {
+        Ident::new(name)
     }
 }
 
 /// The declaration of a function the server provides, whose body the input
-/// never sees.
+/// never sees, from its parameter list and result as PostgreSQL prints them.
+///
+/// [`None`] when sqlparser does not read that list or result.
 pub(super) fn declaration(
     name: ObjectName,
-    args: Vec<OperateFunctionArg>,
-    returns: BuiltinType,
+    arguments: &str,
+    result: &str,
     strict: bool,
     volatility: Volatility,
-    language: &str,
-) -> CreateFunction {
-    server_function(name, args, returns.data_type(), strict, volatility, language)
+    language: Language,
+) -> Option<CreateFunction> {
+    let sql = format!(
+        "CREATE FUNCTION f({arguments}) RETURNS {result} LANGUAGE {} AS ''",
+        language.name()
+    );
+    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, &sql).ok()?;
+    let Some(Statement::CreateFunction(mut function)) = statements.pop() else { return None };
+    function.name = name;
+    function.behavior = Some(volatility.behavior());
+    function.called_on_null = strict.then_some(FunctionCalledOnNull::Strict);
+    Some(function)
 }
 
 /// The declaration of a function the server provides returning `returns`,
@@ -241,153 +206,84 @@ pub(super) fn server_function(
     }
 }
 
-use BuiltinType::{
-    Any, AnyArray, AnyCompatible, AnyElement, AnyNonArray, BigInt, Boolean, Bytea, Date,
-    DoublePrecision, Int, Interval, Money, Numeric, Real, SmallInt, Text, TextArray, Time, TimeTz,
-    Timestamp, TimestampTz, Uuid, VariadicAny, VariadicAnyCompatible,
-};
-use FunctionKind::{Aggregate, Normal, Window};
-use NullInput::{CalledOnNull, NullAt, Strict};
-use Volatility::{Immutable, Stable, Volatile};
+/// [`POSTGRES_18_FUNCTIONS`], each row declared the first time a database
+/// reaches it.
+pub(super) struct Postgres18Functions;
 
-/// The builtins a parsed schema can call, strict, volatile and of the kind
-/// PostgreSQL 18 declares. The SQL value functions such as `current_date` have
-/// no `pg_proc` row, and the planner holds every one of them stable. An
-/// aggregate's own row is never strict, since the strictness of its transition
-/// function decides which input rows it skips.
-pub(super) static POSTGRES_BUILTINS: &[PostgresBuiltin] = &[
-    PostgresBuiltin("length", &[Text], Int, Strict, Immutable, Normal),
-    PostgresBuiltin("len", &[Text], Int, CalledOnNull, Volatile, Normal),
-    PostgresBuiltin("char_length", &[Text], Int, Strict, Immutable, Normal),
-    PostgresBuiltin("character_length", &[Text], Int, Strict, Immutable, Normal),
-    PostgresBuiltin("octet_length", &[Text], Int, Strict, Immutable, Normal),
-    PostgresBuiltin("lower", &[Text], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("upper", &[Text], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("btrim", &[Text], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("btrim", &[Text, Text], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("split_part", &[Text, Text, Int], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("string_to_array", &[Text, Text], TextArray, NullAt(&[0]), Immutable, Normal),
-    PostgresBuiltin(
-        "string_to_array",
-        &[Text, Text, Text],
-        TextArray,
-        NullAt(&[0]),
-        Immutable,
-        Normal,
-    ),
-    PostgresBuiltin("current_setting", &[Text], Text, Strict, Stable, Normal),
-    PostgresBuiltin("current_setting", &[Text, Boolean], Text, Strict, Stable, Normal),
-    // No `pg_proc` row, so `COALESCE` and `NULLIF` follow their expressions.
-    PostgresBuiltin(
-        "coalesce",
-        &[VariadicAnyCompatible],
-        AnyCompatible,
-        CalledOnNull,
-        Immutable,
-        Normal,
-    ),
-    PostgresBuiltin("nullif", &[AnyElement, Any], AnyElement, NullAt(&[0]), Immutable, Normal),
-    PostgresBuiltin("decode", &[Text, Text], Bytea, Strict, Immutable, Normal),
-    PostgresBuiltin("now", &[], TimestampTz, Strict, Stable, Normal),
-    PostgresBuiltin("current_timestamp", &[], TimestampTz, CalledOnNull, Stable, Normal),
-    PostgresBuiltin("current_date", &[], Date, CalledOnNull, Stable, Normal),
-    PostgresBuiltin("current_time", &[], TimeTz, CalledOnNull, Stable, Normal),
-    PostgresBuiltin("localtimestamp", &[], Timestamp, CalledOnNull, Stable, Normal),
-    PostgresBuiltin("localtime", &[], Time, CalledOnNull, Stable, Normal),
-    PostgresBuiltin("gen_random_uuid", &[], Uuid, Strict, Volatile, Normal),
-    PostgresBuiltin("uuidv4", &[], Uuid, Strict, Volatile, Normal),
-    PostgresBuiltin("uuidv7", &[], Uuid, Strict, Volatile, Normal),
-    PostgresBuiltin("uuidv7", &[Interval], Uuid, Strict, Volatile, Normal),
-    // `count(*)` calls the parameterless overload.
-    PostgresBuiltin("count", &[], BigInt, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("count", &[Any], BigInt, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[SmallInt], BigInt, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[Int], BigInt, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[BigInt], Numeric, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[Real], Real, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[DoublePrecision], DoublePrecision, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[Numeric], Numeric, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[Money], Money, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("sum", &[Interval], Interval, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("avg", &[SmallInt], Numeric, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("avg", &[Int], Numeric, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("avg", &[BigInt], Numeric, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("avg", &[Real], DoublePrecision, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("avg", &[DoublePrecision], DoublePrecision, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("avg", &[Numeric], Numeric, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("avg", &[Interval], Interval, CalledOnNull, Immutable, Aggregate),
-    // `anyelement` stands for the `min` and `max` of every ordered type.
-    PostgresBuiltin("min", &[AnyElement], AnyElement, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("max", &[AnyElement], AnyElement, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("array_agg", &[AnyNonArray], AnyArray, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("array_agg", &[AnyArray], AnyArray, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("string_agg", &[Text, Text], Text, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("bool_and", &[Boolean], Boolean, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("bool_or", &[Boolean], Boolean, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("every", &[Boolean], Boolean, CalledOnNull, Immutable, Aggregate),
-    // The hypothetical-set aggregates, called `rank(...) WITHIN GROUP (ORDER BY
-    // ...)`, share their names with the window functions below.
-    PostgresBuiltin("rank", &[VariadicAny], BigInt, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin("dense_rank", &[VariadicAny], BigInt, CalledOnNull, Immutable, Aggregate),
-    PostgresBuiltin(
-        "percent_rank",
-        &[VariadicAny],
-        DoublePrecision,
-        CalledOnNull,
-        Immutable,
-        Aggregate,
-    ),
-    PostgresBuiltin(
-        "cume_dist",
-        &[VariadicAny],
-        DoublePrecision,
-        CalledOnNull,
-        Immutable,
-        Aggregate,
-    ),
-    PostgresBuiltin("row_number", &[], BigInt, CalledOnNull, Immutable, Window),
-    PostgresBuiltin("rank", &[], BigInt, CalledOnNull, Immutable, Window),
-    PostgresBuiltin("dense_rank", &[], BigInt, CalledOnNull, Immutable, Window),
-    PostgresBuiltin("percent_rank", &[], DoublePrecision, CalledOnNull, Immutable, Window),
-    PostgresBuiltin("cume_dist", &[], DoublePrecision, CalledOnNull, Immutable, Window),
-    PostgresBuiltin("ntile", &[Int], Int, Strict, Immutable, Window),
-    PostgresBuiltin("lag", &[AnyElement], AnyElement, Strict, Immutable, Window),
-    PostgresBuiltin("lag", &[AnyElement, Int], AnyElement, Strict, Immutable, Window),
-    PostgresBuiltin(
-        "lag",
-        &[AnyCompatible, Int, AnyCompatible],
-        AnyCompatible,
-        Strict,
-        Immutable,
-        Window,
-    ),
-    PostgresBuiltin("lead", &[AnyElement], AnyElement, Strict, Immutable, Window),
-    PostgresBuiltin("lead", &[AnyElement, Int], AnyElement, Strict, Immutable, Window),
-    PostgresBuiltin(
-        "lead",
-        &[AnyCompatible, Int, AnyCompatible],
-        AnyCompatible,
-        Strict,
-        Immutable,
-        Window,
-    ),
-    PostgresBuiltin("first_value", &[AnyElement], AnyElement, Strict, Immutable, Window),
-    PostgresBuiltin("last_value", &[AnyElement], AnyElement, Strict, Immutable, Window),
-    PostgresBuiltin("nth_value", &[AnyElement, Int], AnyElement, Strict, Immutable, Window),
-    PostgresBuiltin("current_user", &[], Text, Strict, Stable, Normal),
-    PostgresBuiltin("session_user", &[], Text, Strict, Stable, Normal),
-    PostgresBuiltin("user", &[], Text, CalledOnNull, Stable, Normal),
-    PostgresBuiltin("random", &[], DoublePrecision, Strict, Volatile, Normal),
-    PostgresBuiltin("random", &[Int, Int], Int, Strict, Volatile, Normal),
-    PostgresBuiltin("random", &[BigInt, BigInt], BigInt, Strict, Volatile, Normal),
-    PostgresBuiltin("random", &[Numeric, Numeric], Numeric, Strict, Volatile, Normal),
-    PostgresBuiltin("clock_timestamp", &[], TimestampTz, Strict, Volatile, Normal),
-    PostgresBuiltin("statement_timestamp", &[], TimestampTz, Strict, Stable, Normal),
-    PostgresBuiltin("transaction_timestamp", &[], TimestampTz, Strict, Stable, Normal),
-    PostgresBuiltin("timeofday", &[], Text, Strict, Volatile, Normal),
-    PostgresBuiltin("md5", &[Text], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("substring", &[Text, Int], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("substring", &[Text, Int, Int], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("substring", &[Text, Text], Text, Strict, Immutable, Normal),
-    PostgresBuiltin("substring", &[Text, Text, Text], Text, Strict, Immutable, Normal),
-];
+/// The one table of PostgreSQL 18's builtins every database shares.
+pub(super) static POSTGRES_18_BUILTINS: Postgres18Functions = Postgres18Functions;
+
+/// The declaration of each row of [`POSTGRES_18_FUNCTIONS`], set once.
+static DECLARED: [OnceBox<Option<Stored<CreateFunction>>>; POSTGRES_18_FUNCTIONS.len()] =
+    [const { OnceBox::new() }; POSTGRES_18_FUNCTIONS.len()];
+
+/// `name` folded as PostgreSQL folds an unquoted identifier, byte by byte.
+fn folded_bytes(name: &str) -> impl Iterator<Item = u8> + '_ {
+    name.bytes().map(|byte| byte.to_ascii_lowercase())
+}
+
+impl BuiltinTable<CreateFunction> for Postgres18Functions {
+    fn schema(&self) -> &'static str {
+        PG_CATALOG
+    }
+
+    fn len(&self) -> usize {
+        POSTGRES_18_FUNCTIONS.len()
+    }
+
+    fn rows_folding_to(&self, folded: &str) -> Range<usize> {
+        let start =
+            POSTGRES_18_FUNCTIONS.partition_point(|row| folded_bytes(row.name).lt(folded.bytes()));
+        let end =
+            POSTGRES_18_FUNCTIONS.partition_point(|row| folded_bytes(row.name).le(folded.bytes()));
+        start..end
+    }
+
+    fn name(&self, row: usize) -> &'static str {
+        POSTGRES_18_FUNCTIONS.get(row).map_or("", |row| row.name)
+    }
+
+    fn function(&self, row: usize) -> Option<&'static Stored<CreateFunction>> {
+        let builtin = POSTGRES_18_FUNCTIONS.get(row)?;
+        DECLARED
+            .get(row)?
+            .get_or_init(|| {
+                Box::new(
+                    builtin.function().map(|function| (Arc::new(function), builtin.metadata())),
+                )
+            })
+            .as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::{POSTGRES_18_BUILTINS, POSTGRES_18_FUNCTIONS, folded_bytes};
+    use crate::structs::generic_db::builtin_functions::BuiltinTable;
+
+    #[test]
+    fn every_row_declares_its_function() {
+        let undeclared: Vec<_> = (0..POSTGRES_18_FUNCTIONS.len())
+            .filter(|row| POSTGRES_18_BUILTINS.function(*row).is_none())
+            .map(|row| {
+                let builtin = &POSTGRES_18_FUNCTIONS[row];
+                (builtin.name, builtin.arguments, builtin.result)
+            })
+            .collect();
+        assert!(undeclared.is_empty(), "rows sqlparser cannot declare: {undeclared:?}");
+    }
+
+    /// A lookup reads the rows of one folded name, and within them those of
+    /// one stored name, as adjacent runs.
+    #[test]
+    fn rows_are_sorted_by_folded_then_stored_name() {
+        assert!(POSTGRES_18_FUNCTIONS.windows(2).all(|pair| {
+            folded_bytes(pair[0].name)
+                .cmp(folded_bytes(pair[1].name))
+                .then_with(|| pair[0].name.cmp(pair[1].name))
+                .is_le()
+        }));
+    }
+}

@@ -18,7 +18,7 @@ use crate::{
     traits::DatabaseLike,
     utils::{
         call_sites::{Call, call_reaches, for_each_call},
-        object_name::{Qualifier, qualifier_of},
+        object_name::{Qualifier, object_name_last_part, qualifier_of},
     },
 };
 
@@ -64,7 +64,8 @@ impl<'db, 'path, DB: DatabaseLike> CallCollector<'db, 'path, DB> {
                 }
             }
         };
-        for function in database.functions().filter(|function| reaches(function)) {
+        let Some((called, _)) = object_name_last_part(name) else { return Ok(()) };
+        for function in database.functions_named(called).filter(|function| reaches(function)) {
             if !self.functions.iter().any(|seen| core::ptr::eq(*seen, function)) {
                 self.functions.push(function);
             }

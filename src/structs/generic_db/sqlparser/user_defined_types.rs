@@ -47,7 +47,6 @@ use crate::{
     structs::{IdentifierCase, UserDefinedType, metadata::ExpressionCalls},
     traits::{DomainLike, UserDefinedTypeKind, UserDefinedTypeLike},
     utils::{
-        call_sites::call_reaches,
         identifier_resolution::normalize_identifier,
         object_name::{Qualifier, object_name_identifiers, qualifier_of},
     },
@@ -243,21 +242,18 @@ fn definition_function_calls(
 ) -> ExpressionCalls<CreateFunction> {
     let functions = builder.function_arc_vec();
     let search_path: Vec<(&str, bool)> = builder.search_path().collect();
-    let case = builder.identifier_case();
+    let scope = super::calls_in_expression::CallScope {
+        functions: &functions,
+        builtins: builder.builtins(),
+        search_path: &search_path,
+        case: builder.identifier_case(),
+    };
     let sites = names
         .iter()
         .map(|(name, arguments)| {
-            functions
-                .iter()
-                .filter(|function| {
-                    call_reaches(
-                        function.as_ref(),
-                        name,
-                        *arguments,
-                        || search_path.iter().copied(),
-                        case,
-                    )
-                })
+            scope
+                .candidates(name)
+                .filter(|function| scope.reaches(function, name, *arguments))
                 .cloned()
                 .collect()
         })

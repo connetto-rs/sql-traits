@@ -84,7 +84,7 @@ impl TriggerLike for CreateTrigger {
         let (name, quoted) = object_name_last_part(called)?;
         let name = normalize_identifier(name, quoted);
         let schema = in_schema(qualifier_of(called).named());
-        database.functions().find(|function| {
+        database.functions_named(&name).find(|function| {
             let target = function.target_name();
             function
                 .args

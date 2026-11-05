@@ -11,7 +11,7 @@ use crate::{
         ColumnIdentity, GenericDB, IdentifierCase, RelationIdentity, SchemaProfile, TargetName,
         generic_db::{Identified, RelationSlot},
     },
-    traits::{DatabaseLike, Relation, TableLike},
+    traits::{DatabaseLike, FunctionLike, Relation, TableLike},
     utils::object_name::{
         RelationKey, function_has_stored_identity, function_search_path, relation_search_path,
         render_relation, render_sequence_candidate, render_table_candidate, render_view_candidate,
@@ -396,7 +396,20 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
 
     #[inline]
     fn functions(&self) -> impl Iterator<Item = &Self::Function> {
-        self.functions.iter().map(|(func, _)| func.as_ref())
+        self.functions
+            .iter()
+            .chain(self.builtins.functions())
+            .map(|(function, _)| function.as_ref())
+    }
+
+    fn functions_named<'db>(&'db self, name: &str) -> impl Iterator<Item = &'db Self::Function> {
+        self.functions
+            .iter()
+            .filter(move |(function, _)| {
+                IdentifierCase::Folded.identifiers_match(function.name(), false, name, false)
+            })
+            .chain(self.builtins.named(name))
+            .map(|(function, _)| function.as_ref())
     }
 
     fn function_by_stored_identity(
@@ -672,25 +685,40 @@ impl<P: SchemaProfile> GenericDB<P> {
         })
     }
 
-    /// Functions whose stored identity equals `key`, in storage order.
-    fn indexed_functions(&self, key: &RelationKey) -> impl Iterator<Item = &P::Function> {
+    /// Functions whose stored identity equals `key`, the database's own in
+    /// storage order before the provided ones.
+    fn indexed_functions<'db, 'key>(
+        &'db self,
+        key: &'key RelationKey,
+    ) -> impl Iterator<Item = &'db P::Function> + use<'db, 'key, P> {
         self.function_index
             .get(key)
             .map_or(&[][..], Vec::as_slice)
             .iter()
             .filter_map(|position| self.functions.get(*position))
+            .chain(self.builtins.keyed(key, false))
             .map(|(function, _)| function.as_ref())
     }
 
-    /// Functions a probe accepts, in storage order.
+    /// Functions a probe accepts, the database's own in storage order before
+    /// the provided ones.
     fn probed_functions<'db>(&'db self, probe: &IndexProbe) -> Vec<&'db P::Function> {
         let aliases: &[RelationKey] = if probe.aliases {
             self.folded_function_index.get(&probe.key).map_or(&[][..], Vec::as_slice)
         } else {
             &[]
         };
-        self.indexed_functions(&probe.key)
-            .chain(aliases.iter().flat_map(|key| self.indexed_functions(key)))
+        let own = |key: &RelationKey| {
+            self.function_index
+                .get(key)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(|position| self.functions.get(*position))
+        };
+        own(&probe.key)
+            .chain(aliases.iter().flat_map(own))
+            .chain(self.builtins.keyed(&probe.key, probe.aliases))
+            .map(|(function, _)| function.as_ref())
             .filter(|function| {
                 probe.accepts(|| stored_function_key(*function, IdentifierCase::Exact))
             })

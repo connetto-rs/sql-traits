@@ -12,7 +12,10 @@ use crate::{
     structs::{
         ColumnIdentity, GenericDB, IdentifierCase, IdentityCounter, Meta, RelationIdentity,
         SchemaProfile,
-        generic_db::{Identified, RelationSlot, Stored},
+        generic_db::{
+            Identified, RelationSlot, Stored,
+            builtin_functions::{BuiltinTable, Builtins},
+        },
     },
     traits::{
         DomainLike, ExtensionLike, FunctionLike, PolicyLike, RoleLike, RuleLike, SchemaLike,
@@ -108,6 +111,9 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     foreign_keys: Vec<Stored<P::ForeignKey>>,
     /// List of functions created in the database.
     functions: Vec<Stored<P::Function>>,
+    /// The functions the engine provides without a declaration, less those
+    /// [`Self::functions`] took over or the input dropped.
+    builtins: Builtins<P::Function>,
     /// List of triggers created in the database.
     triggers: Vec<Stored<P::Trigger>>,
     /// List of rewrite rules created in the database.
@@ -160,6 +166,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             unique_indices: self.unique_indices.clone(),
             foreign_keys: self.foreign_keys.clone(),
             functions: self.functions.clone(),
+            builtins: self.builtins.clone(),
             triggers: self.triggers.clone(),
             rules: self.rules.clone(),
             extensions: self.extensions.clone(),
@@ -226,6 +233,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             unique_indices: Vec::new(),
             foreign_keys: Vec::new(),
             functions: Vec::new(),
+            builtins: Builtins::none(),
             triggers: Vec::new(),
             rules: Vec::new(),
             extensions: Vec::new(),
@@ -425,6 +433,26 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &self.functions
     }
 
+    /// Returns the functions the engine provides that this builder still
+    /// reaches through the shared table.
+    pub(crate) fn builtins(&self) -> &Builtins<P::Function> {
+        &self.builtins
+    }
+
+    /// Moves the provided functions named as `name` folds into the builder's
+    /// own store, where a statement naming one of them can alter or drop it.
+    pub(crate) fn take_builtins_named(&mut self, name: &str) {
+        let taken = self.builtins.take_named(name);
+        self.functions.extend(taken);
+    }
+
+    /// Moves every provided function into the builder's own store, as
+    /// [`Self::take_builtins_named`] does for one name.
+    pub(crate) fn take_all_builtins(&mut self) {
+        let taken = self.builtins.take_all();
+        self.functions.extend(taken);
+    }
+
     /// Returns a slice of table grant Arc references with their metadata.
     pub(crate) fn table_grants(&self) -> &[Stored<P::TableGrant>] {
         &self.table_grants
@@ -539,6 +567,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             unique_indices: Vec::new(),
             foreign_keys: Vec::new(),
             functions: Vec::new(),
+            builtins: Builtins::none(),
             triggers: Vec::new(),
             rules: Vec::new(),
             extensions: Vec::new(),
@@ -570,6 +599,13 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     #[inline]
     pub fn with_identifier_case(mut self, case: IdentifierCase) -> Self {
         self.identifier_case = case;
+        self
+    }
+
+    /// Reaches the functions `table` provides without a declaration.
+    #[must_use]
+    pub(crate) fn with_builtins(mut self, table: &'static dyn BuiltinTable<P::Function>) -> Self {
+        self.builtins = Builtins::of(table);
         self
     }
 
@@ -1054,6 +1090,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             unique_indices,
             foreign_keys,
             functions,
+            builtins,
             function_index: _,
             folded_function_index: _,
             triggers,
@@ -1089,6 +1126,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             unique_indices,
             foreign_keys,
             functions,
+            builtins,
             triggers,
             rules,
             extensions,
@@ -1254,6 +1292,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             unique_indices: self.unique_indices,
             foreign_keys: self.foreign_keys,
             functions: self.functions,
+            builtins: self.builtins,
             function_index,
             folded_function_index,
             triggers: self.triggers,

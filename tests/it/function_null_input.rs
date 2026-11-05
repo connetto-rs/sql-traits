@@ -11,7 +11,7 @@ fn db(sql: &str) -> ParserDB {
 
 use crate::support::function_overloads::overload;
 
-/// What PostgreSQL 18 declares for every builtin this crate registers.
+/// What PostgreSQL 18 declares for a sample of the builtins in `pg_catalog`.
 mod builtins {
     use FunctionBehavior::{Immutable, Stable, Volatile};
     use FunctionCalledOnNull::{CalledOnNullInput as Called, Strict};
@@ -29,12 +29,8 @@ mod builtins {
         FunctionKind,
     );
 
-    // The SQL value functions such as `current_date` have no `pg_proc` row,
-    // and the planner holds them stable.
     pub(super) const EXPECTED: &[Row] = &[
         ("length", &["text"], Strict, &[true, false], Immutable, Normal),
-        // Not a PostgreSQL function, so nothing vouches for it.
-        ("len", &["text"], Called, &[false, false], Volatile, Normal),
         ("char_length", &["text"], Strict, &[true, false], Immutable, Normal),
         ("character_length", &["text"], Strict, &[true, false], Immutable, Normal),
         ("octet_length", &["text"], Strict, &[true, false], Immutable, Normal),
@@ -63,17 +59,8 @@ mod builtins {
         ),
         ("current_setting", &["text"], Strict, &[true, false], Stable, Normal),
         ("current_setting", &["text", "boolean"], Strict, &[true, true, false], Stable, Normal),
-        // The variadic array is not `NULL` when one of its elements is.
-        ("coalesce", &["anycompatiblearray"], Called, &[false, false], Immutable, Normal),
-        // `nullif(NULL, 1)` is `NULL`, `nullif(1, NULL)` is 1.
-        ("nullif", &["anyelement", "any"], Called, &[true, false, false], Immutable, Normal),
         ("decode", &["text", "text"], Strict, &[true, true, false], Immutable, Normal),
         ("now", &[], Strict, &[false], Stable, Normal),
-        ("current_timestamp", &[], Called, &[false], Stable, Normal),
-        ("current_date", &[], Called, &[false], Stable, Normal),
-        ("current_time", &[], Called, &[false], Stable, Normal),
-        ("localtimestamp", &[], Called, &[false], Stable, Normal),
-        ("localtime", &[], Called, &[false], Stable, Normal),
         ("gen_random_uuid", &[], Strict, &[false], Volatile, Normal),
         ("uuidv4", &[], Strict, &[false], Volatile, Normal),
         ("uuidv7", &[], Strict, &[false], Volatile, Normal),
@@ -95,8 +82,10 @@ mod builtins {
         ("avg", &["double precision"], Called, &[false, false], Immutable, Aggregate),
         ("avg", &["numeric"], Called, &[false, false], Immutable, Aggregate),
         ("avg", &["interval"], Called, &[false, false], Immutable, Aggregate),
-        ("min", &["anyelement"], Called, &[false, false], Immutable, Aggregate),
-        ("max", &["anyelement"], Called, &[false, false], Immutable, Aggregate),
+        ("min", &["int"], Called, &[false, false], Immutable, Aggregate),
+        ("min", &["anyarray"], Called, &[false, false], Immutable, Aggregate),
+        ("max", &["text"], Called, &[false, false], Immutable, Aggregate),
+        ("max", &["bytea"], Called, &[false, false], Immutable, Aggregate),
         ("array_agg", &["anynonarray"], Called, &[false, false], Immutable, Aggregate),
         ("array_agg", &["anyarray"], Called, &[false, false], Immutable, Aggregate),
         ("string_agg", &["text", "text"], Called, &[false, false, false], Immutable, Aggregate),
@@ -138,7 +127,6 @@ mod builtins {
         ("nth_value", &["anyelement", "int"], Strict, &[true, true, false], Immutable, Window),
         ("current_user", &[], Strict, &[false], Stable, Normal),
         ("session_user", &[], Strict, &[false], Stable, Normal),
-        ("user", &[], Called, &[false], Stable, Normal),
         ("random", &[], Strict, &[false], Volatile, Normal),
         ("random", &["int", "int"], Strict, &[true, true, false], Volatile, Normal),
         ("random", &["bigint", "bigint"], Strict, &[true, true, false], Volatile, Normal),
@@ -170,10 +158,9 @@ mod builtins {
 }
 
 #[test]
-fn every_builtin_answers_as_postgres_declares() {
+fn sampled_builtins_answer_as_postgres_declares() {
     let database = db("");
-    let expected = builtins::EXPECTED;
-    for (name, argument_types, behavior, answers, volatility, kind) in expected {
+    for (name, argument_types, behavior, answers, volatility, kind) in builtins::EXPECTED {
         let function = overload(&database, "pg_catalog", name, argument_types);
         let actual = (0..answers.len())
             .map(|index| function.returns_null_on_null_argument(&database, index))
@@ -189,11 +176,44 @@ fn every_builtin_answers_as_postgres_declares() {
             "{name}({argument_types:?})"
         );
     }
-    let registered = database
-        .functions()
-        .filter(|function| function.target_name().schema() == Some("pg_catalog"))
-        .count();
-    assert_eq!(registered, expected.len(), "every registered builtin is listed above");
+}
+
+/// The builtins are the rows of `pg_proc` in `pg_catalog`, as many as a
+/// freshly initialised PostgreSQL 18.6 holds, and nothing it does not hold.
+#[test]
+fn the_builtins_are_the_pg_catalog_rows_of_pg_proc() {
+    let database = db("");
+    let in_catalog = || {
+        database
+            .functions()
+            .filter(|function| function.target_name().schema() == Some("pg_catalog"))
+    };
+    assert_eq!(in_catalog().count(), 3402);
+    for absent in [
+        "len",
+        "coalesce",
+        "nullif",
+        "greatest",
+        "least",
+        "current_date",
+        "current_time",
+        "current_timestamp",
+        "localtime",
+        "localtimestamp",
+        "user",
+    ] {
+        assert!(in_catalog().all(|function| function.name() != absent), "{absent}");
+    }
+    for present in ["generate_series", "pg_sleep", "array_length", "current_user", "system_user"] {
+        assert!(in_catalog().any(|function| function.name() == present), "{present}");
+    }
+}
+
+/// Every other dialect reaches none of PostgreSQL's builtins.
+#[test]
+fn only_postgres_holds_the_builtins() {
+    let database = ParserDB::parse::<GenericDialect>("").expect("schema builds");
+    assert_eq!(database.functions().count(), 0);
 }
 
 #[test]

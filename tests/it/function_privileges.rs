@@ -709,3 +709,28 @@ fn an_account_grantee_is_listed_as_written() {
 
     assert_eq!(holders(&db), [PrivilegeHolder::Public, named("'app'@'%'")]);
 }
+
+/// A `pg_catalog` function takes `REVOKE` as a declared one does, one
+/// overload by its signature and every one through the schema-wide form.
+#[test]
+fn a_provided_function_takes_revokes() {
+    let provided = |db: &ParserDB, name: &str| {
+        db.function_by_target(
+            TargetName::new(name, false).with_schema("pg_catalog", false),
+            IdentifierCase::AsWritten,
+        )
+        .expect("unambiguous lookup")
+        .expect("the function is provided")
+        .is_executable_by_public(db)
+    };
+    let db = parse("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_sleep(double precision) FROM PUBLIC;")
+        .expect("schema parses");
+    assert_eq!(provided(&db, "pg_sleep"), Ok(false));
+    assert_eq!(provided(&db, "now"), Ok(true));
+
+    let db = parse("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pg_catalog FROM PUBLIC;")
+        .expect("schema parses");
+    assert_eq!(provided(&db, "pg_sleep"), Ok(false));
+    assert_eq!(provided(&db, "now"), Ok(false));
+    assert_eq!(db.functions().count(), 3402);
+}

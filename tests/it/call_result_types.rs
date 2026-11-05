@@ -404,7 +404,9 @@ fn an_earlier_schema_hides_a_function_of_the_same_arguments() -> Result<(), Look
         .functions_reached_by(&call("lower(x)"), IdentifierCase::AsWritten)?
         .map(|function| function.target_name().to_string())
         .collect();
-    assert_eq!(reached, ["pg_catalog.lower"]);
+    // `pg_catalog.lower(text)` hides it, and the range and multirange
+    // overloads take one argument too.
+    assert_eq!(reached, ["pg_catalog.lower"; 3]);
     assert_eq!(returns(&db, "lower(x)", &[Some("TEXT")]).as_deref(), Some("TEXT"));
     Ok(())
 }

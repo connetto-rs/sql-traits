@@ -6,14 +6,21 @@ use core::{convert::Infallible, ops::ControlFlow};
 use sqlparser::ast::{CreateFunction, ObjectName, Visit};
 
 use crate::{
-    structs::{IdentifierCase, metadata::ExpressionCalls},
-    utils::call_sites::{call_reaches, for_each_call},
+    structs::{IdentifierCase, generic_db::builtin_functions::Builtins, metadata::ExpressionCalls},
+    utils::{
+        call_sites::{call_reaches, for_each_call},
+        object_name::object_name_last_part,
+    },
 };
 
 /// The functions a call may reach, and the path an unqualified call walks.
 pub(super) struct CallScope<'a> {
-    /// Every function the schema holds.
+    /// Every function the schema declares, and every provided one a
+    /// statement took over.
     pub(super) functions: &'a [Arc<CreateFunction>],
+    /// The functions the engine provides that the schema still reaches
+    /// through the shared table.
+    pub(super) builtins: &'a Builtins<CreateFunction>,
     /// The search path in force where the call is written.
     pub(super) search_path: &'a [(&'a str, bool)],
     /// The comparison schema names are taken under.
@@ -31,6 +38,18 @@ impl CallScope<'_> {
     ) -> bool {
         call_reaches(function, called, arguments, || self.search_path.iter().copied(), self.case)
     }
+
+    /// The functions a call to `called` may reach before its argument count
+    /// and schema are weighed, every declared one and the provided ones
+    /// whose name folds as the called name does.
+    pub(super) fn candidates<'s>(
+        &'s self,
+        called: &'s ObjectName,
+    ) -> impl Iterator<Item = &'s Arc<CreateFunction>> + use<'s> {
+        let named = object_name_last_part(called).map(|(name, _)| name);
+        let provided = named.into_iter().flat_map(|name| self.builtins.named(name));
+        self.functions.iter().chain(provided.map(|(function, _)| function))
+    }
 }
 
 /// Resolves every call in `node`, subqueries included, under `scope`, except
@@ -43,6 +62,7 @@ pub(super) fn calls_in<N: Visit + ?Sized>(
     ExpressionCalls::resolve_carrying(
         node,
         scope.functions,
+        |name| scope.builtins.named(name).map(|(function, _)| function),
         scope.search_path,
         scope.case,
         |name, arguments| carried.take(name, arguments),
@@ -127,7 +147,7 @@ mod tests {
 
     use crate::{
         prelude::ParserDB,
-        structs::{IdentifierCase, TargetName},
+        structs::{IdentifierCase, TargetName, generic_db::builtin_functions::Builtins},
         traits::{DatabaseLike, FunctionLike, TableLike},
     };
 
@@ -277,9 +297,10 @@ mod tests {
             ("a = ANY(f(a))", &["f"]),
             ("EXISTS (SELECT 1 FROM m WHERE f(m.a) = 1)", &["f"]),
             ("EXISTS (SELECT f(m.a) FROM m)", &["f"]),
-            ("a = (SELECT max(g(b)) FROM m GROUP BY f(c) HAVING f(d) > 0)", &["max", "g", "f"]),
+            ("a = (SELECT max(g(b)) FROM m GROUP BY f(c) HAVING f(d) > 0)", &["g", "f"]),
             ("CASE WHEN f(a) > 0 THEN g(a) ELSE 0 END = 1", &["f", "g"]),
-            ("COALESCE(f(a), 0) = 1", &["coalesce", "f"]),
+            // `COALESCE` is an expression, not a call to a function.
+            ("COALESCE(f(a), 0) = 1", &["f"]),
             ("a IN (SELECT g(b) FROM m)", &["g"]),
             ("EXISTS (SELECT 1 FROM rows_of(g(a)) AS r)", &["rows_of", "g"]),
             ("EXISTS (SELECT 1 FROM m, LATERAL rows_of(m.a) AS r)", &["rows_of"]),
@@ -332,7 +353,7 @@ mod tests {
         let scope = scope(&functions);
         let cases: [(&str, &[&str]); 4] = [
             ("f(a) IN UNNEST(g(b))", &["f", "g"]),
-            ("COUNT(*) IN UNNEST(g(b))", &["count", "g"]),
+            ("COUNT(*) IN UNNEST(g(b))", &["g"]),
             ("(f(a)) IN UNNEST(g(b))", &["f", "g"]),
             // `ARRAY(SELECT ...)` passes its query as the one argument.
             ("ARRAY(SELECT 1) IN UNNEST(g(b))", &["g"]),
@@ -386,10 +407,13 @@ mod tests {
         assert!(!scope.reaches(function, &run_time_schema, 0));
     }
 
-    /// The scope a call written on the default search path sees.
+    /// The scope a call written on the default search path sees, without the
+    /// functions an engine provides.
     fn scope(functions: &[Arc<sqlparser::ast::CreateFunction>]) -> super::CallScope<'_> {
+        static NONE: Builtins<sqlparser::ast::CreateFunction> = Builtins::none();
         super::CallScope {
             functions,
+            builtins: &NONE,
             search_path: &[("public", false)],
             case: IdentifierCase::AsWritten,
         }

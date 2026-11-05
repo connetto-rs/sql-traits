@@ -8,7 +8,10 @@ use sqlparser::ast::{Expr, Function, ObjectName, Visit};
 use crate::{
     structs::IdentifierCase,
     traits::FunctionLike,
-    utils::call_sites::{call_reaches, for_each_call},
+    utils::{
+        call_sites::{call_reaches, for_each_call},
+        object_name::object_name_last_part,
+    },
 };
 
 /// The functions each call of an expression or a bound function body may
@@ -147,28 +150,45 @@ impl<F: FunctionLike> ExpressionCalls<F> {
         search_path: &[(&str, bool)],
         case: IdentifierCase,
     ) -> Self {
-        Self::resolve_carrying(node, functions, search_path, case, |_, _| None)
+        Self::resolve_carrying(
+            node,
+            functions,
+            |_| core::iter::empty(),
+            search_path,
+            case,
+            |_, _| None,
+        )
     }
 
     /// Resolves every call in `node` as [`resolve`](Self::resolve) does,
-    /// except a call `carried` answers a binding for, which keeps it.
-    pub(crate) fn resolve_carrying<N: Visit + ?Sized>(
+    /// among `functions` and the functions `provided` answers for a called
+    /// name, those the engine provides whose name folds as it does, except a
+    /// call `carried` answers a binding for, which keeps it.
+    pub(crate) fn resolve_carrying<'f, N: Visit + ?Sized, I>(
         node: &N,
         functions: &[Arc<F>],
+        provided: impl Fn(&str) -> I,
         search_path: &[(&str, bool)],
         case: IdentifierCase,
         mut carried: impl FnMut(&ObjectName, usize) -> Option<Vec<Arc<F>>>,
-    ) -> Self {
+    ) -> Self
+    where
+        F: 'f,
+        I: Iterator<Item = &'f Arc<F>>,
+    {
         let path = || search_path.iter().copied();
         let mut sites = Vec::new();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
             let site = carried(call.name, call.arguments).unwrap_or_else(|| {
+                let named = object_name_last_part(call.name).map(|(name, _)| name);
+                let reaches = |function: &&Arc<F>| {
+                    call_reaches(function.as_ref(), call.name, call.arguments, path, case)
+                };
                 functions
                     .iter()
-                    .filter(|function| {
-                        call_reaches(function.as_ref(), call.name, call.arguments, path, case)
-                    })
+                    .filter(reaches)
                     .cloned()
+                    .chain(named.into_iter().flat_map(&provided).filter(reaches).cloned())
                     .collect()
             });
             sites.push(site);

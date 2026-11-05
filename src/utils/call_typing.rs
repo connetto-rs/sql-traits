@@ -14,6 +14,8 @@ use crate::{
     structs::{IdentifierCase, TargetName},
     traits::{DatabaseLike, FunctionLike},
     utils::{
+        call_sites::{ExpressionForm, expression_form},
+        common_type_name,
         identifier_resolution::identifiers_match,
         object_name::{
             function_search_path, overqualified_object_name, run_time_object_name,
@@ -704,6 +706,9 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
     }
     let target =
         target_name_from_object_name(&call.name).ok_or_else(|| run_time_object_name(&call.name))?;
+    if expression_form(&call.name).is_some() {
+        return Ok(Vec::new());
+    }
     let Some(written) = written_argument_names(call) else { return Ok(Vec::new()) };
     let path: Vec<(&str, bool)> = match target.schema() {
         Some(schema) => vec![(schema, target.schema_is_quoted())],
@@ -711,7 +716,7 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
     };
 
     let mut reached: Vec<(usize, &'db D::Function, Declared)> = database
-        .functions()
+        .functions_named(target.name())
         .filter(|function| {
             case.identifiers_match(
                 function.name(),
@@ -743,6 +748,33 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
         }
     }
     Ok(functions)
+}
+
+/// What `call`, an expression PostgreSQL's grammar writes as `form`, returns
+/// given its argument types.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ArgumentTypeCount`] when `argument_types` does not
+/// hold one entry per argument `call` writes.
+pub(crate) fn expression_result<'a>(
+    form: ExpressionForm,
+    call: &Function,
+    argument_types: &[Option<&'a str>],
+) -> Result<Option<Cow<'a, str>>, LookupError> {
+    let written = written_argument_names(call).map_or(0, |written| written.len());
+    check_argument_count(call, written, argument_types.len())?;
+    Ok(match form {
+        ExpressionForm::CommonType => common_type_name(argument_types),
+        // An untyped first argument takes the type `=` compares it under.
+        ExpressionForm::FirstArgument => {
+            match argument_types.first().copied().flatten() {
+                Some("unknown") => common_type_name(argument_types),
+                first => first.map(Cow::Borrowed),
+            }
+        }
+        ExpressionForm::Value(name) => Some(Cow::Borrowed(name)),
+    })
 }
 
 /// A function a call may run, with the type that call returns.

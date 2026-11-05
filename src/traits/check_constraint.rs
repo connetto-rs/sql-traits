@@ -1028,7 +1028,7 @@ pub trait CheckConstraintLike:
     /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TABLE users (name TEXT CHECK (lower(name) = name));",
+    ///     "CREATE TABLE users (name TEXT CHECK (initcap(name) = name));",
     /// )?;
     /// let table = db.tables().next().unwrap();
     /// let check = table.check_constraints(&db)?.next().unwrap();
@@ -1036,7 +1036,7 @@ pub trait CheckConstraintLike:
     /// let Expr::Function(call) = left.as_ref() else { panic!() };
     /// let reached: Vec<_> = check.functions_reached_by(call, &db)?.collect();
     /// assert_eq!(reached.len(), 1);
-    /// assert_eq!(reached[0].target_name().to_string(), "pg_catalog.lower");
+    /// assert_eq!(reached[0].target_name().to_string(), "pg_catalog.initcap");
     /// # Ok(())
     /// # }
     /// ```
@@ -1646,7 +1646,8 @@ mod tests {
                 col2 TEXT CHECK (len(col2) > 0)
             );
         ";
-        let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(sql)
+            .expect("Failed to parse SQL");
         let table = db
             .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
             .expect("unambiguous lookup")
@@ -1664,13 +1665,9 @@ mod tests {
             "Function 'length' not found. Found: {functions_length:?}"
         );
 
+        // PostgreSQL provides no `len`.
         let cc_len = &constraints[1];
-        let functions_len: Vec<_> =
-            cc_len.functions(&db).expect("functions").map(|f| f.name().to_string()).collect();
-        assert!(
-            functions_len.contains(&"len".to_string()),
-            "Function 'len' not found. Found: {functions_len:?}"
-        );
+        assert_eq!(cc_len.functions(&db).expect("functions").count(), 0);
     }
 
     #[test]
@@ -1682,7 +1679,8 @@ mod tests {
                 c3 INT CHECK (c3 > 0)
             );
         ";
-        let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(sql)
+            .expect("Failed to parse SQL");
         let table = db
             .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
             .expect("unambiguous lookup")
@@ -1696,11 +1694,11 @@ mod tests {
             .any(|cc| cc.functions(&db).expect("functions").any(|f| f.name() == "now"));
         assert!(has_now, "Function 'now' not found in constraints");
 
-        // Find constraint with 'coalesce'
+        // `COALESCE` is an expression, which calls no function.
         let has_coalesce = constraints
             .iter()
             .any(|cc| cc.functions(&db).expect("functions").any(|f| f.name() == "coalesce"));
-        assert!(has_coalesce, "Function 'coalesce' not found in constraints");
+        assert!(!has_coalesce, "'coalesce' reached a function");
     }
 
     #[test]
@@ -1713,7 +1711,8 @@ mod tests {
                 c4 UUID CHECK (c4 = uuidv7('10 minutes'::INTERVAL))
             );
         ";
-        let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(sql)
+            .expect("Failed to parse SQL");
         let table = db
             .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
             .expect("unambiguous lookup")

@@ -62,7 +62,8 @@ fn nested_policy_calls_reach_their_functions() {
         [
             ("string_to_array".to_owned(), vec!["pg_catalog.string_to_array".to_owned()]),
             ("current_setting".to_owned(), vec!["pg_catalog.current_setting".to_owned()]),
-            ("lower".to_owned(), vec!["pg_catalog.lower".to_owned()]),
+            // `lower` of text, of a range and of a multirange each take one.
+            ("lower".to_owned(), vec!["pg_catalog.lower".to_owned(); 3]),
             ("auth.uid".to_owned(), vec!["auth.uid".to_owned()]),
         ]
     );
@@ -77,6 +78,8 @@ fn nested_policy_calls_reach_their_functions() {
         [
             "pg_catalog.string_to_array",
             "pg_catalog.current_setting",
+            "pg_catalog.lower",
+            "pg_catalog.lower",
             "pg_catalog.lower",
             "auth.uid"
         ]
@@ -253,7 +256,7 @@ fn check_constraint_calls_reach_their_functions() {
     assert_eq!(
         calls,
         [
-            ("lower".to_owned(), vec!["pg_catalog.lower Immutable".to_owned()]),
+            ("lower".to_owned(), vec!["pg_catalog.lower Immutable".to_owned(); 3]),
             ("stamp".to_owned(), vec!["stamp Volatile".to_owned()]),
         ]
     );
