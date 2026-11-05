@@ -19,7 +19,8 @@ use crate::{
     structs::{SequenceParameters, TargetName},
     traits::{
         DatabaseLike, DomainLike, ExtensionLike, Metadata, PolicyLike, Relation, RuleLike,
-        SequenceLike, SequenceOrigin, SequenceOwner, ViewLike,
+        SequenceLike, SequenceOrigin, SequenceOwner, UserDefinedTypeKind, UserDefinedTypeLike,
+        ViewLike,
     },
 };
 
@@ -171,6 +172,22 @@ impl<DB: DatabaseLike> DomainLike for Absent<DB> {
     }
 
     fn data_type<'db>(&'db self, _: &'db Self::DB) -> &'db DB::DataType {
+        self.unreachable()
+    }
+}
+
+impl<DB: DatabaseLike> UserDefinedTypeLike for Absent<DB> {
+    type DB = DB;
+
+    fn name(&self) -> &str {
+        self.unreachable()
+    }
+
+    fn schema(&self) -> Option<&str> {
+        self.unreachable()
+    }
+
+    fn kind(&self) -> UserDefinedTypeKind {
         self.unreachable()
     }
 }

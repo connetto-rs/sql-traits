@@ -82,7 +82,7 @@ use crate::{
 /// refuses with [`Error::InvalidSequenceParameters`], and every `OWNED BY`
 /// the errors of [`resolve_owner`] name.
 pub(super) fn create_sequence(
-    builder: ParserDBBuilder,
+    mut builder: ParserDBBuilder,
     temporary: bool,
     if_not_exists: bool,
     mut name: ObjectName,
@@ -97,6 +97,9 @@ pub(super) fn create_sequence(
         .ok_or(Error::UnnamedObject { object_kind: ObjectKind::Sequence })?;
     let schema = qualifier_of(&name).named();
 
+    // A sequence takes a shell of its name over, filling the type name.
+    super::user_defined_types::take_over_shell(&mut builder, name_ident, schema);
+
     let relation = relation_name_holder(&builder, name_ident, schema);
     if relation.is_some() && if_not_exists {
         return Ok(builder);
@@ -106,10 +109,10 @@ pub(super) fn create_sequence(
     let parameters = SequenceParameters::from_options(&options).map_err(|reason| {
         Error::InvalidSequenceParameters { sequence_name: name_ident.value.clone(), reason }
     })?;
-    // A sequence has no row type, yet PostgreSQL refuses it a name a domain
-    // holds whatever `IF NOT EXISTS` says.
+    // PostgreSQL refuses a sequence a name of the type pool, `IF NOT EXISTS` or
+    // not.
     if let Some(conflicting_kind) =
-        relation.or_else(|| domains::domain_name_holder(&builder, name_ident, schema))
+        relation.or_else(|| domains::domain_or_user_type_holder(&builder, name_ident, schema))
     {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Sequence,

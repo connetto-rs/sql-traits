@@ -11,12 +11,15 @@
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{CreateFunction, CreateFunctionBody, ObjectName, VisitMut};
+use sqlparser::ast::{
+    CreateFunction, CreateFunctionBody, ObjectName, UserDefinedTypeRangeOption,
+    UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption, VisitMut,
+};
 
 use super::{CarriedCalls, ParserDB, ParserDBBuilder, StoredTable, function_argument_types};
 use crate::{
     errors::Error,
-    structs::{TableAttribute, metadata::ExpressionCalls},
+    structs::{TableAttribute, UserDefinedType, metadata::ExpressionCalls},
     traits::FunctionLike,
     utils::call_sites::{call_reaches, for_each_call_name_mut},
 };
@@ -111,6 +114,53 @@ fn renamed_call(
     }
 }
 
+/// Respells every function name a user-defined type's definition writes, in
+/// the order its calls bind them, to the name its bound function moves to.
+fn respell_user_type(
+    node: &mut UserDefinedType,
+    calls: &ExpressionCalls<CreateFunction>,
+    moves: &Moves,
+) -> Result<(), Error> {
+    let mut sites = calls.sites().iter();
+    let mut respell = |name: &mut ObjectName| -> Result<(), Error> {
+        renamed_call(moves, sites.next().map(Vec::as_slice), name).map(|renamed| {
+            if let Some(renamed) = renamed {
+                *name = renamed;
+            }
+        })
+    };
+    if let Some(representation) = node.representation.as_mut() {
+        match representation {
+            UserDefinedTypeRepresentation::SqlDefinition { options } => {
+                for option in options {
+                    match option {
+                        UserDefinedTypeSqlDefinitionOption::Input(name)
+                        | UserDefinedTypeSqlDefinitionOption::Output(name)
+                        | UserDefinedTypeSqlDefinitionOption::Receive(name)
+                        | UserDefinedTypeSqlDefinitionOption::Send(name)
+                        | UserDefinedTypeSqlDefinitionOption::TypmodOut(name)
+                        | UserDefinedTypeSqlDefinitionOption::Analyze(name)
+                        | UserDefinedTypeSqlDefinitionOption::Subscript(name)
+                        | UserDefinedTypeSqlDefinitionOption::TypmodIn(name) => respell(name)?,
+                        _ => {}
+                    }
+                }
+            }
+            UserDefinedTypeRepresentation::Range { options } => {
+                for option in options {
+                    match option {
+                        UserDefinedTypeRangeOption::Canonical(name)
+                        | UserDefinedTypeRangeOption::SubtypeDiff(name) => respell(name)?,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Respells every call of `node` to the name `renamed` gives it from its
 /// written name and argument count, leaving a call it gives none as written.
 fn respell_each<N: VisitMut + ?Sized>(
@@ -195,6 +245,11 @@ pub(super) fn move_functions(
     for (domain, calls) in builder.domains_mut() {
         if moves.reached_by(calls) {
             respell(Arc::make_mut(domain), calls, moves)?;
+        }
+    }
+    for (type_, calls) in builder.user_defined_types_mut() {
+        if moves.reached_by(calls) {
+            respell_user_type(Arc::make_mut(type_), calls, moves)?;
         }
     }
     let case = builder.identifier_case();

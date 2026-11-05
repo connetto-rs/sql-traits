@@ -27,6 +27,7 @@ mod schema;
 mod sequence;
 mod sequence_parameters;
 mod target_name;
+mod user_defined_type;
 mod view;
 
 pub use absent::Absent;
@@ -59,4 +60,5 @@ pub use sequence::Sequence;
 pub(crate) use sequence::StoredSequenceOwner;
 pub use sequence_parameters::{SequenceParameters, SequenceType};
 pub use target_name::TargetName;
+pub use user_defined_type::UserDefinedType;
 pub use view::{MaterializedView, View, ViewDeclaration};

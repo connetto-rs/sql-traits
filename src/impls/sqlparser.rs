@@ -28,6 +28,7 @@ mod role_membership;
 mod schema;
 mod sequence;
 mod unique_constraint;
+mod user_defined_type;
 mod view;
 
 pub(crate) use column_def::{foreign_options_of, serial_sequence_type};
@@ -41,3 +42,6 @@ pub(crate) use grant::{
     split_by_column_scope, validate_granted_columns,
 };
 pub(crate) use helper_set::helper_set;
+pub(crate) use user_defined_type::{
+    bound_user_type, user_type_holds, user_type_in_schema, user_type_named,
+};

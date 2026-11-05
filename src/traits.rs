@@ -36,6 +36,8 @@ pub mod extension;
 pub use extension::ExtensionLike;
 pub mod domain;
 pub use domain::DomainLike;
+pub mod user_defined_type;
+pub use user_defined_type::{UserDefinedTypeKind, UserDefinedTypeLike};
 pub mod policy;
 pub use policy::PolicyLike;
 pub mod role;

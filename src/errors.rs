@@ -47,6 +47,8 @@ pub enum ObjectKind {
     Sequence,
     /// A domain declared by a `CREATE DOMAIN` statement.
     Domain,
+    /// A user-defined type declared by a `CREATE TYPE` statement.
+    Type,
 }
 
 impl core::fmt::Display for ObjectKind {
@@ -69,6 +71,7 @@ impl core::fmt::Display for ObjectKind {
             Self::Schema => "Schema",
             Self::Sequence => "Sequence",
             Self::Domain => "Domain",
+            Self::Type => "Type",
         })
     }
 }
@@ -2463,6 +2466,129 @@ pub enum Error {
         expected_kind: ObjectKind,
         /// Kind the name actually holds.
         actual_kind: ObjectKind,
+    },
+    #[error("Type `{type_name}` not found.")]
+    /// Error indicating that a `DROP TYPE` statement without `IF EXISTS`, or
+    /// an `ALTER TYPE` statement, names a type the input never creates, or a
+    /// type of the database system.
+    TypeNotFound {
+        /// Name the statement wrote.
+        type_name: String,
+    },
+    #[error("Type `{type_name}` cannot be dropped: the database system requires it.")]
+    /// Error indicating that a `DROP TYPE` statement names a type of the
+    /// database system, which PostgreSQL refuses even with `IF EXISTS`.
+    TypeRequiredBySystem {
+        /// Name the statement wrote.
+        type_name: String,
+    },
+    #[error("Type `{type_name}` is only a shell.")]
+    /// Error indicating that a statement declares a value or a definition
+    /// with a type `CREATE TYPE name;` recorded as a shell and never filled,
+    /// or alters one.
+    TypeIsOnlyShell {
+        /// Name of the shell type.
+        type_name: String,
+    },
+    #[error(
+        "Type `{type_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
+    )]
+    /// Error indicating that a statement drops a type a column, a composite
+    /// attribute, a domain or a range is declared with.
+    ///
+    /// PostgreSQL refuses without `CASCADE`, and `CASCADE` drops the columns,
+    /// the composite attributes, the domains and the ranges along with it.
+    TypeHasDependents {
+        /// Name of the type the statement drops.
+        type_name: String,
+        /// [`ObjectKind::Column`], [`ObjectKind::Domain`], [`ObjectKind::Type`]
+        /// or [`ObjectKind::Table`].
+        dependent_kind: ObjectKind,
+        /// The column as `table.column`, or the name of the other object.
+        dependent_name: String,
+    },
+    #[error(
+        "Type `{type_name}` cannot be dropped: {requiring_kind} `{requiring_name}` requires it."
+    )]
+    /// Error indicating that a `DROP TYPE` statement names the multirange of
+    /// a range, the array of a base type, or the row type of a relation,
+    /// which PostgreSQL removes only with the object that needs it, whatever
+    /// the statement asks.
+    TypeDropRequiredBy {
+        /// Name the statement wrote.
+        type_name: String,
+        /// [`ObjectKind::Type`] for a range or a base type, or the kind of
+        /// relation whose row type the name holds.
+        requiring_kind: ObjectKind,
+        /// Name of the object that requires the dropped one.
+        requiring_name: String,
+    },
+    #[error("Type `{type_name}` is a {relation_kind}'s row type.")]
+    /// Error indicating that an `ALTER TYPE` statement names the row type of
+    /// a relation, which only the statement for the relation changes.
+    TypeIsRowType {
+        /// Name the statement wrote.
+        type_name: String,
+        /// Kind of relation that owns the row type.
+        relation_kind: ObjectKind,
+    },
+    #[error("Cannot alter array type `{array_name}`.")]
+    /// Error indicating that an `ALTER TYPE` statement names the array type
+    /// of a type, which only a statement for the type it is the array of
+    /// changes.
+    CannotAlterArrayType {
+        /// The type whose array type the statement names, spelled as `name[]`.
+        array_name: String,
+    },
+    #[error("Enum label `{label}` of type `{type_name}` already exists.")]
+    /// Error indicating that an `ALTER TYPE ... ADD VALUE` or `RENAME VALUE`
+    /// statement writes a label the enum already holds.
+    EnumLabelExists {
+        /// Name of the enum.
+        type_name: String,
+        /// Label the statement wrote.
+        label: String,
+    },
+    #[error("Label `{label}` is not an existing enum label of type `{type_name}`.")]
+    /// Error indicating that an `ALTER TYPE ... ADD VALUE ... BEFORE/AFTER`
+    /// or `RENAME VALUE` statement names a label the enum does not hold.
+    EnumLabelNotFound {
+        /// Name of the enum.
+        type_name: String,
+        /// Label the statement wrote.
+        label: String,
+    },
+    #[error("Type `{type_name}` is not an enum.")]
+    /// Error indicating that an `ALTER TYPE ... ADD VALUE` or `RENAME VALUE`
+    /// statement names a type of another kind than enum.
+    NotAnEnum {
+        /// Name the statement wrote.
+        type_name: String,
+    },
+    #[error("The type attribute `subtype` is required for type `{type_name}`.")]
+    /// Error indicating that a `CREATE TYPE ... AS RANGE` statement names no
+    /// `SUBTYPE`.
+    RangeSubtypeRequired {
+        /// Name the statement wrote.
+        type_name: String,
+    },
+    #[error("Enum label `{label}` of type `{type_name}` is written more than once.")]
+    /// Error indicating that a `CREATE TYPE ... AS ENUM` statement writes the
+    /// same label twice.
+    DuplicateEnumLabel {
+        /// Name the statement wrote.
+        type_name: String,
+        /// Label the statement wrote twice.
+        label: String,
+    },
+    #[error("Column `{attribute}` of type `{type_name}` is specified more than once.")]
+    /// Error indicating that a `CREATE TYPE ... AS (...)` statement writes the
+    /// same attribute name twice.
+    DuplicateCompositeAttribute {
+        /// Name the statement wrote.
+        type_name: String,
+        /// Attribute the statement wrote twice.
+        attribute: String,
     },
     #[error("{constraint} constraints are not supported on foreign table `{table_name}`.")]
     /// Error indicating that a statement gives a foreign table a primary key,

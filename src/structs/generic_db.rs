@@ -116,6 +116,8 @@ pub struct GenericDB<P: SchemaProfile> {
     extensions: Vec<Stored<P::Extension>>,
     /// List of domains created in the database.
     domains: Vec<Stored<P::Domain>>,
+    /// List of user-defined types created in the database.
+    user_defined_types: Vec<Stored<P::UserDefinedType>>,
     /// List of policies created in the database.
     policies: Vec<Stored<P::Policy>>,
     /// List of check constraints in the database.
@@ -161,6 +163,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("rules", &self.rules.len())
             .field("extensions", &self.extensions.len())
             .field("domains", &self.domains.len())
+            .field("user_defined_types", &self.user_defined_types.len())
             .field("policies", &self.policies.len())
             .field("check_constraints", &self.check_constraints.len())
             .field("roles", &self.roles.len())
@@ -203,6 +206,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             rules: self.rules.clone(),
             extensions: self.extensions.clone(),
             domains: self.domains.clone(),
+            user_defined_types: self.user_defined_types.clone(),
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),

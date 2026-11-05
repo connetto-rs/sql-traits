@@ -1,0 +1,17 @@
+CREATE TYPE mood AS ENUM ('sad', 'ok');
+CREATE TYPE point AS (x int, y int);
+CREATE TYPE span AS RANGE (subtype = int);
+CREATE TYPE myrangeish AS RANGE (subtype = int);
+CREATE TYPE "RangeX" AS RANGE (subtype = int, multirange_type_name = mm);
+CREATE TYPE shell;
+CREATE TYPE shell AS ENUM ('a');
+CREATE TYPE over_shell AS (a int, b shell);
+CREATE SCHEMA types;
+CREATE TYPE types.feeling AS ENUM ('a');
+ALTER TYPE mood RENAME TO feeling_old;
+ALTER TYPE feeling_old ADD VALUE 'new' BEFORE 'ok';
+ALTER TYPE feeling_old RENAME VALUE 'ok' TO 'fine';
+DROP TYPE myrangeish, "RangeX" CASCADE;
+DROP TYPE types.feeling;
+ALTER SCHEMA types RENAME TO kinds;
+DROP SCHEMA kinds CASCADE;

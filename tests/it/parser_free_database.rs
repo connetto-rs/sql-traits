@@ -17,7 +17,9 @@ use sql_traits::{
     errors::LookupError,
     prelude::*,
     structs::{ForeignTableSource, TargetName},
-    traits::{ColumnCollation, TypeMatch, grant::GrantTarget},
+    traits::{
+        ColumnCollation, TypeMatch, UserDefinedTypeKind, UserDefinedTypeLike, grant::GrantTarget,
+    },
     utils::{identifier_resolution::SearchPath, scalar_family::ScalarFamily},
 };
 use sqlparser::{
@@ -51,6 +53,7 @@ struct MemoryCatalog {
     rules: Vec<MemoryRule>,
     extensions: Vec<MemoryExtension>,
     domains: Vec<MemoryDomain>,
+    user_defined_types: Vec<MemoryUserDefinedType>,
     policies: Vec<MemoryPolicy>,
     roles: Vec<MemoryRole>,
     role_memberships: Vec<MemoryRoleMembership>,
@@ -193,6 +196,13 @@ struct MemoryDomain {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct MemoryUserDefinedType {
+    name: String,
+    schema: Option<String>,
+    kind: UserDefinedTypeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryPolicy {
     name: String,
     table_name: String,
@@ -250,6 +260,7 @@ plain_metadata!(
     MemoryRule,
     MemoryExtension,
     MemoryDomain,
+    MemoryUserDefinedType,
     MemoryPolicy,
     MemoryRole,
     MemoryRoleMembership,
@@ -273,6 +284,7 @@ impl DatabaseLike for MemoryCatalog {
     type Rule = MemoryRule;
     type Extension = MemoryExtension;
     type Domain = MemoryDomain;
+    type UserDefinedType = MemoryUserDefinedType;
     type Policy = MemoryPolicy;
     type Role = MemoryRole;
     type RoleMembership = MemoryRoleMembership;
@@ -330,6 +342,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn domains(&self) -> impl Iterator<Item = &Self::Domain> {
         self.domains.iter()
+    }
+
+    fn user_defined_types(&self) -> impl Iterator<Item = &Self::UserDefinedType> {
+        self.user_defined_types.iter()
     }
 
     fn indexes(&self) -> impl Iterator<Item = &Self::Index> {
@@ -1178,6 +1194,22 @@ impl DomainLike for MemoryDomain {
 
     fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db MemoryDataType {
         &self.data_type
+    }
+}
+
+impl UserDefinedTypeLike for MemoryUserDefinedType {
+    type DB = MemoryCatalog;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
+    fn kind(&self) -> UserDefinedTypeKind {
+        self.kind
     }
 }
 
