@@ -10301,6 +10301,11 @@ impl ParserDB {
                         access_resolution,
                     )?;
                 }
+                Statement::Do(block) => {
+                    return Err(crate::errors::Error::UnsupportedDoBlock {
+                        statement: block.to_string(),
+                    });
+                }
                 _ => {
                     // Statements this model tracks nothing for.
                     //
