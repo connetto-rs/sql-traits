@@ -3091,6 +3091,14 @@ pub enum Error {
         /// The statement as written.
         statement: String,
     },
+    #[error("`{statement}` runs code whose effects on the schema this model cannot represent.")]
+    /// A PostgreSQL `DO` block ran. What it creates, alters or grants depends
+    /// on the database it runs against, so the document is refused rather
+    /// than modelled as though the block had not run.
+    UnsupportedDoBlock {
+        /// The statement as written.
+        statement: String,
+    },
     #[error("`{statement}` can only be used inside a transaction.")]
     /// A statement that ends or marks a transaction ran with none open, in an
     /// engine that refuses it there.

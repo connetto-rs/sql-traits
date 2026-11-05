@@ -33,6 +33,7 @@ mod default_privileges;
 mod definer_helpers;
 mod deployment;
 mod descendant_drops;
+mod do_blocks;
 mod domains;
 mod dropped_column_readers;
 mod dropped_policies;
