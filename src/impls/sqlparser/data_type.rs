@@ -4,11 +4,14 @@
 use alloc::borrow::Cow;
 use core::num::NonZeroU32;
 
-use sqlparser::ast::{ArrayElemTypeDef, DataType, TypeModifier};
+use sqlparser::ast::{
+    ArrayElemTypeDef, DataType, ExactNumberInfo, TimezoneInfo, TypeModifier,
+    UserDefinedTypeRepresentation,
+};
 
 use crate::{
-    impls::sqlparser::bound_domain,
-    structs::ParserDB,
+    impls::sqlparser::{SqlparserDialect, bound_domain, bound_user_type},
+    structs::{ParserDB, UserDefinedType},
     traits::{DataTypeLike, DatabaseLike, ExtensionLike, IntervalFields, VectorKind, VectorType},
     utils::{
         identifier_resolution::{identifiers_match, normalize_identifier},
@@ -16,8 +19,20 @@ use crate::{
         object_name::{
             PG_CATALOG, Qualifier, object_name_last_part, qualifier_of, relation_search_path,
         },
+        postgres_types::PgType,
     },
 };
+
+/// PostgreSQL 18's `pg_range`: each range type, its multirange and its
+/// subtype.
+static CATALOG_RANGES: [(&str, &str, DataType); 6] = [
+    ("daterange", "datemultirange", DataType::Date),
+    ("int4range", "int4multirange", DataType::Int4(None)),
+    ("int8range", "int8multirange", DataType::Int8(None)),
+    ("numrange", "nummultirange", DataType::Numeric(ExactNumberInfo::None)),
+    ("tsrange", "tsmultirange", DataType::Timestamp(None, TimezoneInfo::None)),
+    ("tstzrange", "tstzmultirange", DataType::Timestamp(None, TimezoneInfo::Tz)),
+];
 
 /// The extension that creates pgvector's types.
 const PGVECTOR_EXTENSION: &str = "vector";
@@ -185,4 +200,62 @@ impl DataTypeLike for DataType {
         }
         None
     }
+
+    fn send_function(&self, database: &Self::DB) -> Option<bool> {
+        // Only PostgreSQL has binary send functions.
+        if !matches!(*database.dialect(), SqlparserDialect::PostgreSql | SqlparserDialect::Generic)
+        {
+            return None;
+        }
+        if let Some(base) = self.base_type(database) {
+            return base.send_function(database);
+        }
+        if let Some((user_type, _)) = user_type_of(self, database) {
+            return Some(match user_type.representation() {
+                Some(UserDefinedTypeRepresentation::SqlDefinition { .. }) => {
+                    user_type.declares_send()
+                }
+                Some(_) => true,
+                None => false,
+            });
+        }
+        PgType::of(self).send_function()
+    }
+
+    fn range_subtype<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self> {
+        if !matches!(self, Self::Custom(..)) {
+            return None;
+        }
+        if let Some((user_type, _)) = user_type_of(self, database) {
+            return user_type.range_subtype();
+        }
+        let PgType::Catalog(name) = PgType::of(self) else {
+            return None;
+        };
+        CATALOG_RANGES
+            .iter()
+            .find(|(range, multirange, _)| name == *range || name == *multirange)
+            .map(|(_, _, subtype)| subtype)
+    }
+
+    fn composite_fields<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<impl Iterator<Item = &'db Self>> {
+        let (user_type, _) = user_type_of(self, database)?;
+        let attributes = user_type.composite_attributes()?;
+        Some(attributes.iter().map(|attribute| &attribute.data_type))
+    }
+}
+
+/// The user-defined type a type name reaches, with whether the name is its
+/// multirange's.
+fn user_type_of<'db>(
+    data_type: &DataType,
+    database: &'db ParserDB,
+) -> Option<(&'db UserDefinedType, bool)> {
+    let DataType::Custom(name, _) = data_type else {
+        return None;
+    };
+    bound_user_type(database.user_defined_types(), name, database.identifier_case())
 }

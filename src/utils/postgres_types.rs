@@ -77,6 +77,7 @@ static TYPES: &[TypeRow] = &[
     TypeRow("jsonb", b'U', false),
     TypeRow("jsonpath", b'U', false),
     TypeRow("language_handler", b'P', false),
+    TypeRow("line", b'G', false),
     TypeRow("lseg", b'G', false),
     TypeRow("macaddr", b'U', false),
     TypeRow("macaddr8", b'U', false),
@@ -136,6 +137,30 @@ static TYPES: &[TypeRow] = &[
     TypeRow("xid", b'U', false),
     TypeRow("xid8", b'U', false),
     TypeRow("xml", b'U', false),
+];
+
+/// The types of PostgreSQL 18's `pg_type` whose `typsend` is unset, sorted.
+static WITHOUT_SEND: &[&str] = &[
+    "aclitem",
+    "any",
+    "anycompatible",
+    "anycompatiblemultirange",
+    "anycompatiblenonarray",
+    "anycompatiblerange",
+    "anyelement",
+    "anyenum",
+    "anymultirange",
+    "anynonarray",
+    "anyrange",
+    "event_trigger",
+    "fdw_handler",
+    "gtsvector",
+    "index_am_handler",
+    "internal",
+    "language_handler",
+    "table_am_handler",
+    "trigger",
+    "tsm_handler",
 ];
 
 /// The casts PostgreSQL 18's `pg_cast` marks implicit, as source and target,
@@ -482,6 +507,18 @@ impl PgType {
     pub(crate) fn is_array(&self) -> bool {
         matches!(self, Self::Array(_))
     }
+
+    /// Whether the type has a binary send function of its own, or `None` for a
+    /// type the catalog tables do not hold.
+    pub(crate) fn send_function(&self) -> Option<bool> {
+        match self {
+            Self::Catalog(name) => {
+                catalog_row(name).map(|_| WITHOUT_SEND.binary_search(name).is_err())
+            }
+            Self::Array(_) => Some(true),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 /// The catalog row named `name`.
@@ -663,5 +700,26 @@ mod tests {
             args: vec![],
         })]);
         assert!(matches!(PgType::of(&DataType::Custom(name, vec![])), PgType::Other(_)));
+    }
+
+    /// The send facts agree with PostgreSQL 18's `pg_type.typsend`.
+    #[test]
+    fn catalog_types_answer_their_send_function() {
+        assert!(super::WITHOUT_SEND.is_sorted());
+        for (spelling, send) in [
+            ("aclitem", Some(false)),
+            ("gtsvector", Some(false)),
+            ("pg_catalog.aclitem", Some(false)),
+            ("_aclitem", Some(true)),
+            ("aclitem[]", Some(true)),
+            ("INT", Some(true)),
+            ("int4range", Some(true)),
+            ("LINE", Some(true)),
+            ("box2d", None),
+            ("TINYINT", None),
+        ] {
+            let pg_type = PgType::parse(spelling).expect("parses");
+            assert_eq!(pg_type.send_function(), send, "{spelling}");
+        }
     }
 }

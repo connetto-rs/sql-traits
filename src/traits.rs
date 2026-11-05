@@ -13,7 +13,7 @@ pub use column::{
     ColumnCollation, ColumnLike, CreatedFromQuery, IdentityGeneration, MySqlCollationPadding,
     NamedColumnCollation,
 };
-pub use data_type::{DataTypeLike, IntervalFields, VectorKind, VectorType};
+pub use data_type::{BinarySend, DataTypeLike, IntervalFields, VectorKind, VectorType};
 pub mod index;
 pub use database::{DatabaseLike, Relation};
 pub use dialect::DialectLike;
