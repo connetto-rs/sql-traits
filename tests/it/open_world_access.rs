@@ -330,11 +330,12 @@ fn a_policy_naming_no_role_of_its_own_is_never_reported() {
 
 #[test]
 fn open_world_still_refuses_an_unrepresentable_revoke() {
+    // `elsewhere` is never created, so the privileges `ALL` stood for are
+    // unknown and what the revoke leaves cannot be written down.
     let unsupported = open_world().parse::<PostgreSqlDialect>(
-        "CREATE TABLE docs (id uuid PRIMARY KEY, title text);
-         CREATE ROLE app;
-         GRANT SELECT ON docs TO app;
-         REVOKE SELECT (title) ON docs FROM app;",
+        "CREATE ROLE app;
+         GRANT ALL PRIVILEGES ON elsewhere TO app;
+         REVOKE DELETE ON elsewhere FROM app;",
     );
 
     assert!(
