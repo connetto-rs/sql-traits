@@ -41,6 +41,7 @@ fn the_owner_and_its_inheriting_members_hold_every_privilege() {
         assert!(held.update.on_table());
         assert!(held.delete);
         assert!(held.truncate);
+        assert!(held.maintain);
     }
     assert!(!can_select(&database, None, "t", "detached"));
     assert!(!can_select(&database, None, "t", "outsider"));
@@ -55,7 +56,7 @@ fn a_table_without_a_recorded_owner_grants_nothing_through_ownership() {
          CREATE TABLE t (id INTEGER PRIMARY KEY);",
     );
 
-    assert_eq!(table(&database, None, "t").owner_privileges(&database).map(Iterator::count), Ok(7));
+    assert_eq!(table(&database, None, "t").owner_privileges(&database).map(Iterator::count), Ok(8));
     assert!(!can_select(&database, None, "t", "postgres"));
 }
 

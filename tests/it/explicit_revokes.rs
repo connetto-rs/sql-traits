@@ -111,7 +111,7 @@ fn revoke_all_revokes_every_table_privilege_one_by_one() {
 
     assert_eq!(
         revoked_on_table(&database, "profiles", "app_user"),
-        ["INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"]
+        ["INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"]
     );
 }
 

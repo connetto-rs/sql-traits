@@ -13050,7 +13050,8 @@ mod tests {
                         "UPDATE",
                         "TRUNCATE",
                         "REFERENCES",
-                        "TRIGGER"
+                        "TRIGGER",
+                        "MAINTAIN"
                     ])
                 );
                 let role = db.role("r").expect("role exists");
@@ -13080,6 +13081,7 @@ mod tests {
                 ("UPDATE", true),
                 ("TRUNCATE", true),
                 ("REFERENCES", true),
+                ("MAINTAIN", true),
                 ("DELETE", false),
                 ("TRIGGER", false),
             ]
@@ -13128,7 +13130,7 @@ mod tests {
 
             assert_eq!(
                 held_privileges(&db),
-                without_grant_option(&["TRUNCATE", "REFERENCES", "TRIGGER"])
+                without_grant_option(&["TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"])
             );
         }
 

@@ -460,8 +460,7 @@ pub(crate) enum PrivilegeKind {
 }
 
 impl PrivilegeKind {
-    /// The privileges `ALL PRIVILEGES` grants on an object of this kind,
-    /// without `MAINTAIN`, which sqlparser has no action for.
+    /// The privileges `ALL PRIVILEGES` grants on an object of this kind.
     pub(crate) fn all_privileges(self) -> Vec<Action> {
         match self {
             Self::Relation => {
@@ -473,6 +472,7 @@ impl PrivilegeKind {
                     Action::Truncate,
                     Action::References { columns: None },
                     Action::Trigger,
+                    Action::Maintain,
                 ]
             }
             Self::Sequence => {

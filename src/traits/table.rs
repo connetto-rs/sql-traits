@@ -4399,7 +4399,7 @@ pub trait TableLike:
     /// let docs =
     ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
     /// let held: Vec<_> = docs.owner_privileges(&db)?.map(ToString::to_string).collect();
-    /// assert_eq!(held, ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES"]);
+    /// assert_eq!(held, ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES", "MAINTAIN"]);
     /// assert!(!docs.owner_privileges(&db)?.any(|privilege| matches!(privilege, Action::Truncate)));
     /// # Ok(())
     /// # }
@@ -4689,15 +4689,15 @@ pub trait TableLike:
 
 /// How many table privileges PostgreSQL has, in the order
 /// [`privilege_slot`] numbers them.
-const TABLE_PRIVILEGES: usize = 7;
+const TABLE_PRIVILEGES: usize = 8;
 
 /// How many of the table privileges can be granted per column, which
 /// [`privilege_slot`] numbers first.
 const COLUMN_PRIVILEGES: usize = 4;
 
 /// The slot of a table privilege, `SELECT`, `INSERT`, `UPDATE` and
-/// `REFERENCES` first, then `DELETE`, `TRUNCATE` and `TRIGGER`, or `None` for
-/// an action that is no table privilege.
+/// `REFERENCES` first, then `DELETE`, `TRUNCATE`, `TRIGGER` and `MAINTAIN`,
+/// or `None` for an action that is no table privilege.
 fn privilege_slot(action: &sqlparser::ast::Action) -> Option<usize> {
     use sqlparser::ast::Action;
     match action {
@@ -4708,6 +4708,7 @@ fn privilege_slot(action: &sqlparser::ast::Action) -> Option<usize> {
         Action::Delete => Some(4),
         Action::Truncate => Some(5),
         Action::Trigger => Some(6),
+        Action::Maintain => Some(7),
         _ => None,
     }
 }
@@ -4803,6 +4804,7 @@ impl HeldPrivileges {
             delete: self.table[4],
             truncate: self.table[5],
             trigger: self.table[6],
+            maintain: self.table[7],
         }
     }
 }
