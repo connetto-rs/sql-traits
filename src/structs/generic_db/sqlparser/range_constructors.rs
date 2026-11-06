@@ -17,7 +17,13 @@
 //! REPLACE FUNCTION` turns a constructor into an ordinary function, dropping
 //! the dependency.
 
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 
 use sqlparser::{
     ast::{
