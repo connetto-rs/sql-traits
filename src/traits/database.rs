@@ -12,7 +12,7 @@ use sqlparser::ast::Function;
 
 use crate::{
     errors::{Error, LookupError},
-    structs::{IdentifierCase, TargetName},
+    structs::{IdentifierCase, RoleSetting, TargetName},
     traits::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, DomainLike,
         ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike,
@@ -132,24 +132,6 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # }
     /// ```
     fn number_of_tables(&self) -> usize;
-
-    /// Returns the timezone of the database, if any.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    ///
-    /// let db = ParserDB::parse::<GenericDialect>("SET TIME ZONE 'UTC';")?;
-    /// assert_eq!(db.timezone(), Some("UTC"));
-    ///
-    /// let db_no_tz = ParserDB::parse::<GenericDialect>("CREATE TABLE t (id INT);")?;
-    /// assert_eq!(db_no_tz.timezone(), None);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn timezone(&self) -> Option<&str>;
 
     /// Iterates over the tables defined in the schema.
     ///
@@ -1980,6 +1962,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # }
     /// ```
     fn role_memberships(&self) -> impl Iterator<Item = &Self::RoleMembership>;
+
+    /// Iterates over the `ALTER ROLE ... SET` entries, one per role,
+    /// database and setting, in the order they were first set.
+    ///
+    /// [`RoleSetting`] shows them read from a schema.
+    fn role_settings(&self) -> impl Iterator<Item = &RoleSetting>;
 
     /// Returns whether the database has any roles defined.
     ///

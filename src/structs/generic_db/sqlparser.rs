@@ -102,6 +102,7 @@ mod postgres_catalog;
 mod range_constructors;
 mod revocations;
 mod role_memberships;
+mod role_settings;
 mod routine_privileges;
 mod rules;
 mod schema_usage;
@@ -123,6 +124,7 @@ use parsed_source::{ParsedSource, StatementSource};
 use postgres_catalog::CatalogName;
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};
 use role_memberships::CreateRoleMemberships;
+use role_settings::SessionSettings;
 
 /// The object kinds a schema parsed from SQL text holds, each an `sqlparser`
 /// AST node or a wrapper pairing one with the table it belongs to.
@@ -167,6 +169,7 @@ impl SchemaProfile for SqlparserProfile {
             unresolved_function_grants: Vec::new(),
             role_alterations: Vec::new(),
             session_roles: SessionRoles::default(),
+            session_settings: SessionSettings::default(),
             default_privileges: DefaultPrivileges::default(),
         })
     }
@@ -224,8 +227,9 @@ enum TableOrigin {
 /// access-resolution mode, the active PostgreSQL catalog, metadata for
 /// collations the ingested DDL created, the function signatures open-world
 /// grants named without reaching a function, the attribute changes aimed at
-/// roles the input never created, the roles the session runs as, and the
-/// defaults `ALTER DEFAULT PRIVILEGES` recorded.
+/// roles the input never created, the roles the session runs as, the values
+/// its own `SET` statements left, and the defaults `ALTER DEFAULT
+/// PRIVILEGES` recorded.
 ///
 /// The catalog sits behind an [`Arc`], so cloning a database or taking a
 /// snapshot bumps a reference count rather than copying the catalog's
@@ -239,6 +243,7 @@ pub struct ParserIngestion {
     unresolved_function_grants: Vec<FunctionDesc>,
     role_alterations: Vec<UndeclaredRoleAlteration>,
     session_roles: SessionRoles,
+    session_settings: SessionSettings,
     default_privileges: DefaultPrivileges,
 }
 
@@ -257,6 +262,7 @@ impl core::fmt::Debug for ParserIngestion {
             .field("unresolved_function_grants", &self.unresolved_function_grants.len())
             .field("undeclared_role_alterations", &self.role_alterations.len())
             .field("session_roles", &self.session_roles)
+            .field("session_settings", &self.session_settings)
             .field("default_privileges", &self.default_privileges)
             .finish()
     }
@@ -4787,6 +4793,7 @@ impl ParserDBIngestor {
                 unresolved_function_grants: Vec::new(),
                 role_alterations: Vec::new(),
                 session_roles: SessionRoles::starting_as(session_role),
+                session_settings: SessionSettings::default(),
                 default_privileges: DefaultPrivileges::default(),
             },
             access_resolution,
@@ -8179,6 +8186,7 @@ impl ParserDB {
             mut unresolved_function_grants,
             mut role_alterations,
             mut session_roles,
+            mut session_settings,
             mut default_privileges,
         } = catalog;
         let dialect = *builder.dialect();
@@ -8202,6 +8210,22 @@ impl ParserDB {
                     });
                 }
                 session_roles.apply(&change, in_transaction);
+                continue;
+            }
+            if tracks_session_roles(dialect) {
+                session_settings.apply(
+                    &statement,
+                    in_transaction,
+                    dialect.hex_strings_may_be_integers(),
+                )?;
+            }
+            if role_settings::alter_role(
+                &mut builder,
+                &session_roles,
+                &session_settings,
+                &statement,
+                dialect.hex_strings_may_be_integers(),
+            )? {
                 continue;
             }
             // A foreign table takes the table path, so every check on a table's
@@ -8689,6 +8713,7 @@ impl ParserDB {
 
                         role_memberships::drop_role(&mut builder, role_ident);
                         revocations::drop_role(&mut builder, role_ident);
+                        role_settings::drop_role(&mut builder, role_ident);
                         builder
                             .roles_mut()
                             .retain(|(role, ())| !role_matches_lookup_ident(role, role_ident));
@@ -8737,6 +8762,7 @@ impl ParserDB {
                     rename_grantee_role(builder.table_grants_mut(), &name, &new_name);
                     rename_grantee_role(builder.column_grants_mut(), &name, &new_name);
                     revocations::rename_role(&mut builder, &name, &new_name);
+                    role_settings::rename_role(&mut builder, &name, &new_name);
                     rename_execute_grantees(&mut builder, &name, &new_name);
                     default_privileges.rename_role(&name, &new_name);
                 }
@@ -10011,19 +10037,6 @@ impl ParserDB {
                     table_owner::revoke(&mut builder, &revoke);
                     schema_usage::revoke(&mut builder, &revoke);
                 }
-                Statement::Set(sqlparser::ast::Set::SetTimeZone { local, value }) => {
-                    if local {
-                        builder = builder.timezone("LOCAL".to_string());
-                    } else if let Expr::Value(ValueWithSpan {
-                        value: Value::SingleQuotedString(lit),
-                        ..
-                    }) = value
-                    {
-                        builder = builder.timezone(lit);
-                    }
-                    // Ignore unsupported SET TIME ZONE expressions (e.g.,
-                    // binary ops)
-                }
                 statement @ (Statement::Set(sqlparser::ast::Set::SingleAssignment { .. })
                 | Statement::Reset(_)) => {
                     // `SET` replaces the path rather than extending it, so
@@ -10450,6 +10463,7 @@ impl ParserDB {
             unresolved_function_grants,
             role_alterations,
             session_roles,
+            session_settings,
             default_privileges,
         })
     }

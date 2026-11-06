@@ -11,7 +11,7 @@ use sqlparser::ast::{FunctionDesc, Ident, Statement, TransactionModifier};
 
 use super::{
     AccessResolution, CreatedCollationMetadata, DefaultPrivileges, ParserDB, ParserDBBuilder,
-    ParserIngestion, PostgresCatalog, SessionRoles, UndeclaredRoleAlteration,
+    ParserIngestion, PostgresCatalog, SessionRoles, SessionSettings, UndeclaredRoleAlteration,
     parsed_source::StatementSource,
 };
 use crate::{errors::Error, impls::SqlparserDialect, structs::IdentifierCase};
@@ -31,6 +31,8 @@ pub(super) struct Catalog {
     pub(super) role_alterations: Vec<UndeclaredRoleAlteration>,
     /// The roles the session runs as.
     pub(super) session_roles: SessionRoles,
+    /// The values the session's own `SET` statements left.
+    pub(super) session_settings: SessionSettings,
     /// The defaults `ALTER DEFAULT PRIVILEGES` recorded.
     pub(super) default_privileges: DefaultPrivileges,
 }
@@ -45,6 +47,7 @@ impl Catalog {
             unresolved_function_grants,
             role_alterations,
             session_roles,
+            session_settings,
             default_privileges,
         } = Arc::try_unwrap(ingestion).unwrap_or_else(|shared| (*shared).clone());
         let catalog = Self {
@@ -54,6 +57,7 @@ impl Catalog {
             unresolved_function_grants,
             role_alterations,
             session_roles,
+            session_settings,
             default_privileges,
         };
         (catalog, access_resolution)
@@ -67,6 +71,7 @@ impl Catalog {
             unresolved_function_grants: self.unresolved_function_grants,
             role_alterations: self.role_alterations,
             session_roles: self.session_roles,
+            session_settings: self.session_settings,
             default_privileges: self.default_privileges,
         }))
     }
@@ -79,6 +84,7 @@ impl Catalog {
             unresolved_function_grants: self.unresolved_function_grants.clone(),
             role_alterations: self.role_alterations.clone(),
             session_roles: self.session_roles.clone(),
+            session_settings: self.session_settings.clone(),
             default_privileges: self.default_privileges.clone(),
         }))
     }
@@ -154,6 +160,7 @@ pub(super) fn apply(
         // The end of a transaction takes what `SET LOCAL` set with it.
         if matches!(control, Control::Commit { .. } | Control::Rollback { .. }) {
             catalog.session_roles.end_transaction();
+            catalog.session_settings.end_transaction();
         }
         return Ok(catalog);
     }

@@ -126,6 +126,11 @@ impl SessionRoles {
         self.current().current().map(|role| role.stored.as_str())
     }
 
+    /// The stored name of the role `SESSION_USER` names now.
+    pub(super) fn session_role(&self) -> Option<&str> {
+        self.current().session.as_ref().map(|role| role.stored.as_str())
+    }
+
     /// Whether the session runs as `role`, as its current or its session
     /// role, which PostgreSQL refuses to drop or rename.
     pub(super) fn runs_as(&self, role: &Ident) -> bool {
