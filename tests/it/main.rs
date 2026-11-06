@@ -11,6 +11,7 @@ mod absent_table_alterations;
 mod altered_policies;
 mod array_column_types;
 mod array_vector_interval_types;
+mod binary_send;
 mod call_resolution;
 mod call_result_types;
 mod catalog_navigation;

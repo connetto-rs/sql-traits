@@ -458,6 +458,21 @@ impl DataTypeLike for MemoryDataType {
     fn name<'db>(&'db self, _database: &'db Self::DB) -> Cow<'db, str> {
         Cow::Borrowed(&self.0)
     }
+
+    fn send_function(&self, _database: &Self::DB) -> Option<bool> {
+        None
+    }
+
+    fn range_subtype<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
+        None
+    }
+
+    fn composite_fields<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<impl Iterator<Item = &'db Self>> {
+        None::<core::iter::Empty<&'db Self>>
+    }
 }
 
 impl TableLike for MemoryTable {

@@ -1,7 +1,7 @@
 //! Submodule providing a trait for describing declared SQL data types.
 
-use alloc::borrow::Cow;
-use core::{fmt::Debug, num::NonZeroU32};
+use alloc::{borrow::Cow, vec, vec::Vec};
+use core::{fmt::Debug, num::NonZeroU32, ptr};
 
 use crate::{
     traits::DatabaseLike,
@@ -107,6 +107,25 @@ impl VectorType {
     pub const fn dimensions(self) -> Option<u32> {
         self.dimensions
     }
+}
+
+/// What PostgreSQL's `pgoutput` does with a value of a type under the `binary`
+/// option, as [`DataTypeLike::binary_send`] answers it.
+#[derive(Debug)]
+pub enum BinarySend<'db, T: ?Sized> {
+    /// The type and every type its send function reaches have a send function,
+    /// so the value travels in binary.
+    Binary,
+    /// The type has no send function of its own, so `pgoutput` sends the
+    /// column as text.
+    Text,
+    /// The type has a send function, and that function reaches this type,
+    /// which has none, so sending the value raises `no binary output function
+    /// available for type` naming it.
+    Fails(&'db T),
+    /// The implementation cannot tell whether this type, reached on the way,
+    /// has a send function, and no type found fails.
+    Unknown(&'db T),
 }
 
 /// A trait for declared SQL data types, the type of a column or of an array
@@ -601,4 +620,176 @@ pub trait DataTypeLike: Debug + Send + Sync {
     fn base_type<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
         None
     }
+
+    /// Returns whether the type has a binary send function of its own, as
+    /// PostgreSQL's `pg_type.typsend` records it, or `None` when the
+    /// implementation cannot tell, as for a type an extension creates.
+    ///
+    /// A domain answers its base type's, since PostgreSQL copies the send
+    /// function into the domain. Every array, range, multirange, composite and
+    /// enumeration type has one, and so does every base type declared with
+    /// `SEND`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE DOMAIN grant_item AS aclitem;
+    ///      CREATE TABLE t (id INT, acl aclitem, acls aclitem[], item grant_item, shape box2d);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let sends: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).send_function(&db)).collect();
+    /// assert_eq!(sends, [Some(true), Some(false), Some(true), Some(false), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn send_function(&self, database: &Self::DB) -> Option<bool>;
+
+    /// Returns the subtype of a range type, or of the ranges a multirange type
+    /// holds, or `None` for every other type, a domain over a range included.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TYPE floatrange AS RANGE (subtype = float8);
+    ///      CREATE TABLE t (span int4range, spans tstzmultirange, floats floatmultirange, n INT);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let subtypes: Vec<_> = table
+    ///     .columns(&db)?
+    ///     .map(|column| column.data_type(&db).range_subtype(&db).map(|subtype| subtype.name(&db)))
+    ///     .collect();
+    /// assert_eq!(
+    ///     subtypes,
+    ///     [Some("INT4".into()), Some("TIMESTAMPTZ".into()), Some("FLOAT8".into()), None]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn range_subtype<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self>;
+
+    /// Returns the type of each attribute of a composite type, in order, or
+    /// `None` for every other type, a domain over a composite included.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TYPE pair AS (left_side INT, right_side TEXT[]);
+    ///      CREATE TABLE t (p pair, n INT);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let pair = table.column("p", &db, IdentifierCase::AsWritten)?.unwrap().data_type(&db);
+    /// let fields: Vec<_> = pair.composite_fields(&db).unwrap().map(|field| field.name(&db)).collect();
+    /// assert_eq!(fields, ["INT", "TEXT[]"]);
+    /// let n = table.column("n", &db, IdentifierCase::AsWritten)?.unwrap().data_type(&db);
+    /// assert!(n.composite_fields(&db).is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn composite_fields<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<impl Iterator<Item = &'db Self>>;
+
+    /// Returns what `pgoutput` does with a value of the type when a logical
+    /// replication stream asks for the `binary` format.
+    ///
+    /// `pgoutput` sends a column in binary when its type has a send function
+    /// and as text otherwise. The send function of an array, a range, a
+    /// multirange or a composite calls the send function of its element,
+    /// subtype, range or attributes, at any depth and through domains, and
+    /// raises an error on one that has none. The stream then fails at the
+    /// same record on every reconnect. This walks [`Self::send_function`]
+    /// through [`Self::base_type`], [`Self::array_element`],
+    /// [`Self::range_subtype`] and [`Self::composite_fields`] in the order
+    /// PostgreSQL does, so [`BinarySend::Fails`] names the type its error
+    /// names.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE DOMAIN grant_item AS aclitem;
+    ///      CREATE DOMAIN grant_items AS aclitem[];
+    ///      CREATE TABLE t (id INT, acl aclitem, item grant_item, items grant_items, shape box2d);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let sends: Vec<String> = table
+    ///     .columns(&db)?
+    ///     .map(|column| {
+    ///         match column.data_type(&db).binary_send(&db) {
+    ///             BinarySend::Binary => "binary".to_owned(),
+    ///             BinarySend::Text => "text".to_owned(),
+    ///             BinarySend::Fails(failing) => format!("fails on {}", failing.name(&db)),
+    ///             BinarySend::Unknown(unknown) => format!("unknown {}", unknown.name(&db)),
+    ///         }
+    ///     })
+    ///     .collect();
+    /// assert_eq!(sends, ["binary", "text", "text", "fails on aclitem", "unknown box2d"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn binary_send<'db>(&'db self, database: &'db Self::DB) -> BinarySend<'db, Self> {
+        match self.send_function(database) {
+            None => return BinarySend::Unknown(self),
+            Some(false) => return BinarySend::Text,
+            Some(true) => {}
+        }
+        // Pre-order and in attribute order, as PostgreSQL's send functions call
+        // each other.
+        let mut pending = sent_through(self, database);
+        let mut expanded = vec![self];
+        let mut unknown = None;
+        while let Some(sent) = pending.pop() {
+            match sent.send_function(database) {
+                Some(false) => return BinarySend::Fails(sent),
+                None => {
+                    unknown.get_or_insert(sent);
+                }
+                Some(true) if !expanded.iter().any(|seen| ptr::eq(*seen, sent)) => {
+                    expanded.push(sent);
+                    pending.extend(sent_through(sent, database));
+                }
+                Some(true) => {}
+            }
+        }
+        unknown.map_or(BinarySend::Binary, BinarySend::Unknown)
+    }
+}
+
+/// The types the send function of `sent` calls the send functions of, last
+/// first, so popping them visits them in order.
+fn sent_through<'db, T: DataTypeLike + ?Sized>(sent: &'db T, database: &'db T::DB) -> Vec<&'db T> {
+    let structure = sent.base_type(database).unwrap_or(sent);
+    let mut reached: Vec<&'db T> = structure
+        .array_element(database)
+        .into_iter()
+        .chain(structure.range_subtype(database))
+        .chain(structure.composite_fields(database).into_iter().flatten())
+        .collect();
+    reached.reverse();
+    reached
 }
