@@ -7,7 +7,7 @@ use alloc::{
     vec::Vec,
 };
 
-use sqlparser::ast::{CreateFunction, CreateRole, Grantee, GranteeName, Ident};
+use sqlparser::ast::{CreateFunction, CreateRole, Grantee, GranteeName, Ident, ObjectName};
 
 use crate::{
     impls::{
@@ -38,6 +38,9 @@ pub struct FunctionMetadata {
     /// The extensions `ALTER FUNCTION ... DEPENDS ON EXTENSION` made the
     /// function depend on, each dropping it when it is dropped.
     extension_dependencies: Vec<Ident>,
+    /// The range whose `CREATE TYPE` created the function as one of its
+    /// constructors, and which drops it.
+    range_constructor: Option<RangeConstructor>,
     /// The calls of a body PostgreSQL binds at creation, with the functions
     /// each reached then, and none for a body read again each time it runs.
     body_calls: ExpressionCalls<CreateFunction>,
@@ -139,6 +142,27 @@ impl FunctionMetadata {
         if depends {
             self.extension_dependencies.push(extension.clone());
         }
+    }
+
+    /// Returns the range the function is a constructor of.
+    #[must_use]
+    #[inline]
+    pub(crate) fn range_constructor(&self) -> Option<&RangeConstructor> {
+        self.range_constructor.as_ref()
+    }
+
+    /// Returns the range the function is a constructor of, for a rename to
+    /// follow.
+    #[inline]
+    pub(crate) fn range_constructor_mut(&mut self) -> Option<&mut RangeConstructor> {
+        self.range_constructor.as_mut()
+    }
+
+    /// Binds the function to the range it constructs, or frees it from one
+    /// with [`None`].
+    #[inline]
+    pub(crate) fn set_range_constructor(&mut self, constructor: Option<RangeConstructor>) {
+        self.range_constructor = constructor;
     }
 
     /// Returns the calls of the function's body if PostgreSQL bound it at
@@ -273,6 +297,17 @@ impl FunctionMetadata {
             !grantees.iter().any(|revoked| grantees_match(&grant.grantee, revoked))
         });
     }
+}
+
+/// The range a constructor function belongs to, as the internal dependency
+/// PostgreSQL records between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RangeConstructor {
+    /// The range's stored name, kept current through renames.
+    pub(crate) range: ObjectName,
+    /// Whether the function builds the range's multirange, which is then the
+    /// type that requires it.
+    pub(crate) multirange: bool,
 }
 
 /// The holder an `EXECUTE` entry of its own names, which is never `PUBLIC`.

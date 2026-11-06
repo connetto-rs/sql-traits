@@ -1790,6 +1790,17 @@ pub enum Error {
         /// Name of the extension that created it.
         extension_name: String,
     },
+    #[error("Cannot drop function `{function_name}`: type `{type_name}` requires it.")]
+    /// Error indicating that a DROP FUNCTION statement names a constructor
+    /// `CREATE TYPE ... AS RANGE` created, which only dropping the range
+    /// removes. The type is the range for its own constructors and the
+    /// multirange for the multirange's.
+    FunctionRequiredByType {
+        /// Name of the function being dropped.
+        function_name: String,
+        /// Name of the type that requires it.
+        type_name: String,
+    },
     #[error("Table `{table_name}` not found for DROP TABLE statement.")]
     /// Error indicating that a DROP TABLE statement references a table
     /// that does not exist.

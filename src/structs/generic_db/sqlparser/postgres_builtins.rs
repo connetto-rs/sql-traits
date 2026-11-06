@@ -195,6 +195,19 @@ pub(super) fn declaration(
     volatility: Volatility,
     language: &str,
 ) -> CreateFunction {
+    server_function(name, args, returns.data_type(), strict, volatility, language)
+}
+
+/// The declaration of a function the server provides returning `returns`,
+/// with an empty body.
+pub(super) fn server_function(
+    name: ObjectName,
+    args: Vec<OperateFunctionArg>,
+    returns: DataType,
+    strict: bool,
+    volatility: Volatility,
+    language: &str,
+) -> CreateFunction {
     CreateFunction {
         or_alter: false,
         or_replace: false,
@@ -202,7 +215,7 @@ pub(super) fn declaration(
         if_not_exists: false,
         name,
         args: Some(args),
-        return_type: Some(FunctionReturnType::DataType(returns.data_type())),
+        return_type: Some(FunctionReturnType::DataType(returns)),
         function_body: Some(CreateFunctionBody::AsBeforeOptions {
             body: Expr::Value(ValueWithSpan {
                 value: Value::SingleQuotedString(String::new()),
