@@ -6,7 +6,7 @@ use core::num::NonZeroU32;
 
 use sqlparser::ast::{
     ArrayElemTypeDef, DataType, ExactNumberInfo, TimezoneInfo, TypeModifier,
-    UserDefinedTypeRepresentation,
+    UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
 };
 
 use crate::{
@@ -211,11 +211,12 @@ impl DataTypeLike for DataType {
             return base.send_function(database);
         }
         if let Some((user_type, _)) = user_type_of(self, database) {
-            // A shell types no value, so only a base type may lack a send
-            // function.
+            // A shell types no value, so only a base type may lack one.
             return Some(match user_type.representation() {
-                Some(UserDefinedTypeRepresentation::SqlDefinition { .. }) => {
-                    user_type.declares_send()
+                Some(UserDefinedTypeRepresentation::SqlDefinition { options }) => {
+                    options
+                        .iter()
+                        .any(|option| matches!(option, UserDefinedTypeSqlDefinitionOption::Send(_)))
                 }
                 defined => defined.is_some(),
             });
