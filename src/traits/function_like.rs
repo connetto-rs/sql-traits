@@ -433,7 +433,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     parser::Parser,
     /// };
     ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION pick(a anycompatible, b anycompatible) RETURNS anycompatible
+    ///          LANGUAGE sql AS 'SELECT coalesce(a, b)';",
+    /// )?;
     /// let call = |sql: &str| {
     ///     let Statement::Query(query) =
     ///         Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {sql}")).unwrap().remove(0)
@@ -446,28 +449,21 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     };
     ///     call
     /// };
-    /// let coalesce = db
-    ///     .function_by_target(
-    ///         TargetName::new("coalesce", false).with_schema("pg_catalog", false),
-    ///         IdentifierCase::AsWritten,
-    ///     )?
+    /// let pick = db
+    ///     .function_by_target(TargetName::new("pick", false), IdentifierCase::AsWritten)?
     ///     .expect("Function should exist");
     /// let returns = |sql: &str, types: &[Option<&str>]| {
-    ///     coalesce
-    ///         .call_result_type_name(&call(sql), types, &db)
+    ///     pick.call_result_type_name(&call(sql), types, &db)
     ///         .map(|name| name.map(|name| name.into_owned()))
     /// };
     /// assert_eq!(
-    ///     returns("coalesce(b, NULL)", &[Some("BYTEA"), Some("unknown")])?.as_deref(),
+    ///     returns("pick(b, NULL)", &[Some("BYTEA"), Some("unknown")])?.as_deref(),
     ///     Some("BYTEA")
     /// );
-    /// assert_eq!(
-    ///     returns("coalesce(i, j)", &[Some("INT"), Some("BIGINT")])?.as_deref(),
-    ///     Some("BIGINT")
-    /// );
+    /// assert_eq!(returns("pick(i, j)", &[Some("INT"), Some("BIGINT")])?.as_deref(), Some("BIGINT"));
     /// // PostgreSQL finds no common type for a binary string and text.
-    /// assert_eq!(returns("coalesce(b, t)", &[Some("BYTEA"), Some("TEXT")])?, None);
-    /// assert_eq!(returns("coalesce(b, x)", &[Some("BYTEA"), None])?, None);
+    /// assert_eq!(returns("pick(b, t)", &[Some("BYTEA"), Some("TEXT")])?, None);
+    /// assert_eq!(returns("pick(b, x)", &[Some("BYTEA"), None])?, None);
     /// # Ok(())
     /// # }
     /// ```

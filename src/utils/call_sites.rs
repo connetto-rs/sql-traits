@@ -4,8 +4,8 @@
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, ObjectName,
-    TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, InTarget, ObjectName,
+    ObjectNamePart, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use crate::{
@@ -90,6 +90,47 @@ where
     }
 }
 
+/// An expression PostgreSQL's grammar writes with the syntax of a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpressionForm {
+    /// `COALESCE`, `GREATEST` and `LEAST`, of the common type of their
+    /// arguments.
+    CommonType,
+    /// `NULLIF`, of the type of its first argument.
+    FirstArgument,
+    /// A SQL value function such as `CURRENT_DATE`, of a fixed type, spelled
+    /// as sqlparser writes it.
+    Value(&'static str),
+}
+
+/// The expression a call written `called` is, when PostgreSQL reads that
+/// name as one rather than as a call to a function.
+///
+/// Each of these names is a keyword the grammar takes before any function
+/// lookup, so only a bare unquoted name is one. A quoted or qualified name
+/// calls a function as any other does, and so does `current_schema()`,
+/// which only bare is a value function.
+pub(crate) fn expression_form(called: &ObjectName) -> Option<ExpressionForm> {
+    let [ObjectNamePart::Identifier(Ident { value, quote_style: None, .. })] = called.0.as_slice()
+    else {
+        return None;
+    };
+    let form = match value.to_ascii_lowercase().as_str() {
+        "coalesce" | "greatest" | "least" => ExpressionForm::CommonType,
+        "nullif" => ExpressionForm::FirstArgument,
+        "current_date" => ExpressionForm::Value("DATE"),
+        "current_time" => ExpressionForm::Value("TIME WITH TIME ZONE"),
+        "current_timestamp" => ExpressionForm::Value("TIMESTAMP WITH TIME ZONE"),
+        "localtime" => ExpressionForm::Value("TIME"),
+        "localtimestamp" => ExpressionForm::Value("TIMESTAMP"),
+        "current_user" | "current_role" | "session_user" | "user" | "current_catalog" => {
+            ExpressionForm::Value("name")
+        }
+        _ => return None,
+    };
+    Some(form)
+}
+
 /// Hands each call the walk meets to `each`.
 struct Calls<F> {
     each: F,
@@ -100,7 +141,7 @@ impl<B, F: FnMut(Call<'_>) -> ControlFlow<B>> Visitor for Calls<F> {
 
     fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<B> {
         match expression {
-            Expr::Function(function) => {
+            Expr::Function(function) if expression_form(&function.name).is_none() => {
                 let arguments = argument_count(&function.args);
                 (self.each)(Call { name: &function.name, arguments, node: Some(function) })
             }
@@ -152,7 +193,7 @@ impl<B, F: FnMut(&mut ObjectName, usize) -> ControlFlow<B>> VisitorMut for CallN
 
     fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<B> {
         match expression {
-            Expr::Function(function) => {
+            Expr::Function(function) if expression_form(&function.name).is_none() => {
                 let arguments = argument_count(&function.args);
                 (self.each)(&mut function.name, arguments)
             }

@@ -10,6 +10,8 @@ use sqlparser::{
     dialect::PostgreSqlDialect,
 };
 
+use crate::support::function_overloads::overload;
+
 fn parse(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses")
 }
@@ -63,10 +65,12 @@ fn calls_in_a_subquery_reach_functions_of_their_kind() {
             ("count".to_owned(), vec![(0, FunctionKind::Aggregate)]),
             ("count".to_owned(), vec![(1, FunctionKind::Aggregate)]),
             ("bool_and".to_owned(), vec![(1, FunctionKind::Aggregate)]),
-            ("string_agg".to_owned(), vec![(2, FunctionKind::Aggregate)]),
+            // Of text and of bytea.
+            ("string_agg".to_owned(), vec![(2, FunctionKind::Aggregate); 2]),
             ("row_number".to_owned(), vec![(0, FunctionKind::Window)]),
             ("lag".to_owned(), vec![(2, FunctionKind::Window)]),
-            ("lower".to_owned(), vec![(1, FunctionKind::Normal)]),
+            // Of text, of a range and of a multirange.
+            ("lower".to_owned(), vec![(1, FunctionKind::Normal); 3]),
         ]
     );
 }
@@ -157,13 +161,7 @@ fn a_replacement_cannot_change_a_routine_kind() {
     let db = parse(
         "CREATE OR REPLACE FUNCTION pg_catalog.lower(x TEXT) RETURNS TEXT LANGUAGE sql AS 'SELECT x';",
     );
-    let lower = db
-        .function_by_target(
-            TargetName::new("lower", false).with_schema("pg_catalog", false),
-            IdentifierCase::AsWritten,
-        )
-        .expect("unambiguous lookup")
-        .expect("function exists");
+    let lower = overload(&db, "pg_catalog", "lower", &["text"]);
     assert_eq!(lower.kind(&db), Ok(FunctionKind::Normal));
     assert_eq!(lower.body(), Some("SELECT x"));
 }

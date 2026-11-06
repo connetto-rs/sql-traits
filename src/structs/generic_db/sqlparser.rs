@@ -43,6 +43,7 @@ use crate::{
         ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
         IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
         Sequence, TableAttribute, TableMetadata, UserDefinedType, View,
+        generic_db::builtin_functions::Builtins,
         metadata::{
             CheckMetadata, ColumnCreation, ExpressionCalls, IndexMetadata, PolicyMetadata,
             UniqueIndexMetadata,
@@ -95,6 +96,7 @@ mod parsed_source;
 mod partition_bounds;
 mod partition_keys;
 mod postgres_18_collations;
+mod postgres_18_functions;
 mod postgres_builtins;
 mod postgres_catalog;
 mod range_constructors;
@@ -1044,6 +1046,7 @@ impl ParserDBBuilder {
             node,
             &calls_in_expression::CallScope {
                 functions: &functions,
+                builtins: self.builtins(),
                 search_path: &search_path,
                 case: self.identifier_case(),
             },
@@ -1152,6 +1155,7 @@ impl ParserDBBuilder {
         // A bound name left bare is one in the default schema.
         let trigger_scope = calls_in_expression::CallScope {
             functions: &[],
+            builtins: &Builtins::none(),
             search_path: &[("public", false)],
             case: self.identifier_case(),
         };
@@ -1196,6 +1200,7 @@ impl ParserDBBuilder {
         let case = self.identifier_case();
         let scope = calls_in_expression::CallScope {
             functions: &functions,
+            builtins: self.builtins(),
             search_path: &search_path,
             case,
         };
@@ -1207,8 +1212,8 @@ impl ParserDBBuilder {
                 .position(|&entry| schema_qualifiers_match(declared_in, Some(entry), case))
                 .map_or(0, |position| position + 1)
         };
-        functions
-            .iter()
+        scope
+            .candidates(called)
             .filter(|function| {
                 scope.reaches(function, called, 0)
                     && function_argument_types(function.args.as_deref()).is_empty()
@@ -3414,6 +3419,55 @@ fn validate_table_schema(
     )
 }
 
+/// Moves the functions the engine provides that `statement` names as objects
+/// into the builder's own store, where the statement replaces, alters, grants
+/// on or drops them as it would a declared function.
+///
+/// A provided function is taken by name, whatever schema the statement
+/// qualifies it with, since taking one changes no answer.
+fn take_builtins_named_by(builder: &mut ParserDBBuilder, statement: &Statement) {
+    fn named(name: &ObjectName) -> Option<&str> {
+        object_name_last_part(name).map(|(name, _)| name)
+    }
+    let signatures: &[FunctionDesc] = match statement {
+        Statement::CreateFunction(function) => {
+            if let Some(name) = named(&function.name) {
+                builder.take_builtins_named(name);
+            }
+            return;
+        }
+        Statement::AlterFunction(alter) => core::slice::from_ref(&alter.function),
+        Statement::DropFunction(drop) => &drop.func_desc,
+        // This model holds no procedure, so `DROP PROCEDURE` and a grant on
+        // procedures reach no provided function.
+        Statement::Grant(Grant { objects: Some(objects), .. })
+        | Statement::Revoke(sqlparser::ast::Revoke { objects: Some(objects), .. }) => {
+            match objects {
+                GrantObjects::Functions(signatures) | GrantObjects::Routines(signatures) => {
+                    signatures
+                }
+                GrantObjects::AllFunctionsInSchema { schemas }
+                | GrantObjects::AllRoutinesInSchema { schemas } => {
+                    let names_catalog = |schema: &ObjectName| {
+                        object_name_last_part(schema).is_some_and(|(schema, quoted)| {
+                            identifiers_match(schema, quoted, PG_CATALOG, false)
+                        })
+                    };
+                    if schemas.iter().any(names_catalog) {
+                        builder.take_all_builtins();
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+        _ => return,
+    };
+    for name in signatures.iter().filter_map(|signature| named(&signature.name)) {
+        builder.take_builtins_named(name);
+    }
+}
+
 /// Splits a `CREATE FOREIGN TABLE` into the table node it declares and the
 /// server and options PostgreSQL keeps apart in `pg_foreign_table`.
 fn foreign_table_node(foreign_table: CreateForeignTable) -> (CreateTable, ForeignTableSource) {
@@ -4717,12 +4771,12 @@ impl ParserDBIngestor {
         let mut builder: ParserDBBuilder = super::GenericDBBuilder::new(catalog_name, dialect)
             .with_identifier_case(identifier_case);
 
-        for builtin in postgres_builtins::POSTGRES_BUILTINS {
-            builder = builder.add_function(Arc::new(builtin.function()), builtin.metadata());
-        }
-        // Every PostgreSQL database is created holding PL/pgSQL.
+        // Every PostgreSQL database is created holding the `pg_catalog`
+        // functions and PL/pgSQL.
         if matches!(dialect, SqlparserDialect::PostgreSql) {
-            builder = builder.add_extension(Arc::new(extensions::plpgsql()), ());
+            builder = builder
+                .with_builtins(&postgres_builtins::POSTGRES_18_BUILTINS)
+                .add_extension(Arc::new(extensions::plpgsql()), ());
         }
 
         Self {
@@ -8159,6 +8213,7 @@ impl ParserDB {
                 }
                 statement => (statement, None),
             };
+            take_builtins_named_by(&mut builder, &statement);
             match statement {
                 Statement::CreateFunction(mut create_function) => {
                     // Two functions may share a name as long as they take

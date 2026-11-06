@@ -137,23 +137,23 @@ fn a_builtin_is_reached_through_the_implicit_catalog_schema() -> Result<(), Look
 
     assert!(
         db.function_by_target(
-            TargetName::new("coalesce", false).with_schema("pg_catalog", false),
+            TargetName::new("pg_sleep", false).with_schema("pg_catalog", false),
             IdentifierCase::AsWritten
         )?
         .is_some()
     );
     assert!(
-        db.function_by_target(TargetName::new("coalesce", false), IdentifierCase::AsWritten)?
+        db.function_by_target(TargetName::new("pg_sleep", false), IdentifierCase::AsWritten)?
             .is_none()
     );
     assert!(
-        db.resolve_target_function(target("pg_catalog.coalesce"), IdentifierCase::AsWritten)?
+        db.resolve_target_function(target("pg_catalog.pg_sleep"), IdentifierCase::AsWritten)?
             .is_some()
     );
     assert_eq!(
-        db.resolve_target_function(target("coalesce"), IdentifierCase::AsWritten)?
+        db.resolve_target_function(target("pg_sleep"), IdentifierCase::AsWritten)?
             .map(|function| function.target_name().to_string()),
-        Some("pg_catalog.coalesce".to_owned())
+        Some("pg_catalog.pg_sleep".to_owned())
     );
 
     // A declaration written without a schema resides in the default one, which
@@ -171,17 +171,17 @@ fn a_builtin_is_reached_through_the_implicit_catalog_schema() -> Result<(), Look
 /// the path names the catalog after the schema holding it.
 #[test]
 fn the_catalog_schema_is_searched_where_the_path_puts_it() -> Result<(), LookupError> {
-    let shadowing = "CREATE FUNCTION lower(x TEXT) RETURNS TEXT LANGUAGE sql AS 'SELECT x';";
+    let shadowing = "CREATE FUNCTION initcap(x TEXT) RETURNS TEXT LANGUAGE sql AS 'SELECT x';";
     let catalog_first = db(shadowing);
     let public_first = db(&format!("{shadowing} SET search_path TO public, pg_catalog;"));
 
     let reached = |db: &ParserDB| -> Result<Option<String>, LookupError> {
         Ok(db
-            .resolve_target_function(target("lower"), IdentifierCase::AsWritten)?
+            .resolve_target_function(target("initcap"), IdentifierCase::AsWritten)?
             .map(|function| function.target_name().to_string()))
     };
-    assert_eq!(reached(&catalog_first)?.as_deref(), Some("pg_catalog.lower"));
-    assert_eq!(reached(&public_first)?.as_deref(), Some("lower"));
+    assert_eq!(reached(&catalog_first)?.as_deref(), Some("pg_catalog.initcap"));
+    assert_eq!(reached(&public_first)?.as_deref(), Some("initcap"));
 
     Ok(())
 }
@@ -199,7 +199,7 @@ fn an_identity_lookup_compares_stored_parts() -> Result<(), LookupError> {
     assert!(db.function_by_stored_identity(None, "helper")?.is_none());
     assert!(db.function_by_stored_identity(None, "bare")?.is_some());
     assert!(db.function_by_stored_identity(Some("public"), "bare")?.is_none());
-    assert!(db.function_by_stored_identity(Some("pg_catalog"), "coalesce")?.is_some());
+    assert!(db.function_by_stored_identity(Some("pg_catalog"), "pg_sleep")?.is_some());
 
     Ok(())
 }
@@ -230,4 +230,39 @@ fn overloads_of_one_name_are_reported_as_ambiguous() {
         ),
         Err(LookupError::AmbiguousFunctionLookup { .. })
     ));
+}
+
+/// A provided function is dropped as a declared one is, and only the dropped
+/// overload goes.
+#[test]
+fn a_provided_function_can_be_dropped() -> Result<(), LookupError> {
+    let db = db("DROP FUNCTION pg_catalog.pg_sleep(double precision);
+         DROP FUNCTION pg_catalog.upper(text);");
+
+    assert!(db.resolve_target_function(target("pg_sleep"), IdentifierCase::AsWritten)?.is_none());
+    let mut upper: Vec<String> = db
+        .functions_named("upper")
+        .map(|function| function.argument_type_names(&db).collect::<Vec<_>>().join(", "))
+        .collect();
+    upper.sort_unstable();
+    assert_eq!(upper, ["anymultirange", "anyrange"]);
+    assert_eq!(db.functions().count(), 3400);
+    Ok(())
+}
+
+/// A builtin `pg_proc` stores with capitals is reached only quoted, since an
+/// unquoted reference folds, unless the lookup folds both sides.
+#[test]
+fn a_capitalised_builtin_is_reached_only_quoted() -> Result<(), LookupError> {
+    let db = db("");
+    let reached = |written: &str, case: IdentifierCase| -> Result<bool, LookupError> {
+        Ok(db.resolve_target_function(target(written), case)?.is_some())
+    };
+
+    assert!(db.function_by_stored_identity(Some("pg_catalog"), "RI_FKey_cascade_del")?.is_some());
+    assert!(reached("\"RI_FKey_cascade_del\"", IdentifierCase::AsWritten)?);
+    assert!(!reached("RI_FKey_cascade_del", IdentifierCase::AsWritten)?);
+    assert!(reached("ri_fkey_cascade_del", IdentifierCase::Folded)?);
+    assert!(!reached("ri_fkey_cascade_del", IdentifierCase::Exact)?);
+    Ok(())
 }

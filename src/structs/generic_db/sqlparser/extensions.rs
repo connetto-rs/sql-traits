@@ -15,9 +15,9 @@ use super::{
     Creator, ParserDBBuilder, case_idents_match, declared_schema, function_signatures_match,
     object_name_last_identifier,
     postgres_builtins::{
-        BuiltinType::{self, Text, Uuid},
+        Language,
         Volatility::{self, Immutable, Volatile},
-        declaration, parameter,
+        declaration,
     },
     stored_ident,
 };
@@ -45,43 +45,32 @@ pub(super) fn plpgsql() -> CreateExtension {
     }
 }
 
-/// One function an extension's install script creates, by name, parameters,
-/// result and volatility. Every one modelled here is strict and written in C.
-struct ExtensionFunction(
-    &'static str,
-    &'static [(&'static str, BuiltinType)],
-    BuiltinType,
-    Volatility,
-);
+/// One function an extension's install script creates, by name, parameters
+/// and result as PostgreSQL prints them, and volatility. Every one modelled
+/// here is strict and written in C.
+struct ExtensionFunction(&'static str, &'static str, &'static str, Volatility);
 
 impl ExtensionFunction {
     /// The declaration, in the schema the extension landed in.
-    fn function(&self, schema: Option<&Ident>) -> CreateFunction {
-        let Self(name, parameters, returns, volatility) = *self;
+    fn function(&self, schema: Option<&Ident>) -> Option<CreateFunction> {
+        let Self(name, arguments, result, volatility) = *self;
         let name = schema.cloned().into_iter().chain([Ident::new(name)]).collect::<Vec<_>>();
-        declaration(
-            ObjectName::from(name),
-            parameters.iter().map(|&(name, data_type)| parameter(Some(name), data_type)).collect(),
-            returns,
-            true,
-            volatility,
-            "c",
-        )
+        declaration(ObjectName::from(name), arguments, result, true, volatility, Language::C)
     }
 }
 
 /// The functions `uuid-ossp` 1.1 creates, the version PostgreSQL 18 installs.
 static UUID_OSSP: &[ExtensionFunction] = &[
-    ExtensionFunction("uuid_nil", &[], Uuid, Immutable),
-    ExtensionFunction("uuid_ns_dns", &[], Uuid, Immutable),
-    ExtensionFunction("uuid_ns_url", &[], Uuid, Immutable),
-    ExtensionFunction("uuid_ns_oid", &[], Uuid, Immutable),
-    ExtensionFunction("uuid_ns_x500", &[], Uuid, Immutable),
-    ExtensionFunction("uuid_generate_v1", &[], Uuid, Volatile),
-    ExtensionFunction("uuid_generate_v1mc", &[], Uuid, Volatile),
-    ExtensionFunction("uuid_generate_v3", &[("namespace", Uuid), ("name", Text)], Uuid, Immutable),
-    ExtensionFunction("uuid_generate_v4", &[], Uuid, Volatile),
-    ExtensionFunction("uuid_generate_v5", &[("namespace", Uuid), ("name", Text)], Uuid, Immutable),
+    ExtensionFunction("uuid_nil", "", "uuid", Immutable),
+    ExtensionFunction("uuid_ns_dns", "", "uuid", Immutable),
+    ExtensionFunction("uuid_ns_url", "", "uuid", Immutable),
+    ExtensionFunction("uuid_ns_oid", "", "uuid", Immutable),
+    ExtensionFunction("uuid_ns_x500", "", "uuid", Immutable),
+    ExtensionFunction("uuid_generate_v1", "", "uuid", Volatile),
+    ExtensionFunction("uuid_generate_v1mc", "", "uuid", Volatile),
+    ExtensionFunction("uuid_generate_v3", "namespace uuid, name text", "uuid", Immutable),
+    ExtensionFunction("uuid_generate_v4", "", "uuid", Volatile),
+    ExtensionFunction("uuid_generate_v5", "namespace uuid, name text", "uuid", Immutable),
 ];
 
 /// The functions the extension called `name` creates, empty for an extension
@@ -111,7 +100,7 @@ fn create_extension_functions(
         .as_ref()
         .map(|schema| (schema.value.as_str(), schema.quote_style.is_some()));
     for member in extension_functions(&extension.name) {
-        let function = member.function(extension.schema.as_ref());
+        let Some(function) = member.function(extension.schema.as_ref()) else { continue };
         let taken = builder.functions().iter().any(|(existing, _)| {
             function_signatures_match(
                 &existing.name,

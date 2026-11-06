@@ -709,3 +709,51 @@ fn an_account_grantee_is_listed_as_written() {
 
     assert_eq!(holders(&db), [PrivilegeHolder::Public, named("'app'@'%'")]);
 }
+
+/// A `pg_catalog` function takes `REVOKE` as a declared one does, one
+/// overload by its signature and every one through the schema-wide form.
+#[test]
+fn a_provided_function_takes_revokes() {
+    let provided = |db: &ParserDB, name: &str| {
+        db.function_by_target(
+            TargetName::new(name, false).with_schema("pg_catalog", false),
+            IdentifierCase::AsWritten,
+        )
+        .expect("unambiguous lookup")
+        .expect("the function is provided")
+        .is_executable_by_public(db)
+    };
+    let db = parse("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_sleep(double precision) FROM PUBLIC;")
+        .expect("schema parses");
+    assert_eq!(provided(&db, "pg_sleep"), Ok(false));
+    assert_eq!(provided(&db, "now"), Ok(true));
+
+    let db = parse("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pg_catalog FROM PUBLIC;")
+        .expect("schema parses");
+    assert_eq!(provided(&db, "pg_sleep"), Ok(false));
+    assert_eq!(provided(&db, "now"), Ok(false));
+    assert_eq!(db.functions().count(), 3402);
+}
+
+/// A later statement on a `pg_catalog` function edits the entry the first one
+/// edited, so a grant after the revoke reaches its grantee.
+#[test]
+fn statements_on_one_provided_function_edit_one_entry() {
+    let db = parse(
+        "CREATE ROLE sleeper;
+         REVOKE EXECUTE ON FUNCTION pg_catalog.pg_sleep(double precision) FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION pg_catalog.pg_sleep(double precision) TO sleeper;",
+    )
+    .expect("schema parses");
+    let pg_sleep = db
+        .function_by_target(
+            TargetName::new("pg_sleep", false).with_schema("pg_catalog", false),
+            IdentifierCase::AsWritten,
+        )
+        .expect("unambiguous lookup")
+        .expect("pg_sleep is provided");
+
+    assert_eq!(pg_sleep.is_executable_by_public(&db), Ok(false));
+    assert_eq!(pg_sleep.can_execute(role(&db, "sleeper"), &db), Ok(true));
+    assert_eq!(db.functions().count(), 3402);
+}

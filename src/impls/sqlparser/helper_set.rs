@@ -621,9 +621,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         call: &Function,
         arguments: usize,
     ) -> Result<&'db DB::Function, HelperSetError> {
+        let name = object_name_last_part(&call.name).map_or("", |(name, _)| name);
         let reached = |path: &SearchPath<'db>| {
             let path = || path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
-            let mut reached = self.database.functions().filter(move |function| {
+            let mut reached = self.database.functions_named(name).filter(move |function| {
                 call_reaches(*function, &call.name, arguments, path, IdentifierCase::AsWritten)
             });
             match (reached.next(), reached.next()) {
@@ -841,7 +842,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         // overload declared in a schema the owner can use, which the call may
         // reach, is refused.
         let path = || scope.usable_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
-        if self.database.functions().any(|function| {
+        if self.database.functions_named(name).any(|function| {
             call_reaches(function, &call.name, list.args.len(), path, IdentifierCase::AsWritten)
                 && function.target_name().schema() != Some("pg_catalog")
         }) {

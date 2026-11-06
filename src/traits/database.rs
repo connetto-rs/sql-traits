@@ -20,7 +20,8 @@ use crate::{
         TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
     },
     utils::{
-        call_typing::{Selection, reached_functions, resolve_call},
+        call_sites::expression_form,
+        call_typing::{Selection, expression_result, reached_functions, resolve_call},
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
             RelationKey, function_has_stored_identity, function_search_path,
@@ -516,32 +517,61 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         Ok(ordered_tables)
     }
 
-    /// Iterates over the functions created in the database.
+    /// Iterates over the functions created in the database, and under
+    /// PostgreSQL every function `pg_catalog` provides.
     ///
     /// # Example
     ///
     /// ```rust
     /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "
+    /// let sql = "
     /// CREATE FUNCTION add_one(x INT) RETURNS INT AS 'SELECT x + 1;';
     /// CREATE FUNCTION greet(name TEXT) RETURNS TEXT AS 'SELECT \"Hello, \" || name;';
-    /// ",
-    /// )?;
+    /// ";
+    /// let db = ParserDB::parse::<GenericDialect>(sql)?;
     /// let function_names: Vec<&str> = db.functions().map(|f| f.name()).collect();
+    /// assert_eq!(function_names, ["add_one", "greet"]);
     ///
-    /// // There will be more than two functions because the parser may add
-    /// // additional built-in functions automatically. We check that certainly
-    /// // our two functions are present.
-    /// assert!(function_names.contains(&"add_one"));
-    /// assert!(function_names.contains(&"greet"));
-    ///
+    /// // PostgreSQL also provides `pg_catalog.generate_series` and the rest.
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(sql)?;
+    /// assert!(db.functions().any(|f| f.name() == "generate_series"));
     /// # Ok(())
     /// # }
     /// ```
     fn functions(&self) -> impl Iterator<Item = &Self::Function>;
+
+    /// Iterates over the functions whose stored name folds to what `name`
+    /// folds to, in every schema.
+    ///
+    /// Every lookup of `name`, whatever its quoting, schema and comparison,
+    /// reaches a subset of these, so a caller narrows them under its own
+    /// rule instead of walking [`Self::functions`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION \"Series\"() RETURNS INT LANGUAGE sql AS 'SELECT 1';",
+    /// )?;
+    /// // The overloads PostgreSQL provides in `pg_catalog`.
+    /// assert_eq!(db.functions_named("generate_series").count(), 9);
+    /// assert_eq!(db.functions_named("SERIES").count(), 1);
+    /// assert_eq!(db.functions_named("absent").count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn functions_named<'db>(&'db self, name: &str) -> impl Iterator<Item = &'db Self::Function> {
+        self.functions().filter(move |function| {
+            IdentifierCase::Folded.identifiers_match(function.name(), false, name, false)
+        })
+    }
 
     /// Returns the table stored under exactly this identity.
     ///
@@ -1575,8 +1605,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// ```rust
     /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::{prelude::*, structs::TargetName};
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE SCHEMA app;
     ///      CREATE FUNCTION app.touch() RETURNS INT AS 'SELECT 1;';
     ///      SET search_path TO app;",
@@ -1743,6 +1774,11 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// agree. Answers [`None`] when PostgreSQL would refuse the call, and
     /// when the result depends on a type nobody knows.
     ///
+    /// An expression PostgreSQL's grammar writes like a call reaches no
+    /// function and answers its own type. `COALESCE`, `GREATEST` and `LEAST`
+    /// answer the common type of their arguments, `NULLIF` the type of its
+    /// first, and a SQL value function such as `CURRENT_DATE` its fixed type.
+    ///
     /// # Errors
     ///
     /// Returns [`LookupError::InvalidObjectName`] when the called name has
@@ -1798,6 +1834,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         argument_types: &[Option<&'db str>],
         case: IdentifierCase,
     ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        if let Some(form) = expression_form(&call.name) {
+            return expression_result(form, call, argument_types);
+        }
         Ok(match resolve_call(self, call, argument_types, case)? {
             Selection::Chosen((_, result)) => result,
             Selection::Refused => None,

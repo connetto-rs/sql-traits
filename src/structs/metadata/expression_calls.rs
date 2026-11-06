@@ -8,8 +8,15 @@ use sqlparser::ast::{Expr, Function, ObjectName, Visit};
 use crate::{
     structs::IdentifierCase,
     traits::FunctionLike,
-    utils::call_sites::{call_reaches, for_each_call},
+    utils::{
+        call_sites::{call_reaches, for_each_call},
+        object_name::object_name_last_part,
+    },
 };
+
+/// Hands each function an engine provides under a called name to the
+/// callback, one at a time.
+pub(crate) type Provided<'a, F> = &'a dyn Fn(&str, &mut dyn FnMut(&Arc<F>));
 
 /// The functions each call of an expression or a bound function body may
 /// reach, resolved under the search path of the statement that wrote it.
@@ -147,14 +154,21 @@ impl<F: FunctionLike> ExpressionCalls<F> {
         search_path: &[(&str, bool)],
         case: IdentifierCase,
     ) -> Self {
-        Self::resolve_carrying(node, functions, search_path, case, |_, _| None)
+        Self::resolve_carrying(node, functions, &|_, _| {}, search_path, case, |_, _| None)
     }
 
     /// Resolves every call in `node` as [`resolve`](Self::resolve) does,
-    /// except a call `carried` answers a binding for, which keeps it.
+    /// among `functions` and the functions `provided` hands over for a called
+    /// name, those the engine provides whose name folds as it does, except a
+    /// call `carried` answers a binding for, which keeps it.
+    ///
+    /// `provided` is a trait object, since this walk is instantiated for every
+    /// node type a visitor meets and each generic parameter would lengthen
+    /// every one of those symbols.
     pub(crate) fn resolve_carrying<N: Visit + ?Sized>(
         node: &N,
         functions: &[Arc<F>],
+        provided: Provided<'_, F>,
         search_path: &[(&str, bool)],
         case: IdentifierCase,
         mut carried: impl FnMut(&ObjectName, usize) -> Option<Vec<Arc<F>>>,
@@ -163,13 +177,18 @@ impl<F: FunctionLike> ExpressionCalls<F> {
         let mut sites = Vec::new();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
             let site = carried(call.name, call.arguments).unwrap_or_else(|| {
-                functions
-                    .iter()
-                    .filter(|function| {
-                        call_reaches(function.as_ref(), call.name, call.arguments, path, case)
-                    })
-                    .cloned()
-                    .collect()
+                let reaches = |function: &Arc<F>| {
+                    call_reaches(function.as_ref(), call.name, call.arguments, path, case)
+                };
+                let mut site: Vec<Arc<F>> =
+                    functions.iter().filter(|function| reaches(function)).cloned().collect();
+                let named = object_name_last_part(call.name).map_or("", |(name, _)| name);
+                provided(named, &mut |function| {
+                    if reaches(function) {
+                        site.push(Arc::clone(function));
+                    }
+                });
+                site
             });
             sites.push(site);
             ControlFlow::Continue(())

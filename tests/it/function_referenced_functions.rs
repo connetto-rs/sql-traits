@@ -76,6 +76,35 @@ fn a_policy_is_followed_through_the_calls_of_the_functions_it_calls() {
     assert!(read.contains(&"members"), "read {read:?}");
 }
 
+/// A body calling a `pg_catalog` function reaches the overloads `pg_proc`
+/// holds for its argument count, and `COALESCE` is an expression reaching
+/// nothing.
+#[test]
+fn builtin_calls_reach_the_pg_proc_rows() {
+    let database = postgres(
+        "CREATE FUNCTION series(n INT) RETURNS SETOF INT LANGUAGE sql
+             AS 'SELECT generate_series(1, n)';
+         CREATE FUNCTION volatile_tick() RETURNS VOID LANGUAGE sql AS 'SELECT pg_sleep(0)';
+         CREATE FUNCTION permissive_sum(a INT, b INT) RETURNS INT LANGUAGE sql
+             AS 'SELECT coalesce(a, 0) + coalesce(b, 0)';",
+    );
+    let mut series = called_by(&database, "series").unwrap();
+    series.sort_unstable();
+    assert_eq!(
+        series,
+        [
+            "pg_catalog.generate_series(BIGINT, BIGINT)",
+            "pg_catalog.generate_series(INT, INT)",
+            "pg_catalog.generate_series(NUMERIC, NUMERIC)",
+        ]
+    );
+    assert_eq!(
+        called_by(&database, "volatile_tick").unwrap(),
+        ["pg_catalog.pg_sleep(DOUBLE PRECISION)"]
+    );
+    assert_eq!(called_by(&database, "permissive_sum").unwrap(), Vec::<String>::new());
+}
+
 const TWO_FS: &str = "
     CREATE SCHEMA app;
     CREATE FUNCTION app.f() RETURNS INT LANGUAGE sql AS 'SELECT 1';

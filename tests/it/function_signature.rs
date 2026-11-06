@@ -173,15 +173,15 @@ fn a_variadic_argument_is_named_only_when_the_input_names_it() {
         vec![Some(TargetName::new("items", false))]
     );
 
-    // A registered builtin resides in the catalog schema, so the lookup names
-    // it.
+    // `concat` takes an unnamed `VARIADIC "any"`, and residing in the catalog
+    // schema the lookup names it.
     let builtin = database
         .function_by_target(
-            TargetName::new("coalesce", false).with_schema("pg_catalog", false),
+            TargetName::new("concat", false).with_schema("pg_catalog", false),
             IdentifierCase::AsWritten,
         )
         .expect("unambiguous lookup")
-        .expect("coalesce is registered");
+        .expect("concat is provided");
     assert_eq!(builtin.argument_names(&database).collect::<Vec<_>>(), vec![None]);
 }
 

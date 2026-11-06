@@ -82,10 +82,12 @@ fn builtin_and_declared_calls_answer_their_result_types() {
 }
 
 /// `anycompatible` takes PostgreSQL's common type, and a call the server
-/// refuses answers nothing.
+/// refuses answers nothing, whether a `VARIADIC anycompatiblearray` function
+/// or the `COALESCE` expression takes the arguments.
 #[test]
 fn compatible_arguments_take_their_common_type() {
-    let db = db("");
+    let db = db("CREATE FUNCTION pick(VARIADIC xs anycompatiblearray) RETURNS anycompatible
+             LANGUAGE sql AS 'SELECT xs[1]';");
     let cases: &[(&[Option<&str>], Option<&str>)] = &[
         (&[Some("INT"), Some("BIGINT")], Some("BIGINT")),
         (&[Some("BIGINT"), Some("INT")], Some("BIGINT")),
@@ -100,6 +102,7 @@ fn compatible_arguments_take_their_common_type() {
         (&[Some("INT"), None], None),
     ];
     for (types, expected) in cases {
+        assert_eq!(returns(&db, "pick(x, y)", types).as_deref(), *expected, "{types:?}");
         assert_eq!(returns(&db, "coalesce(x, y)", types).as_deref(), *expected, "{types:?}");
         assert_eq!(common_type_name(types).as_deref(), *expected, "{types:?}");
     }
@@ -262,12 +265,57 @@ fn uuid_ossp_calls_return_uuid() {
 /// one argument.
 #[test]
 fn bare_and_subquery_calls_count_their_arguments() -> Result<(), LookupError> {
-    let db = db("CREATE FUNCTION \"array\"(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';");
-    assert_eq!(returns(&db, "current_date", &[]).as_deref(), Some("DATE"));
+    let db = db("CREATE FUNCTION \"array\"(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION f() RETURNS DATE LANGUAGE sql AS 'SELECT now()::date';");
+    // sqlparser writes only keywords bare, so the bare call is built.
+    let mut bare = call("f()");
+    bare.args = sqlparser::ast::FunctionArguments::None;
+    assert_eq!(
+        db.call_result_type_name(&bare, &[], IdentifierCase::AsWritten)?.as_deref(),
+        Some("DATE")
+    );
     assert_eq!(
         db.functions_reached_by(&call("ARRAY(SELECT 1)"), IdentifierCase::AsWritten)?.count(),
         1
     );
+    Ok(())
+}
+
+/// `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` and the SQL value functions are
+/// expressions PostgreSQL types itself, so they reach no function, while a
+/// quoted or qualified spelling calls the `pg_proc` function of that name.
+#[test]
+fn expression_forms_answer_their_own_types() -> Result<(), LookupError> {
+    let db = db("");
+    let int = Some("INT");
+    let literal = Some("unknown");
+    let cases: &[Case<'_>] = &[
+        ("greatest(a, b)", &[int, Some("BIGINT")], Some("BIGINT")),
+        ("least(a, 'x')", &[Some("TEXT"), literal], Some("TEXT")),
+        ("nullif(a, b)", &[int, Some("BIGINT")], Some("INT")),
+        // An untyped first argument takes the type it is compared under.
+        ("nullif('1', b)", &[literal, int], Some("INT")),
+        ("current_date", &[], Some("DATE")),
+        ("current_time", &[], Some("TIME WITH TIME ZONE")),
+        ("current_timestamp", &[], Some("TIMESTAMP WITH TIME ZONE")),
+        ("localtime", &[], Some("TIME")),
+        ("localtimestamp", &[], Some("TIMESTAMP")),
+        ("current_user", &[], Some("name")),
+        ("session_user", &[], Some("name")),
+        ("user", &[], Some("name")),
+        ("current_catalog", &[], Some("name")),
+    ];
+    for (expression, types, expected) in cases {
+        assert_eq!(returns(&db, expression, types).as_deref(), *expected, "{expression} {types:?}");
+        let written = call(expression);
+        let reached = db.functions_reached_by(&written, IdentifierCase::AsWritten)?;
+        assert_eq!(reached.count(), 0, "{expression}");
+    }
+    assert_eq!(returns(&db, "\"current_user\"()", &[]).as_deref(), Some("name"));
+    assert!(matches!(
+        db.call_result_type_name(&call("nullif(a, b)"), &[int], IdentifierCase::AsWritten),
+        Err(LookupError::ArgumentTypeCount { .. })
+    ));
     Ok(())
 }
 
@@ -404,7 +452,9 @@ fn an_earlier_schema_hides_a_function_of_the_same_arguments() -> Result<(), Look
         .functions_reached_by(&call("lower(x)"), IdentifierCase::AsWritten)?
         .map(|function| function.target_name().to_string())
         .collect();
-    assert_eq!(reached, ["pg_catalog.lower"]);
+    // `pg_catalog.lower(text)` hides it, and the range and multirange
+    // overloads take one argument too.
+    assert_eq!(reached, ["pg_catalog.lower"; 3]);
     assert_eq!(returns(&db, "lower(x)", &[Some("TEXT")]).as_deref(), Some("TEXT"));
     Ok(())
 }

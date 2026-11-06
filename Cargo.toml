@@ -52,6 +52,7 @@ tempfile = { version = "3.25", optional = true }
 sha2 = { version = "0.10", default-features = false }
 unicode-normalization = { version = "0.1", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
+once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
 
 # Follow upstream parser and comment APIs.
 [patch.crates-io]

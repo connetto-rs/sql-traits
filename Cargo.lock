@@ -890,6 +890,7 @@ dependencies = [
  "arbitrary",
  "geometric-traits",
  "git2",
+ "once_cell",
  "proptest",
  "serde",
  "serde_json",

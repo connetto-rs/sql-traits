@@ -1076,6 +1076,20 @@ CREATE TYPE r AS RANGE (canonical = canon, subtype_diff = sdiff, subtype = int);
     .expect("the range is stored with its functions");
 }
 
+/// A range's subtype difference function may be one `pg_catalog` provides,
+/// which the range then holds in place.
+#[test]
+fn a_range_holds_a_provided_difference_function() {
+    let error = parse(
+        "
+CREATE TYPE floatrange AS RANGE (subtype = float8, subtype_diff = float8mi);
+DROP FUNCTION pg_catalog.float8mi(double precision, double precision);
+",
+    )
+    .expect_err("the range references the function");
+    assert!(matches!(error, Error::FunctionReferenced { .. }), "{error:?}");
+}
+
 /// A rename may not take a name a domain holds.
 #[test]
 fn a_rename_onto_a_domain_name_is_refused() {
