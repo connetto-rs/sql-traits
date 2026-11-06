@@ -182,13 +182,12 @@ impl<F: FunctionLike> ExpressionCalls<F> {
                 };
                 let mut site: Vec<Arc<F>> =
                     functions.iter().filter(|function| reaches(function)).cloned().collect();
-                if let Some((name, _)) = object_name_last_part(call.name) {
-                    provided(name, &mut |function| {
-                        if reaches(function) {
-                            site.push(Arc::clone(function));
-                        }
-                    });
-                }
+                let named = object_name_last_part(call.name).map_or("", |(name, _)| name);
+                provided(named, &mut |function| {
+                    if reaches(function) {
+                        site.push(Arc::clone(function));
+                    }
+                });
                 site
             });
             sites.push(site);

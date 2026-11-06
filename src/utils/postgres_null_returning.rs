@@ -57,6 +57,11 @@ pub(crate) fn null_returning_positions(
 /// assert_eq!(postgres_null_returning_arguments("pg_catalog", "string_to_array", &split), &[0]);
 /// assert!(postgres_null_returning_arguments("public", "string_to_array", &split).is_empty());
 /// assert!(postgres_null_returning_arguments("pg_catalog", "concat", &["\"any\""]).is_empty());
+/// // A spelling that reads as no type matches no signature.
+/// assert!(
+///     postgres_null_returning_arguments("pg_catalog", "string_to_array", &["text", "("])
+///         .is_empty()
+/// );
 /// ```
 #[must_use]
 pub fn postgres_null_returning_arguments(

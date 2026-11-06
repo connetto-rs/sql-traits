@@ -142,12 +142,13 @@ impl<F: FunctionLike + 'static> Builtins<F> {
         let Some(table) = self.table else { return Vec::new() };
         let mut taken = Vec::new();
         for row in rows {
-            if let Err(position) = self.taken.binary_search(&row) {
-                self.taken.insert(position, row);
-                if let Some((function, metadata)) = table.function(row) {
-                    taken.push((Arc::clone(function), metadata.clone()));
-                }
-            }
+            let Err(position) = self.taken.binary_search(&row) else { continue };
+            self.taken.insert(position, row);
+            taken.extend(
+                table
+                    .function(row)
+                    .map(|(function, metadata)| (Arc::clone(function), metadata.clone())),
+            );
         }
         taken
     }

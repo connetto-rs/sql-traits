@@ -3405,13 +3405,14 @@ fn take_builtins_named_by(builder: &mut ParserDBBuilder, statement: &Statement) 
         }
         Statement::AlterFunction(alter) => core::slice::from_ref(&alter.function),
         Statement::DropFunction(drop) => &drop.func_desc,
-        Statement::DropProcedure { proc_desc, .. } => proc_desc,
+        // This model holds no procedure, so `DROP PROCEDURE` and a grant on
+        // procedures reach no provided function.
         Statement::Grant(Grant { objects: Some(objects), .. })
         | Statement::Revoke(sqlparser::ast::Revoke { objects: Some(objects), .. }) => {
             match objects {
-                GrantObjects::Functions(signatures)
-                | GrantObjects::Routines(signatures)
-                | GrantObjects::Procedures(signatures) => signatures,
+                GrantObjects::Functions(signatures) | GrantObjects::Routines(signatures) => {
+                    signatures
+                }
                 GrantObjects::AllFunctionsInSchema { schemas }
                 | GrantObjects::AllRoutinesInSchema { schemas } => {
                     let names_catalog = |schema: &ObjectName| {
@@ -3429,10 +3430,8 @@ fn take_builtins_named_by(builder: &mut ParserDBBuilder, statement: &Statement) 
         }
         _ => return,
     };
-    for signature in signatures {
-        if let Some(name) = named(&signature.name) {
-            builder.take_builtins_named(name);
-        }
+    for name in signatures.iter().filter_map(|signature| named(&signature.name)) {
+        builder.take_builtins_named(name);
     }
 }
 

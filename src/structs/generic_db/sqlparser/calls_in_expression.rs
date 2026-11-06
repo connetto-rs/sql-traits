@@ -367,6 +367,26 @@ mod tests {
         }
     }
 
+    /// A call without an argument list passes nothing, so it reaches the
+    /// overload taking no arguments. sqlparser writes only keywords bare, so
+    /// the bare call is built.
+    #[test]
+    fn a_bare_call_reaches_the_parameterless_overload() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "CREATE FUNCTION f() RETURNS INT AS 'SELECT 1';
+             CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT $1';",
+        )
+        .expect("function declarations parse");
+        let functions: Vec<_> = db.functions().cloned().map(Arc::new).collect();
+        let mut bare = expression("f()");
+        let Expr::Function(call) = &mut bare else { panic!("expected a call") };
+        call.args = sqlparser::ast::FunctionArguments::None;
+        let calls = super::calls_in(&bare, &scope(&functions), &mut super::CarriedCalls::default());
+        let arities: Vec<usize> =
+            calls.functions().map(|function| function.args.as_ref().map_or(0, Vec::len)).collect();
+        assert_eq!(arities, [0]);
+    }
+
     /// Parses `sql` as a standalone expression.
     fn expression(sql: &str) -> Expr {
         Parser::new(&GenericDialect {})

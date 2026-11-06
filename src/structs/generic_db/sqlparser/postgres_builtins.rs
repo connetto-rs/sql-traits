@@ -76,55 +76,53 @@ impl Language {
 /// `pg_get_function_arguments` spells them, its result as
 /// `pg_get_function_result` does, its strictness, volatility, kind and
 /// language.
-pub(super) struct PostgresBuiltin {
-    name: &'static str,
-    arguments: &'static str,
-    result: &'static str,
-    null_input: NullInput,
-    volatility: Volatility,
-    kind: FunctionKind,
-    language: Language,
-}
-
-/// A row of [`POSTGRES_18_FUNCTIONS`].
-pub(super) const fn builtin(
-    name: &'static str,
-    arguments: &'static str,
-    result: &'static str,
-    null_input: NullInput,
-    volatility: Volatility,
-    kind: FunctionKind,
-    language: Language,
-) -> PostgresBuiltin {
-    PostgresBuiltin { name, arguments, result, null_input, volatility, kind, language }
-}
+///
+/// A tuple struct, so a row is built by its constructor rather than by a
+/// function only const evaluation ever runs.
+#[derive(Clone, Copy)]
+pub(super) struct PostgresBuiltin(
+    pub(super) &'static str,
+    pub(super) &'static str,
+    pub(super) &'static str,
+    pub(super) NullInput,
+    pub(super) Volatility,
+    pub(super) FunctionKind,
+    pub(super) Language,
+);
 
 impl PostgresBuiltin {
+    /// The name `pg_proc` stores.
+    fn name(&self) -> &'static str {
+        self.0
+    }
+
     /// The declaration in `pg_catalog`, so a user function may shadow it the
     /// way the server allows.
     fn function(&self) -> Option<CreateFunction> {
+        let Self(name, arguments, result, null_input, volatility, _, language) = *self;
         let name = ObjectName(vec![
             ObjectNamePart::Identifier(Ident::new(PG_CATALOG)),
-            ObjectNamePart::Identifier(stored_ident(self.name)),
+            ObjectNamePart::Identifier(stored_ident(name)),
         ]);
         declaration(
             name,
-            self.arguments,
-            self.result,
-            matches!(self.null_input, NullInput::Strict),
-            self.volatility,
-            self.language,
+            arguments,
+            result,
+            matches!(null_input, NullInput::Strict),
+            volatility,
+            language,
         )
     }
 
     fn metadata(&self) -> FunctionMetadata {
+        let Self(name, arguments, _, _, _, kind, _) = *self;
         let mut metadata = FunctionMetadata::default();
-        if let Some(positions) = null_returning_positions(self.name, |types| {
-            self.arguments.split(", ").eq(types.iter().copied())
-        }) {
+        if let Some(positions) =
+            null_returning_positions(name, |types| arguments.split(", ").eq(types.iter().copied()))
+        {
             metadata.set_null_returning_arguments(positions);
         }
-        metadata.set_kind(self.kind);
+        metadata.set_kind(kind);
         metadata
     }
 }
@@ -232,15 +230,15 @@ impl BuiltinTable<CreateFunction> for Postgres18Functions {
     }
 
     fn rows_folding_to(&self, folded: &str) -> Range<usize> {
-        let start =
-            POSTGRES_18_FUNCTIONS.partition_point(|row| folded_bytes(row.name).lt(folded.bytes()));
-        let end =
-            POSTGRES_18_FUNCTIONS.partition_point(|row| folded_bytes(row.name).le(folded.bytes()));
+        let start = POSTGRES_18_FUNCTIONS
+            .partition_point(|row| folded_bytes(row.name()).lt(folded.bytes()));
+        let end = POSTGRES_18_FUNCTIONS
+            .partition_point(|row| folded_bytes(row.name()).le(folded.bytes()));
         start..end
     }
 
     fn name(&self, row: usize) -> &'static str {
-        POSTGRES_18_FUNCTIONS.get(row).map_or("", |row| row.name)
+        POSTGRES_18_FUNCTIONS.get(row).map_or("", PostgresBuiltin::name)
     }
 
     fn function(&self, row: usize) -> Option<&'static Stored<CreateFunction>> {
@@ -258,21 +256,17 @@ impl BuiltinTable<CreateFunction> for Postgres18Functions {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
-
-    use super::{POSTGRES_18_BUILTINS, POSTGRES_18_FUNCTIONS, folded_bytes};
+    use super::{POSTGRES_18_BUILTINS, POSTGRES_18_FUNCTIONS, PostgresBuiltin, folded_bytes};
     use crate::structs::generic_db::builtin_functions::BuiltinTable;
 
     #[test]
     fn every_row_declares_its_function() {
-        let undeclared: Vec<_> = (0..POSTGRES_18_FUNCTIONS.len())
-            .filter(|row| POSTGRES_18_BUILTINS.function(*row).is_none())
-            .map(|row| {
-                let builtin = &POSTGRES_18_FUNCTIONS[row];
-                (builtin.name, builtin.arguments, builtin.result)
-            })
-            .collect();
-        assert!(undeclared.is_empty(), "rows sqlparser cannot declare: {undeclared:?}");
+        for (row, PostgresBuiltin(name, arguments, result, ..)) in
+            POSTGRES_18_FUNCTIONS.iter().enumerate()
+        {
+            let declared = POSTGRES_18_BUILTINS.function(row).is_some();
+            assert!(declared, "sqlparser cannot declare {name}({arguments}) {result}");
+        }
     }
 
     /// A lookup reads the rows of one folded name, and within them those of
@@ -280,9 +274,9 @@ mod tests {
     #[test]
     fn rows_are_sorted_by_folded_then_stored_name() {
         assert!(POSTGRES_18_FUNCTIONS.windows(2).all(|pair| {
-            folded_bytes(pair[0].name)
-                .cmp(folded_bytes(pair[1].name))
-                .then_with(|| pair[0].name.cmp(pair[1].name))
+            folded_bytes(pair[0].name())
+                .cmp(folded_bytes(pair[1].name()))
+                .then_with(|| pair[0].name().cmp(pair[1].name()))
                 .is_le()
         }));
     }
