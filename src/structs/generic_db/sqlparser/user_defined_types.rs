@@ -47,9 +47,7 @@ use crate::{
     utils::{
         call_sites::call_reaches,
         identifier_resolution::normalize_identifier,
-        object_name::{
-            Qualifier, object_name_identifiers, object_name_last_ident_mut, qualifier_of,
-        },
+        object_name::{Qualifier, object_name_identifiers, qualifier_of},
     },
 };
 
@@ -896,42 +894,18 @@ pub(super) fn drop_types_in(
     drop_positions(builder, &doomed, true)
 }
 
-/// Whether the stored type name `name` is the one `from` names, in `schema`,
-/// and if so rewrites its last part to `to`.
+/// Rewrites the last part of the stored type name `name` to `to` when it is
+/// the name `from` holds in `from_schema`.
 fn retarget_type_name(
     name: &mut ObjectName,
-    (from_name, from_name_quoted): (&str, bool),
-    (from_schema, from_schema_quoted): (&str, bool),
+    from: (&str, bool),
+    from_schema: (&str, bool),
     to: &Ident,
     case: IdentifierCase,
-) -> bool {
-    let schema_ok = if name.0.len() >= 2 {
-        matches!(
-            &name.0[name.0.len() - 2],
-            sqlparser::ast::ObjectNamePart::Identifier(schema)
-                if case.identifiers_match(
-                    &schema.value,
-                    schema.quote_style.is_some(),
-                    from_schema,
-                    from_schema_quoted,
-                )
-        )
-    } else {
-        case.identifiers_match(DEFAULT_SCHEMA, false, from_schema, from_schema_quoted)
-    };
-    object_name_last_ident_mut(name).is_some_and(|ident| {
-        let named = case.identifiers_match(
-            &ident.value,
-            ident.quote_style.is_some(),
-            from_name,
-            from_name_quoted,
-        );
-        if named && schema_ok {
-            ident.value.clone_from(&to.value);
-            ident.quote_style = to.quote_style;
-        }
-        named && schema_ok
-    })
+) {
+    if names_type(name, from, from_schema, case) {
+        rewrite_last_ident(name, to);
+    }
 }
 
 /// Whether a column's declared type names the type a rename re-points, so its
@@ -944,12 +918,7 @@ fn column_renames_type(
 ) -> bool {
     custom_name(data_type).is_some_and(|name| {
         object_name_identifiers(name).is_ok_and(|(_, _)| {
-            retarget_type_name_preview(
-                name,
-                (from_name, from_name_quoted),
-                (from_schema, from_schema_quoted),
-                case,
-            )
+            names_type(name, (from_name, from_name_quoted), (from_schema, from_schema_quoted), case)
         })
     })
 }
@@ -1035,9 +1004,9 @@ fn repoint_type_references(
     Ok(builder)
 }
 
-/// A read-only preview of [`retarget_type_name`], for deciding whether a
-/// stored reference names the type a rename re-points.
-fn retarget_type_name_preview(
+/// Whether the stored type name `name` is the name `from` holds in
+/// `from_schema`.
+fn names_type(
     name: &ObjectName,
     (from_name, from_name_quoted): (&str, bool),
     (from_schema, from_schema_quoted): (&str, bool),
