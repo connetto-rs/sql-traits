@@ -7,11 +7,7 @@ use sqlparser::ast::CreateFunction;
 use crate::{
     structs::{IdentifierCase, ParserDB, UserDefinedType},
     traits::{Metadata, UserDefinedTypeKind, UserDefinedTypeLike},
-    utils::{
-        identifier_resolution::normalize_identifier,
-        object_name::{object_name_identifiers, object_name_last_part, qualifier_of},
-        postgres_types::names_catalog_type,
-    },
+    utils::object_name::{object_name_identifiers, object_name_last_part, qualifier_of},
 };
 
 /// The schema a user-defined type stored without a qualifier lives in.
@@ -123,8 +119,7 @@ pub(crate) fn user_type_holds(
 /// multirange's, since the multirange is not a type the schema lists of its
 /// own. Ingestion rewrites every type name reaching a user-defined type to
 /// that type's qualifier, as it does for every other stored reference, so a
-/// bare name names the default schema, and a bare name of a type `pg_catalog`
-/// holds reaches that catalog type, never a stored one.
+/// bare name names the default schema.
 pub(crate) fn bound_user_type<'a>(
     types: impl IntoIterator<Item = &'a UserDefinedType>,
     reference: &sqlparser::ast::ObjectName,
@@ -134,7 +129,6 @@ pub(crate) fn bound_user_type<'a>(
     let name = (name.value.as_str(), name.quote_style.is_some());
     let schema = match schema {
         Some(schema) => (schema.value.as_str(), schema.quote_style.is_some()),
-        None if names_catalog_type(&normalize_identifier(name.0, name.1)) => return None,
         None => (DEFAULT_SCHEMA, false),
     };
     for type_ in types {

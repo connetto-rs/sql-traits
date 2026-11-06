@@ -183,7 +183,15 @@ impl<DB: DatabaseLike> UserDefinedTypeLike for Absent<DB> {
         self.unreachable()
     }
 
+    fn name_is_quoted(&self) -> bool {
+        self.unreachable()
+    }
+
     fn schema(&self) -> Option<&str> {
+        self.unreachable()
+    }
+
+    fn schema_is_quoted(&self) -> bool {
         self.unreachable()
     }
 

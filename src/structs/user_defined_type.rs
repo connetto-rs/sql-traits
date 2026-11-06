@@ -73,22 +73,6 @@ impl UserDefinedType {
         }
     }
 
-    /// Whether a base type declared `SEND`, which lets a value of it be sent
-    /// by value in the binary wire format.
-    #[must_use]
-    pub fn declares_send(&self) -> bool {
-        matches!(
-            &self.representation,
-            Some(UserDefinedTypeRepresentation::SqlDefinition { options })
-                if options
-                    .iter()
-                    .any(|option| matches!(
-                        option,
-                        sqlparser::ast::UserDefinedTypeSqlDefinitionOption::Send(_)
-                    ))
-        )
-    }
-
     /// The definition the type was created with, or `None` for a shell.
     #[must_use]
     pub fn representation(&self) -> Option<&UserDefinedTypeRepresentation> {

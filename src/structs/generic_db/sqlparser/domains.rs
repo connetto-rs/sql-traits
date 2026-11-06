@@ -353,34 +353,21 @@ pub(super) fn require_existing_type(
     let Some(name) = custom_name(data_type) else {
         return Ok(());
     };
-    let Ok((schema, ident)) = object_name_identifiers(name) else {
+    let Ok((_, ident)) = object_name_identifiers(name) else {
         return Ok(());
     };
     if names_catalog_type(&normalize_identifier(&ident.value, ident.quote_style.is_some())) {
         return Ok(());
     }
-    // A shell types no value.
+    // A shell types no value. A bare name reaches a shell of another schema
+    // on the path only through [`bind_type`], which runs before this.
     let types = builder.user_defined_types().iter().map(|(type_, _)| type_.as_ref());
-    if let Some((type_, _multirange)) = bound_user_type(types, name, builder.identifier_case()) {
-        if type_.is_shell() {
-            return Err(Error::TypeIsOnlyShell { type_name: name.to_string() });
-        }
-        return Ok(());
+    if let Some((type_, _multirange)) = bound_user_type(types, name, builder.identifier_case())
+        && type_.is_shell()
+    {
+        return Err(Error::TypeIsOnlyShell { type_name: name.to_string() });
     }
-    let reached = match schema {
-        Some(schema) => reach_in_schema(builder, ident, ident_parts(schema)),
-        None => reach_type(builder, ident),
-    };
-    match reached {
-        Some(Reached::Domain(_) | Reached::RowType(_) | Reached::Catalog) | None => Ok(()),
-        Some(Reached::UserType(position, _)) => {
-            let (stored_type, _) = &builder.user_defined_types()[position];
-            if stored_type.is_shell() {
-                return Err(Error::TypeIsOnlyShell { type_name: stored_type.name().to_string() });
-            }
-            Ok(())
-        }
-    }
+    Ok(())
 }
 
 /// The position among the stored domains of the domain a declared type names,

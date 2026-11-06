@@ -26,7 +26,7 @@ use alloc::{
 };
 
 use sqlparser::ast::{
-    AlterType, AlterTypeOperation, CreateFunction, DataType, Ident, ObjectName,
+    AlterType, AlterTypeOperation, CreateFunction, DataType, Ident, ObjectName, ObjectNamePart,
     UserDefinedTypeCompositeAttributeDef, UserDefinedTypeRangeOption,
     UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
 };
@@ -47,7 +47,9 @@ use crate::{
     utils::{
         call_sites::call_reaches,
         identifier_resolution::normalize_identifier,
-        object_name::{Qualifier, object_name_identifiers, qualifier_of},
+        object_name::{
+            Qualifier, object_name_identifiers, object_name_last_ident_mut, qualifier_of,
+        },
     },
 };
 
@@ -167,7 +169,8 @@ fn array_type_of(
     if reach(ident).is_some() {
         return None;
     }
-    let base = Ident { value: base.to_owned(), quote_style: ident.quote_style, span: ident.span };
+    let base =
+        Ident { value: String::from(base), quote_style: ident.quote_style, span: ident.span };
     matches!(reach(&base), Some(Reached::UserType(_, _)))
         .then(|| normalize_identifier(&base.value, base.quote_style.is_some()).into_owned())
 }
@@ -194,40 +197,42 @@ fn multirange_from_range_name((value, quoted): (&str, bool)) -> ObjectName {
 /// resolves that option by.
 type NamedFunction = (ObjectName, usize);
 
-/// The function names a base type or a range option carries, each with the
-/// argument count PostgreSQL resolves that option by.
-fn named_functions_of(representation: &UserDefinedTypeRepresentation) -> Vec<NamedFunction> {
-    let mut names = Vec::new();
-    match representation {
-        UserDefinedTypeRepresentation::SqlDefinition { options } => {
-            for option in options {
-                let (name, arguments) = match option {
-                    UserDefinedTypeSqlDefinitionOption::Input(name)
-                    | UserDefinedTypeSqlDefinitionOption::Output(name)
-                    | UserDefinedTypeSqlDefinitionOption::Receive(name)
-                    | UserDefinedTypeSqlDefinitionOption::Send(name)
-                    | UserDefinedTypeSqlDefinitionOption::TypmodOut(name)
-                    | UserDefinedTypeSqlDefinitionOption::Analyze(name)
-                    | UserDefinedTypeSqlDefinitionOption::Subscript(name)
-                    | UserDefinedTypeSqlDefinitionOption::TypmodIn(name) => (name, 1),
-                    _ => continue,
-                };
-                names.push((name.clone(), arguments));
+/// The function names the options of a base type carry, each with the
+/// argument count PostgreSQL resolves the option by.
+fn sql_definition_functions_of(
+    options: &[UserDefinedTypeSqlDefinitionOption],
+) -> Vec<NamedFunction> {
+    options
+        .iter()
+        .filter_map(|option| {
+            match option {
+                UserDefinedTypeSqlDefinitionOption::Input(name)
+                | UserDefinedTypeSqlDefinitionOption::Output(name)
+                | UserDefinedTypeSqlDefinitionOption::Receive(name)
+                | UserDefinedTypeSqlDefinitionOption::Send(name)
+                | UserDefinedTypeSqlDefinitionOption::TypmodOut(name)
+                | UserDefinedTypeSqlDefinitionOption::Analyze(name)
+                | UserDefinedTypeSqlDefinitionOption::Subscript(name)
+                | UserDefinedTypeSqlDefinitionOption::TypmodIn(name) => Some((name.clone(), 1)),
+                _ => None,
             }
-        }
-        UserDefinedTypeRepresentation::Range { options } => {
-            for option in options {
-                let (name, arguments) = match option {
-                    UserDefinedTypeRangeOption::Canonical(name) => (name, 1),
-                    UserDefinedTypeRangeOption::SubtypeDiff(name) => (name, 2),
-                    _ => continue,
-                };
-                names.push((name.clone(), arguments));
+        })
+        .collect()
+}
+
+/// The function names the options of a range carry, each with the argument
+/// count PostgreSQL resolves the option by.
+fn range_functions_of(options: &[UserDefinedTypeRangeOption]) -> Vec<NamedFunction> {
+    options
+        .iter()
+        .filter_map(|option| {
+            match option {
+                UserDefinedTypeRangeOption::Canonical(name) => Some((name.clone(), 1)),
+                UserDefinedTypeRangeOption::SubtypeDiff(name) => Some((name.clone(), 2)),
+                _ => None,
             }
-        }
-        _ => {}
-    }
-    names
+        })
+        .collect()
 }
 
 /// The functions a type definition names, resolved to the functions they
@@ -260,6 +265,34 @@ fn definition_function_calls(
     ExpressionCalls::new(sites)
 }
 
+/// What a `CREATE TYPE` name reaches among the stored relations, and never the
+/// catalog, whose schema `place_relation` refuses for a type before this
+/// lookup.
+enum CreationTarget {
+    /// The user-defined type at this position.
+    UserType(usize),
+    /// A domain.
+    Domain,
+    /// The row type of a relation of this kind.
+    RowType(ObjectKind),
+}
+
+/// The target a `CREATE TYPE` name reaches, or nothing for a free name; the
+/// pg_catalog schema is refused before this lookup, so a name reaches no
+/// catalog type.
+fn creation_reaches(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    (schema, schema_quoted): (&str, bool),
+) -> Option<CreationTarget> {
+    match reach_in_schema(builder, name, (schema, schema_quoted)) {
+        Some(Reached::UserType(position, _)) => Some(CreationTarget::UserType(position)),
+        Some(Reached::Domain(_)) => Some(CreationTarget::Domain),
+        Some(Reached::RowType(kind)) => Some(CreationTarget::RowType(kind)),
+        Some(Reached::Catalog) | None => None,
+    }
+}
+
 /// Records a `CREATE TYPE`, binding the types and functions its definition
 /// names and computing the multirange a range brings.
 ///
@@ -277,9 +310,8 @@ pub(super) fn create_user_defined_type(
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, ObjectKind::Type, builder.catalog_name())?;
     place_relation(&builder, &mut name, false, ObjectKind::Type, role)?;
-    let Some(name_ident) = object_name_last_identifier(&name) else {
-        return Err(Error::UnnamedObject { object_kind: ObjectKind::Type });
-    };
+    let name_ident = object_name_last_identifier(&name)
+        .ok_or(Error::UnnamedObject { object_kind: ObjectKind::Type })?;
     let schema = qualifier_of(&name).named().unwrap_or((DEFAULT_SCHEMA, false));
     let is_composite =
         matches!(representation, Some(UserDefinedTypeRepresentation::Composite { .. }));
@@ -297,39 +329,35 @@ pub(super) fn create_user_defined_type(
     }
     // Only a free name or a shell this creation fills is taken, never a shell
     // over a shell.
-    let mut shell_position = None;
-    if let Some(reached) = reach_in_schema(&builder, name_ident, schema) {
-        match reached {
-            Reached::UserType(position, _is_multirange)
-                if builder.user_defined_types()[position].0.is_shell()
-                    && representation.is_some() =>
-            {
-                shell_position = Some(position);
-            }
-            Reached::UserType(_, _) => {
-                return Err(Error::RelationNameAlreadyTaken {
-                    object_kind: ObjectKind::Type,
-                    conflicting_kind: ObjectKind::Type,
-                    object_name: name_ident.value.clone(),
-                });
-            }
-            Reached::Domain(_) => {
-                return Err(Error::RelationNameAlreadyTaken {
-                    object_kind: ObjectKind::Type,
-                    conflicting_kind: ObjectKind::Domain,
-                    object_name: name_ident.value.clone(),
-                });
-            }
-            Reached::RowType(conflicting_kind) => {
-                return Err(Error::RelationNameAlreadyTaken {
-                    object_kind: ObjectKind::Type,
-                    conflicting_kind,
-                    object_name: name_ident.value.clone(),
-                });
-            }
-            Reached::Catalog => {}
+    let shell_position = match creation_reaches(&builder, name_ident, schema) {
+        Some(CreationTarget::UserType(position))
+            if builder.user_defined_types()[position].0.is_shell() && representation.is_some() =>
+        {
+            Some(position)
         }
-    }
+        Some(CreationTarget::UserType(_)) => {
+            return Err(Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::Type,
+                conflicting_kind: ObjectKind::Type,
+                object_name: name_ident.value.clone(),
+            });
+        }
+        Some(CreationTarget::Domain) => {
+            return Err(Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::Type,
+                conflicting_kind: ObjectKind::Domain,
+                object_name: name_ident.value.clone(),
+            });
+        }
+        Some(CreationTarget::RowType(conflicting_kind)) => {
+            return Err(Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::Type,
+                conflicting_kind,
+                object_name: name_ident.value.clone(),
+            });
+        }
+        None => None,
+    };
     let mut representation = representation;
     let (multirange_name, named_functions) = if let Some(representation) = representation.as_mut() {
         bind_representation(&builder, name_ident, schema, representation)?
@@ -409,19 +437,13 @@ fn bind_representation(
             }
         }
         UserDefinedTypeRepresentation::Range { options } => {
-            let Some(subtype_index) = options
-                .iter()
-                .position(|option| matches!(option, UserDefinedTypeRangeOption::Subtype(_)))
-            else {
-                return Err(Error::RangeSubtypeRequired { type_name: name_ident.value.clone() });
-            };
             let explicit_name = options.iter().find_map(|option| {
                 match option {
                     UserDefinedTypeRangeOption::MultirangeTypeName(name) => Some(name.clone()),
                     _ => None,
                 }
             });
-            let Some(subtype) = options.get_mut(subtype_index).and_then(|option| {
+            let Some(subtype) = options.iter_mut().find_map(|option| {
                 match option {
                     UserDefinedTypeRangeOption::Subtype(data_type) => Some(data_type),
                     _ => None,
@@ -431,7 +453,7 @@ fn bind_representation(
             };
             bind_type(builder, subtype)?;
             require_existing_type(builder, subtype)?;
-            named_functions = named_functions_of(representation);
+            named_functions = range_functions_of(options);
             let mut multirange = match explicit_name {
                 Some(explicit) => explicit,
                 None => multirange_from_range_name(ident_parts(name_ident)),
@@ -466,13 +488,13 @@ fn bind_representation(
             multirange_name = Some(multirange);
         }
         UserDefinedTypeRepresentation::SqlDefinition { options } => {
-            for option in options {
+            for option in &mut *options {
                 if let UserDefinedTypeSqlDefinitionOption::Element(data_type) = option {
                     bind_type(builder, data_type)?;
                     require_existing_type(builder, data_type)?;
                 }
             }
-            named_functions = named_functions_of(representation);
+            named_functions = sql_definition_functions_of(options);
         }
     }
     Ok((multirange_name, named_functions))
@@ -805,16 +827,17 @@ fn drop_dependents_cascade(
         )?;
     }
     // The composite stays, possibly with no attribute left.
-    let removals: Vec<(usize, Vec<usize>)> = builder
+    let kept: Vec<(usize, Vec<UserDefinedTypeCompositeAttributeDef>)> = builder
         .user_defined_types()
         .iter()
         .enumerate()
         .filter_map(|(position, (type_, _))| {
-            let representation = type_.representation.as_ref()?;
-            let UserDefinedTypeRepresentation::Composite { attributes } = representation else {
+            let UserDefinedTypeRepresentation::Composite { attributes } =
+                type_.representation.as_ref()?
+            else {
                 return None;
             };
-            let indices: Vec<usize> = attributes
+            let doomed_indices: Vec<usize> = attributes
                 .iter()
                 .enumerate()
                 .filter(|(_, attribute)| {
@@ -822,20 +845,22 @@ fn drop_dependents_cascade(
                 })
                 .map(|(index, _)| index)
                 .collect();
-            (!indices.is_empty()).then_some((position, indices))
+            if doomed_indices.is_empty() {
+                return None;
+            }
+            let attributes = attributes
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !doomed_indices.contains(index))
+                .map(|(_, attribute)| attribute.clone())
+                .collect();
+            Some((position, attributes))
         })
         .collect();
-    for (position, indices) in removals {
+    for (position, attributes) in kept {
         let (type_, _) = &mut builder.user_defined_types_mut()[position];
         let type_ = Arc::make_mut(type_);
-        let Some(UserDefinedTypeRepresentation::Composite { attributes }) =
-            type_.representation.as_mut()
-        else {
-            continue;
-        };
-        for index in indices.iter().rev() {
-            attributes.remove(*index);
-        }
+        type_.representation = Some(UserDefinedTypeRepresentation::Composite { attributes });
     }
     Ok(builder)
 }
@@ -880,47 +905,33 @@ fn retarget_type_name(
     to: &Ident,
     case: IdentifierCase,
 ) -> bool {
-    let parts = &mut name.0;
-    let Some(last_index) = parts.len().checked_sub(1) else {
-        return false;
-    };
-    let is_match = match &parts[last_index] {
-        sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-            case.identifiers_match(
-                &ident.value,
-                ident.quote_style.is_some(),
-                from_name,
-                from_name_quoted,
-            )
-        }
-        sqlparser::ast::ObjectNamePart::Function(_) => false,
-    };
-    if !is_match {
-        return false;
-    }
-    let schema_ok = if last_index >= 1 {
-        match &parts[last_index - 1] {
-            sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                case.identifiers_match(
-                    &ident.value,
-                    ident.quote_style.is_some(),
+    let schema_ok = if name.0.len() >= 2 {
+        matches!(
+            &name.0[name.0.len() - 2],
+            sqlparser::ast::ObjectNamePart::Identifier(schema)
+                if case.identifiers_match(
+                    &schema.value,
+                    schema.quote_style.is_some(),
                     from_schema,
                     from_schema_quoted,
                 )
-            }
-            sqlparser::ast::ObjectNamePart::Function(_) => false,
-        }
+        )
     } else {
         case.identifiers_match(DEFAULT_SCHEMA, false, from_schema, from_schema_quoted)
     };
-    if !schema_ok {
-        return false;
-    }
-    if let sqlparser::ast::ObjectNamePart::Identifier(ident) = &mut parts[last_index] {
-        ident.value.clone_from(&to.value);
-        ident.quote_style = to.quote_style;
-    }
-    true
+    object_name_last_ident_mut(name).is_some_and(|ident| {
+        let named = case.identifiers_match(
+            &ident.value,
+            ident.quote_style.is_some(),
+            from_name,
+            from_name_quoted,
+        );
+        if named && schema_ok {
+            ident.value.clone_from(&to.value);
+            ident.quote_style = to.quote_style;
+        }
+        named && schema_ok
+    })
 }
 
 /// Whether a column's declared type names the type a rename re-points, so its
@@ -952,6 +963,7 @@ fn repoint_type_references(
     to: &Ident,
 ) -> Result<ParserDBBuilder, Error> {
     let case = builder.identifier_case();
+    let from = (from_name, from_name_quoted);
     // Every table whose a column names the type, rebuilt.
     let hosts: Vec<super::StoredTable> = builder
         .tables()
@@ -972,13 +984,7 @@ fn repoint_type_references(
         builder = ParserDB::replace_table_node(builder, host, |_, node| {
             for column in &mut node.columns {
                 if let Some(name) = custom_name_mut(&mut column.data_type) {
-                    retarget_type_name(
-                        name,
-                        (from_name, from_name_quoted),
-                        (from_schema, from_schema_quoted),
-                        to,
-                        case,
-                    );
+                    retarget_type_name(name, from, (from_schema, from_schema_quoted), to, case);
                 }
             }
             Ok(())
@@ -988,13 +994,7 @@ fn repoint_type_references(
     for (domain, _) in builder.domains_mut() {
         let domain = Arc::make_mut(domain);
         if let Some(name) = custom_name_mut(&mut domain.data_type) {
-            retarget_type_name(
-                name,
-                (from_name, from_name_quoted),
-                (from_schema, from_schema_quoted),
-                to,
-                case,
-            );
+            retarget_type_name(name, from, (from_schema, from_schema_quoted), to, case);
         }
     }
     // Attributes, subtypes and elements of every user-defined type.
@@ -1007,13 +1007,7 @@ fn repoint_type_references(
             UserDefinedTypeRepresentation::Composite { attributes } => {
                 for attribute in attributes {
                     if let Some(name) = custom_name_mut(&mut attribute.data_type) {
-                        retarget_type_name(
-                            name,
-                            (from_name, from_name_quoted),
-                            (from_schema, from_schema_quoted),
-                            to,
-                            case,
-                        );
+                        retarget_type_name(name, from, (from_schema, from_schema_quoted), to, case);
                     }
                 }
             }
@@ -1022,13 +1016,7 @@ fn repoint_type_references(
                     if let UserDefinedTypeRangeOption::Subtype(data_type) = option
                         && let Some(name) = custom_name_mut(data_type)
                     {
-                        retarget_type_name(
-                            name,
-                            (from_name, from_name_quoted),
-                            (from_schema, from_schema_quoted),
-                            to,
-                            case,
-                        );
+                        retarget_type_name(name, from, (from_schema, from_schema_quoted), to, case);
                     }
                 }
             }
@@ -1037,13 +1025,7 @@ fn repoint_type_references(
                     if let UserDefinedTypeSqlDefinitionOption::Element(data_type) = option
                         && let Some(name) = custom_name_mut(data_type)
                     {
-                        retarget_type_name(
-                            name,
-                            (from_name, from_name_quoted),
-                            (from_schema, from_schema_quoted),
-                            to,
-                            case,
-                        );
+                        retarget_type_name(name, from, (from_schema, from_schema_quoted), to, case);
                     }
                 }
             }
@@ -1061,39 +1043,28 @@ fn retarget_type_name_preview(
     (from_schema, from_schema_quoted): (&str, bool),
     case: IdentifierCase,
 ) -> bool {
-    let parts = &name.0;
-    let Some(last_index) = parts.len().checked_sub(1) else {
-        return false;
-    };
-    let is_match = match &parts[last_index] {
-        sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-            case.identifiers_match(
-                &ident.value,
-                ident.quote_style.is_some(),
-                from_name,
-                from_name_quoted,
-            )
-        }
-        sqlparser::ast::ObjectNamePart::Function(_) => false,
-    };
-    if !is_match {
-        return false;
-    }
-    if last_index >= 1 {
-        match &parts[last_index - 1] {
-            sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                case.identifiers_match(
-                    &ident.value,
-                    ident.quote_style.is_some(),
+    let schema_ok = if name.0.len() >= 2 {
+        matches!(
+            &name.0[name.0.len() - 2],
+            sqlparser::ast::ObjectNamePart::Identifier(schema)
+                if case.identifiers_match(
+                    &schema.value,
+                    schema.quote_style.is_some(),
                     from_schema,
                     from_schema_quoted,
                 )
-            }
-            sqlparser::ast::ObjectNamePart::Function(_) => false,
-        }
+        )
     } else {
         case.identifiers_match(DEFAULT_SCHEMA, false, from_schema, from_schema_quoted)
-    }
+    };
+    name.0.last().and_then(sqlparser::ast::ObjectNamePart::as_ident).is_some_and(|ident| {
+        case.identifiers_match(
+            &ident.value,
+            ident.quote_style.is_some(),
+            from_name,
+            from_name_quoted,
+        )
+    }) && schema_ok
 }
 
 /// Applies an `ALTER TYPE` statement.
@@ -1148,13 +1119,10 @@ fn resolve_named_type(
     }
 }
 
-/// Rewrites the last identifier of `stored` to `new_name`, its quoting kept.
+/// Replaces the last identifier of `stored` with `new_name`.
 fn rewrite_last_ident(stored: &mut ObjectName, new_name: &Ident) {
-    let Some(sqlparser::ast::ObjectNamePart::Identifier(ident)) = stored.0.last_mut() else {
-        return;
-    };
-    ident.value.clone_from(&new_name.value);
-    ident.quote_style = new_name.quote_style;
+    stored.0.pop();
+    stored.0.push(ObjectNamePart::Identifier(new_name.clone()));
 }
 
 fn alter_type_rename(
@@ -1252,27 +1220,28 @@ fn alter_type_rename(
         Doomed::UserType(position) => {
             let (type_, _) = &mut builder.user_defined_types_mut()[position];
             let type_ = Arc::make_mut(type_);
-            let Some(multirange) = &mut type_.multirange_name else {
-                return Err(Error::TypeNotFound { type_name: name.to_string() });
-            };
+            // The name matched the multirange's spelling, which only a type
+            // that declares one holds.
+            let multirange = type_
+                .multirange_name
+                .as_mut()
+                .ok_or(Error::TypeNotFound { type_name: name.to_string() })?;
             rewrite_last_ident(multirange, new_name);
         }
     }
     Ok(builder)
 }
 
-fn enum_labels(representation: &UserDefinedTypeRepresentation) -> Option<&Vec<Ident>> {
-    match representation {
-        UserDefinedTypeRepresentation::Enum { labels } => Some(labels),
-        _ => None,
-    }
-}
-
-fn enum_labels_mut(representation: &mut UserDefinedTypeRepresentation) -> Option<&mut Vec<Ident>> {
-    match representation {
-        UserDefinedTypeRepresentation::Enum { labels } => Some(labels),
-        _ => None,
-    }
+/// The index the label called `value` holds among `labels`, under `case`.
+fn label_position(labels: &[Ident], value: &Ident, case: IdentifierCase) -> Option<usize> {
+    labels.iter().position(|label| {
+        case.identifiers_match(
+            &label.value,
+            label.quote_style.is_some(),
+            &value.value,
+            value.quote_style.is_some(),
+        )
+    })
 }
 
 /// Whether an enum label is called `value`, under `case`.
@@ -1301,66 +1270,34 @@ fn alter_type_add_value(
         return Err(Error::NotAnEnum { type_name: name.to_string() });
     }
     let case = builder.identifier_case();
-    let (type_, _) = &builder.user_defined_types()[position];
     let type_name = name.to_string();
-    let Some(representation) = &type_.representation else {
+    let (type_, _) = &mut builder.user_defined_types_mut()[position];
+    let type_ = Arc::make_mut(type_);
+    let Some(UserDefinedTypeRepresentation::Enum { labels }) = type_.representation.as_mut() else {
         return Err(Error::NotAnEnum { type_name });
     };
-    let Some(labels) = enum_labels(representation) else {
-        return Err(Error::NotAnEnum { type_name });
-    };
-    // A position relative to an unknown label is refused.
-    if let Some(position_ref) = &add.position {
-        let neighbor = match position_ref {
-            sqlparser::ast::AlterTypeAddValuePosition::Before(neighbor)
-            | sqlparser::ast::AlterTypeAddValuePosition::After(neighbor) => neighbor,
-        };
-        if !label_named(labels, neighbor, case) {
-            return Err(Error::EnumLabelNotFound { type_name, label: neighbor.value.clone() });
-        }
-    }
+    // A held label is refused, or skipped with IF NOT EXISTS, before its
+    // position is checked.
     if label_named(labels, &add.value, case) {
         if add.if_not_exists {
             return Ok(builder);
         }
         return Err(Error::EnumLabelExists { type_name, label: add.value.value.clone() });
     }
-    let (type_, _) = &mut builder.user_defined_types_mut()[position];
-    let type_ = Arc::make_mut(type_);
-    let Some(representation) = type_.representation.as_mut() else {
-        return Err(Error::NotAnEnum { type_name });
-    };
-    let Some(labels) = enum_labels_mut(representation) else {
-        return Err(Error::NotAnEnum { type_name });
-    };
-    let insert_at = match &add.position {
-        Some(sqlparser::ast::AlterTypeAddValuePosition::Before(neighbor)) => {
-            labels
-                .iter()
-                .position(|label| {
-                    case.identifiers_match(
-                        &label.value,
-                        label.quote_style.is_some(),
-                        &neighbor.value,
-                        neighbor.quote_style.is_some(),
-                    )
-                })
-                .unwrap_or(labels.len())
+    // A position relative to an unknown label is refused.
+    let insert_at = if let Some(position_ref) = &add.position {
+        let neighbor = match position_ref {
+            sqlparser::ast::AlterTypeAddValuePosition::Before(neighbor)
+            | sqlparser::ast::AlterTypeAddValuePosition::After(neighbor) => neighbor,
+        };
+        let index = label_position(labels, neighbor, case)
+            .ok_or_else(|| Error::EnumLabelNotFound { type_name, label: neighbor.value.clone() })?;
+        match position_ref {
+            sqlparser::ast::AlterTypeAddValuePosition::Before(_) => index,
+            sqlparser::ast::AlterTypeAddValuePosition::After(_) => index + 1,
         }
-        Some(sqlparser::ast::AlterTypeAddValuePosition::After(neighbor)) => {
-            labels
-                .iter()
-                .position(|label| {
-                    case.identifiers_match(
-                        &label.value,
-                        label.quote_style.is_some(),
-                        &neighbor.value,
-                        neighbor.quote_style.is_some(),
-                    )
-                })
-                .map_or(labels.len(), |index| index + 1)
-        }
-        None => labels.len(),
+    } else {
+        labels.len()
     };
     labels.insert(insert_at, add.value);
     Ok(builder)
@@ -1380,38 +1317,19 @@ fn alter_type_rename_value(
         return Err(Error::NotAnEnum { type_name: name.to_string() });
     }
     let case = builder.identifier_case();
-    let (type_, _) = &builder.user_defined_types()[position];
     let type_name = name.to_string();
-    let Some(representation) = &type_.representation else {
+    let (type_, _) = &mut builder.user_defined_types_mut()[position];
+    let type_ = Arc::make_mut(type_);
+    let Some(UserDefinedTypeRepresentation::Enum { labels }) = type_.representation.as_mut() else {
         return Err(Error::NotAnEnum { type_name });
     };
-    let Some(labels) = enum_labels(representation) else {
-        return Err(Error::NotAnEnum { type_name });
-    };
-    if !label_named(labels, &renamed.from, case) {
+    let Some(index) = label_position(labels, &renamed.from, case) else {
         return Err(Error::EnumLabelNotFound { type_name, label: renamed.from.value.clone() });
-    }
+    };
     if label_named(labels, &renamed.to, case) {
         return Err(Error::EnumLabelExists { type_name, label: renamed.to.value.clone() });
     }
-    let (type_, _) = &mut builder.user_defined_types_mut()[position];
-    let type_ = Arc::make_mut(type_);
-    let Some(representation) = type_.representation.as_mut() else {
-        return Err(Error::NotAnEnum { type_name });
-    };
-    let Some(labels) = enum_labels_mut(representation) else {
-        return Err(Error::NotAnEnum { type_name });
-    };
-    if let Some(index) = labels.iter().position(|label| {
-        case.identifiers_match(
-            &label.value,
-            label.quote_style.is_some(),
-            &renamed.from.value,
-            renamed.from.quote_style.is_some(),
-        )
-    }) {
-        labels[index] = renamed.to;
-    }
+    labels[index] = renamed.to;
     Ok(builder)
 }
 
@@ -1487,11 +1405,11 @@ pub(super) fn follow_schema_rename(
     }
     // A domain over a moved type follows it to the new schema.
     for (domain, _) in builder.domains_mut() {
-        if custom_name(&domain.data_type).is_some_and(reaches_moved) {
-            let domain = Arc::make_mut(domain);
-            if let Some(name) = custom_name_mut(&mut domain.data_type) {
-                retarget(name);
-            }
+        let domain = Arc::make_mut(domain);
+        if let Some(name) = custom_name_mut(&mut domain.data_type)
+            && reaches_moved(name)
+        {
+            retarget(name);
         }
     }
     let hosts: Vec<super::StoredTable> = builder

@@ -298,6 +298,16 @@ pub(crate) fn object_name_last_part(object_name: &ObjectName) -> Option<(&str, b
     }
 }
 
+/// The last identifier part of an object name, for rewriting in place.
+///
+/// A part built at run time yields [`None`], the same answer as an empty name.
+pub(crate) fn object_name_last_ident_mut(object_name: &mut ObjectName) -> Option<&mut Ident> {
+    match object_name.0.last_mut() {
+        Some(ObjectNamePart::Identifier(ident)) => Some(ident),
+        Some(ObjectNamePart::Function(_)) | None => None,
+    }
+}
+
 /// What an object name says about the schema it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Qualifier<'a> {
@@ -1264,8 +1274,8 @@ mod tests {
     };
 
     use super::{
-        Qualifier, object_name_identifiers, object_name_last_part, qualifier_of,
-        relation_name_is_claimed, render_table_candidate, render_view_candidate,
+        Qualifier, object_name_identifiers, object_name_last_ident_mut, object_name_last_part,
+        qualifier_of, relation_name_is_claimed, render_table_candidate, render_view_candidate,
         require_local_object_name, resolve_object_name, resolve_table_object_name_in_iter,
         resolve_table_object_name_on_search_path_in_iter, resolve_target_from_candidates,
         resolve_target_in_iter, resolve_view_on_search_path_in_iter, table_matches_object_name,
@@ -1338,6 +1348,17 @@ mod tests {
         // A name built when the statement runs carries no identifier to read.
         assert_eq!(object_name_last_part(&ObjectName(vec![function_part("IDENTIFIER")])), None);
         assert_eq!(object_name_last_part(&ObjectName(Vec::new())), None);
+    }
+
+    #[test]
+    fn object_name_last_ident_mut_variants() {
+        let mut name = obj(&[("t", false)]);
+        assert!(object_name_last_ident_mut(&mut name).is_some());
+        assert!(object_name_last_ident_mut(&mut ObjectName(Vec::new())).is_none());
+        // A name built when the statement runs carries no identifier to
+        // rewrite.
+        let mut name = ObjectName(vec![function_part("IDENTIFIER")]);
+        assert!(object_name_last_ident_mut(&mut name).is_none());
     }
 
     #[test]

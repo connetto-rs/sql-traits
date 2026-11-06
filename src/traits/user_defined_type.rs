@@ -60,12 +60,10 @@ pub trait UserDefinedTypeLike: Clone + Debug + Metadata + Send + Sync {
 
     /// Returns whether the type name was quoted in SQL.
     ///
-    /// The default `false` folds every identifier to lowercase, so an
-    /// implementation over a source that preserves quoting must override it.
-    #[inline]
-    fn name_is_quoted(&self) -> bool {
-        false
-    }
+    /// An unquoted name folds to lowercase when it is stored, so an
+    /// implementation over a source that preserves quoting answers it from
+    /// the quoting its source kept.
+    fn name_is_quoted(&self) -> bool;
 
     /// Returns the name PostgreSQL stores for this type: an unquoted
     /// identifier folds to lowercase, a quoted one keeps its case.
@@ -106,13 +104,7 @@ pub trait UserDefinedTypeLike: Clone + Debug + Metadata + Send + Sync {
     /// Returns whether the schema identifier was quoted in SQL.
     ///
     /// This only matters when [`Self::schema`] returns `Some`.
-    ///
-    /// The default `false` folds every identifier to lowercase, so an
-    /// implementation over a source that preserves quoting must override it.
-    #[inline]
-    fn schema_is_quoted(&self) -> bool {
-        false
-    }
+    fn schema_is_quoted(&self) -> bool;
 
     /// Returns the name PostgreSQL stores for this type's schema.
     #[inline]
@@ -148,33 +140,4 @@ pub trait UserDefinedTypeLike: Clone + Debug + Metadata + Send + Sync {
     /// # }
     /// ```
     fn kind(&self) -> UserDefinedTypeKind;
-}
-
-impl<T: UserDefinedTypeLike> UserDefinedTypeLike for &T {
-    type DB = T::DB;
-
-    #[inline]
-    fn name(&self) -> &str {
-        (*self).name()
-    }
-
-    #[inline]
-    fn name_is_quoted(&self) -> bool {
-        (*self).name_is_quoted()
-    }
-
-    #[inline]
-    fn schema(&self) -> Option<&str> {
-        (*self).schema()
-    }
-
-    #[inline]
-    fn schema_is_quoted(&self) -> bool {
-        (*self).schema_is_quoted()
-    }
-
-    #[inline]
-    fn kind(&self) -> UserDefinedTypeKind {
-        (*self).kind()
-    }
 }

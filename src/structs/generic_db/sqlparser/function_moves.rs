@@ -129,36 +129,50 @@ fn respell_user_type(
             }
         })
     };
-    if let Some(representation) = node.representation.as_mut() {
-        match representation {
-            UserDefinedTypeRepresentation::SqlDefinition { options } => {
-                for option in options {
-                    match option {
-                        UserDefinedTypeSqlDefinitionOption::Input(name)
-                        | UserDefinedTypeSqlDefinitionOption::Output(name)
-                        | UserDefinedTypeSqlDefinitionOption::Receive(name)
-                        | UserDefinedTypeSqlDefinitionOption::Send(name)
-                        | UserDefinedTypeSqlDefinitionOption::TypmodOut(name)
-                        | UserDefinedTypeSqlDefinitionOption::Analyze(name)
-                        | UserDefinedTypeSqlDefinitionOption::Subscript(name)
-                        | UserDefinedTypeSqlDefinitionOption::TypmodIn(name) => respell(name)?,
-                        _ => {}
-                    }
-                }
+    // A base type and a range declare functions, which a moved one respells.
+    if let Some(UserDefinedTypeRepresentation::SqlDefinition { options }) =
+        node.representation.as_mut()
+    {
+        for option in options {
+            if let Some(name) = base_function_name(option) {
+                respell(name)?;
             }
-            UserDefinedTypeRepresentation::Range { options } => {
-                for option in options {
-                    match option {
-                        UserDefinedTypeRangeOption::Canonical(name)
-                        | UserDefinedTypeRangeOption::SubtypeDiff(name) => respell(name)?,
-                        _ => {}
-                    }
-                }
+        }
+    }
+    if let Some(UserDefinedTypeRepresentation::Range { options }) = node.representation.as_mut() {
+        for option in options {
+            if let Some(name) = range_function_name(option) {
+                respell(name)?;
             }
-            _ => {}
         }
     }
     Ok(())
+}
+
+/// The function name a base type option declares, or none for an option that
+/// declares no function.
+fn base_function_name(option: &mut UserDefinedTypeSqlDefinitionOption) -> Option<&mut ObjectName> {
+    match option {
+        UserDefinedTypeSqlDefinitionOption::Input(name)
+        | UserDefinedTypeSqlDefinitionOption::Output(name)
+        | UserDefinedTypeSqlDefinitionOption::Receive(name)
+        | UserDefinedTypeSqlDefinitionOption::Send(name)
+        | UserDefinedTypeSqlDefinitionOption::TypmodOut(name)
+        | UserDefinedTypeSqlDefinitionOption::Analyze(name)
+        | UserDefinedTypeSqlDefinitionOption::Subscript(name)
+        | UserDefinedTypeSqlDefinitionOption::TypmodIn(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// The function name a range option declares, or none for the subtype and
+/// multirange options, which name types.
+fn range_function_name(option: &mut UserDefinedTypeRangeOption) -> Option<&mut ObjectName> {
+    match option {
+        UserDefinedTypeRangeOption::Canonical(name)
+        | UserDefinedTypeRangeOption::SubtypeDiff(name) => Some(name),
+        _ => None,
+    }
 }
 
 /// Respells every call of `node` to the name `renamed` gives it from its

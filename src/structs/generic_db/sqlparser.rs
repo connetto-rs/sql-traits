@@ -6025,13 +6025,13 @@ impl ParserDB {
         if matches!(origin, TableOrigin::Declaration(..)) {
             validate_table_schema(&builder, &create_table)?;
             // A table takes a shell of its name over, filling the type name.
-            if let Some(name_ident) = object_name_last_identifier(&create_table.name) {
-                user_defined_types::take_over_shell(
-                    &mut builder,
-                    name_ident,
-                    table_schema_qualifier(&create_table),
-                );
-            }
+            let name_ident = object_name_last_identifier(&create_table.name)
+                .ok_or(crate::errors::Error::UnnamedObject { object_kind: ObjectKind::Table })?;
+            user_defined_types::take_over_shell(
+                &mut builder,
+                name_ident,
+                table_schema_qualifier(&create_table),
+            );
         }
         validate_distinct_columns(&create_table, builder.identifier_case())?;
         let table_kind = if table_metadata.foreign_source().is_some() {

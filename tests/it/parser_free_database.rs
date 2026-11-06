@@ -1204,8 +1204,16 @@ impl UserDefinedTypeLike for MemoryUserDefinedType {
         &self.name
     }
 
+    fn name_is_quoted(&self) -> bool {
+        false
+    }
+
     fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
+    }
+
+    fn schema_is_quoted(&self) -> bool {
+        false
     }
 
     fn kind(&self) -> UserDefinedTypeKind {
