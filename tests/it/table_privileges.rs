@@ -69,6 +69,7 @@ fn held(privileges: &TablePrivileges<'_, Column>) -> Vec<String> {
         ("DELETE", privileges.delete),
         ("TRUNCATE", privileges.truncate),
         ("TRIGGER", privileges.trigger),
+        ("MAINTAIN", privileges.maintain),
     ] {
         if holds {
             held.push(name.to_string());
@@ -77,8 +78,8 @@ fn held(privileges: &TablePrivileges<'_, Column>) -> Vec<String> {
     held
 }
 
-const EVERYTHING: [&str; 7] =
-    ["SELECT", "INSERT", "UPDATE", "REFERENCES", "DELETE", "TRUNCATE", "TRIGGER"];
+const EVERYTHING: [&str; 8] =
+    ["SELECT", "INSERT", "UPDATE", "REFERENCES", "DELETE", "TRUNCATE", "TRIGGER", "MAINTAIN"];
 
 #[test]
 fn a_column_grant_holds_on_its_columns_and_never_on_the_table() {
@@ -156,8 +157,23 @@ fn revoking_one_privilege_from_all_privileges_keeps_the_rest() {
     assert!(held_by_r.truncate);
     assert_eq!(
         held(&held_by_r),
-        ["SELECT", "INSERT", "REFERENCES", "DELETE", "TRUNCATE", "TRIGGER"]
+        ["SELECT", "INSERT", "REFERENCES", "DELETE", "TRUNCATE", "TRIGGER", "MAINTAIN"]
     );
+}
+
+#[test]
+fn maintain_is_granted_and_revoked_like_the_other_table_privileges() {
+    let db = parse(&format!(
+        "{ROLES}
+         CREATE TABLE g (id INT);
+         ALTER TABLE g OWNER TO own;
+         GRANT MAINTAIN ON g TO r;
+         REVOKE MAINTAIN ON g FROM own;"
+    ));
+
+    // {own=arwdDxt/own,r=m/own}
+    assert_eq!(held(&privileges(&db, "g", "r")), ["MAINTAIN"]);
+    assert_eq!(held(&privileges(&db, "g", "own")), EVERYTHING[..7]);
 }
 
 #[test]
@@ -423,7 +439,7 @@ fn an_owner_loses_only_the_privilege_revoked_from_it() {
 
     assert_eq!(
         held(&privileges(&db, "docs", "app_owner")),
-        ["SELECT", "INSERT", "REFERENCES", "DELETE", "TRUNCATE", "TRIGGER"]
+        ["SELECT", "INSERT", "REFERENCES", "DELETE", "TRUNCATE", "TRIGGER", "MAINTAIN"]
     );
     assert_eq!(held(&privileges(&db, "docs", "reader")), ["SELECT", "UPDATE"]);
 }
@@ -447,7 +463,7 @@ fn caller_roles_hold_what_their_memberships_carry() {
 }
 
 /// A dialect that checks no privilege against the object it names lets a
-/// grant carry one tables do not have, which holds none of the seven.
+/// grant carry one tables do not have, which holds none of the eight.
 #[test]
 fn a_privilege_tables_lack_holds_nothing() {
     let db = ParserDB::parse::<GenericDialect>(

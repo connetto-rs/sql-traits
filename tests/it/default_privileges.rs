@@ -500,6 +500,26 @@ fn table_defaults_reach_tables_views_and_their_owner() {
 }
 
 #[test]
+fn table_defaults_grant_and_revoke_maintain() {
+    let db = parse(
+        "CREATE ROLE anon; CREATE ROLE r; CREATE ROLE svc;
+         ALTER DEFAULT PRIVILEGES FOR ROLE r GRANT MAINTAIN ON TABLES TO anon;
+         ALTER DEFAULT PRIVILEGES FOR ROLE r GRANT ALL ON TABLES TO svc;
+         ALTER DEFAULT PRIVILEGES FOR ROLE r REVOKE MAINTAIN ON TABLES FROM r;
+         SET ROLE r;
+         CREATE TABLE t (id INT);",
+    )
+    .expect("schema parses");
+    let t = table(&db, "t");
+
+    // {r=arwdDxt/r,anon=m/r,svc=arwdDxtm/r}
+    assert_eq!(relation_privileges(&db, "t", "anon"), ["MAINTAIN"]);
+    assert!(t.privileges(role(&db, "svc"), &db).expect("table is held").maintain);
+    assert!(!t.privileges(role(&db, "r"), &db).expect("table is held").maintain);
+    assert!(t.privileges(role(&db, "r"), &db).expect("table is held").trigger);
+}
+
+#[test]
 fn sequence_defaults_reach_declared_and_serial_sequences() {
     let db = parse(
         "CREATE ROLE anon; CREATE ROLE r;
@@ -557,6 +577,10 @@ fn postgresql_refusals_are_kept() {
             "InvalidDefaultPrivilege",
         ),
         ("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON TABLES TO PUBLIC;", "InvalidDefaultPrivilege"),
+        (
+            "ALTER DEFAULT PRIVILEGES GRANT MAINTAIN ON SEQUENCES TO PUBLIC;",
+            "InvalidDefaultPrivilege",
+        ),
         (
             "ALTER DEFAULT PRIVILEGES GRANT SELECT ON FUNCTIONS TO PUBLIC;",
             "InvalidDefaultPrivilege",

@@ -52,8 +52,8 @@ impl<C: PartialEq> ColumnPrivilege<'_, C> {
 /// [`TableLike::privileges`](crate::traits::TableLike::privileges) answers.
 ///
 /// `SELECT`, `INSERT`, `UPDATE` and `REFERENCES` can be granted per column, so
-/// each says where it holds. `DELETE`, `TRUNCATE` and `TRIGGER` exist only on
-/// the whole table.
+/// each says where it holds. `DELETE`, `TRUNCATE`, `TRIGGER` and `MAINTAIN`
+/// exist only on the whole table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TablePrivileges<'db, C> {
     /// `SELECT`.
@@ -70,6 +70,8 @@ pub struct TablePrivileges<'db, C> {
     pub truncate: bool,
     /// `TRIGGER`.
     pub trigger: bool,
+    /// `MAINTAIN`.
+    pub maintain: bool,
 }
 
 impl<C> TablePrivileges<'_, C> {
@@ -84,6 +86,7 @@ impl<C> TablePrivileges<'_, C> {
             delete: true,
             truncate: true,
             trigger: true,
+            maintain: true,
         }
     }
 }

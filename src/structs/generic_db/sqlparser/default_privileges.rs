@@ -335,6 +335,7 @@ impl DefaultKind {
                     Rights::TRUNCATE,
                     Rights::REFERENCES,
                     Rights::TRIGGER,
+                    Rights::MAINTAIN,
                 ])
             }
             Self::Sequences => all(&[Rights::SELECT, Rights::UPDATE, Rights::USAGE]),
@@ -384,10 +385,11 @@ impl Rights {
     const EXECUTE: Self = Self(1 << 7);
     const USAGE: Self = Self(1 << 8);
     const CREATE: Self = Self(1 << 9);
+    const MAINTAIN: Self = Self(1 << 10);
 
     /// Each privilege beside the action spelling it, in the order PostgreSQL
     /// lists a relation's.
-    const ACTIONS: [(Self, Action); 10] = [
+    const ACTIONS: [(Self, Action); 11] = [
         (Self::SELECT, Action::Select { columns: None }),
         (Self::INSERT, Action::Insert { columns: None }),
         (Self::UPDATE, Action::Update { columns: None }),
@@ -395,6 +397,7 @@ impl Rights {
         (Self::TRUNCATE, Action::Truncate),
         (Self::REFERENCES, Action::References { columns: None }),
         (Self::TRIGGER, Action::Trigger),
+        (Self::MAINTAIN, Action::Maintain),
         (Self::EXECUTE, Action::Execute { obj_type: None }),
         (Self::USAGE, Action::Usage),
         (Self::CREATE, Action::Create { obj_type: None }),
