@@ -198,7 +198,8 @@ pub(super) fn requiring_type(
 
 /// Drops the constructors of the ranges at the positions `doomed` accepts,
 /// which PostgreSQL drops with the range whatever the statement says about
-/// `CASCADE`.
+/// `CASCADE`, `alongside` holding the functions the same statement drops
+/// later.
 ///
 /// # Errors
 ///
@@ -207,6 +208,7 @@ pub(super) fn requiring_type(
 pub(super) fn drop_range_constructors(
     builder: &mut ParserDBBuilder,
     doomed: impl Fn(usize) -> bool,
+    alongside: &[Arc<CreateFunction>],
 ) -> Result<(), Error> {
     let case = builder.identifier_case();
     let ranges: Vec<&UserDefinedType> = builder
@@ -226,20 +228,7 @@ pub(super) fn drop_range_constructors(
         })
         .map(|(function, _)| Arc::clone(function))
         .collect();
-    if dropping.is_empty() {
-        return Ok(());
-    }
-    if let Some(called) =
-        dropping.iter().find(|function| builder.is_function_used(function, &dropping))
-    {
-        return Err(Error::FunctionReferenced {
-            function_name: last_str(&called.name).to_string(),
-        });
-    }
-    builder
-        .functions_mut()
-        .retain(|(function, _)| !dropping.iter().any(|dropped| Arc::ptr_eq(dropped, function)));
-    Ok(())
+    builder.drop_function_nodes(&dropping, alongside)
 }
 
 /// Points the constructors of the range at `position` at the name `new_name`

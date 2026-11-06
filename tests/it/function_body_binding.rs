@@ -2453,7 +2453,7 @@ fn a_block_body_whole_row_reference_a_column_rename_captures() {
     .expect("the rename is accepted");
     assert_eq!(
         text(&db, "f"),
-        "CREATE FUNCTION f() RETURNS p12t LANGUAGE sql BEGIN ATOMIC UPDATE p12tt AS p12t SET a = 1 WHERE p12t IS NOT NULL RETURNING p12t; END",
+        "CREATE FUNCTION f() RETURNS p12tt LANGUAGE sql BEGIN ATOMIC UPDATE p12tt AS p12t SET a = 1 WHERE p12t IS NOT NULL RETURNING p12t; END",
         "the whole-row references shield the relation rename"
     );
 
@@ -2467,7 +2467,7 @@ fn a_block_body_whole_row_reference_a_column_rename_captures() {
     .expect("the rename is accepted");
     assert_eq!(
         text(&db, "f"),
-        "CREATE FUNCTION f() RETURNS p13t LANGUAGE sql BEGIN ATOMIC INSERT INTO p13tt AS p13t (a) VALUES (1) RETURNING p13t; END",
+        "CREATE FUNCTION f() RETURNS p13tt LANGUAGE sql BEGIN ATOMIC INSERT INTO p13tt AS p13t (a) VALUES (1) RETURNING p13t; END",
         "the insert target the whole-row reference names shields the rename"
     );
 

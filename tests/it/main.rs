@@ -58,6 +58,7 @@ mod function_referenced_tables;
 mod function_references;
 mod function_resolution;
 mod function_signature;
+mod function_signature_types;
 mod function_volatility;
 mod fuzz_crashes;
 mod generated_constraint_names;

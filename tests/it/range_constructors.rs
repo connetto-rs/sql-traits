@@ -6,7 +6,10 @@
 //! statements.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, ObjectKind},
+    prelude::*,
+};
 use sqlparser::{
     ast::ArgMode,
     dialect::{GenericDialect, PostgreSqlDialect},
@@ -278,7 +281,8 @@ fn a_function_of_a_constructor_signature_is_refused() {
 }
 
 /// `CREATE OR REPLACE` turns a constructor into an ordinary function, which
-/// `DROP FUNCTION` then drops and which a dropped range leaves behind.
+/// `DROP FUNCTION` then drops and which holds the range in place as any
+/// function naming it does.
 #[test]
 fn a_replaced_constructor_is_an_ordinary_function() {
     let replace = "CREATE TYPE span AS RANGE (subtype = int4);
@@ -286,16 +290,13 @@ fn a_replaced_constructor_is_an_ordinary_function() {
              LANGUAGE sql AS 'SELECT NULL::span';";
     parse(&format!("{replace} DROP FUNCTION span(int4, int4);"))
         .expect("the replaced constructor is dropped on its own");
-    let database = parse(&format!("{replace} DROP TYPE span;")).expect("the range is dropped");
-    let names: Vec<String> = database
-        .functions()
-        .filter(|function| function.target_name().schema() != Some("pg_catalog"))
-        .map(|function| describe(&database, function))
-        .collect();
-    assert_eq!(
-        names,
-        ["span(INT4, INT4) -> span sql 'SELECT NULL::span' CALLED ON NULL INPUT VOLATILE"]
-    );
+    assert!(matches!(
+        parse(&format!("{replace} DROP TYPE span;")),
+        Err(Error::TypeHasDependents { dependent_kind: ObjectKind::Function, .. })
+    ));
+    let database =
+        parse(&format!("{replace} DROP TYPE span CASCADE;")).expect("the range is dropped");
+    assert_eq!(user_functions(&database), Vec::<String>::new());
 }
 
 /// An alteration keeps a constructor bound to its range.
