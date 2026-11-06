@@ -219,6 +219,11 @@ pub(super) fn declaration(
         options: None,
         remote_connection: None,
         security: None,
+        leakproof: None,
+        window: false,
+        cost: None,
+        rows: None,
+        support: None,
         set_params: vec![],
     }
 }
