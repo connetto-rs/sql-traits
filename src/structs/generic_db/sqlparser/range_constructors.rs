@@ -251,19 +251,17 @@ pub(super) fn follow_range_rename(
 ) {
     let case = builder.identifier_case();
     let range = builder.user_defined_types()[position].0.as_ref();
-    let renamed: Vec<usize> = builder
+    let renamed: Vec<bool> = builder
         .functions()
         .iter()
-        .enumerate()
-        .filter(|(_, (_, metadata))| {
+        .map(|(_, metadata)| {
             metadata
                 .range_constructor()
                 .is_some_and(|constructor| constructs(constructor, range, case))
         })
-        .map(|(index, _)| index)
         .collect();
-    for index in renamed {
-        if let Some(constructor) = builder.functions_mut()[index].1.range_constructor_mut() {
+    for ((_, metadata), renamed) in builder.functions_mut().iter_mut().zip(renamed) {
+        if renamed && let Some(constructor) = metadata.range_constructor_mut() {
             rewrite_last_ident(&mut constructor.range, new_name);
         }
     }
