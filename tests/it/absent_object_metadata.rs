@@ -272,8 +272,8 @@ fn the_identity_scanning_accessors_still_answer_a_live_receiver() {
 
 /// These filter the database's own triggers, policies and grants by comparing
 /// each one's table against the receiver, the same shape as the four above, so
-/// they resolve the receiver first for the same reason. The `can_*` methods
-/// inherit it through `grants`.
+/// they resolve the receiver first for the same reason. The `privileges`
+/// reader inherits it through `columns` and `grants`.
 #[test]
 fn the_database_filtering_accessors_report_an_absent_receiver() {
     let (stale, database) = parse_with_create_table(
@@ -287,10 +287,5 @@ fn the_database_filtering_accessors_report_an_absent_receiver() {
     assert_eq!(stale.triggers(&database).err(), absent_table("t"));
     assert_eq!(stale.policies(&database).err(), absent_table("t"));
     assert_eq!(stale.grants(&database).err(), absent_table("t"));
-    assert_eq!(stale.can_select(reader, &database).err(), absent_table("t"));
-    assert_eq!(stale.can_insert(reader, &database).err(), absent_table("t"));
-    assert_eq!(stale.can_update(reader, &database).err(), absent_table("t"));
-    assert_eq!(stale.can_delete(reader, &database).err(), absent_table("t"));
-    assert_eq!(stale.can_write(reader, &database).err(), absent_table("t"));
-    assert_eq!(stale.can_truncate(reader, &database).err(), absent_table("t"));
+    assert_eq!(stale.privileges(reader, &database).err(), absent_table("t"));
 }

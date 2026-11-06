@@ -127,7 +127,10 @@ fn a_grant_to_everyone_applies_to_every_role() {
             "{label}: a grant to everyone applies to every role"
         );
         assert!(
-            table.can_select(reader, db).expect("the table is known"),
+            table
+                .privileges(reader, db)
+                .map(|held| held.select.on_table())
+                .expect("the table is known"),
             "{label}: the readers built on applies_to_role follow it"
         );
     }
