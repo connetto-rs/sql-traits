@@ -862,8 +862,8 @@ pub enum HelperSetError {
         /// The table.
         table: String,
     },
-    /// The owner lacks `SELECT` on a table the body reads, so every call
-    /// raises `42501`.
+    /// The owner holds `SELECT` neither on a table the body reads nor on
+    /// every column of it the body reads, so every call raises `42501`.
     #[error("owner `{owner}` of helper `{function}` lacks SELECT on `{table}`")]
     MissingSelect {
         /// The helper.
@@ -872,6 +872,18 @@ pub enum HelperSetError {
         owner: String,
         /// The table.
         table: String,
+    },
+    /// The owner lacks `USAGE` on the schema of a table or helper the body
+    /// names. A qualified name then raises `42501`, and an unqualified one
+    /// skips the schema on the path and finds nothing there.
+    #[error("owner `{owner}` of helper `{function}` lacks USAGE on schema `{schema}`")]
+    MissingUsage {
+        /// The helper.
+        function: String,
+        /// The owner.
+        owner: String,
+        /// The schema.
+        schema: String,
     },
     /// The owner lacks `EXECUTE` on a helper the body calls, so every call
     /// raises `42501`.

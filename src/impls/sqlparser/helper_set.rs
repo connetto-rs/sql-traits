@@ -7,13 +7,14 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::ops::ControlFlow;
 
 use sqlparser::{
     ast::{
         ArgMode, BinaryOperator, DataType, Distinct, Expr, Function, FunctionArg, FunctionArgExpr,
         FunctionArgumentList, FunctionArguments, FunctionBehavior, FunctionSecurity, GroupByExpr,
         Ident, InTarget, Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator, Statement,
-        TableFactor, Value,
+        TableFactor, Value, visit_expressions,
     },
     parser::Parser,
 };
@@ -28,7 +29,7 @@ use crate::{
     },
     traits::{
         ColumnLike, DatabaseLike, DialectLike, ForeignKeyLike, FunctionLike, Relation, RoleLike,
-        TableLike,
+        SchemaLike, TableLike,
     },
     utils::{
         call_sites::call_reaches,
@@ -125,6 +126,9 @@ struct Scope<'db, DB: DatabaseLike> {
     function: &'db DB::Function,
     name: String,
     path: SearchPath<'db>,
+    /// The entries of [`path`](Self::path) whose schema the owner holds
+    /// `USAGE` on, which are the ones PostgreSQL searches for the owner.
+    usable_path: SearchPath<'db>,
     parameters: Vec<Parameter<'db>>,
     owner: &'db DB::Role,
 }
@@ -189,23 +193,57 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
         expression: &Expr,
         database: &'db DB,
     ) -> Result<Option<&'db DB::Column>, LookupError> {
-        let ident = match unnest(expression) {
-            Expr::Identifier(ident) => ident,
+        let Some(name) = self.column_name(expression) else { return Ok(None) };
+        self.table.column(&name.to_string(), database, IdentifierCase::AsWritten)
+    }
+
+    /// The name `expression` gives a column of this table, bare or qualified
+    /// by the table's name or alias.
+    fn column_name<'e>(&self, expression: &'e Expr) -> Option<&'e Ident> {
+        match unnest(expression) {
+            Expr::Identifier(ident) => Some(ident),
             Expr::CompoundIdentifier(parts) => {
-                let [qualifier, ident] = parts.as_slice() else { return Ok(None) };
-                if !identifiers_match(
+                let [qualifier, ident] = parts.as_slice() else { return None };
+                identifiers_match(
                     &self.qualifier.value,
                     self.qualifier.quote_style.is_some(),
                     &qualifier.value,
                     qualifier.quote_style.is_some(),
-                ) {
-                    return Ok(None);
-                }
-                ident
+                )
+                .then_some(ident)
             }
-            _ => return Ok(None),
-        };
-        self.table.column(&ident.to_string(), database, IdentifierCase::AsWritten)
+            _ => None,
+        }
+    }
+
+    /// Every column of the table `select` names, each once, which the owner
+    /// needs `SELECT` on wherever the name stands.
+    fn columns_read(
+        &self,
+        select: &Select,
+        database: &'db DB,
+    ) -> Result<Vec<&'db DB::Column>, LookupError> {
+        let columns: Vec<&'db DB::Column> = self.table.columns(database)?.collect();
+        let mut read: Vec<&'db DB::Column> = Vec::new();
+        let _: ControlFlow<()> = visit_expressions(select, |expression| {
+            let named = self.column_name(expression).and_then(|name| {
+                let name = name.to_string();
+                columns.iter().copied().find(|column| {
+                    IdentifierCase::AsWritten.names_stored(
+                        column.column_name(),
+                        column.column_name_is_quoted(),
+                        &name,
+                    )
+                })
+            });
+            if let Some(column) = named
+                && !read.iter().any(|seen| core::ptr::eq(*seen, column))
+            {
+                read.push(column);
+            }
+            ControlFlow::Continue(())
+        });
+        Ok(read)
     }
 }
 
@@ -321,7 +359,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 owner: owner.to_string(),
             });
         };
-        let scope = Scope { function, name, path, parameters, owner };
+        let usable_path = path
+            .iter()
+            .filter(|(schema, quoted)| {
+                self.declared_schema(schema, *quoted)
+                    .is_none_or(|schema| schema.has_usage(owner, database))
+            })
+            .cloned()
+            .collect();
+        let scope = Scope { function, name, path, usable_path, parameters, owner };
 
         // A body bound at creation resolves its names with no path, so it is
         // not read as one written to run under the pinned path.
@@ -375,6 +421,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let Some(column) = table.column(returned, self.database)? else {
             return Err(scope.arm_shape(select));
         };
+        self.require_select(scope, select, &table)?;
         let keyed = self.keyed_table(table.table, column)?;
         if let Expr::In { expr, target: InTarget::Subquery(called), negated: false, .. } =
             unnest(selection)
@@ -446,15 +493,22 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         {
             return Err(scope.arm_shape(select));
         }
-        let Some(Relation::Table(table)) = resolve_relation_object_name_on_path(
-            name,
-            database,
-            &scope.path,
-            IdentifierCase::AsWritten,
-        )?
-        else {
-            return Err(scope.arm_shape(select));
+        let resolve = |path: &SearchPath<'db>| {
+            resolve_relation_object_name_on_path(name, database, path, IdentifierCase::AsWritten)
         };
+        let table = match resolve(&scope.usable_path)? {
+            Some(Relation::Table(table)) => table,
+            Some(_) => return Err(scope.arm_shape(select)),
+            None => {
+                // A table only a schema the owner cannot use holds is not
+                // found.
+                if let Some(Relation::Table(hidden)) = resolve(&scope.path)? {
+                    self.require_usage(scope, table_schema(hidden))?;
+                }
+                return Err(scope.arm_shape(select));
+            }
+        };
+        self.require_usage(scope, table_schema(table))?;
         let refuse = |reason: fn(String, String, String) -> HelperSetError| {
             reason(
                 scope.name.clone(),
@@ -462,11 +516,6 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 target_name_of_table(table).to_string(),
             )
         };
-        if !table.privileges(scope.owner, database)?.select.on_table() {
-            return Err(refuse(|function, owner, table| {
-                HelperSetError::MissingSelect { function, owner, table }
-            }));
-        }
         // `Lookup` is not met for a table the database resolved itself, and
         // every other answer leaves the owner bound by some policy.
         if !matches!(
@@ -519,6 +568,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else {
                 return Err(shape());
             };
+            // A column of the table takes the name before a parameter does,
+            // and passes a value of each row.
+            if table.column(argument, database)?.is_some() {
+                return Err(shape());
+            }
             let passed = scope.parameter(argument).map(|(passed, _)| passed.value.clone());
             let literal = || {
                 let Expr::Value(value) = argument else { return None };
@@ -567,19 +621,81 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         call: &Function,
         arguments: usize,
     ) -> Result<&'db DB::Function, HelperSetError> {
-        let path = || scope.path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
-        let mut reached = self.database.functions().filter(|function| {
-            call_reaches(*function, &call.name, arguments, path, IdentifierCase::AsWritten)
-        });
-        match (reached.next(), reached.next()) {
-            (Some(callee), None) => Ok(callee),
-            _ => {
-                Err(HelperSetError::UnresolvedCall {
+        let reached = |path: &SearchPath<'db>| {
+            let path = || path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
+            let mut reached = self.database.functions().filter(move |function| {
+                call_reaches(*function, &call.name, arguments, path, IdentifierCase::AsWritten)
+            });
+            match (reached.next(), reached.next()) {
+                (Some(callee), None) => Some(callee),
+                _ => None,
+            }
+        };
+        let unresolved = || {
+            HelperSetError::UnresolvedCall {
+                function: scope.name.clone(),
+                call: call.name.to_string(),
+            }
+        };
+        let Some(callee) = reached(&scope.usable_path) else {
+            // A helper only a schema the owner cannot use holds is not found.
+            if let Some(hidden) = reached(&scope.path) {
+                self.require_usage(scope, function_schema(&hidden.target_name()))?;
+            }
+            return Err(unresolved());
+        };
+        self.require_usage(scope, function_schema(&callee.target_name()))?;
+        Ok(callee)
+    }
+
+    /// The schema `(name, quoted)` names, or `None` where the database
+    /// declares none by that name, as it declares no `pg_catalog`.
+    fn declared_schema(&self, name: &str, quoted: bool) -> Option<&'db DB::Schema> {
+        self.database
+            .schemas()
+            .find(|schema| identifiers_match(schema.name(), schema.name_is_quoted(), name, quoted))
+    }
+
+    /// Refuses the answer where the owner lacks `USAGE` on `schema`.
+    fn require_usage(
+        &self,
+        scope: &Scope<'db, DB>,
+        (name, quoted): (&str, bool),
+    ) -> Result<(), HelperSetError> {
+        match self.declared_schema(name, quoted) {
+            Some(schema) if !schema.has_usage(scope.owner, self.database) => {
+                Err(HelperSetError::MissingUsage {
                     function: scope.name.clone(),
-                    call: call.name.to_string(),
+                    owner: scope.owner.name().to_string(),
+                    schema: schema.name().to_string(),
                 })
             }
+            _ => Ok(()),
         }
+    }
+
+    /// Refuses the answer where the owner holds `SELECT` neither on the
+    /// arm's table nor on every column of it the arm reads.
+    fn require_select(
+        &self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        table: &ArmTable<'_, 'db, DB>,
+    ) -> Result<(), HelperSetError> {
+        let held = table.table.privileges(scope.owner, self.database)?.select;
+        if held.on_table()
+            || table
+                .columns_read(select, self.database)?
+                .iter()
+                .all(|column| held.on_column(column))
+        {
+            return Ok(());
+        }
+        Err(HelperSetError::MissingSelect {
+            function: scope.name.clone(),
+            owner: scope.owner.name().to_string(),
+            table: target_name_of_table(table.table).to_string(),
+        })
     }
 
     fn grant_arm(
@@ -722,8 +838,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         let list = plain_arguments(call)?;
         // PostgreSQL's own `current_setting` is in `pg_catalog`, and an
-        // overload declared elsewhere that the call may reach is refused.
-        let path = || scope.path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
+        // overload declared in a schema the owner can use, which the call may
+        // reach, is refused.
+        let path = || scope.usable_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
         if self.database.functions().any(|function| {
             call_reaches(function, &call.name, list.args.len(), path, IdentifierCase::AsWritten)
                 && function.target_name().schema() != Some("pg_catalog")
@@ -991,6 +1108,19 @@ fn plain_arguments(call: &Function) -> Option<&FunctionArgumentList> {
         && list.duplicate_treatment.is_none()
         && list.clauses.is_empty();
     plain.then_some(list)
+}
+
+/// The schema `table` lives in, `public` for one stored without a qualifier.
+fn table_schema<T: TableLike>(table: &T) -> (&str, bool) {
+    table
+        .table_schema()
+        .map_or(("public", false), |schema| (schema, table.table_schema_is_quoted()))
+}
+
+/// The schema a function's `target` name lives in, `public` for one stored
+/// without a qualifier.
+fn function_schema<'t>(target: &'t TargetName<'_>) -> (&'t str, bool) {
+    target.schema().map_or(("public", false), |schema| (schema, target.schema_is_quoted()))
 }
 
 /// `expression` without the parentheses around it.

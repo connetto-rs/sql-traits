@@ -115,6 +115,7 @@ mod run_time_object_names;
 mod scalar_family_allocations;
 mod schema_drop;
 mod schema_rename;
+mod schema_usage;
 mod scope_identifier_context;
 mod search_path;
 mod search_path_creation;

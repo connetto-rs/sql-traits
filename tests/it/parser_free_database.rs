@@ -742,6 +742,16 @@ impl SchemaLike for MemorySchema {
     fn authorization(&self) -> Option<&str> {
         None
     }
+
+    /// This catalog records no privileges, so its schemas hold only the
+    /// owner's entry a created schema starts with.
+    fn public_holds_usage(&self) -> bool {
+        false
+    }
+
+    fn owner_holds_usage(&self) -> bool {
+        true
+    }
 }
 
 impl ViewLike for MemoryView {

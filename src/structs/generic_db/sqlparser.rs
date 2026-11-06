@@ -101,6 +101,7 @@ mod revocations;
 mod role_memberships;
 mod routine_privileges;
 mod rules;
+mod schema_usage;
 mod sequences;
 mod table_as;
 mod table_owner;
@@ -167,7 +168,7 @@ impl SchemaProfile for SqlparserProfile {
     }
 
     fn initial_schemas() -> impl IntoIterator<Item = (Arc<Schema>, ())> {
-        [(Arc::new(Schema::with_quoted("public".to_string(), false)), ())]
+        [(Arc::new(Schema::initial_public()), ())]
     }
 
     fn is_foreign_table(metadata: &TableMetadata<CreateTable>) -> bool {
@@ -4460,12 +4461,7 @@ fn rename_role_references(builder: &mut ParserDBBuilder, previous: &Ident, repla
     }
     for (schema, ()) in builder.schemas_mut() {
         if schema.authorization() == Some(previous_name.as_str()) {
-            let replacement_schema = Schema::with_authorization_and_quoted(
-                schema.name().to_string(),
-                replacement_name.clone(),
-                schema.is_quoted(),
-            );
-            *schema = Arc::new(replacement_schema);
+            *schema = Arc::new(schema.owned_by(replacement_name.clone()));
         }
     }
     for (policy, _) in builder.policies_mut() {
@@ -9917,6 +9913,7 @@ impl ParserDB {
                         revocations::record(&mut builder, &part);
                     }
                     table_owner::revoke(&mut builder, &revoke);
+                    schema_usage::revoke(&mut builder, &revoke);
                 }
                 Statement::Set(sqlparser::ast::Set::SetTimeZone { local, value }) => {
                     if local {
@@ -10237,15 +10234,8 @@ impl ParserDB {
 
                                 let schemas = builder.schemas_mut();
                                 let (old_schema, ()) = schemas.remove(idx);
-                                let new_schema = if let Some(auth) = old_schema.authorization() {
-                                    Schema::with_authorization_and_quoted(
-                                        new_schema_name.clone(),
-                                        auth.to_string(),
-                                        new_schema_quoted,
-                                    )
-                                } else {
-                                    Schema::with_quoted(new_schema_name.clone(), new_schema_quoted)
-                                };
+                                let new_schema =
+                                    old_schema.renamed(new_schema_name.clone(), new_schema_quoted);
                                 schemas.push((Arc::new(new_schema), ()));
                                 schemas.sort_by(|(a, ()), (b, ())| a.name().cmp(b.name()));
                                 rename_created_collation_schemas(
@@ -10294,8 +10284,10 @@ impl ParserDB {
                                     validate_owner_role(&builder, owner, &current_schema_name)?;
                                 }
                                 // Update the authorization
-                                let owner_name = match owner {
-                                    sqlparser::ast::Owner::Ident(ident) => stored_role_name(ident),
+                                let (owner_name, owner_ident) = match owner {
+                                    sqlparser::ast::Owner::Ident(ident) => {
+                                        (stored_role_name(ident), ident)
+                                    }
                                     sqlparser::ast::Owner::CurrentRole
                                     | sqlparser::ast::Owner::CurrentUser
                                     | sqlparser::ast::Owner::SessionUser => continue,
@@ -10312,12 +10304,16 @@ impl ParserDB {
                                     continue;
                                 };
                                 let (old_schema, ()) = schemas.remove(idx);
-                                let new_schema = Schema::with_authorization_and_quoted(
-                                    old_schema.name().to_string(),
-                                    owner_name,
-                                    old_schema.is_quoted(),
-                                );
-                                schemas.push((Arc::new(new_schema), ()));
+                                let previous_owner = old_schema.authorization().map(String::from);
+                                schemas.push((Arc::new(old_schema.owned_by(owner_name)), ()));
+                                if let Some(previous_owner) = previous_owner {
+                                    schema_usage::change_owner(
+                                        &mut builder,
+                                        (&current_schema_name, current_schema_quoted),
+                                        &previous_owner,
+                                        owner_ident,
+                                    );
+                                }
                             }
                             // Other operations don't affect our schema tracking
                             AlterSchemaOperation::SetDefaultCollate { .. }

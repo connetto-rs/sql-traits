@@ -814,7 +814,8 @@ fn an_owner_lacking_a_privilege_the_body_needs_refuses_the_answer() {
          $$;
          ALTER FUNCTION other.docs_with(TEXT) OWNER TO stranger;
          GRANT SELECT ON members TO stranger;
-         REVOKE EXECUTE ON FUNCTION other.docs_with(TEXT) FROM PUBLIC;",
+         REVOKE EXECUTE ON FUNCTION other.docs_with(TEXT) FROM PUBLIC;
+         GRANT USAGE ON SCHEMA other TO owner;",
     );
     assert!(matches!(
         refusal(&calls),
@@ -1214,4 +1215,179 @@ fn an_argument_or_return_type_the_reader_cannot_compare_refuses_the_answer() {
     let record =
         helper(DEFINER, GRANT_ARM, "").replace("RETURNS SETOF TEXT", "RETURNS SETOF record");
     assert!(matches!(refusal(&record), HelperSetError::ReturnType { .. }));
+}
+
+/// [`helper`] with `members` moved into schema `grants`, `header` the
+/// helper's options, `table` the name its body reads `members` by, and
+/// `after` the statements after it.
+fn in_grants(header: &str, table: &str, after: &str) -> String {
+    let body = GRANT_ARM.replace("FROM members", &format!("FROM {table}"));
+    helper(header, &body, after)
+        .replace("CREATE TABLE members (", "CREATE SCHEMA grants; CREATE TABLE grants.members (")
+        .replace(
+            "GRANT SELECT ON docs, members TO owner;",
+            "GRANT SELECT ON docs, grants.members TO owner;",
+        )
+}
+
+fn answered(sql: &str) -> String {
+    let database = postgres(sql);
+    let deployment = deployment();
+    render(
+        &answer(&database, &deployment, "public", "docs_with", &[text("read")]).expect("answered"),
+    )
+}
+
+#[test]
+fn an_owner_lacking_usage_on_the_schema_of_a_table_it_reads_refuses_the_answer() {
+    let missing = |sql: &str| {
+        matches!(
+            refusal(sql),
+            HelperSetError::MissingUsage { schema, owner, .. } if schema == "grants" && owner == "owner"
+        )
+    };
+    assert!(missing(&in_grants(DEFINER, "grants.members", "")));
+    let reached_on_path = DEFINER.replace("search_path = public", "search_path = grants");
+    assert!(
+        missing(&in_grants(&reached_on_path, "members", "")),
+        "an unqualified name on the path"
+    );
+    let granted = "GRANT USAGE ON SCHEMA grants TO owner;";
+    assert_eq!(
+        answered(&in_grants(DEFINER, "grants.members", granted)),
+        "members.doc_id WHERE user_id = app.user_id AND role IN ('read')"
+    );
+    let owned = in_grants(DEFINER, "grants.members", "")
+        .replace("CREATE SCHEMA grants;", "CREATE SCHEMA grants AUTHORIZATION owner;");
+    answered(&owned);
+}
+
+#[test]
+fn a_path_schema_the_owner_cannot_use_is_skipped_as_postgres_skips_it() {
+    let path = DEFINER.replace("search_path = public", "search_path = grants, public");
+    let both = in_grants(&path, "members", "")
+        .replace(
+            "CREATE SCHEMA grants;",
+            "CREATE SCHEMA grants; CREATE TABLE members (doc_id TEXT, user_id TEXT, role TEXT);",
+        )
+        .replace(
+            "GRANT SELECT ON docs, grants.members",
+            "GRANT SELECT ON docs, members, grants.members",
+        );
+    let database = postgres(&both);
+    let deployment = deployment();
+    let set =
+        answer(&database, &deployment, "public", "docs_with", &[text("read")]).expect("answered");
+    let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
+    assert_eq!(grant.table().table_schema(), None, "public.members, past grants.members");
+
+    let database = postgres(&format!("{both} GRANT USAGE ON SCHEMA grants TO owner;"));
+    let set =
+        answer(&database, &deployment, "public", "docs_with", &[text("read")]).expect("answered");
+    let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
+    assert_eq!(grant.table().table_schema(), Some("grants"));
+
+    let nowhere = helper(DEFINER, &GRANT_ARM.replace("FROM members", "FROM nowhere"), "");
+    assert!(matches!(refusal(&nowhere), HelperSetError::ArmShape { .. }));
+}
+
+#[test]
+fn revoking_publics_usage_on_public_refuses_a_helper_reading_it() {
+    let revoked = helper(DEFINER, GRANT_ARM, "REVOKE USAGE ON SCHEMA public FROM PUBLIC;");
+    assert!(matches!(
+        refusal(&revoked),
+        HelperSetError::MissingUsage { schema, .. } if schema == "public"
+    ));
+    answered(&format!("{revoked} GRANT USAGE ON SCHEMA public TO owner;"));
+}
+
+#[test]
+fn an_owner_lacking_usage_on_the_schema_of_a_helper_it_calls_refuses_the_answer() {
+    let called = |call: &str, path: &str, after: &str| {
+        let sql = folders(call, after)
+            .replace(
+                "CREATE FUNCTION teams_with(",
+                "CREATE SCHEMA authz; CREATE FUNCTION authz.teams_with(",
+            )
+            .replace("ALTER FUNCTION teams_with(", "ALTER FUNCTION authz.teams_with(")
+            .replacen(
+                "SET search_path = public AS $$ SELECT id",
+                &format!("SET search_path = {path} AS $$ SELECT id"),
+                1,
+            );
+        folders_with(&sql, text("read"))
+    };
+    assert!(matches!(
+        called("authz.teams_with($1)", "public", ""),
+        Err(HelperSetError::MissingUsage { schema, .. }) if schema == "authz"
+    ));
+    assert!(matches!(
+        called("teams_with($1)", "authz, public", ""),
+        Err(HelperSetError::MissingUsage { schema, .. }) if schema == "authz"
+    ));
+    called("authz.teams_with($1)", "public", "GRANT USAGE ON SCHEMA authz TO owner;")
+        .expect("answered");
+}
+
+#[test]
+fn select_on_every_column_an_arm_reads_is_enough() {
+    let columns = |granted: &str| {
+        helper(DEFINER, GRANT_ARM, &format!("GRANT SELECT ({granted}) ON members TO owner;"))
+            .replace("GRANT SELECT ON docs, members TO owner;", "GRANT SELECT ON docs TO owner;")
+    };
+    assert_eq!(
+        answered(&columns("doc_id, user_id, role")),
+        "members.doc_id WHERE user_id = app.user_id AND role IN ('read')"
+    );
+    let twice = helper(
+        DEFINER,
+        &GRANT_ARM.replace("role = min_role", "(role = min_role OR members.role = 'admin')"),
+        "GRANT SELECT (doc_id, user_id, role) ON members TO owner;",
+    )
+    .replace("GRANT SELECT ON docs, members TO owner;", "GRANT SELECT ON docs TO owner;");
+    assert_eq!(
+        answered(&twice),
+        "members.doc_id WHERE user_id = app.user_id AND role IN ('read', 'admin')"
+    );
+    assert!(matches!(
+        refusal(&columns("doc_id, user_id")),
+        HelperSetError::MissingSelect { table, .. } if table == "members"
+    ));
+    let folded = helper(
+        DEFINER,
+        &GRANT_ARM.replace("role = min_role", "(role = 'admin' OR min_role = 'read')"),
+        "GRANT SELECT (doc_id, user_id) ON members TO owner;",
+    )
+    .replace("GRANT SELECT ON docs, members TO owner;", "GRANT SELECT ON docs TO owner;");
+    assert!(
+        matches!(refusal(&folded), HelperSetError::MissingSelect { .. }),
+        "a column read in a condition that reduces to TRUE is still read"
+    );
+
+    let parent = |granted: &str| {
+        folders("teams_with($1)", &format!("GRANT SELECT ({granted}) ON folders TO owner;"))
+            .replace(
+                "GRANT SELECT ON teams, team_members, folders",
+                "GRANT SELECT ON teams, team_members",
+            )
+    };
+    folders_with(&parent("id, team_id"), text("read")).expect("answered");
+    assert!(matches!(
+        folders_with(&parent("id"), text("read")),
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "folders"
+    ));
+}
+
+#[test]
+fn a_parent_argument_named_like_a_column_passes_the_column() {
+    let sql = folders("teams_with(min_role)", "")
+        .replace(
+            "CREATE FUNCTION folders_with(TEXT)",
+            "CREATE FUNCTION folders_with(min_role TEXT)",
+        )
+        .replace(
+            "team_id TEXT REFERENCES teams (id)\n",
+            "team_id TEXT REFERENCES teams (id), min_role TEXT\n",
+        );
+    assert!(matches!(folders_with(&sql, text("read")), Err(HelperSetError::ArmShape { .. })));
 }
