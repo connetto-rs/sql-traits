@@ -74,7 +74,8 @@ impl SessionSettings {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidTimeZone`] for a `timezone` PostgreSQL refuses.
+    /// Returns [`Error::InvalidTimeZone`] for a `TimeZone` setting PostgreSQL
+    /// refuses.
     pub(super) fn apply(
         &mut self,
         statement: &Statement,
@@ -199,7 +200,7 @@ fn literal(value: &Expr, hex_strings_may_be_integers: bool) -> Option<String> {
         .map(|(text, exact)| if exact { text.into_owned() } else { text.to_ascii_lowercase() })
 }
 
-/// Refuses a `timezone` value PostgreSQL refuses.
+/// Refuses a `TimeZone` setting PostgreSQL refuses.
 fn check_time_zone(name: &str, value: &str) -> Result<(), Error> {
     if name.eq_ignore_ascii_case("timezone")
         && let Err(reason) = PgTimeZone::parse(value)
@@ -221,7 +222,7 @@ fn check_time_zone(name: &str, value: &str) -> Result<(), Error> {
 ///
 /// Returns [`Error::NonLiteralSetting`] for a value PostgreSQL's grammar
 /// refuses, [`Error::UnknownCurrentSetting`] for `FROM CURRENT` on a value the
-/// input leaves unknown, [`Error::InvalidTimeZone`] for a `timezone`
+/// input leaves unknown, [`Error::InvalidTimeZone`] for a `TimeZone` setting
 /// PostgreSQL refuses and [`Error::UnnamedSessionRoleSetting`] for a session
 /// role the input never names.
 pub(super) fn alter_role(
