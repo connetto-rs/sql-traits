@@ -67,15 +67,9 @@ impl<F: FunctionLike + 'static> Builtins<F> {
         self.taken.binary_search(&row).is_err()
     }
 
-    fn declared(
-        &self,
-        rows: Range<usize>,
-    ) -> impl Iterator<Item = (usize, &Stored<F>)> + use<'_, F> {
-        let table = self.table;
-        rows.filter(|row| self.reached(*row)).filter_map(move |row| {
-            let stored: &Stored<F> = table?.function(row)?;
-            Some((row, stored))
-        })
+    /// The functions of `rows` still reached through the table.
+    fn declared(&self, rows: Range<usize>) -> Rows<'_, F> {
+        Rows { builtins: self, rows }
     }
 
     /// Every row of the table.
@@ -84,8 +78,8 @@ impl<F: FunctionLike + 'static> Builtins<F> {
     }
 
     /// Every function still reached through the table, in table order.
-    pub(crate) fn functions(&self) -> impl Iterator<Item = &Stored<F>> + use<'_, F> {
-        self.declared(self.rows()).map(|(_, stored)| stored)
+    pub(crate) fn functions(&self) -> Rows<'_, F> {
+        self.declared(self.rows())
     }
 
     /// The rows whose stored name folds as `name` does.
@@ -97,17 +91,13 @@ impl<F: FunctionLike + 'static> Builtins<F> {
 
     /// The functions whose stored name folds as `name` does, in every
     /// schema, a superset of those any lookup of `name` reaches.
-    pub(crate) fn named(&self, name: &str) -> impl Iterator<Item = &Stored<F>> + use<'_, F> {
-        self.declared(self.rows_named(name)).map(|(_, stored)| stored)
+    pub(crate) fn named(&self, name: &str) -> Rows<'_, F> {
+        self.declared(self.rows_named(name))
     }
 
     /// The functions an index probe for `key` reaches: those stored under
     /// exactly `key`, and with `aliases` every one whose key folds to it.
-    pub(crate) fn keyed(
-        &self,
-        key: &RelationKey,
-        aliases: bool,
-    ) -> impl Iterator<Item = &Stored<F>> + use<'_, F> {
+    pub(crate) fn keyed(&self, key: &RelationKey, aliases: bool) -> Rows<'_, F> {
         let rows = match self.table {
             Some(table) if table.schema() == key.schema => {
                 let folded = self.rows_named(&key.name);
@@ -125,7 +115,7 @@ impl<F: FunctionLike + 'static> Builtins<F> {
             }
             _ => 0..0,
         };
-        self.declared(rows).map(|(_, stored)| stored)
+        self.declared(rows)
     }
 
     /// The metadata of `function`, when it is one of the table's rows.
@@ -160,5 +150,26 @@ impl<F: FunctionLike + 'static> Builtins<F> {
             }
         }
         taken
+    }
+}
+
+/// The functions of a range of table rows that a [`Builtins`] still reaches.
+///
+/// A named type, so the many generic callers it flows into carry a short
+/// symbol rather than a nested adapter chain.
+pub(crate) struct Rows<'a, F: FunctionLike + 'static> {
+    builtins: &'a Builtins<F>,
+    rows: Range<usize>,
+}
+
+impl<'a, F: FunctionLike + 'static> Iterator for Rows<'a, F> {
+    type Item = &'a Stored<F>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let table = self.builtins.table?;
+        self.rows
+            .by_ref()
+            .filter(|row| self.builtins.reached(*row))
+            .find_map(|row| table.function(row))
     }
 }

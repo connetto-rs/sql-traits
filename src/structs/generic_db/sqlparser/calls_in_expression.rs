@@ -62,7 +62,11 @@ pub(super) fn calls_in<N: Visit + ?Sized>(
     ExpressionCalls::resolve_carrying(
         node,
         scope.functions,
-        |name| scope.builtins.named(name).map(|(function, _)| function),
+        &|name, each| {
+            for (function, _) in scope.builtins.named(name) {
+                each(function);
+            }
+        },
         scope.search_path,
         scope.case,
         |name, arguments| carried.take(name, arguments),
