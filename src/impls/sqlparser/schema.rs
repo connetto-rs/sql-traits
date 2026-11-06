@@ -23,4 +23,12 @@ impl SchemaLike for Schema {
     fn authorization(&self) -> Option<&str> {
         Schema::authorization(self)
     }
+
+    fn public_holds_usage(&self) -> bool {
+        Schema::public_holds_usage(self)
+    }
+
+    fn owner_holds_usage(&self) -> bool {
+        Schema::owner_holds_usage(self)
+    }
 }

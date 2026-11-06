@@ -1467,8 +1467,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
     /// function returning `SETOF` one scalar type with a pinned
     /// `search_path`, owned by a declared role holding `SELECT` on every
-    /// table it reads and exempt from their row-level security, and when
-    /// its body is a `UNION` of arms of two shapes.
+    /// table it reads, or on every column of it the body names, `USAGE` on
+    /// the schema of every table and helper the body names, and exempt from
+    /// the row-level security of the tables, and when its body is a `UNION`
+    /// of arms of two shapes.
     ///
     /// - A grant arm, `SELECT <column> FROM <table> WHERE <caller column> =
     ///   current_setting('<setting>'[, true]) [AND <condition>]`, where the
@@ -1484,11 +1486,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///
     /// A grant arm whose condition reduces to `FALSE` or `NULL` keeps no row
     /// and is left out. A column named like a parameter is the column, as
-    /// PostgreSQL resolves names in a SQL function.
-    ///
-    /// The owner's `USAGE` on the schemas the helper and what it reads live
-    /// in is not checked, and a `SELECT` granted on columns alone is not
-    /// counted.
+    /// PostgreSQL resolves names in a SQL function. An unqualified name is
+    /// looked up past the schemas on the path the owner cannot use, as
+    /// PostgreSQL leaves them out of the owner's path.
     ///
     /// # Arguments
     ///

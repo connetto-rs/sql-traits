@@ -1,11 +1,16 @@
 //! Submodule providing a trait for describing SQL Schema-like entities.
 
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, vec::Vec};
 use core::fmt::Debug;
 
+use sqlparser::ast::Action;
+
 use crate::{
-    traits::{DatabaseLike, Metadata},
-    utils::identifier_resolution::normalize_identifier,
+    structs::ActingRole,
+    traits::{
+        DatabaseLike, GrantLike, Metadata, RoleLike, grant::GrantTarget, role::privilege_holders,
+    },
+    utils::identifier_resolution::{identifiers_match, normalize_identifier},
 };
 
 /// A trait for types that can be treated as SQL schemas.
@@ -90,6 +95,98 @@ pub trait SchemaLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
     /// # }
     /// ```
     fn authorization(&self) -> Option<&str>;
+
+    /// Returns whether `PUBLIC` holds the `USAGE` the schema was created
+    /// with, apart from any `GRANT`.
+    ///
+    /// A new PostgreSQL database's `public` schema gives it, until `REVOKE
+    /// USAGE ON SCHEMA public FROM PUBLIC` takes it. Every schema created
+    /// later starts without it.
+    fn public_holds_usage(&self) -> bool;
+
+    /// Returns whether the owner's own entry still holds `USAGE`, which the
+    /// owner holds from creation until a `REVOKE` naming the owner takes it.
+    fn owner_holds_usage(&self) -> bool;
+
+    /// Returns whether `role` holds `USAGE` on this schema, as PostgreSQL's
+    /// `has_schema_privilege(role, schema, 'USAGE')` answers it.
+    ///
+    /// `USAGE` reaches `role` through a grant naming the role itself,
+    /// `PUBLIC`, or one of the
+    /// [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of the
+    /// role, through `PUBLIC`'s initial entry as
+    /// [`public_holds_usage`](Self::public_holds_usage) reports it, and
+    /// through the owner's own entry when the role or one it inherits from is
+    /// the [`authorization`](Self::authorization) owner. `ALL PRIVILEGES`
+    /// carries it and `CREATE` does not. A superuser holds it, and
+    /// [`ActingRole::Public`] holds what `PUBLIC` holds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE reader; CREATE ROLE stranger;
+    ///      CREATE SCHEMA app;
+    ///      GRANT USAGE ON SCHEMA app TO reader;
+    ///      REVOKE USAGE ON SCHEMA public FROM PUBLIC;",
+    /// )?;
+    /// let (reader, stranger) = (db.role("reader").unwrap(), db.role("stranger").unwrap());
+    /// let app = db.schema("app").unwrap();
+    /// assert!(app.has_usage(reader, &db));
+    /// assert!(!app.has_usage(stranger, &db));
+    /// assert!(!db.schema("public").unwrap().has_usage(stranger, &db));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn has_usage<'db>(
+        &'db self,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> bool
+    where
+        Self: 'db,
+    {
+        let holders: Vec<&<Self::DB as DatabaseLike>::Role> = match role.into() {
+            ActingRole::Declared(role) if role.is_superuser() => return true,
+            ActingRole::Declared(role) => privilege_holders(role, database).collect(),
+            ActingRole::Public => Vec::new(),
+        };
+        if self.public_holds_usage() {
+            return true;
+        }
+        if self.owner_holds_usage()
+            && let Some(owner) = self.authorization()
+            && holders.iter().any(|holder| holder.stored_name() == owner)
+        {
+            return true;
+        }
+        database.table_grants().any(|grant| {
+            let on_schema = match grant.target() {
+                GrantTarget::Schemas(mut names) => {
+                    names.any(|name| {
+                        identifiers_match(
+                            name.name(),
+                            name.name_is_quoted(),
+                            self.name(),
+                            self.name_is_quoted(),
+                        )
+                    })
+                }
+                _ => false,
+            };
+            on_schema
+                && (grant.applies_to_public()
+                    || holders.iter().any(|holder| grant.applies_to_role(holder)))
+                && (grant.is_all_privileges()
+                    || grant
+                        .privileges(database)
+                        .any(|privilege| matches!(privilege, Action::Usage)))
+        })
+    }
 }
 
 /// Blanket implementation for references to `SchemaLike` types.
@@ -106,6 +203,14 @@ impl<S: SchemaLike> SchemaLike for &S {
 
     fn authorization(&self) -> Option<&str> {
         (*self).authorization()
+    }
+
+    fn public_holds_usage(&self) -> bool {
+        (*self).public_holds_usage()
+    }
+
+    fn owner_holds_usage(&self) -> bool {
+        (*self).owner_holds_usage()
     }
 }
 
@@ -533,6 +638,8 @@ mod tests {
             assert_eq!(<&_ as SchemaLike>::name(&s_ref), "my_schema");
             assert!(!<&_ as SchemaLike>::name_is_quoted(&s_ref));
             assert_eq!(<&_ as SchemaLike>::authorization(&s_ref), Some("admin"));
+            assert!(!<&_ as SchemaLike>::public_holds_usage(&s_ref));
+            assert!(<&_ as SchemaLike>::owner_holds_usage(&s_ref));
         }
     }
 }
