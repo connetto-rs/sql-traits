@@ -5,12 +5,12 @@ use core::{fmt::Debug, hash::Hash};
 
 use sqlparser::ast::{
     ArgMode, Expr, Function, FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam,
-    FunctionSecurity, Value,
+    FunctionSecurity, Statement, Value,
 };
 
 use crate::{
     errors::{HelperSetError, LookupError},
-    impls::{body_calls, body_expression, body_reads, helper_set},
+    impls::{atomic_statements, body_calls, body_expression, body_reads, helper_set},
     structs::{Deployment, FunctionBody, FunctionKind, HelperSet, PrivilegeHolder, TargetName},
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
@@ -584,6 +584,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///
     /// [`body`](FunctionLike::body),
     /// [`body_expression`](FunctionLike::body_expression),
+    /// [`atomic_statements`](FunctionLike::atomic_statements),
     /// [`body_is_bound`](FunctionLike::body_is_bound),
     /// [`referenced_tables`](FunctionLike::referenced_tables),
     /// [`referenced_relations`](FunctionLike::referenced_relations),
@@ -673,8 +674,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// `BEGIN ATOMIC` block binds the same way, but it holds a list of
     /// statements rather than an expression, so it answers [`None`] here and
     /// in [`body`](FunctionLike::body), and
-    /// [`body_is_bound`](FunctionLike::body_is_bound) tells it apart from a
-    /// function with no body.
+    /// [`atomic_statements`](FunctionLike::atomic_statements) hands its
+    /// statements back.
     ///
     /// # Errors
     ///
@@ -742,6 +743,70 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         database: &Self::DB,
     ) -> Result<Option<Cow<'f, Expr>>, LookupError> {
         body_expression(self, database)
+    }
+
+    /// Returns the statements of a function written as a `BEGIN ATOMIC`
+    /// block.
+    ///
+    /// The block is the form of a body PostgreSQL binds at `CREATE FUNCTION`
+    /// that holds a list of statements, beside the `RETURN <expression>` form
+    /// [`body_expression`](FunctionLike::body_expression) hands back. Its
+    /// statements answer the name the store holds for each relation they
+    /// reached, as that expression does. A bound body handed over as the
+    /// definition a catalog prints, [`FunctionBody::BoundDefinition`], is
+    /// parsed here under the dialect of `database`.
+    ///
+    /// Every other body answers [`None`]. That includes SQL Server's
+    /// `AS BEGIN ... END`, read each time the function runs, whose statements
+    /// [`written_body`](FunctionLike::written_body) hands over as
+    /// [`FunctionBody::Statements`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyUnparsable`] when the printed
+    /// definition of a bound body does not parse, or holds no body bound at
+    /// creation.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE SCHEMA app;
+    /// CREATE TABLE app.t (a INT);
+    /// SET search_path = app;
+    /// CREATE FUNCTION cleared() RETURNS INT LANGUAGE sql BEGIN ATOMIC
+    ///     DELETE FROM t WHERE a = 0;
+    ///     SELECT count(*)::int FROM t;
+    /// END;
+    /// CREATE FUNCTION counted() RETURNS INT LANGUAGE sql RETURN (SELECT count(*)::int FROM t);
+    /// ",
+    /// )?;
+    /// let function = |name| {
+    ///     let in_app = TargetName::new(name, false).with_schema("app", false);
+    ///     db.function_by_target(in_app, IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    /// };
+    /// let cleared = function("cleared").atomic_statements(&db)?.expect("a BEGIN ATOMIC body");
+    /// assert_eq!(
+    ///     cleared.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    ///     ["DELETE FROM app.t WHERE a = 0", "SELECT count(*)::INT FROM app.t"],
+    /// );
+    /// assert_eq!(function("counted").atomic_statements(&db)?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn atomic_statements<'f>(
+        &'f self,
+        database: &Self::DB,
+    ) -> Result<Option<Cow<'f, [Statement]>>, LookupError> {
+        atomic_statements(self, database)
     }
 
     /// Returns the function-local configuration after later alterations.

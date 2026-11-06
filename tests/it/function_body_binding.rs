@@ -9,7 +9,11 @@ use sql_traits::{
     errors::{Error, LookupError, ObjectKind},
     prelude::*,
 };
-use sqlparser::{ast::CreateFunction, dialect::PostgreSqlDialect, parser::Parser};
+use sqlparser::{
+    ast::CreateFunction,
+    dialect::{MsSqlDialect, PostgreSqlDialect},
+    parser::Parser,
+};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -86,6 +90,47 @@ fn a_block_body_resolves_under_the_creation_search_path() {
             .is_some(),
         "the function outlives the table the item shadows"
     );
+}
+
+/// A `BEGIN ATOMIC` body hands back its statements as they were bound, while
+/// a body in any other spelling, a SQL Server `BEGIN ... END` list included,
+/// answers none.
+#[test]
+fn a_block_body_hands_back_its_bound_statements() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.w (a INT);
+         SET search_path = app, public;
+         CREATE FUNCTION public.f() RETURNS INT LANGUAGE sql BEGIN ATOMIC
+             DELETE FROM w WHERE a = 0;
+             SELECT count(*)::int FROM w;
+         END;
+         CREATE FUNCTION public.r() RETURNS INT LANGUAGE sql RETURN (SELECT a FROM w);
+         CREATE FUNCTION public.q() RETURNS INT LANGUAGE sql AS 'SELECT 1';",
+    )
+    .expect("every body binds under the session path");
+    let statements = |db: &ParserDB, name| {
+        function(db, name)
+            .atomic_statements(db)
+            .expect("a parsed body")
+            .map(|statements| statements.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        statements(&db, "f"),
+        Some(vec![
+            String::from("DELETE FROM app.w WHERE a = 0"),
+            String::from("SELECT count(*)::INT FROM app.w"),
+        ]),
+    );
+    assert_eq!(statements(&db, "r"), None);
+    assert_eq!(statements(&db, "q"), None);
+
+    let db = ParserDB::parse::<MsSqlDialect>(
+        "CREATE FUNCTION s() RETURNS INT AS BEGIN SELECT 1; RETURN 1; END",
+    )
+    .expect("a SQL Server body parses");
+    assert!(matches!(function(&db, "s").written_body(), Some(FunctionBody::Statements(_))));
+    assert_eq!(statements(&db, "s"), None);
 }
 
 /// A relation any statement of the block names that the database does not
