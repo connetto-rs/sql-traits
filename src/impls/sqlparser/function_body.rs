@@ -144,20 +144,43 @@ fn unparsable<F: FunctionLike>(function: &F, reason: &dyn ToString) -> LookupErr
     }
 }
 
+/// The body of `function` bound at creation, parsed from the definition a
+/// catalog prints where it is handed over as one, or [`None`] for a body
+/// written in another form.
+fn bound_body<'f, F: FunctionLike>(
+    function: &'f F,
+    database: &F::DB,
+) -> Result<Option<SqlBody<'f>>, LookupError> {
+    Ok(match function.written_body() {
+        Some(FunctionBody::Return(expression)) => Some(SqlBody::Return(Cow::Borrowed(expression))),
+        Some(FunctionBody::Atomic(statements)) => Some(SqlBody::Atomic(Cow::Borrowed(statements))),
+        Some(FunctionBody::BoundDefinition(definition)) => {
+            Some(bound_definition_body(function, definition, database)?)
+        }
+        _ => None,
+    })
+}
+
 /// The expression of a body written `RETURN <expression>`, as
 /// [`FunctionLike::body_expression`] describes.
 pub(crate) fn body_expression<'f, F: FunctionLike>(
     function: &'f F,
     database: &F::DB,
 ) -> Result<Option<Cow<'f, Expr>>, LookupError> {
-    Ok(match function.written_body() {
-        Some(FunctionBody::Return(expression)) => Some(Cow::Borrowed(expression)),
-        Some(FunctionBody::BoundDefinition(definition)) => {
-            match bound_definition_body(function, definition, database)? {
-                SqlBody::Return(expression) => Some(expression),
-                _ => None,
-            }
-        }
+    Ok(match bound_body(function, database)? {
+        Some(SqlBody::Return(expression)) => Some(expression),
+        _ => None,
+    })
+}
+
+/// The statements of a body written as a `BEGIN ATOMIC` block, as
+/// [`FunctionLike::atomic_statements`] describes.
+pub(crate) fn atomic_statements<'f, F: FunctionLike>(
+    function: &'f F,
+    database: &F::DB,
+) -> Result<Option<Cow<'f, [Statement]>>, LookupError> {
+    Ok(match bound_body(function, database)? {
+        Some(SqlBody::Atomic(statements)) => Some(statements),
         _ => None,
     })
 }

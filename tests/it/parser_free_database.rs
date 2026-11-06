@@ -1978,6 +1978,11 @@ fn the_inherited_body_analysis_reads_a_printed_bound_definition() -> Result<(), 
             .map(|called| called.name().to_string())
             .collect())
     };
+    let statements = |name| -> Result<Option<Vec<String>>, LookupError> {
+        Ok(function(name)
+            .atomic_statements(&catalog)?
+            .map(|statements| statements.iter().map(ToString::to_string).collect()))
+    };
     let unparsable = |error: Option<LookupError>, name: &str| matches!(error, Some(LookupError::FunctionBodyUnparsable { function, .. }) if function == name);
 
     assert!(function("returned").body_is_bound());
@@ -1988,21 +1993,28 @@ fn the_inherited_body_analysis_reads_a_printed_bound_definition() -> Result<(), 
     );
     assert_eq!(read("returned")?, ["app.notes"]);
     assert_eq!(called("returned")?, ["touch"]);
+    assert_eq!(statements("returned")?, None);
 
     assert!(function("atomic").body_is_bound());
     assert_eq!(function("atomic").body_expression(&catalog)?, None);
     assert_eq!(read("atomic")?, ["app.docs"]);
+    assert_eq!(
+        statements("atomic")?,
+        Some(vec![String::from("SELECT count(*) AS count FROM app.docs")]),
+    );
 
     // The catalog answers the calls of a bound body without the parse.
     assert!(function("broken").body_is_bound());
     assert!(unparsable(read("broken").err(), "broken"));
     assert!(unparsable(function("broken").body_expression(&catalog).err(), "broken"));
+    assert!(unparsable(function("broken").atomic_statements(&catalog).err(), "broken"));
     assert_eq!(called("broken")?, ["touch"]);
 
     // A definition holding no bound body is not the body it claims to be.
     for name in ["unbound", "select"] {
         assert!(unparsable(read(name).err(), name), "{name}");
         assert!(unparsable(function(name).body_expression(&catalog).err(), name), "{name}");
+        assert!(unparsable(function(name).atomic_statements(&catalog).err(), name), "{name}");
     }
     Ok(())
 }
