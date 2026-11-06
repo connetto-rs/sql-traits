@@ -112,7 +112,7 @@ mod tests {
 
     use crate::{
         structs::ParserDB,
-        traits::{PolicyLike, RoleLike},
+        traits::{DatabaseLike, PolicyLike, RoleLike},
     };
 
     /// Helper to parse SQL using PostgreSQL dialect
@@ -242,7 +242,6 @@ mod tests {
             r#"
             CREATE ROLE My_Role;
             CREATE ROLE "MY_ROLE";
-            CREATE ROLE "public";
             CREATE TABLE t1 (id INT);
             CREATE TABLE t2 (id INT);
             CREATE POLICY p1 ON t1 TO My_Role USING (true);
@@ -260,9 +259,10 @@ mod tests {
         let quoted_policies: Vec<_> = quoted.policies(&db).map(PolicyLike::name).collect();
         assert_eq!(quoted_policies, ["p2"]);
 
-        let quoted_public = db.role("public").expect("quoted public role resolves");
-        let quoted_public_policies: Vec<_> =
-            quoted_public.policies(&db).map(PolicyLike::name).collect();
-        assert_eq!(quoted_public_policies, ["p4"]);
+        // A quoted lowercase `"public"` is the pseudo-role, so p4 names no
+        // role.
+        let public: Vec<_> =
+            db.policies().filter(PolicyLike::applies_to_public).map(PolicyLike::name).collect();
+        assert_eq!(public, ["p3", "p4"]);
     }
 }

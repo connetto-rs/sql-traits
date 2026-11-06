@@ -63,7 +63,8 @@ fn role_matches_ident(role: &CreateRole, lookup_name: &str, lookup_quoted: bool)
 
 /// Returns whether a grantee names the `PUBLIC` pseudo-role, in either
 /// spelling the parser produces: the dedicated grantee type for the keyword,
-/// and a bare unquoted `PUBLIC` identifier for dialects that reserve it.
+/// and an identifier [`is_public_pseudo_role`] recognises, which a quoted
+/// `"public"` and a dialect reserving the word both produce.
 pub(crate) fn grantee_is_public(grantee: &Grantee) -> bool {
     if grantee.grantee_type == GranteesType::Public {
         return true;
@@ -129,10 +130,10 @@ pub(crate) fn schema_matches_table<T: TableLike>(schema_name: &ObjectName, table
 }
 
 pub(crate) fn grantees_match(left_grantee: &Grantee, right_grantee: &Grantee) -> bool {
-    if left_grantee.grantee_type == GranteesType::Public
-        || right_grantee.grantee_type == GranteesType::Public
-    {
-        return left_grantee.grantee_type == right_grantee.grantee_type;
+    match (grantee_is_public(left_grantee), grantee_is_public(right_grantee)) {
+        (true, true) => return true,
+        (true, false) | (false, true) => return false,
+        (false, false) => {}
     }
 
     // A keyword principal is the same principal only as the same keyword, and
