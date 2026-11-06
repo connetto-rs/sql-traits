@@ -136,6 +136,7 @@ mod temporary_namespace;
 mod thread_safety;
 mod transactional_ingestion;
 mod type_name_normalization;
+mod user_defined_types;
 mod view_options;
 mod views;
 mod views_follow_renames;

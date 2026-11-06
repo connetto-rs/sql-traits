@@ -16,7 +16,7 @@ use crate::{
     },
     traits::{
         DomainLike, ExtensionLike, FunctionLike, PolicyLike, RoleLike, RuleLike, SchemaLike,
-        TableLike, TriggerLike, ViewLike,
+        TableLike, TriggerLike, UserDefinedTypeLike, ViewLike,
     },
     utils::object_name::{
         RelationKey, render_table_candidate, stored_function_key, stored_sequence_key,
@@ -116,6 +116,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     extensions: Vec<Stored<P::Extension>>,
     /// List of domains created in the database.
     domains: Vec<Stored<P::Domain>>,
+    /// List of user-defined types created in the database.
+    user_defined_types: Vec<Stored<P::UserDefinedType>>,
     /// List of policies created in the database.
     policies: Vec<Stored<P::Policy>>,
     /// List of check constraints in the database.
@@ -162,6 +164,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             rules: self.rules.clone(),
             extensions: self.extensions.clone(),
             domains: self.domains.clone(),
+            user_defined_types: self.user_defined_types.clone(),
             policies: self.policies.clone(),
             check_constraints: self.check_constraints.clone(),
             roles: self.roles.clone(),
@@ -227,6 +230,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             rules: Vec::new(),
             extensions: Vec::new(),
             domains: Vec::new(),
+            user_defined_types: Vec::new(),
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
@@ -396,6 +400,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &self.domains
     }
 
+    /// Returns a slice of user-defined type Arc references with their metadata.
+    pub(crate) fn user_defined_types(&self) -> &[Stored<P::UserDefinedType>] {
+        &self.user_defined_types
+    }
+
     /// Returns a slice of foreign key Arc references with their metadata.
     pub(crate) fn foreign_keys(&self) -> &[Stored<P::ForeignKey>] {
         &self.foreign_keys
@@ -476,6 +485,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &mut self.domains
     }
 
+    /// Returns a mutable reference to the user-defined types list.
+    pub(crate) fn user_defined_types_mut(&mut self) -> &mut Vec<Stored<P::UserDefinedType>> {
+        &mut self.user_defined_types
+    }
+
     /// Returns a mutable reference to the policies list.
     pub(crate) fn policies_mut(&mut self) -> &mut Vec<Stored<P::Policy>> {
         &mut self.policies
@@ -529,6 +543,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             rules: Vec::new(),
             extensions: Vec::new(),
             domains: Vec::new(),
+            user_defined_types: Vec::new(),
             policies: Vec::new(),
             check_constraints: Vec::new(),
             roles: Vec::new(),
@@ -767,6 +782,18 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     #[inline]
     pub fn add_domain(mut self, domain: Arc<P::Domain>, metadata: Meta<P::Domain>) -> Self {
         self.domains.push((domain, metadata));
+        self
+    }
+
+    /// Adds a user-defined type with its metadata to the builder.
+    #[must_use]
+    #[inline]
+    pub fn add_user_defined_type(
+        mut self,
+        type_: Arc<P::UserDefinedType>,
+        metadata: Meta<P::UserDefinedType>,
+    ) -> Self {
+        self.user_defined_types.push((type_, metadata));
         self
     }
 
@@ -1033,6 +1060,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             rules,
             extensions,
             domains,
+            user_defined_types,
             policies,
             check_constraints,
             roles,
@@ -1065,6 +1093,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             rules,
             extensions,
             domains,
+            user_defined_types,
             policies,
             check_constraints,
             roles,
@@ -1109,6 +1138,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.extensions.sort_unstable_by(|(a, _), (b, _)| a.stored_name().cmp(&b.stored_name()));
         // A domain name is unique in its schema.
         self.domains.sort_unstable_by(|(a, _), (b, _)| {
+            (a.stored_schema(), a.stored_name()).cmp(&(b.stored_schema(), b.stored_name()))
+        });
+        // A user-defined type name is unique in its schema.
+        self.user_defined_types.sort_unstable_by(|(a, _), (b, _)| {
             (a.stored_schema(), a.stored_name()).cmp(&(b.stored_schema(), b.stored_name()))
         });
         self.policies.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
@@ -1227,6 +1260,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             rules: self.rules,
             extensions: self.extensions,
             domains: self.domains,
+            user_defined_types: self.user_defined_types,
             policies: self.policies,
             check_constraints: self.check_constraints,
             roles: self.roles,

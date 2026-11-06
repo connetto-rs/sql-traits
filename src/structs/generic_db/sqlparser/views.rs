@@ -38,9 +38,10 @@ use sqlparser::ast::{
 use super::{
     AlterTableScope, Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier,
     bind_reference, domains, function_bodies, object_name_last_identifier,
-    object_name_matches_resolved_identity, place_relation, require_named_in_catalog,
+    object_name_matches_resolved_identity, place_relation, relation_name_holder,
+    require_named_in_catalog,
     rules::{self, RuleHost},
-    stored_ident,
+    stored_ident, user_defined_types,
     view_rewrites::{self, Rename},
 };
 use crate::{
@@ -137,7 +138,11 @@ pub(super) fn create_view(
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
     }
 
-    let holder = domains::relation_or_domain_holder(&builder, name_ident, schema);
+    // A view takes a shell of its name over, filling the type name.
+    user_defined_types::take_over_shell(&mut builder, name_ident, schema);
+
+    let holder = relation_name_holder(&builder, name_ident, schema)
+        .or_else(|| domains::domain_or_user_type_holder(&builder, name_ident, schema));
 
     if let Some(conflicting_kind) = holder {
         // `CREATE MATERIALIZED VIEW ... IF NOT EXISTS` skips silently when a
@@ -709,16 +714,16 @@ fn rename_view(
 
     // A rename to the name it already answers to changes nothing, and asking
     // the name pool first would report the view colliding with itself.
+    let schema = current.schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted));
     if !crate::utils::identifier_resolution::identifiers_match(
         current.name.as_str(),
         current.quoted,
         new_ident.value.as_str(),
         new_ident.quote_style.is_some(),
-    ) && let Some(conflicting_kind) = domains::relation_or_domain_holder(
-        &builder,
-        new_ident,
-        current.schema.as_ref().map(|(value, quoted)| (value.as_str(), *quoted)),
-    ) {
+    ) && let Some(conflicting_kind) =
+        domains::relation_or_domain_holder(&builder, new_ident, schema)
+            .or_else(|| domains::rename_type_holder(&builder, new_ident, schema))
+    {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: kind,
             conflicting_kind,

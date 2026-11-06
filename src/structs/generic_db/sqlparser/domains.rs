@@ -30,14 +30,13 @@ use alloc::{string::ToString, sync::Arc, vec::Vec};
 use sqlparser::ast::{ArrayElemTypeDef, CreateDomain, DataType, Ident, ObjectName};
 
 use super::{
-    AlterTableScope, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, bind_reference,
-    inheritance, object_name_last_identifier, place_relation, relation_name_holder,
-    require_named_in_catalog,
+    ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, bind_reference,
+    object_name_last_identifier, place_relation, relation_name_holder, require_named_in_catalog,
 };
 use crate::{
     errors::{Error, ObjectKind},
-    impls::{bound_domain, domain_in_schema, domain_named},
-    traits::DomainLike,
+    impls::{bound_domain, bound_user_type, domain_in_schema, domain_named, user_type_holds},
+    traits::{DomainLike, UserDefinedTypeLike},
     utils::{
         identifier_resolution::{identifiers_match, is_temporary_schema, normalize_identifier},
         object_name::{
@@ -57,14 +56,17 @@ pub(super) enum DropSpelling {
     /// `DROP DOMAIN`, which drops nothing but a domain.
     Domain,
     /// `DROP TYPE`, which drops a domain as well as the kinds of type this
-    /// model does not hold.
+    /// model holds.
     Type,
 }
 
 /// What a type name reaches in the first schema holding a type of that name.
-enum Reached {
+pub(super) enum Reached {
     /// The domain at this position among the stored domains.
     Domain(usize),
+    /// The user-defined type at this position, with whether the name is its
+    /// multirange's.
+    UserType(usize, bool),
     /// The row type of a relation of this kind.
     RowType(ObjectKind),
     /// A type of `pg_catalog`.
@@ -78,7 +80,7 @@ enum Reached {
 /// Refuses a name another domain or the row type of a relation holds in the
 /// schema, and a schema the input never creates.
 pub(super) fn create_domain(
-    builder: ParserDBBuilder,
+    mut builder: ParserDBBuilder,
     mut domain: CreateDomain,
     role: Option<&str>,
 ) -> Result<ParserDBBuilder, Error> {
@@ -87,9 +89,9 @@ pub(super) fn create_domain(
     let name = object_name_last_identifier(&domain.name)
         .ok_or(Error::UnnamedObject { object_kind: ObjectKind::Domain })?;
     let schema = qualifier_of(&domain.name).named();
-    let holder = domain_name_holder(&builder, name, schema).or_else(|| {
-        relation_name_holder(&builder, name, schema).filter(|kind| has_row_type(*kind))
-    });
+    // A domain takes a shell of its name over, filling the type name.
+    super::user_defined_types::take_over_shell(&mut builder, name, schema);
+    let holder = type_name_holder(&builder, name, schema);
     if let Some(conflicting_kind) = holder {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Domain,
@@ -97,7 +99,7 @@ pub(super) fn create_domain(
             object_name: name.value.clone(),
         });
     }
-    bind_type(&builder, &mut domain.data_type);
+    bind_type(&builder, &mut domain.data_type)?;
     let calls = builder.calls_in(&domain);
     Ok(builder.add_domain(Arc::new(domain), calls))
 }
@@ -130,6 +132,62 @@ pub(super) fn relation_or_domain_holder(
         .or_else(|| domain_name_holder(builder, name, schema))
 }
 
+/// Returns the kind of type a relation may not take, a domain or a filled
+/// user-defined type the relation's own name would clash with in the pool of
+/// type names. A row type is left out, since another relation holding it is a
+/// relation name the relation pool already names.
+pub(super) fn domain_or_user_type_holder(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    schema: SchemaQualifier<'_>,
+) -> Option<ObjectKind> {
+    let case = builder.identifier_case();
+    let schema_tuple = schema.unwrap_or((DEFAULT_SCHEMA, false));
+    domain_name_holder(builder, name, schema).or_else(|| {
+        builder
+            .user_defined_types()
+            .iter()
+            .any(|(type_, _)| {
+                !type_.is_shell()
+                    && user_type_holds(type_, ident_parts(name), schema_tuple, case).is_some()
+            })
+            .then_some(ObjectKind::Type)
+    })
+}
+
+/// Returns the kind of type a relation rename may not take, a domain or a
+/// user-defined type, its multirange included, which a rename cannot take
+/// over the way a creation fills a shell.
+pub(super) fn rename_type_holder(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    schema: SchemaQualifier<'_>,
+) -> Option<ObjectKind> {
+    if let Some(kind) = domain_name_holder(builder, name, schema) {
+        return Some(kind);
+    }
+    let case = builder.identifier_case();
+    let schema_tuple = schema.unwrap_or((DEFAULT_SCHEMA, false));
+    builder.user_defined_types().iter().find_map(|(type_, _)| {
+        user_type_holds(type_, ident_parts(name), schema_tuple, case).map(|_| ObjectKind::Type)
+    })
+}
+
+/// Returns the kind of type already holding `name` in the pool of type names
+/// of `schema`, a domain, a filled user-defined type, or the row type of a
+/// relation, which a new type, domain or relation may not take.
+///
+/// A shell is left out, since a creation of any kind takes it over or fills
+/// it rather than colliding with it.
+pub(super) fn type_name_holder(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    schema: SchemaQualifier<'_>,
+) -> Option<ObjectKind> {
+    domain_or_user_type_holder(builder, name, schema)
+        .or_else(|| relation_name_holder(builder, name, schema).filter(|kind| has_row_type(*kind)))
+}
+
 /// Whether a relation of this kind carries a row type, whose name is taken in
 /// the pool of type names.
 const fn has_row_type(kind: ObjectKind) -> bool {
@@ -147,7 +205,7 @@ fn schema_ident(name: &str, quoted: bool) -> Ident {
 }
 
 /// What a bare type name reaches through the session's path.
-fn reach_type(builder: &ParserDBBuilder, name: &Ident) -> Option<Reached> {
+pub(super) fn reach_type(builder: &ParserDBBuilder, name: &Ident) -> Option<Reached> {
     let temporary =
         (!builder.search_path().any(|(schema, quoted)| is_temporary_schema(schema, quoted)))
             .then_some((TEMPORARY_SCHEMA, false));
@@ -165,7 +223,7 @@ fn reach_type(builder: &ParserDBBuilder, name: &Ident) -> Option<Reached> {
 
 /// What a type name reaches in one schema, if the schema holds a type of that
 /// name.
-fn reach_in_schema(
+pub(super) fn reach_in_schema(
     builder: &ParserDBBuilder,
     name: &Ident,
     (schema, schema_quoted): (&str, bool),
@@ -186,6 +244,14 @@ fn reach_in_schema(
     }) {
         return Some(Reached::Domain(position));
     }
+    if let Some((position, is_multirange)) =
+        builder.user_defined_types().iter().enumerate().find_map(|(position, (type_, _))| {
+            user_type_holds(type_, ident_parts(name), schema, case)
+                .map(|is_multirange| (position, is_multirange))
+        })
+    {
+        return Some(Reached::UserType(position, is_multirange));
+    }
     relation_name_holder(builder, name, Some(schema))
         .filter(|kind| has_row_type(*kind))
         .map(Reached::RowType)
@@ -197,7 +263,9 @@ fn reach_in_schema(
 macro_rules! innermost_type_name {
     ($(#[$doc:meta])* $name:ident $($mutability:tt)?) => {
         $(#[$doc])*
-        fn $name(data_type: &$($mutability)? DataType) -> Option<&$($mutability)? ObjectName> {
+        pub(super) fn $name(
+            data_type: &$($mutability)? DataType,
+        ) -> Option<&$($mutability)? ObjectName> {
             match data_type {
                 DataType::Custom(name, _) => Some(name),
                 DataType::Array(
@@ -222,32 +290,84 @@ innermost_type_name!(
     custom_name_mut mut
 );
 
-/// Binds a declared type naming a domain, or an array of one, to the domain
-/// the session's path reaches now, writing that domain's schema into the
-/// name.
+/// Binds a declared type naming a domain or a user-defined type, or an array
+/// of either, to the type the session's path reaches now, writing that type's
+/// schema into the name.
 ///
-/// A domain of the default schema stays bare, unless `pg_catalog` holds a type
-/// of its name, which a bare name would reach instead.
-pub(super) fn bind_type(builder: &ParserDBBuilder, data_type: &mut DataType) {
-    if builder.domains().is_empty() {
-        return;
+/// A type of the default schema stays bare, unless `pg_catalog` holds a type of
+/// its name, which a bare name would reach instead.
+///
+/// # Errors
+///
+/// Returns [`Error::TypeIsOnlyShell`] for a type that reaches a shell, a name
+/// held by a bare `CREATE TYPE name;` and never filled.
+pub(super) fn bind_type(builder: &ParserDBBuilder, data_type: &mut DataType) -> Result<(), Error> {
+    if builder.domains().is_empty() && builder.user_defined_types().is_empty() {
+        return Ok(());
     }
     let Some(name) = custom_name_mut(data_type) else {
-        return;
+        return Ok(());
     };
     let Ok((None, ident)) = object_name_identifiers(name) else {
-        return;
+        return Ok(());
     };
-    let Some(Reached::Domain(position)) = reach_type(builder, ident) else {
-        return;
+    let Some(reached) = reach_type(builder, ident) else {
+        return Ok(());
     };
-    let domain = &builder.domains()[position].0;
-    let qualifier = match domain.schema() {
-        Some(schema) => Some(schema_ident(schema, domain.schema_is_quoted())),
-        None if names_catalog_type(&domain.stored_name()) => Some(Ident::new(DEFAULT_SCHEMA)),
-        None => None,
+    match reached {
+        Reached::Domain(position) => {
+            let domain = &builder.domains()[position].0;
+            let qualifier = match domain.schema() {
+                Some(schema) => Some(schema_ident(schema, domain.schema_is_quoted())),
+                None if names_catalog_type(&domain.stored_name()) => {
+                    Some(Ident::new(DEFAULT_SCHEMA))
+                }
+                None => None,
+            };
+            bind_reference(name, qualifier);
+        }
+        Reached::UserType(position, _is_multirange) => {
+            let type_ = &builder.user_defined_types()[position].0;
+            if type_.is_shell() {
+                return Err(Error::TypeIsOnlyShell { type_name: type_.name().to_string() });
+            }
+            let qualifier =
+                type_.schema().map(|schema| schema_ident(schema, type_.schema_is_quoted()));
+            bind_reference(name, qualifier);
+        }
+        Reached::RowType(_) | Reached::Catalog => {}
+    }
+    Ok(())
+}
+
+/// Refuses a type a definition declares over when it names a shell, keeping
+/// an unknown name the input never creates, as a column and a domain do.
+///
+/// # Errors
+///
+/// Returns [`Error::TypeIsOnlyShell`] for a name that reaches a shell.
+pub(super) fn require_existing_type(
+    builder: &ParserDBBuilder,
+    data_type: &DataType,
+) -> Result<(), Error> {
+    let Some(name) = custom_name(data_type) else {
+        return Ok(());
     };
-    bind_reference(name, qualifier);
+    let Ok((_, ident)) = object_name_identifiers(name) else {
+        return Ok(());
+    };
+    if names_catalog_type(&normalize_identifier(&ident.value, ident.quote_style.is_some())) {
+        return Ok(());
+    }
+    // A shell types no value. A bare name reaches a shell of another schema
+    // on the path only through [`bind_type`], which runs before this.
+    let types = builder.user_defined_types().iter().map(|(type_, _)| type_.as_ref());
+    if let Some((type_, _multirange)) = bound_user_type(types, name, builder.identifier_case())
+        && type_.is_shell()
+    {
+        return Err(Error::TypeIsOnlyShell { type_name: name.to_string() });
+    }
+    Ok(())
 }
 
 /// The position among the stored domains of the domain a declared type names,
@@ -262,48 +382,6 @@ pub(super) fn named_domain(builder: &ParserDBBuilder, data_type: &DataType) -> O
     builder.domains().iter().position(|(stored, _)| core::ptr::eq(stored.as_ref(), domain))
 }
 
-/// Applies a `DROP DOMAIN` or a `DROP TYPE`.
-///
-/// # Errors
-///
-/// Refuses a `DROP DOMAIN` naming no domain without `IF EXISTS`, one naming
-/// the row type of a relation, and, without `CASCADE`, a domain a column or
-/// another domain is declared with.
-pub(super) fn drop_domains(
-    builder: ParserDBBuilder,
-    names: &[ObjectName],
-    if_exists: bool,
-    cascade: bool,
-    spelling: DropSpelling,
-) -> Result<ParserDBBuilder, Error> {
-    let mut doomed = Vec::with_capacity(names.len());
-    for name in names {
-        let (schema, ident) = object_name_identifiers(name)?;
-        let reached = match schema {
-            Some(schema) => reach_in_schema(&builder, ident, ident_parts(schema)),
-            None => reach_type(&builder, ident),
-        };
-        // PostgreSQL refuses a name reaching a type that is no domain,
-        // `IF EXISTS` or not, and skips only a name reaching nothing.
-        let skipped = if_exists && reached.is_none();
-        match (reached, spelling) {
-            (Some(Reached::Domain(position)), _) => doomed.push(position),
-            (Some(Reached::RowType(actual_kind)), DropSpelling::Domain) => {
-                return Err(Error::RelationKindMismatch {
-                    object_name: name.to_string(),
-                    expected_kind: ObjectKind::Domain,
-                    actual_kind,
-                });
-            }
-            (Some(Reached::Catalog) | None, DropSpelling::Domain) if !skipped => {
-                return Err(Error::DropDomainNotFound { domain_name: name.to_string() });
-            }
-            _ => {}
-        }
-    }
-    drop_positions(builder, doomed, cascade)
-}
-
 /// Whether a domain lives in the schema.
 pub(super) fn schema_holds_domain(
     builder: &ParserDBBuilder,
@@ -315,132 +393,6 @@ pub(super) fn schema_holds_domain(
         .domains()
         .iter()
         .any(|(domain, _)| domain_in_schema(domain, (schema_name, schema_quoted), case))
-}
-
-/// Drops every domain of a schema `DROP SCHEMA ... CASCADE` removes, with what
-/// a cascading drop of each takes.
-///
-/// # Errors
-///
-/// Returns the errors dropping a column a domain declares returns.
-pub(super) fn drop_domains_in(
-    builder: ParserDBBuilder,
-    schema_name: &str,
-    schema_quoted: bool,
-) -> Result<ParserDBBuilder, Error> {
-    let case = builder.identifier_case();
-    let doomed = builder
-        .domains()
-        .iter()
-        .enumerate()
-        .filter(|(_, (domain, _))| domain_in_schema(domain, (schema_name, schema_quoted), case))
-        .map(|(position, _)| position)
-        .collect();
-    drop_positions(builder, doomed, true)
-}
-
-/// Drops the domains at `doomed`, refusing what uses them unless `cascade`,
-/// in which case the domains and columns using them go too.
-fn drop_positions(
-    mut builder: ParserDBBuilder,
-    mut doomed: Vec<usize>,
-    cascade: bool,
-) -> Result<ParserDBBuilder, Error> {
-    if doomed.is_empty() {
-        return Ok(builder);
-    }
-    let domain_name =
-        |builder: &ParserDBBuilder, position: usize| builder.domains()[position].0.name.to_string();
-
-    // Every domain declared over a doomed one, followed to the end of the
-    // chain.
-    let mut grew = true;
-    while grew {
-        grew = false;
-        for (position, (domain, _)) in builder.domains().iter().enumerate() {
-            if doomed.contains(&position) {
-                continue;
-            }
-            let Some(used) = named_domain(&builder, &domain.data_type) else {
-                continue;
-            };
-            if !doomed.contains(&used) {
-                continue;
-            }
-            if !cascade {
-                return Err(Error::DomainHasDependents {
-                    domain_name: domain_name(&builder, used),
-                    dependent_kind: ObjectKind::Domain,
-                    dependent_name: domain.name.to_string(),
-                });
-            }
-            doomed.push(position);
-            grew = true;
-        }
-    }
-
-    let uses_doomed = |builder: &ParserDBBuilder, data_type: &DataType| {
-        named_domain(builder, data_type).filter(|used| doomed.contains(used))
-    };
-
-    if !cascade {
-        for (table, _, _) in builder.tables() {
-            for column in &table.columns {
-                if let Some(used) = uses_doomed(&builder, &column.data_type) {
-                    return Err(Error::DomainHasDependents {
-                        domain_name: domain_name(&builder, used),
-                        dependent_kind: ObjectKind::Column,
-                        dependent_name: alloc::format!("{}.{}", table.name, column.name),
-                    });
-                }
-            }
-        }
-    }
-
-    // A column a parent passes down leaves with the parent's, so only the
-    // columns a table declares itself are dropped, one at a time, each drop
-    // taking what dropping a column takes.
-    loop {
-        let next = builder.tables().iter().find_map(|(table, _, _)| {
-            table
-                .columns
-                .iter()
-                .find(|column| {
-                    uses_doomed(&builder, &column.data_type).is_some()
-                        && !inheritance::is_inherited_column(&builder, table, &column.name)
-                })
-                .map(|column| (qualified_table_name(&table.name), column.name.clone()))
-        });
-        let Some((table_name, column_name)) = next else {
-            break;
-        };
-        builder = ParserDB::alter_table_drop_columns(
-            builder,
-            &table_name,
-            AlterTableScope { if_exists: false, only: false },
-            &[column_name],
-            false,
-            true,
-        )?;
-    }
-
-    let mut position = 0;
-    builder.domains_mut().retain(|_| {
-        let kept = !doomed.contains(&position);
-        position += 1;
-        kept
-    });
-    Ok(builder)
-}
-
-/// A stored table name with the default schema written out, so a lookup
-/// reaches that table whatever the session's path holds.
-fn qualified_table_name(name: &ObjectName) -> ObjectName {
-    let mut qualified = name.clone();
-    if matches!(qualifier_of(name), Qualifier::Absent) {
-        bind_reference(&mut qualified, Some(Ident::new(DEFAULT_SCHEMA)));
-    }
-    qualified
 }
 
 /// Points the domains of a renamed schema, and every declared type naming one

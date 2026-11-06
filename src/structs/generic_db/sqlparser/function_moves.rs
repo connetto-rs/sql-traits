@@ -11,12 +11,15 @@
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{CreateFunction, CreateFunctionBody, ObjectName, VisitMut};
+use sqlparser::ast::{
+    CreateFunction, CreateFunctionBody, ObjectName, UserDefinedTypeRangeOption,
+    UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption, VisitMut,
+};
 
 use super::{CarriedCalls, ParserDB, ParserDBBuilder, StoredTable, function_argument_types};
 use crate::{
     errors::Error,
-    structs::{TableAttribute, metadata::ExpressionCalls},
+    structs::{TableAttribute, UserDefinedType, metadata::ExpressionCalls},
     traits::FunctionLike,
     utils::call_sites::{call_reaches, for_each_call_name_mut},
 };
@@ -111,6 +114,67 @@ fn renamed_call(
     }
 }
 
+/// Respells every function name a user-defined type's definition writes, in
+/// the order its calls bind them, to the name its bound function moves to.
+fn respell_user_type(
+    node: &mut UserDefinedType,
+    calls: &ExpressionCalls<CreateFunction>,
+    moves: &Moves,
+) -> Result<(), Error> {
+    let mut sites = calls.sites().iter();
+    let mut respell = |name: &mut ObjectName| -> Result<(), Error> {
+        renamed_call(moves, sites.next().map(Vec::as_slice), name).map(|renamed| {
+            if let Some(renamed) = renamed {
+                *name = renamed;
+            }
+        })
+    };
+    // A base type and a range declare functions, which a moved one respells.
+    if let Some(UserDefinedTypeRepresentation::SqlDefinition { options }) =
+        node.representation.as_mut()
+    {
+        for option in options {
+            if let Some(name) = base_function_name(option) {
+                respell(name)?;
+            }
+        }
+    }
+    if let Some(UserDefinedTypeRepresentation::Range { options }) = node.representation.as_mut() {
+        for option in options {
+            if let Some(name) = range_function_name(option) {
+                respell(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The function name a base type option declares, or none for an option that
+/// declares no function.
+fn base_function_name(option: &mut UserDefinedTypeSqlDefinitionOption) -> Option<&mut ObjectName> {
+    match option {
+        UserDefinedTypeSqlDefinitionOption::Input(name)
+        | UserDefinedTypeSqlDefinitionOption::Output(name)
+        | UserDefinedTypeSqlDefinitionOption::Receive(name)
+        | UserDefinedTypeSqlDefinitionOption::Send(name)
+        | UserDefinedTypeSqlDefinitionOption::TypmodOut(name)
+        | UserDefinedTypeSqlDefinitionOption::Analyze(name)
+        | UserDefinedTypeSqlDefinitionOption::Subscript(name)
+        | UserDefinedTypeSqlDefinitionOption::TypmodIn(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// The function name a range option declares, or none for the subtype and
+/// multirange options, which name types.
+fn range_function_name(option: &mut UserDefinedTypeRangeOption) -> Option<&mut ObjectName> {
+    match option {
+        UserDefinedTypeRangeOption::Canonical(name)
+        | UserDefinedTypeRangeOption::SubtypeDiff(name) => Some(name),
+        _ => None,
+    }
+}
+
 /// Respells every call of `node` to the name `renamed` gives it from its
 /// written name and argument count, leaving a call it gives none as written.
 fn respell_each<N: VisitMut + ?Sized>(
@@ -195,6 +259,11 @@ pub(super) fn move_functions(
     for (domain, calls) in builder.domains_mut() {
         if moves.reached_by(calls) {
             respell(Arc::make_mut(domain), calls, moves)?;
+        }
+    }
+    for (type_, calls) in builder.user_defined_types_mut() {
+        if moves.reached_by(calls) {
+            respell_user_type(Arc::make_mut(type_), calls, moves)?;
         }
     }
     let case = builder.identifier_case();

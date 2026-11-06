@@ -42,7 +42,7 @@ use crate::{
     structs::{
         ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
         IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
-        Sequence, TableAttribute, TableMetadata, View,
+        Sequence, TableAttribute, TableMetadata, UserDefinedType, View,
         metadata::{
             CheckMetadata, ColumnCreation, ExpressionCalls, IndexMetadata, PolicyMetadata,
             UniqueIndexMetadata,
@@ -105,6 +105,7 @@ mod sequences;
 mod table_as;
 mod table_owner;
 mod transactions;
+mod user_defined_types;
 mod view_rewrites;
 mod views;
 
@@ -139,6 +140,7 @@ impl SchemaProfile for SqlparserProfile {
     type Rule = CreateRule;
     type Extension = CreateExtension;
     type Domain = CreateDomain;
+    type UserDefinedType = UserDefinedType;
     type Policy = CreatePolicy;
     type Role = CreateRole;
     type RoleMembership = RoleMembership;
@@ -1089,6 +1091,9 @@ impl ParserDBBuilder {
         for (_, calls) in self.domains_mut() {
             calls.replace_function(stale, fresh);
         }
+        for (_, calls) in self.user_defined_types_mut() {
+            calls.replace_function(stale, fresh);
+        }
         for (_, calls) in self.triggers_mut() {
             calls.replace_function(stale, fresh);
         }
@@ -1141,6 +1146,7 @@ impl ParserDBBuilder {
                 .any(|(_, metadata, _)| calls_dropped(metadata.calls()))
             || self.rules().iter().any(|(_, calls)| calls_dropped(calls))
             || self.domains().iter().any(|(_, calls)| calls_dropped(calls))
+            || self.user_defined_types().iter().any(|(_, calls)| calls_dropped(calls))
     }
 
     /// The function a trigger written to run `called` runs, as of this
@@ -1587,6 +1593,7 @@ impl ParserDBBuilder {
             )
         }) || extensions::schema_holds_extension(self, schema_name, schema_quoted)
             || domains::schema_holds_domain(self, schema_name, schema_quoted)
+            || user_defined_types::schema_holds_type(self, schema_name, schema_quoted)
             || self
                 .functions()
                 .iter()
@@ -4068,6 +4075,8 @@ fn relation_name_holder(
             constraint_names::index_name_held(builder, name, schema)
                 .then_some(ObjectKind::UniqueIndex)
         })
+        // Of the user-defined types only a composite takes a relation name.
+        .or_else(|| user_defined_types::composite_name_holder(builder, name, schema))
 }
 
 /// Checks that nothing in the schema of a table node already holds a name the
@@ -4092,10 +4101,10 @@ fn validate_relation_names(
             Some(holder) if holder == *object_kind && *object_kind == table_kind => None,
             holder => holder,
         }
-        // The relation's row type shares the pool of type names with domains.
+        // The row type shares the pool of type names with domains and user-defined types.
         .or_else(|| {
             (*object_kind == table_kind)
-                .then(|| domains::domain_name_holder(builder, name, schema))
+                .then(|| domains::domain_or_user_type_holder(builder, name, schema))
                 .flatten()
         });
         let conflicting_kind = introduced[..position]
@@ -5354,6 +5363,17 @@ impl ParserDB {
         let renamed = StoredTable::of(resolved_table);
         let key = stored_table_key(resolved_table, IdentifierCase::AsWritten);
         let target = RenameTarget::new(new_name, &resolved_table.name)?;
+        // A rename cannot take a shell over the way a creation fills it.
+        if let Some(new_ident) = object_name_last_identifier(&target.name)
+            && let Some(conflicting_kind) =
+                domains::rename_type_holder(&builder, new_ident, qualifier_of(&target.name).named())
+        {
+            return Err(crate::errors::Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::Table,
+                conflicting_kind,
+                object_name: new_ident.value.clone(),
+            });
+        }
         let readers = view_rewrites::readers(&builder, &[&key]);
 
         // Collected before the rename, while the old name is still the key.
@@ -6004,6 +6024,14 @@ impl ParserDB {
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         if matches!(origin, TableOrigin::Declaration(..)) {
             validate_table_schema(&builder, &create_table)?;
+            // A table takes a shell of its name over, filling the type name.
+            let name_ident = object_name_last_identifier(&create_table.name)
+                .ok_or(crate::errors::Error::UnnamedObject { object_kind: ObjectKind::Table })?;
+            user_defined_types::take_over_shell(
+                &mut builder,
+                name_ident,
+                table_schema_qualifier(&create_table),
+            );
         }
         validate_distinct_columns(&create_table, builder.identifier_case())?;
         let table_kind = if table_metadata.foreign_source().is_some() {
@@ -7689,7 +7717,7 @@ impl ParserDB {
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let mut operation = operation.clone();
         if let AlterColumnOperation::SetDataType { data_type, .. } = &mut operation {
-            domains::bind_type(&builder, data_type);
+            domains::bind_type(&builder, data_type)?;
         }
         let mut identity_sequence = None;
         if let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? {
@@ -8744,7 +8772,7 @@ impl ParserDB {
                                 &resolved_schema_name,
                                 resolved_schema_quoted,
                             )?;
-                            builder = domains::drop_domains_in(
+                            builder = user_defined_types::drop_types_in(
                                 builder,
                                 &resolved_schema_name,
                                 resolved_schema_quoted,
@@ -8978,7 +9006,7 @@ impl ParserDB {
                                 column_position,
                                 ..
                             } => {
-                                domains::bind_type(&builder, &mut column_def.data_type);
+                                domains::bind_type(&builder, &mut column_def.data_type)?;
                                 for option in &column_def.options {
                                     if let ColumnOption::ForeignKey(foreign_key) = &option.option {
                                         Self::refuse_reference_from_permanent_start(
@@ -9355,7 +9383,7 @@ impl ParserDB {
                         session_roles.creating_role(),
                     )?;
                     for column in &mut create_table.columns {
-                        domains::bind_type(&builder, &mut column.data_type);
+                        domains::bind_type(&builder, &mut column.data_type)?;
                     }
 
                     // Refused before `IF NOT EXISTS`, as PostgreSQL refuses it
@@ -9534,8 +9562,19 @@ impl ParserDB {
                         session_roles.creating_role(),
                     )?;
                 }
+                Statement::CreateType { name, representation } => {
+                    builder = user_defined_types::create_user_defined_type(
+                        builder,
+                        name,
+                        representation,
+                        session_roles.creating_role(),
+                    )?;
+                }
+                Statement::AlterType(alter) => {
+                    builder = user_defined_types::alter_type(builder, alter)?;
+                }
                 Statement::DropDomain(DropDomain { if_exists, name, drop_behavior }) => {
-                    builder = domains::drop_domains(
+                    builder = user_defined_types::drop_types(
                         builder,
                         core::slice::from_ref(&name),
                         if_exists,
@@ -9550,7 +9589,7 @@ impl ParserDB {
                     cascade,
                     ..
                 } => {
-                    builder = domains::drop_domains(
+                    builder = user_defined_types::drop_types(
                         builder,
                         &names,
                         if_exists,
@@ -10248,6 +10287,11 @@ impl ParserDB {
                                     (&new_schema_name, new_schema_quoted),
                                 )?;
                                 builder = domains::follow_schema_rename(
+                                    builder,
+                                    (&current_schema_name, current_schema_quoted),
+                                    (&new_schema_name, new_schema_quoted),
+                                )?;
+                                builder = user_defined_types::follow_schema_rename(
                                     builder,
                                     (&current_schema_name, current_schema_quoted),
                                     (&new_schema_name, new_schema_quoted),

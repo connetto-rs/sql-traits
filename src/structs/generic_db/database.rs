@@ -37,6 +37,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type Rule = P::Rule;
     type Extension = P::Extension;
     type Domain = P::Domain;
+    type UserDefinedType = P::UserDefinedType;
     type Policy = P::Policy;
     type Role = P::Role;
     type RoleMembership = P::RoleMembership;
@@ -381,6 +382,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     #[inline]
     fn domains(&self) -> impl Iterator<Item = &Self::Domain> {
         self.domains.iter().map(|(domain, _)| domain.as_ref())
+    }
+
+    #[inline]
+    fn user_defined_types(&self) -> impl Iterator<Item = &Self::UserDefinedType> {
+        self.user_defined_types.iter().map(|(type_, _)| type_.as_ref())
     }
 
     #[inline]

@@ -17,7 +17,7 @@ use crate::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, DomainLike,
         ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike,
         RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike,
-        TriggerLike, UniqueIndexLike, ViewLike,
+        TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
     },
     utils::{
         call_typing::{Selection, reached_functions, resolve_call},
@@ -62,6 +62,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type Extension: ExtensionLike<DB = Self>;
     /// Type of the domains in the schema.
     type Domain: DomainLike<DB = Self>;
+    /// Type of the user-defined types in the schema.
+    type UserDefinedType: UserDefinedTypeLike<DB = Self>;
     /// Type of the unique indexes in the schema.
     type UniqueIndex: UniqueIndexLike<DB = Self>;
     /// Type of the check constraints in the schema.
@@ -267,6 +269,29 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # }
     /// ```
     fn domains(&self) -> impl Iterator<Item = &Self::Domain>;
+
+    /// Iterates over the user-defined types defined in the schema.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::{prelude::*, traits::UserDefinedTypeKind};
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "
+    /// CREATE TYPE point AS (x int, y int);
+    /// CREATE TYPE mood AS ENUM ('sad', 'ok');
+    /// ",
+    /// )?;
+    /// let mut kinds: Vec<UserDefinedTypeKind> =
+    ///     db.user_defined_types().map(|type_| type_.kind()).collect();
+    /// kinds.sort_by_key(|kind| format!("{kind:?}"));
+    /// assert_eq!(kinds, vec![UserDefinedTypeKind::Composite, UserDefinedTypeKind::Enum]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn user_defined_types(&self) -> impl Iterator<Item = &Self::UserDefinedType>;
 
     /// Iterates over the indexes defined in the schema.
     ///
