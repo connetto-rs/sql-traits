@@ -14,7 +14,8 @@ fn can_select(database: &ParserDB, table: &str, role: &str) -> bool {
         .table_by_target(TargetName::new(table, false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("the table exists")
-        .can_select(database.role(role).expect("the role exists"), database)
+        .privileges(database.role(role).expect("the role exists"), database)
+        .map(|held| held.select.on_table())
         .expect("the table is in the database")
 }
 
@@ -113,12 +114,12 @@ fn every_table_privilege_is_inherited() {
         .expect("the table exists");
     let app_user = database.role("app_user").expect("the role exists");
 
-    assert_eq!(table.can_insert(app_user, &database), Ok(true));
-    assert_eq!(table.can_update(app_user, &database), Ok(true));
-    assert_eq!(table.can_delete(app_user, &database), Ok(true));
-    assert_eq!(table.can_truncate(app_user, &database), Ok(true));
-    assert_eq!(table.can_write(app_user, &database), Ok(true));
-    assert_eq!(table.can_select(app_user, &database), Ok(false));
+    let held = table.privileges(app_user, &database).expect("the table is in the database");
+    assert!(held.insert.on_table());
+    assert!(held.update.on_table());
+    assert!(held.delete);
+    assert!(held.truncate);
+    assert!(!held.select.on_table());
 }
 
 #[test]

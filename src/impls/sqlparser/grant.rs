@@ -392,7 +392,6 @@ pub(crate) fn split_by_column_scope(mut grant: Grant) -> (Option<Grant>, Option<
 struct ActionRevokeApplication {
     retained: Option<Action>,
     revoked: Option<Action>,
-    unsupported: bool,
 }
 
 fn partition_action_for_revoke(
@@ -400,35 +399,19 @@ fn partition_action_for_revoke(
     revoke_action: &Action,
 ) -> ActionRevokeApplication {
     if mem::discriminant(&grant_action) != mem::discriminant(revoke_action) {
-        return ActionRevokeApplication {
-            retained: Some(grant_action),
-            revoked: None,
-            unsupported: false,
-        };
+        return ActionRevokeApplication { retained: Some(grant_action), revoked: None };
     }
 
     if !is_column_scoped_action(&grant_action) {
-        return ActionRevokeApplication {
-            retained: None,
-            revoked: Some(grant_action),
-            unsupported: false,
-        };
+        return ActionRevokeApplication { retained: None, revoked: Some(grant_action) };
     }
 
     match (action_columns(&grant_action), action_columns(revoke_action)) {
-        (None, Some(_)) => {
-            ActionRevokeApplication {
-                retained: Some(grant_action),
-                revoked: None,
-                unsupported: true,
-            }
-        }
+        // A column's entry is apart from the table's, so a revoke naming
+        // columns leaves a table-wide grant whole.
+        (None, Some(_)) => ActionRevokeApplication { retained: Some(grant_action), revoked: None },
         (None | Some(_), None) => {
-            ActionRevokeApplication {
-                retained: None,
-                revoked: Some(grant_action),
-                unsupported: false,
-            }
+            ActionRevokeApplication { retained: None, revoked: Some(grant_action) }
         }
         (Some(grant_columns), Some(revoke_columns)) => {
             let (withdrawn_columns, retained_columns): (Vec<Ident>, Vec<Ident>) =
@@ -447,7 +430,7 @@ fn partition_action_for_revoke(
             let revoked = (!withdrawn_columns.is_empty())
                 .then(|| action_with_columns(&grant_action, Some(withdrawn_columns)));
 
-            ActionRevokeApplication { retained, revoked, unsupported: false }
+            ActionRevokeApplication { retained, revoked }
         }
     }
 }
@@ -547,9 +530,6 @@ fn partition_actions_for_revoke(
                 break;
             };
             let application = partition_action_for_revoke(action, revoke_action);
-            if application.unsupported {
-                return PrivilegeRevokeApplication::UNSUPPORTED;
-            }
             current = application.retained;
             if let Some(withdrawn) = application.revoked {
                 withdrawn_actions.push(withdrawn);

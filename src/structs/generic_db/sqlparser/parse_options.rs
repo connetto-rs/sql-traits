@@ -160,7 +160,7 @@ impl ParseOptions {
     /// let docs =
     ///     db.table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)?.unwrap();
     /// assert_eq!(docs.owner(&db)?, Some("postgres"));
-    /// assert_eq!(docs.can_select(db.role("anon").unwrap(), &db), Ok(true));
+    /// assert!(docs.privileges(db.role("anon").unwrap(), &db)?.select.on_table());
     /// # Ok::<(), Box<dyn core::error::Error>>(())
     /// ```
     #[must_use]

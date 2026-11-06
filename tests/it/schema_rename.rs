@@ -176,7 +176,7 @@ fn grants_follow_the_move() {
     let reader = db.role("reader").expect("the role is declared");
 
     let parent = table(&db, "s2.parent").expect("parent moved");
-    assert_eq!(parent.can_select(reader, &db), Ok(true));
+    assert_eq!(parent.privileges(reader, &db).map(|held| held.select.on_table()), Ok(true));
     let mut reached: Vec<String> = db
         .table_grants()
         .filter(|grant| grant.applies_to_role(reader))

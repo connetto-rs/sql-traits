@@ -48,7 +48,7 @@ fn rename_repoints_every_modeled_role_reference() {
     assert_eq!(altered_schema.authorization(), Some("Renamed_Owner"));
     assert_eq!(memberships, ["Renamed_Owner"]);
     assert_eq!(policies, ["docs_read"]);
-    assert_eq!(docs.can_select(renamed, &database), Ok(true));
+    assert_eq!(docs.privileges(renamed, &database).map(|held| held.select.on_table()), Ok(true));
 }
 
 /// A rename repoints only the grantees naming the renamed role.
@@ -81,10 +81,22 @@ fn rename_leaves_the_grants_of_other_roles_alone() {
         .expect("unambiguous lookup")
         .expect("f exists");
 
-    assert_eq!(table("docs").can_select(role("after"), &database), Ok(true));
-    assert_eq!(table("docs").can_select(role("other"), &database), Ok(true));
-    assert_eq!(table("notes").can_select(role("bystander"), &database), Ok(true));
-    assert_eq!(table("notes").can_select(role("after"), &database), Ok(false));
+    assert_eq!(
+        table("docs").privileges(role("after"), &database).map(|held| held.select.on_table()),
+        Ok(true)
+    );
+    assert_eq!(
+        table("docs").privileges(role("other"), &database).map(|held| held.select.on_table()),
+        Ok(true)
+    );
+    assert_eq!(
+        table("notes").privileges(role("bystander"), &database).map(|held| held.select.on_table()),
+        Ok(true)
+    );
+    assert_eq!(
+        table("notes").privileges(role("after"), &database).map(|held| held.select.on_table()),
+        Ok(false)
+    );
     assert_eq!(function.can_execute(role("after"), &database), Ok(true));
     assert_eq!(function.can_execute(role("other"), &database), Ok(true));
     assert_eq!(function.can_execute(role("bystander"), &database), Ok(false));

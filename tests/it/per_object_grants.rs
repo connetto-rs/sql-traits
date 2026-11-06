@@ -26,7 +26,8 @@ fn can_select(db: &ParserDB, schema: &str, table: &str) -> bool {
     )
     .expect("unambiguous lookup")
     .expect("the table is declared")
-    .can_select(db.role("reader").expect("the role is declared"), db)
+    .privileges(db.role("reader").expect("the role is declared"), db)
+    .map(|held| held.select.on_table())
     .expect("the table is held")
 }
 

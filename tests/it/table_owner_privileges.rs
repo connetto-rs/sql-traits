@@ -15,7 +15,8 @@ fn parse(sql: &str) -> ParserDB {
 
 fn can_select(database: &ParserDB, schema: Option<&str>, name: &str, role: &str) -> bool {
     table(database, schema, name)
-        .can_select(database.role(role).expect("the role exists"), database)
+        .privileges(database.role(role).expect("the role exists"), database)
+        .map(|held| held.select.on_table())
         .expect("the table is in the database")
 }
 
@@ -34,11 +35,12 @@ fn the_owner_and_its_inheriting_members_hold_every_privilege() {
 
     for role in ["owners", "maintainer"] {
         let role = database.role(role).expect("the role exists");
-        assert_eq!(t.can_select(role, &database), Ok(true));
-        assert_eq!(t.can_insert(role, &database), Ok(true));
-        assert_eq!(t.can_update(role, &database), Ok(true));
-        assert_eq!(t.can_delete(role, &database), Ok(true));
-        assert_eq!(t.can_truncate(role, &database), Ok(true));
+        let held = t.privileges(role, &database).expect("the table is in the database");
+        assert!(held.select.on_table());
+        assert!(held.insert.on_table());
+        assert!(held.update.on_table());
+        assert!(held.delete);
+        assert!(held.truncate);
     }
     assert!(!can_select(&database, None, "t", "detached"));
     assert!(!can_select(&database, None, "t", "outsider"));
@@ -67,8 +69,9 @@ fn the_owner_can_revoke_its_own_privileges_and_grant_them_back() {
     );
     let owners = revoked.role("owners").expect("the role exists");
     let t = table(&revoked, None, "t");
-    assert_eq!(t.can_select(owners, &revoked), Ok(false));
-    assert_eq!(t.can_insert(owners, &revoked), Ok(true));
+    let held = t.privileges(owners, &revoked).expect("the table is in the database");
+    assert!(!held.select.on_table());
+    assert!(held.insert.on_table());
 
     let restored = parse(
         "CREATE ROLE owners;
@@ -157,9 +160,11 @@ fn an_owner_change_hands_the_entry_over_as_it_stands() {
     let previous = database.role("previous").expect("the role exists");
     let next = database.role("next").expect("the role exists");
 
-    assert_eq!(t.can_select(previous, &database), Ok(false));
-    assert_eq!(t.can_select(next, &database), Ok(true));
-    assert_eq!(t.can_truncate(next, &database), Ok(false));
+    let held = t.privileges(previous, &database).expect("the table is in the database");
+    assert!(!held.select.on_table());
+    let held = t.privileges(next, &database).expect("the table is in the database");
+    assert!(held.select.on_table());
+    assert!(!held.truncate);
 }
 
 /// A grant naming the old owner, as grantee or as grantor, moves to the new
@@ -187,7 +192,12 @@ fn an_owner_change_moves_the_grants_naming_the_old_owner_on_that_table() {
     assert!(!can_select(&database, None, "t", "previous"));
     assert!(can_select(&database, None, "u", "previous"));
     let previous = database.role("previous").expect("the role exists");
-    assert_eq!(table(&database, None, "u").can_insert(previous, &database), Ok(true));
+    assert_eq!(
+        table(&database, None, "u")
+            .privileges(previous, &database)
+            .map(|held| held.insert.on_table()),
+        Ok(true)
+    );
 
     let mut grants_on_t: Vec<(String, Vec<String>, Option<&str>)> = table(&database, None, "t")
         .grants(&database)
@@ -272,6 +282,7 @@ fn the_entry_survives_table_rewrites_role_renames_and_rollbacks() {
     let t = table(&database, None, "t");
     let keepers = database.role("keepers").expect("the role exists");
 
-    assert_eq!(t.can_select(keepers, &database), Ok(false));
-    assert_eq!(t.can_insert(keepers, &database), Ok(true));
+    let held = t.privileges(keepers, &database).expect("the table is in the database");
+    assert!(!held.select.on_table());
+    assert!(held.insert.on_table());
 }

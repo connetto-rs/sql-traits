@@ -4528,18 +4528,8 @@ fn apply_revoke_to_grant_store(
 
         if application.unsupported {
             unsupported.get_or_insert(
-                if all_privileges.is_none()
-                    && matches!(
-                        (&targeted_grant.privileges, &revoke.privileges),
-                        (Privileges::All { .. }, Privileges::Actions(_))
-                    )
-                {
-                    "revoke of a subset from ALL PRIVILEGES on objects whose privilege set this \
-                     model does not know"
-                } else {
-                    "column-scoped REVOKE against a table-wide action grant is not representable \
-                     in this model"
-                },
+                "revoke of a subset from ALL PRIVILEGES on objects whose privilege set this model \
+                 does not know",
             );
             updated_grants.push((grant, ()));
             continue;
@@ -12921,10 +12911,10 @@ mod tests {
                 .expect("Table should exist");
             let role = db.role("my_role").expect("Role should exist");
             assert!(
-                !table.can_select(role, &db).expect("can_select"),
+                !table.privileges(role, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked while INSERT remains"
             );
-            assert!(table.can_insert(role, &db).expect("can_insert"));
+            assert!(table.privileges(role, &db).expect("privileges").insert.on_table());
         }
 
         #[test]
@@ -12944,7 +12934,7 @@ mod tests {
             let role = db.role("r").expect("role exists");
 
             assert!(!grant.with_grant_option());
-            assert!(table.can_select(role, &db).expect("select resolves"));
+            assert!(table.privileges(role, &db).expect("select resolves").select.on_table());
         }
 
         #[test]
@@ -13072,8 +13062,9 @@ mod tests {
                     .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
                     .expect("unambiguous lookup")
                     .expect("table exists");
-                assert!(!table.can_delete(role, &db).expect("table resolves"));
-                assert!(table.can_update(role, &db).expect("table resolves"));
+                let held = table.privileges(role, &db).expect("table resolves");
+                assert!(!held.delete);
+                assert!(held.update.on_table());
             }
         }
 
@@ -13223,24 +13214,59 @@ mod tests {
             assert_eq!(held_privileges(&db), without_grant_option(&["SELECT"]));
         }
 
+        /// The revocations recorded on table `t`, as privilege, column and
+        /// grantee.
+        fn recorded_revocations(db: &ParserDB) -> Vec<(String, Option<String>, String)> {
+            let table = db
+                .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+                .expect("unambiguous lookup")
+                .expect("table exists");
+            db.table_metadata(table)
+                .expect("table metadata")
+                .revocations()
+                .iter()
+                .map(|revoked| {
+                    (
+                        revoked.privilege().to_string(),
+                        revoked.column().map(|column| column.value.clone()),
+                        revoked.grantee().to_string(),
+                    )
+                })
+                .collect()
+        }
+
         #[test]
-        fn test_revoke_column_scoped_against_all_privileges_is_unsupported() {
+        fn test_revoke_column_scoped_against_all_privileges_keeps_the_grant() {
+            // PostgreSQL 18.6 accepts it and changes nothing, since the
+            // column's own entry is empty and the table entry is another level.
             let sql = r"
                 CREATE TABLE t (id INT);
                 CREATE ROLE r;
                 GRANT ALL PRIVILEGES ON t TO r;
                 REVOKE SELECT (id) ON t FROM r;
             ";
-            let result = ParserDB::parse::<PostgreSqlDialect>(sql);
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
 
-            assert!(
-                matches!(
-                    &result,
-                    Err(Error::UnsupportedRevoke { reason, .. })
-                        if reason.contains("column-scoped REVOKE against a table-wide action grant")
-                ),
-                "got {result:?}"
+            let grants: Vec<_> = db.table_grants().collect();
+            assert_eq!(grants.len(), 1);
+            assert!(grants[0].is_all_privileges());
+            assert_eq!(
+                recorded_revocations(&db),
+                [("SELECT".to_string(), Some("id".to_string()), "r".to_string())]
             );
+        }
+
+        #[test]
+        fn test_revoke_column_scoped_and_table_wide_against_table_wide_actions() {
+            let sql = r"
+                CREATE TABLE t (id INT);
+                CREATE ROLE r;
+                GRANT SELECT, DELETE ON t TO r;
+                REVOKE SELECT (id), DELETE ON t FROM r;
+            ";
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
+
+            assert_eq!(held_privileges(&db), without_grant_option(&["SELECT"]));
         }
 
         #[test]
@@ -13259,20 +13285,21 @@ mod tests {
         }
 
         #[test]
-        fn test_revoke_column_scoped_against_table_wide_action_is_unsupported() {
+        fn test_revoke_column_scoped_against_table_wide_action_keeps_the_grant() {
             let sql = r"
                 CREATE TABLE t (id INT, name TEXT);
                 CREATE ROLE my_role;
                 GRANT SELECT ON t TO my_role;
                 REVOKE SELECT (id) ON t FROM my_role;
             ";
-            let result = ParserDB::parse::<PostgreSqlDialect>(sql);
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
 
-            assert!(matches!(
-                result,
-                Err(Error::UnsupportedRevoke { reason, .. })
-                    if reason.contains("column-scoped REVOKE against a table-wide action grant")
-            ));
+            assert_eq!(held_privileges(&db), without_grant_option(&["SELECT"]));
+            assert_eq!(db.column_grants().count(), 0);
+            assert_eq!(
+                recorded_revocations(&db),
+                [("SELECT".to_string(), Some("id".to_string()), "my_role".to_string())]
+            );
         }
 
         #[test]
@@ -13317,11 +13344,11 @@ mod tests {
             let role_b = db.role("b").expect("Role b should exist");
 
             assert!(
-                !table.can_select(role_a, &db).expect("can_select"),
+                !table.privileges(role_a, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked for a"
             );
             assert!(
-                table.can_select(role_b, &db).expect("can_select"),
+                table.privileges(role_b, &db).expect("privileges").select.on_table(),
                 "SELECT should remain for b"
             );
         }
@@ -13345,11 +13372,11 @@ mod tests {
             let role_b = db.role("b").expect("Role b should exist");
 
             assert!(
-                table.can_select(role_a, &db).expect("can_select"),
+                table.privileges(role_a, &db).expect("privileges").select.on_table(),
                 "SELECT should remain for a"
             );
             assert!(
-                !table.can_select(role_b, &db).expect("can_select"),
+                !table.privileges(role_b, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked for b"
             );
         }
@@ -13374,19 +13401,19 @@ mod tests {
 
             assert_eq!(db.table_grants().count(), 2);
             assert!(
-                !table.can_select(role_a, &db).expect("can_select"),
+                !table.privileges(role_a, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked for a"
             );
             assert!(
-                table.can_insert(role_a, &db).expect("can_insert"),
+                table.privileges(role_a, &db).expect("privileges").insert.on_table(),
                 "INSERT should remain for a"
             );
             assert!(
-                table.can_select(role_b, &db).expect("can_select"),
+                table.privileges(role_b, &db).expect("privileges").select.on_table(),
                 "SELECT should remain for b"
             );
             assert!(
-                table.can_insert(role_b, &db).expect("can_insert"),
+                table.privileges(role_b, &db).expect("privileges").insert.on_table(),
                 "INSERT should remain for b"
             );
         }
@@ -13410,19 +13437,19 @@ mod tests {
             let role_b = db.role("b").expect("Role b should exist");
 
             assert!(
-                !table.can_select(role_a, &db).expect("can_select"),
+                !table.privileges(role_a, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked for a"
             );
             assert!(
-                !table.can_insert(role_a, &db).expect("can_insert"),
+                !table.privileges(role_a, &db).expect("privileges").insert.on_table(),
                 "INSERT should be revoked for a"
             );
             assert!(
-                table.can_select(role_b, &db).expect("can_select"),
+                table.privileges(role_b, &db).expect("privileges").select.on_table(),
                 "SELECT should remain for b"
             );
             assert!(
-                table.can_insert(role_b, &db).expect("can_insert"),
+                table.privileges(role_b, &db).expect("privileges").insert.on_table(),
                 "INSERT should remain for b"
             );
         }
@@ -13455,7 +13482,7 @@ mod tests {
                 .expect("unambiguous lookup")
                 .expect("Table should exist");
             let app_user = db.role("app_user").expect("Role should exist");
-            assert!(table.can_select(app_user, &db).expect("can_select"));
+            assert!(table.privileges(app_user, &db).expect("privileges").select.on_table());
         }
 
         #[test]
@@ -13486,8 +13513,8 @@ mod tests {
                 .expect("unambiguous lookup")
                 .expect("s2.t should exist");
 
-            assert!(s1_t.can_select(role, &db).expect("can_select"));
-            assert!(!s2_t.can_select(role, &db).expect("can_select"));
+            assert!(s1_t.privileges(role, &db).expect("privileges").select.on_table());
+            assert!(!s2_t.privileges(role, &db).expect("privileges").select.on_table());
         }
 
         #[test]
@@ -13505,7 +13532,7 @@ mod tests {
                 .expect("unambiguous lookup")
                 .expect("Table should exist");
             let role = db.role("my_role").expect("Role should exist");
-            assert!(!table.can_select(role, &db).expect("can_select"));
+            assert!(!table.privileges(role, &db).expect("privileges").select.on_table());
             assert_eq!(db.table_grants().count(), 0);
         }
 
@@ -13677,10 +13704,13 @@ mod tests {
             let r1 = db.role("r1").unwrap();
             let r2 = db.role("r2").unwrap();
             assert!(
-                !table.can_select(r1, &db).expect("can_select"),
+                !table.privileges(r1, &db).expect("privileges").select.on_table(),
                 "r1 should have had SELECT revoked"
             );
-            assert!(table.can_select(r2, &db).expect("can_select"), "r2 should still have SELECT");
+            assert!(
+                table.privileges(r2, &db).expect("privileges").select.on_table(),
+                "r2 should still have SELECT"
+            );
         }
 
         /// `grant_objects_inner_match` schema-list arm: REVOKE on
