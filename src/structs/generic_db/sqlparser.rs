@@ -4519,18 +4519,8 @@ fn apply_revoke_to_grant_store(
 
         if application.unsupported {
             unsupported.get_or_insert(
-                if all_privileges.is_none()
-                    && matches!(
-                        (&targeted_grant.privileges, &revoke.privileges),
-                        (Privileges::All { .. }, Privileges::Actions(_))
-                    )
-                {
-                    "revoke of a subset from ALL PRIVILEGES on objects whose privilege set this \
-                     model does not know"
-                } else {
-                    "column-scoped REVOKE against a table-wide action grant is not representable \
-                     in this model"
-                },
+                "revoke of a subset from ALL PRIVILEGES on objects whose privilege set this model \
+                 does not know",
             );
             updated_grants.push((grant, ()));
             continue;
@@ -13179,24 +13169,59 @@ mod tests {
             assert_eq!(held_privileges(&db), without_grant_option(&["SELECT"]));
         }
 
+        /// The revocations recorded on table `t`, as privilege, column and
+        /// grantee.
+        fn recorded_revocations(db: &ParserDB) -> Vec<(String, Option<String>, String)> {
+            let table = db
+                .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+                .expect("unambiguous lookup")
+                .expect("table exists");
+            db.table_metadata(table)
+                .expect("table metadata")
+                .revocations()
+                .iter()
+                .map(|revoked| {
+                    (
+                        revoked.privilege().to_string(),
+                        revoked.column().map(|column| column.value.clone()),
+                        revoked.grantee().to_string(),
+                    )
+                })
+                .collect()
+        }
+
         #[test]
-        fn test_revoke_column_scoped_against_all_privileges_is_unsupported() {
+        fn test_revoke_column_scoped_against_all_privileges_keeps_the_grant() {
+            // PostgreSQL 18.6 accepts it and changes nothing, since the
+            // column's own entry is empty and the table entry is another level.
             let sql = r"
                 CREATE TABLE t (id INT);
                 CREATE ROLE r;
                 GRANT ALL PRIVILEGES ON t TO r;
                 REVOKE SELECT (id) ON t FROM r;
             ";
-            let result = ParserDB::parse::<PostgreSqlDialect>(sql);
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
 
-            assert!(
-                matches!(
-                    &result,
-                    Err(Error::UnsupportedRevoke { reason, .. })
-                        if reason.contains("column-scoped REVOKE against a table-wide action grant")
-                ),
-                "got {result:?}"
+            let grants: Vec<_> = db.table_grants().collect();
+            assert_eq!(grants.len(), 1);
+            assert!(grants[0].is_all_privileges());
+            assert_eq!(
+                recorded_revocations(&db),
+                [("SELECT".to_string(), Some("id".to_string()), "r".to_string())]
             );
+        }
+
+        #[test]
+        fn test_revoke_column_scoped_and_table_wide_against_table_wide_actions() {
+            let sql = r"
+                CREATE TABLE t (id INT);
+                CREATE ROLE r;
+                GRANT SELECT, DELETE ON t TO r;
+                REVOKE SELECT (id), DELETE ON t FROM r;
+            ";
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
+
+            assert_eq!(held_privileges(&db), without_grant_option(&["SELECT"]));
         }
 
         #[test]
@@ -13215,20 +13240,21 @@ mod tests {
         }
 
         #[test]
-        fn test_revoke_column_scoped_against_table_wide_action_is_unsupported() {
+        fn test_revoke_column_scoped_against_table_wide_action_keeps_the_grant() {
             let sql = r"
                 CREATE TABLE t (id INT, name TEXT);
                 CREATE ROLE my_role;
                 GRANT SELECT ON t TO my_role;
                 REVOKE SELECT (id) ON t FROM my_role;
             ";
-            let result = ParserDB::parse::<PostgreSqlDialect>(sql);
+            let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses");
 
-            assert!(matches!(
-                result,
-                Err(Error::UnsupportedRevoke { reason, .. })
-                    if reason.contains("column-scoped REVOKE against a table-wide action grant")
-            ));
+            assert_eq!(held_privileges(&db), without_grant_option(&["SELECT"]));
+            assert_eq!(db.column_grants().count(), 0);
+            assert_eq!(
+                recorded_revocations(&db),
+                [("SELECT".to_string(), Some("id".to_string()), "my_role".to_string())]
+            );
         }
 
         #[test]
