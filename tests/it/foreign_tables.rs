@@ -156,7 +156,7 @@ fn a_grant_on_a_foreign_table_resolves_to_it() {
         assert_eq!(grant.tables(&db).count(), 0);
     }
     assert!(grants[0].with_grant_option());
-    assert!(remote.can_select(app, &db).expect("held"));
+    assert!(remote.privileges(app, &db).map(|held| held.select.on_table()).expect("held"));
 }
 
 #[test]
@@ -165,7 +165,7 @@ fn a_revoke_on_a_foreign_table_resolves_to_it() {
         db(&format!("{REMOTE} GRANT SELECT ON remote TO app; REVOKE SELECT ON remote FROM app;"));
     let remote = foreign(&db, "remote");
     let app = db.role("app").expect("role");
-    assert!(!remote.can_select(app, &db).expect("held"));
+    assert!(!remote.privileges(app, &db).map(|held| held.select.on_table()).expect("held"));
 }
 
 #[test]

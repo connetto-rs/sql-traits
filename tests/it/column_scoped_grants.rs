@@ -22,11 +22,8 @@ fn table<'db>(database: &'db ParserDB, name: &str) -> &'db <ParserDB as Database
 fn table_privileges(database: &ParserDB, role: &str) -> [bool; 3] {
     let a = table(database, "a");
     let role = database.role(role).expect("the role exists");
-    [
-        a.can_select(role, database).expect("the table is in the database"),
-        a.can_insert(role, database).expect("the table is in the database"),
-        a.can_update(role, database).expect("the table is in the database"),
-    ]
+    let held = a.privileges(role, database).expect("the table is in the database");
+    [held.select.on_table(), held.insert.on_table(), held.update.on_table()]
 }
 
 fn rendered(grants: impl Iterator<Item = impl core::fmt::Display>) -> Vec<String> {

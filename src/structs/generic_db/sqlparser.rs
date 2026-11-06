@@ -12867,10 +12867,10 @@ mod tests {
                 .expect("Table should exist");
             let role = db.role("my_role").expect("Role should exist");
             assert!(
-                !table.can_select(role, &db).expect("can_select"),
+                !table.privileges(role, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked while INSERT remains"
             );
-            assert!(table.can_insert(role, &db).expect("can_insert"));
+            assert!(table.privileges(role, &db).expect("privileges").insert.on_table());
         }
 
         #[test]
@@ -12890,7 +12890,7 @@ mod tests {
             let role = db.role("r").expect("role exists");
 
             assert!(!grant.with_grant_option());
-            assert!(table.can_select(role, &db).expect("select resolves"));
+            assert!(table.privileges(role, &db).expect("select resolves").select.on_table());
         }
 
         #[test]
@@ -13018,8 +13018,9 @@ mod tests {
                     .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
                     .expect("unambiguous lookup")
                     .expect("table exists");
-                assert!(!table.can_delete(role, &db).expect("table resolves"));
-                assert!(table.can_update(role, &db).expect("table resolves"));
+                let held = table.privileges(role, &db).expect("table resolves");
+                assert!(!held.delete);
+                assert!(held.update.on_table());
             }
         }
 
@@ -13299,11 +13300,11 @@ mod tests {
             let role_b = db.role("b").expect("Role b should exist");
 
             assert!(
-                !table.can_select(role_a, &db).expect("can_select"),
+                !table.privileges(role_a, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked for a"
             );
             assert!(
-                table.can_select(role_b, &db).expect("can_select"),
+                table.privileges(role_b, &db).expect("privileges").select.on_table(),
                 "SELECT should remain for b"
             );
         }
@@ -13327,11 +13328,11 @@ mod tests {
             let role_b = db.role("b").expect("Role b should exist");
 
             assert!(
-                table.can_select(role_a, &db).expect("can_select"),
+                table.privileges(role_a, &db).expect("privileges").select.on_table(),
                 "SELECT should remain for a"
             );
             assert!(
-                !table.can_select(role_b, &db).expect("can_select"),
+                !table.privileges(role_b, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked for b"
             );
         }
@@ -13356,19 +13357,19 @@ mod tests {
 
             assert_eq!(db.table_grants().count(), 2);
             assert!(
-                !table.can_select(role_a, &db).expect("can_select"),
+                !table.privileges(role_a, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked for a"
             );
             assert!(
-                table.can_insert(role_a, &db).expect("can_insert"),
+                table.privileges(role_a, &db).expect("privileges").insert.on_table(),
                 "INSERT should remain for a"
             );
             assert!(
-                table.can_select(role_b, &db).expect("can_select"),
+                table.privileges(role_b, &db).expect("privileges").select.on_table(),
                 "SELECT should remain for b"
             );
             assert!(
-                table.can_insert(role_b, &db).expect("can_insert"),
+                table.privileges(role_b, &db).expect("privileges").insert.on_table(),
                 "INSERT should remain for b"
             );
         }
@@ -13392,19 +13393,19 @@ mod tests {
             let role_b = db.role("b").expect("Role b should exist");
 
             assert!(
-                !table.can_select(role_a, &db).expect("can_select"),
+                !table.privileges(role_a, &db).expect("privileges").select.on_table(),
                 "SELECT should be revoked for a"
             );
             assert!(
-                !table.can_insert(role_a, &db).expect("can_insert"),
+                !table.privileges(role_a, &db).expect("privileges").insert.on_table(),
                 "INSERT should be revoked for a"
             );
             assert!(
-                table.can_select(role_b, &db).expect("can_select"),
+                table.privileges(role_b, &db).expect("privileges").select.on_table(),
                 "SELECT should remain for b"
             );
             assert!(
-                table.can_insert(role_b, &db).expect("can_insert"),
+                table.privileges(role_b, &db).expect("privileges").insert.on_table(),
                 "INSERT should remain for b"
             );
         }
@@ -13437,7 +13438,7 @@ mod tests {
                 .expect("unambiguous lookup")
                 .expect("Table should exist");
             let app_user = db.role("app_user").expect("Role should exist");
-            assert!(table.can_select(app_user, &db).expect("can_select"));
+            assert!(table.privileges(app_user, &db).expect("privileges").select.on_table());
         }
 
         #[test]
@@ -13468,8 +13469,8 @@ mod tests {
                 .expect("unambiguous lookup")
                 .expect("s2.t should exist");
 
-            assert!(s1_t.can_select(role, &db).expect("can_select"));
-            assert!(!s2_t.can_select(role, &db).expect("can_select"));
+            assert!(s1_t.privileges(role, &db).expect("privileges").select.on_table());
+            assert!(!s2_t.privileges(role, &db).expect("privileges").select.on_table());
         }
 
         #[test]
@@ -13487,7 +13488,7 @@ mod tests {
                 .expect("unambiguous lookup")
                 .expect("Table should exist");
             let role = db.role("my_role").expect("Role should exist");
-            assert!(!table.can_select(role, &db).expect("can_select"));
+            assert!(!table.privileges(role, &db).expect("privileges").select.on_table());
             assert_eq!(db.table_grants().count(), 0);
         }
 
@@ -13659,10 +13660,13 @@ mod tests {
             let r1 = db.role("r1").unwrap();
             let r2 = db.role("r2").unwrap();
             assert!(
-                !table.can_select(r1, &db).expect("can_select"),
+                !table.privileges(r1, &db).expect("privileges").select.on_table(),
                 "r1 should have had SELECT revoked"
             );
-            assert!(table.can_select(r2, &db).expect("can_select"), "r2 should still have SELECT");
+            assert!(
+                table.privileges(r2, &db).expect("privileges").select.on_table(),
+                "r2 should still have SELECT"
+            );
         }
 
         /// `grant_objects_inner_match` schema-list arm: REVOKE on

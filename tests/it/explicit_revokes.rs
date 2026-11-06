@@ -80,8 +80,9 @@ fn a_revoke_matching_a_recorded_grant_takes_it_and_is_kept() {
     let profiles = table(&database, None, "profiles");
     let app_user = database.role("app_user").expect("the role exists");
 
-    assert_eq!(profiles.can_update(app_user, &database), Ok(false));
-    assert_eq!(profiles.can_select(app_user, &database), Ok(true));
+    let held = profiles.privileges(app_user, &database).expect("the table is in the database");
+    assert!(!held.update.on_table());
+    assert!(held.select.on_table());
     assert_eq!(revoked_on_table(&database, "profiles", "app_user"), ["UPDATE"]);
 }
 

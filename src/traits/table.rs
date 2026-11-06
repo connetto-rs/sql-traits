@@ -1,18 +1,19 @@
 //! Submodule providing a trait for describing SQL Table-like entities.
 
-use alloc::{borrow::Cow, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
-        ActingRole, ColumnDefinition, ColumnScope, ForeignTableSource, IdentifierCase,
-        PartitionBound, RowSecurity, RowStatement, SchemaFingerprint,
+        ActingRole, ColumnDefinition, ColumnPrivilege, ColumnScope, ForeignTableSource,
+        IdentifierCase, PartitionBound, RowSecurity, RowStatement, SchemaFingerprint,
+        TablePrivileges,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
-        ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, GrantLike, Metadata, PolicyLike,
-        Relation, RoleLike, RuleLike, TableGrantLike, TriggerLike,
+        ColumnGrantLike, ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, GrantLike,
+        Metadata, PolicyLike, Relation, RoleLike, RuleLike, TableGrantLike, TriggerLike,
         check_constraint::{evaluate_constant_expr, non_tautological},
         role::privilege_holders,
     },
@@ -4592,23 +4593,22 @@ pub trait TableLike:
             .filter(move |grant| grant.applies_to_table(self.borrow(), database)))
     }
 
-    /// Returns whether the given role can read (SELECT) from this table.
+    /// Returns the privileges `role` holds on this table, per command and per
+    /// column, as PostgreSQL's `has_table_privilege`, `has_column_privilege`
+    /// and `has_any_column_privilege` answer them.
     ///
-    /// A role can read if there's a grant that:
-    /// - Applies to this table (naming it, or sweeping its schema while it
-    ///   existed)
-    /// - Names this role, `PUBLIC`, or one of the
-    ///   [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of this
-    ///   role
-    /// - Includes SELECT on the whole table, or ALL PRIVILEGES. A SELECT on
-    ///   some of its columns does not count, as PostgreSQL's
-    ///   `has_table_privilege` does not count it either.
-    ///
-    /// A role also can read when it, or one of its inherited roles, is the
-    /// table's [`owner`](Self::owner) and the owner's own entry still holds
-    /// SELECT, as [`owner_privileges`](Self::owner_privileges) reports.
-    /// `can_insert`, `can_update`, `can_delete` and `can_truncate` follow the
-    /// same two paths.
+    /// A privilege reaches `role` through a grant naming the role itself,
+    /// `PUBLIC`, or one of the
+    /// [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of the
+    /// role, and through the owner's own entry, as
+    /// [`owner_privileges`](Self::owner_privileges) reports it, when the role
+    /// or one it inherits from is the table's [`owner`](Self::owner). What a
+    /// `REVOKE` took is gone from those entries already. A table-level
+    /// privilege holds on every column, while a column grant holds on the
+    /// columns it names and never on the table. A superuser holds every
+    /// privilege, and a role that is a member of a superuser does not.
+    /// [`ActingRole::Public`], a caller holding no role, holds what `PUBLIC`
+    /// holds.
     ///
     /// # Errors
     ///
@@ -4618,260 +4618,193 @@ pub trait TableLike:
     /// # Example
     ///
     /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
-    /// CREATE TABLE my_table (id INT);
-    /// CREATE ROLE reader;
-    /// CREATE ROLE writer;
-    /// GRANT SELECT ON my_table TO reader;
-    /// GRANT INSERT ON my_table TO writer;
+    /// CREATE TABLE profiles (id INT, display_name TEXT, is_admin BOOL);
+    /// CREATE ROLE app_user;
+    /// GRANT SELECT ON profiles TO app_user;
+    /// GRANT UPDATE (display_name) ON profiles TO app_user;
     /// ",
     /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let reader = db.role("reader").unwrap();
-    /// let writer = db.role("writer").unwrap();
+    /// let profiles =
+    ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let column = |name| profiles.columns(&db).unwrap().find(|c| c.column_name() == name).unwrap();
+    /// let held = profiles.privileges(db.role("app_user").unwrap(), &db)?;
     ///
-    /// assert!(table.can_select(reader, &db)?);
-    /// assert!(!table.can_select(writer, &db)?);
+    /// assert!(held.select.on_table());
+    /// assert!(!held.update.on_table());
+    /// assert!(held.update.on_column(column("display_name")));
+    /// assert!(!held.update.on_column(column("is_admin")));
+    /// assert!(!held.delete);
     /// # Ok(())
     /// # }
     /// ```
-    fn can_select(
-        &self,
-        role: &<Self::DB as DatabaseLike>::Role,
-        database: &Self::DB,
-    ) -> Result<bool, LookupError> {
-        use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Select { columns: None }))
-    }
+    fn privileges<'db>(
+        &'db self,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db,
+    {
+        let holders: Vec<&<Self::DB as DatabaseLike>::Role> = match role.into() {
+            ActingRole::Declared(role) if role.is_superuser() => {
+                self.require_in_database(database)?;
+                return Ok(TablePrivileges::all());
+            }
+            ActingRole::Declared(role) => privilege_holders(role, database).collect(),
+            ActingRole::Public => Vec::new(),
+        };
+        let columns: Vec<&'db <Self::DB as DatabaseLike>::Column> =
+            self.columns(database)?.collect();
+        let mut held = HeldPrivileges::new(columns.len());
 
-    /// Returns whether the given role can insert into this table.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this table.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "
-    /// CREATE TABLE my_table (id INT);
-    /// CREATE ROLE writer;
-    /// GRANT INSERT ON my_table TO writer;
-    /// ",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let writer = db.role("writer").unwrap();
-    ///
-    /// assert!(table.can_insert(writer, &db)?);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn can_insert(
-        &self,
-        role: &<Self::DB as DatabaseLike>::Role,
-        database: &Self::DB,
-    ) -> Result<bool, LookupError> {
-        use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Insert { columns: None }))
-    }
-
-    /// Returns whether the given role can update this table.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this table.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "
-    /// CREATE TABLE my_table (id INT);
-    /// CREATE ROLE updater;
-    /// GRANT UPDATE ON my_table TO updater;
-    /// ",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let updater = db.role("updater").unwrap();
-    ///
-    /// assert!(table.can_update(updater, &db)?);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn can_update(
-        &self,
-        role: &<Self::DB as DatabaseLike>::Role,
-        database: &Self::DB,
-    ) -> Result<bool, LookupError> {
-        use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Update { columns: None }))
-    }
-
-    /// Returns whether the given role can delete from this table.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this table.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "
-    /// CREATE TABLE my_table (id INT);
-    /// CREATE ROLE deleter;
-    /// GRANT DELETE ON my_table TO deleter;
-    /// ",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let deleter = db.role("deleter").unwrap();
-    ///
-    /// assert!(table.can_delete(deleter, &db)?);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn can_delete(
-        &self,
-        role: &<Self::DB as DatabaseLike>::Role,
-        database: &Self::DB,
-    ) -> Result<bool, LookupError> {
-        use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Delete))
-    }
-
-    /// Returns whether the given role can write to this table (INSERT, UPDATE,
-    /// or DELETE).
-    ///
-    /// This is a convenience method that checks if the role has any write
-    /// permission.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this table.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "
-    /// CREATE TABLE my_table (id INT);
-    /// CREATE ROLE reader;
-    /// CREATE ROLE writer;
-    /// GRANT SELECT ON my_table TO reader;
-    /// GRANT INSERT ON my_table TO writer;
-    /// ",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let reader = db.role("reader").unwrap();
-    /// let writer = db.role("writer").unwrap();
-    ///
-    /// assert!(!table.can_write(reader, &db)?);
-    /// assert!(table.can_write(writer, &db)?);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn can_write(
-        &self,
-        role: &<Self::DB as DatabaseLike>::Role,
-        database: &Self::DB,
-    ) -> Result<bool, LookupError> {
-        Ok(self.can_insert(role, database)?
-            || self.can_update(role, database)?
-            || self.can_delete(role, database)?)
-    }
-
-    /// Returns whether the given role can truncate this table.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this table.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "
-    /// CREATE TABLE my_table (id INT);
-    /// CREATE ROLE truncator;
-    /// GRANT TRUNCATE ON my_table TO truncator;
-    /// ",
-    /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let truncator = db.role("truncator").unwrap();
-    ///
-    /// assert!(table.can_truncate(truncator, &db)?);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn can_truncate(
-        &self,
-        role: &<Self::DB as DatabaseLike>::Role,
-        database: &Self::DB,
-    ) -> Result<bool, LookupError> {
-        use sqlparser::ast::Action;
-        holds_privilege(self, role, database, |p| matches!(p, Action::Truncate))
+        if let Some(owner) = self.owner(database)?
+            && holders.iter().any(|holder| holder.stored_name() == owner)
+        {
+            for privilege in self.owner_privileges(database)? {
+                held.take(privilege, &columns);
+            }
+        }
+        for grant in self.grants(database)? {
+            held.take_grant(grant, &holders, &columns, database);
+        }
+        let table: &<Self::DB as DatabaseLike>::Table = self.borrow();
+        for grant in database.column_grants().filter(|grant| {
+            matches!(
+                grant.relation(database),
+                Some(Relation::Table(granted) | Relation::ForeignTable(granted))
+                    if core::ptr::eq(granted, table)
+            )
+        }) {
+            held.take_grant(grant, &holders, &columns, database);
+        }
+        Ok(held.answer(&columns))
     }
 }
 
-/// Returns whether `role` holds a privilege on `table` that `privilege`
-/// accepts, through a grant to the role itself, to `PUBLIC`, or to one of
-/// the roles it inherits from, or through the owner's own entry when the
-/// role or one it inherits from owns the table.
-fn holds_privilege<T: TableLike>(
-    table: &T,
-    role: &<T::DB as DatabaseLike>::Role,
-    database: &T::DB,
-    privilege: impl Fn(&sqlparser::ast::Action) -> bool,
-) -> Result<bool, LookupError> {
-    let mut grants = table.grants(database)?;
-    let holders: Vec<_> = privilege_holders(role, database).collect();
-    if let Some(owner) = table.owner(database)?
-        && holders.iter().any(|holder| holder.stored_name() == owner)
-        && table.owner_privileges(database)?.any(&privilege)
-    {
-        return Ok(true);
+/// How many table privileges PostgreSQL has, in the order
+/// [`privilege_slot`] numbers them.
+const TABLE_PRIVILEGES: usize = 7;
+
+/// How many of the table privileges can be granted per column, which
+/// [`privilege_slot`] numbers first.
+const COLUMN_PRIVILEGES: usize = 4;
+
+/// The slot of a table privilege, `SELECT`, `INSERT`, `UPDATE` and
+/// `REFERENCES` first, then `DELETE`, `TRUNCATE` and `TRIGGER`, or `None` for
+/// an action that is no table privilege.
+fn privilege_slot(action: &sqlparser::ast::Action) -> Option<usize> {
+    use sqlparser::ast::Action;
+    match action {
+        Action::Select { .. } => Some(0),
+        Action::Insert { .. } => Some(1),
+        Action::Update { .. } => Some(2),
+        Action::References { .. } => Some(3),
+        Action::Delete => Some(4),
+        Action::Truncate => Some(5),
+        Action::Trigger => Some(6),
+        _ => None,
     }
-    Ok(grants.any(|grant| {
-        holders.iter().any(|holder| grant.applies_to_role(holder))
-            && (grant.is_all_privileges() || grant.privileges(database).any(&privilege))
-    }))
+}
+
+/// The table privileges one role has been found to hold, at the table level
+/// and on each column of the table by position.
+struct HeldPrivileges {
+    table: [bool; TABLE_PRIVILEGES],
+    columns: [Vec<bool>; COLUMN_PRIVILEGES],
+}
+
+impl HeldPrivileges {
+    fn new(columns: usize) -> Self {
+        Self {
+            table: [false; TABLE_PRIVILEGES],
+            columns: core::array::from_fn(|_| vec![false; columns]),
+        }
+    }
+
+    /// Records what `grant` gives, when it reaches one of `holders`, or
+    /// `PUBLIC`.
+    fn take_grant<G: GrantLike, C: ColumnLike>(
+        &mut self,
+        grant: &G,
+        holders: &[&<G::DB as DatabaseLike>::Role],
+        columns: &[&C],
+        database: &G::DB,
+    ) {
+        if !(grant.applies_to_public()
+            || holders.iter().any(|holder| grant.applies_to_role(holder)))
+        {
+            return;
+        }
+        if grant.is_all_privileges() {
+            self.table = [true; TABLE_PRIVILEGES];
+            return;
+        }
+        for privilege in grant.privileges(database) {
+            self.take(privilege, columns);
+        }
+    }
+
+    /// Records `privilege` on the table, or on the columns it lists.
+    fn take<C: ColumnLike>(&mut self, privilege: &sqlparser::ast::Action, columns: &[&C]) {
+        use sqlparser::ast::Action;
+        let Some(slot) = privilege_slot(privilege) else {
+            return;
+        };
+        let listed = match privilege {
+            Action::Select { columns: listed }
+            | Action::Insert { columns: listed }
+            | Action::Update { columns: listed }
+            | Action::References { columns: listed } => listed.as_deref(),
+            _ => None,
+        };
+        let Some(listed) = listed else {
+            self.table[slot] = true;
+            return;
+        };
+        for (held, column) in self.columns[slot].iter_mut().zip(columns) {
+            *held |= listed.iter().any(|ident| {
+                identifiers_match(
+                    &ident.value,
+                    ident.quote_style.is_some(),
+                    column.column_name(),
+                    column.column_name_is_quoted(),
+                )
+            });
+        }
+    }
+
+    fn answer<'db, C>(self, columns: &[&'db C]) -> TablePrivileges<'db, C> {
+        let [select, insert, update, references] = self.columns;
+        let column_privilege = |slot: usize, held: Vec<bool>| {
+            if self.table[slot] {
+                ColumnPrivilege::Table
+            } else {
+                ColumnPrivilege::Columns(
+                    columns
+                        .iter()
+                        .zip(held)
+                        .filter(|(_, held)| *held)
+                        .map(|(column, _)| *column)
+                        .collect(),
+                )
+            }
+        };
+        TablePrivileges {
+            select: column_privilege(0, select),
+            insert: column_privilege(1, insert),
+            update: column_privilege(2, update),
+            references: column_privilege(3, references),
+            delete: self.table[4],
+            truncate: self.table[5],
+            trigger: self.table[6],
+        }
+    }
 }
 
 impl<T: TableLike> TableLike for &T
