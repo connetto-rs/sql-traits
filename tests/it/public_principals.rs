@@ -1,12 +1,14 @@
 //! Tests that "applies to every role" is one question with one answer.
 //!
 //! SQL spells "everyone" as `PUBLIC`, and the grammar hands that back as an
-//! ordinary unquoted name, so it is indistinguishable from a role somebody
-//! created with that name unless the reader also checks the quoting. A policy
-//! has a second way to say it, by writing no `TO` clause at all, and a grant
-//! has a second spelling, because Microsoft SQL Server reserves the word and
-//! the parser then falls back to reading it as a name. These tests pin all
-//! four routes to the same answer.
+//! ordinary name, so it is indistinguishable from a role somebody created with
+//! that name unless the reader also checks the quoting. PostgreSQL folds the
+//! name before it compares it with `public`, so a quoted `"public"` means
+//! everyone too, while a quoted `"PUBLIC"` is a role of that exact name. A
+//! policy has a second way to say it, by writing no `TO` clause at all, and a
+//! grant has a second spelling, because Microsoft SQL Server reserves the word
+//! and the parser then falls back to reading it as a name. These tests pin
+//! every route to the same answer.
 #![allow(clippy::expect_used)]
 
 use sql_traits::prelude::*;
@@ -19,6 +21,7 @@ const POLICIES: &str = "CREATE ROLE \"PUBLIC\";
      CREATE POLICY implied ON docs USING (true);
      CREATE POLICY named ON docs TO reader USING (true);
      CREATE POLICY quoted ON docs TO \"PUBLIC\" USING (true);
+     CREATE POLICY lowercase_quoted ON docs TO \"public\" USING (true);
      CREATE POLICY mixed ON docs TO reader, PUBLIC USING (true);";
 
 fn policy_applies_to_public(name: &str) -> bool {
@@ -34,6 +37,9 @@ fn a_policy_says_everyone_two_ways() {
     assert!(policy_applies_to_public("spelled"));
     assert!(policy_applies_to_public("implied"), "an absent TO clause defaults to PUBLIC");
     assert!(policy_applies_to_public("mixed"), "one PUBLIC among named roles still means everyone");
+    // PostgreSQL 18.6 stores `polroles = {0}` for `TO "public"`, as for `TO
+    // public`.
+    assert!(policy_applies_to_public("lowercase_quoted"), "a quoted lowercase public is PUBLIC");
 }
 
 #[test]
@@ -63,6 +69,7 @@ fn a_policy_applying_to_everyone_names_no_role() {
     let none: Vec<String> = Vec::new();
     assert_eq!(roles("spelled"), none);
     assert_eq!(roles("implied"), none);
+    assert_eq!(roles("lowercase_quoted"), none);
     assert_eq!(roles("mixed"), none, "PostgreSQL drops the roles listed beside PUBLIC");
     assert_eq!(roles("named"), ["reader"]);
     assert_eq!(roles("quoted"), ["\"PUBLIC\""]);
@@ -140,6 +147,78 @@ fn a_grant_naming_a_role_does_not_say_everyone() {
 
     let by_reference = &grant;
     assert!(!by_reference.applies_to_public());
+}
+
+/// The grantee spellings PostgreSQL 18.6 reads as `PUBLIC`, and the one it
+/// reads as a role. `GRANT INSERT ON docs TO "public"` stores `=a/postgres`,
+/// and `TO "PUBLIC"` stores `PUBLIC=d/postgres`.
+const GRANTEE_SPELLINGS: [(&str, bool); 4] =
+    [("public", true), ("\"public\"", true), ("GROUP public", true), ("\"PUBLIC\"", false)];
+
+#[test]
+fn a_grant_reads_each_spelling_as_postgresql_does() {
+    for (spelling, everyone) in GRANTEE_SPELLINGS {
+        let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+            "CREATE ROLE \"PUBLIC\";
+             CREATE ROLE reader;
+             CREATE TABLE docs (id INT);
+             GRANT SELECT ON docs TO {spelling};"
+        ))
+        .expect("schema builds");
+        let grant = db.table_grants().next().expect("the grant exists");
+        let reader = db.role("reader").expect("the role exists");
+
+        assert_eq!(grant.applies_to_public(), everyone, "{spelling}");
+        assert_eq!(grant.applies_to_role(reader), everyone, "{spelling}");
+    }
+}
+
+#[test]
+fn a_revoke_reads_each_spelling_as_postgresql_does() {
+    for (spelling, everyone) in GRANTEE_SPELLINGS {
+        let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+            "CREATE ROLE \"PUBLIC\";
+             CREATE TABLE docs (id INT);
+             GRANT SELECT ON docs TO PUBLIC;
+             REVOKE SELECT ON docs FROM {spelling};"
+        ))
+        .expect("schema builds");
+
+        assert_eq!(db.table_grants().next().is_none(), everyone, "{spelling}");
+    }
+}
+
+#[test]
+fn a_revoke_from_public_takes_a_grant_to_any_spelling_of_it() {
+    for (spelling, everyone) in GRANTEE_SPELLINGS {
+        let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+            "CREATE ROLE \"PUBLIC\";
+             CREATE TABLE docs (id INT);
+             GRANT SELECT ON docs TO {spelling};
+             REVOKE SELECT ON docs FROM PUBLIC;"
+        ))
+        .expect("schema builds");
+
+        assert_eq!(db.table_grants().next().is_none(), everyone, "{spelling}");
+    }
+}
+
+#[test]
+fn a_function_revoke_reads_each_spelling_as_postgresql_does() {
+    for (spelling, everyone) in GRANTEE_SPELLINGS {
+        let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+            "CREATE ROLE \"PUBLIC\";
+             CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+             REVOKE EXECUTE ON FUNCTION f() FROM {spelling};"
+        ))
+        .expect("schema builds");
+        let f = db
+            .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("the function exists");
+
+        assert_eq!(f.is_executable_by_public(&db), Ok(!everyone), "{spelling}");
+    }
 }
 
 #[test]

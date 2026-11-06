@@ -82,12 +82,23 @@ pub fn stored_identifier_matches_lookup(
 /// Returns whether an identifier names the `PUBLIC` pseudo-role, meaning every
 /// role, rather than a role somebody created.
 ///
-/// SQL spells "everyone" as an unquoted `PUBLIC`, which the grammar hands back
-/// as an ordinary identifier. A quoted `"PUBLIC"` is a role of that exact name
-/// and is not the pseudo-role.
+/// SQL spells "everyone" as `PUBLIC`, which the grammar hands back as an
+/// ordinary identifier. PostgreSQL folds the identifier first and then
+/// compares it with `public`, so a quoted `"public"` is the pseudo-role as
+/// well, while a quoted `"PUBLIC"` is a role of that exact name.
+///
+/// # Example
+///
+/// ```rust
+/// use sql_traits::utils::identifier_resolution::is_public_pseudo_role;
+///
+/// assert!(is_public_pseudo_role("PUBLIC", false));
+/// assert!(is_public_pseudo_role("public", true));
+/// assert!(!is_public_pseudo_role("PUBLIC", true));
+/// ```
 #[must_use]
 pub fn is_public_pseudo_role(value: &str, quoted: bool) -> bool {
-    !quoted && value.eq_ignore_ascii_case("PUBLIC")
+    if quoted { value == "public" } else { value.eq_ignore_ascii_case("public") }
 }
 
 /// A `search_path`, each schema as PostgreSQL stores it with whether it
@@ -134,8 +145,9 @@ pub enum SessionPrincipal {
 ///
 /// SQL spells these principals as keywords, which the grammar hands back as
 /// ordinary identifiers wherever a role name may stand. A quoted
-/// `"current_user"` is a role of that exact name and is not the keyword, the
-/// same rule [`is_public_pseudo_role`] applies to `PUBLIC`.
+/// `"current_user"` is a role of that exact name, since PostgreSQL's grammar
+/// recognises the keyword before any name, whereas it recognises `PUBLIC` by
+/// the folded name, which [`is_public_pseudo_role`] follows.
 #[must_use]
 pub fn session_principal(value: &str, quoted: bool) -> Option<SessionPrincipal> {
     if quoted {

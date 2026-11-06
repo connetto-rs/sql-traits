@@ -280,8 +280,9 @@ pub trait PolicyLike:
     ///
     /// A policy says so by writing `TO PUBLIC`, alone or beside named roles,
     /// or by writing no `TO` clause at all, which PostgreSQL defaults to
-    /// `PUBLIC`. [`Self::roles`] names no role for such a policy, and a quoted
-    /// `"PUBLIC"` is a role of that exact name, not the pseudo-role.
+    /// `PUBLIC`. [`Self::roles`] names no role for such a policy. A quoted
+    /// `"public"` is the pseudo-role too, as PostgreSQL folds the name before
+    /// comparing it, while a quoted `"PUBLIC"` is a role of that exact name.
     ///
     /// # Example
     ///

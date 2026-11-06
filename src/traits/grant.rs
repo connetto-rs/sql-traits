@@ -117,10 +117,10 @@ pub trait GrantLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     ///
     /// `TO PUBLIC` reaches the model in two spellings, and this reader folds
     /// both: the parser records a dedicated public grantee for the keyword,
-    /// and hands back an ordinary unquoted `PUBLIC` name instead for dialects
-    /// that reserve the word. Neither is safe to spot from [`Self::grantees`]
-    /// without knowing that, and the second is indistinguishable there from a
-    /// role somebody created called `public`.
+    /// and hands back an ordinary name instead for a quoted `"public"` and for
+    /// dialects that reserve the word. Neither is safe to spot from
+    /// [`Self::grantees`] without knowing that, and the second looks there
+    /// like a role called `public`, which PostgreSQL never lets exist.
     ///
     /// # Example
     ///
