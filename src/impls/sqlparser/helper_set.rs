@@ -462,8 +462,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 target_name_of_table(table).to_string(),
             )
         };
-        // A superuser passes every privilege check, whatever it was granted.
-        if !scope.owner.is_superuser() && !table.can_select(scope.owner, database)? {
+        if !table.privileges(scope.owner, database)?.select.on_table() {
             return Err(refuse(|function, owner, table| {
                 HelperSetError::MissingSelect { function, owner, table }
             }));

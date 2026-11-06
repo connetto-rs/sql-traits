@@ -471,19 +471,25 @@ fn table_defaults_reach_tables_views_and_their_owner() {
     let r = role(&db, "r");
     let t = table(&db, "t");
 
-    assert_eq!(t.can_select(anon, &db), Ok(true));
-    assert_eq!(t.can_insert(anon, &db), Ok(true));
-    assert_eq!(t.can_delete(anon, &db), Ok(false));
-    assert_eq!(t.can_delete(r, &db), Ok(false));
-    assert_eq!(t.can_update(r, &db), Ok(true));
+    let held = t.privileges(anon, &db).expect("table is held");
+    assert!(held.select.on_table());
+    assert!(held.insert.on_table());
+    assert!(!held.delete);
+    let held = t.privileges(r, &db).expect("table is held");
+    assert!(!held.delete);
+    assert!(held.update.on_table());
     assert!(
         !t.owner_privileges(&db)
             .expect("table is held")
             .any(|held| matches!(held, Action::Truncate))
     );
-    assert_eq!(table(&db, "before").can_select(anon, &db), Ok(false));
-    assert_eq!(table(&db, "revoked").can_select(anon, &db), Ok(true));
-    assert_eq!(table(&db, "revoked").can_insert(anon, &db), Ok(false));
+    assert_eq!(
+        table(&db, "before").privileges(anon, &db).map(|held| held.select.on_table()),
+        Ok(false)
+    );
+    let held = table(&db, "revoked").privileges(anon, &db).expect("table is held");
+    assert!(held.select.on_table());
+    assert!(!held.insert.on_table());
     assert_eq!(relation_privileges(&db, "v", "anon"), ["INSERT", "SELECT"]);
     assert_eq!(relation_privileges(&db, "mv", "anon"), ["INSERT", "SELECT"]);
     assert!(db.table_grants().any(|grant| {
@@ -728,8 +734,9 @@ fn table_grants_accumulate_per_grantee() {
     let t = table(&db, "t");
 
     assert_eq!(relation_privileges(&db, "t", "anon"), ["INSERT", "SELECT", "UPDATE"]);
-    assert_eq!(t.can_update(role(&db, "other"), &db), Ok(true));
-    assert_eq!(t.can_select(role(&db, "other"), &db), Ok(false));
+    let held = t.privileges(role(&db, "other"), &db).expect("table is held");
+    assert!(held.update.on_table());
+    assert!(!held.select.on_table());
 }
 
 /// Revoking what a grantee never held leaves no default behind, so nothing
@@ -824,7 +831,7 @@ fn a_default_revoking_everything_falls_back_to_the_builtin_privileges() {
 
     assert!(executable_by_public(&db, "f"));
     assert!(can_execute(&db, "f", "r"));
-    assert_eq!(table(&db, "t").can_delete(role(&db, "r"), &db), Ok(true));
+    assert_eq!(table(&db, "t").privileges(role(&db, "r"), &db).map(|held| held.delete), Ok(true));
 }
 
 /// An empty global default still gives way to a schema's, which then stands
@@ -841,6 +848,6 @@ fn an_empty_global_default_leaves_the_schema_default_alone() {
     .expect("schema parses");
     let t = table(&db, "t");
 
-    assert_eq!(t.can_select(role(&db, "reader"), &db), Ok(true));
-    assert_eq!(t.can_select(role(&db, "r"), &db), Ok(false));
+    assert_eq!(t.privileges(role(&db, "reader"), &db).map(|held| held.select.on_table()), Ok(true));
+    assert_eq!(t.privileges(role(&db, "r"), &db).map(|held| held.select.on_table()), Ok(false));
 }

@@ -130,6 +130,7 @@ mod table_like;
 mod table_owner_privileges;
 mod table_ownership;
 mod table_persistence;
+mod table_privileges;
 mod table_storage_parameters;
 mod target_names;
 mod temporary_namespace;
