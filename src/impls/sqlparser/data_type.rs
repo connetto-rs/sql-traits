@@ -211,12 +211,13 @@ impl DataTypeLike for DataType {
             return base.send_function(database);
         }
         if let Some((user_type, _)) = user_type_of(self, database) {
+            // A shell types no value, so only a base type may lack a send
+            // function.
             return Some(match user_type.representation() {
                 Some(UserDefinedTypeRepresentation::SqlDefinition { .. }) => {
                     user_type.declares_send()
                 }
-                Some(_) => true,
-                None => false,
+                defined => defined.is_some(),
             });
         }
         PgType::of(self).send_function()

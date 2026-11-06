@@ -128,15 +128,6 @@ pub enum BinarySend<'db, T: ?Sized> {
     Unknown(&'db T),
 }
 
-impl<T: ?Sized> Clone for BinarySend<'_, T> {
-    #[inline]
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T: ?Sized> Copy for BinarySend<'_, T> {}
-
 /// A trait for declared SQL data types, the type of a column or of an array
 /// element.
 ///

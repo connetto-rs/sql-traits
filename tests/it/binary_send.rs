@@ -4,7 +4,7 @@
 //! set to `true`.
 #![allow(clippy::expect_used)]
 
-use sql_traits::prelude::*;
+use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 
 /// The declared type of column `name` of table `t`.
@@ -141,6 +141,21 @@ fn user_defined_types_fail_where_postgresql_fails() {
     );
 }
 
+/// A composite whose attribute names the composite itself, which PostgreSQL
+/// refuses but the model keeps as an unbound name, still gets an answer.
+#[test]
+fn a_type_reaching_itself_is_walked_once() {
+    assert_sent("CREATE TYPE looped AS (a INT, b looped);", &[("looped", "binary")]);
+}
+
+/// A column of a shell type cannot be declared.
+#[test]
+fn a_shell_types_no_column() {
+    let error = ParserDB::parse::<PostgreSqlDialect>("CREATE TYPE sh; CREATE TABLE t (c sh);")
+        .expect_err("PostgreSQL refuses a column of a shell type");
+    assert!(matches!(error, Error::TypeIsOnlyShell { .. }), "{error:?}");
+}
+
 /// A type that cannot be told about leaves the answer unknown unless another
 /// type on the way is known to fail. The row type of a table is one this
 /// model does not follow.
@@ -223,6 +238,7 @@ fn catalog_ranges_answer_their_subtype() {
         ("pg_catalog.daterange", Some("DATE")),
         ("int4range[]", None),
         ("INT", None),
+        ("box2d", None),
     ];
     let columns: Vec<String> = cases
         .iter()
