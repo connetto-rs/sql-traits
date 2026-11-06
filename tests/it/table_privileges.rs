@@ -256,6 +256,7 @@ fn each_command_is_answered_on_its_own() {
 
     assert_eq!(held(&privileges(&db, "docs", "reader_writer")), ["SELECT", "INSERT"]);
     assert_eq!(held(&privileges(&db, "docs", "inserter")), ["INSERT"]);
+    assert!(privileges(&db, "docs", "inserter").insert.on_any_column());
     assert!(!privileges(&db, "docs", "inserter").update.on_any_column());
 }
 
