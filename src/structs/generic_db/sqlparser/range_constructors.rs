@@ -28,8 +28,7 @@ use alloc::{
 use sqlparser::{
     ast::{
         ArgMode, ArrayElemTypeDef, CreateFunction, CreateFunctionBody, DataType, Expr,
-        FunctionParallel, Ident, ObjectName, OperateFunctionArg, UserDefinedTypeRangeOption,
-        UserDefinedTypeRepresentation, Value, ValueWithSpan,
+        FunctionParallel, Ident, ObjectName, OperateFunctionArg, Value, ValueWithSpan,
     },
     tokenizer::Span,
 };
@@ -89,21 +88,12 @@ fn declaration(
 /// The five constructors of `range`, each with whether it builds the
 /// multirange, or none for a shell or a type that is no range.
 fn constructors_of(range: &UserDefinedType) -> Vec<(CreateFunction, bool)> {
-    let Some(UserDefinedTypeRepresentation::Range { options }) = &range.representation else {
-        return Vec::new();
-    };
-    let Some(subtype) = options.iter().find_map(|option| {
-        match option {
-            UserDefinedTypeRangeOption::Subtype(subtype) => Some(subtype),
-            _ => None,
-        }
-    }) else {
-        return Vec::new();
-    };
-    let Some(multirange) = range.multirange_name.as_ref() else {
-        return Vec::new();
-    };
-    let Some(multirange_ident) = object_name_last_identifier(multirange) else {
+    let (Some(subtype), Some((multirange, multirange_ident))) = (
+        range.range_subtype(),
+        range
+            .multirange_name()
+            .and_then(|multirange| Some((multirange, object_name_last_identifier(multirange)?))),
+    ) else {
         return Vec::new();
     };
     let range_type = named_type(&range.name);
@@ -189,22 +179,21 @@ fn constructs(
 
 /// The name of the type that requires the constructor `constructor`: its
 /// range, or the range's multirange for a multirange constructor.
-pub(super) fn requiring_type(builder: &ParserDBBuilder, constructor: &RangeConstructor) -> String {
+pub(super) fn requiring_type(
+    builder: &ParserDBBuilder,
+    constructor: &RangeConstructor,
+) -> Option<String> {
     let case = builder.identifier_case();
     let range = builder
         .user_defined_types()
         .iter()
         .map(|(type_, _)| type_.as_ref())
-        .find(|range| constructs(constructor, range, case));
-    let Some(range) = range else {
-        return last_str(&constructor.range).to_string();
-    };
-    if constructor.multirange
-        && let Some(multirange) = range.multirange_name().and_then(object_name_last_identifier)
-    {
-        return multirange.value.clone();
-    }
-    range.name().to_string()
+        .find(|range| constructs(constructor, range, case))?;
+    let multirange = constructor
+        .multirange
+        .then(|| range.multirange_name().and_then(object_name_last_identifier))
+        .flatten();
+    Some(multirange.map_or_else(|| range.name().to_string(), |multirange| multirange.value.clone()))
 }
 
 /// Drops the constructors of the ranges at the positions `doomed` accepts,

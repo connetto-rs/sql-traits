@@ -8264,13 +8264,14 @@ impl ParserDB {
                                 extension_name: extension.value.clone(),
                             });
                         }
-                        if let Some(constructor) = metadata.range_constructor() {
+                        if let Some(type_name) =
+                            metadata.range_constructor().and_then(|constructor| {
+                                range_constructors::requiring_type(&builder, constructor)
+                            })
+                        {
                             return Err(crate::errors::Error::FunctionRequiredByType {
                                 function_name: function_name.to_string(),
-                                type_name: range_constructors::requiring_type(
-                                    &builder,
-                                    constructor,
-                                ),
+                                type_name,
                             });
                         }
                         if builder.is_function_used(function, &dropping) {
