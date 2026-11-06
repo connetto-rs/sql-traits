@@ -1094,6 +1094,13 @@ impl FunctionLike for MemoryFunction {
         Ok(true)
     }
 
+    fn execute_holders<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = PrivilegeHolder<'db>>, LookupError> {
+        Ok(core::iter::once(PrivilegeHolder::Public))
+    }
+
     fn can_grant_execute(
         &self,
         _role: &MemoryRole,
