@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ebb8b04a934420a56574b85f6573a846e4d753e2"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#7a4f958cc63a67aaa816d6ee3402042db9ee5a35"
 dependencies = [
  "log",
  "recursive",
@@ -449,7 +449,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ebb8b04a934420a56574b85f6573a846e4d753e2"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#7a4f958cc63a67aaa816d6ee3402042db9ee5a35"
 dependencies = [
  "proc-macro2",
  "quote",
