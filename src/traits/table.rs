@@ -4685,6 +4685,74 @@ pub trait TableLike:
         }
         Ok(held.answer(&columns))
     }
+
+    /// Returns the privileges `role` may hold on this table as far as this
+    /// source can tell, in the shape [`privileges`](Self::privileges)
+    /// answers. A privilege missing here is one the source proves `role`
+    /// lacks.
+    ///
+    /// A source holding the complete access control list, as a live catalog
+    /// does, answers what [`privileges`](Self::privileges) answers. A parsed
+    /// schema is open-world. A platform may grant privileges through defaults
+    /// the statements never spell, so a privilege no statement granted may
+    /// still be held, and only an explicit `REVOKE` shows that it is gone. A
+    /// [`ParserDB`](crate::structs::ParserDB) table leaves a privilege out
+    /// only when a table-level `REVOKE` of it names `role` itself, with no
+    /// `GRANTED BY` or with `GRANTED BY` naming the table's
+    /// [`owner`](Self::owner), the grantor of the privileges PostgreSQL
+    /// creates for a table. It then keeps what
+    /// [`privileges`](Self::privileges) finds `role` still holding, through a
+    /// grant reaching it directly, through `PUBLIC` or through a role it
+    /// inherits from, or through the owner's own entry. A `REVOKE` from
+    /// `PUBLIC` or from a role `role` inherits from proves nothing about
+    /// `role`, and neither does a column `REVOKE`, which leaves a table-level
+    /// privilege in place. A superuser holds every privilege, so nothing is
+    /// left out for one. For [`ActingRole::Public`] the role itself is
+    /// `PUBLIC`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE profiles (id INT, display_name TEXT, is_admin BOOL);
+    /// CREATE ROLE app_user;
+    /// CREATE ROLE auditor;
+    /// REVOKE UPDATE ON profiles FROM app_user;
+    /// GRANT UPDATE (display_name) ON profiles TO app_user;
+    /// ",
+    /// )?;
+    /// let profiles =
+    ///     db.table_by_target(TargetName::new("profiles", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let column = |name| profiles.columns(&db).unwrap().find(|c| c.column_name() == name).unwrap();
+    ///
+    /// // No statement granted `auditor` anything, and none took anything away.
+    /// let auditor = profiles.possible_privileges(db.role("auditor").unwrap(), &db)?;
+    /// assert!(auditor.update.on_column(column("is_admin")));
+    ///
+    /// let app_user = profiles.possible_privileges(db.role("app_user").unwrap(), &db)?;
+    /// assert!(app_user.update.on_column(column("display_name")));
+    /// assert!(!app_user.update.on_column(column("is_admin")));
+    /// assert!(app_user.delete);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn possible_privileges<'db>(
+        &'db self,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db;
 }
 
 /// How many table privileges PostgreSQL has, in the order
@@ -4993,6 +5061,17 @@ where
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
         T::owner_privileges(self, database)
+    }
+
+    fn possible_privileges<'db>(
+        &'db self,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db,
+    {
+        T::possible_privileges(self, role, database)
     }
 
     fn primary_key_columns<'db>(

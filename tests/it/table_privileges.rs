@@ -11,7 +11,10 @@
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::PostgreSqlDialect;
 
-use crate::support::table_lookup::table;
+use crate::support::{
+    privilege_listing::{EVERYTHING, privilege_names as held},
+    table_lookup::table,
+};
 
 type Column = <ParserDB as DatabaseLike>::Column;
 
@@ -45,41 +48,6 @@ fn column<'db>(db: &'db ParserDB, relation: &str, name: &str) -> &'db Column {
         .find(|column| column.column_name() == name)
         .expect("the column exists")
 }
-
-/// Each privilege held, the column ones spelled with their columns when only
-/// column grants give them.
-fn held(privileges: &TablePrivileges<'_, Column>) -> Vec<String> {
-    let mut held = Vec::new();
-    for (name, privilege) in [
-        ("SELECT", &privileges.select),
-        ("INSERT", &privileges.insert),
-        ("UPDATE", &privileges.update),
-        ("REFERENCES", &privileges.references),
-    ] {
-        match privilege {
-            ColumnPrivilege::Table => held.push(name.to_string()),
-            ColumnPrivilege::Columns(columns) if columns.is_empty() => {}
-            ColumnPrivilege::Columns(columns) => {
-                let names: Vec<&str> = columns.iter().map(ColumnLike::column_name).collect();
-                held.push(format!("{name} ({})", names.join(", ")));
-            }
-        }
-    }
-    for (name, holds) in [
-        ("DELETE", privileges.delete),
-        ("TRUNCATE", privileges.truncate),
-        ("TRIGGER", privileges.trigger),
-        ("MAINTAIN", privileges.maintain),
-    ] {
-        if holds {
-            held.push(name.to_string());
-        }
-    }
-    held
-}
-
-const EVERYTHING: [&str; 8] =
-    ["SELECT", "INSERT", "UPDATE", "REFERENCES", "DELETE", "TRUNCATE", "TRIGGER", "MAINTAIN"];
 
 #[test]
 fn a_column_grant_holds_on_its_columns_and_never_on_the_table() {

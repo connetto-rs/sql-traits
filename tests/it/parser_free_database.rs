@@ -650,6 +650,18 @@ impl TableLike for MemoryTable {
     ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
         Ok(core::iter::empty())
     }
+
+    /// This catalog holds every grant, so what no grant gives is withheld.
+    fn possible_privileges<'db>(
+        &'db self,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.privileges(role, database)
+    }
 }
 
 impl ColumnLike for MemoryColumn {

@@ -6,6 +6,7 @@ pub(crate) mod column_type_probes;
 #[cfg(not(coverage))]
 pub(crate) mod counting_allocator;
 pub(crate) mod function_overloads;
+pub(crate) mod privilege_listing;
 pub(crate) mod query_parsing;
 pub(crate) mod relation_labels;
 pub(crate) mod sequence_names;
