@@ -14,14 +14,15 @@
 //! `pg_catalog`, then along the search path, unless the path lists either of
 //! the first two where it wants them. The first schema holding a type of that
 //! name ends the walk, whether the type is a domain or a row type. Every type
-//! name a column or a domain is declared with is bound to the domain it reached
-//! when the statement ran, so neither a later path nor a later domain of the
-//! same name changes which domain it names.
+//! name a column, a domain or a function's signature is declared with is
+//! bound to the domain it reached when the statement ran, so neither a later
+//! path nor a later domain of the same name changes which domain it names.
 //!
-//! Dropping a domain is refused while a column or another domain is declared
-//! with it, an array of it included. `CASCADE` drops those columns, taking
-//! along what dropping a column takes, and those domains, with their own
-//! columns and domains in turn. `DROP TYPE` drops a domain as `DROP DOMAIN`
+//! Dropping a domain is refused while a column, another domain or a
+//! function's signature is declared with it, an array of it included.
+//! `CASCADE` drops those columns, taking along what dropping a column takes,
+//! those domains, with their own columns and domains in turn, and those
+//! functions. `DROP TYPE` drops a domain as `DROP DOMAIN`
 //! does, and passes over a name reaching anything else, since the other kinds
 //! of type are not modelled.
 
@@ -36,6 +37,7 @@ use super::{
 use crate::{
     errors::{Error, ObjectKind},
     impls::{bound_domain, bound_user_type, domain_in_schema, domain_named, user_type_holds},
+    structs::UserDefinedType,
     traits::{DomainLike, UserDefinedTypeLike},
     utils::{
         identifier_resolution::{identifiers_match, is_temporary_schema, normalize_identifier},
@@ -206,6 +208,15 @@ fn schema_ident(name: &str, quoted: bool) -> Ident {
 
 /// What a bare type name reaches through the session's path.
 pub(super) fn reach_type(builder: &ParserDBBuilder, name: &Ident) -> Option<Reached> {
+    reach_type_in(builder, name).map(|(reached, _)| reached)
+}
+
+/// What a bare type name reaches through the session's path, with the schema
+/// that holds it.
+fn reach_type_in<'builder>(
+    builder: &'builder ParserDBBuilder,
+    name: &Ident,
+) -> Option<(Reached, (&'builder str, bool))> {
     let temporary =
         (!builder.search_path().any(|(schema, quoted)| is_temporary_schema(schema, quoted)))
             .then_some((TEMPORARY_SCHEMA, false));
@@ -218,7 +229,7 @@ pub(super) fn reach_type(builder: &ParserDBBuilder, name: &Ident) -> Option<Reac
         .chain(catalog)
         .chain(builder.search_path())
         .filter(|(schema, _)| !schema.is_empty())
-        .find_map(|schema| reach_in_schema(builder, name, schema))
+        .find_map(|schema| reach_in_schema(builder, name, schema).map(|reached| (reached, schema)))
 }
 
 /// What a type name reaches in one schema, if the schema holds a type of that
@@ -314,30 +325,65 @@ pub(super) fn bind_type(builder: &ParserDBBuilder, data_type: &mut DataType) -> 
     let Some(reached) = reach_type(builder, ident) else {
         return Ok(());
     };
-    match reached {
-        Reached::Domain(position) => {
-            let domain = &builder.domains()[position].0;
-            let qualifier = match domain.schema() {
-                Some(schema) => Some(schema_ident(schema, domain.schema_is_quoted())),
-                None if names_catalog_type(&domain.stored_name()) => {
-                    Some(Ident::new(DEFAULT_SCHEMA))
-                }
-                None => None,
-            };
-            bind_reference(name, qualifier);
-        }
+    let qualifier = match reached {
+        Reached::Domain(position) => domain_qualifier(&builder.domains()[position].0),
         Reached::UserType(position, _is_multirange) => {
             let type_ = &builder.user_defined_types()[position].0;
             if type_.is_shell() {
                 return Err(Error::TypeIsOnlyShell { type_name: type_.name().to_string() });
             }
-            let qualifier =
-                type_.schema().map(|schema| schema_ident(schema, type_.schema_is_quoted()));
-            bind_reference(name, qualifier);
+            user_type_qualifier(type_)
         }
-        Reached::RowType(_) | Reached::Catalog => {}
-    }
+        Reached::RowType(_) | Reached::Catalog => return Ok(()),
+    };
+    bind_reference(name, qualifier);
     Ok(())
+}
+
+/// Binds a type a function's signature declares, as [`bind_type`] binds a
+/// column's, reaching the row type of a relation too and keeping a shell,
+/// which a signature may name.
+pub(super) fn bind_signature_type(builder: &ParserDBBuilder, data_type: &mut DataType) {
+    let Some(name) = custom_name_mut(data_type) else {
+        return;
+    };
+    let Ok((None, ident)) = object_name_identifiers(name) else {
+        return;
+    };
+    let Some((reached, (schema, quoted))) = reach_type_in(builder, ident) else {
+        return;
+    };
+    let qualifier = match reached {
+        Reached::Domain(position) => domain_qualifier(&builder.domains()[position].0),
+        Reached::UserType(position, _is_multirange) => {
+            user_type_qualifier(&builder.user_defined_types()[position].0)
+        }
+        Reached::RowType(_) => {
+            let default = identifiers_match(schema, quoted, DEFAULT_SCHEMA, false)
+                && !names_catalog_type(&normalize_identifier(
+                    &ident.value,
+                    ident.quote_style.is_some(),
+                ));
+            (!default).then(|| schema_ident(schema, quoted))
+        }
+        Reached::Catalog => return,
+    };
+    bind_reference(name, qualifier);
+}
+
+/// The qualifier a name binding to `domain` takes, none for the default
+/// schema unless `pg_catalog` holds a type of its name.
+fn domain_qualifier(domain: &CreateDomain) -> Option<Ident> {
+    match domain.schema() {
+        Some(schema) => Some(schema_ident(schema, domain.schema_is_quoted())),
+        None if names_catalog_type(&domain.stored_name()) => Some(Ident::new(DEFAULT_SCHEMA)),
+        None => None,
+    }
+}
+
+/// The qualifier a name binding to the user-defined type `type_` takes.
+fn user_type_qualifier(type_: &UserDefinedType) -> Option<Ident> {
+    type_.schema().map(|schema| schema_ident(schema, type_.schema_is_quoted()))
 }
 
 /// Refuses a type a definition declares over when it names a shell, keeping
@@ -451,6 +497,7 @@ pub(super) fn follow_schema_rename(
             retarget(name);
         }
     }
+    super::signature_types::retarget_signatures(&mut builder, reaches_moved, retarget);
 
     let hosts: Vec<StoredTable> = builder
         .tables()

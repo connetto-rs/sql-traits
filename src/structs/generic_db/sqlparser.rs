@@ -104,6 +104,7 @@ mod routine_privileges;
 mod rules;
 mod schema_usage;
 mod sequences;
+mod signature_types;
 mod table_as;
 mod table_owner;
 mod transactions;
@@ -1099,6 +1100,38 @@ impl ParserDBBuilder {
         for (_, calls) in self.triggers_mut() {
             calls.replace_function(stale, fresh);
         }
+    }
+
+    /// Drops the stored functions `dropping`, refusing while anything but
+    /// them and the functions `alongside`, which the same statement drops
+    /// later, still calls one.
+    ///
+    /// PostgreSQL drops such a caller under `CASCADE`, which this model does
+    /// for no function drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::Error::FunctionReferenced`] for a function
+    /// something else still calls.
+    fn drop_function_nodes(
+        &mut self,
+        dropping: &[Arc<CreateFunction>],
+        alongside: &[Arc<CreateFunction>],
+    ) -> Result<(), crate::errors::Error> {
+        if dropping.is_empty() {
+            return Ok(());
+        }
+        let doomed: Vec<Arc<CreateFunction>> = dropping.iter().chain(alongside).cloned().collect();
+        if let Some(called) =
+            dropping.iter().find(|function| self.is_function_used(function, &doomed))
+        {
+            return Err(crate::errors::Error::FunctionReferenced {
+                function_name: last_str(&called.name).to_string(),
+            });
+        }
+        self.functions_mut()
+            .retain(|(function, _)| !dropping.iter().any(|dropped| Arc::ptr_eq(dropped, function)));
+        Ok(())
     }
 
     /// Whether an object still calls the stored function `dropped`, leaving
@@ -5394,6 +5427,7 @@ impl ParserDB {
 
         builder.rewrite_table_references(&renamed, &target);
 
+        signature_types::follow_relation_rename(&mut builder, &key, &target.name);
         if let Some(readers) = readers
             && object_name_last_identifier(&target.name).is_some()
         {
@@ -5404,38 +5438,23 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// Drops every function stored in `schema`, as `DROP SCHEMA ... CASCADE`
-    /// does once the schema's tables, views and domains are gone.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::errors::Error::FunctionReferenced`] when something
-    /// outside the schema still calls one of them. PostgreSQL drops that caller
-    /// too, which this model does for no function drop.
-    fn drop_functions_in(
-        mut builder: ParserDBBuilder,
+    /// The functions `DROP SCHEMA ... CASCADE` drops once the schema's tables,
+    /// views and types are gone: those stored in `schema`, and those anywhere
+    /// whose signature names a type the schema holds.
+    fn functions_dropped_with_schema(
+        builder: &ParserDBBuilder,
         schema: (&str, bool),
-    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+    ) -> Vec<Arc<CreateFunction>> {
         let case = builder.identifier_case();
-        let doomed: Vec<Arc<CreateFunction>> = builder
-            .functions()
-            .iter()
-            .filter(|(function, _)| {
-                schema_qualifiers_match(qualifier_of(&function.name).named(), Some(schema), case)
-            })
-            .map(|(function, _)| Arc::clone(function))
-            .collect();
-        if let Some(called) =
-            doomed.iter().find(|function| builder.is_function_used(function, &doomed))
-        {
-            return Err(crate::errors::Error::FunctionReferenced {
-                function_name: last_str(&called.name).to_string(),
-            });
+        let mut doomed = signature_types::functions_naming_schema_types(builder, schema);
+        for (function, _) in builder.functions() {
+            if schema_qualifiers_match(qualifier_of(&function.name).named(), Some(schema), case)
+                && !doomed.iter().any(|held| Arc::ptr_eq(held, function))
+            {
+                doomed.push(Arc::clone(function));
+            }
         }
-        builder
-            .functions_mut()
-            .retain(|(function, _)| !doomed.iter().any(|dropped| Arc::ptr_eq(dropped, function)));
-        Ok(builder)
+        doomed
     }
 
     /// Moves every function and relation stored in schema `from` to `to`,
@@ -6672,8 +6691,13 @@ impl ParserDB {
     /// `pg_temp`.
     fn functions_named(builder: &ParserDBBuilder, func_desc: &FunctionDesc) -> Vec<usize> {
         let case = builder.identifier_case();
+        // The listed types bind as the signatures they are compared with did.
+        let args = func_desc.args.clone().map(|mut args| {
+            signature_types::bind_arguments(builder, &mut args);
+            args
+        });
         let named = |function: &CreateFunction, name: &ObjectName| {
-            match &func_desc.args {
+            match &args {
                 Some(args) => {
                     function_signatures_match(
                         &function.name,
@@ -8160,6 +8184,7 @@ impl ParserDB {
                     for parameter in &mut create_function.set_params {
                         settle_search_path_parameter(parameter, &builder)?;
                     }
+                    signature_types::bind_signature(&builder, &mut create_function);
                     let case = builder.identifier_case();
                     let existing = builder.functions().iter().position(|(existing, _)| {
                         function_signatures_match(
@@ -8744,6 +8769,10 @@ impl ParserDB {
                         // first, the functions last so nothing else in it
                         // still calls them.
                         if cascade {
+                            let schema = (resolved_schema_name.as_str(), resolved_schema_quoted);
+                            // Read while the schema's types are there to name.
+                            let doomed_functions =
+                                Self::functions_dropped_with_schema(&builder, schema);
                             let doomed: Vec<StoredTable> = builder
                                 .tables()
                                 .iter()
@@ -8774,13 +8803,10 @@ impl ParserDB {
                             )?;
                             builder = user_defined_types::drop_types_in(
                                 builder,
-                                &resolved_schema_name,
-                                resolved_schema_quoted,
+                                schema,
+                                &doomed_functions,
                             )?;
-                            builder = Self::drop_functions_in(
-                                builder,
-                                (&resolved_schema_name, resolved_schema_quoted),
-                            )?;
+                            builder.drop_function_nodes(&doomed_functions, &[])?;
                         }
 
                         // Remove the schema

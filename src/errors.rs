@@ -2460,18 +2460,20 @@ pub enum Error {
     #[error(
         "Domain `{domain_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
     )]
-    /// Error indicating that a statement drops a domain a column or another
-    /// domain is declared with.
+    /// Error indicating that a statement drops a domain a column, another
+    /// domain or a function's signature is declared with.
     ///
-    /// PostgreSQL refuses without `CASCADE`, and `CASCADE` drops the columns
-    /// and the domains along with it. A column of an array of the domain uses
-    /// it too.
+    /// PostgreSQL refuses without `CASCADE`, and `CASCADE` drops the columns,
+    /// the domains and the functions along with it. A column of an array of
+    /// the domain uses it too.
     DomainHasDependents {
         /// Name of the domain the statement drops.
         domain_name: String,
-        /// [`ObjectKind::Column`] or [`ObjectKind::Domain`].
+        /// [`ObjectKind::Column`], [`ObjectKind::Domain`] or
+        /// [`ObjectKind::Function`].
         dependent_kind: ObjectKind,
-        /// The column as `table.column`, or the name of the domain.
+        /// The column as `table.column`, or the name of the domain or the
+        /// function.
         dependent_name: String,
     },
     #[error("`{object_name}` is a {actual_kind}, not a {expected_kind}.")]
@@ -2517,15 +2519,18 @@ pub enum Error {
         "Type `{type_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
     )]
     /// Error indicating that a statement drops a type a column, a composite
-    /// attribute, a domain or a range is declared with.
+    /// attribute, a domain, a range or a function's signature is declared
+    /// with.
     ///
     /// PostgreSQL refuses without `CASCADE`, and `CASCADE` drops the columns,
-    /// the composite attributes, the domains and the ranges along with it.
+    /// the composite attributes, the domains, the ranges and the functions
+    /// along with it.
     TypeHasDependents {
         /// Name of the type the statement drops.
         type_name: String,
-        /// [`ObjectKind::Column`], [`ObjectKind::Domain`], [`ObjectKind::Type`]
-        /// or [`ObjectKind::Table`].
+        /// [`ObjectKind::Column`], [`ObjectKind::Domain`],
+        /// [`ObjectKind::Type`], [`ObjectKind::Table`] or
+        /// [`ObjectKind::Function`].
         dependent_kind: ObjectKind,
         /// The column as `table.column`, or the name of the other object.
         dependent_name: String,
@@ -2767,22 +2772,23 @@ pub enum Error {
         option_name: String,
     },
     #[error(
-        "{object_kind} `{object_name}` cannot be dropped because {dependent_kind} `{dependent_name}` reads it."
+        "{object_kind} `{object_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
     )]
-    /// Error indicating that a statement drops a relation a view reads.
+    /// Error indicating that a statement drops a relation a view or a
+    /// function body reads, or whose row type a function's signature names.
     ///
-    /// PostgreSQL refuses without `CASCADE`, and `CASCADE` drops the reading
-    /// views along with it. A view whose definition read a relation dropped
-    /// from under it would name nothing, which is the dangling reference this
-    /// refusal exists to prevent.
+    /// PostgreSQL refuses without `CASCADE`, and `CASCADE` drops the
+    /// dependents along with it. A view whose definition read a relation
+    /// dropped from under it would name nothing, which is the dangling
+    /// reference this refusal exists to prevent.
     RelationHasDependents {
         /// Kind of relation the statement drops.
         object_kind: ObjectKind,
         /// Name of the relation the statement drops.
         object_name: String,
-        /// Kind of the view reading it.
+        /// Kind of the view or function depending on it.
         dependent_kind: ObjectKind,
-        /// Name of the view reading it.
+        /// Name of the view or function depending on it.
         dependent_name: String,
     },
     #[error(

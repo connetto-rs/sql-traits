@@ -859,6 +859,7 @@ fn retarget_view(
             .chain([ident.clone()])
             .collect::<Vec<_>>(),
     );
+    super::signature_types::follow_relation_rename(&mut builder, &key, &stored_name);
     if let Some(readers) = readers {
         // Within the schema every spelling keeps its qualifier, a move needs
         // the new one.
@@ -1401,11 +1402,16 @@ fn readers_closure(
                     stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
                 ),
                 None,
+                // A signature naming a relation's row type depends on the
+                // relation as a body reading it does.
                 function
                     .function_body
                     .as_ref()
                     .and_then(|body| function_bodies::relations_read(builder, body))
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(super::signature_types::row_type_keys(function))
+                    .collect(),
             )
         }))
         .chain(builder.rules().iter().map(|(rule, _)| {

@@ -17,8 +17,9 @@
 //! a declared value may not name. `DROP TYPE` drops a domain as `DROP DOMAIN`
 //! does, and the user-defined types this model holds as well, refusing what
 //! uses them without `CASCADE` and dropping the columns, composite
-//! attributes, domains and ranges that use them with it. A range brings the
-//! constructor functions [`range_constructors`] records, which go with it.
+//! attributes, domains and ranges that use them, and the functions whose
+//! signatures name them, with it. A range brings the constructor functions
+//! [`range_constructors`] records, which go with it.
 
 use alloc::{
     string::{String, ToString},
@@ -40,6 +41,7 @@ use super::{
     },
     object_name_last_identifier, place_relation, range_constructors, relation_name_holder,
     require_named_in_catalog,
+    signature_types::{retarget_signatures, signature_types},
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -649,7 +651,7 @@ pub(super) fn drop_types(
             _ => {}
         }
     }
-    drop_positions(builder, &doomed, cascade)
+    drop_positions(builder, &doomed, cascade, &[])
 }
 
 /// The name a stored table is stored under, with the default schema written
@@ -728,12 +730,14 @@ fn extend_doomed_by_dependents(
 }
 
 /// Drops the objects at `doomed`, refusing what uses them unless `cascade`,
-/// in which case the columns, composite attributes, domains and ranges using
-/// them go too.
+/// in which case the columns, composite attributes, domains, ranges and
+/// functions using them go too. `alongside` holds the functions the same
+/// statement drops later, whose calls hold nothing in place.
 fn drop_positions(
     mut builder: ParserDBBuilder,
     doomed: &[Doomed],
     cascade: bool,
+    alongside: &[Arc<CreateFunction>],
 ) -> Result<ParserDBBuilder, Error> {
     if doomed.is_empty() {
         return Ok(builder);
@@ -784,9 +788,35 @@ fn drop_positions(
     }
     // A range takes its constructors along, after a cascade has dropped the
     // columns of its type and the checks on them.
-    range_constructors::drop_range_constructors(&mut builder, |position| {
-        doomed_user_type(&doomed_owned, position)
-    })?;
+    range_constructors::drop_range_constructors(
+        &mut builder,
+        |position| doomed_user_type(&doomed_owned, position),
+        alongside,
+    )?;
+    // Any other function whose signature names a doomed type holds it in
+    // place, and goes with it under `CASCADE`.
+    let naming: Vec<(Arc<CreateFunction>, Doomed)> = builder
+        .functions()
+        .iter()
+        .filter_map(|(function, _)| {
+            signature_types(function)
+                .find_map(|data_type| {
+                    declared_type_reaches_doomed(&builder, data_type, &doomed_owned)
+                })
+                .map(|used| (Arc::clone(function), used))
+        })
+        .collect();
+    if !cascade && let Some((function, used)) = naming.first() {
+        return Err(dependents_error(
+            &builder,
+            used,
+            ObjectKind::Function,
+            function.name.to_string(),
+        ));
+    }
+    let naming: Vec<Arc<CreateFunction>> =
+        naming.into_iter().map(|(function, _)| function).collect();
+    builder.drop_function_nodes(&naming, alongside)?;
 
     // Remove the doomed, domains and user-defined types alike.
     let mut domain_position = 0;
@@ -875,34 +905,37 @@ fn drop_dependents_cascade(
 }
 
 /// Drops every type of a schema `DROP SCHEMA ... CASCADE` removes, with what a
-/// cascading drop of each takes.
+/// cascading drop of each takes, `alongside` holding the functions the schema
+/// drop takes afterwards.
 ///
 /// # Errors
 ///
-/// Returns the errors dropping a column a type declares returns.
+/// Returns the errors dropping a column a type declares returns, and
+/// [`Error::FunctionReferenced`] for a function naming one of the types that
+/// something outside the drop still calls.
 pub(super) fn drop_types_in(
     builder: ParserDBBuilder,
-    schema_name: &str,
-    schema_quoted: bool,
+    schema: (&str, bool),
+    alongside: &[Arc<CreateFunction>],
 ) -> Result<ParserDBBuilder, Error> {
     let case = builder.identifier_case();
     let doomed_domains: Vec<Doomed> = builder
         .domains()
         .iter()
         .enumerate()
-        .filter(|(_, (domain, _))| domain_in_schema(domain, (schema_name, schema_quoted), case))
+        .filter(|(_, (domain, _))| domain_in_schema(domain, schema, case))
         .map(|(position, _)| Doomed::Domain(position))
         .collect();
     let doomed_types: Vec<Doomed> = builder
         .user_defined_types()
         .iter()
         .enumerate()
-        .filter(|(_, (type_, _))| user_type_in_schema(type_, (schema_name, schema_quoted), case))
+        .filter(|(_, (type_, _))| user_type_in_schema(type_, schema, case))
         .map(|(position, _)| Doomed::UserType(position))
         .collect();
     let mut doomed = doomed_domains;
     doomed.extend(doomed_types);
-    drop_positions(builder, &doomed, true)
+    drop_positions(builder, &doomed, true, alongside)
 }
 
 /// Rewrites the last part of the stored type name `name` to `to` when it is
@@ -1012,6 +1045,12 @@ fn repoint_type_references(
             UserDefinedTypeRepresentation::Enum { .. } => {}
         }
     }
+    // Every function signature naming the type.
+    retarget_signatures(
+        &mut builder,
+        |name| names_type(name, from, (from_schema, from_schema_quoted), case),
+        |name| retarget_type_name(name, from, (from_schema, from_schema_quoted), to, case),
+    );
     Ok(builder)
 }
 
@@ -1390,6 +1429,8 @@ pub(super) fn follow_schema_rename(
             retarget(&mut constructor.range);
         }
     }
+    // So does every function signature naming a moved type.
+    retarget_signatures(&mut builder, reaches_moved, retarget);
     // A domain over a moved type follows it to the new schema.
     for (domain, _) in builder.domains_mut() {
         let domain = Arc::make_mut(domain);
