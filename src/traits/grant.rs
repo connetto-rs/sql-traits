@@ -158,7 +158,8 @@ pub trait GrantLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// itself, so [`TargetName::name`] is the schema and [`TargetName::schema`]
     /// is the catalog qualifier when the SQL wrote one. A grant on a function
     /// is no grant here at all, and is read through
-    /// [`FunctionLike::can_execute`](crate::traits::FunctionLike::can_execute).
+    /// [`FunctionLike::execute_holders`](crate::traits::FunctionLike::execute_holders)
+    /// and [`FunctionLike::can_execute`](crate::traits::FunctionLike::can_execute).
     ///
     /// Unlike the resolving readers of [`TableGrantLike`] this applies no
     /// resolution and cannot fail, so a caller with its own resolution rules

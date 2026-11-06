@@ -6,7 +6,7 @@
 //! still holds `EXECUTE` decides whether any caller can borrow them.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{errors::Error, prelude::*, utils::identifier_resolution::SessionPrincipal};
 use sqlparser::{ast::CreateFunction, dialect::PostgreSqlDialect};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
@@ -592,4 +592,120 @@ fn a_rolled_back_revoke_leaves_the_default() {
     .expect("schema parses");
 
     assert_eq!(function(&db, "f", &[]).is_executable_by_public(&db), Ok(true));
+}
+
+/// The entries holding `EXECUTE` on `f()`, as `execute_holders` lists them.
+fn holders(db: &ParserDB) -> Vec<PrivilegeHolder<'_>> {
+    function(db, "f", &[]).execute_holders(db).expect("the function is held").collect()
+}
+
+fn named(name: &str) -> PrivilegeHolder<'_> {
+    PrivilegeHolder::Role(name.into())
+}
+
+/// PostgreSQL 18.6 reads a new function's entries as `acldefault` gives them,
+/// `{=X/fown,fown=X/fown}`.
+#[test]
+fn a_new_function_is_held_by_public_and_its_owner() {
+    let db = parse(
+        "CREATE ROLE fown;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         ALTER FUNCTION f() OWNER TO fown;",
+    )
+    .expect("schema parses");
+
+    assert_eq!(holders(&db), [PrivilegeHolder::Public, named("fown")]);
+}
+
+/// `{fown=X/fown,fanon=X/fown}` after the revoke and the grant.
+#[test]
+fn a_revoke_from_public_leaves_the_owner_and_the_grantees() {
+    let db = parse(
+        "CREATE ROLE fown; CREATE ROLE fanon;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         ALTER FUNCTION f() OWNER TO fown;
+         REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION f() TO fanon;",
+    )
+    .expect("schema parses");
+
+    assert_eq!(holders(&db), [named("fown"), named("fanon")]);
+}
+
+/// The owner holds one entry, `{fanon=X/fown,fown=X/fown}` once it revoked
+/// its own and granted it back, and one when granted what it already held.
+#[test]
+fn the_owner_is_listed_once() {
+    let db = parse(
+        "CREATE ROLE fown; CREATE ROLE fanon;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         ALTER FUNCTION f() OWNER TO fown;
+         REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION f() TO fanon;
+         REVOKE EXECUTE ON FUNCTION f() FROM fown;
+         GRANT EXECUTE ON FUNCTION f() TO fown;",
+    )
+    .expect("schema parses");
+    assert_eq!(holders(&db), [named("fanon"), named("fown")]);
+
+    let regranted = parse(
+        "CREATE ROLE fown;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         ALTER FUNCTION f() OWNER TO fown;
+         GRANT EXECUTE ON FUNCTION f() TO \"fown\";",
+    )
+    .expect("schema parses");
+    assert_eq!(holders(&regranted), [PrivilegeHolder::Public, named("fown")]);
+}
+
+/// `{fown=X/fown,fanon=X/fown}` for a function `fown` creates under these
+/// defaults.
+#[test]
+fn a_default_privilege_grant_is_listed() {
+    let db = parse(
+        "CREATE ROLE fown; CREATE ROLE fanon;
+         ALTER DEFAULT PRIVILEGES FOR ROLE fown GRANT EXECUTE ON FUNCTIONS TO fanon;
+         ALTER DEFAULT PRIVILEGES FOR ROLE fown REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+         SET ROLE fown;
+         CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';",
+    )
+    .expect("schema parses");
+
+    assert_eq!(holders(&db), [named("fown"), named("fanon")]);
+}
+
+/// A grantee is listed by its stored name, whether or not the schema declares
+/// it, and a keyword grantee as the principal PostgreSQL resolved it from.
+#[test]
+fn undeclared_and_keyword_grantees_are_listed_as_written() {
+    let db = open_world(
+        "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION f() TO Ghost, \"Quoted\", CURRENT_USER;",
+    )
+    .expect("the open world lets undeclared roles through");
+
+    assert_eq!(
+        holders(&db),
+        [
+            named("ghost"),
+            named("Quoted"),
+            PrivilegeHolder::SessionPrincipal(SessionPrincipal::CurrentUser)
+        ]
+    );
+}
+
+/// An account written as MySQL's `'user'@'host'` is no role name to fold, so
+/// the entry keeps it as written.
+#[test]
+fn an_account_grantee_is_listed_as_written() {
+    let db = ParseOptions::default()
+        .with_access_resolution(AccessResolution::OpenWorld)
+        .parse::<GenericDialect>(
+            "CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+             GRANT EXECUTE ON FUNCTION f TO 'app'@'%';",
+        )
+        .expect("the open world lets the account through");
+
+    assert_eq!(holders(&db), [PrivilegeHolder::Public, named("'app'@'%'")]);
 }

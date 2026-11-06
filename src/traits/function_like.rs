@@ -11,7 +11,7 @@ use sqlparser::ast::{
 use crate::{
     errors::{HelperSetError, LookupError},
     impls::{body_calls, body_expression, body_reads, helper_set},
-    structs::{Deployment, FunctionBody, FunctionKind, HelperSet, TargetName},
+    structs::{Deployment, FunctionBody, FunctionKind, HelperSet, PrivilegeHolder, TargetName},
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
         call_typing::{
@@ -1358,6 +1358,56 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         role: &<Self::DB as DatabaseLike>::Role,
         database: &Self::DB,
     ) -> Result<bool, LookupError>;
+
+    /// Returns who holds `EXECUTE` on the function directly, the entries
+    /// `aclexplode` lists for its access list.
+    ///
+    /// `PUBLIC` comes first while it holds the privilege, then the role
+    /// [`owner`](FunctionLike::owner) names while its own entry holds, then
+    /// every other grantee in the order first granted, each role once and by
+    /// the name PostgreSQL stores, declared or not. A `CURRENT_USER`,
+    /// `CURRENT_ROLE` or `SESSION_USER` grantee is listed as the principal
+    /// PostgreSQL resolved to a role when the statement ran. A role holding
+    /// the privilege only through a membership is not listed, which
+    /// [`can_execute`](FunctionLike::can_execute) answers for one role.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE app_owner;
+    /// CREATE ROLE authenticated;
+    /// CREATE FUNCTION f() RETURNS INT LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+    /// ALTER FUNCTION f() OWNER TO app_owner;
+    /// REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;
+    /// GRANT EXECUTE ON FUNCTION f() TO authenticated;
+    /// ",
+    /// )?;
+    /// let f = db
+    ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let holders: Vec<_> = f.execute_holders(&db)?.collect();
+    /// assert_eq!(
+    ///     holders,
+    ///     [PrivilegeHolder::Role("app_owner".into()), PrivilegeHolder::Role("authenticated".into())]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn execute_holders<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = PrivilegeHolder<'db>>, LookupError>;
 
     /// Returns whether `role` may grant `EXECUTE` on the function to other
     /// roles.

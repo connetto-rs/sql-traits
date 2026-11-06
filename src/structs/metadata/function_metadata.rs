@@ -1,12 +1,20 @@
 //! Submodule defining a `FunctionMetadata` struct.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
-use sqlparser::ast::{CreateFunction, CreateRole, Grantee, Ident};
+use sqlparser::ast::{CreateFunction, CreateRole, Grantee, GranteeName, Ident};
 
 use crate::{
-    impls::{grantee_is_public, grantee_matches_role, grantees_match},
-    structs::{FunctionKind, metadata::ExpressionCalls},
+    impls::{
+        grantee_is_public, grantee_is_session_principal, grantee_matches_role, grantees_match,
+    },
+    structs::{FunctionKind, PrivilegeHolder, metadata::ExpressionCalls},
+    utils::{identifier_resolution::normalize_identifier, object_name::object_name_last_part},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -202,6 +210,22 @@ impl FunctionMetadata {
             || (self.execute.owner && self.is_owned_by(role))
     }
 
+    /// Returns the entries holding `EXECUTE`, `PUBLIC` first, then the owner
+    /// while its own entry holds, then each other grantee in the order first
+    /// granted, each role once.
+    pub(crate) fn execute_holders(&self) -> impl Iterator<Item = PrivilegeHolder<'_>> {
+        let owner = self.owner.as_deref().filter(|_| self.execute.owner);
+        let grantees = self.execute.grantees().map(execute_holder).filter(move |holder| {
+            !matches!(holder, PrivilegeHolder::Role(name) if Some(name.as_ref()) == owner)
+        });
+        self.execute
+            .public
+            .then_some(PrivilegeHolder::Public)
+            .into_iter()
+            .chain(owner.map(|owner| PrivilegeHolder::Role(Cow::Borrowed(owner))))
+            .chain(grantees)
+    }
+
     /// Returns whether `role` may grant `EXECUTE` on the function to others,
     /// which it may when an entry of its own carries the grant option, or when
     /// it is the recorded owner, whom ownership lets grant whatever its own
@@ -249,6 +273,21 @@ impl FunctionMetadata {
             !grantees.iter().any(|revoked| grantees_match(&grant.grantee, revoked))
         });
     }
+}
+
+/// The holder an `EXECUTE` entry of its own names, which is never `PUBLIC`.
+/// A name that is no plain identifier, such as a MySQL `'user'@'host'`, is
+/// kept as written.
+fn execute_holder(grantee: &Grantee) -> PrivilegeHolder<'_> {
+    if let Some(principal) = grantee_is_session_principal(grantee) {
+        return PrivilegeHolder::SessionPrincipal(principal);
+    }
+    if let Some(GranteeName::ObjectName(name)) = &grantee.name
+        && let Some((value, quoted)) = object_name_last_part(name)
+    {
+        return PrivilegeHolder::Role(normalize_identifier(value, quoted));
+    }
+    PrivilegeHolder::Role(Cow::Owned(grantee.to_string()))
 }
 
 /// Who holds `EXECUTE` on a function, as PostgreSQL's `pg_proc.proacl`
