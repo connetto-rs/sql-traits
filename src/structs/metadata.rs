@@ -12,6 +12,7 @@ mod index_metadata;
 pub use index_metadata::{IndexMetadata, UniqueIndexMetadata};
 mod function_metadata;
 pub use function_metadata::FunctionMetadata;
+pub(crate) use function_metadata::RangeConstructor;
 mod check_metadata;
 pub use check_metadata::CheckMetadata;
 mod expression_calls;

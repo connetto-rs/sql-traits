@@ -17,7 +17,8 @@
 //! a declared value may not name. `DROP TYPE` drops a domain as `DROP DOMAIN`
 //! does, and the user-defined types this model holds as well, refusing what
 //! uses them without `CASCADE` and dropping the columns, composite
-//! attributes, domains and ranges that use them with it.
+//! attributes, domains and ranges that use them with it. A range brings the
+//! constructor functions [`range_constructors`] records, which go with it.
 
 use alloc::{
     string::{String, ToString},
@@ -32,12 +33,13 @@ use sqlparser::ast::{
 };
 
 use super::{
-    ParserDB, ParserDBBuilder, SchemaQualifier, bind_reference,
+    DefaultPrivileges, ParserDB, ParserDBBuilder, SchemaQualifier, bind_reference,
     domains::{
         DropSpelling, Reached, bind_type, custom_name, custom_name_mut, reach_in_schema,
         reach_type, require_existing_type,
     },
-    object_name_last_identifier, place_relation, relation_name_holder, require_named_in_catalog,
+    object_name_last_identifier, place_relation, range_constructors, relation_name_holder,
+    require_named_in_catalog,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -292,19 +294,22 @@ fn creation_reaches(
 }
 
 /// Records a `CREATE TYPE`, binding the types and functions its definition
-/// names and computing the multirange a range brings.
+/// names, computing the multirange a range brings and recording a range's
+/// constructors.
 ///
 /// # Errors
 ///
 /// Refuses a name another type, a domain or the row type of a relation holds
 /// in the schema, a name a relation holds for a composite, a definition over
-/// a shell or over a type it never creates, a range without a `SUBTYPE`, and a
-/// multirange name another type holds.
+/// a shell or over a type it never creates, a range without a `SUBTYPE`, a
+/// multirange name another type holds, and a range whose schema already
+/// holds a function of a constructor's signature.
 pub(super) fn create_user_defined_type(
     builder: ParserDBBuilder,
     mut name: ObjectName,
     representation: Option<UserDefinedTypeRepresentation>,
     role: Option<&str>,
+    defaults: &DefaultPrivileges,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, ObjectKind::Type, builder.catalog_name())?;
     place_relation(&builder, &mut name, false, ObjectKind::Type, role)?;
@@ -373,6 +378,7 @@ pub(super) fn create_user_defined_type(
             kept
         });
     }
+    let builder = range_constructors::create_range_constructors(builder, &node, defaults)?;
     Ok(builder.add_user_defined_type(node, calls))
 }
 
@@ -776,6 +782,11 @@ fn drop_positions(
     if cascade {
         builder = drop_dependents_cascade(builder, &doomed_owned)?;
     }
+    // A range takes its constructors along, after a cascade has dropped the
+    // columns of its type and the checks on them.
+    range_constructors::drop_range_constructors(&mut builder, |position| {
+        doomed_user_type(&doomed_owned, position)
+    })?;
 
     // Remove the doomed, domains and user-defined types alike.
     let mut domain_position = 0;
@@ -1089,7 +1100,7 @@ fn resolve_named_type(
 }
 
 /// Replaces the last identifier of `stored` with `new_name`.
-fn rewrite_last_ident(stored: &mut ObjectName, new_name: &Ident) {
+pub(super) fn rewrite_last_ident(stored: &mut ObjectName, new_name: &Ident) {
     stored.0.pop();
     stored.0.push(ObjectNamePart::Identifier(new_name.clone()));
 }
@@ -1182,6 +1193,7 @@ fn alter_type_rename(
             rewrite_last_ident(&mut domain.name, new_name);
         }
         Doomed::UserType(position) if !is_multirange => {
+            range_constructors::follow_range_rename(&mut builder, position, new_name);
             let (type_, _) = &mut builder.user_defined_types_mut()[position];
             let type_ = Arc::make_mut(type_);
             rewrite_last_ident(&mut type_.name, new_name);
@@ -1370,6 +1382,12 @@ pub(super) fn follow_schema_rename(
             for name in representation {
                 retarget(name);
             }
+        }
+    }
+    // The constructors of a moved range follow it.
+    for (_, metadata) in builder.functions_mut() {
+        if let Some(constructor) = metadata.range_constructor_mut() {
+            retarget(&mut constructor.range);
         }
     }
     // A domain over a moved type follows it to the new schema.

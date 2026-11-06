@@ -97,6 +97,7 @@ mod partition_keys;
 mod postgres_18_collations;
 mod postgres_builtins;
 mod postgres_catalog;
+mod range_constructors;
 mod revocations;
 mod role_memberships;
 mod routine_privileges;
@@ -8209,6 +8210,9 @@ impl ParserDB {
                         (None, creator.function_metadata(schema, builder.identifier_case()))
                     };
                     metadata.set_null_returning_arguments(&[]);
+                    // PostgreSQL drops the dependency on a range whose
+                    // constructor a replacement takes over.
+                    metadata.set_range_constructor(None);
                     metadata.set_body_calls(body_calls);
                     default_privileges::require_creator_executes(
                         &builder,
@@ -8258,6 +8262,15 @@ impl ParserDB {
                             return Err(crate::errors::Error::FunctionRequiredByExtension {
                                 function_name: function_name.to_string(),
                                 extension_name: extension.value.clone(),
+                            });
+                        }
+                        if let Some(constructor) = metadata.range_constructor() {
+                            return Err(crate::errors::Error::FunctionRequiredByType {
+                                function_name: function_name.to_string(),
+                                type_name: range_constructors::requiring_type(
+                                    &builder,
+                                    constructor,
+                                ),
                             });
                         }
                         if builder.is_function_used(function, &dropping) {
@@ -9554,6 +9567,7 @@ impl ParserDB {
                         name,
                         representation,
                         session_roles.creating_role(),
+                        &default_privileges,
                     )?;
                 }
                 Statement::AlterType(alter) => {

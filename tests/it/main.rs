@@ -99,6 +99,7 @@ mod propagated_constraints;
 mod public_principals;
 mod public_schema;
 mod query_outputs;
+mod range_constructors;
 mod reader_identifier_rules;
 mod recursive_cte_identifier_context;
 mod reference_binding;
