@@ -92,6 +92,17 @@ fn a_member_of_the_owner_grants_as_the_owner_unless_it_holds_the_option() {
         table_grantors(&database),
         [("member_r".to_owned(), Some("owner_r")), ("reader".to_owned(), Some("member_r"))]
     );
+
+    let database = parse(
+        "SET ROLE owner_r; CREATE TABLE app.t (id INT);
+         GRANT SELECT ON app.t TO other_r WITH GRANT OPTION; RESET ROLE;
+         SET ROLE member_r; GRANT SELECT ON app.t TO reader; RESET ROLE;",
+    );
+    assert_eq!(
+        table_grantors(&database),
+        [("other_r".to_owned(), Some("owner_r")), ("reader".to_owned(), Some("owner_r"))],
+        "another role's option leaves the member granting as the owner"
+    );
 }
 
 #[test]
@@ -136,12 +147,74 @@ fn a_default_privilege_records_the_owner_it_belongs_to() {
 }
 
 #[test]
-fn granted_by_current_user_names_the_role_set() {
+fn a_session_principal_in_granted_by_names_the_role_it_stands_for() {
     let database = parse(
         "SET ROLE owner_r; CREATE TABLE app.t (id INT);
          GRANT SELECT ON app.t TO reader GRANTED BY CURRENT_USER; RESET ROLE;",
     );
     assert_eq!(table_grantors(&database), [("reader".to_owned(), Some("owner_r"))]);
+
+    let database = parse(
+        "SET ROLE owner_r; CREATE TABLE app.t (id INT); RESET ROLE;
+         GRANT SELECT ON app.t TO reader GRANTED BY SESSION_USER;",
+    );
+    assert_eq!(
+        table_grantors(&database),
+        [("reader".to_owned(), Some("owner_r"))],
+        "the session role is the superuser postgres, which grants as the owner"
+    );
+}
+
+#[test]
+fn all_privileges_are_granted_through_an_option_on_all_of_them() {
+    let database = parse(
+        "CREATE TABLE app.t (id INT);
+         GRANT ALL ON app.t TO other_r WITH GRANT OPTION;
+         SET ROLE other_r; GRANT ALL ON app.t TO reader; RESET ROLE;",
+    );
+    assert_eq!(
+        table_grantors(&database),
+        [("other_r".to_owned(), Some("postgres")), ("reader".to_owned(), Some("other_r"))]
+    );
+}
+
+#[test]
+fn a_role_holding_some_of_the_options_grants_as_itself() {
+    let database = parse(
+        "CREATE TABLE app.t (id INT, c INT);
+         GRANT SELECT (c) ON app.t TO other_r WITH GRANT OPTION;
+         GRANT UPDATE ON app.t TO other_r WITH GRANT OPTION;
+         SET ROLE other_r; GRANT SELECT, UPDATE ON app.t TO reader; RESET ROLE;",
+    );
+    assert_eq!(
+        table_grantors(&database),
+        [("other_r".to_owned(), Some("postgres")), ("reader".to_owned(), Some("other_r"))],
+        "an option on one column does not cover the whole table"
+    );
+}
+
+#[test]
+fn an_option_reached_along_two_memberships_names_its_holder() {
+    let database = parse(
+        "CREATE ROLE team_a; CREATE ROLE team_b; CREATE ROLE holders;
+         GRANT team_a, team_b TO member_r; GRANT holders TO team_a, team_b;
+         CREATE TABLE app.t (id INT);
+         GRANT SELECT ON app.t TO holders WITH GRANT OPTION;
+         SET ROLE member_r; GRANT SELECT ON app.t TO reader; RESET ROLE;",
+    );
+    assert_eq!(
+        table_grantors(&database),
+        [("holders".to_owned(), Some("postgres")), ("reader".to_owned(), Some("holders"))]
+    );
+}
+
+#[test]
+fn a_sequence_grant_answers_no_grantor_since_its_owner_is_unknown() {
+    let database = parse(
+        "SET ROLE owner_r; CREATE SEQUENCE app.s; RESET ROLE;
+         GRANT USAGE ON SEQUENCE app.s TO reader;",
+    );
+    assert_eq!(table_grantors(&database), [("reader".to_owned(), None)]);
 }
 
 #[test]
@@ -151,6 +224,25 @@ fn the_grantor_follows_an_owner_change_and_a_rename() {
          ALTER VIEW app.v OWNER TO owner_r;",
     );
     assert_eq!(table_grantors(&database), [("reader".to_owned(), Some("owner_r"))]);
+
+    let database = parse(
+        "CREATE VIEW app.v AS SELECT 1 AS x; GRANT SELECT ON app.v TO reader;
+         ALTER VIEW app.v OWNER TO postgres;",
+    );
+    assert_eq!(
+        table_grantors(&database),
+        [("reader".to_owned(), Some("postgres"))],
+        "handing a view to its owner changes nothing"
+    );
+
+    let database = parse(
+        "CREATE MATERIALIZED VIEW app.m AS SELECT 1 AS x; GRANT SELECT ON app.m TO reader;
+         ALTER MATERIALIZED VIEW app.m OWNER TO owner_r; GRANT SELECT ON app.m TO other_r;",
+    );
+    assert_eq!(
+        table_grantors(&database),
+        [("reader".to_owned(), Some("owner_r")), ("other_r".to_owned(), Some("owner_r"))]
+    );
 
     let database = parse(
         "SET ROLE owner_r; CREATE TABLE app.t (id INT); GRANT SELECT ON app.t TO reader; RESET ROLE;
