@@ -126,13 +126,55 @@ fn dropping_public_counts_what_it_holds() {
     assert_eq!(db.functions().filter(|function| function.name() == "f").count(), 0);
 }
 
+/// `public` stays owned by `pg_database_owner` whatever role applies the DDL,
+/// until an owner change or a recreation.
 #[test]
-fn public_can_be_given_an_owner() {
+fn public_starts_owned_by_pg_database_owner() {
+    let owner = |db: &ParserDB, schema: &str| {
+        db.schema(schema).expect("schema is listed").authorization().map(str::to_owned)
+    };
+    let db = parse("CREATE TABLE t (a INT);").expect("t lands in public");
+    assert_eq!(owner(&db, "public"), Some("pg_database_owner".to_owned()));
+    let db = ParseOptions::default()
+        .with_session_role("migrator")
+        .parse::<PostgreSqlDialect>("CREATE ROLE migrator; CREATE TABLE t (a INT);")
+        .expect("t lands in public");
+    assert_eq!(owner(&db, "public"), Some("pg_database_owner".to_owned()));
+    let db = parse("ALTER SCHEMA public RENAME TO main;").expect("public can be renamed");
+    assert_eq!(owner(&db, "main"), Some("pg_database_owner".to_owned()));
+
     let db = parse("CREATE ROLE pub_owner; ALTER SCHEMA public OWNER TO pub_owner;")
         .expect("public can be re-owned");
-    let (public, ()) =
-        db.schemas().find(|(schema, ())| schema.name() == "public").expect("public is listed");
-    assert_eq!(public.authorization(), Some("pub_owner"));
+    assert_eq!(owner(&db, "public"), Some("pub_owner".to_owned()));
+    let db = parse("DROP SCHEMA public; CREATE SCHEMA public;").expect("public can be created");
+    assert_eq!(owner(&db, "public"), None, "a recreated public belongs to its creator");
+
+    let db =
+        ParserDB::parse::<GenericDialect>("CREATE TABLE t (a INT);").expect("t lands in public");
+    assert_eq!(owner(&db, "public"), None, "only PostgreSQL has the predefined role");
+}
+
+/// Grants, revokes and owner changes may name `public`'s owner without a
+/// `CREATE ROLE`.
+#[test]
+fn pg_database_owner_needs_no_create_role() {
+    let sql = "CREATE SCHEMA app; CREATE TABLE app.t (a INT);
+         GRANT USAGE ON SCHEMA app TO pg_database_owner;
+         REVOKE CREATE ON SCHEMA public FROM \"pg_database_owner\";
+         ALTER TABLE app.t OWNER TO PG_DATABASE_OWNER;
+         ALTER SCHEMA app OWNER TO pg_database_owner;";
+    let db = parse(sql).expect("every PostgreSQL database holds pg_database_owner");
+    assert_eq!(db.schema("app").expect("app is listed").authorization(), Some("pg_database_owner"));
+    assert!(db.role("pg_database_owner").is_none(), "the role is not declared");
+    assert!(db.validate_access_targets().is_ok());
+
+    let refused =
+        ParserDB::parse::<GenericDialect>("GRANT USAGE ON SCHEMA public TO pg_database_owner;");
+    assert!(
+        matches!(&refused, Err(Error::RoleNotFoundForGrant { role_name })
+            if role_name == "pg_database_owner"),
+        "got {refused:?}"
+    );
 }
 
 /// The catalog lists `public` from the start, under every dialect, and stops

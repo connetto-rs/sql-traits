@@ -175,8 +175,12 @@ impl SchemaProfile for SqlparserProfile {
         })
     }
 
-    fn initial_schemas() -> impl IntoIterator<Item = (Arc<Schema>, ())> {
-        [(Arc::new(Schema::initial_public()), ())]
+    fn initial_schemas(dialect: &SqlparserDialect) -> impl IntoIterator<Item = (Arc<Schema>, ())> {
+        // PostgreSQL 15 and later hand `public` to the database owner's
+        // predefined role.
+        let owner = matches!(dialect, SqlparserDialect::PostgreSql)
+            .then(|| String::from(PG_DATABASE_OWNER));
+        [(Arc::new(Schema::initial_public(owner)), ())]
     }
 
     fn is_foreign_table(metadata: &TableMetadata<CreateTable>) -> bool {
@@ -3146,6 +3150,22 @@ fn role_matches_lookup_ident(role: &CreateRole, lookup_ident: &Ident) -> bool {
     })
 }
 
+/// The predefined role standing for whoever owns the database, which owns
+/// `public` from creation.
+const PG_DATABASE_OWNER: &str = "pg_database_owner";
+
+/// Whether `role_ident` names `pg_database_owner`, a role every PostgreSQL
+/// database holds without a `CREATE ROLE`.
+fn names_pg_database_owner(dialect: SqlparserDialect, role_ident: &Ident) -> bool {
+    matches!(dialect, SqlparserDialect::PostgreSql)
+        && identifiers_match(
+            &role_ident.value,
+            role_ident.quote_style.is_some(),
+            PG_DATABASE_OWNER,
+            false,
+        )
+}
+
 fn stored_role_name(role_ident: &Ident) -> String {
     normalize_identifier(&role_ident.value, role_ident.quote_style.is_some()).into_owned()
 }
@@ -3238,7 +3258,9 @@ fn validate_owner_role_ident(
     role_ident: &Ident,
     object_name: &str,
 ) -> Result<(), crate::errors::Error> {
-    if builder.roles().iter().any(|(role, ())| role_matches_lookup_ident(role, role_ident)) {
+    if builder.roles().iter().any(|(role, ())| role_matches_lookup_ident(role, role_ident))
+        || names_pg_database_owner(*builder.dialect(), role_ident)
+    {
         return Ok(());
     }
 
@@ -4381,7 +4403,8 @@ fn validate_declared_column(
 
 /// Enforces [`AccessResolution::ClosedWorld`] on one `GRANT` or `REVOKE`: every
 /// relation target names a table, a view or a sequence, and every grantee
-/// names a role, that the input has created up to this statement.
+/// names a role, that the input has created up to this statement, or
+/// `pg_database_owner`.
 ///
 /// The two statements carry the same targets and the database answers for them
 /// alike, reporting an absent relation before an absent role, which is the
@@ -4411,7 +4434,8 @@ fn validate_access_targets_against_builder(
         };
 
         let role_exists =
-            builder.roles().iter().any(|(role, ())| role_matches_lookup_ident(role, grantee_ident));
+            builder.roles().iter().any(|(role, ())| role_matches_lookup_ident(role, grantee_ident))
+                || names_pg_database_owner(*builder.dialect(), grantee_ident);
         if !role_exists {
             return Err(crate::errors::Error::RoleNotFoundForGrant {
                 role_name: grantee_ident.value.clone(),
@@ -4860,7 +4884,8 @@ pub type ParserDB = GenericDB<SqlparserProfile>;
 /// same role unresolved and are reported apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnresolvedAccessReference<'a> {
-    /// A grantee naming a role no `CREATE ROLE` in the input creates.
+    /// A grantee naming a role no `CREATE ROLE` in the input creates, other
+    /// than PostgreSQL's `pg_database_owner`.
     GranteeRole(&'a Ident),
     /// A grant target naming a relation no table, view or sequence the input
     /// creates holds.
@@ -5281,6 +5306,9 @@ impl ParserDB {
         let declares = |role_ident: &Ident| {
             self.roles.iter().any(|(role, ())| role_matches_lookup_ident(role.as_ref(), role_ident))
         };
+        let names_grantee = |role_ident: &Ident| {
+            declares(role_ident) || names_pg_database_owner(self.dialect, role_ident)
+        };
 
         let mut unresolved = BTreeSet::new();
         for grant in grants {
@@ -5288,7 +5316,7 @@ impl ParserDB {
                 let Some(grantee_ident) = grantee_role_ident(grantee) else {
                     continue;
                 };
-                if !declares(grantee_ident) {
+                if !names_grantee(grantee_ident) {
                     unresolved.insert(UnresolvedAccessReference::GranteeRole(grantee_ident));
                 }
             }
@@ -5310,7 +5338,7 @@ impl ParserDB {
             for grantee_ident in
                 metadata.execute_privileges().grantees().filter_map(grantee_role_ident)
             {
-                if !declares(grantee_ident) {
+                if !names_grantee(grantee_ident) {
                     unresolved.insert(UnresolvedAccessReference::GranteeRole(grantee_ident));
                 }
             }

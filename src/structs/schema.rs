@@ -94,10 +94,14 @@ impl Schema {
         Self { authorization: Some(authorization), ..Self::with_quoted(name, quoted) }
     }
 
-    /// The `public` schema a new PostgreSQL database holds, on which `PUBLIC`
-    /// holds `USAGE`.
-    pub(crate) fn initial_public() -> Self {
-        Self { public_usage: true, ..Self::with_quoted("public".into(), false) }
+    /// The `public` schema a new database holds, owned by `owner`, on which
+    /// `PUBLIC` holds `USAGE`.
+    pub(crate) fn initial_public(owner: Option<String>) -> Self {
+        Self {
+            authorization: owner,
+            public_usage: true,
+            ..Self::with_quoted("public".into(), false)
+        }
     }
 
     /// This schema under another name, keeping its owner and entries.

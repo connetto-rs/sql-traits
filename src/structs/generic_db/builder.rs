@@ -553,6 +553,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     #[must_use]
     /// Creates a new `GenericDBBuilder` instance.
     pub fn new(catalog_name: String, dialect: P::Dialect) -> Self {
+        let schemas = P::initial_schemas(&dialect).into_iter().collect();
         Self {
             dialect,
             catalog_name,
@@ -577,7 +578,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             check_constraints: Vec::new(),
             roles: Vec::new(),
             role_memberships: Vec::new(),
-            schemas: P::initial_schemas().into_iter().collect(),
+            schemas,
             table_grants: Vec::new(),
             column_grants: Vec::new(),
             search_path: Self::default_search_path(),

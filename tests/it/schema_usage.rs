@@ -124,6 +124,18 @@ fn public_keeps_its_entry_through_a_rename_and_an_owner_change() {
 }
 
 #[test]
+fn public_hands_pg_database_owners_entry_to_a_new_owner() {
+    let revoked = "REVOKE USAGE ON SCHEMA public FROM PUBLIC;";
+    let database = parse(&format!("{revoked} ALTER SCHEMA public OWNER TO o;"));
+    assert!(usage(&database, "o", "public"));
+    let database = parse(&format!(
+        "{revoked} REVOKE USAGE ON SCHEMA public FROM pg_database_owner;
+         ALTER SCHEMA public OWNER TO o;"
+    ));
+    assert!(!usage(&database, "o", "public"), "a revoked owner entry stays revoked");
+}
+
+#[test]
 fn an_owner_change_merges_the_old_owners_grants_into_the_new_owners() {
     let database = parse(
         "CREATE SCHEMA v AUTHORIZATION o;
