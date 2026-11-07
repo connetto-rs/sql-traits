@@ -219,6 +219,7 @@ pub(super) fn losing_not_null(
                 .columns
                 .iter()
                 .any(|declared| column.matches(&declared.name) && super::states_not_null(declared))
+                || super::table_not_null(parent, &column.ident()).is_some()
         },
     )
 }
@@ -488,6 +489,15 @@ pub(super) fn requires_a_value(
                     .options
                     .iter()
                     .any(|option| matches!(option.option, ColumnOption::NotNull))
+            }) || parent.constraints.iter().any(|constraint| {
+                matches!(constraint, TableConstraint::NotNull(not_null)
+                if !not_null.no_inherit
+                && super::identifiers_match(
+                    &not_null.column.value,
+                    not_null.column.quote_style.is_some(),
+                    column,
+                    false,
+                ))
             })
         })
     })
@@ -652,6 +662,7 @@ pub(super) fn same_column(left: &Ident, right: &Ident) -> bool {
 pub(super) fn passes_down(kind: ParentKind, constraint: &TableConstraint) -> bool {
     match constraint {
         TableConstraint::Check(check) => !check.no_inherit,
+        TableConstraint::NotNull(not_null) => !not_null.no_inherit,
         _ => kind == ParentKind::PartitionOf,
     }
 }
@@ -734,6 +745,7 @@ fn without_generated_name(constraint: &TableConstraint) -> TableConstraint {
             unique.index_name = None;
         }
         TableConstraint::Check(check) => stored_check(check),
+        TableConstraint::NotNull(not_null) => not_null.name = None,
         _ => {}
     }
     bare
@@ -752,6 +764,7 @@ pub(super) fn declared_name(constraint: &TableConstraint) -> Option<&Ident> {
         TableConstraint::Unique(unique) => unique.name.as_ref(),
         TableConstraint::PrimaryKey(primary_key) => primary_key.name.as_ref(),
         TableConstraint::ForeignKey(foreign_key) => foreign_key.name.as_ref(),
+        TableConstraint::NotNull(not_null) => not_null.name.as_ref(),
         _ => None,
     }
 }
@@ -1104,6 +1117,97 @@ pub(super) struct Inherited {
     pub(super) column_metadata: Vec<super::PreservedColumnMetadata>,
 }
 
+/// Copies one constraint from a parent into the child's list.
+///
+/// A requirement the child states on its own column is the child's own, and
+/// the parent's spelling of it adds nothing.
+///
+/// # Errors
+///
+/// Returns `Error::InheritedConstraintConflict` when the copy's name, if it
+/// carries one, is already taken by a constraint it cannot merge with, which
+/// PostgreSQL refuses.
+fn copy_parent_constraint(
+    builder: &ParserDBBuilder,
+    kind: ParentKind,
+    create_table: &CreateTable,
+    constraint: &TableConstraint,
+    taken: &mut Vec<Ident>,
+    constraints: &mut Vec<TableConstraint>,
+    child_name: &str,
+) -> Result<(), Error> {
+    if let TableConstraint::NotNull(not_null) = constraint
+        && create_table.columns.iter().any(|declared| {
+            same_column(&declared.name, &not_null.column) && super::states_not_null(declared)
+        })
+    {
+        return Ok(());
+    }
+    if holds_constraint(create_table, constraint)
+        || constraints.iter().any(|held| is_copy_of(held, constraint))
+    {
+        return Ok(());
+    }
+    let Some(copy) = received_constraint(builder, kind, create_table, constraint, taken) else {
+        return Ok(());
+    };
+    // A child holding an exact copy was merged above, so a name still taken
+    // here belongs to a constraint the arriving one cannot merge with.
+    if let Some(name) = declared_name(&copy)
+        && (create_table
+            .constraints
+            .iter()
+            .any(|held| super::table_constraint_has_name(held, name))
+            || constraints.iter().any(|held| super::table_constraint_has_name(held, name)))
+    {
+        return Err(Error::InheritedConstraintConflict {
+            table_name: child_name.to_owned(),
+            constraint_name: name.value.clone(),
+        });
+    }
+    constraints.push(copy);
+    Ok(())
+}
+
+/// A `NOT NULL` a parent writes on the table states a requirement on the
+/// child's column, which the child's copy of it carries the way a column
+/// option would.
+///
+/// # Errors
+///
+/// Returns [`Error::ParentTableNotFound`] when a parent was never created.
+fn apply_not_null_options(
+    builder: &ParserDBBuilder,
+    parents: &[(ParentKind, ObjectName)],
+    child_name: &str,
+    columns: &mut [ColumnDef],
+) -> Result<(), Error> {
+    for (kind, parent_name) in parents {
+        let parent = resolve_parent(builder, parent_name, child_name)?;
+        for constraint in &parent.constraints {
+            let TableConstraint::NotNull(not_null) = constraint else {
+                continue;
+            };
+            if !passes_down(*kind, constraint) {
+                continue;
+            }
+            for column in columns.iter_mut() {
+                if same_column(&column.name, &not_null.column)
+                    && !column
+                        .options
+                        .iter()
+                        .any(|held| matches!(held.option, ColumnOption::NotNull))
+                {
+                    column
+                        .options
+                        .push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Gives the node the columns and constraints its parents pass down, answering
 /// what it took from a parent rather than declaring itself.
 ///
@@ -1179,36 +1283,20 @@ pub(super) fn apply_parents(
         }
 
         for constraint in &parent.constraints {
-            if holds_constraint(create_table, constraint)
-                || constraints.iter().any(|held| is_copy_of(held, constraint))
-            {
-                continue;
-            }
-            let Some(copy) =
-                received_constraint(builder, *kind, create_table, constraint, &mut taken)
-            else {
-                continue;
-            };
-            // A child holding an exact copy was merged above, so a name still
-            // taken here belongs to a constraint the arriving one cannot merge
-            // with, which PostgreSQL refuses.
-            if let Some(name) = declared_name(&copy)
-                && (create_table
-                    .constraints
-                    .iter()
-                    .any(|held| super::table_constraint_has_name(held, name))
-                    || constraints.iter().any(|held| super::table_constraint_has_name(held, name)))
-            {
-                return Err(Error::InheritedConstraintConflict {
-                    table_name: child_name.clone(),
-                    constraint_name: name.value.clone(),
-                });
-            }
-            constraints.push(copy);
+            copy_parent_constraint(
+                builder,
+                *kind,
+                create_table,
+                constraint,
+                &mut taken,
+                &mut constraints,
+                &child_name,
+            )?;
         }
     }
 
     merge_local_columns(&context, &create_table.columns, &mut columns, &column_metadata)?;
+    apply_not_null_options(builder, &parents, &child_name, &mut columns)?;
 
     column_metadata.retain(|metadata| {
         !local_collations.iter().any(|local| {

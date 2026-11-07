@@ -1196,6 +1196,72 @@ pub enum Error {
         /// Name of the partitioned table.
         table_name: String,
     },
+    #[error("Cannot add a `NO INHERIT` not-null constraint to partitioned table `{table_name}`.")]
+    /// Error indicating that a `NO INHERIT` table-level `NOT NULL` was written
+    /// on a partitioned table, which PostgreSQL refuses because a partitioned
+    /// table's not-null constraints are enforced on its partitions.
+    NoInheritNotNullOnPartitionedTable {
+        /// Name of the partitioned table.
+        table_name: String,
+    },
+    #[error(
+        "Column `{column_name}` of table `{table_name}` is written `NOT NULL` under both `{first_name}` and `{second_name}`."
+    )]
+    /// Error indicating that one table-level `NOT NULL` constraint of a table
+    /// is written twice under two different names, which PostgreSQL refuses
+    /// because the two spellings are one constraint and carry one name.
+    ConflictingNotNullConstraintNames {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the column the constraint holds.
+        column_name: String,
+        /// Name of the first spelling.
+        first_name: String,
+        /// Name of the second spelling.
+        second_name: String,
+    },
+    #[error(
+        "Table `{table_name}` writes a `NO INHERIT` not-null constraint on column `{column_name}` beside another spelling of it."
+    )]
+    /// Error indicating that a `NO INHERIT` table-level `NOT NULL` of a table
+    /// meets another spelling of the same requirement, a column option or a
+    /// second table-level one, which PostgreSQL refuses because the two
+    /// spellings are one constraint that cannot hold both inheritabilities.
+    ConflictingNoInheritNotNull {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the column the constraint holds.
+        column_name: String,
+    },
+    #[error(
+        "Cannot create not-null constraint `{constraint_name}` on column `{column_name}` of table `{table_name}`, a not-null constraint named `{existing_name}` already exists for that column."
+    )]
+    /// Error indicating that `ALTER TABLE ... ADD CONSTRAINT ... NOT NULL`
+    /// named a column the table already requires a value of, whichever
+    /// spelling states it, so PostgreSQL refuses the second requirement.
+    NotNullConstraintAlreadyExists {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the column the constraint would hold.
+        column_name: String,
+        /// Name the statement wrote for the arriving constraint.
+        constraint_name: String,
+        /// Name of the requirement the column already holds.
+        existing_name: String,
+    },
+    #[error(
+        "Cannot change the `NO INHERIT` status of not-null constraint `{constraint_name}` on table `{table_name}`."
+    )]
+    /// Error indicating that a statement would flip the inheritability of a
+    /// table's not-null requirement, either by adding a `NOT NULL` of another
+    /// status beside the one the column already holds or by `SET NOT NULL`
+    /// over a `NO INHERIT` requirement, which PostgreSQL refuses.
+    NotNullNoInheritStatusChange {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the requirement the column already holds.
+        constraint_name: String,
+    },
     #[error(
         "Column `{column_name}` of table `{table_name}` must require a value before `ONLY` may add a primary key above it."
     )]

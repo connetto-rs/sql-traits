@@ -130,6 +130,7 @@ impl<'node> Slot<'node> {
                 held: ColumnOptionDef { option: ColumnOption::NotNull, .. },
                 ..
             } => Some(&def.name),
+            Self::Table(_, TableConstraint::NotNull(not_null)) => Some(&not_null.column),
             _ => None,
         }
     }
@@ -177,6 +178,9 @@ impl<'node> Slot<'node> {
                             Some(generated_names::index_columns_part(&columns, &exclude.include)?),
                             "excl",
                         )
+                    }
+                    TableConstraint::NotNull(not_null) => {
+                        constraint(Some(generated_names::column_part(&not_null.column)), "not_null")
                     }
                     _ => None,
                 }
@@ -243,28 +247,91 @@ fn keys(slots: &[Slot<'_>]) -> Vec<String> {
 
 /// The name each slot of the node answers to: the one written, else the one
 /// PostgreSQL gave it, as PostgreSQL stores either.
+///
+/// A `NOT NULL` written on a column and on the table is one constraint, so the
+/// slots of the pair answer alike to the pair's name.
 pub(super) fn names<'a>(
     node: &'a CreateTable,
     recorded: &'a [GeneratedConstraintName],
 ) -> Vec<(Slot<'a>, Option<Cow<'a, str>>)> {
     let slots = slots(node);
     let keys = keys(&slots);
-    slots
-        .into_iter()
-        .zip(keys)
+    let mut named: Vec<(Slot<'a>, Option<Cow<'a, str>>)> = slots
+        .iter()
+        .zip(&keys)
         .map(|(slot, key)| {
             let name = match slot.declared_name() {
                 Some(declared) => Some(stored_ident_name(declared)),
                 None => {
                     recorded
                         .iter()
-                        .find(|generated| generated.slot == key)
+                        .find(|generated| generated.slot == *key)
                         .map(|generated| Cow::Borrowed(generated.name.as_str()))
                 }
             };
-            (slot, name)
+            (*slot, name)
         })
-        .collect()
+        .collect();
+    for (index, partner) in slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| matches!(slot, &Slot::Table(_, TableConstraint::NotNull(_))))
+        .filter_map(|(index, _)| {
+            not_null_partner_index(&slots, index).map(|partner| (index, partner))
+        })
+    {
+        // The table's spelling holds the pair's name, the option's spelling
+        // only where the table's carries none.
+        let pair = named[index].1.clone().or_else(|| named[partner].1.clone());
+        named[index].1.clone_from(&pair);
+        named[partner].1 = pair;
+    }
+    named
+}
+
+/// The slot that holds the name of the requirement the slot at `index` is a
+/// spelling of: the column's `NOT NULL` option, an earlier entry of the same
+/// requirement, or a table entry the column spells.
+fn not_null_partner_index(slots: &[Slot<'_>], index: usize) -> Option<usize> {
+    let (column, is_table) = match &slots[index] {
+        Slot::Table(_, TableConstraint::NotNull(not_null)) => (&not_null.column, true),
+        Slot::Column {
+            def, held: ColumnOptionDef { option: ColumnOption::NotNull, .. }, ..
+        } => (&def.name, false),
+        _ => return None,
+    };
+    // A requirement spelled twice in the list is one constraint, and the
+    // first entry holds its name.
+    if is_table
+        && let Some(earlier) = slots.iter().take(index).enumerate().find(|(_, other)| {
+            match other {
+                Slot::Table(_, TableConstraint::NotNull(held)) => {
+                    inheritance::same_column(&held.column, column)
+                }
+                _ => false,
+            }
+        })
+    {
+        return Some(earlier.0);
+    }
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(other, _)| *other != index)
+        .find(|(_, other)| {
+            match other {
+                Slot::Table(_, TableConstraint::NotNull(not_null)) => {
+                    !is_table && inheritance::same_column(&not_null.column, column)
+                }
+                Slot::Column {
+                    def,
+                    held: ColumnOptionDef { option: ColumnOption::NotNull, .. },
+                    ..
+                } => is_table && inheritance::same_column(&def.name, column),
+                _ => false,
+            }
+        })
+        .map(|(other, _)| other)
 }
 
 /// The constraint of the node answering to `name`, written or generated.
@@ -274,10 +341,19 @@ pub(super) fn locate(
     name: &Ident,
 ) -> Option<Position> {
     let wanted = stored_ident_name(name);
-    names(node, recorded)
+    // The two spellings of one `NOT NULL` are a single constraint, and the
+    // table's slot answers for the pair.
+    let answering: Vec<Slot<'_>> = names(node, recorded)
         .into_iter()
-        .find(|(_, held)| held.as_deref() == Some(wanted.as_ref()))
-        .map(|(slot, _)| slot.position())
+        .filter(|(_, held)| held.as_deref() == Some(wanted.as_ref()))
+        .map(|(slot, _)| slot)
+        .collect();
+    answering
+        .iter()
+        .find(|slot| matches!(slot, Slot::Table(_, TableConstraint::NotNull(_))))
+        .or(answering.first())
+        .copied()
+        .map(Slot::position)
 }
 
 /// Carries the generated names across a rebuild of the node.
@@ -360,6 +436,24 @@ fn received_name(builder: &ParserDBBuilder, node: &CreateTable, slot: Slot<'_>) 
                     (Slot::Table(_, constraint), Slot::Table(_, passed)) => {
                         inheritance::is_copy_of(constraint, passed)
                     }
+                    // A `NOT NULL` and its copy are one constraint whether the
+                    // parent writes it on a column or on the table.
+                    (
+                        Slot::Table(_, TableConstraint::NotNull(not_null)),
+                        Slot::Column {
+                            def,
+                            held: ColumnOptionDef { option: ColumnOption::NotNull, .. },
+                            ..
+                        },
+                    ) => inheritance::same_column(&not_null.column, &def.name),
+                    (
+                        Slot::Column {
+                            def,
+                            held: ColumnOptionDef { option: ColumnOption::NotNull, .. },
+                            ..
+                        },
+                        Slot::Table(_, TableConstraint::NotNull(not_null)),
+                    ) => inheritance::same_column(&def.name, &not_null.column),
                     _ => false,
                 };
                 same.then_some(name).flatten().map(Cow::into_owned)
@@ -448,7 +542,22 @@ fn new_names(
     let mut recorded = metadata.generated_constraint_names().to_vec();
     let slots = slots(node);
     let keys = keys(&slots);
-    for (slot, key) in slots.into_iter().zip(keys) {
+    for ((index, slot), key) in slots.iter().enumerate().zip(&keys) {
+        let slot = *slot;
+        // The requirement's name is one: the column's option answers the
+        // table's slot, a table slot a named option spells answers the
+        // option's, and a repeated entry answers the first one's.
+        if let Some(partner) = not_null_partner_index(&slots, index) {
+            let partner_is_table =
+                matches!(slots[partner], Slot::Table(_, TableConstraint::NotNull(_)));
+            if matches!(slot, Slot::Column { .. })
+                || slots[partner].declared_name().is_some()
+                || partner_is_table
+            {
+                continue;
+            }
+        }
+        let key = key.clone();
         let unnamed = slot.declared_name().is_none()
             && !recorded.iter().any(|generated| generated.slot == key);
         let Some(naming) = unnamed.then(|| slot.naming()).flatten() else {
@@ -593,6 +702,14 @@ pub(super) fn merge_named_copies(builder: &ParserDBBuilder, node: &mut CreateTab
     removed
 }
 
+/// The position of the other spelling of a paired `NOT NULL`.
+fn not_null_partner_position(node: &CreateTable, position: Position) -> Option<Position> {
+    let slots = slots(node);
+    slots.iter().enumerate().filter(|(_, slot)| slot.position() == position).find_map(
+        |(index, _)| not_null_partner_index(&slots, index).map(|partner| slots[partner].position()),
+    )
+}
+
 /// The slot at `position` of the node.
 fn slot_at(node: &CreateTable, position: Position) -> Option<(Slot<'_>, String)> {
     let slots = slots(node);
@@ -623,6 +740,7 @@ fn passes_down(slot: Slot<'_>) -> bool {
         }
         Slot::Table(_, constraint) => {
             matches!(constraint, TableConstraint::Check(check) if !check.no_inherit)
+                || matches!(constraint, TableConstraint::NotNull(not_null) if !not_null.no_inherit)
         }
     }
 }
@@ -735,6 +853,17 @@ fn rename_on(
     else {
         return Ok(builder);
     };
+    // A paired `NOT NULL` writes its name on the spelling that carries it,
+    // and the table's slot answers for the pair.
+    let slot = if slot.declared_name().is_some()
+        || recorded.iter().any(|generated| generated.slot == key)
+    {
+        slot
+    } else {
+        not_null_partner_position(node, slot.position())
+            .and_then(|position| slot_at(node, position))
+            .map_or(slot, |(partner, _)| partner)
+    };
     if slot.declared_name().is_some() {
         let position = slot.position();
         return ParserDB::replace_table_node(builder, table, |_, node| {
@@ -784,6 +913,8 @@ fn rename_declared(node: &mut CreateTable, position: Position, new: &Ident) {
                 foreign_key.name = new;
             } else if let TableConstraint::Exclude(exclude) = constraint {
                 exclude.name = new;
+            } else if let TableConstraint::NotNull(not_null) = constraint {
+                not_null.name = new;
             } else if let TableConstraint::PrimaryKeyUsingIndex(using_index)
             | TableConstraint::UniqueUsingIndex(using_index) = constraint
             {

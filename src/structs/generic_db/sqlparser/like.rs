@@ -17,11 +17,11 @@
 use alloc::{string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, CreateTableLikeDefaults, CreateTableLikeKind, DataType,
-    Ident, ObjectName,
+    ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, CreateTableLikeDefaults,
+    CreateTableLikeKind, DataType, Ident, ObjectName, TableConstraint,
 };
 
-use super::{ParserDBBuilder, column_copy::copy_column};
+use super::{ParserDBBuilder, column_copy::copy_column, inheritance};
 use crate::{
     errors::Error,
     structs::{TableAttribute, metadata::ColumnCreation},
@@ -100,7 +100,16 @@ pub(super) fn apply_like(
         .columns
         .iter()
         .map(|column| {
-            let copy = copy_column(column, |option| is_copied_option(option, with_defaults));
+            let mut copy = copy_column(column, |option| is_copied_option(option, with_defaults));
+            // A `NOT NULL` the source spells on the table states a
+            // requirement the copy's column carries the way the option would.
+            if copied.constraints.iter().any(|constraint| {
+                matches!(constraint, TableConstraint::NotNull(not_null)
+                    if inheritance::same_column(&not_null.column, &copy.name))
+            }) && !copy.options.iter().any(|held| matches!(held.option, ColumnOption::NotNull))
+            {
+                copy.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
+            }
             if let Some(creation) = creation_of(builder, copied, column) {
                 creations.push((copy.name.clone(), creation));
             }

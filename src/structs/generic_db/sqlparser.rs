@@ -27,11 +27,12 @@ use sqlparser::{
         CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
         DataType, DropBehavior, DropDomain, Expr, ForeignKeyConstraint, FunctionDefinitionSetParam,
         FunctionDesc, FunctionSetValue, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName,
-        GranteesType, Ident, IndexColumn, MySQLColumnPosition, ObjectName, ObjectNamePart,
-        OperateFunctionArg, OrderByExpr, OrderByOptions, Owner, Privileges, Query,
-        RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
-        TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut,
-        Visitor, VisitorMut, helpers::stmt_create_table::CreateTableBuilder, visit_relations,
+        GranteesType, Ident, IndexColumn, MySQLColumnPosition, NotNullConstraint, ObjectName,
+        ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner,
+        PrimaryKeyConstraint, Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption,
+        SchemaName, SqlOption, Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value,
+        ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
+        helpers::stmt_create_table::CreateTableBuilder, visit_relations,
     },
     dialect::Dialect,
 };
@@ -54,7 +55,7 @@ use crate::{
         columns_in_expression,
         identifier_resolution::{
             identifiers_match, is_public_pseudo_role, is_temporary_schema, normalize_identifier,
-            session_principal,
+            session_principal, stored_ident_name,
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
         object_name::{
@@ -2535,6 +2536,11 @@ impl NamedColumn {
         node.columns.iter().any(|column| self.matches(&column.name))
     }
 
+    /// The identifier the column is spelled with.
+    fn ident(&self) -> Ident {
+        stored_ident(&self.name, self.quoted)
+    }
+
     fn in_idents(&self, idents: &[Ident]) -> bool {
         idents.iter().any(|ident| self.matches(ident))
     }
@@ -2758,6 +2764,11 @@ fn rename_column_in_node(
 
     for constraint in &mut node.constraints {
         rename_column_idents(include_of_mut(constraint), from, to);
+        if let TableConstraint::NotNull(not_null) = constraint
+            && from.matches(&not_null.column)
+        {
+            not_null.column = to.clone();
+        }
     }
 }
 
@@ -2829,6 +2840,7 @@ fn constraint_involves_column(
                 || (table.named_by(&foreign_key.foreign_table)
                     && column.in_idents(&foreign_key.referred_columns))
         }
+        TableConstraint::NotNull(not_null) => column.matches(&not_null.column),
         other => {
             column.in_idents(include_of(other)) || column.in_expressions(other, table, declaring)
         }
@@ -3674,27 +3686,94 @@ fn refuse_alter_foreign_table_of_other_kind(
 /// PostgreSQL enforces every constraint of a partitioned table on its
 /// partitions, so the one spelling that would keep a check from them is
 /// refused, written as a table constraint or on a column alike.
-fn refuse_no_inherit_check_on_partitioned(
+fn refuse_no_inherit_constraints_on_partitioned(
     create_table: &CreateTable,
 ) -> Result<(), crate::errors::Error> {
     if create_table.partition_by.is_none() {
         return Ok(());
     }
-    let on_table = create_table
+    let check_on_table = create_table
         .constraints
         .iter()
         .any(|constraint| matches!(constraint, TableConstraint::Check(check) if check.no_inherit));
-    let on_column = create_table
+    let check_on_column = create_table
         .columns
         .iter()
         .flat_map(|column| &column.options)
         .any(|option| matches!(&option.option, ColumnOption::Check(check) if check.no_inherit));
-    if on_table || on_column {
+    if check_on_table || check_on_column {
         return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
             table_name: create_table.table_name().to_string(),
         });
     }
+    if create_table.constraints.iter().any(|constraint| {
+        matches!(constraint, TableConstraint::NotNull(not_null) if not_null.no_inherit)
+    }) {
+        return Err(crate::errors::Error::NoInheritNotNullOnPartitionedTable {
+            table_name: create_table.table_name().to_string(),
+        });
+    }
     Ok(())
+}
+
+/// Refuses the spellings of a table's own `NOT NULL` requirements that
+/// PostgreSQL refuses while creating it, measured on 18.
+///
+/// The two spellings of one requirement, written on the column and in the
+/// constraint list, are one constraint carrying one name and one
+/// inheritability, so two different names for them are refused, as is a
+/// `NO INHERIT` one beside any other spelling of the same requirement.
+fn refuse_not_null_conflicts(create_table: &CreateTable) -> Result<(), crate::errors::Error> {
+    for column in &create_table.columns {
+        let mut named: Vec<String> = Vec::new();
+        let mut spelled_no_inherit = false;
+        let mut spellings = 0usize;
+        for option in &column.options {
+            if matches!(&option.option, ColumnOption::NotNull) {
+                spellings += 1;
+                if let Some(name) = &option.name {
+                    named.push(stored_ident_name(name).into_owned());
+                }
+            }
+        }
+        for constraint in &create_table.constraints {
+            let TableConstraint::NotNull(not_null) = constraint else {
+                continue;
+            };
+            if !idents_match(&not_null.column, &column.name) {
+                continue;
+            }
+            spellings += 1;
+            spelled_no_inherit |= not_null.no_inherit;
+            if let Some(name) = &not_null.name {
+                named.push(stored_ident_name(name).into_owned());
+            }
+        }
+        if spelled_no_inherit && spellings > 1 {
+            return Err(crate::errors::Error::ConflictingNoInheritNotNull {
+                table_name: create_table.table_name().to_string(),
+                column_name: column.name.value.clone(),
+            });
+        }
+        if let Some((first, second)) = first_repeated_name(&named) {
+            return Err(crate::errors::Error::ConflictingNotNullConstraintNames {
+                table_name: create_table.table_name().to_string(),
+                column_name: column.name.value.clone(),
+                first_name: first,
+                second_name: second,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The first two different written names of one column's `NOT NULL`, in the
+/// order the spellings were written, or [`None`] when they agree.
+fn first_repeated_name(named: &[String]) -> Option<(String, String)> {
+    named
+        .iter()
+        .find_map(|first| named.iter().find(|second| **second != *first))
+        .map(|second| (named[0].clone(), second.clone()))
 }
 
 /// Refuses a foreign key joining two tables PostgreSQL keeps apart by how
@@ -4349,6 +4428,7 @@ fn table_constraint_name(constraint: &TableConstraint) -> Option<&Ident> {
             Some(using_index.name.as_ref().unwrap_or(&using_index.index_name))
         }
         TableConstraint::Exclude(exclude) => exclude.name.as_ref(),
+        TableConstraint::NotNull(not_null) => not_null.name.as_ref(),
     }
 }
 
@@ -4395,6 +4475,30 @@ fn column_option_is_constraint(option: &ColumnOption) -> bool {
 /// Whether the column already states that it must hold a value.
 fn states_not_null(column: &ColumnDef) -> bool {
     column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull))
+}
+
+/// The table-level `NOT NULL` the node holds on `column`, if the constraint
+/// list names one for it.
+pub(crate) fn table_not_null<'node>(
+    node: &'node CreateTable,
+    column: &Ident,
+) -> Option<&'node NotNullConstraint> {
+    node.constraints.iter().find_map(|constraint| {
+        match constraint {
+            TableConstraint::NotNull(not_null) if idents_match(&not_null.column, column) => {
+                Some(not_null)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Whether the node requires `column` to hold a value, in either spelling:
+/// stated on the column or held by a table-level `NOT NULL` naming it.
+pub(crate) fn requires_value(node: &CreateTable, column: &Ident) -> bool {
+    node.columns.iter().find(|declared| idents_match(&declared.name, column)).is_some_and(
+        |declared| states_not_null(declared) || table_not_null(node, &declared.name).is_some(),
+    )
 }
 
 /// Writes down the `NOT NULL` a key, an identity or a serial type implies, so
@@ -6050,6 +6154,23 @@ impl ParserDB {
 
                     table_metadata.set_primary_key(primary_key_columns);
                 }
+                TableConstraint::NotNull(not_null) => {
+                    let declared = table_metadata.column_arcs().any(|declared| {
+                        identifiers_match(
+                            declared.column_name(),
+                            declared.column_name_is_quoted(),
+                            not_null.column.value.as_str(),
+                            not_null.column.quote_style.is_some(),
+                        )
+                    });
+                    if !declared {
+                        return Err(LookupError::ColumnNotFound {
+                            table_name: create_table.name.to_string(),
+                            column_name: not_null.column.value.clone(),
+                        }
+                        .into());
+                    }
+                }
                 _ => {}
             }
         }
@@ -6261,7 +6382,7 @@ impl ParserDB {
                     let node = Self::stored_node(builder, &descendant)?;
                     if let Some(column) = node.columns.iter().find(|column| {
                         keyed.iter().any(|keyed| idents_match(keyed, &column.name))
-                            && !states_not_null(column)
+                            && !requires_value(node, &column.name)
                     }) {
                         return Err(crate::errors::Error::OnlyPrimaryKeyOnNullableColumn {
                             table_name: descendant.name.clone(),
@@ -6270,9 +6391,65 @@ impl ParserDB {
                     }
                 }
             }
+            TableConstraint::NotNull(not_null) => {
+                let node = Self::stored_node(builder, stored)?;
+                if not_null.no_inherit && node.partition_by.is_some() {
+                    return Err(crate::errors::Error::NoInheritNotNullOnPartitionedTable {
+                        table_name: stored.name.clone(),
+                    });
+                }
+                if requires_value(node, &not_null.column) {
+                    let existing =
+                        Self::not_null_requirement_name(builder, stored, node, &not_null.column);
+                    let existing_no_inherit =
+                        table_not_null(node, &not_null.column).is_some_and(|held| held.no_inherit);
+                    if existing_no_inherit != not_null.no_inherit {
+                        return Err(crate::errors::Error::NotNullNoInheritStatusChange {
+                            table_name: stored.name.clone(),
+                            constraint_name: existing,
+                        });
+                    }
+                    // Restating the requirement, unnamed or under its own name,
+                    // changes nothing, and only another name is refused.
+                    if let Some(name) = &not_null.name
+                        && stored_ident_name(name) != existing.as_str()
+                    {
+                        return Err(crate::errors::Error::NotNullConstraintAlreadyExists {
+                            table_name: stored.name.clone(),
+                            column_name: not_null.column.value.clone(),
+                            constraint_name: stored_ident_name(name).into_owned(),
+                            existing_name: existing,
+                        });
+                    }
+                    return Ok(());
+                }
+                if !not_null.no_inherit {
+                    Self::refuse_only_with_children(
+                        builder,
+                        stored,
+                        scope,
+                        crate::errors::InheritedChange::AddConstraint,
+                    )?;
+                }
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// The name the `NOT NULL` requirement `column` of `stored` already
+    /// answers to, whichever spelling states it.
+    fn not_null_requirement_name(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        node: &CreateTable,
+        column: &Ident,
+    ) -> String {
+        constraint_names::names(node, generated_constraint_names(builder, stored))
+            .into_iter()
+            .find(|(slot, _)| slot.not_null_of().is_some_and(|held| idents_match(held, column)))
+            .and_then(|(_, name)| name)
+            .map_or_else(|| format!("{}_{}_not_null", stored.name, column.value), Cow::into_owned)
     }
 
     /// Refuses a unique index on `stored`, whichever statement creates it, when
@@ -6290,6 +6467,98 @@ impl ParserDB {
             }
             None => Ok(()),
         }
+    }
+
+    /// Writes the requirement to hold a value an added primary key implies on
+    /// every table below, even where the key itself stays put, since PostgreSQL
+    /// records it as a constraint of its own and passes that one down. The
+    /// named table already carries it, because storing its node writes it in.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ObjectKind::Table.not_in_database` when a stored entry is
+    /// missing.
+    fn require_keyed_columns_below(
+        mut builder: ParserDBBuilder,
+        stored: &StoredTable,
+        primary_key: &PrimaryKeyConstraint,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let keyed = plain_column_names(&primary_key.columns);
+        for child in inheritance::descendants(&builder, stored) {
+            builder = Self::replace_table_node(builder, &child, |_, node| {
+                for column in &mut node.columns {
+                    if keyed.iter().any(|keyed| idents_match(keyed, &column.name)) {
+                        state_not_null(column);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(builder)
+    }
+
+    /// Propagates an added table-level `NOT NULL` to the tables below: as a
+    /// copy of the constraint and as the requirement on the column. A child
+    /// already requiring the value keeps its own requirement instead of a
+    /// copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ObjectKind::Table.not_in_database` when a stored entry is
+    /// missing.
+    fn add_not_null_constraint_below(
+        builder: ParserDBBuilder,
+        stored: &StoredTable,
+        (constraint, not_null): (&TableConstraint, &NotNullConstraint),
+        validated: bool,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let mut builder = builder;
+        let mut frontier = alloc::vec![stored.clone()];
+        let mut reached: Vec<StoredTable> = Vec::new();
+        while let Some(current) = frontier.pop() {
+            for (kind, child) in inheritance::direct_children(&builder, &current) {
+                if !inheritance::passes_down(kind, constraint) || reached.contains(&child) {
+                    continue;
+                }
+                reached.push(child.clone());
+                let node = Self::stored_node(&builder, &child)?;
+                if requires_value(node, &not_null.column) {
+                    continue;
+                }
+                let copy = inheritance::partition_copy(&builder, node, constraint, &mut Vec::new());
+                let recorded = copy.clone();
+                builder = Self::replace_table_node(builder, &child, |_, node| {
+                    node.constraints.push(recorded.clone());
+                    for declared in node
+                        .columns
+                        .iter_mut()
+                        .filter(|declared| idents_match(&declared.name, &not_null.column))
+                    {
+                        // The child required no value, so it states no `NOT
+                        // NULL`.
+                        declared
+                            .options
+                            .retain(|option| !matches!(option.option, ColumnOption::Null));
+                        declared
+                            .options
+                            .push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
+                    }
+                    Ok(())
+                })?;
+                inheritance::mark_inherited_constraint(&mut builder, &child, &copy);
+                inheritance::mark_inherited_not_null(
+                    &mut builder,
+                    &child,
+                    &not_null.column.value,
+                    true,
+                );
+                if !validated {
+                    constraint_validity::record(&mut builder, &child, &copy, false);
+                }
+                frontier.push(child.clone());
+            }
+        }
+        Ok(builder)
     }
 
     /// Adds a constraint to a table and to every table that takes its shape
@@ -6318,6 +6587,11 @@ impl ParserDB {
             return Ok(builder);
         };
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
+        if let TableConstraint::NotNull(not_null) = &constraint
+            && requires_value(Self::stored_node(&builder, &stored)?, &not_null.column)
+        {
+            return Ok(builder);
+        }
         if let Some(name) = table_constraint_name(&constraint)
             && constraint_names::locate(
                 Self::stored_node(&builder, &stored)?,
@@ -6350,22 +6624,17 @@ impl ParserDB {
             return Ok(builder);
         }
 
-        // The requirement to hold a value reaches every table below, even where
-        // the key itself stays put: PostgreSQL records it as a constraint of
-        // its own and passes that one down. The named table already carries it,
-        // because storing its node writes it in.
         if let TableConstraint::PrimaryKey(primary_key) = &constraint {
-            let keyed = plain_column_names(&primary_key.columns);
-            for child in inheritance::descendants(&builder, &stored) {
-                builder = Self::replace_table_node(builder, &child, |_, node| {
-                    for column in &mut node.columns {
-                        if keyed.iter().any(|keyed| idents_match(keyed, &column.name)) {
-                            state_not_null(column);
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
+            builder = Self::require_keyed_columns_below(builder, &stored, primary_key)?;
+        }
+
+        if let TableConstraint::NotNull(not_null) = &constraint {
+            return Self::add_not_null_constraint_below(
+                builder,
+                &stored,
+                (&constraint, not_null),
+                validated,
+            );
         }
 
         let mut frontier = alloc::vec![(stored, constraint)];
@@ -6455,6 +6724,9 @@ impl ParserDB {
         match constraint_names::locate(node, generated_constraint_names(&builder, &stored), name) {
             Some(constraint_names::Position::Table(position)) => {
                 let dropped = node.constraints[position].clone();
+                if let TableConstraint::NotNull(not_null) = &dropped {
+                    return Self::drop_not_null_constraint(builder, &stored, scope, name, not_null);
+                }
                 return Self::drop_table_constraint(
                     builder, &stored, scope, name, position, dropped,
                 );
@@ -6572,6 +6844,162 @@ impl ParserDB {
         Ok(builder)
     }
 
+    /// Drops a table-level `NOT NULL` the way `DROP NOT NULL` does, since the
+    /// requirement is one whether written on the column or in the list: the
+    /// named table loses both spellings and the tables below lose what they
+    /// only received.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::Error::InheritedConstraintNotDroppable`] for a
+    /// copy a parent still passes down, [`Error::RequiredValueNotDroppable`]
+    /// for a column a key covers, [`Error::AlterTableNotFound`] for an absent
+    /// table and `ObjectKind::Table.not_in_database` when the stored entry is
+    /// missing.
+    fn drop_not_null_constraint(
+        builder: ParserDBBuilder,
+        stored: &StoredTable,
+        scope: AlterTableScope,
+        name: &Ident,
+        not_null: &NotNullConstraint,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let node = Self::stored_node(&builder, stored)?;
+        let held = TableConstraint::NotNull(not_null.clone());
+        if inheritance::requires_a_value(&builder, node, &not_null.column.value) {
+            return Err(crate::errors::Error::InheritedConstraintNotDroppable {
+                table_name: stored.name.clone(),
+                constraint_name: name.value.clone(),
+            });
+        }
+        if node.constraints.iter().any(|constraint| {
+            matches!(constraint, TableConstraint::PrimaryKey(_))
+                && table_constraint_covers_column(constraint, &not_null.column.value)
+        }) || node.columns.iter().any(|declared| {
+            idents_match(&declared.name, &not_null.column)
+                && declared
+                    .options
+                    .iter()
+                    .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+        }) {
+            return Err(crate::errors::Error::RequiredValueNotDroppable {
+                table_name: stored.name.clone(),
+                column_name: not_null.column.value.clone(),
+                reason: crate::errors::RequiredValue::CoveredByKey,
+            });
+        }
+
+        let column = not_null.column.clone();
+        let column_name = not_null.column.value.clone();
+
+        // Every spelling of the one requirement goes, option included.
+        let builder = Self::replace_table_node(builder, stored, |_, node| {
+            node.constraints.retain(|held| {
+                !matches!(held, TableConstraint::NotNull(not_null)
+                    if idents_match(&not_null.column, &column))
+            });
+            for declared in
+                node.columns.iter_mut().filter(|declared| idents_match(&declared.name, &column))
+            {
+                declared.options.retain(|option| !matches!(option.option, ColumnOption::NotNull));
+            }
+            Ok(())
+        })?;
+        Self::drop_not_null_copies_below(builder, stored, &held, scope.only, &column, &column_name)
+    }
+
+    /// Removes the copies of a dropped table-level `NOT NULL` the tables
+    /// below hold, one edge at a time.
+    ///
+    /// `own` keeps each child's copy as its own, the way an `ONLY` drop does
+    /// when nothing passes the requirement down afterwards; otherwise the
+    /// copy is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ObjectKind::Table.not_in_database` when a stored entry is
+    /// missing.
+    fn drop_not_null_copies_below(
+        builder: ParserDBBuilder,
+        stored: &StoredTable,
+        held: &TableConstraint,
+        own: bool,
+        column: &Ident,
+        column_name: &str,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        if own {
+            // The tables below keep their copies, and each becomes the
+            // holder's own now that nothing passes it down.
+            let mut builder = builder;
+            for (_, child) in inheritance::direct_children(&builder, stored) {
+                let node = Self::stored_node(&builder, &child)?;
+                let Some(copy) = node
+                    .constraints
+                    .iter()
+                    .find(|held| {
+                        matches!(held, TableConstraint::NotNull(held)
+                            if idents_match(&held.column, column))
+                    })
+                    .cloned()
+                else {
+                    continue;
+                };
+                inheritance::unmark_inherited_constraint(&mut builder, &child, &copy);
+                inheritance::mark_inherited_not_null(&mut builder, &child, column_name, false);
+            }
+            return Ok(builder);
+        }
+
+        let mut builder = builder;
+        let mut frontier = alloc::vec![(stored.clone(), held.clone())];
+        let mut reached: Vec<StoredTable> = Vec::new();
+        while let Some((current, passed)) = frontier.pop() {
+            for (kind, child) in inheritance::direct_children(&builder, &current) {
+                if reached.contains(&child) || !inheritance::passes_down(kind, &passed) {
+                    continue;
+                }
+                reached.push(child.clone());
+
+                let node = Self::stored_node(&builder, &child)?;
+                let Some(copy) = node
+                    .constraints
+                    .iter()
+                    .find(|held| inheritance::is_copy_of(held, &passed))
+                    .cloned()
+                else {
+                    continue;
+                };
+
+                // A copy the table declared itself stays, and so does one
+                // another parent still requires, whichever spelling it uses.
+                if !inheritance::records_inherited_constraint(&builder, &child, &copy)
+                    || inheritance::requires_a_value(&builder, node, column_name)
+                {
+                    continue;
+                }
+
+                let removed = copy.clone();
+                builder = Self::replace_table_node(builder, &child, |_, node| {
+                    node.constraints.retain(|held| *held != removed);
+                    for declared in node
+                        .columns
+                        .iter_mut()
+                        .filter(|declared| idents_match(&declared.name, column))
+                    {
+                        declared
+                            .options
+                            .retain(|option| !matches!(option.option, ColumnOption::NotNull));
+                    }
+                    Ok(())
+                })?;
+                inheritance::unmark_inherited_constraint(&mut builder, &child, &removed);
+                inheritance::mark_inherited_not_null(&mut builder, &child, column_name, false);
+                frontier.push((child, copy));
+            }
+        }
+
+        Ok(builder)
+    }
+
     /// Drops a constraint written on one of the table's columns.
     ///
     /// Nothing has to be recorded about where such a copy came from, unlike one
@@ -6587,6 +7015,26 @@ impl ParserDB {
         (written_on, option): (&Ident, &ColumnOptionDef),
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let node = Self::stored_node(&builder, stored)?;
+        // A key's implied `NOT NULL` is not its own, so a key-covered column
+        // refuses the drop the way `DROP NOT NULL` does.
+        if matches!(&option.option, ColumnOption::NotNull)
+            && (node.constraints.iter().any(|constraint| {
+                matches!(constraint, TableConstraint::PrimaryKey(_))
+                    && table_constraint_covers_column(constraint, &written_on.value)
+            }) || node.columns.iter().any(|declared| {
+                idents_match(&declared.name, written_on)
+                    && declared
+                        .options
+                        .iter()
+                        .any(|held| matches!(held.option, ColumnOption::PrimaryKey(_)))
+            }))
+        {
+            return Err(crate::errors::Error::RequiredValueNotDroppable {
+                table_name: stored.name.clone(),
+                column_name: written_on.value.clone(),
+                reason: crate::errors::RequiredValue::CoveredByKey,
+            });
+        }
         if inheritance::receives_column_constraint(&builder, node, written_on, option) {
             return Err(crate::errors::Error::InheritedConstraintNotDroppable {
                 table_name: stored.name.clone(),
@@ -7898,7 +8346,8 @@ impl ParserDB {
             return Ok(builder);
         };
         let column = NamedColumn::of(column_name, builder.identifier_case());
-        if !column.declared_by(Self::stored_node(&builder, &stored)?) {
+        let node = Self::stored_node(&builder, &stored)?;
+        if !column.declared_by(node) {
             return Err(LookupError::ColumnNotFound {
                 table_name: stored.name.clone(),
                 column_name: column.name.clone(),
@@ -7906,14 +8355,20 @@ impl ParserDB {
             .into());
         }
         let set = matches!(operation, AlterColumnOperation::SetNotNull);
+        if set && table_not_null(node, &column.ident()).is_some_and(|held| held.no_inherit) {
+            return Err(crate::errors::Error::NotNullNoInheritStatusChange {
+                table_name: stored.name.clone(),
+                constraint_name: Self::not_null_requirement_name(
+                    &builder,
+                    &stored,
+                    node,
+                    &column.ident(),
+                ),
+            });
+        }
         // Requiring a value the column already requires changes nothing, so
         // only a new requirement has to reach the partitions.
-        if set
-            && !Self::stored_node(&builder, &stored)?
-                .columns
-                .iter()
-                .any(|declared| column.matches(&declared.name) && states_not_null(declared))
-        {
+        if set && !requires_value(node, &column.ident()) {
             Self::refuse_only_with_partitions(
                 &builder,
                 &stored,
@@ -7927,11 +8382,8 @@ impl ParserDB {
             inheritance::descendants(&builder, &stored)
                 .into_iter()
                 .filter(|child| {
-                    Self::stored_node(&builder, child).is_ok_and(|node| {
-                        node.columns.iter().any(|declared| {
-                            column.matches(&declared.name) && !states_not_null(declared)
-                        })
-                    })
+                    Self::stored_node(&builder, child)
+                        .is_ok_and(|node| !requires_value(node, &column.ident()))
                 })
                 .collect()
         } else {
@@ -7942,15 +8394,85 @@ impl ParserDB {
         for (table, received) in
             core::iter::once((stored, false)).chain(below.into_iter().map(|child| (child, set)))
         {
-            builder = Self::replace_table_node(builder, &table, |_, node| {
-                for declared in
-                    node.columns.iter_mut().filter(|declared| column.matches(&declared.name))
-                {
-                    Self::apply_alter_column(declared, operation.clone());
+            builder = Self::apply_not_null_to_table(builder, &table, &column, received, operation)?;
+        }
+        Ok(builder)
+    }
+
+    /// Applies a `SET NOT NULL` or `DROP NOT NULL` to one table, keeping its
+    /// copies of the requirement in step with what it holds afterwards.
+    ///
+    /// `received` is whether the table receives the requirement from a parent
+    /// through the copy this call makes or removes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ObjectKind::Table.not_in_database` when the stored entry is
+    /// missing.
+    fn apply_not_null_to_table(
+        builder: ParserDBBuilder,
+        table: &StoredTable,
+        column: &NamedColumn,
+        received: bool,
+        operation: &AlterColumnOperation,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let set = matches!(operation, AlterColumnOperation::SetNotNull);
+        let inherited_copy = if set {
+            None
+        } else {
+            Self::stored_node(&builder, table)?
+                .constraints
+                .iter()
+                .find(|constraint| {
+                    matches!(constraint, TableConstraint::NotNull(not_null)
+                        if idents_match(&not_null.column, &column.ident()))
+                })
+                .cloned()
+        };
+        let mut pushed = None;
+        let mut builder = Self::replace_table_node(builder, table, |_, node| {
+            // A requirement the node already holds, table-level included, is
+            // left as written.
+            if set && requires_value(node, &column.ident()) {
+                return Ok(());
+            }
+            let column_ident = node
+                .columns
+                .iter()
+                .find(|declared| column.matches(&declared.name))
+                .map(|declared| declared.name.clone());
+            for declared in
+                node.columns.iter_mut().filter(|declared| column.matches(&declared.name))
+            {
+                Self::apply_alter_column(declared, operation.clone());
+            }
+            if set {
+                // The copy below is unnamed and takes the parent's name.
+                if received && let Some(column_ident) = column_ident {
+                    let copy = TableConstraint::NotNull(NotNullConstraint {
+                        name: None,
+                        column: column_ident,
+                        no_inherit: false,
+                    });
+                    node.constraints.push(copy.clone());
+                    pushed = Some(copy);
                 }
-                Ok(())
-            })?;
-            inheritance::mark_inherited_not_null(&mut builder, &table, &column.name, received);
+            } else {
+                node.constraints.retain(|constraint| {
+                    !matches!(constraint, TableConstraint::NotNull(not_null)
+                        if idents_match(&not_null.column, &column.ident()))
+                });
+            }
+            Ok(())
+        })?;
+        inheritance::mark_inherited_not_null(&mut builder, table, &column.name, received);
+        // The unnamed copy takes the parent's name, so the table records it as
+        // received.
+        if let Some(copy) = pushed {
+            inheritance::mark_inherited_constraint(&mut builder, table, &copy);
+        }
+        if let Some(copy) = inherited_copy {
+            inheritance::unmark_inherited_constraint(&mut builder, table, &copy);
         }
         Ok(builder)
     }
@@ -8086,13 +8608,7 @@ impl ParserDB {
                 }
             }
             AlterColumnOperation::AddGenerated { .. } => {
-                let requires = declared.is_some_and(|declared| {
-                    declared
-                        .options
-                        .iter()
-                        .any(|option| matches!(option.option, ColumnOption::NotNull))
-                });
-                if !requires {
+                if !requires_value(node, &column.ident()) {
                     return Err(crate::errors::Error::IdentityNeedsRequiredValue {
                         table_name: stored.name.clone(),
                         column_name: column.name.clone(),
@@ -9579,9 +10095,15 @@ impl ParserDB {
                     // from it sees them. A parent has to exist by now, the
                     // way a foreign key target does, which is also what
                     // leaves the edges acyclic.
+                    refuse_not_null_conflicts(&create_table)?;
                     // What the child requires a value of itself stays its own,
                     // whatever a parent requires.
-                    let own_not_null = required_columns(&create_table);
+                    let own_not_null: Vec<Ident> = create_table
+                        .columns
+                        .iter()
+                        .filter(|column| requires_value(&create_table, &column.name))
+                        .map(|column| column.name.clone())
+                        .collect();
                     let mut inherited = inheritance::apply_parents(
                         &builder,
                         &mut create_table,
@@ -9603,7 +10125,7 @@ impl ParserDB {
                             bound,
                         )?;
                     }
-                    refuse_no_inherit_check_on_partitioned(&create_table)?;
+                    refuse_no_inherit_constraints_on_partitioned(&create_table)?;
                     record_implied_not_null(&mut create_table);
                     bind_foreign_key_targets(&builder, &mut create_table);
                     let name = create_table.name.clone();
