@@ -2972,9 +2972,9 @@ pub enum Error {
     #[error(
         "Cannot rename constraint `{constraint_name}` of table `{table_name}` because it is inherited."
     )]
-    /// Error indicating that a table tried to rename a constraint it receives
-    /// from a parent, which only the parent can rename, for every table below
-    /// it at once.
+    /// Error indicating that a table tried to rename a check or `NOT NULL`
+    /// constraint it receives from a parent, which only the parent can rename,
+    /// for every table below it at once.
     InheritedConstraintNotRenamable {
         /// Name of the table the statement names.
         table_name: String,
