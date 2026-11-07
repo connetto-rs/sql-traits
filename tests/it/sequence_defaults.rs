@@ -263,6 +263,23 @@ fn a_column_owning_a_sequence_it_does_not_draw_from_is_not_serial() {
     assert!(!serial(&db, "t", "id"));
 }
 
+/// A database holding neither the column nor its sequence finds no shape to
+/// read.
+#[test]
+fn a_serial_column_read_against_another_database_is_not_serial() {
+    let db = parse("CREATE TABLE t (id serial);").expect("parses");
+    let other = parse("CREATE TABLE u (x INT);").expect("parses");
+    let id = db
+        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("table exists")
+        .column("id", &db, IdentifierCase::AsWritten)
+        .expect("lookup succeeds")
+        .expect("column exists");
+    assert!(id.is_serial(&db));
+    assert!(!id.is_serial(&other));
+}
+
 #[test]
 fn a_serial_column_draws_from_its_sequence() {
     assert_eq!(

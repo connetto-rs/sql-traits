@@ -528,14 +528,18 @@ pub(super) fn plan_column_sequences<'column>(
         .collect()
 }
 
-/// Spells out each serial column among `columns` that `planned` names a
-/// sequence of `table` for, drawing from that sequence.
+/// Gives each serial column among `columns` that `planned` names a sequence
+/// of `table` for the integer type and `NOT NULL` PostgreSQL stores it as,
+/// with a default drawing from that sequence in place of the type.
 pub(super) fn spell_out_serials<'column>(
     planned: &[ColumnSequence],
     table: &StoredTable,
     columns: impl IntoIterator<Item = &'column mut ColumnDef>,
 ) {
     for column in columns {
+        let Some(integer) = serial_sequence_type(&column.data_type) else {
+            continue;
+        };
         let Some(planned) = planned.iter().find(|planned| {
             planned.origin == SequenceOrigin::Serial && planned.column == column.name
         }) else {
@@ -546,7 +550,14 @@ pub(super) fn spell_out_serials<'column>(
         if let Some(schema) = table.schema.as_deref() {
             target = target.with_schema(schema, table.schema_quoted);
         }
-        spell_out_serial(column, nextval(target.to_string()));
+        column.data_type = integer;
+        if !column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull)) {
+            column.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
+        }
+        column.options.push(ColumnOptionDef {
+            name: None,
+            option: ColumnOption::Default(nextval(target.to_string())),
+        });
     }
 }
 
@@ -989,19 +1000,6 @@ fn drawn_by_column<'sequence>(
             _ => None,
         }
     })
-}
-
-/// Gives a serial column the integer type and `NOT NULL` PostgreSQL stores it
-/// as, with `default` drawing in place of the type.
-fn spell_out_serial(column: &mut ColumnDef, default: Expr) {
-    let Some(integer) = serial_sequence_type(&column.data_type) else {
-        return;
-    };
-    column.data_type = integer;
-    if !column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull)) {
-        column.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
-    }
-    column.options.push(ColumnOptionDef { name: None, option: ColumnOption::Default(default) });
 }
 
 impl ParserDB {
