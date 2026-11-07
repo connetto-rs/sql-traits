@@ -273,7 +273,8 @@ fn the_identity_scanning_accessors_still_answer_a_live_receiver() {
 /// These filter the database's own triggers, policies and grants by comparing
 /// each one's table against the receiver, the same shape as the four above, so
 /// they resolve the receiver first for the same reason. The `privileges`
-/// reader inherits it through `columns` and `grants`.
+/// reader inherits it through `columns` and `grants`, and
+/// `possible_privileges` through the table's metadata.
 #[test]
 fn the_database_filtering_accessors_report_an_absent_receiver() {
     let (stale, database) = parse_with_create_table(
@@ -288,4 +289,5 @@ fn the_database_filtering_accessors_report_an_absent_receiver() {
     assert_eq!(stale.policies(&database).err(), absent_table("t"));
     assert_eq!(stale.grants(&database).err(), absent_table("t"));
     assert_eq!(stale.privileges(reader, &database).err(), absent_table("t"));
+    assert_eq!(stale.possible_privileges(reader, &database).err(), absent_table("t"));
 }

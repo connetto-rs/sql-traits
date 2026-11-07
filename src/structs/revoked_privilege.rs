@@ -18,6 +18,8 @@ use crate::impls::{grantee_is_public, grantee_matches_role};
 /// which is the role named by `GRANTED BY` when there is one and the owner
 /// when a superuser runs it, so [`Self::granted_by`] tells whose grants the
 /// statement could reach.
+/// [`TableLike::possible_privileges`](crate::traits::TableLike::possible_privileges)
+/// reads these revocations into what a role may still hold.
 ///
 /// `REVOKE ALL` revokes each table privilege on its own, and `REVOKE GRANT
 /// OPTION FOR` revokes no privilege. A table-level `GRANT` hands back only the

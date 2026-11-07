@@ -4,13 +4,16 @@
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use ::sqlparser::ast::{
-    CreateTable, CreateTableOptions, Expr, ForValues, ObjectNamePart, PartitionBoundValue,
+    Action, CreateTable, CreateTableOptions, Expr, ForValues, ObjectNamePart, PartitionBoundValue,
     SqlOption, Value, ValueWithSpan,
 };
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ForeignTableSource, ListDatum, ParserDB, PartitionBound, RangeDatum, TableMetadata},
+    structs::{
+        ActingRole, ColumnPrivilege, ForeignTableSource, ListDatum, ParserDB, PartitionBound,
+        RangeDatum, RevokedPrivilege, TableMetadata, TablePrivileges,
+    },
     traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
     utils::{
         identifier_resolution::{identifiers_match, stored_ident_name},
@@ -382,6 +385,50 @@ impl TableLike for CreateTable {
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
         Ok(table_metadata(self, database)?.owner_privileges())
+    }
+
+    fn possible_privileges<'db>(
+        &'db self,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db,
+    {
+        let role = role.into();
+        let metadata = table_metadata(self, database)?;
+        let owner = metadata.owner();
+        let lost: Vec<&Action> = metadata
+            .revoked_privileges()
+            .filter(|revoked| {
+                let names_role = match &role {
+                    ActingRole::Declared(role) => {
+                        !revoked.applies_to_public() && revoked.applies_to_role(role)
+                    }
+                    ActingRole::Public => revoked.applies_to_public(),
+                };
+                names_role && revoked.granted_by().is_none_or(|grantor| Some(grantor) == owner)
+            })
+            .map(RevokedPrivilege::privilege)
+            .collect();
+        let is_lost = |privilege: fn(&Action) -> bool| lost.iter().any(|action| privilege(action));
+        let held = self.privileges(role, database)?;
+        let possible =
+            |privilege, held| if is_lost(privilege) { held } else { ColumnPrivilege::Table };
+
+        Ok(TablePrivileges {
+            select: possible(|action| matches!(action, Action::Select { .. }), held.select),
+            insert: possible(|action| matches!(action, Action::Insert { .. }), held.insert),
+            update: possible(|action| matches!(action, Action::Update { .. }), held.update),
+            references: possible(
+                |action| matches!(action, Action::References { .. }),
+                held.references,
+            ),
+            delete: held.delete || !is_lost(|action| matches!(action, Action::Delete)),
+            truncate: held.truncate || !is_lost(|action| matches!(action, Action::Truncate)),
+            trigger: held.trigger || !is_lost(|action| matches!(action, Action::Trigger)),
+            maintain: held.maintain || !is_lost(|action| matches!(action, Action::Maintain)),
+        })
     }
 }
 
