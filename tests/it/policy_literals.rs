@@ -14,7 +14,7 @@ use sql_values::{DateTimeError, PgType};
 use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 
 const TABLES: &str =
-    "CREATE TABLE t (id INT, tz TIMESTAMPTZ, d DATE, ts TIMESTAMP, tt TIMETZ, s TEXT);
+    "CREATE TABLE t (id INT, tz TIMESTAMPTZ, d DATE, ts TIMESTAMP, tt TIMETZ, tm TIME, s TEXT);
      CREATE TABLE m (doc INT, granted TIMESTAMPTZ, expires TIMESTAMPTZ);";
 
 fn parse(script: &str) -> ParserDB {
@@ -156,6 +156,8 @@ fn a_literal_needing_state_the_script_never_settles_answers_an_error_for_its_cla
          CREATE POLICY p_order ON t USING (d < '01/02/2026');
          CREATE POLICY p_fine ON t USING (tz < '2026-01-01 12:00+00');
          SET TIME ZONE 'Europe/Rome';
+         CREATE POLICY p_stamp ON t USING (ts < 'now');
+         CREATE POLICY p_first ON t USING (d < 'today' AND tz < 'now');
          CREATE POLICY p_clock ON t USING (tt < '12:00');",
     );
     assert_eq!(
@@ -175,6 +177,20 @@ fn a_literal_needing_state_the_script_never_settles_answers_an_error_for_its_cla
     assert_eq!(
         using(&db, "p_order"),
         Err(unreadable("p_order", "01/02/2026", PgType::Date, DateTimeError::NeedsDateOrder))
+    );
+    assert_eq!(
+        using(&db, "p_stamp"),
+        Err(unreadable("p_stamp", "now", PgType::Timestamp, DateTimeError::NeedsCurrentTime))
+    );
+    let db_time = parse("CREATE POLICY p_time ON t USING (tm < 'now');");
+    assert_eq!(
+        using(&db_time, "p_time"),
+        Err(unreadable("p_time", "now", PgType::Time, DateTimeError::NeedsCurrentTime))
+    );
+    // The first literal of a clause that cannot be read is the one answered.
+    assert_eq!(
+        using(&db, "p_first"),
+        Err(unreadable("p_first", "today", PgType::Date, DateTimeError::NeedsCurrentTime))
     );
     assert_eq!(
         using(&db, "p_fine"),
@@ -198,12 +214,106 @@ fn date_style_orders_a_date_written_in_numbers_alone() -> Result<(), LookupError
          SET DateStyle = 'SQL, MDY';
          CREATE POLICY p_mdy ON t USING (d < '01/02/2026');
          SET datestyle = 'DMY, EURO';
-         CREATE POLICY p_repeated ON t USING (d < '01/02/2026');",
+         CREATE POLICY p_repeated ON t USING (d < '01/02/2026');
+         SET DateStyle = 'ISO, YMD';
+         CREATE POLICY p_ymd ON t USING (d < '01/02/03');
+         SET DateStyle = 'DMY, MDY';
+         CREATE POLICY p_conflicting_order ON t USING (d < '01/02/2026');
+         SET DateStyle = 'ISO, SQL';
+         CREATE POLICY p_conflicting_style ON t USING (d < '01/02/2026');",
     );
     assert_eq!(using(&db, "p_dmy")?, "d < '2026-02-01'::DATE");
     assert_eq!(using(&db, "p_repeated")?, "d < '2026-02-01'::DATE");
     assert_eq!(using(&db, "p_german")?, "d < '2026-02-01'::DATE");
     assert_eq!(using(&db, "p_mdy")?, "d < '2026-01-02'::DATE");
+    assert_eq!(using(&db, "p_ymd")?, "d < '2001-02-03'::DATE");
+    // PostgreSQL refuses both settings, so the order they leave is not guessed.
+    for name in ["p_conflicting_order", "p_conflicting_style"] {
+        assert_eq!(
+            using(&db, name),
+            Err(unreadable(name, "01/02/2026", PgType::Date, DateTimeError::NeedsDateOrder))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn session_time_zones_compare_as_written() -> Result<(), Error> {
+    use std::collections::HashSet;
+
+    let zone = |name: &str| ParseOptions::default().with_session_time_zone(name);
+    assert_eq!(zone("UTC")?, zone("UTC")?);
+    assert_ne!(zone("UTC")?, zone("utc")?);
+    assert!(zone("Europe/Rome")? < zone("UTC")?);
+    assert_eq!(zone("UTC")?.cmp(&zone("UTC")?), core::cmp::Ordering::Equal);
+    let distinct: HashSet<ParseOptions> = [zone("UTC")?, zone("UTC")?, zone("Asia/Tokyo")?].into();
+    assert_eq!(distinct.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn every_typed_position_reads_its_literal_as_postgresql_does() -> Result<(), LookupError> {
+    let db = parse(
+        "SET TIME ZONE 'Europe/Rome';
+         CREATE FUNCTION \"coalesce\"(a TIMESTAMPTZ, b TEXT) RETURNS BOOLEAN LANGUAGE sql
+             AS 'SELECT a IS NULL';
+         CREATE POLICY p_time ON t USING (tm < '12:00');
+         CREATE POLICY p_times ON t USING (coalesce(tm, tt, '12:00+02') IS NOT NULL);
+         CREATE POLICY p_stamps ON t USING (coalesce(d, ts, '2026-01-01') IS NOT NULL);
+         CREATE POLICY p_kept_date ON t USING (coalesce(tz, '2026-01-01'::date) < now());
+         CREATE POLICY p_nested_col ON t USING ((tz) < '2026-01-01');
+         CREATE POLICY p_coalesce_side ON t USING (coalesce(tz, ts) < '2026-01-01');
+         CREATE POLICY p_nullif_side ON t USING (nullif(d, tz) < '2026-01-01');
+         CREATE POLICY p_nullif_lit ON t USING (nullif('2026-01-01', tz) IS NULL);
+         CREATE POLICY p_between_subject ON t
+             USING ('2026-01-01' BETWEEN tz AND '2026-07-01'::timestamptz);
+         CREATE POLICY p_in_column ON t USING (tz IN (ts, '2026-01-01'));
+         CREATE POLICY p_no_column ON t USING ('2026-01-01 12:00'::timestamptz < now());
+         CREATE POLICY p_opaque ON t USING (lower(s) = 'a');
+         CREATE POLICY p_other_casts ON t USING (s = 'a'::text OR s = text 'b');
+         CREATE POLICY p_quoted ON t USING (\"coalesce\"(tz, '2026-01-01'));
+         CREATE POLICY p_derived ON t USING (EXISTS (SELECT 1
+             FROM (SELECT expires AS x FROM m) q WHERE q.x < '2026-01-01'));
+         CREATE POLICY p_computed ON t USING (EXISTS (SELECT 1
+             FROM (SELECT now() AS x) q WHERE q.x < '2026-01-01'));",
+    );
+    let instant = |text: &str| format!("'{text}'::TIMESTAMP WITH TIME ZONE");
+    let new_year = instant("2025-12-31 23:00:00+00");
+    assert_eq!(using(&db, "p_time")?, "tm < '12:00:00'::TIME WITHOUT TIME ZONE");
+    assert_eq!(
+        using(&db, "p_times")?,
+        "coalesce(tm, tt, '12:00:00+02'::TIME WITH TIME ZONE) IS NOT NULL"
+    );
+    assert_eq!(
+        using(&db, "p_stamps")?,
+        "coalesce(d, ts, '2026-01-01 00:00:00'::TIMESTAMP WITHOUT TIME ZONE) IS NOT NULL"
+    );
+    // A date converts to an instant in the zone of each statement.
+    assert_eq!(using(&db, "p_kept_date")?, "coalesce(tz, '2026-01-01'::DATE) < now()");
+    assert_eq!(using(&db, "p_nested_col")?, format!("(tz) < {new_year}"));
+    assert_eq!(using(&db, "p_coalesce_side")?, format!("coalesce(tz, ts) < {new_year}"));
+    // `nullif` answers its first argument's type.
+    assert_eq!(using(&db, "p_nullif_side")?, "nullif(d, tz) < '2026-01-01'::DATE");
+    assert_eq!(using(&db, "p_nullif_lit")?, format!("nullif({new_year}, tz) IS NULL"));
+    assert_eq!(
+        using(&db, "p_between_subject")?,
+        format!("{new_year} BETWEEN tz AND '2026-06-30 22:00:00+00'::TIMESTAMPTZ")
+    );
+    assert_eq!(using(&db, "p_in_column")?, format!("tz IN (ts, {new_year})"));
+    assert_eq!(using(&db, "p_no_column")?, "'2026-01-01 11:00:00+00'::TIMESTAMPTZ < now()");
+    assert_eq!(using(&db, "p_opaque")?, "lower(s) = 'a'");
+    assert_eq!(using(&db, "p_other_casts")?, "s = 'a'::TEXT OR s = TEXT 'b'");
+    assert_eq!(using(&db, "p_quoted")?, "\"coalesce\"(tz, '2026-01-01')");
+    assert_eq!(
+        using(&db, "p_derived")?,
+        format!("EXISTS (SELECT 1 FROM (SELECT expires AS x FROM m) q WHERE q.x < {new_year})")
+    );
+    // PostgreSQL types it by the type of `now()`, which is not inferred here,
+    // so it is never guessed.
+    assert_eq!(
+        using(&db, "p_computed")?,
+        "EXISTS (SELECT 1 FROM (SELECT now() AS x) q WHERE q.x < '2026-01-01')"
+    );
     Ok(())
 }
 

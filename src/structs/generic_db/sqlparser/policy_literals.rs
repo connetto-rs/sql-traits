@@ -4,8 +4,8 @@
 //!
 //! An untyped literal takes its type from the other side of a comparison, the
 //! subject of `BETWEEN` or `IN`, or the common type of the arguments of
-//! `coalesce`, `nullif`, `greatest` and `least`, where that side is a column
-//! or a cast, and stays as written anywhere else.
+//! `coalesce`, `nullif`, `greatest` and `least`, where that side is a table's
+//! column or a cast, and stays as written anywhere else.
 
 use alloc::{
     boxed::Box,
@@ -224,45 +224,40 @@ fn untyped_literal(expr: &Expr) -> Option<(&Expr, &str)> {
 /// The functions whose untyped arguments take a type from the others.
 #[derive(Clone, Copy)]
 enum RowPure {
-    /// `coalesce`, `greatest` and `least`, typed by their common type.
+    /// `coalesce`, `greatest` and `least`, of their arguments' common type.
     Common,
-    /// `nullif`, which compares its two arguments.
+    /// `nullif`, of its first argument's type.
     Nullif,
 }
 
-/// Which of [`RowPure`] `function` calls, with its arguments, when it calls
-/// one with plain arguments alone.
+/// Which of [`RowPure`] `function` calls, with its arguments.
+///
+/// A quoted name calls a function of that name, which a schema may create.
 fn row_pure(function: &Function) -> Option<(RowPure, Vec<&Expr>)> {
     let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         return None;
     };
-    if name.quote_style.is_some() {
-        return None;
-    }
-    let kind = if ["coalesce", "greatest", "least"]
-        .iter()
-        .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
-    {
+    let is =
+        |candidate: &str| name.quote_style.is_none() && name.value.eq_ignore_ascii_case(candidate);
+    let kind = if ["coalesce", "greatest", "least"].into_iter().any(&is) {
         RowPure::Common
-    } else if name.value.eq_ignore_ascii_case("nullif") {
+    } else if is("nullif") {
         RowPure::Nullif
     } else {
         return None;
     };
     let FunctionArguments::List(list) = &function.args else { return None };
-    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
-        return None;
-    }
+    // PostgreSQL's grammar gives these four plain expression arguments only.
     let arguments = list
         .args
         .iter()
-        .map(|argument| {
+        .filter_map(|argument| {
             match argument {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
                 _ => None,
             }
         })
-        .collect::<Option<Vec<_>>>()?;
+        .collect();
     Some((kind, arguments))
 }
 
@@ -427,19 +422,13 @@ impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
                             arguments.iter().map(|argument| self.operand(argument)).collect();
                         common(types).map_or(Operand::Opaque, Operand::Typed)
                     }
+                    // A literal first argument takes the second's type.
                     Some((RowPure::Nullif, arguments)) => {
-                        match arguments.as_slice() {
-                            [first, second] => {
-                                match (self.operand(first), self.operand(second)) {
-                                    (Operand::Typed(temporal), _)
-                                    | (Operand::Untyped, Operand::Typed(temporal)) => {
-                                        Operand::Typed(temporal)
-                                    }
-                                    _ => Operand::Opaque,
-                                }
-                            }
-                            _ => Operand::Opaque,
-                        }
+                        arguments
+                            .iter()
+                            .map(|argument| self.operand(argument))
+                            .find(|operand| *operand != Operand::Untyped)
+                            .unwrap_or(Operand::Opaque)
                     }
                     None => Operand::Opaque,
                 }
@@ -531,15 +520,11 @@ impl Visitor for Coercions<'_, '_, '_, '_> {
                     }
                 }
             }
+            // `nullif` compares its two arguments, which types a literal as
+            // their common type.
             Expr::Function(function) => {
-                match row_pure(function) {
-                    Some((RowPure::Common, arguments)) => self.by_common_type(&arguments),
-                    Some((RowPure::Nullif, arguments)) => {
-                        if let [first, second] = arguments.as_slice() {
-                            self.compared(first, second);
-                        }
-                    }
-                    None => {}
+                if let Some((_, arguments)) = row_pure(function) {
+                    self.by_common_type(&arguments);
                 }
             }
             Expr::Cast {
@@ -594,13 +579,13 @@ impl VisitorMut for Respell {
                     format: None,
                 };
             }
-            (Form::Typed, Expr::Value(literal)) => {
-                literal.value = Value::SingleQuotedString(stored);
-            }
             (Form::Typed, Expr::TypedString(typed)) => {
                 typed.value.value = Value::SingleQuotedString(stored);
             }
-            (Form::Typed, _) => {}
+            // The literal a cast holds.
+            (Form::Typed, expr) => {
+                *expr = Expr::Value(Value::SingleQuotedString(stored).with_empty_span());
+            }
         }
         ControlFlow::Continue(())
     }
@@ -632,10 +617,9 @@ fn coercions(
         return unscoped.finish();
     }
     let read = view_rewrites::catalog(builder, core::iter::once(query));
-    let Ok(scope) = ColumnScope::from_query(query, &read, IdentifierCase::AsWritten) else {
-        return unscoped.finish();
-    };
-    let mut scoped = Coercions::new(Some((&scope, &read)), session);
+    // A query whose scopes cannot be derived types only its casts.
+    let scope = ColumnScope::from_query(query, &read, IdentifierCase::AsWritten).ok();
+    let mut scoped = Coercions::new(scope.as_ref().map(|scope| (scope, &read)), session);
     let walk = query.visit(&mut scoped);
     debug_assert!(walk.is_continue(), "the walk never breaks");
     scoped.finish()
