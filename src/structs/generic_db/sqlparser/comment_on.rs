@@ -63,7 +63,7 @@ fn comment_on_table(
     mut builder: ParserDBBuilder,
     mut name: ObjectName,
     expected: ObjectKind,
-    documentation: Option<String>,
+    mut documentation: Option<String>,
     if_exists: bool,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, expected, builder.catalog_name())?;
@@ -73,12 +73,11 @@ fn comment_on_table(
     if kind != expected {
         return Err(kind_mismatch(&name, expected, kind));
     }
-    let table = builder.resolve_table_object_name(&name)?;
-    let position = builder.tables().iter().position(|(stored, _, _)| {
-        table.is_some_and(|table| core::ptr::eq(stored.as_ref(), table))
-    });
-    if let Some(position) = position {
-        builder.tables_mut()[position].1.set_documentation(documentation);
+    let table = builder.resolve_table_object_name(&name)?.map(core::ptr::from_ref);
+    for (stored, metadata, _) in builder.tables_mut() {
+        if table == Some(core::ptr::from_ref(stored.as_ref())) {
+            metadata.set_documentation(documentation.take());
+        }
     }
     Ok(builder)
 }
