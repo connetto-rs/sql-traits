@@ -50,18 +50,21 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
         false
     }
 
-    /// Returns the schema qualifier written on the index name, if any.
+    /// Returns the schema the index lives in, which is always the schema of
+    /// the table it is built on, or `None` when that table has none, as
+    /// [`TableLike::table_schema`] answers.
     ///
     /// # Example
     ///
     /// ```rust
     /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE SCHEMA app;
     ///      CREATE TABLE app.users (id int, name text);
-    ///      CREATE INDEX app.\"IdxName\" ON app.users (name);",
+    ///      CREATE INDEX \"IdxName\" ON app.users (name);",
     /// )?;
     /// let index = db.indexes().next().unwrap();
     /// assert_eq!(index.name(), Some("IdxName"));
@@ -73,7 +76,7 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// ```
     fn schema(&self) -> Option<&str>;
 
-    /// Returns whether that schema qualifier was quoted in SQL.
+    /// Returns whether the identifier of that schema was quoted in SQL.
     ///
     /// This only matters when [`Self::schema`] returns `Some`.
     ///

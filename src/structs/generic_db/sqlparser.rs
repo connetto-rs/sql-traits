@@ -4119,6 +4119,34 @@ fn relation_names_of(create_table: &CreateTable) -> Vec<(ObjectKind, &Ident)> {
     names
 }
 
+/// Refuses a qualifier on the name of `create_index` naming a schema other
+/// than the one `table` is in, since an index lives in its table's schema.
+///
+/// # Errors
+///
+/// Returns [`crate::errors::Error::IndexInAnotherSchema`] when the qualifier
+/// names another schema.
+fn refuse_index_in_another_schema(
+    create_index: &CreateIndex,
+    table: &CreateTable,
+    case: IdentifierCase,
+) -> Result<(), crate::errors::Error> {
+    let Some(name) = create_index.name.as_ref() else {
+        return Ok(());
+    };
+    let Some(written) = qualifier_of(name).named() else {
+        return Ok(());
+    };
+    if schema_qualifiers_match(Some(written), table_schema_qualifier(table), case) {
+        return Ok(());
+    }
+    Err(crate::errors::Error::IndexInAnotherSchema {
+        index_name: last_str(name).to_string(),
+        schema_name: written.0.to_string(),
+        table_name: table.table_name().to_string(),
+    })
+}
+
 /// Returns whether an index holds `name` in `schema`. An index takes its schema
 /// from the table it is on.
 fn index_holds_name<A>(
@@ -5505,6 +5533,7 @@ impl ParserDB {
                 index_name: create_index.name.as_ref().map_or("<unnamed>", last_str).to_string(),
             });
         };
+        refuse_index_in_another_schema(&create_index, table, builder.identifier_case())?;
         builder.refuse_foreign_table(table, &create_index.table_name)?;
         if create_index.unique {
             Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;

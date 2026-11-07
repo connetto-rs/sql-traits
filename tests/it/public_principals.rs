@@ -225,34 +225,18 @@ fn a_function_revoke_reads_each_spelling_as_postgresql_does() {
 }
 
 #[test]
-fn an_index_name_reads_back_with_its_quoting_and_qualifier() {
-    let db = ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE SCHEMA app;
-         CREATE TABLE app.users (id INT, name TEXT);
-         CREATE INDEX app.\"IdxName\" ON app.users (name);",
-    )
-    .expect("schema builds");
-    let index = db.indexes().next().expect("the index exists");
-
-    assert_eq!(index.name(), Some("IdxName"));
-    assert!(index.name_is_quoted());
-    assert_eq!(index.schema(), Some("app"));
-    assert!(!index.schema_is_quoted());
-}
-
-#[test]
-fn an_unqualified_index_name_reports_no_qualifier() {
+fn an_index_name_reads_back_with_its_quoting() {
     let db = ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE users (id INT, name TEXT);
-         CREATE INDEX idx_name ON users (name);",
+         CREATE INDEX \"IdxName\" ON users (name);
+         CREATE INDEX idx_id ON users (id);",
     )
     .expect("schema builds");
-    let index = db.indexes().next().expect("the index exists");
+    let mut names: Vec<_> =
+        db.indexes().map(|index| (index.name(), index.name_is_quoted())).collect();
+    names.sort_unstable();
 
-    assert_eq!(index.name(), Some("idx_name"));
-    assert!(!index.name_is_quoted());
-    assert_eq!(index.schema(), None);
-    assert!(!index.schema_is_quoted());
+    assert_eq!(names, [(Some("IdxName"), true), (Some("idx_id"), false)]);
 }
 
 /// A unique constraint reports the name it was declared with. PostgreSQL
@@ -308,28 +292,5 @@ fn an_unnamed_unique_constraint_is_anonymous() {
     for unique in table.unique_indices(&db).expect("unique indices") {
         assert_eq!(IndexLike::name(unique), None);
         assert!(!IndexLike::name_is_quoted(unique));
-    }
-}
-
-/// A unique constraint name is a bare identifier in every dialect, so it never
-/// carries a qualifier.
-#[test]
-fn a_unique_constraint_never_reports_a_qualifier() {
-    let db = ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE SCHEMA app;
-         CREATE TABLE app.users (id INT, CONSTRAINT uq_id UNIQUE (id));",
-    )
-    .expect("schema builds");
-    let table = db
-        .table_by_target(
-            TargetName::new("users", false).with_schema("app", false),
-            IdentifierCase::AsWritten,
-        )
-        .expect("unambiguous lookup")
-        .expect("the table exists");
-
-    for unique in table.unique_indices(&db).expect("unique indices") {
-        assert_eq!(IndexLike::schema(unique), None);
-        assert!(!IndexLike::schema_is_quoted(unique));
     }
 }

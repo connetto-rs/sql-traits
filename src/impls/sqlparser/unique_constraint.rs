@@ -76,11 +76,14 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
         unique_constraint_name(self.attribute()).is_some_and(|name| name.quote_style.is_some())
     }
 
-    /// Always `None`: the parser stores a unique constraint name as a bare
-    /// identifier, which cannot carry a qualifier.
     #[inline]
     fn schema(&self) -> Option<&str> {
-        None
+        self.table().table_schema()
+    }
+
+    #[inline]
+    fn schema_is_quoted(&self) -> bool {
+        self.table().table_schema_is_quoted()
     }
 
     fn constraint_name<'db>(
