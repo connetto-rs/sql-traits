@@ -23,6 +23,19 @@ fn names_of<'a>(arguments: &'a [Option<TargetName<'_>>]) -> Vec<Option<&'a str>>
     arguments.iter().map(|name| name.as_ref().map(TargetName::name)).collect()
 }
 
+/// Returns the configuration `database` stores for function `name`, each
+/// setting as its `SET` clause.
+fn configuration_of(database: &ParserDB, name: &str) -> Vec<String> {
+    database
+        .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("function exists")
+        .configuration_parameters()
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
 #[test]
 fn the_language_clause_is_reported_as_written_and_as_stored() {
     let database = db("CREATE FUNCTION one() RETURNS INT LANGUAGE SQL AS 'SELECT 1';
@@ -316,16 +329,7 @@ fn configuration_parameters_follow_create_and_alter_order() {
          ALTER FUNCTION altered() RESET work_mem SET search_path TO c;
          CREATE FUNCTION current_path() RETURNS INT LANGUAGE sql
              SET search_path FROM CURRENT AS 'SELECT 1';");
-    let parameters = |name: &str| {
-        database
-            .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
-            .expect("unambiguous lookup")
-            .expect("function exists")
-            .configuration_parameters()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    };
+    let parameters = |name: &str| configuration_of(&database, name);
 
     assert_eq!(parameters("created"), ["SET search_path = a, pg_temp", "SET work_mem = '64kB'"]);
     assert_eq!(parameters("altered"), ["SET search_path = c", "SET statement_timeout = '1s'"]);
@@ -349,16 +353,7 @@ fn set_to_default_removes_the_setting() {
          CREATE FUNCTION altered() RETURNS INT LANGUAGE sql
              SET work_mem = '1MB' SET search_path = app AS 'SELECT 1';
          ALTER FUNCTION altered() SET search_path = DEFAULT SET Work_Mem TO DEFAULT;");
-    let parameters = |name: &str| {
-        database
-            .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
-            .expect("unambiguous lookup")
-            .expect("function exists")
-            .configuration_parameters()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    };
+    let parameters = |name: &str| configuration_of(&database, name);
 
     assert_eq!(parameters("default_path"), [] as [&str; 0]);
     assert_eq!(parameters("cleared"), ["SET search_path = app"]);
@@ -372,14 +367,5 @@ fn configuration_parameter_prefixes_remain_distinct() {
     let database = db("CREATE FUNCTION f() RETURNS INT LANGUAGE sql
              SET a.b.c TO x SET other.b.c TO y AS 'SELECT 1';
          ALTER FUNCTION f() RESET a.b.c;");
-    let parameters = database
-        .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)
-        .expect("unambiguous lookup")
-        .expect("function exists")
-        .configuration_parameters()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-
-    assert_eq!(parameters, ["SET other.b.c = y"]);
+    assert_eq!(configuration_of(&database, "f"), ["SET other.b.c = y"]);
 }
