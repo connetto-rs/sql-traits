@@ -2508,8 +2508,9 @@ pub enum Error {
         statement: String,
     },
     #[error("`{value}` is no `TimeZone` PostgreSQL accepts: {reason}")]
-    /// Error indicating that `ALTER ROLE ... SET timezone` or a session `SET`
-    /// of it names a zone PostgreSQL refuses.
+    /// Error indicating that `ALTER ROLE ... SET timezone`, a session `SET`
+    /// of it, or a [`RoleSetting`](crate::structs::RoleSetting) of it names a
+    /// zone PostgreSQL refuses.
     InvalidTimeZone {
         /// The refused value.
         value: String,

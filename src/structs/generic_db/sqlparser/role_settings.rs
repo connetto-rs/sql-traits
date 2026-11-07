@@ -21,7 +21,7 @@ use sqlparser::ast::{
 use super::{ParserDBBuilder, SessionRoles, stored_role_name};
 use crate::{
     errors::Error,
-    structs::RoleSetting,
+    structs::{RoleSetting, role_setting::setting_zone},
     utils::{
         identifier_resolution::{SessionPrincipal, normalize_identifier, session_principal},
         object_name::{require_static_object_name, setting_value},
@@ -208,13 +208,7 @@ fn literal(value: &Expr, hex_strings_may_be_integers: bool) -> Option<String> {
 /// `text` as the value of the setting `name`, carrying the zone of a
 /// `TimeZone` setting and refused when PostgreSQL refuses that zone.
 fn valued(name: &str, text: String) -> Result<Value, Error> {
-    if !name.eq_ignore_ascii_case("timezone") {
-        return Ok(Value { text, zone: None });
-    }
-    match PgTimeZone::parse(&text) {
-        Ok(zone) => Ok(Value { text, zone: Some(zone) }),
-        Err(reason) => Err(Error::InvalidTimeZone { value: text, reason }),
-    }
+    Ok(Value { zone: setting_zone(name, &text)?, text })
 }
 
 /// Records what an `ALTER ROLE ... SET` or `RESET` statement leaves in

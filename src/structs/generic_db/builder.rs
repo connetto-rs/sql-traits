@@ -934,6 +934,24 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self
     }
 
+    /// Adds an `ALTER ROLE ... SET` entry to the builder, after the entries
+    /// already added.
+    #[must_use]
+    #[inline]
+    pub fn add_role_setting(mut self, setting: RoleSetting) -> Self {
+        self.role_settings.push(setting);
+        self
+    }
+
+    /// Adds multiple `ALTER ROLE ... SET` entries to the builder, in the
+    /// order given.
+    #[must_use]
+    #[inline]
+    pub fn add_role_settings(mut self, settings: impl IntoIterator<Item = RoleSetting>) -> Self {
+        self.role_settings.extend(settings);
+        self
+    }
+
     /// Adds a schema with its metadata to the builder.
     #[must_use]
     #[inline]
@@ -1346,10 +1364,10 @@ mod tests {
     use crate::{
         impls::SqlparserDialect,
         structs::{
-            ParserDB, ParserDBBuilder, SqlparserProfile,
+            Deployment, ParserDB, ParserDBBuilder, RoleSetting, SqlparserProfile, TimeZoneSource,
             role_membership::{MembershipGrant, RoleMembership},
         },
-        traits::RoleLike,
+        traits::{DatabaseLike, RoleLike},
     };
 
     /// A membership of `member` in `role` under one grant without a
@@ -1381,6 +1399,50 @@ mod tests {
         assert_eq!(parents, ["reader", "auditor"]);
     }
 
+    /// The entries a builder is handed answer `role_settings` in the order
+    /// they were added, and a `TimeZone` entry sets the zone a request runs
+    /// in as `ALTER ROLE ... SET` does.
+    #[test]
+    fn added_role_settings_set_the_request_time_zone() {
+        let database = ParserDB::parse::<PostgreSqlDialect>("CREATE ROLE l; CREATE ROLE a;")
+            .expect("the roles parse");
+        let (builder, ingestion) = ParserDBBuilder::from_database(database);
+        let setting = |role: Option<&str>, database: Option<&str>, name, value| {
+            RoleSetting::new(role.map(Into::into), database.map(Into::into), name, value)
+                .expect("PostgreSQL accepts every value")
+        };
+        let database = builder
+            .add_role_setting(setting(Some("l"), Some("d"), "TimeZone", "Asia/Tokyo"))
+            .add_role_settings([
+                setting(None, None, "TimeZone", "Europe/Rome"),
+                setting(Some("l"), None, "work_mem", "64MB"),
+            ])
+            .into_database(ingestion);
+
+        let entries: Vec<_> = database
+            .role_settings()
+            .map(|setting| (setting.role(), setting.database(), setting.name(), setting.value()))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (Some("l"), Some("d"), "TimeZone", "Asia/Tokyo"),
+                (None, None, "TimeZone", "Europe/Rome"),
+                (Some("l"), None, "work_mem", "64MB"),
+            ]
+        );
+
+        let zone = |connected: &str| {
+            let deployment = Deployment::new("l", ["a"], [])
+                .expect("a valid description")
+                .connected_to(connected);
+            let resolved = deployment.resolve(&database).expect("the login role is declared");
+            resolved.login_time_zone().map(|zone| (zone.name().to_owned(), zone.source()))
+        };
+        assert_eq!(zone("d"), Ok(("Asia/Tokyo".to_owned(), TimeZoneSource::LoginRoleInDatabase)));
+        assert_eq!(zone("other"), Ok(("Europe/Rome".to_owned(), TimeZoneSource::AllRoles)));
+    }
+
     #[test]
     fn empty_bulk_additions_preserve_every_collection() {
         let builder = ParserDBBuilder::new("catalog".to_string(), SqlparserDialect::Generic)
@@ -1394,6 +1456,7 @@ mod tests {
             .add_functions(core::iter::empty())
             .add_roles(core::iter::empty())
             .add_role_memberships(core::iter::empty())
+            .add_role_settings(core::iter::empty())
             .add_schemas(core::iter::empty())
             .add_table_grants(core::iter::empty())
             .add_column_grants(core::iter::empty());
