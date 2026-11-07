@@ -314,8 +314,6 @@ fn configuration_parameters_follow_create_and_alter_order() {
          ALTER FUNCTION altered() SET search_path TO b, pg_temp
              SET statement_timeout TO '1s';
          ALTER FUNCTION altered() RESET work_mem SET search_path TO c;
-         CREATE FUNCTION default_path() RETURNS INT LANGUAGE sql
-             SET search_path TO DEFAULT AS 'SELECT 1';
          CREATE FUNCTION current_path() RETURNS INT LANGUAGE sql
              SET search_path FROM CURRENT AS 'SELECT 1';");
     let parameters = |name: &str| {
@@ -331,9 +329,42 @@ fn configuration_parameters_follow_create_and_alter_order() {
 
     assert_eq!(parameters("created"), ["SET search_path = a, pg_temp", "SET work_mem = '64kB'"]);
     assert_eq!(parameters("altered"), ["SET search_path = c", "SET statement_timeout = '1s'"]);
-    assert_eq!(parameters("default_path"), ["SET search_path = DEFAULT"]);
     // PostgreSQL stores the path the clause read, as `pg_proc.proconfig` shows.
     assert_eq!(parameters("current_path"), ["SET search_path = public"]);
+}
+
+/// `SET name = DEFAULT` removes the setting like `RESET name`, and a repeated
+/// name keeps its first position with the last value, as `pg_proc.proconfig`
+/// stores them.
+#[test]
+fn set_to_default_removes_the_setting() {
+    let database = db("CREATE FUNCTION default_path() RETURNS INT LANGUAGE sql
+             SET search_path TO DEFAULT AS 'SELECT 1';
+         CREATE FUNCTION cleared() RETURNS INT LANGUAGE sql
+             SET work_mem = '1MB' SET search_path = app SET work_mem TO DEFAULT AS 'SELECT 1';
+         CREATE FUNCTION restored() RETURNS INT LANGUAGE sql
+             SET work_mem = DEFAULT SET search_path = app SET work_mem = '3MB' AS 'SELECT 1';
+         CREATE FUNCTION repeated() RETURNS INT LANGUAGE sql
+             SET work_mem = '1MB' SET search_path = app SET work_mem = '2MB' AS 'SELECT 1';
+         CREATE FUNCTION altered() RETURNS INT LANGUAGE sql
+             SET work_mem = '1MB' SET search_path = app AS 'SELECT 1';
+         ALTER FUNCTION altered() SET search_path = DEFAULT SET Work_Mem TO DEFAULT;");
+    let parameters = |name: &str| {
+        database
+            .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("function exists")
+            .configuration_parameters()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(parameters("default_path"), [] as [&str; 0]);
+    assert_eq!(parameters("cleared"), ["SET search_path = app"]);
+    assert_eq!(parameters("restored"), ["SET search_path = app", "SET work_mem = '3MB'"]);
+    assert_eq!(parameters("repeated"), ["SET work_mem = '2MB'", "SET search_path = app"]);
+    assert_eq!(parameters("altered"), [] as [&str; 0]);
 }
 
 #[test]

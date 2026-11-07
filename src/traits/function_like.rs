@@ -805,7 +805,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         atomic_statements(self, database)
     }
 
-    /// Returns the function-local configuration after later alterations.
+    /// Returns the function-local configuration after later alterations, one
+    /// entry per setting in the order `pg_proc.proconfig` stores them.
+    /// `SET name = DEFAULT` removes the setting as `RESET name` does, so no
+    /// entry holds `DEFAULT`.
     fn configuration_parameters(&self) -> &[FunctionDefinitionSetParam];
 
     /// Returns the `search_path` the function sets for its own body, each
