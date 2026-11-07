@@ -78,6 +78,7 @@ mod attach_partition;
 mod calls_in_expression;
 use calls_in_expression::CarriedCalls;
 mod column_copy;
+mod comment_on;
 mod constraint_names;
 mod constraint_validity;
 mod default_privileges;
@@ -11027,6 +11028,15 @@ impl ParserDB {
                         &session_roles,
                         &builder,
                         access_resolution,
+                    )?;
+                }
+                Statement::Comment { object_type, object_name, comment, if_exists } => {
+                    builder = comment_on::comment_on(
+                        builder,
+                        object_type,
+                        object_name,
+                        comment,
+                        if_exists,
                     )?;
                 }
                 Statement::Do(block) => {

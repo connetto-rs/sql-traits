@@ -91,11 +91,16 @@ impl ColumnMetadata {
         self
     }
 
-    /// Stores the comment block written above the column.
+    /// Stores the documentation of the column.
     #[must_use]
     pub fn with_documentation(mut self, documentation: Option<String>) -> Self {
         self.documentation = documentation;
         self
+    }
+
+    /// Replaces the documentation of the column, as `COMMENT ON COLUMN` does.
+    pub(crate) fn set_documentation(&mut self, documentation: Option<String>) {
+        self.documentation = documentation;
     }
 
     pub(crate) fn with_postgres_default_collation(mut self) -> Self {
@@ -144,7 +149,7 @@ impl ColumnMetadata {
         self.mysql_padding
     }
 
-    /// Returns the comment block written above the column.
+    /// Returns the documentation of the column.
     #[must_use]
     pub fn documentation(&self) -> Option<&str> {
         self.documentation.as_deref()
