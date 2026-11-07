@@ -88,13 +88,14 @@ fn comment_on_column(
 ) -> Result<ParserDBBuilder, Error> {
     require_static_object_name(&name)?;
     let mut relation = name;
-    // A static name ends in an identifier.
-    let Some(ObjectNamePart::Identifier(column)) = relation.0.pop() else {
-        return Err(Error::UnqualifiedCommentColumn { column_name: relation.to_string() });
+    let column = match relation.0.pop() {
+        Some(ObjectNamePart::Identifier(column)) if !relation.0.is_empty() => column,
+        part => {
+            return Err(Error::UnqualifiedCommentColumn {
+                column_name: part.map(|part| part.to_string()).unwrap_or_default(),
+            });
+        }
     };
-    if relation.0.is_empty() {
-        return Err(Error::UnqualifiedCommentColumn { column_name: column.value });
-    }
     require_named_in_catalog(&mut relation, ObjectKind::Table, builder.catalog_name())?;
     let Some((kind, schema)) = reached(&builder, &relation, ObjectKind::Table, if_exists)? else {
         return Ok(builder);
@@ -161,17 +162,14 @@ fn reached<'name>(
 }
 
 /// The position among the stored tables of the table or foreign table `name`
-/// reaches.
+/// reaches, once the relation pool has shown it holds one.
 fn table_position(builder: &ParserDBBuilder, name: &ObjectName) -> Result<usize, Error> {
-    let not_found = || {
-        Error::RelationNotFound { object_kind: ObjectKind::Table, object_name: name.to_string() }
-    };
-    let table = builder.resolve_table_object_name(name)?.ok_or_else(not_found)?;
     builder
-        .tables()
-        .iter()
-        .position(|(stored, _, _)| core::ptr::eq(stored.as_ref(), table))
-        .ok_or_else(not_found)
+        .resolve_table_object_name(name)?
+        .and_then(|table| {
+            builder.tables().iter().position(|(stored, _, _)| core::ptr::eq(stored.as_ref(), table))
+        })
+        .ok_or_else(|| ObjectKind::Table.not_in_database(&name.to_string()).into())
 }
 
 fn kind_mismatch(name: &ObjectName, expected: ObjectKind, actual: ObjectKind) -> Error {
