@@ -20,7 +20,7 @@ pub use sqlparser::{
 };
 
 use crate::{
-    structs::{ColumnIdentity, IdentifierCase, IdentityCounter, RelationIdentity},
+    structs::{ColumnIdentity, IdentifierCase, IdentityCounter, RelationIdentity, RoleSetting},
     traits::{PolicyLike, RoleLike, SchemaLike, TableLike, TriggerLike},
     utils::{
         identifier_resolution::stored_identifier_matches_lookup,
@@ -56,8 +56,8 @@ pub struct GenericDB<P: SchemaProfile> {
     dialect: P::Dialect,
     /// Catalog name of the database.
     catalog_name: String,
-    /// Timezone of the database.
-    timezone: Option<String>,
+    /// The `ALTER ROLE ... SET` entries, in the order they were first set.
+    role_settings: Vec<RoleSetting>,
     /// List of tables in the database.
     tables: Vec<Identified<P::Table, RelationIdentity>>,
     /// List of foreign tables in the database, the same kind of node as a
@@ -150,7 +150,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
         f.debug_struct("GenericDB")
             .field("dialect", &self.dialect)
             .field("catalog_name", &self.catalog_name)
-            .field("timezone", &self.timezone)
+            .field("role_settings", &self.role_settings)
             .field("tables", &self.tables.len())
             .field("foreign_tables", &self.foreign_tables.len())
             .field("views", &self.views.len())
@@ -193,7 +193,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
         Self {
             dialect: self.dialect.clone(),
             catalog_name: self.catalog_name.clone(),
-            timezone: self.timezone.clone(),
+            role_settings: self.role_settings.clone(),
             tables: self.tables.clone(),
             foreign_tables: self.foreign_tables.clone(),
             views: self.views.clone(),

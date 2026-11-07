@@ -8,7 +8,8 @@ use alloc::{
 use crate::{
     errors::LookupError,
     structs::{
-        ColumnIdentity, GenericDB, IdentifierCase, RelationIdentity, SchemaProfile, TargetName,
+        ColumnIdentity, GenericDB, IdentifierCase, RelationIdentity, RoleSetting, SchemaProfile,
+        TargetName,
         generic_db::{Identified, RelationSlot},
     },
     traits::{DatabaseLike, FunctionLike, Relation, TableLike},
@@ -61,11 +62,6 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     #[inline]
     fn number_of_tables(&self) -> usize {
         self.tables.len()
-    }
-
-    #[inline]
-    fn timezone(&self) -> Option<&str> {
-        self.timezone.as_deref()
     }
 
     #[inline]
@@ -444,6 +440,10 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
 
     fn role_memberships(&self) -> impl Iterator<Item = &Self::RoleMembership> {
         self.role_memberships.iter().map(|(membership, _)| membership.as_ref())
+    }
+
+    fn role_settings(&self) -> impl Iterator<Item = &RoleSetting> {
+        self.role_settings.iter()
     }
 
     fn table_grants(&self) -> impl Iterator<Item = &Self::TableGrant> {

@@ -668,6 +668,34 @@ pub enum DeploymentError {
         /// The missing role.
         role: String,
     },
+    /// The default `TimeZone` is one PostgreSQL refuses.
+    #[error("`{zone}` is no `TimeZone` PostgreSQL accepts: {reason}")]
+    InvalidTimeZone {
+        /// The refused zone.
+        zone: String,
+        /// Why PostgreSQL refuses it.
+        #[source]
+        reason: sql_values::TimeZoneError,
+    },
+    /// The role is not one the deployment acts as.
+    #[error("role `{role}` is not an acting role of the deployment")]
+    NotAnActingRole {
+        /// The role asked about.
+        role: String,
+    },
+    /// No `ALTER ROLE ... SET` reaching a request sets `TimeZone`, and the
+    /// deployment declares no server default.
+    #[error(
+        "no role setting gives the request a `TimeZone` and the deployment declares no default"
+    )]
+    NoDefaultTimeZone,
+    /// A `TimeZone` set `IN DATABASE` may reach a request, and the deployment
+    /// names no database to match it against.
+    #[error("a `TimeZone` set in one database reaches the request, and the deployment names none")]
+    NoDatabase {
+        /// The role the setting is for, [`None`] for every role.
+        role: Option<String>,
+    },
 }
 
 /// Why [`TableLike::row_security`](crate::traits::TableLike::row_security)
@@ -2386,6 +2414,48 @@ pub enum Error {
     /// more than one value, or a value that is no name, string, number or
     /// boolean, which PostgreSQL refuses.
     InvalidSessionRole {
+        /// The statement, rendered by sqlparser.
+        statement: String,
+    },
+    #[error(
+        "`{statement}` sets a value that is no name, string, number or boolean, which PostgreSQL \
+         refuses."
+    )]
+    /// Error indicating that `ALTER ROLE ... SET` gives a setting a value
+    /// PostgreSQL's grammar reads as no literal, such as a function call or
+    /// an interval.
+    NonLiteralSetting {
+        /// The statement, rendered by sqlparser.
+        statement: String,
+    },
+    #[error(
+        "`{statement}` stores the session's current `{setting}`, which the input leaves unknown."
+    )]
+    /// Error indicating that `ALTER ROLE ... SET ... FROM CURRENT` reads a
+    /// setting the input never set, or returned to the value the session
+    /// started with, which the server's configuration and the role running
+    /// the input decide.
+    UnknownCurrentSetting {
+        /// The setting, as written.
+        setting: String,
+        /// The statement, rendered by sqlparser.
+        statement: String,
+    },
+    #[error("`{value}` is no `TimeZone` PostgreSQL accepts: {reason}")]
+    /// Error indicating that `ALTER ROLE ... SET timezone` or a session `SET`
+    /// of it names a zone PostgreSQL refuses.
+    InvalidTimeZone {
+        /// The refused value.
+        value: String,
+        /// Why PostgreSQL refuses it.
+        #[source]
+        reason: sql_values::TimeZoneError,
+    },
+    #[error("`{statement}` names the role the session runs as, which the input never names.")]
+    /// Error indicating that `ALTER ROLE CURRENT_USER`, `CURRENT_ROLE` or
+    /// `SESSION_USER` sets a setting while the session runs as the role the
+    /// input runs as without naming it.
+    UnnamedSessionRoleSetting {
         /// The statement, rendered by sqlparser.
         statement: String,
     },

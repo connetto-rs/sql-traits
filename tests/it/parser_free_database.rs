@@ -309,10 +309,6 @@ impl DatabaseLike for MemoryCatalog {
         self.tables.len()
     }
 
-    fn timezone(&self) -> Option<&str> {
-        None
-    }
-
     fn search_path(&self) -> impl Iterator<Item = (&str, bool)> {
         self.search_path
             .iter()
@@ -412,6 +408,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn role_memberships(&self) -> impl Iterator<Item = &Self::RoleMembership> {
         self.role_memberships.iter()
+    }
+
+    fn role_settings(&self) -> impl Iterator<Item = &RoleSetting> {
+        core::iter::empty()
     }
 
     fn table_grants(&self) -> impl Iterator<Item = &Self::TableGrant> {

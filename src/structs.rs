@@ -23,6 +23,7 @@ mod partition_bound;
 mod privilege_holder;
 mod revoked_privilege;
 mod role_membership;
+mod role_setting;
 mod row_security;
 mod schema;
 mod sequence;
@@ -38,8 +39,8 @@ pub use column_scope::{
     ColumnScope, QueryOutput, RelationBinding,
 };
 pub use deployment::{
-    Deployment, JsonField, ResolvedDeployment, SessionSetting, SetPacking, SettingContent,
-    SettingPresence, SettingValue,
+    Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
+    SettingContent, SettingPresence, SettingValue, TimeZoneSource,
 };
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
@@ -54,6 +55,7 @@ pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
 pub use privilege_holder::PrivilegeHolder;
 pub use revoked_privilege::RevokedPrivilege;
 pub use role_membership::RoleMembership;
+pub use role_setting::RoleSetting;
 pub use row_security::{
     ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,
     RowSecurityExemption, RowStatement, RowVersion,

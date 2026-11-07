@@ -148,9 +148,29 @@ pub(crate) fn search_path_entry(
     value: &Expr,
     hex_strings_may_be_integers: bool,
 ) -> Result<(Cow<'_, str>, bool), LookupError> {
+    setting_value(value, hex_strings_may_be_integers).ok_or_else(|| {
+        LookupError::InvalidObjectName {
+            object_name: value.to_string(),
+            reason: "PostgreSQL accepts only names, strings, numbers and booleans in \
+                     search_path"
+                .to_string(),
+        }
+    })
+}
+
+/// Reads a value PostgreSQL's grammar takes for a setting, a name, string,
+/// number or boolean, as PostgreSQL prints it and whether it compares exactly
+/// as a name, or [`None`] for any other expression.
+///
+/// A bare identifier comes back as written and unquoted, for the caller to
+/// fold. Every other value compares exactly.
+pub(crate) fn setting_value(
+    value: &Expr,
+    hex_strings_may_be_integers: bool,
+) -> Option<(Cow<'_, str>, bool)> {
     let spelled = match value {
         Expr::Identifier(ident) => {
-            return Ok((Cow::Borrowed(ident.value.as_str()), ident.quote_style.is_some()));
+            return Some((Cow::Borrowed(ident.value.as_str()), ident.quote_style.is_some()));
         }
         Expr::Value(ValueWithSpan { value, .. }) => {
             match value {
@@ -177,14 +197,7 @@ pub(crate) fn search_path_entry(
         }
         _ => None,
     };
-    spelled.map(|name| (name, true)).ok_or_else(|| {
-        LookupError::InvalidObjectName {
-            object_name: value.to_string(),
-            reason: "PostgreSQL accepts only names, strings, numbers and booleans in \
-                     search_path"
-                .to_string(),
-        }
-    })
+    spelled.map(|name| (name, true))
 }
 
 /// Spells a numeric `search_path` entry the way PostgreSQL prints it, or

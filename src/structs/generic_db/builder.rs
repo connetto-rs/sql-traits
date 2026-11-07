@@ -11,7 +11,7 @@ use crate::{
     errors::LookupError,
     structs::{
         ColumnIdentity, GenericDB, IdentifierCase, IdentityCounter, Meta, RelationIdentity,
-        SchemaProfile,
+        RoleSetting, SchemaProfile,
         generic_db::{
             Identified, RelationSlot, Stored,
             builtin_functions::{BuiltinTable, Builtins},
@@ -88,8 +88,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     dialect: P::Dialect,
     /// Catalog name of the database.
     catalog_name: String,
-    /// Timezone of the database.
-    timezone: Option<String>,
+    /// The `ALTER ROLE ... SET` entries, in the order they were first set.
+    role_settings: Vec<RoleSetting>,
     /// List of tables in the database.
     tables: Vec<Identified<P::Table, RelationIdentity>>,
     /// List of plain views in the database.
@@ -155,7 +155,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
         Self {
             dialect: self.dialect.clone(),
             catalog_name: self.catalog_name.clone(),
-            timezone: self.timezone.clone(),
+            role_settings: self.role_settings.clone(),
             tables: self.tables.clone(),
             views: self.views.clone(),
             materialized_views: self.materialized_views.clone(),
@@ -222,7 +222,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         Self {
             dialect: self.dialect.clone(),
             catalog_name: self.catalog_name.clone(),
-            timezone: self.timezone.clone(),
+            role_settings: Vec::new(),
             views: views_named_by(&self.views, keys),
             materialized_views: views_named_by(&self.materialized_views, keys),
             sequences: Vec::new(),
@@ -556,7 +556,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         Self {
             dialect,
             catalog_name,
-            timezone: None,
+            role_settings: Vec::new(),
             tables: Vec::new(),
             views: Vec::new(),
             materialized_views: Vec::new(),
@@ -626,12 +626,9 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         Ok(())
     }
 
-    /// Sets the timezone for the database.
-    #[must_use]
-    #[inline]
-    pub fn timezone(mut self, timezone: String) -> Self {
-        self.timezone = Some(timezone);
-        self
+    /// Mutable access to the `ALTER ROLE ... SET` entries.
+    pub(crate) fn role_settings_mut(&mut self) -> &mut Vec<RoleSetting> {
+        &mut self.role_settings
     }
 
     /// Adds a table with its metadata to the builder, under an identity no
@@ -1074,7 +1071,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         let GenericDB {
             dialect,
             catalog_name,
-            timezone,
+            role_settings,
             mut tables,
             foreign_tables,
             views,
@@ -1115,7 +1112,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         let builder = Self {
             dialect,
             catalog_name,
-            timezone,
+            role_settings,
             tables,
             views,
             materialized_views,
@@ -1276,7 +1273,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         GenericDB {
             dialect: self.dialect,
             catalog_name,
-            timezone: self.timezone,
+            role_settings: self.role_settings,
             tables,
             foreign_tables,
             views: self.views,

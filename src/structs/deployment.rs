@@ -2,9 +2,10 @@
 
 use alloc::{string::String, vec::Vec};
 
+use sql_values::PgTimeZone;
 use sqlparser::ast::DataType;
 
-use crate::{errors::DeploymentError, traits::DatabaseLike};
+use crate::{errors::DeploymentError, structs::RoleSetting, traits::DatabaseLike};
 
 /// The roles a deployment's requests run as and the session settings its
 /// policies read.
@@ -59,6 +60,9 @@ pub struct Deployment {
     login_role: String,
     acting_roles: Vec<String>,
     settings: Vec<SessionSetting>,
+    database: Option<String>,
+    default_time_zone: Option<String>,
+    acting_role_settings: bool,
 }
 
 impl Deployment {
@@ -96,7 +100,64 @@ impl Deployment {
             }
             declared.push(setting);
         }
-        Ok(Self { login_role: login_role.into(), acting_roles: roles, settings: declared })
+        Ok(Self {
+            login_role: login_role.into(),
+            acting_roles: roles,
+            settings: declared,
+            database: None,
+            default_time_zone: None,
+            acting_role_settings: false,
+        })
+    }
+
+    /// The same deployment, connecting to the database PostgreSQL stores as
+    /// `database`, whose `ALTER ROLE ... IN DATABASE` settings then reach its
+    /// requests.
+    #[must_use]
+    pub fn connected_to(self, database: impl Into<String>) -> Self {
+        Self { database: Some(database.into()), ..self }
+    }
+
+    /// The same deployment on a server whose `postgresql.conf` sets
+    /// `TimeZone` to `zone`, which a request runs in when no role setting
+    /// reaching it sets one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::InvalidTimeZone`] for a zone PostgreSQL
+    /// refuses, as [`PgTimeZone::parse`] reads it.
+    pub fn with_default_time_zone(self, zone: impl Into<String>) -> Result<Self, DeploymentError> {
+        let zone = zone.into();
+        if let Err(reason) = PgTimeZone::parse(&zone) {
+            return Err(DeploymentError::InvalidTimeZone { zone, reason });
+        }
+        Ok(Self { default_time_zone: Some(zone), ..self })
+    }
+
+    /// The same deployment applying the acting role's own settings to each
+    /// request, as PostgREST does after switching roles, where PostgreSQL's
+    /// `SET ROLE` applies only the login role's.
+    #[must_use]
+    pub fn with_acting_role_settings(self) -> Self {
+        Self { acting_role_settings: true, ..self }
+    }
+
+    /// The database the deployment connects to, when declared.
+    #[must_use]
+    pub fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
+    /// The server's default `TimeZone`, as written, when declared.
+    #[must_use]
+    pub fn default_time_zone(&self) -> Option<&str> {
+        self.default_time_zone.as_deref()
+    }
+
+    /// Whether each request applies the acting role's own settings.
+    #[must_use]
+    pub fn applies_acting_role_settings(&self) -> bool {
+        self.acting_role_settings
     }
 
     /// The role every request logs in as, which `session_user` names.
@@ -129,7 +190,7 @@ impl Deployment {
     /// Returns [`DeploymentError::UndeclaredRole`] naming the first role,
     /// login role first, that `database` does not declare.
     pub fn resolve<'db, DB: DatabaseLike>(
-        &self,
+        &'db self,
         database: &'db DB,
     ) -> Result<ResolvedDeployment<'db, DB>, DeploymentError> {
         let declared = |name: &str| {
@@ -138,13 +199,15 @@ impl Deployment {
         let login_role = declared(&self.login_role)?;
         let acting_roles =
             self.acting_roles.iter().map(|role| declared(role)).collect::<Result<Vec<_>, _>>()?;
-        Ok(ResolvedDeployment { login_role, acting_roles })
+        Ok(ResolvedDeployment { deployment: self, database, login_role, acting_roles })
     }
 }
 
 /// A [`Deployment`]'s roles as declared in one database.
 #[derive(Debug)]
 pub struct ResolvedDeployment<'db, DB: DatabaseLike> {
+    deployment: &'db Deployment,
+    database: &'db DB,
     login_role: &'db DB::Role,
     acting_roles: Vec<&'db DB::Role>,
 }
@@ -160,6 +223,139 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     pub fn acting_roles(&self) -> impl Iterator<Item = &'db DB::Role> + '_ {
         self.acting_roles.iter().copied()
     }
+
+    /// The `TimeZone` a request acting as `acting_role` runs in, and the
+    /// step that supplies it.
+    ///
+    /// PostgreSQL takes the first entry setting `TimeZone` of the login role
+    /// in the database, the login role, every role in the database, every
+    /// role, and then `postgresql.conf`. `SET ROLE` applies none of the
+    /// acting role's own, unless [`Deployment::with_acting_role_settings`]
+    /// puts the acting role in the database and the acting role first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::NotAnActingRole`] for a role the
+    /// deployment does not act as, [`DeploymentError::NoDatabase`] when an
+    /// entry set in one database is reached and the deployment names no
+    /// database, and [`DeploymentError::NoDefaultTimeZone`] when no entry
+    /// sets the zone and the deployment declares no default.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE authenticator LOGIN NOINHERIT;
+    ///      CREATE ROLE web_user NOLOGIN;
+    ///      ALTER ROLE ALL IN DATABASE app SET timezone = 'Europe/Rome';
+    ///      ALTER ROLE web_user SET timezone = 'America/New_York';",
+    /// )
+    /// .expect("the schema parses");
+    /// let plain = Deployment::new("authenticator", ["web_user"], [])
+    ///     .and_then(|deployment| deployment.connected_to("app").with_default_time_zone("Etc/UTC"))
+    ///     .expect("a valid description");
+    /// let postgrest = plain.clone().with_acting_role_settings();
+    ///
+    /// let zone = plain.resolve(&database).and_then(|resolved| {
+    ///     resolved.time_zone("web_user").map(|zone| (zone.name(), zone.source()))
+    /// });
+    /// assert_eq!(zone, Ok(("Europe/Rome", TimeZoneSource::Database)));
+    ///
+    /// let zone = postgrest.resolve(&database).and_then(|resolved| {
+    ///     resolved.time_zone("web_user").map(|zone| (zone.name(), zone.source()))
+    /// });
+    /// assert_eq!(zone, Ok(("America/New_York", TimeZoneSource::ActingRole)));
+    /// ```
+    pub fn time_zone(&self, acting_role: &str) -> Result<RequestTimeZone<'db>, DeploymentError> {
+        let deployment = self.deployment;
+        let database = self.database;
+        if !deployment.acting_roles.iter().any(|role| role == acting_role) {
+            return Err(DeploymentError::NotAnActingRole { role: acting_role.into() });
+        }
+        let acting =
+            [(TimeZoneSource::ActingRoleInDatabase, TimeZoneSource::ActingRole, Some(acting_role))];
+        let login = [
+            (
+                TimeZoneSource::LoginRoleInDatabase,
+                TimeZoneSource::LoginRole,
+                Some(deployment.login_role.as_str()),
+            ),
+            (TimeZoneSource::Database, TimeZoneSource::AllRoles, None),
+        ];
+        let acting = if deployment.acting_role_settings { &acting[..] } else { &[] };
+        for &(in_database, everywhere, role) in acting.iter().chain(&login) {
+            let zone_set = |set_in: Option<&str>| {
+                database
+                    .role_settings()
+                    .find(|setting| setting.is_keyed(role, set_in) && setting.is_named("timezone"))
+                    .map(RoleSetting::value)
+            };
+            if let Some(connected) = deployment.database.as_deref() {
+                if let Some(name) = zone_set(Some(connected)) {
+                    return Ok(RequestTimeZone { name, source: in_database });
+                }
+            } else if database.role_settings().any(|setting| {
+                setting.role() == role
+                    && setting.database().is_some()
+                    && setting.is_named("timezone")
+            }) {
+                return Err(DeploymentError::NoDatabase { role: role.map(Into::into) });
+            }
+            if let Some(name) = zone_set(None) {
+                return Ok(RequestTimeZone { name, source: everywhere });
+            }
+        }
+        deployment
+            .default_time_zone
+            .as_deref()
+            .map(|name| RequestTimeZone { name, source: TimeZoneSource::ServerDefault })
+            .ok_or(DeploymentError::NoDefaultTimeZone)
+    }
+}
+
+/// The `TimeZone` a request runs in, from
+/// [`ResolvedDeployment::time_zone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTimeZone<'db> {
+    name: &'db str,
+    source: TimeZoneSource,
+}
+
+impl<'db> RequestTimeZone<'db> {
+    /// The zone as its setting writes it, which [`PgTimeZone::parse`] reads.
+    #[must_use]
+    pub fn name(&self) -> &'db str {
+        self.name
+    }
+
+    /// The step that supplies the zone.
+    #[must_use]
+    pub fn source(&self) -> TimeZoneSource {
+        self.source
+    }
+}
+
+/// Which step of PostgreSQL's precedence supplies a request's `TimeZone`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimeZoneSource {
+    /// `ALTER ROLE acting IN DATABASE d SET`, applied per request.
+    ActingRoleInDatabase,
+    /// `ALTER ROLE acting SET`, applied per request.
+    ActingRole,
+    /// `ALTER ROLE login IN DATABASE d SET`.
+    LoginRoleInDatabase,
+    /// `ALTER ROLE login SET`.
+    LoginRole,
+    /// `ALTER ROLE ALL IN DATABASE d SET`, which `ALTER DATABASE d SET`
+    /// writes too.
+    Database,
+    /// `ALTER ROLE ALL SET`.
+    AllRoles,
+    /// The deployment's declared server default.
+    ServerDefault,
 }
 
 /// One session setting a deployment's policies read with `current_setting`.
