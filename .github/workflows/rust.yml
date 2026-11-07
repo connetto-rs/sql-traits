@@ -165,8 +165,11 @@ jobs:
       uses: taiki-e/install-action@cargo-llvm-cov
     - name: Measure all targets
       run: cargo llvm-cov --workspace --all-targets --features git,serde --no-report
+    # Coverage reads only the `__llvm_cov*` and `__llvm_prf_*` sections, which survive stripping the symbol table of each persisted doctest binary.
     - name: Measure doctests and write the report
       run: cargo llvm-cov --workspace --doc --features git,serde --no-clean --lcov --output-path target/coverage.lcov
+      env:
+        RUSTDOCFLAGS: -C strip=symbols
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
       with:
