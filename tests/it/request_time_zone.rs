@@ -42,6 +42,16 @@ fn zone(
     resolved.time_zone("a").map(|zone| (zone.name().to_string(), zone.source()))
 }
 
+/// The zone a request that never runs `SET ROLE` runs in, and the step that
+/// set it.
+fn login_zone(
+    database: &ParserDB,
+    deployment: &Deployment,
+) -> Result<(String, TimeZoneSource), DeploymentError> {
+    let resolved = deployment.resolve(database).expect("every role is declared");
+    resolved.login_time_zone().map(|zone| (zone.name().to_string(), zone.source()))
+}
+
 fn answer(name: &str, source: TimeZoneSource) -> (String, TimeZoneSource) {
     (name.to_string(), source)
 }
@@ -211,4 +221,59 @@ fn only_an_acting_role_of_the_deployment_is_answered_for() {
         resolved.time_zone("l").map(|zone| zone.name().to_string()),
         Err(DeploymentError::NotAnActingRole { role: "l".into() })
     );
+}
+
+#[test]
+fn a_request_without_set_role_runs_in_the_login_chain() {
+    // PostgreSQL 18.6: `SHOW timezone` logged in as `l` to `d` without
+    // `SET ROLE`, after each reset, `a`'s own settings kept throughout.
+    let steps = [
+        ("", answer("America/Chicago", TimeZoneSource::LoginRoleInDatabase)),
+        ("ALTER ROLE l IN DATABASE d RESET ALL;", answer("Asia/Tokyo", TimeZoneSource::LoginRole)),
+        ("ALTER ROLE l RESET timezone;", answer("Europe/Paris", TimeZoneSource::Database)),
+        (
+            "ALTER ROLE ALL IN DATABASE d RESET timezone;",
+            answer("Europe/Rome", TimeZoneSource::AllRoles),
+        ),
+        ("ALTER ROLE ALL RESET ALL;", answer("Etc/UTC", TimeZoneSource::ServerDefault)),
+    ];
+    let mut sql = String::from(CHAIN);
+    for (reset, expected) in steps {
+        sql.push(' ');
+        sql.push_str(reset);
+        let database = parse(&sql);
+        assert_eq!(login_zone(&database, &plain()).as_ref(), Ok(&expected));
+        // Applying the acting role's settings after switching changes
+        // nothing for a request that never switches.
+        assert_eq!(
+            login_zone(&database, &plain().with_acting_role_settings()).as_ref(),
+            Ok(&expected)
+        );
+    }
+}
+
+#[test]
+fn a_request_without_set_role_needs_the_database_and_a_default() {
+    let deployment =
+        Deployment::new("l", ["a"], []).expect("a valid description").with_acting_role_settings();
+    assert_eq!(login_zone(&parse(""), &deployment), Err(DeploymentError::NoDefaultTimeZone));
+    assert_eq!(
+        login_zone(&parse("ALTER ROLE l IN DATABASE d SET timezone = 'Asia/Tokyo';"), &deployment),
+        Err(DeploymentError::NoDatabase { role: Some("l".into()) })
+    );
+    assert_eq!(
+        login_zone(
+            &parse("ALTER ROLE ALL IN DATABASE d SET timezone = 'Asia/Tokyo';"),
+            &deployment
+        ),
+        Err(DeploymentError::NoDatabase { role: None })
+    );
+
+    // The acting role's settings are never reached, so they need no database.
+    let database = parse("ALTER ROLE a IN DATABASE d SET timezone = 'Asia/Tokyo';");
+    assert_eq!(
+        zone(&database, &deployment),
+        Err(DeploymentError::NoDatabase { role: Some("a".into()) })
+    );
+    assert_eq!(login_zone(&database, &deployment), Err(DeploymentError::NoDefaultTimeZone));
 }

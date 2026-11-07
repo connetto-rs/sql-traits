@@ -271,12 +271,67 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     /// ```
     pub fn time_zone(&self, acting_role: &str) -> Result<RequestTimeZone<'db>, DeploymentError> {
         let deployment = self.deployment;
-        let database = self.database;
         if !deployment.acting_roles.iter().any(|role| role == acting_role) {
             return Err(DeploymentError::NotAnActingRole { role: acting_role.into() });
         }
-        let acting =
-            [(TimeZoneSource::ActingRoleInDatabase, TimeZoneSource::ActingRole, Some(acting_role))];
+        self.time_zone_from(deployment.acting_role_settings.then_some(acting_role))
+    }
+
+    /// The `TimeZone` a request runs in before any `SET ROLE`, and the step
+    /// that supplies it.
+    ///
+    /// PostgreSQL takes the steps [`Self::time_zone`] takes after the acting
+    /// role's. A request that has not switched roles has no acting role, so
+    /// no acting role's own settings are read, whatever
+    /// [`Deployment::with_acting_role_settings`] says.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::NoDatabase`] when an entry set in one
+    /// database is reached and the deployment names no database, and
+    /// [`DeploymentError::NoDefaultTimeZone`] when no entry sets the zone
+    /// and the deployment declares no default.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE authenticator LOGIN NOINHERIT;
+    ///      CREATE ROLE web_user NOLOGIN;
+    ///      ALTER ROLE ALL IN DATABASE app SET timezone = 'Europe/Rome';
+    ///      ALTER ROLE web_user SET timezone = 'America/New_York';",
+    /// )
+    /// .expect("the schema parses");
+    /// let postgrest = Deployment::new("authenticator", ["web_user"], [])
+    ///     .and_then(|deployment| deployment.connected_to("app").with_default_time_zone("Etc/UTC"))
+    ///     .expect("a valid description")
+    ///     .with_acting_role_settings();
+    /// let resolved = postgrest.resolve(&database).expect("every role is declared");
+    ///
+    /// let zone = resolved.login_time_zone().map(|zone| (zone.name(), zone.source()));
+    /// assert_eq!(zone, Ok(("Europe/Rome", TimeZoneSource::Database)));
+    ///
+    /// let zone = resolved.time_zone("web_user").map(|zone| (zone.name(), zone.source()));
+    /// assert_eq!(zone, Ok(("America/New_York", TimeZoneSource::ActingRole)));
+    /// ```
+    pub fn login_time_zone(&self) -> Result<RequestTimeZone<'db>, DeploymentError> {
+        self.time_zone_from(None)
+    }
+
+    /// The `TimeZone` of a request reading `acting_role`'s own settings, when
+    /// given, ahead of the login role's chain.
+    fn time_zone_from(
+        &self,
+        acting_role: Option<&str>,
+    ) -> Result<RequestTimeZone<'db>, DeploymentError> {
+        let deployment = self.deployment;
+        let database = self.database;
+        let acting = acting_role.map(|role| {
+            (TimeZoneSource::ActingRoleInDatabase, TimeZoneSource::ActingRole, Some(role))
+        });
         let login = [
             (
                 TimeZoneSource::LoginRoleInDatabase,
@@ -285,7 +340,6 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
             ),
             (TimeZoneSource::Database, TimeZoneSource::AllRoles, None),
         ];
-        let acting = if deployment.acting_role_settings { &acting[..] } else { &[] };
         for &(in_database, everywhere, role) in acting.iter().chain(&login) {
             let zone_set = |set_in: Option<&str>| {
                 database
@@ -316,8 +370,8 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     }
 }
 
-/// The `TimeZone` a request runs in, from
-/// [`ResolvedDeployment::time_zone`].
+/// The `TimeZone` a request runs in, from [`ResolvedDeployment::time_zone`]
+/// or [`ResolvedDeployment::login_time_zone`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestTimeZone<'db> {
     name: &'db str,
