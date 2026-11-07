@@ -5,14 +5,16 @@
 
 use alloc::{borrow::ToOwned, string::String};
 
-use super::scalar_family::scalar_family;
+use super::{normalize_postgres_type, scalar_family::scalar_family};
 
 /// Returns a canonical type token for the given SQL data type string.
 ///
-/// Known families map to fixed uppercase tokens (`INT`, `STRING`, …).
-/// Unknown types are emitted as `OTHER:<lowercase-normalized-db-type>`
-/// with internal whitespace collapsed to a single ASCII space, per
-/// FINGERPRINT_SPEC §7.2.1.
+/// Known families map to fixed uppercase tokens (`INT`, `STRING`, …), read
+/// from the spelling [`normalize_postgres_type()`] answers, as
+/// [`DataTypeLike::scalar_family`](crate::traits::DataTypeLike::scalar_family)
+/// reads them. Unknown types are emitted as
+/// `OTHER:<lowercase-normalized-db-type>` with internal whitespace collapsed
+/// to a single ASCII space, per FINGERPRINT_SPEC §7.2.1.
 ///
 /// # Examples
 ///
@@ -30,11 +32,12 @@ use super::scalar_family::scalar_family;
 /// assert_eq!(canonical_type_token("INTERVAL YEAR TO MONTH"), "INTERVAL");
 /// assert_eq!(canonical_type_token("TIMESTAMP WITH TIME ZONE"), "TIMESTAMPTZ");
 /// assert_eq!(canonical_type_token("JSONB"), "JSONB");
+/// assert_eq!(canonical_type_token("pg_catalog.timestamptz"), "TIMESTAMPTZ");
 /// ```
 #[must_use]
 pub fn canonical_type_token(sql_type: &str) -> String {
     let trimmed = sql_type.trim();
-    if let Some(family) = scalar_family(trimmed) {
+    if let Some(family) = scalar_family(&normalize_postgres_type(trimmed)) {
         return family.token().to_owned();
     }
 

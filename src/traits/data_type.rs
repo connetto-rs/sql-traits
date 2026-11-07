@@ -195,6 +195,8 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// Returns the builtin scalar family of the type, or `None` for a type
     /// outside every family, such as an enumeration, a domain or an array.
     /// The family of a domain's type is that of its [`Self::base_type`].
+    /// The family is read from [`Self::normalized_name`], so every spelling of
+    /// one type answers alike, `pg_catalog.timestamptz` as `timestamptz` does.
     ///
     /// # Example
     ///
@@ -224,7 +226,7 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// ```
     #[inline]
     fn scalar_family(&self, database: &Self::DB) -> Option<ScalarFamily> {
-        classify_scalar_family(self.name(database).as_ref())
+        classify_scalar_family(&self.normalized_name(database))
     }
 
     /// Returns whether the type belongs to the string family.
