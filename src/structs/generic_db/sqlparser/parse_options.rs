@@ -1,10 +1,6 @@
 //! Options controlling how SQL text is turned into a [`ParserDB`].
 
 use alloc::{string::String, vec::Vec};
-use core::{
-    cmp::Ordering,
-    hash::{Hash, Hasher},
-};
 #[cfg(feature = "std")]
 use std::path::Path;
 
@@ -68,7 +64,7 @@ pub enum AccessResolution {
 /// assert_eq!(db.table_grants().count(), 1);
 /// # Ok::<(), sql_traits::errors::Error>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParseOptions {
     access_resolution: AccessResolution,
     postgres_catalog: PostgresCatalog,
@@ -77,38 +73,11 @@ pub struct ParseOptions {
     session_time_zone: Option<WrittenTimeZone>,
 }
 
-/// A `TimeZone` setting as written, with the zone PostgreSQL reads from it,
-/// compared by what is written.
-#[derive(Debug, Clone)]
+/// A `TimeZone` setting as written, with the zone PostgreSQL reads from it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct WrittenTimeZone {
     pub(super) written: String,
     pub(super) zone: PgTimeZone,
-}
-
-impl PartialEq for WrittenTimeZone {
-    fn eq(&self, other: &Self) -> bool {
-        self.written == other.written
-    }
-}
-
-impl Eq for WrittenTimeZone {}
-
-impl PartialOrd for WrittenTimeZone {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for WrittenTimeZone {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.written.cmp(&other.written)
-    }
-}
-
-impl Hash for WrittenTimeZone {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.written.hash(state);
-    }
 }
 
 /// The settings of a [`ParseOptions`] that ingestion takes apart.

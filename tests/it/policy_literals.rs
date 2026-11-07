@@ -238,20 +238,6 @@ fn date_style_orders_a_date_written_in_numbers_alone() -> Result<(), LookupError
 }
 
 #[test]
-fn session_time_zones_compare_as_written() -> Result<(), Error> {
-    use std::collections::HashSet;
-
-    let zone = |name: &str| ParseOptions::default().with_session_time_zone(name);
-    assert_eq!(zone("UTC")?, zone("UTC")?);
-    assert_ne!(zone("UTC")?, zone("utc")?);
-    assert!(zone("Europe/Rome")? < zone("UTC")?);
-    assert_eq!(zone("UTC")?.cmp(&zone("UTC")?), core::cmp::Ordering::Equal);
-    let distinct: HashSet<ParseOptions> = [zone("UTC")?, zone("UTC")?, zone("Asia/Tokyo")?].into();
-    assert_eq!(distinct.len(), 2);
-    Ok(())
-}
-
-#[test]
 fn every_typed_position_reads_its_literal_as_postgresql_does() -> Result<(), LookupError> {
     let db = parse(
         "SET TIME ZONE 'Europe/Rome';
@@ -314,6 +300,11 @@ fn every_typed_position_reads_its_literal_as_postgresql_does() -> Result<(), Loo
         using(&db, "p_computed")?,
         "EXISTS (SELECT 1 FROM (SELECT now() AS x) q WHERE q.x < '2026-01-01')"
     );
+    let row = parse(
+        "SET TIME ZONE 'Europe/Rome';
+         CREATE POLICY p_row ON t USING (coalesce(t.*) IS NOT NULL AND tz < '2026-01-01');",
+    );
+    assert_eq!(using(&row, "p_row")?, format!("coalesce(t.*) IS NOT NULL AND tz < {new_year}"));
     Ok(())
 }
 

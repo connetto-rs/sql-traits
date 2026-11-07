@@ -20,7 +20,7 @@ use sql_values::{
 };
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, InTarget, ObjectName, ObjectNamePart, Query, Select, SetExpr, TableFactor,
+    FunctionArguments, InTarget, ObjectName, ObjectNamePart, Query, Select, TableFactor,
     TableWithJoins, TimezoneInfo, TypedString, Value, ValueWithSpan, Visit, VisitMut, Visitor,
     VisitorMut, visit_expressions,
 };
@@ -247,17 +247,18 @@ fn row_pure(function: &Function) -> Option<(RowPure, Vec<&Expr>)> {
         return None;
     };
     let FunctionArguments::List(list) = &function.args else { return None };
-    // PostgreSQL's grammar gives these four plain expression arguments only.
+    // A whole-row argument such as `t.*` is a record, beside which no literal
+    // is typed here.
     let arguments = list
         .args
         .iter()
-        .filter_map(|argument| {
+        .map(|argument| {
             match argument {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
                 _ => None,
             }
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     Some((kind, arguments))
 }
 
@@ -664,10 +665,22 @@ pub(super) fn bind(
         }
         Err(unreadable) => Some(unreadable),
     };
-    if let SetExpr::Select(select) = *query.body
-        && let Some(clause) = select.selection
-    {
-        *expression = clause;
-    }
+    let walk = VisitMut::visit(&mut query, &mut Restore { target: expression });
+    debug_assert!(walk.is_break(), "the clause is the first expression of the wrapper query");
     unreadable
+}
+
+/// Swaps `target` with the first expression a walk of the wrapper query meets,
+/// which is its clause, and stops.
+struct Restore<'a> {
+    target: &'a mut Expr,
+}
+
+impl VisitorMut for Restore<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        core::mem::swap(self.target, expr);
+        ControlFlow::Break(())
+    }
 }
