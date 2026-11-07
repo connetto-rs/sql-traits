@@ -108,6 +108,25 @@ fn nested_policy_calls_reach_their_functions() {
     );
 }
 
+/// A clause holding a literal whose stored value is unknown still resolves
+/// the calls borrowed from it.
+#[test]
+fn calls_of_a_clause_with_an_unread_literal_reach_their_functions() {
+    let db = parse(
+        "CREATE SCHEMA auth;
+         CREATE FUNCTION auth.uid() RETURNS TEXT LANGUAGE sql AS 'SELECT NULL';
+         CREATE TABLE items (owner TEXT, expires TIMESTAMPTZ);
+         CREATE POLICY p ON items USING (expires > '2026-01-01 09:00' AND owner = auth.uid());",
+    );
+    let policy = policy(&db, "p");
+    let using = policy.using_clause(&db).expect("policy is held").expect("USING clause");
+    assert!(matches!(using, PolicyExpression::Written { .. }), "the literal needs a zone");
+    let calls = names_per_call(using.expression(), |call| {
+        policy.functions_reached_by(call, &db).map(names)
+    });
+    assert_eq!(calls, [("auth.uid".to_owned(), vec!["auth.uid".to_owned()])]);
+}
+
 /// Each call answers only for itself, and every overload accepting its
 /// argument count counts.
 #[test]

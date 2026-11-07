@@ -353,6 +353,45 @@ fn alter_policy_reads_the_clauses_it_writes_in_the_zone_it_runs_in() -> Result<(
     Ok(())
 }
 
+/// A clause's text, with the error it carries when it is written.
+fn clause(expression: Option<PolicyExpression<'_>>) -> (String, Option<LookupError>) {
+    match expression.expect("the clause exists") {
+        PolicyExpression::Stored(expression) => (expression.to_string(), None),
+        PolicyExpression::Written { expression, unreadable } => {
+            (expression.to_string(), Some(unreadable))
+        }
+    }
+}
+
+#[test]
+fn a_clause_with_an_unread_literal_answers_as_written_beside_its_error() -> Result<(), LookupError>
+{
+    let db = parse(
+        "CREATE POLICY p_walk ON t USING (tz < '2026-01-01 12:00' AND id IN (SELECT doc FROM m))
+             WITH CHECK (tz < '2026-01-01 12:00');
+         SET TIME ZONE 'Asia/Tokyo';
+         ALTER POLICY p_walk ON t WITH CHECK (tz < '2026-01-01 12:00' OR s = 'x');",
+    );
+    let walked = policy(&db, "p_walk");
+    assert_eq!(
+        clause(walked.using_clause(&db)?),
+        (
+            "tz < '2026-01-01 12:00' AND id IN (SELECT doc FROM m)".to_owned(),
+            Some(unreadable(
+                "p_walk",
+                "2026-01-01 12:00",
+                PgType::TimestampTz,
+                DateTimeError::NeedsTimeZone
+            ))
+        )
+    );
+    assert_eq!(
+        clause(walked.check_clause(&db)?),
+        ("tz < '2026-01-01 03:00:00+00'::TIMESTAMP WITH TIME ZONE OR s = 'x'".to_owned(), None)
+    );
+    Ok(())
+}
+
 #[test]
 fn a_dialect_without_policies_of_its_own_keeps_literals_as_written() -> Result<(), Error> {
     let db = ParserDB::parse::<GenericDialect>(&format!(

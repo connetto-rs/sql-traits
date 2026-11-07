@@ -117,6 +117,35 @@ fn a_loop_past_the_table_read_is_still_refused() {
 }
 
 #[test]
+fn a_literal_whose_value_is_unknown_hides_no_loop() {
+    let d = "
+        CREATE TABLE d (id int PRIMARY KEY, team int, expires timestamptz);
+        ALTER TABLE d ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY d_sel ON d FOR SELECT
+            USING (expires > '2026-01-01 09:00' AND team IN (SELECT id FROM u));";
+    let looping =
+        format!("{d} CREATE POLICY u_sel ON u FOR SELECT USING (v IN (SELECT id FROM d));");
+    assert_eq!(recursion(&looping, "d", "reader", SELECT).as_deref(), Some("d"));
+    assert_eq!(recursion(&looping, "u", "reader", SELECT).as_deref(), Some("u"));
+
+    // Without a loop the gate on `d` is judged, which needs the literal's
+    // value.
+    let database = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{TABLES}{d} CREATE POLICY u_sel ON u FOR SELECT USING (true);"
+    ))
+    .expect("builds");
+    let reader = database.role("reader").expect("the role exists");
+    let table = database
+        .table_by_target(TargetName::new("d", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the table exists");
+    assert!(matches!(
+        table.row_security(SELECT, reader, &database),
+        Err(RowSecurityError::Lookup(LookupError::PolicyLiteralUnreadable { .. }))
+    ));
+}
+
+#[test]
 fn a_loop_closes_only_through_policies_and_tables_that_bind_the_role() {
     let loop_back =
         "CREATE POLICY t_sel ON t FOR SELECT USING (EXISTS (SELECT 1 FROM u WHERE u.id = t.id));";
