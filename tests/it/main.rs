@@ -66,6 +66,7 @@ mod generated_constraint_names;
 mod generated_index_names;
 mod golden_fingerprints;
 mod granted_columns;
+mod grantors;
 mod implicit_sequences;
 mod implied_referenced_columns;
 mod incremental_schema_ingestion;

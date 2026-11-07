@@ -976,14 +976,14 @@ impl<'a> Creator<'a> {
                     continue;
                 }
                 // Every privilege covers the whole object, so no column grant
-                // arises.
+                // arises, and the owner the defaults belong to grants it.
                 let grant = Grant {
                     privileges: Privileges::Actions(rights.actions()),
                     objects: Some(objects.clone()),
                     grantees: vec![grantee.clone()],
                     with_grant_option,
                     as_grantor: None,
-                    granted_by: None,
+                    granted_by: self.owner.map(super::grantors::grantor_ident),
                     current_grants: None,
                 };
                 builder = builder.add_table_grant(alloc::sync::Arc::new(grant), ());

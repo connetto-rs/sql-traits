@@ -41,7 +41,9 @@ use super::{
     object_name_matches_resolved_identity, place_relation, relation_name_holder,
     require_named_in_catalog,
     rules::{self, RuleHost},
-    stored_ident, user_defined_types,
+    stored_ident,
+    table_owner::Handover,
+    user_defined_types,
     view_rewrites::{self, Rename},
 };
 use crate::{
@@ -1132,7 +1134,8 @@ impl GrantedView {
     }
 }
 
-/// Records the role a view is handed to.
+/// Records the role a view is handed to, and hands it every grant on the
+/// view naming the old owner, as grantee or grantor.
 ///
 /// `CURRENT_ROLE`, `CURRENT_USER` and `SESSION_USER` name whoever runs the
 /// statement, so the owner became one the input never spells and the model
@@ -1147,14 +1150,36 @@ fn set_view_owner(
         Owner::Ident(ident) => Some(super::stored_role_name(ident)),
         Owner::CurrentRole | Owner::CurrentUser | Owner::SessionUser => None,
     };
-    if kind == ObjectKind::MaterializedView {
-        if let Some(position) = materialized_view_position(&builder, name) {
-            builder.materialized_views_mut()[position].1.set_owner(owner);
-        }
-    } else if let Some(position) = plain_view_position(&builder, name) {
-        builder.views_mut()[position].1.set_owner(owner);
+    let handed = if kind == ObjectKind::MaterializedView {
+        materialized_view_position(&builder, name).and_then(|position| {
+            let (view, metadata, _) = &mut builder.materialized_views_mut()[position];
+            hand_view(view.as_ref(), metadata, owner)
+        })
+    } else {
+        plain_view_position(&builder, name).and_then(|position| {
+            let (view, metadata, _) = &mut builder.views_mut()[position];
+            hand_view(view.as_ref(), metadata, owner)
+        })
+    };
+    if let Some((view, previous)) = handed {
+        let handover = Handover::new(&previous, new_owner);
+        handover.apply(builder.table_grants_mut(), |grant| view.named_by(grant));
+        handover.apply(builder.column_grants_mut(), |grant| view.named_by(grant));
     }
     builder
+}
+
+/// Records `next` as the owner of `view`, returning the grants' name for the
+/// view and its old owner when that hands it to another role.
+fn hand_view<V: ViewLike>(
+    view: &V,
+    metadata: &mut ViewMetadata,
+    next: Option<String>,
+) -> Option<(GrantedView, String)> {
+    let previous = metadata.owner().filter(|previous| next.as_deref() != Some(*previous));
+    let handed = previous.map(|previous| (GrantedView::of(view), previous.to_string()));
+    metadata.set_owner(next);
+    handed
 }
 
 /// The roles the recorded views name as their owners.
@@ -1166,6 +1191,16 @@ pub(super) fn view_owner_names(builder: &ParserDBBuilder) -> Vec<String> {
         .chain(builder.materialized_views().iter().map(|(_, metadata, _)| metadata))
         .filter_map(|metadata| metadata.owner().map(ToString::to_string))
         .collect()
+}
+
+/// The stored name of the role owning the plain or materialized view `name`
+/// reaches, when the input records it.
+pub(super) fn view_owner<'b>(builder: &'b ParserDBBuilder, name: &ObjectName) -> Option<&'b str> {
+    if let Some(position) = plain_view_position(builder, name) {
+        return builder.views()[position].1.owner();
+    }
+    let position = materialized_view_position(builder, name)?;
+    builder.materialized_views()[position].1.owner()
 }
 
 /// Binds every stored relation a definition reads, remembering the first

@@ -228,36 +228,42 @@ pub trait GrantLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// ```
     fn with_grant_option(&self) -> bool;
 
-    /// Returns the role that granted this privilege, if specified.
+    /// Returns the stored name of the role PostgreSQL records as the grantor
+    /// of this privilege.
     ///
-    /// This is the `GRANTED BY` clause in PostgreSQL. Note that the `GRANTED
-    /// BY` clause cannot use pseudo-roles, only actual database roles.
+    /// PostgreSQL chooses the grantor from the role the `GRANT` acts as, the
+    /// one `GRANTED BY` names or else the current role. When that role owns
+    /// the object, is a superuser or uses the owner's privileges, the owner is
+    /// the grantor. Otherwise the grantor is that role, or a role it inherits
+    /// from, holding the privilege `WITH GRANT OPTION`. A grant that
+    /// `ALTER DEFAULT PRIVILEGES` gives a new object records its owner.
+    ///
+    /// Returns `None` when the grantor is unknown, as for a grant made while
+    /// no role is named for the session to run as.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use sql_traits::prelude::*;
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "
-    /// CREATE TABLE my_table (id INT);
-    /// CREATE ROLE admin;
+    /// let db = ParseOptions::default()
+    ///     .with_session_role("admin")
+    ///     .parse::<PostgreSqlDialect>(
+    ///         "
+    /// CREATE ROLE editor;
     /// CREATE ROLE app_user;
-    /// GRANT SELECT ON my_table TO app_user GRANTED BY admin;
+    /// CREATE TABLE my_table (id INT);
+    /// GRANT SELECT ON my_table TO editor WITH GRANT OPTION;
+    /// SET ROLE editor;
+    /// GRANT SELECT ON my_table TO app_user;
     /// ",
-    /// )?;
-    /// let grant = db.table_grants().next().unwrap();
-    /// let grantor = grant.granted_by(&db).unwrap();
-    /// assert_eq!(grantor.name(), "admin");
-    /// # Ok(())
-    /// # }
+    ///     )
+    ///     .expect("the schema parses");
+    /// let grantors: Vec<_> = db.table_grants().map(|grant| grant.granted_by(&db)).collect();
+    /// assert_eq!(grantors, [Some("admin"), Some("editor")]);
     /// ```
-    fn granted_by<'a>(
-        &'a self,
-        database: &'a Self::DB,
-    ) -> Option<&'a <Self::DB as DatabaseLike>::Role>;
+    fn granted_by<'a>(&'a self, database: &'a Self::DB) -> Option<&'a str>;
 
     /// Returns whether this grant applies to a specific role.
     ///
@@ -333,10 +339,7 @@ impl<T: GrantLike> GrantLike for &T {
         (*self).with_grant_option()
     }
 
-    fn granted_by<'a>(
-        &'a self,
-        database: &'a Self::DB,
-    ) -> Option<&'a <Self::DB as DatabaseLike>::Role> {
+    fn granted_by<'a>(&'a self, database: &'a Self::DB) -> Option<&'a str> {
         (*self).granted_by(database)
     }
 

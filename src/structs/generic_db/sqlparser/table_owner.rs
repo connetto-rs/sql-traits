@@ -8,7 +8,10 @@ use sqlparser::ast::{
     Owner, Revoke,
 };
 
-use super::{ParserDBBuilder, StoredTable, grantee_role_ident, rename_grantee, stored_role_name};
+use super::{
+    ParserDBBuilder, StoredTable, grantee_role_ident, grantors::grantor_ident, rename_grantee,
+    stored_role_name,
+};
 use crate::{
     impls::{grantees_match, schema_matches_table},
     structs::RevokedPrivilege,
@@ -67,9 +70,15 @@ pub(super) fn change_owner(
     next: &Owner,
 ) {
     let table = StoredTable::of(handed);
-    let handover = Handover { table: &table, previous, next: owner_ident(next) };
-    handover.apply(builder.table_grants_mut());
-    handover.apply(builder.column_grants_mut());
+    let on_table = |grant: &Grant| {
+        matches!(
+            &grant.objects,
+            Some(GrantObjects::Tables(names)) if names.iter().any(|name| table.named_by(name))
+        )
+    };
+    let handover = Handover::new(previous, next);
+    handover.apply(builder.table_grants_mut(), on_table);
+    handover.apply(builder.column_grants_mut(), on_table);
 }
 
 /// Hands every revocation on a table naming its old owner `previous`, as
@@ -93,32 +102,39 @@ pub(super) fn hand_over_revocations(
     super::revocations::deduplicate(revocations);
 }
 
-/// One owner change of one table.
-struct Handover<'a> {
-    /// The table changing hands.
-    table: &'a StoredTable,
+/// One owner change of one object.
+pub(super) struct Handover<'a> {
     /// The canonical name of the old owner.
     previous: &'a str,
-    /// The new owner, as a grant would spell it.
+    /// The new owner, as a grantee would spell it.
     next: Ident,
+    /// The new owner as a grantor, `None` for a session principal, which
+    /// names no role the input spells.
+    next_grantor: Option<Ident>,
 }
 
-impl Handover<'_> {
-    /// Rewrites each grant of one store on the table changing hands that
-    /// names the old owner. Every stored grant names one object.
-    fn apply(&self, grants: &mut [(Arc<Grant>, ())]) {
+impl<'a> Handover<'a> {
+    /// The change handing the object from `previous` to `next`.
+    pub(super) fn new(previous: &'a str, next: &Owner) -> Self {
+        let next_grantor = match next {
+            Owner::Ident(ident) => Some(grantor_ident(&stored_role_name(ident))),
+            Owner::CurrentUser | Owner::CurrentRole | Owner::SessionUser => None,
+        };
+        Self { previous, next: owner_ident(next), next_grantor }
+    }
+
+    /// Rewrites each grant of one store on the object changing hands, those
+    /// `on` holds, that names the old owner. Every stored grant names one
+    /// object.
+    pub(super) fn apply(&self, grants: &mut [(Arc<Grant>, ())], on: impl Fn(&Grant) -> bool) {
         for (grant, ()) in grants {
-            let on_table = matches!(
-                &grant.objects,
-                Some(GrantObjects::Tables(names)) if names.iter().any(|name| self.table.named_by(name))
-            );
             let names_previous =
                 grant.grantees.iter().any(|grantee| names_role(grantee, self.previous))
                     || grant
                         .granted_by
                         .as_ref()
                         .is_some_and(|grantor| stored_role_name(grantor) == self.previous);
-            if on_table && names_previous {
+            if names_previous && on(grant) {
                 *grant = Arc::new(self.handed_over(grant));
             }
         }
@@ -142,13 +158,12 @@ impl Handover<'_> {
                 grantees.push(grantee);
             }
         }
-        let granted_by = grant.granted_by.as_ref().map(|grantor| {
-            if stored_role_name(grantor) == self.previous {
-                self.next.clone()
-            } else {
-                grantor.clone()
+        let granted_by = match &grant.granted_by {
+            Some(grantor) if stored_role_name(grantor) == self.previous => {
+                self.next_grantor.clone()
             }
-        });
+            other => other.clone(),
+        };
         Grant { grantees, granted_by, ..grant.clone() }
     }
 }

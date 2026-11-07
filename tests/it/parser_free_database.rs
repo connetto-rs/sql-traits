@@ -1501,7 +1501,7 @@ impl GrantLike for MemoryTableGrant {
         false
     }
 
-    fn granted_by<'a>(&'a self, _database: &'a Self::DB) -> Option<&'a MemoryRole> {
+    fn granted_by<'a>(&'a self, _database: &'a Self::DB) -> Option<&'a str> {
         None
     }
 
@@ -1560,7 +1560,7 @@ impl GrantLike for MemoryColumnGrant {
         false
     }
 
-    fn granted_by<'a>(&'a self, _database: &'a Self::DB) -> Option<&'a MemoryRole> {
+    fn granted_by<'a>(&'a self, _database: &'a Self::DB) -> Option<&'a str> {
         None
     }
 

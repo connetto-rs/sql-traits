@@ -148,5 +148,5 @@ fn an_owner_change_merges_the_old_owners_grants_into_the_new_owners() {
     let grant = database.table_grants().next().expect("the grant on v remains");
     let grantees: Vec<String> = grant.grantees(&database).map(ToString::to_string).collect();
     assert_eq!(grantees, ["o2", "x"], "o's entry is now o2's, once");
-    assert_eq!(grant.granted_by(&database).map(RoleLike::name), Some("o2"));
+    assert_eq!(grant.granted_by(&database), Some("o2"));
 }
