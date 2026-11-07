@@ -38,6 +38,30 @@ fn names<'db>(functions: impl Iterator<Item = &'db sqlparser::ast::CreateFunctio
     functions.map(|function| function.target_name().to_string()).collect()
 }
 
+/// Every call of `expression`, in walk order, with the qualified names of the
+/// functions `lookup` answers for it.
+fn names_per_call(
+    expression: &Expr,
+    mut lookup: impl FnMut(&sqlparser::ast::Function) -> Result<Vec<String>, LookupError>,
+) -> Vec<(String, Vec<String>)> {
+    reached_per_call(expression, |call| lookup(call).expect("call belongs to the queried object"))
+}
+
+/// Every call of `expression`, in walk order, with the call `lookup` names
+/// when it refuses the call as no node of the object it queries.
+fn refusals_per_call(
+    expression: &Expr,
+    mut lookup: impl FnMut(&sqlparser::ast::Function) -> Result<Vec<String>, LookupError>,
+) -> Vec<(String, Vec<String>)> {
+    reached_per_call(expression, |call| {
+        match lookup(call) {
+            Err(LookupError::CallNotInExpression { call }) => vec![call],
+            Err(error) => panic!("unexpected error {error}"),
+            Ok(_) => panic!("a call from elsewhere was answered"),
+        }
+    })
+}
+
 /// The calls of a policy resolve wherever they are nested, an unqualified
 /// built-in through `pg_catalog`, each to the overloads taking its arguments.
 #[test]
@@ -54,9 +78,7 @@ fn nested_policy_calls_reach_their_functions() {
     );
     let policy = policy(&db, "p");
     let using = policy.using_expression(&db).expect("USING clause");
-    let calls = reached_per_call(using, |call| {
-        names(policy.functions_reached_by(call, &db).expect("call belongs to the policy"))
-    });
+    let calls = names_per_call(using, |call| policy.functions_reached_by(call, &db).map(names));
     assert_eq!(
         calls,
         [
@@ -131,8 +153,8 @@ fn a_variadic_parameter_without_a_default_needs_an_argument() {
          );",
     );
     let policy = policy(&db, "p");
-    let calls = reached_per_call(policy.using_expression(&db).expect("USING clause"), |call| {
-        names(policy.functions_reached_by(call, &db).expect("call belongs to the policy"))
+    let calls = names_per_call(policy.using_expression(&db).expect("USING clause"), |call| {
+        policy.functions_reached_by(call, &db).map(names)
     });
     assert_eq!(
         calls,
@@ -171,9 +193,7 @@ fn a_subquery_call_resolves_under_the_statement_search_path() {
     );
     let policy = policy(&db, "p");
     let using = policy.using_expression(&db).expect("USING clause");
-    let calls = reached_per_call(using, |call| {
-        names(policy.functions_reached_by(call, &db).expect("call belongs to the policy"))
-    });
+    let calls = names_per_call(using, |call| policy.functions_reached_by(call, &db).map(names));
     assert_eq!(calls, [("f".to_owned(), vec!["app.f".to_owned()])]);
 }
 
@@ -190,13 +210,8 @@ fn a_call_from_elsewhere_is_refused() {
     let q = policy(&db, "q");
     let copy = q.using_expression(&db).expect("USING clause").clone();
     for expression in [&copy, q.using_expression(&db).expect("USING clause")] {
-        let refusals = reached_per_call(expression, |call| {
-            match p.functions_reached_by(call, &db) {
-                Err(LookupError::CallNotInExpression { call }) => vec![call],
-                Err(error) => panic!("unexpected error {error}"),
-                Ok(_) => panic!("a call of another expression was answered"),
-            }
-        });
+        let refusals =
+            refusals_per_call(expression, |call| p.functions_reached_by(call, &db).map(names));
         assert_eq!(refusals, [("lower".to_owned(), vec!["lower(owner)".to_owned()])]);
     }
 }
@@ -261,18 +276,63 @@ fn check_constraint_calls_reach_their_functions() {
         ]
     );
     let copy = check.expression(&db).clone();
-    let refusals = reached_per_call(&copy, |call| {
-        match check.functions_reached_by(call, &db) {
-            Err(LookupError::CallNotInExpression { call }) => vec![call],
-            Err(error) => panic!("unexpected error {error}"),
-            Ok(_) => panic!("a call of a copy was answered"),
-        }
-    });
+    let refusals =
+        refusals_per_call(&copy, |call| check.functions_reached_by(call, &db).map(names));
     assert_eq!(
         refusals,
         [
             ("lower".to_owned(), vec!["lower(name)".to_owned()]),
             ("stamp".to_owned(), vec!["stamp(name)".to_owned()]),
+        ]
+    );
+}
+
+/// `COALESCE`, `CURRENT_USER` and the other names PostgreSQL reads as
+/// expressions are nodes of the expression that reach no function, while the
+/// calls written inside them answer for themselves. A copy of one is refused.
+#[test]
+fn an_expression_form_reaches_no_function() {
+    let db = parse(
+        "CREATE TABLE items (owner TEXT, CHECK (coalesce(lower(owner), current_user) = owner));
+         CREATE POLICY p ON items USING (owner = lower(current_user))
+             WITH CHECK (owner = session_user);",
+    );
+    let lower = || vec!["pg_catalog.lower".to_owned(); 3];
+    let policy = policy(&db, "p");
+    let in_policy = |expression: &Expr| {
+        names_per_call(expression, |call| policy.functions_reached_by(call, &db).map(names))
+    };
+    assert_eq!(
+        in_policy(policy.using_expression(&db).expect("USING clause")),
+        [("lower".to_owned(), lower()), ("current_user".to_owned(), Vec::new())]
+    );
+    assert_eq!(
+        in_policy(policy.check_expression(&db).expect("WITH CHECK clause")),
+        [("session_user".to_owned(), Vec::new())]
+    );
+
+    let table = db.tables().next().expect("table exists");
+    let check = table.check_constraints(&db).expect("table is held").next().expect("check");
+    let in_check = names_per_call(check.expression(&db), |call| {
+        check.functions_reached_by(call, &db).map(names)
+    });
+    assert_eq!(
+        in_check,
+        [
+            ("coalesce".to_owned(), Vec::new()),
+            ("lower".to_owned(), lower()),
+            ("current_user".to_owned(), Vec::new()),
+        ]
+    );
+
+    let copy = policy.using_expression(&db).expect("USING clause").clone();
+    let refusals =
+        refusals_per_call(&copy, |call| policy.functions_reached_by(call, &db).map(names));
+    assert_eq!(
+        refusals,
+        [
+            ("lower".to_owned(), vec!["lower(current_user)".to_owned()]),
+            ("current_user".to_owned(), vec!["current_user".to_owned()]),
         ]
     );
 }

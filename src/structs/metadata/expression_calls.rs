@@ -9,7 +9,7 @@ use crate::{
     structs::IdentifierCase,
     traits::FunctionLike,
     utils::{
-        call_sites::{call_reaches, for_each_call},
+        call_sites::{Call, Site, call_reaches, for_each_call, for_each_site},
         object_name::object_name_last_part,
     },
 };
@@ -69,17 +69,27 @@ impl<F> ExpressionCalls<F> {
         call: &Function,
     ) -> Option<impl Iterator<Item = &'s F> + use<'s, F>> {
         let mut position = 0;
-        let found = for_each_call(expression, |site| {
-            if site.node.is_some_and(|node| core::ptr::eq(node, call)) {
-                return ControlFlow::Break(position);
+        let found = for_each_site(expression, |site| {
+            match site {
+                Site::Call(Call { node: Some(node), .. }) if core::ptr::eq(node, call) => {
+                    ControlFlow::Break(Some(position))
+                }
+                Site::ExpressionForm(node) if core::ptr::eq(node, call) => ControlFlow::Break(None),
+                Site::Call(_) => {
+                    position += 1;
+                    ControlFlow::Continue(())
+                }
+                Site::ExpressionForm(_) => ControlFlow::Continue(()),
             }
-            position += 1;
-            ControlFlow::Continue(())
         });
         let ControlFlow::Break(position) = found else {
             return None;
         };
-        Some(self.sites.get(position)?.iter().map(AsRef::as_ref))
+        let reached: &[Arc<F>] = match position {
+            Some(position) => self.sites.get(position)?,
+            None => &[],
+        };
+        Some(reached.iter().map(AsRef::as_ref))
     }
 
     /// Re-points every function referencing the allocation `stale` at `fresh`.

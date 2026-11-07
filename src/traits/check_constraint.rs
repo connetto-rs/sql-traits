@@ -1012,6 +1012,8 @@ pub trait CheckConstraintLike:
     /// `call` is a node of [`Self::expression`] at any depth, subqueries
     /// included. Resolution follows the rules of
     /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by).
+    /// An expression PostgreSQL's grammar writes like a call, such as
+    /// `COALESCE` or `CURRENT_USER`, reaches no function.
     ///
     /// # Errors
     ///
