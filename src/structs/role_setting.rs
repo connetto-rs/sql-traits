@@ -2,6 +2,8 @@
 
 use alloc::string::String;
 
+use sql_values::PgTimeZone;
+
 /// The value a role, or every role, starts a session with in one database, or
 /// in every database, as `ALTER ROLE { name | ALL } [IN DATABASE d] SET`
 /// leaves it.
@@ -40,6 +42,7 @@ pub struct RoleSetting {
     pub(crate) database: Option<String>,
     pub(crate) name: String,
     pub(crate) value: String,
+    pub(crate) zone: Option<PgTimeZone>,
 }
 
 impl RoleSetting {
@@ -79,5 +82,11 @@ impl RoleSetting {
     /// Whether the entry has the key of one `pg_db_role_setting` row.
     pub(crate) fn is_keyed(&self, role: Option<&str>, database: Option<&str>) -> bool {
         self.role.as_deref() == role && self.database.as_deref() == database
+    }
+
+    /// The zone a `TimeZone` entry sets, as [`PgTimeZone::parse`] reads its
+    /// value, or [`None`] for an entry of another name.
+    pub(crate) fn time_zone(&self) -> Option<&PgTimeZone> {
+        self.zone.as_ref()
     }
 }

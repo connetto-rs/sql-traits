@@ -32,7 +32,14 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Held {
     name: String,
-    value: String,
+    value: Value,
+}
+
+/// A setting's value, with the zone PostgreSQL reads from a `TimeZone` one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Value {
+    text: String,
+    zone: Option<PgTimeZone>,
 }
 
 /// The values a session's own `SET` statements leave, as `SET ... FROM
@@ -52,20 +59,20 @@ pub(super) struct SessionSettings {
 #[derive(Clone)]
 enum Change {
     /// Sets `name` to a known value, or to one the input leaves unknown.
-    Set { name: String, value: Option<String> },
+    Set { name: String, value: Option<Value> },
     /// Returns every setting to the value the session started with.
     ResetAll,
 }
 
 impl SessionSettings {
     /// The value `name` holds now, compared without case.
-    fn current(&self, name: &str) -> Option<&str> {
+    fn current(&self, name: &str) -> Option<&Value> {
         self.local
             .as_ref()
             .unwrap_or(&self.committed)
             .iter()
             .find(|held| held.name.eq_ignore_ascii_case(name))
-            .map(|held| held.value.as_str())
+            .map(|held| &held.value)
     }
 
     /// Applies what `statement` does to the session's settings. A `SET
@@ -126,9 +133,7 @@ fn change_of(
             // of its own, so its text stays unknown.
             _ => None,
         };
-        if let Some(value) = &value {
-            check_time_zone(&name, value)?;
-        }
+        let value = value.map(|text| valued(&name, text)).transpose()?;
         Ok(Change::Set { name, value })
     };
     Ok(Some(match statement {
@@ -200,14 +205,16 @@ fn literal(value: &Expr, hex_strings_may_be_integers: bool) -> Option<String> {
         .map(|(text, exact)| if exact { text.into_owned() } else { text.to_ascii_lowercase() })
 }
 
-/// Refuses a `TimeZone` setting PostgreSQL refuses.
-fn check_time_zone(name: &str, value: &str) -> Result<(), Error> {
-    if name.eq_ignore_ascii_case("timezone")
-        && let Err(reason) = PgTimeZone::parse(value)
-    {
-        return Err(Error::InvalidTimeZone { value: value.to_string(), reason });
+/// `text` as the value of the setting `name`, carrying the zone of a
+/// `TimeZone` setting and refused when PostgreSQL refuses that zone.
+fn valued(name: &str, text: String) -> Result<Value, Error> {
+    if !name.eq_ignore_ascii_case("timezone") {
+        return Ok(Value { text, zone: None });
     }
-    Ok(())
+    match PgTimeZone::parse(&text) {
+        Ok(zone) => Ok(Value { text, zone: Some(zone) }),
+        Err(reason) => Err(Error::InvalidTimeZone { value: text, reason }),
+    }
 }
 
 /// Records what an `ALTER ROLE ... SET` or `RESET` statement leaves in
@@ -250,14 +257,13 @@ pub(super) fn alter_role(
                             statement: statement.to_string(),
                         });
                     };
-                    Some(value.to_string())
+                    Some(value.clone())
                 }
                 SetConfigValue::Value(value) => {
                     let Some(value) = literal(value, hex_strings_may_be_integers) else {
                         return Err(Error::NonLiteralSetting { statement: statement.to_string() });
                     };
-                    check_time_zone(&name, &value)?;
-                    Some(value)
+                    Some(valued(&name, value)?)
                 }
             };
             let entries = builder.role_settings_mut();
@@ -265,11 +271,17 @@ pub(super) fn alter_role(
                 entry.is_keyed(role.as_deref(), database.as_deref()) && entry.is_named(&name)
             });
             match (position, value) {
-                (Some(position), Some(value)) => entries[position].value = value,
+                (Some(position), Some(Value { text, zone })) => {
+                    let entry = &mut entries[position];
+                    entry.value = text;
+                    entry.zone = zone;
+                }
                 (Some(position), None) => {
                     entries.remove(position);
                 }
-                (None, Some(value)) => entries.push(RoleSetting { role, database, name, value }),
+                (None, Some(Value { text, zone })) => {
+                    entries.push(RoleSetting { role, database, name, value: text, zone });
+                }
                 (None, None) => {}
             }
         }
