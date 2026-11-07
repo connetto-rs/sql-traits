@@ -749,10 +749,10 @@ pub trait TableLike:
     /// let table = policy.table(&db)?;
     /// let case = IdentifierCase::AsWritten;
     /// assert_eq!(
-    ///     table.expression_truth(&db, policy.using_expression(&db).unwrap(), case)?,
+    ///     table.expression_truth(&db, policy.using_expression(&db)?.unwrap(), case)?,
     ///     Some(true),
     /// );
-    /// assert_eq!(table.expression_truth(&db, policy.check_expression(&db).unwrap(), case)?, None,);
+    /// assert_eq!(table.expression_truth(&db, policy.check_expression(&db)?.unwrap(), case)?, None,);
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
     fn expression_truth(
@@ -4504,7 +4504,9 @@ pub trait TableLike:
     /// # Errors
     ///
     /// Returns [`RowSecurityError::Lookup`] when the table is not in
-    /// `database`, [`RowSecurityError::RoleRequired`] when a policy gating the
+    /// `database` or a clause the statement reads holds a literal
+    /// [`PolicyLike::using_expression`] cannot read,
+    /// [`RowSecurityError::RoleRequired`] when a policy gating the
     /// statement is scoped to a role and `role` is [`ActingRole::Public`],
     /// [`RowSecurityError::UnsettledRole`] when a policy's `TO` list cannot be
     /// settled for `role` from the schema, and

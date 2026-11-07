@@ -26,7 +26,7 @@ use core::ops::ControlFlow;
 use sqlparser::ast::{
     ArgMode, CreateFunction, CreateFunctionBody, DataType, Expr, FunctionReturnType, GroupByExpr,
     Ident, Insert, ObjectName, OperateFunctionArg, Query, Select, SelectFlavor, SelectItem,
-    SetExpr, Statement, TableFactor, TableObject, VisitMut, VisitorMut,
+    SetExpr, Statement, TableFactor, TableObject, TableWithJoins, VisitMut, VisitorMut,
     helpers::attached_token::AttachedToken,
 };
 
@@ -216,9 +216,18 @@ pub(super) fn bind_rule_parts(
 /// The query a `RETURN` body's expression is wrapped in, the shape the
 /// rename machinery rewrites and checks.
 pub(super) fn definition(expr: &Expr) -> Query {
+    wrapping_query(wrapping_select(
+        alloc::vec![SelectItem::UnnamedExpr(expr.clone())],
+        Vec::new(),
+        None,
+    ))
+}
+
+/// A query holding `select` alone.
+pub(super) fn wrapping_query(select: Select) -> Query {
     Query {
         with: None,
-        body: Box::new(SetExpr::Select(Box::new(body_select(expr)))),
+        body: Box::new(SetExpr::Select(Box::new(select))),
         order_by: None,
         limit_clause: None,
         fetch: None,
@@ -230,9 +239,13 @@ pub(super) fn definition(expr: &Expr) -> Query {
     }
 }
 
-/// The select a wrapper query holds around a body expression: one projection
-/// item, no `FROM`, nothing else to resolve.
-fn body_select(expr: &Expr) -> Select {
+/// A select wrapped around expressions to resolve them: `projection` read
+/// from `from` where `selection` holds, and nothing else.
+pub(super) fn wrapping_select(
+    projection: Vec<SelectItem>,
+    from: Vec<TableWithJoins>,
+    selection: Option<Expr>,
+) -> Select {
     Select {
         select_token: AttachedToken::empty(),
         optimizer_hints: Vec::new(),
@@ -240,13 +253,13 @@ fn body_select(expr: &Expr) -> Select {
         select_modifiers: None,
         top: None,
         top_before_distinct: false,
-        projection: alloc::vec![SelectItem::UnnamedExpr(expr.clone())],
+        projection,
         exclude: None,
         into: None,
-        from: Vec::new(),
+        from,
         lateral_views: Vec::new(),
         prewhere: None,
-        selection: None,
+        selection,
         connect_by: Vec::new(),
         group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
         cluster_by: Vec::new(),

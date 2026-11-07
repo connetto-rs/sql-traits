@@ -97,6 +97,7 @@ mod parse_options;
 mod parsed_source;
 mod partition_bounds;
 mod partition_keys;
+mod policy_literals;
 mod postgres_18_collations;
 mod postgres_18_functions;
 mod postgres_builtins;
@@ -4934,8 +4935,13 @@ impl ParserDBIngestor {
         dialect: SqlparserDialect,
         options: ParseOptions,
     ) -> Self {
-        let (access_resolution, postgres_catalog, identifier_case, session_role) =
-            options.into_parts();
+        let parse_options::IngestionParts {
+            access_resolution,
+            postgres_catalog,
+            identifier_case,
+            session_role,
+            session_time_zone,
+        } = options.into_parts();
         let postgres = Arc::new(if matches!(dialect, SqlparserDialect::PostgreSql) {
             postgres_catalog
         } else {
@@ -4960,7 +4966,7 @@ impl ParserDBIngestor {
                 unresolved_function_grants: Vec::new(),
                 role_alterations: Vec::new(),
                 session_roles: SessionRoles::starting_as(session_role),
-                session_settings: SessionSettings::default(),
+                session_settings: SessionSettings::starting_in(session_time_zone),
                 default_privileges: DefaultPrivileges::default(),
             },
             access_resolution,
@@ -10361,6 +10367,18 @@ impl ParserDB {
                         });
                     }
 
+                    // PostgreSQL stores each literal as this session reads it.
+                    let session = policy_literals::LiteralSession::of(&session_settings);
+                    let bind = |clause: Option<&mut Expr>| {
+                        clause.filter(|_| matches!(dialect, SqlparserDialect::PostgreSql)).and_then(
+                            |clause| {
+                                policy_literals::bind(&builder, &policy.table_name, clause, session)
+                            },
+                        )
+                    };
+                    let using_unreadable = bind(policy.using.as_mut());
+                    let check_unreadable = bind(policy.with_check.as_mut());
+
                     let using_calls = policy
                         .using
                         .as_ref()
@@ -10370,7 +10388,9 @@ impl ParserDB {
                         .as_ref()
                         .map_or_else(ExpressionCalls::default, |check| builder.calls_in(check));
 
-                    let metadata = PolicyMetadata::new(using_calls, check_calls);
+                    let mut metadata = PolicyMetadata::new(using_calls, check_calls);
+                    metadata.set_using_unreadable(using_unreadable);
+                    metadata.set_check_unreadable(check_unreadable);
                     builder = builder.add_policy(Arc::new(policy), metadata);
                 }
                 Statement::CreateRole(mut create_role) => {
@@ -10842,7 +10862,7 @@ impl ParserDB {
                         AlterPolicyOperation::Rename { new_name } => {
                             Arc::make_mut(&mut builder.policies_mut()[index].0).name = new_name;
                         }
-                        AlterPolicyOperation::Apply { to, using, with_check } => {
+                        AlterPolicyOperation::Apply { to, mut using, mut with_check } => {
                             if access_resolution == AccessResolution::ClosedWorld {
                                 validate_policy_roles(
                                     &builder,
@@ -10851,8 +10871,23 @@ impl ParserDB {
                                 )?;
                             }
 
-                            // The calls of an expression are resolved against
-                            // the builder, so they are collected before the
+                            let session = policy_literals::LiteralSession::of(&session_settings);
+                            let bind = |clause: Option<&mut Expr>| {
+                                clause
+                                    .filter(|_| matches!(dialect, SqlparserDialect::PostgreSql))
+                                    .and_then(|clause| {
+                                        policy_literals::bind(
+                                            &builder,
+                                            &table_name,
+                                            clause,
+                                            session,
+                                        )
+                                    })
+                            };
+                            let using_unreadable = bind(using.as_mut());
+                            let check_unreadable = bind(with_check.as_mut());
+
+                            // Calls resolve against the builder, before its
                             // store is borrowed mutably.
                             let calls = |expression: Option<&Expr>| {
                                 expression.map(|expression| builder.calls_in(expression))
@@ -10876,9 +10911,11 @@ impl ParserDB {
                             }
                             if let Some(using_calls) = using_calls {
                                 metadata.set_using_calls(using_calls);
+                                metadata.set_using_unreadable(using_unreadable);
                             }
                             if let Some(check_calls) = check_calls {
                                 metadata.set_check_calls(check_calls);
+                                metadata.set_check_unreadable(check_unreadable);
                             }
                         }
                     }

@@ -574,6 +574,23 @@ pub enum LookupError {
         /// The parser's account of what it could not read.
         reason: String,
     },
+    /// A quoted literal of a policy expression is read as a date or time value
+    /// when the policy is created, under session state the input does not
+    /// settle, such as the `TimeZone`, the `DateStyle` order or the current
+    /// time, or in a spelling PostgreSQL refuses.
+    #[error(
+        "Policy `{policy}` reads the literal '{literal}' as {data_type} when it is created, and that value is not known here: {reason}"
+    )]
+    PolicyLiteralUnreadable {
+        /// Name of the policy, as written.
+        policy: String,
+        /// The literal's text, as written.
+        literal: String,
+        /// The type PostgreSQL reads the literal as.
+        data_type: sql_values::PgType,
+        /// What reading the literal needed or refused.
+        reason: sql_values::DateTimeError,
+    },
 }
 
 /// Why a text could not be read back as a target name by

@@ -4,6 +4,7 @@ use alloc::{string::String, vec::Vec};
 #[cfg(feature = "std")]
 use std::path::Path;
 
+use sql_values::PgTimeZone;
 use sqlparser::{ast::Statement, dialect::Dialect};
 
 use crate::{
@@ -63,12 +64,29 @@ pub enum AccessResolution {
 /// assert_eq!(db.table_grants().count(), 1);
 /// # Ok::<(), sql_traits::errors::Error>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParseOptions {
     access_resolution: AccessResolution,
     postgres_catalog: PostgresCatalog,
     identifier_case: IdentifierCase,
     session_role: Option<String>,
+    session_time_zone: Option<WrittenTimeZone>,
+}
+
+/// A `TimeZone` setting as written, with the zone PostgreSQL reads from it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct WrittenTimeZone {
+    pub(super) written: String,
+    pub(super) zone: PgTimeZone,
+}
+
+/// The settings of a [`ParseOptions`] that ingestion takes apart.
+pub(super) struct IngestionParts {
+    pub(super) access_resolution: AccessResolution,
+    pub(super) postgres_catalog: PostgresCatalog,
+    pub(super) identifier_case: IdentifierCase,
+    pub(super) session_role: Option<String>,
+    pub(super) session_time_zone: Option<WrittenTimeZone>,
 }
 
 impl Default for ParseOptions {
@@ -78,6 +96,7 @@ impl Default for ParseOptions {
             postgres_catalog: PostgresCatalog::default(),
             identifier_case: IdentifierCase::AsWritten,
             session_role: None,
+            session_time_zone: None,
         }
     }
 }
@@ -170,6 +189,50 @@ impl ParseOptions {
         self
     }
 
+    /// Sets the `TimeZone` the session running the input starts in, as
+    /// PostgreSQL reads `zone`.
+    ///
+    /// A migration's session takes its zone from the server's configuration
+    /// and the settings of the role it logs in as, which no statement shows,
+    /// so this states it. PostgreSQL reads a `timestamptz` or `timetz` literal
+    /// of a policy in that zone when it creates the policy, until a `SET TIME
+    /// ZONE` of the input replaces it, and `RESET TIME ZONE` comes back to
+    /// it. Without one, such a literal answers
+    /// [`LookupError::PolicyLiteralUnreadable`](crate::errors::LookupError::PolicyLiteralUnreadable)
+    /// until the input sets a zone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTimeZone`] for a zone PostgreSQL refuses.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let sql = "CREATE TABLE docs (expires TIMESTAMPTZ);
+    ///            CREATE POLICY current ON docs USING (expires > '2026-01-01 12:00');";
+    ///
+    /// let db = ParseOptions::default()
+    ///     .with_session_time_zone("Europe/Rome")?
+    ///     .parse::<PostgreSqlDialect>(sql)?;
+    /// let policy = db.policies().next().unwrap();
+    /// let using = policy.using_expression(&db)?.unwrap();
+    /// assert_eq!(using.to_string(), "expires > '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE");
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn with_session_time_zone(mut self, zone: impl Into<String>) -> Result<Self, Error> {
+        let written = zone.into();
+        match PgTimeZone::parse(&written) {
+            Ok(zone) => {
+                self.session_time_zone = Some(WrittenTimeZone { written, zone });
+                Ok(self)
+            }
+            Err(reason) => Err(Error::InvalidTimeZone { value: written, reason }),
+        }
+    }
+
     /// Returns the comparison a creation takes a name under.
     #[must_use]
     #[inline]
@@ -192,10 +255,14 @@ impl ParseOptions {
     }
 
     /// Returns the owned settings used during ingestion.
-    pub(super) fn into_parts(
-        self,
-    ) -> (AccessResolution, PostgresCatalog, IdentifierCase, Option<String>) {
-        (self.access_resolution, self.postgres_catalog, self.identifier_case, self.session_role)
+    pub(super) fn into_parts(self) -> IngestionParts {
+        IngestionParts {
+            access_resolution: self.access_resolution,
+            postgres_catalog: self.postgres_catalog,
+            identifier_case: self.identifier_case,
+            session_role: self.session_role,
+            session_time_zone: self.session_time_zone,
+        }
     }
 
     /// Starts statement-by-statement ingestion under these options.
