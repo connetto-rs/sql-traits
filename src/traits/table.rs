@@ -5925,6 +5925,28 @@ mod tests {
             assert_ne!(fp_serial, fp_plain, "generated/identity flag must affect the fingerprint");
         }
 
+        /// A `pg_catalog`-qualified builtin and `bpchar` fingerprint as the
+        /// family [`DataTypeLike::scalar_family`] answers, so each spelling of
+        /// one type yields one fingerprint.
+        #[test]
+        fn test_type_spellings_of_one_family_fingerprint_alike() {
+            let fingerprint = |sql: &str| {
+                let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(sql)
+                    .expect("the table parses");
+                db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+                    .expect("unambiguous lookup")
+                    .expect("the DDL declares the table")
+                    .schema_fingerprint(&db)
+                    .expect("fingerprint")
+            };
+            assert_eq!(
+                fingerprint(
+                    "CREATE TABLE t (a pg_catalog.timestamptz, b pg_catalog.int4, c bpchar);"
+                ),
+                fingerprint("CREATE TABLE t (a timestamptz, b int4, c char(3));"),
+            );
+        }
+
         // ---------------------------------------------------------------
         // Spec §12 envelope-aware comparability tests (audit §7, P-13).
         //

@@ -5,7 +5,10 @@
 
 use core::fmt::Write;
 
-use sql_traits::{prelude::*, utils::normalize_postgres_type};
+use sql_traits::{
+    prelude::*,
+    utils::{normalize_postgres_type, scalar_family::ScalarFamily},
+};
 use sqlparser::dialect::PostgreSqlDialect;
 
 /// Each row is a return type as DDL may write it, beside `format_type`'s print
@@ -143,4 +146,50 @@ fn test_column_type_normalizes_like_its_print() {
         .map(|print| normalize_postgres_type(print).into_owned())
         .collect();
     assert_eq!(names, printed);
+}
+
+/// A `pg_catalog` qualifier names the type its bare spelling names, so both
+/// spellings answer one scalar family.
+#[test]
+fn test_pg_catalog_qualified_type_has_the_family_of_its_bare_spelling() {
+    let pairs = [
+        ("pg_catalog.timestamptz", "timestamptz", ScalarFamily::TimestampTz),
+        ("\"pg_catalog\".\"timestamptz\"", "timestamptz", ScalarFamily::TimestampTz),
+        ("pg_catalog.timestamptz(3)", "timestamptz(3)", ScalarFamily::TimestampTz),
+        ("pg_catalog.timestamp", "timestamp", ScalarFamily::Timestamp),
+        ("pg_catalog.timetz", "timetz", ScalarFamily::Time),
+        ("pg_catalog.time(3)", "time(3)", ScalarFamily::Time),
+        ("PG_CATALOG.Int4", "int4", ScalarFamily::Int),
+        ("pg_catalog.bool", "bool", ScalarFamily::Bool),
+        ("pg_catalog.float8", "float8", ScalarFamily::Float),
+        ("pg_catalog.numeric(10, 2)", "numeric(10, 2)", ScalarFamily::Decimal),
+        ("pg_catalog.varchar(10)", "varchar(10)", ScalarFamily::String),
+        ("pg_catalog.bpchar(3)", "bpchar(3)", ScalarFamily::String),
+        ("pg_catalog.bytea", "bytea", ScalarFamily::Bytes),
+        ("pg_catalog.uuid", "uuid", ScalarFamily::Uuid),
+        ("pg_catalog.date", "date", ScalarFamily::Date),
+        ("pg_catalog.interval", "interval", ScalarFamily::Interval),
+        ("pg_catalog.jsonb", "jsonb", ScalarFamily::Jsonb),
+    ];
+    let mut ddl = String::from("CREATE TABLE t (");
+    for (index, (qualified, bare, _)) in pairs.iter().enumerate() {
+        if index > 0 {
+            ddl.push_str(", ");
+        }
+        write!(ddl, "q{index} {qualified}, b{index} {bare}").expect("writing to a string");
+    }
+    ddl.push_str(");");
+    let database = ParserDB::parse::<PostgreSqlDialect>(&ddl).expect("the table parses");
+    let table = database
+        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the DDL declares the table");
+    let families: Vec<_> = table
+        .columns(&database)
+        .expect("the table has columns")
+        .map(|column| column.data_type(&database).scalar_family(&database))
+        .collect();
+    for ((qualified, bare, family), spellings) in pairs.iter().zip(families.chunks(2)) {
+        assert_eq!(spellings, [Some(*family); 2], "{qualified} beside {bare}");
+    }
 }
