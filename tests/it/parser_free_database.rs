@@ -1349,11 +1349,14 @@ impl PolicyLike for MemoryPolicy {
         true
     }
 
-    fn using_expression<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Expr>
+    fn using_expression<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {
-        None
+        Ok(None)
     }
 
     fn using_functions<'db>(
@@ -1363,11 +1366,14 @@ impl PolicyLike for MemoryPolicy {
         Ok(core::iter::empty())
     }
 
-    fn check_expression<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Expr>
+    fn check_expression<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {
-        None
+        Ok(None)
     }
 
     fn check_functions<'db>(

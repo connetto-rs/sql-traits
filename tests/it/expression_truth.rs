@@ -111,11 +111,11 @@ fn policy_expressions_can_be_analyzed_independently() -> Result<(), Error> {
     for policy in db.policies() {
         let table = policy.table(&db)?;
         let using = policy
-            .using_expression(&db)
+            .using_expression(&db)?
             .map(|expr| table.expression_truth(&db, expr, IdentifierCase::AsWritten))
             .transpose()?;
         let check = policy
-            .check_expression(&db)
+            .check_expression(&db)?
             .map(|expr| table.expression_truth(&db, expr, IdentifierCase::AsWritten))
             .transpose()?;
         let expected = match policy.name() {

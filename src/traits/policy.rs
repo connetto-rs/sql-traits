@@ -373,28 +373,50 @@ pub trait PolicyLike:
             && privilege_holders(role, database).any(|holder| named.contains(&holder.stored_name()))
     }
 
-    /// Returns the `USING` expression of the policy, if any.
+    /// Returns the `USING` expression of the policy, if any, each literal
+    /// holding the value PostgreSQL stored for it when it created the clause.
+    ///
+    /// PostgreSQL reads a quoted literal as the type its position demands
+    /// while it parses the clause, so a `timestamptz` or `timetz` literal is
+    /// the instant of the session's `TimeZone` there, and comes back as that
+    /// instant in UTC, cast to its type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::PolicyLiteralUnreadable`] for a literal whose
+    /// value needed session state the input does not settle, such as a
+    /// `TimeZone`, a `DateStyle` order or the time of creation, and
+    /// [`LookupError::ObjectNotInDatabase`] when `database` does not hold
+    /// this policy.
     ///
     /// # Example
     ///
     /// ```rust
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
-    /// CREATE TABLE my_table (id INT);
-    /// CREATE POLICY my_policy ON my_table USING (id > 0);
+    /// CREATE TABLE my_table (id INT, expires TIMESTAMPTZ);
+    /// SET TIME ZONE 'Asia/Tokyo';
+    /// CREATE POLICY my_policy ON my_table USING (expires > '2026-01-01 09:00');
     /// ",
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
     /// let policy = table.policies(&db)?.next().unwrap();
-    /// assert!(policy.using_expression(&db).is_some());
+    /// assert_eq!(
+    ///     policy.using_expression(&db)?.unwrap().to_string(),
+    ///     "expires > '2026-01-01 00:00:00+00'::TIMESTAMP WITH TIME ZONE",
+    /// );
     /// # Ok(())
     /// # }
     /// ```
-    fn using_expression<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Expr>
+    fn using_expression<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db;
 
@@ -432,7 +454,16 @@ pub trait PolicyLike:
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError>;
 
-    /// Returns explicit `WITH CHECK`, or `None` without a `USING` fallback.
+    /// Returns explicit `WITH CHECK`, or `None` without a `USING` fallback,
+    /// each literal holding the value PostgreSQL stored for it, as
+    /// [`Self::using_expression`] answers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::PolicyLiteralUnreadable`] for a literal whose
+    /// value needed session state the input does not settle, and
+    /// [`LookupError::ObjectNotInDatabase`] when `database` does not hold
+    /// this policy.
     ///
     /// # Example
     ///
@@ -449,11 +480,14 @@ pub trait PolicyLike:
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
     /// let policy = table.policies(&db)?.next().unwrap();
-    /// assert!(policy.check_expression(&db).is_some());
+    /// assert!(policy.check_expression(&db)?.is_some());
     /// # Ok(())
     /// # }
     /// ```
-    fn check_expression<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Expr>
+    fn check_expression<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db;
 
@@ -523,7 +557,7 @@ pub trait PolicyLike:
     ///      CREATE POLICY p ON items USING (owner = ANY(string_to_array(owner, ',')));",
     /// )?;
     /// let policy = db.policies().next().unwrap();
-    /// let Some(Expr::AnyOp { right, .. }) = policy.using_expression(&db) else { panic!() };
+    /// let Some(Expr::AnyOp { right, .. }) = policy.using_expression(&db)? else { panic!() };
     /// let Expr::Function(call) = right.as_ref() else { panic!() };
     /// let reached: Vec<_> = policy.functions_reached_by(call, &db)?.collect();
     /// // The built-in overload taking two arguments, found in `pg_catalog`.
@@ -583,7 +617,10 @@ where
         (*self).applies_to_public()
     }
 
-    fn using_expression<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Expr>
+    fn using_expression<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {
@@ -597,7 +634,10 @@ where
         (*self).using_functions(database)
     }
 
-    fn check_expression<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Expr>
+    fn check_expression<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {
@@ -670,9 +710,9 @@ mod tests {
         assert_eq!(roles, ["reader"]);
         assert!(!policy_ref.applies_to_public());
 
-        let using_expr = policy_ref.using_expression(&db);
-        assert!(using_expr.is_some());
-        let using_str = using_expr.unwrap().to_string();
+        let using_expr =
+            policy_ref.using_expression(&db).expect("literals read").expect("USING clause");
+        let using_str = using_expr.to_string();
         assert!(using_str.contains("id > 0"));
         assert!(using_str.contains("my_func()"));
 
@@ -684,22 +724,19 @@ mod tests {
         // Every call of the clause answers through the reference, and the
         // answers together are the clause's functions.
         let mut reached = Vec::new();
-        let ControlFlow::<Infallible>::Continue(()) =
-            visit_expressions(using_expr.expect("USING clause"), |expression| {
-                if let Expr::Function(call) = expression {
-                    reached.extend(
-                        policy_ref
-                            .functions_reached_by(call, &db)
-                            .expect("call belongs to the policy"),
-                    );
-                }
-                ControlFlow::Continue(())
-            });
+        let ControlFlow::<Infallible>::Continue(()) = visit_expressions(using_expr, |expression| {
+            if let Expr::Function(call) = expression {
+                reached.extend(
+                    policy_ref.functions_reached_by(call, &db).expect("call belongs to the policy"),
+                );
+            }
+            ControlFlow::Continue(())
+        });
         assert_eq!(reached, using_funcs);
 
-        let check_expr = policy_ref.check_expression(&db);
-        assert!(check_expr.is_some());
-        let check_str = check_expr.unwrap().to_string();
+        let check_expr =
+            policy_ref.check_expression(&db).expect("literals read").expect("WITH CHECK clause");
+        let check_str = check_expr.to_string();
         assert!(check_str.contains("id < 10"));
         assert!(check_str.contains("check_func()"));
 

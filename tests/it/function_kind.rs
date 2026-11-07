@@ -20,7 +20,7 @@ fn parse(sql: &str) -> ParserDB {
 /// argument count and kind of each function it reaches.
 fn kinds_per_call(db: &ParserDB, policy: &str) -> Vec<(String, Vec<(usize, FunctionKind)>)> {
     let policy = db.policies().find(|candidate| candidate.name() == policy).expect("policy exists");
-    let using = policy.using_expression(db).expect("USING clause");
+    let using = policy.using_expression(db).expect("literals read").expect("USING clause");
     let mut calls = Vec::new();
     let ControlFlow::<Infallible>::Continue(()) = visit_expressions(using, |expression| {
         if let Expr::Function(call) = expression {

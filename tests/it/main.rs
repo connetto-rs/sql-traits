@@ -96,6 +96,7 @@ mod partition_keys;
 mod per_object_grants;
 mod persisted_names_and_collations;
 mod policy_applies_to_role;
+mod policy_literals;
 mod policy_recursion;
 mod possible_privileges;
 mod postgres_catalog_cost;

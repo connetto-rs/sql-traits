@@ -272,7 +272,7 @@ impl<DB: DatabaseLike<Policy = Self>> PolicyLike for Absent<DB> {
         self.unreachable()
     }
 
-    fn using_expression<'db>(&'db self, _: &'db Self::DB) -> Option<&'db Expr>
+    fn using_expression<'db>(&'db self, _: &'db Self::DB) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {
@@ -286,7 +286,7 @@ impl<DB: DatabaseLike<Policy = Self>> PolicyLike for Absent<DB> {
         self.unreachable::<Result<core::iter::Empty<_>, _>>()
     }
 
-    fn check_expression<'db>(&'db self, _: &'db Self::DB) -> Option<&'db Expr>
+    fn check_expression<'db>(&'db self, _: &'db Self::DB) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {

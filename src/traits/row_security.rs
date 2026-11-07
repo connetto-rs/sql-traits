@@ -215,14 +215,17 @@ pub(crate) fn row_security<'db, T: TableLike>(
             if !covers(policy, command) || !applies(policy, role, database)? {
                 continue;
             }
-            let using = || policy.using_expression(database).map(|e| (PolicyClause::Using, e));
             let read = match reads {
-                Reads::Using => using(),
+                Reads::Using => {
+                    policy.using_expression(database)?.map(|e| (PolicyClause::Using, e))
+                }
                 Reads::Check => {
-                    policy
-                        .check_expression(database)
-                        .map(|e| (PolicyClause::WithCheck, e))
-                        .or_else(using)
+                    match policy.check_expression(database)? {
+                        Some(check) => Some((PolicyClause::WithCheck, check)),
+                        None => {
+                            policy.using_expression(database)?.map(|e| (PolicyClause::Using, e))
+                        }
+                    }
                 }
             };
             let Some((clause, expression)) = read else { continue };
@@ -356,7 +359,7 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
                 for policy in table.policies(self.database)? {
                     if covers(policy, GatedCommand::Select) && applies(policy, role, self.database)?
                     {
-                        expressions.extend(policy.using_expression(self.database));
+                        expressions.extend(policy.using_expression(self.database)?);
                     }
                 }
                 self.table(table, expressions, role)

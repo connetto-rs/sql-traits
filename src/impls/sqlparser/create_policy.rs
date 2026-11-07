@@ -82,11 +82,17 @@ impl PolicyLike for CreatePolicy {
         }
     }
 
-    fn using_expression<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Expr>
+    fn using_expression<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {
-        self.using.as_ref()
+        match policy_metadata(self, database)?.using_unreadable() {
+            Some(literal) => Err(literal.error(&self.name.value)),
+            None => Ok(self.using.as_ref()),
+        }
     }
 
     fn using_functions<'db>(
@@ -96,11 +102,17 @@ impl PolicyLike for CreatePolicy {
         Ok(policy_metadata(self, database)?.using_calls().functions())
     }
 
-    fn check_expression<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Expr>
+    fn check_expression<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {
-        self.with_check.as_ref()
+        match policy_metadata(self, database)?.check_unreadable() {
+            Some(literal) => Err(literal.error(&self.name.value)),
+            None => Ok(self.with_check.as_ref()),
+        }
     }
 
     fn check_functions<'db>(
