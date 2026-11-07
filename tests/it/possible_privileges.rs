@@ -46,6 +46,26 @@ fn a_privilege_never_granted_stays_possible() {
     assert_eq!(possible(&db, "app"), EVERYTHING);
 }
 
+/// Whether `table` proves `role` lacks `UPDATE` on every column, read by a
+/// consumer generic over the table type.
+fn update_withheld<T: TableLike<DB = ParserDB>>(table: T, role: &str, db: &ParserDB) -> bool {
+    let role = db.role(role).expect("the role exists");
+    !table
+        .possible_privileges(role, db)
+        .expect("the table is in the database")
+        .update
+        .on_any_column()
+}
+
+#[test]
+fn a_borrowed_table_answers_as_the_table_does() {
+    let db = parse(&format!("{PROFILES} CREATE ROLE other; REVOKE UPDATE ON profiles FROM app;"));
+    let profiles: &<ParserDB as DatabaseLike>::Table = table(&db, None, "profiles");
+
+    assert!(update_withheld(profiles, "app", &db));
+    assert!(!update_withheld(profiles, "other", &db));
+}
+
 #[test]
 fn a_revoke_naming_the_role_leaves_what_it_still_holds() {
     let db = parse(&format!(
