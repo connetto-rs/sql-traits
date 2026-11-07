@@ -473,15 +473,24 @@ fn collation_option_bool(key: &Ident, value: &Expr) -> Result<bool, crate::error
     }
 }
 
+/// Accepts the providers PostgreSQL 18 knows, which it reads as a string from a
+/// word or a string constant and compares ignoring case.
 fn validate_collation_provider(key: &Ident, value: &Expr) -> Result<(), crate::errors::Error> {
-    let Expr::Identifier(provider) = value else {
-        return Err(invalid_collation_option(&key.to_string(), value.to_string()));
+    let provider = match value {
+        Expr::Identifier(provider) => provider.value.as_str(),
+        Expr::Value(ValueWithSpan {
+            value:
+                Value::SingleQuotedString(provider)
+                | Value::EscapedStringLiteral(provider)
+                | Value::UnicodeStringLiteral(provider),
+            ..
+        }) => provider.as_str(),
+        Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(provider), .. }) => {
+            provider.value.as_str()
+        }
+        _ => return Err(invalid_collation_option(&key.to_string(), value.to_string())),
     };
-    if provider.quote_style.is_none()
-        && (provider.value.eq_ignore_ascii_case("builtin")
-            || provider.value.eq_ignore_ascii_case("libc")
-            || provider.value.eq_ignore_ascii_case("icu"))
-    {
+    if ["builtin", "libc", "icu"].iter().any(|known| provider.eq_ignore_ascii_case(known)) {
         Ok(())
     } else {
         Err(invalid_collation_option(&key.to_string(), value.to_string()))

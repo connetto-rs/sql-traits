@@ -2,8 +2,9 @@
 
 use super::postgres_catalog::PostgresCatalogCollation;
 
-/// The collations PostgreSQL 18 creates in `pg_catalog`, the fixed ones first
-/// and then the ICU collations `initdb` imports. No two share an identity.
+/// The collations PostgreSQL 18 creates in `pg_catalog`, the fixed ones first,
+/// then the libc and ICU collations `initdb` imports in the official
+/// `postgres:18.6` image. No two share an identity.
 pub(super) static POSTGRES_18_COLLATIONS: &[PostgresCatalogCollation] = &[
     PostgresCatalogCollation::built_in("default", false),
     PostgresCatalogCollation::built_in("C", true),
@@ -13,6 +14,10 @@ pub(super) static POSTGRES_18_COLLATIONS: &[PostgresCatalogCollation] = &[
     PostgresCatalogCollation::built_in("unicode", false),
     PostgresCatalogCollation::built_in("pg_c_utf8", false),
     PostgresCatalogCollation::built_in("pg_unicode_fast", false),
+    // The libc locales of the official image, whose names only a quoted
+    // identifier can spell.
+    PostgresCatalogCollation::built_in("en_US", true),
+    PostgresCatalogCollation::built_in("en_US.utf8", true),
     icu("af-NA-x-icu"),
     icu("af-ZA-x-icu"),
     icu("af-x-icu"),

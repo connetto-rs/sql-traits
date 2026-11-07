@@ -1308,12 +1308,12 @@ mod tests {
     fn collation_catalog_reaches_parsed_statement_constructors() {
         let catalog = PostgresCatalog::empty()
             .with_collation(
-                PostgresCatalogCollation::new("en_US.utf8", true).with_deterministic(false),
+                PostgresCatalogCollation::new("fr_FR.utf8", true).with_deterministic(false),
             )
             .with_collatable_type(PostgresCatalogType::new("text", false));
         let statements = sqlparser::parser::Parser::parse_sql(
             &PostgreSqlDialect {},
-            "CREATE TABLE t (name TEXT COLLATE \"en_US.utf8\");",
+            "CREATE TABLE t (name TEXT COLLATE \"fr_FR.utf8\");",
         )
         .expect("parse statements");
         let db = ParserDB::from_statements_with_dialect(
@@ -1326,7 +1326,7 @@ mod tests {
 
         let statements = sqlparser::parser::Parser::parse_sql(
             &PostgreSqlDialect {},
-            "CREATE TABLE t (name TEXT COLLATE \"en_US.utf8\");",
+            "CREATE TABLE t (name TEXT COLLATE \"fr_FR.utf8\");",
         )
         .expect("parse statements");
         let db = ParseOptions::default()
@@ -1346,7 +1346,7 @@ mod tests {
 
         let mut path = std::env::temp_dir();
         path.push(format!("sql_traits_catalog_{}.sql", std::process::id()));
-        std::fs::write(&path, "CREATE TABLE t (name TEXT COLLATE \"en_US.utf8\");")
+        std::fs::write(&path, "CREATE TABLE t (name TEXT COLLATE \"fr_FR.utf8\");")
             .expect("write sql");
         let db = ParseOptions::default()
             .with_postgres_catalog(catalog)
@@ -2068,6 +2068,41 @@ mod tests {
         assert!(matches!(result, Err(Error::InvalidCollationOption { .. })));
     }
 
+    /// PostgreSQL reads the provider as a string and compares it ignoring
+    /// case, so every spelling of that string names the same provider.
+    #[test]
+    fn collation_create_accepts_every_provider_spelling() {
+        for provider in [
+            "icu",
+            "'icu'",
+            "\"icu\"",
+            "'ICU'",
+            "\"LIBC\"",
+            "E'builtin'",
+            "$$icu$$",
+            "U&'icu'",
+            "Libc",
+        ] {
+            let result = ParserDB::parse::<PostgreSqlDialect>(&format!(
+                "CREATE COLLATION c (provider = {provider}, locale = 'und');"
+            ));
+            assert!(result.is_ok(), "provider = {provider}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn collation_create_rejects_unknown_provider_string() {
+        for provider in ["'xyz'", "'icu '", "''", "1"] {
+            let result = ParserDB::parse::<PostgreSqlDialect>(&format!(
+                "CREATE COLLATION c (provider = {provider}, locale = 'und');"
+            ));
+            assert!(
+                matches!(&result, Err(Error::InvalidCollationOption { option_name, .. }) if &**option_name == "provider"),
+                "provider = {provider}: {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn collation_create_if_not_exists_validates_before_skip() {
         let result = ParserDB::parse::<PostgreSqlDialect>(
@@ -2197,6 +2232,23 @@ mod tests {
             ",
         );
         assert!(matches!(result, Err(Error::CollationNotFound { .. })));
+    }
+
+    /// The official PostgreSQL 18 image creates these libc collations at
+    /// `initdb`, and their names need quoting.
+    #[test]
+    fn collation_resolves_initdb_libc_locales() {
+        let db = parse_with::<PostgreSqlDialect>(
+            r#"CREATE TABLE t (a TEXT COLLATE "en_US", b TEXT COLLATE pg_catalog."en_US.utf8");"#,
+        );
+        for name in ["a", "b"] {
+            assert!(matches!(
+                column_named(&db, name).collation(&db),
+                Ok(ColumnCollation::Named(_))
+            ));
+        }
+        let result = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (a TEXT COLLATE en_US);");
+        assert!(matches!(result, Err(Error::CollationNotFound { .. })), "{result:?}");
     }
 
     #[test]
