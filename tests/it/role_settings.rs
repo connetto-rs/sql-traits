@@ -257,6 +257,26 @@ fn a_time_zone_postgresql_refuses_is_refused() {
 }
 
 #[test]
+fn a_constructed_entry_answers_as_the_catalog_row_holds_it() {
+    // PostgreSQL 18.6 stored TimeZone=Asia/Tokyo under r in app for
+    // `ALTER ROLE r IN DATABASE app SET timezone = 'Asia/Tokyo'`.
+    let setting = RoleSetting::new(Some("r".into()), Some("app".into()), "TimeZone", "Asia/Tokyo")
+        .expect("PostgreSQL accepts the zone");
+    assert_eq!(
+        (setting.role(), setting.database(), setting.name(), setting.value()),
+        (Some("r"), Some("app"), "TimeZone", "Asia/Tokyo")
+    );
+    assert!(setting.is_named("timezone"));
+
+    assert!(matches!(
+        RoleSetting::new(None, None, "TimeZone", "bogus"),
+        Err(Error::InvalidTimeZone { value, reason: TimeZoneError::InvalidValue }) if value == "bogus"
+    ));
+    // A setting of another name is not read as a zone.
+    RoleSetting::new(None, None, "app.timezone", "bogus").expect("PostgreSQL stores any text");
+}
+
+#[test]
 fn from_current_stores_the_value_the_session_set() {
     // PostgreSQL 18.6 stored TimeZone=Asia/Tokyo.
     let db = parse(

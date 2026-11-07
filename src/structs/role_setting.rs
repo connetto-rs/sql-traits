@@ -4,6 +4,8 @@ use alloc::string::String;
 
 use sql_values::PgTimeZone;
 
+use crate::errors::Error;
+
 /// The value a role, or every role, starts a session with in one database, or
 /// in every database, as `ALTER ROLE { name | ALL } [IN DATABASE d] SET`
 /// leaves it.
@@ -46,6 +48,41 @@ pub struct RoleSetting {
 }
 
 impl RoleSetting {
+    /// The entry setting `name` to `value` for `role`, or every role when
+    /// [`None`], in `database`, or every database when [`None`], as one
+    /// `pg_db_role_setting` row holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidTimeZone`] for a `TimeZone` entry whose value
+    /// PostgreSQL refuses, as [`PgTimeZone::parse`] reads it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    ///
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// let setting = RoleSetting::new(Some("reader".into()), None, "TimeZone", "Europe/Rome")?;
+    ///
+    /// assert_eq!(setting.role(), Some("reader"));
+    /// assert_eq!(setting.database(), None);
+    /// assert!(setting.is_named("timezone"));
+    /// assert!(RoleSetting::new(None, None, "TimeZone", "bogus").is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(
+        role: Option<String>,
+        database: Option<String>,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let (name, value) = (name.into(), value.into());
+        let zone = setting_zone(&name, &value)?;
+        Ok(Self { role, database, name, value, zone })
+    }
+
     /// The role the entry applies to, by the name PostgreSQL stores, or
     /// [`None`] for every role.
     #[must_use]
@@ -60,7 +97,8 @@ impl RoleSetting {
         self.database.as_deref()
     }
 
-    /// The setting's name, folded as PostgreSQL folds an unquoted identifier.
+    /// The setting's name, as [`RoleSetting::new`] was given it, or folded
+    /// as PostgreSQL folds an identifier when read from SQL text.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -89,4 +127,19 @@ impl RoleSetting {
     pub(crate) fn time_zone(&self) -> Option<&PgTimeZone> {
         self.zone.as_ref()
     }
+}
+
+/// The zone PostgreSQL reads from `value` when `name` is `TimeZone`, or
+/// [`None`] for a setting of another name.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidTimeZone`] for a zone PostgreSQL refuses.
+pub(crate) fn setting_zone(name: &str, value: &str) -> Result<Option<PgTimeZone>, Error> {
+    if !name.eq_ignore_ascii_case("timezone") {
+        return Ok(None);
+    }
+    PgTimeZone::parse(value)
+        .map(Some)
+        .map_err(|reason| Error::InvalidTimeZone { value: value.into(), reason })
 }
