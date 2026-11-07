@@ -14,8 +14,8 @@ use sqlparser::ast::{
 use crate::{
     errors::{LookupError, RowSecurityError},
     structs::{
-        ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,
-        RowSecurityExemption, RowStatement, RowVersion,
+        ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, PolicyExpression, RowGate,
+        RowSecurity, RowSecurityExemption, RowStatement, RowVersion,
     },
     traits::{
         DataStatementLike, DatabaseLike, PolicyLike, Relation, RoleLike, TableLike, ViewLike,
@@ -206,6 +206,7 @@ pub(crate) fn row_security<'db, T: TableLike>(
     }
     let policies: Vec<_> = table.policies(database)?.collect();
     let mut gates = Vec::new();
+    let mut unreadable = None;
     for (command, reads, row, failure) in specs(statement) {
         let mut gate =
             RowGate { command, row, failure, permissive: Vec::new(), restrictive: Vec::new() };
@@ -216,19 +217,22 @@ pub(crate) fn row_security<'db, T: TableLike>(
                 continue;
             }
             let read = match reads {
-                Reads::Using => {
-                    policy.using_expression(database)?.map(|e| (PolicyClause::Using, e))
-                }
+                Reads::Using => policy.using_clause(database)?.map(|e| (PolicyClause::Using, e)),
                 Reads::Check => {
-                    match policy.check_expression(database)? {
+                    match policy.check_clause(database)? {
                         Some(check) => Some((PolicyClause::WithCheck, check)),
-                        None => {
-                            policy.using_expression(database)?.map(|e| (PolicyClause::Using, e))
-                        }
+                        None => policy.using_clause(database)?.map(|e| (PolicyClause::Using, e)),
                     }
                 }
             };
             let Some((clause, expression)) = read else { continue };
+            let expression = match expression {
+                PolicyExpression::Stored(expression) => expression,
+                PolicyExpression::Written { expression, unreadable: error } => {
+                    unreadable.get_or_insert(error);
+                    expression
+                }
+            };
             let term = GateTerm { policy, clause, expression };
             match policy.policy_type() {
                 CreatePolicyType::Permissive => gate.permissive.push(term),
@@ -245,6 +249,11 @@ pub(crate) fn row_security<'db, T: TableLike>(
     let mut expansion = Expansion { database, stack: Vec::new() };
     if let Some(relation) = expansion.table(table.borrow(), expressions, role)? {
         return Ok(RowSecurity::InfiniteRecursion { relation });
+    }
+    // PostgreSQL refuses a loop before it reads any value, so only a gate it
+    // goes on to judge needs the values its literals stored.
+    if let Some(error) = unreadable {
+        return Err(error.into());
     }
     Ok(RowSecurity::Gated(gates))
 }
@@ -359,7 +368,9 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
                 for policy in table.policies(self.database)? {
                     if covers(policy, GatedCommand::Select) && applies(policy, role, self.database)?
                     {
-                        expressions.extend(policy.using_expression(self.database)?);
+                        expressions.extend(
+                            policy.using_clause(self.database)?.map(|using| using.expression()),
+                        );
                     }
                 }
                 self.table(table, expressions, role)

@@ -6,7 +6,10 @@ use sqlparser::ast::{CreatePolicy, CreatePolicyCommand, CreatePolicyType, Expr, 
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ParserDB, TargetName, metadata::PolicyMetadata},
+    structs::{
+        ParserDB, PolicyExpression, TargetName,
+        metadata::{PolicyMetadata, UnreadableLiteral},
+    },
     traits::{DatabaseLike, Metadata, PolicyLike},
     utils::{
         identifier_resolution::is_public_pseudo_role,
@@ -26,6 +29,21 @@ fn policy_metadata<'db>(
     database
         .policy_metadata(policy)
         .ok_or_else(|| ObjectKind::Policy.not_in_database(&policy.name.value))
+}
+
+/// One clause of `policy`, written when `unreadable` names a literal of it
+/// whose stored value is not known.
+fn clause<'db>(
+    policy: &CreatePolicy,
+    expression: &'db Expr,
+    unreadable: Option<&UnreadableLiteral>,
+) -> PolicyExpression<'db> {
+    match unreadable {
+        Some(literal) => {
+            PolicyExpression::Written { expression, unreadable: literal.error(&policy.name.value) }
+        }
+        None => PolicyExpression::Stored(expression),
+    }
 }
 
 impl PolicyLike for CreatePolicy {
@@ -82,17 +100,15 @@ impl PolicyLike for CreatePolicy {
         }
     }
 
-    fn using_expression<'db>(
+    fn using_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<&'db Expr>, LookupError>
+    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
-        match policy_metadata(self, database)?.using_unreadable() {
-            Some(literal) => Err(literal.error(&self.name.value)),
-            None => Ok(self.using.as_ref()),
-        }
+        let unreadable = policy_metadata(self, database)?.using_unreadable();
+        Ok(self.using.as_ref().map(|using| clause(self, using, unreadable)))
     }
 
     fn using_functions<'db>(
@@ -102,17 +118,15 @@ impl PolicyLike for CreatePolicy {
         Ok(policy_metadata(self, database)?.using_calls().functions())
     }
 
-    fn check_expression<'db>(
+    fn check_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<&'db Expr>, LookupError>
+    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
-        match policy_metadata(self, database)?.check_unreadable() {
-            Some(literal) => Err(literal.error(&self.name.value)),
-            None => Ok(self.with_check.as_ref()),
-        }
+        let unreadable = policy_metadata(self, database)?.check_unreadable();
+        Ok(self.with_check.as_ref().map(|check| clause(self, check, unreadable)))
     }
 
     fn check_functions<'db>(

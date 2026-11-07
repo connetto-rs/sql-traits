@@ -4504,8 +4504,8 @@ pub trait TableLike:
     /// # Errors
     ///
     /// Returns [`RowSecurityError::Lookup`] when the table is not in
-    /// `database` or a clause the statement reads holds a literal
-    /// [`PolicyLike::using_expression`] cannot read,
+    /// `database` or, where no loop refuses the statement first, a gate of the
+    /// statement holds a literal [`PolicyLike::using_expression`] cannot read,
     /// [`RowSecurityError::RoleRequired`] when a policy gating the
     /// statement is scoped to a role and `role` is [`ActingRole::Public`],
     /// [`RowSecurityError::UnsettledRole`] when a policy's `TO` list cannot be

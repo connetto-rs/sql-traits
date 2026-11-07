@@ -7,7 +7,7 @@ use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Function, Owne
 
 use crate::{
     errors::LookupError,
-    structs::TargetName,
+    structs::{PolicyExpression, TargetName},
     traits::{DatabaseLike, Metadata, RoleLike, role::privilege_holders},
     utils::identifier_resolution::normalize_identifier,
 };
@@ -418,6 +418,57 @@ pub trait PolicyLike:
         database: &'db Self::DB,
     ) -> Result<Option<&'db Expr>, LookupError>
     where
+        Self: 'db,
+    {
+        self.using_clause(database)?.map(PolicyExpression::stored).transpose()
+    }
+
+    /// Returns the `USING` clause of the policy, if any, stored when every
+    /// literal of it could be read and written when one could not.
+    ///
+    /// A walk of the relations, subqueries and calls the clause holds reads
+    /// [`PolicyExpression::expression`], which answers either form. A caller
+    /// comparing values reads [`Self::using_expression`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this policy.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE teams (id INT);
+    /// CREATE TABLE docs (team INT, expires TIMESTAMPTZ);
+    /// CREATE POLICY docs_read ON docs
+    ///     USING (expires > '2026-01-01 09:00' AND team IN (SELECT id FROM teams));
+    /// ",
+    /// )?;
+    /// let policy = db.policies().next().unwrap();
+    /// // The script sets no `TimeZone`, so the literal's stored value is unknown.
+    /// let Some(PolicyExpression::Written { expression, unreadable }) = policy.using_clause(&db)?
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(
+    ///     expression.to_string(),
+    ///     "expires > '2026-01-01 09:00' AND team IN (SELECT id FROM teams)",
+    /// );
+    /// assert!(matches!(unreadable, LookupError::PolicyLiteralUnreadable { .. }));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn using_clause<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    where
         Self: 'db;
 
     /// Returns the functions used in the `USING` expression.
@@ -489,6 +540,45 @@ pub trait PolicyLike:
         database: &'db Self::DB,
     ) -> Result<Option<&'db Expr>, LookupError>
     where
+        Self: 'db,
+    {
+        self.check_clause(database)?.map(PolicyExpression::stored).transpose()
+    }
+
+    /// Returns explicit `WITH CHECK`, or `None` without a `USING` fallback,
+    /// stored or written as [`Self::using_clause`] answers `USING`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this policy.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE docs (id INT, expires TIMESTAMPTZ);
+    /// SET TIME ZONE 'UTC';
+    /// CREATE POLICY docs_write ON docs WITH CHECK (expires > '2026-01-01 09:00');
+    /// ",
+    /// )?;
+    /// let policy = db.policies().next().unwrap();
+    /// let Some(PolicyExpression::Stored(check)) = policy.check_clause(&db)? else { unreachable!() };
+    /// assert_eq!(check.to_string(), "expires > '2026-01-01 09:00:00+00'::TIMESTAMP WITH TIME ZONE");
+    /// assert_eq!(policy.using_clause(&db)?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn check_clause<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    where
         Self: 'db;
 
     /// Returns the functions used in the `WITH CHECK` expression.
@@ -528,14 +618,14 @@ pub trait PolicyLike:
     /// Returns the functions one call in the policy's expressions may reach,
     /// resolved under the search path of the statement that wrote the clause.
     ///
-    /// `call` is a node of [`Self::using_expression`] or
-    /// [`Self::check_expression`], at any depth, subqueries included. An
-    /// unqualified name reaches `pg_catalog` and every schema on the path, a
-    /// qualified one only its own schema, and every overload accepting the
-    /// call's argument count counts, since argument types are not inferred.
-    /// A caller needing a property of whatever the call runs asks each
-    /// reachable function. An expression PostgreSQL's grammar writes like a
-    /// call, such as `COALESCE` or `CURRENT_USER`, reaches no function.
+    /// `call` is a node of [`Self::using_clause`] or [`Self::check_clause`],
+    /// at any depth, subqueries included. An unqualified name reaches
+    /// `pg_catalog` and every schema on the path, a qualified one only its own
+    /// schema, and every overload accepting the call's argument count counts,
+    /// since argument types are not inferred. A caller needing a property of
+    /// whatever the call runs asks each reachable function. An expression
+    /// PostgreSQL's grammar writes like a call, such as `COALESCE` or
+    /// `CURRENT_USER`, reaches no function.
     ///
     /// # Errors
     ///
@@ -617,14 +707,14 @@ where
         (*self).applies_to_public()
     }
 
-    fn using_expression<'db>(
+    fn using_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<&'db Expr>, LookupError>
+    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
-        (*self).using_expression(database)
+        (*self).using_clause(database)
     }
 
     fn using_functions<'db>(
@@ -634,14 +724,14 @@ where
         (*self).using_functions(database)
     }
 
-    fn check_expression<'db>(
+    fn check_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<&'db Expr>, LookupError>
+    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
-        (*self).check_expression(database)
+        (*self).check_clause(database)
     }
 
     fn check_functions<'db>(
