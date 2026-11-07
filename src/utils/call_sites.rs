@@ -29,6 +29,25 @@ pub(crate) struct Call<'a> {
     pub(crate) node: Option<&'a Function>,
 }
 
+/// One node a walk meets that is written with the syntax of a call.
+#[derive(Clone, Copy)]
+pub(crate) enum Site<'a> {
+    /// A call to a function.
+    Call(Call<'a>),
+    /// A function expression PostgreSQL reads as an expression rather than
+    /// as a call, which runs no function, as [`expression_form`] decides.
+    ExpressionForm(&'a Function),
+}
+
+/// Hands every node in `node` written with the syntax of a call to `each`, in
+/// the order a pre-order walk meets them, until `each` breaks.
+pub(crate) fn for_each_site<N: Visit + ?Sized, B>(
+    node: &N,
+    each: impl FnMut(Site<'_>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    node.visit(&mut Sites { each })
+}
+
 /// Hands every call in `node` to `each`, in the order a pre-order walk meets
 /// them, until `each` breaks.
 ///
@@ -37,9 +56,14 @@ pub(crate) struct Call<'a> {
 /// carries an argument list.
 pub(crate) fn for_each_call<N: Visit + ?Sized, B>(
     node: &N,
-    each: impl FnMut(Call<'_>) -> ControlFlow<B>,
+    mut each: impl FnMut(Call<'_>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
-    node.visit(&mut Calls { each })
+    for_each_site(node, |site| {
+        match site {
+            Site::Call(call) => each(call),
+            Site::ExpressionForm(_) => ControlFlow::Continue(()),
+        }
+    })
 }
 
 /// Hands the written name and the argument count of every call in `node` to
@@ -131,22 +155,29 @@ pub(crate) fn expression_form(called: &ObjectName) -> Option<ExpressionForm> {
     Some(form)
 }
 
-/// Hands each call the walk meets to `each`.
-struct Calls<F> {
+/// Hands each node the walk meets with the syntax of a call to `each`.
+struct Sites<F> {
     each: F,
 }
 
-impl<B, F: FnMut(Call<'_>) -> ControlFlow<B>> Visitor for Calls<F> {
+impl<B, F: FnMut(Site<'_>) -> ControlFlow<B>> Visitor for Sites<F> {
     type Break = B;
 
     fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<B> {
         match expression {
-            Expr::Function(function) if expression_form(&function.name).is_none() => {
+            Expr::Function(function) if expression_form(&function.name).is_some() => {
+                (self.each)(Site::ExpressionForm(function))
+            }
+            Expr::Function(function) => {
                 let arguments = argument_count(&function.args);
-                (self.each)(Call { name: &function.name, arguments, node: Some(function) })
+                (self.each)(Site::Call(Call {
+                    name: &function.name,
+                    arguments,
+                    node: Some(function),
+                }))
             }
             Expr::In { target: InTarget::Table { name, args: Some(args) }, .. } => {
-                (self.each)(Call { name, arguments: args.len(), node: None })
+                (self.each)(Site::Call(Call { name, arguments: args.len(), node: None }))
             }
             _ => ControlFlow::Continue(()),
         }
@@ -155,10 +186,10 @@ impl<B, F: FnMut(Call<'_>) -> ControlFlow<B>> Visitor for Calls<F> {
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<B> {
         match factor {
             TableFactor::Table { name, args: Some(args), .. } => {
-                (self.each)(Call { name, arguments: args.args.len(), node: None })
+                (self.each)(Site::Call(Call { name, arguments: args.args.len(), node: None }))
             }
             TableFactor::Function { name, args, .. } => {
-                (self.each)(Call { name, arguments: args.len(), node: None })
+                (self.each)(Site::Call(Call { name, arguments: args.len(), node: None }))
             }
             _ => ControlFlow::Continue(()),
         }
