@@ -717,8 +717,7 @@ fn slot_at(node: &CreateTable, position: Position) -> Option<(Slot<'_>, String)>
     slots.into_iter().zip(keys).find(|(slot, _)| slot.position() == position)
 }
 
-/// Whether the table receives the constraint in `slot` from a parent, which
-/// then alone may rename it.
+/// Whether the table receives the constraint in `slot` from a parent.
 fn received_from_parent(builder: &ParserDBBuilder, node: &CreateTable, slot: Slot<'_>) -> bool {
     match slot {
         Slot::Column {
@@ -775,10 +774,11 @@ fn backed_by_index(slot: Slot<'_>) -> bool {
 /// # Errors
 ///
 /// Returns [`Error::RenameConstraintNotFound`] for a name the table does not
-/// hold, [`Error::InheritedConstraintNotRenamable`] for a constraint received
-/// from a parent, [`Error::OnlyRefusedWithChildren`] when `ONLY` would leave
-/// copies below under the old name, [`Error::ConstraintAlreadyExists`] for a
-/// name another constraint of the table holds, and
+/// hold, [`Error::InheritedConstraintNotRenamable`] for a check or `NOT NULL`
+/// received from a parent, [`Error::OnlyRefusedWithChildren`] when `ONLY`
+/// would leave copies below under the old name,
+/// [`Error::ConstraintAlreadyExists`] for a name another constraint of the
+/// table holds, and
 /// [`Error::RelationNameAlreadyTaken`] when a key's new name, which its index
 /// takes too, belongs to another relation of the schema.
 pub(super) fn rename_constraint(
@@ -791,6 +791,89 @@ pub(super) fn rename_constraint(
     let Some(stored) = ParserDB::alter_table_target(&builder, table_name, scope)? else {
         return Ok(builder);
     };
+    rename_constraint_of(builder, stored, scope, old, new)
+}
+
+/// The table holding the primary key, unique or exclusion constraint whose
+/// index `name` reaches, or [`None`] when `name` reaches an index of its own
+/// or nothing at all.
+///
+/// PostgreSQL renames such an index together with its constraint, and checks
+/// the schema's relation names before the table's constraint names, so a
+/// clash with a relation is reported here.
+///
+/// # Errors
+///
+/// Returns [`Error::RelationNameAlreadyTaken`] when another relation of the
+/// schema holds `new`.
+pub(super) fn key_index_table(
+    builder: &ParserDBBuilder,
+    name: &ObjectName,
+    old: &Ident,
+    new: &Ident,
+) -> Result<Option<StoredTable>, Error> {
+    let case = builder.identifier_case();
+    let reached = builder
+        .relation_reached(name)
+        .filter(|(kind, _)| matches!(kind, ObjectKind::UniqueIndex))
+        .and_then(|(_, schema)| {
+            builder
+                .tables()
+                .iter()
+                .find(|(table, metadata, _)| {
+                    schema_qualifiers_match(table_schema_qualifier(table), Some(schema), case)
+                        && locate(table, metadata.generated_constraint_names(), old)
+                            .and_then(|position| slot_at(table, position))
+                            .is_some_and(|(slot, _)| backed_by_index(slot))
+                })
+                .map(|(table, _, _)| (StoredTable::of(table), schema))
+        });
+    let Some((stored, schema)) = reached else {
+        return Ok(None);
+    };
+    match super::relation_name_holder(builder, new, Some(schema)) {
+        Some(conflicting_kind) => {
+            Err(Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::UniqueIndex,
+                conflicting_kind,
+                object_name: new.value.clone(),
+            })
+        }
+        None => Ok(Some(stored)),
+    }
+}
+
+/// Applies `ALTER INDEX ... RENAME TO new` to the key of `stored` answering to
+/// `old`, which [`key_index_table`] found. The rename reaches that one
+/// relation, never the partitions or children below it.
+///
+/// # Errors
+///
+/// Returns the errors of [`rename_constraint`].
+pub(super) fn rename_key_index(
+    builder: ParserDBBuilder,
+    stored: StoredTable,
+    old: &Ident,
+    new: &Ident,
+) -> Result<ParserDBBuilder, Error> {
+    rename_constraint_of(
+        builder,
+        stored,
+        AlterTableScope { if_exists: false, only: true },
+        old,
+        new,
+    )
+}
+
+/// Renames the constraint of `stored` answering to `old`, as
+/// [`rename_constraint`] describes.
+fn rename_constraint_of(
+    builder: ParserDBBuilder,
+    stored: StoredTable,
+    scope: AlterTableScope,
+    old: &Ident,
+    new: &Ident,
+) -> Result<ParserDBBuilder, Error> {
     let node = ParserDB::stored_node(&builder, &stored)?;
     let recorded = super::generated_constraint_names(&builder, &stored);
     let Some((slot, _)) = locate(node, recorded, old).and_then(|position| slot_at(node, position))
@@ -800,7 +883,9 @@ pub(super) fn rename_constraint(
             constraint_name: old.value.clone(),
         });
     };
-    if received_from_parent(&builder, node, slot) {
+    // PostgreSQL leaves a received check or `NOT NULL` to the parent to
+    // rename, and lets a table rename a key or foreign key it received.
+    if passes_down(slot) && received_from_parent(&builder, node, slot) {
         return Err(Error::InheritedConstraintNotRenamable {
             table_name: stored.name.clone(),
             constraint_name: old.value.clone(),

@@ -9089,6 +9089,16 @@ impl ParserDB {
                     name,
                     operation: AlterIndexOperation::RenameIndex { index_name: new_name },
                 } => {
+                    // The index behind a key is renamed with the key itself.
+                    if let (Some(old), Some(ObjectNamePart::Identifier(new_ident))) =
+                        (object_name_last_identifier(&name), new_name.0.last())
+                        && let Some(stored) =
+                            constraint_names::key_index_table(&builder, &name, old, new_ident)?
+                    {
+                        builder =
+                            constraint_names::rename_key_index(builder, stored, old, new_ident)?;
+                        continue;
+                    }
                     let Some(position) = builder.index_position(&name)? else {
                         return Err(crate::errors::Error::AlterIndexNotFound {
                             index_name: last_str(&name).to_string(),
