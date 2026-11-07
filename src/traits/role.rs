@@ -359,34 +359,75 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
         &'db self,
         database: &'db Self::DB,
     ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Role> {
-        /// Appends to `reached` each role an inheriting membership among
-        /// `memberships` grants, unless it is the walk's own role or was
-        /// reached already.
-        fn reach<'db, DB: DatabaseLike>(
-            memberships: impl Iterator<Item = &'db DB::RoleMembership>,
-            database: &'db DB,
-            own_name: &str,
-            reached: &mut Vec<&'db DB::Role>,
-        ) {
-            for granted in memberships
-                .filter(|membership| membership.inherit_option())
-                .filter_map(|membership| membership.role(database))
-            {
-                if granted.stored_name() != own_name && !reached.contains(&granted) {
-                    reached.push(granted);
-                }
-            }
-        }
+        reached_roles(
+            self.memberships(database),
+            &self.stored_name(),
+            RoleMembershipLike::inherit_option,
+            database,
+        )
+        .into_iter()
+    }
 
-        let own_name = self.stored_name();
-        let mut reached = Vec::new();
-        reach(self.memberships(database), database, &own_name, &mut reached);
-        let mut next = 0;
-        while let Some(&role) = reached.get(next) {
-            next += 1;
-            reach(role.memberships(database), database, &own_name, &mut reached);
+    /// Returns whether this role holds `privilege` on `target`, the answer
+    /// of `pg_has_role(this role, target, privilege)`.
+    ///
+    /// A superuser holds every privilege on every role. Otherwise a role is
+    /// a member of itself, uses itself and may set itself, but never holds
+    /// the admin option on itself. Chains pass only through roles the
+    /// database holds, as in [`inherited_roles`](Self::inherited_roles).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE ROLE admins;
+    /// CREATE ROLE app_user;
+    /// GRANT admins TO app_user WITH INHERIT FALSE;
+    /// ",
+    /// )?;
+    ///
+    /// let app_user = db.role("app_user").unwrap();
+    /// let admins = db.role("admins").unwrap();
+    /// assert!(app_user.has_role(admins, RolePrivilege::Member, &db));
+    /// assert!(!app_user.has_role(admins, RolePrivilege::Usage, &db));
+    /// assert!(app_user.has_role(admins, RolePrivilege::Set, &db));
+    /// assert!(!app_user.has_role(admins, RolePrivilege::Admin, &db));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn has_role(
+        &self,
+        target: &<Self::DB as DatabaseLike>::Role,
+        privilege: RolePrivilege,
+        database: &Self::DB,
+    ) -> bool {
+        if self.is_superuser() {
+            return true;
         }
-        reached.into_iter()
+        let own_name = self.stored_name();
+        let target_name = target.stored_name();
+        if target_name == own_name {
+            return privilege != RolePrivilege::Admin;
+        }
+        let follows: fn(&<Self::DB as DatabaseLike>::RoleMembership) -> bool = match privilege {
+            RolePrivilege::Member | RolePrivilege::Admin => |_| true,
+            RolePrivilege::Usage => RoleMembershipLike::inherit_option,
+            RolePrivilege::Set => RoleMembershipLike::set_option,
+        };
+        let reached = reached_roles(self.memberships(database), &own_name, follows, database);
+        if privilege == RolePrivilege::Admin {
+            return self
+                .memberships(database)
+                .chain(reached.iter().flat_map(|role| role.memberships(database)))
+                .any(|membership| {
+                    membership.admin_option() && membership.stored_role_name() == target_name
+                });
+        }
+        reached.iter().any(|role| role.stored_name() == target_name)
     }
 
     /// Returns the policies that reference this role.
@@ -424,6 +465,60 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
         &'db self,
         database: &'db Self::DB,
     ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Policy>;
+}
+
+/// A privilege one role may hold on another, as `pg_has_role` names it.
+///
+/// [`RoleLike::has_role`] answers whether a role holds one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RolePrivilege {
+    /// `MEMBER`, held along any chain of memberships.
+    Member,
+    /// `USAGE`, the right to use the target's privileges without
+    /// `SET ROLE`, held along a chain whose every membership carries
+    /// [`inherit_option`](RoleMembershipLike::inherit_option).
+    Usage,
+    /// `SET`, the right to `SET ROLE` to the target, held along a chain
+    /// whose every membership carries
+    /// [`set_option`](RoleMembershipLike::set_option).
+    Set,
+    /// `MEMBER WITH ADMIN OPTION`, the right to grant and revoke membership
+    /// in the target, held when the member or a role it is a
+    /// [`Member`](Self::Member) of holds a membership in the target carrying
+    /// [`admin_option`](RoleMembershipLike::admin_option).
+    Admin,
+}
+
+/// Returns each role the database holds that `memberships` reach along
+/// chains of the memberships `follows` accepts, once, in the order reached,
+/// and never the role named `own_name` whose memberships they are.
+fn reached_roles<'db, DB: DatabaseLike>(
+    memberships: impl Iterator<Item = &'db DB::RoleMembership>,
+    own_name: &str,
+    follows: impl Fn(&DB::RoleMembership) -> bool,
+    database: &'db DB,
+) -> Vec<&'db DB::Role> {
+    let push = |reached: &mut Vec<&'db DB::Role>, membership: &'db DB::RoleMembership| {
+        if follows(membership)
+            && let Some(granted) = membership.role(database)
+            && granted.stored_name() != own_name
+            && !reached.contains(&granted)
+        {
+            reached.push(granted);
+        }
+    };
+    let mut reached = Vec::new();
+    for membership in memberships {
+        push(&mut reached, membership);
+    }
+    let mut next = 0;
+    while let Some(&role) = reached.get(next) {
+        next += 1;
+        for membership in role.memberships(database) {
+            push(&mut reached, membership);
+        }
+    }
+    reached
 }
 
 /// Returns `role` and its [`inherited_roles`](RoleLike::inherited_roles),

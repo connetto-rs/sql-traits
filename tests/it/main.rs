@@ -111,6 +111,7 @@ mod request_time_zone;
 mod required_column_values;
 mod role_lifecycle;
 mod role_memberships;
+mod role_privileges;
 mod role_settings;
 mod row_security;
 mod rule_and_trigger_column_reads;

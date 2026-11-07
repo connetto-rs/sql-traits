@@ -41,7 +41,7 @@ pub use user_defined_type::{UserDefinedTypeKind, UserDefinedTypeLike};
 pub mod policy;
 pub use policy::PolicyLike;
 pub mod role;
-pub use role::RoleLike;
+pub use role::{RoleLike, RolePrivilege};
 pub mod role_membership;
 pub use role_membership::RoleMembershipLike;
 pub mod schema;
