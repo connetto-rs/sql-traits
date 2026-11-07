@@ -341,8 +341,12 @@ pub trait ColumnLike:
         normalize_identifier(self.column_name(), self.column_name_is_quoted())
     }
 
-    /// Returns documentation from standalone comments above the column name.
-    /// A blank line detaches the preceding comment group.
+    /// Returns the documentation of the column.
+    ///
+    /// The documentation starts as the standalone comment block written above
+    /// the column name, a blank line detaching the preceding comment group. A
+    /// later `COMMENT ON COLUMN` replaces it, and `IS NULL` or an empty text
+    /// removes it, as PostgreSQL applies them.
     ///
     /// # Arguments
     ///
@@ -364,8 +368,10 @@ pub trait ColumnLike:
     ///     "CREATE TABLE my_table (
     ///     -- the id of the table_row
     ///     id INT,
-    ///     name TEXT
-    /// );",
+    ///     name TEXT,
+    ///     mail TEXT
+    /// );
+    /// COMMENT ON COLUMN my_table.mail IS 'where to write';",
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
@@ -375,6 +381,9 @@ pub trait ColumnLike:
     ///     table.column("name", &db, IdentifierCase::AsWritten)?.expect("Column 'name' should exist");
     /// assert_eq!(column.column_doc(&db)?, Some("the id of the table_row"));
     /// assert!(column_name.column_doc(&db)?.is_none());
+    /// let column_mail =
+    ///     table.column("mail", &db, IdentifierCase::AsWritten)?.expect("Column 'mail' should exist");
+    /// assert_eq!(column_mail.column_doc(&db)?, Some("where to write"));
     /// # Ok(())
     /// # }
     /// ```

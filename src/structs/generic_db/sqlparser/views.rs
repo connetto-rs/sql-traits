@@ -593,10 +593,31 @@ fn require_view_column(
     name: &ObjectName,
     column_name: &Ident,
 ) -> Result<ParserDBBuilder, Error> {
-    plain_view_position(&builder, name).map_or(Ok(()), |position| {
-        require_exposed(&builder, builder.views()[position].0.declaration(), column_name)
-    })?;
+    require_exposed_column(&builder, name, column_name)?;
     Ok(builder)
+}
+
+/// Checks that the plain or materialized view `name` reaches exposes
+/// `column_name`, accepting any name when the model cannot name every column
+/// the view exposes or `name` reaches no view.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ColumnNotFound`] when the view's columns can all be
+/// named and none is `column_name`.
+pub(super) fn require_exposed_column(
+    builder: &ParserDBBuilder,
+    name: &ObjectName,
+    column_name: &Ident,
+) -> Result<(), Error> {
+    let plain = || plain_view_position(builder, name).map(|at| builder.views()[at].0.declaration());
+    let materialized = || {
+        materialized_view_position(builder, name)
+            .map(|at| builder.materialized_views()[at].0.declaration())
+    };
+    plain()
+        .or_else(materialized)
+        .map_or(Ok(()), |declaration| require_exposed(builder, declaration, column_name))
 }
 
 /// Refuses `column_name` when the view `declaration` describes exposes no

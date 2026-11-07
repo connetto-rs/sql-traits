@@ -44,7 +44,7 @@ use super::{
     signature_types::{retarget_signatures, signature_types},
 };
 use crate::{
-    errors::{Error, ObjectKind},
+    errors::{Error, LookupError, ObjectKind},
     impls::{domain_in_schema, user_type_in_schema, user_type_named},
     structs::{IdentifierCase, UserDefinedType, metadata::ExpressionCalls},
     traits::{DomainLike, UserDefinedTypeKind, UserDefinedTypeLike},
@@ -93,17 +93,56 @@ pub(super) fn composite_name_holder(
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
+    composites_named(builder, name, schema).next().map(|_| ObjectKind::Type)
+}
+
+/// The composite user types holding `name` in `schema`.
+fn composites_named<'builder>(
+    builder: &'builder ParserDBBuilder,
+    name: &'builder Ident,
+    schema: SchemaQualifier<'builder>,
+) -> impl Iterator<Item = &'builder UserDefinedType> {
     let case = builder.identifier_case();
     let schema = schema.unwrap_or((DEFAULT_SCHEMA, false));
-    builder
-        .user_defined_types()
-        .iter()
-        .any(|(type_, _)| {
-            type_.kind() == UserDefinedTypeKind::Composite
-                && user_type_named(type_, ident_parts(name), case)
-                && user_type_in_schema(type_, schema, case)
-        })
-        .then_some(ObjectKind::Type)
+    builder.user_defined_types().iter().map(|(type_, _)| type_.as_ref()).filter(move |type_| {
+        type_.kind() == UserDefinedTypeKind::Composite
+            && user_type_named(type_, ident_parts(name), case)
+            && user_type_in_schema(type_, schema, case)
+    })
+}
+
+/// Checks that the composite type `name` in `schema` has the attribute
+/// `attribute`, for a `COMMENT ON COLUMN` naming it.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ColumnNotFound`] when the composite has no
+/// attribute of that name.
+pub(super) fn require_composite_attribute(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    schema: (&str, bool),
+    attribute: &Ident,
+) -> Result<(), Error> {
+    let case = builder.identifier_case();
+    let held = composites_named(builder, name, Some(schema))
+        .flat_map(|composite| composite.composite_attributes().unwrap_or_default())
+        .any(|held| {
+            case.identifiers_match(
+                &held.name.value,
+                held.name.quote_style.is_some(),
+                &attribute.value,
+                attribute.quote_style.is_some(),
+            )
+        });
+    if held {
+        return Ok(());
+    }
+    Err(LookupError::ColumnNotFound {
+        table_name: name.value.clone(),
+        column_name: attribute.value.clone(),
+    }
+    .into())
 }
 
 /// Removes a shell of `name` in `schema`, so a domain or relation of that

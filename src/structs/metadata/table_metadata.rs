@@ -89,7 +89,7 @@ pub struct TableMetadata<T: TableLike> {
     /// The privileges a `REVOKE` took on the table or one of its columns and
     /// no later `GRANT` at that level handed back, in the order revoked.
     revoked_privileges: Vec<RevokedPrivilege>,
-    /// The comment block written above the table.
+    /// The documentation of the table.
     documentation: Option<String>,
     /// The server and options a foreign table reads its rows through, absent
     /// for an ordinary table.
@@ -465,14 +465,14 @@ impl<T: TableLike> TableMetadata<T> {
         self.primary_key.iter().map(core::convert::AsRef::as_ref)
     }
 
-    /// Returns the comment block written above the table.
+    /// Returns the documentation of the table.
     #[inline]
     #[must_use]
     pub fn documentation(&self) -> Option<&str> {
         self.documentation.as_deref()
     }
 
-    /// Sets the comment block written above the table.
+    /// Sets the documentation of the table.
     #[inline]
     pub fn set_documentation(&mut self, documentation: Option<String>) {
         self.documentation = documentation;
