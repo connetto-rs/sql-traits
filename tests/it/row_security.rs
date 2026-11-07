@@ -86,7 +86,7 @@ fn every_statement_shape_gates_the_rows_postgresql_gates() {
     use RowVersion::{Existing, Inserted, Updated};
 
     let database = parse(ONE_POLICY_PER_COMMAND);
-    let cases: [(RowStatement, &[Gate]); 16] = [
+    let cases: [(RowStatement, &[Gate]); 20] = [
         (RowStatement::Select, &[(Select, Existing, Filter)]),
         (RowStatement::SelectLocking, &[(Select, Existing, Filter), (Update, Existing, Filter)]),
         (RowStatement::Insert { returning: false }, &[(Insert, Inserted, Raise)]),
@@ -129,15 +129,24 @@ fn every_statement_shape_gates_the_rows_postgresql_gates() {
             ],
         ),
         (
-            RowStatement::MergeInsert { returning: false },
+            RowStatement::MergeInsert { reads: false, returning: false },
+            &[(Insert, Inserted, Raise)],
+        ),
+        (RowStatement::MergeInsert { reads: false, returning: true }, &[(Insert, Inserted, Raise)]),
+        (
+            RowStatement::MergeInsert { reads: true, returning: false },
             &[(Select, Existing, Filter), (Insert, Inserted, Raise)],
         ),
         (
-            RowStatement::MergeInsert { returning: true },
+            RowStatement::MergeInsert { reads: true, returning: true },
             &[(Select, Existing, Filter), (Select, Inserted, Raise), (Insert, Inserted, Raise)],
         ),
         (
-            RowStatement::MergeUpdate,
+            RowStatement::MergeUpdate { reads: false },
+            &[(Update, Existing, Raise), (Update, Updated, Raise)],
+        ),
+        (
+            RowStatement::MergeUpdate { reads: true },
             &[
                 (Select, Existing, Filter),
                 (Select, Updated, Raise),
@@ -145,7 +154,11 @@ fn every_statement_shape_gates_the_rows_postgresql_gates() {
                 (Update, Updated, Raise),
             ],
         ),
-        (RowStatement::MergeDelete, &[(Select, Existing, Filter), (Delete, Existing, Raise)]),
+        (RowStatement::MergeDelete { reads: false }, &[(Delete, Existing, Raise)]),
+        (
+            RowStatement::MergeDelete { reads: true },
+            &[(Select, Existing, Filter), (Delete, Existing, Raise)],
+        ),
         (RowStatement::MergeDoNothing, &[(Select, Existing, Filter)]),
     ];
     for (statement, expected) in cases {
