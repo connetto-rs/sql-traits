@@ -77,7 +77,9 @@ pub trait SchemaLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
     /// In PostgreSQL, schemas can have an owner specified via the
     /// `AUTHORIZATION` clause. Without one the schema belongs to the role it
     /// was created under, as `SET ROLE` and `SET SESSION AUTHORIZATION` leave
-    /// it, and to none when the input had set no role.
+    /// it, and to none when the input had set no role. Under PostgreSQL the
+    /// `public` schema a database starts with belongs to `pg_database_owner`,
+    /// the predefined role standing for whoever owns the database.
     ///
     /// # Example
     ///

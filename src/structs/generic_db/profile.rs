@@ -110,9 +110,12 @@ pub trait SchemaProfile: Sized {
     /// full default catalog and every other dialect with an empty one.
     fn default_ingestion(dialect: &Self::Dialect) -> Self::Ingestion;
 
-    /// Returns the schemas a database of this profile starts with, before any
-    /// object is added, such as `public` for the parser profile.
-    fn initial_schemas() -> impl IntoIterator<Item = (Arc<Self::Schema>, Meta<Self::Schema>)>;
+    /// Returns the schemas a database of this profile starts with under the
+    /// given dialect, before any object is added, such as `public` for the
+    /// parser profile.
+    fn initial_schemas(
+        dialect: &Self::Dialect,
+    ) -> impl IntoIterator<Item = (Arc<Self::Schema>, Meta<Self::Schema>)>;
 
     /// Returns whether the table `metadata` describes is a foreign table, which
     /// the built database lists apart from ordinary tables.
