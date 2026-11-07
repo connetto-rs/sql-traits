@@ -9,7 +9,12 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 /// normalize alike.
 ///
 /// - A builtin answers the crate's upper-case token, so `int4`, `integer` and
-///   `INT` all answer `INT`, and `character varying` answers `VARCHAR`.
+///   `INT` all answer `INT`, `character varying` answers `VARCHAR`, and
+///   `bpchar`, `character`, `nchar` and `national character` answer `CHAR`.
+/// - A builtin's type modifiers are dropped wherever they stand, so
+///   `character(4)` answers `CHAR`, `timestamp(3) with time zone` answers
+///   `TIMESTAMP WITH TIME ZONE` and `interval day to second(3)` answers
+///   `INTERVAL`, as their declarations do.
 /// - Any other unquoted name folds, so `void` and `VOID` both answer `VOID`.
 /// - A quoted name is read as it stands. It answers bare when an unquoted name
 ///   means the same type, as `"mytype"` does, and stays quoted otherwise, as
@@ -20,7 +25,8 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 ///   `pg_catalog` qualifier is dropped.
 /// - `float(p)` answers `REAL` up to 24 bits of precision and `DOUBLE
 ///   PRECISION` beyond, and a bare `float` is double precision, as PostgreSQL
-///   reads both. Any other type modifier list is kept as written.
+///   reads both. The modifier list of any type outside the builtins is kept as
+///   written.
 ///
 /// # Examples
 ///
@@ -79,9 +85,16 @@ const ALIASES: &[(&str, &str)] = &[
     ("varchar", "VARCHAR"),
     ("character varying", "VARCHAR"),
     ("char varying", "VARCHAR"),
+    ("nchar varying", "VARCHAR"),
+    ("national character varying", "VARCHAR"),
+    ("national char varying", "VARCHAR"),
     ("bpchar", "CHAR"),
     ("char", "CHAR"),
     ("character", "CHAR"),
+    ("nchar", "CHAR"),
+    ("national character", "CHAR"),
+    ("national char", "CHAR"),
+    ("bit", "BIT"),
     ("varbit", "VARBIT"),
     ("bit varying", "VARBIT"),
     ("timestamp", "TIMESTAMP WITHOUT TIME ZONE"),
@@ -92,7 +105,12 @@ const ALIASES: &[(&str, &str)] = &[
     ("time without time zone", "TIME WITHOUT TIME ZONE"),
     ("timetz", "TIME WITH TIME ZONE"),
     ("time with time zone", "TIME WITH TIME ZONE"),
+    ("interval", "INTERVAL"),
 ];
+
+/// The fields `interval` may be restricted to, which PostgreSQL reads as part
+/// of its type modifier.
+const INTERVAL_FIELDS: &[&str] = &["year", "month", "day", "hour", "minute", "second", "to"];
 
 /// Keywords that name a type only when written bare and unqualified.
 ///
@@ -121,7 +139,7 @@ const TYPE_KEYWORDS: &[&str] = &[
 /// one.
 fn canonical(pg_type: &str) -> Option<Cow<'static, str>> {
     if is_single_unquoted_name(pg_type) {
-        if let Some(token) = alias(pg_type) {
+        if let Some(token) = builtin(pg_type) {
             return (token != pg_type).then_some(Cow::Borrowed(token));
         }
         return (!is_folded(pg_type)).then(|| Cow::Owned(fold_words(pg_type)));
@@ -145,15 +163,42 @@ fn push_normalized(out: &mut String, pg_type: &str) {
         return;
     }
     let (name, modifiers) = split_modifiers(pg_type);
-    if let Some(token) = float_with_precision(name, modifiers) {
+    if let Some(token) = float_with_precision(name, modifiers).or_else(|| builtin(pg_type)) {
         out.push_str(token);
         return;
     }
-    match parse_parts(name) {
-        Some(parts) => push_name(out, &parts),
-        None => out.push_str(&fold_words(name)),
+    let names_builtin = if let Some(parts) = parse_parts(name) {
+        push_name(out, &parts)
+    } else {
+        out.push_str(&fold_words(name));
+        false
+    };
+    if !names_builtin {
+        out.push_str(modifiers);
     }
-    out.push_str(modifiers);
+}
+
+/// Returns the token of the builtin an unquoted, unqualified spelling names
+/// once its type modifiers are set aside, or `None` when it names none.
+///
+/// The modifier list follows the name or, as PostgreSQL prints `timestamp(3)
+/// with time zone`, stands between its words. An interval's field
+/// restriction is a modifier as well.
+fn builtin(pg_type: &str) -> Option<&'static str> {
+    let (head, tail) = match pg_type.split_once('(') {
+        Some((head, rest)) => (head, rest.split_once(')')?.1),
+        None => (pg_type, ""),
+    };
+    if head.contains(['"', '.']) || tail.contains(['"', '.', '(', ')']) {
+        return None;
+    }
+    let mut words = head.split_ascii_whitespace().chain(tail.split_ascii_whitespace());
+    if let Some(token) = alias(&words) {
+        return Some(token);
+    }
+    let restricts_interval = words.next()?.eq_ignore_ascii_case("interval")
+        && words.all(|word| INTERVAL_FIELDS.iter().any(|field| word.eq_ignore_ascii_case(field)));
+    restricts_interval.then_some("INTERVAL")
 }
 
 /// Returns the type `float(p)` selects, `p` counting binary digits of
@@ -266,13 +311,17 @@ fn parse_parts(name: &str) -> Option<Vec<Part<'_>>> {
     }
 }
 
-/// Appends the normalized spelling of a parsed type name to `out`.
-fn push_name(out: &mut String, parts: &[Part<'_>]) {
+/// Appends the normalized spelling of a parsed type name to `out`, and
+/// returns whether the name is a builtin's.
+fn push_name(out: &mut String, parts: &[Part<'_>]) -> bool {
     match parts {
         [only] if !only.quoted => {
-            match alias(&only.text) {
-                Some(token) => out.push_str(token),
-                None => out.push_str(&fold_words(&only.text)),
+            if let Some(token) = alias(&only.text.split_ascii_whitespace()) {
+                out.push_str(token);
+                true
+            } else {
+                out.push_str(&fold_words(&only.text));
+                false
             }
         }
         // `pg_catalog` is searched first whatever the search path says, so
@@ -292,19 +341,23 @@ fn push_name(out: &mut String, parts: &[Part<'_>]) {
                     out.push_str(&stored.to_ascii_uppercase());
                 }
             }
+            false
         }
     }
 }
 
 /// Appends the normalized spelling of the unqualified type PostgreSQL finds
-/// by looking up `stored` as it stands.
-fn push_looked_up(out: &mut String, stored: &str) {
+/// by looking up `stored` as it stands, and returns whether it is a builtin.
+fn push_looked_up(out: &mut String, stored: &str) -> bool {
     if quoting_matters(stored, true) {
         push_quoted(out, stored);
-    } else if let Some(token) = alias(stored) {
+        false
+    } else if let Some(token) = alias(&stored.split_ascii_whitespace()) {
         out.push_str(token);
+        true
     } else {
         out.push_str(&stored.to_ascii_uppercase());
+        false
     }
 }
 
@@ -345,23 +398,25 @@ pub(crate) fn push_quoted(out: &mut String, stored: &str) {
     out.push('"');
 }
 
-/// Returns the token a builtin spelling answers.
-fn alias(name: &str) -> Option<&'static str> {
+/// Returns the token the builtin spelled by `words` answers.
+fn alias<'a>(words: &(impl Iterator<Item = &'a str> + Clone)) -> Option<&'static str> {
     ALIASES
         .iter()
-        .find(|(spelling, _)| words_eq_ignore_ascii_case(spelling, name))
+        .find(|(spelling, _)| words_eq_ignore_ascii_case(spelling, words.clone()))
         .map(|(_, token)| *token)
 }
 
-/// Whether two spellings hold the same words, ignoring ASCII case and the
-/// whitespace between them.
-fn words_eq_ignore_ascii_case(left: &str, right: &str) -> bool {
-    let mut left = left.split_ascii_whitespace();
-    let mut right = right.split_ascii_whitespace();
+/// Whether a spelling holds `words`, ignoring ASCII case and the whitespace
+/// between them.
+fn words_eq_ignore_ascii_case<'a>(
+    spelling: &str,
+    mut words: impl Iterator<Item = &'a str>,
+) -> bool {
+    let mut spelling = spelling.split_ascii_whitespace();
     loop {
-        match (left.next(), right.next()) {
+        match (spelling.next(), words.next()) {
             (None, None) => return true,
-            (Some(left), Some(right)) if left.eq_ignore_ascii_case(right) => {}
+            (Some(expected), Some(word)) if expected.eq_ignore_ascii_case(word) => {}
             _ => return false,
         }
     }
@@ -442,6 +497,51 @@ mod tests {
         assert_eq!(normalize_postgres_type("text"), "TEXT");
     }
 
+    /// Every grammar spelling of `bpchar` and `varchar`, the national ones
+    /// included, answers the one token of its type.
+    #[test]
+    fn test_normalize_postgres_type_national_strings() {
+        for spelling in ["nchar", "NATIONAL CHARACTER", "national  char", "Nchar(4)"] {
+            assert_eq!(normalize_postgres_type(spelling), "CHAR", "{spelling}");
+        }
+        for spelling in ["nchar varying", "national character varying(3)", "national char varying"]
+        {
+            assert_eq!(normalize_postgres_type(spelling), "VARCHAR", "{spelling}");
+        }
+        assert_eq!(normalize_postgres_type("\"nchar\"(4)"), "\"nchar\"(4)");
+        assert_eq!(normalize_postgres_type("pg_catalog.nchar"), "\"nchar\"");
+    }
+
+    /// A builtin's type modifiers are dropped wherever they stand, as
+    /// PostgreSQL prints them inside `timestamp(3) with time zone` and after
+    /// `character(4)`.
+    #[test]
+    fn test_normalize_postgres_type_drops_builtin_modifiers() {
+        for (spelling, token) in [
+            ("bpchar(4)", "CHAR"),
+            ("character(4)[]", "CHAR[]"),
+            ("pg_catalog.bpchar(4)", "CHAR"),
+            ("\"bpchar\"(4)", "CHAR"),
+            ("character varying(10)", "VARCHAR"),
+            ("SETOF numeric(10, 2)", "SETOF NUMERIC"),
+            ("bit(3)", "BIT"),
+            ("bit varying(5)", "VARBIT"),
+            ("timestamptz(3)", "TIMESTAMP WITH TIME ZONE"),
+            ("timestamp(3) with time zone", "TIMESTAMP WITH TIME ZONE"),
+            ("timestamp ( 3 )  without time zone[]", "TIMESTAMP WITHOUT TIME ZONE[]"),
+            ("time(2) with time zone", "TIME WITH TIME ZONE"),
+            ("interval(3)", "INTERVAL"),
+            ("interval year to month", "INTERVAL"),
+            ("INTERVAL DAY TO SECOND(3)", "INTERVAL"),
+            ("pg_catalog.interval(3)", "INTERVAL"),
+        ] {
+            assert_eq!(normalize_postgres_type(spelling), token, "{spelling}");
+        }
+        assert_eq!(normalize_postgres_type("\"char\"(1)"), "\"char\"(1)");
+        assert_eq!(normalize_postgres_type("app.bpchar(4)"), "APP.BPCHAR(4)");
+        assert_eq!(normalize_postgres_type("interval_set(3)"), "INTERVAL_SET(3)");
+    }
+
     #[test]
     fn test_normalize_postgres_type_times() {
         assert_eq!(normalize_postgres_type("timestamp"), "TIMESTAMP WITHOUT TIME ZONE");
@@ -518,6 +618,8 @@ mod tests {
             "double precision",
             "void",
             "geometry(Point, 3857)",
+            "timestamp(3) with time zone",
+            "national character(4)[]",
         ] {
             let once = normalize_postgres_type(spelling).into_owned();
             assert_eq!(normalize_postgres_type(&once), once, "{spelling}");
