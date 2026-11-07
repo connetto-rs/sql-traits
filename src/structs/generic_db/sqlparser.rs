@@ -3095,6 +3095,25 @@ fn settle_search_path_parameter(
     Ok(())
 }
 
+/// Applies one `SET` clause of `CREATE FUNCTION` or `ALTER FUNCTION` to the
+/// settings already stored, the way `pg_proc.proconfig` takes it. A value
+/// replaces the setting of that name in place or appends it, and `DEFAULT`
+/// removes it as `RESET` does.
+fn apply_configuration_parameter(
+    stored: &mut Vec<FunctionDefinitionSetParam>,
+    parameter: FunctionDefinitionSetParam,
+) {
+    let same_name =
+        |kept: &FunctionDefinitionSetParam| parameter_names_match(&kept.name, &parameter.name);
+    if matches!(parameter.value, FunctionSetValue::Default) {
+        stored.retain(|kept| !same_name(kept));
+    } else if let Some(position) = stored.iter().position(same_name) {
+        stored[position] = parameter;
+    } else {
+        stored.push(parameter);
+    }
+}
+
 /// Returns the argument types that make up a function's identity.
 ///
 /// An `OUT` parameter describes the result rather than the call, so PostgreSQL
@@ -8786,8 +8805,9 @@ impl ParserDB {
                         )?;
                         bind_reference(&mut create_function.name, qualifier);
                     }
-                    for parameter in &mut create_function.set_params {
-                        settle_search_path_parameter(parameter, &builder)?;
+                    for mut parameter in core::mem::take(&mut create_function.set_params) {
+                        settle_search_path_parameter(&mut parameter, &builder)?;
+                        apply_configuration_parameter(&mut create_function.set_params, parameter);
                     }
                     signature_types::bind_signature(&builder, &mut create_function);
                     let case = builder.identifier_case();
@@ -10686,15 +10706,10 @@ impl ParserDB {
                                         function.security = Some(security);
                                     }
                                     AlterFunctionAction::Set(parameter) => {
-                                        if let Some(position) =
-                                            function.set_params.iter().position(|stored| {
-                                                parameter_names_match(&stored.name, &parameter.name)
-                                            })
-                                        {
-                                            function.set_params[position] = parameter;
-                                        } else {
-                                            function.set_params.push(parameter);
-                                        }
+                                        apply_configuration_parameter(
+                                            &mut function.set_params,
+                                            parameter,
+                                        );
                                     }
                                     AlterFunctionAction::Reset(ResetConfig::ALL) => {
                                         function.set_params.clear();
