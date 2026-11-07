@@ -3,13 +3,13 @@
 use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
 use core::{convert::Infallible, ops::ControlFlow};
 
-use sqlparser::ast::{Expr, Function, ObjectName, Visit};
+use sqlparser::ast::{Expr, Function, ObjectName, Visit, visit_expressions};
 
 use crate::{
     structs::IdentifierCase,
     traits::FunctionLike,
     utils::{
-        call_sites::{call_reaches, for_each_call},
+        call_sites::{call_reaches, expression_form, for_each_call},
         object_name::object_name_last_part,
     },
 };
@@ -59,7 +59,9 @@ impl<F> ExpressionCalls<F> {
     }
 
     /// Returns the functions `call` may reach, or `None` when `call` is not a
-    /// node of `expression`, the expression this record was built from.
+    /// node of `expression`, the expression this record was built from. An
+    /// expression PostgreSQL's grammar writes like a call, such as `COALESCE`
+    /// or `CURRENT_USER`, reaches none.
     ///
     /// `call` is matched by address, so it has to be borrowed from
     /// `expression` itself rather than from a copy.
@@ -68,18 +70,34 @@ impl<F> ExpressionCalls<F> {
         expression: &Expr,
         call: &Function,
     ) -> Option<impl Iterator<Item = &'s F> + use<'s, F>> {
-        let mut position = 0;
-        let found = for_each_call(expression, |site| {
-            if site.node.is_some_and(|node| core::ptr::eq(node, call)) {
-                return ControlFlow::Break(position);
+        let reached: &[Arc<F>] = if expression_form(&call.name).is_some() {
+            let found = visit_expressions(expression, |node| {
+                match node {
+                    Expr::Function(function) if core::ptr::eq(function, call) => {
+                        ControlFlow::Break(())
+                    }
+                    _ => ControlFlow::Continue(()),
+                }
+            });
+            if found.is_continue() {
+                return None;
             }
-            position += 1;
-            ControlFlow::Continue(())
-        });
-        let ControlFlow::Break(position) = found else {
-            return None;
+            &[]
+        } else {
+            let mut position = 0;
+            let found = for_each_call(expression, |site| {
+                if site.node.is_some_and(|node| core::ptr::eq(node, call)) {
+                    return ControlFlow::Break(position);
+                }
+                position += 1;
+                ControlFlow::Continue(())
+            });
+            let ControlFlow::Break(position) = found else {
+                return None;
+            };
+            self.sites.get(position)?
         };
-        Some(self.sites.get(position)?.iter().map(AsRef::as_ref))
+        Some(reached.iter().map(AsRef::as_ref))
     }
 
     /// Re-points every function referencing the allocation `stale` at `fresh`.

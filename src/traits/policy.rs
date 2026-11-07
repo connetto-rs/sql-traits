@@ -500,7 +500,8 @@ pub trait PolicyLike:
     /// qualified one only its own schema, and every overload accepting the
     /// call's argument count counts, since argument types are not inferred.
     /// A caller needing a property of whatever the call runs asks each
-    /// reachable function.
+    /// reachable function. An expression PostgreSQL's grammar writes like a
+    /// call, such as `COALESCE` or `CURRENT_USER`, reaches no function.
     ///
     /// # Errors
     ///

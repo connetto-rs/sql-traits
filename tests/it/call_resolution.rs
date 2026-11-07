@@ -276,3 +276,60 @@ fn check_constraint_calls_reach_their_functions() {
         ]
     );
 }
+
+/// `COALESCE`, `CURRENT_USER` and the other names PostgreSQL reads as
+/// expressions are nodes of the expression that reach no function, while the
+/// calls written inside them answer for themselves. A copy of one is refused.
+#[test]
+fn an_expression_form_reaches_no_function() {
+    let db = parse(
+        "CREATE TABLE items (owner TEXT, CHECK (coalesce(lower(owner), current_user) = owner));
+         CREATE POLICY p ON items USING (owner = lower(current_user))
+             WITH CHECK (owner = session_user);",
+    );
+    let lower = || vec!["pg_catalog.lower".to_owned(); 3];
+    let policy = policy(&db, "p");
+    let in_policy = |expression: &Expr| {
+        reached_per_call(expression, |call| {
+            names(policy.functions_reached_by(call, &db).expect("call belongs to the policy"))
+        })
+    };
+    assert_eq!(
+        in_policy(policy.using_expression(&db).expect("USING clause")),
+        [("lower".to_owned(), lower()), ("current_user".to_owned(), Vec::new())]
+    );
+    assert_eq!(
+        in_policy(policy.check_expression(&db).expect("WITH CHECK clause")),
+        [("session_user".to_owned(), Vec::new())]
+    );
+
+    let table = db.tables().next().expect("table exists");
+    let check = table.check_constraints(&db).expect("table is held").next().expect("check");
+    let in_check = reached_per_call(check.expression(&db), |call| {
+        names(check.functions_reached_by(call, &db).expect("call belongs to the check"))
+    });
+    assert_eq!(
+        in_check,
+        [
+            ("coalesce".to_owned(), Vec::new()),
+            ("lower".to_owned(), lower()),
+            ("current_user".to_owned(), Vec::new()),
+        ]
+    );
+
+    let copy = policy.using_expression(&db).expect("USING clause").clone();
+    let refusals = reached_per_call(&copy, |call| {
+        match policy.functions_reached_by(call, &db) {
+            Err(LookupError::CallNotInExpression { call }) => vec![call],
+            Err(error) => panic!("unexpected error {error}"),
+            Ok(_) => panic!("a call of a copy was answered"),
+        }
+    });
+    assert_eq!(
+        refusals,
+        [
+            ("lower".to_owned(), vec!["lower(current_user)".to_owned()]),
+            ("current_user".to_owned(), vec!["current_user".to_owned()]),
+        ]
+    );
+}
