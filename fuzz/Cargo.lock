@@ -552,9 +552,9 @@ dependencies = [
 
 [[package]]
 name = "sql-values"
-version = "0.4.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f56a5a7052722ec108626adec5c2baa675b1dc55d70fa8a71c6e87527ddba3e"
+checksum = "aa63391be723434747b0c2ffc2e7270f4a7a476d083b55cdda961c4773d1d5e4"
 dependencies = [
  "jiff",
  "thiserror",

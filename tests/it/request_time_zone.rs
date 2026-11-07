@@ -159,6 +159,26 @@ fn the_zone_is_named_as_written() {
 }
 
 #[test]
+fn the_zone_is_the_one_postgresql_reads_from_the_setting() {
+    let parsed = |database: &ParserDB, deployment: &Deployment| {
+        let resolved = deployment.resolve(database).expect("every role is declared");
+        let zone = resolved.time_zone("a").expect("a zone is set").zone();
+        (zone.name().to_string(), zone.fixed_offset())
+    };
+    let database = parse("ALTER ROLE ALL IN DATABASE d SET timezone = 'europe/rome';");
+    assert_eq!(parsed(&database, &plain()), ("Europe/Rome".to_string(), None));
+
+    let database = parse("SET TIME ZONE '+2'; ALTER ROLE l SET timezone FROM CURRENT;");
+    assert_eq!(parsed(&database, &plain()), ("<+02>-02".to_string(), Some(7_200)));
+
+    let deployment = Deployment::new("l", ["a"], [])
+        .expect("a valid description")
+        .with_default_time_zone("+05:30")
+        .expect("a zone PostgreSQL reads");
+    assert_eq!(parsed(&parse(""), &deployment), ("+05:30".to_string(), Some(-19_800)));
+}
+
+#[test]
 fn a_missing_default_is_refused_when_nothing_sets_the_zone() {
     let deployment =
         Deployment::new("l", ["a"], []).expect("a valid description").connected_to("d");

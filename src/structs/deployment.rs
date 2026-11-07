@@ -5,7 +5,7 @@ use alloc::{string::String, vec::Vec};
 use sql_values::PgTimeZone;
 use sqlparser::ast::DataType;
 
-use crate::{errors::DeploymentError, structs::RoleSetting, traits::DatabaseLike};
+use crate::{errors::DeploymentError, traits::DatabaseLike};
 
 /// The roles a deployment's requests run as and the session settings its
 /// policies read.
@@ -61,7 +61,7 @@ pub struct Deployment {
     acting_roles: Vec<String>,
     settings: Vec<SessionSetting>,
     database: Option<String>,
-    default_time_zone: Option<String>,
+    default_time_zone: Option<(String, PgTimeZone)>,
     acting_role_settings: bool,
 }
 
@@ -128,10 +128,10 @@ impl Deployment {
     /// refuses, as [`PgTimeZone::parse`] reads it.
     pub fn with_default_time_zone(self, zone: impl Into<String>) -> Result<Self, DeploymentError> {
         let zone = zone.into();
-        if let Err(reason) = PgTimeZone::parse(&zone) {
-            return Err(DeploymentError::InvalidTimeZone { zone, reason });
+        match PgTimeZone::parse(&zone) {
+            Ok(parsed) => Ok(Self { default_time_zone: Some((zone, parsed)), ..self }),
+            Err(reason) => Err(DeploymentError::InvalidTimeZone { zone, reason }),
         }
-        Ok(Self { default_time_zone: Some(zone), ..self })
     }
 
     /// The same deployment applying the acting role's own settings to each
@@ -151,7 +151,7 @@ impl Deployment {
     /// The server's default `TimeZone`, as written, when declared.
     #[must_use]
     pub fn default_time_zone(&self) -> Option<&str> {
-        self.default_time_zone.as_deref()
+        self.default_time_zone.as_ref().map(|(written, _)| written.as_str())
     }
 
     /// Whether each request applies the acting role's own settings.
@@ -264,6 +264,11 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     /// });
     /// assert_eq!(zone, Ok(("Europe/Rome", TimeZoneSource::Database)));
     ///
+    /// // The zone PostgreSQL reads from the setting, which has transitions.
+    /// let resolved = plain.resolve(&database).expect("every role is declared");
+    /// let zone = resolved.time_zone("web_user").expect("a zone is set").zone();
+    /// assert_eq!((zone.name(), zone.fixed_offset()), ("Europe/Rome", None));
+    ///
     /// let zone = postgrest.resolve(&database).and_then(|resolved| {
     ///     resolved.time_zone("web_user").map(|zone| (zone.name(), zone.source()))
     /// });
@@ -341,15 +346,15 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
             (TimeZoneSource::Database, TimeZoneSource::AllRoles, None),
         ];
         for &(in_database, everywhere, role) in acting.iter().chain(&login) {
-            let zone_set = |set_in: Option<&str>| {
-                database
-                    .role_settings()
-                    .find(|setting| setting.is_keyed(role, set_in) && setting.is_named("timezone"))
-                    .map(RoleSetting::value)
+            let zone_set = |set_in: Option<&str>, source| {
+                database.role_settings().find_map(|setting| {
+                    let zone = setting.time_zone().filter(|_| setting.is_keyed(role, set_in))?;
+                    Some(RequestTimeZone { name: setting.value(), zone, source })
+                })
             };
             if let Some(connected) = deployment.database.as_deref() {
-                if let Some(name) = zone_set(Some(connected)) {
-                    return Ok(RequestTimeZone { name, source: in_database });
+                if let Some(zone) = zone_set(Some(connected), in_database) {
+                    return Ok(zone);
                 }
             } else if database.role_settings().any(|setting| {
                 setting.role() == role
@@ -358,14 +363,16 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
             }) {
                 return Err(DeploymentError::NoDatabase { role: role.map(Into::into) });
             }
-            if let Some(name) = zone_set(None) {
-                return Ok(RequestTimeZone { name, source: everywhere });
+            if let Some(zone) = zone_set(None, everywhere) {
+                return Ok(zone);
             }
         }
         deployment
             .default_time_zone
-            .as_deref()
-            .map(|name| RequestTimeZone { name, source: TimeZoneSource::ServerDefault })
+            .as_ref()
+            .map(|(name, zone)| {
+                RequestTimeZone { name, zone, source: TimeZoneSource::ServerDefault }
+            })
             .ok_or(DeploymentError::NoDefaultTimeZone)
     }
 }
@@ -375,14 +382,22 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestTimeZone<'db> {
     name: &'db str,
+    zone: &'db PgTimeZone,
     source: TimeZoneSource,
 }
 
 impl<'db> RequestTimeZone<'db> {
-    /// The zone as its setting writes it, which [`PgTimeZone::parse`] reads.
+    /// The zone as its setting writes it, which [`Self::zone`] reads.
     #[must_use]
     pub fn name(&self) -> &'db str {
         self.name
+    }
+
+    /// The zone PostgreSQL runs the request in, as [`PgTimeZone::parse`]
+    /// reads [`Self::name`].
+    #[must_use]
+    pub fn zone(&self) -> &'db PgTimeZone {
+        self.zone
     }
 
     /// The step that supplies the zone.
