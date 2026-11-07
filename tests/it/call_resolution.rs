@@ -77,7 +77,7 @@ fn nested_policy_calls_reach_their_functions() {
          );",
     );
     let policy = policy(&db, "p");
-    let using = policy.using_expression(&db).expect("USING clause");
+    let using = policy.using_expression(&db).expect("literals read").expect("USING clause");
     let calls = names_per_call(using, |call| policy.functions_reached_by(call, &db).map(names));
     assert_eq!(
         calls,
@@ -130,11 +130,11 @@ fn each_call_reaches_the_overloads_accepting_its_arguments() {
         })
     };
     assert_eq!(
-        arities(policy.using_expression(&db).expect("USING clause")),
+        arities(policy.using_expression(&db).expect("literals read").expect("USING clause")),
         [("f".to_owned(), vec!["INT".to_owned(), "TEXT".to_owned()])]
     );
     assert_eq!(
-        arities(policy.check_expression(&db).expect("WITH CHECK clause")),
+        arities(policy.check_expression(&db).expect("literals read").expect("WITH CHECK clause")),
         [("f".to_owned(), vec!["TEXT, TEXT".to_owned()])]
     );
 }
@@ -153,9 +153,8 @@ fn a_variadic_parameter_without_a_default_needs_an_argument() {
          );",
     );
     let policy = policy(&db, "p");
-    let calls = names_per_call(policy.using_expression(&db).expect("USING clause"), |call| {
-        policy.functions_reached_by(call, &db).map(names)
-    });
+    let using = policy.using_expression(&db).expect("literals read").expect("USING clause");
+    let calls = names_per_call(using, |call| policy.functions_reached_by(call, &db).map(names));
     assert_eq!(
         calls,
         [
@@ -192,7 +191,7 @@ fn a_subquery_call_resolves_under_the_statement_search_path() {
          SET search_path TO public;",
     );
     let policy = policy(&db, "p");
-    let using = policy.using_expression(&db).expect("USING clause");
+    let using = policy.using_expression(&db).expect("literals read").expect("USING clause");
     let calls = names_per_call(using, |call| policy.functions_reached_by(call, &db).map(names));
     assert_eq!(calls, [("f".to_owned(), vec!["app.f".to_owned()])]);
 }
@@ -208,8 +207,9 @@ fn a_call_from_elsewhere_is_refused() {
     );
     let p = policy(&db, "p");
     let q = policy(&db, "q");
-    let copy = q.using_expression(&db).expect("USING clause").clone();
-    for expression in [&copy, q.using_expression(&db).expect("USING clause")] {
+    let using = q.using_expression(&db).expect("literals read").expect("USING clause");
+    let copy = using.clone();
+    for expression in [&copy, using] {
         let refusals =
             refusals_per_call(expression, |call| p.functions_reached_by(call, &db).map(names));
         assert_eq!(refusals, [("lower".to_owned(), vec!["lower(owner)".to_owned()])]);
@@ -239,14 +239,14 @@ fn per_call_answers_follow_replacements_and_altered_clauses() {
         })
     };
     assert_eq!(
-        behaviour(policy.using_expression(&db).expect("USING clause")),
+        behaviour(policy.using_expression(&db).expect("literals read").expect("USING clause")),
         [
             ("f".to_owned(), vec!["f STRICT".to_owned()]),
             ("g".to_owned(), vec!["g CALLED ON NULL INPUT".to_owned()]),
         ]
     );
     assert_eq!(
-        behaviour(policy.check_expression(&db).expect("WITH CHECK clause")),
+        behaviour(policy.check_expression(&db).expect("literals read").expect("WITH CHECK clause")),
         [("g".to_owned(), vec!["g CALLED ON NULL INPUT".to_owned()])]
     );
 }
@@ -303,11 +303,11 @@ fn an_expression_form_reaches_no_function() {
         names_per_call(expression, |call| policy.functions_reached_by(call, &db).map(names))
     };
     assert_eq!(
-        in_policy(policy.using_expression(&db).expect("USING clause")),
+        in_policy(policy.using_expression(&db).expect("literals read").expect("USING clause")),
         [("lower".to_owned(), lower()), ("current_user".to_owned(), Vec::new())]
     );
     assert_eq!(
-        in_policy(policy.check_expression(&db).expect("WITH CHECK clause")),
+        in_policy(policy.check_expression(&db).expect("literals read").expect("WITH CHECK clause")),
         [("session_user".to_owned(), Vec::new())]
     );
 
@@ -325,7 +325,7 @@ fn an_expression_form_reaches_no_function() {
         ]
     );
 
-    let copy = policy.using_expression(&db).expect("USING clause").clone();
+    let copy = policy.using_expression(&db).expect("literals read").expect("USING clause").clone();
     let refusals =
         refusals_per_call(&copy, |call| policy.functions_reached_by(call, &db).map(names));
     assert_eq!(

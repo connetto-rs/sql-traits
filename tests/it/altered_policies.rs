@@ -35,11 +35,13 @@ fn policy<'db>(database: &'db ParserDB, name: &str) -> &'db sqlparser::ast::Crea
 }
 
 fn using(database: &ParserDB, name: &str) -> Option<String> {
-    policy(database, name).using_expression(database).map(ToString::to_string)
+    let using = policy(database, name).using_expression(database).expect("literals read");
+    using.map(ToString::to_string)
 }
 
 fn check(database: &ParserDB, name: &str) -> Option<String> {
-    policy(database, name).check_expression(database).map(ToString::to_string)
+    let check = policy(database, name).check_expression(database).expect("literals read");
+    check.map(ToString::to_string)
 }
 
 fn roles(database: &ParserDB, name: &str) -> Vec<String> {
@@ -151,7 +153,8 @@ fn the_policy_altered_is_the_one_on_the_table_the_statement_names() {
             .policies(&database)
             .expect("the table is in this database")
             .map(|policy| {
-                policy.using_expression(&database).map(ToString::to_string).expect("a USING clause")
+                let using = policy.using_expression(&database).expect("literals read");
+                using.map(ToString::to_string).expect("a USING clause")
             })
             .collect::<Vec<_>>()
     };

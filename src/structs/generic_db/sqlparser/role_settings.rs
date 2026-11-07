@@ -18,7 +18,7 @@ use sqlparser::ast::{
     Reset, ResetConfig, ResetStatement, Set, SetConfigValue, Statement,
 };
 
-use super::{ParserDBBuilder, SessionRoles, stored_role_name};
+use super::{ParserDBBuilder, SessionRoles, parse_options::WrittenTimeZone, stored_role_name};
 use crate::{
     errors::Error,
     structs::RoleSetting,
@@ -45,12 +45,14 @@ struct Value {
 /// The values a session's own `SET` statements leave, as `SET ... FROM
 /// CURRENT` reads them.
 ///
-/// A setting is absent while its value is not known, because the input never
-/// set it or returned it to the value the session started with. A `SET LOCAL`
-/// holds until its transaction ends, a plain `SET` lasts past it, and a
-/// rollback restores the catalog copy carrying this state.
+/// A setting is absent while its value is not known, because neither the
+/// input nor the session's start set it. A `SET LOCAL` holds until its
+/// transaction ends, a plain `SET` lasts past it, a `RESET` returns to the
+/// value the session started with, and a rollback restores the catalog copy
+/// carrying this state.
 #[derive(Debug, Clone, Default)]
 pub(super) struct SessionSettings {
+    started: Vec<Held>,
     committed: Vec<Held>,
     local: Option<Vec<Held>>,
 }
@@ -60,11 +62,28 @@ pub(super) struct SessionSettings {
 enum Change {
     /// Sets `name` to a known value, or to one the input leaves unknown.
     Set { name: String, value: Option<Value> },
+    /// Returns `name` to the value the session started with.
+    Reset { name: String },
     /// Returns every setting to the value the session started with.
     ResetAll,
 }
 
 impl SessionSettings {
+    /// A session starting in the `TimeZone` `zone` names, and with every
+    /// other setting unknown.
+    pub(super) fn starting_in(zone: Option<WrittenTimeZone>) -> Self {
+        let started: Vec<Held> = zone
+            .into_iter()
+            .map(|WrittenTimeZone { written, zone }| {
+                Held {
+                    name: "timezone".to_string(),
+                    value: Value { text: written, zone: Some(zone) },
+                }
+            })
+            .collect();
+        Self { committed: started.clone(), started, local: None }
+    }
+
     /// The value `name` holds now, compared without case.
     fn current(&self, name: &str) -> Option<&Value> {
         self.local
@@ -73,6 +92,17 @@ impl SessionSettings {
             .iter()
             .find(|held| held.name.eq_ignore_ascii_case(name))
             .map(|held| &held.value)
+    }
+
+    /// The `TimeZone` the session runs in now, when known.
+    pub(super) fn time_zone(&self) -> Option<&PgTimeZone> {
+        self.current("timezone").and_then(|value| value.zone.as_ref())
+    }
+
+    /// The `DateStyle` the session runs under now, as PostgreSQL prints it,
+    /// when known.
+    pub(super) fn date_style(&self) -> Option<&str> {
+        self.current("datestyle").map(|value| value.text.as_str())
     }
 
     /// Applies what `statement` does to the session's settings. A `SET
@@ -95,7 +125,7 @@ impl SessionSettings {
         if local {
             if in_transaction {
                 let mut overlay = self.local.take().unwrap_or_else(|| self.committed.clone());
-                change.apply_to(&mut overlay);
+                change.apply_to(&mut overlay, &self.started);
                 self.local = Some(overlay);
             }
             return Ok(());
@@ -103,9 +133,9 @@ impl SessionSettings {
         // A plain `SET` inside a transaction also replaces what a `SET LOCAL`
         // holds until the transaction ends.
         if let Some(overlay) = &mut self.local {
-            change.clone().apply_to(overlay);
+            change.clone().apply_to(overlay, &self.started);
         }
-        change.apply_to(&mut self.committed);
+        change.apply_to(&mut self.committed, &self.started);
         Ok(())
     }
 
@@ -126,7 +156,7 @@ fn change_of(
             [Expr::Identifier(ident)]
                 if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("DEFAULT") =>
             {
-                None
+                return Ok(Change::Reset { name });
             }
             [value] => literal(value, hex_strings_may_be_integers),
             // A list such as a `search_path` is printed with quoting rules
@@ -145,33 +175,48 @@ fn change_of(
                 if ident.quote_style.is_none()
                     && (ident.value.eq_ignore_ascii_case("LOCAL")
                         || ident.value.eq_ignore_ascii_case("DEFAULT")));
-            let values = if reset { &[][..] } else { core::slice::from_ref(value) };
-            (set("timezone".to_string(), values)?, *local)
+            let name = "timezone".to_string();
+            let change = if reset {
+                Change::Reset { name }
+            } else {
+                set(name, core::slice::from_ref(value))?
+            };
+            (change, *local)
         }
         Statement::Reset(ResetStatement { reset: Reset::ALL })
         | Statement::Discard { object_type: DiscardObject::ALL } => (Change::ResetAll, false),
         Statement::Reset(ResetStatement { reset: Reset::ConfigurationParameter(name) }) => {
-            (Change::Set { name: setting_name(name)?, value: None }, false)
+            (Change::Reset { name: setting_name(name)? }, false)
         }
         _ => return Ok(None),
     }))
 }
 
 impl Change {
-    fn apply_to(self, held: &mut Vec<Held>) {
-        match self {
-            Self::ResetAll => held.clear(),
-            Self::Set { name, value } => {
-                let position = held.iter().position(|kept| kept.name.eq_ignore_ascii_case(&name));
-                match (position, value) {
-                    (Some(position), Some(value)) => held[position].value = value,
-                    (Some(position), None) => {
-                        held.remove(position);
-                    }
-                    (None, Some(value)) => held.push(Held { name, value }),
-                    (None, None) => {}
-                }
+    fn apply_to(self, held: &mut Vec<Held>, started: &[Held]) {
+        let (name, value) = match self {
+            Self::ResetAll => {
+                held.clear();
+                held.extend_from_slice(started);
+                return;
             }
+            Self::Set { name, value } => (name, value),
+            Self::Reset { name } => {
+                let value = started
+                    .iter()
+                    .find(|kept| kept.name.eq_ignore_ascii_case(&name))
+                    .map(|kept| kept.value.clone());
+                (name, value)
+            }
+        };
+        let position = held.iter().position(|kept| kept.name.eq_ignore_ascii_case(&name));
+        match (position, value) {
+            (Some(position), Some(value)) => held[position].value = value,
+            (Some(position), None) => {
+                held.remove(position);
+            }
+            (None, Some(value)) => held.push(Held { name, value }),
+            (None, None) => {}
         }
     }
 }
