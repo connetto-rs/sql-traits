@@ -1,5 +1,7 @@
 //! Tests that `ALTER TABLE ... RENAME CONSTRAINT` renames a constraint, written
-//! or given its name by PostgreSQL, on the table and on every copy below it.
+//! or given its name by PostgreSQL, on the table and on every copy below it,
+//! and that `ALTER INDEX ... RENAME TO` on the index behind a key renames the
+//! key with it.
 //!
 //! Every accepted and refused statement here was measured against PostgreSQL
 //! 18, and against 17 where `NOT NULL` is not involved.
@@ -10,7 +12,7 @@ extern crate alloc;
 use alloc::borrow::Cow;
 
 use sql_traits::{
-    errors::{Error, InheritedChange, LookupError},
+    errors::{Error, InheritedChange, LookupError, ObjectKind},
     prelude::*,
 };
 use sqlparser::dialect::PostgreSqlDialect;
@@ -79,6 +81,127 @@ fn a_renamed_key_moves_its_index_name() {
              ALTER TABLE p RENAME CONSTRAINT p_pkey TO pk;"
         ),
         Err(Error::RelationNameAlreadyTaken { .. })
+    ));
+}
+
+/// PostgreSQL renames a primary key or unique constraint together with the
+/// index behind it, whichever of the two the statement names.
+#[test]
+fn renaming_a_key_index_renames_the_key() {
+    for (setup, table, old) in [
+        ("CREATE TABLE p (a INT PRIMARY KEY);", "p", "p_pkey"),
+        ("CREATE TABLE p (a INT UNIQUE);", "p", "p_a_key"),
+        ("CREATE TABLE p (a INT CONSTRAINT u UNIQUE);", "p", "u"),
+        ("CREATE TABLE p (a INT, CONSTRAINT u PRIMARY KEY (a));", "p", "u"),
+        ("CREATE SCHEMA app; CREATE TABLE app.p (a INT PRIMARY KEY);", "app.p", "app.p_pkey"),
+        (
+            "CREATE SCHEMA app; CREATE TABLE app.p (a INT PRIMARY KEY); SET search_path TO app;",
+            "p",
+            "p_pkey",
+        ),
+    ] {
+        let renamed = format!("{setup} ALTER INDEX {old} RENAME TO k;");
+        let (qualifier, old_bare) = old.rsplit_once('.').unwrap_or(("", old));
+        let new = if qualifier.is_empty() { "k".to_owned() } else { format!("{qualifier}.k") };
+        assert!(drops(&renamed, table, "k"), "{setup}");
+        assert!(parse(&format!("{renamed} ALTER INDEX {new} RENAME TO k2;")).is_ok(), "{setup}");
+        assert!(!drops(&renamed, table, old_bare), "{setup}");
+    }
+
+    let db = accepted("CREATE TABLE p (a INT PRIMARY KEY); ALTER INDEX p_pkey RENAME TO pk;");
+    let p = db
+        .table_by_target(TargetName::new("p", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("held");
+    let key = p.unique_indices(&db).expect("held").next().expect("one key");
+    assert_eq!(owned(key.constraint_name(&db)), Some("pk".to_owned()));
+    // The old name leaves the schema's pool of relation names, the new one
+    // joins it.
+    accepted(
+        "CREATE TABLE p (a INT PRIMARY KEY); ALTER INDEX p_pkey RENAME TO pk; CREATE TABLE p_pkey (x INT);",
+    );
+    assert!(matches!(
+        parse(
+            "CREATE TABLE p (a INT PRIMARY KEY); ALTER INDEX p_pkey RENAME TO pk; CREATE TABLE pk (x INT);"
+        ),
+        Err(Error::RelationNameAlreadyTaken { .. })
+    ));
+}
+
+/// Each refusal names the clash PostgreSQL 18 reports first, a relation of
+/// the schema before a constraint of the table.
+#[test]
+fn renaming_a_key_index_onto_a_held_name_is_refused() {
+    assert!(matches!(
+        parse(
+            "CREATE TABLE p (a INT PRIMARY KEY, c INT CHECK (c > 0));
+             ALTER INDEX p_pkey RENAME TO p_c_check;"
+        ),
+        Err(Error::ConstraintAlreadyExists { table_name, constraint_name })
+            if table_name == "p" && constraint_name == "p_c_check"
+    ));
+    for taken in [
+        "CREATE TABLE p (a INT PRIMARY KEY); CREATE TABLE q (x INT); ALTER INDEX p_pkey RENAME TO q;",
+        "CREATE TABLE p (a INT, b INT, CONSTRAINT k UNIQUE (a), CONSTRAINT l UNIQUE (b));
+         ALTER INDEX k RENAME TO l;",
+    ] {
+        assert!(
+            matches!(
+                parse(taken),
+                Err(Error::RelationNameAlreadyTaken { object_kind: ObjectKind::UniqueIndex, .. })
+            ),
+            "{taken}"
+        );
+    }
+}
+
+/// A partition holds its own index under its own name. A rename of the
+/// partitioned table's index leaves it alone, and the partition's own index
+/// can be renamed through `ALTER INDEX` too.
+#[test]
+fn a_partitioned_key_index_and_a_partition_key_index_rename_apart() {
+    let partitioned = "CREATE TABLE pt (a INT PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (10);";
+    for (rename, expected) in [
+        ("ALTER INDEX pt_pkey RENAME TO ptk;", ["ptk", "pt1_pkey"]),
+        ("ALTER INDEX pt1_pkey RENAME TO y;", ["pt_pkey", "y"]),
+    ] {
+        let db = accepted(&format!("{partitioned} {rename}"));
+        let names: Vec<_> = ["pt", "pt1"]
+            .into_iter()
+            .map(|name| {
+                let table = db
+                    .table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+                    .expect("unambiguous lookup")
+                    .expect("held");
+                let key = table.unique_indices(&db).expect("held").next().expect("one key");
+                owned(key.constraint_name(&db))
+            })
+            .collect();
+        assert_eq!(names, expected.map(|name| Some(name.to_owned())), "{rename}");
+    }
+}
+
+/// Only a check or `NOT NULL` received from a parent is the parent's alone to
+/// rename. A partition renames the key and the foreign key it received.
+#[test]
+fn a_partition_renames_the_keys_it_received() {
+    let partitioned = "CREATE TABLE r (id INT PRIMARY KEY);
+         CREATE TABLE pt (a INT PRIMARY KEY REFERENCES r, c INT CHECK (c > 0))
+             PARTITION BY RANGE (a);
+         CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (10);";
+    for (old, new) in [("pt1_pkey", "x"), ("pt_a_fkey", "f2")] {
+        let renamed = format!("{partitioned} ALTER TABLE pt1 RENAME CONSTRAINT {old} TO {new};");
+        accepted(&format!("{renamed} ALTER TABLE pt1 RENAME CONSTRAINT {new} TO {new}b;"));
+        assert!(matches!(
+            parse(&format!("{renamed} ALTER TABLE pt1 RENAME CONSTRAINT {old} TO {new}b;")),
+            Err(Error::RenameConstraintNotFound { .. })
+        ));
+    }
+    assert!(matches!(
+        parse(&format!("{partitioned} ALTER TABLE pt1 RENAME CONSTRAINT pt_c_check TO c2;")),
+        Err(Error::InheritedConstraintNotRenamable { table_name, constraint_name })
+            if table_name == "pt1" && constraint_name == "pt_c_check"
     ));
 }
 
