@@ -1161,7 +1161,7 @@ fn copy_parent_constraint(
             || constraints.iter().any(|held| super::table_constraint_has_name(held, name)))
     {
         return Err(Error::InheritedConstraintConflict {
-            table_name: child_name.to_owned(),
+            table_name: child_name.to_string(),
             constraint_name: name.value.clone(),
         });
     }

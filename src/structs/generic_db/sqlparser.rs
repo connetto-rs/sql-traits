@@ -6852,8 +6852,9 @@ impl ParserDB {
     /// # Errors
     ///
     /// Returns [`crate::errors::Error::InheritedConstraintNotDroppable`] for a
-    /// copy a parent still passes down, [`Error::RequiredValueNotDroppable`]
-    /// for a column a key covers, [`Error::AlterTableNotFound`] for an absent
+    /// copy a parent still passes down,
+    /// [`crate::errors::Error::RequiredValueNotDroppable`] for a column a key
+    /// covers, [`crate::errors::Error::AlterTableNotFound`] for an absent
     /// table and `ObjectKind::Table.not_in_database` when the stored entry is
     /// missing.
     fn drop_not_null_constraint(
