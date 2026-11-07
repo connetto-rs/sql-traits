@@ -193,16 +193,20 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     /// `database`.
     ///
     /// A stored node carries the `NOT NULL` a key or an identity implies, so
-    /// the option alone answers for anything this crate built. The key and the
-    /// identity are still consulted, so a node assembled by hand rather than
-    /// parsed answers alike.
+    /// the option alone answers for anything this crate built. The key, the
+    /// identity and a table-level `NOT NULL` naming the column are still
+    /// consulted, so a node assembled by hand rather than parsed answers
+    /// alike.
     #[inline]
     fn is_nullable(&self, database: &Self::DB) -> Result<bool, LookupError> {
         let declared = self.attribute().options.iter().any(|option| {
             matches!(option.option, sqlparser::ast::ColumnOption::NotNull)
                 || is_identity(&option.option)
         });
-        Ok(!declared && !self.is_primary_key(database)?)
+        let table_holds =
+            crate::structs::generic_db::table_not_null(self.table(), &self.attribute().name)
+                .is_some();
+        Ok(!declared && !table_holds && !self.is_primary_key(database)?)
     }
 
     #[inline]

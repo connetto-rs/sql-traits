@@ -135,6 +135,7 @@ mod table_as_query;
 mod table_inheritance;
 mod table_inheritance_reads;
 mod table_like;
+mod table_not_null_constraints;
 mod table_owner_privileges;
 mod table_ownership;
 mod table_persistence;

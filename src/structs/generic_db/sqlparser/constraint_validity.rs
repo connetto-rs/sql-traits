@@ -30,7 +30,10 @@ use crate::errors::{Error, InheritedChange};
 
 /// Whether the kind can be added `NOT VALID` and validated afterwards.
 fn takes_validation(constraint: &TableConstraint) -> bool {
-    matches!(constraint, TableConstraint::Check(_) | TableConstraint::ForeignKey(_))
+    matches!(
+        constraint,
+        TableConstraint::Check(_) | TableConstraint::ForeignKey(_) | TableConstraint::NotNull(_)
+    )
 }
 
 /// Refuses `NOT VALID` on a kind PostgreSQL always checks on arrival.
@@ -177,10 +180,14 @@ pub(super) fn validate_constraint(
             return Ok(builder);
         }
         // A foreign key on a partitioned table is validated on every partition
-        // whatever the statement says, while a check refuses `ONLY` outright.
-        if let TableConstraint::Check(check) = held
-            && !check.no_inherit
-        {
+        // whatever the statement says, while a check and a not-null refuse
+        // `ONLY` outright.
+        let only_refused = match held {
+            TableConstraint::Check(check) => !check.no_inherit,
+            TableConstraint::NotNull(not_null) => !not_null.no_inherit,
+            _ => false,
+        };
+        if only_refused {
             ParserDB::refuse_only_with_children(
                 &builder,
                 &stored,

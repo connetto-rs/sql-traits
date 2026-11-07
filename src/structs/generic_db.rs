@@ -12,12 +12,12 @@ use core::fmt::Debug;
 pub use builder::GenericDBBuilder;
 pub(crate) use profile::{Identified, Stored};
 pub use profile::{Meta, SchemaProfile};
-pub(crate) use sqlparser::ConstraintObject;
 pub use sqlparser::{
     AccessResolution, ParseOptions, ParserDB, ParserDBBuilder, ParserDBIngestor, ParserIngestion,
     PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType, SqlparserProfile,
     UnresolvedAccessReference,
 };
+pub(crate) use sqlparser::{ConstraintObject, table_not_null};
 
 use crate::{
     structs::{ColumnIdentity, IdentifierCase, IdentityCounter, RelationIdentity, RoleSetting},
