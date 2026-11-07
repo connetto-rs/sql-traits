@@ -1583,6 +1583,23 @@ pub enum Error {
         /// Name of the index.
         index_name: String,
     },
+    #[error(
+        "Index `{index_name}` is qualified by schema `{schema_name}`, but table `{table_name}` is in another schema."
+    )]
+    /// Error indicating that the name of an index carries a schema qualifier
+    /// other than the schema of the table it is built on.
+    ///
+    /// An index always lives in its table's schema. PostgreSQL refuses any
+    /// qualifier on the name, and SQLite takes one only when it names the
+    /// table's schema.
+    IndexInAnotherSchema {
+        /// Name of the index.
+        index_name: String,
+        /// Schema the index name was qualified by.
+        schema_name: String,
+        /// Name of the table the index is built on.
+        table_name: String,
+    },
     #[error("Relation `{relation_name}` not found for the owner of sequence `{sequence_name}`.")]
     /// Error indicating that `OWNED BY` names a relation that does not exist.
     RelationNotFoundForSequenceOwner {

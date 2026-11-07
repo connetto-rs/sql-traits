@@ -9,7 +9,7 @@ use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, TableAttribute, metadata::IndexMetadata},
     traits::{DatabaseLike, IndexLike, Metadata, TableLike},
-    utils::object_name::{Qualifier, object_name_last_part, qualifier_of},
+    utils::object_name::object_name_last_part,
 };
 
 impl Metadata for TableAttribute<CreateTable, CreateIndex> {
@@ -17,12 +17,6 @@ impl Metadata for TableAttribute<CreateTable, CreateIndex> {
 }
 
 impl TableAttribute<CreateTable, CreateIndex> {
-    /// What the index name says about its schema, if the index is named at
-    /// all.
-    fn index_qualifier(&self) -> Qualifier<'_> {
-        self.attribute().name.as_ref().map_or(Qualifier::Absent, qualifier_of)
-    }
-
     /// The metadata `database` keeps for this index, or the error saying it
     /// holds no such index.
     fn metadata<'db>(
@@ -79,12 +73,12 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
 
     #[inline]
     fn schema(&self) -> Option<&str> {
-        self.index_qualifier().named().map(|(schema, _)| schema)
+        self.table().table_schema()
     }
 
     #[inline]
     fn schema_is_quoted(&self) -> bool {
-        self.index_qualifier().named().is_some_and(|(_, quoted)| quoted)
+        self.table().table_schema_is_quoted()
     }
 
     #[inline]

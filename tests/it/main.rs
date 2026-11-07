@@ -68,6 +68,7 @@ mod granted_columns;
 mod implicit_sequences;
 mod implied_referenced_columns;
 mod incremental_schema_ingestion;
+mod index_schema;
 mod indexed_lookup_equivalence;
 mod inheritance_changes;
 mod inherited_column_declarations;
