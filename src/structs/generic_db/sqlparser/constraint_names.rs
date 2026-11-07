@@ -794,50 +794,68 @@ pub(super) fn rename_constraint(
     rename_constraint_of(builder, stored, scope, old, new)
 }
 
-/// Applies `ALTER INDEX name RENAME TO new` to the index behind a primary key,
-/// unique or exclusion constraint, which PostgreSQL renames together with the
-/// constraint. The schema's relation names are checked before the table's
-/// constraint names, as PostgreSQL does.
+/// The table holding the primary key, unique or exclusion constraint whose
+/// index `name` reaches, or [`None`] when `name` reaches an index of its own
+/// or nothing at all.
+///
+/// PostgreSQL renames such an index together with its constraint, and checks
+/// the schema's relation names before the table's constraint names, so a
+/// clash with a relation is reported here.
 ///
 /// # Errors
 ///
-/// Returns [`Error::AlterIndexNotFound`] when `name` reaches no index backing
-/// a constraint, [`Error::RelationNameAlreadyTaken`] when another relation of
-/// the schema holds `new`, and the errors of [`rename_constraint`] otherwise.
-pub(super) fn rename_constraint_index(
-    builder: ParserDBBuilder,
+/// Returns [`Error::RelationNameAlreadyTaken`] when another relation of the
+/// schema holds `new`.
+pub(super) fn key_index_table(
+    builder: &ParserDBBuilder,
     name: &ObjectName,
+    old: &Ident,
     new: &Ident,
-) -> Result<ParserDBBuilder, Error> {
-    let not_found = || Error::AlterIndexNotFound { index_name: super::last_str(name).to_string() };
-    let Some(old) = super::object_name_last_identifier(name) else {
-        return Err(not_found());
+) -> Result<Option<StoredTable>, Error> {
+    let case = builder.identifier_case();
+    let reached = builder
+        .relation_reached(name)
+        .filter(|(kind, _)| matches!(kind, ObjectKind::UniqueIndex))
+        .and_then(|(_, schema)| {
+            builder
+                .tables()
+                .iter()
+                .find(|(table, metadata, _)| {
+                    schema_qualifiers_match(table_schema_qualifier(table), Some(schema), case)
+                        && locate(table, metadata.generated_constraint_names(), old)
+                            .and_then(|position| slot_at(table, position))
+                            .is_some_and(|(slot, _)| backed_by_index(slot))
+                })
+                .map(|(table, _, _)| (StoredTable::of(table), schema))
+        });
+    let Some((stored, schema)) = reached else {
+        return Ok(None);
     };
-    let stored = {
-        let Some((_, schema)) = builder.relation_reached(name) else {
-            return Err(not_found());
-        };
-        let case = builder.identifier_case();
-        let Some(stored) = builder.tables().iter().find_map(|(table, metadata, _)| {
-            (schema_qualifiers_match(table_schema_qualifier(table), Some(schema), case)
-                && locate(table, metadata.generated_constraint_names(), old)
-                    .and_then(|position| slot_at(table, position))
-                    .is_some_and(|(slot, _)| backed_by_index(slot)))
-            .then(|| StoredTable::of(table))
-        }) else {
-            return Err(not_found());
-        };
-        if let Some(conflicting_kind) = super::relation_name_holder(&builder, new, Some(schema)) {
-            return Err(Error::RelationNameAlreadyTaken {
+    match super::relation_name_holder(builder, new, Some(schema)) {
+        Some(conflicting_kind) => {
+            Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::UniqueIndex,
                 conflicting_kind,
                 object_name: new.value.clone(),
-            });
+            })
         }
-        stored
-    };
-    // A rename through the index reaches that one relation, never the
-    // partitions or children below it.
+        None => Ok(Some(stored)),
+    }
+}
+
+/// Applies `ALTER INDEX ... RENAME TO new` to the key of `stored` answering to
+/// `old`, which [`key_index_table`] found. The rename reaches that one
+/// relation, never the partitions or children below it.
+///
+/// # Errors
+///
+/// Returns the errors of [`rename_constraint`].
+pub(super) fn rename_key_index(
+    builder: ParserDBBuilder,
+    stored: StoredTable,
+    old: &Ident,
+    new: &Ident,
+) -> Result<ParserDBBuilder, Error> {
     rename_constraint_of(
         builder,
         stored,
