@@ -48,14 +48,25 @@ fn specs(statement: RowStatement) -> Vec<Spec> {
 
     let mut specs = Vec::new();
     match statement {
-        RowStatement::Select => specs.push((Select, Using, Existing, Filter)),
+        RowStatement::Select | RowStatement::MergeDoNothing => {
+            specs.push((Select, Using, Existing, Filter));
+        }
         RowStatement::SelectLocking => {
             specs.extend([(Select, Using, Existing, Filter), (Update, Using, Existing, Filter)]);
         }
-        RowStatement::Insert { returning } | RowStatement::MergeInsert { returning } => {
+        RowStatement::Insert { returning } => {
             specs.push((Insert, Check, Inserted, Raise));
             if returning {
                 specs.push((Select, Using, Inserted, Raise));
+            }
+        }
+        RowStatement::MergeInsert { reads, returning } => {
+            specs.push((Insert, Check, Inserted, Raise));
+            if reads {
+                specs.push((Select, Using, Existing, Filter));
+                if returning {
+                    specs.push((Select, Using, Inserted, Raise));
+                }
             }
         }
         RowStatement::Update { reads } => {
@@ -86,24 +97,18 @@ fn specs(statement: RowStatement) -> Vec<Spec> {
                 (Update, Check, Updated, Raise),
             ]);
         }
-        RowStatement::MergeUpdate => {
-            specs.extend([
-                (Update, Using, Existing, Raise),
-                (Select, Using, Updated, Raise),
-                (Update, Check, Updated, Raise),
-            ]);
+        RowStatement::MergeUpdate { reads } => {
+            specs.extend([(Update, Using, Existing, Raise), (Update, Check, Updated, Raise)]);
+            if reads {
+                specs.extend([(Select, Using, Existing, Filter), (Select, Using, Updated, Raise)]);
+            }
         }
-        RowStatement::MergeDelete => specs.push((Delete, Using, Existing, Raise)),
-        RowStatement::MergeDoNothing => {}
-    }
-    if matches!(
-        statement,
-        RowStatement::MergeInsert { .. }
-            | RowStatement::MergeUpdate
-            | RowStatement::MergeDelete
-            | RowStatement::MergeDoNothing
-    ) {
-        specs.push((Select, Using, Existing, Filter));
+        RowStatement::MergeDelete { reads } => {
+            specs.push((Delete, Using, Existing, Raise));
+            if reads {
+                specs.push((Select, Using, Existing, Filter));
+            }
+        }
     }
     specs
 }

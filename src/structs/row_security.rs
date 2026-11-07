@@ -57,14 +57,27 @@ pub enum RowStatement {
     InsertOnConflictDoUpdate,
     /// `MERGE ... WHEN NOT MATCHED THEN INSERT`.
     MergeInsert {
-        /// Whether `RETURNING` reads the inserted row back.
+        /// Whether the statement reads a column of the target, as
+        /// [`MergeUpdate`](Self::MergeUpdate) states it.
+        reads: bool,
+        /// Whether the statement has a `RETURNING` clause, whatever it names.
         returning: bool,
     },
     /// `MERGE ... WHEN MATCHED THEN UPDATE`.
-    MergeUpdate,
+    MergeUpdate {
+        /// Whether the statement reads a column of the target, in the join
+        /// condition, a `WHEN` condition, a `SET` expression or `RETURNING`,
+        /// or holds a `DO NOTHING` action. Every `WHEN` clause of the
+        /// statement counts, not only the one taking this action.
+        reads: bool,
+    },
     /// `MERGE ... WHEN MATCHED THEN DELETE`.
-    MergeDelete,
-    /// `MERGE ... THEN DO NOTHING`.
+    MergeDelete {
+        /// Whether the statement reads a column of the target, as
+        /// [`MergeUpdate`](Self::MergeUpdate) states it.
+        reads: bool,
+    },
+    /// `MERGE ... THEN DO NOTHING`, which always reads the target.
     MergeDoNothing,
 }
 
