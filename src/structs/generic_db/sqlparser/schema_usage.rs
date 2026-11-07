@@ -6,7 +6,9 @@ use alloc::{sync::Arc, vec::Vec};
 
 use sqlparser::ast::{Action, GrantObjects, Ident, Privileges, Revoke};
 
-use super::{ParserDBBuilder, grantee_role_ident, rename_grantee, stored_role_name};
+use super::{
+    ParserDBBuilder, grantee_role_ident, grantors::grantor_ident, rename_grantee, stored_role_name,
+};
 use crate::{
     impls::{grantee_is_public, grantees_match},
     utils::{identifier_resolution::identifiers_match, object_name::object_name_last_part},
@@ -90,7 +92,7 @@ pub(super) fn change_owner(
         }
         grant.grantees = grantees;
         if names_previous(grant.granted_by.as_ref()) {
-            grant.granted_by = Some(next.clone());
+            grant.granted_by = Some(grantor_ident(&stored_role_name(next)));
         }
     }
 }

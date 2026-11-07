@@ -183,6 +183,7 @@ fn an_owner_change_moves_the_grants_naming_the_old_owner_on_that_table() {
          REVOKE SELECT ON t FROM previous;
          GRANT SELECT ON t, u TO previous;
          GRANT SELECT ON t TO reader GRANTED BY previous;
+         GRANT UPDATE ON t TO admin WITH GRANT OPTION;
          GRANT UPDATE ON t TO previous, next GRANTED BY admin;
          GRANT INSERT ON u TO previous;
          GRANT DELETE ON t TO reader;
@@ -207,7 +208,7 @@ fn an_owner_change_moves_the_grants_naming_the_old_owner_on_that_table() {
             (
                 grant.privileges(&database).map(ToString::to_string).collect(),
                 grant.grantees(&database).map(ToString::to_string).collect(),
-                grant.granted_by(&database).map(RoleLike::name),
+                grant.granted_by(&database),
             )
         })
         .collect();
@@ -218,6 +219,7 @@ fn an_owner_change_moves_the_grants_naming_the_old_owner_on_that_table() {
             ("DELETE".to_owned(), vec!["reader".to_owned()], None),
             ("SELECT".to_owned(), vec!["next".to_owned()], None),
             ("SELECT".to_owned(), vec!["reader".to_owned()], Some("next")),
+            ("UPDATE".to_owned(), vec!["admin".to_owned()], None),
             ("UPDATE".to_owned(), vec!["next".to_owned()], Some("admin")),
         ]
     );

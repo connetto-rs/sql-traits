@@ -53,14 +53,6 @@ fn object_names_match(left: &ObjectName, right: &ObjectName) -> bool {
     })
 }
 
-fn role_matches_ident(role: &CreateRole, lookup_name: &str, lookup_quoted: bool) -> bool {
-    role.names.iter().any(|role_name| {
-        object_name_last_part(role_name).is_some_and(|(role_name, role_quoted)| {
-            identifiers_match(role_name, role_quoted, lookup_name, lookup_quoted)
-        })
-    })
-}
-
 /// Returns whether a grantee names the `PUBLIC` pseudo-role, in either
 /// spelling the parser produces: the dedicated grantee type for the keyword,
 /// and an identifier [`is_public_pseudo_role`] recognises, which a quoted
@@ -679,16 +671,10 @@ impl GrantLike for Grant {
         self.with_grant_option
     }
 
-    fn granted_by<'a>(
-        &'a self,
-        database: &'a Self::DB,
-    ) -> Option<&'a <Self::DB as DatabaseLike>::Role> {
-        self.granted_by.as_ref().and_then(|ident| {
-            database.roles().find(|role| {
-                let role: &CreateRole = role;
-                role_matches_ident(role, ident.value.as_str(), ident.quote_style.is_some())
-            })
-        })
+    fn granted_by<'a>(&'a self, _database: &'a Self::DB) -> Option<&'a str> {
+        // Ingestion stores the grantor quoted under its stored name, so the
+        // written value is that name.
+        self.granted_by.as_ref().map(|grantor| grantor.value.as_str())
     }
 
     fn applies_to_role(&self, role: &<Self::DB as DatabaseLike>::Role) -> bool {
