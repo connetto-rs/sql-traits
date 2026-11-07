@@ -615,10 +615,9 @@ pub(super) fn require_exposed_column(
         materialized_view_position(builder, name)
             .map(|at| builder.materialized_views()[at].0.declaration())
     };
-    let Some(declaration) = plain().or_else(materialized) else {
-        return Ok(());
-    };
-    require_exposed(builder, declaration, column_name)
+    plain()
+        .or_else(materialized)
+        .map_or(Ok(()), |declaration| require_exposed(builder, declaration, column_name))
 }
 
 /// Refuses `column_name` when the view `declaration` describes exposes no

@@ -73,8 +73,13 @@ fn comment_on_table(
     if kind != expected {
         return Err(kind_mismatch(&name, expected, kind));
     }
-    let position = table_position(&builder, &name)?;
-    builder.tables_mut()[position].1.set_documentation(documentation);
+    let table = builder.resolve_table_object_name(&name)?;
+    let position = builder.tables().iter().position(|(stored, _, _)| {
+        table.is_some_and(|table| core::ptr::eq(stored.as_ref(), table))
+    });
+    if let Some(position) = position {
+        builder.tables_mut()[position].1.set_documentation(documentation);
+    }
     Ok(builder)
 }
 
@@ -107,29 +112,30 @@ fn comment_on_column(
             return Ok(builder);
         }
         ObjectKind::Type => {
-            if let Some(composite) = object_name_last_identifier(&relation) {
+            object_name_last_identifier(&relation).map_or(Ok(()), |composite| {
                 user_defined_types::require_composite_attribute(
                     &builder, composite, schema, &column,
-                )?;
-            }
+                )
+            })?;
             return Ok(builder);
         }
         other => return Err(kind_mismatch(&relation, ObjectKind::Table, other)),
     }
 
-    let table = &builder.tables()[table_position(&builder, &relation)?].0;
+    let table = builder.resolve_table_object_name(&relation)?;
     let case = builder.identifier_case();
     let position = builder
         .columns()
         .iter()
         .position(|(candidate, _, _)| {
-            core::ptr::eq(TableAttribute::table(candidate.as_ref()), table.as_ref())
-                && case.identifiers_match(
-                    candidate.column_name(),
-                    candidate.column_name_is_quoted(),
-                    &column.value,
-                    column.quote_style.is_some(),
-                )
+            table.is_some_and(|table| {
+                core::ptr::eq(TableAttribute::table(candidate.as_ref()), table)
+            }) && case.identifiers_match(
+                candidate.column_name(),
+                candidate.column_name_is_quoted(),
+                &column.value,
+                column.quote_style.is_some(),
+            )
         })
         .ok_or_else(|| {
             LookupError::ColumnNotFound {
@@ -159,17 +165,6 @@ fn reached<'name>(
             Err(Error::RelationNotFound { object_kind: expected, object_name: name.to_string() })
         }
     }
-}
-
-/// The position among the stored tables of the table or foreign table `name`
-/// reaches, once the relation pool has shown it holds one.
-fn table_position(builder: &ParserDBBuilder, name: &ObjectName) -> Result<usize, Error> {
-    builder
-        .resolve_table_object_name(name)?
-        .and_then(|table| {
-            builder.tables().iter().position(|(stored, _, _)| core::ptr::eq(stored.as_ref(), table))
-        })
-        .ok_or_else(|| ObjectKind::Table.not_in_database(&name.to_string()).into())
 }
 
 fn kind_mismatch(name: &ObjectName, expected: ObjectKind, actual: ObjectKind) -> Error {
