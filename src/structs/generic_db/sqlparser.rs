@@ -89,6 +89,7 @@ mod foreign_options;
 mod function_bodies;
 mod function_moves;
 mod generated_names;
+mod grantors;
 mod inheritance;
 mod leading_comments;
 mod like;
@@ -4613,16 +4614,24 @@ fn rename_grantee(grantee: &mut Grantee, replacement: &Ident) {
     )])));
 }
 
-/// Rewrites every grant grantee naming `previous`.
-fn rename_grantee_role(grants: &mut [(Arc<Grant>, ())], previous: &Ident, replacement: &Ident) {
+/// Rewrites every grant grantee and grantor naming `previous`.
+fn rename_grant_roles(grants: &mut [(Arc<Grant>, ())], previous: &Ident, replacement: &Ident) {
+    let names_previous =
+        |grantor: Option<&Ident>| grantor.is_some_and(|grantor| idents_match(grantor, previous));
     for (grant, ()) in grants {
-        if !grant.grantees.iter().any(|grantee| grantee_names(grantee, previous)) {
+        if !grant.grantees.iter().any(|grantee| grantee_names(grantee, previous))
+            && !names_previous(grant.granted_by.as_ref())
+        {
             continue;
         }
-        for grantee in &mut Arc::make_mut(grant).grantees {
+        let grant = Arc::make_mut(grant);
+        for grantee in &mut grant.grantees {
             if grantee_names(grantee, previous) {
                 rename_grantee(grantee, replacement);
             }
+        }
+        if names_previous(grant.granted_by.as_ref()) {
+            grant.granted_by = Some(grantors::grantor_ident(&stored_role_name(replacement)));
         }
     }
 }
@@ -9285,8 +9294,8 @@ impl ParserDB {
                     }
 
                     rename_role_references(&mut builder, &name, &new_name);
-                    rename_grantee_role(builder.table_grants_mut(), &name, &new_name);
-                    rename_grantee_role(builder.column_grants_mut(), &name, &new_name);
+                    rename_grant_roles(builder.table_grants_mut(), &name, &new_name);
+                    rename_grant_roles(builder.column_grants_mut(), &name, &new_name);
                     revocations::rename_role(&mut builder, &name, &new_name);
                     role_settings::rename_role(&mut builder, &name, &new_name);
                     rename_execute_grantees(&mut builder, &name, &new_name);
@@ -10486,10 +10495,21 @@ impl ParserDB {
                         }
                         parts
                     };
+                    let acting = grantors::acting_role(
+                        grant.granted_by.as_ref(),
+                        session_roles.creating_role(),
+                        session_roles.session_role(),
+                    );
                     for part in parts {
                         revocations::hand_back(&mut builder, &part);
+                        // Both halves are weighed against the grants recorded
+                        // before either, as PostgreSQL reads the old lists.
                         let (relation_part, column_part) =
                             crate::impls::split_by_column_scope(part);
+                        let relation_part = relation_part
+                            .map(|part| grantors::record(&builder, acting.as_deref(), part));
+                        let column_part = column_part
+                            .map(|part| grantors::record(&builder, acting.as_deref(), part));
                         if let Some(part) = relation_part {
                             builder = builder.add_table_grant(Arc::new(part), ());
                         }
