@@ -1613,6 +1613,13 @@ pub enum Error {
         /// The owner the statement wrote.
         owner: String,
     },
+    #[error("`COMMENT ON COLUMN {column_name}` names no relation before the column.")]
+    /// Error indicating that `COMMENT ON COLUMN` names a bare column, which
+    /// PostgreSQL refuses because a column name must be qualified.
+    UnqualifiedCommentColumn {
+        /// The column the statement wrote.
+        column_name: String,
+    },
     #[error(
         "Sequence `{sequence_name}` cannot be owned by `{relation_name}`, which is in another schema."
     )]

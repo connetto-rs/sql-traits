@@ -241,8 +241,13 @@ pub trait TableLike:
         }))
     }
 
-    /// Returns documentation from standalone comments above `CREATE`.
-    /// A blank line detaches the preceding comment group.
+    /// Returns the documentation of the table.
+    ///
+    /// The documentation starts as the standalone comment block written above
+    /// `CREATE`, a blank line detaching the preceding comment group. A later
+    /// `COMMENT ON TABLE`, or `COMMENT ON FOREIGN TABLE` for a foreign table,
+    /// replaces it, and `IS NULL` or an empty text removes it, as PostgreSQL
+    /// applies them.
     ///
     /// # Arguments
     ///
@@ -265,6 +270,8 @@ pub trait TableLike:
     ///     CREATE TABLE my_table (id INT);
     ///     -- the next table to create
     ///     CREATE TABLE my_next_table (id INT);
+    ///     CREATE TABLE commented (id INT);
+    ///     COMMENT ON TABLE commented IS 'documented by the catalog';
     /// ",
     /// )?;
     /// let table =
@@ -274,6 +281,10 @@ pub trait TableLike:
     ///     .unwrap();
     /// assert_eq!(table.table_doc(&db)?, None); // No documentation available
     /// assert_eq!(table_next.table_doc(&db)?, Some("the next table to create"));
+    /// let commented = db
+    ///     .table_by_target(TargetName::new("commented", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// assert_eq!(commented.table_doc(&db)?, Some("documented by the catalog"));
     /// # Ok(())
     /// # }
     /// ```
