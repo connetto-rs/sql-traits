@@ -588,7 +588,11 @@ impl<P: SchemaProfile> GenericDB<P> {
     /// ```
     pub fn policy_metadata(&self, policy: &P::Policy) -> Option<&Meta<P::Policy>> {
         self.policies
-            .binary_search_by(|(p, _)| p.name().cmp(policy.name()))
+            .binary_search_by(|(p, _)| {
+                p.name()
+                    .cmp(policy.name())
+                    .then_with(|| p.target_table_name().cmp(&policy.target_table_name()))
+            })
             .ok()
             .map(|index| &self.policies[index].1)
     }

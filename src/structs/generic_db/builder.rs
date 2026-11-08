@@ -1198,7 +1198,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.user_defined_types.sort_unstable_by(|(a, _), (b, _)| {
             (a.stored_schema(), a.stored_name()).cmp(&(b.stored_schema(), b.stored_name()))
         });
-        self.policies.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
+        // A policy name is unique per table, so the table breaks the tie.
+        self.policies.sort_unstable_by(|(a, _), (b, _)| {
+            a.name().cmp(b.name()).then_with(|| a.target_table_name().cmp(&b.target_table_name()))
+        });
         self.check_constraints.sort_unstable_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
         self.roles
             .sort_unstable_by(|(left, _), (right, _)| left.stored_name().cmp(&right.stored_name()));
