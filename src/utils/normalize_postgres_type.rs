@@ -313,16 +313,14 @@ fn parse_parts(name: &str) -> Option<Vec<Part<'_>>> {
 
 /// Appends the normalized spelling of a parsed type name to `out`, and
 /// returns whether the name is a builtin's.
+///
+/// A lone unquoted name is folded as it stands, since [`builtin`] has already
+/// answered every builtin spelled with at most one modifier list.
 fn push_name(out: &mut String, parts: &[Part<'_>]) -> bool {
     match parts {
         [only] if !only.quoted => {
-            if let Some(token) = alias(&only.text.split_ascii_whitespace()) {
-                out.push_str(token);
-                true
-            } else {
-                out.push_str(&fold_words(&only.text));
-                false
-            }
+            out.push_str(&fold_words(&only.text));
+            false
         }
         // `pg_catalog` is searched first whatever the search path says, so
         // the qualified name is an ordinary lookup of the bare one, exactly
