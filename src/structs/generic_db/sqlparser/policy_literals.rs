@@ -33,7 +33,7 @@ use super::{
 use crate::{
     structs::{
         ColumnDefinition, ColumnDefinitionScope, ColumnScope, IdentifierCase, ParserDB,
-        metadata::UnreadableLiteral,
+        metadata::{ClauseLiterals, UnreadableLiteral},
     },
     traits::ColumnLike,
 };
@@ -627,17 +627,17 @@ fn coercions(
 }
 
 /// Rewrites every date and time literal of `expression`, a clause of a policy
-/// on `table`, as the value PostgreSQL stores for it under `session`, or
-/// answers the first one whose value is not known here and leaves the clause
-/// as written.
+/// on `table`, as the value PostgreSQL stores for it under `session`, keeping
+/// the clause as written beside it, or answers the first literal whose value
+/// is not known here and leaves the clause as written.
 pub(super) fn bind(
     builder: &ParserDBBuilder,
     table: &ObjectName,
     expression: &mut Expr,
     session: LiteralSession<'_>,
-) -> Option<UnreadableLiteral> {
+) -> ClauseLiterals {
     if !holds_quoted_literal(expression) {
-        return None;
+        return ClauseLiterals::AsWritten;
     }
     let clause = core::mem::replace(expression, Expr::Value(Value::Null.with_empty_span()));
     let from = TableWithJoins {
@@ -657,17 +657,26 @@ pub(super) fn bind(
         joins: Vec::new(),
     };
     let mut query = wrapping_query(wrapping_select(Vec::new(), alloc::vec![from], Some(clause)));
-    let unreadable = match coercions(builder, &query, session) {
+    let literals = match coercions(builder, &query, session) {
+        Ok(coercions) if coercions.is_empty() => ClauseLiterals::AsWritten,
         Ok(coercions) => {
+            // The clause is the first expression of the wrapper query.
+            let written =
+                visit_expressions(&query, |clause| ControlFlow::Break(Box::new(clause.clone())))
+                    .break_value();
             let walk = VisitMut::visit(&mut query, &mut Respell { coercions });
             debug_assert!(walk.is_continue(), "the respelling never breaks");
-            None
+            written.map_or(ClauseLiterals::AsWritten, ClauseLiterals::Stored)
         }
-        Err(unreadable) => Some(unreadable),
+        Err(unreadable) => ClauseLiterals::Unreadable(unreadable),
     };
     let walk = VisitMut::visit(&mut query, &mut Restore { target: expression });
     debug_assert!(walk.is_break(), "the clause is the first expression of the wrapper query");
-    unreadable
+    match literals {
+        // A typed literal can store the very text it was written with.
+        ClauseLiterals::Stored(written) if *written == *expression => ClauseLiterals::AsWritten,
+        literals => literals,
+    }
 }
 
 /// Swaps `target` with the first expression a walk of the wrapper query meets,

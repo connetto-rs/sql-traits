@@ -1,8 +1,9 @@
 //! Submodule defining a generic `PolicyMetadata` struct.
 
-use alloc::{string::String, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc};
 
 use sql_values::{DateTimeError, PgType};
+use sqlparser::ast::Expr;
 
 use super::ExpressionCalls;
 use crate::{
@@ -17,12 +18,37 @@ pub struct PolicyMetadata<U: PolicyLike> {
     using_calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
     /// The calls of the check expression.
     check_calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
-    /// The first literal of the using expression its creation read a value
-    /// for that is not known here.
-    using_unreadable: Option<UnreadableLiteral>,
-    /// The first literal of the check expression its creation read a value
-    /// for that is not known here.
-    check_unreadable: Option<UnreadableLiteral>,
+    /// How the literals of the using expression were read.
+    using_literals: ClauseLiterals,
+    /// How the literals of the check expression were read.
+    check_literals: ClauseLiterals,
+}
+
+/// The calls of one clause of the policy `U`.
+type PolicyCalls<U> = ExpressionCalls<<<U as PolicyLike>::DB as DatabaseLike>::Function>;
+
+/// How the literals of one clause of a policy were read when PostgreSQL
+/// created it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClauseLiterals {
+    /// No literal holds a value other than the one written, so the clause
+    /// reads as written.
+    AsWritten,
+    /// Literals hold the value PostgreSQL stored, and this is the clause as
+    /// the input spells it.
+    Stored(Box<Expr>),
+    /// A literal holds a value not known here, so the clause stays as written.
+    Unreadable(UnreadableLiteral),
+}
+
+impl ClauseLiterals {
+    /// The clause as the input spells it, where its stored literals differ.
+    fn written_mut(&mut self) -> Option<&mut Expr> {
+        match self {
+            Self::Stored(written) => Some(written),
+            Self::AsWritten | Self::Unreadable(_) => None,
+        }
+    }
 }
 
 /// A literal of a policy expression that PostgreSQL read as a date or time
@@ -57,7 +83,12 @@ impl<U: PolicyLike> PolicyMetadata<U> {
         using_calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
         check_calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
     ) -> Self {
-        Self { using_calls, check_calls, using_unreadable: None, check_unreadable: None }
+        Self {
+            using_calls,
+            check_calls,
+            using_literals: ClauseLiterals::AsWritten,
+            check_literals: ClauseLiterals::AsWritten,
+        }
     }
 
     /// Returns the calls of the using expression.
@@ -94,26 +125,33 @@ impl<U: PolicyLike> PolicyMetadata<U> {
         self.check_calls = calls;
     }
 
-    /// The literal of the using expression whose value is not known here.
-    pub(crate) fn using_unreadable(&self) -> Option<&UnreadableLiteral> {
-        self.using_unreadable.as_ref()
+    /// How the literals of the using expression were read.
+    pub(crate) fn using_literals(&self) -> &ClauseLiterals {
+        &self.using_literals
     }
 
-    /// Records the literal of the current using expression whose value is
-    /// not known here, if any.
-    pub(crate) fn set_using_unreadable(&mut self, literal: Option<UnreadableLiteral>) {
-        self.using_unreadable = literal;
+    /// Records how the literals of the current using expression were read.
+    pub(crate) fn set_using_literals(&mut self, literals: ClauseLiterals) {
+        self.using_literals = literals;
     }
 
-    /// The literal of the check expression whose value is not known here.
-    pub(crate) fn check_unreadable(&self) -> Option<&UnreadableLiteral> {
-        self.check_unreadable.as_ref()
+    /// How the literals of the check expression were read.
+    pub(crate) fn check_literals(&self) -> &ClauseLiterals {
+        &self.check_literals
     }
 
-    /// Records the literal of the current check expression whose value is
-    /// not known here, if any.
-    pub(crate) fn set_check_unreadable(&mut self, literal: Option<UnreadableLiteral>) {
-        self.check_unreadable = literal;
+    /// Records how the literals of the current check expression were read.
+    pub(crate) fn set_check_literals(&mut self, literals: ClauseLiterals) {
+        self.check_literals = literals;
+    }
+
+    /// The using and check expressions as the input spells them, where their
+    /// stored literals differ, each with the calls it holds.
+    pub(crate) fn written_clauses_mut(&mut self) -> [(Option<&mut Expr>, &PolicyCalls<U>); 2] {
+        [
+            (self.using_literals.written_mut(), &self.using_calls),
+            (self.check_literals.written_mut(), &self.check_calls),
+        ]
     }
 
     /// Re-points every cached function still referencing the allocation

@@ -471,6 +471,48 @@ pub trait PolicyLike:
     where
         Self: 'db;
 
+    /// Returns the `USING` clause of the policy, if any, as the input spells
+    /// it, or `None` when this source holds no such spelling.
+    ///
+    /// [`Self::using_clause`] answers each literal with the value PostgreSQL
+    /// stored for it, cast to the type it was read as. This clause keeps every
+    /// literal and cast as written, and follows the same renames of the
+    /// columns and functions it names. A catalog stores only the typed
+    /// constant, so it never knows whether a cast was written and answers
+    /// `None` for a clause that exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this policy.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE events (at TIMESTAMP);
+    ///      CREATE POLICY recent ON events USING (at > '2026-01-01 12:00');",
+    /// )?;
+    /// let policy = db.policies().next().unwrap();
+    /// assert_eq!(
+    ///     policy.using_expression(&db)?.unwrap().to_string(),
+    ///     "at > '2026-01-01 12:00:00'::TIMESTAMP WITHOUT TIME ZONE",
+    /// );
+    /// assert_eq!(policy.written_using(&db)?.unwrap().to_string(), "at > '2026-01-01 12:00'");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn written_using<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
+    where
+        Self: 'db;
+
     /// Returns the functions used in the `USING` expression.
     ///
     /// # Errors
@@ -581,6 +623,39 @@ pub trait PolicyLike:
     where
         Self: 'db;
 
+    /// Returns explicit `WITH CHECK`, or `None` without a `USING` fallback,
+    /// as the input spells it, as [`Self::written_using`] answers `USING`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this policy.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE events (on_day DATE);
+    ///      CREATE POLICY current ON events WITH CHECK (on_day >= '2026-01-01');",
+    /// )?;
+    /// let policy = db.policies().next().unwrap();
+    /// assert_eq!(policy.check_expression(&db)?.unwrap().to_string(), "on_day >= '2026-01-01'::DATE");
+    /// assert_eq!(policy.written_check(&db)?.unwrap().to_string(), "on_day >= '2026-01-01'");
+    /// assert_eq!(policy.written_using(&db)?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn written_check<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
+    where
+        Self: 'db;
+
     /// Returns the functions used in the `WITH CHECK` expression.
     ///
     /// # Errors
@@ -618,14 +693,15 @@ pub trait PolicyLike:
     /// Returns the functions one call in the policy's expressions may reach,
     /// resolved under the search path of the statement that wrote the clause.
     ///
-    /// `call` is a node of [`Self::using_clause`] or [`Self::check_clause`],
-    /// at any depth, subqueries included. An unqualified name reaches
-    /// `pg_catalog` and every schema on the path, a qualified one only its own
-    /// schema, and every overload accepting the call's argument count counts,
-    /// since argument types are not inferred. A caller needing a property of
-    /// whatever the call runs asks each reachable function. An expression
-    /// PostgreSQL's grammar writes like a call, such as `COALESCE` or
-    /// `CURRENT_USER`, reaches no function.
+    /// `call` is a node of [`Self::using_clause`], [`Self::check_clause`],
+    /// [`Self::written_using`] or [`Self::written_check`], at any depth,
+    /// subqueries included. An unqualified name reaches `pg_catalog` and every
+    /// schema on the path, a qualified one only its own schema, and every
+    /// overload accepting the call's argument count counts, since argument
+    /// types are not inferred. A caller needing a property of whatever the
+    /// call runs asks each reachable function. An expression PostgreSQL's
+    /// grammar writes like a call, such as `COALESCE` or `CURRENT_USER`,
+    /// reaches no function.
     ///
     /// # Errors
     ///
@@ -717,6 +793,16 @@ where
         (*self).using_clause(database)
     }
 
+    fn written_using<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
+    where
+        Self: 'db,
+    {
+        (*self).written_using(database)
+    }
+
     fn using_functions<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -732,6 +818,16 @@ where
         Self: 'db,
     {
         (*self).check_clause(database)
+    }
+
+    fn written_check<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
+    where
+        Self: 'db,
+    {
+        (*self).written_check(database)
     }
 
     fn check_functions<'db>(

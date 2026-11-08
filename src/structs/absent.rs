@@ -282,6 +282,13 @@ impl<DB: DatabaseLike<Policy = Self>> PolicyLike for Absent<DB> {
         self.unreachable()
     }
 
+    fn written_using<'db>(&'db self, _: &'db Self::DB) -> Result<Option<&'db Expr>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.unreachable()
+    }
+
     fn using_functions<'db>(
         &'db self,
         _: &'db Self::DB,
@@ -293,6 +300,13 @@ impl<DB: DatabaseLike<Policy = Self>> PolicyLike for Absent<DB> {
         &'db self,
         _: &'db Self::DB,
     ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.unreachable()
+    }
+
+    fn written_check<'db>(&'db self, _: &'db Self::DB) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {

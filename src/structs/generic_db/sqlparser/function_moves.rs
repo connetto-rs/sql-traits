@@ -239,6 +239,11 @@ pub(super) fn move_functions(
             let policy = Arc::make_mut(policy);
             respell(&mut policy.using, metadata.using_calls(), moves)?;
             respell(&mut policy.with_check, metadata.check_calls(), moves)?;
+            for (written, calls) in metadata.written_clauses_mut() {
+                if let Some(written) = written {
+                    respell(written, calls, moves)?;
+                }
+            }
         }
     }
     for (view, metadata, _) in builder.views_mut() {

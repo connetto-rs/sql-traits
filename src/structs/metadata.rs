@@ -19,6 +19,6 @@ mod expression_calls;
 pub use expression_calls::ExpressionCalls;
 mod policy_metadata;
 pub use policy_metadata::PolicyMetadata;
-pub(crate) use policy_metadata::UnreadableLiteral;
+pub(crate) use policy_metadata::{ClauseLiterals, UnreadableLiteral};
 mod view_metadata;
 pub use view_metadata::ViewMetadata;
