@@ -128,8 +128,7 @@ fn a_literal_whose_value_is_unknown_hides_no_loop() {
     assert_eq!(recursion(&looping, "d", "reader", SELECT).as_deref(), Some("d"));
     assert_eq!(recursion(&looping, "u", "reader", SELECT).as_deref(), Some("u"));
 
-    // Without a loop the gate on `d` is judged, which needs the literal's
-    // value.
+    // Without a loop the gate on `d` is answered, its term marked unread.
     let database = ParserDB::parse::<PostgreSqlDialect>(&format!(
         "{TABLES}{d} CREATE POLICY u_sel ON u FOR SELECT USING (true);"
     ))
@@ -139,9 +138,11 @@ fn a_literal_whose_value_is_unknown_hides_no_loop() {
         .table_by_target(TargetName::new("d", false), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("the table exists");
+    let security = table.row_security(SELECT, reader, &database).expect("settled");
+    let gate = &security.gates().expect("the role is not exempt")[0];
     assert!(matches!(
-        table.row_security(SELECT, reader, &database),
-        Err(RowSecurityError::Lookup(LookupError::PolicyLiteralUnreadable { .. }))
+        gate.permissive()[0].expression(),
+        PolicyExpression::Written { unreadable: LookupError::PolicyLiteralUnreadable { .. }, .. }
     ));
 }
 

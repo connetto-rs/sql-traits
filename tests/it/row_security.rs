@@ -5,7 +5,11 @@
 //! own the table, one policy clause denied at a time.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::RowSecurityError, prelude::*};
+use sql_traits::{
+    errors::{LookupError, RowSecurityError},
+    prelude::*,
+};
+use sql_values::{DateTimeError, PgType};
 use sqlparser::dialect::PostgreSqlDialect;
 
 fn parse(sql: &str) -> ParserDB {
@@ -59,7 +63,12 @@ fn terms(
         terms
             .iter()
             .map(|term| {
-                format!("{} {:?}: {}", term.policy().name(), term.clause(), term.expression())
+                format!(
+                    "{} {:?}: {}",
+                    term.policy().name(),
+                    term.clause(),
+                    term.expression().expression()
+                )
             })
             .collect()
     };
@@ -396,7 +405,7 @@ fn a_caller_holding_no_role_gets_the_public_policies_and_refuses_a_scoped_one() 
         t.row_security(RowStatement::Select, ActingRole::Public, &database).expect("settled");
     let gate = &security.gates().expect("a caller holding no role is not exempt")[0];
     let permissive: Vec<String> =
-        gate.permissive().iter().map(|term| term.expression().to_string()).collect();
+        gate.permissive().iter().map(|term| term.expression().expression().to_string()).collect();
     assert_eq!(permissive, ["v = 1"]);
 
     assert_eq!(
@@ -410,4 +419,58 @@ fn a_caller_holding_no_role_gets_the_public_policies_and_refuses_a_scoped_one() 
         .row_security(RowStatement::Select, ActingRole::Public, &disabled)
         .expect("settled");
     assert_eq!(security.exemption(), Some(RowSecurityExemption::Disabled));
+}
+
+/// PostgreSQL judges every policy on the value its literals stored, so a
+/// literal whose value is not known here leaves its own term unread and every
+/// other term of the statement as it is.
+#[test]
+fn a_literal_whose_value_is_unknown_marks_its_own_term_alone() {
+    fn read<'a>(
+        terms: &'a [GateTerm<'_, <ParserDB as DatabaseLike>::Policy>],
+    ) -> Vec<(&'a str, String, Option<&'a LookupError>)> {
+        terms
+            .iter()
+            .map(|term| {
+                let unreadable = match term.expression() {
+                    PolicyExpression::Stored(_) => None,
+                    PolicyExpression::Written { unreadable, .. } => Some(unreadable),
+                };
+                (term.policy().name(), term.expression().expression().to_string(), unreadable)
+            })
+            .collect()
+    }
+    let database = parse(
+        "CREATE ROLE reader NOLOGIN;
+         CREATE TABLE t (id int PRIMARY KEY, owner text, expires timestamptz);
+         ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY own ON t FOR SELECT USING (owner = 'alice');
+         CREATE POLICY open_until ON t FOR SELECT USING (expires > '2026-01-01 09:00');
+         CREATE POLICY live ON t AS RESTRICTIVE FOR SELECT USING (expires > '2026-01-01 08:00');",
+    );
+    let security = security(&database, "reader", RowStatement::Select).expect("settled");
+    let gates = security.gates().expect("the role is not exempt");
+    assert_eq!(gates.len(), 1, "a SELECT puts one gate on a row");
+    let gate = &gates[0];
+    let unknown_zone = |policy: &str, literal: &str| {
+        LookupError::PolicyLiteralUnreadable {
+            policy: policy.to_owned(),
+            literal: literal.to_owned(),
+            data_type: PgType::TimestampTz,
+            reason: DateTimeError::NeedsTimeZone,
+        }
+    };
+    let open_until = unknown_zone("open_until", "2026-01-01 09:00");
+    let live = unknown_zone("live", "2026-01-01 08:00");
+    assert_eq!(
+        read(gate.permissive()),
+        [
+            ("open_until", "expires > '2026-01-01 09:00'".to_owned(), Some(&open_until)),
+            ("own", "owner = 'alice'".to_owned(), None),
+        ]
+    );
+    assert_eq!(
+        read(gate.restrictive()),
+        [("live", "expires > '2026-01-01 08:00'".to_owned(), Some(&live))]
+    );
 }

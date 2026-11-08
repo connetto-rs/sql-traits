@@ -14,8 +14,8 @@ use sqlparser::ast::{
 use crate::{
     errors::{LookupError, RowSecurityError},
     structs::{
-        ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, PolicyExpression, RowGate,
-        RowSecurity, RowSecurityExemption, RowStatement, RowVersion,
+        ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,
+        RowSecurityExemption, RowStatement, RowVersion,
     },
     traits::{
         DataStatementLike, DatabaseLike, PolicyLike, Relation, RoleLike, TableLike, ViewLike,
@@ -206,7 +206,6 @@ pub(crate) fn row_security<'db, T: TableLike>(
     }
     let policies: Vec<_> = table.policies(database)?.collect();
     let mut gates = Vec::new();
-    let mut unreadable = None;
     for (command, reads, row, failure) in specs(statement) {
         let mut gate =
             RowGate { command, row, failure, permissive: Vec::new(), restrictive: Vec::new() };
@@ -226,13 +225,6 @@ pub(crate) fn row_security<'db, T: TableLike>(
                 }
             };
             let Some((clause, expression)) = read else { continue };
-            let expression = match expression {
-                PolicyExpression::Stored(expression) => expression,
-                PolicyExpression::Written { expression, unreadable: error } => {
-                    unreadable.get_or_insert(error);
-                    expression
-                }
-            };
             let term = GateTerm { policy, clause, expression };
             match policy.policy_type() {
                 CreatePolicyType::Permissive => gate.permissive.push(term),
@@ -244,16 +236,11 @@ pub(crate) fn row_security<'db, T: TableLike>(
     let expressions = gates
         .iter()
         .flat_map(|gate| gate.permissive.iter().chain(&gate.restrictive))
-        .map(GateTerm::expression)
+        .map(|term| term.expression.expression())
         .collect();
     let mut expansion = Expansion { database, stack: Vec::new() };
     if let Some(relation) = expansion.table(table.borrow(), expressions, role)? {
         return Ok(RowSecurity::InfiniteRecursion { relation });
-    }
-    // PostgreSQL refuses a loop before it reads any value, so only a gate it
-    // goes on to judge needs the values its literals stored.
-    if let Some(error) = unreadable {
-        return Err(error.into());
     }
     Ok(RowSecurity::Gated(gates))
 }
