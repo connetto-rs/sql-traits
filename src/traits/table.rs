@@ -4500,13 +4500,15 @@ pub trait TableLike:
     /// a role other than `role`. Where expanding the applied policies loops
     /// back into a table still being expanded, the answer is
     /// [`RowSecurity::InfiniteRecursion`], as PostgreSQL refuses the statement.
+    /// A policy clause holding a literal whose stored value is not known here
+    /// stays in its gate as
+    /// [`PolicyExpression::Written`](crate::structs::PolicyExpression::Written),
+    /// so every other term is answered as usual.
     ///
     /// # Errors
     ///
     /// Returns [`RowSecurityError::Lookup`] when the table is not in
-    /// `database` or, where no loop refuses the statement first, a gate of the
-    /// statement holds a literal [`PolicyLike::using_expression`] cannot read,
-    /// [`RowSecurityError::RoleRequired`] when a policy gating the
+    /// `database`, [`RowSecurityError::RoleRequired`] when a policy gating the
     /// statement is scoped to a role and `role` is [`ActingRole::Public`],
     /// [`RowSecurityError::UnsettledRole`] when a policy's `TO` list cannot be
     /// settled for `role` from the schema, and

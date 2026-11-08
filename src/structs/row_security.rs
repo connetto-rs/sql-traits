@@ -4,7 +4,7 @@
 
 use alloc::{string::String, vec::Vec};
 
-use sqlparser::ast::Expr;
+use super::PolicyExpression;
 
 /// Who a statement runs as.
 #[derive(Debug)]
@@ -126,12 +126,12 @@ pub enum PolicyClause {
     WithCheck,
 }
 
-/// One policy's expression in a gate.
+/// One policy's clause in a gate.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GateTerm<'db, P> {
     pub(crate) policy: &'db P,
     pub(crate) clause: PolicyClause,
-    pub(crate) expression: &'db Expr,
+    pub(crate) expression: PolicyExpression<'db>,
 }
 
 impl<'db, P> GateTerm<'db, P> {
@@ -148,10 +148,11 @@ impl<'db, P> GateTerm<'db, P> {
         self.clause
     }
 
-    /// The expression.
+    /// The clause, [`PolicyExpression::Written`] where a literal of it holds
+    /// a value not known here.
     #[must_use]
-    pub fn expression(&self) -> &'db Expr {
-        self.expression
+    pub fn expression(&self) -> &PolicyExpression<'db> {
+        &self.expression
     }
 }
 
