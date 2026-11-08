@@ -930,6 +930,10 @@ mod tests {
             policy_ref.check_functions(&db).expect("check_functions").collect();
         assert_eq!(check_funcs.len(), 1);
         assert_eq!(check_funcs[0].name(), "check_func");
+
+        // The dialect binds no literal, so each clause reads as written.
+        assert_eq!(policy_ref.written_using(&db).expect("policy is held"), Some(using_expr));
+        assert_eq!(policy_ref.written_check(&db).expect("policy is held"), Some(check_expr));
     }
 
     #[test]
