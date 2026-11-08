@@ -393,6 +393,34 @@ fn a_clause_with_an_unread_literal_answers_as_written_beside_its_error() -> Resu
 }
 
 #[test]
+fn a_policy_name_on_two_tables_answers_each_policy_its_own_literals() -> Result<(), LookupError> {
+    let on_m = "CREATE POLICY p ON m USING (expires > '2026-01-01 09:00');";
+    let on_t = "CREATE POLICY p ON t USING (s = current_user);";
+    for script in [format!("{on_m}{on_t}"), format!("{on_t}{on_m}")] {
+        let db = parse(&script);
+        let on = |table: &str| {
+            db.policies()
+                .find(|policy| policy.target_table_name().name() == table)
+                .expect("policy exists")
+        };
+        assert_eq!(
+            clause(on("m").using_clause(&db)?),
+            (
+                "expires > '2026-01-01 09:00'".to_owned(),
+                Some(unreadable(
+                    "p",
+                    "2026-01-01 09:00",
+                    PgType::TimestampTz,
+                    DateTimeError::NeedsTimeZone
+                ))
+            )
+        );
+        assert_eq!(clause(on("t").using_clause(&db)?), ("s = current_user".to_owned(), None));
+    }
+    Ok(())
+}
+
+#[test]
 fn a_dialect_without_policies_of_its_own_keeps_literals_as_written() -> Result<(), Error> {
     let db = ParserDB::parse::<GenericDialect>(&format!(
         "{TABLES} CREATE POLICY p ON t USING (tz < '2026-01-01 12:00');"
