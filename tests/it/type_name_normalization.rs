@@ -148,6 +148,88 @@ fn test_column_type_normalizes_like_its_print() {
     assert_eq!(names, printed);
 }
 
+/// Each row is a column type as DDL may write it, beside PostgreSQL 18's
+/// `format_type` print of the column, which carries its type modifiers.
+const MODIFIED_COLUMNS: &[(&str, &str)] = &[
+    ("NCHAR(4)", "character(4)"),
+    ("NCHAR", "character(1)"),
+    ("BPCHAR(4)", "character(4)"),
+    ("bpchar(4)[]", "character(4)[]"),
+    ("pg_catalog.bpchar(4)", "character(4)"),
+    ("CHAR(4)", "character(4)"),
+    ("bpchar", "bpchar"),
+    ("\"char\"", "\"char\""),
+    ("varchar(10)", "character varying(10)"),
+    ("\"varchar\"(5)", "character varying(5)"),
+    ("character varying(4)[]", "character varying(4)[]"),
+    ("numeric(10,2)", "numeric(10,2)"),
+    ("timestamptz(3)", "timestamp(3) with time zone"),
+    ("timestamp(3)", "timestamp(3) without time zone"),
+    ("time(2)", "time(2) without time zone"),
+    ("timetz(2)", "time(2) with time zone"),
+    ("bit(3)", "bit(3)"),
+    ("bit varying(5)", "bit varying(5)"),
+    ("interval(3)", "interval(3)"),
+    ("interval year to month", "interval year to month"),
+    ("interval day to second(3)", "interval day to second(3)"),
+    ("interval minute", "interval minute"),
+    ("float(10)", "real"),
+];
+
+/// A type modifier narrows a builtin without naming another type, so a
+/// declared column and PostgreSQL's print of it answer one name wherever the
+/// modifier stands.
+#[test]
+fn test_column_type_with_modifiers_normalizes_like_its_print() {
+    let mut ddl = String::from("CREATE TABLE t (");
+    for (index, (declared, _)) in MODIFIED_COLUMNS.iter().enumerate() {
+        if index > 0 {
+            ddl.push_str(", ");
+        }
+        write!(ddl, "c{index} {declared}").expect("writing to a string");
+    }
+    ddl.push_str(");");
+    let database = ParserDB::parse::<PostgreSqlDialect>(&ddl).expect("the table parses");
+    let table = database
+        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the DDL declares the table");
+    let columns = table.columns(&database).expect("the table has columns");
+    for ((declared, printed), column) in MODIFIED_COLUMNS.iter().zip(columns) {
+        assert_eq!(
+            column.data_type(&database).normalized_name(&database),
+            normalize_postgres_type(printed),
+            "{declared} beside {printed}"
+        );
+    }
+}
+
+/// Every spelling PostgreSQL stores as the blank-padded `bpchar` answers
+/// `CHAR`, element types of arrays included, while the one-byte `"char"`
+/// stays apart.
+#[test]
+fn test_bpchar_spellings_answer_char() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE t (a NCHAR(4), b nchar, c BPCHAR(4), d pg_catalog.bpchar(4), \
+         e character(4), f bpchar, g bpchar(4)[], h nchar(2)[], i \"char\");",
+    )
+    .expect("the table parses");
+    let table = database
+        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the DDL declares the table");
+    let names: Vec<String> = table
+        .columns(&database)
+        .expect("the table has columns")
+        .map(|column| {
+            let data_type = column.data_type(&database);
+            let element = data_type.array_element(&database).unwrap_or(data_type);
+            element.normalized_name(&database).into_owned()
+        })
+        .collect();
+    assert_eq!(names, ["CHAR", "CHAR", "CHAR", "CHAR", "CHAR", "CHAR", "CHAR", "CHAR", "\"char\""]);
+}
+
 /// A `pg_catalog` qualifier names the type its bare spelling names, so both
 /// spellings answer one scalar family.
 #[test]
