@@ -215,6 +215,20 @@ pub enum RowSecurityExemption {
     Owner,
 }
 
+impl core::fmt::Display for RowSecurityExemption {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Disabled => "the table does not enable row-level security",
+            Self::Superuser => "the role is a superuser",
+            Self::BypassRls => "the role has BYPASSRLS",
+            Self::Owner => {
+                "the role owns the table, or inherits from its owner, and the table does not \
+                 FORCE row-level security"
+            }
+        })
+    }
+}
+
 /// What row-level security applies to one statement for one role.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RowSecurity<'db, P> {
@@ -257,6 +271,29 @@ impl<'db, P> RowSecurity<'db, P> {
         match self {
             Self::InfiniteRecursion { relation } => Some(relation),
             Self::Exempt(_) | Self::Gated(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use super::RowSecurityExemption;
+
+    #[test]
+    fn exemptions_render_why_row_security_does_not_apply() {
+        for (exemption, text) in [
+            (RowSecurityExemption::Disabled, "the table does not enable row-level security"),
+            (RowSecurityExemption::Superuser, "the role is a superuser"),
+            (RowSecurityExemption::BypassRls, "the role has BYPASSRLS"),
+            (
+                RowSecurityExemption::Owner,
+                "the role owns the table, or inherits from its owner, and the table does not \
+                 FORCE row-level security",
+            ),
+        ] {
+            assert_eq!(exemption.to_string(), text);
         }
     }
 }
