@@ -46,8 +46,8 @@ use crate::{
         Sequence, TableAttribute, TableMetadata, UserDefinedType, View,
         generic_db::builtin_functions::Builtins,
         metadata::{
-            CheckMetadata, ColumnCreation, ExpressionCalls, IndexMetadata, PolicyMetadata,
-            UniqueIndexMetadata,
+            CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
+            PolicyMetadata, UniqueIndexMetadata,
         },
     },
     traits::{ColumnLike, IndexLike, SequenceLike, TableLike, ViewLike},
@@ -1496,9 +1496,14 @@ impl ParserDBBuilder {
             }
         }
 
-        for (policy, _) in self.policies_mut() {
+        for (policy, metadata) in self.policies_mut() {
             if table.named_by(&policy.table_name) {
                 rename_column_in_expressions(Arc::make_mut(policy), table, declaring, from, to);
+                for (written, _) in metadata.written_clauses_mut() {
+                    if let Some(written) = written {
+                        rename_column_in_expressions(written, table, declaring, from, to);
+                    }
+                }
             }
         }
 
@@ -10399,14 +10404,15 @@ impl ParserDB {
                     // PostgreSQL stores each literal as this session reads it.
                     let session = policy_literals::LiteralSession::of(&session_settings);
                     let bind = |clause: Option<&mut Expr>| {
-                        clause.filter(|_| matches!(dialect, SqlparserDialect::PostgreSql)).and_then(
+                        clause.filter(|_| matches!(dialect, SqlparserDialect::PostgreSql)).map_or(
+                            ClauseLiterals::AsWritten,
                             |clause| {
                                 policy_literals::bind(&builder, &policy.table_name, clause, session)
                             },
                         )
                     };
-                    let using_unreadable = bind(policy.using.as_mut());
-                    let check_unreadable = bind(policy.with_check.as_mut());
+                    let using_literals = bind(policy.using.as_mut());
+                    let check_literals = bind(policy.with_check.as_mut());
 
                     let using_calls = policy
                         .using
@@ -10418,8 +10424,8 @@ impl ParserDB {
                         .map_or_else(ExpressionCalls::default, |check| builder.calls_in(check));
 
                     let mut metadata = PolicyMetadata::new(using_calls, check_calls);
-                    metadata.set_using_unreadable(using_unreadable);
-                    metadata.set_check_unreadable(check_unreadable);
+                    metadata.set_using_literals(using_literals);
+                    metadata.set_check_literals(check_literals);
                     builder = builder.add_policy(Arc::new(policy), metadata);
                 }
                 Statement::CreateRole(mut create_role) => {
@@ -10910,7 +10916,7 @@ impl ParserDB {
                             let bind = |clause: Option<&mut Expr>| {
                                 clause
                                     .filter(|_| matches!(dialect, SqlparserDialect::PostgreSql))
-                                    .and_then(|clause| {
+                                    .map_or(ClauseLiterals::AsWritten, |clause| {
                                         policy_literals::bind(
                                             &builder,
                                             &table_name,
@@ -10919,8 +10925,8 @@ impl ParserDB {
                                         )
                                     })
                             };
-                            let using_unreadable = bind(using.as_mut());
-                            let check_unreadable = bind(with_check.as_mut());
+                            let using_literals = bind(using.as_mut());
+                            let check_literals = bind(with_check.as_mut());
 
                             // Calls resolve against the builder, before its
                             // store is borrowed mutably.
@@ -10946,11 +10952,11 @@ impl ParserDB {
                             }
                             if let Some(using_calls) = using_calls {
                                 metadata.set_using_calls(using_calls);
-                                metadata.set_using_unreadable(using_unreadable);
+                                metadata.set_using_literals(using_literals);
                             }
                             if let Some(check_calls) = check_calls {
                                 metadata.set_check_calls(check_calls);
-                                metadata.set_check_unreadable(check_unreadable);
+                                metadata.set_check_literals(check_literals);
                             }
                         }
                     }

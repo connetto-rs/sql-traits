@@ -1359,6 +1359,16 @@ impl PolicyLike for MemoryPolicy {
         Ok(None)
     }
 
+    fn written_using<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(None)
+    }
+
     fn using_functions<'db>(
         &'db self,
         _database: &'db Self::DB,
@@ -1370,6 +1380,16 @@ impl PolicyLike for MemoryPolicy {
         &'db self,
         _database: &'db Self::DB,
     ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(None)
+    }
+
+    fn written_check<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>
     where
         Self: 'db,
     {

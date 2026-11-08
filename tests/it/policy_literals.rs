@@ -4,14 +4,17 @@
 //!
 //! Every expected value is what PostgreSQL 18.6 stored for the same script,
 //! read back from `pg_policies` under `TimeZone` `UTC`.
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 
 use sql_traits::{
     errors::{Error, LookupError},
     prelude::*,
 };
 use sql_values::{DateTimeError, PgType};
-use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
+use sqlparser::{
+    ast::Expr,
+    dialect::{GenericDialect, PostgreSqlDialect},
+};
 
 const TABLES: &str =
     "CREATE TABLE t (id INT, tz TIMESTAMPTZ, d DATE, ts TIMESTAMP, tt TIMETZ, tm TIME, s TEXT);
@@ -32,6 +35,16 @@ fn using(db: &ParserDB, name: &str) -> Result<String, LookupError> {
 
 fn check(db: &ParserDB, name: &str) -> Result<String, LookupError> {
     let check = policy(db, name).check_expression(db)?;
+    Ok(check.expect("a WITH CHECK clause").to_string())
+}
+
+fn written_using(db: &ParserDB, name: &str) -> Result<String, LookupError> {
+    let using = policy(db, name).written_using(db)?;
+    Ok(using.expect("a USING clause").to_string())
+}
+
+fn written_check(db: &ParserDB, name: &str) -> Result<String, LookupError> {
+    let check = policy(db, name).written_check(db)?;
     Ok(check.expect("a WITH CHECK clause").to_string())
 }
 
@@ -416,6 +429,75 @@ fn a_policy_name_on_two_tables_answers_each_policy_its_own_literals() -> Result<
             )
         );
         assert_eq!(clause(on("t").using_clause(&db)?), ("s = current_user".to_owned(), None));
+    }
+    Ok(())
+}
+
+#[test]
+fn each_clause_answers_as_written_beside_its_stored_literals() -> Result<(), LookupError> {
+    let db = parse(
+        "SET TIME ZONE 'Europe/Rome';
+         CREATE POLICY p_read ON t USING (ts < '2026-01-01 12:00')
+             WITH CHECK (tz > '2026-01-01'::timestamptz AND id > 0);
+         CREATE POLICY p_plain ON t USING (s = 'x');
+         CREATE POLICY p_check ON t WITH CHECK (d < '2026-01-01');
+         RESET timezone;
+         CREATE POLICY p_unread ON t USING (tz < '2026-01-01 12:00');",
+    );
+    assert_eq!(using(&db, "p_read")?, "ts < '2026-01-01 12:00:00'::TIMESTAMP WITHOUT TIME ZONE");
+    assert_eq!(written_using(&db, "p_read")?, "ts < '2026-01-01 12:00'");
+    assert_eq!(check(&db, "p_read")?, "tz > '2025-12-31 23:00:00+00'::TIMESTAMPTZ AND id > 0");
+    assert_eq!(written_check(&db, "p_read")?, "tz > '2026-01-01'::TIMESTAMPTZ AND id > 0");
+    assert_eq!(written_using(&db, "p_plain")?, "s = 'x'");
+    assert_eq!(policy(&db, "p_plain").written_check(&db)?, None);
+    assert_eq!(policy(&db, "p_check").written_using(&db)?, None);
+    assert_eq!(written_check(&db, "p_check")?, "d < '2026-01-01'");
+    assert_eq!(written_using(&db, "p_unread")?, "tz < '2026-01-01 12:00'");
+    Ok(())
+}
+
+#[test]
+fn the_written_clause_follows_the_statements_that_respell_the_stored_one() -> Result<(), LookupError>
+{
+    let db = parse(
+        "SET TIME ZONE 'UTC';
+         CREATE SCHEMA s;
+         CREATE SCHEMA o;
+         CREATE FUNCTION s.f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+         CREATE POLICY p_alter ON t USING (ts < '2026-01-01 12:00') WITH CHECK (id > 0);
+         ALTER POLICY p_alter ON t USING (d < '2026-01-01');
+         CREATE POLICY p_moved ON t USING (ts < '2026-01-01 12:00' AND s.f() = id)
+             WITH CHECK (d < '2026-01-01' OR s.f() = 1);
+         ALTER TABLE t RENAME COLUMN ts TO stamp;
+         ALTER FUNCTION s.f() SET SCHEMA o;",
+    );
+    assert_eq!(written_using(&db, "p_alter")?, "d < '2026-01-01'");
+    assert_eq!(written_check(&db, "p_alter")?, "id > 0");
+    assert_eq!(
+        using(&db, "p_moved")?,
+        "stamp < '2026-01-01 12:00:00'::TIMESTAMP WITHOUT TIME ZONE AND o.f() = id"
+    );
+    assert_eq!(written_using(&db, "p_moved")?, "stamp < '2026-01-01 12:00' AND o.f() = id");
+    assert_eq!(written_check(&db, "p_moved")?, "d < '2026-01-01' OR o.f() = 1");
+    Ok(())
+}
+
+#[test]
+fn a_call_of_the_written_clause_reaches_the_functions_of_the_stored_one() -> Result<(), LookupError>
+{
+    let db = parse(
+        "SET TIME ZONE 'UTC';
+         CREATE FUNCTION f(x TIMESTAMP) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';
+         CREATE POLICY p ON t USING (ts < '2026-01-01' AND f(ts))
+             WITH CHECK (d < '2026-01-01' AND f(ts));",
+    );
+    let policy = policy(&db, "p");
+    for written in [policy.written_using(&db)?, policy.written_check(&db)?] {
+        let Some(Expr::BinaryOp { right, .. }) = written else { panic!("a conjunction") };
+        let Expr::Function(call) = right.as_ref() else { panic!("a call") };
+        let reached: Vec<_> =
+            policy.functions_reached_by(call, &db)?.map(FunctionLike::name).collect();
+        assert_eq!(reached, ["f"]);
     }
     Ok(())
 }
