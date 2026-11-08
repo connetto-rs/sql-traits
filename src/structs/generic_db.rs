@@ -501,11 +501,13 @@ impl<P: SchemaProfile> GenericDB<P> {
             .or_else(|| self.builtins.metadata(function))
     }
 
-    /// Returns a reference of the trigger by name.
+    /// Returns the trigger of the given name on `table`. A trigger name is
+    /// unique per table, so the same name may name a trigger on another table.
     ///
     /// # Arguments
     ///
     /// * `name` - The name of the trigger to retrieve.
+    /// * `table` - The table carrying the trigger.
     ///
     /// # Example
     ///
@@ -516,22 +518,28 @@ impl<P: SchemaProfile> GenericDB<P> {
     /// let db = ParserDB::parse::<GenericDialect>(
     ///     "
     ///     CREATE TABLE t (id INT);
+    ///     CREATE TABLE u (id INT);
     ///     CREATE FUNCTION f() RETURNS TRIGGER AS 'BEGIN END' LANGUAGE plpgsql;
     ///     CREATE TRIGGER my_trigger AFTER INSERT ON t FOR EACH ROW EXECUTE PROCEDURE f();
     ///     ",
     /// )?;
-    /// let trigger = db.trigger("my_trigger").unwrap();
+    /// let t = db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let u = db.table_by_target(TargetName::new("u", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let trigger = db.trigger("my_trigger", t).unwrap();
     /// assert_eq!(trigger.name(), "my_trigger");
-    /// assert!(db.trigger("non_existent").is_none());
+    /// assert!(db.trigger("my_trigger", u).is_none());
+    /// assert!(db.trigger("non_existent", t).is_none());
     /// # Ok(())
     /// # }
     /// ```
     #[must_use]
-    pub fn trigger(&self, name: &str) -> Option<&P::Trigger> {
-        self.triggers
-            .binary_search_by(|(t, _)| t.name().cmp(name))
-            .ok()
-            .map(|index| self.triggers[index].0.as_ref())
+    pub fn trigger(&self, name: &str, table: &P::Table) -> Option<&P::Trigger> {
+        let first = self.triggers.partition_point(|(t, _)| t.name() < name);
+        self.triggers[first..]
+            .iter()
+            .map(|(t, _)| t.as_ref())
+            .take_while(|t| t.name() == name)
+            .find(|t| t.table(self).is_ok_and(|on| on == table))
     }
 
     /// Returns a reference to the metadata of the specified trigger, if it
@@ -554,14 +562,18 @@ impl<P: SchemaProfile> GenericDB<P> {
     ///     CREATE TRIGGER my_trigger AFTER INSERT ON t FOR EACH ROW EXECUTE PROCEDURE f();
     ///     ",
     /// )?;
-    /// let trigger = db.trigger("my_trigger").unwrap();
+    /// let trigger = db.triggers().next().unwrap();
     /// assert!(db.trigger_metadata(trigger).is_some());
     /// # Ok(())
     /// # }
     /// ```
     pub fn trigger_metadata(&self, trigger: &P::Trigger) -> Option<&Meta<P::Trigger>> {
         self.triggers
-            .binary_search_by(|(t, _)| t.name().cmp(trigger.name()))
+            .binary_search_by(|(t, _)| {
+                t.name()
+                    .cmp(trigger.name())
+                    .then_with(|| t.target_table_name().cmp(&trigger.target_table_name()))
+            })
             .ok()
             .map(|index| &self.triggers[index].1)
     }

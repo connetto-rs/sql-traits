@@ -1181,7 +1181,10 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.functions.sort_unstable_by(|(a, _), (b, _)| {
             a.name().cmp(b.name()).then_with(|| a.as_ref().cmp(b.as_ref()))
         });
-        self.triggers.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
+        // A trigger name is unique per table, so the table breaks the tie.
+        self.triggers.sort_unstable_by(|(a, _), (b, _)| {
+            a.name().cmp(b.name()).then_with(|| a.target_table_name().cmp(&b.target_table_name()))
+        });
         // A rule name is unique per relation, so the relation breaks the tie.
         self.rules.sort_unstable_by(|(a, _), (b, _)| {
             a.name()
