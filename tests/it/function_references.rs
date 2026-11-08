@@ -128,6 +128,42 @@ fn a_trigger_reports_the_function_it_runs() {
     assert!(trigger.function(&spelled_public).is_some(), "public.f is the f a bare name reaches");
 }
 
+/// A trigger name is unique per table, so one name on two tables names two
+/// triggers, each with the calls of its own `WHEN` condition.
+#[test]
+fn a_trigger_name_on_two_tables_names_each_tables_own_trigger() {
+    let on_a =
+        "CREATE TRIGGER t BEFORE INSERT ON a FOR EACH ROW WHEN (fa() > 0) EXECUTE FUNCTION trg();";
+    let on_b =
+        "CREATE TRIGGER t BEFORE INSERT ON b FOR EACH ROW WHEN (fb() > 0) EXECUTE FUNCTION trg();";
+    for triggers in [format!("{on_a} {on_b}"), format!("{on_b} {on_a}")] {
+        let db = parse(&format!(
+            "CREATE FUNCTION fa() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             CREATE FUNCTION fb() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 2';
+             CREATE FUNCTION trg() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+             CREATE TABLE a (id INT);
+             CREATE TABLE b (id INT);
+             {triggers}"
+        ))
+        .expect("schema parses");
+        for (table, called) in [("a", "fa"), ("b", "fb")] {
+            let table = db
+                .table_by_target(TargetName::new(table, false), IdentifierCase::AsWritten)
+                .expect("the lookup runs")
+                .expect("the table exists");
+            let trigger = db.trigger("t", table).expect("the table carries t");
+            assert_eq!(trigger.table(&db).expect("the trigger's table"), table);
+            let calls: Vec<&str> = db
+                .trigger_metadata(trigger)
+                .expect("the trigger is held")
+                .functions()
+                .map(FunctionLike::name)
+                .collect();
+            assert_eq!(calls, [called], "{triggers}");
+        }
+    }
+}
+
 /// The functions `f` and `trg` and the table `t` every dependent below is
 /// written against.
 const CALLED: &str = "CREATE FUNCTION f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
