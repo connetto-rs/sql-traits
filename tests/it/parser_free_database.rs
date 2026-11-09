@@ -2692,7 +2692,9 @@ fn legal_policy_commands_route_each_clause_and_diagnose_missing_prerequisites() 
                     check: has_check.then(|| Expr::Value(Value::Boolean(true).into())),
                 };
                 let catalog = catalog();
-                let analysis = policy.clause_analysis(&catalog).expect("analysis");
+                let borrowed_policy = &policy;
+                let analysis =
+                    PolicyLike::clause_analysis(&borrowed_policy, &catalog).expect("analysis");
                 assert_eq!(analysis.command(), command);
                 assert_eq!(analysis.mode(), mode);
                 assert_eq!(analysis.invalid_clause(), None);
