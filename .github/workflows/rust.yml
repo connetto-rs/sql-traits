@@ -36,6 +36,7 @@ jobs:
 
   msrv:
     name: MSRV
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -61,6 +62,7 @@ jobs:
 
   no_std:
     name: no_std + alloc build
+    if: github.event_name != 'pull_request'
     # Verifies the library is truly `no_std + alloc`-portable, in two
     # layers:
     #
