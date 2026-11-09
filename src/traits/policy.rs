@@ -7,7 +7,7 @@ use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Function, Owne
 
 use crate::{
     errors::LookupError,
-    structs::{PolicyExpression, TargetName},
+    structs::{PolicyAnalysis, PolicyExpression, TargetName},
     traits::{DatabaseLike, Metadata, RoleLike, role::privilege_holders},
     utils::identifier_resolution::normalize_identifier,
 };
@@ -237,6 +237,53 @@ pub trait PolicyLike:
     /// # }
     /// ```
     fn policy_type(&self) -> CreatePolicyType;
+
+    /// Analyzes declared clauses and their legal targets without consulting an
+    /// acting role.
+    ///
+    /// Illegal definitions retain their clauses but supply no effective targets
+    /// or missing-clause diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns a clause accessor's [`LookupError`] when the database cannot
+    /// supply the definition.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "CREATE TABLE docs(id INT);
+    ///      CREATE POLICY p ON docs FOR UPDATE USING (id > 0);",
+    /// )?;
+    /// let policy = db.policies().next().unwrap();
+    /// let analysis = policy.clause_analysis(&db)?;
+    /// assert_eq!(PolicyTarget::UpdateCheck.clause(), PolicyClause::WithCheck);
+    /// assert_eq!(analysis.source(PolicyTarget::UpdateCheck), Some(PolicyClause::Using));
+    /// assert_eq!(
+    ///     analysis.targets(PolicyClause::Using).collect::<Vec<_>>(),
+    ///     [PolicyTarget::UpdateUsing, PolicyTarget::UpdateCheck],
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn clause_analysis<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<PolicyAnalysis<'db>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(PolicyAnalysis::new(
+            self.command(),
+            self.policy_type(),
+            self.using_clause(database)?,
+            self.check_clause(database)?,
+        ))
+    }
 
     /// Returns the roles the policy names.
     ///
@@ -770,6 +817,16 @@ where
 
     fn policy_type(&self) -> CreatePolicyType {
         (*self).policy_type()
+    }
+
+    fn clause_analysis<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<PolicyAnalysis<'db>, LookupError>
+    where
+        Self: 'db,
+    {
+        (*self).clause_analysis(database)
     }
 
     fn roles<'db>(&'db self, database: &'db Self::DB) -> impl Iterator<Item = &'db Owner>

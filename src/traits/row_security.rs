@@ -7,15 +7,14 @@ use alloc::{
 use core::{ops::ControlFlow, ptr};
 
 use sqlparser::ast::{
-    CreatePolicyCommand, CreatePolicyType, Expr, FunctionArguments, InTarget, Owner, Query, Visit,
-    Visitor,
+    CreatePolicyType, Expr, FunctionArguments, InTarget, Owner, Query, Visit, Visitor,
 };
 
 use crate::{
     errors::{LookupError, RowSecurityError},
     structs::{
-        ActingRole, GateFailure, GateTerm, GatedCommand, PolicyClause, RowGate, RowSecurity,
-        RowSecurityExemption, RowStatement, RowVersion,
+        ActingRole, GateFailure, GateTerm, PolicyClause, PolicyTarget, RowGate, RowSecurity,
+        RowSecurityExemption, RowStatement, RowVersion, policy_analysis::command_targets,
     },
     traits::{
         DataStatementLike, DatabaseLike, PolicyLike, Relation, RoleLike, TableLike, ViewLike,
@@ -24,17 +23,8 @@ use crate::{
     utils::identifier_resolution::normalize_identifier,
 };
 
-/// Which clause a gate reads: `USING` alone, or `WITH CHECK` falling back to
-/// `USING`.
-#[derive(Clone, Copy)]
-enum Reads {
-    Using,
-    Check,
-}
-
-/// One row of PostgreSQL's table: whose policies, which clause, which row,
-/// and what failing does.
-type Spec = (GatedCommand, Reads, RowVersion, GateFailure);
+/// One statement gate's clause context, row version and failure behavior.
+type Spec = (PolicyTarget, RowVersion, GateFailure);
 
 /// The gates `statement` puts on a row, measured on PostgreSQL 18.6.
 ///
@@ -42,86 +32,74 @@ type Spec = (GatedCommand, Reads, RowVersion, GateFailure);
 /// `WITH CHECK`, as PostgreSQL forces it.
 fn specs(statement: RowStatement) -> Vec<Spec> {
     use GateFailure::{Filter, Raise};
-    use GatedCommand::{Delete, Insert, Select, Update};
-    use Reads::{Check, Using};
+    use PolicyTarget::{Delete, Insert, Select, UpdateCheck, UpdateUsing};
     use RowVersion::{Existing, Inserted, Updated};
 
     let mut specs = Vec::new();
     match statement {
         RowStatement::Select | RowStatement::MergeDoNothing => {
-            specs.push((Select, Using, Existing, Filter));
+            specs.push((Select, Existing, Filter));
         }
         RowStatement::SelectLocking => {
-            specs.extend([(Select, Using, Existing, Filter), (Update, Using, Existing, Filter)]);
+            specs.extend([(Select, Existing, Filter), (UpdateUsing, Existing, Filter)]);
         }
         RowStatement::Insert { returning } => {
-            specs.push((Insert, Check, Inserted, Raise));
+            specs.push((Insert, Inserted, Raise));
             if returning {
-                specs.push((Select, Using, Inserted, Raise));
+                specs.push((Select, Inserted, Raise));
             }
         }
         RowStatement::MergeInsert { reads, returning } => {
-            specs.push((Insert, Check, Inserted, Raise));
+            specs.push((Insert, Inserted, Raise));
             if reads {
-                specs.push((Select, Using, Existing, Filter));
+                specs.push((Select, Existing, Filter));
                 if returning {
-                    specs.push((Select, Using, Inserted, Raise));
+                    specs.push((Select, Inserted, Raise));
                 }
             }
         }
         RowStatement::Update { reads } => {
-            specs.extend([(Update, Using, Existing, Filter), (Update, Check, Updated, Raise)]);
+            specs.extend([(UpdateUsing, Existing, Filter), (UpdateCheck, Updated, Raise)]);
             if reads {
-                specs.extend([(Select, Using, Existing, Filter), (Select, Using, Updated, Raise)]);
+                specs.extend([(Select, Existing, Filter), (Select, Updated, Raise)]);
             }
         }
         RowStatement::Delete { reads } => {
-            specs.push((Delete, Using, Existing, Filter));
+            specs.push((Delete, Existing, Filter));
             if reads {
-                specs.push((Select, Using, Existing, Filter));
+                specs.push((Select, Existing, Filter));
             }
         }
         RowStatement::InsertOnConflictDoNothing { arbiter } => {
-            specs.push((Insert, Check, Inserted, Raise));
+            specs.push((Insert, Inserted, Raise));
             if arbiter {
-                specs.push((Select, Using, Inserted, Raise));
+                specs.push((Select, Inserted, Raise));
             }
         }
         RowStatement::InsertOnConflictDoUpdate => {
             specs.extend([
-                (Insert, Check, Inserted, Raise),
-                (Select, Using, Inserted, Raise),
-                (Select, Using, Existing, Raise),
-                (Update, Using, Existing, Raise),
-                (Select, Using, Updated, Raise),
-                (Update, Check, Updated, Raise),
+                (Insert, Inserted, Raise),
+                (Select, Inserted, Raise),
+                (Select, Existing, Raise),
+                (UpdateUsing, Existing, Raise),
+                (Select, Updated, Raise),
+                (UpdateCheck, Updated, Raise),
             ]);
         }
         RowStatement::MergeUpdate { reads } => {
-            specs.extend([(Update, Using, Existing, Raise), (Update, Check, Updated, Raise)]);
+            specs.extend([(UpdateUsing, Existing, Raise), (UpdateCheck, Updated, Raise)]);
             if reads {
-                specs.extend([(Select, Using, Existing, Filter), (Select, Using, Updated, Raise)]);
+                specs.extend([(Select, Existing, Filter), (Select, Updated, Raise)]);
             }
         }
         RowStatement::MergeDelete { reads } => {
-            specs.push((Delete, Using, Existing, Raise));
+            specs.push((Delete, Existing, Raise));
             if reads {
-                specs.push((Select, Using, Existing, Filter));
+                specs.push((Select, Existing, Filter));
             }
         }
     }
     specs
-}
-
-/// Whether `policy` is written for `command`, directly or through `FOR ALL`.
-fn covers<P: PolicyLike>(policy: &P, command: GatedCommand) -> bool {
-    match policy.command() {
-        CreatePolicyCommand::All => true,
-        CreatePolicyCommand::Select => command == GatedCommand::Select,
-        CreatePolicyCommand::Insert => command == GatedCommand::Insert,
-        CreatePolicyCommand::Update => command == GatedCommand::Update,
-        CreatePolicyCommand::Delete => command == GatedCommand::Delete,
-    }
 }
 
 /// Whether `policy`'s `TO` list reaches `role`.
@@ -204,34 +182,55 @@ pub(crate) fn row_security<'db, T: TableLike>(
     if let Some(exemption) = exemption(table, role, database)? {
         return Ok(RowSecurity::Exempt(exemption));
     }
-    let policies: Vec<_> = table.policies(database)?.collect();
-    let mut gates = Vec::new();
-    for (command, reads, row, failure) in specs(statement) {
-        let mut gate =
-            RowGate { command, row, failure, permissive: Vec::new(), restrictive: Vec::new() };
-        for &policy in &policies {
-            // A policy the gate does not consult is never settled, so its `TO`
-            // list cannot refuse a statement it plays no part in.
-            if !covers(policy, command) || !applies(policy, role, database)? {
-                continue;
+    let specs = specs(statement);
+    let mut gates: Vec<_> = specs
+        .iter()
+        .map(|&(target, row, failure)| {
+            RowGate {
+                command: target.command(),
+                row,
+                failure,
+                permissive: Vec::new(),
+                restrictive: Vec::new(),
             }
-            let read = match reads {
-                Reads::Using => policy.using_clause(database)?.map(|e| (PolicyClause::Using, e)),
-                Reads::Check => {
-                    match policy.check_clause(database)? {
-                        Some(check) => Some((PolicyClause::WithCheck, check)),
-                        None => policy.using_clause(database)?.map(|e| (PolicyClause::Using, e)),
+        })
+        .collect();
+    for policy in table.policies(database)? {
+        let consulted = command_targets(policy.command())
+            .iter()
+            .any(|target| specs.iter().any(|(read, _, _)| target == read));
+        if !consulted || !applies(policy, role, database)? {
+            continue;
+        }
+        let analysis = policy.clause_analysis(database)?;
+        let mode = analysis.mode();
+        let using_targets = analysis.targets(PolicyClause::Using);
+        let check_targets = analysis.targets(PolicyClause::WithCheck);
+        let (using, check) = analysis.into_clauses();
+        for (clause, expression, targets) in [
+            (PolicyClause::Using, using, using_targets),
+            (PolicyClause::WithCheck, check, check_targets),
+        ] {
+            let Some(expression) = expression else { continue };
+            let mut destinations = specs
+                .iter()
+                .zip(&mut gates)
+                .filter(|((target, _, _), _)| targets.clone().any(|reached| reached == *target))
+                .map(|(_, gate)| {
+                    match mode {
+                        CreatePolicyType::Permissive => &mut gate.permissive,
+                        CreatePolicyType::Restrictive => &mut gate.restrictive,
                     }
+                })
+                .peekable();
+            while let Some(bucket) = destinations.next() {
+                if destinations.peek().is_none() {
+                    bucket.push(GateTerm { policy, clause, expression });
+                    break;
                 }
-            };
-            let Some((clause, expression)) = read else { continue };
-            let term = GateTerm { policy, clause, expression };
-            match policy.policy_type() {
-                CreatePolicyType::Permissive => gate.permissive.push(term),
-                CreatePolicyType::Restrictive => gate.restrictive.push(term),
+                bucket.push(GateTerm { policy, clause, expression: expression.clone() });
             }
         }
-        gates.push(gate);
     }
     let expressions = gates
         .iter()
@@ -353,11 +352,17 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
                 }
                 let mut expressions = Vec::new();
                 for policy in table.policies(self.database)? {
-                    if covers(policy, GatedCommand::Select) && applies(policy, role, self.database)?
+                    if command_targets(policy.command()).contains(&PolicyTarget::Select)
+                        && applies(policy, role, self.database)?
                     {
-                        expressions.extend(
-                            policy.using_clause(self.database)?.map(|using| using.expression()),
-                        );
+                        let analysis = policy.clause_analysis(self.database)?;
+                        if let Some(source) = analysis.source(PolicyTarget::Select) {
+                            expressions.extend(
+                                analysis
+                                    .clause(source)
+                                    .map(crate::structs::PolicyExpression::expression),
+                            );
+                        }
                     }
                 }
                 self.table(table, expressions, role)
