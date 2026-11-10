@@ -3,6 +3,7 @@
 //! In sqlparser, both table-level and column-level grants are represented
 //! by the same `Grant` struct. This module implements all grant traits
 //! on `Grant` to support both use cases.
+//! Session-principal grantees bind to known DDL-time roles during ingestion.
 
 use alloc::{string::ToString, vec, vec::Vec};
 use core::mem;
@@ -83,8 +84,7 @@ pub(crate) fn grantee_matches_role(grantee: &Grantee, role: &CreateRole) -> bool
         return true;
     }
 
-    // The keyword names the session, so no declared role receives the grant,
-    // whatever a role of that spelling is called.
+    // An unresolved session principal reaches no declared role.
     if grantee_is_session_principal(grantee).is_some() {
         return false;
     }

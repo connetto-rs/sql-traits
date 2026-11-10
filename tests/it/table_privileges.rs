@@ -256,6 +256,80 @@ fn a_grant_to_a_session_principal_reaches_no_declared_role() {
     assert_eq!(held(&privileges(&db, "docs", "other")), Vec::<String>::new());
 }
 
+#[test]
+fn session_grantees_revoke_and_restore_owner_privileges() {
+    for grantee in ["CURRENT_USER", "CURRENT_ROLE"] {
+        let ddl = format!(
+            "CREATE ROLE app_owner;
+             CREATE TABLE docs (id INT);
+             ALTER TABLE docs OWNER TO app_owner;
+             SET ROLE app_owner;
+             REVOKE SELECT ON docs FROM {grantee};"
+        );
+        let revoked = parse(&format!("{ddl} RESET ROLE;"));
+        assert!(!privileges(&revoked, "docs", "app_owner").select.on_table());
+
+        let restored = parse(&format!("{ddl} GRANT SELECT ON docs TO {grantee}; RESET ROLE;"));
+        assert!(privileges(&restored, "docs", "app_owner").select.on_table());
+    }
+}
+
+#[test]
+fn session_grantees_remain_bound_when_the_current_role_changes() {
+    for grantee in ["CURRENT_USER", "CURRENT_ROLE"] {
+        let db = parse(&format!(
+            "CREATE ROLE first_reader; CREATE ROLE second_reader;
+             CREATE TABLE docs (id INT);
+             SET ROLE first_reader;
+             GRANT SELECT ON docs TO {grantee};
+             SET ROLE second_reader;
+             GRANT SELECT ON docs TO {grantee};
+             REVOKE SELECT ON docs FROM first_reader;
+             RESET ROLE;
+             REVOKE SELECT ON docs FROM {grantee};"
+        ));
+        assert!(!privileges(&db, "docs", "first_reader").select.on_table());
+        assert!(privileges(&db, "docs", "second_reader").select.on_table());
+    }
+}
+
+#[test]
+fn session_grantees_preserve_quoted_role_identity() {
+    let db = parse(
+        r#"CREATE ROLE "Reader"; CREATE ROLE reader; CREATE ROLE "current_user";
+           CREATE TABLE docs (id INT);
+           SET ROLE "Reader";
+           GRANT SELECT ON docs TO CURRENT_USER;
+           GRANT UPDATE ON docs TO "current_user";
+           SET ROLE "current_user";
+           GRANT INSERT ON docs TO CURRENT_ROLE;
+           RESET ROLE;"#,
+    );
+    assert_eq!(held(&privileges(&db, "docs", "Reader")), ["SELECT"]);
+    assert_eq!(held(&privileges(&db, "docs", "reader")), Vec::<String>::new());
+    assert_eq!(held(&privileges(&db, "docs", "current_user")), ["INSERT", "UPDATE"]);
+}
+
+#[test]
+fn session_grantees_distinguish_session_and_transaction_local_roles() {
+    let db = parse(
+        "CREATE ROLE login_role; CREATE ROLE acting_role; CREATE ROLE local_role;
+         CREATE TABLE docs (id INT);
+         SET SESSION AUTHORIZATION login_role;
+         SET ROLE acting_role;
+         BEGIN;
+         SET LOCAL ROLE local_role;
+         GRANT SELECT ON docs TO CURRENT_USER;
+         GRANT INSERT ON docs TO SESSION_USER;
+         COMMIT;
+         GRANT UPDATE ON docs TO CURRENT_ROLE;
+         RESET ROLE;",
+    );
+    assert_eq!(held(&privileges(&db, "docs", "login_role")), ["INSERT"]);
+    assert_eq!(held(&privileges(&db, "docs", "acting_role")), ["UPDATE"]);
+    assert_eq!(held(&privileges(&db, "docs", "local_role")), ["SELECT"]);
+}
+
 /// `GROUP public` and `"public"` are `PUBLIC` in PostgreSQL 18.6, while
 /// `"Reader"` and `Reader` name two different roles.
 #[test]
