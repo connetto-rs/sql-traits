@@ -503,10 +503,10 @@ pub enum LookupError {
     ObjectNotInDatabase {
         /// Kind of object that was looked up.
         object_kind: ObjectKind,
-        /// Best-effort rendering identifying the object: its own quoted name,
-        /// or the table it is declared on when it has no name of its
-        /// own. Build it with [`ObjectKind::not_in_database`] or
-        /// [`ObjectKind::anonymous_not_in_database`] rather than by hand.
+        /// Best-effort rendering identifying the object by name, its declaring
+        /// table, or the sequence it owns. Use [`ObjectKind::not_in_database`]
+        /// for a name or [`ObjectKind::anonymous_not_in_database`] for a
+        /// declaring table.
         object: String,
     },
     /// A column named by a constraint is not declared by the table that

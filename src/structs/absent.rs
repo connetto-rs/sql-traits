@@ -132,7 +132,10 @@ impl<DB: DatabaseLike> SequenceLike for Absent<DB> {
         self.unreachable()
     }
 
-    fn owner<'db>(&'db self, _: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>
+    fn owner<'db>(
+        &'db self,
+        _: &'db Self::DB,
+    ) -> Result<Option<SequenceOwner<'db, Self::DB>>, LookupError>
     where
         Self: 'db,
     {

@@ -22,7 +22,7 @@ fn described(database: &ParserDB) -> Vec<String> {
         .sequences()
         .map(|sequence| {
             let parameters = sequence.parameters();
-            let owner = match sequence.owner(database) {
+            let owner = match sequence.owner(database).expect("owner resolves") {
                 Some(SequenceOwner::Column(column)) => {
                     format!(
                         "{}.{}",

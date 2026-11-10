@@ -109,7 +109,7 @@ fn every_reference_follows_the_move() {
         .sequences()
         .find(|sequence| sequence.sequence_name() == "child_id_seq")
         .expect("the serial sequence survives");
-    let owner = match serial.owner(&db) {
+    let owner = match serial.owner(&db).expect("owner resolves") {
         Some(SequenceOwner::Column(column)) => Some(column),
         _ => None,
     }
