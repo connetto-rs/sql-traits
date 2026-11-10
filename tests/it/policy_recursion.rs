@@ -77,6 +77,7 @@ fn a_read_policy_reading_its_own_table_refuses_every_statement_applying_it() {
 #[test]
 fn a_write_policy_reading_its_own_table_reads_it_through_the_read_policies() {
     let open_read = "CREATE POLICY t_sel ON t FOR SELECT USING (true);
+         CREATE POLICY t_clauseless ON t FOR SELECT;
          CREATE POLICY t_ins ON t FOR INSERT WITH CHECK (EXISTS (SELECT 1 FROM t t2));
          CREATE POLICY t_upd ON t FOR UPDATE USING (EXISTS (SELECT 1 FROM t t2 WHERE t2.id = t.id));
          CREATE POLICY t_del ON t FOR DELETE USING (EXISTS (SELECT 1 FROM t t2 WHERE t2.id = t.id));";

@@ -206,6 +206,10 @@ struct MemoryUserDefinedType {
 struct MemoryPolicy {
     name: String,
     table_name: String,
+    command: CreatePolicyCommand,
+    mode: CreatePolicyType,
+    using: Option<Expr>,
+    check: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -631,8 +635,8 @@ impl TableLike for MemoryTable {
         Ok(database.foreign_keys.iter().filter(|key| key.host_table_name == self.name))
     }
 
-    fn has_row_level_security(&self, _database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(false)
+    fn has_row_level_security(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(database.policies.iter().any(|policy| policy.table_name == self.name))
     }
 
     fn has_forced_row_level_security(&self, _database: &Self::DB) -> Result<bool, LookupError> {
@@ -1331,11 +1335,11 @@ impl PolicyLike for MemoryPolicy {
     }
 
     fn command(&self) -> CreatePolicyCommand {
-        CreatePolicyCommand::All
+        self.command
     }
 
     fn policy_type(&self) -> CreatePolicyType {
-        CreatePolicyType::Permissive
+        self.mode
     }
 
     fn roles<'db>(&'db self, _database: &'db Self::DB) -> impl Iterator<Item = &'db Owner>
@@ -1356,7 +1360,7 @@ impl PolicyLike for MemoryPolicy {
     where
         Self: 'db,
     {
-        Ok(None)
+        Ok(self.using.as_ref().map(PolicyExpression::Stored))
     }
 
     fn written_using<'db>(
@@ -1383,7 +1387,7 @@ impl PolicyLike for MemoryPolicy {
     where
         Self: 'db,
     {
-        Ok(None)
+        Ok(self.check.as_ref().map(PolicyExpression::Stored))
     }
 
     fn written_check<'db>(
@@ -2592,4 +2596,155 @@ fn a_wholly_unresolvable_key_names_its_first_column() {
             column_name: String::from("dropped_id"),
         })
     );
+}
+
+#[test]
+fn illegal_policy_clauses_cannot_add_runtime_terms() {
+    use sqlparser::ast::Value;
+
+    for mode in [CreatePolicyType::Permissive, CreatePolicyType::Restrictive] {
+        for (command, has_using, has_check, statement) in [
+            (CreatePolicyCommand::Select, true, true, RowStatement::Select),
+            (CreatePolicyCommand::Select, false, true, RowStatement::Select),
+            (CreatePolicyCommand::Delete, true, true, RowStatement::Delete { reads: false }),
+            (CreatePolicyCommand::Delete, false, true, RowStatement::Delete { reads: false }),
+            (CreatePolicyCommand::Insert, true, false, RowStatement::Insert { returning: false }),
+            (CreatePolicyCommand::Insert, true, true, RowStatement::Insert { returning: false }),
+        ] {
+            let mut catalog = catalog();
+            catalog.policies.push(MemoryPolicy {
+                name: String::from("invalid"),
+                table_name: String::from("docs"),
+                command,
+                mode,
+                using: has_using.then(|| Expr::Value(Value::Boolean(true).into())),
+                check: has_check.then(|| Expr::Value(Value::Boolean(true).into())),
+            });
+            let analysis = catalog.policies[0].clause_analysis(&catalog).expect("analysis");
+            let error = if command == CreatePolicyCommand::Insert {
+                sql_traits::errors::PolicyClauseError::UsingForInsert
+            } else {
+                sql_traits::errors::PolicyClauseError::WithCheckForSelectOrDelete
+            };
+            assert_eq!(analysis.invalid_clause(), Some(error));
+            assert_eq!(analysis.command(), command);
+            assert_eq!(analysis.mode(), mode);
+            assert_eq!(analysis.clause(PolicyClause::Using).is_some(), has_using);
+            assert_eq!(analysis.clause(PolicyClause::WithCheck).is_some(), has_check);
+            assert_eq!(analysis.targets(PolicyClause::Using).collect::<Vec<_>>(), []);
+            assert_eq!(analysis.targets(PolicyClause::WithCheck).collect::<Vec<_>>(), []);
+            assert_eq!(analysis.missing_clauses().collect::<Vec<_>>(), []);
+            let docs = &catalog.tables[0];
+            let security =
+                docs.row_security(statement, ActingRole::Public, &catalog).expect("settled");
+            for gate in security.gates().expect("RLS applies") {
+                assert_eq!(gate.permissive(), [], "{command:?} {mode:?}");
+                assert_eq!(gate.restrictive(), [], "{command:?} {mode:?}");
+            }
+            catalog.policies.push(MemoryPolicy {
+                name: String::from("valid"),
+                table_name: String::from("docs"),
+                command: CreatePolicyCommand::All,
+                mode: CreatePolicyType::Permissive,
+                using: Some(Expr::Value(Value::Boolean(true).into())),
+                check: None,
+            });
+            let security = catalog.tables[0]
+                .row_security(statement, ActingRole::Public, &catalog)
+                .expect("settled");
+            for gate in security.gates().expect("RLS applies") {
+                assert_eq!(
+                    gate.permissive().iter().map(|term| term.policy().name()).collect::<Vec<_>>(),
+                    ["valid"],
+                    "{command:?} {mode:?}"
+                );
+                assert_eq!(gate.restrictive(), [], "{command:?} {mode:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn legal_policy_commands_route_each_clause_and_diagnose_missing_prerequisites() {
+    use PolicyTarget::{Delete, Insert, Select, UpdateCheck, UpdateUsing};
+    use sqlparser::ast::Value;
+
+    for (command, visibility, checks) in [
+        (CreatePolicyCommand::All, &[Select, UpdateUsing, Delete][..], &[Insert, UpdateCheck][..]),
+        (CreatePolicyCommand::Select, &[Select][..], &[][..]),
+        (CreatePolicyCommand::Insert, &[][..], &[Insert][..]),
+        (CreatePolicyCommand::Update, &[UpdateUsing][..], &[UpdateCheck][..]),
+        (CreatePolicyCommand::Delete, &[Delete][..], &[][..]),
+    ] {
+        for mode in [CreatePolicyType::Permissive, CreatePolicyType::Restrictive] {
+            for (has_using, has_check) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                if (has_using && visibility.is_empty()) || (has_check && checks.is_empty()) {
+                    continue;
+                }
+                let policy = MemoryPolicy {
+                    name: String::from("p"),
+                    table_name: String::from("docs"),
+                    command,
+                    mode,
+                    using: has_using.then(|| Expr::Value(Value::Boolean(false).into())),
+                    check: has_check.then(|| Expr::Value(Value::Boolean(true).into())),
+                };
+                let catalog = catalog();
+                let borrowed_policy = &policy;
+                let analysis =
+                    PolicyLike::clause_analysis(&borrowed_policy, &catalog).expect("analysis");
+                assert_eq!(analysis.command(), command);
+                assert_eq!(analysis.mode(), mode);
+                assert_eq!(analysis.invalid_clause(), None);
+                for target in [Select, Insert, UpdateUsing, UpdateCheck, Delete] {
+                    let expected = if checks.contains(&target) && has_check {
+                        Some(PolicyClause::WithCheck)
+                    } else if has_using
+                        && (visibility.contains(&target) || checks.contains(&target))
+                    {
+                        Some(PolicyClause::Using)
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        analysis.source(target),
+                        expected,
+                        "{command:?} {mode:?} {has_using} {has_check} {target:?}"
+                    );
+                    if let Some(source) = expected {
+                        let expected_value =
+                            if source == PolicyClause::Using { "false" } else { "true" };
+                        assert_eq!(
+                            analysis
+                                .clause(source)
+                                .expect("source exists")
+                                .expression()
+                                .to_string(),
+                            expected_value
+                        );
+                    }
+                }
+                let mut expected_missing = Vec::new();
+                if !has_using && !visibility.is_empty() {
+                    expected_missing.push((
+                        PolicyClause::Using,
+                        visibility.iter().map(|target| target.command()).collect::<Vec<_>>(),
+                    ));
+                }
+                if !has_using && !has_check && checks.contains(&Insert) {
+                    expected_missing.push((PolicyClause::WithCheck, vec![GatedCommand::Insert]));
+                }
+                assert_eq!(
+                    analysis
+                        .missing_clauses()
+                        .map(|missing| (missing.clause(), missing.commands().collect::<Vec<_>>()))
+                        .collect::<Vec<_>>(),
+                    expected_missing,
+                    "{command:?} {mode:?} {has_using} {has_check}"
+                );
+            }
+        }
+    }
 }

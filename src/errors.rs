@@ -715,6 +715,17 @@ pub enum DeploymentError {
     },
 }
 
+/// An illegal combination of a policy command and stored clauses.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyClauseError {
+    /// An `INSERT` policy stores `USING`.
+    #[error("only WITH CHECK expression allowed for INSERT")]
+    UsingForInsert,
+    /// A `SELECT` or `DELETE` policy stores `WITH CHECK`.
+    #[error("WITH CHECK cannot be applied to SELECT or DELETE")]
+    WithCheckForSelectOrDelete,
+}
+
 /// Why [`TableLike::row_security`](crate::traits::TableLike::row_security)
 /// cannot answer.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
