@@ -323,14 +323,20 @@ fn implicit_sequences_use_the_table_owner_when_another_role_adds_columns() {
 #[test]
 fn sequence_owners_and_grantors_follow_role_renames() {
     let database = parse(
-        "SET ROLE owner_r; CREATE SEQUENCE app.s;
+        "CREATE SEQUENCE app.other;
+         SET ROLE owner_r; CREATE SEQUENCE app.s;
          GRANT USAGE ON SEQUENCE app.s TO reader; RESET ROLE;
          ALTER ROLE owner_r RENAME TO \"Keeper\";
-         GRANT SELECT ON SEQUENCE app.s TO other_r;",
+         GRANT SELECT ON SEQUENCE app.s TO other_r;
+         GRANT SELECT ON SEQUENCE app.other TO reader;",
     );
     assert_eq!(
         table_grantors(&database),
-        [("reader".to_owned(), Some("Keeper")), ("other_r".to_owned(), Some("Keeper"))]
+        [
+            ("reader".to_owned(), Some("Keeper")),
+            ("other_r".to_owned(), Some("Keeper")),
+            ("reader".to_owned(), Some("postgres")),
+        ]
     );
 }
 
@@ -390,5 +396,22 @@ fn attached_sequences_and_their_grants_follow_relation_owner_changes() {
             ("vs", Some("owner_r")),
             ("vs", Some("owner_r")),
         ]
+    );
+}
+
+#[test]
+fn assigning_an_unknown_sequence_owner_preserves_unknown_past_grantors() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE ROLE keeper;
+         CREATE TABLE t (id serial);
+         GRANT USAGE ON SEQUENCE t_id_seq TO PUBLIC;
+         ALTER TABLE t OWNER TO keeper;
+         SET ROLE keeper;
+         GRANT SELECT ON SEQUENCE t_id_seq TO PUBLIC;",
+    )
+    .expect("schema parses");
+    assert_eq!(
+        table_grantors(&database),
+        [("PUBLIC".to_owned(), None), ("PUBLIC".to_owned(), Some("keeper"))]
     );
 }
