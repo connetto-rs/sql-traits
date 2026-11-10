@@ -528,6 +528,100 @@ fn written_modifier(modifiers: &[TypeModifier]) -> Option<u64> {
     }
 }
 
+/// Declared decimal digits, including fractional digits, under the engine's
+/// precision rules.
+pub(super) fn numeric_precision(dialect: SqlparserDialect, ty: &DataType) -> Option<u64> {
+    let bare = match dialect {
+        // https://www.sqlite.org/datatype3.html#affinity_name_examples
+        SqlparserDialect::SQLite => return None,
+        // https://dev.mysql.com/doc/refman/8.4/en/fixed-point-types.html
+        SqlparserDialect::Ansi | SqlparserDialect::Generic
+        // https://www.postgresql.org/docs/18/datatype-numeric.html#DATATYPE-NUMERIC-DECIMAL
+        | SqlparserDialect::PostgreSql
+        // https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/Data-Types.html#GUID-0BC16006-32F1-42B1-B45E-F27A494963FF
+        | SqlparserDialect::Oracle => None,
+        // https://clickhouse.com/docs/en/reference/data-types/decimal
+        SqlparserDialect::ClickHouse
+        // https://docs.databricks.com/aws/en/sql/language-manual/data-types/decimal-type
+        | SqlparserDialect::Databricks
+        // https://cwiki.apache.org/confluence/display/Hive/LanguageManual+Types
+        | SqlparserDialect::Hive
+        // https://dev.mysql.com/doc/refman/8.4/en/fixed-point-types.html
+        | SqlparserDialect::MySql
+        // https://spark.apache.org/docs/latest/api/scala/org/apache/spark/sql/types/DecimalType.html
+        | SqlparserDialect::Spark => Some(10),
+        // https://duckdb.org/docs/stable/sql/data_types/numeric.html
+        SqlparserDialect::DuckDb
+        // https://learn.microsoft.com/en-us/sql/t-sql/data-types/decimal-and-numeric-transact-sql
+        | SqlparserDialect::MsSql
+        // https://docs.aws.amazon.com/redshift/latest/dg/r_Numeric_types201.html
+        | SqlparserDialect::Redshift => Some(18),
+        // https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/data-types#decimal_types
+        SqlparserDialect::BigQuery
+        // https://docs.snowflake.com/en/sql-reference/data-types-numeric
+        | SqlparserDialect::Snowflake => Some(38),
+        // https://docs.teradata.com/r/Enterprise_IntelliFlex_VMware/SQL-Data-Types-and-Literals/Numeric-Data-Types/DECIMAL/NUMERIC-Data-Types
+        SqlparserDialect::Teradata => Some(5),
+    };
+    match ty {
+        DataType::Nullable(inner) | DataType::Zerofill(inner) => numeric_precision(dialect, inner),
+        DataType::Numeric(info)
+        | DataType::Decimal(info)
+        | DataType::DecimalUnsigned(info)
+        | DataType::Dec(info)
+        | DataType::DecUnsigned(info) => written_precision(info, bare),
+        DataType::BigNumeric(info) | DataType::BigDecimal(info) => written_precision(info, None),
+        DataType::Custom(name, modifiers) => custom_precision(dialect, name, modifiers),
+        _ => None,
+    }
+}
+
+/// Precision written on a decimal type, or the engine default.
+fn written_precision(info: &ExactNumberInfo, bare: Option<u64>) -> Option<u64> {
+    match info {
+        ExactNumberInfo::None => bare,
+        ExactNumberInfo::Precision(precision)
+        | ExactNumberInfo::PrecisionAndScale(precision, _) => Some(*precision),
+    }
+}
+
+/// Precision of a decimal spelling the parser represents as a custom type.
+fn custom_precision(
+    dialect: SqlparserDialect,
+    name: &ObjectName,
+    modifiers: &[TypeModifier],
+) -> Option<u64> {
+    let generic = dialect == SqlparserDialect::Generic;
+    let bare = if custom_type_is(name, "NUMBER")
+        && (generic
+            || matches!(
+                dialect,
+                SqlparserDialect::Oracle | SqlparserDialect::Teradata | SqlparserDialect::Snowflake
+            )) {
+        // https://docs.teradata.com/r/Enterprise_IntelliFlex_VMware/SQL-Data-Types-and-Literals/Numeric-Data-Types/NUMBER-Data-Type/Usage-Notes
+        (dialect == SqlparserDialect::Snowflake).then_some(38)
+    } else if custom_type_is(name, "FIXED") && (generic || dialect.is_mysql_family()) {
+        // https://dev.mysql.com/doc/refman/8.4/en/numeric-type-syntax.html
+        (!generic).then_some(10)
+    } else if generic || dialect == SqlparserDialect::ClickHouse {
+        written_modifier(modifiers)?;
+        // https://clickhouse.com/docs/en/reference/data-types/decimal#decimal-value-ranges
+        return [("DECIMAL32", 9), ("DECIMAL64", 18), ("DECIMAL128", 38), ("DECIMAL256", 76)]
+            .into_iter()
+            .find_map(|(spelling, precision)| custom_type_is(name, spelling).then_some(precision));
+    } else {
+        return None;
+    };
+    match modifiers {
+        [] => bare,
+        [TypeModifier::Number(precision, false)]
+        | [TypeModifier::Number(precision, false), TypeModifier::Number(_, false)] => {
+            precision.parse().ok()
+        }
+        _ => None,
+    }
+}
+
 /// Digits a value of a decimal type keeps to the right of the decimal point.
 ///
 /// A precision without a scale means scale 0 wherever a scale is kept. A bare

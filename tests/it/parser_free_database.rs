@@ -463,6 +463,10 @@ impl DataTypeLike for MemoryDataType {
         Cow::Borrowed(&self.0)
     }
 
+    fn numeric_precision(&self, _database: &Self::DB) -> Option<u64> {
+        None
+    }
+
     fn send_function(&self, _database: &Self::DB) -> Option<bool> {
         None
     }

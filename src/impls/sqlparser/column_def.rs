@@ -742,6 +742,174 @@ mod tests {
         }
     }
 
+    mod numeric_precision {
+        use sqlparser::dialect::{
+            AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
+            DuckDbDialect, GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+            PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
+            SparkSqlDialect, TeradataDialect,
+        };
+
+        use super::{ColumnLike, DataTypeLike, column_named, parse_with};
+
+        fn assert_precisions<D: Dialect + Default + 'static>(cases: &[(&str, Option<u64>)]) {
+            let columns: Vec<String> =
+                cases.iter().enumerate().map(|(index, (ty, _))| format!("c{index} {ty}")).collect();
+            let db = parse_with::<D>(&format!("CREATE TABLE t ({});", columns.join(", ")));
+            for (index, (ty, expected)) in cases.iter().enumerate() {
+                let column = column_named(&db, &format!("c{index}"));
+                assert_eq!(column.data_type(&db).numeric_precision(&db), *expected, "{ty}");
+            }
+        }
+
+        #[test]
+        fn written_precision_counts_all_decimal_digits() {
+            let cases = [
+                ("NUMERIC(10,2)", Some(10)),
+                ("DECIMAL(12,4)", Some(12)),
+                ("DECIMAL(10)", Some(10)),
+                ("DEC(7,0)", Some(7)),
+                ("INT", None),
+                ("FLOAT(10)", None),
+                ("VARCHAR(10)", None),
+            ];
+            assert_precisions::<AnsiDialect>(&cases);
+            assert_precisions::<BigQueryDialect>(&cases);
+            assert_precisions::<ClickHouseDialect>(&cases);
+            assert_precisions::<DatabricksDialect>(&cases);
+            assert_precisions::<DuckDbDialect>(&cases);
+            assert_precisions::<GenericDialect>(&cases);
+            assert_precisions::<HiveDialect>(&cases);
+            assert_precisions::<MsSqlDialect>(&cases);
+            assert_precisions::<MySqlDialect>(&cases);
+            assert_precisions::<OracleDialect>(&cases);
+            assert_precisions::<PostgreSqlDialect>(&cases);
+            assert_precisions::<RedshiftSqlDialect>(&cases);
+            assert_precisions::<SnowflakeDialect>(&cases);
+            assert_precisions::<SparkSqlDialect>(&cases);
+            assert_precisions::<TeradataDialect>(&cases);
+        }
+
+        #[test]
+        fn postgres_18_declared_precision_is_independent_of_scale() {
+            assert_precisions::<PostgreSqlDialect>(&[
+                ("NUMERIC", None),
+                ("DECIMAL", None),
+                ("NUMERIC(5,-2)", Some(5)),
+                ("NUMERIC(2,4)", Some(2)),
+                ("NUMERIC(10,2)[]", None),
+            ]);
+        }
+
+        #[test]
+        fn mysql_8_4_defaults_and_modifiers_keep_decimal_precision() {
+            assert_precisions::<MySqlDialect>(&[
+                ("NUMERIC", Some(10)),
+                ("DECIMAL", Some(10)),
+                ("FIXED", Some(10)),
+                ("FIXED(12,3)", Some(12)),
+                ("DECIMAL(7,2) UNSIGNED", Some(7)),
+                ("DECIMAL(8,2) ZEROFILL", Some(8)),
+                ("DEC UNSIGNED", Some(10)),
+            ]);
+        }
+
+        #[test]
+        fn bare_decimal_uses_the_engine_precision_default() {
+            let ten = [("NUMERIC", Some(10)), ("DECIMAL", Some(10))];
+            assert_precisions::<ClickHouseDialect>(&ten);
+            assert_precisions::<DatabricksDialect>(&ten);
+            assert_precisions::<HiveDialect>(&ten);
+            assert_precisions::<SparkSqlDialect>(&ten);
+            let eighteen = [("NUMERIC", Some(18)), ("DECIMAL", Some(18))];
+            assert_precisions::<DuckDbDialect>(&eighteen);
+            assert_precisions::<MsSqlDialect>(&eighteen);
+            assert_precisions::<RedshiftSqlDialect>(&eighteen);
+            assert_precisions::<SnowflakeDialect>(&[
+                ("NUMERIC", Some(38)),
+                ("DECIMAL", Some(38)),
+                ("NUMBER", Some(38)),
+                ("NUMBER(12,3)", Some(12)),
+            ]);
+            assert_precisions::<TeradataDialect>(&[
+                ("NUMERIC", Some(5)),
+                ("DECIMAL", Some(5)),
+                ("NUMBER", None),
+                ("NUMBER(12,3)", Some(12)),
+            ]);
+        }
+
+        #[test]
+        fn a_precision_without_an_engine_default_stays_unspecified() {
+            let cases = [("NUMERIC", None), ("DECIMAL", None)];
+            assert_precisions::<AnsiDialect>(&cases);
+            assert_precisions::<GenericDialect>(&cases);
+            assert_precisions::<OracleDialect>(&cases);
+            assert_precisions::<OracleDialect>(&[
+                ("NUMBER", None),
+                ("NUMBER(10)", Some(10)),
+                ("NUMBER(12,3)", Some(12)),
+            ]);
+        }
+
+        #[test]
+        fn bigquery_only_models_integral_decimal_precision() {
+            assert_precisions::<BigQueryDialect>(&[
+                ("NUMERIC", Some(38)),
+                ("DECIMAL", Some(38)),
+                ("BIGNUMERIC", None),
+                ("BIGDECIMAL", None),
+                ("BIGNUMERIC(50,20)", Some(50)),
+                ("BIGDECIMAL(40,10)", Some(40)),
+            ]);
+        }
+
+        #[test]
+        fn clickhouse_sized_decimals_supply_precision_separately_from_scale() {
+            let cases = [
+                ("Decimal32(4)", Some(9)),
+                ("Decimal64(6)", Some(18)),
+                ("Decimal128(10)", Some(38)),
+                ("Decimal256(20)", Some(76)),
+                ("Nullable(Decimal(10,2))", Some(10)),
+            ];
+            assert_precisions::<ClickHouseDialect>(&cases);
+            assert_precisions::<GenericDialect>(&cases);
+        }
+
+        #[test]
+        fn custom_precision_requires_a_decimal_spelling_and_numeric_modifiers() {
+            assert_precisions::<PostgreSqlDialect>(&[
+                ("NUMBER(10,2)", None),
+                ("FIXED(10,2)", None),
+                ("Decimal64(4)", None),
+                ("money_amount", None),
+            ]);
+            assert_precisions::<OracleDialect>(&[
+                ("NUMBER(p,2)", None),
+                ("NUMBER('10')", None),
+                ("NUMBER(10,2,1)", None),
+                ("FIXED(10,2)", None),
+            ]);
+            assert_precisions::<GenericDialect>(&[
+                ("NUMBER", None),
+                ("NUMBER(10)", Some(10)),
+                ("FIXED", None),
+                ("FIXED(12,3)", Some(12)),
+            ]);
+        }
+
+        #[test]
+        fn sqlite_does_not_enforce_declared_precision() {
+            assert_precisions::<SQLiteDialect>(&[
+                ("NUMERIC(10,2)", None),
+                ("DECIMAL(10)", None),
+                ("NUMERIC", None),
+                ("DECIMAL", None),
+            ]);
+        }
+    }
+
     mod numeric_scale {
         use sqlparser::dialect::{
             AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
