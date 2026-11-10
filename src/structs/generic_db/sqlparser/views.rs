@@ -1271,6 +1271,17 @@ fn set_view_owner(
         handover.apply(builder.table_grants_mut(), |grant| view.named_by(grant));
         handover.apply(builder.column_grants_mut(), |grant| view.named_by(grant));
     }
+    if kind == ObjectKind::View
+        && let Some(position) = plain_view_position(&builder, name)
+    {
+        let identity = builder.views()[position].2;
+        super::sequences::change_owner(&mut builder, new_owner, |_, owner| {
+            matches!(
+                owner,
+                crate::structs::StoredSequenceOwner::ViewColumn { view, .. } if view == identity
+            )
+        });
+    }
     builder
 }
 

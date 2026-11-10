@@ -1640,6 +1640,10 @@ impl ParserDBBuilder {
             })
             || views::view_owner_names(self).iter().any(|owner| owner == stored_name.as_str())
             || self
+                .sequences()
+                .iter()
+                .any(|(sequence, ())| sequence.authorization_owner() == Some(stored_name.as_str()))
+            || self
                 .schemas()
                 .iter()
                 .any(|(schema, ())| schema.authorization() == Some(stored_name.as_str()))
@@ -4772,6 +4776,11 @@ fn rename_role_references(builder: &mut ParserDBBuilder, previous: &Ident, repla
     for (_, metadata, _) in builder.materialized_views_mut() {
         if metadata.owner() == Some(previous_name.as_str()) {
             metadata.set_owner(Some(replacement_name.clone()));
+        }
+    }
+    for (sequence, ()) in builder.sequences_mut() {
+        if sequence.authorization_owner() == Some(previous_name.as_str()) {
+            Arc::make_mut(sequence).set_authorization_owner(Some(replacement_name.clone()));
         }
     }
     for (schema, ()) in builder.schemas_mut() {
@@ -10186,6 +10195,11 @@ impl ParserDB {
                                         metadata.set_owner(owner);
                                     },
                                 )?;
+                                sequences::change_table_owner(
+                                    &mut builder,
+                                    &alter_table.name,
+                                    &new_owner,
+                                );
                                 if let Some((table, previous)) = handover {
                                     table_owner::change_owner(
                                         &mut builder,

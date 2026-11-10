@@ -219,8 +219,10 @@ fn grant_objects_inner_match(left: &GrantObjects, right: &GrantObjects) -> bool 
         ) => object_name_lists_match(left_databases, right_databases),
         (GrantObjects::Databases(left_objects), GrantObjects::Databases(right_objects))
         | (GrantObjects::Schemas(left_objects), GrantObjects::Schemas(right_objects))
-        | (GrantObjects::Sequences(left_objects), GrantObjects::Sequences(right_objects))
-        | (GrantObjects::Tables(left_objects), GrantObjects::Tables(right_objects))
+        | (
+            GrantObjects::Sequences(left_objects) | GrantObjects::Tables(left_objects),
+            GrantObjects::Sequences(right_objects) | GrantObjects::Tables(right_objects),
+        )
         | (GrantObjects::Views(left_objects), GrantObjects::Views(right_objects))
         | (GrantObjects::Warehouses(left_objects), GrantObjects::Warehouses(right_objects))
         | (GrantObjects::Integrations(left_objects), GrantObjects::Integrations(right_objects))
@@ -244,8 +246,7 @@ fn grant_objects_inner_match(left: &GrantObjects, right: &GrantObjects) -> bool 
     }
 }
 
-/// Whether two object lists name the same objects of the same kind, in order,
-/// under PostgreSQL's identifier folding.
+/// Whether object lists name the same targets under identifier folding.
 pub(crate) fn grant_objects_match(
     left: Option<&GrantObjects>,
     right: Option<&GrantObjects>,

@@ -46,6 +46,8 @@ pub struct Sequence {
     parameters: SequenceParameters,
     /// What owns the sequence, if anything does.
     owner: Option<StoredSequenceOwner>,
+    /// The stored role owning the sequence's privileges.
+    authorization_owner: Option<String>,
     /// Why the sequence exists.
     origin: SequenceOrigin,
 }
@@ -59,6 +61,7 @@ impl Sequence {
         options: Vec<SequenceOptions>,
         parameters: SequenceParameters,
         owner: Option<StoredSequenceOwner>,
+        authorization_owner: Option<String>,
         origin: SequenceOrigin,
     ) -> Self {
         let schema_is_quoted = schema.as_ref().is_some_and(|(_, quoted)| *quoted);
@@ -70,6 +73,7 @@ impl Sequence {
             options,
             parameters,
             owner,
+            authorization_owner,
             origin,
         }
     }
@@ -136,6 +140,16 @@ impl Sequence {
     /// Returns what owns the sequence, if anything does.
     pub(crate) fn stored_owner(&self) -> Option<StoredSequenceOwner> {
         self.owner
+    }
+
+    /// Returns the stored role owning the sequence's privileges.
+    pub(crate) fn authorization_owner(&self) -> Option<&str> {
+        self.authorization_owner.as_deref()
+    }
+
+    /// Sets the role owning the sequence's privileges.
+    pub(crate) fn set_authorization_owner(&mut self, owner: Option<String>) {
+        self.authorization_owner = owner;
     }
 
     /// Returns why the sequence exists.

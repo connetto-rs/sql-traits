@@ -13,7 +13,7 @@ use sqlparser::ast::{Action, Grant, GrantObjects, Ident, ObjectName, Privileges}
 
 use super::{
     NamedColumn, ParserDBBuilder, action_columns, grantee_role_ident, role_matches_lookup_ident,
-    stored_role_name, views,
+    sequences, stored_role_name, views,
 };
 use crate::{
     impls::grant_objects_match,
@@ -127,6 +127,7 @@ fn object_owner<'b>(
 ) -> Option<&'b str> {
     match objects? {
         GrantObjects::Tables(names) => relation_owner(builder, names.first()?),
+        GrantObjects::Sequences(names) => sequences::authorization_owner(builder, names.first()?),
         GrantObjects::Schemas(names) => {
             let (name, quoted) = object_name_last_part(names.first()?)?;
             builder
@@ -141,8 +142,7 @@ fn object_owner<'b>(
     }
 }
 
-/// The stored name of the role owning the table, view or materialized view
-/// `name` reaches. A sequence records no owner.
+/// Returns the authorization owner of the relation `name` reaches.
 fn relation_owner<'b>(builder: &'b ParserDBBuilder, name: &ObjectName) -> Option<&'b str> {
     if let Ok(Some(table)) = builder.resolve_table_object_name(name) {
         return builder
@@ -151,7 +151,7 @@ fn relation_owner<'b>(builder: &'b ParserDBBuilder, name: &ObjectName) -> Option
             .find(|(stored, _, _)| ptr::eq(stored.as_ref(), table))
             .and_then(|(_, metadata, _)| metadata.owner());
     }
-    views::view_owner(builder, name)
+    views::view_owner(builder, name).or_else(|| sequences::authorization_owner(builder, name))
 }
 
 /// Whether the input declares the role stored as `role` a superuser.
