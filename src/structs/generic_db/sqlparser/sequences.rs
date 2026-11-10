@@ -51,7 +51,8 @@ use sqlparser::{
 use super::{
     Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, domains,
     object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
-    relation_name_holder, require_named_in_catalog, schema_qualifiers_match, stored_ident, views,
+    relation_name_holder, require_named_in_catalog, schema_qualifiers_match, stored_ident,
+    type_arrays::TypeArrays, views,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -293,6 +294,7 @@ pub(super) fn drop_sequences(
     names: &[ObjectName],
     if_exists: bool,
     cascade: bool,
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     for name in names {
         if object_name_last_identifier(name).is_none() {
@@ -311,7 +313,7 @@ pub(super) fn drop_sequences(
             refuse_dropping_identity_sequence(&builder, &doomed)?;
             let key = stored_sequence_key(doomed.as_ref(), IdentifierCase::AsWritten);
             if cascade {
-                views::remove_dependent_views(&mut builder, &key);
+                views::remove_dependent_views(&mut builder, &key, arrays);
             } else {
                 views::refuse_dependent_views(
                     &builder,

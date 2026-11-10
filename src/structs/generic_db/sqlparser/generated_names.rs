@@ -43,8 +43,9 @@ fn stored(value: &str, quoted: bool) -> String {
 
 /// An identifier reaching exactly the stored name `value`, bare only when
 /// folding leaves it unchanged.
-fn spelled(value: String) -> Ident {
-    // Never a keyword bare, since a generated name ends in `_` and a label.
+pub(super) fn spelled(value: String) -> Ident {
+    // Never a keyword bare: a generated name is lowercase letters, digits
+    // and underscores, starting with one of them.
     let mut bytes = value.bytes();
     let bare = bytes.next().is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_')
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
@@ -98,10 +99,12 @@ pub(super) fn column_part(column: &Ident) -> String {
     stored(&column.value, column.quote_style.is_some())
 }
 
-/// `name1`, the optional `name2` and `label` joined by `_`, the longer name
+/// `name1`, the optional `name2` and the optional `label` joined by `_`,
+/// omitting a part and its underscore when it is [`None`], the longer name
 /// giving up a byte at a time until the whole fits.
-fn object_name(name1: &str, name2: Option<&str>, label: &str) -> String {
-    let overhead = usize::from(name2.is_some()) + 1 + label.len();
+pub(super) fn object_name(name1: &str, name2: Option<&str>, label: Option<&str>) -> String {
+    let label_len = label.map_or(0, str::len);
+    let overhead = usize::from(name2.is_some()) + usize::from(label.is_some()) + label_len;
     let available = MAX_NAME_BYTES.saturating_sub(overhead);
     let mut name1_bytes = name1.len();
     let mut name2_bytes = name2.map_or(0, str::len);
@@ -119,8 +122,10 @@ fn object_name(name1: &str, name2: Option<&str>, label: &str) -> String {
         name.push('_');
         name.push_str(clipped(name2, name2_bytes));
     }
-    name.push('_');
-    name.push_str(label);
+    if let Some(label) = label {
+        name.push('_');
+        name.push_str(label);
+    }
     name
 }
 
@@ -138,9 +143,9 @@ pub(super) fn index_name_on(
     let mut pass = 0u32;
     loop {
         let candidate = if pass == 0 {
-            spelled(object_name(&table_name, columns, label))
+            spelled(object_name(&table_name, columns, Some(label)))
         } else {
-            spelled(object_name(&table_name, columns, &format!("{label}{pass}")))
+            spelled(object_name(&table_name, columns, Some(&format!("{label}{pass}"))))
         };
         if relation_name_holder(builder, &candidate, schema).is_none() && !also_taken(&candidate) {
             return candidate;
@@ -161,9 +166,9 @@ pub(super) fn constraint_name_on(
     let mut pass = 0u32;
     loop {
         let candidate = if pass == 0 {
-            object_name(&table_name, columns, label)
+            object_name(&table_name, columns, Some(label))
         } else {
-            object_name(&table_name, columns, &format!("{label}{pass}"))
+            object_name(&table_name, columns, Some(&format!("{label}{pass}")))
         };
         if !taken(&candidate) {
             return candidate;

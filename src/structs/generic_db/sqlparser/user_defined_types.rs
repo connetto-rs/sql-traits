@@ -22,6 +22,7 @@
 //! [`range_constructors`] records, which go with it.
 
 use alloc::{
+    format,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -42,6 +43,7 @@ use super::{
     object_name_last_identifier, place_relation, range_constructors, relation_name_holder,
     require_named_in_catalog,
     signature_types::{retarget_signatures, signature_types},
+    type_arrays::TypeArrays,
 };
 use crate::{
     errors::{Error, LookupError, ObjectKind},
@@ -190,31 +192,6 @@ pub(super) fn schema_holds_type(
         .any(|(type_, _)| user_type_in_schema(type_, (schema_name, schema_quoted), case))
 }
 
-/// The stored name of the type whose array type the name `_X` names, or
-/// `None` when the name is held by a type of its own or is no array of a
-/// stored type.
-fn array_type_of(
-    builder: &ParserDBBuilder,
-    ident: &Ident,
-    schema: Option<(&str, bool)>,
-) -> Option<String> {
-    let base = ident.value.strip_prefix('_').filter(|base| !base.is_empty())?;
-    let reach = |name: &Ident| {
-        match schema {
-            Some(schema) => reach_in_schema(builder, name, schema),
-            None => reach_type(builder, name),
-        }
-    };
-    // A type holding `_x` itself shadows the array of `x`.
-    if reach(ident).is_some() {
-        return None;
-    }
-    let base =
-        Ident { value: String::from(base), quote_style: ident.quote_style, span: ident.span };
-    matches!(reach(&base), Some(Reached::UserType(_, _)))
-        .then(|| normalize_identifier(&base.value, base.quote_style.is_some()).into_owned())
-}
-
 /// The multirange a range type brings, named after the range's stored
 /// (case-folded) name, replacing the first case-sensitive `range` with
 /// `multirange` or appending `_multirange` when it writes none, under the
@@ -347,6 +324,7 @@ pub(super) fn create_user_defined_type(
     representation: Option<UserDefinedTypeRepresentation>,
     role: Option<&str>,
     defaults: &DefaultPrivileges,
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, ObjectKind::Type, builder.catalog_name())?;
     place_relation(&builder, &mut name, false, ObjectKind::Type, role)?;
@@ -398,12 +376,16 @@ pub(super) fn create_user_defined_type(
         }
         None => None,
     };
+    Arc::make_mut(arrays).displace(&builder, &name);
     let mut representation = representation;
     let (multirange_name, named_functions) = if let Some(representation) = representation.as_mut() {
-        bind_representation(&builder, name_ident, schema, representation)?
+        bind_representation(&builder, name_ident, schema, representation, arrays)?
     } else {
         (None, Vec::new())
     };
+    if let Some(multirange) = &multirange_name {
+        Arc::make_mut(arrays).displace(&builder, multirange);
+    }
     let calls = definition_function_calls(&builder, &named_functions);
     let node = Arc::new(UserDefinedType { name, representation, multirange_name });
     let mut builder = builder;
@@ -416,7 +398,15 @@ pub(super) fn create_user_defined_type(
         });
     }
     let builder = range_constructors::create_range_constructors(builder, &node, defaults)?;
-    Ok(builder.add_user_defined_type(node, calls))
+    let builder = builder.add_user_defined_type(Arc::clone(&node), calls);
+    if !node.is_shell() {
+        let arrays = Arc::make_mut(arrays);
+        arrays.create(&builder, &node.name);
+        if let Some(multirange) = &node.multirange_name {
+            arrays.create(&builder, multirange);
+        }
+    }
+    Ok(builder)
 }
 
 /// Refuses a composite that writes an attribute name twice, compared as
@@ -451,6 +441,7 @@ fn bind_representation(
     name_ident: &Ident,
     schema: (&str, bool),
     representation: &mut UserDefinedTypeRepresentation,
+    arrays: &TypeArrays,
 ) -> Result<(Option<ObjectName>, Vec<NamedFunction>), Error> {
     let mut multirange_name = None;
     let mut named_functions = Vec::new();
@@ -462,7 +453,7 @@ fn bind_representation(
                 &name_ident.value,
             )?;
             for attribute in attributes {
-                bind_type(builder, &mut attribute.data_type)?;
+                bind_type(builder, &mut attribute.data_type, arrays)?;
                 require_existing_type(builder, &attribute.data_type)?;
             }
         }
@@ -492,16 +483,19 @@ fn bind_representation(
             }) else {
                 return Err(Error::RangeSubtypeRequired { type_name: name_ident.value.clone() });
             };
-            bind_type(builder, subtype)?;
+            bind_type(builder, subtype, arrays)?;
             require_existing_type(builder, subtype)?;
             named_functions = range_functions_of(options);
             let mut multirange = match explicit_name {
                 Some(explicit) => explicit,
                 None => multirange_from_range_name(ident_parts(name_ident)),
             };
-            bind_reference(&mut multirange, Some(schema_ident(schema.0, schema.1)));
+            if qualifier_of(&multirange).named().is_none() {
+                bind_reference(&mut multirange, Some(schema_ident(schema.0, schema.1)));
+            }
             // The multirange names the pool of type names too.
             let multirange_ident = object_name_last_identifier(&multirange).unwrap_or(name_ident);
+            let schema = qualifier_of(&multirange).named().unwrap_or(schema);
             match reach_in_schema(builder, multirange_ident, schema) {
                 Some(Reached::RowType(kind)) => {
                     return Err(Error::RelationNameAlreadyTaken {
@@ -531,7 +525,7 @@ fn bind_representation(
         UserDefinedTypeRepresentation::SqlDefinition { options } => {
             for option in &mut *options {
                 if let UserDefinedTypeSqlDefinitionOption::Element(data_type) = option {
-                    bind_type(builder, data_type)?;
+                    bind_type(builder, data_type, arrays)?;
                     require_existing_type(builder, data_type)?;
                 }
             }
@@ -612,6 +606,7 @@ pub(super) fn drop_types(
     if_exists: bool,
     cascade: bool,
     spelling: DropSpelling,
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     let mut doomed: Vec<Doomed> = Vec::new();
     for name in names {
@@ -619,12 +614,12 @@ pub(super) fn drop_types(
         let schema_parts = schema.map(ident_parts);
         // An array type goes only with the type it is the array of.
         if spelling == DropSpelling::Type
-            && let Some(base) = array_type_of(&builder, ident, schema_parts)
+            && let Some(base) = arrays.element(&builder, name)
         {
             return Err(Error::TypeDropRequiredBy {
-                type_name: alloc::format!("{base}[]"),
+                type_name: format!("{}[]", base.name()),
                 requiring_kind: ObjectKind::Type,
-                requiring_name: base,
+                requiring_name: base.name().to_string(),
             });
         }
         let reached = match schema_parts {
@@ -686,7 +681,7 @@ pub(super) fn drop_types(
             _ => {}
         }
     }
-    drop_positions(builder, &doomed, cascade, &[])
+    drop_positions(builder, &doomed, cascade, &[], arrays)
 }
 
 /// The name a stored table is stored under, with the default schema written
@@ -773,6 +768,7 @@ fn drop_positions(
     doomed: &[Doomed],
     cascade: bool,
     alongside: &[Arc<CreateFunction>],
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     if doomed.is_empty() {
         return Ok(builder);
@@ -819,7 +815,7 @@ fn drop_positions(
     }
 
     if cascade {
-        builder = drop_dependents_cascade(builder, &doomed_owned)?;
+        builder = drop_dependents_cascade(builder, &doomed_owned, arrays)?;
     }
     // A range takes its constructors along, after a cascade has dropped the
     // columns of its type and the checks on them.
@@ -855,15 +851,25 @@ fn drop_positions(
 
     // Remove the doomed, domains and user-defined types alike.
     let mut domain_position = 0;
-    builder.domains_mut().retain(|_| {
+    builder.domains_mut().retain(|(domain, _)| {
         let kept = !doomed_domain(&doomed_owned, domain_position);
         domain_position += 1;
+        if !kept {
+            Arc::make_mut(arrays).remove(&domain.name);
+        }
         kept
     });
     let mut type_position = 0;
-    builder.user_defined_types_mut().retain(|_| {
+    builder.user_defined_types_mut().retain(|(type_, _)| {
         let kept = !doomed_user_type(&doomed_owned, type_position);
         type_position += 1;
+        if !kept {
+            let arrays = Arc::make_mut(arrays);
+            arrays.remove(&type_.name);
+            if let Some(multirange) = &type_.multirange_name {
+                arrays.remove(multirange);
+            }
+        }
         kept
     });
     Ok(builder)
@@ -874,6 +880,7 @@ fn drop_positions(
 fn drop_dependents_cascade(
     mut builder: ParserDBBuilder,
     doomed: &[Doomed],
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     // An inherited column leaves with the parent's, so only declared columns
     // are dropped.
@@ -898,6 +905,7 @@ fn drop_dependents_cascade(
             &[column_name],
             false,
             true,
+            arrays,
         )?;
     }
     // The composite stays, possibly with no attribute left.
@@ -952,6 +960,7 @@ pub(super) fn drop_types_in(
     builder: ParserDBBuilder,
     schema: (&str, bool),
     alongside: &[Arc<CreateFunction>],
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     let case = builder.identifier_case();
     let doomed_domains: Vec<Doomed> = builder
@@ -970,20 +979,32 @@ pub(super) fn drop_types_in(
         .collect();
     let mut doomed = doomed_domains;
     doomed.extend(doomed_types);
-    drop_positions(builder, &doomed, true, alongside)
+    drop_positions(builder, &doomed, true, alongside, arrays)
 }
 
-/// Rewrites the last part of the stored type name `name` to `to` when it is
-/// the name `from` holds in `from_schema`.
+/// Retargets a matching type reference while preserving qualification within
+/// its schema.
 fn retarget_type_name(
     name: &mut ObjectName,
     from: (&str, bool),
     from_schema: (&str, bool),
-    to: &Ident,
+    to: &ObjectName,
     case: IdentifierCase,
 ) {
     if names_type(name, from, from_schema, case) {
-        rewrite_last_ident(name, to);
+        let destination_schema = qualifier_of(to).named().unwrap_or((DEFAULT_SCHEMA, false));
+        if case.identifiers_match(
+            from_schema.0,
+            from_schema.1,
+            destination_schema.0,
+            destination_schema.1,
+        ) {
+            if let Some(ident) = object_name_last_identifier(to) {
+                rewrite_last_ident(name, ident);
+            }
+        } else {
+            name.clone_from(to);
+        }
     }
 }
 
@@ -1002,14 +1023,15 @@ fn column_renames_type(
     })
 }
 
-/// Re-points every stored type reference that names `from` in `schema` to
-/// `to`, which a renamed type or multirange reaches.
-fn repoint_type_references(
+/// Repoints declared types and signatures to a renamed type identity.
+pub(super) fn repoint_type_references(
     mut builder: ParserDBBuilder,
-    (from_name, from_name_quoted): (&str, bool),
-    (from_schema, from_schema_quoted): (&str, bool),
-    to: &Ident,
+    previous: &ObjectName,
+    to: &ObjectName,
 ) -> Result<ParserDBBuilder, Error> {
+    let (schema, ident) = object_name_identifiers(previous)?;
+    let (from_name, from_name_quoted) = ident_parts(ident);
+    let (from_schema, from_schema_quoted) = schema.map_or((DEFAULT_SCHEMA, false), ident_parts);
     let case = builder.identifier_case();
     let from = (from_name, from_name_quoted);
     // Every table whose a column names the type, rebuilt.
@@ -1133,10 +1155,11 @@ fn names_type(
 pub(super) fn alter_type(
     builder: ParserDBBuilder,
     alter: AlterType,
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     match alter.operation {
         AlterTypeOperation::Rename(rename) => {
-            alter_type_rename(builder, &alter.name, &rename.new_name)
+            alter_type_rename(builder, &alter.name, &rename.new_name, arrays)
         }
         AlterTypeOperation::AddValue(add) => alter_type_add_value(builder, &alter.name, add),
         AlterTypeOperation::RenameValue(renamed) => {
@@ -1183,14 +1206,28 @@ fn alter_type_rename(
     builder: ParserDBBuilder,
     name: &ObjectName,
     new_name: &Ident,
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     // The array type of a stored type is altered only through its type.
-    let (schema, ident) = object_name_identifiers(name)?;
-    if let Some(base) = array_type_of(&builder, ident, schema.map(ident_parts)) {
-        return Err(Error::CannotAlterArrayType { array_name: alloc::format!("{base}[]") });
+    if let Some(base) = arrays.element(&builder, name) {
+        return Err(Error::CannotAlterArrayType { array_name: format!("{}[]", base.name()) });
     }
     let (target, is_multirange) = resolve_named_type(&builder, name)?;
-    let schema = qualifier_of(name).named().unwrap_or((DEFAULT_SCHEMA, false));
+    let old_name = match target {
+        Doomed::Domain(position) => builder.domains()[position].0.name.clone(),
+        Doomed::UserType(position) => {
+            let type_ = &builder.user_defined_types()[position].0;
+            if is_multirange {
+                type_
+                    .multirange_name
+                    .clone()
+                    .ok_or_else(|| Error::TypeNotFound { type_name: name.to_string() })?
+            } else {
+                type_.name.clone()
+            }
+        }
+    };
+    let schema = qualifier_of(&old_name).named().unwrap_or((DEFAULT_SCHEMA, false));
     match reach_in_schema(&builder, new_name, schema) {
         Some(Reached::RowType(kind)) => {
             return Err(Error::TypeIsRowType {
@@ -1230,36 +1267,12 @@ fn alter_type_rename(
             object_name: new_name.value.clone(),
         });
     }
-    // Rewrite the stored name, or the multirange name, to the new one.
-    let (stored_name, stored_name_quoted) = match target {
-        Doomed::Domain(position) => {
-            let (domain, _) = &builder.domains()[position];
-            (domain.name().to_string(), domain.name_is_quoted())
-        }
-        Doomed::UserType(position) if !is_multirange => {
-            let (type_, _) = &builder.user_defined_types()[position];
-            (type_.name().to_string(), type_.name_is_quoted())
-        }
-        Doomed::UserType(position) => {
-            let (type_, _) = &builder.user_defined_types()[position];
-            let multirange = type_
-                .multirange_name()
-                .ok_or(Error::TypeNotFound { type_name: name.to_string() })?;
-            let (stored, quoted) = object_name_identifiers(multirange)
-                .ok()
-                .map_or((type_.name(), type_.name_is_quoted()), |(_, ident)| {
-                    (ident.value.as_str(), ident.quote_style.is_some())
-                });
-            (stored.to_string(), quoted)
-        }
-    };
+    let mut destination = old_name.clone();
+    rewrite_last_ident(&mut destination, new_name);
+    let array_was_displaced = arrays.array_is_named(&old_name, &destination);
+    Arc::make_mut(arrays).displace(&builder, &destination);
     // Re-point the references, then rewrite the stored name.
-    let mut builder = repoint_type_references(
-        builder,
-        (stored_name.as_str(), stored_name_quoted),
-        schema,
-        new_name,
-    )?;
+    let mut builder = repoint_type_references(builder, &old_name, &destination)?;
     match target {
         Doomed::Domain(position) => {
             let (domain, _) = &mut builder.domains_mut()[position];
@@ -1284,6 +1297,7 @@ fn alter_type_rename(
             rewrite_last_ident(multirange, new_name);
         }
     }
+    Arc::make_mut(arrays).rename(&builder, &old_name, &destination, array_was_displaced);
     Ok(builder)
 }
 

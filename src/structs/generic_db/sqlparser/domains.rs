@@ -33,6 +33,7 @@ use sqlparser::ast::{ArrayElemTypeDef, CreateDomain, DataType, Ident, ObjectName
 use super::{
     ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, bind_reference,
     object_name_last_identifier, place_relation, relation_name_holder, require_named_in_catalog,
+    type_arrays::TypeArrays,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -75,7 +76,9 @@ pub(super) enum Reached {
     Catalog,
 }
 
-/// Records a `CREATE DOMAIN`, binding the type it is declared over.
+/// Records a `CREATE DOMAIN`, binding the type it is declared over. A
+/// generated array holding the name is displaced before the domain fills it,
+/// and the domain's own array is registered once it enters the namespace.
 ///
 /// # Errors
 ///
@@ -85,6 +88,7 @@ pub(super) fn create_domain(
     mut builder: ParserDBBuilder,
     mut domain: CreateDomain,
     role: Option<&str>,
+    arrays: &mut Arc<TypeArrays>,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut domain.name, ObjectKind::Domain, builder.catalog_name())?;
     place_relation(&builder, &mut domain.name, false, ObjectKind::Domain, role)?;
@@ -101,9 +105,13 @@ pub(super) fn create_domain(
             object_name: name.value.clone(),
         });
     }
-    bind_type(&builder, &mut domain.data_type)?;
+    Arc::make_mut(arrays).displace(&builder, &domain.name);
+    bind_type(&builder, &mut domain.data_type, arrays)?;
     let calls = builder.calls_in(&domain);
-    Ok(builder.add_domain(Arc::new(domain), calls))
+    let node = Arc::new(domain);
+    let builder = builder.add_domain(Arc::clone(&node), calls);
+    Arc::make_mut(arrays).create(&builder, &node.name);
+    Ok(builder)
 }
 
 /// Returns [`ObjectKind::Domain`] when a domain holds `name` in `schema`.
@@ -303,7 +311,8 @@ innermost_type_name!(
 
 /// Binds a declared type naming a domain or a user-defined type, or an array
 /// of either, to the type the session's path reaches now, writing that type's
-/// schema into the name.
+/// schema into the name. A name reaching a generated array binds to its
+/// element first, qualified with the schema the element holds in.
 ///
 /// A type of the default schema stays bare, unless `pg_catalog` holds a type of
 /// its name, which a bare name would reach instead.
@@ -312,7 +321,12 @@ innermost_type_name!(
 ///
 /// Returns [`Error::TypeIsOnlyShell`] for a type that reaches a shell, a name
 /// held by a bare `CREATE TYPE name;` and never filled.
-pub(super) fn bind_type(builder: &ParserDBBuilder, data_type: &mut DataType) -> Result<(), Error> {
+pub(super) fn bind_type(
+    builder: &ParserDBBuilder,
+    data_type: &mut DataType,
+    arrays: &TypeArrays,
+) -> Result<(), Error> {
+    arrays.bind_type(builder, data_type);
     if builder.domains().is_empty() && builder.user_defined_types().is_empty() {
         return Ok(());
     }
@@ -343,7 +357,12 @@ pub(super) fn bind_type(builder: &ParserDBBuilder, data_type: &mut DataType) -> 
 /// Binds a type a function's signature declares, as [`bind_type`] binds a
 /// column's, reaching the row type of a relation too and keeping a shell,
 /// which a signature may name.
-pub(super) fn bind_signature_type(builder: &ParserDBBuilder, data_type: &mut DataType) {
+pub(super) fn bind_signature_type(
+    builder: &ParserDBBuilder,
+    data_type: &mut DataType,
+    arrays: &TypeArrays,
+) {
+    arrays.bind_type(builder, data_type);
     let Some(name) = custom_name_mut(data_type) else {
         return;
     };

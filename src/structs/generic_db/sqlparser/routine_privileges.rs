@@ -15,7 +15,7 @@ use sqlparser::ast::{
 
 use super::{
     AccessResolution, ParserDB, ParserDBBuilder, grantee_role_ident, schema_qualifiers_match,
-    stored_role_name, validate_access_targets_against_builder,
+    stored_role_name, type_arrays::TypeArrays, validate_access_targets_against_builder,
 };
 use crate::{
     errors::Error,
@@ -70,8 +70,9 @@ pub(super) fn grant(
     routines: Routines,
     grant: &Grant,
     access_resolution: AccessResolution,
+    arrays: &TypeArrays,
 ) -> Result<Vec<FunctionDesc>, Error> {
-    let reached = Reached::of(builder, &routines, access_resolution)?;
+    let reached = Reached::of(builder, &routines, access_resolution, arrays)?;
     validate(builder, &grant.grantees, &grant.privileges, access_resolution)?;
 
     for &position in &reached.functions {
@@ -102,8 +103,9 @@ pub(super) fn revoke(
     routines: &Routines,
     revoke: &Revoke,
     access_resolution: AccessResolution,
+    arrays: &TypeArrays,
 ) -> Result<(), Error> {
-    let reached = Reached::of(builder, routines, access_resolution)?;
+    let reached = Reached::of(builder, routines, access_resolution, arrays)?;
     validate(builder, &revoke.grantees, &revoke.privileges, access_resolution)?;
 
     let names_owner = |grantee: &Grantee, owner: &str| {
@@ -162,6 +164,7 @@ impl Reached {
         builder: &ParserDBBuilder,
         routines: &Routines,
         access_resolution: AccessResolution,
+        arrays: &TypeArrays,
     ) -> Result<Self, Error> {
         let case = builder.identifier_case();
         let functions = builder.functions();
@@ -170,7 +173,7 @@ impl Reached {
         match routines {
             Routines::Functions(signatures) => {
                 for (index, signature) in signatures.iter().enumerate() {
-                    let matching = ParserDB::functions_named(builder, signature);
+                    let matching = ParserDB::functions_named(builder, signature, arrays);
                     match matching.as_slice() {
                         [] => reached.miss(index, signature, access_resolution)?,
                         [_, _, ..] if signature.args.is_none() => {

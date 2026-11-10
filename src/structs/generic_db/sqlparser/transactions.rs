@@ -12,7 +12,7 @@ use sqlparser::ast::{FunctionDesc, Ident, Statement, TransactionModifier};
 use super::{
     AccessResolution, CreatedCollationMetadata, DefaultPrivileges, ParserDB, ParserDBBuilder,
     ParserIngestion, PostgresCatalog, SessionRoles, SessionSettings, UndeclaredRoleAlteration,
-    parsed_source::StatementSource,
+    parsed_source::StatementSource, type_arrays::TypeArrays,
 };
 use crate::{errors::Error, impls::SqlparserDialect, structs::IdentifierCase};
 
@@ -23,6 +23,7 @@ pub(super) struct Catalog {
     /// The PostgreSQL catalog collations and collatable types resolve
     /// against.
     pub(super) postgres: Arc<PostgresCatalog>,
+    pub(super) type_arrays: Arc<TypeArrays>,
     /// Collations the ingested statements created.
     pub(super) collations: Vec<CreatedCollationMetadata>,
     /// Signatures open-world grants named without reaching a function.
@@ -43,6 +44,7 @@ impl Catalog {
         let ParserIngestion {
             access_resolution,
             active_postgres_catalog,
+            type_arrays,
             collation_metadata,
             unresolved_function_grants,
             role_alterations,
@@ -53,6 +55,7 @@ impl Catalog {
         let catalog = Self {
             builder,
             postgres: active_postgres_catalog,
+            type_arrays,
             collations: collation_metadata,
             unresolved_function_grants,
             role_alterations,
@@ -67,6 +70,7 @@ impl Catalog {
         self.builder.into_database(Arc::new(ParserIngestion {
             access_resolution,
             active_postgres_catalog: self.postgres,
+            type_arrays: self.type_arrays,
             collation_metadata: self.collations,
             unresolved_function_grants: self.unresolved_function_grants,
             role_alterations: self.role_alterations,
@@ -80,6 +84,7 @@ impl Catalog {
         self.builder.snapshot_with(Arc::new(ParserIngestion {
             access_resolution,
             active_postgres_catalog: Arc::clone(&self.postgres),
+            type_arrays: Arc::clone(&self.type_arrays),
             collation_metadata: self.collations.clone(),
             unresolved_function_grants: self.unresolved_function_grants.clone(),
             role_alterations: self.role_alterations.clone(),

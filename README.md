@@ -13,7 +13,7 @@ This library provides a set of traits to abstract over SQL database schemas, all
 ## Features
 
 - **Generic Schema Abstraction**: Traits such as `DatabaseLike`, `TableLike`, `ColumnLike`, `ForeignKeyLike`, and `UniqueIndexLike` define a common interface for schema introspection.
-- **SQL Parser Integration**: The `ParserDB` struct implements these traits using `sqlparser-rs`, enabling the construction of an introspectable database model directly from SQL DDL strings.
+- **Parser integration**. `ParserDB` builds schema models from `SQL` declarations and tracks PostgreSQL generated-array ownership through renames, drops, and transactions.
 - **Metadata Support**: Comprehensive support for table attributes, indices, and constraints.
 
 ## Usage

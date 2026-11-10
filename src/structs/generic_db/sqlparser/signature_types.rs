@@ -19,6 +19,7 @@ use super::{
     ParserDBBuilder,
     domains::{Reached, bind_signature_type, custom_name, custom_name_mut, reach_in_schema},
     object_name_last_identifier, schema_qualifiers_match,
+    type_arrays::TypeArrays,
     view_rewrites::edit_function,
     views::bound_read_key,
 };
@@ -71,17 +72,25 @@ fn signature_types_mut(function: &mut CreateFunction) -> impl Iterator<Item = &m
 
 /// Binds every bare type name the signature of `function` declares to the
 /// type the session's path reaches now.
-pub(super) fn bind_signature(builder: &ParserDBBuilder, function: &mut CreateFunction) {
+pub(super) fn bind_signature(
+    builder: &ParserDBBuilder,
+    function: &mut CreateFunction,
+    arrays: &TypeArrays,
+) {
     for data_type in signature_types_mut(function) {
-        bind_signature_type(builder, data_type);
+        bind_signature_type(builder, data_type, arrays);
     }
 }
 
 /// Binds the argument types a statement naming a function lists, the way
 /// the function's own signature was bound, so the two compare alike.
-pub(super) fn bind_arguments(builder: &ParserDBBuilder, arguments: &mut [OperateFunctionArg]) {
+pub(super) fn bind_arguments(
+    builder: &ParserDBBuilder,
+    arguments: &mut [OperateFunctionArg],
+    arrays: &TypeArrays,
+) {
     for argument in arguments {
-        bind_signature_type(builder, &mut argument.data_type);
+        bind_signature_type(builder, &mut argument.data_type, arrays);
     }
 }
 
@@ -108,20 +117,6 @@ pub(super) fn retarget_signatures(
             }
         });
     }
-}
-
-/// Points every signature naming the row type of the relation `key` names at
-/// `to`, the relation's name once renamed or moved.
-pub(super) fn follow_relation_rename(
-    builder: &mut ParserDBBuilder,
-    key: &RelationKey,
-    to: &ObjectName,
-) {
-    retarget_signatures(
-        builder,
-        |name| bound_read_key(None, name).as_ref() == Some(key),
-        |name| name.clone_from(to),
-    );
 }
 
 /// The relations whose row types the signature of `function` names, keyed
