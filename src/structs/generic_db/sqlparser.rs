@@ -10559,6 +10559,7 @@ impl ParserDB {
                     // against a name nothing can read covers nothing and says
                     // so nowhere.
                     require_static_access_names(grant.objects.as_ref())?;
+                    session_roles.bind_grantees(&mut grant.grantees);
                     if let Some(routines) = routine_privileges::Routines::take(&mut grant.objects) {
                         unresolved_function_grants.extend(routine_privileges::grant(
                             &mut builder,
@@ -10634,6 +10635,7 @@ impl ParserDB {
                 }
                 Statement::Revoke(mut revoke) => {
                     require_static_access_names(revoke.objects.as_ref())?;
+                    session_roles.bind_grantees(&mut revoke.grantees);
                     if let Some(routines) = routine_privileges::Routines::take(&mut revoke.objects)
                     {
                         routine_privileges::revoke(

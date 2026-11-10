@@ -131,6 +131,23 @@ impl SessionRoles {
         self.current().session.as_ref().map(|role| role.stored.as_str())
     }
 
+    /// Binds session-principal grantees to known DDL-time roles.
+    pub(super) fn bind_grantees(&self, grantees: &mut [Grantee]) {
+        for grantee in grantees {
+            let role = match grantee_is_session_principal(grantee) {
+                Some(SessionPrincipal::CurrentUser) => self.creating_role(),
+                Some(SessionPrincipal::SessionUser) => self.session_role(),
+                None => continue,
+            };
+            if let Some(role) = role {
+                grantee.name =
+                    Some(GranteeName::ObjectName(ObjectName::from(vec![Ident::with_quote(
+                        '"', role,
+                    )])));
+            }
+        }
+    }
+
     /// Whether the session runs as `role`, as its current or its session
     /// role, which PostgreSQL refuses to drop or rename.
     pub(super) fn runs_as(&self, role: &Ident) -> bool {
