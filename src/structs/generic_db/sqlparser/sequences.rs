@@ -52,7 +52,7 @@ use super::{
     Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, domains,
     object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
     relation_name_holder, require_named_in_catalog, schema_qualifiers_match, stored_ident,
-    type_arrays::TypeArrays, views,
+    type_arrays::TypeArrays, user_defined_types::TypeDrop, views,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -282,6 +282,10 @@ pub(super) fn holds_sequence(builder: &ParserDBBuilder, name: &ObjectName) -> bo
 
 /// Drops the sequences a `DROP SEQUENCE` names.
 ///
+/// Returns the builder alongside the identities and functions the views a
+/// `CASCADE` takes, each dropped row type with its stored array, read before
+/// the removal.
+///
 /// # Errors
 ///
 /// Returns [`Error::RelationKindMismatch`] for a name another relation kind
@@ -295,7 +299,8 @@ pub(super) fn drop_sequences(
     if_exists: bool,
     cascade: bool,
     arrays: &mut Arc<TypeArrays>,
-) -> Result<ParserDBBuilder, Error> {
+) -> Result<(ParserDBBuilder, TypeDrop), Error> {
+    let mut drop = TypeDrop { types: Vec::new(), functions: Vec::new() };
     for name in names {
         if object_name_last_identifier(name).is_none() {
             return Err(Error::UnnamedObject { object_kind: ObjectKind::Sequence });
@@ -313,7 +318,9 @@ pub(super) fn drop_sequences(
             refuse_dropping_identity_sequence(&builder, &doomed)?;
             let key = stored_sequence_key(doomed.as_ref(), IdentifierCase::AsWritten);
             if cascade {
-                views::remove_dependent_views(&mut builder, &key, arrays);
+                let taken = views::remove_dependent_views(&mut builder, &key, arrays);
+                drop.types.extend(taken.types);
+                drop.functions.extend(taken.functions);
             } else {
                 views::refuse_dependent_views(
                     &builder,
@@ -345,7 +352,7 @@ pub(super) fn drop_sequences(
             None => {}
         }
     }
-    Ok(builder)
+    Ok((builder, drop))
 }
 
 /// Drops every sequence stored in a schema `DROP SCHEMA ... CASCADE` drops.

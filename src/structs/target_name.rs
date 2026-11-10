@@ -248,6 +248,11 @@ impl<'a> TargetName<'a> {
             schema_is_quoted: self.schema_is_quoted,
         }
     }
+
+    /// Transfers the identifier, qualifier and their quoting flags.
+    pub(crate) fn into_parts(self) -> (Cow<'a, str>, bool, Option<Cow<'a, str>>, bool) {
+        (self.name, self.name_is_quoted, self.schema, self.schema_is_quoted)
+    }
 }
 
 /// Writes one identifier, quoting it and doubling any embedded quote when it

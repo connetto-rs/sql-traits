@@ -18,9 +18,9 @@ use crate::{
     errors::LookupError,
     structs::{PolicyExpression, SequenceParameters, TargetName},
     traits::{
-        DatabaseLike, DomainLike, ExtensionLike, Metadata, PolicyLike, Relation, RuleLike,
-        SequenceLike, SequenceOrigin, SequenceOwner, UserDefinedTypeKind, UserDefinedTypeLike,
-        ViewLike,
+        DatabaseLike, DomainLike, ExtensionLike, Metadata, OperatorKind, OperatorLike, PolicyLike,
+        Relation, RuleLike, SequenceLike, SequenceOrigin, SequenceOwner, UserDefinedTypeKind,
+        UserDefinedTypeLike, ViewLike,
     },
 };
 
@@ -87,6 +87,34 @@ impl<DB> Hash for Absent<DB> {
 
 impl<DB> Metadata for Absent<DB> {
     type Meta = ();
+}
+
+impl<DB: DatabaseLike<Operator = Self>> OperatorLike for Absent<DB> {
+    type DB = DB;
+
+    fn target_name(&self) -> TargetName<'_> {
+        self.unreachable()
+    }
+
+    fn kind(&self) -> OperatorKind {
+        self.unreachable()
+    }
+
+    fn left_type<'db>(&'db self, _: &'db DB) -> Option<TargetName<'db>> {
+        self.unreachable()
+    }
+
+    fn right_type<'db>(&'db self, _: &'db DB) -> Option<TargetName<'db>> {
+        self.unreachable()
+    }
+
+    fn result_type<'db>(&'db self, _: &'db DB) -> Option<TargetName<'db>> {
+        self.unreachable()
+    }
+
+    fn implementation<'db>(&'db self, _: &'db DB) -> Option<&'db DB::Function> {
+        self.unreachable()
+    }
 }
 
 impl<DB: DatabaseLike> ViewLike for Absent<DB> {

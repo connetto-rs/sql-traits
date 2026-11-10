@@ -32,6 +32,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type Index = P::Index;
     type ForeignKey = P::ForeignKey;
     type Function = P::Function;
+    type Operator = P::Operator;
     type UniqueIndex = P::UniqueIndex;
     type CheckConstraint = P::CheckConstraint;
     type Trigger = P::Trigger;
@@ -52,6 +53,10 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     #[inline]
     fn dialect(&self) -> &Self::Dialect {
         &self.dialect
+    }
+
+    fn operators(&self) -> Option<impl Iterator<Item = &Self::Operator>> {
+        P::operators(&self.dialect, &self.ingestion)
     }
 
     #[inline]

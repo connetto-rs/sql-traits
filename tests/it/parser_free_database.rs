@@ -282,6 +282,7 @@ impl DatabaseLike for MemoryCatalog {
     type Index = MemoryIndex;
     type ForeignKey = MemoryForeignKey;
     type Function = MemoryFunction;
+    type Operator = sql_traits::structs::Absent<Self>;
     type UniqueIndex = MemoryUniqueIndex;
     type CheckConstraint = MemoryCheckConstraint;
     type Trigger = MemoryTrigger;

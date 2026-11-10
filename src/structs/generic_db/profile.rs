@@ -12,9 +12,9 @@ use crate::{
     structs::GenericDB,
     traits::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, DomainLike,
-        ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, Metadata, PolicyLike, RoleLike,
-        RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike,
-        TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
+        ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, Metadata, OperatorLike, PolicyLike,
+        RoleLike, RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike,
+        TableLike, TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
     },
 };
 
@@ -67,6 +67,8 @@ pub trait SchemaProfile: Sized {
     /// The functions the schema holds, owned so the functions an engine
     /// provides can be shared by every database of the process.
     type Function: FunctionLike<DB = GenericDB<Self>> + 'static;
+    /// The operators the catalog holds.
+    type Operator: OperatorLike<DB = GenericDB<Self>>;
     /// The check constraints the schema holds.
     type CheckConstraint: CheckConstraintLike<DB = GenericDB<Self>>;
     /// The triggers the schema holds.
@@ -109,6 +111,17 @@ pub trait SchemaProfile: Sized {
     /// dialect's defaults: the parser profile answers PostgreSQL with the
     /// full default catalog and every other dialect with an empty one.
     fn default_ingestion(dialect: &Self::Dialect) -> Self::Ingestion;
+
+    /// Returns the modeled operator catalog, or `None` when it is unavailable.
+    fn operators<'a>(
+        _dialect: &'a Self::Dialect,
+        _ingestion: &'a Self::Ingestion,
+    ) -> Option<impl Iterator<Item = &'a Self::Operator>>
+    where
+        Self::Operator: 'a,
+    {
+        None::<core::iter::Empty<&'a Self::Operator>>
+    }
 
     /// Returns the schemas a database of this profile starts with under the
     /// given dialect, before any object is added, such as `public` for the

@@ -127,6 +127,9 @@ use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
 use parsed_source::{ParsedSource, StatementSource};
 use postgres_catalog::CatalogName;
+mod postgres_operator;
+pub use postgres_operator::PostgresCatalogOperator;
+mod postgres_18_operators;
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};
 use role_memberships::CreateRoleMemberships;
 use role_settings::SessionSettings;
@@ -148,6 +151,7 @@ impl SchemaProfile for SqlparserProfile {
     type UniqueIndex = TableAttribute<CreateTable, UniqueConstraint>;
     type ForeignKey = TableAttribute<CreateTable, ForeignKeyConstraint>;
     type Function = CreateFunction;
+    type Operator = PostgresCatalogOperator;
     type CheckConstraint = TableAttribute<CreateTable, CheckConstraint>;
     type Trigger = CreateTrigger;
     type Rule = CreateRule;
@@ -179,6 +183,17 @@ impl SchemaProfile for SqlparserProfile {
             session_settings: SessionSettings::default(),
             default_privileges: DefaultPrivileges::default(),
         })
+    }
+
+    fn operators<'a>(
+        dialect: &'a SqlparserDialect,
+        ingestion: &'a Arc<ParserIngestion>,
+    ) -> Option<impl Iterator<Item = &'a PostgresCatalogOperator>>
+    where
+        Self::Operator: 'a,
+    {
+        matches!(dialect, SqlparserDialect::PostgreSql)
+            .then(|| ingestion.active_postgres_catalog.operators())
     }
 
     fn initial_schemas(dialect: &SqlparserDialect) -> impl IntoIterator<Item = (Arc<Schema>, ())> {
@@ -270,6 +285,7 @@ impl core::fmt::Debug for ParserIngestion {
                 "catalog_collatable_types",
                 &self.active_postgres_catalog.collatable_types().count(),
             )
+            .field("catalog_operators", &self.active_postgres_catalog.operators().count())
             .field("created_collations", &self.collation_metadata.len())
             .field("unresolved_function_grants", &self.unresolved_function_grants.len())
             .field("undeclared_role_alterations", &self.role_alterations.len())
@@ -5649,6 +5665,7 @@ impl ParserDB {
         new_name: ObjectName,
         if_exists: bool,
         arrays: &mut Arc<TypeArrays>,
+        catalog: &mut Arc<PostgresCatalog>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(resolved_table) = builder.resolve_table_object_name(old_name)? else {
             if if_exists {
@@ -5679,10 +5696,13 @@ impl ParserDB {
             builder.identifier_case(),
         );
         let array_was_displaced = arrays.array_is_named(&original, &target.name);
-        if changing_schema {
-            Arc::make_mut(arrays).move_schema(&builder, &original, &target.name)?;
+        let array_move = if changing_schema {
+            Arc::make_mut(arrays).move_schema(&builder, &original, &target.name)?
         } else {
-            Arc::make_mut(arrays).displace(&builder, &target.name);
+            Arc::make_mut(arrays).displace(&builder, &target.name)
+        };
+        if let Some((previous, current)) = array_move {
+            Arc::make_mut(catalog).rename_type_identity(&previous, current);
         }
         let readers = view_rewrites::readers(&builder, &[&key]);
 
@@ -5725,9 +5745,13 @@ impl ParserDB {
             view_rewrites::follow_renames(&mut builder, readers, &followed)?;
         }
 
-        if !changing_schema {
-            Arc::make_mut(arrays).rename(&builder, &original, &target.name, array_was_displaced);
+        if !changing_schema
+            && let Some((previous, current)) =
+                Arc::make_mut(arrays).rename(&builder, &original, &target.name, array_was_displaced)
+        {
+            Arc::make_mut(catalog).rename_type_identity(&previous, current);
         }
+        Arc::make_mut(catalog).rename_type_identity(&original, &target.name);
         Ok(builder)
     }
 
@@ -5750,6 +5774,30 @@ impl ParserDB {
         doomed
     }
 
+    /// Removes operators naming dropped types or declaring their removed
+    /// functions.
+    fn drop_operators_for_type_drop(
+        catalog: &mut Arc<PostgresCatalog>,
+        builder: &ParserDBBuilder,
+        drop: &user_defined_types::TypeDrop,
+        arrays: &TypeArrays,
+    ) {
+        if drop.types.is_empty() && drop.functions.is_empty() {
+            return;
+        }
+        let catalog = Arc::make_mut(catalog);
+        catalog.drop_operators_naming_types(&drop.types);
+        if drop.functions.is_empty() {
+            return;
+        }
+        let case = builder.identifier_case();
+        catalog.drop_operators_where(&|operator| {
+            drop.functions.iter().any(|function| {
+                operator.declares_function(arrays, &function.name, function.args.as_deref(), case)
+            })
+        });
+    }
+
     /// Moves every function and relation stored in schema `from` to `to`,
     /// carrying every reference to each along, as `ALTER SCHEMA ... RENAME TO`
     /// does.
@@ -5764,6 +5812,7 @@ impl ParserDB {
         from: (&str, bool),
         to: (&str, bool),
         arrays: &mut Arc<TypeArrays>,
+        catalog: &mut Arc<PostgresCatalog>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let case = builder.identifier_case();
         let in_from =
@@ -5794,7 +5843,7 @@ impl ParserDB {
             .collect();
         for (name, ident) in tables {
             let moved = ObjectName::from(vec![stored_ident(to.0, to.1), ident]);
-            builder = Self::rename_table_checked(builder, &name, moved, false, arrays)?;
+            builder = Self::rename_table_checked(builder, &name, moved, false, arrays, catalog)?;
         }
         views::move_views(builder, from, to)
     }
@@ -7691,24 +7740,26 @@ impl ParserDB {
 
     /// Removes the views reading `table` under `CASCADE`, and otherwise refuses
     /// the drop of `dropped` that would take `table` away from under them.
+    ///
+    /// Returns the identities removed by the reader cascade.
     fn release_dependent_views(
         builder: &mut ParserDBBuilder,
         table: &StoredTable,
         dropped: &StoredTable,
         cascade: bool,
         arrays: &mut Arc<TypeArrays>,
-    ) -> Result<(), crate::errors::Error> {
+    ) -> Result<user_defined_types::TypeDrop, crate::errors::Error> {
         let key = stored_table_key(Self::stored_node(builder, table)?, IdentifierCase::AsWritten);
         if cascade {
-            views::remove_dependent_views(builder, &key, arrays);
-            return Ok(());
+            return Ok(views::remove_dependent_views(builder, &key, arrays));
         }
         let dropped_kind = if builder.is_foreign_table(Self::stored_node(builder, dropped)?) {
             ObjectKind::ForeignTable
         } else {
             ObjectKind::Table
         };
-        views::refuse_dependent_views(builder, &key, dropped_kind, &dropped.name)
+        views::refuse_dependent_views(builder, &key, dropped_kind, &dropped.name)?;
+        Ok(user_defined_types::TypeDrop::default())
     }
 
     /// Removes tables together with the foreign keys the remaining tables
@@ -8056,9 +8107,10 @@ impl ParserDB {
         column_if_exists: bool,
         cascade: bool,
         arrays: &mut Arc<TypeArrays>,
-    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+    ) -> Result<(ParserDBBuilder, user_defined_types::TypeDrop), crate::errors::Error> {
+        let mut removed = user_defined_types::TypeDrop::default();
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
-            return Ok(builder);
+            return Ok((builder, removed));
         };
 
         for column_name in column_names {
@@ -8122,7 +8174,9 @@ impl ParserDB {
             }
             if !readers.is_empty() {
                 let doomed = views::readers_and_dependents(&builder, readers);
-                views::remove_readers(&mut builder, &doomed, arrays);
+                let readers = views::remove_readers(&mut builder, &doomed, arrays);
+                removed.types.extend(readers.types);
+                removed.functions.extend(readers.functions);
             }
 
             // The referencing tables lose their foreign key before the column
@@ -8165,7 +8219,7 @@ impl ParserDB {
 
         // Settled per clause, since each `DROP COLUMN` carries its own
         // `CASCADE`.
-        sequences::settle_dropped_sequences(builder, cascade)
+        Ok((sequences::settle_dropped_sequences(builder, cascade)?, removed))
     }
 
     /// Renames a column and carries every mention of it along, the stored
@@ -9043,6 +9097,27 @@ impl ParserDB {
                                 function_name: function_name.to_string(),
                             });
                         }
+                        // An operator the catalog declares on this function
+                        // holds it in place, and goes with it under CASCADE.
+                        if active_postgres_catalog.operator_declares_function(
+                            &type_arrays,
+                            &function.name,
+                            function.args.as_deref(),
+                            builder.identifier_case(),
+                        ) {
+                            if drop_function.drop_behavior != Some(DropBehavior::Cascade) {
+                                return Err(crate::errors::Error::FunctionReferenced {
+                                    function_name: function_name.to_string(),
+                                });
+                            }
+                            Arc::make_mut(&mut active_postgres_catalog)
+                                .drop_operators_declaring_function(
+                                    &type_arrays,
+                                    &function.name,
+                                    function.args.as_deref(),
+                                    builder.identifier_case(),
+                                );
+                        }
 
                         builder.functions_mut().remove(position);
                     }
@@ -9083,6 +9158,7 @@ impl ParserDB {
                         }
                     }
 
+                    let mut removed = user_defined_types::TypeDrop::default();
                     for dropped in targets {
                         let case = builder.identifier_case();
                         if !builder
@@ -9093,13 +9169,15 @@ impl ParserDB {
                             continue;
                         }
 
-                        Self::release_dependent_views(
+                        let reader_rowtypes = Self::release_dependent_views(
                             &mut builder,
                             &dropped,
                             &dropped,
                             cascade,
                             &mut type_arrays,
                         )?;
+                        removed.types.extend(reader_rowtypes.types);
+                        removed.functions.extend(reader_rowtypes.functions);
 
                         // An `INHERITS` child builds its column list out of its
                         // parents, so only `CASCADE` takes it along, while a
@@ -9116,16 +9194,37 @@ impl ParserDB {
 
                         let mut doomed = inheritance::descendants(&builder, &dropped);
                         for table in &doomed {
-                            Self::release_dependent_views(
+                            let reader_rowtypes = Self::release_dependent_views(
                                 &mut builder,
                                 table,
                                 &dropped,
                                 cascade,
                                 &mut type_arrays,
                             )?;
+                            removed.types.extend(reader_rowtypes.types);
+                            removed.functions.extend(reader_rowtypes.functions);
                         }
                         let table_name = dropped.name.clone();
                         doomed.push(dropped);
+                        for table in &doomed {
+                            let node = Self::stored_node(&builder, table)?;
+                            for name in
+                                core::iter::once(&node.name).chain(type_arrays.array(&node.name))
+                            {
+                                if !cascade
+                                    && let Some(operator) =
+                                        active_postgres_catalog.operator_naming_type(name)
+                                {
+                                    return Err(crate::errors::Error::RelationHasDependents {
+                                        object_kind: expected_kind,
+                                        object_name: table_name.clone(),
+                                        dependent_kind: ObjectKind::Operator,
+                                        dependent_name: operator.name().to_string(),
+                                    });
+                                }
+                                removed.types.push(name.clone());
+                            }
+                        }
 
                         if !cascade && builder.is_referenced_from_outside(&doomed) {
                             return Err(crate::errors::Error::TableReferenced { table_name });
@@ -9133,6 +9232,12 @@ impl ParserDB {
 
                         builder = Self::remove_tables(builder, &doomed, &mut type_arrays)?;
                     }
+                    Self::drop_operators_for_type_drop(
+                        &mut active_postgres_catalog,
+                        &builder,
+                        &removed,
+                        &type_arrays,
+                    );
                 }
                 Statement::Drop {
                     object_type:
@@ -9143,14 +9248,27 @@ impl ParserDB {
                     cascade,
                     ..
                 } => {
-                    builder = views::drop_views(
+                    let operators_holding = |name: &ObjectName| {
+                        active_postgres_catalog
+                            .operator_naming_type(name)
+                            .map(|operator| operator.name().to_string())
+                    };
+                    let (next_builder, removed) = views::drop_views(
                         builder,
                         &names,
                         object_type == sqlparser::ast::ObjectType::MaterializedView,
                         if_exists,
                         cascade,
                         &mut type_arrays,
+                        &operators_holding,
                     )?;
+                    builder = next_builder;
+                    Self::drop_operators_for_type_drop(
+                        &mut active_postgres_catalog,
+                        &builder,
+                        &removed,
+                        &type_arrays,
+                    );
                 }
                 Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Index,
@@ -9519,10 +9637,15 @@ impl ParserDB {
                         let resolved_schema_quoted = schema.is_quoted();
 
                         // Check for contained objects unless CASCADE is
-                        // specified
+                        // specified, the catalog's operators counting
+                        // alongside the declared ones.
                         if !cascade
-                            && builder
+                            && (builder
                                 .is_schema_non_empty(&resolved_schema_name, resolved_schema_quoted)
+                                || active_postgres_catalog.holds_operators_in_schema(
+                                    &resolved_schema_name,
+                                    resolved_schema_quoted,
+                                ))
                         {
                             return Err(crate::errors::Error::SchemaNotEmpty {
                                 schema_name: resolved_schema_name.clone(),
@@ -9550,12 +9673,33 @@ impl ParserDB {
                                 })
                                 .map(StoredTable::of)
                                 .collect();
+                            let mut removed = user_defined_types::TypeDrop::default();
+                            for table in &doomed {
+                                let readers = Self::release_dependent_views(
+                                    &mut builder,
+                                    table,
+                                    table,
+                                    true,
+                                    &mut type_arrays,
+                                )?;
+                                removed.types.extend(readers.types);
+                                removed.functions.extend(readers.functions);
+                                let node = Self::stored_node(&builder, table)?;
+                                removed.types.extend(
+                                    core::iter::once(&node.name)
+                                        .chain(type_arrays.array(&node.name))
+                                        .cloned(),
+                                );
+                            }
                             builder = Self::remove_tables(builder, &doomed, &mut type_arrays)?;
-                            builder = views::drop_views_in(
+                            let (next_builder, reader_rowtypes) = views::drop_views_in(
                                 builder,
                                 (&resolved_schema_name, resolved_schema_quoted),
                                 &mut type_arrays,
                             )?;
+                            builder = next_builder;
+                            removed.types.extend(reader_rowtypes.types);
+                            removed.functions.extend(reader_rowtypes.functions);
                             sequences::drop_sequences_in(
                                 &mut builder,
                                 &resolved_schema_name,
@@ -9566,13 +9710,23 @@ impl ParserDB {
                                 &resolved_schema_name,
                                 resolved_schema_quoted,
                             )?;
-                            builder = user_defined_types::drop_types_in(
+                            let (next_builder, types) = user_defined_types::drop_types_in(
                                 builder,
                                 schema,
                                 &doomed_functions,
                                 &mut type_arrays,
                             )?;
+                            builder = next_builder;
+                            removed.types.extend(types.types);
+                            removed.functions.extend(types.functions);
                             builder.drop_function_nodes(&doomed_functions, &[])?;
+                            removed.functions.extend(doomed_functions);
+                            Self::drop_operators_for_type_drop(
+                                &mut active_postgres_catalog,
+                                &builder,
+                                &removed,
+                                &type_arrays,
+                            );
                         }
 
                         // Remove the schema
@@ -9588,6 +9742,8 @@ impl ParserDB {
                             (&resolved_schema_name, resolved_schema_quoted),
                             builder.identifier_case(),
                         );
+                        Arc::make_mut(&mut active_postgres_catalog)
+                            .drop_schema(&resolved_schema_name, resolved_schema_quoted);
                     }
                 }
                 Statement::CreateIndex(mut create_index) => {
@@ -9645,7 +9801,12 @@ impl ParserDB {
                     builder = builder.add_index(index, metadata);
                 }
                 Statement::AlterView(alter_view) => {
-                    builder = views::apply_alter_view(builder, &alter_view, &mut type_arrays)?;
+                    builder = views::apply_alter_view(
+                        builder,
+                        &alter_view,
+                        &mut type_arrays,
+                        &mut active_postgres_catalog,
+                    )?;
                 }
                 Statement::AlterTable(alter_table) => {
                     let scope = AlterTableScope {
@@ -9685,6 +9846,7 @@ impl ParserDB {
                                 kind,
                                 &operation,
                                 &mut type_arrays,
+                                &mut active_postgres_catalog,
                             )?;
                             continue;
                         }
@@ -9753,6 +9915,7 @@ impl ParserDB {
                                     new_name,
                                     alter_table.if_exists,
                                     &mut type_arrays,
+                                    &mut active_postgres_catalog,
                                 )?;
                             }
                             AlterTableOperation::AddConstraint { constraint, not_valid } => {
@@ -9835,7 +9998,7 @@ impl ParserDB {
                                 drop_behavior,
                                 ..
                             } => {
-                                builder = Self::alter_table_drop_columns(
+                                let (next, removed) = Self::alter_table_drop_columns(
                                     builder,
                                     &alter_table.name,
                                     scope,
@@ -9844,6 +10007,10 @@ impl ParserDB {
                                     drop_behavior == Some(DropBehavior::Cascade),
                                     &mut type_arrays,
                                 )?;
+                                builder = next;
+                                Self::drop_operators_for_type_drop(
+                                    &mut active_postgres_catalog, &builder, &removed, &type_arrays,
+                                );
                             }
                             AlterTableOperation::RenameColumn {
                                 old_column_name,
@@ -10206,7 +10373,12 @@ impl ParserDB {
                     {
                         continue;
                     }
-                    Arc::make_mut(&mut type_arrays).displace(&builder, &create_table.name);
+                    if let Some((previous, current)) =
+                        Arc::make_mut(&mut type_arrays).displace(&builder, &create_table.name)
+                    {
+                        Arc::make_mut(&mut active_postgres_catalog)
+                            .rename_type_identity(&previous, current);
+                    }
                     for column in &mut create_table.columns {
                         domains::bind_type(&builder, &mut column.data_type, &type_arrays)?;
                     }
@@ -10361,13 +10533,20 @@ impl ParserDB {
                     cascade,
                     ..
                 } => {
-                    builder = sequences::drop_sequences(
+                    let (next_builder, removed) = sequences::drop_sequences(
                         builder,
                         &names,
                         if_exists,
                         cascade,
                         &mut type_arrays,
                     )?;
+                    builder = next_builder;
+                    Self::drop_operators_for_type_drop(
+                        &mut active_postgres_catalog,
+                        &builder,
+                        &removed,
+                        &type_arrays,
+                    );
                 }
                 Statement::CreateDomain(create_domain) => {
                     builder = domains::create_domain(
@@ -10375,6 +10554,7 @@ impl ParserDB {
                         create_domain,
                         session_roles.creating_role(),
                         &mut type_arrays,
+                        &mut active_postgres_catalog,
                     )?;
                 }
                 Statement::CreateType { name, representation } => {
@@ -10385,20 +10565,42 @@ impl ParserDB {
                         session_roles.creating_role(),
                         &default_privileges,
                         &mut type_arrays,
+                        &mut active_postgres_catalog,
                     )?;
                 }
                 Statement::AlterType(alter) => {
-                    builder = user_defined_types::alter_type(builder, alter, &mut type_arrays)?;
+                    builder = user_defined_types::alter_type(
+                        builder,
+                        alter,
+                        &mut type_arrays,
+                        &mut active_postgres_catalog,
+                    )?;
                 }
                 Statement::DropDomain(DropDomain { if_exists, name, drop_behavior }) => {
-                    builder = user_defined_types::drop_types(
+                    let cascade = drop_behavior == Some(DropBehavior::Cascade);
+                    // An operator naming the type, its array or its domain
+                    // keeps it from dropping without `CASCADE`.
+                    let operators_holding = |name: &ObjectName| {
+                        active_postgres_catalog
+                            .operator_naming_type(name)
+                            .map(|operator| operator.name().to_string())
+                    };
+                    let (next_builder, drop) = user_defined_types::drop_types(
                         builder,
                         core::slice::from_ref(&name),
                         if_exists,
-                        drop_behavior == Some(DropBehavior::Cascade),
+                        cascade,
                         domains::DropSpelling::Domain,
                         &mut type_arrays,
+                        &operators_holding,
                     )?;
+                    builder = next_builder;
+                    Self::drop_operators_for_type_drop(
+                        &mut active_postgres_catalog,
+                        &builder,
+                        &drop,
+                        &type_arrays,
+                    );
                 }
                 Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Type,
@@ -10407,18 +10609,40 @@ impl ParserDB {
                     cascade,
                     ..
                 } => {
-                    builder = user_defined_types::drop_types(
+                    // An operator naming a type, its array or a range's
+                    // multirange keeps the type from dropping without
+                    // `CASCADE`.
+                    let operators_holding = |name: &ObjectName| {
+                        active_postgres_catalog
+                            .operator_naming_type(name)
+                            .map(|operator| operator.name().to_string())
+                    };
+                    let (next_builder, drop) = user_defined_types::drop_types(
                         builder,
                         &names,
                         if_exists,
                         cascade,
                         domains::DropSpelling::Type,
                         &mut type_arrays,
+                        &operators_holding,
                     )?;
+                    builder = next_builder;
+                    Self::drop_operators_for_type_drop(
+                        &mut active_postgres_catalog,
+                        &builder,
+                        &drop,
+                        &type_arrays,
+                    );
                 }
                 Statement::CreateView(create_view) => {
                     let creator = Creator::session(&session_roles, &default_privileges);
-                    builder = views::create_view(builder, create_view, creator, &mut type_arrays)?;
+                    builder = views::create_view(
+                        builder,
+                        create_view,
+                        creator,
+                        &mut type_arrays,
+                        &mut active_postgres_catalog,
+                    )?;
                 }
                 Statement::CreatePolicy(mut policy) => {
                     require_named(&policy.table_name, crate::errors::ObjectKind::Table)?;
@@ -10806,6 +11030,7 @@ impl ParserDB {
                             rename.new_name,
                             false,
                             &mut type_arrays,
+                            &mut active_postgres_catalog,
                         )?;
                     }
                 }
@@ -10925,7 +11150,15 @@ impl ParserDB {
                             let mut renamed = function.name.clone();
                             renamed.0.pop();
                             renamed.0.push(ObjectNamePart::Identifier(new_name));
-                            builder = Self::move_function(builder, function, renamed)?;
+                            let moved_name = renamed.clone();
+                            builder = Self::move_function(builder, Arc::clone(&function), renamed)?;
+                            Arc::make_mut(&mut active_postgres_catalog).rename_function(
+                                &type_arrays,
+                                &function.name,
+                                function.args.as_deref(),
+                                &moved_name,
+                                builder.identifier_case(),
+                            );
                         }
                         AlterFunctionOperation::SetSchema { schema_name } => {
                             Self::refuse_aggregate_alteration(&kind, &func_desc)?;
@@ -10951,7 +11184,15 @@ impl ParserDB {
                             }
                             let mut moved = schema_name.clone();
                             moved.0.extend(function.name.0.last().cloned());
-                            builder = Self::move_function(builder, function, moved)?;
+                            let moved_name = moved.clone();
+                            builder = Self::move_function(builder, Arc::clone(&function), moved)?;
+                            Arc::make_mut(&mut active_postgres_catalog).rename_function(
+                                &type_arrays,
+                                &function.name,
+                                function.args.as_deref(),
+                                &moved_name,
+                                builder.identifier_case(),
+                            );
                         }
                         AlterFunctionOperation::DependsOnExtension { no, extension_name } => {
                             let position =
@@ -11134,6 +11375,7 @@ impl ParserDB {
                                     (&current_schema_name, current_schema_quoted),
                                     (&new_schema_name, new_schema_quoted),
                                     &mut type_arrays,
+                                    &mut active_postgres_catalog,
                                 )?;
                                 builder = domains::follow_schema_rename(
                                     builder,

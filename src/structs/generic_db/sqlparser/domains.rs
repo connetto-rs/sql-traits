@@ -31,7 +31,7 @@ use alloc::{string::ToString, sync::Arc, vec::Vec};
 use sqlparser::ast::{ArrayElemTypeDef, CreateDomain, DataType, Ident, ObjectName};
 
 use super::{
-    ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, bind_reference,
+    ParserDB, ParserDBBuilder, PostgresCatalog, SchemaQualifier, StoredTable, bind_reference,
     object_name_last_identifier, place_relation, relation_name_holder, require_named_in_catalog,
     type_arrays::TypeArrays,
 };
@@ -89,6 +89,7 @@ pub(super) fn create_domain(
     mut domain: CreateDomain,
     role: Option<&str>,
     arrays: &mut Arc<TypeArrays>,
+    catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut domain.name, ObjectKind::Domain, builder.catalog_name())?;
     place_relation(&builder, &mut domain.name, false, ObjectKind::Domain, role)?;
@@ -105,7 +106,9 @@ pub(super) fn create_domain(
             object_name: name.value.clone(),
         });
     }
-    Arc::make_mut(arrays).displace(&builder, &domain.name);
+    if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &domain.name) {
+        Arc::make_mut(catalog).rename_type_identity(&previous, current);
+    }
     bind_type(&builder, &mut domain.data_type, arrays)?;
     let calls = builder.calls_in(&domain);
     let node = Arc::new(domain);
