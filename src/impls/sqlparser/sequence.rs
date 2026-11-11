@@ -1,6 +1,9 @@
 //! Implementation of the `SequenceLike` trait for the stored sequence.
 
+use alloc::format;
+
 use crate::{
+    errors::{LookupError, ObjectKind},
     structs::{ParserDB, Sequence, SequenceParameters, StoredSequenceOwner},
     traits::{DatabaseLike, Metadata, SequenceLike, SequenceOrigin, SequenceOwner},
 };
@@ -32,20 +35,38 @@ impl SequenceLike for Sequence {
         Sequence::parameters(self)
     }
 
-    fn owner<'db>(&'db self, database: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>
+    fn owner<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<SequenceOwner<'db, Self::DB>>, LookupError>
     where
         Self: 'db,
     {
-        match self.stored_owner()? {
+        let Some(stored_owner) = self.stored_owner() else {
+            return Ok(None);
+        };
+        let (owner, object_kind) = match stored_owner {
             StoredSequenceOwner::Column(identity) => {
-                database.column_by_identity(identity).map(SequenceOwner::Column)
+                (
+                    database.column_by_identity(identity).map(SequenceOwner::Column),
+                    ObjectKind::Column,
+                )
             }
             StoredSequenceOwner::ViewColumn { view, ordinal } => {
-                database
-                    .view_by_identity(view)
-                    .map(|view| SequenceOwner::ViewColumn { view, ordinal })
+                (
+                    database
+                        .view_by_identity(view)
+                        .map(|view| SequenceOwner::ViewColumn { view, ordinal }),
+                    ObjectKind::View,
+                )
             }
-        }
+        };
+        owner.map(Some).ok_or_else(|| {
+            LookupError::ObjectNotInDatabase {
+                object_kind,
+                object: format!("owning sequence `{}`", self.target_name()),
+            }
+        })
     }
 
     fn origin(&self) -> SequenceOrigin {

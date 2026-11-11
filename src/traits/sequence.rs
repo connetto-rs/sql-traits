@@ -4,6 +4,7 @@ use alloc::borrow::Cow;
 use core::{fmt::Debug, hash::Hash};
 
 use crate::{
+    errors::LookupError,
     structs::{SequenceParameters, TargetName},
     traits::{DatabaseLike, Metadata},
     utils::identifier_resolution::{is_temporary_schema, normalize_identifier},
@@ -229,6 +230,13 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
     /// through every rename of the column and of its relation, and dropping
     /// either drops the sequence.
     ///
+    /// `Ok(None)` means the sequence is unowned, including `OWNED BY NONE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LookupError`] when the recorded owning column or relation is
+    /// absent from `database`.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -243,13 +251,16 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
     /// )?;
     /// let sequence = db.sequences().next().expect("the sequence is recorded");
     /// assert!(matches!(
-    ///     sequence.owner(&db),
+    ///     sequence.owner(&db)?,
     ///     Some(SequenceOwner::Column(column)) if column.column_name() == "ticket_id"
     /// ));
     /// # Ok(())
     /// # }
     /// ```
-    fn owner<'db>(&'db self, database: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>
+    fn owner<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<SequenceOwner<'db, Self::DB>>, LookupError>
     where
         Self: 'db;
 

@@ -816,11 +816,14 @@ impl SequenceLike for MemorySequence {
             .expect("PostgreSQL's defaults are valid parameters")
     }
 
-    fn owner<'db>(&'db self, _database: &'db Self::DB) -> Option<SequenceOwner<'db, Self::DB>>
+    fn owner<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<SequenceOwner<'db, Self::DB>>, LookupError>
     where
         Self: 'db,
     {
-        None
+        Ok(None)
     }
 
     fn origin(&self) -> SequenceOrigin {

@@ -32,7 +32,7 @@ fn sequence<'db>(database: &'db ParserDB, name: &str) -> &'db <ParserDB as Datab
 /// The relation and column owning a sequence, if any, a view column named by
 /// its position.
 fn owner_of(database: &ParserDB, name: &str) -> Option<(String, String)> {
-    sequence(database, name).owner(database).map(|owner| {
+    sequence(database, name).owner(database).expect("owner resolves").map(|owner| {
         match owner {
             SequenceOwner::Column(column) => {
                 (
@@ -45,6 +45,28 @@ fn owner_of(database: &ParserDB, name: &str) -> Option<(String, String)> {
             }
         }
     })
+}
+
+#[test]
+fn an_unloaded_table_owner_is_an_error() {
+    let db =
+        parse("CREATE TABLE t (id INT); CREATE SEQUENCE s OWNED BY t.id;").expect("schema parses");
+    let empty = parse("").expect("empty schema parses");
+    assert!(matches!(
+        sequence(&db, "s").owner(&empty),
+        Err(LookupError::ObjectNotInDatabase { object_kind: ObjectKind::Column, .. })
+    ));
+}
+
+#[test]
+fn an_unloaded_view_owner_is_an_error() {
+    let db = parse("CREATE VIEW v AS SELECT 1 AS id; CREATE SEQUENCE s OWNED BY v.id;")
+        .expect("schema parses");
+    let empty = parse("").expect("empty schema parses");
+    assert!(matches!(
+        sequence(&db, "s").owner(&empty),
+        Err(LookupError::ObjectNotInDatabase { object_kind: ObjectKind::View, .. })
+    ));
 }
 
 #[test]
