@@ -115,6 +115,7 @@ mod signature_types;
 mod table_as;
 mod table_owner;
 mod transactions;
+mod type_arrays;
 mod user_defined_types;
 mod view_rewrites;
 mod views;
@@ -129,6 +130,7 @@ use postgres_catalog::CatalogName;
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};
 use role_memberships::CreateRoleMemberships;
 use role_settings::SessionSettings;
+use type_arrays::TypeArrays;
 
 /// The object kinds a schema parsed from SQL text holds, each an `sqlparser`
 /// AST node or a wrapper pairing one with the table it belongs to.
@@ -169,6 +171,7 @@ impl SchemaProfile for SqlparserProfile {
             } else {
                 PostgresCatalog::empty()
             }),
+            type_arrays: Arc::new(TypeArrays::default()),
             collation_metadata: Vec::new(),
             unresolved_function_grants: Vec::new(),
             role_alterations: Vec::new(),
@@ -247,6 +250,7 @@ enum TableOrigin {
 pub struct ParserIngestion {
     access_resolution: AccessResolution,
     active_postgres_catalog: Arc<PostgresCatalog>,
+    type_arrays: Arc<TypeArrays>,
     collation_metadata: Vec<CreatedCollationMetadata>,
     unresolved_function_grants: Vec<FunctionDesc>,
     role_alterations: Vec<UndeclaredRoleAlteration>,
@@ -272,6 +276,7 @@ impl core::fmt::Debug for ParserIngestion {
             .field("session_roles", &self.session_roles)
             .field("session_settings", &self.session_settings)
             .field("default_privileges", &self.default_privileges)
+            .field("type_arrays", &self.type_arrays)
             .finish()
     }
 }
@@ -4995,6 +5000,7 @@ impl ParserDBIngestor {
             catalog: transactions::Catalog {
                 builder,
                 postgres,
+                type_arrays: Arc::new(TypeArrays::default()),
                 collations: Vec::new(),
                 unresolved_function_grants: Vec::new(),
                 role_alterations: Vec::new(),
@@ -5642,6 +5648,7 @@ impl ParserDB {
         old_name: &ObjectName,
         new_name: ObjectName,
         if_exists: bool,
+        arrays: &mut Arc<TypeArrays>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(resolved_table) = builder.resolve_table_object_name(old_name)? else {
             if if_exists {
@@ -5654,6 +5661,7 @@ impl ParserDB {
         let renamed = StoredTable::of(resolved_table);
         let key = stored_table_key(resolved_table, IdentifierCase::AsWritten);
         let target = RenameTarget::new(new_name, &resolved_table.name)?;
+        let original = resolved_table.name.clone();
         // A rename cannot take a shell over the way a creation fills it.
         if let Some(new_ident) = object_name_last_identifier(&target.name)
             && let Some(conflicting_kind) =
@@ -5664,6 +5672,17 @@ impl ParserDB {
                 conflicting_kind,
                 object_name: new_ident.value.clone(),
             });
+        }
+        let changing_schema = !schema_qualifiers_match(
+            qualifier_of(&original).named(),
+            qualifier_of(&target.name).named(),
+            builder.identifier_case(),
+        );
+        let array_was_displaced = arrays.array_is_named(&original, &target.name);
+        if changing_schema {
+            Arc::make_mut(arrays).move_schema(&builder, &original, &target.name)?;
+        } else {
+            Arc::make_mut(arrays).displace(&builder, &target.name);
         }
         let readers = view_rewrites::readers(&builder, &[&key]);
 
@@ -5698,7 +5717,7 @@ impl ParserDB {
 
         builder.rewrite_table_references(&renamed, &target);
 
-        signature_types::follow_relation_rename(&mut builder, &key, &target.name);
+        builder = user_defined_types::repoint_type_references(builder, &original, &target.name)?;
         if let Some(readers) = readers
             && object_name_last_identifier(&target.name).is_some()
         {
@@ -5706,6 +5725,9 @@ impl ParserDB {
             view_rewrites::follow_renames(&mut builder, readers, &followed)?;
         }
 
+        if !changing_schema {
+            Arc::make_mut(arrays).rename(&builder, &original, &target.name, array_was_displaced);
+        }
         Ok(builder)
     }
 
@@ -5741,6 +5763,7 @@ impl ParserDB {
         mut builder: ParserDBBuilder,
         from: (&str, bool),
         to: (&str, bool),
+        arrays: &mut Arc<TypeArrays>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let case = builder.identifier_case();
         let in_from =
@@ -5771,7 +5794,7 @@ impl ParserDB {
             .collect();
         for (name, ident) in tables {
             let moved = ObjectName::from(vec![stored_ident(to.0, to.1), ident]);
-            builder = Self::rename_table_checked(builder, &name, moved, false)?;
+            builder = Self::rename_table_checked(builder, &name, moved, false, arrays)?;
         }
         views::move_views(builder, from, to)
     }
@@ -7305,11 +7328,15 @@ impl ParserDB {
     /// `pg_catalog` are left out, as a statement naming one has always been
     /// refused as naming nothing here, and functions are never looked for in
     /// `pg_temp`.
-    fn functions_named(builder: &ParserDBBuilder, func_desc: &FunctionDesc) -> Vec<usize> {
+    fn functions_named(
+        builder: &ParserDBBuilder,
+        func_desc: &FunctionDesc,
+        arrays: &TypeArrays,
+    ) -> Vec<usize> {
         let case = builder.identifier_case();
         // The listed types bind as the signatures they are compared with did.
         let args = func_desc.args.clone().map(|mut args| {
-            signature_types::bind_arguments(builder, &mut args);
+            signature_types::bind_arguments(builder, &mut args, arrays);
             args
         });
         let named = |function: &CreateFunction, name: &ObjectName| {
@@ -7370,8 +7397,9 @@ impl ParserDB {
     fn alter_function_target(
         builder: &ParserDBBuilder,
         func_desc: &FunctionDesc,
+        arrays: &TypeArrays,
     ) -> Result<usize, crate::errors::Error> {
-        let matching = Self::functions_named(builder, func_desc);
+        let matching = Self::functions_named(builder, func_desc, arrays);
 
         let Some(&position) = matching.first() else {
             return Err(crate::errors::Error::AlterFunctionNotFound {
@@ -7668,10 +7696,11 @@ impl ParserDB {
         table: &StoredTable,
         dropped: &StoredTable,
         cascade: bool,
+        arrays: &mut Arc<TypeArrays>,
     ) -> Result<(), crate::errors::Error> {
         let key = stored_table_key(Self::stored_node(builder, table)?, IdentifierCase::AsWritten);
         if cascade {
-            views::remove_dependent_views(builder, &key);
+            views::remove_dependent_views(builder, &key, arrays);
             return Ok(());
         }
         let dropped_kind = if builder.is_foreign_table(Self::stored_node(builder, dropped)?) {
@@ -7692,8 +7721,10 @@ impl ParserDB {
     fn remove_tables(
         mut builder: ParserDBBuilder,
         doomed: &[StoredTable],
+        arrays: &mut Arc<TypeArrays>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         for table in doomed {
+            Arc::make_mut(arrays).remove(&Self::stored_node(&builder, table)?.name);
             builder.remove_table(
                 &table.name,
                 table.name_quoted,
@@ -8024,6 +8055,7 @@ impl ParserDB {
         column_names: &[Ident],
         column_if_exists: bool,
         cascade: bool,
+        arrays: &mut Arc<TypeArrays>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
@@ -8090,7 +8122,7 @@ impl ParserDB {
             }
             if !readers.is_empty() {
                 let doomed = views::readers_and_dependents(&builder, readers);
-                views::remove_readers(&mut builder, &doomed);
+                views::remove_readers(&mut builder, &doomed, arrays);
             }
 
             // The referencing tables lose their foreign key before the column
@@ -8341,10 +8373,11 @@ impl ParserDB {
         column_name: &Ident,
         operation: &AlterColumnOperation,
         defaults: &DefaultPrivileges,
+        arrays: &TypeArrays,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let mut operation = operation.clone();
         if let AlterColumnOperation::SetDataType { data_type, .. } = &mut operation {
-            domains::bind_type(&builder, data_type)?;
+            domains::bind_type(&builder, data_type, arrays)?;
         }
         let mut identity_sequence = None;
         if let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? {
@@ -8805,6 +8838,7 @@ impl ParserDB {
         let transactions::Catalog {
             mut builder,
             postgres: mut active_postgres_catalog,
+            mut type_arrays,
             collations: mut collation_metadata,
             mut unresolved_function_grants,
             mut role_alterations,
@@ -8887,7 +8921,7 @@ impl ParserDB {
                         settle_search_path_parameter(&mut parameter, &builder)?;
                         apply_configuration_parameter(&mut create_function.set_params, parameter);
                     }
-                    signature_types::bind_signature(&builder, &mut create_function);
+                    signature_types::bind_signature(&builder, &mut create_function, &type_arrays);
                     let case = builder.identifier_case();
                     let existing = builder.functions().iter().position(|(existing, _)| {
                         function_signatures_match(
@@ -8962,13 +8996,15 @@ impl ParserDB {
                         .func_desc
                         .iter()
                         .filter_map(|func_desc| {
-                            let position = *Self::functions_named(&builder, func_desc).first()?;
+                            let position =
+                                *Self::functions_named(&builder, func_desc, &type_arrays)
+                                    .first()?;
                             Some(Arc::clone(&builder.functions()[position].0))
                         })
                         .collect();
                     for func_desc in &drop_function.func_desc {
                         let function_name = last_str(&func_desc.name);
-                        let matching = Self::functions_named(&builder, func_desc);
+                        let matching = Self::functions_named(&builder, func_desc, &type_arrays);
 
                         let Some(&position) = matching.first() else {
                             if drop_function.if_exists {
@@ -9057,7 +9093,13 @@ impl ParserDB {
                             continue;
                         }
 
-                        Self::release_dependent_views(&mut builder, &dropped, &dropped, cascade)?;
+                        Self::release_dependent_views(
+                            &mut builder,
+                            &dropped,
+                            &dropped,
+                            cascade,
+                            &mut type_arrays,
+                        )?;
 
                         // An `INHERITS` child builds its column list out of its
                         // parents, so only `CASCADE` takes it along, while a
@@ -9074,7 +9116,13 @@ impl ParserDB {
 
                         let mut doomed = inheritance::descendants(&builder, &dropped);
                         for table in &doomed {
-                            Self::release_dependent_views(&mut builder, table, &dropped, cascade)?;
+                            Self::release_dependent_views(
+                                &mut builder,
+                                table,
+                                &dropped,
+                                cascade,
+                                &mut type_arrays,
+                            )?;
                         }
                         let table_name = dropped.name.clone();
                         doomed.push(dropped);
@@ -9083,7 +9131,7 @@ impl ParserDB {
                             return Err(crate::errors::Error::TableReferenced { table_name });
                         }
 
-                        builder = Self::remove_tables(builder, &doomed)?;
+                        builder = Self::remove_tables(builder, &doomed, &mut type_arrays)?;
                     }
                 }
                 Statement::Drop {
@@ -9101,6 +9149,7 @@ impl ParserDB {
                         object_type == sqlparser::ast::ObjectType::MaterializedView,
                         if_exists,
                         cascade,
+                        &mut type_arrays,
                     )?;
                 }
                 Statement::Drop {
@@ -9501,10 +9550,11 @@ impl ParserDB {
                                 })
                                 .map(StoredTable::of)
                                 .collect();
-                            builder = Self::remove_tables(builder, &doomed)?;
+                            builder = Self::remove_tables(builder, &doomed, &mut type_arrays)?;
                             builder = views::drop_views_in(
                                 builder,
                                 (&resolved_schema_name, resolved_schema_quoted),
+                                &mut type_arrays,
                             )?;
                             sequences::drop_sequences_in(
                                 &mut builder,
@@ -9520,6 +9570,7 @@ impl ParserDB {
                                 builder,
                                 schema,
                                 &doomed_functions,
+                                &mut type_arrays,
                             )?;
                             builder.drop_function_nodes(&doomed_functions, &[])?;
                         }
@@ -9594,7 +9645,7 @@ impl ParserDB {
                     builder = builder.add_index(index, metadata);
                 }
                 Statement::AlterView(alter_view) => {
-                    builder = views::apply_alter_view(builder, &alter_view)?;
+                    builder = views::apply_alter_view(builder, &alter_view, &mut type_arrays)?;
                 }
                 Statement::AlterTable(alter_table) => {
                     let scope = AlterTableScope {
@@ -9628,8 +9679,13 @@ impl ParserDB {
                         // supports. A view takes over here so the table path
                         // never sees a name it does not hold.
                         if let Some(kind) = views::holds_view(&builder, &alter_table.name) {
-                            builder =
-                                views::alter_view(builder, &alter_table.name, kind, &operation)?;
+                            builder = views::alter_view(
+                                builder,
+                                &alter_table.name,
+                                kind,
+                                &operation,
+                                &mut type_arrays,
+                            )?;
                             continue;
                         }
                         if let Some(table) = builder.resolve_table_object_name(&alter_table.name)? {
@@ -9696,6 +9752,7 @@ impl ParserDB {
                                     &alter_table.name,
                                     new_name,
                                     alter_table.if_exists,
+                                    &mut type_arrays,
                                 )?;
                             }
                             AlterTableOperation::AddConstraint { constraint, not_valid } => {
@@ -9747,7 +9804,7 @@ impl ParserDB {
                                 column_position,
                                 ..
                             } => {
-                                domains::bind_type(&builder, &mut column_def.data_type)?;
+                                domains::bind_type(&builder, &mut column_def.data_type, &type_arrays)?;
                                 for option in &column_def.options {
                                     if let ColumnOption::ForeignKey(foreign_key) = &option.option {
                                         Self::refuse_reference_from_permanent_start(
@@ -9785,6 +9842,7 @@ impl ParserDB {
                                     &column_names,
                                     if_exists,
                                     drop_behavior == Some(DropBehavior::Cascade),
+                                    &mut type_arrays,
                                 )?;
                             }
                             AlterTableOperation::RenameColumn {
@@ -9807,6 +9865,7 @@ impl ParserDB {
                                     &column_name,
                                     &op,
                                     &default_privileges,
+                                    &type_arrays,
                                 )?;
                             }
                             AlterTableOperation::ChangeColumn {
@@ -10123,9 +10182,6 @@ impl ParserDB {
                         ObjectKind::Table,
                         session_roles.creating_role(),
                     )?;
-                    for column in &mut create_table.columns {
-                        domains::bind_type(&builder, &mut column.data_type)?;
-                    }
 
                     // Refused before `IF NOT EXISTS`, as PostgreSQL refuses it
                     // while placing the name.
@@ -10149,6 +10205,10 @@ impl ParserDB {
                         .is_some()
                     {
                         continue;
+                    }
+                    Arc::make_mut(&mut type_arrays).displace(&builder, &create_table.name);
+                    for column in &mut create_table.columns {
+                        domains::bind_type(&builder, &mut column.data_type, &type_arrays)?;
                     }
 
                     if create_table.unlogged && create_table.partition_by.is_some() {
@@ -10275,6 +10335,7 @@ impl ParserDB {
                         &inherited.column_metadata,
                         TableOrigin::Declaration(documentation, creations),
                     )?;
+                    Arc::make_mut(&mut type_arrays).create(&builder, &name);
                     sequences::own_column_sequences(&mut builder, &stored, column_sequences);
                     builder = creator.grant(
                         builder,
@@ -10300,13 +10361,20 @@ impl ParserDB {
                     cascade,
                     ..
                 } => {
-                    builder = sequences::drop_sequences(builder, &names, if_exists, cascade)?;
+                    builder = sequences::drop_sequences(
+                        builder,
+                        &names,
+                        if_exists,
+                        cascade,
+                        &mut type_arrays,
+                    )?;
                 }
                 Statement::CreateDomain(create_domain) => {
                     builder = domains::create_domain(
                         builder,
                         create_domain,
                         session_roles.creating_role(),
+                        &mut type_arrays,
                     )?;
                 }
                 Statement::CreateType { name, representation } => {
@@ -10316,10 +10384,11 @@ impl ParserDB {
                         representation,
                         session_roles.creating_role(),
                         &default_privileges,
+                        &mut type_arrays,
                     )?;
                 }
                 Statement::AlterType(alter) => {
-                    builder = user_defined_types::alter_type(builder, alter)?;
+                    builder = user_defined_types::alter_type(builder, alter, &mut type_arrays)?;
                 }
                 Statement::DropDomain(DropDomain { if_exists, name, drop_behavior }) => {
                     builder = user_defined_types::drop_types(
@@ -10328,6 +10397,7 @@ impl ParserDB {
                         if_exists,
                         drop_behavior == Some(DropBehavior::Cascade),
                         domains::DropSpelling::Domain,
+                        &mut type_arrays,
                     )?;
                 }
                 Statement::Drop {
@@ -10343,11 +10413,12 @@ impl ParserDB {
                         if_exists,
                         cascade,
                         domains::DropSpelling::Type,
+                        &mut type_arrays,
                     )?;
                 }
                 Statement::CreateView(create_view) => {
                     let creator = Creator::session(&session_roles, &default_privileges);
-                    builder = views::create_view(builder, create_view, creator)?;
+                    builder = views::create_view(builder, create_view, creator, &mut type_arrays)?;
                 }
                 Statement::CreatePolicy(mut policy) => {
                     require_named(&policy.table_name, crate::errors::ObjectKind::Table)?;
@@ -10566,6 +10637,7 @@ impl ParserDB {
                             routines,
                             &grant,
                             access_resolution,
+                            &type_arrays,
                         )?);
                         continue;
                     }
@@ -10643,6 +10715,7 @@ impl ParserDB {
                             &routines,
                             &revoke,
                             access_resolution,
+                            &type_arrays,
                         )?;
                         continue;
                     }
@@ -10732,6 +10805,7 @@ impl ParserDB {
                             &rename.old_name,
                             rename.new_name,
                             false,
+                            &mut type_arrays,
                         )?;
                     }
                 }
@@ -10759,7 +10833,8 @@ impl ParserDB {
                                 });
                             }
 
-                            let position = Self::alter_function_target(&builder, &func_desc)?;
+                            let position =
+                                Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
 
                             // After the function, because the database reports
                             // an absent function first. The keyword owners name
@@ -10806,7 +10881,8 @@ impl ParserDB {
                                 }
                             }
 
-                            let position = Self::alter_function_target(&builder, &func_desc)?;
+                            let position =
+                                Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
                             let function_arc = &mut builder.functions_mut()[position].0;
                             let stale = Arc::clone(function_arc);
                             let function = Arc::make_mut(function_arc);
@@ -10843,7 +10919,8 @@ impl ParserDB {
                         }
                         AlterFunctionOperation::RenameTo { new_name } => {
                             Self::refuse_aggregate_alteration(&kind, &func_desc)?;
-                            let position = Self::alter_function_target(&builder, &func_desc)?;
+                            let position =
+                                Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
                             let function = Arc::clone(&builder.functions()[position].0);
                             let mut renamed = function.name.clone();
                             renamed.0.pop();
@@ -10852,7 +10929,8 @@ impl ParserDB {
                         }
                         AlterFunctionOperation::SetSchema { schema_name } => {
                             Self::refuse_aggregate_alteration(&kind, &func_desc)?;
-                            let position = Self::alter_function_target(&builder, &func_desc)?;
+                            let position =
+                                Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
                             let function = Arc::clone(&builder.functions()[position].0);
                             let schema = last_str(&schema_name);
                             let quoted = object_name_last_identifier(&schema_name)
@@ -10876,7 +10954,8 @@ impl ParserDB {
                             builder = Self::move_function(builder, function, moved)?;
                         }
                         AlterFunctionOperation::DependsOnExtension { no, extension_name } => {
-                            let position = Self::alter_function_target(&builder, &func_desc)?;
+                            let position =
+                                Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
                             extensions::set_function_dependency(
                                 &mut builder,
                                 position,
@@ -11054,6 +11133,7 @@ impl ParserDB {
                                     builder,
                                     (&current_schema_name, current_schema_quoted),
                                     (&new_schema_name, new_schema_quoted),
+                                    &mut type_arrays,
                                 )?;
                                 builder = domains::follow_schema_rename(
                                     builder,
@@ -11065,6 +11145,10 @@ impl ParserDB {
                                     (&current_schema_name, current_schema_quoted),
                                     (&new_schema_name, new_schema_quoted),
                                 )?;
+                                Arc::make_mut(&mut type_arrays).rename_schema(
+                                    (&current_schema_name, current_schema_quoted),
+                                    (&new_schema_name, new_schema_quoted),
+                                );
                                 current_schema_name = new_schema_name;
                                 current_schema_quoted = new_schema_quoted;
                             }
@@ -11148,6 +11232,7 @@ impl ParserDB {
         Ok(transactions::Catalog {
             builder,
             postgres: active_postgres_catalog,
+            type_arrays,
             collations: collation_metadata,
             unresolved_function_grants,
             role_alterations,
