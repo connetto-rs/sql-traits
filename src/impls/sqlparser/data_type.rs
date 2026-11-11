@@ -115,6 +115,11 @@ impl DataTypeLike for DataType {
     }
 
     #[inline]
+    fn numeric_precision(&self, database: &Self::DB) -> Option<u64> {
+        super::dialect::numeric_precision(*database.dialect(), self)
+    }
+
+    #[inline]
     fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
         super::dialect::numeric_scale(*database.dialect(), self)
     }

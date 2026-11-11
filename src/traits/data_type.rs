@@ -379,6 +379,16 @@ pub trait DataTypeLike: Debug + Send + Sync {
         None
     }
 
+    /// Returns the declared number of decimal digits, including fractional
+    /// digits, or `None` when the type fixes no integral decimal precision.
+    ///
+    /// `NUMERIC(p, s)` and `DECIMAL(p)` answer `p`, and a bare decimal takes
+    /// its engine's default. Integer, floating-point and non-numeric types,
+    /// unconstrained PostgreSQL `NUMERIC`, Oracle `NUMBER`, and every SQLite
+    /// type answer `None`. BigQuery's fractional bare `BIGNUMERIC` precision is
+    /// not modeled and answers `None`.
+    fn numeric_precision(&self, database: &Self::DB) -> Option<u64>;
+
     /// Returns how many digits a value of a decimal type keeps to the right
     /// of the decimal point, or `None` when the type fixes no scale.
     ///
