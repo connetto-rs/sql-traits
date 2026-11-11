@@ -1225,8 +1225,15 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     }
 
     /// Sorts, indexes, and seals the built objects into a database carrying
-    /// the given ingestion state.
-    pub(crate) fn into_database(mut self, ingestion: P::Ingestion) -> GenericDB<P> {
+    /// the given profile state.
+    ///
+    /// The state is where [`SchemaProfile::operators`] reads the operator
+    /// catalog from, so a profile that loads its catalog outside the parser
+    /// hands the loaded catalog here and keeps its dialect stateless.
+    /// Converting the builder with [`From`] seals it under
+    /// [`SchemaProfile::default_ingestion`] instead.
+    #[must_use]
+    pub fn into_database(mut self, ingestion: P::Ingestion) -> GenericDB<P> {
         self.sort_stores();
         let catalog_name = self.catalog_name;
         let (foreign_tables, tables): (Vec<_>, Vec<_>) =

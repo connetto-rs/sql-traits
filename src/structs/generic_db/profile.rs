@@ -95,13 +95,16 @@ pub trait SchemaProfile: Sized {
     type ColumnGrant: ColumnGrantLike<DB = GenericDB<Self>>;
     /// The SQL dialect the schema is expressed in.
     type Dialect: DialectLike<DB = GenericDB<Self>>;
-    /// The state a statement-by-statement ingestion carries beyond the
-    /// schema objects themselves, preserved inside every built database so
-    /// ingestion can resume from it.
+    /// The state a built database carries beyond the schema objects
+    /// themselves, which statement-by-statement ingestion resumes from and
+    /// which holds the catalogs the profile answers, such as the operators
+    /// [`Self::operators`] reads.
     ///
     /// The parser profile stores its access-resolution mode, the active
     /// PostgreSQL catalog, and metadata for collations the ingested DDL
-    /// created.
+    /// created. A profile loading its catalog from a live engine stores the
+    /// loaded entries and seals them in with
+    /// [`GenericDBBuilder::into_database`](crate::structs::generic_db::GenericDBBuilder::into_database).
     type Ingestion: Clone + core::fmt::Debug + Send + Sync;
 
     /// Returns the state a fresh ingestion starts from under the given
@@ -112,7 +115,8 @@ pub trait SchemaProfile: Sized {
     /// full default catalog and every other dialect with an empty one.
     fn default_ingestion(dialect: &Self::Dialect) -> Self::Ingestion;
 
-    /// Returns the modeled operator catalog, or `None` when it is unavailable.
+    /// Returns the operator catalog `ingestion` holds under `dialect`, or
+    /// `None` when it is unavailable, which a loaded empty catalog is not.
     fn operators<'a>(
         _dialect: &'a Self::Dialect,
         _ingestion: &'a Self::Ingestion,
