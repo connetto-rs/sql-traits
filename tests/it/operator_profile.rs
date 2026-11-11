@@ -1,4 +1,5 @@
-//! Unavailable operator metadata remains distinct from a known-empty catalog.
+//! An external profile's operator catalog, built into the database it
+//! belongs to, stays distinct from unavailable operator metadata.
 
 extern crate alloc;
 
@@ -283,6 +284,10 @@ impl DataTypeLike for NoneKind {
     }
 
     fn send_function(&self, _database: &Self::DB) -> Option<bool> {
+        self.unreach()
+    }
+
+    fn numeric_precision(&self, _database: &Self::DB) -> Option<u64> {
         self.unreach()
     }
 
@@ -804,9 +809,52 @@ impl ColumnGrantLike for NoneKind {
     }
 }
 
-/// Empty ingestion state.
-#[derive(Debug, Clone, Copy)]
-struct AlternateIngestion;
+/// One entry of a catalog loaded outside the parser.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CatalogOperator {
+    /// Schema holding the operator.
+    schema: &'static str,
+    /// Operator symbol.
+    name: &'static str,
+}
+
+impl Metadata for CatalogOperator {
+    type Meta = ();
+}
+
+impl OperatorLike for CatalogOperator {
+    type DB = AlternateDB;
+
+    fn target_name(&self) -> TargetName<'_> {
+        TargetName::new(self.name, false).with_schema(self.schema, false)
+    }
+
+    fn kind(&self) -> OperatorKind {
+        OperatorKind::Binary
+    }
+
+    fn left_type<'db>(&'db self, _database: &'db Self::DB) -> Option<TargetName<'db>> {
+        None
+    }
+
+    fn right_type<'db>(&'db self, _database: &'db Self::DB) -> Option<TargetName<'db>> {
+        None
+    }
+
+    fn result_type<'db>(&'db self, _database: &'db Self::DB) -> Option<TargetName<'db>> {
+        None
+    }
+
+    fn implementation<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<&'db <Self::DB as DatabaseLike>::Function> {
+        None
+    }
+}
+
+/// The operator catalog the profile loads, `None` when it is unavailable.
+type AlternateCatalog = Option<Arc<[CatalogOperator]>>;
 
 /// PostgreSQL syntax for an empty schema profile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -837,7 +885,7 @@ impl DialectLike for AlternateDialect {
     }
 }
 
-/// A profile with unavailable operator metadata.
+/// A profile whose operator catalog is loaded outside the parser.
 struct AlternateProfile;
 
 /// The database the profile describes.
@@ -854,7 +902,7 @@ impl SchemaProfile for AlternateProfile {
     type UniqueIndex = NoneKind;
     type ForeignKey = NoneKind;
     type Function = NoneKind;
-    type Operator = Absent<AlternateDB>;
+    type Operator = CatalogOperator;
     type CheckConstraint = NoneKind;
     type Trigger = NoneKind;
     type Rule = Absent<AlternateDB>;
@@ -868,10 +916,20 @@ impl SchemaProfile for AlternateProfile {
     type TableGrant = NoneKind;
     type ColumnGrant = NoneKind;
     type Dialect = AlternateDialect;
-    type Ingestion = AlternateIngestion;
+    type Ingestion = AlternateCatalog;
 
     fn default_ingestion(_dialect: &Self::Dialect) -> Self::Ingestion {
-        AlternateIngestion
+        None
+    }
+
+    fn operators<'a>(
+        _dialect: &'a Self::Dialect,
+        ingestion: &'a Self::Ingestion,
+    ) -> Option<impl Iterator<Item = &'a Self::Operator>>
+    where
+        Self::Operator: 'a,
+    {
+        ingestion.as_deref().map(<[CatalogOperator]>::iter)
     }
 
     fn initial_schemas(
@@ -898,4 +956,41 @@ fn unavailable_operators_stay_distinct_from_an_empty_catalog() -> Result<(), Err
         .parse::<PostgreSqlDialect>("")?;
     assert!(empty.operators().is_some_and(|mut operators| operators.next().is_none()));
     Ok(())
+}
+
+/// The builder for an empty database of the profile.
+fn alternate_builder() -> GenericDBBuilder<AlternateProfile> {
+    GenericDBBuilder::new(String::from("profile"), AlternateDialect)
+}
+
+/// A loaded catalog is read back entry by entry, by the database and by its
+/// clone alike, as the very entries the loader stored.
+#[test]
+fn a_loaded_catalog_reaches_the_database_and_its_clones() {
+    let catalog: Arc<[CatalogOperator]> = Arc::from([
+        CatalogOperator { schema: "pg_catalog", name: "+" },
+        CatalogOperator { schema: "public", name: "+" },
+    ]);
+    let database = alternate_builder().into_database(Some(Arc::clone(&catalog)));
+    let clone = database.clone();
+
+    for database in [&database, &clone] {
+        let operators: Vec<_> = database.operators().into_iter().flatten().collect();
+        assert_eq!(operators.len(), catalog.len());
+        assert!(
+            operators.iter().zip(catalog.iter()).all(|(read, stored)| core::ptr::eq(*read, stored))
+        );
+    }
+}
+
+/// A loaded catalog without entries answers an empty catalog, which the
+/// default state answering unavailable stays distinct from.
+#[test]
+fn a_loaded_empty_catalog_stays_distinct_from_unavailable() {
+    let empty = alternate_builder().into_database(Some(Arc::from([])));
+    assert!(empty.operators().is_some_and(|mut operators| operators.next().is_none()));
+    assert!(empty.clone().operators().is_some_and(|mut operators| operators.next().is_none()));
+
+    let unavailable: AlternateDB = alternate_builder().into();
+    assert!(unavailable.operators().is_none());
 }
