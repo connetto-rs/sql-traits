@@ -14,8 +14,8 @@ pub(crate) use profile::{Identified, Stored};
 pub use profile::{Meta, SchemaProfile};
 pub use sqlparser::{
     AccessResolution, ParseOptions, ParserDB, ParserDBBuilder, ParserDBIngestor, ParserIngestion,
-    PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType, SqlparserProfile,
-    UnresolvedAccessReference,
+    PostgresCatalog, PostgresCatalogCollation, PostgresCatalogOperator, PostgresCatalogType,
+    SqlparserProfile, UnresolvedAccessReference,
 };
 pub(crate) use sqlparser::{ConstraintObject, table_not_null};
 

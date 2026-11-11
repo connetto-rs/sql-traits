@@ -203,13 +203,14 @@ pub(super) fn requiring_type(
 ///
 /// # Errors
 ///
-/// Returns [`Error::FunctionReferenced`] when something still calls one, as
-/// dropping the function itself does.
+/// Returns the constructors it removes alongside the builder, and
+/// [`Error::FunctionReferenced`] when something still calls one, as dropping
+/// the function itself does.
 pub(super) fn drop_range_constructors(
     builder: &mut ParserDBBuilder,
     doomed: impl Fn(usize) -> bool,
     alongside: &[Arc<CreateFunction>],
-) -> Result<(), Error> {
+) -> Result<Vec<Arc<CreateFunction>>, Error> {
     let case = builder.identifier_case();
     let ranges: Vec<&UserDefinedType> = builder
         .user_defined_types()
@@ -228,7 +229,8 @@ pub(super) fn drop_range_constructors(
         })
         .map(|(function, _)| Arc::clone(function))
         .collect();
-    builder.drop_function_nodes(&dropping, alongside)
+    builder.drop_function_nodes(&dropping, alongside)?;
+    Ok(dropping)
 }
 
 /// Points the constructors of the range at `position` at the name `new_name`

@@ -30,21 +30,23 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, AlterView, AlterViewOperation, CreateView, Expr,
-    Grant, GrantObjects, Ident, ObjectName, ObjectNamePart, Owner, Query, RenameTableNameKind,
-    SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    AlterColumnOperation, AlterTableOperation, AlterView, AlterViewOperation, CreateFunction,
+    CreateView, Expr, Grant, GrantObjects, Ident, ObjectName, ObjectNamePart, Owner, Query,
+    RenameTableNameKind, SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visit, VisitMut,
+    Visitor, VisitorMut,
 };
 
 use super::{
     AlterTableScope, Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier,
     bind_reference, domains, function_bodies, object_name_last_identifier,
-    object_name_matches_resolved_identity, place_relation, relation_name_holder,
-    require_named_in_catalog,
+    object_name_matches_resolved_identity, place_relation,
+    postgres_catalog::PostgresCatalog,
+    relation_name_holder, require_named_in_catalog,
     rules::{self, RuleHost},
     stored_ident,
     table_owner::Handover,
     type_arrays::TypeArrays,
-    user_defined_types,
+    user_defined_types::{self, TypeDrop},
     view_rewrites::{self, Rename},
 };
 use crate::{
@@ -91,6 +93,7 @@ pub(super) fn create_view(
     mut node: CreateView,
     creator: Creator<'_>,
     arrays: &mut Arc<TypeArrays>,
+    catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     let kind = declared_kind(&node);
     require_named_in_catalog(&mut node.name, kind, builder.catalog_name())?;
@@ -162,7 +165,9 @@ pub(super) fn create_view(
         });
     }
 
-    Arc::make_mut(arrays).displace(&builder, &node.name);
+    if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &node.name) {
+        Arc::make_mut(catalog).rename_type_identity(&previous, current);
+    }
     let mut metadata = ViewMetadata::default();
     metadata.set_owner(creator.owner());
     metadata.set_calls(builder.calls_in(&node.query));
@@ -254,12 +259,17 @@ fn stored_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<
 /// spelling. A name nothing holds is refused unless the statement wrote `IF
 /// EXISTS`.
 ///
+/// Returns the builder alongside the identities and functions the drop
+/// takes, each dropped row type with its stored array, every reader a
+/// `CASCADE` takes along with them.
+///
 /// # Errors
 ///
 /// Returns [`Error::RelationKindMismatch`] for a name held by another relation
 /// kind, [`Error::RelationNotFound`] for a name nothing holds, and
-/// [`Error::RelationHasDependents`] when a view reads the one being dropped
-/// and the statement wrote no `CASCADE`.
+/// [`Error::RelationHasDependents`] when a view reads the one being dropped or
+/// an operator names its row type or stored array and the statement wrote no
+/// `CASCADE`.
 pub(super) fn drop_views(
     mut builder: ParserDBBuilder,
     names: &[ObjectName],
@@ -267,8 +277,10 @@ pub(super) fn drop_views(
     if_exists: bool,
     cascade: bool,
     arrays: &mut Arc<TypeArrays>,
-) -> Result<ParserDBBuilder, Error> {
+    operators_holding: &impl Fn(&ObjectName) -> Option<String>,
+) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let expected_kind = if materialized { ObjectKind::MaterializedView } else { ObjectKind::View };
+    let mut drop = TypeDrop { types: Vec::new(), functions: Vec::new() };
     for name in names {
         if object_name_last_identifier(name).is_none() {
             return Err(Error::UnnamedObject { object_kind: expected_kind });
@@ -289,8 +301,25 @@ pub(super) fn drop_views(
                 stored_view_key(builder.views()[position].0.as_ref(), IdentifierCase::AsWritten)
             };
             if cascade {
-                remove_dependent_views(&mut builder, &key, arrays);
+                let taken = remove_dependent_views(&mut builder, &key, arrays);
+                drop.types.extend(taken.types);
+                drop.functions.extend(taken.functions);
             } else {
+                let owner = if materialized {
+                    rowtype_name(builder.materialized_views()[position].0.as_ref())
+                } else {
+                    rowtype_name(builder.views()[position].0.as_ref())
+                };
+                if let Some(symbol) =
+                    rowtype_identities(arrays, &owner).iter().find_map(operators_holding)
+                {
+                    return Err(Error::RelationHasDependents {
+                        object_kind: expected_kind,
+                        object_name: rendered_name(name),
+                        dependent_kind: ObjectKind::Operator,
+                        dependent_name: symbol,
+                    });
+                }
                 refuse_dependent_views(&builder, &key, expected_kind, &rendered_name(name))?;
             }
             // Re-read the position: a cascade may have removed views ahead of
@@ -301,16 +330,20 @@ pub(super) fn drop_views(
                 plain_view_position(&builder, name)
             };
             if let Some(position) = position {
-                let dropped = if materialized {
+                if materialized {
                     let (view, _, _) = builder.materialized_views_mut().remove(position);
-                    GrantedView::of(view.as_ref())
+                    let dropped = GrantedView::of(view.as_ref());
+                    drop.types.extend(rowtype_identities(arrays, &dropped.type_name()));
+                    dropped.forget_grants(&mut builder);
+                    Arc::make_mut(arrays).remove(&dropped.type_name());
                 } else {
                     let (view, _, _) = builder.views_mut().remove(position);
                     rules::drop_rules_on(&mut builder, &RuleHost::of_view(view.as_ref()));
-                    GrantedView::of(view.as_ref())
-                };
-                dropped.forget_grants(&mut builder);
-                Arc::make_mut(arrays).remove(&dropped.type_name());
+                    let dropped = GrantedView::of(view.as_ref());
+                    drop.types.extend(rowtype_identities(arrays, &dropped.type_name()));
+                    dropped.forget_grants(&mut builder);
+                    Arc::make_mut(arrays).remove(&dropped.type_name());
+                }
             }
             // A sequence the view owned goes with it.
             super::sequences::drop_orphaned_sequences(&mut builder);
@@ -337,7 +370,7 @@ pub(super) fn drop_views(
             None => {}
         }
     }
-    Ok(builder)
+    Ok((builder, drop))
 }
 
 /// The position of the materialized view a written `name` resolves to,
@@ -413,12 +446,13 @@ pub(super) fn alter_view(
     kind: ObjectKind,
     operation: &AlterTableOperation,
     arrays: &mut Arc<TypeArrays>,
+    catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     match operation {
         AlterTableOperation::RenameTable { table_name } => {
             let (RenameTableNameKind::As(new_name) | RenameTableNameKind::To(new_name)) =
                 table_name;
-            rename_view(builder, name, kind, new_name, arrays)
+            rename_view(builder, name, kind, new_name, arrays, catalog)
         }
         AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
             rename_view_column(builder, name, kind, old_column_name, new_column_name)
@@ -475,6 +509,7 @@ pub(super) fn apply_alter_view(
     builder: ParserDBBuilder,
     statement: &AlterView,
     arrays: &mut Arc<TypeArrays>,
+    catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     let AlterView { materialized, name, if_exists, operation } = statement;
     let (kind, held) = if *materialized {
@@ -519,7 +554,7 @@ pub(super) fn apply_alter_view(
             Ok(reset_view_options(builder, name, kind, options))
         }
         AlterViewOperation::RenameTo { new_name } => {
-            rename_view(builder, name, kind, new_name, arrays)
+            rename_view(builder, name, kind, new_name, arrays, catalog)
         }
         AlterViewOperation::RenameColumn { old_column_name, new_column_name } => {
             rename_view_column(builder, name, kind, old_column_name, new_column_name)
@@ -727,6 +762,7 @@ fn rename_view(
     kind: ObjectKind,
     new_name: &ObjectName,
     arrays: &mut Arc<TypeArrays>,
+    catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     let Some(new_ident) = object_name_last_identifier(new_name) else {
         return Err(Error::UnnamedObject { object_kind: kind });
@@ -769,9 +805,16 @@ fn rename_view(
     let mut to = from.clone();
     user_defined_types::rewrite_last_ident(&mut to, new_ident);
     let array_was_displaced = arrays.array_is_named(&from, &to);
-    Arc::make_mut(arrays).displace(&builder, &to);
+    if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &to) {
+        Arc::make_mut(catalog).rename_type_identity(&previous, current);
+    }
     let builder = retarget_view(builder, kind, position, None, new_ident)?;
-    Arc::make_mut(arrays).rename(&builder, &from, &to, array_was_displaced);
+    if let Some((previous, current)) =
+        Arc::make_mut(arrays).rename(&builder, &from, &to, array_was_displaced)
+    {
+        Arc::make_mut(catalog).rename_type_identity(&previous, current);
+    }
+    Arc::make_mut(catalog).rename_type_identity(&from, &to);
     Ok(builder)
 }
 
@@ -813,6 +856,10 @@ pub(super) fn move_views(
 /// Drops every view and materialized view stored in `schema`, with the views
 /// reading them, as `DROP SCHEMA ... CASCADE` does.
 ///
+/// Returns the builder alongside the identities and functions the drop
+/// takes, each dropped row type with its stored array, every reader a
+/// `CASCADE` takes along with them.
+///
 /// # Errors
 ///
 /// Returns the refusals [`drop_views`] meets.
@@ -820,7 +867,7 @@ pub(super) fn drop_views_in(
     builder: ParserDBBuilder,
     schema: (&str, bool),
     arrays: &mut Arc<TypeArrays>,
-) -> Result<ParserDBBuilder, Error> {
+) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let case = builder.identifier_case();
     let plain: Vec<ObjectName> = builder
         .views()
@@ -834,13 +881,42 @@ pub(super) fn drop_views_in(
         .filter(|(view, _, _)| stored_in(view.as_ref(), schema, case))
         .map(|(view, _, _)| qualified_in(view.as_ref(), schema))
         .collect();
-    let builder = drop_views(builder, &plain, false, true, true, arrays)?;
-    drop_views(builder, &materialized, true, true, true, arrays)
+    // A schema cascade never refuses, so the callback the refusal consults
+    // holds nothing.
+    let no_operator = |_: &ObjectName| None::<String>;
+    let (builder, mut drop) = drop_views(builder, &plain, false, true, true, arrays, &no_operator)?;
+    let (builder, materialized_drop) =
+        drop_views(builder, &materialized, true, true, true, arrays, &no_operator)?;
+    drop.types.extend(materialized_drop.types);
+    drop.functions.extend(materialized_drop.functions);
+    Ok((builder, drop))
 }
 
 /// The name of a stored view written out with `schema`, the one it sits in.
 fn qualified_in<V: ViewLike>(view: &V, schema: (&str, bool)) -> ObjectName {
     ObjectName::from(vec![stored_ident(schema.0, schema.1), view_ident(view)])
+}
+
+/// The schema an object stored without a schema lives in.
+const DEFAULT_SCHEMA: &str = "public";
+
+/// The name a view's row type is held under: the schema the view sits in,
+/// which a view stored without one sits in `public`, and the view's stored
+/// name, each with its quoting.
+fn rowtype_name<V: ViewLike>(view: &V) -> ObjectName {
+    let (schema, quoted) =
+        stored_schema_of(view).unwrap_or((alloc::string::String::from(DEFAULT_SCHEMA), false));
+    qualified_in(view, (&schema, quoted))
+}
+
+/// The identities a dropped view's row type holds, the row type and its
+/// stored array, read before the array's association is removed.
+fn rowtype_identities(arrays: &TypeArrays, rowtype: &ObjectName) -> Vec<ObjectName> {
+    let mut identities = vec![rowtype.clone()];
+    if let Some(array) = arrays.array(rowtype) {
+        identities.push(array.clone());
+    }
+    identities
 }
 
 /// Whether a stored view sits in `schema`, a view stored without one sitting
@@ -1585,23 +1661,31 @@ pub(super) fn refuse_dependent_views(
 
 /// Removes the views and functions a `CASCADE` takes along with the relation
 /// `key` names.
+///
+/// Returns the identities the row types of the views the cascade takes are
+/// held under, each with its stored array, and the functions the cascade
+/// takes, read before the removal.
 pub(super) fn remove_dependent_views(
     builder: &mut ParserDBBuilder,
     key: &RelationKey,
     arrays: &mut Arc<TypeArrays>,
-) {
+) -> TypeDrop {
     let doomed = dependent_views(builder, key);
-    remove_readers(builder, &doomed, arrays);
+    remove_readers(builder, &doomed, arrays)
 }
 
 /// Removes the views, materialized views, functions and rules `doomed` names,
 /// with the grants on them, the rules on the views, and the sequences they
 /// owned.
+///
+/// Returns the identities the row types of the removed views hold, each with
+/// its stored array, and the functions the removal takes, read before the
+/// removal.
 pub(super) fn remove_readers(
     builder: &mut ParserDBBuilder,
     doomed: &[Dependent],
     arrays: &mut Arc<TypeArrays>,
-) {
+) -> TypeDrop {
     let is_doomed =
         |kind: ObjectKind, own_key: RelationKey| doomed.contains(&Dependent::Reader(kind, own_key));
     let hosts: Vec<RuleHost> = builder
@@ -1635,6 +1719,22 @@ pub(super) fn remove_readers(
                 .map(GrantedView::of),
         )
         .collect();
+    let mut types: Vec<ObjectName> = Vec::new();
+    for view in &granted {
+        types.extend(rowtype_identities(arrays, &view.type_name()));
+    }
+    let functions: Vec<Arc<CreateFunction>> = builder
+        .functions()
+        .iter()
+        .filter(|(function, _)| {
+            is_doomed(
+                ObjectKind::Function,
+                stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
+            )
+        })
+        .map(|(function, _)| function)
+        .cloned()
+        .collect();
     builder.views_mut().retain(|(view, _, _)| {
         !is_doomed(ObjectKind::View, stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
     });
@@ -1659,4 +1759,5 @@ pub(super) fn remove_readers(
         rules::drop_rules_on(builder, host);
     }
     super::sequences::drop_orphaned_sequences(builder);
+    TypeDrop { types, functions }
 }

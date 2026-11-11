@@ -49,6 +49,9 @@ pub enum ObjectKind {
     Domain,
     /// A user-defined type declared by a `CREATE TYPE` statement.
     Type,
+    /// An operator the catalog holds, by the schema-qualified symbol it runs
+    /// under.
+    Operator,
 }
 
 impl core::fmt::Display for ObjectKind {
@@ -72,6 +75,7 @@ impl core::fmt::Display for ObjectKind {
             Self::Sequence => "Sequence",
             Self::Domain => "Domain",
             Self::Type => "Type",
+            Self::Operator => "Operator",
         })
     }
 }
@@ -2963,21 +2967,15 @@ pub enum Error {
     #[error(
         "{object_kind} `{object_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
     )]
-    /// Error indicating that a statement drops a relation a view or a
-    /// function body reads, or whose row type a function's signature names.
-    ///
-    /// PostgreSQL refuses without `CASCADE`, and `CASCADE` drops the
-    /// dependents along with it. A view whose definition read a relation
-    /// dropped from under it would name nothing, which is the dangling
-    /// reference this refusal exists to prevent.
+    /// Error indicating that a relation has dependents preventing its removal.
     RelationHasDependents {
         /// Kind of relation the statement drops.
         object_kind: ObjectKind,
         /// Name of the relation the statement drops.
         object_name: String,
-        /// Kind of the view or function depending on it.
+        /// Kind of the dependent object.
         dependent_kind: ObjectKind,
-        /// Name of the view or function depending on it.
+        /// Name of the dependent object.
         dependent_name: String,
     },
     #[error(

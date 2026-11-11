@@ -282,6 +282,7 @@ impl DatabaseLike for MemoryCatalog {
     type Index = MemoryIndex;
     type ForeignKey = MemoryForeignKey;
     type Function = MemoryFunction;
+    type Operator = sql_traits::structs::Absent<Self>;
     type UniqueIndex = MemoryUniqueIndex;
     type CheckConstraint = MemoryCheckConstraint;
     type Trigger = MemoryTrigger;
@@ -2747,4 +2748,9 @@ fn legal_policy_commands_route_each_clause_and_diagnose_missing_prerequisites() 
             }
         }
     }
+}
+
+#[test]
+fn an_engine_without_an_operator_catalog_answers_none() {
+    assert!(MemoryCatalog::default().operators().is_none());
 }

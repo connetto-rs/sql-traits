@@ -15,7 +15,7 @@ use crate::{
     structs::{IdentifierCase, RoleSetting, TargetName},
     traits::{
         CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, DomainLike,
-        ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, PolicyLike, RoleLike,
+        ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, OperatorLike, PolicyLike, RoleLike,
         RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike,
         TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
     },
@@ -55,6 +55,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type ForeignKey: ForeignKeyLike<DB = Self>;
     /// Type of the functions in the schema.
     type Function: FunctionLike<DB = Self>;
+    /// Type of the operators in the catalog.
+    type Operator: OperatorLike<DB = Self>;
     /// Type of the triggers in the schema.
     type Trigger: TriggerLike<DB = Self>;
     /// Type of the rewrite rules in the schema.
@@ -97,6 +99,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
 
     /// Returns the SQL dialect this database is expressed in.
     fn dialect(&self) -> &Self::Dialect;
+
+    /// Returns all modeled operators, including shells, or `None` when the
+    /// catalog is unavailable.
+    fn operators(&self) -> Option<impl Iterator<Item = &Self::Operator>> {
+        None::<core::iter::Empty<&Self::Operator>>
+    }
 
     /// Returns the name of the database.
     ///

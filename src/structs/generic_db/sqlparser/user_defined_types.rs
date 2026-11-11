@@ -40,8 +40,9 @@ use super::{
         DropSpelling, Reached, bind_type, custom_name, custom_name_mut, reach_in_schema,
         reach_type, require_existing_type,
     },
-    object_name_last_identifier, place_relation, range_constructors, relation_name_holder,
-    require_named_in_catalog,
+    object_name_last_identifier, place_relation,
+    postgres_catalog::PostgresCatalog,
+    range_constructors, relation_name_holder, require_named_in_catalog,
     signature_types::{retarget_signatures, signature_types},
     type_arrays::TypeArrays,
 };
@@ -86,6 +87,15 @@ fn doomed_domain(doomed: &[Doomed], position: usize) -> bool {
 /// Whether `doomed` holds the user-defined type at `position`.
 fn doomed_user_type(doomed: &[Doomed], position: usize) -> bool {
     doomed.contains(&Doomed::UserType(position))
+}
+
+/// The type identities and functions removed by a dependency cascade.
+#[derive(Default)]
+pub(super) struct TypeDrop {
+    /// Removed owners and their stored arrays, captured before removal.
+    pub(super) types: Vec<ObjectName>,
+    /// Removed constructors, signature dependents, and reader functions.
+    pub(super) functions: Vec<Arc<CreateFunction>>,
 }
 
 /// Whether a composite user type holds `name` in `schema`, which the relation
@@ -325,6 +335,7 @@ pub(super) fn create_user_defined_type(
     role: Option<&str>,
     defaults: &DefaultPrivileges,
     arrays: &mut Arc<TypeArrays>,
+    catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     require_named_in_catalog(&mut name, ObjectKind::Type, builder.catalog_name())?;
     place_relation(&builder, &mut name, false, ObjectKind::Type, role)?;
@@ -376,15 +387,19 @@ pub(super) fn create_user_defined_type(
         }
         None => None,
     };
-    Arc::make_mut(arrays).displace(&builder, &name);
+    if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &name) {
+        Arc::make_mut(catalog).rename_type_identity(&previous, current);
+    }
     let mut representation = representation;
     let (multirange_name, named_functions) = if let Some(representation) = representation.as_mut() {
         bind_representation(&builder, name_ident, schema, representation, arrays)?
     } else {
         (None, Vec::new())
     };
-    if let Some(multirange) = &multirange_name {
-        Arc::make_mut(arrays).displace(&builder, multirange);
+    if let Some(multirange) = &multirange_name
+        && let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, multirange)
+    {
+        Arc::make_mut(catalog).rename_type_identity(&previous, current);
     }
     let calls = definition_function_calls(&builder, &named_functions);
     let node = Arc::new(UserDefinedType { name, representation, multirange_name });
@@ -588,8 +603,69 @@ fn declared_type_reaches_doomed(
     }
 }
 
+/// The identities an owner holds: its stored name and the stored array the
+/// ownership record names, a range's multirange and the multirange's array.
+fn type_identities(
+    arrays: &TypeArrays,
+    owner: &ObjectName,
+    multirange: Option<&ObjectName>,
+) -> Vec<ObjectName> {
+    let mut identities = vec![owner.clone()];
+    if let Some(array) = arrays.array(owner) {
+        identities.push(array.clone());
+    }
+    if let Some(multirange) = multirange {
+        identities.push(multirange.clone());
+        if let Some(array) = arrays.array(multirange) {
+            identities.push(array.clone());
+        }
+    }
+    identities
+}
+
+/// The identities a held type or domain holds, which an operator naming any
+/// of them keeps the type from dropping.
+fn held_type_identities(
+    builder: &ParserDBBuilder,
+    arrays: &TypeArrays,
+    held: Option<Doomed>,
+) -> Vec<ObjectName> {
+    let Some(held) = held else {
+        return Vec::new();
+    };
+    match held {
+        Doomed::Domain(position) => {
+            let domain = &builder.domains()[position].0;
+            type_identities(arrays, &domain.name, None)
+        }
+        Doomed::UserType(position) => {
+            let type_ = &builder.user_defined_types()[position].0;
+            type_identities(arrays, &type_.name, type_.multirange_name.as_ref())
+        }
+    }
+}
+
+/// The identities every doomed type holds, each owner with its stored array
+/// and a range's multirange with its array.
+fn doomed_type_identities(
+    builder: &ParserDBBuilder,
+    arrays: &TypeArrays,
+    doomed: &[Doomed],
+) -> Vec<ObjectName> {
+    doomed
+        .iter()
+        .copied()
+        .flat_map(|held| held_type_identities(builder, arrays, Some(held)))
+        .collect()
+}
+
 /// Applies a `DROP DOMAIN` or a `DROP TYPE`, dropping the domains and
-/// user-defined types the names reach.
+/// user-defined types the names reach, the domains and types that depend on
+/// them, and the functions a dropped type takes with it.
+///
+/// Returns the builder alongside the identities and functions the drop took,
+/// each doomed owner with its stored array, read before the removal, which
+/// the operator facts the statement drops follow.
 ///
 /// # Errors
 ///
@@ -597,9 +673,10 @@ fn declared_type_reaches_doomed(
 /// user-defined type or the row type of a relation, a `DROP TYPE` naming the
 /// multirange of a range, the array of a type, or the row type of a relation,
 /// one naming a type of the database system, and one naming nothing without
-/// `IF EXISTS`. Without `CASCADE` it refuses a type a column, a composite
-/// attribute, a domain, a range or a base type's element uses. With it, those
-/// go too.
+/// `IF EXISTS`. Once a name resolves to a droppable type, without `CASCADE` it
+/// refuses a type a column, a composite attribute, a domain, a range or a base
+/// type's element uses, and a type, its stored array, or a range's multirange
+/// that `operators_holding` names. With it, those go too.
 pub(super) fn drop_types(
     builder: ParserDBBuilder,
     names: &[ObjectName],
@@ -607,7 +684,8 @@ pub(super) fn drop_types(
     cascade: bool,
     spelling: DropSpelling,
     arrays: &mut Arc<TypeArrays>,
-) -> Result<ParserDBBuilder, Error> {
+    operators_holding: &impl Fn(&ObjectName) -> Option<String>,
+) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let mut doomed: Vec<Doomed> = Vec::new();
     for name in names {
         let (schema, ident) = object_name_identifiers(name)?;
@@ -627,11 +705,12 @@ pub(super) fn drop_types(
             None => reach_type(&builder, ident),
         };
         let skipped = if_exists && reached.is_none();
-        match (reached, spelling) {
+        let held = match (reached, spelling) {
             (Some(Reached::Domain(position)), _) => {
                 if !doomed_domain(&doomed, position) {
                     doomed.push(Doomed::Domain(position));
                 }
+                Some(Doomed::Domain(position))
             }
             (Some(Reached::UserType(_position, _is_multirange)), DropSpelling::Domain) => {
                 return Err(Error::RelationKindMismatch {
@@ -644,6 +723,7 @@ pub(super) fn drop_types(
                 if !doomed_user_type(&doomed, position) {
                     doomed.push(Doomed::UserType(position));
                 }
+                Some(Doomed::UserType(position))
             }
             // A multirange goes only with its range.
             (Some(Reached::UserType(position, true)), DropSpelling::Type) => {
@@ -678,7 +758,18 @@ pub(super) fn drop_types(
             (None, DropSpelling::Type) if !skipped => {
                 return Err(Error::TypeNotFound { type_name: name.to_string() });
             }
-            _ => {}
+            _ => None,
+        };
+        if !cascade {
+            for candidate in held_type_identities(&builder, arrays, held) {
+                if let Some(symbol) = operators_holding(&candidate) {
+                    return Err(Error::TypeDropRequiredBy {
+                        type_name: name.to_string(),
+                        requiring_kind: ObjectKind::Operator,
+                        requiring_name: symbol,
+                    });
+                }
+            }
         }
     }
     drop_positions(builder, &doomed, cascade, &[], arrays)
@@ -763,15 +854,19 @@ fn extend_doomed_by_dependents(
 /// in which case the columns, composite attributes, domains, ranges and
 /// functions using them go too. `alongside` holds the functions the same
 /// statement drops later, whose calls hold nothing in place.
+///
+/// Returns the builder alongside the identities the doomed types hold, each
+/// with its stored array, and the functions the drop removes, read before the
+/// removal.
 fn drop_positions(
     mut builder: ParserDBBuilder,
     doomed: &[Doomed],
     cascade: bool,
     alongside: &[Arc<CreateFunction>],
     arrays: &mut Arc<TypeArrays>,
-) -> Result<ParserDBBuilder, Error> {
+) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     if doomed.is_empty() {
-        return Ok(builder);
+        return Ok((builder, TypeDrop { types: Vec::new(), functions: Vec::new() }));
     }
     // Domains, ranges and element-holding types over a doomed type, to the end
     // of the chain.
@@ -814,16 +909,20 @@ fn drop_positions(
         }
     }
 
-    if cascade {
-        builder = drop_dependents_cascade(builder, &doomed_owned, arrays)?;
-    }
+    let mut removed = if cascade {
+        let (next, removed) = drop_dependents_cascade(builder, &doomed_owned, arrays)?;
+        builder = next;
+        removed
+    } else {
+        TypeDrop::default()
+    };
     // A range takes its constructors along, after a cascade has dropped the
     // columns of its type and the checks on them.
-    range_constructors::drop_range_constructors(
+    removed.functions.extend(range_constructors::drop_range_constructors(
         &mut builder,
         |position| doomed_user_type(&doomed_owned, position),
         alongside,
-    )?;
+    )?);
     // Any other function whose signature names a doomed type holds it in
     // place, and goes with it under `CASCADE`.
     let naming: Vec<(Arc<CreateFunction>, Doomed)> = builder
@@ -848,6 +947,8 @@ fn drop_positions(
     let naming: Vec<Arc<CreateFunction>> =
         naming.into_iter().map(|(function, _)| function).collect();
     builder.drop_function_nodes(&naming, alongside)?;
+    removed.functions.extend(naming);
+    removed.types.extend(doomed_type_identities(&builder, arrays, &doomed_owned));
 
     // Remove the doomed, domains and user-defined types alike.
     let mut domain_position = 0;
@@ -872,7 +973,7 @@ fn drop_positions(
         }
         kept
     });
-    Ok(builder)
+    Ok((builder, removed))
 }
 
 /// Drops the columns and composite attributes that use the doomed types, for a
@@ -881,7 +982,8 @@ fn drop_dependents_cascade(
     mut builder: ParserDBBuilder,
     doomed: &[Doomed],
     arrays: &mut Arc<TypeArrays>,
-) -> Result<ParserDBBuilder, Error> {
+) -> Result<(ParserDBBuilder, TypeDrop), Error> {
+    let mut removed = TypeDrop::default();
     // An inherited column leaves with the parent's, so only declared columns
     // are dropped.
     loop {
@@ -898,7 +1000,7 @@ fn drop_dependents_cascade(
         let Some((table_name, column_name)) = next else {
             break;
         };
-        builder = ParserDB::alter_table_drop_columns(
+        let (next, columns) = ParserDB::alter_table_drop_columns(
             builder,
             &table_name,
             super::AlterTableScope { if_exists: false, only: false },
@@ -907,6 +1009,9 @@ fn drop_dependents_cascade(
             true,
             arrays,
         )?;
+        builder = next;
+        removed.types.extend(columns.types);
+        removed.functions.extend(columns.functions);
     }
     // The composite stays, possibly with no attribute left.
     let kept: Vec<(usize, Vec<UserDefinedTypeCompositeAttributeDef>)> = builder
@@ -944,12 +1049,16 @@ fn drop_dependents_cascade(
         let type_ = Arc::make_mut(type_);
         type_.representation = Some(UserDefinedTypeRepresentation::Composite { attributes });
     }
-    Ok(builder)
+    Ok((builder, removed))
 }
 
 /// Drops every type of a schema `DROP SCHEMA ... CASCADE` removes, with what a
 /// cascading drop of each takes, `alongside` holding the functions the schema
 /// drop takes afterwards.
+///
+/// Returns the builder alongside the identities the doomed types hold, each
+/// with its stored array, and the functions the drop removes, read before the
+/// removal.
 ///
 /// # Errors
 ///
@@ -961,7 +1070,7 @@ pub(super) fn drop_types_in(
     schema: (&str, bool),
     alongside: &[Arc<CreateFunction>],
     arrays: &mut Arc<TypeArrays>,
-) -> Result<ParserDBBuilder, Error> {
+) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let case = builder.identifier_case();
     let doomed_domains: Vec<Doomed> = builder
         .domains()
@@ -1156,14 +1265,19 @@ pub(super) fn alter_type(
     builder: ParserDBBuilder,
     alter: AlterType,
     arrays: &mut Arc<TypeArrays>,
+    catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     match alter.operation {
         AlterTypeOperation::Rename(rename) => {
-            alter_type_rename(builder, &alter.name, &rename.new_name, arrays)
+            alter_type_rename(builder, &alter.name, &rename.new_name, arrays, catalog)
         }
-        AlterTypeOperation::AddValue(add) => alter_type_add_value(builder, &alter.name, add),
+        AlterTypeOperation::AddValue(add) => {
+            let builder = alter_type_add_value(builder, &alter.name, add)?;
+            Ok(builder)
+        }
         AlterTypeOperation::RenameValue(renamed) => {
-            alter_type_rename_value(builder, &alter.name, renamed)
+            let builder = alter_type_rename_value(builder, &alter.name, renamed)?;
+            Ok(builder)
         }
     }
 }
@@ -1207,6 +1321,7 @@ fn alter_type_rename(
     name: &ObjectName,
     new_name: &Ident,
     arrays: &mut Arc<TypeArrays>,
+    catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     // The array type of a stored type is altered only through its type.
     if let Some(base) = arrays.element(&builder, name) {
@@ -1270,7 +1385,9 @@ fn alter_type_rename(
     let mut destination = old_name.clone();
     rewrite_last_ident(&mut destination, new_name);
     let array_was_displaced = arrays.array_is_named(&old_name, &destination);
-    Arc::make_mut(arrays).displace(&builder, &destination);
+    if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &destination) {
+        Arc::make_mut(catalog).rename_type_identity(&previous, current);
+    }
     // Re-point the references, then rewrite the stored name.
     let mut builder = repoint_type_references(builder, &old_name, &destination)?;
     match target {
@@ -1297,7 +1414,12 @@ fn alter_type_rename(
             rewrite_last_ident(multirange, new_name);
         }
     }
-    Arc::make_mut(arrays).rename(&builder, &old_name, &destination, array_was_displaced);
+    if let Some((previous, current)) =
+        Arc::make_mut(arrays).rename(&builder, &old_name, &destination, array_was_displaced)
+    {
+        Arc::make_mut(catalog).rename_type_identity(&previous, current);
+    }
+    Arc::make_mut(catalog).rename_type_identity(&old_name, &destination);
     Ok(builder)
 }
 
