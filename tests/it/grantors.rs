@@ -304,7 +304,7 @@ fn sequence_authorization_is_independent_of_column_ownership() {
         )
         .expect("valid name")
         .expect("sequence exists");
-    assert!(matches!(owned.owner(&database), Some(SequenceOwner::Column(_))));
+    assert!(matches!(owned.owner(&database), Ok(Some(SequenceOwner::Column(_)))));
 }
 
 #[test]

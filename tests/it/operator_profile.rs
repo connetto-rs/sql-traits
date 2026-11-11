@@ -282,6 +282,10 @@ impl DataTypeLike for NoneKind {
         self.unreach()
     }
 
+    fn numeric_precision(&self, _database: &Self::DB) -> Option<u64> {
+        self.unreach()
+    }
+
     fn send_function(&self, _database: &Self::DB) -> Option<bool> {
         self.unreach()
     }
