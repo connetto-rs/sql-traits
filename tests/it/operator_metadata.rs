@@ -1,7 +1,10 @@
 //! Operator catalog identities and incomplete metadata.
 #![expect(clippy::unwrap_used, reason = "Fixtures must expose their declared catalog entities.")]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, ObjectKind},
+    prelude::*,
+};
 use sqlparser::{
     dialect::{PostgreSqlDialect, SQLiteDialect},
     parser::Parser,
@@ -9,6 +12,10 @@ use sqlparser::{
 
 fn pg(name: &str) -> TargetName<'_> {
     TargetName::new(name, false).with_schema("pg_catalog", false)
+}
+
+fn app(name: &str) -> TargetName<'_> {
+    TargetName::new(name, false).with_schema("app", false)
 }
 
 #[test]
@@ -163,7 +170,13 @@ fn replacement_uses_catalog_identity_including_schema_quoting() {
     let actual = db
         .operators()
         .unwrap()
-        .map(|operator| (operator.target_name(), operator.result_type(&db)))
+        .map(|operator| {
+            (
+                TargetName::new(operator.name(), operator.name_is_quoted())
+                    .with_schema(operator.schema().unwrap(), operator.schema_is_quoted()),
+                operator.result_type(&db),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         actual,
@@ -336,4 +349,139 @@ fn internal_char_is_distinct_from_sql_character() {
         })
         .unwrap();
     assert_eq!(operator.implementation(&db).unwrap().target_name(), pg("chareq"));
+}
+
+#[test]
+fn an_unqualified_implementation_identity_defaults_to_pg_catalog() {
+    let options =
+        ParseOptions::default().with_postgres_catalog(PostgresCatalog::empty().with_operator(
+            PostgresCatalogOperator::new("===", Some(pg("int4")), pg("int8")).with_implementation(
+                TargetName::new("equal", false),
+                TargetName::new("bool", false),
+            ),
+        ));
+    let db = options.parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA app;
+         CREATE SCHEMA IF NOT EXISTS pg_catalog;
+         CREATE FUNCTION app.equal(a int4, b int8) RETURNS BOOL LANGUAGE SQL AS 'SELECT FALSE';
+         CREATE FUNCTION pg_catalog.equal(a int4, b int8) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';",
+    ).unwrap();
+    assert_eq!(
+        db.operators().unwrap().next().unwrap().implementation(&db).unwrap().target_name(),
+        pg("equal"),
+    );
+}
+
+#[test]
+fn an_implementation_requires_exactly_the_operator_operand_count() {
+    for arguments in ["a app.token", "a app.token, b app.token, c app.token"] {
+        let options = ParseOptions::default().with_postgres_catalog(
+            PostgresCatalog::empty().with_operator(
+                PostgresCatalogOperator::new("===", Some(app("token")), app("token"))
+                    .with_schema("app", false)
+                    .with_implementation(app("equal"), pg("bool")),
+            ),
+        );
+        let db = options
+            .parse::<PostgreSqlDialect>(&format!(
+                "CREATE SCHEMA app;
+             CREATE TYPE app.token AS ENUM ('a');
+             CREATE FUNCTION app.equal({arguments}) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';",
+            ))
+            .unwrap();
+        assert!(db.operators().unwrap().next().unwrap().implementation(&db).is_none());
+    }
+}
+
+#[test]
+fn prefix_replacement_links_the_latest_implementation() {
+    let first = PostgresCatalogOperator::new("~", None, app("token"))
+        .with_implementation(app("first"), app("token"));
+    let second = PostgresCatalogOperator::new("~", None, app("token"))
+        .with_implementation(app("second"), app("token"));
+    let catalog = PostgresCatalog::empty().with_operator(first).with_operator(second);
+    let db = ParseOptions::default().with_postgres_catalog(catalog)
+        .parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA app;
+             CREATE TYPE app.token AS ENUM ('a');
+             CREATE FUNCTION app.first(value app.token) RETURNS app.token LANGUAGE SQL AS 'SELECT value';
+             CREATE FUNCTION app.second(value app.token) RETURNS app.token LANGUAGE SQL AS 'SELECT value';",
+        ).unwrap();
+    assert_eq!(db.operators().unwrap().count(), 1);
+    let held = db.operators().unwrap().next().unwrap();
+    assert_eq!(held.kind(), OperatorKind::Prefix);
+    assert_eq!(held.implementation(&db).unwrap().target_name(), app("second"));
+}
+
+#[test]
+fn a_shell_fact_does_not_hold_the_function_a_drop_releases() {
+    let options = ParseOptions::default().with_postgres_catalog(
+        PostgresCatalog::empty().with_operator(
+            PostgresCatalogOperator::new("===", Some(app("token")), app("token"))
+                .with_schema("app", false),
+        ),
+    );
+    let db = options.parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA app;
+         CREATE TYPE app.token AS ENUM ('a');
+         CREATE FUNCTION app.equal(a app.token, b app.token) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';
+         DROP FUNCTION app.equal(app.token, app.token);",
+    ).unwrap();
+    assert_eq!(db.operators().unwrap().count(), 1);
+    let operator = db.operators().unwrap().next().unwrap();
+    assert_eq!(operator.target_name(), app("==="));
+    assert!(operator.implementation(&db).is_none());
+    assert!(!db.functions().any(|function| function.target_name() == app("equal")));
+}
+
+#[test]
+fn a_restricted_drop_identifies_the_dependent_operator() {
+    let operator_name = "===";
+    let result = ParseOptions::default()
+        .with_postgres_catalog(
+            PostgresCatalog::empty().with_operator(
+                PostgresCatalogOperator::new(operator_name, None, app("_token"))
+                    .with_schema("app", false),
+            ),
+        )
+        .parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA app;
+         CREATE TABLE app.token (a INT);
+         DROP TABLE app.token;",
+        );
+    let err = result.unwrap_err();
+    assert!(matches!(
+        err,
+        Error::RelationHasDependents { dependent_kind: ObjectKind::Operator, .. }
+    ));
+    assert!(err.to_string().contains(operator_name));
+}
+
+#[test]
+fn unnamed_function_metadata_cannot_supply_an_operator_implementation() {
+    let parsed = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION equal(a INT, b INT) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';",
+    )
+    .unwrap();
+    let function = parsed.functions().find(|function| function.name() == "equal").unwrap();
+    let mut unnamed = function.clone();
+    unnamed.name.0.clear();
+    let db: ParserDB = ParserDB::new("manual".into(), *parsed.dialect())
+        .add_function(
+            std::sync::Arc::new(unnamed),
+            sql_traits::structs::FunctionMetadata::default(),
+        )
+        .add_function(
+            std::sync::Arc::new(function.clone()),
+            sql_traits::structs::FunctionMetadata::default(),
+        )
+        .into();
+    let operator = PostgresCatalogOperator::new("===", Some(pg("int4")), pg("int4"))
+        .with_implementation(TargetName::new("", false).with_schema("public", false), pg("bool"));
+    assert!(operator.implementation(&db).is_none());
+    let named = operator.with_implementation(
+        TargetName::new("equal", false).with_schema("public", false),
+        pg("bool"),
+    );
+    assert_eq!(named.implementation(&db).unwrap().name(), "equal");
 }

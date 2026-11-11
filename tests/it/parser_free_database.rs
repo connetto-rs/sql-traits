@@ -2749,3 +2749,8 @@ fn legal_policy_commands_route_each_clause_and_diagnose_missing_prerequisites() 
         }
     }
 }
+
+#[test]
+fn an_engine_without_an_operator_catalog_answers_none() {
+    assert!(MemoryCatalog::default().operators().is_none());
+}

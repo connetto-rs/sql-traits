@@ -350,13 +350,9 @@ impl PostgresCatalog {
         args: Option<&[OperateFunctionArg]>,
         case: IdentifierCase,
     ) {
-        let declaring = |operator: &PostgresCatalogOperator| {
-            operator.declares_function(type_arrays, name, args, case)
-        };
-        if !self.operators.iter().any(declaring) {
-            return;
-        }
-        self.operators.to_mut().retain(|operator| !declaring(operator));
+        self.operators
+            .to_mut()
+            .retain(|operator| !operator.declares_function(type_arrays, name, args, case));
     }
 
     /// Drops every operator `declares` answers for, when any does, leaving

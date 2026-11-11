@@ -2,7 +2,7 @@
 //! functions they name.
 #![expect(clippy::unwrap_used, reason = "Fixtures must expose their declared catalog entities.")]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{errors::Error, prelude::*, traits::ColumnCollation};
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
 fn pg(name: &str) -> TargetName<'_> {
@@ -423,4 +423,161 @@ fn a_relation_cascade_removes_operators_declaring_reader_functions() {
          DROP TABLE app.base CASCADE;",
     );
     assert!(db.operators().unwrap().next().is_none());
+}
+
+#[test]
+fn a_table_displacement_keeps_the_link_of_the_facts_it_renames() {
+    let db = parse(
+        configured(Some(app("_token")), app("_token")),
+        "CREATE SCHEMA app;
+         CREATE TYPE app.token AS ENUM ('a');
+         CREATE FUNCTION app.equal(a app.token[], b app.token[]) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';
+         CREATE TABLE app._token (a INT);",
+    );
+    let function = the_operator(&db).implementation(&db).unwrap();
+    assert_eq!(function.target_name(), app("equal"));
+}
+
+#[test]
+fn a_domain_displacement_keeps_the_link_of_the_facts_it_renames() {
+    let db = parse(
+        configured(Some(app("_token")), app("_token")),
+        "CREATE SCHEMA app;
+         CREATE TYPE app.token AS ENUM ('a');
+         CREATE FUNCTION app.equal(a app.token[], b app.token[]) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';
+         CREATE DOMAIN app._token AS INT;",
+    );
+    let function = the_operator(&db).implementation(&db).unwrap();
+    assert_eq!(function.target_name(), app("equal"));
+}
+
+#[test]
+fn a_view_displacement_keeps_the_link_of_the_facts_it_renames() {
+    let db = parse(
+        configured(Some(app("_token")), app("_token")),
+        "CREATE SCHEMA app;
+         CREATE TYPE app.token AS ENUM ('a');
+         CREATE FUNCTION app.equal(a app.token[], b app.token[]) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';
+         CREATE VIEW app._token AS SELECT 1 AS a;",
+    );
+    let function = the_operator(&db).implementation(&db).unwrap();
+    assert_eq!(function.target_name(), app("equal"));
+}
+
+#[test]
+fn a_range_multirange_displacement_keeps_the_link_of_the_facts_it_renames() {
+    let db = parse(
+        configured(Some(app("_foo_multirange")), app("_foo_multirange")),
+        "CREATE SCHEMA app;
+         CREATE TYPE app.foo_multirange AS ENUM ('a');
+         CREATE FUNCTION app.equal(a app.foo_multirange[], b app.foo_multirange[]) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';
+         CREATE TYPE app._foo AS RANGE (subtype = app.foo_multirange);",
+    );
+    let function = the_operator(&db).implementation(&db).unwrap();
+    assert_eq!(function.target_name(), app("equal"));
+}
+
+#[test]
+fn schema_rename_preserves_shells_and_unrelated_collations() {
+    let catalog = PostgresCatalog::postgres_18()
+        .with_collation(
+            PostgresCatalogCollation::new("folded", false)
+                .with_schema("app", false)
+                .with_deterministic(false),
+        )
+        .with_collation(PostgresCatalogCollation::new("folded", false).with_schema("other", false))
+        .with_operator(
+            PostgresCatalogOperator::new("~", None, pg("int4")).with_schema("app", false),
+        );
+    let db = parse(
+        ParseOptions::default().with_postgres_catalog(catalog),
+        "CREATE SCHEMA app;
+         CREATE SCHEMA other;
+         ALTER SCHEMA app RENAME TO moved;
+         CREATE TABLE retained (
+             changed TEXT COLLATE moved.folded,
+             kept TEXT COLLATE other.folded
+         );",
+    );
+    let operator =
+        db.operators().unwrap().find(|operator| operator.schema() == Some("moved")).unwrap();
+    assert_eq!(operator.kind(), OperatorKind::Prefix);
+    assert!(operator.left_type(&db).is_none());
+    assert!(operator.result_type(&db).is_none());
+    assert!(operator.implementation(&db).is_none());
+    let table = db
+        .table_by_target(TargetName::new("retained", false), IdentifierCase::AsWritten)
+        .unwrap()
+        .unwrap();
+    for (column_name, schema, deterministic) in
+        [("changed", "moved", false), ("kept", "other", true)]
+    {
+        let column = table.column(column_name, &db, IdentifierCase::AsWritten).unwrap().unwrap();
+        assert!(matches!(
+            column.collation(&db),
+            Ok(ColumnCollation::Named(collation))
+                if *collation.name() == TargetName::new("folded", false).with_schema(schema, false)
+                    && collation.postgres_deterministic() == Some(deterministic)
+        ));
+    }
+}
+
+#[test]
+fn a_type_rename_repoints_only_the_facts_the_type_names() {
+    let options = ParseOptions::default().with_postgres_catalog(
+        PostgresCatalog::empty()
+            .with_operator(
+                PostgresCatalogOperator::new(
+                    "===",
+                    Some(TargetName::new("token", false).with_schema("app", false)),
+                    TargetName::new("token", false).with_schema("app", false),
+                )
+                .with_schema("app", false)
+                .with_implementation(app("equal"), pg("bool")),
+            )
+            .with_operator(
+                PostgresCatalogOperator::new(
+                    "!==",
+                    Some(TargetName::new("other", false).with_schema("app", false)),
+                    TargetName::new("other", false).with_schema("app", false),
+                )
+                .with_schema("app", false)
+                .with_implementation(app("same"), pg("bool")),
+            ),
+    );
+    let db = options
+        .parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA app;
+         CREATE TYPE app.token AS ENUM ('a');
+         CREATE TYPE app.other AS ENUM ('b');
+         ALTER TYPE app.token RENAME TO renamed;",
+        )
+        .unwrap();
+    let facts: Vec<_> = db.operators().unwrap().collect();
+    assert_eq!(facts.len(), 2);
+    assert_eq!(facts[0].right_type(&db), Some(app("renamed")));
+    assert_eq!(facts[1].right_type(&db), Some(app("other")));
+}
+
+#[test]
+fn dropping_a_builder_assembled_range_requires_no_recorded_array_ownership() {
+    let parsed =
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TYPE spans AS RANGE (SUBTYPE = INT4);")
+            .unwrap();
+    let range = parsed.user_defined_types().find(|type_| type_.name() == "spans").unwrap();
+    let db: ParserDB = ParserDB::new("manual".into(), *parsed.dialect())
+        .add_user_defined_type(
+            std::sync::Arc::new(range.clone()),
+            sql_traits::structs::metadata::ExpressionCalls::default(),
+        )
+        .into();
+    let drop_range =
+        Parser::parse_sql(&PostgreSqlDialect {}, "DROP TYPE spans;").unwrap().remove(0);
+    let dropped = db.into_ingestor().apply_statement(drop_range).unwrap().finish();
+    assert!(!dropped.user_defined_types().any(|type_| type_.name() == "spans"));
+    assert!(dropped.operators().unwrap().any(|operator| {
+        operator.name() == "="
+            && operator.left_type(&dropped) == Some(pg("int4"))
+            && operator.right_type(&dropped) == Some(pg("int4"))
+    }));
 }
