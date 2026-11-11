@@ -5,9 +5,10 @@ use sql_traits::{errors::Error, prelude::*};
 use sqlparser::{
     ast::{
         ArrayElemTypeDef, CreateDomain, CreateFunction, DataType, FunctionReturnType, Ident,
-        ObjectName,
+        ObjectName, Statement,
     },
     dialect::PostgreSqlDialect,
+    parser::Parser,
 };
 
 fn parse(sql: &str) -> ParserDB {
@@ -277,5 +278,53 @@ fn generic_dialect_does_not_infer_postgresql_arrays() {
     assert_eq!(
         column_type(&db, "t", "c"),
         &DataType::Custom(ObjectName::from(Ident::new("_token")), Vec::new())
+    );
+}
+
+/// Stores `statement` under PostgreSQL semantics, creating its schema first.
+fn store(statement: Statement) -> ParserDB {
+    let mut statements =
+        Parser::parse_sql(&PostgreSqlDialect {}, "CREATE SCHEMA o;").expect("the schema parses");
+    statements.push(statement);
+    let mut ingestor = ParserDBIngestor::new::<PostgreSqlDialect>("test".to_string());
+    for statement in statements {
+        ingestor = ingestor.apply_statement(statement).expect("the statement applies");
+    }
+    ingestor.finish()
+}
+
+/// The table creation `sql` parses to, for rewriting its column type.
+fn create_table(sql: &str) -> Statement {
+    Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("the statement parses").remove(0)
+}
+
+#[test]
+fn an_untyped_array_declaration_preserves_its_unknown_element() {
+    let mut statement = create_table("CREATE TABLE o.t (c INT);");
+    let Statement::CreateTable(create_table) = &mut statement else {
+        panic!("the statement is a table creation")
+    };
+    create_table.columns[0].data_type = DataType::Array(ArrayElemTypeDef::None);
+    let db = store(statement);
+    assert_eq!(column_type(&db, "t", "c"), &DataType::Array(ArrayElemTypeDef::None));
+}
+
+#[test]
+fn a_nested_untyped_array_declaration_preserves_its_unknown_element() {
+    let mut statement = create_table("CREATE TABLE o.t (c INT);");
+    let Statement::CreateTable(create_table) = &mut statement else {
+        panic!("the statement is a table creation")
+    };
+    create_table.columns[0].data_type = DataType::Array(ArrayElemTypeDef::SquareBracket(
+        Box::new(DataType::Array(ArrayElemTypeDef::None)),
+        None,
+    ));
+    let db = store(statement);
+    assert_eq!(
+        column_type(&db, "t", "c"),
+        &DataType::Array(ArrayElemTypeDef::SquareBracket(
+            Box::new(DataType::Array(ArrayElemTypeDef::None)),
+            None,
+        ))
     );
 }

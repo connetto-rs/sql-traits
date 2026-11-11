@@ -325,11 +325,7 @@ impl TypeArrays {
         else {
             return Ok(None);
         };
-        let (from_schema, from_schema_quoted) = schema_of(from);
         let (to_schema, to_schema_quoted) = schema_of(to);
-        if case.identifiers_match(from_schema, from_schema_quoted, to_schema, to_schema_quoted) {
-            return Ok(None);
-        }
         let Some((to_name, to_name_quoted)) = object_name_last_part(to) else {
             return Err(Error::UnnamedObject { object_kind: ObjectKind::Type });
         };

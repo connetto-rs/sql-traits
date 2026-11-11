@@ -151,6 +151,7 @@ mod temporary_namespace;
 mod thread_safety;
 mod transactional_ingestion;
 mod type_array_binding;
+mod type_array_builder;
 mod type_array_identities;
 mod type_name_normalization;
 mod user_defined_types;

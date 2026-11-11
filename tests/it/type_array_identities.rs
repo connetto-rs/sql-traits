@@ -226,3 +226,30 @@ fn moving_a_rowtype_refuses_type_and_array_collisions() {
         );
     }
 }
+
+#[test]
+fn moving_a_rowtype_into_the_catalog_preserves_its_array_identity() {
+    let result = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA IF NOT EXISTS pg_catalog;
+         CREATE TABLE custom_row (value INT);
+         ALTER TABLE custom_row RENAME TO pg_catalog.custom_row;
+         DROP TYPE pg_catalog._custom_row;",
+    );
+    assert!(
+        matches!(&result, Err(Error::TypeDropRequiredBy { requiring_name, .. }) if requiring_name == "custom_row"),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn renaming_a_range_through_its_multirange_renames_the_stored_multirange() {
+    let result = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TYPE span AS RANGE (SUBTYPE = INT4);
+         ALTER TYPE span_multirange RENAME TO span_multirange_2;
+         DROP TYPE span_multirange_2;",
+    );
+    assert!(matches!(
+        result,
+        Err(Error::TypeDropRequiredBy { requiring_name, .. }) if requiring_name == "span"
+    ));
+}
