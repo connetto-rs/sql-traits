@@ -23,7 +23,7 @@ use crate::{
     errors::Error,
     structs::{RoleSetting, role_setting::setting_zone},
     utils::{
-        identifier_resolution::{SessionPrincipal, normalize_identifier, session_principal},
+        identifier_resolution::{SessionPrincipal, session_principal, stored_identifier},
         object_name::{require_static_object_name, setting_value},
     },
 };
@@ -233,7 +233,7 @@ fn setting_name(name: &ObjectName) -> Result<String, Error> {
         .0
         .iter()
         .filter_map(ObjectNamePart::as_ident)
-        .map(|part| normalize_identifier(&part.value, part.quote_style.is_some()));
+        .map(|part| stored_identifier(&part.value, part.quote_style.is_some()));
     let mut joined = parts.next().map(Cow::into_owned).unwrap_or_default();
     for part in parts {
         joined.push('.');

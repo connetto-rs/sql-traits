@@ -18,7 +18,7 @@ use crate::{
     impls::SqlparserDialect,
     structs::{IdentifierCase, TargetName},
     utils::{
-        identifier_resolution::{identifiers_match, is_temporary_schema, normalize_identifier},
+        identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
         object_name::{
             PG_CATALOG, TEMPORARY_SCHEMA, object_name_identifiers, object_name_last_part,
             qualifier_of,
@@ -477,7 +477,7 @@ fn postgres(builder: &ParserDBBuilder) -> bool {
 
 /// Resolves an array name through the built-in element registry.
 fn builtin_element(name: &str, quoted: bool) -> Option<&'static str> {
-    let folded = normalize_identifier(name, quoted);
+    let folded = stored_identifier(name, quoted);
     let element = folded.as_ref().strip_prefix('_')?;
     BUILTIN_ARRAY_ELEMENTS
         .binary_search(&element)
@@ -492,7 +492,7 @@ fn generated_array_name(
     quoted: bool,
     mut held: impl FnMut(&str, bool) -> bool,
 ) -> String {
-    let base = normalize_identifier(base, quoted);
+    let base = stored_identifier(base, quoted);
     let mut pass = 0u32;
     loop {
         let label = (pass > 0).then(|| pass.to_string());

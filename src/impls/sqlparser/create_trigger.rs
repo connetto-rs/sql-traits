@@ -10,7 +10,7 @@ use crate::{
     structs::{ParserDB, TargetName},
     traits::{DatabaseLike, FunctionLike, Metadata, TriggerLike},
     utils::{
-        identifier_resolution::normalize_identifier,
+        identifier_resolution::stored_identifier,
         last_str,
         object_name::{
             object_name_last_part, qualifier_of, resolve_required_bound_table_or_foreign_table,
@@ -21,7 +21,7 @@ use crate::{
 
 /// The schema a stored or bound name lives in, `public` when it writes none.
 fn in_schema(schema: Option<(&str, bool)>) -> Cow<'_, str> {
-    schema.map_or(Cow::Borrowed("public"), |(schema, quoted)| normalize_identifier(schema, quoted))
+    schema.map_or(Cow::Borrowed("public"), |(schema, quoted)| stored_identifier(schema, quoted))
 }
 
 impl Metadata for CreateTrigger {
@@ -82,7 +82,7 @@ impl TriggerLike for CreateTrigger {
     {
         let called = &self.exec_body.as_ref()?.func_desc.name;
         let (name, quoted) = object_name_last_part(called)?;
-        let name = normalize_identifier(name, quoted);
+        let name = stored_identifier(name, quoted);
         let schema = in_schema(qualifier_of(called).named());
         database.functions_named(&name).find(|function| {
             let target = function.target_name();

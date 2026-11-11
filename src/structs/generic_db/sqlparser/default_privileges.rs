@@ -33,7 +33,7 @@ use crate::{
     impls::{SqlparserDialect, grantee_is_public, grantee_is_session_principal, grantees_match},
     structs::{FunctionMetadata, IdentifierCase},
     utils::{
-        identifier_resolution::{SessionPrincipal, normalize_identifier},
+        identifier_resolution::{SessionPrincipal, stored_identifier},
         last_str,
         object_name::{qualifier_of, search_path_entry},
     },
@@ -1033,7 +1033,7 @@ pub(super) fn require_creator_executes(
     // is `sql`.
     let validated = function.language.as_ref().is_none_or(|language| {
         matches!(
-            normalize_identifier(&language.value, language.quote_style.is_some()).as_ref(),
+            stored_identifier(&language.value, language.quote_style.is_some()).as_ref(),
             "sql" | "plpgsql"
         )
     });

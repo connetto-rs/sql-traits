@@ -12,7 +12,7 @@ use crate::{
         CheckConstraintLike, DataTypeLike, DatabaseLike, ForeignKeyLike, IndexLike, Metadata,
         TableLike, check_constraint::non_tautological,
     },
-    utils::identifier_resolution::normalize_identifier,
+    utils::identifier_resolution::stored_identifier,
 };
 
 /// The padding rule MySQL exposes for a collation.
@@ -338,7 +338,7 @@ pub trait ColumnLike:
     /// ```
     #[inline]
     fn stored_column_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.column_name(), self.column_name_is_quoted())
+        stored_identifier(self.column_name(), self.column_name_is_quoted())
     }
 
     /// Returns the documentation of the column.

@@ -7,7 +7,7 @@ use crate::{
     structs::{IdentifierCase, ParserDB},
     traits::{DomainLike, Metadata},
     utils::{
-        identifier_resolution::normalize_identifier,
+        identifier_resolution::stored_identifier,
         object_name::{object_name_identifiers, object_name_last_part, qualifier_of},
         postgres_types::names_catalog_type,
     },
@@ -91,7 +91,7 @@ pub(crate) fn bound_domain<'a>(
     let name = (name.value.as_str(), name.quote_style.is_some());
     let schema = match schema {
         Some(schema) => (schema.value.as_str(), schema.quote_style.is_some()),
-        None if names_catalog_type(&normalize_identifier(name.0, name.1)) => return None,
+        None if names_catalog_type(&stored_identifier(name.0, name.1)) => return None,
         None => (DEFAULT_SCHEMA, false),
     };
     domains

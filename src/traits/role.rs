@@ -5,7 +5,7 @@ use core::{fmt::Debug, iter::once};
 
 use crate::{
     traits::{DatabaseLike, Metadata, RoleMembershipLike},
-    utils::identifier_resolution::normalize_identifier,
+    utils::identifier_resolution::stored_identifier,
 };
 
 /// A trait for types that can be treated as SQL roles.
@@ -40,7 +40,7 @@ pub trait RoleLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
 
     /// Returns the canonical stored role name.
     fn stored_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.name(), self.name_is_quoted())
+        stored_identifier(self.name(), self.name_is_quoted())
     }
 
     /// Returns whether this role has the `SUPERUSER` attribute.

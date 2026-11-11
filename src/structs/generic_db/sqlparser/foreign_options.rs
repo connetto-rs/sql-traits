@@ -7,7 +7,7 @@ use sqlparser::ast::{
     AlterGenericOption, ColumnDef, ColumnOption, ColumnOptionDef, CreateServerOption,
 };
 
-use crate::utils::identifier_resolution::normalize_identifier;
+use crate::utils::identifier_resolution::stored_identifier;
 
 /// Why PostgreSQL refuses a change, with the key it names as PostgreSQL
 /// stores it.
@@ -39,7 +39,7 @@ impl Refusal {
 
 /// The key of `option`, as PostgreSQL stores it.
 fn stored_key(option: &CreateServerOption) -> Cow<'_, str> {
-    normalize_identifier(&option.key.value, option.key.quote_style.is_some())
+    stored_identifier(&option.key.value, option.key.quote_style.is_some())
 }
 
 /// Applies `changes` to `options` one after the other, as PostgreSQL does:
@@ -59,7 +59,7 @@ pub(super) fn change<T>(
                 (stored_key(option), Some(option))
             }
             AlterGenericOption::Drop(key) => {
-                (normalize_identifier(&key.value, key.quote_style.is_some()), None)
+                (stored_identifier(&key.value, key.quote_style.is_some()), None)
             }
         };
         let held = options.iter().position(|option| key_of(option) == key);

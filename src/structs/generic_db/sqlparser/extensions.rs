@@ -25,7 +25,7 @@ use crate::{
     errors::{Error, ObjectKind},
     structs::metadata::FunctionMetadata,
     utils::{
-        identifier_resolution::{identifiers_match, is_temporary_schema, normalize_identifier},
+        identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
         last_str,
         object_name::{PG_CATALOG, TEMPORARY_SCHEMA},
     },
@@ -76,7 +76,7 @@ static UUID_OSSP: &[ExtensionFunction] = &[
 /// The functions the extension called `name` creates, empty for an extension
 /// whose functions are not modelled.
 fn extension_functions(name: &Ident) -> &'static [ExtensionFunction] {
-    match normalize_identifier(&name.value, name.quote_style.is_some()).as_ref() {
+    match stored_identifier(&name.value, name.quote_style.is_some()).as_ref() {
         "uuid-ossp" => UUID_OSSP,
         _ => &[],
     }

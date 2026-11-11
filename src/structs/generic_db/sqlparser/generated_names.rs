@@ -16,40 +16,29 @@ use crate::{
     traits::TableLike,
     utils::{
         figured_names::{Figure, figure},
-        identifier_resolution::normalize_identifier,
+        identifier_resolution::{MAX_NAME_BYTES, clipped, stored_identifier},
     },
 };
 
-/// The most bytes PostgreSQL keeps of a name, `NAMEDATALEN` less one.
-const MAX_NAME_BYTES: usize = 63;
-
-/// The longest prefix of `name` within `limit` bytes ending on a character
-/// boundary, as `pg_mbcliplen` cuts.
-fn clipped(name: &str, limit: usize) -> &str {
-    let mut end = limit.min(name.len());
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
+/// The name PostgreSQL stores for a written identifier, owned.
+fn stored(value: &str, quoted: bool) -> String {
+    stored_identifier(value, quoted).into_owned()
 }
 
-/// The name PostgreSQL stores for a written identifier, cut as its scanner cuts
-/// it.
-fn stored(value: &str, quoted: bool) -> String {
-    let mut name = normalize_identifier(value, quoted).into_owned();
-    name.truncate(clipped(&name, MAX_NAME_BYTES).len());
-    name
+/// Whether `value` reads back as itself when written bare: lowercase letters,
+/// digits and underscores, starting with a letter or an underscore.
+///
+/// Keywords are not considered, since no generated name spells one.
+pub(super) fn bare_spelling(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 /// An identifier reaching exactly the stored name `value`, bare only when
 /// folding leaves it unchanged.
 pub(super) fn spelled(value: String) -> Ident {
-    // Never a keyword bare: a generated name is lowercase letters, digits
-    // and underscores, starting with one of them.
-    let mut bytes = value.bytes();
-    let bare = bytes.next().is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
-    if bare { Ident::new(value) } else { Ident::with_quote('"', value) }
+    if bare_spelling(&value) { Ident::new(value) } else { Ident::with_quote('"', value) }
 }
 
 /// The column part of the name of an index over `columns` and `include`, or

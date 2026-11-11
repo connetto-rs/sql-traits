@@ -1,9 +1,10 @@
 //! Identifier resolution helpers with PostgreSQL matching semantics.
 //!
 //! PostgreSQL folds unquoted identifiers to lowercase and treats quoted
-//! identifiers as exact/case-sensitive. Identifiers are additionally
-//! Unicode-NFC-normalized and whitespace-trimmed per
-//! FINGERPRINT_SPEC §7.1.
+//! identifiers as exact/case-sensitive. [`stored_identifier`] answers the
+//! name the catalog holds. [`normalize_identifier`] answers the form two
+//! names are compared under, which is additionally Unicode-NFC-normalized and
+//! whitespace-trimmed per FINGERPRINT_SPEC §7.1.
 
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
@@ -171,6 +172,9 @@ pub fn session_principal(value: &str, quoted: bool) -> Option<SessionPrincipal> 
 ///    precomposed `é` vs `e` + combining acute).
 /// 3. ASCII-lowercase unquoted identifiers (matching PostgreSQL folding);
 ///    quoted identifiers retain their case post-NFC.
+///
+/// The result is not a name PostgreSQL stores, which [`stored_identifier`]
+/// answers.
 #[must_use]
 pub fn normalize_identifier(value: &str, quoted: bool) -> Cow<'_, str> {
     let trimmed = value.trim();
@@ -189,9 +193,50 @@ pub fn normalize_identifier(value: &str, quoted: bool) -> Cow<'_, str> {
     }
 }
 
+/// The most bytes PostgreSQL keeps of a name, `NAMEDATALEN` less one.
+pub(crate) const MAX_NAME_BYTES: usize = 63;
+
+/// The longest prefix of `name` within `limit` bytes ending on a character
+/// boundary, as `pg_mbcliplen` cuts.
+pub(crate) fn clipped(name: &str, limit: usize) -> &str {
+    let mut end = limit.min(name.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
+/// Returns the name PostgreSQL stores for an identifier written as `value`,
+/// quoted or not.
+///
+/// This is what `downcase_identifier` and `truncate_identifier` make of it
+/// under a UTF-8 server encoding. A quoted identifier is kept byte for byte,
+/// spaces and Unicode composition included, and an unquoted one has ASCII `A`
+/// to `Z` lowered and nothing else changed. Either is cut to at most 63 bytes
+/// on a character boundary.
+///
+/// # Example
+///
+/// ```rust
+/// use sql_traits::utils::identifier_resolution::stored_identifier;
+///
+/// assert_eq!(stored_identifier("Owner_Id", false), "owner_id");
+/// assert_eq!(stored_identifier(" Owner_Id ", true), " Owner_Id ");
+/// assert_eq!(stored_identifier(&"r".repeat(70), false).len(), 63);
+/// ```
+#[must_use]
+pub fn stored_identifier(value: &str, quoted: bool) -> Cow<'_, str> {
+    let kept = clipped(value, MAX_NAME_BYTES);
+    if quoted || !kept.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Borrowed(kept)
+    } else {
+        Cow::Owned(kept.to_ascii_lowercase())
+    }
+}
+
 /// Returns the name PostgreSQL stores for a written identifier.
 ///
-/// This is [`normalize_identifier`] applied to the parser's own node, which
+/// This is [`stored_identifier`] applied to the parser's own node, which
 /// carries the quoting the writer used.
 ///
 /// # Example
@@ -205,7 +250,7 @@ pub fn normalize_identifier(value: &str, quoted: bool) -> Cow<'_, str> {
 /// ```
 #[must_use]
 pub fn stored_ident_name(ident: &Ident) -> Cow<'_, str> {
-    normalize_identifier(&ident.value, ident.quote_style.is_some())
+    stored_identifier(&ident.value, ident.quote_style.is_some())
 }
 
 /// Returns the folded terminal name of a call, and [`None`] when that name was
@@ -332,6 +377,24 @@ mod tests {
     fn stored_ident_name_follows_the_parsed_quote_style() {
         assert_eq!(stored_ident_name(&Ident::new("Owner_Id")), "owner_id");
         assert_eq!(stored_ident_name(&Ident::with_quote('"', "Owner_Id")), "Owner_Id");
+    }
+
+    /// Each row was read back from `pg_roles` on PostgreSQL 18 with a UTF-8
+    /// server encoding.
+    #[test]
+    fn stored_ident_name_answers_what_postgres_stores() {
+        let quoted = |value: &str| stored_ident_name(&Ident::with_quote('"', value)).into_owned();
+        let bare = |value: &str| stored_ident_name(&Ident::new(value)).into_owned();
+        assert_eq!(quoted(" spaced "), " spaced ");
+        assert_eq!(quoted("e\u{301}"), "e\u{301}");
+        assert_eq!(quoted("\u{e9}"), "\u{e9}");
+        assert_eq!(bare("xe\u{301}Y"), "xe\u{301}y");
+        assert_eq!(bare("\u{c0}B"), "\u{c0}b");
+        assert_eq!(quoted("a\"b"), "a\"b");
+        assert_eq!(bare(&"r".repeat(70)), "r".repeat(63));
+        assert_eq!(quoted(&"R".repeat(70)), "R".repeat(63));
+        // A two-byte character straddling the 63rd byte is dropped whole.
+        assert_eq!(quoted(&"\u{c9}".repeat(34)), "\u{c9}".repeat(31));
     }
 
     #[test]

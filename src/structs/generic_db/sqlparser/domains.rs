@@ -41,7 +41,7 @@ use crate::{
     structs::UserDefinedType,
     traits::{DomainLike, UserDefinedTypeLike},
     utils::{
-        identifier_resolution::{identifiers_match, is_temporary_schema, normalize_identifier},
+        identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
         object_name::{
             PG_CATALOG, Qualifier, TEMPORARY_SCHEMA, object_name_identifiers, qualifier_of,
         },
@@ -252,7 +252,7 @@ pub(super) fn reach_in_schema(
 ) -> Option<Reached> {
     let case = builder.identifier_case();
     if identifiers_match(schema, schema_quoted, PG_CATALOG, false)
-        && names_catalog_type(&normalize_identifier(&name.value, name.quote_style.is_some()))
+        && names_catalog_type(&stored_identifier(&name.value, name.quote_style.is_some()))
     {
         return Some(Reached::Catalog);
     }
@@ -382,7 +382,7 @@ pub(super) fn bind_signature_type(
         }
         Reached::RowType(_) => {
             let default = identifiers_match(schema, quoted, DEFAULT_SCHEMA, false)
-                && !names_catalog_type(&normalize_identifier(
+                && !names_catalog_type(&stored_identifier(
                     &ident.value,
                     ident.quote_style.is_some(),
                 ));
@@ -424,7 +424,7 @@ pub(super) fn require_existing_type(
     let Ok((_, ident)) = object_name_identifiers(name) else {
         return Ok(());
     };
-    if names_catalog_type(&normalize_identifier(&ident.value, ident.quote_style.is_some())) {
+    if names_catalog_type(&stored_identifier(&ident.value, ident.quote_style.is_some())) {
         return Ok(());
     }
     // A shell types no value. A bare name reaches a shell of another schema
