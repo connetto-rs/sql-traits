@@ -14,7 +14,7 @@ use crate::{
     structs::{ParserDB, UserDefinedType},
     traits::{DataTypeLike, DatabaseLike, ExtensionLike, IntervalFields, VectorKind, VectorType},
     utils::{
-        identifier_resolution::{identifiers_match, normalize_identifier},
+        identifier_resolution::{identifiers_match, stored_identifier},
         normalize_sqlparser_type,
         object_name::{
             PG_CATALOG, Qualifier, object_name_last_part, qualifier_of, relation_search_path,
@@ -88,7 +88,7 @@ fn written_element(definition: &ArrayElemTypeDef) -> Option<&DataType> {
 fn on_type_search_path(database: &ParserDB, schema: &str) -> bool {
     schema == PG_CATALOG
         || relation_search_path(|| database.search_path())
-            .any(|(entry, quoted)| normalize_identifier(entry, quoted) == schema)
+            .any(|(entry, quoted)| stored_identifier(entry, quoted) == schema)
 }
 
 impl DataTypeLike for DataType {
@@ -149,9 +149,7 @@ impl DataTypeLike for DataType {
         let schema = extension.stored_schema().unwrap_or(Cow::Borrowed(DEFAULT_SCHEMA));
         let resolves = match qualifier_of(name) {
             Qualifier::Absent => on_type_search_path(database, &schema),
-            Qualifier::Named(qualifier, quoted) => {
-                normalize_identifier(qualifier, quoted) == schema
-            }
+            Qualifier::Named(qualifier, quoted) => stored_identifier(qualifier, quoted) == schema,
             Qualifier::RunTime => false,
         };
         if !resolves {

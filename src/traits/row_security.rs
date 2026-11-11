@@ -20,7 +20,7 @@ use crate::{
         DataStatementLike, DatabaseLike, PolicyLike, Relation, RoleLike, TableLike, ViewLike,
         role::privilege_holders,
     },
-    utils::identifier_resolution::normalize_identifier,
+    utils::identifier_resolution::stored_identifier,
 };
 
 /// One statement gate's clause context, row version and failure behavior.
@@ -128,7 +128,7 @@ fn applies<DB: DatabaseLike>(
     let unsettled = policy.roles(database).find_map(|owner| {
         match owner {
             Owner::Ident(ident) => {
-                let stored = normalize_identifier(&ident.value, ident.quote_style.is_some());
+                let stored = stored_identifier(&ident.value, ident.quote_style.is_some());
                 database.role(&stored).is_none().then(|| ident.value.clone())
             }
             Owner::CurrentRole => Some("CURRENT_ROLE".to_string()),

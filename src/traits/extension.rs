@@ -5,7 +5,7 @@ use core::fmt::Debug;
 
 use crate::{
     traits::{DatabaseLike, Metadata},
-    utils::identifier_resolution::normalize_identifier,
+    utils::identifier_resolution::stored_identifier,
 };
 
 /// A trait for types that can be treated as PostgreSQL extensions, the
@@ -48,7 +48,7 @@ pub trait ExtensionLike: Clone + Debug + Metadata + Send + Sync {
     /// identifier folds to lowercase, a quoted one keeps its case.
     #[inline]
     fn stored_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.name(), self.name_is_quoted())
+        stored_identifier(self.name(), self.name_is_quoted())
     }
 
     /// Returns the schema the extension was created in, or `None` for one
@@ -97,7 +97,7 @@ pub trait ExtensionLike: Clone + Debug + Metadata + Send + Sync {
     /// Returns the name PostgreSQL stores for this extension's schema.
     #[inline]
     fn stored_schema(&self) -> Option<Cow<'_, str>> {
-        self.schema().map(|schema| normalize_identifier(schema, self.schema_is_quoted()))
+        self.schema().map(|schema| stored_identifier(schema, self.schema_is_quoted()))
     }
 
     /// Returns the version of the extension installed, or `None` when the

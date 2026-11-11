@@ -18,7 +18,7 @@ use crate::{
             accepts_positional, actuals, bind, check_argument_count, declared_at_call, input_modes,
             written_argument_names,
         },
-        identifier_resolution::{SearchPath, normalize_identifier},
+        identifier_resolution::{SearchPath, stored_identifier},
         normalize_postgres_type_cow,
     },
 };
@@ -84,7 +84,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     #[inline]
     fn stored_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.name(), self.name_is_quoted())
+        stored_identifier(self.name(), self.name_is_quoted())
     }
 
     /// Returns the argument type names (if any) of the function as strings.
@@ -211,7 +211,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ) -> impl Iterator<Item = Option<Cow<'db, str>>> {
         self.argument_names(database).map(|argument| {
             argument.map(|name| {
-                Cow::Owned(normalize_identifier(name.name(), name.name_is_quoted()).into_owned())
+                Cow::Owned(stored_identifier(name.name(), name.name_is_quoted()).into_owned())
             })
         })
     }
@@ -572,7 +572,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// See [`language`](FunctionLike::language) for an example.
     #[inline]
     fn stored_language(&self) -> Option<Cow<'_, str>> {
-        self.language().map(|language| normalize_identifier(language, self.language_is_quoted()))
+        self.language().map(|language| stored_identifier(language, self.language_is_quoted()))
     }
 
     /// Returns the body as it is written, or [`None`] for a function whose

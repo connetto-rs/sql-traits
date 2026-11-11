@@ -54,8 +54,8 @@ use crate::{
     utils::{
         columns_in_expression,
         identifier_resolution::{
-            identifiers_match, is_public_pseudo_role, is_temporary_schema, normalize_identifier,
-            session_principal, stored_ident_name,
+            identifiers_match, is_public_pseudo_role, is_temporary_schema, session_principal,
+            stored_ident_name, stored_identifier,
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
         object_name::{
@@ -3219,7 +3219,7 @@ fn names_pg_database_owner(dialect: SqlparserDialect, role_ident: &Ident) -> boo
 }
 
 fn stored_role_name(role_ident: &Ident) -> String {
-    normalize_identifier(&role_ident.value, role_ident.quote_style.is_some()).into_owned()
+    stored_identifier(&role_ident.value, role_ident.quote_style.is_some()).into_owned()
 }
 
 /// The identifier a stored name is written with.

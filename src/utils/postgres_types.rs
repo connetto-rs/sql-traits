@@ -22,7 +22,7 @@ use sqlparser::{
     parser::Parser,
 };
 
-use crate::utils::identifier_resolution::normalize_identifier;
+use crate::utils::identifier_resolution::stored_identifier;
 
 /// One `pg_type` row, with the type's name, `typcategory` and `typispreferred`.
 struct TypeRow(&'static str, u8, bool);
@@ -399,7 +399,7 @@ impl PgType {
             .map(|part| {
                 part.as_ident().map_or_else(
                     || Cow::Owned(part.to_string()),
-                    |ident| normalize_identifier(&ident.value, ident.quote_style.is_some()),
+                    |ident| stored_identifier(&ident.value, ident.quote_style.is_some()),
                 )
             })
             .collect();

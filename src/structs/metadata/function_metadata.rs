@@ -14,7 +14,7 @@ use crate::{
         grantee_is_public, grantee_is_session_principal, grantee_matches_role, grantees_match,
     },
     structs::{FunctionKind, PrivilegeHolder, metadata::ExpressionCalls},
-    utils::{identifier_resolution::normalize_identifier, object_name::object_name_last_part},
+    utils::{identifier_resolution::stored_identifier, object_name::object_name_last_part},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -320,7 +320,7 @@ fn execute_holder(grantee: &Grantee) -> PrivilegeHolder<'_> {
     if let Some(GranteeName::ObjectName(name)) = &grantee.name
         && let Some((value, quoted)) = object_name_last_part(name)
     {
-        return PrivilegeHolder::Role(normalize_identifier(value, quoted));
+        return PrivilegeHolder::Role(stored_identifier(value, quoted));
     }
     PrivilegeHolder::Role(Cow::Owned(grantee.to_string()))
 }

@@ -17,7 +17,7 @@ use crate::{
         check_constraint::{evaluate_constant_expr, non_tautological},
         role::privilege_holders,
     },
-    utils::identifier_resolution::{identifiers_match, is_temporary_schema, normalize_identifier},
+    utils::identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
 };
 
 /// How a partitioned table routes a row to one of its partitions.
@@ -112,7 +112,7 @@ pub trait TableLike:
     /// ```
     #[inline]
     fn stored_table_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.table_name(), self.table_name_is_quoted())
+        stored_identifier(self.table_name(), self.table_name_is_quoted())
     }
 
     /// Returns whether the table has a snake_case name.
@@ -380,8 +380,7 @@ pub trait TableLike:
     /// ```
     #[inline]
     fn stored_table_schema(&self) -> Option<Cow<'_, str>> {
-        self.table_schema()
-            .map(|schema| normalize_identifier(schema, self.table_schema_is_quoted()))
+        self.table_schema().map(|schema| stored_identifier(schema, self.table_schema_is_quoted()))
     }
 
     /// Returns whether this table lives in the session's temporary schema.

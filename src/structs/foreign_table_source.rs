@@ -2,7 +2,7 @@
 
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
-use crate::utils::identifier_resolution::normalize_identifier;
+use crate::utils::identifier_resolution::stored_identifier;
 
 /// The `SERVER` and table-level `OPTIONS` of a `CREATE FOREIGN TABLE`, as
 /// PostgreSQL records them in `pg_foreign_table`. The options of each column
@@ -57,7 +57,7 @@ impl ForeignTableSource {
             options: options
                 .into_iter()
                 .map(|(key, quoted, value)| {
-                    (normalize_identifier(key, quoted).into_owned(), value.into())
+                    (stored_identifier(key, quoted).into_owned(), value.into())
                 })
                 .collect(),
         }
@@ -79,7 +79,7 @@ impl ForeignTableSource {
     /// folds to lowercase, a quoted one keeps its case.
     #[must_use]
     pub fn stored_server_name(&self) -> Cow<'_, str> {
-        normalize_identifier(&self.server_name, self.server_name_is_quoted)
+        stored_identifier(&self.server_name, self.server_name_is_quoted)
     }
 
     /// Returns the table-level options as PostgreSQL stores them, each key

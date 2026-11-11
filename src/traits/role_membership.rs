@@ -5,7 +5,7 @@ use core::fmt::Debug;
 
 use crate::{
     traits::{DatabaseLike, Metadata},
-    utils::identifier_resolution::normalize_identifier,
+    utils::identifier_resolution::stored_identifier,
 };
 
 /// A trait for types that can be treated as the membership of one role in
@@ -57,7 +57,7 @@ pub trait RoleMembershipLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync 
 
     /// Returns the canonical stored name of the granted role.
     fn stored_role_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.role_name(), self.role_name_is_quoted())
+        stored_identifier(self.role_name(), self.role_name_is_quoted())
     }
 
     /// Returns the name of the member, as written.
@@ -70,7 +70,7 @@ pub trait RoleMembershipLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync 
 
     /// Returns the canonical stored name of the member.
     fn stored_member_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.member_name(), self.member_name_is_quoted())
+        stored_identifier(self.member_name(), self.member_name_is_quoted())
     }
 
     /// Returns the granted role, or `None` when the database holds no role

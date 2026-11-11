@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     errors::LookupError,
     traits::{ColumnLike, DataTypeLike, TableLike},
-    utils::fingerprint_type_token::canonical_type_token,
+    utils::{
+        fingerprint_type_token::canonical_type_token, identifier_resolution::normalize_identifier,
+    },
 };
 
 /// Current fingerprint canonicalization version (FINGERPRINT_SPEC §10.1).
@@ -356,12 +358,14 @@ pub fn canonical_bytes_v1<T: TableLike>(
     buf.extend_from_slice(&FINGERPRINT_VERSION.to_be_bytes());
     buf.extend_from_slice(&PROFILE_PERSISTENCE_V1.to_be_bytes());
 
-    // Schema name (empty string if None)
-    let schema_name = table.stored_table_schema().unwrap_or(Cow::Borrowed(""));
+    // Schema name in the §7.1 form, empty string if None
+    let schema_name = table.table_schema().map_or(Cow::Borrowed(""), |schema| {
+        normalize_identifier(schema, table.table_schema_is_quoted())
+    });
     write_str(&mut buf, &schema_name);
 
     // Table name
-    let table_name = table.stored_table_name();
+    let table_name = normalize_identifier(table.table_name(), table.table_name_is_quoted());
     write_str(&mut buf, &table_name);
 
     // Columns
@@ -371,7 +375,7 @@ pub fn canonical_bytes_v1<T: TableLike>(
         let ordinal_u32 = u32::try_from(ordinal).expect("ordinal fits in u32");
         buf.extend_from_slice(&ordinal_u32.to_be_bytes());
 
-        let col_name = column.stored_column_name();
+        let col_name = normalize_identifier(column.column_name(), column.column_name_is_quoted());
         write_str(&mut buf, &col_name);
 
         let type_token = canonical_type_token(&column.data_type(database).name(database));

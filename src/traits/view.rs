@@ -10,7 +10,7 @@ use crate::{
     structs::TargetName,
     traits::{DatabaseLike, Metadata},
     utils::{
-        identifier_resolution::{is_temporary_schema, normalize_identifier},
+        identifier_resolution::{is_temporary_schema, stored_identifier},
         output_from_wildcard,
     },
 };
@@ -89,7 +89,7 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// ```
     #[inline]
     fn stored_view_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.view_name(), self.view_name_is_quoted())
+        stored_identifier(self.view_name(), self.view_name_is_quoted())
     }
 
     /// Returns the schema the view is stored in, or `None` for one stored in
@@ -111,7 +111,7 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// Returns the name PostgreSQL stores for this view's schema.
     #[inline]
     fn stored_view_schema(&self) -> Option<Cow<'_, str>> {
-        self.view_schema().map(|schema| normalize_identifier(schema, self.view_schema_is_quoted()))
+        self.view_schema().map(|schema| stored_identifier(schema, self.view_schema_is_quoted()))
     }
 
     /// Returns whether this view lives in the session's temporary schema.

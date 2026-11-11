@@ -52,9 +52,10 @@ use sqlparser::{
 
 use super::{
     Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, domains,
-    object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
-    relation_name_holder, require_named_in_catalog, schema_qualifiers_match, stored_ident,
-    table_owner::Handover, type_arrays::TypeArrays, user_defined_types::TypeDrop, views,
+    generated_names, object_name_last_identifier, object_name_matches_resolved_identity,
+    place_relation, relation_name_holder, require_named_in_catalog, schema_qualifiers_match,
+    stored_ident, table_owner::Handover, type_arrays::TypeArrays, user_defined_types::TypeDrop,
+    views,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -65,7 +66,7 @@ use crate::{
     },
     traits::{ColumnLike, DatabaseLike, SequenceLike, SequenceOrigin, TableLike},
     utils::{
-        identifier_resolution::{identifiers_match, normalize_identifier},
+        identifier_resolution::{MAX_NAME_BYTES, clipped, identifiers_match, stored_identifier},
         last_str,
         object_name::{
             object_name_identifiers, qualifier_of, require_static_object_name,
@@ -490,24 +491,11 @@ fn refuse_dropping_identity_sequence(
     Ok(())
 }
 
-/// The longest name PostgreSQL keeps, in bytes.
-const NAME_BYTES: usize = 63;
-
-/// The longest prefix of `name` that fits in `bytes` without splitting a
-/// character.
-fn clipped(name: &str, bytes: usize) -> &str {
-    let mut end = bytes.min(name.len());
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
-}
-
 /// Joins a table name, a column name and a label the way PostgreSQL's
 /// `makeObjectName` does, cutting the longer of the two names a byte at a
-/// time until the whole fits in [`NAME_BYTES`].
+/// time until the whole fits in [`MAX_NAME_BYTES`].
 fn object_name(table: &str, column: &str, label: &str) -> String {
-    let available = NAME_BYTES.saturating_sub(label.len() + 2);
+    let available = MAX_NAME_BYTES.saturating_sub(label.len() + 2);
     let (mut table_bytes, mut column_bytes) = (table.len(), column.len());
     while table_bytes + column_bytes > available {
         if table_bytes > column_bytes {
@@ -569,15 +557,14 @@ pub(super) fn plan_column_sequences<'column>(
         return Vec::new();
     }
     let schema = table.schema.as_deref().map(|schema| (schema, table.schema_quoted));
-    let table_name = normalize_identifier(&table.name, table.name_quoted);
+    let table_name = stored_identifier(&table.name, table.name_quoted);
     columns
         .into_iter()
         .filter_map(|column| {
             let (origin, options) = column_sequence_request(column)?;
             let column_name =
-                normalize_identifier(&column.name.value, column.name.quote_style.is_some());
-            let table_name = clipped(&table_name, NAME_BYTES);
-            let column_name = clipped(&column_name, NAME_BYTES);
+                stored_identifier(&column.name.value, column.name.quote_style.is_some());
+            let (table_name, column_name) = (table_name.as_ref(), column_name.as_ref());
             // Each pass that finds the name taken found a relation holding it,
             // so the passes end before the relations do.
             let name = (0..=builder.relation_count())
@@ -616,7 +603,7 @@ pub(super) fn spell_out_serials<'column>(
         }) else {
             continue;
         };
-        let quoted = normalize_identifier(&planned.name, false) != planned.name.as_str();
+        let quoted = !generated_names::bare_spelling(&planned.name);
         let mut target = TargetName::new(&planned.name, quoted);
         if let Some(schema) = table.schema.as_deref() {
             target = target.with_schema(schema, table.schema_quoted);
@@ -668,7 +655,7 @@ pub(super) fn create_column_sequences(
                 object_name: name,
             });
         }
-        let quoted = normalize_identifier(&name, false) != name.as_str();
+        let quoted = !generated_names::bare_spelling(&name);
         let granted = ObjectName::from(
             schema
                 .iter()

@@ -10,7 +10,7 @@ use crate::{
     traits::{
         DatabaseLike, GrantLike, Metadata, RoleLike, grant::GrantTarget, role::privilege_holders,
     },
-    utils::identifier_resolution::{identifiers_match, normalize_identifier},
+    utils::identifier_resolution::{identifiers_match, stored_identifier},
 };
 
 /// A trait for types that can be treated as SQL schemas.
@@ -69,7 +69,7 @@ pub trait SchemaLike: Debug + Clone + Ord + Eq + Metadata + Send + Sync {
     /// ```
     #[inline]
     fn stored_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.name(), self.name_is_quoted())
+        stored_identifier(self.name(), self.name_is_quoted())
     }
 
     /// Returns the authorization owner of the schema, if specified.

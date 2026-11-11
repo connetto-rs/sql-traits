@@ -9,7 +9,7 @@ use crate::{
     errors::LookupError,
     structs::{PolicyAnalysis, PolicyExpression, TargetName},
     traits::{DatabaseLike, Metadata, RoleLike, role::privilege_holders},
-    utils::identifier_resolution::normalize_identifier,
+    utils::identifier_resolution::stored_identifier,
 };
 
 /// A trait for types that can be treated as SQL policies.
@@ -410,7 +410,7 @@ pub trait PolicyLike:
             .filter_map(|owner| {
                 match owner {
                     Owner::Ident(ident) => {
-                        Some(normalize_identifier(&ident.value, ident.quote_style.is_some()))
+                        Some(stored_identifier(&ident.value, ident.quote_style.is_some()))
                     }
                     Owner::CurrentRole | Owner::CurrentUser | Owner::SessionUser => None,
                 }

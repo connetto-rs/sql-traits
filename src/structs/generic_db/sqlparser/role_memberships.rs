@@ -23,7 +23,7 @@ use crate::{
     errors::Error,
     structs::{RoleMembership, role_membership::MembershipGrant},
     traits::RoleLike,
-    utils::identifier_resolution::{is_public_pseudo_role, normalize_identifier},
+    utils::identifier_resolution::{is_public_pseudo_role, stored_identifier},
 };
 
 /// One of the options a membership grant carries.
@@ -37,7 +37,7 @@ enum MembershipOption {
 impl MembershipOption {
     /// Reads an option name as PostgreSQL does, refusing any other name.
     fn read(name: &Ident) -> Result<Self, Error> {
-        match normalize_identifier(&name.value, name.quote_style.is_some()).as_ref() {
+        match stored_identifier(&name.value, name.quote_style.is_some()).as_ref() {
             "admin" => Ok(Self::Admin),
             "inherit" => Ok(Self::Inherit),
             "set" => Ok(Self::Set),

@@ -52,7 +52,7 @@ use crate::{
     structs::{IdentifierCase, UserDefinedType, metadata::ExpressionCalls},
     traits::{DomainLike, UserDefinedTypeKind, UserDefinedTypeLike},
     utils::{
-        identifier_resolution::normalize_identifier,
+        identifier_resolution::stored_identifier,
         object_name::{Qualifier, object_name_identifiers, qualifier_of},
     },
 };
@@ -207,7 +207,7 @@ pub(super) fn schema_holds_type(
 /// `multirange` or appending `_multirange` when it writes none, under the
 /// range's quoting.
 fn multirange_from_range_name((value, quoted): (&str, bool)) -> ObjectName {
-    let stored = normalize_identifier(value, quoted);
+    let stored = stored_identifier(value, quoted);
     let multirange = if let Some(index) = stored.find("range") {
         let mut name = String::with_capacity(stored.len() + 3);
         name.push_str(&stored[..index]);

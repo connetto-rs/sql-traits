@@ -7,7 +7,7 @@ use crate::{
     errors::LookupError,
     structs::{SequenceParameters, TargetName},
     traits::{DatabaseLike, Metadata},
-    utils::identifier_resolution::{is_temporary_schema, normalize_identifier},
+    utils::identifier_resolution::{is_temporary_schema, stored_identifier},
 };
 
 /// The column a sequence is owned by, saying which kind of relation holds it.
@@ -109,7 +109,7 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
     /// ```
     #[inline]
     fn stored_sequence_name(&self) -> Cow<'_, str> {
-        normalize_identifier(self.sequence_name(), self.sequence_name_is_quoted())
+        stored_identifier(self.sequence_name(), self.sequence_name_is_quoted())
     }
 
     /// Returns the schema the sequence is stored in, or `None` for one stored
@@ -152,7 +152,7 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
     #[inline]
     fn stored_sequence_schema(&self) -> Option<Cow<'_, str>> {
         self.sequence_schema()
-            .map(|schema| normalize_identifier(schema, self.sequence_schema_is_quoted()))
+            .map(|schema| stored_identifier(schema, self.sequence_schema_is_quoted()))
     }
 
     /// Returns whether this sequence lives in the session's temporary schema.

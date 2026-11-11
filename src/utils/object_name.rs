@@ -25,7 +25,7 @@ use crate::{
     structs::{IdentifierCase, TargetName},
     traits::{DatabaseLike, FunctionLike, Relation, SequenceLike, TableLike, ViewLike},
     utils::identifier_resolution::{
-        SearchPath, identifiers_match, is_temporary_schema, normalize_identifier,
+        SearchPath, identifiers_match, is_temporary_schema, stored_identifier,
     },
 };
 
@@ -563,7 +563,7 @@ pub(crate) fn function_has_stored_identity<F: FunctionLike>(
 ) -> bool {
     let target = function.target_name();
     let stored_schema =
-        target.schema().map(|schema| normalize_identifier(schema, target.schema_is_quoted()));
+        target.schema().map(|schema| stored_identifier(schema, target.schema_is_quoted()));
     stored_schema.as_deref() == schema && function.stored_name() == name
 }
 

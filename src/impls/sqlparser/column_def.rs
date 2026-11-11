@@ -17,7 +17,7 @@ use crate::{
         NamedColumnCollation, TableLike,
     },
     utils::{
-        identifier_resolution::normalize_identifier, identity_generation, is_identity,
+        identifier_resolution::stored_identifier, identity_generation, is_identity,
         object_name::target_name_of_object_name,
     },
 };
@@ -72,7 +72,7 @@ pub(crate) fn foreign_options_of(column: &ColumnDef) -> impl Iterator<Item = (Co
         .flatten()
         .map(|option| {
             (
-                normalize_identifier(&option.key.value, option.key.quote_style.is_some()),
+                stored_identifier(&option.key.value, option.key.quote_style.is_some()),
                 option.value.value.as_str(),
             )
         })
