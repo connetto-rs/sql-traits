@@ -13,6 +13,8 @@
 //! the sequence's own schema, and the sequence leaves when that column or its
 //! relation does. The tie is kept by identity, so renaming either keeps it.
 //!
+//! Sequence privileges belong to the creator, independently of `OWNED BY`.
+//!
 //! PostgreSQL also creates a sequence for every `serial` column and every
 //! identity column a statement declares, named `<table>_<column>_seq` and
 //! numbered when that name is taken, in the table's schema and owned by the
@@ -40,8 +42,8 @@ use sqlparser::{
     ast::{
         CastKind, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType, Expr, Function,
         FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Grant, GrantObjects,
-        Ident, ObjectName, ObjectNamePart, SequenceOptions, TypedString, Value, ValueWithSpan,
-        visit_expressions, visit_expressions_mut,
+        Ident, ObjectName, ObjectNamePart, Owner, SequenceOptions, TypedString, Value,
+        ValueWithSpan, visit_expressions, visit_expressions_mut,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -52,7 +54,7 @@ use super::{
     Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, domains,
     object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
     relation_name_holder, require_named_in_catalog, schema_qualifiers_match, stored_ident,
-    type_arrays::TypeArrays, user_defined_types::TypeDrop, views,
+    table_owner::Handover, type_arrays::TypeArrays, user_defined_types::TypeDrop, views,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -140,6 +142,7 @@ pub(super) fn create_sequence(
         kept,
         parameters,
         owner,
+        creator.owner(),
         SequenceOrigin::Declared,
     );
     let builder = builder.add_sequence(Arc::new(sequence), ());
@@ -278,6 +281,65 @@ fn resolve_sequence<'builder>(
 /// path.
 pub(super) fn holds_sequence(builder: &ParserDBBuilder, name: &ObjectName) -> bool {
     resolve_sequence(builder, name).ok().flatten().is_some()
+}
+
+/// Returns the authorization owner of the sequence a written name reaches.
+pub(super) fn authorization_owner<'b>(
+    builder: &'b ParserDBBuilder,
+    name: &ObjectName,
+) -> Option<&'b str> {
+    resolve_sequence(builder, name).ok()??.authorization_owner()
+}
+
+/// Transfers the sequences attached to a table to its authorization owner.
+pub(super) fn change_table_owner(builder: &mut ParserDBBuilder, name: &ObjectName, next: &Owner) {
+    let Some(table) = builder.resolve_table_object_name(name).ok().flatten().map(StoredTable::of)
+    else {
+        return;
+    };
+    change_owner(builder, next, |builder, owner| {
+        let StoredSequenceOwner::Column(identity) = owner else {
+            return false;
+        };
+        builder.columns().iter().any(|(column, _, held)| {
+            *held == identity
+                && table.matches(TableAttribute::table(column.as_ref()), builder.identifier_case())
+        })
+    });
+}
+
+/// Transfers attached sequences and their grants to a relation's new owner.
+pub(super) fn change_owner(
+    builder: &mut ParserDBBuilder,
+    next: &Owner,
+    attached: impl Fn(&ParserDBBuilder, StoredSequenceOwner) -> bool,
+) {
+    let next_name = match next {
+        Owner::Ident(ident) => Some(super::stored_role_name(ident)),
+        Owner::CurrentRole | Owner::CurrentUser | Owner::SessionUser => None,
+    };
+    for index in 0..builder.sequences().len() {
+        let sequence = &builder.sequences()[index].0;
+        if sequence.authorization_owner() == next_name.as_deref()
+            || !sequence.stored_owner().is_some_and(|owner| attached(builder, owner))
+        {
+            continue;
+        }
+        {
+            let sequence = Arc::clone(sequence);
+            if let Some(previous) = sequence.authorization_owner() {
+                Handover::new(previous, next).apply(builder.table_grants_mut(), |grant| {
+                    matches!(
+                        &grant.objects,
+                        Some(GrantObjects::Tables(names) | GrantObjects::Sequences(names))
+                            if names.iter().any(|name| names_sequence_identity(name, &sequence))
+                    )
+                });
+            }
+        }
+        Arc::make_mut(&mut builder.sequences_mut()[index].0)
+            .set_authorization_owner(next_name.clone());
+    }
 }
 
 /// Drops the sequences a `DROP SEQUENCE` names.
@@ -623,6 +685,7 @@ pub(super) fn create_column_sequences(
             options,
             parameters,
             None,
+            creator.owner(),
             origin,
         ));
         created.push((column, Arc::as_ptr(&sequence)));
