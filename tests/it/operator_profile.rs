@@ -299,11 +299,19 @@ impl DataTypeLike for NoneKind {
         self.unreach()
     }
 
-    fn composite_fields<'db>(
+    fn structure_kind(&self, _database: &Self::DB) -> Option<StructureKind> {
+        self.unreach()
+    }
+
+    fn structured_fields<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> Option<impl Iterator<Item = &'db Self>> {
-        self.unreach::<Option<core::iter::Empty<&'db Self>>>()
+    ) -> Option<impl Iterator<Item = StructuredField<'db, Self>>> {
+        self.unreach::<Option<core::iter::Empty<StructuredField<'db, Self>>>>()
+    }
+
+    fn map_entry<'db>(&'db self, _database: &'db Self::DB) -> Option<MapEntry<'db, Self>> {
+        self.unreach()
     }
 }
 

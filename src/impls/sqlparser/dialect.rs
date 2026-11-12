@@ -172,7 +172,7 @@ impl SqlparserDialect {
 
 /// Returns true when the [`ObjectName`] segments spell a single identifier
 /// case-insensitively equal to `expected`.
-fn custom_type_is(name: &ObjectName, expected: &str) -> bool {
+pub(super) fn custom_type_is(name: &ObjectName, expected: &str) -> bool {
     matches!(
         name.0.as_slice(),
         [ObjectNamePart::Identifier(ident)] if ident.value.eq_ignore_ascii_case(expected)

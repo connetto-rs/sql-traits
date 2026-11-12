@@ -35,7 +35,8 @@ use sqlparser::ast::{
 };
 
 use super::{
-    DefaultPrivileges, ParserDB, ParserDBBuilder, SchemaQualifier, bind_reference,
+    CollationResolution, CreatedCollationMetadata, DefaultPrivileges, ParserDB, ParserDBBuilder,
+    SchemaQualifier, bind_reference, collation_resolution_for_name,
     domains::{
         DropSpelling, Reached, bind_type, custom_name, custom_name_mut, reach_in_schema,
         reach_type, require_existing_type,
@@ -49,7 +50,7 @@ use super::{
 use crate::{
     errors::{Error, LookupError, ObjectKind},
     impls::{domain_in_schema, user_type_in_schema, user_type_named},
-    structs::{IdentifierCase, UserDefinedType, metadata::ExpressionCalls},
+    structs::{AttributeCollation, IdentifierCase, UserDefinedType, metadata::ExpressionCalls},
     traits::{DomainLike, UserDefinedTypeKind, UserDefinedTypeLike},
     utils::{
         identifier_resolution::stored_identifier,
@@ -328,12 +329,17 @@ fn creation_reaches(
 /// a shell or over a type it never creates, a range without a `SUBTYPE`, a
 /// multirange name another type holds, and a range whose schema already
 /// holds a function of a constructor's signature.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is ingestion state the creation reads or updates"
+)]
 pub(super) fn create_user_defined_type(
     builder: ParserDBBuilder,
     mut name: ObjectName,
     representation: Option<UserDefinedTypeRepresentation>,
     role: Option<&str>,
     defaults: &DefaultPrivileges,
+    collations: &[CreatedCollationMetadata],
     arrays: &mut Arc<TypeArrays>,
     catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
@@ -402,7 +408,10 @@ pub(super) fn create_user_defined_type(
         Arc::make_mut(catalog).rename_type_identity(&previous, current);
     }
     let calls = definition_function_calls(&builder, &named_functions);
-    let node = Arc::new(UserDefinedType { name, representation, multirange_name });
+    let attribute_collations =
+        attribute_collations(&builder, representation.as_ref(), collations, catalog);
+    let node =
+        Arc::new(UserDefinedType { name, representation, multirange_name, attribute_collations });
     let mut builder = builder;
     if let Some(position) = shell_position {
         let mut seen = 0;
@@ -422,6 +431,41 @@ pub(super) fn create_user_defined_type(
         }
     }
     Ok(builder)
+}
+
+/// The facts of the collation each composite attribute's `COLLATE` names,
+/// resolved against the search path in force as the type is created, as a
+/// column's are when its table is.
+fn attribute_collations(
+    builder: &ParserDBBuilder,
+    representation: Option<&UserDefinedTypeRepresentation>,
+    collations: &[CreatedCollationMetadata],
+    catalog: &PostgresCatalog,
+) -> Vec<AttributeCollation> {
+    let Some(UserDefinedTypeRepresentation::Composite { attributes }) = representation else {
+        return Vec::new();
+    };
+    let mut search_path = None;
+    attributes
+        .iter()
+        .filter_map(|attribute| {
+            let collation = attribute.collation.as_ref()?;
+            let search_path = search_path.get_or_insert_with(|| {
+                builder
+                    .search_path()
+                    .map(|(schema, quoted)| (schema.to_string(), quoted))
+                    .collect::<Vec<_>>()
+            });
+            let metadata =
+                collation_resolution_for_name(collation, collations, catalog, search_path)
+                    .map(CollationResolution::into_column_metadata)?;
+            Some(AttributeCollation {
+                attribute: attribute.name.clone(),
+                postgres_deterministic: metadata.postgres_deterministic(),
+                mysql_padding: metadata.mysql_padding(),
+            })
+        })
+        .collect()
 }
 
 /// Refuses a composite that writes an attribute name twice, compared as

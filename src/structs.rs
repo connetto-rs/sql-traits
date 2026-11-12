@@ -71,5 +71,6 @@ pub(crate) use sequence::StoredSequenceOwner;
 pub use sequence_parameters::{SequenceParameters, SequenceType};
 pub use table_privileges::{ColumnPrivilege, TablePrivileges};
 pub use target_name::TargetName;
+pub(crate) use user_defined_type::AttributeCollation;
 pub use user_defined_type::UserDefinedType;
 pub use view::{MaterializedView, View, ViewDeclaration};
