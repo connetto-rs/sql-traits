@@ -239,3 +239,24 @@ fn collatable_types_report_their_collation() {
     // A collation the database cannot name leaves the domain's facts open.
     assert!(db.type_facts(app("lost")).is_none());
 }
+
+/// A domain keeps the collation its `COLLATE` named on the search path in
+/// force when it was created, as PostgreSQL stores `typcollation` then.
+#[test]
+fn a_domain_keeps_the_collation_named_at_creation() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA a;
+         CREATE SCHEMA b;
+         CREATE COLLATION a.c (provider = icu, locale = 'de');
+         CREATE COLLATION b.c (provider = icu, locale = 'fr');
+         SET search_path = a;
+         CREATE DOMAIN public.d AS TEXT COLLATE c;
+         SET search_path = b;",
+    )
+    .unwrap();
+    let d = TargetName::new("d", false).with_schema("public", false);
+    assert_eq!(
+        db.type_facts(d).unwrap().collation(),
+        Some(&TargetName::new("c", false).with_schema("a", false))
+    );
+}
