@@ -14,6 +14,7 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         object_name::{Qualifier, function_search_path, object_name_last_part, qualifier_of},
+        walk::{walk, walk_mut},
     },
 };
 
@@ -43,9 +44,9 @@ pub(crate) enum Site<'a> {
 /// the order a pre-order walk meets them, until `each` breaks.
 pub(crate) fn for_each_site<N: Visit + ?Sized, B>(
     node: &N,
-    each: impl FnMut(Site<'_>) -> ControlFlow<B>,
+    mut each: impl FnMut(Site<'_>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
-    node.visit(&mut Sites { each })
+    walk(node, &mut Sites { each: &mut each })
 }
 
 /// Hands every call in `node` to `each`, in the order a pre-order walk meets
@@ -71,9 +72,9 @@ pub(crate) fn for_each_call<N: Visit + ?Sized, B>(
 /// breaks.
 pub(crate) fn for_each_call_name_mut<N: VisitMut + ?Sized, B>(
     node: &mut N,
-    each: impl FnMut(&mut ObjectName, usize) -> ControlFlow<B>,
+    mut each: impl FnMut(&mut ObjectName, usize) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
-    node.visit(&mut CallNames { each })
+    walk_mut(node, &mut CallNames { each: &mut each })
 }
 
 /// Whether a call to `called` passing `arguments` arguments may run
@@ -156,11 +157,11 @@ pub(crate) fn expression_form(called: &ObjectName) -> Option<ExpressionForm> {
 }
 
 /// Hands each node the walk meets with the syntax of a call to `each`.
-struct Sites<F> {
-    each: F,
+struct Sites<'f, B> {
+    each: &'f mut dyn FnMut(Site<'_>) -> ControlFlow<B>,
 }
 
-impl<B, F: FnMut(Site<'_>) -> ControlFlow<B>> Visitor for Sites<F> {
+impl<B> Visitor for Sites<'_, B> {
     type Break = B;
 
     fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<B> {
@@ -215,11 +216,11 @@ fn argument_count(arguments: &FunctionArguments) -> usize {
 }
 
 /// Hands the name and argument count of each call the walk meets to `each`.
-struct CallNames<F> {
-    each: F,
+struct CallNames<'f, B> {
+    each: &'f mut dyn FnMut(&mut ObjectName, usize) -> ControlFlow<B>,
 }
 
-impl<B, F: FnMut(&mut ObjectName, usize) -> ControlFlow<B>> VisitorMut for CallNames<F> {
+impl<B> VisitorMut for CallNames<'_, B> {
     type Break = B;
 
     fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<B> {
