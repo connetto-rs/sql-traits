@@ -439,7 +439,8 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// and `UHUGEINT` and ClickHouse's `UInt8` through `UInt256`. Every other
     /// numeric type answers `Some(false)`, every type in SQLite included,
     /// since SQLite stores a negative value whatever the declared type says. A
-    /// domain answers as its [`Self::base_type`] does.
+    /// domain answers `None`, as [`Self::scalar_family`] does, and its
+    /// signedness is that of its [`Self::base_type`].
     ///
     /// # Example
     ///
