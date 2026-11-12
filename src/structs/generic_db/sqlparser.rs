@@ -10590,6 +10590,7 @@ impl ParserDB {
                         representation,
                         session_roles.creating_role(),
                         &default_privileges,
+                        &collation_metadata,
                         &mut type_arrays,
                         &mut active_postgres_catalog,
                     )?;

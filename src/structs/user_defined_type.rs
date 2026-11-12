@@ -1,8 +1,25 @@
 //! The stored form of a user-defined type a `CREATE TYPE` statement defines.
 
+use alloc::vec::Vec;
+
 use sqlparser::ast::{
-    DataType, ObjectName, UserDefinedTypeCompositeAttributeDef, UserDefinedTypeRepresentation,
+    DataType, Ident, ObjectName, UserDefinedTypeCompositeAttributeDef,
+    UserDefinedTypeRepresentation,
 };
+
+use crate::traits::MySqlCollationPadding;
+
+/// The facts of the collation a composite attribute's `COLLATE` resolved to
+/// when its type was created.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct AttributeCollation {
+    /// The attribute whose `COLLATE` this resolves.
+    pub(crate) attribute: Ident,
+    /// Whether the collation is deterministic, where PostgreSQL records it.
+    pub(crate) postgres_deterministic: Option<bool>,
+    /// The collation's padding, where MySQL records it.
+    pub(crate) mysql_padding: Option<MySqlCollationPadding>,
+}
 
 /// A user-defined type `CREATE TYPE` defines, stored after its type
 /// references are bound.
@@ -22,6 +39,9 @@ pub struct UserDefinedType {
     /// The multirange a range type brings, named after the type it comes with
     /// or the name `MULTIRANGE_TYPE_NAME` gave it.
     pub(crate) multirange_name: Option<ObjectName>,
+    /// The facts of the collation each composite attribute's `COLLATE`
+    /// names, resolved against the search path in force at creation.
+    pub(crate) attribute_collations: Vec<AttributeCollation>,
 }
 
 impl UserDefinedType {
@@ -33,6 +53,13 @@ impl UserDefinedType {
             Some(UserDefinedTypeRepresentation::Composite { attributes }) => Some(attributes),
             _ => None,
         }
+    }
+
+    /// The facts of the collation `attribute`'s `COLLATE` resolved to when the
+    /// type was created, or `None` for an attribute whose collation resolved
+    /// to none.
+    pub(crate) fn attribute_collation(&self, attribute: &Ident) -> Option<&AttributeCollation> {
+        self.attribute_collations.iter().find(|resolved| resolved.attribute == *attribute)
     }
 
     /// The `SUBTYPE` a range type is declared over, or `None` for a type that

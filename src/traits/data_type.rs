@@ -4,7 +4,7 @@ use alloc::{borrow::Cow, vec, vec::Vec};
 use core::{fmt::Debug, num::NonZeroU32, ptr};
 
 use crate::{
-    traits::DatabaseLike,
+    traits::{ColumnCollation, DatabaseLike},
     utils::{
         normalize_postgres_type_cow,
         scalar_family::{ScalarFamily, scalar_family as classify_scalar_family},
@@ -126,6 +126,168 @@ pub enum BinarySend<'db, T: ?Sized> {
     /// The implementation cannot tell whether this type, reached on the way,
     /// has a send function, and no type found fails.
     Unknown(&'db T),
+}
+
+/// How a structured type holds its fields, as
+/// [`DataTypeLike::structure_kind`] answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StructureKind {
+    /// Every field holds a value at once, as in a `STRUCT` or a PostgreSQL
+    /// composite type.
+    Struct,
+    /// One field at a time holds the value, as in DuckDB's `UNION`.
+    Union,
+    /// Snowflake's structured `OBJECT`.
+    Object,
+    /// ClickHouse's `Tuple`, whose fields may be unnamed.
+    Tuple,
+    /// ClickHouse's `Nested`, which stores each field as an array holding one
+    /// element per nested row.
+    Nested,
+}
+
+/// A field of a structured type, as [`DataTypeLike::structured_fields`]
+/// answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredField<'db, T: ?Sized> {
+    name: Option<&'db str>,
+    name_is_quoted: bool,
+    data_type: &'db T,
+    nullable: bool,
+    options: Vec<(Cow<'db, str>, Cow<'db, str>)>,
+    collation: ColumnCollation<'db>,
+}
+
+impl<'db, T: ?Sized> StructuredField<'db, T> {
+    /// Creates an unnamed field of `data_type`, admitting `NULL` when
+    /// `nullable`, with no options and the database's default collation.
+    #[must_use]
+    #[inline]
+    pub const fn new(data_type: &'db T, nullable: bool) -> Self {
+        Self {
+            name: None,
+            name_is_quoted: false,
+            data_type,
+            nullable,
+            options: Vec::new(),
+            collation: ColumnCollation::DatabaseDefault,
+        }
+    }
+
+    /// Names the field `name` as written, quoted when `quoted`.
+    #[must_use]
+    #[inline]
+    pub const fn with_name(mut self, name: &'db str, quoted: bool) -> Self {
+        self.name = Some(name);
+        self.name_is_quoted = quoted;
+        self
+    }
+
+    /// Gives the field its options, each a key and its value as text, in the
+    /// order written.
+    #[must_use]
+    #[inline]
+    pub fn with_options(mut self, options: Vec<(Cow<'db, str>, Cow<'db, str>)>) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Gives the field the collation it declares.
+    #[must_use]
+    #[inline]
+    pub fn with_collation(mut self, collation: ColumnCollation<'db>) -> Self {
+        self.collation = collation;
+        self
+    }
+
+    /// Returns the field's name as written, or `None` for an unnamed field,
+    /// such as one of ClickHouse's `Tuple(Int32, String)`.
+    #[must_use]
+    #[inline]
+    pub const fn name(&self) -> Option<&'db str> {
+        self.name
+    }
+
+    /// Returns whether the field's name is written quoted.
+    #[must_use]
+    #[inline]
+    pub const fn name_is_quoted(&self) -> bool {
+        self.name_is_quoted
+    }
+
+    /// Returns the field's type, without the collation it declares.
+    #[must_use]
+    #[inline]
+    pub const fn data_type(&self) -> &'db T {
+        self.data_type
+    }
+
+    /// Returns whether the field admits `NULL`, which a written `NOT NULL`
+    /// and a type that does not admit it refuse.
+    #[must_use]
+    #[inline]
+    pub const fn is_nullable(&self) -> bool {
+        self.nullable
+    }
+
+    /// Returns the field's options, such as BigQuery's
+    /// `OPTIONS(rounding_mode = 'ROUND_HALF_EVEN')`, each a key as written and
+    /// its value as text, a string literal by its contents. An empty
+    /// `OPTIONS()` answers none, as an omitted one does.
+    #[must_use]
+    #[inline]
+    pub fn options(&self) -> &[(Cow<'db, str>, Cow<'db, str>)] {
+        &self.options
+    }
+
+    /// Returns the collation the field declares. Its facts are those of the
+    /// collation the name reached when the type was declared, as a column's
+    /// are those of the collation it reached when its table was.
+    #[must_use]
+    #[inline]
+    pub const fn collation(&self) -> &ColumnCollation<'db> {
+        &self.collation
+    }
+}
+
+/// The key and value types of a map type, as [`DataTypeLike::map_entry`]
+/// answers them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapEntry<'db, T: ?Sized> {
+    key: &'db T,
+    value: &'db T,
+    value_nullable: bool,
+}
+
+impl<'db, T: ?Sized> MapEntry<'db, T> {
+    /// Creates the entry of a map from `key` to `value`, whose value admits
+    /// `NULL` when `value_nullable`.
+    #[must_use]
+    #[inline]
+    pub const fn new(key: &'db T, value: &'db T, value_nullable: bool) -> Self {
+        Self { key, value, value_nullable }
+    }
+
+    /// Returns the key type.
+    #[must_use]
+    #[inline]
+    pub const fn key(&self) -> &'db T {
+        self.key
+    }
+
+    /// Returns the value type.
+    #[must_use]
+    #[inline]
+    pub const fn value(&self) -> &'db T {
+        self.value
+    }
+
+    /// Returns whether a value admits `NULL`.
+    #[must_use]
+    #[inline]
+    pub const fn value_is_nullable(&self) -> bool {
+        self.value_nullable
+    }
 }
 
 /// A trait for declared SQL data types, the type of a column or of an array
@@ -618,6 +780,43 @@ pub trait DataTypeLike: Debug + Send + Sync {
         None
     }
 
+    /// Returns whether a value of the type itself may be `NULL`.
+    ///
+    /// ClickHouse admits `NULL` only in a type wrapped in `Nullable` and in
+    /// `Variant` and `Dynamic`, which hold `NULL` of their own. So `Int32`
+    /// answers `false`, while `Nullable(Int32)`,
+    /// `LowCardinality(Nullable(String))` and `Variant(UInt64, String)` answer
+    /// `true`. Every other engine lets a value of any type be `NULL` and keeps
+    /// `NOT NULL` on the column, field or element that holds it, so every type
+    /// answers `true` there.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::{ClickHouseDialect, PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<ClickHouseDialect>(
+    ///     "CREATE TABLE t (id Int32, note Nullable(String), tag LowCardinality(Nullable(String))) \
+    ///      ENGINE = MergeTree ORDER BY id;",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let admits: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).admits_null(&db)).collect();
+    /// assert_eq!(admits, [false, true, true]);
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT NOT NULL);")?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let id = table.column("id", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// assert!(id.data_type(&db).admits_null(&db));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn admits_null(&self, database: &Self::DB) -> bool;
+
     /// Returns the type a domain is defined over, followed through every
     /// domain in between, or `None` for a type that names no domain.
     ///
@@ -725,8 +924,42 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// ```
     fn range_subtype<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self>;
 
-    /// Returns the type of each attribute of a composite type, in order, or
-    /// `None` for every other type, a domain over a composite included.
+    /// Returns how a structured type holds its fields, or `None` for a type
+    /// that holds none, a domain over a composite included.
+    ///
+    /// An inline `STRUCT` or ClickHouse `Tuple`, a DuckDB `UNION`, a Snowflake
+    /// `OBJECT`, a ClickHouse `Nested` and a PostgreSQL composite type answer,
+    /// and [`Self::structured_fields`] answers their fields.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::DuckDbDialect;
+    ///
+    /// let db = ParserDB::parse::<DuckDbDialect>(
+    ///     "CREATE TABLE t (s STRUCT(code INTEGER), u UNION(code INTEGER, label VARCHAR), n INTEGER);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let kinds: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).structure_kind(&db)).collect();
+    /// assert_eq!(kinds, [Some(StructureKind::Struct), Some(StructureKind::Union), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn structure_kind(&self, database: &Self::DB) -> Option<StructureKind>;
+
+    /// Returns the fields of a structured type in declaration order, or
+    /// `None` for every type [`Self::structure_kind`] answers `None` for.
+    ///
+    /// Each field answers its name where one is written, its type, whether
+    /// it admits `NULL`, its options and its collation. A field's type
+    /// answers every fact this trait answers for a column type, so the
+    /// precision of `STRUCT<amount NUMERIC(10, 2)>`'s field is that type's
+    /// [`Self::numeric_precision`]. A PostgreSQL composite type answers its
+    /// attributes the same way.
     ///
     /// # Example
     ///
@@ -736,23 +969,68 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TYPE pair AS (left_side INT, right_side TEXT[]);
+    ///     "CREATE TYPE pair AS (left_side INT, right_side TEXT COLLATE \"C\");
     ///      CREATE TABLE t (p pair, n INT);",
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
     /// let pair = table.column("p", &db, IdentifierCase::AsWritten)?.unwrap().data_type(&db);
-    /// let fields: Vec<_> = pair.composite_fields(&db).unwrap().map(|field| field.name(&db)).collect();
-    /// assert_eq!(fields, ["INT", "TEXT[]"]);
+    /// let fields: Vec<_> = pair
+    ///     .structured_fields(&db)
+    ///     .unwrap()
+    ///     .map(|field| (field.name(), field.data_type().name(&db), field.is_nullable()))
+    ///     .collect();
+    /// assert_eq!(
+    ///     fields,
+    ///     [(Some("left_side"), "INT".into(), true), (Some("right_side"), "TEXT".into(), true)]
+    /// );
+    /// let right_side = pair.structured_fields(&db).unwrap().nth(1).unwrap();
+    /// let ColumnCollation::Named(collation) = right_side.collation() else {
+    ///     panic!("a declared COLLATE names the collation");
+    /// };
+    /// assert_eq!(collation.name().name(), "C");
     /// let n = table.column("n", &db, IdentifierCase::AsWritten)?.unwrap().data_type(&db);
-    /// assert!(n.composite_fields(&db).is_none());
+    /// assert!(n.structured_fields(&db).is_none());
     /// # Ok(())
     /// # }
     /// ```
-    fn composite_fields<'db>(
+    fn structured_fields<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Option<impl Iterator<Item = &'db Self>>;
+    ) -> Option<impl Iterator<Item = StructuredField<'db, Self>>>;
+
+    /// Returns the key and value types of a map type, or `None` for every
+    /// other type.
+    ///
+    /// ClickHouse's `Map(K, V)`, Snowflake's `MAP(K, V)` and Hive's
+    /// `MAP<K, V>` answer. The value answers whether it admits `NULL`, which
+    /// Snowflake's `MAP(K, V NOT NULL)` and a ClickHouse value not wrapped in
+    /// `Nullable` refuse.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::ClickHouseDialect;
+    ///
+    /// let db = ParserDB::parse::<ClickHouseDialect>(
+    ///     "CREATE TABLE t (id UInt64, tags Map(String, Nullable(UInt64))) \
+    ///      ENGINE = MergeTree ORDER BY id;",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let tags = table.column("tags", &db, IdentifierCase::AsWritten)?.unwrap().data_type(&db);
+    /// let entry = tags.map_entry(&db).unwrap();
+    /// assert_eq!(entry.key().name(&db), "STRING");
+    /// assert_eq!(entry.value().name(&db), "UINT64");
+    /// assert!(entry.value_is_nullable());
+    /// let id = table.column("id", &db, IdentifierCase::AsWritten)?.unwrap().data_type(&db);
+    /// assert!(id.map_entry(&db).is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn map_entry<'db>(&'db self, database: &'db Self::DB) -> Option<MapEntry<'db, Self>>;
 
     /// Returns what `pgoutput` does with a value of the type when a logical
     /// replication stream asks for the `binary` format.
@@ -764,7 +1042,7 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// raises an error on one that has none. The stream then fails at the
     /// same record on every reconnect. This walks [`Self::send_function`]
     /// through [`Self::base_type`], [`Self::array_element`],
-    /// [`Self::range_subtype`] and [`Self::composite_fields`] in the order
+    /// [`Self::range_subtype`] and [`Self::structured_fields`] in the order
     /// PostgreSQL does, so [`BinarySend::Fails`] names the type its error
     /// names.
     ///
@@ -833,7 +1111,13 @@ fn sent_through<'db, T: DataTypeLike + ?Sized>(sent: &'db T, database: &'db T::D
         .array_element(database)
         .into_iter()
         .chain(structure.range_subtype(database))
-        .chain(structure.composite_fields(database).into_iter().flatten())
+        .chain(
+            structure
+                .structured_fields(database)
+                .into_iter()
+                .flatten()
+                .map(|field| field.data_type()),
+        )
         .collect();
     reached.reverse();
     reached

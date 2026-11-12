@@ -481,15 +481,27 @@ impl DataTypeLike for MemoryDataType {
         None
     }
 
+    fn admits_null(&self, _database: &Self::DB) -> bool {
+        true
+    }
+
     fn range_subtype<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
         None
     }
 
-    fn composite_fields<'db>(
+    fn structure_kind(&self, _database: &Self::DB) -> Option<StructureKind> {
+        None
+    }
+
+    fn structured_fields<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> Option<impl Iterator<Item = &'db Self>> {
-        None::<core::iter::Empty<&'db Self>>
+    ) -> Option<impl Iterator<Item = StructuredField<'db, Self>>> {
+        None::<core::iter::Empty<StructuredField<'db, Self>>>
+    }
+
+    fn map_entry<'db>(&'db self, _database: &'db Self::DB) -> Option<MapEntry<'db, Self>> {
+        None
     }
 }
 

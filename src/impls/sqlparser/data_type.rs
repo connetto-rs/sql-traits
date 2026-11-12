@@ -1,23 +1,29 @@
 //! Submodule implementing the [`DataTypeLike`] trait for `sqlparser`'s
 //! [`DataType`] enum.
 
-use alloc::borrow::Cow;
-use core::num::NonZeroU32;
+use alloc::{borrow::Cow, string::ToString};
+use core::{num::NonZeroU32, slice};
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, DataType, ExactNumberInfo, TimezoneInfo, TypeModifier,
-    UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
+    ArrayElemTypeDef, ColumnDef, ColumnOption, DataType, ExactNumberInfo, Expr, MapBracketKind,
+    ObjectName, ObjectNamePart, SqlOption, StructField, TimezoneInfo, TypeModifier, UnionField,
+    UserDefinedTypeCompositeAttributeDef, UserDefinedTypeRepresentation,
+    UserDefinedTypeSqlDefinitionOption, Value, ValueWithSpan,
 };
 
 use crate::{
     impls::sqlparser::{SqlparserDialect, bound_domain, bound_user_type},
     structs::{ParserDB, UserDefinedType},
-    traits::{DataTypeLike, DatabaseLike, ExtensionLike, IntervalFields, VectorKind, VectorType},
+    traits::{
+        ColumnCollation, DataTypeLike, DatabaseLike, ExtensionLike, IntervalFields, MapEntry,
+        NamedColumnCollation, StructureKind, StructuredField, VectorKind, VectorType,
+    },
     utils::{
         identifier_resolution::{identifiers_match, stored_identifier},
         normalize_sqlparser_type,
         object_name::{
             PG_CATALOG, Qualifier, object_name_last_part, qualifier_of, relation_search_path,
+            target_name_of_object_name,
         },
         postgres_types::PgType,
         scalar_family::ScalarFamily,
@@ -102,27 +108,27 @@ impl DataTypeLike for DataType {
 
     #[inline]
     fn fixed_binary_length(&self, database: &Self::DB) -> Option<u64> {
-        super::dialect::fixed_binary_length(*database.dialect(), self)
+        super::dialect::fixed_binary_length(*database.dialect(), stored_as(self))
     }
 
     #[inline]
     fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
-        super::dialect::max_character_length(*database.dialect(), self)
+        super::dialect::max_character_length(*database.dialect(), stored_as(self))
     }
 
     #[inline]
     fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
-        super::dialect::fractional_seconds_precision(*database.dialect(), self)
+        super::dialect::fractional_seconds_precision(*database.dialect(), stored_as(self))
     }
 
     #[inline]
     fn numeric_precision(&self, database: &Self::DB) -> Option<u64> {
-        super::dialect::numeric_precision(*database.dialect(), self)
+        super::dialect::numeric_precision(*database.dialect(), stored_as(self))
     }
 
     #[inline]
     fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
-        super::dialect::numeric_scale(*database.dialect(), self)
+        super::dialect::numeric_scale(*database.dialect(), stored_as(self))
     }
 
     fn is_unsigned(&self, database: &Self::DB) -> Option<bool> {
@@ -136,7 +142,7 @@ impl DataTypeLike for DataType {
 
     #[inline]
     fn interval_fields(&self, _database: &Self::DB) -> Option<IntervalFields> {
-        match self {
+        match stored_as(self) {
             Self::Interval { fields, .. } => fields.map(interval_fields),
             _ => None,
         }
@@ -174,7 +180,7 @@ impl DataTypeLike for DataType {
     }
 
     fn array_element<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
-        let Self::Array(definition) = self else {
+        let Self::Array(definition) = stored_as(self) else {
             return None;
         };
         let mut element = written_element(definition)?;
@@ -186,12 +192,31 @@ impl DataTypeLike for DataType {
 
     fn array_dimensions(&self, _database: &Self::DB) -> Option<NonZeroU32> {
         let mut dimensions = 0_u32;
-        let mut current = Some(self);
+        let mut current = Some(stored_as(self));
         while let Some(Self::Array(definition)) = current {
             dimensions = dimensions.saturating_add(1);
             current = written_element(definition);
         }
         NonZeroU32::new(dimensions)
+    }
+
+    fn admits_null(&self, database: &Self::DB) -> bool {
+        let mut current = self;
+        while let Self::LowCardinality(inner) = current {
+            current = inner;
+        }
+        // ClickHouse's `Variant` and `Dynamic` hold `NULL` of their own and
+        // refuse a `Nullable` around them.
+        match current {
+            Self::Nullable(_) => true,
+            Self::Custom(name, _)
+                if super::dialect::custom_type_is(name, "Variant")
+                    || super::dialect::custom_type_is(name, "Dynamic") =>
+            {
+                true
+            }
+            _ => !matches!(*database.dialect(), SqlparserDialect::ClickHouse),
+        }
     }
 
     fn base_type<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self> {
@@ -253,14 +278,181 @@ impl DataTypeLike for DataType {
             .map(|(_, _, subtype)| subtype)
     }
 
-    fn composite_fields<'db>(
+    fn structure_kind(&self, database: &Self::DB) -> Option<StructureKind> {
+        match stored_as(self) {
+            Self::Struct(..) => Some(StructureKind::Struct),
+            Self::Union(_) => Some(StructureKind::Union),
+            Self::Object(_) => Some(StructureKind::Object),
+            Self::Tuple(_) => Some(StructureKind::Tuple),
+            Self::Nested(_) => Some(StructureKind::Nested),
+            stored => {
+                let (user_type, _) = user_type_of(stored, database)?;
+                user_type.composite_attributes().map(|_| StructureKind::Struct)
+            }
+        }
+    }
+
+    fn structured_fields<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Option<impl Iterator<Item = &'db Self>> {
-        let (user_type, _) = user_type_of(self, database)?;
-        let attributes = user_type.composite_attributes()?;
-        Some(attributes.iter().map(|attribute| &attribute.data_type))
+    ) -> Option<impl Iterator<Item = StructuredField<'db, Self>>> {
+        let written = match stored_as(self) {
+            Self::Struct(fields, _) | Self::Tuple(fields) => WrittenFields::Struct(fields.iter()),
+            Self::Union(fields) => WrittenFields::Union(fields.iter()),
+            Self::Object(columns) | Self::Nested(columns) => WrittenFields::Column(columns.iter()),
+            stored => {
+                let (user_type, _) = user_type_of(stored, database)?;
+                WrittenFields::Composite(user_type, user_type.composite_attributes()?.iter())
+            }
+        };
+        Some(FieldsOf { written, database })
     }
+
+    fn map_entry<'db>(&'db self, database: &'db Self::DB) -> Option<MapEntry<'db, Self>> {
+        let Self::Map(key, value, bracket) = stored_as(self) else {
+            return None;
+        };
+        let value_nullable =
+            !matches!(bracket, MapBracketKind::ParenthesesNotNull) && value.admits_null(database);
+        Some(MapEntry::new(key, value, value_nullable))
+    }
+}
+
+/// The type a value is stored as, through ClickHouse's `LowCardinality`, which
+/// changes only how a column stores its values, and `Nullable`, which only
+/// lets a value be `NULL`.
+fn stored_as(data_type: &DataType) -> &DataType {
+    let mut current = data_type;
+    while let DataType::LowCardinality(inner) | DataType::Nullable(inner) = current {
+        current = inner;
+    }
+    current
+}
+
+/// The fields a structured type writes, by the node each is written as.
+enum WrittenFields<'db> {
+    /// The fields of a `STRUCT` or a `Tuple`.
+    Struct(slice::Iter<'db, StructField>),
+    /// The fields of a `UNION`.
+    Union(slice::Iter<'db, UnionField>),
+    /// The fields of an `OBJECT` or a `Nested`, written as column definitions.
+    Column(slice::Iter<'db, ColumnDef>),
+    /// The attributes of a composite type, with the type that records the
+    /// facts of their collations.
+    Composite(&'db UserDefinedType, slice::Iter<'db, UserDefinedTypeCompositeAttributeDef>),
+}
+
+/// The fields of a structured type, as the database holding it answers them.
+struct FieldsOf<'db> {
+    written: WrittenFields<'db>,
+    database: &'db ParserDB,
+}
+
+impl<'db> Iterator for FieldsOf<'db> {
+    type Item = StructuredField<'db, DataType>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let database = self.database;
+        Some(match &mut self.written {
+            WrittenFields::Struct(fields) => {
+                let field = fields.next()?;
+                let (data_type, collation) = collated(&field.field_type);
+                let built = StructuredField::new(data_type, data_type.admits_null(database))
+                    .with_collation(collation);
+                let built = match &field.field_name {
+                    Some(name) => built.with_name(&name.value, name.quote_style.is_some()),
+                    None => built,
+                };
+                match &field.options {
+                    Some(options) => built.with_options(options.iter().map(option_entry).collect()),
+                    None => built,
+                }
+            }
+            WrittenFields::Union(fields) => {
+                let field = fields.next()?;
+                let (data_type, collation) = collated(&field.field_type);
+                StructuredField::new(data_type, data_type.admits_null(database))
+                    .with_name(&field.field_name.value, field.field_name.quote_style.is_some())
+                    .with_collation(collation)
+            }
+            WrittenFields::Column(columns) => column_field(columns.next()?, database),
+            WrittenFields::Composite(user_type, attributes) => {
+                let attribute = attributes.next()?;
+                let built = StructuredField::new(
+                    &attribute.data_type,
+                    attribute.data_type.admits_null(database),
+                )
+                .with_name(&attribute.name.value, attribute.name.quote_style.is_some());
+                let Some(name) = &attribute.collation else {
+                    return Some(built);
+                };
+                let mut named = NamedColumnCollation::new(target_name_of_object_name(name));
+                if let Some(resolved) = user_type.attribute_collation(&attribute.name) {
+                    named = named
+                        .with_postgres_deterministic(resolved.postgres_deterministic)
+                        .with_mysql_padding(resolved.mysql_padding);
+                }
+                built.with_collation(ColumnCollation::Named(named))
+            }
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.written {
+            WrittenFields::Struct(fields) => fields.size_hint(),
+            WrittenFields::Union(fields) => fields.size_hint(),
+            WrittenFields::Column(columns) => columns.size_hint(),
+            WrittenFields::Composite(_, attributes) => attributes.size_hint(),
+        }
+    }
+}
+
+/// The type a field declares, without the `COLLATE` written after it, and
+/// the collation that names.
+fn collated(written: &DataType) -> (&DataType, ColumnCollation<'_>) {
+    match written {
+        DataType::Collate(data_type, name) => (data_type, named_collation(name)),
+        data_type => (data_type, ColumnCollation::DatabaseDefault),
+    }
+}
+
+/// The collation `name` names, without facts, since an inline field's
+/// collation is resolved against no catalog.
+fn named_collation(name: &ObjectName) -> ColumnCollation<'_> {
+    ColumnCollation::Named(NamedColumnCollation::new(target_name_of_object_name(name)))
+}
+
+/// A field written as a column definition, with the `NOT NULL` it declares.
+fn column_field<'db>(
+    column: &'db ColumnDef,
+    database: &'db ParserDB,
+) -> StructuredField<'db, DataType> {
+    let (data_type, collation) = collated(&column.data_type);
+    let not_null =
+        column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull));
+    StructuredField::new(data_type, !not_null && data_type.admits_null(database))
+        .with_name(&column.name.value, column.name.quote_style.is_some())
+        .with_collation(collation)
+}
+
+/// An option as a key as written and its value as text, a string literal by
+/// its contents.
+fn option_entry(option: &SqlOption) -> (Cow<'_, str>, Cow<'_, str>) {
+    let SqlOption::KeyValue { key, value } = option else {
+        return (Cow::Owned(option.to_string()), Cow::Borrowed(""));
+    };
+    let key = match key.0.as_slice() {
+        [ObjectNamePart::Identifier(part)] => Cow::Borrowed(part.value.as_str()),
+        _ => Cow::Owned(key.to_string()),
+    };
+    let value = match value {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(text) | Value::DoubleQuotedString(text),
+            ..
+        }) => Cow::Borrowed(text.as_str()),
+        _ => Cow::Owned(value.to_string()),
+    };
+    (key, value)
 }
 
 /// The user-defined type a type name reaches, with whether the name is its
