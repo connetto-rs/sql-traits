@@ -428,6 +428,39 @@ pub trait DataTypeLike: Debug + Send + Sync {
         None
     }
 
+    /// Returns whether a numeric type holds only values of zero and above, or
+    /// `None` for a type outside the integer, floating-point and decimal
+    /// families.
+    ///
+    /// MySQL's `UNSIGNED` integers, decimals and floating types answer
+    /// `Some(true)`, and so does every numeric type MySQL declares with
+    /// `ZEROFILL`, which implies `UNSIGNED`, or as `SERIAL`, which is a
+    /// `BIGINT UNSIGNED`. So do DuckDB's `UTINYINT`, `USMALLINT`, `UBIGINT`
+    /// and `UHUGEINT` and ClickHouse's `UInt8` through `UInt256`. Every other
+    /// numeric type answers `Some(false)`, every type in SQLite included,
+    /// since SQLite stores a negative value whatever the declared type says. A
+    /// domain answers as its [`Self::base_type`] does.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::MySqlDialect;
+    ///
+    /// let db = ParserDB::parse::<MySqlDialect>(
+    ///     "CREATE TABLE t (id INT, hits INT UNSIGNED, price DECIMAL(10,2) UNSIGNED, label VARCHAR(10));",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let unsigned: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).is_unsigned(&db)).collect();
+    /// assert_eq!(unsigned, [Some(false), Some(true), Some(true), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_unsigned(&self, database: &Self::DB) -> Option<bool>;
+
     /// Returns the fields an interval type restricts its values to, or `None`
     /// for an interval that keeps every field and for every other type.
     ///

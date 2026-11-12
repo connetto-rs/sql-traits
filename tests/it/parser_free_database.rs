@@ -469,6 +469,14 @@ impl DataTypeLike for MemoryDataType {
         None
     }
 
+    fn is_unsigned(&self, database: &Self::DB) -> Option<bool> {
+        matches!(
+            self.scalar_family(database),
+            Some(ScalarFamily::Int | ScalarFamily::Float | ScalarFamily::Decimal)
+        )
+        .then_some(false)
+    }
+
     fn send_function(&self, _database: &Self::DB) -> Option<bool> {
         None
     }
@@ -2453,6 +2461,7 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
     assert_eq!(first_type.max_character_length(&catalog), None);
     assert_eq!(first_type.fractional_seconds_precision(&catalog), None);
     assert_eq!(first_type.numeric_scale(&catalog), None);
+    assert_eq!(first_type.is_unsigned(&catalog), Some(false));
     assert_eq!(first_type.interval_fields(&catalog), None);
     assert_eq!(first_type.vector(&catalog), None);
     assert!(first_type.array_element(&catalog).is_none());

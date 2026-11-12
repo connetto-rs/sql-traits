@@ -287,6 +287,10 @@ impl DataTypeLike for NoneKind {
         self.unreach()
     }
 
+    fn is_unsigned(&self, _database: &Self::DB) -> Option<bool> {
+        self.unreach()
+    }
+
     fn send_function(&self, _database: &Self::DB) -> Option<bool> {
         self.unreach()
     }

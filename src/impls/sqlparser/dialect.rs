@@ -718,6 +718,57 @@ fn modifier_scale(modifiers: &[TypeModifier], bare: Option<i64>) -> Option<i64> 
     }
 }
 
+/// Whether a numeric type holds only values of zero and above under the
+/// engine's rules.
+///
+/// SQLite stores a negative value in any column, so no type it declares is
+/// unsigned. The generic dialect names no engine and reads a written
+/// `UNSIGNED` or `ZEROFILL` as MySQL does.
+pub(super) fn is_unsigned(dialect: SqlparserDialect, ty: &DataType) -> bool {
+    if dialect == SqlparserDialect::SQLite {
+        return false;
+    }
+    match ty {
+        DataType::Nullable(inner) | DataType::LowCardinality(inner) => is_unsigned(dialect, inner),
+        // https://dev.mysql.com/doc/refman/8.4/en/numeric-type-attributes.html
+        DataType::Zerofill(_)
+        | DataType::TinyIntUnsigned(_)
+        | DataType::SmallIntUnsigned(_)
+        | DataType::MediumIntUnsigned(_)
+        | DataType::IntUnsigned(_)
+        | DataType::IntegerUnsigned(_)
+        | DataType::BigIntUnsigned(_)
+        | DataType::Int2Unsigned(_)
+        | DataType::Int4Unsigned(_)
+        | DataType::Int8Unsigned(_)
+        | DataType::DecimalUnsigned(_)
+        | DataType::DecUnsigned(_)
+        | DataType::FloatUnsigned(_)
+        | DataType::RealUnsigned
+        | DataType::DoubleUnsigned(_)
+        | DataType::DoublePrecisionUnsigned
+        | DataType::Unsigned
+        | DataType::UnsignedInteger
+        // https://duckdb.org/docs/stable/sql/data_types/numeric.html#fixed-width-integer-types
+        | DataType::UTinyInt
+        | DataType::USmallInt
+        | DataType::UBigInt
+        | DataType::UHugeInt
+        // https://clickhouse.com/docs/reference/data-types/int-uint
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::UInt128
+        | DataType::UInt256 => true,
+        // https://dev.mysql.com/doc/refman/8.4/en/numeric-type-syntax.html
+        DataType::Custom(name, _) => {
+            dialect == SqlparserDialect::MySql && custom_type_is(name, "SERIAL")
+        }
+        _ => false,
+    }
+}
+
 impl DialectLike for SqlparserDialect {
     type DB = ParserDB;
     type Match = TypeMatch;
