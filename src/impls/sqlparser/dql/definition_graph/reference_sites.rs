@@ -19,7 +19,9 @@ use super::{
     Bound, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
     output_columns::unwrap_nested,
 };
-use crate::{errors::LookupError, structs::IdentifierCase, traits::DatabaseLike};
+use crate::{
+    errors::LookupError, structs::IdentifierCase, traits::DatabaseLike, utils::walk::walk,
+};
 
 /// What one column reference reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +166,7 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, DB> {
     /// queries nested in it on their own terms.
     fn node<N: Visit + ?Sized>(&mut self, node: &N, cursor: Option<ScopeCursor>) {
         let mut sites = Sites { walk: self, cursor, depth: 0 };
-        let walked = node.visit(&mut sites);
+        let walked = walk(node, &mut sites);
         debug_assert!(walked.is_continue(), "the site visitor never breaks");
     }
 

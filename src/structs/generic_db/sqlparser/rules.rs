@@ -15,8 +15,8 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CreateRule, CreateRuleAction, CreateRuleEvent, Expr, Ident, ObjectName, Statement, Visit,
-    VisitMut, Visitor, VisitorMut,
+    CreateRule, CreateRuleAction, CreateRuleEvent, Expr, Ident, ObjectName, Statement, Visitor,
+    VisitorMut,
 };
 
 use super::{
@@ -33,6 +33,7 @@ use crate::{
         identifier_resolution::identifiers_match,
         last_str,
         object_name::{RelationKey, target_key, target_name_of_object_name},
+        walk::{walk, walk_mut},
     },
 };
 
@@ -256,7 +257,7 @@ pub(super) fn follow_column_rename(
 /// through `NEW` or `OLD`.
 pub(super) fn reads_row_column(rule: &CreateRule, column: &NamedColumn) -> bool {
     rule.condition.as_ref().is_some_and(|condition| expression_reads_row_column(condition, column))
-        || rule.action.visit(&mut RowColumnMentioned { column }).is_break()
+        || walk(&rule.action, &mut RowColumnMentioned { column }).is_break()
 }
 
 /// Renames every `NEW` and `OLD` reference to `from` in the rule's condition
@@ -266,14 +267,14 @@ pub(super) fn rename_row_column(rule: &mut CreateRule, from: &NamedColumn, to: &
         rename_row_column_in_expression(condition, from, to);
     }
     let mut renamer = RowColumnRenamer { column: from, to };
-    let _: ControlFlow<()> = VisitMut::visit(&mut rule.action, &mut renamer);
+    let _: ControlFlow<()> = walk_mut(&mut rule.action, &mut renamer);
 }
 
 /// Whether the expression reads the relation's row column through `NEW` or
 /// `OLD`, which a trigger's `WHEN` condition does as well.
 pub(super) fn expression_reads_row_column(expression: &Expr, column: &NamedColumn) -> bool {
     let mut mentioned = RowColumnMentioned { column };
-    expression.visit(&mut mentioned).is_break()
+    walk(expression, &mut mentioned).is_break()
 }
 
 /// Renames every `NEW` and `OLD` reference to `from` in the expression.
@@ -283,7 +284,7 @@ pub(super) fn rename_row_column_in_expression(
     to: &Ident,
 ) {
     let mut renamer = RowColumnRenamer { column: from, to };
-    let _: ControlFlow<()> = VisitMut::visit(expression, &mut renamer);
+    let _: ControlFlow<()> = walk_mut(expression, &mut renamer);
 }
 
 /// The column a `NEW.column` or `OLD.column` expression names, if the

@@ -908,7 +908,7 @@ mod tests {
     use core::{convert::Infallible, ops::ControlFlow};
 
     use sqlparser::{
-        ast::{CreatePolicyCommand, CreatePolicyType, visit_expressions},
+        ast::{CreatePolicyCommand, CreatePolicyType},
         dialect::GenericDialect,
     };
 
@@ -916,6 +916,7 @@ mod tests {
     use crate::{
         structs::{IdentifierCase, ParserDB, TargetName},
         traits::{DatabaseLike, FunctionLike, TableLike},
+        utils::walk::walk_expressions,
     };
 
     #[test]
@@ -967,7 +968,7 @@ mod tests {
         // Every call of the clause answers through the reference, and the
         // answers together are the clause's functions.
         let mut reached = Vec::new();
-        let ControlFlow::<Infallible>::Continue(()) = visit_expressions(using_expr, |expression| {
+        let ControlFlow::<Infallible>::Continue(()) = walk_expressions(using_expr, |expression| {
             if let Expr::Function(call) = expression {
                 reached.extend(
                     policy_ref.functions_reached_by(call, &db).expect("call belongs to the policy"),

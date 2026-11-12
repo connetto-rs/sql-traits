@@ -36,7 +36,7 @@ use super::{
 };
 use crate::{
     errors::Error,
-    utils::{last_str, object_name::RelationKey, with_scopes::WithScopes},
+    utils::{last_str, object_name::RelationKey, walk::walk_mut, with_scopes::WithScopes},
 };
 
 /// Binds every stored relation the body of `function` reads, refusing the
@@ -182,7 +182,7 @@ fn bind_node<N: VisitMut>(
     missing: &impl Fn(&ObjectName) -> Error,
 ) -> Result<(), Error> {
     let mut binder = BodyBinder { builder, bare_temporary, scopes: WithScopes::default() };
-    match node.visit(&mut binder) {
+    match walk_mut(node, &mut binder) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(name) => Err(missing(&name)),
     }

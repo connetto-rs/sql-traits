@@ -15,8 +15,7 @@ use sqlparser::ast::{
     OnInsert, OutputClause, Query, ReturnStatement, ReturnStatementValue, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Statement, TableAlias, TableAliasColumnDef,
     TableAliasWithoutColumns, TableFactor, TableObject, TableWithJoins, Update,
-    UpdateTableFromKind, Visit, VisitMut, Visitor, VisitorMut,
-    helpers::attached_token::AttachedToken,
+    UpdateTableFromKind, VisitMut, Visitor, VisitorMut, helpers::attached_token::AttachedToken,
 };
 
 use super::{
@@ -40,6 +39,7 @@ use crate::{
             stored_view_key, table_matches_key, target_key, target_name_from_object_name,
             target_name_of_object_name, view_matches_key,
         },
+        walk::{walk, walk_mut},
         with_scopes::WithScopes,
     },
 };
@@ -653,7 +653,7 @@ fn replace_embedded(statement: &mut Statement, position: usize, stored: &Query, 
     }
 
     let mut replace = Replace { position, seen: 0, stored, query };
-    let _: ControlFlow<()> = VisitMut::visit(statement, &mut replace);
+    let _: ControlFlow<()> = walk_mut(statement, &mut replace);
 }
 
 /// A statement holding `query` as the part `shape` spells it.
@@ -764,7 +764,7 @@ pub(super) fn spell_out(builder: &ParserDBBuilder, query: &mut Query) {
         wildcards: references.wildcards.into_iter().collect(),
         naturals: references.natural_joins.into_iter().collect(),
     };
-    let walked = VisitMut::visit(query, &mut spell);
+    let walked = walk_mut(query, &mut spell);
     debug_assert!(walked.is_continue(), "the visitor never breaks");
 }
 
@@ -806,7 +806,7 @@ fn spells_anything(query: &Query) -> bool {
         }
     }
 
-    query.visit(&mut Spellable).is_break()
+    walk(query, &mut Spellable).is_break()
 }
 
 /// The constraint a join operator carries, for a rewrite that respells it.
@@ -866,7 +866,7 @@ fn renamed_factors(query: &Query, renames: &[Rename]) -> BTreeMap<usize, usize> 
 
     let mut finder =
         Finder { renames, scopes: WithScopes::default(), dml_depth: 0, found: BTreeMap::new() };
-    let walked = query.visit(&mut finder);
+    let walked = walk(query, &mut finder);
     debug_assert!(walked.is_continue(), "the finder never breaks");
     finder.found
 }
@@ -954,7 +954,7 @@ fn merged_through_using(
     }
 
     let mut using = Using { reading, renames, found: BTreeSet::new() };
-    let walked = query.visit(&mut using);
+    let walked = walk(query, &mut using);
     debug_assert!(walked.is_continue(), "the visitor never breaks");
     using.found
 }
@@ -1178,7 +1178,7 @@ fn factor_shapes(query: &Query) -> BTreeMap<usize, FactorShape> {
     }
 
     let mut shapes = Shapes { dml_depth: 0, found: BTreeMap::new() };
-    let walked = query.visit(&mut shapes);
+    let walked = walk(query, &mut shapes);
     debug_assert!(walked.is_continue(), "the visitor never breaks");
     shapes.found
 }
@@ -1201,7 +1201,7 @@ fn bare_names(query: &Query) -> BTreeMap<usize, Ident> {
     }
 
     let mut bare = Bare { found: BTreeMap::new() };
-    let walked = query.visit(&mut bare);
+    let walked = walk(query, &mut bare);
     debug_assert!(walked.is_continue(), "the visitor never breaks");
     bare.found
 }
@@ -1283,7 +1283,7 @@ fn respell(query: &mut Query, before: &ParserDB, renames: &[Rename]) -> Option<Q
         }
     }
 
-    let walked = VisitMut::visit(query, &mut edits);
+    let walked = walk_mut(query, &mut edits);
     debug_assert!(walked.is_continue(), "the edits never break");
     Some(references)
 }
@@ -1338,7 +1338,7 @@ fn qualify_captured(
         }
         qualifiers.insert(site.expression, exposed.clone());
     }
-    let walked = VisitMut::visit(query, &mut Qualify { qualifiers });
+    let walked = walk_mut(query, &mut Qualify { qualifiers });
     debug_assert!(walked.is_continue(), "the visitor never breaks");
     true
 }
@@ -1379,7 +1379,7 @@ fn shielded(original: &Query, renames: &[Rename]) -> Query {
             }
         }
     }
-    let walked = VisitMut::visit(&mut query, &mut edits);
+    let walked = walk_mut(&mut query, &mut edits);
     debug_assert!(walked.is_continue(), "the edits never break");
     query
 }
@@ -1462,7 +1462,7 @@ fn dml_shell(
 
     let mut shells =
         Shells { before, renames, holder_name, rule_context, scopes: CteScopes::default() };
-    match query.visit(&mut shells) {
+    match walk_mut(query, &mut shells) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(error) => Err(error),
     }
@@ -1593,7 +1593,7 @@ pub(super) fn normalize_block_references(
     let catalog = builder.catalog_name();
     let mut normalizer = NormalizeDmls { builder, catalog, scopes: CteScopes::default() };
     for statement in statements.iter_mut() {
-        match statement.visit(&mut normalizer) {
+        match walk_mut(statement, &mut normalizer) {
             ControlFlow::Continue(()) => {}
             ControlFlow::Break(error) => return Err(error),
         }
@@ -1722,7 +1722,7 @@ fn normalize_statement_references(
         return Ok(());
     }
     let mut references = ReferenceRewrites { rewrites };
-    let walked = VisitMut::visit(statement, &mut references);
+    let walked = walk_mut(statement, &mut references);
     debug_assert!(walked.is_continue(), "the rewriter never breaks");
     Ok(())
 }
@@ -1922,11 +1922,11 @@ pub(super) fn refuse_ambiguous_block_reference(
     let reads = statements_read(builder, core::iter::once(statement));
     let slice = catalog_reads(builder, reads);
     let mut scopes = Scopes { slice: &slice, scopes: CteScopes::default() };
-    let walked = statement.visit(&mut scopes);
+    let walked = walk(statement, &mut scopes);
     debug_assert!(walked.is_continue(), "the walker never breaks");
     let Scopes { scopes, .. } = scopes;
     let mut checker = Ambiguous { slice: &slice, scopes, chain: Vec::new() };
-    match statement.visit(&mut checker) {
+    match walk(statement, &mut checker) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(column) => Err(ambiguous(column)),
     }
@@ -2461,7 +2461,7 @@ pub(super) fn spell_block_statement(
     }
 
     let mut wildcards = Wildcards { builder };
-    let walked = statement.visit(&mut wildcards);
+    let walked = walk_mut(statement, &mut wildcards);
     debug_assert!(walked.is_continue(), "the speller never breaks");
 
     let reads = statements_read(builder, core::iter::once(&*statement));
@@ -2470,7 +2470,7 @@ pub(super) fn spell_block_statement(
     match statement_dml_mut(statement) {
         Some(dml) => dml.spell(&slice, too_wide),
         None => {
-            match statement.visit(&mut returning) {
+            match walk_mut(statement, &mut returning) {
                 ControlFlow::Continue(()) => Ok(()),
                 ControlFlow::Break(error) => Err(error),
             }
@@ -2480,20 +2480,17 @@ pub(super) fn spell_block_statement(
 
 /// The `RETURNING` wildcards and the missing `INSERT` column list one
 /// data-modifying statement spells at creation.
-struct ReturningSpeller<'a, F> {
+struct ReturningSpeller<'a> {
     slice: &'a ParserDB,
-    too_wide: &'a F,
+    too_wide: &'a dyn Fn() -> Error,
 }
 
-impl<F> VisitorMut for ReturningSpeller<'_, F>
-where
-    F: Fn() -> Error,
-{
+impl VisitorMut for ReturningSpeller<'_> {
     type Break = Error;
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
         if let Some(dml) = dml_ref_mut(&mut query.body)
-            && let Err(error) = dml.spell(self.slice, self.too_wide)
+            && let Err(error) = dml.spell(self.slice, &self.too_wide)
         {
             return ControlFlow::Break(error);
         }
@@ -2970,7 +2967,7 @@ fn clause_references(statement: &Statement) -> Vec<(usize, Vec<Ident>)> {
     }
 
     let mut finder = References { depth: 0, found: Vec::new() };
-    let walked = statement.visit(&mut finder);
+    let walked = walk(statement, &mut finder);
     debug_assert!(walked.is_continue(), "the finder never breaks");
     finder.found
 }
@@ -3155,7 +3152,7 @@ fn respell_embedded(
         open: Vec::new(),
         parts: Vec::new(),
     };
-    let walked = VisitMut::visit(node, &mut embedded);
+    let walked = walk_mut(node, &mut embedded);
     debug_assert!(walked.is_continue(), "the walker never breaks");
     embedded.parts
 }
@@ -3193,7 +3190,7 @@ fn respell_shell(
         return Ok(None);
     }
     captured_sites(&mut edits, &sites, &factors, renames, holder_name);
-    let walked = VisitMut::visit(statement, &mut edits);
+    let walked = walk_mut(statement, &mut edits);
     debug_assert!(walked.is_continue(), "the edits never break");
     if let Some(dml) = statement_dml_mut(statement) {
         apply_returning_aliases(dml, &edits.outputs);
@@ -3405,7 +3402,7 @@ fn on_conflict_addresses(statement: &Statement) -> BTreeSet<usize> {
     };
     let mut addresses = BTreeSet::new();
     let mut finder = References { addresses: &mut addresses };
-    let walked = predicate.visit(&mut finder);
+    let walked = walk(predicate, &mut finder);
     debug_assert!(walked.is_continue(), "the finder never breaks");
     addresses
 }
@@ -3585,7 +3582,7 @@ fn shield_shell(
             }
         }
     }
-    let walked = VisitMut::visit(statement, &mut edits);
+    let walked = walk_mut(statement, &mut edits);
     debug_assert!(walked.is_continue(), "the edits never break");
     if let Some(alias) = insert_alias
         && let Statement::Insert(Insert { table_alias, .. }) = statement

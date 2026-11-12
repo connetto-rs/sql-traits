@@ -17,7 +17,7 @@ use core::{cmp::Ordering, ops::ControlFlow};
 
 use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateTable, DataType, ExactNumberInfo, Expr, ForValues,
-    ObjectNamePart, PartitionBoundValue, TimezoneInfo, UnaryOperator, Value, ValueWithSpan, Visit,
+    ObjectNamePart, PartitionBoundValue, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
     Visitor,
 };
 
@@ -25,6 +25,7 @@ use super::{ParserDB, ParserDBBuilder, StoredTable, inheritance, partition_keys}
 use crate::{
     errors::{Error, InvalidBound},
     traits::{PartitionStrategy, TableLike},
+    utils::walk::walk,
 };
 
 /// The type a key column's values are read as, for the types the model can
@@ -473,7 +474,7 @@ fn reads_column(expr: &Expr) -> bool {
             }
         }
     }
-    expr.visit(&mut Columns).is_break()
+    walk(expr, &mut Columns).is_break()
 }
 
 /// Whether the expression is a `NULL` literal.

@@ -6,9 +6,7 @@ use alloc::{
 };
 use core::{ops::ControlFlow, ptr};
 
-use sqlparser::ast::{
-    CreatePolicyType, Expr, FunctionArguments, InTarget, Owner, Query, Visit, Visitor,
-};
+use sqlparser::ast::{CreatePolicyType, Expr, FunctionArguments, InTarget, Owner, Query, Visitor};
 
 use crate::{
     errors::{LookupError, RowSecurityError},
@@ -20,7 +18,7 @@ use crate::{
         DataStatementLike, DatabaseLike, PolicyLike, Relation, RoleLike, TableLike, ViewLike,
         role::privilege_holders,
     },
-    utils::identifier_resolution::stored_identifier,
+    utils::{identifier_resolution::stored_identifier, walk::walk},
 };
 
 /// One statement gate's clause context, row version and failure behavior.
@@ -316,7 +314,7 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
     ) -> Result<Option<String>, RowSecurityError> {
         let mut collector = SubqueryReads { database: self.database, depth: 0, reads: None };
         for expression in expressions {
-            if let ControlFlow::Break(error) = expression.visit(&mut collector) {
+            if let ControlFlow::Break(error) = walk(expression, &mut collector) {
                 return Err(error.into());
             }
         }

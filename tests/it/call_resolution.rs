@@ -1,6 +1,10 @@
 //! Tests that each call in a policy or check expression answers the
 //! functions it may reach, wherever it is nested.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test code ships in no binary, so walking the tree directly costs nothing"
+)]
 
 use core::{convert::Infallible, ops::ControlFlow};
 

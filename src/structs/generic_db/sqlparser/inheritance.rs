@@ -20,7 +20,7 @@ use core::ops::ControlFlow;
 use sqlparser::ast::{
     ArrayElemTypeDef, CharacterLength, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
     CreateTable, DataType, ExactNumberInfo, Expr, Ident, ObjectName, TableConstraint, TimezoneInfo,
-    Value, visit_expressions_mut,
+    Value,
 };
 
 use super::{
@@ -30,7 +30,7 @@ use super::{
 use crate::{
     errors::Error,
     traits::TableLike,
-    utils::{identifier_resolution::stored_ident_name, is_identity},
+    utils::{identifier_resolution::stored_ident_name, is_identity, walk::walk_expressions_mut},
 };
 
 /// Which spelling links a child to a table it takes its shape from.
@@ -416,7 +416,7 @@ fn stored_check(check: &mut CheckConstraint) {
 /// change the tree still tells them apart.
 pub(super) fn stored_expr(expr: &Expr) -> Expr {
     let mut stored = expr.clone();
-    let _: ControlFlow<()> = visit_expressions_mut(&mut stored, |expr| {
+    let _: ControlFlow<()> = walk_expressions_mut(&mut stored, |expr| {
         match expr {
             Expr::Nested(inner) => {
                 let placeholder = Expr::Value(Value::Null.into());

@@ -3,7 +3,7 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     Expr, Ident, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
-    Values, Visit, Visitor,
+    Values, Visitor,
 };
 
 use super::{
@@ -18,7 +18,10 @@ use crate::{
     errors::LookupError,
     structs::{ColumnBinding, ColumnDefinition, IdentifierCase, QueryOutput},
     traits::DatabaseLike,
-    utils::figured_names::{Figure, figure},
+    utils::{
+        figured_names::{Figure, figure},
+        walk::walk,
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +183,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
         }
         self.graph.select_index.sort_by_key(|entry| entry.address);
         let mut collector = QueryCollector { derivation: self, queries: BTreeMap::new() };
-        let _: ControlFlow<()> = query.visit(&mut collector);
+        let _: ControlFlow<()> = walk(query, &mut collector);
         let queries = collector.queries;
         self.graph.queries =
             queries.into_iter().map(|(address, outputs)| QueryNode { address, outputs }).collect();

@@ -32,8 +32,8 @@ use core::ops::ControlFlow;
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, AlterView, AlterViewOperation, CreateFunction,
     CreateView, Expr, Grant, GrantObjects, Ident, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visit, VisitMut,
-    Visitor, VisitorMut,
+    RenameTableNameKind, SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visitor,
+    VisitorMut,
 };
 
 use super::{
@@ -64,6 +64,7 @@ use crate::{
             target_name_from_object_name,
         },
         output_from_wildcard,
+        walk::{walk, walk_mut},
         with_scopes::WithScopes,
     },
 };
@@ -1361,8 +1362,8 @@ impl VisitorMut for DefinitionBinder<'_> {
 pub(super) fn bind_definition(builder: &ParserDBBuilder, query: &mut Query) -> Option<String> {
     let mut binder =
         DefinitionBinder { builder, scopes: WithScopes::default(), temporary_read: None };
-    let walk = query.visit(&mut binder);
-    debug_assert!(walk.is_continue(), "the binder never breaks");
+    let walked = walk_mut(query, &mut binder);
+    debug_assert!(walked.is_continue(), "the binder never breaks");
     binder.temporary_read
 }
 
@@ -1412,8 +1413,8 @@ pub(super) fn relations_read_in(definition: &Query) -> Vec<RelationKey> {
     let mut read = Vec::new();
     let mut visitor =
         RelationsRead { builder: None, scopes: WithScopes::default(), read: &mut read };
-    let walk = definition.visit(&mut visitor);
-    debug_assert!(walk.is_continue(), "the visitor never breaks");
+    let walked = walk(definition, &mut visitor);
+    debug_assert!(walked.is_continue(), "the visitor never breaks");
     read
 }
 
@@ -1456,8 +1457,8 @@ pub(super) fn statements_read<'a>(
             scopes: WithScopes::default(),
             read: &mut read,
         };
-        let walk = statement.visit(&mut visitor);
-        debug_assert!(walk.is_continue(), "the visitor never breaks");
+        let walked = walk(statement, &mut visitor);
+        debug_assert!(walked.is_continue(), "the visitor never breaks");
     }
     read
 }

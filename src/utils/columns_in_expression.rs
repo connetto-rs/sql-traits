@@ -7,12 +7,13 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AccessExpr, Expr, FunctionArg, FunctionArguments, Ident, InTarget, Query, Visit, Visitor,
+    AccessExpr, Expr, FunctionArg, FunctionArguments, Ident, InTarget, Query, Visitor,
 };
 
 use crate::{
-    structs::TargetName, traits::column::ColumnLike,
-    utils::identifier_resolution::identifiers_match,
+    structs::TargetName,
+    traits::column::ColumnLike,
+    utils::{identifier_resolution::identifiers_match, walk::walk},
 };
 
 /// Whether a written reference names a stored column, folding an unquoted
@@ -253,7 +254,7 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
         labels: Vec::new(),
         parameters: Vec::new(),
     };
-    match expr.visit(&mut visitor) {
+    match walk(expr, &mut visitor) {
         ControlFlow::Continue(()) => Ok(visitor.read),
         ControlFlow::Break(error) => Err(error),
     }

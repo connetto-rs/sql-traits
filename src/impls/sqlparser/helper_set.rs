@@ -14,7 +14,7 @@ use sqlparser::{
         ArgMode, BinaryOperator, DataType, Distinct, Expr, Function, FunctionArg, FunctionArgExpr,
         FunctionArgumentList, FunctionArguments, FunctionBehavior, FunctionSecurity, GroupByExpr,
         Ident, InTarget, Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator, Statement,
-        TableFactor, Value, visit_expressions,
+        TableFactor, Value,
     },
     parser::Parser,
 };
@@ -38,6 +38,7 @@ use crate::{
             Qualifier, object_name_last_part, qualifier_of, resolve_relation_object_name_on_path,
             target_name_of_table,
         },
+        walk::walk_expressions,
     },
 };
 
@@ -225,7 +226,7 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
     ) -> Result<Vec<&'db DB::Column>, LookupError> {
         let columns: Vec<&'db DB::Column> = self.table.columns(database)?.collect();
         let mut read: Vec<&'db DB::Column> = Vec::new();
-        let _: ControlFlow<()> = visit_expressions(select, |expression| {
+        let _: ControlFlow<()> = walk_expressions(select, |expression| {
             let named = self.column_name(expression).and_then(|name| {
                 let name = name.to_string();
                 columns.iter().copied().find(|column| {

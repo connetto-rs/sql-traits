@@ -9,6 +9,10 @@ use sqlparser::ast::{
 };
 
 /// Walks `node` with `visitor`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one place the traversal is instantiated, for the trait object"
+)]
 pub(crate) fn walk<N: Visit + ?Sized, B>(
     node: &N,
     visitor: &mut dyn Visitor<Break = B>,
@@ -17,11 +21,74 @@ pub(crate) fn walk<N: Visit + ?Sized, B>(
 }
 
 /// Walks `node` with `visitor`, which may rewrite what it meets.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one place the rewriting traversal is instantiated, for the trait object"
+)]
 pub(crate) fn walk_mut<N: VisitMut + ?Sized, B>(
     node: &mut N,
     visitor: &mut dyn VisitorMut<Break = B>,
 ) -> ControlFlow<B> {
     node.visit(&mut DynamicMut(visitor))
+}
+
+/// Hands every expression in `node` to `each` before its subexpressions,
+/// until `each` breaks.
+pub(crate) fn walk_expressions<N: Visit + ?Sized, B>(
+    node: &N,
+    mut each: impl FnMut(&Expr) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    walk(node, &mut Expressions(&mut each))
+}
+
+/// Hands every expression in `node` to `each` after its subexpressions, so
+/// `each` may replace it, until `each` breaks.
+pub(crate) fn walk_expressions_mut<N: VisitMut + ?Sized, B>(
+    node: &mut N,
+    mut each: impl FnMut(&mut Expr) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    walk_mut(node, &mut ExpressionsMut(&mut each))
+}
+
+/// Hands every relation name in `node` to `each`, until `each` breaks.
+pub(crate) fn walk_relations<N: Visit + ?Sized, B>(
+    node: &N,
+    mut each: impl FnMut(&ObjectName) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    walk(node, &mut Relations(&mut each))
+}
+
+/// Hands each expression the walk meets to a borrowed closure.
+struct Expressions<'f, B>(&'f mut dyn FnMut(&Expr) -> ControlFlow<B>);
+
+impl<B> Visitor for Expressions<'_, B> {
+    type Break = B;
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<B> {
+        (self.0)(expr)
+    }
+}
+
+/// Hands each expression the walk leaves to a borrowed closure.
+struct ExpressionsMut<'f, B>(&'f mut dyn FnMut(&mut Expr) -> ControlFlow<B>);
+
+impl<B> VisitorMut for ExpressionsMut<'_, B> {
+    type Break = B;
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<B> {
+        (self.0)(expr)
+    }
+}
+
+/// Hands each relation name the walk meets to a borrowed closure.
+struct Relations<'f, B>(&'f mut dyn FnMut(&ObjectName) -> ControlFlow<B>);
+
+impl<B> Visitor for Relations<'_, B> {
+    type Break = B;
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<B> {
+        (self.0)(relation)
+    }
 }
 
 /// Forwards every hook to a borrowed visitor. A hook left to its default here
@@ -218,6 +285,10 @@ impl<B> VisitorMut for DynamicMut<'_, B> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the direct walks are the oracle the adaptors are checked against"
+)]
 mod tests {
     //! A hook the adaptors fail to forward is silently skipped, so a walk
     //! through them has to meet the same nodes, in the same order, as a

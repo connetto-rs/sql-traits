@@ -32,7 +32,7 @@ use sqlparser::{
         PrimaryKeyConstraint, Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption,
         SchemaName, SqlOption, Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value,
         ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
-        helpers::stmt_create_table::CreateTableBuilder, visit_relations,
+        helpers::stmt_create_table::CreateTableBuilder,
     },
     dialect::Dialect,
 };
@@ -70,6 +70,7 @@ use crate::{
             table_matches_key, table_matches_object_name, target_name_of_idents,
             target_name_of_object_name, view_matches_key,
         },
+        walk::{walk, walk_mut, walk_relations},
     },
 };
 
@@ -2619,7 +2620,7 @@ impl NamedColumn {
         declaring: &[StoredTable],
     ) -> bool {
         let mut mentioned = ColumnMentioned { scope: ColumnScope::new(self, table, declaring) };
-        node.visit(&mut mentioned).is_break()
+        walk(node, &mut mentioned).is_break()
     }
 }
 
@@ -2646,7 +2647,7 @@ impl<'a> ColumnScope<'a> {
 
     fn enter(&mut self, query: &Query) {
         let reads_declaring = !self.declaring.is_empty()
-            && visit_relations(query, |relation| {
+            && walk_relations(query, |relation| {
                 if self.declaring.iter().any(|declared| declared.named_by(relation)) {
                     ControlFlow::Break(())
                 } else {
@@ -2754,7 +2755,7 @@ fn rename_column_in_expressions<N: VisitMut>(
     to: &Ident,
 ) {
     let mut renamer = ColumnRenamer { scope: ColumnScope::new(from, table, declaring), to };
-    let _: ControlFlow<()> = node.visit(&mut renamer);
+    let _: ControlFlow<()> = walk_mut(node, &mut renamer);
 }
 
 /// The tables other than `altered` that declare a column of this name.

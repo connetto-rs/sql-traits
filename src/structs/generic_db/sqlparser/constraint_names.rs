@@ -16,7 +16,7 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, Expr, Ident,
-    ObjectName, TableConstraint, visit_expressions,
+    ObjectName, TableConstraint,
 };
 
 use super::{
@@ -26,7 +26,7 @@ use super::{
 use crate::{
     errors::{Error, InheritedChange, ObjectKind},
     structs::{TableMetadata, metadata::GeneratedConstraintName},
-    utils::identifier_resolution::stored_ident_name,
+    utils::{identifier_resolution::stored_ident_name, walk::walk_expressions},
 };
 
 /// One constraint a table node holds: an option written on a column, or an
@@ -193,7 +193,7 @@ impl<'node> Slot<'node> {
 /// puts in the check's name.
 fn only_column(expr: &Expr) -> Option<String> {
     let mut found: Vec<String> = Vec::new();
-    let _: ControlFlow<()> = visit_expressions(expr, |expr| {
+    let _: ControlFlow<()> = walk_expressions(expr, |expr| {
         let column = match expr {
             Expr::Identifier(ident) => Some(ident),
             Expr::CompoundIdentifier(parts) => parts.last(),

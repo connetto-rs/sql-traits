@@ -37,6 +37,7 @@ use crate::{
             resolve_bound_relation_object_name, resolve_relation_object_name,
             resolve_relation_object_name_on_path, search_path_change,
         },
+        walk::walk,
         with_scopes::WithScopes,
     },
 };
@@ -231,7 +232,7 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
     /// multi-table `DELETE` targets `listed`, which the visitor does not
     /// reach.
     fn collect<N: Visit>(&mut self, node: &N, listed: &[ObjectName]) -> Result<(), LookupError> {
-        if let ControlFlow::Break(error) = node.visit(self) {
+        if let ControlFlow::Break(error) = walk(node, self) {
             return Err(error);
         }
         for object_name in listed {
@@ -250,7 +251,7 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
         }
         self.expanded.push(view);
         let was_bound = core::mem::replace(&mut self.bound, true);
-        let outcome = view.definition().visit(self);
+        let outcome = walk(view.definition(), self);
         self.bound = was_bound;
         outcome.break_value().map_or(Ok(()), Err)
     }
@@ -526,7 +527,7 @@ pub(crate) fn sets_search_path_at_run_time(statement: &Statement) -> bool {
             ControlFlow::Continue(())
         }
     }
-    statement.visit(&mut SetConfigCalls).is_break()
+    walk(statement, &mut SetConfigCalls).is_break()
 }
 
 impl<DB: DatabaseLike> DataStatementLike<DB> for Query {
