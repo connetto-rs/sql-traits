@@ -262,3 +262,45 @@ fn common_types_read_casts_and_type_facts() {
     assert_eq!(db.common_type_name(&[Some("t"), Some("c")]), None);
     assert_eq!(db.common_type_name(&[Some("c"), Some("t")]), None);
 }
+
+/// A configured cast decides selection as a built-in one does, both by
+/// adding a conversion and by replacing a built-in cast's context.
+#[test]
+fn configured_casts_change_which_function_a_call_runs() {
+    let schema = "CREATE SCHEMA app;
+         CREATE TYPE app.celsius AS ENUM ('c');
+         CREATE TYPE app.fahrenheit AS ENUM ('f');
+         CREATE FUNCTION app.to_f(app.celsius) RETURNS app.fahrenheit
+             LANGUAGE sql AS 'SELECT ''f''::app.fahrenheit';
+         CREATE FUNCTION warm(t app.fahrenheit) RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION wide(x BIGINT) RETURNS INT LANGUAGE sql AS 'SELECT 1';";
+    let app = |name| TargetName::new(name, false).with_schema("app", false);
+    let pg = |name| TargetName::new(name, false).with_schema("pg_catalog", false);
+    let parse_with = |catalog: PostgresCatalog| {
+        ParseOptions::default()
+            .with_postgres_catalog(catalog)
+            .parse::<PostgreSqlDialect>(schema)
+            .expect("schema parses")
+    };
+    let celsius = [Some("app.celsius")];
+    let int = [Some("INT")];
+
+    let built_in = parse_with(PostgresCatalog::default());
+    assert_eq!(chosen(&built_in, "warm(t)", &celsius), None);
+    assert_eq!(chosen(&built_in, "wide(x)", &int).as_deref(), Some("BIGINT"));
+
+    let converting =
+        parse_with(PostgresCatalog::default().with_cast(PostgresCatalogCast::through_function(
+            app("celsius"),
+            app("fahrenheit"),
+            CastContext::Implicit,
+            app("to_f"),
+            [app("celsius")],
+        )));
+    assert_eq!(chosen(&converting, "warm(t)", &celsius).as_deref(), Some("app.fahrenheit"));
+
+    let explicit_only = parse_with(PostgresCatalog::default().with_cast(
+        PostgresCatalogCast::binary_coercible(pg("int4"), pg("int8"), CastContext::Explicit),
+    ));
+    assert_eq!(chosen(&explicit_only, "wide(x)", &int), None);
+}
