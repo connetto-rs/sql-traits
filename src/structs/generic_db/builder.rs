@@ -339,11 +339,6 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.search_path.iter().map(|(name, quoted)| (name.as_str(), *quoted))
     }
 
-    /// Replaces the schemas an unqualified name resolves against.
-    pub(crate) fn set_search_path(&mut self, search_path: Vec<(String, bool)>) {
-        self.search_path = search_path;
-    }
-
     /// Returns the SQL dialect recorded for this builder.
     pub(crate) fn dialect(&self) -> &P::Dialect {
         &self.dialect
@@ -600,6 +595,23 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     #[inline]
     pub fn with_identifier_case(mut self, case: IdentifierCase) -> Self {
         self.identifier_case = case;
+        self
+    }
+
+    /// Sets the schemas an unqualified name resolves against, in order, each
+    /// with whether it was quoted, replacing the path wholesale as `SET
+    /// search_path` does.
+    ///
+    /// A profile loading a live session passes that session's path, so the
+    /// database resolves a bare name where the session would. Each schema is
+    /// spelled as stored and marked quoted, which keeps it from folding.
+    #[must_use]
+    #[inline]
+    pub fn with_search_path(
+        mut self,
+        search_path: impl IntoIterator<Item = (String, bool)>,
+    ) -> Self {
+        self.search_path = search_path.into_iter().collect();
         self
     }
 

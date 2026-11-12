@@ -11040,14 +11040,14 @@ impl ParserDB {
                         builder.dialect().hex_strings_may_be_integers();
                     match search_path_change(&statement, hex_strings_may_be_integers)? {
                         Some(SearchPathChange::Set(path)) => {
-                            builder.set_search_path(
+                            builder = builder.with_search_path(
                                 path.into_iter()
-                                    .map(|(schema, quoted)| (schema.into_owned(), quoted))
-                                    .collect(),
+                                    .map(|(schema, quoted)| (schema.into_owned(), quoted)),
                             );
                         }
                         Some(SearchPathChange::Reset) => {
-                            builder.set_search_path(ParserDBBuilder::default_search_path());
+                            builder =
+                                builder.with_search_path(ParserDBBuilder::default_search_path());
                         }
                         None => {}
                     }
