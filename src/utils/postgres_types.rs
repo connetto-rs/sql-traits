@@ -202,6 +202,10 @@ impl PgType {
     pub(crate) const UNKNOWN: Self = Self::Catalog("unknown");
     /// `text`, what PostgreSQL makes of arguments that are all unknown.
     pub(crate) const TEXT: Self = Self::Catalog("text");
+    /// `record`, the row type of no table in particular.
+    pub(crate) const RECORD: Self = Self::Catalog("record");
+    /// `record[]`, which `pg_type` holds as the pseudo-type `_record`.
+    pub(crate) const RECORD_ARRAY: Self = Self::Catalog("_record");
 
     /// The type `name` denotes, or [`None`] for a name that does not parse as
     /// a type.
@@ -329,6 +333,7 @@ impl PgType {
     pub(crate) fn array(self) -> Self {
         match self {
             Self::Array(_) => self,
+            element if element == Self::RECORD => Self::RECORD_ARRAY,
             element => Self::Array(Box::new(element)),
         }
     }
@@ -337,6 +342,7 @@ impl PgType {
     pub(crate) fn element(&self) -> Option<&Self> {
         match self {
             Self::Array(element) => Some(element),
+            _ if *self == Self::RECORD_ARRAY => Some(&RECORD),
             Self::Catalog(_) | Self::Named(_) | Self::Other(_) => None,
         }
     }
@@ -400,6 +406,9 @@ impl PgType {
         }
     }
 }
+
+/// The element of `record[]`.
+static RECORD: PgType = PgType::RECORD;
 
 /// The catalog row named `name`.
 fn catalog_row(name: &str) -> Option<&'static TypeRow> {
@@ -544,5 +553,13 @@ mod tests {
             assert_eq!(PgType::parse(&pg_type.spelling()).as_ref(), Some(&pg_type), "{spelling}");
         }
         assert_eq!(PgType::parse("\"char\"").expect("parses").spelling(), "pg_catalog.char");
+    }
+
+    /// `record[]` is the catalog's own `_record`, whose element is `record`.
+    #[test]
+    fn record_arrays_are_the_catalog_record_array() {
+        let record_array = PgType::parse("record[]").expect("parses");
+        assert_eq!(Some(&record_array), PgType::parse("_record").as_ref());
+        assert_eq!(record_array.element(), PgType::parse("record").as_ref());
     }
 }

@@ -10,8 +10,8 @@
 use alloc::{borrow::Cow, vec::Vec};
 
 use crate::{
-    structs::{IdentifierCase, TargetName, TypeCategory, TypeFacts},
-    traits::{CastContext, CastLike, DatabaseLike, Relation, TableLike},
+    structs::{CoercionStep, IdentifierCase, TargetName, TypeCategory, TypeFacts},
+    traits::{CastContext, CastLike, CastMethod, DatabaseLike, Relation, TableLike},
     utils::{
         object_name::{PG_CATALOG, type_search_path},
         postgres_types::PgType,
@@ -168,58 +168,245 @@ pub(crate) fn base<'p, D: DatabaseLike>(
     }
 }
 
+/// Where the coercion search records the steps it finds.
+///
+/// A proof needs no steps, so `()` records none and spares the lookups that
+/// only name them, while a plan collects them in execution order.
+pub(crate) trait Steps<'db, D: DatabaseLike + 'db> {
+    /// Whether the sink keeps steps, so the search names them.
+    const PLANS: bool;
+
+    /// The position the next step takes.
+    fn mark(&self) -> usize;
+
+    /// Forgets the steps recorded since `mark`.
+    fn reset(&mut self, mark: usize);
+
+    /// Records the step `step` builds.
+    fn push(&mut self, step: impl FnOnce() -> CoercionStep<'db, D>);
+
+    /// Records the step `step` names, [`Proof::Unknown`] when it cannot be
+    /// named. A sink keeping no steps never names one.
+    fn note(&mut self, step: impl FnOnce() -> Option<CoercionStep<'db, D>>) -> Proof;
+
+    /// Runs `search` for an array's elements, recording its steps as one
+    /// element-wise step, which the caller discards with [`Self::reset`]
+    /// when the search fails.
+    fn elements(&mut self, search: impl FnOnce(&mut Self) -> Proof) -> Proof;
+}
+
+impl<'db, D: DatabaseLike + 'db> Steps<'db, D> for () {
+    const PLANS: bool = false;
+
+    fn mark(&self) -> usize {
+        0
+    }
+
+    fn reset(&mut self, _mark: usize) {}
+
+    fn push(&mut self, _step: impl FnOnce() -> CoercionStep<'db, D>) {}
+
+    fn note(&mut self, _step: impl FnOnce() -> Option<CoercionStep<'db, D>>) -> Proof {
+        Proof::Yes
+    }
+
+    fn elements(&mut self, search: impl FnOnce(&mut Self) -> Proof) -> Proof {
+        search(self)
+    }
+}
+
+impl<'db, D: DatabaseLike + 'db> Steps<'db, D> for Vec<CoercionStep<'db, D>> {
+    const PLANS: bool = true;
+
+    fn mark(&self) -> usize {
+        self.len()
+    }
+
+    fn reset(&mut self, mark: usize) {
+        self.truncate(mark);
+    }
+
+    fn push(&mut self, step: impl FnOnce() -> CoercionStep<'db, D>) {
+        Vec::push(self, step());
+    }
+
+    fn note(&mut self, step: impl FnOnce() -> Option<CoercionStep<'db, D>>) -> Proof {
+        step().map_or(Proof::Unknown, |step| {
+            Vec::push(self, step);
+            Proof::Yes
+        })
+    }
+
+    fn elements(&mut self, search: impl FnOnce(&mut Self) -> Proof) -> Proof {
+        let mut element = Vec::new();
+        let proof = search(&mut element);
+        Vec::push(self, CoercionStep::Array { element });
+        proof
+    }
+}
+
 /// Whether PostgreSQL converts a value of the canonical type `source` to the
 /// canonical type `target` without being asked, as `can_coerce_type` decides
 /// under `COERCION_IMPLICIT` for a declared target that is not polymorphic.
 pub(crate) fn can_coerce<D: DatabaseLike>(database: &D, source: &PgType, target: &PgType) -> Proof {
-    if source == target || source.is_unknown() || target.is_any() {
+    coerce(database, source, None, target, &mut ())
+}
+
+/// The steps PostgreSQL applies to convert a value of the canonical type
+/// `source`, carrying the modifier `typmod`, to the canonical type `target`,
+/// as `coerce_type` builds them, or [`None`] when the facts do not prove a
+/// conversion.
+pub(crate) fn conversion<'db, D: DatabaseLike>(
+    database: &'db D,
+    source: &PgType,
+    typmod: Option<i32>,
+    target: &PgType,
+) -> Option<Vec<CoercionStep<'db, D>>> {
+    let mut steps = Vec::new();
+    (coerce(database, source, typmod, target, &mut steps) == Proof::Yes).then_some(steps)
+}
+
+/// The search behind [`can_coerce`] and [`conversion`], recording the steps
+/// it finds in `steps`.
+fn coerce<'db, D: DatabaseLike, S: Steps<'db, D>>(
+    database: &'db D,
+    source: &PgType,
+    typmod: Option<i32>,
+    target: &PgType,
+    steps: &mut S,
+) -> Proof {
+    if source == target || target.is_any() {
         return Proof::Yes;
+    }
+    if source.is_unknown() {
+        return literal(database, target, steps);
     }
     if database.casts().is_none() {
         return Proof::Unknown;
     }
-    pathway(database, source, target)
-        .or_else(|| record(database, source, target))
-        .or_else(|| inherits(database, source, target))
+    let attempt = |steps: &mut S, search: &dyn Fn(&mut S) -> Proof| {
+        let mark = steps.mark();
+        let proof = search(steps);
+        if proof != Proof::Yes {
+            steps.reset(mark);
+        }
+        proof
+    };
+    attempt(steps, &|steps| pathway(database, source, typmod, target, steps))
+        .or_else(|| attempt(steps, &|steps| record(database, source, target, steps)))
+        .or_else(|| attempt(steps, &|steps| inherits(database, source, target, steps)))
+}
+
+/// The reading of an untyped literal as `target`, by the input function of
+/// its base type without a modifier and then the domain's steps.
+fn literal<'db, D: DatabaseLike, S: Steps<'db, D>>(
+    database: &'db D,
+    target: &PgType,
+    steps: &mut S,
+) -> Proof {
+    if !S::PLANS {
+        return Proof::Yes;
+    }
+    let Ok(base) = base(database, target) else { return Proof::Unknown };
+    let input =
+        steps.note(|| Some(CoercionStep::LiteralInput { type_name: type_name(database, &base)? }));
+    match (input, base) {
+        (Proof::Yes, Cow::Owned(base)) => domain(database, target, &base, None, steps),
+        (input, _) => input,
+    }
 }
 
 /// Whether `find_coercion_pathway` finds an implicit conversion between two
-/// canonical types.
-fn pathway<D: DatabaseLike>(database: &D, source: &PgType, target: &PgType) -> Proof {
-    let (Ok(source), Ok(target)) = (base(database, source), base(database, target)) else {
+/// canonical types, recording the steps `coerce_type` takes along it.
+fn pathway<'db, D: DatabaseLike, S: Steps<'db, D>>(
+    database: &'db D,
+    source: &PgType,
+    typmod: Option<i32>,
+    target: &PgType,
+    steps: &mut S,
+) -> Proof {
+    let (Ok(source_base), Ok(target_base)) = (base(database, source), base(database, target))
+    else {
         return Proof::Unknown;
     };
-    if source == target {
-        return Proof::Yes;
+    let mut typmod = typmod;
+    let source_domain = match &source_base {
+        Cow::Owned(_) => facts(database, source).and_then(TypeFacts::into_domain),
+        Cow::Borrowed(_) => None,
+    };
+    if let Some(domain) = source_domain {
+        typmod = domain.base_typmod();
+        steps.push(|| CoercionStep::DomainToBase { base: domain.into_base() });
     }
-    match cast_context(database, &source, &target) {
-        Some(context) => Proof::of(context == CastContext::Implicit),
-        // Arrays convert element by element without a cast of their own.
-        None => {
-            match (&*source, &*target) {
-                (PgType::Array(source), PgType::Array(target)) => pathway(database, source, target),
-                _ => Proof::No,
+    let converted = if source_base == target_base {
+        Proof::Yes
+    } else {
+        // A converted value carries no modifier, and an array's modifier is
+        // its elements'.
+        let element_typmod = typmod.take();
+        match cast(database, &source_base, &target_base) {
+            Some(cast) if cast.context() == CastContext::Implicit => {
+                steps.note(|| {
+                    Some(match cast.method() {
+                        CastMethod::Binary => CoercionStep::Relabel(cast),
+                        CastMethod::Function => CoercionStep::Function(cast),
+                        CastMethod::InOut => CoercionStep::InOut(cast),
+                    })
+                })
+            }
+            Some(_) => Proof::No,
+            // Arrays convert element by element without a cast of their own.
+            None => {
+                match (&*source_base, &*target_base) {
+                    (PgType::Array(source), PgType::Array(target)) => {
+                        steps.elements(|steps| {
+                            pathway(database, source, element_typmod, target, steps)
+                        })
+                    }
+                    _ => Proof::No,
+                }
             }
         }
+    };
+    match (converted, target_base) {
+        (Proof::Yes, Cow::Owned(base)) => domain(database, target, &base, typmod, steps),
+        (converted, _) => converted,
     }
 }
 
-/// The context of the cast the database holds from `source` to `target`, of
-/// a database known to answer casts.
-fn cast_context<D: DatabaseLike>(
-    database: &D,
+/// The steps `coerce_to_domain` adds for the domain `target` over `base`, to
+/// a value carrying the modifier `typmod`, the length coercion the domain's
+/// modifier needs and the domain's check.
+fn domain<'db, D: DatabaseLike, S: Steps<'db, D>>(
+    database: &'db D,
+    target: &PgType,
+    base: &PgType,
+    typmod: Option<i32>,
+    steps: &mut S,
+) -> Proof {
+    if !S::PLANS {
+        return Proof::Yes;
+    }
+    let applied = facts(database, target).and_then(|facts| facts.domain()?.base_typmod());
+    if let Some(applied) = applied.filter(|applied| typmod != Some(*applied))
+        && let Some(cast) = cast(database, base, base)
+    {
+        steps.push(|| CoercionStep::LengthCoercion { cast, typmod: applied });
+    }
+    steps.note(|| Some(CoercionStep::DomainCheck { domain: type_name(database, target)? }))
+}
+
+/// The cast the database holds from `source` to `target`, of a database
+/// known to answer casts.
+fn cast<'db, D: DatabaseLike>(
+    database: &'db D,
     source: &PgType,
     target: &PgType,
-) -> Option<CastContext> {
+) -> Option<&'db D::Cast> {
     let of = |name: TargetName<'_>| canonical_owned(database, PgType::from_target(&name));
-    database
-        .casts()
-        .into_iter()
-        .flatten()
-        .find(|cast| {
-            of(cast.source_type(database)) == *source && of(cast.target_type(database)) == *target
-        })
-        .map(CastLike::context)
+    database.casts().into_iter().flatten().find(|cast| {
+        of(cast.source_type(database)) == *source && of(cast.target_type(database)) == *target
+    })
 }
 
 /// Whether the facts prove `pg_type` a composite type, `ISCOMPLEX`.
@@ -234,25 +421,35 @@ fn is_complex<D: DatabaseLike>(database: &D, pg_type: &PgType) -> Proof {
 
 /// Whether `record` and a composite type meet, which `can_coerce_type`
 /// accepts in either direction, and a composite type meets `record[]`.
-fn record<D: DatabaseLike>(database: &D, source: &PgType, target: &PgType) -> Proof {
-    let record = PgType::Catalog("record");
-    if *source == record {
-        return is_complex(database, target);
-    }
-    if *target == record {
-        return is_complex(database, source);
-    }
-    match (source, target) {
-        (PgType::Array(element), PgType::Array(target)) if **target == record => {
-            is_complex(database, element)
+fn record<'db, D: DatabaseLike, S: Steps<'db, D>>(
+    database: &'db D,
+    source: &PgType,
+    target: &PgType,
+    steps: &mut S,
+) -> Proof {
+    let (proof, step) = if *source == PgType::RECORD {
+        (is_complex(database, target), CoercionStep::RecordToComposite)
+    } else if *target == PgType::RECORD {
+        (is_complex(database, source), CoercionStep::CompositeToRecord)
+    } else {
+        match source {
+            PgType::Array(element) if *target == PgType::RECORD_ARRAY => {
+                (is_complex(database, element), CoercionStep::CompositeToRecord)
+            }
+            _ => return Proof::No,
         }
-        _ => Proof::No,
-    }
+    };
+    if proof == Proof::Yes { steps.note(|| Some(step)) } else { proof }
 }
 
 /// Whether the row type of a table converts to the row type of a table it
 /// inherits from, or to the composite type it was created `OF`.
-fn inherits<D: DatabaseLike>(database: &D, source: &PgType, target: &PgType) -> Proof {
+fn inherits<'db, D: DatabaseLike, S: Steps<'db, D>>(
+    database: &'db D,
+    source: &PgType,
+    target: &PgType,
+    steps: &mut S,
+) -> Proof {
     let (PgType::Named(source_name), PgType::Named(target_name)) = (source, target) else {
         return Proof::No;
     };
@@ -275,7 +472,10 @@ fn inherits<D: DatabaseLike>(database: &D, source: &PgType, target: &PgType) -> 
             _ => Ok(Proof::No),
         }
     });
-    proof.unwrap_or(Proof::Unknown)
+    match proof.unwrap_or(Proof::Unknown) {
+        Proof::Yes => steps.note(|| Some(CoercionStep::Inherited)),
+        proof => proof,
+    }
 }
 
 /// Whether `table` is `ancestor` or descends from it by inheritance or

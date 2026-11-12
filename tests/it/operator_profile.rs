@@ -1015,7 +1015,7 @@ fn operators_of_unknown_operand_types_leave_an_invocation_open() {
     let catalog: Arc<[CatalogOperator]> =
         Arc::from([CatalogOperator { schema: "pg_catalog", name: "+" }]);
     let database = alternate_builder().into_database(Some(catalog));
-    let int4 = || OperandType::Known(TargetName::new("int4", false));
+    let int4 = || OperandType::Known { type_name: TargetName::new("int4", false), typmod: None };
     assert!(matches!(
         database.resolve_operator(
             TargetName::new("+", false),

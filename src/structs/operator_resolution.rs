@@ -2,15 +2,20 @@
 //! each operand takes.
 
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 
 use crate::{structs::TargetName, traits::DatabaseLike};
 
 /// The type of one operand of an operator invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OperandType<'a> {
-    /// A value of the named type.
-    Known(TargetName<'a>),
+    /// A value of the named type, carrying the type modifier `typmod`, as
+    /// `pg_attribute.atttypmod` stores it, or none.
+    Known {
+        /// The type of the value.
+        type_name: TargetName<'a>,
+        /// The type modifier the value carries, or `None` for none.
+        typmod: Option<i32>,
+    },
     /// An untyped literal such as `'admin'` or `NULL`, of type `unknown`.
     UntypedLiteral,
     /// A value whose type the caller does not know.
@@ -71,18 +76,24 @@ impl<'db, DB: DatabaseLike> SelectedOperator<'db, DB> {
     }
 }
 
-/// The type one operand takes in the selected operator.
+/// The type one operand takes in the selected operator and how PostgreSQL
+/// converts it there.
 #[derive(Debug, Clone)]
 pub struct OperandEvidence<'db, DB: DatabaseLike> {
     target: TargetName<'db>,
     polymorphic_binding: bool,
-    database: PhantomData<&'db DB>,
+    conversion: Vec<CoercionStep<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> OperandEvidence<'db, DB> {
-    /// Creates the evidence of an operand that takes `target`.
-    pub(crate) const fn new(target: TargetName<'db>, polymorphic_binding: bool) -> Self {
-        Self { target, polymorphic_binding, database: PhantomData }
+    /// Creates the evidence of an operand that takes `target` by
+    /// `conversion`.
+    pub(crate) const fn new(
+        target: TargetName<'db>,
+        polymorphic_binding: bool,
+        conversion: Vec<CoercionStep<'db, DB>>,
+    ) -> Self {
+        Self { target, polymorphic_binding, conversion }
     }
 
     /// Returns the type the operand takes, the operator's declared type or,
@@ -97,4 +108,59 @@ impl<'db, DB: DatabaseLike> OperandEvidence<'db, DB> {
     pub const fn is_polymorphic_binding(&self) -> bool {
         self.polymorphic_binding
     }
+
+    /// Returns the steps that carry the operand to the target type, in the
+    /// order PostgreSQL applies them, empty when the operand already has it.
+    #[must_use]
+    pub fn conversion(&self) -> &[CoercionStep<'db, DB>] {
+        &self.conversion
+    }
+}
+
+/// One step of the conversion PostgreSQL applies to an operand.
+#[derive(Debug, Clone)]
+pub enum CoercionStep<'db, DB: DatabaseLike> {
+    /// The input function of this type reads an untyped literal, the base
+    /// type's for a domain target.
+    LiteralInput {
+        /// The type whose input function reads the literal.
+        type_name: TargetName<'db>,
+    },
+    /// A domain value is read as its base type.
+    DomainToBase {
+        /// The base type of the domain.
+        base: TargetName<'db>,
+    },
+    /// A binary-coercible cast relabels the value.
+    Relabel(&'db DB::Cast),
+    /// A cast function converts the value.
+    Function(&'db DB::Cast),
+    /// The output function of the source type and the input function of the
+    /// target type convert the value.
+    InOut(&'db DB::Cast),
+    /// Each element of an array is converted by this plan.
+    Array {
+        /// The plan applied to each element.
+        element: Vec<CoercionStep<'db, DB>>,
+    },
+    /// A `record` value is read as the composite target type.
+    RecordToComposite,
+    /// A composite value, or an array of them, is read as `record`.
+    CompositeToRecord,
+    /// The row of a table is converted to the row of a table it inherits
+    /// from or is a partition of.
+    Inherited,
+    /// The length coercion of the base type applies the modifier a domain
+    /// declares for it.
+    LengthCoercion {
+        /// The cast of the base type to itself that applies the modifier.
+        cast: &'db DB::Cast,
+        /// The modifier, as `pg_type.typtypmod` stores it.
+        typmod: i32,
+    },
+    /// The value is checked against the constraints of the domain.
+    DomainCheck {
+        /// The domain the value converts to.
+        domain: TargetName<'db>,
+    },
 }

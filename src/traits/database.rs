@@ -1920,9 +1920,17 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// `pg_catalog` and the search path, keeping the earliest of operators
     /// with identical operand types.
     ///
+    /// Each operand of the selected operator carries the steps PostgreSQL
+    /// applies to it, as `coerce_type` builds them. A domain operand is read
+    /// as its base type, a cast relabels or converts it, an array converts
+    /// element by element, and a domain target ends with the length coercion
+    /// its modifier needs and its check. An operand's modifier, as
+    /// `pg_attribute.atttypmod` stores it, decides whether that length
+    /// coercion applies.
+    ///
     /// The answer is [`OperatorResolution::Undetermined`] when the database
     /// answers no operators, an operand type is unknown or the casts and type
-    /// facts it answers leave the choice open.
+    /// facts it answers leave the choice or a conversion open.
     ///
     /// # Example
     ///
@@ -1932,7 +1940,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
-    /// let pg = |name| OperandType::Known(TargetName::new(name, false));
+    /// let pg = |name| OperandType::Known { type_name: TargetName::new(name, false), typmod: None };
     /// let case = IdentifierCase::AsWritten;
     ///
     /// // `int4 > numeric` converts the left operand to `numeric`.
@@ -1944,6 +1952,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// };
     /// assert_eq!(selected.left().map(|left| left.target().name()), Some("numeric"));
     /// assert_eq!(selected.right().target().name(), "numeric");
+    /// // A cast function carries the `int4` operand there, and the other
+    /// // operand needs nothing.
+    /// let conversion = selected.left().map(OperandEvidence::conversion);
+    /// assert!(matches!(conversion, Some([CoercionStep::Function(cast)])
+    ///     if cast.source_type(&db).name() == "int4"));
+    /// assert!(selected.right().conversion().is_empty());
     ///
     /// // An untyped literal takes the other operand's type.
     /// let equals = TargetName::new("=", false);
