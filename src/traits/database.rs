@@ -14,10 +14,10 @@ use crate::{
     errors::{Error, LookupError},
     structs::{IdentifierCase, RoleSetting, TargetName},
     traits::{
-        CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, DomainLike,
-        ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, OperatorLike, PolicyLike, RoleLike,
-        RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike, TableLike,
-        TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
+        CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
+        DomainLike, ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, OperatorLike,
+        PolicyLike, RoleLike, RoleMembershipLike, RuleLike, SchemaLike, SequenceLike,
+        TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
     },
     utils::{
         call_sites::expression_form,
@@ -57,6 +57,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type Function: FunctionLike<DB = Self>;
     /// Type of the operators in the catalog.
     type Operator: OperatorLike<DB = Self>;
+    /// Type of the casts in the catalog.
+    type Cast: CastLike<DB = Self>;
     /// Type of the triggers in the schema.
     type Trigger: TriggerLike<DB = Self>;
     /// Type of the rewrite rules in the schema.
@@ -104,6 +106,11 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// catalog is unavailable.
     fn operators(&self) -> Option<impl Iterator<Item = &Self::Operator>> {
         None::<core::iter::Empty<&Self::Operator>>
+    }
+
+    /// Returns all modeled casts, or `None` when the catalog is unavailable.
+    fn casts(&self) -> Option<impl Iterator<Item = &Self::Cast>> {
+        None::<core::iter::Empty<&Self::Cast>>
     }
 
     /// Returns the name of the database.

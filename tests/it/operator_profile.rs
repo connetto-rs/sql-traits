@@ -903,6 +903,7 @@ impl SchemaProfile for AlternateProfile {
     type ForeignKey = NoneKind;
     type Function = NoneKind;
     type Operator = CatalogOperator;
+    type Cast = Absent<AlternateDB>;
     type CheckConstraint = NoneKind;
     type Trigger = NoneKind;
     type Rule = Absent<AlternateDB>;
@@ -943,18 +944,21 @@ impl SchemaProfile for AlternateProfile {
     }
 }
 
-/// The inherited operator catalog remains unavailable under PostgreSQL syntax.
+/// The inherited operator and cast catalogs remain unavailable under
+/// PostgreSQL syntax.
 #[test]
-fn unavailable_operators_stay_distinct_from_an_empty_catalog() -> Result<(), Error> {
+fn unavailable_catalogs_stay_distinct_from_empty_ones() -> Result<(), Error> {
     let catalog_name = String::from("profile");
     let database: GenericDB<AlternateProfile> =
         GenericDBBuilder::<AlternateProfile>::new(catalog_name, AlternateDialect).into();
     assert!(database.operators().is_none());
+    assert!(database.casts().is_none());
 
     let empty = ParseOptions::default()
         .with_postgres_catalog(PostgresCatalog::empty())
         .parse::<PostgreSqlDialect>("")?;
     assert!(empty.operators().is_some_and(|mut operators| operators.next().is_none()));
+    assert!(empty.casts().is_some_and(|mut casts| casts.next().is_none()));
     Ok(())
 }
 

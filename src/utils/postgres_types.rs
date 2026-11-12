@@ -1,13 +1,14 @@
 //! PostgreSQL's type categories, preferred types and implicit casts, and the
 //! common-type rule built on them.
 //!
-//! The tables mirror `pg_type` and `pg_cast` of PostgreSQL 18. A type name is
+//! The type table mirrors `pg_type` of PostgreSQL 18, and implicit casts are
+//! read from the built-in `pg_cast` rows of the parser catalog. A type name is
 //! read with sqlparser's PostgreSQL dialect, so every spelling the server
 //! accepts for a builtin type (`INT`, `int4`, `integer`, `INT ARRAY`) denotes
-//! the same entry. A name the tables do not hold, an extension's or a schema's
-//! own type, is a type of its own in the user-defined category, equal only to
-//! itself and reached by no implicit cast. These tables do not follow a
-//! domain to its base type, so a domain is such a type of its own.
+//! the same entry. A name the table does not hold, an extension's or a
+//! schema's own type, is a type of its own in the user-defined category, equal
+//! only to itself and reached by no implicit cast. A domain is not followed to
+//! its base type, so it is such a type of its own.
 
 use alloc::{
     borrow::Cow,
@@ -22,7 +23,9 @@ use sqlparser::{
     parser::Parser,
 };
 
-use crate::utils::identifier_resolution::stored_identifier;
+use crate::{
+    structs::generic_db::built_in_implicit_cast, utils::identifier_resolution::stored_identifier,
+};
 
 /// One `pg_type` row, with the type's name, `typcategory` and `typispreferred`.
 struct TypeRow(&'static str, u8, bool);
@@ -161,118 +164,6 @@ static WITHOUT_SEND: &[&str] = &[
     "table_am_handler",
     "trigger",
     "tsm_handler",
-];
-
-/// The casts PostgreSQL 18's `pg_cast` marks implicit, as source and target,
-/// sorted. A type's cast to itself, which only applies a length, is left out.
-static IMPLICIT_CASTS: &[(&str, &str)] = &[
-    ("bit", "varbit"),
-    ("bpchar", "name"),
-    ("bpchar", "text"),
-    ("bpchar", "varchar"),
-    ("char", "text"),
-    ("cidr", "inet"),
-    ("date", "timestamp"),
-    ("date", "timestamptz"),
-    ("float4", "float8"),
-    ("int2", "float4"),
-    ("int2", "float8"),
-    ("int2", "int4"),
-    ("int2", "int8"),
-    ("int2", "numeric"),
-    ("int2", "oid"),
-    ("int2", "regclass"),
-    ("int2", "regcollation"),
-    ("int2", "regconfig"),
-    ("int2", "regdictionary"),
-    ("int2", "regnamespace"),
-    ("int2", "regoper"),
-    ("int2", "regoperator"),
-    ("int2", "regproc"),
-    ("int2", "regprocedure"),
-    ("int2", "regrole"),
-    ("int2", "regtype"),
-    ("int4", "float4"),
-    ("int4", "float8"),
-    ("int4", "int8"),
-    ("int4", "numeric"),
-    ("int4", "oid"),
-    ("int4", "regclass"),
-    ("int4", "regcollation"),
-    ("int4", "regconfig"),
-    ("int4", "regdictionary"),
-    ("int4", "regnamespace"),
-    ("int4", "regoper"),
-    ("int4", "regoperator"),
-    ("int4", "regproc"),
-    ("int4", "regprocedure"),
-    ("int4", "regrole"),
-    ("int4", "regtype"),
-    ("int8", "float4"),
-    ("int8", "float8"),
-    ("int8", "numeric"),
-    ("int8", "oid"),
-    ("int8", "regclass"),
-    ("int8", "regcollation"),
-    ("int8", "regconfig"),
-    ("int8", "regdictionary"),
-    ("int8", "regnamespace"),
-    ("int8", "regoper"),
-    ("int8", "regoperator"),
-    ("int8", "regproc"),
-    ("int8", "regprocedure"),
-    ("int8", "regrole"),
-    ("int8", "regtype"),
-    ("macaddr", "macaddr8"),
-    ("macaddr8", "macaddr"),
-    ("name", "text"),
-    ("numeric", "float4"),
-    ("numeric", "float8"),
-    ("oid", "regclass"),
-    ("oid", "regcollation"),
-    ("oid", "regconfig"),
-    ("oid", "regdictionary"),
-    ("oid", "regnamespace"),
-    ("oid", "regoper"),
-    ("oid", "regoperator"),
-    ("oid", "regproc"),
-    ("oid", "regprocedure"),
-    ("oid", "regrole"),
-    ("oid", "regtype"),
-    ("pg_dependencies", "bytea"),
-    ("pg_dependencies", "text"),
-    ("pg_mcv_list", "bytea"),
-    ("pg_mcv_list", "text"),
-    ("pg_ndistinct", "bytea"),
-    ("pg_ndistinct", "text"),
-    ("pg_node_tree", "text"),
-    ("regclass", "oid"),
-    ("regcollation", "oid"),
-    ("regconfig", "oid"),
-    ("regdictionary", "oid"),
-    ("regnamespace", "oid"),
-    ("regoper", "oid"),
-    ("regoper", "regoperator"),
-    ("regoperator", "oid"),
-    ("regoperator", "regoper"),
-    ("regproc", "oid"),
-    ("regproc", "regprocedure"),
-    ("regprocedure", "oid"),
-    ("regprocedure", "regproc"),
-    ("regrole", "oid"),
-    ("regtype", "oid"),
-    ("text", "bpchar"),
-    ("text", "name"),
-    ("text", "regclass"),
-    ("text", "varchar"),
-    ("time", "interval"),
-    ("time", "timetz"),
-    ("timestamp", "timestamptz"),
-    ("varbit", "bit"),
-    ("varchar", "bpchar"),
-    ("varchar", "name"),
-    ("varchar", "regclass"),
-    ("varchar", "text"),
 ];
 
 /// `typcategory` of an array type.
@@ -503,7 +394,7 @@ impl PgType {
         }
         match (self, target) {
             (Self::Catalog(source), Self::Catalog(target)) => {
-                IMPLICIT_CASTS.binary_search(&(*source, *target)).is_ok()
+                built_in_implicit_cast(source, target)
             }
             (Self::Array(source), Self::Array(target)) => source.coerces_implicitly_to(target),
             _ => false,

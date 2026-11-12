@@ -1,12 +1,16 @@
-use alloc::{borrow::Cow, string::String};
+use alloc::{borrow::Cow, string::String, sync::Arc};
 
-use sqlparser::ast::{ObjectName, OperateFunctionArg};
+use sqlparser::ast::{CreateFunction, ObjectName, OperateFunctionArg};
 
 use super::{
-    postgres_18_collations::POSTGRES_18_COLLATIONS, postgres_18_operators::POSTGRES_18_OPERATORS,
-    postgres_operator::PostgresCatalogOperator, type_arrays::TypeArrays,
+    postgres_18_collations::POSTGRES_18_COLLATIONS,
+    postgres_18_operators::POSTGRES_18_OPERATORS,
+    postgres_cast::{POSTGRES_18_CASTS, PostgresCatalogCast},
+    postgres_operator::PostgresCatalogOperator,
+    type_arrays::TypeArrays,
 };
 use crate::{
+    errors::ObjectKind,
     structs::{IdentifierCase, TargetName},
     utils::{
         identifier_resolution::identifiers_match,
@@ -39,6 +43,15 @@ pub struct PostgresCatalog {
     collations: Cow<'static, [PostgresCatalogCollation]>,
     collatable_types: Cow<'static, [PostgresCatalogType]>,
     operators: Cow<'static, [PostgresCatalogOperator]>,
+    casts: Cow<'static, [PostgresCatalogCast]>,
+}
+
+/// A catalog fact that keeps an object from dropping without `CASCADE`.
+pub(crate) struct CatalogDependent {
+    /// [`ObjectKind::Operator`] or [`ObjectKind::Cast`].
+    pub(crate) kind: ObjectKind,
+    /// The operator symbol or the `(source AS target)` cast spelling.
+    pub(crate) name: String,
 }
 
 /// A PostgreSQL collation identity and its deterministic flag.
@@ -165,6 +178,7 @@ impl PostgresCatalog {
             collations: Cow::Borrowed(&[]),
             collatable_types: Cow::Borrowed(&[]),
             operators: Cow::Borrowed(&[]),
+            casts: Cow::Borrowed(&[]),
         }
     }
 
@@ -175,6 +189,7 @@ impl PostgresCatalog {
             collations: Cow::Borrowed(POSTGRES_18_COLLATIONS),
             collatable_types: Cow::Borrowed(POSTGRES_18_COLLATABLE_TYPES),
             operators: Cow::Borrowed(POSTGRES_18_OPERATORS),
+            casts: Cow::Borrowed(POSTGRES_18_CASTS),
         }
     }
 
@@ -205,6 +220,15 @@ impl PostgresCatalog {
         self
     }
 
+    /// Adds or replaces the cast between the same source and target types.
+    #[must_use]
+    pub fn with_cast(mut self, cast: PostgresCatalogCast) -> Self {
+        let casts = self.casts.to_mut();
+        casts.retain(|held| !held.repeats(&cast));
+        casts.push(cast);
+        self
+    }
+
     /// Returns the collation facts in insertion order.
     // Clippy versions disagree on whether an opaque iterator return needs an
     // explicit `must_use`, so carry the attribute and silence the redundancy.
@@ -229,8 +253,18 @@ impl PostgresCatalog {
         self.operators.iter()
     }
 
-    /// Moves the facts the schema rename carries, collations and operators,
-    /// leaving every fact it does not touch in place.
+    /// Returns the cast facts in insertion order.
+    #[expect(
+        clippy::double_must_use,
+        reason = "some clippy versions read an opaque iterator return as already must_use"
+    )]
+    #[must_use]
+    pub fn casts(&self) -> impl Iterator<Item = &PostgresCatalogCast> {
+        self.casts.iter()
+    }
+
+    /// Moves the facts the schema rename carries, collations, operators and
+    /// casts, leaving every fact it does not touch in place.
     pub(crate) fn rename_schema(
         &mut self,
         from: &str,
@@ -256,6 +290,13 @@ impl PostgresCatalog {
                 operator.follow_schema_rename(from, from_quoted, to, to_quoted);
             }
         }
+        if self.casts.iter().any(|cast| cast.touches_schema(from, from_quoted)) {
+            for cast in
+                self.casts.to_mut().iter_mut().filter(|cast| cast.touches_schema(from, from_quoted))
+            {
+                cast.follow_schema_rename(from, from_quoted, to, to_quoted);
+            }
+        }
     }
 
     /// Whether an operator the catalog holds lives in `schema`, which a
@@ -264,37 +305,49 @@ impl PostgresCatalog {
         self.operators.iter().any(|operator| operator.lives_in_schema(schema, quoted))
     }
 
-    /// Drops the operators of `schema` and every operator a dropped object of
-    /// the schema still runs, which PostgreSQL drops with it.
+    /// Drops the operators of `schema` and every operator or cast a dropped
+    /// object of the schema still runs, which PostgreSQL drops with it.
     pub(crate) fn drop_schema(&mut self, schema: &str, quoted: bool) {
-        if self.operators.iter().all(|operator| !operator.touches_schema(schema, quoted)) {
-            return;
+        if self.operators.iter().any(|operator| operator.touches_schema(schema, quoted)) {
+            self.operators.to_mut().retain(|operator| !operator.touches_schema(schema, quoted));
         }
-        self.operators.to_mut().retain(|operator| !operator.touches_schema(schema, quoted));
+        if self.casts.iter().any(|cast| cast.touches_schema(schema, quoted)) {
+            self.casts.to_mut().retain(|cast| !cast.touches_schema(schema, quoted));
+        }
     }
 
-    /// The operator that names the type `name` writes, which a rename or a
-    /// drop without `CASCADE` of the type would leave behind.
-    pub(crate) fn operator_naming_type(
-        &self,
-        name: &ObjectName,
-    ) -> Option<&PostgresCatalogOperator> {
-        self.operators.iter().find(|operator| operator.uses_type(name))
+    /// The operator or cast that names the type `name` writes, which a drop
+    /// without `CASCADE` of the type would leave behind.
+    pub(crate) fn dependent_naming_type(&self, name: &ObjectName) -> Option<CatalogDependent> {
+        if let Some(operator) = self.operators.iter().find(|operator| operator.uses_type(name)) {
+            return Some(CatalogDependent {
+                kind: ObjectKind::Operator,
+                name: String::from(operator.name()),
+            });
+        }
+        self.casts
+            .iter()
+            .find(|cast| cast.uses_type(name))
+            .map(|cast| CatalogDependent { kind: ObjectKind::Cast, name: cast.described() })
     }
 
-    /// Drops the operators whose signature names a type of `names`, which
+    /// Drops the operators and casts naming a type of `names`, which
     /// PostgreSQL drops with the type under `CASCADE`.
-    pub(crate) fn drop_operators_naming_types(&mut self, names: &[ObjectName]) {
+    pub(crate) fn drop_facts_naming_types(&mut self, names: &[ObjectName]) {
         let naming =
             |operator: &PostgresCatalogOperator| names.iter().any(|name| operator.uses_type(name));
-        if !self.operators.iter().any(naming) {
-            return;
+        if self.operators.iter().any(naming) {
+            self.operators.to_mut().retain(|operator| !naming(operator));
         }
-        self.operators.to_mut().retain(|operator| !naming(operator));
+        let cast_naming =
+            |cast: &PostgresCatalogCast| names.iter().any(|name| cast.uses_type(name));
+        if self.casts.iter().any(cast_naming) {
+            self.casts.to_mut().retain(|cast| !cast_naming(cast));
+        }
     }
 
-    /// Tests whether an operator declares this exact function signature.
-    pub(super) fn operator_declares_function(
+    /// Tests whether an operator or a cast runs this exact function signature.
+    pub(super) fn fact_declares_function(
         &self,
         type_arrays: &TypeArrays,
         name: &ObjectName,
@@ -304,9 +357,11 @@ impl PostgresCatalog {
         self.operators
             .iter()
             .any(|operator| operator.declares_function(type_arrays, name, args, case))
+            || self.casts.iter().any(|cast| cast.declares_function(type_arrays, name, args, case))
     }
 
-    /// Repoints operators declaring the renamed function's exact signature.
+    /// Repoints operators and casts running the renamed function's exact
+    /// signature.
     pub(super) fn rename_function(
         &mut self,
         type_arrays: &TypeArrays,
@@ -318,53 +373,84 @@ impl PostgresCatalog {
         let moves = |operator: &PostgresCatalogOperator| {
             operator.declares_function(type_arrays, from, from_args, case)
         };
-        if !self.operators.iter().any(moves) {
-            return;
-        }
-        for operator in self.operators.to_mut() {
-            if moves(operator) {
+        if self.operators.iter().any(moves) {
+            for operator in self.operators.to_mut().iter_mut().filter(|operator| moves(operator)) {
                 operator.rename_implementation(to);
             }
         }
-    }
-
-    /// Repoints every operand or result naming the type `from` at `to`, the
-    /// identity the type is stored under afterwards.
-    pub(crate) fn rename_type_identity(&mut self, from: &ObjectName, to: &ObjectName) {
-        let renames = |operator: &PostgresCatalogOperator| operator.uses_type(from);
-        if !self.operators.iter().any(renames) {
-            return;
-        }
-        for operator in self.operators.to_mut() {
-            if renames(operator) {
-                operator.rename_type_use(from, to);
+        if self.casts.iter().any(|cast| cast.declares_function(type_arrays, from, from_args, case))
+        {
+            for cast in self.casts.to_mut() {
+                cast.follow_function_rename(type_arrays, from, from_args, to, case);
             }
         }
     }
 
-    /// Removes operators declaring the dropped function's exact signature.
-    pub(super) fn drop_operators_declaring_function(
+    /// Repoints every operator and cast identity naming the type `from` at
+    /// `to`, the identity the type is stored under afterwards.
+    pub(crate) fn rename_type_identity(&mut self, from: &ObjectName, to: &ObjectName) {
+        let renames = |operator: &PostgresCatalogOperator| operator.uses_type(from);
+        if self.operators.iter().any(renames) {
+            for operator in self.operators.to_mut().iter_mut().filter(|operator| renames(operator))
+            {
+                operator.rename_type_use(from, to);
+            }
+        }
+        if self.casts.iter().any(|cast| cast.holds_type(from)) {
+            for cast in self.casts.to_mut().iter_mut().filter(|cast| cast.holds_type(from)) {
+                cast.rename_type_use(from, to);
+            }
+        }
+    }
+
+    /// Removes operators and casts running the dropped function's exact
+    /// signature.
+    pub(super) fn drop_facts_declaring_function(
         &mut self,
         type_arrays: &TypeArrays,
         name: &ObjectName,
         args: Option<&[OperateFunctionArg]>,
         case: IdentifierCase,
     ) {
-        self.operators
-            .to_mut()
-            .retain(|operator| !operator.declares_function(type_arrays, name, args, case));
+        self.drop_facts_running(type_arrays, case, &core::iter::once((name, args)));
     }
 
-    /// Drops every operator `declares` answers for, when any does, leaving
-    /// the borrowed list alone when none does.
-    pub(crate) fn drop_operators_where(
+    /// Removes operators and casts running any of `functions`, leaving the
+    /// borrowed lists alone when none does.
+    pub(super) fn drop_facts_declaring_functions(
         &mut self,
-        declares: &impl Fn(&PostgresCatalogOperator) -> bool,
+        type_arrays: &TypeArrays,
+        functions: &[Arc<CreateFunction>],
+        case: IdentifierCase,
     ) {
-        if !self.operators.iter().any(declares) {
-            return;
+        let signatures =
+            functions.iter().map(|function| (&function.name, function.args.as_deref()));
+        self.drop_facts_running(type_arrays, case, &signatures);
+    }
+
+    /// Removes operators and casts running any of `signatures`.
+    fn drop_facts_running<'f>(
+        &mut self,
+        type_arrays: &TypeArrays,
+        case: IdentifierCase,
+        signatures: &(impl Iterator<Item = (&'f ObjectName, Option<&'f [OperateFunctionArg]>)> + Clone),
+    ) {
+        let operator_runs = |operator: &PostgresCatalogOperator| {
+            signatures
+                .clone()
+                .any(|(name, args)| operator.declares_function(type_arrays, name, args, case))
+        };
+        if self.operators.iter().any(operator_runs) {
+            self.operators.to_mut().retain(|operator| !operator_runs(operator));
         }
-        self.operators.to_mut().retain(|operator| !declares(operator));
+        let cast_runs = |cast: &PostgresCatalogCast| {
+            signatures
+                .clone()
+                .any(|(name, args)| cast.declares_function(type_arrays, name, args, case))
+        };
+        if self.casts.iter().any(cast_runs) {
+            self.casts.to_mut().retain(|cast| !cast_runs(cast));
+        }
     }
 }
 
