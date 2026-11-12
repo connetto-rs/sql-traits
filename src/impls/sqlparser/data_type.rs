@@ -132,12 +132,11 @@ impl DataTypeLike for DataType {
     }
 
     fn is_unsigned(&self, database: &Self::DB) -> Option<bool> {
-        let declared = self.base_type(database).unwrap_or(self);
         matches!(
-            declared.scalar_family(database),
+            self.scalar_family(database),
             Some(ScalarFamily::Int | ScalarFamily::Float | ScalarFamily::Decimal)
         )
-        .then(|| super::dialect::is_unsigned(*database.dialect(), declared))
+        .then(|| super::dialect::is_unsigned(*database.dialect(), self))
     }
 
     #[inline]

@@ -1225,13 +1225,16 @@ mod tests {
         }
 
         #[test]
-        fn a_domain_answers_as_its_base_type() {
+        fn a_domain_answers_none_and_its_base_type_answers_for_it() {
             let db = parse_with::<GenericDialect>(
                 "CREATE DOMAIN counter AS INT UNSIGNED; CREATE DOMAIN label AS TEXT; \
                  CREATE TABLE t (hits counter, name label);",
             );
-            assert_eq!(column_named(&db, "hits").data_type(&db).is_unsigned(&db), Some(true));
-            assert_eq!(column_named(&db, "name").data_type(&db).is_unsigned(&db), None);
+            let hits = column_named(&db, "hits").data_type(&db);
+            assert_eq!(hits.is_unsigned(&db), None);
+            assert_eq!(hits.base_type(&db).and_then(|base| base.is_unsigned(&db)), Some(true));
+            let name = column_named(&db, "name").data_type(&db);
+            assert_eq!(name.base_type(&db).and_then(|base| base.is_unsigned(&db)), None);
         }
     }
 
