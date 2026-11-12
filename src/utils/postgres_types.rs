@@ -424,6 +424,12 @@ fn catalog_row(name: &str) -> Option<&'static TypeRow> {
     TYPES.binary_search_by(|row| row.0.cmp(name)).ok().and_then(|index| TYPES.get(index))
 }
 
+/// The stored name, `typcategory` and `typispreferred` of the PostgreSQL 18
+/// type stored as `name` in `pg_catalog`.
+pub(crate) fn built_in_type(name: &str) -> Option<(&'static str, u8, bool)> {
+    catalog_row(name).map(|row| (row.0, row.1, row.2))
+}
+
 /// The integer type a `serial` spelling declares.
 fn serial_type(name: &str) -> Option<&'static str> {
     match name {

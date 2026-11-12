@@ -960,8 +960,8 @@ impl SchemaProfile for AlternateProfile {
     }
 }
 
-/// The inherited operator and cast catalogs remain unavailable under
-/// PostgreSQL syntax.
+/// The inherited operator and cast catalogs and type facts remain
+/// unavailable under PostgreSQL syntax.
 #[test]
 fn unavailable_catalogs_stay_distinct_from_empty_ones() -> Result<(), Error> {
     let catalog_name = String::from("profile");
@@ -969,6 +969,11 @@ fn unavailable_catalogs_stay_distinct_from_empty_ones() -> Result<(), Error> {
         GenericDBBuilder::<AlternateProfile>::new(catalog_name, AlternateDialect).into();
     assert!(database.operators().is_none());
     assert!(database.casts().is_none());
+    assert!(
+        database
+            .type_facts(TargetName::new("int4", false).with_schema("pg_catalog", false))
+            .is_none()
+    );
 
     let empty = ParseOptions::default()
         .with_postgres_catalog(PostgresCatalog::empty())

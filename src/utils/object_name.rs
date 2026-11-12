@@ -70,6 +70,26 @@ where
         .chain(search_path().filter(|&(schema, quoted)| !is_temporary_schema(schema, quoted)))
 }
 
+/// The schemas a type lookup walks for an unqualified name.
+///
+/// PostgreSQL searches the temporary schema and then `pg_catalog` before the
+/// path, each where the path puts it when the path names it.
+pub(crate) fn type_search_path<'path, I>(
+    search_path: impl Fn() -> I,
+) -> impl Iterator<Item = (&'path str, bool)>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
+    let temporary = search_path().any(|(schema, quoted)| is_temporary_schema(schema, quoted));
+    let catalog =
+        search_path().any(|(schema, quoted)| identifiers_match(schema, quoted, PG_CATALOG, false));
+    (!temporary)
+        .then_some((TEMPORARY_SCHEMA, false))
+        .into_iter()
+        .chain((!catalog).then_some((PG_CATALOG, false)))
+        .chain(search_path())
+}
+
 /// Whether a configuration parameter name is `search_path`, which PostgreSQL
 /// matches without regard to case or quoting.
 pub(crate) fn is_search_path_parameter(name: &ObjectName) -> bool {

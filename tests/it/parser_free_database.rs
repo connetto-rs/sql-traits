@@ -2784,4 +2784,5 @@ fn an_engine_without_operator_or_cast_catalogs_answers_none() {
     let database = MemoryCatalog::default();
     assert!(database.operators().is_none());
     assert!(database.casts().is_none());
+    assert!(database.type_facts(TargetName::new("int4", false)).is_none());
 }

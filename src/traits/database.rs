@@ -12,7 +12,7 @@ use sqlparser::ast::Function;
 
 use crate::{
     errors::{Error, LookupError},
-    structs::{IdentifierCase, RoleSetting, TargetName},
+    structs::{IdentifierCase, RoleSetting, TargetName, TypeFacts},
     traits::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
         DomainLike, ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, OperatorLike,
@@ -111,6 +111,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// Returns all modeled casts, or `None` when the catalog is unavailable.
     fn casts(&self) -> Option<impl Iterator<Item = &Self::Cast>> {
         None::<core::iter::Empty<&Self::Cast>>
+    }
+
+    /// Returns the conversion facts of the type `type_name` names, or `None`
+    /// when the database holds no facts for it.
+    fn type_facts(&self, _type_name: TargetName<'_>) -> Option<TypeFacts<'_>> {
+        None
     }
 
     /// Returns the name of the database.
