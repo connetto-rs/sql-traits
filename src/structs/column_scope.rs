@@ -111,10 +111,8 @@ impl<'scope> ColumnBinding<'scope> {
     /// };
     ///
     /// let db = ParserDB::parse::<GenericDialect>("CREATE TABLE docs(id INT, title TEXT);")?;
-    /// let sql = "SELECT d.title FROM docs AS d";
-    /// let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, sql)?.remove(0) else {
-    ///     unreachable!()
-    /// };
+    /// let parsed = Parser::parse_sql(&GenericDialect {}, "SELECT d.title FROM docs AS d")?;
+    /// let Statement::Query(query) = parsed.into_iter().next().unwrap() else { unreachable!() };
     /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
     /// let reference = Expr::CompoundIdentifier(vec![Ident::new("d"), Ident::new("title")]);
     /// let (_, binding) = scope.resolve_column_binding(&reference)?.expect("column resolves");
