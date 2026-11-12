@@ -9,7 +9,7 @@
 use alloc::sync::Arc;
 
 use crate::{
-    structs::GenericDB,
+    structs::{GenericDB, TargetName, TypeFacts},
     traits::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
         DomainLike, ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, Metadata, OperatorLike,
@@ -139,6 +139,15 @@ pub trait SchemaProfile: Sized {
         Self::Cast: 'a,
     {
         None::<core::iter::Empty<&'a Self::Cast>>
+    }
+
+    /// Returns the conversion facts of the type `type_name` names in
+    /// `database`, or `None` when the profile holds no facts for it.
+    fn type_facts<'a>(
+        _database: &'a GenericDB<Self>,
+        _type_name: TargetName<'_>,
+    ) -> Option<TypeFacts<'a>> {
+        None
     }
 
     /// Returns the schemas a database of this profile starts with under the

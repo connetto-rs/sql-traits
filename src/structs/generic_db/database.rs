@@ -9,7 +9,7 @@ use crate::{
     errors::LookupError,
     structs::{
         ColumnIdentity, GenericDB, IdentifierCase, RelationIdentity, RoleSetting, SchemaProfile,
-        TargetName,
+        TargetName, TypeFacts,
         generic_db::{Identified, RelationSlot},
     },
     traits::{DatabaseLike, FunctionLike, Relation, TableLike},
@@ -62,6 +62,10 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
 
     fn casts(&self) -> Option<impl Iterator<Item = &Self::Cast>> {
         P::casts(&self.dialect, &self.ingestion)
+    }
+
+    fn type_facts(&self, type_name: TargetName<'_>) -> Option<TypeFacts<'_>> {
+        P::type_facts(self, type_name)
     }
 
     #[inline]

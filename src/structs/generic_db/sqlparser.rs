@@ -116,6 +116,7 @@ mod table_as;
 mod table_owner;
 mod transactions;
 mod type_arrays;
+mod type_facts;
 mod user_defined_types;
 mod view_rewrites;
 mod views;
@@ -209,6 +210,13 @@ impl SchemaProfile for SqlparserProfile {
     {
         matches!(dialect, SqlparserDialect::PostgreSql)
             .then(|| ingestion.active_postgres_catalog.casts())
+    }
+
+    fn type_facts<'a>(
+        database: &'a ParserDB,
+        type_name: crate::structs::TargetName<'_>,
+    ) -> Option<crate::structs::TypeFacts<'a>> {
+        type_facts::type_facts(database, &type_name)
     }
 
     fn initial_schemas(dialect: &SqlparserDialect) -> impl IntoIterator<Item = (Arc<Schema>, ())> {
