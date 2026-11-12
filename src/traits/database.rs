@@ -22,6 +22,7 @@ use crate::{
     utils::{
         call_sites::expression_form,
         call_typing::{Selection, expression_result, reached_functions, resolve_call},
+        coercion::common_type_name,
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
             RelationKey, function_has_stored_identity, function_search_path,
@@ -1838,7 +1839,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<Cow<'db, str>>, LookupError> {
         if let Some(form) = expression_form(&call.name) {
-            return expression_result(form, call, argument_types);
+            return expression_result(self, form, call, argument_types);
         }
         Ok(match resolve_call(self, call, argument_types, case)? {
             Selection::Chosen((_, result)) => result,
@@ -1857,6 +1858,50 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
                     .and(first)
             }
         })
+    }
+
+    /// Returns the type PostgreSQL gives a set of values that must share
+    /// one, as in `COALESCE`, `CASE`, `ARRAY[...]`, `VALUES` and `UNION`, by
+    /// `select_common_type`.
+    ///
+    /// Each entry is a type name, `unknown` for an untyped literal such as
+    /// `NULL` or `'abc'`, or [`None`] for a value whose type the caller does
+    /// not know. The answer is the winning name as given, the base type of a
+    /// domain when values of several types meet one, and `TEXT` when every
+    /// value is an untyped literal. It is [`None`] when a value's type is not
+    /// known, when no common type exists and PostgreSQL refuses the
+    /// statement, and when the casts or type facts the database answers do
+    /// not settle the type.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE DOMAIN code AS VARCHAR(3);")?;
+    /// assert_eq!(db.common_type_name(&[Some("BYTEA"), Some("unknown")]).as_deref(), Some("BYTEA"));
+    /// assert_eq!(db.common_type_name(&[Some("INT"), Some("BIGINT")]).as_deref(), Some("BIGINT"));
+    /// // `double precision` is the preferred numeric type.
+    /// assert_eq!(db.common_type_name(&[Some("FLOAT8"), Some("NUMERIC")]).as_deref(), Some("FLOAT8"));
+    /// assert_eq!(db.common_type_name(&[Some("unknown"), Some("unknown")]).as_deref(), Some("TEXT"));
+    /// // A domain meeting another value takes part as its base type.
+    /// assert_eq!(db.common_type_name(&[Some("code"), Some("unknown")]).as_deref(), Some("varchar"));
+    /// assert_eq!(db.common_type_name(&[Some("code"), Some("code")]).as_deref(), Some("code"));
+    /// // Binary strings and text belong to different categories.
+    /// assert_eq!(db.common_type_name(&[Some("BYTEA"), Some("TEXT")]), None);
+    /// assert_eq!(db.common_type_name(&[Some("INT"), None]), None);
+    ///
+    /// // A database answering no casts proves no conversion.
+    /// let sqlite = ParserDB::parse::<SQLiteDialect>("")?;
+    /// assert_eq!(sqlite.common_type_name(&[Some("INT"), Some("unknown")]).as_deref(), Some("INT"));
+    /// assert_eq!(sqlite.common_type_name(&[Some("INT"), Some("BIGINT")]), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn common_type_name<'a>(&self, types: &[Option<&'a str>]) -> Option<Cow<'a, str>> {
+        common_type_name(self, types)
     }
 
     /// Iterates over the policies defined in the schema.

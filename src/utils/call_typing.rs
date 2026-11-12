@@ -11,17 +11,20 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::{IdentifierCase, TargetName},
+    structs::{IdentifierCase, TargetName, TypeCategory},
     traits::{DatabaseLike, FunctionLike},
     utils::{
         call_sites::{ExpressionForm, expression_form},
-        common_type_name,
+        coercion::{
+            CommonType, Proof, Undetermined, base, can_coerce, canonical_owned, common_type_name,
+            facts, select_common_type,
+        },
         identifier_resolution::identifiers_match,
         object_name::{
             function_search_path, overqualified_object_name, run_time_object_name,
             target_name_from_object_name,
         },
-        postgres_types::{CommonType, PgType, Polymorphic, parse_data_type, select_common_type},
+        postgres_types::{PgType, Polymorphic, parse_data_type},
     },
 };
 
@@ -109,7 +112,10 @@ pub(crate) fn declared_at_call<F: FunctionLike>(
         .zip(function.argument_names(database))
         .zip(&modes)
         .filter(|(_, mode)| **mode != ArgMode::Out)
-        .map(|((declared, name), _)| Input { name, declared: PgType::parse(&declared) })
+        .map(|((declared, name), _)| {
+            let declared = PgType::parse(&declared).map(|parsed| canonical_owned(database, parsed));
+            Input { name, declared }
+        })
         .collect();
     let input_modes: Vec<ArgMode> =
         modes.into_iter().filter(|mode| *mode != ArgMode::Out).collect();
@@ -177,12 +183,16 @@ pub(crate) struct Actual<'a> {
 
 /// Reads the argument types a caller gives, [`None`] where the caller does
 /// not know one or names no type.
-pub(crate) fn actuals<'a>(argument_types: &[Option<&'a str>]) -> Vec<Option<Actual<'a>>> {
+pub(crate) fn actuals<'a, D: DatabaseLike>(
+    database: &D,
+    argument_types: &[Option<&'a str>],
+) -> Vec<Option<Actual<'a>>> {
     argument_types
         .iter()
         .map(|name| {
             name.and_then(|spelling| {
-                PgType::parse(spelling).map(|pg_type| Actual { pg_type, spelling })
+                let pg_type = canonical_owned(database, PgType::parse(spelling)?);
+                Some(Actual { pg_type, spelling })
             })
         })
         .collect()
@@ -219,6 +229,9 @@ enum Spelling<'a> {
     Given(&'a str),
     /// The element type of the array the caller named.
     ElementOf(&'a str),
+    /// The type's own spelling, for the base type of a domain the caller
+    /// named.
+    Canonical,
     /// `text`, what unknown types alone resolve to.
     Text,
 }
@@ -228,21 +241,22 @@ impl<'a> Bound<'a> {
         Self { pg_type: actual.pg_type.clone(), spelling: Spelling::Given(actual.spelling) }
     }
 
-    /// The element of an array the caller named.
-    fn element_of(actual: &Actual<'a>) -> Option<Self> {
-        Some(Self {
-            pg_type: actual.pg_type.element()?.clone(),
-            spelling: Spelling::ElementOf(actual.spelling),
+    /// The type the caller named with domains reduced to their base types, as
+    /// the array families bind it.
+    fn flattened<D: DatabaseLike>(database: &D, actual: &Actual<'a>) -> Result<Self, Undetermined> {
+        Ok(match base(database, &actual.pg_type)? {
+            Cow::Borrowed(_) => Self::given(actual),
+            Cow::Owned(pg_type) => Self { pg_type, spelling: Spelling::Canonical },
         })
     }
 
     /// The element of the array type this binds.
     fn element(&self) -> Option<Self> {
-        let Spelling::Given(spelling) = self.spelling else { return None };
-        Some(Self {
-            pg_type: self.pg_type.element()?.clone(),
-            spelling: Spelling::ElementOf(spelling),
-        })
+        let spelling = match self.spelling {
+            Spelling::Given(spelling) => Spelling::ElementOf(spelling),
+            Spelling::ElementOf(_) | Spelling::Canonical | Spelling::Text => Spelling::Canonical,
+        };
+        Some(Self { pg_type: self.pg_type.element()?.clone(), spelling })
     }
 
     /// The name of the bound type.
@@ -261,9 +275,9 @@ impl<'a> Bound<'a> {
                     return Some(Cow::Owned(innermost_element(*element).to_string()));
                 }
                 // `_int4` names the array by the catalog's own spelling.
-                let PgType::Catalog(name) = self.pg_type else { return None };
-                Some(Cow::Borrowed(name))
+                Some(self.pg_type.spelling())
             }
+            Spelling::Canonical => Some(self.pg_type.spelling()),
             Spelling::Text => Some(Cow::Borrowed("TEXT")),
         }
     }
@@ -305,6 +319,9 @@ pub(crate) struct Binding<'a> {
     array: Option<Bound<'a>>,
     /// What `anycompatible` binds to.
     compatible: Family<Bound<'a>>,
+    /// Whether the database's facts leave open that the function takes the
+    /// argument types.
+    uncertain: bool,
 }
 
 /// What one family of polymorphic parameters binds to.
@@ -314,29 +331,34 @@ enum Family<T> {
     /// No argument of the family has a type, or every one is an untyped
     /// literal.
     Unbound,
-    /// An argument of the family has a type the caller does not know.
+    /// An argument of the family has a type the caller does not know, or the
+    /// database's facts do not settle the family's type.
     Undetermined,
 }
 
 /// Binds the polymorphic parameters as `enforce_generic_type_consistency` does,
-/// or [`None`] when the function cannot take the argument types.
-pub(crate) fn bind<'a>(
+/// or [`None`] when the database proves the function cannot take the argument
+/// types.
+pub(crate) fn bind<'a, D: DatabaseLike>(
+    database: &D,
     declared: Vec<Option<PgType>>,
     actuals: &[Option<Actual<'a>>],
 ) -> Option<Binding<'a>> {
-    let (element, array, compatible) = bind_families(&declared, actuals)?;
-    Some(Binding { declared, element, array, compatible })
+    let ((element, array, compatible), uncertain) = bind_families(database, &declared, actuals)?;
+    Some(Binding { declared, element, array, compatible, uncertain })
 }
 
 /// What `anyelement`, `anyarray` and `anycompatible` bind to, `anyarray` only
 /// when an argument decides it directly.
 type Families<'a> = (Family<Bound<'a>>, Option<Bound<'a>>, Family<Bound<'a>>);
 
-/// The work of [`bind`], over borrowed declared types.
-fn bind_families<'a>(
+/// The work of [`bind`], over borrowed declared types, with whether the
+/// database's facts leave the binding open.
+fn bind_families<'a, D: DatabaseLike>(
+    database: &D,
     declared: &[Option<PgType>],
     actuals: &[Option<Actual<'a>>],
-) -> Option<Families<'a>> {
+) -> Option<(Families<'a>, bool)> {
     let mut element: Option<Bound<'a>> = None;
     let mut array: Option<Bound<'a>> = None;
     let mut element_undetermined = false;
@@ -344,6 +366,7 @@ fn bind_families<'a>(
     let mut compatible: Vec<Bound<'a>> = Vec::new();
     let mut compatible_undetermined = false;
     let mut compatible_nonarray = false;
+    let mut uncertain = false;
 
     for (declared, actual) in declared.iter().zip(actuals) {
         // A declaration this model cannot read takes anything.
@@ -351,11 +374,12 @@ fn bind_families<'a>(
         let known = actual.as_ref().filter(|actual| !actual.pg_type.is_unknown());
         match declared.polymorphic() {
             None => {
-                if actual
-                    .as_ref()
-                    .is_some_and(|actual| !actual.pg_type.coerces_implicitly_to(declared))
-                {
-                    return None;
+                if let Some(actual) = actual {
+                    match can_coerce(database, &actual.pg_type, declared) {
+                        Proof::Yes => {}
+                        Proof::No => return None,
+                        Proof::Unknown => uncertain = true,
+                    }
                 }
             }
             Some(Polymorphic::Any | Polymorphic::Range) => {}
@@ -377,12 +401,17 @@ fn bind_families<'a>(
                     (None, _) => element_undetermined = true,
                     (Some(_), None) => {}
                     (Some(_), Some(actual)) => {
-                        if !actual.pg_type.is_array()
-                            || array.as_ref().is_some_and(|bound| bound.pg_type != actual.pg_type)
+                        let Ok(bound) = Bound::flattened(database, actual) else {
+                            element_undetermined = true;
+                            uncertain = true;
+                            continue;
+                        };
+                        if !bound.pg_type.is_array()
+                            || array.as_ref().is_some_and(|array| array.pg_type != bound.pg_type)
                         {
                             return None;
                         }
-                        array = Some(Bound::given(actual));
+                        array = Some(bound);
                     }
                 }
             }
@@ -398,25 +427,46 @@ fn bind_families<'a>(
                 match (actual, known) {
                     (None, _) => compatible_undetermined = true,
                     (Some(_), None) => {}
-                    (Some(_), Some(actual)) => compatible.push(Bound::element_of(actual)?),
+                    (Some(_), Some(actual)) => {
+                        let Ok(bound) = Bound::flattened(database, actual) else {
+                            compatible_undetermined = true;
+                            uncertain = true;
+                            continue;
+                        };
+                        compatible.push(bound.element()?);
+                    }
                 }
             }
         }
     }
 
-    let element = element_family(element, array.as_ref(), element_undetermined, nonarray)?;
-    let compatible = compatible_family(compatible, compatible_undetermined, compatible_nonarray)?;
-    Some((element, array, compatible))
+    let (element, element_uncertain) =
+        element_family(database, element, array.as_ref(), element_undetermined, nonarray)?;
+    let (compatible, compatible_uncertain) =
+        compatible_family(database, compatible, compatible_undetermined, compatible_nonarray)?;
+    Some(((element, array, compatible), uncertain || element_uncertain || compatible_uncertain))
+}
+
+/// How a `nonarray` form takes the bound type, [`None`] when the type is an
+/// array or a domain over one, which the form refuses, and otherwise whether
+/// the database's facts leave that open.
+fn takes_as_nonarray<D: DatabaseLike>(database: &D, bound: &Bound<'_>) -> Option<bool> {
+    match base(database, &bound.pg_type) {
+        Ok(base) => (!base.is_array()).then_some(false),
+        Err(Undetermined) => Some(true),
+    }
 }
 
 /// What `anyelement` binds to, the element of the `anyarray` argument when no
-/// `anyelement` argument decides it, or [`None`] when the two disagree.
-fn element_family<'a>(
+/// `anyelement` argument decides it, with whether the database's facts leave
+/// it open, or [`None`] when the two disagree.
+fn element_family<'a, D: DatabaseLike>(
+    database: &D,
     element: Option<Bound<'a>>,
     array: Option<&Bound<'a>>,
     undetermined: bool,
     nonarray: bool,
-) -> Option<Family<Bound<'a>>> {
+) -> Option<(Family<Bound<'a>>, bool)> {
     let from_array = match array {
         Some(array) => Some(array.element()?),
         None => None,
@@ -426,32 +476,41 @@ fn element_family<'a>(
         (Some(element), _) => Some(element),
         (None, from_array) => from_array,
     };
-    if nonarray && element.as_ref().is_some_and(|bound| bound.pg_type.is_array()) {
-        return None;
-    }
-    Some(match element {
-        _ if undetermined => Family::Undetermined,
-        Some(bound) => Family::Decided(bound),
-        None => Family::Unbound,
-    })
+    let uncertain = match &element {
+        Some(bound) if nonarray => takes_as_nonarray(database, bound)?,
+        _ => false,
+    };
+    Some((
+        match element {
+            _ if undetermined => Family::Undetermined,
+            Some(bound) => Family::Decided(bound),
+            None => Family::Unbound,
+        },
+        uncertain,
+    ))
 }
 
-/// What `anycompatible` binds to, the common type of its arguments, or
-/// [`None`] when they have none.
-fn compatible_family(
-    mut bounds: Vec<Bound<'_>>,
+/// What `anycompatible` binds to, the common type of its arguments, with
+/// whether the database's facts leave that type open, or [`None`] when they
+/// prove the arguments have none.
+fn compatible_family<'a, D: DatabaseLike>(
+    database: &D,
+    mut bounds: Vec<Bound<'a>>,
     undetermined: bool,
     nonarray: bool,
-) -> Option<Family<Bound<'_>>> {
+) -> Option<(Family<Bound<'a>>, bool)> {
     if undetermined {
-        return Some(Family::Undetermined);
+        return Some((Family::Undetermined, false));
     }
-    let position = match select_common_type(&bounds, |bound| &bound.pg_type)? {
-        CommonType::At(position) => position,
-        CommonType::AllUnknown => return Some(Family::Unbound),
+    let common = match select_common_type(database, &bounds, |bound| &bound.pg_type) {
+        Err(Undetermined) => return Some((Family::Undetermined, true)),
+        Ok(None) => return None,
+        Ok(Some(CommonType::AllUnknown)) => return Some((Family::Unbound, false)),
+        Ok(Some(CommonType::At(position))) => bounds.swap_remove(position),
+        Ok(Some(CommonType::Base(pg_type))) => Bound { pg_type, spelling: Spelling::Canonical },
     };
-    let common = bounds.swap_remove(position);
-    (!(nonarray && common.pg_type.is_array())).then_some(Family::Decided(common))
+    let uncertain = if nonarray { takes_as_nonarray(database, &common)? } else { false };
+    Some((Family::Decided(common), uncertain))
 }
 
 impl<'a> Binding<'a> {
@@ -510,8 +569,9 @@ pub(crate) enum Selection<T> {
     /// PostgreSQL refuses the call, since no function takes the argument
     /// types or several do and nothing tells them apart.
     Refused,
-    /// The caller does not know every argument's type, and these functions
-    /// take the call whatever the unknown types are.
+    /// PostgreSQL runs one of these functions or refuses the call, and the
+    /// argument types the caller does not know or the facts the database
+    /// does not hold leave open which.
     Undetermined(Vec<T>),
 }
 
@@ -521,27 +581,36 @@ fn declared_type<'b>(binding: &'b Binding<'_>, position: usize) -> Option<&'b Pg
     binding.declared.get(position).and_then(Option::as_ref)
 }
 
-/// Keeps the candidates scoring best, which keeps them all when none scores.
+/// The candidates `kept` holds, left undetermined.
+fn undetermined<T: Copy>(kept: &[&(T, Binding<'_>)]) -> Selection<T> {
+    Selection::Undetermined(kept.iter().map(|(candidate, _)| *candidate).collect())
+}
+
+/// The one candidate `kept` holds.
+fn only<T: Copy>(kept: &[&(T, Binding<'_>)]) -> Option<T> {
+    match kept {
+        [(chosen, _)] => Some(*chosen),
+        _ => None,
+    }
+}
+
+/// Keeps the candidates of `kept` with the best of `scores`, which keeps them
+/// all when none scores.
 fn keep_best<'c, 'b, T>(
-    kept: Vec<&'c (T, Binding<'b>)>,
-    score: impl Fn(&Binding<'b>) -> usize,
+    kept: &[&'c (T, Binding<'b>)],
+    scores: Vec<usize>,
 ) -> Vec<&'c (T, Binding<'b>)> {
-    let best = kept.iter().map(|(_, binding)| score(binding)).max().unwrap_or(0);
-    kept.into_iter().filter(|(_, binding)| score(binding) == best).collect()
+    let best = scores.iter().copied().max().unwrap_or(0);
+    kept.iter().zip(scores).filter(|(_, score)| *score == best).map(|(kept, _)| *kept).collect()
 }
 
 /// Picks the function a call runs as `func_get_detail` and
 /// `func_select_candidate` do.
-pub(crate) fn select<T: Copy>(
+pub(crate) fn select<D: DatabaseLike, T: Copy>(
+    database: &D,
     candidates: &[(T, Binding<'_>)],
     actuals: &[Option<Actual<'_>>],
 ) -> Selection<T> {
-    let only = |kept: &[&(T, Binding<'_>)]| {
-        match kept {
-            [(chosen, _)] => Some(*chosen),
-            _ => None,
-        }
-    };
     let all: Vec<&(T, Binding<'_>)> = candidates.iter().collect();
     if all.is_empty() {
         return Selection::Refused;
@@ -551,10 +620,10 @@ pub(crate) fn select<T: Copy>(
         .map(|actual| actual.as_ref().map(|actual| &actual.pg_type))
         .collect::<Option<Vec<&PgType>>>()
     else {
-        return only(&all).map_or_else(
-            || Selection::Undetermined(all.iter().map(|(candidate, _)| *candidate).collect()),
-            Selection::Chosen,
-        );
+        return match all.as_slice() {
+            [(chosen, binding)] if !binding.uncertain => Selection::Chosen(*chosen),
+            _ => undetermined(&all),
+        };
     };
 
     let exact: Vec<&(T, Binding<'_>)> = all
@@ -567,34 +636,67 @@ pub(crate) fn select<T: Copy>(
                 .all(|(position, input)| declared_type(binding, position) == Some(*input))
         })
         .collect();
-    if let Some(chosen) = only(&exact).or_else(|| only(&all)) {
+    if let Some(chosen) = only(&exact) {
         return Selection::Chosen(chosen);
     }
+    // Which candidates take the argument types at all is open.
+    if all.iter().any(|(_, binding)| binding.uncertain) {
+        return undetermined(&all);
+    }
+    if let Some(chosen) = only(&all) {
+        return Selection::Chosen(chosen);
+    }
+    // The ranking reads domains as their base types.
+    let Ok(inputs) = inputs
+        .iter()
+        .map(|input| base(database, input))
+        .collect::<Result<Vec<Cow<'_, PgType>>, _>>()
+    else {
+        return undetermined(&all);
+    };
+    rank(database, &all, &inputs)
+}
 
+/// The ranking steps of `func_select_candidate` over candidates that all
+/// take the argument types, the domains among which are reduced to their
+/// base types.
+fn rank<D: DatabaseLike, T: Copy>(
+    database: &D,
+    all: &[&(T, Binding<'_>)],
+    inputs: &[Cow<'_, PgType>],
+) -> Selection<T> {
     let known = |position: usize| inputs.get(position).filter(|input| !input.is_unknown());
-    let kept = keep_best(all, |binding| {
-        (0..inputs.len())
-            .filter(|&position| {
-                known(position)
-                    .is_some_and(|input| declared_type(binding, position) == Some(*input))
-            })
-            .count()
-    });
+    let exact_matches = all
+        .iter()
+        .map(|(_, binding)| {
+            (0..inputs.len())
+                .filter(|&position| {
+                    known(position)
+                        .is_some_and(|input| declared_type(binding, position) == Some(input))
+                })
+                .count()
+        })
+        .collect();
+    let kept = keep_best(all, exact_matches);
     if let Some(chosen) = only(&kept) {
         return Selection::Chosen(chosen);
     }
-    let kept = keep_best(kept, |binding| {
-        (0..inputs.len())
-            .filter(|&position| {
-                known(position).is_some_and(|input| {
-                    declared_type(binding, position).is_some_and(|declared| {
-                        declared == *input
-                            || (declared.is_preferred() && declared.category() == input.category())
-                    })
-                })
-            })
-            .count()
-    });
+    let preferred_matches = inputs
+        .iter()
+        .map(|input| {
+            if input.is_unknown() {
+                return Ok(None);
+            }
+            facts(database, input).map(|facts| Some(facts.category())).ok_or(Undetermined)
+        })
+        .collect::<Result<Vec<Option<TypeCategory>>, _>>()
+        .and_then(|categories| {
+            kept.iter()
+                .map(|(_, binding)| preferred_matches(database, binding, inputs, &categories))
+                .collect::<Result<Vec<usize>, _>>()
+        });
+    let Ok(preferred_matches) = preferred_matches else { return undetermined(&kept) };
+    let kept = keep_best(&kept, preferred_matches);
     if let Some(chosen) = only(&kept) {
         return Selection::Chosen(chosen);
     }
@@ -604,7 +706,11 @@ pub(crate) fn select<T: Copy>(
         return Selection::Refused;
     }
 
-    let kept = leaning_categories(kept, &unknowns);
+    let kept = match leaning_categories(database, &kept, &unknowns) {
+        Ok(Some(survivors)) => survivors,
+        Ok(None) => kept,
+        Err(Undetermined) => return undetermined(&kept),
+    };
     if let Some(chosen) = only(&kept) {
         return Selection::Chosen(chosen);
     }
@@ -614,65 +720,104 @@ pub(crate) fn select<T: Copy>(
     if let Some(shared) = others.next().filter(|first| others.all(|other| other == *first)) {
         let assumed: Vec<Option<Actual<'_>>> = inputs
             .iter()
-            .map(|_| Some(Actual { pg_type: (*shared).clone(), spelling: "" }))
+            .map(|_| Some(Actual { pg_type: PgType::clone(shared), spelling: "" }))
             .collect();
-        let matching: Vec<_> = kept
-            .iter()
-            .filter(|(_, binding)| bind_families(&binding.declared, &assumed).is_some())
-            .collect();
-        if let [(chosen, _)] = matching.as_slice() {
-            return Selection::Chosen(*chosen);
+        let mut taking = Vec::new();
+        let mut open = false;
+        for candidate in &kept {
+            match bind_families(database, &candidate.1.declared, &assumed) {
+                None => {}
+                Some((_, uncertain)) => {
+                    open |= uncertain;
+                    taking.push(*candidate);
+                }
+            }
+        }
+        match (taking.as_slice(), open) {
+            ([(chosen, _)], false) => return Selection::Chosen(*chosen),
+            ([_, ..], true) => return undetermined(&taking),
+            _ => {}
         }
     }
     Selection::Refused
 }
 
-/// The untyped-literal category step of `func_select_candidate`, keeping all
-/// candidates when it settles nothing.
-fn leaning_categories<'k, T>(
-    kept: Vec<&'k (T, Binding<'k>)>,
+/// How many positions of a known argument type `binding` declares that type
+/// for, or a preferred type of the argument's category.
+fn preferred_matches<D: DatabaseLike>(
+    database: &D,
+    binding: &Binding<'_>,
+    inputs: &[Cow<'_, PgType>],
+    categories: &[Option<TypeCategory>],
+) -> Result<usize, Undetermined> {
+    let mut matches = 0;
+    for (position, category) in categories.iter().enumerate() {
+        let (Some(category), Some(declared)) = (category, declared_type(binding, position)) else {
+            continue;
+        };
+        if *declared == *inputs[position] {
+            matches += 1;
+            continue;
+        }
+        let facts = facts(database, declared).ok_or(Undetermined)?;
+        if facts.is_preferred() && facts.category() == *category {
+            matches += 1;
+        }
+    }
+    Ok(matches)
+}
+
+/// The untyped-literal category step of `func_select_candidate`, the
+/// candidates it keeps or [`None`] when it settles nothing.
+fn leaning_categories<'k, 'b, D: DatabaseLike, T>(
+    database: &D,
+    kept: &[&'k (T, Binding<'b>)],
     unknowns: &[usize],
-) -> Vec<&'k (T, Binding<'k>)> {
+) -> Result<Option<Vec<&'k (T, Binding<'b>)>>, Undetermined> {
+    let declared_facts = |binding: &Binding<'_>, position: usize| {
+        declared_type(binding, position)
+            .and_then(|declared| facts(database, declared))
+            .map(|facts| (facts.category(), facts.is_preferred()))
+            .ok_or(Undetermined)
+    };
     let mut slots = Vec::with_capacity(unknowns.len());
     for &position in unknowns {
-        let mut category: Option<u8> = None;
+        let mut category: Option<TypeCategory> = None;
         let mut preferred = false;
         let mut conflict = false;
-        for (_, binding) in &kept {
-            let declared = declared_type(binding, position);
-            let current = declared.map_or(b'U', PgType::category);
-            let current_preferred = declared.is_some_and(PgType::is_preferred);
+        for (_, binding) in kept {
+            let (current, current_preferred) = declared_facts(binding, position)?;
             match category {
                 None => {
                     category = Some(current);
                     preferred = current_preferred;
                 }
                 Some(settled) if settled == current => preferred |= current_preferred,
-                Some(_) if declared.is_some_and(PgType::is_string_category) => {
+                Some(_) if current == TypeCategory::STRING => {
                     category = Some(current);
                     preferred = current_preferred;
                 }
                 Some(_) => conflict = true,
             }
         }
-        let Some(category) = category else { return kept };
-        if conflict && category != PgType::TEXT.category() {
-            return kept;
+        let Some(category) = category else { return Ok(None) };
+        if conflict && category != TypeCategory::STRING {
+            return Ok(None);
         }
         slots.push((position, category, preferred));
     }
-    let survivors: Vec<_> = kept
-        .iter()
-        .copied()
-        .filter(|(_, binding)| {
-            slots.iter().all(|&(position, category, preferred)| {
-                let declared = declared_type(binding, position);
-                declared.map_or(b'U', PgType::category) == category
-                    && (!preferred || declared.is_some_and(PgType::is_preferred))
-            })
-        })
-        .collect();
-    if survivors.is_empty() { kept } else { survivors }
+    let mut survivors = Vec::with_capacity(kept.len());
+    for candidate in kept {
+        let mut keep = true;
+        for &(position, category, preferred) in &slots {
+            let (current, current_preferred) = declared_facts(&candidate.1, position)?;
+            keep &= current == category && (!preferred || current_preferred);
+        }
+        if keep {
+            survivors.push(*candidate);
+        }
+    }
+    Ok((!survivors.is_empty()).then_some(survivors))
 }
 
 /// The input arguments of a function, by mode and type, which identify it
@@ -685,7 +830,9 @@ fn input_signature<F: FunctionLike>(
         .argument_modes()
         .zip(function.argument_type_names(database))
         .filter(|(mode, _)| *mode != ArgMode::Out)
-        .map(|(mode, declared)| (mode, PgType::parse(&declared)))
+        .map(|(mode, declared)| {
+            (mode, PgType::parse(&declared).map(|parsed| canonical_owned(database, parsed)))
+        })
         .collect()
 }
 
@@ -757,7 +904,8 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
 ///
 /// Returns [`LookupError::ArgumentTypeCount`] when `argument_types` does not
 /// hold one entry per argument `call` writes.
-pub(crate) fn expression_result<'a>(
+pub(crate) fn expression_result<'a, D: DatabaseLike>(
+    database: &D,
     form: ExpressionForm,
     call: &Function,
     argument_types: &[Option<&'a str>],
@@ -765,11 +913,11 @@ pub(crate) fn expression_result<'a>(
     let written = written_argument_names(call).map_or(0, |written| written.len());
     check_argument_count(call, written, argument_types.len())?;
     Ok(match form {
-        ExpressionForm::CommonType => common_type_name(argument_types),
+        ExpressionForm::CommonType => common_type_name(database, argument_types),
         // An untyped first argument takes the type `=` compares it under.
         ExpressionForm::FirstArgument => {
             match argument_types.first().copied().flatten() {
-                Some("unknown") => common_type_name(argument_types),
+                Some("unknown") => common_type_name(database, argument_types),
                 first => first.map(Cow::Borrowed),
             }
         }
@@ -795,16 +943,16 @@ pub(crate) fn resolve_call<'a, D: DatabaseLike>(
 ) -> Result<Selection<Resolved<'a, D::Function>>, LookupError> {
     let Some(written) = written_argument_names(call) else { return Ok(Selection::Refused) };
     check_argument_count(call, written.len(), argument_types.len())?;
-    let actuals = actuals(argument_types);
+    let actuals = actuals(database, argument_types);
     let mut answers: Vec<Resolved<'a, D::Function>> = Vec::new();
     let mut bound: Vec<(usize, Binding<'a>)> = Vec::new();
     for (function, declared) in reached_functions(database, call, case)? {
-        let Some(binding) = bind(declared, &actuals) else { continue };
+        let Some(binding) = bind(database, declared, &actuals) else { continue };
         let result = function.result_type_name(database).and_then(|result| binding.result(result));
         bound.push((answers.len(), binding));
         answers.push((function, result));
     }
-    Ok(match select(&bound, &actuals) {
+    Ok(match select(database, &bound, &actuals) {
         Selection::Chosen(position) => {
             answers.into_iter().nth(position).map_or(Selection::Refused, Selection::Chosen)
         }

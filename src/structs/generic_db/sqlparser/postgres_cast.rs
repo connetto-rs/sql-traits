@@ -266,14 +266,3 @@ impl CastLike for PostgresCatalogCast {
         })
     }
 }
-
-/// Whether PostgreSQL 18 converts `source` to `target` implicitly, by stored
-/// type names, a type's length coercion of itself left out.
-pub(crate) fn built_in_implicit_cast(source: &str, target: &str) -> bool {
-    source != target
-        && POSTGRES_18_CASTS
-            .binary_search_by(|cast| {
-                (cast.source.name(), cast.target.name()).cmp(&(source, target))
-            })
-            .is_ok_and(|position| POSTGRES_18_CASTS[position].context == CastContext::Implicit)
-}

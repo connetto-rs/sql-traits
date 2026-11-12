@@ -131,7 +131,6 @@ use postgres_catalog::CatalogName;
 mod postgres_cast;
 mod postgres_operator;
 pub use postgres_cast::PostgresCatalogCast;
-pub(crate) use postgres_cast::built_in_implicit_cast;
 pub use postgres_operator::PostgresCatalogOperator;
 mod postgres_18_operators;
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};

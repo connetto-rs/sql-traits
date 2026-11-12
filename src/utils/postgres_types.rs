@@ -1,18 +1,15 @@
-//! PostgreSQL's type categories, preferred types and implicit casts, and the
-//! common-type rule built on them.
+//! PostgreSQL's type identities as a call or a declaration spells them.
 //!
-//! The type table mirrors `pg_type` of PostgreSQL 18, and implicit casts are
-//! read from the built-in `pg_cast` rows of the parser catalog. A type name is
-//! read with sqlparser's PostgreSQL dialect, so every spelling the server
-//! accepts for a builtin type (`INT`, `int4`, `integer`, `INT ARRAY`) denotes
-//! the same entry. A name the table does not hold, an extension's or a
-//! schema's own type, is a type of its own in the user-defined category, equal
-//! only to itself and reached by no implicit cast. A domain is not followed to
-//! its base type, so it is such a type of its own.
+//! The type table mirrors `pg_type` of PostgreSQL 18. A type name is read with
+//! sqlparser's PostgreSQL dialect, so every spelling the server accepts for a
+//! builtin type (`INT`, `int4`, `integer`, `INT ARRAY`) denotes the same entry.
+//! A name the table does not hold, an extension's or a schema's own type, is
+//! kept by its stored name, which the coercion rules look up in the database.
 
 use alloc::{
     borrow::Cow,
     boxed::Box,
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -24,7 +21,8 @@ use sqlparser::{
 };
 
 use crate::{
-    structs::generic_db::built_in_implicit_cast, utils::identifier_resolution::stored_identifier,
+    structs::TargetName,
+    utils::{identifier_resolution::stored_identifier, object_name::PG_CATALOG},
 };
 
 /// One `pg_type` row, with the type's name, `typcategory` and `typispreferred`.
@@ -166,13 +164,6 @@ static WITHOUT_SEND: &[&str] = &[
     "tsm_handler",
 ];
 
-/// `typcategory` of an array type.
-const ARRAY: u8 = b'A';
-/// `typcategory` of the string types.
-const STRING: u8 = b'S';
-/// `typcategory` of a user-defined type.
-const USER_DEFINED: u8 = b'U';
-
 /// A type as PostgreSQL identifies it, without the length, precision or
 /// dimensions a declaration may add.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,7 +173,10 @@ pub(crate) enum PgType {
     /// The array type over an element type. PostgreSQL has one array type per
     /// element type whatever the dimensions.
     Array(Box<PgType>),
-    /// A type the catalog tables do not hold, by its folded qualified name.
+    /// A type of one or two name parts the catalog tables do not hold, by
+    /// its stored name, compared exactly.
+    Named(TargetName<'static>),
+    /// A type sqlparser names that no stored name spells.
     Other(String),
 }
 
@@ -291,31 +285,44 @@ impl PgType {
     /// The type a written name denotes, the catalog's when it holds the name
     /// in `pg_catalog`.
     fn named(name: &ObjectName) -> Self {
-        let parts: Vec<Cow<'_, str>> = name
+        let stored: Option<Vec<Cow<'_, str>>> = name
             .0
             .iter()
             .map(|part| {
-                part.as_ident().map_or_else(
-                    || Cow::Owned(part.to_string()),
-                    |ident| stored_identifier(&ident.value, ident.quote_style.is_some()),
-                )
+                part.as_ident()
+                    .map(|ident| stored_identifier(&ident.value, ident.quote_style.is_some()))
             })
             .collect();
-        let terminal = match parts.as_slice() {
-            [only] => Some(only.as_ref()),
-            [schema, terminal] if schema == "pg_catalog" => Some(terminal.as_ref()),
-            _ => None,
-        };
-        if let Some(terminal) = terminal {
-            if let Some(row) = catalog_row(serial_type(terminal).unwrap_or(terminal)) {
+        match stored.as_deref() {
+            Some([name]) => Self::stored(None, name),
+            Some([schema, name]) => Self::stored(Some(schema), name),
+            _ => Self::Other(name.to_string()),
+        }
+    }
+
+    /// The type a database names `name`.
+    pub(crate) fn from_target(name: &TargetName<'_>) -> Self {
+        let schema = name.schema().map(|schema| stored_identifier(schema, name.schema_is_quoted()));
+        Self::stored(schema.as_deref(), &stored_identifier(name.name(), name.name_is_quoted()))
+    }
+
+    /// The type the stored `name` denotes in `schema`, or on the search path.
+    fn stored(schema: Option<&str>, name: &str) -> Self {
+        if schema.is_none_or(|schema| schema == PG_CATALOG) {
+            if let Some(row) = catalog_row(serial_type(name).unwrap_or(name)) {
                 return Self::Catalog(row.0);
             }
             // `_int4` is the catalog's own name for `int4[]`.
-            if let Some(row) = terminal.strip_prefix('_').and_then(catalog_row) {
+            if let Some(row) = name.strip_prefix('_').and_then(catalog_row) {
                 return Self::Catalog(row.0).array();
             }
         }
-        Self::Other(parts.join("."))
+        let name = TargetName::new(name, true);
+        let name = match schema {
+            Some(schema) => name.with_schema(schema, true),
+            None => name,
+        };
+        Self::Named(name.into_owned())
     }
 
     /// The array type over this one. An array's array is the array itself,
@@ -331,7 +338,7 @@ impl PgType {
     pub(crate) fn element(&self) -> Option<&Self> {
         match self {
             Self::Array(element) => Some(element),
-            Self::Catalog(_) | Self::Other(_) => None,
+            Self::Catalog(_) | Self::Named(_) | Self::Other(_) => None,
         }
     }
 
@@ -359,45 +366,16 @@ impl PgType {
         *self == Self::UNKNOWN
     }
 
-    /// `typcategory`.
-    pub(crate) fn category(&self) -> u8 {
+    /// A spelling that reads back as this type with the PostgreSQL dialect.
+    pub(crate) fn spelling(&self) -> Cow<'static, str> {
         match self {
-            Self::Catalog(name) => catalog_row(name).map_or(USER_DEFINED, |row| row.1),
-            Self::Array(_) => ARRAY,
-            Self::Other(_) => USER_DEFINED,
-        }
-    }
-
-    /// `typispreferred`.
-    pub(crate) fn is_preferred(&self) -> bool {
-        match self {
-            Self::Catalog(name) => catalog_row(name).is_some_and(|row| row.2),
-            Self::Array(_) | Self::Other(_) => false,
-        }
-    }
-
-    /// Whether the category is that of the string types, which an untyped
-    /// literal leans towards.
-    pub(crate) fn is_string_category(&self) -> bool {
-        self.category() == STRING
-    }
-
-    /// Whether PostgreSQL converts a value of this type to `target` without
-    /// being asked, mirroring `can_coerce_type` under `COERCION_IMPLICIT` for
-    /// a declared, non-polymorphic target.
-    pub(crate) fn coerces_implicitly_to(&self, target: &Self) -> bool {
-        if self == target
-            || self.is_unknown()
-            || matches!(target.polymorphic(), Some(Polymorphic::Any))
-        {
-            return true;
-        }
-        match (self, target) {
-            (Self::Catalog(source), Self::Catalog(target)) => {
-                built_in_implicit_cast(source, target)
-            }
-            (Self::Array(source), Self::Array(target)) => source.coerces_implicitly_to(target),
-            _ => false,
+            // A bare name sqlparser reads as another type, `char` among
+            // them, is qualified.
+            Self::Catalog(name) if Self::parse(name).as_ref() == Some(self) => Cow::Borrowed(name),
+            Self::Catalog(name) => Cow::Owned(format!("{PG_CATALOG}.{name}")),
+            Self::Array(element) => Cow::Owned(format!("{}[]", element.spelling())),
+            Self::Named(name) => Cow::Owned(name.to_string()),
+            Self::Other(name) => Cow::Owned(name.clone()),
         }
     }
 
@@ -414,7 +392,7 @@ impl PgType {
                 catalog_row(name).map(|_| WITHOUT_SEND.binary_search(name).is_err())
             }
             Self::Array(_) => Some(true),
-            Self::Other(_) => None,
+            Self::Named(_) | Self::Other(_) => None,
         }
     }
 }
@@ -454,86 +432,6 @@ pub(crate) fn parse_data_type(name: &str) -> Option<DataType> {
     let mut parser = Parser::new(&PostgreSqlDialect {}).try_with_sql(name).ok()?;
     let data_type = parser.parse_data_type().ok()?;
     matches!(parser.peek_token_ref().token, sqlparser::tokenizer::Token::EOF).then_some(data_type)
-}
-
-/// The type PostgreSQL's `select_common_type` and `verify_common_type` settle
-/// on for `items`, or [`None`] when they have no common type.
-pub(crate) fn select_common_type<T>(
-    items: &[T],
-    type_of: impl Fn(&T) -> &PgType,
-) -> Option<CommonType> {
-    let mut chosen: Option<(usize, &PgType)> = None;
-    for (index, candidate) in items.iter().map(&type_of).enumerate() {
-        if candidate.is_unknown() {
-            continue;
-        }
-        let Some((_, current)) = chosen else {
-            chosen = Some((index, candidate));
-            continue;
-        };
-        if candidate == current {
-            continue;
-        }
-        if candidate.category() != current.category() {
-            return None;
-        }
-        if !current.is_preferred()
-            && current.coerces_implicitly_to(candidate)
-            && !candidate.coerces_implicitly_to(current)
-        {
-            chosen = Some((index, candidate));
-        }
-    }
-    let Some((position, common)) = chosen else { return Some(CommonType::AllUnknown) };
-    items
-        .iter()
-        .map(type_of)
-        .all(|candidate| candidate.coerces_implicitly_to(common))
-        .then_some(CommonType::At(position))
-}
-
-/// The type [`select_common_type`] settles on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommonType {
-    /// The type at this position of the input.
-    At(usize),
-    /// Every input was an untyped literal, so the type is `text`.
-    AllUnknown,
-}
-
-/// Answers the type PostgreSQL gives a set of values that must share one, as
-/// in `COALESCE`, `CASE`, `ARRAY[...]`, `VALUES` and `UNION`, by
-/// `select_common_type`.
-///
-/// Each entry is a type name, `unknown` for an untyped literal such as `NULL`
-/// or `'abc'`, or [`None`] for a value whose type the caller does not know.
-/// The answer is the winning name as given, `TEXT` when every value is an
-/// untyped literal, and [`None`] when a value's type is not known or no
-/// common type exists, where PostgreSQL refuses the statement.
-///
-/// # Example
-///
-/// ```rust
-/// use sql_traits::utils::common_type_name;
-///
-/// assert_eq!(common_type_name(&[Some("BYTEA"), Some("unknown")]).as_deref(), Some("BYTEA"));
-/// assert_eq!(common_type_name(&[Some("INT"), Some("BIGINT")]).as_deref(), Some("BIGINT"));
-/// // `double precision` is the preferred numeric type.
-/// assert_eq!(common_type_name(&[Some("FLOAT8"), Some("NUMERIC")]).as_deref(), Some("FLOAT8"));
-/// assert_eq!(common_type_name(&[Some("unknown"), Some("unknown")]).as_deref(), Some("TEXT"));
-/// // Binary strings and text belong to different categories.
-/// assert_eq!(common_type_name(&[Some("BYTEA"), Some("TEXT")]), None);
-/// assert_eq!(common_type_name(&[Some("INT"), None]), None);
-/// ```
-#[must_use]
-pub fn common_type_name<'a>(types: &[Option<&'a str>]) -> Option<Cow<'a, str>> {
-    let names: Vec<&'a str> = types.iter().copied().collect::<Option<_>>()?;
-    let parsed: Vec<PgType> =
-        names.iter().map(|name| PgType::parse(name)).collect::<Option<_>>()?;
-    match select_common_type(&parsed, |pg_type| pg_type)? {
-        CommonType::At(position) => names.get(position).map(|name| Cow::Borrowed(*name)),
-        CommonType::AllUnknown => Some(Cow::Borrowed("TEXT")),
-    }
 }
 
 #[cfg(test)]
@@ -631,5 +529,16 @@ mod tests {
             let pg_type = PgType::parse(spelling).expect("parses");
             assert_eq!(pg_type.send_function(), send, "{spelling}");
         }
+    }
+
+    /// Every type's spelling reads back as the type, a catalog name sqlparser
+    /// reads as another type included.
+    #[test]
+    fn spellings_read_back_as_their_types() {
+        for spelling in ["int4", "\"char\"", "_int4", "app.\"Mood\"", "app.mood[]", "TINYINT"] {
+            let pg_type = PgType::parse(spelling).expect("parses");
+            assert_eq!(PgType::parse(&pg_type.spelling()).as_ref(), Some(&pg_type), "{spelling}");
+        }
+        assert_eq!(PgType::parse("\"char\"").expect("parses").spelling(), "pg_catalog.char");
     }
 }
