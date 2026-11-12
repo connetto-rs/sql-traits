@@ -24,6 +24,7 @@ fn built_in_types_carry_their_catalog_category_and_preference() {
     assert!(!int4.is_preferred());
     assert!(int4.domain().is_none());
     assert!(int4.array_element().is_none());
+    assert_eq!(int4.array_type(), Some(&pg("_int4")));
     assert!(facts(&db, pg("float8")).is_preferred());
     assert!(facts(&db, pg("text")).is_preferred());
     assert_eq!(facts(&db, pg("unknown")).category(), TypeCategory::UNKNOWN);
@@ -31,6 +32,9 @@ fn built_in_types_carry_their_catalog_category_and_preference() {
     let array = facts(&db, pg("_int4"));
     assert_eq!(array.category(), TypeCategory::ARRAY);
     assert_eq!(array.array_element(), Some(&pg("int4")));
+    // An array type has no array of its own.
+    assert!(array.array_type().is_none());
+    assert!(facts(&db, pg("unknown")).array_type().is_none());
 
     // An unqualified built-in name reads as its `pg_catalog` type.
     assert_eq!(facts(&db, TargetName::new("int4", false)).category(), TypeCategory::NUMERIC);
@@ -65,7 +69,9 @@ fn declared_types_carry_the_category_of_their_kind() {
     assert_eq!(array.category(), TypeCategory::ARRAY);
     assert!(!array.is_preferred());
     assert_eq!(array.array_element(), Some(&app("mood")));
+    assert_eq!(facts(&db, app("mood")).array_type(), Some(&app("_mood")));
     assert_eq!(facts(&db, app("_readings")).array_element(), Some(&app("readings")));
+    assert_eq!(facts(&db, app("readings")).array_type(), Some(&app("_readings")));
     assert!(db.type_facts(app("_pending")).is_none());
 }
 

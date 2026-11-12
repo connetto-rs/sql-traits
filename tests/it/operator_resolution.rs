@@ -1,0 +1,248 @@
+//! Tests that an operator invocation resolves to the `pg_operator` overload
+//! PostgreSQL 18 selects and names the type each operand takes. Every
+//! expected selection was read back from a PostgreSQL 18 server.
+#![expect(clippy::unwrap_used, reason = "Fixtures must parse.")]
+
+use sql_traits::prelude::*;
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+
+/// An untyped literal operand.
+const LITERAL: OperandType<'static> = OperandType::UntypedLiteral;
+
+fn known(name: &str) -> OperandType<'_> {
+    OperandType::Known(TargetName::new(name, false))
+}
+
+fn app(name: &str) -> TargetName<'_> {
+    TargetName::new(name, false).with_schema("app", false)
+}
+
+fn pg(name: &str) -> TargetName<'_> {
+    TargetName::new(name, false).with_schema("pg_catalog", false)
+}
+
+/// The resolution of `operator` over the operands, spelled as the selected
+/// operator's signature and each operand's target, a polymorphic binding
+/// marked with `*`.
+fn resolved(
+    db: &ParserDB,
+    operator: TargetName<'_>,
+    left: Option<OperandType<'_>>,
+    right: OperandType<'_>,
+) -> String {
+    let signature = |operator: &PostgresCatalogOperator| {
+        let left = operator.left_type(db).map(|left| left.to_string()).unwrap_or_default();
+        let right = operator.right_type(db).unwrap().to_string();
+        format!("{}({left},{right})", operator.target_name())
+    };
+    let target = |evidence: &OperandEvidence<'_, ParserDB>| {
+        let marker = if evidence.is_polymorphic_binding() { "*" } else { "" };
+        format!("{}{marker}", evidence.target())
+    };
+    match db.resolve_operator(operator, left, right, IdentifierCase::AsWritten) {
+        OperatorResolution::Selected(selected) => {
+            let left = selected.left().map(target).unwrap_or_default();
+            format!("{} as {left},{}", signature(selected.operator()), target(selected.right()))
+        }
+        OperatorResolution::NotFound => "not found".to_owned(),
+        OperatorResolution::Ambiguous(operators) => {
+            let mut signatures: Vec<String> = operators.into_iter().map(signature).collect();
+            signatures.sort();
+            format!("ambiguous {}", signatures.join(" "))
+        }
+        OperatorResolution::UnboundPolymorphic(operator) => {
+            format!("unbound {}", signature(operator))
+        }
+        OperatorResolution::Undetermined => "undetermined".to_owned(),
+    }
+}
+
+fn op(name: &str) -> TargetName<'_> {
+    TargetName::new(name, false)
+}
+
+/// The built-in selections a PostgreSQL 18 server stores for the same
+/// expressions.
+#[test]
+fn built_in_operators_resolve_as_postgres_selects_them() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE DOMAIN dtext AS TEXT;").unwrap();
+    let cases: [(&str, Option<OperandType<'_>>, OperandType<'_>, &str); 9] = [
+        (
+            ">",
+            Some(known("int4")),
+            known("int8"),
+            "pg_catalog.>(pg_catalog.int4,pg_catalog.int8) as pg_catalog.int4,pg_catalog.int8",
+        ),
+        (
+            ">",
+            Some(known("integer")),
+            known("numeric"),
+            "pg_catalog.>(pg_catalog.numeric,pg_catalog.numeric) as \
+             pg_catalog.numeric,pg_catalog.numeric",
+        ),
+        (
+            "=",
+            Some(known("text")),
+            LITERAL,
+            "pg_catalog.=(pg_catalog.text,pg_catalog.text) as pg_catalog.text,pg_catalog.text",
+        ),
+        (
+            "=",
+            Some(known("varchar")),
+            known("text"),
+            "pg_catalog.=(pg_catalog.text,pg_catalog.text) as pg_catalog.text,pg_catalog.text",
+        ),
+        // A domain operand meeting an untyped literal reads as its base type.
+        (
+            "=",
+            Some(known("dtext")),
+            LITERAL,
+            "pg_catalog.=(pg_catalog.text,pg_catalog.text) as pg_catalog.text,pg_catalog.text",
+        ),
+        (
+            "<@",
+            Some(known("int4[]")),
+            LITERAL,
+            "pg_catalog.<@(pg_catalog.anyarray,pg_catalog.anyarray) as \
+             pg_catalog._int4*,pg_catalog._int4*",
+        ),
+        (
+            "||",
+            Some(known("_int4")),
+            known("int8"),
+            "pg_catalog.||(pg_catalog.anycompatiblearray,pg_catalog.anycompatible) as \
+             pg_catalog._int8*,pg_catalog.int8*",
+        ),
+        (
+            "=",
+            Some(LITERAL),
+            LITERAL,
+            "pg_catalog.=(pg_catalog.text,pg_catalog.text) as pg_catalog.text,pg_catalog.text",
+        ),
+        ("~~", Some(known("int4")), known("int4"), "not found"),
+    ];
+    for (name, left, right, expected) in cases {
+        assert_eq!(resolved(&db, op(name), left, right), expected, "{name}");
+    }
+    let prefix = resolved(&db, op("~"), None, LITERAL);
+    assert!(prefix.starts_with("ambiguous "), "{prefix}");
+    assert!(prefix.contains("pg_catalog.~(,pg_catalog.int4)"), "{prefix}");
+}
+
+/// A range operand reaches the range pseudo-types, but which range binds
+/// needs `pg_range` facts, so the invocation stays open where PostgreSQL 18
+/// selects `@>(anyrange,anyelement)`.
+#[test]
+fn range_operands_stay_open() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("").unwrap();
+    assert_eq!(resolved(&db, op("@>"), Some(known("int4range")), known("int4")), "undetermined");
+}
+
+/// User operators over the polymorphic pseudo-types bind as PostgreSQL 18
+/// binds them, and refuse when only untyped literals reach a family.
+#[test]
+fn polymorphic_operators_bind_their_operands() {
+    let operator = |name: &str, left: &str, right: &str| {
+        PostgresCatalogOperator::new(name, Some(pg(left)), pg(right)).with_schema("public", false)
+    };
+    let catalog = PostgresCatalog::default()
+        .with_operator(operator("===", "anyelement", "anyelement"))
+        .with_operator(operator("&&&", "anyelement", "anyarray"))
+        .with_operator(operator("@@@", "anyrange", "anyelement"))
+        .with_operator(operator("~~~", "int4", "any"));
+    let db = ParseOptions::default()
+        .with_postgres_catalog(catalog)
+        .parse::<PostgreSqlDialect>("CREATE TYPE mood AS ENUM ('calm');")
+        .unwrap();
+    assert_eq!(
+        resolved(&db, op("==="), Some(LITERAL), LITERAL),
+        "unbound public.===(pg_catalog.anyelement,pg_catalog.anyelement)"
+    );
+    assert_eq!(
+        resolved(&db, op("==="), Some(known("int4")), known("int4")),
+        "public.===(pg_catalog.anyelement,pg_catalog.anyelement) as \
+         pg_catalog.int4*,pg_catalog.int4*"
+    );
+    assert_eq!(
+        resolved(&db, op("==="), Some(known("mood")), known("public.mood")),
+        "public.===(pg_catalog.anyelement,pg_catalog.anyelement) as \"public\".\"mood\"*,\
+         \"public\".\"mood\"*"
+    );
+    // A type PostgreSQL does not know binds to no type it can name.
+    assert_eq!(resolved(&db, op("==="), Some(known("TINYINT")), known("TINYINT")), "undetermined");
+    // An operand typed as the pseudo-type itself matches exactly and binds
+    // nothing.
+    assert_eq!(
+        resolved(&db, op("==="), Some(known("anyelement")), known("anyelement")),
+        "undetermined"
+    );
+    // `anyarray` takes the array over the type `anyelement` binds.
+    assert_eq!(
+        resolved(&db, op("&&&"), Some(known("int4")), LITERAL),
+        "public.&&&(pg_catalog.anyelement,pg_catalog.anyarray) as \
+         pg_catalog.int4*,pg_catalog._int4*"
+    );
+    // PostgreSQL cannot tell which range an untyped literal is.
+    assert_eq!(
+        resolved(&db, op("@@@"), Some(LITERAL), known("int4")),
+        "unbound public.@@@(pg_catalog.anyrange,pg_catalog.anyelement)"
+    );
+    // `"any"` takes an operand as it is, an untyped literal staying untyped.
+    assert_eq!(
+        resolved(&db, op("~~~"), Some(known("int4")), known("bytea")),
+        "public.~~~(pg_catalog.int4,pg_catalog.any) as pg_catalog.int4,pg_catalog.bytea"
+    );
+    assert_eq!(
+        resolved(&db, op("~~~"), Some(known("int4")), LITERAL),
+        "public.~~~(pg_catalog.int4,pg_catalog.any) as pg_catalog.int4,pg_catalog.unknown"
+    );
+}
+
+/// `pg_catalog` comes before a path that does not name it, a path naming it
+/// later lets an earlier schema win, and a qualified name searches its
+/// schema alone.
+#[test]
+fn the_search_path_and_qualification_choose_among_identical_signatures() {
+    let catalog = || {
+        PostgresCatalog::default()
+            .with_operator(
+                PostgresCatalogOperator::new("=", Some(pg("int4")), pg("int4"))
+                    .with_schema("app", false),
+            )
+            .with_operator(
+                PostgresCatalogOperator::new("===", Some(pg("int4")), pg("int4"))
+                    .with_schema("app", false),
+            )
+    };
+    let parse = |sql: &str| {
+        ParseOptions::default()
+            .with_postgres_catalog(catalog())
+            .parse::<PostgreSqlDialect>(sql)
+            .unwrap()
+    };
+    let int4 = || Some(known("int4"));
+    let app_first = parse("CREATE SCHEMA app; SET search_path = app, pg_catalog;");
+    assert!(resolved(&app_first, op("="), int4(), known("int4")).starts_with("app.="));
+    let catalog_first = parse("CREATE SCHEMA app; SET search_path = app;");
+    assert!(resolved(&catalog_first, op("="), int4(), known("int4")).starts_with("pg_catalog.="));
+    assert!(resolved(&catalog_first, op("==="), int4(), known("int4")).starts_with("app.==="));
+    let off_path = parse("CREATE SCHEMA app;");
+    assert_eq!(resolved(&off_path, op("==="), int4(), known("int4")), "not found");
+    assert!(resolved(&off_path, app("="), int4(), known("int4")).starts_with("app.="));
+}
+
+/// A missing operator catalog, an operand of unknown type or a type the
+/// database holds no facts about leaves the invocation open.
+#[test]
+fn missing_facts_leave_the_invocation_undetermined() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("").unwrap();
+    assert_eq!(resolved(&db, op("="), Some(OperandType::Unknown), known("int4")), "undetermined");
+    assert_eq!(resolved(&db, op("="), Some(known("missing")), known("int4")), "undetermined");
+    assert_eq!(
+        resolved(&db, op("="), Some(known("missing")), OperandType::UntypedLiteral),
+        "undetermined"
+    );
+    assert_eq!(resolved(&db, op("="), Some(known("not a type (")), known("int4")), "undetermined");
+    let sqlite = ParserDB::parse::<SQLiteDialect>("").unwrap();
+    assert_eq!(resolved(&sqlite, op("="), Some(known("int4")), known("int4")), "undetermined");
+}

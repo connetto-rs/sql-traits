@@ -180,11 +180,10 @@ pub(crate) enum PgType {
     Other(String),
 }
 
-/// The pseudo-types a function may declare in place of a concrete type.
+/// The polymorphic pseudo-types a function may declare in place of a
+/// concrete type, which bind to the types of the arguments they take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Polymorphic {
-    /// `"any"`, which takes a value of any type and binds nothing.
-    Any,
     /// `anyelement`, `anynonarray` and `anyenum`.
     Element { nonarray: bool },
     /// `anyarray`.
@@ -342,12 +341,11 @@ impl PgType {
         }
     }
 
-    /// The pseudo-type this is, when a declaration uses it to stand for the
-    /// type of an argument.
+    /// The polymorphic pseudo-type this is, when a declaration uses it to
+    /// stand for the type of an argument.
     pub(crate) fn polymorphic(&self) -> Option<Polymorphic> {
         let Self::Catalog(name) = self else { return None };
         Some(match *name {
-            "any" => Polymorphic::Any,
             "anyelement" | "anyenum" => Polymorphic::Element { nonarray: false },
             "anynonarray" => Polymorphic::Element { nonarray: true },
             "anyarray" => Polymorphic::Array,
@@ -359,6 +357,12 @@ impl PgType {
             }
             _ => return None,
         })
+    }
+
+    /// Whether this is `"any"`, which takes a value of any type as it is and
+    /// binds nothing.
+    pub(crate) fn is_any(&self) -> bool {
+        *self == Self::Catalog("any")
     }
 
     /// Whether this is the unknown type of an untyped literal.

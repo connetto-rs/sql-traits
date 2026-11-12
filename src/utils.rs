@@ -22,6 +22,7 @@ pub mod fingerprint_type_token;
 pub mod identifier_resolution;
 pub mod maintenance_trigger_parser;
 pub(crate) mod object_name;
+pub(crate) mod operator_typing;
 mod postgres_null_returning;
 pub(crate) mod postgres_types;
 pub(crate) use postgres_null_returning::null_returning_positions;
