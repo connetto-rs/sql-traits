@@ -253,14 +253,18 @@ fn classify_uuid(dialect: SqlparserDialect, ty: &DataType) -> TypeMatch {
             }
         }
 
-        // MySQL: no native UUID type. CHAR(36), CHARACTER(36), VARCHAR(36),
-        // CHARACTER VARYING(36), and CHAR VARYING(36) are all widespread
-        // but ambiguous conventions. BINARY(16) is also common. Report Maybe.
+        // MySQL has no UUID type, so a 36-character string column may hold one.
         DataType::Char(spec)
         | DataType::Character(spec)
+        | DataType::NationalCharacter(spec)
+        | DataType::NationalChar(spec)
+        | DataType::Nchar(spec)
         | DataType::Varchar(spec)
         | DataType::CharacterVarying(spec)
         | DataType::CharVarying(spec)
+        | DataType::NationalCharacterVarying(spec)
+        | DataType::NationalCharVarying(spec)
+        | DataType::NcharVarying(spec)
             if dialect.is_mysql_family() && char_length(spec.as_ref()) == Some(36) =>
         {
             TypeMatch::Maybe
@@ -310,10 +314,17 @@ pub(super) fn max_character_length(dialect: SqlparserDialect, ty: &DataType) -> 
         _ => None,
     };
     let (spec, bare) = match ty {
-        DataType::Char(spec) | DataType::Character(spec) => (spec, Some(1)),
+        DataType::Char(spec)
+        | DataType::Character(spec)
+        | DataType::NationalCharacter(spec)
+        | DataType::NationalChar(spec)
+        | DataType::Nchar(spec) => (spec, Some(1)),
         DataType::Varchar(spec)
         | DataType::CharacterVarying(spec)
         | DataType::CharVarying(spec)
+        | DataType::NationalCharacterVarying(spec)
+        | DataType::NationalCharVarying(spec)
+        | DataType::NcharVarying(spec)
         | DataType::Nvarchar(spec) => (spec, bare_varying),
         DataType::String(length) => return *length,
         _ => return None,
@@ -1057,6 +1068,22 @@ mod tests {
         assert_eq!(classify_uuid(SqlparserDialect::MySql, &varchar_36), TypeMatch::Maybe);
         assert_eq!(classify_uuid(SqlparserDialect::MySql, &char_varying_36), TypeMatch::Maybe);
         assert_eq!(classify_uuid(SqlparserDialect::MySql, &short_spelling_36), TypeMatch::Maybe);
+    }
+
+    #[test]
+    fn classify_uuid_mysql_national_36_is_maybe() {
+        let length = || Some(CharacterLength::IntegerLength { length: 36, unit: None });
+        for ty in [
+            DataType::NationalCharacter(length()),
+            DataType::NationalChar(length()),
+            DataType::NationalCharacterVarying(length()),
+            DataType::NationalCharVarying(length()),
+            DataType::Nchar(length()),
+            DataType::NcharVarying(length()),
+        ] {
+            assert_eq!(classify_uuid(SqlparserDialect::MySql, &ty), TypeMatch::Maybe, "{ty}");
+            assert_eq!(classify_uuid(SqlparserDialect::PostgreSql, &ty), TypeMatch::No, "{ty}");
+        }
     }
 
     #[test]

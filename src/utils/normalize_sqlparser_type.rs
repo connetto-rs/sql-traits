@@ -210,16 +210,22 @@ pub fn normalize_sqlparser_type(sqlparser_type: &DataType) -> Cow<'_, str> {
         DataType::Numeric(_) | DataType::BigNumeric(_) => "NUMERIC".into(),
         // BOOL family
         DataType::Bool | DataType::Boolean => "BOOLEAN".into(),
-        // STRING family. `CHARACTER VARYING` and `CHARACTER LARGE OBJECT` are
-        // the long spellings of `VARCHAR` and `CLOB`.
+        // STRING family, long and `NATIONAL` spellings folded.
         DataType::Text => "TEXT".into(),
         DataType::TinyText => "TINYTEXT".into(),
         DataType::MediumText => "MEDIUMTEXT".into(),
         DataType::LongText => "LONGTEXT".into(),
-        DataType::Varchar(_) | DataType::CharacterVarying(_) | DataType::CharVarying(_) => {
-            "VARCHAR".into()
-        }
-        DataType::Char(_) | DataType::Character(_) => "CHAR".into(),
+        DataType::Varchar(_)
+        | DataType::CharacterVarying(_)
+        | DataType::CharVarying(_)
+        | DataType::NationalCharacterVarying(_)
+        | DataType::NationalCharVarying(_)
+        | DataType::NcharVarying(_) => "VARCHAR".into(),
+        DataType::Char(_)
+        | DataType::Character(_)
+        | DataType::NationalCharacter(_)
+        | DataType::NationalChar(_)
+        | DataType::Nchar(_) => "CHAR".into(),
         DataType::Clob(_) | DataType::CharacterLargeObject(_) | DataType::CharLargeObject(_) => {
             "CLOB".into()
         }
@@ -660,6 +666,12 @@ mod tests {
     fn test_normalize_sqlparser_type_long_string_spellings() {
         assert_eq!(normalize_sqlparser_type(&DataType::CharacterVarying(None)), "VARCHAR");
         assert_eq!(normalize_sqlparser_type(&DataType::CharVarying(None)), "VARCHAR");
+        assert_eq!(normalize_sqlparser_type(&DataType::NationalCharacter(None)), "CHAR");
+        assert_eq!(normalize_sqlparser_type(&DataType::NationalChar(None)), "CHAR");
+        assert_eq!(normalize_sqlparser_type(&DataType::NationalCharacterVarying(None)), "VARCHAR");
+        assert_eq!(normalize_sqlparser_type(&DataType::NationalCharVarying(None)), "VARCHAR");
+        assert_eq!(normalize_sqlparser_type(&DataType::Nchar(None)), "CHAR");
+        assert_eq!(normalize_sqlparser_type(&DataType::NcharVarying(None)), "VARCHAR");
         assert_eq!(normalize_sqlparser_type(&DataType::CharacterLargeObject(None)), "CLOB");
         assert_eq!(normalize_sqlparser_type(&DataType::CharLargeObject(Some(10))), "CLOB");
         assert_eq!(normalize_sqlparser_type(&DataType::TinyText), "TINYTEXT");

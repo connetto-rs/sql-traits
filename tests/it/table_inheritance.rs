@@ -656,6 +656,12 @@ fn another_spelling_of_the_same_type_is_not_a_conflict() {
     for (parent_type, child_type) in [
         ("INT", "INTEGER"),
         ("VARCHAR(10)", "CHARACTER VARYING(10)"),
+        ("CHAR(4)", "NATIONAL CHARACTER(4)"),
+        ("CHARACTER", "NATIONAL CHAR"),
+        ("VARCHAR(10)", "NATIONAL CHARACTER VARYING(10)"),
+        ("VARCHAR", "NATIONAL CHAR VARYING"),
+        ("CHAR(4)", "NCHAR(4)"),
+        ("VARCHAR(10)", "NCHAR VARYING(10)"),
         ("BOOL", "BOOLEAN"),
         ("DECIMAL(10,2)", "NUMERIC(10,2)"),
         ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"),
@@ -966,6 +972,9 @@ fn types_that_differ_only_in_width_or_precision_are_a_conflict() {
         ("VARCHAR(10)", "VARCHAR"),
         ("TIMESTAMP", "TIMESTAMPTZ"),
         ("CHAR(3)", "VARCHAR(3)"),
+        ("NATIONAL CHARACTER(4)", "CHAR(5)"),
+        ("NATIONAL CHAR VARYING(3)", "CHAR(3)"),
+        ("NCHAR(4)", "NCHAR VARYING(4)"),
         // Two shapes of the same idea are still two types, so a typo in the
         // table that collapsed either pair would be caught here.
         ("JSON", "JSONB"),

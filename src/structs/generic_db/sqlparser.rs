@@ -902,10 +902,17 @@ fn catalog_type_for_name<'a>(
 fn postgres_builtin_type_name(data_type: &DataType) -> Option<&'static str> {
     match data_type {
         DataType::Text => Some("text"),
-        DataType::Varchar(_) | DataType::CharacterVarying(_) | DataType::CharVarying(_) => {
-            Some("varchar")
-        }
-        DataType::Char(_) | DataType::Character(_) => Some("bpchar"),
+        DataType::Varchar(_)
+        | DataType::CharacterVarying(_)
+        | DataType::CharVarying(_)
+        | DataType::NationalCharacterVarying(_)
+        | DataType::NationalCharVarying(_)
+        | DataType::NcharVarying(_) => Some("varchar"),
+        DataType::Char(_)
+        | DataType::Character(_)
+        | DataType::NationalCharacter(_)
+        | DataType::NationalChar(_)
+        | DataType::Nchar(_) => Some("bpchar"),
         _ => None,
     }
 }

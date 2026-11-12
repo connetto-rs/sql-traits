@@ -470,6 +470,19 @@ fn other_literal_spellings_read_or_stay_undecided() {
         "v2",
         "v1",
     );
+    for spelling in
+        ["CHAR VARYING", "NATIONAL CHARACTER VARYING", "NATIONAL CHAR VARYING", "NCHAR VARYING"]
+    {
+        overlaps(
+            &format!(
+                "CREATE TABLE nv (s {spelling} COLLATE \"C\") PARTITION BY RANGE (s);
+                 CREATE TABLE n1 PARTITION OF nv FOR VALUES FROM ('b') TO ('d');
+                 CREATE TABLE n2 PARTITION OF nv FOR VALUES FROM ('c') TO ('e');"
+            ),
+            "n2",
+            "n1",
+        );
+    }
     let integers = "CREATE TABLE i (x INT) PARTITION BY RANGE (x);
          CREATE TABLE i1 PARTITION OF i FOR VALUES FROM (+3) TO ((5));";
     overlaps(

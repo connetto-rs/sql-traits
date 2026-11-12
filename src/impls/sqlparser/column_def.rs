@@ -506,6 +506,31 @@ mod tests {
         }
 
         #[test]
+        fn national_spellings_bound_like_their_plain_forms() {
+            fn national<D: Dialect + Default + 'static>() -> [Option<u64>; 8] {
+                lengths::<D, 8>(
+                    "nc NATIONAL CHARACTER(4), nch NATIONAL CHAR(3), bare_nc NATIONAL CHARACTER, \
+                     n NCHAR(2), ncv NATIONAL CHARACTER VARYING(5), nchv NATIONAL CHAR VARYING(6), \
+                     nv NCHAR VARYING(7), bare_ncv NATIONAL CHAR VARYING",
+                    ["nc", "nch", "bare_nc", "n", "ncv", "nchv", "nv", "bare_ncv"],
+                )
+            }
+            assert_eq!(
+                national::<PostgreSqlDialect>(),
+                [Some(4), Some(3), Some(1), Some(2), Some(5), Some(6), Some(7), None]
+            );
+            assert_eq!(
+                national::<MySqlDialect>(),
+                [Some(4), Some(3), Some(1), Some(2), Some(5), Some(6), Some(7), None]
+            );
+            assert_eq!(
+                national::<MsSqlDialect>(),
+                [Some(4), Some(3), Some(1), Some(2), Some(5), Some(6), Some(7), Some(1)]
+            );
+            assert_eq!(national::<SQLiteDialect>(), [None; 8]);
+        }
+
+        #[test]
         fn octet_lengths_bound_characters_too() {
             assert_eq!(
                 lengths::<AnsiDialect, 2>(
@@ -1356,7 +1381,18 @@ mod tests {
 
     #[test]
     fn collation_postgres_accepts_collatable_builtin_types() {
-        for ty in ["TEXT", "VARCHAR(12)", "CHAR(3)", "TEXT[]"] {
+        for ty in [
+            "TEXT",
+            "VARCHAR(12)",
+            "CHAR(3)",
+            "TEXT[]",
+            "NATIONAL CHARACTER(3)",
+            "NCHAR(3)",
+            "NCHAR VARYING",
+            "NATIONAL CHAR",
+            "NATIONAL CHARACTER VARYING(12)",
+            "NATIONAL CHAR VARYING",
+        ] {
             let sql = format!("CREATE TABLE t (name {ty} COLLATE \"C\");");
             let db = parse_with::<PostgreSqlDialect>(&sql);
             let column = column_named(&db, "name");
