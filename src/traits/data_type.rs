@@ -65,6 +65,20 @@ impl IntervalFields {
     }
 }
 
+/// What the declared length of a character type counts, as
+/// [`DataTypeLike::character_length_unit`] answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CharacterLengthUnit {
+    /// Characters, so `VARCHAR(10)` holds ten characters of any width.
+    Characters,
+    /// Bytes of the stored encoding, so `VARCHAR(10)` holds ten one-byte
+    /// characters or fewer wider ones.
+    Octets,
+    /// UTF-16 code units, so a character outside the Basic Multilingual Plane
+    /// takes two of them.
+    Utf16CodeUnits,
+}
+
 /// Which of pgvector's vector types a column holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VectorKind {
@@ -516,9 +530,9 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// MySQL, SQL Server and ANSI SQL pad every `BINARY(n)` value with zero
     /// bytes to exactly `n` bytes, and read a bare `BINARY` as `BINARY(1)`. A
     /// consumer receiving such a value without its trailing zero bytes, as the
-    /// MySQL binary log stores it, needs `n` to restore it. `VARBINARY(n)`
-    /// answers `None`, and so does `BINARY(n)` in a dialect where it bounds a
-    /// varying length.
+    /// MySQL binary log stores it, needs `n` to restore it. ClickHouse pads a
+    /// `FixedString(n)` value the same way. `VARBINARY(n)` answers `None`, and
+    /// so does `BINARY(n)` in a dialect where it bounds a varying length.
     ///
     /// The default answers `None`, so an implementation over a backend with a
     /// fixed-length binary type must override it.
@@ -546,19 +560,85 @@ pub trait DataTypeLike: Debug + Send + Sync {
         None
     }
 
+    /// Returns the most bytes a value of a binary type can hold, or `None`
+    /// when the engine does not bound it by the declared type.
+    ///
+    /// `VARBINARY(n)`, `BINARY(n)`, BigQuery's `BYTES(n)` and ClickHouse's
+    /// `FixedString(n)` answer `n` wherever the engine rejects or truncates a
+    /// longer value. A bare type takes the engine's default length where it
+    /// has one, which is 1 for `BINARY` and SQL Server's `VARBINARY`, 64000
+    /// for Redshift's `VARBYTE` and 8388608 for Snowflake's `BINARY`, and
+    /// answers `None` where it has none. MySQL creates `BLOB(n)` as the
+    /// smallest of `TINYBLOB`, `BLOB`, `MEDIUMBLOB` and `LONGBLOB` holding `n`
+    /// bytes, so it answers that type's 255, 65535, 16777215 or 4294967295.
+    /// SQL Server's `VARBINARY(MAX)`, PostgreSQL's `BYTEA` and every binary
+    /// type of an engine that stores any length, as SQLite, DuckDB, Hive and
+    /// Spark do, answer `None`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::MsSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<MsSqlDialect>(
+    ///     "CREATE TABLE t (digest VARBINARY(32), flag VARBINARY, payload VARBINARY(MAX));",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let lengths: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).max_binary_length(&db)).collect();
+    /// assert_eq!(lengths, [Some(32), Some(1), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn max_binary_length(&self, database: &Self::DB) -> Option<u64>;
+
+    /// Returns the most bits a value of a bit-string type can hold, or `None`
+    /// for a bit string of any length and for every other type.
+    ///
+    /// `BIT(n)` holds exactly `n` bits and `BIT VARYING(n)` or `VARBIT(n)` at
+    /// most `n`, so each answers `n`, and a bare `BIT` is `BIT(1)`. A bare
+    /// `BIT VARYING` holds any length and answers `None`. [`Self::name`] tells
+    /// the fixed type from the varying one. SQL Server's `BIT`, which holds a
+    /// boolean, and DuckDB's `BIT`, which holds a bit string of any length,
+    /// answer `None`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (mask BIT(8), flag BIT, bits BIT VARYING(16), any_bits VARBIT);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let lengths: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).max_bit_length(&db)).collect();
+    /// assert_eq!(lengths, [Some(8), Some(1), Some(16), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn max_bit_length(&self, database: &Self::DB) -> Option<u64>;
+
     /// Returns the most characters a value of the type can hold, or `None`
     /// when the engine does not bound it by the declared type.
     ///
     /// `VARCHAR(n)`, `CHARACTER VARYING(n)`, `CHAR(n)` and `CHARACTER(n)`
-    /// answer `n` wherever the engine rejects or truncates a longer value. A
-    /// bare `CHAR` is `CHAR(1)`. A bare `VARCHAR` takes the engine's default
-    /// length where it has one, as in SQL Server, and answers `None` where it
-    /// is unbounded, as in PostgreSQL. `TEXT` and a length that is not an
-    /// integer literal, such as `VARCHAR(MAX)`, answer `None`. So does every
-    /// declared length in an engine that stores any length regardless, as
-    /// SQLite, DuckDB and ClickHouse do. A length counted in bytes or in UTF-16
-    /// code units still bounds the characters, since every character takes at
-    /// least one of them.
+    /// answer `n` wherever the engine rejects or truncates a longer value, and
+    /// so does `CLOB(n)` in the standard and in Teradata. A bare `CHAR` is
+    /// `CHAR(1)`. A bare `VARCHAR` takes the engine's default length where it
+    /// has one, as in SQL Server, and answers `None` where it is unbounded, as
+    /// in PostgreSQL. `TEXT` and a length that is not an integer literal, such
+    /// as `VARCHAR(MAX)`, answer `None`. So does every declared length in an
+    /// engine that stores any length regardless, as SQLite, DuckDB and
+    /// ClickHouse do. A length counted in bytes or in UTF-16 code units, as
+    /// [`Self::character_length_unit`] tells, still bounds the characters,
+    /// since every character takes at least one of them.
     ///
     /// The default answers `None`, so an implementation over a backend with a
     /// bounded character type must override it.
@@ -585,6 +665,43 @@ pub trait DataTypeLike: Debug + Send + Sync {
     fn max_character_length(&self, _database: &Self::DB) -> Option<u64> {
         None
     }
+
+    /// Returns what the length [`Self::max_character_length`] answers
+    /// counts, or `None` when it answers no length or the engine counts it in
+    /// no single unit.
+    ///
+    /// A unit written in the declaration, as in `VARCHAR(10 OCTETS)`, answers
+    /// as written. An unwritten unit is the engine's. PostgreSQL, MySQL,
+    /// Snowflake, BigQuery and the standard count characters, Redshift counts
+    /// bytes, SQL Server counts bytes in `VARCHAR(n)` and UTF-16 code units in
+    /// `NVARCHAR(n)`, and Oracle counts bytes in `VARCHAR(n)` under its default
+    /// length semantics and characters in `NCHAR(n)`. The generic dialect names
+    /// no engine, so it answers only a written unit.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::MsSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<MsSqlDialect>(
+    ///     "CREATE TABLE notes (code VARCHAR(8), title NVARCHAR(100), body NVARCHAR(MAX));",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("notes", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let units: Vec<_> = table
+    ///     .columns(&db)?
+    ///     .map(|column| column.data_type(&db).character_length_unit(&db))
+    ///     .collect();
+    /// assert_eq!(
+    ///     units,
+    ///     [Some(CharacterLengthUnit::Octets), Some(CharacterLengthUnit::Utf16CodeUnits), None]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn character_length_unit(&self, database: &Self::DB) -> Option<CharacterLengthUnit>;
 
     /// Returns how many fractional digits of a second a value of a time,
     /// timestamp or interval type keeps, or `None` when the type holds no
@@ -632,14 +749,47 @@ pub trait DataTypeLike: Debug + Send + Sync {
         None
     }
 
+    /// Returns the time zone a temporal type names as a parameter, or `None`
+    /// for a type that names none.
+    ///
+    /// ClickHouse's `DateTime64(p, 'zone')` answers `zone`, as written, apart
+    /// from the fractional digits [`Self::fractional_seconds_precision`]
+    /// answers. A type that names no zone, such as a bare `DateTime64(3)`
+    /// reading values in the server's zone, answers `None`, and so does a
+    /// zone-aware type such as `TIMESTAMP WITH TIME ZONE`, which names no zone
+    /// of its own.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::ClickHouseDialect;
+    ///
+    /// let db = ParserDB::parse::<ClickHouseDialect>(
+    ///     "CREATE TABLE events (at DateTime64(3, 'Europe/Rome'), seen DateTime64(3)) \
+    ///      ENGINE = MergeTree ORDER BY at;",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("events", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let zones: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).time_zone(&db)).collect();
+    /// assert_eq!(zones, [Some("Europe/Rome"), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn time_zone<'db>(&'db self, database: &'db Self::DB) -> Option<&'db str>;
+
     /// Returns the declared number of decimal digits, including fractional
     /// digits, or `None` when the type fixes no integral decimal precision.
     ///
     /// `NUMERIC(p, s)` and `DECIMAL(p)` answer `p`, and a bare decimal takes
-    /// its engine's default. Integer, floating-point and non-numeric types,
-    /// unconstrained PostgreSQL `NUMERIC`, Oracle `NUMBER`, and every SQLite
-    /// type answer `None`. BigQuery's fractional bare `BIGNUMERIC` precision is
-    /// not modeled and answers `None`.
+    /// its engine's default. MySQL's `FLOAT(p, s)` and `DOUBLE(p, s)` bound
+    /// their values to `p` decimal digits and answer `p`. Integer, other
+    /// floating-point and non-numeric types, unconstrained PostgreSQL
+    /// `NUMERIC`, Oracle `NUMBER`, and every SQLite type answer `None`.
+    /// BigQuery's fractional bare `BIGNUMERIC` precision is not modeled and
+    /// answers `None`.
     fn numeric_precision(&self, database: &Self::DB) -> Option<u64>;
 
     /// Returns how many digits a value of a decimal type keeps to the right
@@ -650,10 +800,11 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// Server and the standard, 3 in DuckDB and 9 in BigQuery. A bare `NUMERIC`
     /// in PostgreSQL holds any scale and answers `None`, and so does a bare
     /// `NUMBER` in Oracle. A negative scale, which PostgreSQL accepts and which
-    /// rounds a value to tens or hundreds, answers as written. Integer,
-    /// floating-point and non-numeric types answer `None`. So does every
-    /// declared type in SQLite, which stores a decimal value as an integer or a
-    /// float whatever scale it declares.
+    /// rounds a value to tens or hundreds, answers as written. MySQL rounds a
+    /// value of `FLOAT(p, s)` or `DOUBLE(p, s)` to `s` decimal places, so these
+    /// answer `s`. Integer, other floating-point and non-numeric types answer
+    /// `None`. So does every declared type in SQLite, which stores a decimal
+    /// value as an integer or a float whatever scale it declares.
     ///
     /// The default answers `None`, so an implementation over a backend with a
     /// decimal type must override it.

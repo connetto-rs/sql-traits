@@ -477,6 +477,22 @@ impl DataTypeLike for MemoryDataType {
         .then_some(false)
     }
 
+    fn max_binary_length(&self, _database: &Self::DB) -> Option<u64> {
+        None
+    }
+
+    fn max_bit_length(&self, _database: &Self::DB) -> Option<u64> {
+        None
+    }
+
+    fn character_length_unit(&self, _database: &Self::DB) -> Option<CharacterLengthUnit> {
+        None
+    }
+
+    fn time_zone<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db str> {
+        None
+    }
+
     fn send_function(&self, _database: &Self::DB) -> Option<bool> {
         None
     }

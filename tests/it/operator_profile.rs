@@ -291,6 +291,22 @@ impl DataTypeLike for NoneKind {
         self.unreach()
     }
 
+    fn max_binary_length(&self, _database: &Self::DB) -> Option<u64> {
+        self.unreach()
+    }
+
+    fn max_bit_length(&self, _database: &Self::DB) -> Option<u64> {
+        self.unreach()
+    }
+
+    fn character_length_unit(&self, _database: &Self::DB) -> Option<CharacterLengthUnit> {
+        self.unreach()
+    }
+
+    fn time_zone<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db str> {
+        self.unreach()
+    }
+
     fn send_function(&self, _database: &Self::DB) -> Option<bool> {
         self.unreach()
     }
