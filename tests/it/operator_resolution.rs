@@ -187,10 +187,14 @@ fn polymorphic_operators_bind_their_operands() {
         resolved(&db, op("@@@"), Some(LITERAL), known("int4")),
         "unbound public.@@@(pg_catalog.anyrange,pg_catalog.anyelement)"
     );
-    // `"any"` takes an operand as it is.
+    // `"any"` takes an operand as it is, an untyped literal staying untyped.
     assert_eq!(
         resolved(&db, op("~~~"), Some(known("int4")), known("bytea")),
-        "public.~~~(pg_catalog.int4,pg_catalog.any) as pg_catalog.int4,pg_catalog.any"
+        "public.~~~(pg_catalog.int4,pg_catalog.any) as pg_catalog.int4,pg_catalog.bytea"
+    );
+    assert_eq!(
+        resolved(&db, op("~~~"), Some(known("int4")), LITERAL),
+        "public.~~~(pg_catalog.int4,pg_catalog.any) as pg_catalog.int4,pg_catalog.unknown"
     );
 }
 

@@ -121,7 +121,10 @@ pub(crate) fn resolve_operator<'db, D: DatabaseLike>(
     };
     match exact(database, &candidates, &inputs) {
         Err(Undecided) => OperatorResolution::Undetermined,
-        Ok(Some(candidate)) => selected(database, candidate, None),
+        Ok(Some(candidate)) => {
+            let sources: Vec<&PgType> = inputs.iter().collect();
+            selected(database, candidate, None, &sources)
+        }
         Ok(None) => select_candidate(database, &candidates, inputs),
     }
 }
@@ -149,7 +152,9 @@ fn select_candidate<'db, D: DatabaseLike>(
         Selection::Chosen(position) => {
             let binding =
                 bound.iter().find(|(held, _)| *held == position).map(|(_, binding)| binding);
-            selected(database, &candidates[position], binding)
+            let sources: Vec<&PgType> =
+                actuals.iter().flatten().map(|actual| &actual.pg_type).collect();
+            selected(database, &candidates[position], binding, &sources)
         }
         Selection::Undetermined(_) => OperatorResolution::Undetermined,
         Selection::Refused => {
@@ -198,15 +203,21 @@ enum Refusal {
     Undetermined,
 }
 
-/// The selection of `candidate`, each operand taking its declared type or
-/// what `binding` binds a polymorphic declaration to.
+/// The selection of `candidate`, each operand of type `sources` taking its
+/// declared type or what `binding` binds a polymorphic declaration to.
 fn selected<'db, D: DatabaseLike>(
     database: &'db D,
     candidate: &Candidate<'db, D::Operator>,
     binding: Option<&Binding<'_>>,
+    sources: &[&PgType],
 ) -> OperatorResolution<'db, D> {
     let operand = |position: usize, name: &TargetName<'db>| {
         let declared = candidate.declared[position].as_ref();
+        // `"any"` keeps the operand's own type, as `coerce_type` returns it.
+        if declared.is_some_and(PgType::is_any) {
+            let source = type_name(database, sources[position]).ok_or(Refusal::Undetermined)?;
+            return Ok(OperandEvidence::new(source, false));
+        }
         let Some(polymorphic) = declared.and_then(PgType::polymorphic) else {
             return Ok(OperandEvidence::new(name.clone(), false));
         };
