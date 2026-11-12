@@ -65,7 +65,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     }
 
     fn type_facts(&self, type_name: TargetName<'_>) -> Option<TypeFacts<'_>> {
-        P::type_facts(self, type_name)
+        P::type_facts(self, &self.ingestion, type_name)
     }
 
     #[inline]

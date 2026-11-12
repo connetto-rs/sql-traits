@@ -100,7 +100,8 @@ pub trait SchemaProfile: Sized {
     /// The state a built database carries beyond the schema objects
     /// themselves, which statement-by-statement ingestion resumes from and
     /// which holds the catalogs the profile answers, such as the operators
-    /// [`Self::operators`] and the casts [`Self::casts`] read.
+    /// [`Self::operators`], the casts [`Self::casts`] and the type facts
+    /// [`Self::type_facts`] read.
     ///
     /// The parser profile stores its access-resolution mode, the active
     /// PostgreSQL catalog, and metadata for collations the ingested DDL
@@ -142,9 +143,11 @@ pub trait SchemaProfile: Sized {
     }
 
     /// Returns the conversion facts of the type `type_name` names in
-    /// `database`, or `None` when the profile holds no facts for it.
+    /// `database`, whose state is `ingestion`, or `None` when the profile
+    /// holds no facts for it.
     fn type_facts<'a>(
         _database: &'a GenericDB<Self>,
+        _ingestion: &'a Self::Ingestion,
         _type_name: TargetName<'_>,
     ) -> Option<TypeFacts<'a>> {
         None

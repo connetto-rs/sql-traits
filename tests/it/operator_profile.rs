@@ -1,5 +1,5 @@
-//! An external profile's operator catalog, built into the database it
-//! belongs to, stays distinct from unavailable operator metadata.
+//! An external profile's operator catalog and type facts, built into the
+//! database they belong to, stay distinct from unavailable metadata.
 
 extern crate alloc;
 
@@ -869,8 +869,32 @@ impl OperatorLike for CatalogOperator {
     }
 }
 
-/// The operator catalog the profile loads, `None` when it is unavailable.
-type AlternateCatalog = Option<Arc<[CatalogOperator]>>;
+/// A type the profile loads, with the array type over it.
+#[derive(Debug, Clone)]
+struct CatalogType {
+    /// The type's name.
+    name: String,
+    /// The type's `pg_type.typcategory`.
+    category: TypeCategory,
+    /// The name of the array type over the type.
+    array: String,
+}
+
+/// The catalogs the profile loads, each `None` when it is unavailable.
+#[derive(Debug, Clone, Default)]
+struct AlternateCatalog {
+    /// The operators the catalog holds.
+    operators: Option<Arc<[CatalogOperator]>>,
+    /// The types the catalog holds.
+    types: Option<Arc<[CatalogType]>>,
+}
+
+impl AlternateCatalog {
+    /// The catalog holding `operators` and no type facts.
+    fn of_operators(operators: Arc<[CatalogOperator]>) -> Self {
+        Self { operators: Some(operators), types: None }
+    }
+}
 
 /// PostgreSQL syntax for an empty schema profile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -936,7 +960,7 @@ impl SchemaProfile for AlternateProfile {
     type Ingestion = AlternateCatalog;
 
     fn default_ingestion(_dialect: &Self::Dialect) -> Self::Ingestion {
-        None
+        AlternateCatalog::default()
     }
 
     fn operators<'a>(
@@ -946,7 +970,20 @@ impl SchemaProfile for AlternateProfile {
     where
         Self::Operator: 'a,
     {
-        ingestion.as_deref().map(<[CatalogOperator]>::iter)
+        ingestion.operators.as_deref().map(<[CatalogOperator]>::iter)
+    }
+
+    fn type_facts<'a>(
+        _database: &'a GenericDB<Self>,
+        ingestion: &'a Self::Ingestion,
+        type_name: TargetName<'_>,
+    ) -> Option<TypeFacts<'a>> {
+        let loaded =
+            ingestion.types.as_deref()?.iter().find(|loaded| loaded.name == type_name.name())?;
+        Some(
+            TypeFacts::new(loaded.category, false)
+                .with_array_type(TargetName::new(&loaded.array, false)),
+        )
     }
 
     fn initial_schemas(
@@ -996,7 +1033,8 @@ fn a_loaded_catalog_reaches_the_database_and_its_clones() {
         CatalogOperator { schema: "pg_catalog", name: "+" },
         CatalogOperator { schema: "public", name: "+" },
     ]);
-    let database = alternate_builder().into_database(Some(Arc::clone(&catalog)));
+    let database =
+        alternate_builder().into_database(AlternateCatalog::of_operators(Arc::clone(&catalog)));
     let clone = database.clone();
 
     for database in [&database, &clone] {
@@ -1014,7 +1052,7 @@ fn a_loaded_catalog_reaches_the_database_and_its_clones() {
 fn operators_of_unknown_operand_types_leave_an_invocation_open() {
     let catalog: Arc<[CatalogOperator]> =
         Arc::from([CatalogOperator { schema: "pg_catalog", name: "+" }]);
-    let database = alternate_builder().into_database(Some(catalog));
+    let database = alternate_builder().into_database(AlternateCatalog::of_operators(catalog));
     let int4 = || OperandType::Known { type_name: TargetName::new("int4", false), typmod: None };
     assert!(matches!(
         database.resolve_operator(
@@ -1031,10 +1069,40 @@ fn operators_of_unknown_operand_types_leave_an_invocation_open() {
 /// default state answering unavailable stays distinct from.
 #[test]
 fn a_loaded_empty_catalog_stays_distinct_from_unavailable() {
-    let empty = alternate_builder().into_database(Some(Arc::from([])));
+    let empty = alternate_builder().into_database(AlternateCatalog::of_operators(Arc::from([])));
     assert!(empty.operators().is_some_and(|mut operators| operators.next().is_none()));
     assert!(empty.clone().operators().is_some_and(|mut operators| operators.next().is_none()));
 
     let unavailable: AlternateDB = alternate_builder().into();
     assert!(unavailable.operators().is_none());
+}
+
+/// The database holding the given types and no operators.
+fn database_of_types(types: &[(&str, TypeCategory, &str)]) -> AlternateDB {
+    let types = types
+        .iter()
+        .map(|&(name, category, array)| {
+            CatalogType { name: String::from(name), category, array: String::from(array) }
+        })
+        .collect();
+    alternate_builder().into_database(AlternateCatalog { operators: None, types: Some(types) })
+}
+
+/// Each database answers type facts from the types its own loaded catalog
+/// stores, so two databases loading different facts for one name each
+/// answer their own.
+#[test]
+fn type_facts_read_the_catalog_their_database_loaded() {
+    let numeric = database_of_types(&[("money", TypeCategory::NUMERIC, "_money")]);
+    let string = database_of_types(&[("money", TypeCategory::STRING, "money_list")]);
+
+    for (database, category, array) in
+        [(&numeric, TypeCategory::NUMERIC, "_money"), (&string, TypeCategory::STRING, "money_list")]
+    {
+        assert_eq!(
+            database.type_facts(TargetName::new("money", false)),
+            Some(TypeFacts::new(category, false).with_array_type(TargetName::new(array, false)))
+        );
+        assert!(database.type_facts(TargetName::new("int4", false)).is_none());
+    }
 }
