@@ -20,9 +20,9 @@ use crate::{
     impls::sqlparser::{SqlparserDialect, bound_domain, bound_user_type},
     structs::{ParserDB, UserDefinedType},
     traits::{
-        ColumnCollation, DataTypeLike, DatabaseLike, EnumWidth, Enumeration, EnumerationKind,
-        EnumerationMember, ExtensionLike, IntervalFields, MapEntry, NamedColumnCollation,
-        StructureKind, StructuredField, VectorKind, VectorType,
+        CharacterLengthUnit, ColumnCollation, DataTypeLike, DatabaseLike, EnumWidth, Enumeration,
+        EnumerationKind, EnumerationMember, ExtensionLike, IntervalFields, MapEntry,
+        NamedColumnCollation, StructureKind, StructuredField, VectorKind, VectorType,
     },
     utils::{
         identifier_resolution::{identifiers_match, stored_identifier},
@@ -118,13 +118,36 @@ impl DataTypeLike for DataType {
     }
 
     #[inline]
+    fn max_binary_length(&self, database: &Self::DB) -> Option<u64> {
+        super::dialect::max_binary_length(*database.dialect(), stored_as(self))
+    }
+
+    #[inline]
+    fn max_bit_length(&self, database: &Self::DB) -> Option<u64> {
+        super::dialect::max_bit_length(*database.dialect(), stored_as(self))
+    }
+
+    #[inline]
     fn max_character_length(&self, database: &Self::DB) -> Option<u64> {
         super::dialect::max_character_length(*database.dialect(), stored_as(self))
     }
 
     #[inline]
+    fn character_length_unit(&self, database: &Self::DB) -> Option<CharacterLengthUnit> {
+        super::dialect::character_length_unit(*database.dialect(), stored_as(self))
+    }
+
+    #[inline]
     fn fractional_seconds_precision(&self, database: &Self::DB) -> Option<u64> {
         super::dialect::fractional_seconds_precision(*database.dialect(), stored_as(self))
+    }
+
+    #[inline]
+    fn time_zone<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db str> {
+        match stored_as(self) {
+            Self::Datetime64(_, zone) => zone.as_deref(),
+            _ => None,
+        }
     }
 
     #[inline]

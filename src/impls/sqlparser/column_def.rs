@@ -238,9 +238,13 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
 mod tests {
     use alloc::{string::String, sync::Arc};
 
-    use sqlparser::dialect::{
-        AnsiDialect, DatabricksDialect, DuckDbDialect, GenericDialect, HiveDialect, MsSqlDialect,
-        MySqlDialect, PostgreSqlDialect, SQLiteDialect, SnowflakeDialect, SparkSqlDialect,
+    use sqlparser::{
+        ast::DataType,
+        dialect::{
+            AnsiDialect, ClickHouseDialect, DatabricksDialect, DuckDbDialect, GenericDialect,
+            HiveDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
+            SnowflakeDialect, SparkSqlDialect,
+        },
     };
 
     use crate::{
@@ -437,6 +441,17 @@ mod tests {
         assert_eq!(fixed_binary_lengths::<SQLiteDialect>(), [None; 5]);
     }
 
+    #[test]
+    fn clickhouse_fixed_string_pads_to_its_width() {
+        let db = parse_with::<ClickHouseDialect>(
+            "CREATE TABLE t (fixed FixedString(8), low LowCardinality(Nullable(FixedString(16))), \
+             text String);",
+        );
+        let widths = ["fixed", "low", "text"]
+            .map(|name| column_named(&db, name).data_type(&db).fixed_binary_length(&db));
+        assert_eq!(widths, [Some(8), Some(16), None]);
+    }
+
     mod max_character_length {
         use sqlparser::dialect::{
             AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
@@ -547,6 +562,20 @@ mod tests {
                 lengths::<BigQueryDialect, 2>("s STRING(10), bare STRING", ["s", "bare"]),
                 [Some(10), None]
             );
+        }
+        #[test]
+        fn character_large_objects_bound_their_declared_characters() {
+            fn clobs<D: Dialect + Default + 'static>() -> [Option<u64>; 4] {
+                lengths::<D, 4>(
+                    "c CLOB(10), cl CHARACTER LARGE OBJECT(20), chl CHAR LARGE OBJECT(30), bare CLOB",
+                    ["c", "cl", "chl", "bare"],
+                )
+            }
+            let bounded = [Some(10), Some(20), Some(30), None];
+            assert_eq!(clobs::<AnsiDialect>(), bounded);
+            assert_eq!(clobs::<GenericDialect>(), bounded);
+            assert_eq!(clobs::<TeradataDialect>(), bounded);
+            assert_eq!(clobs::<MySqlDialect>(), [None; 4]);
         }
     }
 
@@ -1235,6 +1264,334 @@ mod tests {
             assert_eq!(hits.base_type(&db).and_then(|base| base.is_unsigned(&db)), Some(true));
             let name = column_named(&db, "name").data_type(&db);
             assert_eq!(name.base_type(&db).and_then(|base| base.is_unsigned(&db)), None);
+        }
+    }
+
+    /// Asserts what `answer` gives for a column declared with each type
+    /// under the dialect `D`.
+    fn assert_answers<D, T>(cases: &[(&str, T)], answer: impl Fn(&DataType, &ParserDB) -> T)
+    where
+        D: sqlparser::dialect::Dialect + Default + 'static,
+        T: PartialEq + core::fmt::Debug,
+    {
+        let columns: Vec<String> =
+            cases.iter().enumerate().map(|(index, (ty, _))| format!("c{index} {ty}")).collect();
+        let db = parse_with::<D>(&format!("CREATE TABLE t ({});", columns.join(", ")));
+        for (index, (ty, expected)) in cases.iter().enumerate() {
+            let column = column_named(&db, &format!("c{index}"));
+            assert_eq!(answer(column.data_type(&db), &db), *expected, "{ty}");
+        }
+    }
+
+    mod float_precision_and_scale {
+        use sqlparser::dialect::{GenericDialect, MySqlDialect, PostgreSqlDialect};
+
+        use super::{DataType, DataTypeLike, ParserDB, assert_answers};
+
+        #[test]
+        fn mysql_float_and_double_round_to_their_declared_digits() {
+            let cases = [
+                ("FLOAT(10,2)", (Some(10), Some(2))),
+                ("DOUBLE(12,3)", (Some(12), Some(3))),
+                ("FLOAT(7,4) UNSIGNED", (Some(7), Some(4))),
+                ("DOUBLE(10,2) ZEROFILL", (Some(10), Some(2))),
+                ("FLOAT(10)", (None, None)),
+                ("FLOAT", (None, None)),
+                ("DOUBLE", (None, None)),
+                ("REAL", (None, None)),
+            ];
+            assert_answers::<MySqlDialect, _>(&cases, bounds);
+            assert_answers::<GenericDialect, _>(&cases, bounds);
+        }
+
+        #[test]
+        fn float_digits_bound_nothing_outside_mysql() {
+            assert_answers::<PostgreSqlDialect, _>(
+                &[("FLOAT(10,2)", (None, None)), ("FLOAT(10)", (None, None))],
+                bounds,
+            );
+        }
+
+        /// The decimal precision and scale `ty` bounds its values to.
+        fn bounds(ty: &DataType, db: &ParserDB) -> (Option<u64>, Option<i64>) {
+            (ty.numeric_precision(db), ty.numeric_scale(db))
+        }
+    }
+
+    mod max_binary_length {
+        use sqlparser::dialect::{
+            AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
+            DuckDbDialect, GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+            PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
+            SparkSqlDialect, TeradataDialect,
+        };
+
+        use super::{DataType, DataTypeLike, assert_answers};
+
+        fn assert_lengths<D: Dialect + Default + 'static>(cases: &[(&str, Option<u64>)]) {
+            assert_answers::<D, _>(cases, DataType::max_binary_length);
+        }
+
+        #[test]
+        fn mysql_bounds_binary_strings_by_their_declared_or_storage_length() {
+            assert_lengths::<MySqlDialect>(&[
+                ("VARBINARY(8)", Some(8)),
+                ("BINARY(4)", Some(4)),
+                ("BINARY", Some(1)),
+                ("TINYBLOB", Some(255)),
+                ("BLOB", Some(65_535)),
+                ("MEDIUMBLOB", Some(16_777_215)),
+                ("LONGBLOB", Some(4_294_967_295)),
+                ("VARCHAR(8)", None),
+                ("INT", None),
+            ]);
+        }
+
+        #[test]
+        fn mysql_blob_length_picks_the_smallest_blob_type_holding_it() {
+            assert_lengths::<MySqlDialect>(&[
+                ("BLOB(10)", Some(255)),
+                ("BLOB(255)", Some(255)),
+                ("BLOB(256)", Some(65_535)),
+                ("BLOB(65536)", Some(16_777_215)),
+                ("BLOB(16777216)", Some(4_294_967_295)),
+            ]);
+        }
+
+        #[test]
+        fn sql_server_tells_max_from_the_one_byte_default() {
+            assert_lengths::<MsSqlDialect>(&[
+                ("VARBINARY(16)", Some(16)),
+                ("VARBINARY", Some(1)),
+                ("VARBINARY(MAX)", None),
+                ("BINARY(4)", Some(4)),
+                ("BINARY", Some(1)),
+            ]);
+        }
+
+        #[test]
+        fn redshift_varbyte_defaults_to_64000_bytes() {
+            assert_lengths::<RedshiftSqlDialect>(&[
+                ("VARBINARY(10)", Some(10)),
+                ("VARBINARY", Some(64_000)),
+                ("VARBYTE(12)", Some(12)),
+                ("VARBYTE", Some(64_000)),
+            ]);
+        }
+
+        #[test]
+        fn snowflake_bare_binary_holds_eight_mebibytes() {
+            assert_lengths::<SnowflakeDialect>(&[
+                ("BINARY(10)", Some(10)),
+                ("VARBINARY(12)", Some(12)),
+                ("BINARY", Some(8_388_608)),
+                ("VARBINARY", Some(8_388_608)),
+            ]);
+        }
+
+        #[test]
+        fn written_lengths_bound_where_no_default_is_modeled() {
+            assert_lengths::<BigQueryDialect>(&[("BYTES(10)", Some(10)), ("BYTES", None)]);
+            let standard = [
+                ("VARBINARY(8)", Some(8)),
+                ("BINARY(4)", Some(4)),
+                ("BINARY", Some(1)),
+                ("BLOB(5)", Some(5)),
+                ("BLOB", None),
+                ("VARBINARY", None),
+            ];
+            assert_lengths::<AnsiDialect>(&standard);
+            assert_lengths::<GenericDialect>(&standard);
+            assert_lengths::<GenericDialect>(&[
+                ("BYTES(10)", Some(10)),
+                ("FixedString(8)", Some(8)),
+                ("VARBINARY(MAX)", None),
+            ]);
+            assert_lengths::<TeradataDialect>(&[("BLOB(5)", Some(5)), ("BLOB", None)]);
+        }
+
+        #[test]
+        fn clickhouse_fixed_string_holds_its_width_through_wrappers() {
+            assert_lengths::<ClickHouseDialect>(&[
+                ("FixedString(8)", Some(8)),
+                ("LowCardinality(FixedString(16))", Some(16)),
+                ("Nullable(FixedString(4))", Some(4)),
+                ("String", None),
+            ]);
+        }
+
+        #[test]
+        fn engines_storing_any_length_bound_nothing() {
+            assert_lengths::<PostgreSqlDialect>(&[("BYTEA", None)]);
+            assert_lengths::<DuckDbDialect>(&[("BLOB", None), ("VARBINARY(8)", None)]);
+            assert_lengths::<SQLiteDialect>(&[("BLOB(10)", None), ("VARBINARY(8)", None)]);
+            assert_lengths::<HiveDialect>(&[("BINARY", None)]);
+            assert_lengths::<SparkSqlDialect>(&[("BINARY", None)]);
+            assert_lengths::<DatabricksDialect>(&[("BINARY", None)]);
+            assert_lengths::<OracleDialect>(&[("BLOB", None)]);
+        }
+    }
+
+    mod max_bit_length {
+        use sqlparser::dialect::{
+            AnsiDialect, Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect,
+            PostgreSqlDialect,
+        };
+
+        use super::{DataType, DataTypeLike, assert_answers};
+
+        fn assert_lengths<D: Dialect + Default + 'static>(cases: &[(&str, Option<u64>)]) {
+            assert_answers::<D, _>(cases, DataType::max_bit_length);
+        }
+
+        #[test]
+        fn bit_strings_hold_their_declared_bits() {
+            let cases = [
+                ("BIT(3)", Some(3)),
+                ("BIT", Some(1)),
+                ("BIT VARYING(8)", Some(8)),
+                ("VARBIT(16)", Some(16)),
+                ("VARBIT", None),
+                ("BIT VARYING", None),
+                ("INT", None),
+            ];
+            assert_lengths::<PostgreSqlDialect>(&cases);
+            assert_lengths::<AnsiDialect>(&cases);
+            assert_lengths::<GenericDialect>(&cases);
+        }
+
+        #[test]
+        fn mysql_bit_fields_hold_their_declared_bits() {
+            assert_lengths::<MySqlDialect>(&[("BIT(3)", Some(3)), ("BIT", Some(1))]);
+        }
+
+        #[test]
+        fn a_bit_that_is_no_bit_string_holds_no_length() {
+            assert_lengths::<MsSqlDialect>(&[("BIT", None)]);
+            assert_lengths::<DuckDbDialect>(&[("BIT", None)]);
+        }
+    }
+
+    mod character_length_unit {
+        use sqlparser::dialect::{
+            AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect,
+            DuckDbDialect, GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+            PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
+            SparkSqlDialect, TeradataDialect,
+        };
+
+        use super::{DataType, DataTypeLike, assert_answers};
+        use crate::traits::CharacterLengthUnit::{self, Characters, Octets, Utf16CodeUnits};
+
+        fn assert_units<D: Dialect + Default + 'static>(
+            cases: &[(&str, Option<CharacterLengthUnit>)],
+        ) {
+            assert_answers::<D, _>(cases, DataType::character_length_unit);
+        }
+
+        #[test]
+        fn character_engines_count_characters_unless_octets_are_written() {
+            let cases = [
+                ("VARCHAR(10)", Some(Characters)),
+                ("CHAR", Some(Characters)),
+                ("VARCHAR(10 OCTETS)", Some(Octets)),
+                ("TEXT", None),
+                ("INT", None),
+            ];
+            assert_units::<PostgreSqlDialect>(&cases);
+            assert_units::<MySqlDialect>(&cases);
+            assert_units::<AnsiDialect>(&cases);
+            assert_units::<SnowflakeDialect>(&cases);
+            assert_units::<BigQueryDialect>(&cases);
+            assert_units::<HiveDialect>(&cases);
+            assert_units::<SparkSqlDialect>(&cases);
+            assert_units::<DatabricksDialect>(&cases);
+            assert_units::<TeradataDialect>(&cases);
+            assert_units::<PostgreSqlDialect>(&[("VARCHAR", None)]);
+            assert_units::<AnsiDialect>(&[("CLOB(10)", Some(Characters))]);
+        }
+
+        #[test]
+        fn sql_server_counts_bytes_and_national_byte_pairs() {
+            assert_units::<MsSqlDialect>(&[
+                ("VARCHAR(10)", Some(Octets)),
+                ("CHAR(4)", Some(Octets)),
+                ("VARCHAR", Some(Octets)),
+                ("NVARCHAR(10)", Some(Utf16CodeUnits)),
+                ("NCHAR", Some(Utf16CodeUnits)),
+                ("VARCHAR(MAX)", None),
+                ("NVARCHAR(MAX)", None),
+            ]);
+        }
+
+        #[test]
+        fn redshift_and_oracle_count_bytes() {
+            assert_units::<RedshiftSqlDialect>(&[
+                ("VARCHAR(10)", Some(Octets)),
+                ("VARCHAR", Some(Octets)),
+                ("NCHAR(4)", Some(Octets)),
+            ]);
+            assert_units::<OracleDialect>(&[
+                ("VARCHAR(10)", Some(Octets)),
+                ("CHAR(4)", Some(Octets)),
+                ("NCHAR(4)", Some(Characters)),
+                ("NATIONAL CHARACTER VARYING(5)", Some(Characters)),
+            ]);
+        }
+
+        #[test]
+        fn generic_answers_only_a_written_unit() {
+            assert_units::<GenericDialect>(&[
+                ("CHARACTER(8)", None),
+                ("CHARACTER(8 CHARACTERS)", Some(Characters)),
+                ("CHARACTER(8 OCTETS)", Some(Octets)),
+            ]);
+        }
+
+        #[test]
+        fn engines_storing_any_length_count_no_unit() {
+            let cases = [("VARCHAR(10 OCTETS)", None), ("VARCHAR(10)", None)];
+            assert_units::<ClickHouseDialect>(&cases);
+            assert_units::<DuckDbDialect>(&cases);
+            assert_units::<SQLiteDialect>(&cases);
+        }
+    }
+
+    mod time_zone {
+        use sqlparser::dialect::{ClickHouseDialect, Dialect, GenericDialect, PostgreSqlDialect};
+
+        use super::{DataType, DataTypeLike, ParserDB, assert_answers};
+
+        /// The zone `ty` names, owned so it outlives the parsed schema.
+        fn zone(ty: &DataType, db: &ParserDB) -> Option<String> {
+            ty.time_zone(db).map(String::from)
+        }
+
+        fn assert_zones<D: Dialect + Default + 'static>(cases: &[(&str, Option<&str>)]) {
+            let owned: Vec<_> =
+                cases.iter().map(|(ty, zone)| (*ty, zone.map(String::from))).collect();
+            assert_answers::<D, _>(&owned, zone);
+        }
+
+        #[test]
+        fn datetime64_keeps_its_named_zone_apart_from_its_precision() {
+            let cases = [
+                ("DateTime64(3, 'UTC')", Some("UTC")),
+                ("DateTime64(6, 'Europe/Rome')", Some("Europe/Rome")),
+                ("DateTime64(3)", None),
+                ("Nullable(DateTime64(3, 'Asia/Tokyo'))", Some("Asia/Tokyo")),
+                ("DateTime", None),
+            ];
+            assert_zones::<ClickHouseDialect>(&cases);
+            assert_zones::<GenericDialect>(&cases);
+        }
+
+        #[test]
+        fn a_zone_aware_type_names_no_zone() {
+            assert_zones::<PostgreSqlDialect>(&[
+                ("TIMESTAMPTZ", None),
+                ("TIMESTAMP(3) WITH TIME ZONE", None),
+            ]);
         }
     }
 

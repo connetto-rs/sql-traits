@@ -13,8 +13,8 @@ use core::any::TypeId;
 
 use sqlparser::{
     ast::{
-        CharacterLength, ColumnDef, CreateTable, DataType, ExactNumberInfo, ObjectName,
-        ObjectNamePart, TimezoneInfo, TypeModifier,
+        BinaryLength, CharLengthUnits, CharacterLength, ColumnDef, CreateTable, DataType,
+        ExactNumberInfo, ObjectName, ObjectNamePart, TimezoneInfo, TypeModifier,
     },
     dialect::{
         AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
@@ -26,7 +26,7 @@ use sqlparser::{
 use super::data_type::interval_fields;
 use crate::{
     structs::{ParserDB, TableAttribute},
-    traits::{DialectLike, TypeMatch},
+    traits::{CharacterLengthUnit, DialectLike, TypeMatch},
 };
 
 /// Closed enumeration of every stock `sqlparser` dialect.
@@ -282,16 +282,20 @@ fn classify_uuid(dialect: SqlparserDialect, ty: &DataType) -> TypeMatch {
 /// Width in bytes of a fixed-length binary type.
 ///
 /// `BINARY(n)` holds exactly `n` zero-padded bytes in the MySQL family, SQL
-/// Server and ANSI SQL, where a bare `BINARY` is one byte. Snowflake reads `n`
-/// as a maximum length, and DuckDB, Hive, Spark and Databricks alias `BINARY`
-/// to a varying type.
+/// Server and ANSI SQL, where a bare `BINARY` is one byte, and so does
+/// ClickHouse's `FixedString(n)`. Snowflake reads `n` as a maximum length,
+/// and DuckDB, Hive, Spark and Databricks alias `BINARY` to a varying type.
 pub(super) fn fixed_binary_length(dialect: SqlparserDialect, ty: &DataType) -> Option<u64> {
-    let DataType::Binary(length) = ty else {
-        return None;
-    };
-    (dialect.is_mysql_family()
-        || matches!(dialect, SqlparserDialect::MsSql | SqlparserDialect::Ansi))
-    .then(|| length.unwrap_or(1))
+    match ty {
+        DataType::Binary(length)
+            if dialect.is_mysql_family()
+                || matches!(dialect, SqlparserDialect::MsSql | SqlparserDialect::Ansi) =>
+        {
+            Some(length.unwrap_or(1))
+        }
+        DataType::FixedString(width) => Some(*width),
+        _ => None,
+    }
 }
 
 /// Most characters a value of a character type can hold, where the engine
@@ -327,12 +331,158 @@ pub(super) fn max_character_length(dialect: SqlparserDialect, ty: &DataType) -> 
         | DataType::NcharVarying(spec)
         | DataType::Nvarchar(spec) => (spec, bare_varying),
         DataType::String(length) => return *length,
+        DataType::Clob(length)
+        | DataType::CharacterLargeObject(length)
+        | DataType::CharLargeObject(length)
+            if matches!(
+                dialect,
+                SqlparserDialect::Ansi | SqlparserDialect::Generic | SqlparserDialect::Teradata
+            ) =>
+        {
+            return *length;
+        }
         _ => return None,
     };
     match spec {
         None => bare,
         Some(CharacterLength::IntegerLength { length, .. }) => Some(*length),
         Some(CharacterLength::Max) => None,
+    }
+}
+
+/// What the length [`max_character_length`] answers counts.
+///
+/// A written unit answers as written. Redshift counts bytes, SQL Server counts
+/// bytes in its plain types and UTF-16 code units in its national ones, and
+/// Oracle counts bytes in its plain types under the default
+/// `NLS_LENGTH_SEMANTICS` and characters in its national ones. Every other
+/// engine counts characters. The generic dialect names no engine, so it
+/// answers only a written unit.
+pub(super) fn character_length_unit(
+    dialect: SqlparserDialect,
+    ty: &DataType,
+) -> Option<CharacterLengthUnit> {
+    max_character_length(dialect, ty)?;
+    let (spec, national) = match ty {
+        DataType::Char(spec)
+        | DataType::Character(spec)
+        | DataType::Varchar(spec)
+        | DataType::CharacterVarying(spec)
+        | DataType::CharVarying(spec) => (spec.as_ref(), false),
+        DataType::NationalCharacter(spec)
+        | DataType::NationalChar(spec)
+        | DataType::Nchar(spec)
+        | DataType::NationalCharacterVarying(spec)
+        | DataType::NationalCharVarying(spec)
+        | DataType::NcharVarying(spec)
+        | DataType::Nvarchar(spec) => (spec.as_ref(), true),
+        _ => (None, false),
+    };
+    if let Some(CharacterLength::IntegerLength { unit: Some(unit), .. }) = spec {
+        return Some(match unit {
+            CharLengthUnits::Characters => CharacterLengthUnit::Characters,
+            CharLengthUnits::Octets => CharacterLengthUnit::Octets,
+        });
+    }
+    match dialect {
+        SqlparserDialect::Generic => None,
+        SqlparserDialect::Redshift => Some(CharacterLengthUnit::Octets),
+        SqlparserDialect::MsSql if national => Some(CharacterLengthUnit::Utf16CodeUnits),
+        SqlparserDialect::MsSql | SqlparserDialect::Oracle if !national => {
+            Some(CharacterLengthUnit::Octets)
+        }
+        _ => Some(CharacterLengthUnit::Characters),
+    }
+}
+
+/// Bytes Snowflake's `BINARY` and `VARBINARY` hold without a written length.
+// https://docs.snowflake.com/en/sql-reference/data-types-text#binary
+const SNOWFLAKE_BARE_BINARY: u64 = 8_388_608;
+
+/// Most bytes a value of a binary type can hold, where the engine enforces
+/// the declared length.
+///
+/// `BINARY(n)` is fixed in the MySQL family, SQL Server and ANSI SQL, where a
+/// bare `BINARY` is one byte, and bounds a varying length in Snowflake, where
+/// a bare `BINARY` or `VARBINARY` is 8388608 bytes. A bare `VARBINARY` is one
+/// byte in SQL Server and 64000 in Redshift, which spells it `VARBYTE` too.
+/// MySQL creates `BLOB(n)` as the smallest BLOB type holding `n` bytes, while
+/// the standard and Teradata bound `BLOB(n)` by `n`. PostgreSQL's `BYTEA`
+/// holds any length, and SQLite, DuckDB, Hive, Spark and Databricks store any
+/// length in every binary type.
+pub(super) fn max_binary_length(dialect: SqlparserDialect, ty: &DataType) -> Option<u64> {
+    let fixed = dialect.is_mysql_family()
+        || matches!(dialect, SqlparserDialect::MsSql | SqlparserDialect::Ansi);
+    let varying =
+        fixed || matches!(dialect, SqlparserDialect::Snowflake | SqlparserDialect::Redshift);
+    let bare_varying = match dialect {
+        SqlparserDialect::MsSql => Some(1),
+        SqlparserDialect::Redshift => Some(64_000),
+        SqlparserDialect::Snowflake => Some(SNOWFLAKE_BARE_BINARY),
+        _ => None,
+    };
+    match ty {
+        DataType::Binary(length) if fixed => Some(length.unwrap_or(1)),
+        DataType::Binary(length) if dialect == SqlparserDialect::Snowflake => {
+            Some(length.unwrap_or(SNOWFLAKE_BARE_BINARY))
+        }
+        DataType::Varbinary(length) if varying => {
+            match length {
+                None => bare_varying,
+                Some(BinaryLength::IntegerLength { length }) => Some(*length),
+                Some(BinaryLength::Max) => None,
+            }
+        }
+        DataType::Custom(name, modifiers)
+            if dialect == SqlparserDialect::Redshift && custom_type_is(name, "VARBYTE") =>
+        {
+            modifier_precision(modifiers, 64_000)
+        }
+        DataType::Bytes(length)
+            if matches!(dialect, SqlparserDialect::BigQuery | SqlparserDialect::Generic) =>
+        {
+            *length
+        }
+        DataType::FixedString(width) => Some(*width),
+        DataType::Blob(length)
+            if matches!(
+                dialect,
+                SqlparserDialect::Ansi | SqlparserDialect::Generic | SqlparserDialect::Teradata
+            ) =>
+        {
+            *length
+        }
+        // https://dev.mysql.com/doc/refman/8.4/en/storage-requirements.html#data-types-storage-reqs-strings
+        DataType::Blob(length) if dialect.is_mysql_family() => {
+            let length = length.unwrap_or(BLOB_CAPACITIES[1]);
+            BLOB_CAPACITIES.into_iter().find(|capacity| length <= *capacity)
+        }
+        DataType::TinyBlob if dialect.is_mysql_family() => Some(BLOB_CAPACITIES[0]),
+        DataType::MediumBlob if dialect.is_mysql_family() => Some(BLOB_CAPACITIES[2]),
+        DataType::LongBlob if dialect.is_mysql_family() => Some(BLOB_CAPACITIES[3]),
+        _ => None,
+    }
+}
+
+/// Bytes MySQL's `TINYBLOB`, `BLOB`, `MEDIUMBLOB` and `LONGBLOB` hold.
+const BLOB_CAPACITIES: [u64; 4] = [255, 65_535, 16_777_215, 4_294_967_295];
+
+/// Most bits a value of a bit-string type can hold.
+///
+/// PostgreSQL and the standard declare `BIT(n)` and `BIT VARYING(n)`, and
+/// MySQL declares `BIT(n)`, each with a bare `BIT` of one bit. SQL Server's
+/// `BIT` holds a boolean and DuckDB's a bit string of any length.
+pub(super) fn max_bit_length(dialect: SqlparserDialect, ty: &DataType) -> Option<u64> {
+    let standard = matches!(
+        dialect,
+        SqlparserDialect::PostgreSql | SqlparserDialect::Ansi | SqlparserDialect::Generic
+    );
+    match ty {
+        DataType::Bit(length) if standard || dialect == SqlparserDialect::MySql => {
+            Some(length.unwrap_or(1))
+        }
+        DataType::BitVarying(length) | DataType::VarBit(length) if standard => *length,
+        _ => None,
     }
 }
 
@@ -583,6 +733,14 @@ pub(super) fn numeric_precision(dialect: SqlparserDialect, ty: &DataType) -> Opt
         | DataType::DecUnsigned(info) => written_precision(info, bare),
         DataType::BigNumeric(info) | DataType::BigDecimal(info) => written_precision(info, None),
         DataType::Custom(name, modifiers) => custom_precision(dialect, name, modifiers),
+        DataType::Float(ExactNumberInfo::PrecisionAndScale(precision, _))
+        | DataType::FloatUnsigned(ExactNumberInfo::PrecisionAndScale(precision, _))
+        | DataType::Double(ExactNumberInfo::PrecisionAndScale(precision, _))
+        | DataType::DoubleUnsigned(ExactNumberInfo::PrecisionAndScale(precision, _))
+            if dialect.is_mysql_family() =>
+        {
+            Some(*precision)
+        }
         _ => None,
     }
 }
@@ -663,6 +821,14 @@ pub(super) fn numeric_scale(dialect: SqlparserDialect, ty: &DataType) -> Option<
             written_scale(info, if dialect == SqlparserDialect::BigQuery { Some(38) } else { bare })
         }
         DataType::Custom(name, modifiers) => custom_scale(dialect, name, modifiers),
+        DataType::Float(ExactNumberInfo::PrecisionAndScale(_, scale))
+        | DataType::FloatUnsigned(ExactNumberInfo::PrecisionAndScale(_, scale))
+        | DataType::Double(ExactNumberInfo::PrecisionAndScale(_, scale))
+        | DataType::DoubleUnsigned(ExactNumberInfo::PrecisionAndScale(_, scale))
+            if dialect.is_mysql_family() =>
+        {
+            Some(*scale)
+        }
         _ => None,
     }
 }
