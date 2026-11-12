@@ -49,13 +49,14 @@ use crate::{
 ///         let SelectItem::UnnamedExpr(expression) = item else { unreachable!() };
 ///         context.type_of(expression)
 ///     })
-///     .collect::<Result<Vec<_>, _>>()?;
-/// let pg = |name| TargetName::new(name, false).with_schema("pg_catalog", false);
+///     .collect::<Vec<_>>();
+/// let varchar = TargetName::new("varchar", false).with_schema("pg_catalog", false);
+/// let int4 = TargetName::new("int4", false).with_schema("pg_catalog", false);
 /// assert_eq!(
 ///     types,
 ///     [
-///         OperandType::Known { type_name: pg("varchar"), typmod: Some(9) },
-///         OperandType::Known { type_name: pg("int4"), typmod: None },
+///         Ok(OperandType::Known { type_name: varchar, typmod: Some(9) }),
+///         Ok(OperandType::Known { type_name: int4, typmod: None }),
 ///     ]
 /// );
 /// # Ok::<(), sql_traits::errors::Error>(())

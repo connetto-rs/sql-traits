@@ -52,7 +52,8 @@ fn literals_and_casts_take_their_postgres_types() {
     let query = query(
         "SELECT 'a', 1, 2147483648, 9223372036854775808, 1.5, 1e3, true, NULL,
                 'x'::varchar(5), CAST(1 AS int8), DATE '2024-01-01', ('x'), 'a' COLLATE \"C\",
-                X'1F', B'01', N'n', $1, 0x1F, 0o17, 0b101, 1_000, 0xFFFFFFFFF",
+                X'1F', B'01', N'n', $1, 0x1F, 0o17, 0b101, 1_000, 0xFFFFFFFFF,
+                18446744073709551616, 'x'::geometry(Point, 4326), 'x'::nosuchtype[]",
     );
     let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
     let types: Vec<_> =
@@ -86,6 +87,11 @@ fn literals_and_casts_take_their_postgres_types() {
             pg("int4"),
             pg("int4"),
             pg("int8"),
+            pg("numeric"),
+            // A modifier the model cannot encode, and a type the database
+            // cannot name, leave the cast's type unknown.
+            OperandType::Unknown,
+            OperandType::Unknown,
         ]
     );
 }
@@ -141,6 +147,18 @@ fn references_bind_and_type_in_their_own_scope() {
     );
     // A node that is no column reference binds nothing.
     assert!(context.reference(comparison).unwrap().is_none());
+}
+
+/// A reference that reaches no column, and an expression this context does
+/// not type, take no type.
+#[test]
+fn unresolved_and_untyped_nodes_take_no_type() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE shares (weight INT);").unwrap();
+    let query = query("SELECT nope, weight + 1 FROM shares");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let [missing, sum] = projected(&query)[..] else { unreachable!() };
+    assert_eq!(context.type_of(missing).unwrap(), OperandType::Unknown);
+    assert_eq!(context.type_of(sum).unwrap(), OperandType::Unknown);
 }
 
 /// An output of a derived table takes the type of the expression defining
