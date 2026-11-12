@@ -503,6 +503,13 @@ impl DataTypeLike for MemoryDataType {
     fn map_entry<'db>(&'db self, _database: &'db Self::DB) -> Option<MapEntry<'db, Self>> {
         None
     }
+
+    fn enumeration<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'db>>>> {
+        None::<Enumeration<core::iter::Empty<EnumerationMember<'db>>>>
+    }
 }
 
 impl TableLike for MemoryTable {

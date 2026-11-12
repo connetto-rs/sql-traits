@@ -42,6 +42,7 @@ mod domains;
 mod dropped_column_readers;
 mod dropped_policies;
 mod duplicate_object_names;
+mod enumerated_types;
 mod exhaustive_alter_table;
 mod explicit_revokes;
 mod expression_truth;

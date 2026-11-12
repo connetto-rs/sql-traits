@@ -14,8 +14,8 @@ pub use column::{
     NamedColumnCollation,
 };
 pub use data_type::{
-    BinarySend, DataTypeLike, IntervalFields, MapEntry, StructureKind, StructuredField, VectorKind,
-    VectorType,
+    BinarySend, DataTypeLike, EnumWidth, Enumeration, EnumerationKind, EnumerationMember,
+    IntervalFields, MapEntry, StructureKind, StructuredField, VectorKind, VectorType,
 };
 pub mod index;
 pub use database::{DatabaseLike, Relation};

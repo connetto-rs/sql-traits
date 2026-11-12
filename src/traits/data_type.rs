@@ -109,6 +109,97 @@ impl VectorType {
     }
 }
 
+/// Whether a value of an enumerated type holds one of its members or any
+/// subset of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EnumerationKind {
+    /// `ENUM`, whose value is exactly one member.
+    Enum,
+    /// MySQL's `SET`, whose value is any subset of the members.
+    Set,
+}
+
+/// The integer type ClickHouse stores the values of an enum's members in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EnumWidth {
+    /// `Enum8`, whose values are 8-bit signed integers.
+    Enum8,
+    /// `Enum16`, whose values are 16-bit signed integers.
+    Enum16,
+}
+
+/// One member of an enumerated type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnumerationMember<'db> {
+    label: &'db str,
+    value: Option<i16>,
+}
+
+impl<'db> EnumerationMember<'db> {
+    /// Creates a member named `label` that the engine stores as `value`, or
+    /// as its position when `value` is `None`.
+    #[must_use]
+    #[inline]
+    pub const fn new(label: &'db str, value: Option<i16>) -> Self {
+        Self { label, value }
+    }
+
+    /// Returns the label a value of the type spells the member with.
+    #[must_use]
+    #[inline]
+    pub const fn label(self) -> &'db str {
+        self.label
+    }
+
+    /// Returns the integer the engine stores for the member, or `None` where
+    /// the engine identifies a member by its position.
+    #[must_use]
+    #[inline]
+    pub const fn value(self) -> Option<i16> {
+        self.value
+    }
+}
+
+/// The members of an enumerated type, with the kind of its values and its
+/// storage width, as [`DataTypeLike::enumeration`] answers them.
+#[derive(Debug, Clone)]
+pub struct Enumeration<I> {
+    kind: EnumerationKind,
+    width: Option<EnumWidth>,
+    members: I,
+}
+
+impl<I> Enumeration<I> {
+    /// Creates an enumeration of `kind` stored in `width`, holding `members`.
+    #[must_use]
+    #[inline]
+    pub const fn new(kind: EnumerationKind, width: Option<EnumWidth>, members: I) -> Self {
+        Self { kind, width, members }
+    }
+
+    /// Returns whether a value holds one member or a subset of them.
+    #[must_use]
+    #[inline]
+    pub const fn kind(&self) -> EnumerationKind {
+        self.kind
+    }
+
+    /// Returns the integer type ClickHouse stores the member values in, or
+    /// `None` where the engine stores positions.
+    #[must_use]
+    #[inline]
+    pub const fn width(&self) -> Option<EnumWidth> {
+        self.width
+    }
+
+    /// Returns the members.
+    #[must_use]
+    #[inline]
+    pub fn into_members(self) -> I {
+        self.members
+    }
+}
+
 /// What PostgreSQL's `pgoutput` does with a value of a type under the `binary`
 /// option, as [`DataTypeLike::binary_send`] answers it.
 #[derive(Debug)]
@@ -1032,6 +1123,55 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// # }
     /// ```
     fn map_entry<'db>(&'db self, database: &'db Self::DB) -> Option<MapEntry<'db, Self>>;
+
+    /// Returns the members of an enumerated type with the kind of its values
+    /// and its storage width, or `None` for every other type, a domain over an
+    /// enumerated type and an array of one included.
+    ///
+    /// MySQL's `ENUM` and `SET`, DuckDB's inline `ENUM` and a PostgreSQL enum
+    /// type identify a member by its position, so they answer the members in
+    /// declaration order without values. A PostgreSQL column answers the
+    /// labels of the `CREATE TYPE ... AS ENUM` its type names, with every
+    /// `ALTER TYPE ... ADD VALUE` applied. ClickHouse stores a member as its
+    /// value, so a ClickHouse enum answers each member's value, written or
+    /// assigned, in the order of the values, and its width. A member written
+    /// without a value takes 1 when it is first and the value of the first
+    /// member plus its position otherwise, and a bare `Enum` takes `Enum8`
+    /// when every value fits it. So `Enum8('ready', 'busy')` and
+    /// `Enum('busy' = 2, 'ready' = 1)` answer alike. A ClickHouse enum whose
+    /// values ClickHouse refuses, one not an integer or out of the width's
+    /// range or a mix of written and omitted values after the first member,
+    /// answers `None`. A ClickHouse `Nullable` or `LowCardinality` answers the
+    /// enumeration it wraps.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TYPE status AS ENUM ('pending', 'ready');
+    ///      CREATE TABLE t (s status, n INT);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let status = table.column("s", &db, IdentifierCase::AsWritten)?.unwrap().data_type(&db);
+    /// let enumeration = status.enumeration(&db).unwrap();
+    /// assert_eq!(enumeration.kind(), EnumerationKind::Enum);
+    /// assert_eq!(enumeration.width(), None);
+    /// let labels: Vec<_> = enumeration.into_members().map(EnumerationMember::label).collect();
+    /// assert_eq!(labels, ["pending", "ready"]);
+    /// let n = table.column("n", &db, IdentifierCase::AsWritten)?.unwrap().data_type(&db);
+    /// assert!(n.enumeration(&db).is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn enumeration<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'db>>>>;
 
     /// Returns what `pgoutput` does with a value of the type when a logical
     /// replication stream asks for the `binary` format.

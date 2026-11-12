@@ -317,6 +317,13 @@ impl DataTypeLike for NoneKind {
     fn map_entry<'db>(&'db self, _database: &'db Self::DB) -> Option<MapEntry<'db, Self>> {
         self.unreach()
     }
+
+    fn enumeration<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'db>>>> {
+        self.unreach::<Option<Enumeration<core::iter::Empty<EnumerationMember<'db>>>>>()
+    }
 }
 
 impl IndexLike for NoneKind {
