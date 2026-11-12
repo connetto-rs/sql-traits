@@ -23,7 +23,13 @@ macro_rules! cast {
             context: CastContext::$context,
             implementation: CastImplementation::Function(CastFunction {
                 name: CatalogName::in_pg_catalog(Cow::Borrowed($function), false),
-                arguments: Cow::Borrowed(&[$(CatalogName::in_pg_catalog(Cow::Borrowed($argument), false)),+]),
+                arguments: Cow::Borrowed({
+                    // A `const` item's top-level borrow is `'static` even for
+                    // elements that need dropping.
+                    const ARGUMENTS: &[CatalogName] =
+                        &[$(CatalogName::in_pg_catalog(Cow::Borrowed($argument), false)),+];
+                    ARGUMENTS
+                }),
             }),
         }
     };
