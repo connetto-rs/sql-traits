@@ -473,6 +473,10 @@ impl DataTypeLike for MemoryDataType {
         None
     }
 
+    fn admits_null(&self, _database: &Self::DB) -> bool {
+        true
+    }
+
     fn range_subtype<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
         None
     }

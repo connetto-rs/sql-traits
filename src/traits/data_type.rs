@@ -585,6 +585,41 @@ pub trait DataTypeLike: Debug + Send + Sync {
         None
     }
 
+    /// Returns whether a value of the type itself may be `NULL`.
+    ///
+    /// ClickHouse admits `NULL` only in a type wrapped in `Nullable`, so
+    /// `Int32` answers `false`, while `Nullable(Int32)` and
+    /// `LowCardinality(Nullable(String))` answer `true`. Every other engine
+    /// lets a value of any type be `NULL` and keeps `NOT NULL` on the column,
+    /// field or element that holds it, so every type answers `true` there.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::{ClickHouseDialect, PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<ClickHouseDialect>(
+    ///     "CREATE TABLE t (id Int32, note Nullable(String), tag LowCardinality(Nullable(String))) \
+    ///      ENGINE = MergeTree ORDER BY id;",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let admits: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).admits_null(&db)).collect();
+    /// assert_eq!(admits, [false, true, true]);
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT NOT NULL);")?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let id = table.column("id", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// assert!(id.data_type(&db).admits_null(&db));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn admits_null(&self, database: &Self::DB) -> bool;
+
     /// Returns the type a domain is defined over, followed through every
     /// domain in between, or `None` for a type that names no domain.
     ///

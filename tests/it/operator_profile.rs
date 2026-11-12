@@ -291,6 +291,10 @@ impl DataTypeLike for NoneKind {
         self.unreach()
     }
 
+    fn admits_null(&self, _database: &Self::DB) -> bool {
+        self.unreach()
+    }
+
     fn range_subtype<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
         self.unreach()
     }

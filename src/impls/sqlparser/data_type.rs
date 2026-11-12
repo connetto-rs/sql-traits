@@ -184,6 +184,15 @@ impl DataTypeLike for DataType {
         NonZeroU32::new(dimensions)
     }
 
+    fn admits_null(&self, database: &Self::DB) -> bool {
+        let mut current = self;
+        while let Self::LowCardinality(inner) = current {
+            current = inner;
+        }
+        matches!(current, Self::Nullable(_))
+            || !matches!(*database.dialect(), SqlparserDialect::ClickHouse)
+    }
+
     fn base_type<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self> {
         let case = database.identifier_case();
         let mut current = self;
