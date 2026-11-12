@@ -56,7 +56,9 @@ pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
-pub use operator_resolution::{OperandEvidence, OperandType, OperatorResolution, SelectedOperator};
+pub use operator_resolution::{
+    CoercionStep, OperandEvidence, OperandType, OperatorResolution, SelectedOperator,
+};
 pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
 pub use policy_expression::PolicyExpression;

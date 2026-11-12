@@ -10,7 +10,7 @@ use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 const LITERAL: OperandType<'static> = OperandType::UntypedLiteral;
 
 fn known(name: &str) -> OperandType<'_> {
-    OperandType::Known(TargetName::new(name, false))
+    OperandType::Known { type_name: TargetName::new(name, false), typmod: None }
 }
 
 fn app(name: &str) -> TargetName<'_> {
@@ -245,4 +245,168 @@ fn missing_facts_leave_the_invocation_undetermined() {
     assert_eq!(resolved(&db, op("="), Some(known("not a type (")), known("int4")), "undetermined");
     let sqlite = ParserDB::parse::<SQLiteDialect>("").unwrap();
     assert_eq!(resolved(&sqlite, op("="), Some(known("int4")), known("int4")), "undetermined");
+}
+
+/// The conversion of each operand of the selected operator, the steps of
+/// one operand joined by `,` and the operands by ` | `.
+fn converted(
+    db: &ParserDB,
+    operator: TargetName<'_>,
+    left: Option<OperandType<'_>>,
+    right: OperandType<'_>,
+) -> String {
+    let OperatorResolution::Selected(selected) =
+        db.resolve_operator(operator, left, right, IdentifierCase::AsWritten)
+    else {
+        return "not selected".to_owned();
+    };
+    let plan = |evidence: &OperandEvidence<'_, ParserDB>| steps(db, evidence.conversion());
+    selected
+        .left()
+        .map(plan)
+        .into_iter()
+        .chain([plan(selected.right())])
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// The steps of a conversion plan, each named by what it applies.
+fn steps(db: &ParserDB, plan: &[CoercionStep<'_, ParserDB>]) -> String {
+    let cast = |cast: &PostgresCatalogCast| {
+        format!("{}->{}", cast.source_type(db).name(), cast.target_type(db).name())
+    };
+    plan.iter()
+        .map(|step| {
+            match step {
+                CoercionStep::LiteralInput { type_name } => format!("input {}", type_name.name()),
+                CoercionStep::DomainToBase { base } => format!("base {}", base.name()),
+                CoercionStep::Relabel(relabel) => format!("relabel {}", cast(relabel)),
+                CoercionStep::Function(function) => format!("function {}", cast(function)),
+                CoercionStep::InOut(io) => format!("io {}", cast(io)),
+                CoercionStep::Array { element } => format!("array[{}]", steps(db, element)),
+                CoercionStep::RecordToComposite => "record->composite".to_owned(),
+                CoercionStep::CompositeToRecord => "composite->record".to_owned(),
+                CoercionStep::Inherited => "inherited".to_owned(),
+                CoercionStep::LengthCoercion { cast: length, typmod } => {
+                    format!("length {} {typmod}", cast(length))
+                }
+                CoercionStep::DomainCheck { domain } => format!("check {}", domain.name()),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The conversions a PostgreSQL 18 server stores for the same built-in
+/// operator invocations.
+#[test]
+fn built_in_operators_convert_operands_as_postgres_does() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE DOMAIN dtext AS TEXT;").unwrap();
+    let cases: [(&str, OperandType<'_>, OperandType<'_>, &str); 6] = [
+        (">", known("int4"), known("numeric"), "function int4->numeric | "),
+        ("=", known("text"), LITERAL, " | input text"),
+        ("=", known("varchar"), known("text"), "relabel varchar->text | "),
+        ("=", known("dtext"), LITERAL, "base text | input text"),
+        ("=", known("dtext"), known("text"), "base text | "),
+        ("||", known("int4[]"), known("int8"), "array[function int4->int8] | "),
+    ];
+    for (name, left, right, expected) in cases {
+        assert_eq!(converted(&db, op(name), Some(left), right), expected, "{name}");
+    }
+}
+
+/// A conversion into a domain ends with the length coercion the domain's
+/// modifier needs and the domain's check, as PostgreSQL 18 stores them.
+#[test]
+fn domain_operands_end_with_the_domain_steps() {
+    let catalog = PostgresCatalog::default()
+        .with_operator(
+            PostgresCatalogOperator::new(
+                "<%>",
+                Some(TargetName::new("dint", false).with_schema("public", false)),
+                TargetName::new("dint", false).with_schema("public", false),
+            )
+            .with_schema("public", false),
+        )
+        .with_operator(
+            PostgresCatalogOperator::new(
+                "<~>",
+                Some(TargetName::new("d3", false).with_schema("public", false)),
+                TargetName::new("d3", false).with_schema("public", false),
+            )
+            .with_schema("public", false),
+        );
+    let db = ParseOptions::default()
+        .with_postgres_catalog(catalog)
+        .parse::<PostgreSqlDialect>("CREATE DOMAIN dint AS INT4; CREATE DOMAIN d3 AS VARCHAR(3);")
+        .unwrap();
+    let modified = |name, typmod| {
+        OperandType::Known { type_name: TargetName::new(name, false), typmod: Some(typmod) }
+    };
+    assert_eq!(
+        converted(&db, op("<%>"), Some(known("int2")), known("int4")),
+        "function int2->int4,check dint | check dint"
+    );
+    // `varchar(5)` carries modifier 9 and `varchar(3)` modifier 7.
+    assert_eq!(
+        converted(&db, op("<~>"), Some(known("text")), modified("varchar", 9)),
+        "relabel text->varchar,length varchar->varchar 7,check d3 | \
+         length varchar->varchar 7,check d3"
+    );
+    assert_eq!(
+        converted(&db, op("<~>"), Some(modified("varchar", 7)), LITERAL),
+        "check d3 | input varchar,length varchar->varchar 7,check d3"
+    );
+}
+
+/// Row types meet `record` and the tables they descend from, and a
+/// configured conversion through text runs the types' input and output.
+#[test]
+fn row_and_text_conversions_name_their_steps() {
+    let catalog = PostgresCatalog::default()
+        .with_operator(
+            PostgresCatalogOperator::new(
+                "<#>",
+                Some(TargetName::new("pair", false).with_schema("public", false)),
+                pg("record"),
+            )
+            .with_schema("public", false),
+        )
+        .with_operator(
+            PostgresCatalogOperator::new(
+                "<^>",
+                Some(TargetName::new("parent", false).with_schema("public", false)),
+                pg("_record"),
+            )
+            .with_schema("public", false),
+        )
+        .with_operator(
+            PostgresCatalogOperator::new("<$>", None, app("fahrenheit"))
+                .with_schema("public", false),
+        )
+        .with_cast(PostgresCatalogCast::through_io(
+            app("celsius"),
+            app("fahrenheit"),
+            CastContext::Implicit,
+        ));
+    let db = ParseOptions::default()
+        .with_postgres_catalog(catalog)
+        .parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA app;
+             CREATE TYPE app.celsius AS ENUM ('c');
+             CREATE TYPE app.fahrenheit AS ENUM ('f');
+             CREATE TYPE pair AS (a INT);
+             CREATE TABLE parent (a INT);
+             CREATE TABLE child () INHERITS (parent);",
+        )
+        .unwrap();
+    assert_eq!(
+        converted(&db, op("<#>"), Some(known("record")), known("pair")),
+        "record->composite | composite->record"
+    );
+    assert_eq!(
+        converted(&db, op("<^>"), Some(known("child")), known("parent[]")),
+        "inherited | composite->record"
+    );
+    assert_eq!(converted(&db, op("<$>"), None, known("app.celsius")), "io celsius->fahrenheit");
 }

@@ -79,6 +79,12 @@ impl<'db> DomainFacts<'db> {
     pub const fn base_typmod(&self) -> Option<i32> {
         self.base_typmod
     }
+
+    /// Returns the base type, consuming the facts.
+    #[must_use]
+    pub fn into_base(self) -> TargetName<'db> {
+        self.base
+    }
 }
 
 /// The facts PostgreSQL's type conversion rules read about one type.
@@ -135,6 +141,13 @@ impl<'db> TypeFacts<'db> {
     #[must_use]
     pub const fn domain(&self) -> Option<&DomainFacts<'db>> {
         self.domain.as_ref()
+    }
+
+    /// Returns the domain facts, consuming the facts, or `None` when the type
+    /// is no domain.
+    #[must_use]
+    pub fn into_domain(self) -> Option<DomainFacts<'db>> {
+        self.domain
     }
 
     /// Returns the element type, or `None` when the type is no array.
