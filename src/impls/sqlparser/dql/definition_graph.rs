@@ -1,18 +1,18 @@
 use alloc::{borrow::ToOwned, vec::Vec};
 use core::{marker::PhantomData, slice};
 
-use sqlparser::ast::{Expr, ObjectName, Select, SetOperator};
+use sqlparser::ast::{Expr, ObjectName, Select, SetOperator, TableFactor, TableWithJoins};
 
 use super::{
-    BaseColumnRef, DerivationProfile, Deriving, FromScope, LookupOutcome, OutputNameSource,
-    RelationKey, ResolvedColumn, derive_query_shape, resolve_definition_local,
-    resolve_relation_local,
+    BaseColumnRef, ColumnOrigin, DerivationProfile, Deriving, FromScope, LookupOutcome,
+    OutputNameSource, RelationKey, ResolvedColumn, derive_query_shape, factor_address,
+    resolve_definition_local, resolve_relation_local,
 };
 use crate::{
     errors::LookupError,
     structs::{
         ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope,
-        IdentifierCase, RelationBinding,
+        IdentifierCase, RangeTableEntry, RelationBinding,
     },
     traits::{ColumnLike, CreatedFromQuery, DatabaseLike, TableLike},
 };
@@ -137,10 +137,28 @@ fn select_address(select: &Select) -> usize {
     core::ptr::from_ref(select).addr()
 }
 
+/// Calls `found` with every `FROM` item of `tables`, those inside
+/// parenthesized joins included.
+fn each_from_item<'a>(tables: &'a [TableWithJoins], found: &mut impl FnMut(&'a TableFactor)) {
+    for table in tables {
+        let factors =
+            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation));
+        for factor in factors {
+            found(factor);
+            if let TableFactor::NestedJoin { table_with_joins, .. } = factor {
+                each_from_item(slice::from_ref(table_with_joins.as_ref()), found);
+            }
+        }
+    }
+}
+
 pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     definitions: Vec<DefinitionNode<'query, 'db, DB>>,
     scopes: Vec<ScopeNode<'query, 'db, DB>>,
     select_index: Vec<SelectIndex>,
+    /// Every `FROM` item of every scope, which a binding's origin names by
+    /// address.
+    from_items: Vec<AstRef<'query, 'db, TableFactor>>,
     queries: Vec<QueryNode<'query, 'db>>,
     case: IdentifierCase,
 }
@@ -217,9 +235,18 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         &'scope self,
         resolved: &ResolvedColumn<'scope, 'db, DB, DefinitionId>,
     ) -> Bound<'scope, 'query, 'db, DB> {
+        let entry = match resolved.origin {
+            ColumnOrigin::Entry { factor, ordinal } => {
+                self.from_items
+                    .iter()
+                    .find(|item| factor_address(item.get()) == factor)
+                    .map(|item| RangeTableEntry::new(item.get(), ordinal))
+            }
+            ColumnOrigin::Merged | ColumnOrigin::Output | ColumnOrigin::Unknown => None,
+        };
         (
             self.definition(resolved.definition),
-            ColumnBinding::new(resolved.relation, resolved.exposed, resolved.origin),
+            ColumnBinding::new(resolved.relation, resolved.exposed, resolved.origin, entry),
         )
     }
 
@@ -320,6 +347,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 definitions: alloc::vec![DefinitionNode::Opaque],
                 scopes: Vec::new(),
                 select_index: Vec::new(),
+                from_items: Vec::new(),
                 queries: Vec::new(),
                 case,
             },
@@ -418,6 +446,18 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             outputs: Vec::new(),
         });
         self.graph.select_index.push(SelectIndex { address: select_address(select.get()), scope });
+        match select {
+            AstRef::Query(select) => {
+                each_from_item(&select.from, &mut |item| {
+                    self.graph.from_items.push(AstRef::Query(item));
+                });
+            }
+            AstRef::Database(select) => {
+                each_from_item(&select.from, &mut |item| {
+                    self.graph.from_items.push(AstRef::Database(item));
+                });
+            }
+        }
         scope
     }
 
