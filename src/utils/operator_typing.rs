@@ -1,7 +1,7 @@
 //! Resolves an operator invocation to the `pg_operator` overload PostgreSQL
 //! selects, as `oper`, `binary_oper_exact` and `oper_select_candidate` do.
 
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use crate::{
     structs::{
