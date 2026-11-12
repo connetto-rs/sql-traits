@@ -1,7 +1,7 @@
 //! Submodule implementing the [`DataTypeLike`] trait for `sqlparser`'s
 //! [`DataType`] enum.
 
-use alloc::{borrow::Cow, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, string::ToString};
 use core::{num::NonZeroU32, slice};
 
 use sqlparser::ast::{
@@ -412,26 +412,16 @@ fn named_collation(name: &ObjectName) -> ColumnCollation<'_> {
     ColumnCollation::Named(NamedColumnCollation::new(target_name_of_object_name(name)))
 }
 
-/// A field written as a column definition, with the `NOT NULL`, `COLLATE` and
-/// `OPTIONS` it declares.
+/// A field written as a column definition, with the `NOT NULL` it declares.
 fn column_field<'db>(
     column: &'db ColumnDef,
     database: &'db ParserDB,
 ) -> StructuredField<'db, DataType> {
-    let (data_type, mut collation) = collated(&column.data_type);
-    let mut nullable = data_type.admits_null(database);
-    let mut options = Vec::new();
-    for option in &column.options {
-        match &option.option {
-            ColumnOption::NotNull => nullable = false,
-            ColumnOption::Collation(name) => collation = named_collation(name),
-            ColumnOption::Options(written) => options.extend(written.iter().map(option_entry)),
-            _ => {}
-        }
-    }
-    StructuredField::new(data_type, nullable)
+    let (data_type, collation) = collated(&column.data_type);
+    let not_null =
+        column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull));
+    StructuredField::new(data_type, !not_null && data_type.admits_null(database))
         .with_name(&column.name.value, column.name.quote_style.is_some())
-        .with_options(options)
         .with_collation(collation)
 }
 

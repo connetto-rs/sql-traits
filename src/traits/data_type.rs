@@ -252,21 +252,12 @@ impl<'db, T: ?Sized> StructuredField<'db, T> {
 
 /// The key and value types of a map type, as [`DataTypeLike::map_entry`]
 /// answers them.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapEntry<'db, T: ?Sized> {
     key: &'db T,
     value: &'db T,
     value_nullable: bool,
 }
-
-impl<T: ?Sized> Clone for MapEntry<'_, T> {
-    #[inline]
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T: ?Sized> Copy for MapEntry<'_, T> {}
 
 impl<'db, T: ?Sized> MapEntry<'db, T> {
     /// Creates the entry of a map from `key` to `value`, whose value admits

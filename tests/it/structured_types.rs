@@ -10,7 +10,7 @@ use sqlparser::{
     ast::DataType,
     dialect::{
         BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
-        PostgreSqlDialect, SnowflakeDialect,
+        GenericDialect, PostgreSqlDialect, SnowflakeDialect,
     },
 };
 
@@ -221,6 +221,31 @@ fn fields_answer_names_types_nullability_options_and_collations() {
     assert_eq!(fields[1].options(), [("rounding_mode".into(), "ROUND_HALF_EVEN".into())]);
     assert!(fields.iter().all(StructuredField::is_nullable));
 
+    let database =
+        declaring::<GenericDialect>("STRUCT<flagged INT OPTIONS(heap, policy.mode = 2)>");
+    let field = column_type(&database)
+        .structured_fields(&database)
+        .expect("a struct")
+        .next()
+        .expect("one field");
+    assert_eq!(field.options(), [("heap".into(), "".into()), ("policy.mode".into(), "2".into())]);
+
+    let database = declaring::<DuckDbDialect>("UNION(code INTEGER, label VARCHAR)");
+    let names: Vec<_> = column_type(&database)
+        .structured_fields(&database)
+        .expect("a union")
+        .map(|field| field.name())
+        .collect();
+    assert_eq!(names, [Some("code"), Some("label")]);
+
+    let database = declaring::<SnowflakeDialect>("OBJECT(city VARCHAR NOT NULL, zip VARCHAR)");
+    let nullable: Vec<_> = column_type(&database)
+        .structured_fields(&database)
+        .expect("an object")
+        .map(|field| (field.name(), field.is_nullable()))
+        .collect();
+    assert_eq!(nullable, [(Some("city"), false), (Some("zip"), true)]);
+
     let database = declaring::<ClickHouseDialect>("Tuple(Int32, Nullable(String))");
     let fields: Vec<_> = column_type(&database)
         .structured_fields(&database)
@@ -245,7 +270,7 @@ fn fields_answer_names_types_nullability_options_and_collations() {
 #[test]
 fn composite_attributes_answer_as_fields() {
     let database = ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TYPE pair AS (\"Left\" INT, right_side TEXT COLLATE \"C\");
+        "CREATE TYPE pair AS (\"Left\" INT, right_side TEXT COLLATE \"C\", note TEXT COLLATE missing);
          CREATE TABLE t (c pair);",
     )
     .expect("schema builds");
@@ -260,6 +285,11 @@ fn composite_attributes_answer_as_fields() {
     };
     assert_eq!(collation.name().name(), "C");
     assert_eq!(collation.postgres_deterministic(), Some(true));
+    let ColumnCollation::Named(unresolved) = fields[2].collation() else {
+        panic!("a declared COLLATE names the collation");
+    };
+    assert_eq!(unresolved.name().name(), "missing");
+    assert_eq!(unresolved.postgres_deterministic(), None);
 }
 
 #[test]
