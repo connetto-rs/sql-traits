@@ -348,7 +348,28 @@ enum CollationResolution<'a> {
     Catalog(&'a PostgresCatalogCollation),
 }
 
-impl CollationResolution<'_> {
+impl<'a> CollationResolution<'a> {
+    /// The collation's name, qualified with the schema holding it.
+    fn into_target_name(self) -> Option<crate::structs::TargetName<'a>> {
+        match self {
+            Self::Created(metadata) => {
+                let (name, quoted) = object_name_last_part(&metadata.name)?;
+                let (schema, schema_quoted) = collation_effective_schema(&metadata.name);
+                Some(
+                    crate::structs::TargetName::new(name, quoted)
+                        .with_schema(schema, schema_quoted),
+                )
+            }
+            // A catalog collation a lookup reaches always has the schema it
+            // matched.
+            Self::Catalog(metadata) => {
+                let name =
+                    crate::structs::TargetName::new(metadata.name(), metadata.name_is_quoted());
+                Some(name.with_schema(metadata.schema()?, metadata.schema_is_quoted()))
+            }
+        }
+    }
+
     fn into_column_metadata(self) -> ColumnMetadata {
         match self {
             Self::Created(metadata) => column_metadata_from_created_collation(metadata),
@@ -589,15 +610,6 @@ pub(super) fn stored_column_collation_name(column: &ColumnDef) -> Option<&Object
         }
     })
 }
-fn collation_names_match(stored: &ObjectName, lookup: &ObjectName) -> bool {
-    let Some((stored_name, stored_quoted)) = object_name_last_part(stored) else {
-        return false;
-    };
-    let Some((lookup_name, lookup_quoted)) = object_name_last_part(lookup) else {
-        return false;
-    };
-    identifiers_match(stored_name, stored_quoted, lookup_name, lookup_quoted)
-}
 
 fn collation_names_match_parts(
     stored_name: &str,
@@ -622,14 +634,15 @@ fn collation_schema_matches(stored: &ObjectName, lookup_schema: &str, lookup_quo
 }
 
 fn created_collation_metadata_for_schema<'a>(
-    lookup: &ObjectName,
+    (name, quoted): (&str, bool),
     collations: &'a [CreatedCollationMetadata],
     schema: &str,
     schema_quoted: bool,
 ) -> Option<&'a CreatedCollationMetadata> {
     collations.iter().rev().find(|metadata| {
-        collation_names_match(&metadata.name, lookup)
-            && collation_schema_matches(&metadata.name, schema, schema_quoted)
+        object_name_last_part(&metadata.name).is_some_and(|(stored, stored_quoted)| {
+            identifiers_match(stored, stored_quoted, name, quoted)
+        }) && collation_schema_matches(&metadata.name, schema, schema_quoted)
     })
 }
 
@@ -677,7 +690,10 @@ fn collation_already_exists(
     catalog: &PostgresCatalog,
 ) -> bool {
     let (schema, schema_quoted) = collation_effective_schema(name);
-    collation_resolution_for_schema(name, collations, catalog, schema, schema_quoted).is_some()
+    object_name_last_part(name).is_some_and(|lookup| {
+        collation_resolution_for_schema(lookup, collations, catalog, schema, schema_quoted)
+            .is_some()
+    })
 }
 
 fn search_path_names_pg_catalog(search_path: &[(String, bool)]) -> bool {
@@ -807,7 +823,7 @@ fn column_metadata_from_catalog_collation(metadata: &PostgresCatalogCollation) -
 }
 
 fn collation_resolution_for_schema<'a>(
-    lookup: &ObjectName,
+    lookup: (&str, bool),
     collations: &'a [CreatedCollationMetadata],
     catalog: &'a PostgresCatalog,
     schema: &str,
@@ -822,15 +838,17 @@ fn collation_resolution_for_schema<'a>(
 }
 
 fn catalog_collation_for_schema<'a>(
-    lookup: &ObjectName,
+    (name, quoted): (&str, bool),
     catalog: &'a PostgresCatalog,
     schema: &str,
     schema_quoted: bool,
 ) -> Option<&'a PostgresCatalogCollation> {
-    catalog
-        .collations()
-        .rev()
-        .find(|metadata| catalog_name_matches(metadata.identity(), lookup, schema, schema_quoted))
+    catalog.collations().rev().find(|metadata| {
+        let identity = metadata.identity();
+        identity.schema().is_some_and(|stored| {
+            identifiers_match(stored, identity.schema_is_quoted(), schema, schema_quoted)
+        }) && identifiers_match(identity.name(), identity.name_is_quoted(), name, quoted)
+    })
 }
 
 /// Whether a catalog fact's name spells `lookup` within `schema`. A fact with
@@ -854,10 +872,11 @@ fn collation_resolution_for_name<'a>(
     catalog: &'a PostgresCatalog,
     search_path: &[(String, bool)],
 ) -> Option<CollationResolution<'a>> {
+    let lookup = object_name_last_part(name)?;
     match qualifier_of(name) {
         Qualifier::Named(schema, schema_quoted) => {
             return collation_resolution_for_schema(
-                name,
+                lookup,
                 collations,
                 catalog,
                 schema,
@@ -872,14 +891,14 @@ fn collation_resolution_for_name<'a>(
 
     if !search_path_names_pg_catalog(search_path)
         && let Some(resolution) =
-            collation_resolution_for_schema(name, collations, catalog, "pg_catalog", false)
+            collation_resolution_for_schema(lookup, collations, catalog, "pg_catalog", false)
     {
         return Some(resolution);
     }
 
     for (schema, schema_quoted) in search_path {
         if let Some(resolution) =
-            collation_resolution_for_schema(name, collations, catalog, schema, *schema_quoted)
+            collation_resolution_for_schema(lookup, collations, catalog, schema, *schema_quoted)
         {
             return Some(resolution);
         }

@@ -189,3 +189,53 @@ fn a_domain_over_an_array_coerces_through_the_array_type() {
     // A sequence has no row type.
     assert!(db.type_facts(app("counter")).is_none());
 }
+
+fn quoted_pg(name: &str) -> TargetName<'_> {
+    TargetName::new(name, true).with_schema("pg_catalog", false)
+}
+
+/// Each type reports `pg_type.typcollation` as PostgreSQL 18 stores it.
+#[test]
+fn collatable_types_report_their_collation() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA app;
+         CREATE TYPE app.mood AS ENUM ('happy');
+         CREATE TABLE app.readings (a INT);
+         CREATE DOMAIN app.code AS TEXT COLLATE \"C\";
+         CREATE DOMAIN app.short_code AS app.code;
+         CREATE DOMAIN app.label AS VARCHAR(5);
+         CREATE DOMAIN app.quantity AS INT;
+         CREATE TYPE app.ci;
+         CREATE FUNCTION app.ci_in(cstring) RETURNS app.ci LANGUAGE C AS 'lib', 'ci_in';
+         CREATE FUNCTION app.ci_out(app.ci) RETURNS cstring LANGUAGE C AS 'lib', 'ci_out';
+         CREATE TYPE app.ci (INPUT = app.ci_in, OUTPUT = app.ci_out, COLLATABLE = true);
+         CREATE COLLATION german (provider = icu, locale = 'de');
+         CREATE DOMAIN app.german_text AS TEXT COLLATE german;
+         CREATE DOMAIN app.lost AS TEXT COLLATE missing;",
+    )
+    .unwrap();
+    let collation = |name| db.type_facts(name).unwrap().collation().cloned();
+    let default = Some(quoted_pg("default"));
+    for name in ["text", "varchar", "bpchar", "_text", "_varchar"] {
+        assert_eq!(collation(pg(name)), default, "{name}");
+    }
+    assert_eq!(collation(pg("name")), Some(quoted_pg("C")));
+    assert_eq!(collation(pg("_name")), Some(quoted_pg("C")));
+    for name in ["int4", "_int4", "bool", "jsonb"] {
+        assert_eq!(collation(pg(name)), None, "{name}");
+    }
+    assert_eq!(collation(app("mood")), None);
+    assert_eq!(collation(app("readings")), None);
+    assert_eq!(collation(app("code")), Some(quoted_pg("C")));
+    assert_eq!(collation(app("_code")), Some(quoted_pg("C")));
+    assert_eq!(collation(app("short_code")), Some(quoted_pg("C")));
+    assert_eq!(collation(app("label")), default);
+    assert_eq!(collation(app("quantity")), None);
+    assert_eq!(collation(app("ci")), default);
+    assert_eq!(
+        collation(app("german_text")),
+        Some(TargetName::new("german", false).with_schema("public", false))
+    );
+    // A collation the database cannot name leaves the domain's facts open.
+    assert!(db.type_facts(app("lost")).is_none());
+}

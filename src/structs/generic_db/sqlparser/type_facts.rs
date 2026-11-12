@@ -3,11 +3,11 @@
 use alloc::format;
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, CharacterLength, DataType, ExactNumberInfo, IntervalFields,
-    UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
+    ArrayElemTypeDef, CharacterLength, CreateDomain, DataType, ExactNumberInfo, Ident,
+    IntervalFields, UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
 };
 
-use super::ParserDB;
+use super::{ParserDB, collation_resolution_for_schema};
 use crate::{
     impls::{SqlparserDialect, domain_in_schema, domain_named, user_type_holds},
     structs::{DomainFacts, TargetName, TypeCategory, TypeFacts},
@@ -73,14 +73,14 @@ fn declared_facts_in_schema<'db>(
     name: (&str, bool),
 ) -> Option<TypeFacts<'db>> {
     if identifiers_match(schema.0, schema.1, PG_CATALOG, false) {
-        return built_in_facts(&stored_identifier(name.0, name.1));
+        return built_in_facts(database, &stored_identifier(name.0, name.1));
     }
     let case = database.identifier_case();
     if let Some(domain) = database
         .domains()
         .find(|domain| domain_named(domain, name, case) && domain_in_schema(domain, schema, case))
     {
-        return domain_facts(database, &domain.data_type);
+        return domain_facts(database, domain);
     }
     if let Some((type_, is_multirange)) = database
         .user_defined_types()
@@ -91,7 +91,10 @@ fn declared_facts_in_schema<'db>(
     if let Some(element) =
         database.ingestion.type_arrays.element_in(schema.0, schema.1, name.0, name.1)
     {
-        return Some(TypeFacts::new(TypeCategory::ARRAY, false).with_array_element(element));
+        // An array's values take the collation of its elements.
+        let collation = locate(database, &element).and_then(|(_, facts)| facts.into_collation());
+        let facts = TypeFacts::new(TypeCategory::ARRAY, false).with_array_element(element);
+        return Some(collated(facts, collation));
     }
     let relation = TargetName::new(name.0, name.1).with_schema(schema.0, schema.1);
     match database.resolve_target_relation(relation, case).ok()?? {
@@ -105,15 +108,37 @@ fn declared_facts_in_schema<'db>(
 
 /// The facts of a `pg_catalog` type stored as `name`, an array named after
 /// its element with a leading underscore.
-fn built_in_facts<'db>(name: &str) -> Option<TypeFacts<'db>> {
-    if let Some((_, category, preferred)) = built_in_type(name) {
-        return Some(TypeFacts::new(TypeCategory::new(category), preferred));
-    }
-    let (element, _, _) = name.strip_prefix('_').and_then(built_in_type)?;
-    Some(
+fn built_in_facts<'db>(database: &ParserDB, name: &str) -> Option<TypeFacts<'db>> {
+    let facts = if let Some((_, category, preferred)) = built_in_type(name) {
+        TypeFacts::new(TypeCategory::new(category), preferred)
+    } else {
+        let (element, _, _) = name.strip_prefix('_').and_then(built_in_type)?;
         TypeFacts::new(TypeCategory::ARRAY, false)
-            .with_array_element(TargetName::new(element, false).with_schema(PG_CATALOG, false)),
-    )
+            .with_array_element(TargetName::new(element, false).with_schema(PG_CATALOG, false))
+    };
+    Some(collated(facts, built_in_collation(database, name)))
+}
+
+/// The collation of the `pg_catalog` type stored as `name`, or `None` when
+/// the active catalog holds it not collatable.
+fn built_in_collation(database: &ParserDB, name: &str) -> Option<TargetName<'static>> {
+    let collatable = database.ingestion.active_postgres_catalog.collatable_types().any(|type_| {
+        type_.schema().is_some_and(|schema| {
+            identifiers_match(schema, type_.schema_is_quoted(), PG_CATALOG, false)
+        }) && identifiers_match(type_.name(), type_.name_is_quoted(), name, true)
+    });
+    // `name` and its array compare bytewise, every other type by the
+    // database's collation.
+    let collation = if matches!(name, "name" | "_name") { "C" } else { "default" };
+    collatable.then(|| TargetName::new(collation, true).with_schema(PG_CATALOG, false))
+}
+
+/// `facts` with the collation `collation` names, or as they are for none.
+fn collated<'db>(facts: TypeFacts<'db>, collation: Option<TargetName<'db>>) -> TypeFacts<'db> {
+    match collation {
+        Some(collation) => facts.with_collation(collation),
+        None => facts,
+    }
 }
 
 /// The facts of a stored user-defined type, or of its multirange.
@@ -121,42 +146,83 @@ fn user_type_facts<'db>(
     representation: Option<&UserDefinedTypeRepresentation>,
     is_multirange: bool,
 ) -> TypeFacts<'db> {
-    let (category, preferred) = match representation {
-        _ if is_multirange => (TypeCategory::RANGE, false),
-        None => (TypeCategory::PSEUDO, false),
-        Some(UserDefinedTypeRepresentation::Enum { .. }) => (TypeCategory::ENUM, false),
-        Some(UserDefinedTypeRepresentation::Composite { .. }) => (TypeCategory::COMPOSITE, false),
-        Some(UserDefinedTypeRepresentation::Range { .. }) => (TypeCategory::RANGE, false),
+    let (category, preferred, collatable) = match representation {
+        _ if is_multirange => (TypeCategory::RANGE, false, false),
+        None => (TypeCategory::PSEUDO, false, false),
+        Some(UserDefinedTypeRepresentation::Enum { .. }) => (TypeCategory::ENUM, false, false),
+        Some(UserDefinedTypeRepresentation::Composite { .. }) => {
+            (TypeCategory::COMPOSITE, false, false)
+        }
+        Some(UserDefinedTypeRepresentation::Range { .. }) => (TypeCategory::RANGE, false, false),
         Some(UserDefinedTypeRepresentation::SqlDefinition { options }) => {
             options.iter().fold(
-                (TypeCategory::USER_DEFINED, false),
-                |(category, preferred), option| {
+                (TypeCategory::USER_DEFINED, false, false),
+                |(category, preferred, collatable), option| {
                     match option {
                         UserDefinedTypeSqlDefinitionOption::Category(code) => {
-                            (u8::try_from(*code).map_or(category, TypeCategory::new), preferred)
+                            let category = u8::try_from(*code).map_or(category, TypeCategory::new);
+                            (category, preferred, collatable)
                         }
                         UserDefinedTypeSqlDefinitionOption::Preferred(declared) => {
-                            (category, *declared)
+                            (category, *declared, collatable)
                         }
-                        _ => (category, preferred),
+                        UserDefinedTypeSqlDefinitionOption::Collatable(declared) => {
+                            (category, preferred, *declared)
+                        }
+                        _ => (category, preferred, collatable),
                     }
                 },
             )
         }
     };
-    TypeFacts::new(category, preferred)
+    // A collatable base type's values take the database's collation.
+    let collation =
+        collatable.then(|| TargetName::new("default", true).with_schema(PG_CATALOG, false));
+    collated(TypeFacts::new(category, preferred), collation)
 }
 
-/// The facts of a domain over `data_type`, which takes the category of its
-/// base type and is never preferred.
-fn domain_facts<'db>(database: &'db ParserDB, data_type: &'db DataType) -> Option<TypeFacts<'db>> {
+/// The facts of `domain`, which takes the category of its base type, is
+/// never preferred and takes the collation it declares or its base type's.
+fn domain_facts<'db>(database: &'db ParserDB, domain: &'db CreateDomain) -> Option<TypeFacts<'db>> {
+    let (facts, base_collation) = domain_over(database, &domain.data_type)?;
+    let collation = match &domain.collation {
+        Some(declared) => Some(declared_collation(database, declared)?),
+        None => base_collation,
+    };
+    Some(collated(facts, collation))
+}
+
+/// The collation the unqualified `collation` names on the search path, or
+/// `None` when it names none.
+fn declared_collation<'db>(database: &'db ParserDB, collation: &Ident) -> Option<TargetName<'db>> {
+    let lookup = (collation.value.as_str(), collation.quote_style.is_some());
+    type_search_path(|| database.search_path())
+        .find_map(|(schema, schema_quoted)| {
+            collation_resolution_for_schema(
+                lookup,
+                &database.ingestion.collation_metadata,
+                &database.ingestion.active_postgres_catalog,
+                schema,
+                schema_quoted,
+            )
+        })?
+        .into_target_name()
+}
+
+/// The facts of a domain over `data_type` before its own collation, with the
+/// collation of that base type.
+fn domain_over<'db>(
+    database: &'db ParserDB,
+    data_type: &'db DataType,
+) -> Option<(TypeFacts<'db>, Option<TargetName<'db>>)> {
     if let DataType::Custom(name, modifiers) = data_type {
         // A domain over a domain coerces through the innermost base type,
         // and only that innermost domain may apply a modifier.
         let written = target_name_from_object_name(name).filter(|_| modifiers.is_empty())?;
         let (base_name, base) = locate(database, &written)?;
         let domain = base.domain().cloned().unwrap_or_else(|| DomainFacts::new(base_name, None));
-        return Some(TypeFacts::new(base.category(), false).with_domain(domain));
+        let facts = TypeFacts::new(base.category(), false).with_domain(domain);
+        return Some((facts, base.into_collation()));
     }
     let typmod = typmod(data_type).ok()?;
     let (base, category) = match data_type {
@@ -176,7 +242,8 @@ fn domain_facts<'db>(database: &'db ParserDB, data_type: &'db DataType) -> Optio
             )
         }
     };
-    Some(TypeFacts::new(category, false).with_domain(DomainFacts::new(base, typmod)))
+    let collation = locate(database, &base).and_then(|(_, facts)| facts.into_collation());
+    Some((TypeFacts::new(category, false).with_domain(DomainFacts::new(base, typmod)), collation))
 }
 
 /// The array type over the element `element` declares, a stored type's
