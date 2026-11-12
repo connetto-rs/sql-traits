@@ -199,6 +199,37 @@ impl TypeArrays {
         self.element_in_case(IdentifierCase::AsWritten, schema, schema_quoted, name, name_quoted)
     }
 
+    /// Resolves a qualified stored or built-in type identity to the array
+    /// type over it, qualified with the schema both live in.
+    pub(super) fn array_in(
+        &self,
+        schema: &str,
+        schema_quoted: bool,
+        name: &str,
+        name_quoted: bool,
+    ) -> Option<TargetName<'static>> {
+        if let Some(entry) = self.entries.iter().find(|entry| {
+            entry_holds(
+                &entry.owner,
+                (schema, schema_quoted),
+                (name, name_quoted),
+                IdentifierCase::AsWritten,
+            )
+        }) {
+            let (array, quoted) = object_name_last_part(&entry.array)?;
+            return Some(
+                TargetName::new(array, quoted).with_schema(schema, schema_quoted).into_owned(),
+            );
+        }
+        if !identifiers_match(schema, schema_quoted, PG_CATALOG, false) {
+            return None;
+        }
+        let element = stored_identifier(name, name_quoted);
+        BUILTIN_ARRAY_ELEMENTS.binary_search(&element.as_ref()).ok()?;
+        let array = format!("_{element}");
+        Some(TargetName::new(&array, false).with_schema(PG_CATALOG, false).into_owned())
+    }
+
     /// Binds known array aliases to qualified elements and leaves unknown names
     /// unchanged.
     pub(super) fn bind_type(&self, builder: &ParserDBBuilder, data_type: &mut DataType) {

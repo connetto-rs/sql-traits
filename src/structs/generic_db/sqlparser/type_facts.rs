@@ -52,8 +52,22 @@ fn locate<'db>(
     }
 }
 
-/// The facts of the type `name` names in `schema`.
+/// The facts of the type `name` names in `schema`, with the array type over
+/// it.
 fn facts_in_schema<'db>(
+    database: &'db ParserDB,
+    schema: (&str, bool),
+    name: (&str, bool),
+) -> Option<TypeFacts<'db>> {
+    let facts = declared_facts_in_schema(database, schema, name)?;
+    Some(match database.ingestion.type_arrays.array_in(schema.0, schema.1, name.0, name.1) {
+        Some(array) => facts.with_array_type(array),
+        None => facts,
+    })
+}
+
+/// The facts the declaration of the type `name` names in `schema` gives it.
+fn declared_facts_in_schema<'db>(
     database: &'db ParserDB,
     schema: (&str, bool),
     name: (&str, bool),

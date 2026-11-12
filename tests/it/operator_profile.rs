@@ -1008,6 +1008,25 @@ fn a_loaded_catalog_reaches_the_database_and_its_clones() {
     }
 }
 
+/// An operator whose operand types the catalog does not know may take any
+/// operands, so an invocation it could answer stays open.
+#[test]
+fn operators_of_unknown_operand_types_leave_an_invocation_open() {
+    let catalog: Arc<[CatalogOperator]> =
+        Arc::from([CatalogOperator { schema: "pg_catalog", name: "+" }]);
+    let database = alternate_builder().into_database(Some(catalog));
+    let int4 = || OperandType::Known(TargetName::new("int4", false));
+    assert!(matches!(
+        database.resolve_operator(
+            TargetName::new("+", false),
+            Some(int4()),
+            int4(),
+            IdentifierCase::AsWritten
+        ),
+        OperatorResolution::Undetermined
+    ));
+}
+
 /// A loaded catalog without entries answers an empty catalog, which the
 /// default state answering unavailable stays distinct from.
 #[test]

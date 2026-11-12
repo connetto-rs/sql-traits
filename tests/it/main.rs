@@ -90,6 +90,7 @@ mod operator_lifecycle;
 mod operator_linkage;
 mod operator_metadata;
 mod operator_profile;
+mod operator_resolution;
 mod ordered_index_columns;
 mod output_names;
 mod owned_collations;

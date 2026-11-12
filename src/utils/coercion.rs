@@ -14,7 +14,7 @@ use crate::{
     traits::{CastContext, CastLike, DatabaseLike, Relation, TableLike},
     utils::{
         object_name::{PG_CATALOG, type_search_path},
-        postgres_types::{PgType, Polymorphic},
+        postgres_types::PgType,
     },
 };
 
@@ -123,6 +123,29 @@ pub(crate) fn facts<'db, D: DatabaseLike>(
     }
 }
 
+/// The name the database gives a canonical type, an array type by the
+/// `pg_type.typarray` of its element.
+pub(crate) fn type_name<'db, D: DatabaseLike>(
+    database: &'db D,
+    pg_type: &PgType,
+) -> Option<TargetName<'db>> {
+    match pg_type {
+        PgType::Catalog(name) => Some(TargetName::new(name, false).with_schema(PG_CATALOG, false)),
+        PgType::Named(name) => Some(name.clone()),
+        PgType::Array(element) => array_type_name(database, element),
+        PgType::Other(_) => None,
+    }
+}
+
+/// The name the database gives the array type over the canonical type
+/// `element`, its `pg_type.typarray`.
+pub(crate) fn array_type_name<'db, D: DatabaseLike>(
+    database: &'db D,
+    element: &PgType,
+) -> Option<TargetName<'db>> {
+    facts(database, element)?.array_type().cloned()
+}
+
 /// The base type a canonical type coerces through, borrowed unless the type
 /// is a domain.
 pub(crate) fn base<'p, D: DatabaseLike>(
@@ -149,7 +172,7 @@ pub(crate) fn base<'p, D: DatabaseLike>(
 /// canonical type `target` without being asked, as `can_coerce_type` decides
 /// under `COERCION_IMPLICIT` for a declared target that is not polymorphic.
 pub(crate) fn can_coerce<D: DatabaseLike>(database: &D, source: &PgType, target: &PgType) -> Proof {
-    if source == target || source.is_unknown() || target.polymorphic() == Some(Polymorphic::Any) {
+    if source == target || source.is_unknown() || target.is_any() {
         return Proof::Yes;
     }
     if database.casts().is_none() {

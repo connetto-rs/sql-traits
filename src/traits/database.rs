@@ -12,7 +12,9 @@ use sqlparser::ast::Function;
 
 use crate::{
     errors::{Error, LookupError},
-    structs::{IdentifierCase, RoleSetting, TargetName, TypeFacts},
+    structs::{
+        IdentifierCase, OperandType, OperatorResolution, RoleSetting, TargetName, TypeFacts,
+    },
     traits::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
         DomainLike, ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, OperatorLike,
@@ -32,6 +34,7 @@ use crate::{
             resolve_target_in_iter, resolve_target_on_search_path_in_iter, resolve_view_in_iter,
             resolve_view_on_search_path_in_iter,
         },
+        operator_typing::resolve_operator,
         postgres_types::PgType,
     },
 };
@@ -1902,6 +1905,73 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// ```
     fn common_type_name<'a>(&self, types: &[Option<&'a str>]) -> Option<Cow<'a, str>> {
         common_type_name(self, types)
+    }
+
+    /// Returns what PostgreSQL does with the operator `operator` applied to
+    /// `right`, and to `left` for a binary operator, as its `oper` and
+    /// `oper_select_candidate` decide.
+    ///
+    /// An operator declaring the operand types exactly wins, an untyped
+    /// operand read as the other operand's type and then as that type's
+    /// domain base type. Otherwise the operators whose operands the
+    /// arguments reach by an implicit conversion or a consistent polymorphic
+    /// binding are ranked as [`Self::resolve_call`] ranks functions. A
+    /// qualified name searches its schema only, and an unqualified one
+    /// `pg_catalog` and the search path, keeping the earliest of operators
+    /// with identical operand types.
+    ///
+    /// The answer is [`OperatorResolution::Undetermined`] when the database
+    /// answers no operators, an operand type is unknown or the casts and type
+    /// facts it answers leave the choice open.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let pg = |name| OperandType::Known(TargetName::new(name, false));
+    /// let case = IdentifierCase::AsWritten;
+    ///
+    /// // `int4 > numeric` converts the left operand to `numeric`.
+    /// let greater = TargetName::new(">", false);
+    /// let OperatorResolution::Selected(selected) =
+    ///     db.resolve_operator(greater, Some(pg("int4")), pg("numeric"), case)
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(selected.left().map(|left| left.target().name()), Some("numeric"));
+    /// assert_eq!(selected.right().target().name(), "numeric");
+    ///
+    /// // An untyped literal takes the other operand's type.
+    /// let equals = TargetName::new("=", false);
+    /// let OperatorResolution::Selected(selected) =
+    ///     db.resolve_operator(equals, Some(pg("text")), OperandType::UntypedLiteral, case)
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(selected.right().target().name(), "text");
+    ///
+    /// // A database answering no operators leaves every invocation open.
+    /// let sqlite = ParserDB::parse::<SQLiteDialect>("")?;
+    /// let equals = TargetName::new("=", false);
+    /// assert!(matches!(
+    ///     sqlite.resolve_operator(equals, Some(pg("int4")), pg("int4"), case),
+    ///     OperatorResolution::Undetermined
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn resolve_operator<'db>(
+        &'db self,
+        operator: TargetName<'_>,
+        left: Option<OperandType<'_>>,
+        right: OperandType<'_>,
+        case: IdentifierCase,
+    ) -> OperatorResolution<'db, Self> {
+        resolve_operator(self, &operator, left.as_ref(), &right, case)
     }
 
     /// Iterates over the policies defined in the schema.

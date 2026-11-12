@@ -87,7 +87,7 @@ struct Input<'f> {
 /// The type a `VARIADIC` parameter declares each argument it collects to be.
 fn variadic_element(declared: &PgType) -> Option<PgType> {
     match declared.polymorphic() {
-        Some(Polymorphic::Any) => Some(declared.clone()),
+        _ if declared.is_any() => Some(declared.clone()),
         Some(Polymorphic::Array) => Some(PgType::Catalog("anyelement")),
         Some(Polymorphic::CompatibleArray) => Some(PgType::Catalog("anycompatible")),
         _ => declared.element().cloned(),
@@ -217,8 +217,9 @@ pub(crate) fn check_argument_count(
 
 /// A type a polymorphic parameter binds to, with how to spell it.
 #[derive(Clone)]
-struct Bound<'a> {
-    pg_type: PgType,
+pub(crate) struct Bound<'a> {
+    /// The bound type.
+    pub(crate) pg_type: PgType,
     spelling: Spelling<'a>,
 }
 
@@ -312,13 +313,16 @@ fn innermost_element(data_type: DataType) -> DataType {
 /// What the polymorphic parameters of a function bind to for one call.
 pub(crate) struct Binding<'a> {
     /// The type the call's arguments are declared to take, by position.
-    pub(crate) declared: Vec<Option<PgType>>,
+    pub(crate) declared: Cow<'a, [Option<PgType>]>,
     /// What `anyelement` binds to, when the call decides it.
     element: Family<Bound<'a>>,
     /// What `anyarray` binds to, when an argument decides it directly.
     array: Option<Bound<'a>>,
     /// What `anycompatible` binds to.
     compatible: Family<Bound<'a>>,
+    /// Whether an argument of a known or unknown type, other than an untyped
+    /// literal, reaches a range pseudo-type.
+    range_bound: bool,
     /// Whether the database's facts leave open that the function takes the
     /// argument types.
     uncertain: bool,
@@ -341,16 +345,19 @@ enum Family<T> {
 /// types.
 pub(crate) fn bind<'a, D: DatabaseLike>(
     database: &D,
-    declared: Vec<Option<PgType>>,
+    declared: impl Into<Cow<'a, [Option<PgType>]>>,
     actuals: &[Option<Actual<'a>>],
 ) -> Option<Binding<'a>> {
-    let ((element, array, compatible), uncertain) = bind_families(database, &declared, actuals)?;
-    Some(Binding { declared, element, array, compatible, uncertain })
+    let declared = declared.into();
+    let ((element, array, compatible, range_bound), uncertain) =
+        bind_families(database, &declared, actuals)?;
+    Some(Binding { declared, element, array, compatible, range_bound, uncertain })
 }
 
 /// What `anyelement`, `anyarray` and `anycompatible` bind to, `anyarray` only
-/// when an argument decides it directly.
-type Families<'a> = (Family<Bound<'a>>, Option<Bound<'a>>, Family<Bound<'a>>);
+/// when an argument decides it directly, and whether an argument other than
+/// an untyped literal reaches a range pseudo-type.
+type Families<'a> = (Family<Bound<'a>>, Option<Bound<'a>>, Family<Bound<'a>>, bool);
 
 /// The work of [`bind`], over borrowed declared types, with whether the
 /// database's facts leave the binding open.
@@ -366,6 +373,7 @@ fn bind_families<'a, D: DatabaseLike>(
     let mut compatible: Vec<Bound<'a>> = Vec::new();
     let mut compatible_undetermined = false;
     let mut compatible_nonarray = false;
+    let mut range_bound = false;
     let mut uncertain = false;
 
     for (declared, actual) in declared.iter().zip(actuals) {
@@ -382,7 +390,22 @@ fn bind_families<'a, D: DatabaseLike>(
                     }
                 }
             }
-            Some(Polymorphic::Any | Polymorphic::Range) => {}
+            // A value outside the range category is no range. Which range or
+            // multirange binds, and over which subtype, needs `pg_range`
+            // facts this model does not hold.
+            Some(Polymorphic::Range) => {
+                range_bound |= actual.as_ref().is_none_or(|actual| !actual.pg_type.is_unknown());
+                if let Some(actual) = known {
+                    let category = base(database, &actual.pg_type)
+                        .ok()
+                        .and_then(|base| facts(database, &base))
+                        .map(|facts| facts.category());
+                    match category {
+                        Some(category) if category != TypeCategory::RANGE => return None,
+                        _ => uncertain = true,
+                    }
+                }
+            }
             Some(Polymorphic::Element { nonarray: refuses_arrays }) => {
                 nonarray |= refuses_arrays;
                 match (actual, known) {
@@ -444,7 +467,10 @@ fn bind_families<'a, D: DatabaseLike>(
         element_family(database, element, array.as_ref(), element_undetermined, nonarray)?;
     let (compatible, compatible_uncertain) =
         compatible_family(database, compatible, compatible_undetermined, compatible_nonarray)?;
-    Some(((element, array, compatible), uncertain || element_uncertain || compatible_uncertain))
+    Some((
+        (element, array, compatible, range_bound),
+        uncertain || element_uncertain || compatible_uncertain,
+    ))
 }
 
 /// How a `nonarray` form takes the bound type, [`None`] when the type is an
@@ -526,40 +552,56 @@ impl<'a> Binding<'a> {
         else {
             return Some(result);
         };
-        let text = Bound { pg_type: PgType::TEXT, spelling: Spelling::Text };
-        match polymorphic {
-            Polymorphic::Element { .. } => {
-                match &self.element {
-                    Family::Decided(bound) => bound.name(),
-                    Family::Unbound | Family::Undetermined => None,
-                }
-            }
-            Polymorphic::Array => {
-                if let (Some(array), Family::Decided(_)) = (&self.array, &self.element) {
-                    return array.name();
-                }
-                match &self.element {
-                    Family::Decided(bound) => bound.array_name(),
-                    Family::Unbound | Family::Undetermined => None,
-                }
-            }
-            Polymorphic::Compatible { .. } => {
-                match &self.compatible {
-                    Family::Decided(bound) => bound.name(),
-                    Family::Unbound => text.name(),
-                    Family::Undetermined => None,
-                }
-            }
-            Polymorphic::CompatibleArray => {
-                match &self.compatible {
-                    Family::Decided(bound) => bound.array_name(),
-                    Family::Unbound => text.array_name(),
-                    Family::Undetermined => None,
-                }
-            }
-            Polymorphic::Any | Polymorphic::Range => None,
+        match self.bound(polymorphic) {
+            BoundType::Type(bound) => bound.name(),
+            BoundType::ArrayOf(bound) => bound.array_name(),
+            BoundType::Unbound | BoundType::Undetermined => None,
         }
     }
+
+    /// What a parameter declared `polymorphic` binds to for the call.
+    pub(crate) fn bound(&self, polymorphic: Polymorphic) -> BoundType<'_, 'a> {
+        let (family, array) = match polymorphic {
+            Polymorphic::Element { .. } => (&self.element, false),
+            Polymorphic::Array => {
+                if let (Some(array), Family::Decided(_)) = (&self.array, &self.element) {
+                    return BoundType::Type(Cow::Borrowed(array));
+                }
+                (&self.element, true)
+            }
+            Polymorphic::Compatible { .. } => (&self.compatible, false),
+            Polymorphic::CompatibleArray => (&self.compatible, true),
+            // Untyped literals alone bind no range.
+            Polymorphic::Range => {
+                return if self.range_bound { BoundType::Undetermined } else { BoundType::Unbound };
+            }
+        };
+        let bound = match family {
+            Family::Decided(bound) => Cow::Borrowed(bound),
+            // `anycompatible` resolves untyped literals alone as `text`.
+            Family::Unbound
+                if matches!(polymorphic, Polymorphic::Compatible { .. })
+                    || polymorphic == Polymorphic::CompatibleArray =>
+            {
+                Cow::Owned(Bound { pg_type: PgType::TEXT, spelling: Spelling::Text })
+            }
+            Family::Unbound => return BoundType::Unbound,
+            Family::Undetermined => return BoundType::Undetermined,
+        };
+        if array { BoundType::ArrayOf(bound) } else { BoundType::Type(bound) }
+    }
+}
+
+/// What a polymorphic parameter binds to for one call.
+pub(crate) enum BoundType<'b, 'a> {
+    /// This type.
+    Type(Cow<'b, Bound<'a>>),
+    /// The array type over this type.
+    ArrayOf(Cow<'b, Bound<'a>>),
+    /// Only untyped literals reach the parameter, which PostgreSQL refuses.
+    Unbound,
+    /// What the parameter binds to is not known.
+    Undetermined,
 }
 
 /// Which of the functions a call reaches it runs.
