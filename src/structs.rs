@@ -10,8 +10,9 @@ pub mod generic_db;
 pub(crate) use generic_db::ConstraintObject;
 pub use generic_db::{
     AccessResolution, GenericDB, Meta, ParseOptions, ParserDB, ParserDBBuilder, ParserDBIngestor,
-    ParserIngestion, PostgresCatalog, PostgresCatalogCollation, PostgresCatalogOperator,
-    PostgresCatalogType, SchemaProfile, SqlparserProfile, UnresolvedAccessReference,
+    ParserIngestion, PostgresCatalog, PostgresCatalogCast, PostgresCatalogCollation,
+    PostgresCatalogOperator, PostgresCatalogType, SchemaProfile, SqlparserProfile,
+    UnresolvedAccessReference,
 };
 mod function_body;
 mod function_kind;

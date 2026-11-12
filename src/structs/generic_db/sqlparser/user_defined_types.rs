@@ -41,7 +41,7 @@ use super::{
         reach_type, require_existing_type,
     },
     object_name_last_identifier, place_relation,
-    postgres_catalog::PostgresCatalog,
+    postgres_catalog::{CatalogDependent, PostgresCatalog},
     range_constructors, relation_name_holder, require_named_in_catalog,
     signature_types::{retarget_signatures, signature_types},
     type_arrays::TypeArrays,
@@ -676,7 +676,7 @@ fn doomed_type_identities(
 /// `IF EXISTS`. Once a name resolves to a droppable type, without `CASCADE` it
 /// refuses a type a column, a composite attribute, a domain, a range or a base
 /// type's element uses, and a type, its stored array, or a range's multirange
-/// that `operators_holding` names. With it, those go too.
+/// that `dependent_holding` names. With it, those go too.
 pub(super) fn drop_types(
     builder: ParserDBBuilder,
     names: &[ObjectName],
@@ -684,7 +684,7 @@ pub(super) fn drop_types(
     cascade: bool,
     spelling: DropSpelling,
     arrays: &mut Arc<TypeArrays>,
-    operators_holding: &impl Fn(&ObjectName) -> Option<String>,
+    dependent_holding: &impl Fn(&ObjectName) -> Option<CatalogDependent>,
 ) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let mut doomed: Vec<Doomed> = Vec::new();
     for name in names {
@@ -762,11 +762,11 @@ pub(super) fn drop_types(
         };
         if !cascade {
             for candidate in held_type_identities(&builder, arrays, held) {
-                if let Some(symbol) = operators_holding(&candidate) {
+                if let Some(dependent) = dependent_holding(&candidate) {
                     return Err(Error::TypeDropRequiredBy {
                         type_name: name.to_string(),
-                        requiring_kind: ObjectKind::Operator,
-                        requiring_name: symbol,
+                        requiring_kind: dependent.kind,
+                        requiring_name: dependent.name,
                     });
                 }
             }

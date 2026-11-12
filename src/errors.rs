@@ -52,6 +52,8 @@ pub enum ObjectKind {
     /// An operator the catalog holds, by the schema-qualified symbol it runs
     /// under.
     Operator,
+    /// A cast the catalog holds, by its `(source AS target)` spelling.
+    Cast,
 }
 
 impl core::fmt::Display for ObjectKind {
@@ -76,6 +78,7 @@ impl core::fmt::Display for ObjectKind {
             Self::Domain => "Domain",
             Self::Type => "Type",
             Self::Operator => "Operator",
+            Self::Cast => "Cast",
         })
     }
 }

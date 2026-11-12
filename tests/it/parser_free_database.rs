@@ -283,6 +283,7 @@ impl DatabaseLike for MemoryCatalog {
     type ForeignKey = MemoryForeignKey;
     type Function = MemoryFunction;
     type Operator = sql_traits::structs::Absent<Self>;
+    type Cast = sql_traits::structs::Absent<Self>;
     type UniqueIndex = MemoryUniqueIndex;
     type CheckConstraint = MemoryCheckConstraint;
     type Trigger = MemoryTrigger;
@@ -2758,6 +2759,8 @@ fn legal_policy_commands_route_each_clause_and_diagnose_missing_prerequisites() 
 }
 
 #[test]
-fn an_engine_without_an_operator_catalog_answers_none() {
-    assert!(MemoryCatalog::default().operators().is_none());
+fn an_engine_without_operator_or_cast_catalogs_answers_none() {
+    let database = MemoryCatalog::default();
+    assert!(database.operators().is_none());
+    assert!(database.casts().is_none());
 }

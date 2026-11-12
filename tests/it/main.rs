@@ -14,6 +14,7 @@ mod array_vector_interval_types;
 mod binary_send;
 mod call_resolution;
 mod call_result_types;
+mod cast_metadata;
 mod catalog_navigation;
 mod check_constraint_columns;
 mod clause_bindings;

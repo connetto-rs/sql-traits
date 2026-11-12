@@ -258,7 +258,7 @@ impl OperatorLike for PostgresCatalogOperator {
 }
 
 /// Stores a supplied identity, defaulting its schema to `pg_catalog`.
-fn operand_type(target: TargetName<'_>) -> CatalogName {
+pub(super) fn operand_type(target: TargetName<'_>) -> CatalogName {
     let (name, name_is_quoted, schema, schema_is_quoted) = target.into_parts();
     let mut identity = CatalogName::in_pg_catalog(Cow::Owned(name.into_owned()), name_is_quoted);
     if let Some(schema) = schema {
@@ -268,7 +268,11 @@ fn operand_type(target: TargetName<'_>) -> CatalogName {
 }
 
 /// Compares a stored function identity without allocating an AST name.
-fn function_name_matches(identity: &CatalogName, name: &ObjectName, case: IdentifierCase) -> bool {
+pub(super) fn function_name_matches(
+    identity: &CatalogName,
+    name: &ObjectName,
+    case: IdentifierCase,
+) -> bool {
     let Some((written, quoted)) = super::object_name_last_part(name) else {
         return false;
     };
@@ -285,7 +289,10 @@ fn function_name_matches(identity: &CatalogName, name: &ObjectName, case: Identi
 /// The normalized spelling of the identity PostgreSQL resolves it to, a
 /// generated array answering its element's type with a single pair of
 /// brackets.
-fn operand_spelling(identity: &CatalogName, type_arrays: &TypeArrays) -> Cow<'static, str> {
+pub(super) fn operand_spelling(
+    identity: &CatalogName,
+    type_arrays: &TypeArrays,
+) -> Cow<'static, str> {
     let schema = identity.schema().unwrap_or(DEFAULT_SCHEMA);
     let spelled = match type_arrays.element_in(
         schema,
@@ -313,22 +320,31 @@ struct SpelledOperands {
 impl SpelledOperands {
     /// Whether `args` normalize to exactly the operand spellings held.
     fn arguments_match(&self, args: Option<&[OperateFunctionArg]>) -> bool {
-        let mut written =
-            args.unwrap_or_default().iter().filter(|argument| argument.mode != Some(ArgMode::Out));
-        let mut spelled = [self.left.as_deref(), Some(&self.right)].into_iter().flatten();
-        loop {
-            match (written.next(), spelled.next()) {
-                (None, None) => return true,
-                (Some(argument), Some(spelled)) => {
-                    if normalize_postgres_type_cow(normalize_sqlparser_type(&argument.data_type))
-                        .as_ref()
-                        != spelled
-                    {
-                        return false;
-                    }
+        arguments_match([self.left.as_deref(), Some(&self.right)].into_iter().flatten(), args)
+    }
+}
+
+/// Whether the input arguments of `args` normalize to exactly `spelled`, in
+/// order.
+pub(super) fn arguments_match(
+    spelled: impl IntoIterator<Item = impl AsRef<str>>,
+    args: Option<&[OperateFunctionArg]>,
+) -> bool {
+    let mut written =
+        args.unwrap_or_default().iter().filter(|argument| argument.mode != Some(ArgMode::Out));
+    let mut spelled = spelled.into_iter();
+    loop {
+        match (written.next(), spelled.next()) {
+            (None, None) => return true,
+            (Some(argument), Some(spelled)) => {
+                if normalize_postgres_type_cow(normalize_sqlparser_type(&argument.data_type))
+                    .as_ref()
+                    != spelled.as_ref()
+                {
+                    return false;
                 }
-                _ => return false,
             }
+            _ => return false,
         }
     }
 }
@@ -345,7 +361,7 @@ fn schema_repeats(left: &CatalogName, right: &CatalogName) -> bool {
 }
 
 /// Whether two catalog names hold the same schema-qualified identifier.
-fn identity_repeats(left: &CatalogName, right: &CatalogName) -> bool {
+pub(super) fn identity_repeats(left: &CatalogName, right: &CatalogName) -> bool {
     schema_repeats(left, right)
         && identifiers_match(
             left.name(),

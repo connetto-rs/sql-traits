@@ -40,7 +40,7 @@ use super::{
     AlterTableScope, Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier,
     bind_reference, domains, function_bodies, object_name_last_identifier,
     object_name_matches_resolved_identity, place_relation,
-    postgres_catalog::PostgresCatalog,
+    postgres_catalog::{CatalogDependent, PostgresCatalog},
     relation_name_holder, require_named_in_catalog,
     rules::{self, RuleHost},
     stored_ident,
@@ -268,8 +268,8 @@ fn stored_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<
 /// Returns [`Error::RelationKindMismatch`] for a name held by another relation
 /// kind, [`Error::RelationNotFound`] for a name nothing holds, and
 /// [`Error::RelationHasDependents`] when a view reads the one being dropped or
-/// an operator names its row type or stored array and the statement wrote no
-/// `CASCADE`.
+/// an operator or cast names its row type or stored array and the statement
+/// wrote no `CASCADE`.
 pub(super) fn drop_views(
     mut builder: ParserDBBuilder,
     names: &[ObjectName],
@@ -277,7 +277,7 @@ pub(super) fn drop_views(
     if_exists: bool,
     cascade: bool,
     arrays: &mut Arc<TypeArrays>,
-    operators_holding: &impl Fn(&ObjectName) -> Option<String>,
+    dependent_holding: &impl Fn(&ObjectName) -> Option<CatalogDependent>,
 ) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let expected_kind = if materialized { ObjectKind::MaterializedView } else { ObjectKind::View };
     let mut drop = TypeDrop { types: Vec::new(), functions: Vec::new() };
@@ -310,14 +310,14 @@ pub(super) fn drop_views(
                 } else {
                     rowtype_name(builder.views()[position].0.as_ref())
                 };
-                if let Some(symbol) =
-                    rowtype_identities(arrays, &owner).iter().find_map(operators_holding)
+                if let Some(dependent) =
+                    rowtype_identities(arrays, &owner).iter().find_map(dependent_holding)
                 {
                     return Err(Error::RelationHasDependents {
                         object_kind: expected_kind,
                         object_name: rendered_name(name),
-                        dependent_kind: ObjectKind::Operator,
-                        dependent_name: symbol,
+                        dependent_kind: dependent.kind,
+                        dependent_name: dependent.name,
                     });
                 }
                 refuse_dependent_views(&builder, &key, expected_kind, &rendered_name(name))?;
@@ -883,10 +883,11 @@ pub(super) fn drop_views_in(
         .collect();
     // A schema cascade never refuses, so the callback the refusal consults
     // holds nothing.
-    let no_operator = |_: &ObjectName| None::<String>;
-    let (builder, mut drop) = drop_views(builder, &plain, false, true, true, arrays, &no_operator)?;
+    let no_dependent = |_: &ObjectName| None::<CatalogDependent>;
+    let (builder, mut drop) =
+        drop_views(builder, &plain, false, true, true, arrays, &no_dependent)?;
     let (builder, materialized_drop) =
-        drop_views(builder, &materialized, true, true, true, arrays, &no_operator)?;
+        drop_views(builder, &materialized, true, true, true, arrays, &no_dependent)?;
     drop.types.extend(materialized_drop.types);
     drop.functions.extend(materialized_drop.functions);
     Ok((builder, drop))

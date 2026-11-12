@@ -11,10 +11,10 @@ use alloc::sync::Arc;
 use crate::{
     structs::GenericDB,
     traits::{
-        CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike, DomainLike,
-        ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, Metadata, OperatorLike, PolicyLike,
-        RoleLike, RoleMembershipLike, RuleLike, SchemaLike, SequenceLike, TableGrantLike,
-        TableLike, TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
+        CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
+        DomainLike, ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, Metadata, OperatorLike,
+        PolicyLike, RoleLike, RoleMembershipLike, RuleLike, SchemaLike, SequenceLike,
+        TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
     },
 };
 
@@ -69,6 +69,8 @@ pub trait SchemaProfile: Sized {
     type Function: FunctionLike<DB = GenericDB<Self>> + 'static;
     /// The operators the catalog holds.
     type Operator: OperatorLike<DB = GenericDB<Self>>;
+    /// The casts the catalog holds.
+    type Cast: CastLike<DB = GenericDB<Self>>;
     /// The check constraints the schema holds.
     type CheckConstraint: CheckConstraintLike<DB = GenericDB<Self>>;
     /// The triggers the schema holds.
@@ -98,7 +100,7 @@ pub trait SchemaProfile: Sized {
     /// The state a built database carries beyond the schema objects
     /// themselves, which statement-by-statement ingestion resumes from and
     /// which holds the catalogs the profile answers, such as the operators
-    /// [`Self::operators`] reads.
+    /// [`Self::operators`] and the casts [`Self::casts`] read.
     ///
     /// The parser profile stores its access-resolution mode, the active
     /// PostgreSQL catalog, and metadata for collations the ingested DDL
@@ -125,6 +127,18 @@ pub trait SchemaProfile: Sized {
         Self::Operator: 'a,
     {
         None::<core::iter::Empty<&'a Self::Operator>>
+    }
+
+    /// Returns the cast catalog `ingestion` holds under `dialect`, or `None`
+    /// when it is unavailable, which a loaded empty catalog is not.
+    fn casts<'a>(
+        _dialect: &'a Self::Dialect,
+        _ingestion: &'a Self::Ingestion,
+    ) -> Option<impl Iterator<Item = &'a Self::Cast>>
+    where
+        Self::Cast: 'a,
+    {
+        None::<core::iter::Empty<&'a Self::Cast>>
     }
 
     /// Returns the schemas a database of this profile starts with under the
