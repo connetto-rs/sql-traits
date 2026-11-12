@@ -1120,6 +1120,23 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
         self.graph.resolve_binding(self.root, reference)
     }
 
+    /// Every expression a `SELECT` of the query holds outside the `SELECT`s
+    /// nested in it, by address, with the scope it resolves in.
+    pub(crate) fn expression_scopes(&self) -> alloc::vec::Vec<(usize, ScopeCursor)> {
+        self.graph.expression_scopes()
+    }
+
+    /// The resolver for the scope `cursor` names, the query's own scope for
+    /// `None`.
+    pub(crate) fn resolve_binding_in(
+        &self,
+        cursor: Option<ScopeCursor>,
+        reference: &Expr,
+    ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
+    {
+        self.graph.definition_scope(cursor.unwrap_or(self.root)).resolve_column_binding(reference)
+    }
+
     /// Resolves a relation qualifier with no column, such as a qualified
     /// wildcard's, against the query's own `FROM` relations.
     ///
