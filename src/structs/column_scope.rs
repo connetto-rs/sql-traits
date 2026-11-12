@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use sqlparser::ast::{Expr, ObjectName, Query, Select, SetOperator};
+use sqlparser::ast::{Expr, ObjectName, Query, Select, SetOperator, TableFactor};
 
 use crate::{
     errors::LookupError,
@@ -78,6 +78,7 @@ pub struct ColumnBinding<'scope> {
     relation: Option<(&'scope str, bool)>,
     exposed: Option<(&'scope str, bool)>,
     origin: ColumnOrigin,
+    entry: Option<RangeTableEntry<'scope>>,
 }
 
 impl<'scope> ColumnBinding<'scope> {
@@ -85,13 +86,45 @@ impl<'scope> ColumnBinding<'scope> {
         relation: Option<(&'scope str, bool)>,
         exposed: Option<(&'scope str, bool)>,
         origin: ColumnOrigin,
+        entry: Option<RangeTableEntry<'scope>>,
     ) -> Self {
-        Self { relation, exposed, origin }
+        Self { relation, exposed, origin, entry }
     }
 
     /// The `FROM` item and column the binding reached.
     pub(crate) fn origin(&self) -> ColumnOrigin {
         self.origin
+    }
+
+    /// Returns the `FROM` item and column the reference reached, or `None`
+    /// for a column a `USING` or `NATURAL` join merged, a select-list output
+    /// a clause key named, and an uncertain binding.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, Ident, SetExpr, Statement},
+    ///     dialect::GenericDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>("CREATE TABLE docs(id INT, title TEXT);")?;
+    /// let parsed = Parser::parse_sql(&GenericDialect {}, "SELECT d.title FROM docs AS d")?;
+    /// let Statement::Query(query) = parsed.into_iter().next().unwrap() else { unreachable!() };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
+    /// let reference = Expr::CompoundIdentifier(vec![Ident::new("d"), Ident::new("title")]);
+    /// let (_, binding) = scope.resolve_column_binding(&reference)?.expect("column resolves");
+    /// let entry = binding.entry().expect("one FROM item");
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// assert!(core::ptr::eq(entry.factor(), &select.from[0].relation));
+    /// assert_eq!(entry.ordinal(), 1);
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    #[must_use]
+    pub fn entry(&self) -> Option<RangeTableEntry<'scope>> {
+        self.entry
     }
 
     /// Returns the relation name, or `None` for a merged, anonymous or opaque
@@ -154,6 +187,45 @@ impl<'scope> ColumnBinding<'scope> {
         self.exposed
     }
 }
+
+/// One column of one `FROM` item of the query a scope was built from, what
+/// PostgreSQL's `Var` names by range-table index and attribute number.
+///
+/// Two entries are equal when they name the same column of the same node, so
+/// a table read twice yields distinct entries.
+#[derive(Debug, Clone, Copy)]
+pub struct RangeTableEntry<'scope> {
+    factor: &'scope TableFactor,
+    ordinal: usize,
+}
+
+impl<'scope> RangeTableEntry<'scope> {
+    pub(crate) fn new(factor: &'scope TableFactor, ordinal: usize) -> Self {
+        Self { factor, ordinal }
+    }
+
+    /// Returns the `FROM` item, borrowed from the query or from the
+    /// definition of a view it reads.
+    #[must_use]
+    pub fn factor(&self) -> &'scope TableFactor {
+        self.factor
+    }
+
+    /// Returns the position of the column among the item's output columns,
+    /// counted from zero before an alias column list renames them.
+    #[must_use]
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+}
+
+impl PartialEq for RangeTableEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self.factor, other.factor) && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for RangeTableEntry<'_> {}
 
 /// The relation a qualifier with no column, such as a qualified wildcard's,
 /// matched.

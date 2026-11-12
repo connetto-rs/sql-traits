@@ -41,7 +41,7 @@ mod view;
 pub use absent::Absent;
 pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
-    ColumnScope, QueryOutput, RelationBinding,
+    ColumnScope, QueryOutput, RangeTableEntry, RelationBinding,
 };
 pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,

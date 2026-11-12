@@ -1586,3 +1586,55 @@ fn folded_case_binding_reports_the_views_own_declared_name_not_the_reference_spe
     assert_eq!(relation, Some(("MyView".to_string(), true)));
     assert_eq!(exposed, Some(("a".to_string(), false)));
 }
+
+/// A reference reports the `FROM` item and column it reached, so a table
+/// read again in a nested scope stays apart from the outer read.
+#[test]
+fn bindings_name_the_from_item_they_reached() {
+    let db = ParserDB::parse::<GenericDialect>("CREATE TABLE shares(weight INT, viewer TEXT);")
+        .expect("schema parses");
+    let query =
+        query("SELECT 1 FROM shares AS s WHERE s.weight > (SELECT avg(weight) FROM shares)");
+    let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Select(outer) = query.body.as_ref() else { unreachable!() };
+    let Some(Expr::BinaryOp { right, .. }) = &outer.selection else { unreachable!() };
+    let Expr::Subquery(subquery) = right.as_ref() else { unreachable!() };
+    let SetExpr::Select(inner) = subquery.body.as_ref() else { unreachable!() };
+    let inner_scope = scope.scope_for_select(inner).expect("nested scope");
+
+    let (_, outer_weight) = scope.resolve_column_binding(&reference("s.weight")).unwrap().unwrap();
+    let (_, inner_weight) =
+        inner_scope.resolve_column_binding(&reference("weight")).unwrap().unwrap();
+    let (_, inner_viewer) =
+        inner_scope.resolve_column_binding(&reference("viewer")).unwrap().unwrap();
+    let (outer_weight, inner_weight, inner_viewer) = (
+        outer_weight.entry().expect("outer entry"),
+        inner_weight.entry().expect("inner entry"),
+        inner_viewer.entry().expect("inner entry"),
+    );
+
+    assert!(core::ptr::eq(outer_weight.factor(), core::ptr::from_ref(&outer.from[0].relation)));
+    assert!(core::ptr::eq(inner_weight.factor(), core::ptr::from_ref(&inner.from[0].relation)));
+    assert_eq!((outer_weight.ordinal(), inner_weight.ordinal(), inner_viewer.ordinal()), (0, 0, 1));
+    assert_ne!(outer_weight, inner_weight);
+    assert_ne!(inner_weight, inner_viewer);
+    let (_, again) = inner_scope.resolve_column_binding(&reference("weight")).unwrap().unwrap();
+    assert_eq!(again.entry(), Some(inner_weight));
+}
+
+/// A column a `USING` join merged reached no single `FROM` item, while a
+/// qualified reference to one side did.
+#[test]
+fn merged_columns_name_no_from_item() {
+    let db = schema_db();
+    let query = query("SELECT id FROM a JOIN b USING (id)");
+    let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+
+    let (_, merged) = scope.resolve_column_binding(&reference("id")).unwrap().unwrap();
+    assert_eq!(merged.entry(), None);
+    let (_, right) = scope.resolve_column_binding(&reference("b.id")).unwrap().unwrap();
+    let right = right.entry().expect("one side");
+    assert!(core::ptr::eq(right.factor(), core::ptr::from_ref(&select.from[0].joins[0].relation)));
+    assert_eq!(right.ordinal(), 1);
+}
