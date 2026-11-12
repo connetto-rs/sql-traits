@@ -889,22 +889,30 @@ fn collation_resolution_for_name<'a>(
         Qualifier::Absent => {}
     }
 
-    if !search_path_names_pg_catalog(search_path)
+    bare_collation_resolution(lookup, collations, catalog, || {
+        search_path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted))
+    })
+}
+
+/// The collation the bare name `lookup` reaches, in `pg_catalog` unless the
+/// search path `search_path` walks names it, then along that path.
+fn bare_collation_resolution<'a, 'path, I: Iterator<Item = (&'path str, bool)>>(
+    lookup: (&str, bool),
+    collations: &'a [CreatedCollationMetadata],
+    catalog: &'a PostgresCatalog,
+    search_path: impl Fn() -> I,
+) -> Option<CollationResolution<'a>> {
+    let names_pg_catalog = search_path()
+        .any(|(schema, quoted)| identifiers_match("pg_catalog", false, schema, quoted));
+    if !names_pg_catalog
         && let Some(resolution) =
             collation_resolution_for_schema(lookup, collations, catalog, "pg_catalog", false)
     {
         return Some(resolution);
     }
-
-    for (schema, schema_quoted) in search_path {
-        if let Some(resolution) =
-            collation_resolution_for_schema(lookup, collations, catalog, schema, *schema_quoted)
-        {
-            return Some(resolution);
-        }
-    }
-
-    None
+    search_path().find_map(|(schema, schema_quoted)| {
+        collation_resolution_for_schema(lookup, collations, catalog, schema, schema_quoted)
+    })
 }
 fn catalog_type_for_schema<'a>(
     lookup: &ObjectName,
@@ -1188,8 +1196,8 @@ impl ParserDBBuilder {
         for (_, calls) in self.rules_mut() {
             calls.replace_function(stale, fresh);
         }
-        for (_, calls) in self.domains_mut() {
-            calls.replace_function(stale, fresh);
+        for (_, metadata) in self.domains_mut() {
+            metadata.calls_mut().replace_function(stale, fresh);
         }
         for (_, calls) in self.user_defined_types_mut() {
             calls.replace_function(stale, fresh);
@@ -1278,7 +1286,7 @@ impl ParserDBBuilder {
                 .iter()
                 .any(|(_, metadata, _)| calls_dropped(metadata.calls()))
             || self.rules().iter().any(|(_, calls)| calls_dropped(calls))
-            || self.domains().iter().any(|(_, calls)| calls_dropped(calls))
+            || self.domains().iter().any(|(_, metadata)| calls_dropped(metadata.calls()))
             || self.user_defined_types().iter().any(|(_, calls)| calls_dropped(calls))
     }
 
@@ -10607,6 +10615,7 @@ impl ParserDB {
                         builder,
                         create_domain,
                         session_roles.creating_role(),
+                        &collation_metadata,
                         &mut type_arrays,
                         &mut active_postgres_catalog,
                     )?;

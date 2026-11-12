@@ -261,9 +261,9 @@ pub(super) fn move_functions(
             respell(Arc::make_mut(rule), calls, moves)?;
         }
     }
-    for (domain, calls) in builder.domains_mut() {
-        if moves.reached_by(calls) {
-            respell(Arc::make_mut(domain), calls, moves)?;
+    for (domain, metadata) in builder.domains_mut() {
+        if moves.reached_by(metadata.calls()) {
+            respell(Arc::make_mut(domain), metadata.calls(), moves)?;
         }
     }
     for (type_, calls) in builder.user_defined_types_mut() {

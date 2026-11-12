@@ -31,14 +31,14 @@ use alloc::{string::ToString, sync::Arc, vec::Vec};
 use sqlparser::ast::{ArrayElemTypeDef, CreateDomain, DataType, Ident, ObjectName};
 
 use super::{
-    ParserDB, ParserDBBuilder, PostgresCatalog, SchemaQualifier, StoredTable, bind_reference,
-    object_name_last_identifier, place_relation, relation_name_holder, require_named_in_catalog,
-    type_arrays::TypeArrays,
+    CreatedCollationMetadata, ParserDB, ParserDBBuilder, PostgresCatalog, SchemaQualifier,
+    StoredTable, bare_collation_resolution, bind_reference, object_name_last_identifier,
+    place_relation, relation_name_holder, require_named_in_catalog, type_arrays::TypeArrays,
 };
 use crate::{
     errors::{Error, ObjectKind},
     impls::{bound_domain, bound_user_type, domain_in_schema, domain_named, user_type_holds},
-    structs::UserDefinedType,
+    structs::{TargetName, UserDefinedType, metadata::DomainMetadata},
     traits::{DomainLike, UserDefinedTypeLike},
     utils::{
         identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
@@ -88,6 +88,7 @@ pub(super) fn create_domain(
     mut builder: ParserDBBuilder,
     mut domain: CreateDomain,
     role: Option<&str>,
+    collations: &[CreatedCollationMetadata],
     arrays: &mut Arc<TypeArrays>,
     catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
@@ -110,9 +111,17 @@ pub(super) fn create_domain(
         Arc::make_mut(catalog).rename_type_identity(&previous, current);
     }
     bind_type(&builder, &mut domain.data_type, arrays)?;
+    // PostgreSQL fixes the collation when the domain is created, so a later
+    // search path never rebinds it.
+    let collation = domain.collation.as_ref().and_then(|collation| {
+        let lookup = (collation.value.as_str(), collation.quote_style.is_some());
+        bare_collation_resolution(lookup, collations, catalog, || builder.search_path())
+            .and_then(super::CollationResolution::into_target_name)
+            .map(TargetName::into_owned)
+    });
     let calls = builder.calls_in(&domain);
     let node = Arc::new(domain);
-    let builder = builder.add_domain(Arc::clone(&node), calls);
+    let builder = builder.add_domain(Arc::clone(&node), DomainMetadata::new(calls, collation));
     Arc::make_mut(arrays).create(&builder, &node.name);
     Ok(builder)
 }
