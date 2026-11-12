@@ -3,8 +3,8 @@
 use alloc::format;
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, CharacterLength, CreateDomain, DataType, ExactNumberInfo, Ident,
-    IntervalFields, UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
+    ArrayElemTypeDef, CreateDomain, DataType, Ident, UserDefinedTypeRepresentation,
+    UserDefinedTypeSqlDefinitionOption,
 };
 
 use super::{ParserDB, collation_resolution_for_schema};
@@ -16,11 +16,9 @@ use crate::{
         identifier_resolution::{identifiers_match, stored_identifier},
         object_name::{PG_CATALOG, target_name_from_object_name, type_search_path},
         postgres_types::{PgType, built_in_type},
+        type_modifier,
     },
 };
-
-/// `VARHDRSZ`, the header length a variable-length typmod counts.
-const VARHDRSZ: i32 = 4;
 
 /// The facts of the type `name` names, unqualified names read through the
 /// type search path.
@@ -224,7 +222,7 @@ fn domain_over<'db>(
         let facts = TypeFacts::new(base.category(), false).with_domain(domain);
         return Some((facts, base.into_collation()));
     }
-    let typmod = typmod(data_type).ok()?;
+    let typmod = type_modifier::declared(data_type)?.value();
     let (base, category) = match data_type {
         DataType::Array(
             ArrayElemTypeDef::AngleBracket(element)
@@ -255,104 +253,4 @@ fn array_of<'db>(database: &'db ParserDB, element: &'db DataType) -> Option<Targ
     let PgType::Catalog(name) = PgType::of(element) else { return None };
     let array = format!("_{name}");
     Some(TargetName::new(&array, false).with_schema(PG_CATALOG, false).into_owned())
-}
-
-/// The modifier `data_type` declares as `pg_type.typtypmod` stores it,
-/// `Ok(None)` when it declares none, and `Err` for a modifier this model
-/// does not encode.
-fn typmod(data_type: &DataType) -> Result<Option<i32>, ()> {
-    // A length without a modifier, `VARCHAR(MAX)` included, declares none.
-    let length = |length: &Option<CharacterLength>, default: Option<u64>| {
-        match length {
-            Some(CharacterLength::IntegerLength { length, .. }) => encode(*length + 4),
-            Some(CharacterLength::Max) | None => {
-                default.map_or(Ok(None), |length| encode(length + 4))
-            }
-        }
-    };
-    match data_type {
-        DataType::Varchar(declared)
-        | DataType::CharacterVarying(declared)
-        | DataType::CharVarying(declared)
-        | DataType::NationalCharacterVarying(declared)
-        | DataType::NationalCharVarying(declared)
-        | DataType::NcharVarying(declared) => length(declared, None),
-        // A `char` without a length holds one character.
-        DataType::Char(declared)
-        | DataType::Character(declared)
-        | DataType::NationalCharacter(declared)
-        | DataType::NationalChar(declared)
-        | DataType::Nchar(declared) => length(declared, Some(1)),
-        DataType::Numeric(info) | DataType::Decimal(info) | DataType::Dec(info) => {
-            match info {
-                ExactNumberInfo::None => Ok(None),
-                ExactNumberInfo::Precision(precision) => numeric(*precision, 0),
-                ExactNumberInfo::PrecisionAndScale(precision, scale) => numeric(*precision, *scale),
-            }
-        }
-        // A `bit` without a length holds one bit.
-        DataType::Bit(declared) => encode(declared.unwrap_or(1)),
-        DataType::BitVarying(declared) | DataType::VarBit(declared) => {
-            declared.map_or(Ok(None), encode)
-        }
-        DataType::Time(precision, _) | DataType::Timestamp(precision, _) => {
-            precision.map_or(Ok(None), encode)
-        }
-        DataType::Interval { fields, precision } => interval(*fields, *precision),
-        // An array declaration applies its element's modifier.
-        DataType::Array(
-            ArrayElemTypeDef::AngleBracket(element)
-            | ArrayElemTypeDef::SquareBracket(element, _)
-            | ArrayElemTypeDef::Parenthesis(element)
-            | ArrayElemTypeDef::ParenthesisNotNull(element)
-            | ArrayElemTypeDef::Qualified(element, _),
-        ) => typmod(element),
-        _ => Ok(None),
-    }
-}
-
-/// Encodes a plain length or precision typmod.
-fn encode(value: u64) -> Result<Option<i32>, ()> {
-    i32::try_from(value).map(Some).map_err(|_| ())
-}
-
-/// Encodes `numeric(precision, scale)` as `make_numeric_typmod` does.
-fn numeric(precision: u64, scale: i64) -> Result<Option<i32>, ()> {
-    let precision = i32::try_from(precision).map_err(|_| ())?;
-    let scale = i32::try_from(scale).map_err(|_| ())?;
-    Ok(Some(((precision << 16) | (scale & 0x7ff)) + VARHDRSZ))
-}
-
-/// Encodes an interval's fields and precision as `INTERVAL_TYPMOD` does.
-fn interval(fields: Option<IntervalFields>, precision: Option<u64>) -> Result<Option<i32>, ()> {
-    const MONTH: i32 = 1 << 1;
-    const YEAR: i32 = 1 << 2;
-    const DAY: i32 = 1 << 3;
-    const HOUR: i32 = 1 << 10;
-    const MINUTE: i32 = 1 << 11;
-    const SECOND: i32 = 1 << 12;
-    const FULL_RANGE: i32 = 0x7fff;
-    const FULL_PRECISION: i32 = 0xffff;
-    let range = match fields {
-        None if precision.is_none() => return Ok(None),
-        None => FULL_RANGE,
-        Some(IntervalFields::Year) => YEAR,
-        Some(IntervalFields::Month) => MONTH,
-        Some(IntervalFields::Day) => DAY,
-        Some(IntervalFields::Hour) => HOUR,
-        Some(IntervalFields::Minute) => MINUTE,
-        Some(IntervalFields::Second) => SECOND,
-        Some(IntervalFields::YearToMonth) => YEAR | MONTH,
-        Some(IntervalFields::DayToHour) => DAY | HOUR,
-        Some(IntervalFields::DayToMinute) => DAY | HOUR | MINUTE,
-        Some(IntervalFields::DayToSecond) => DAY | HOUR | MINUTE | SECOND,
-        Some(IntervalFields::HourToMinute) => HOUR | MINUTE,
-        Some(IntervalFields::HourToSecond) => HOUR | MINUTE | SECOND,
-        Some(IntervalFields::MinuteToSecond) => MINUTE | SECOND,
-    };
-    let precision = match precision {
-        Some(precision) => i32::try_from(precision).map_err(|_| ())?,
-        None => FULL_PRECISION,
-    };
-    Ok(Some((range << 16) | precision))
 }

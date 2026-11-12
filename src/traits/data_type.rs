@@ -65,6 +65,37 @@ impl IntervalFields {
     }
 }
 
+/// The type modifier a declared type applies, as `pg_attribute.atttypmod`
+/// stores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TypeModifier {
+    /// The declaration applies none, stored as `-1`.
+    Unmodified,
+    /// The declaration applies this modifier.
+    Modified(i32),
+}
+
+impl TypeModifier {
+    /// Returns the modifier, or `None` for none.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::traits::TypeModifier;
+    ///
+    /// assert_eq!(TypeModifier::Modified(9).value(), Some(9));
+    /// assert_eq!(TypeModifier::Unmodified.value(), None);
+    /// ```
+    #[must_use]
+    #[inline]
+    pub const fn value(self) -> Option<i32> {
+        match self {
+            Self::Unmodified => None,
+            Self::Modified(value) => Some(value),
+        }
+    }
+}
+
 /// What the declared length of a character type counts, as
 /// [`DataTypeLike::character_length_unit`] answers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -897,6 +928,46 @@ pub trait DataTypeLike: Debug + Send + Sync {
     #[inline]
     fn interval_fields(&self, _database: &Self::DB) -> Option<IntervalFields> {
         None
+    }
+
+    /// Returns the type modifier the type applies, as
+    /// `pg_attribute.atttypmod` stores it, or `None` when it is unknown.
+    ///
+    /// `VARCHAR(5)` applies `9`, the length and the four header bytes, and
+    /// `TEXT` applies none. The default reads the modifier from the reported
+    /// parameters where they tell it apart, and answers `None` for time and
+    /// interval types, whose reported precision a declaration may leave
+    /// implicit, and for types outside `pg_catalog`, so an implementation
+    /// that stores the modifier should override it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (code VARCHAR(5), stamp TIMESTAMP(3), note TEXT);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let modifiers: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).typmod(&db)).collect();
+    /// assert_eq!(
+    ///     modifiers,
+    ///     [
+    ///         Some(TypeModifier::Modified(9)),
+    ///         Some(TypeModifier::Modified(3)),
+    ///         Some(TypeModifier::Unmodified),
+    ///     ]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn typmod(&self, database: &Self::DB) -> Option<TypeModifier> {
+        crate::utils::type_modifier::derived(self, database)
     }
 
     /// Returns the pgvector type this type names, with its declared dimension
