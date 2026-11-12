@@ -214,6 +214,7 @@ impl SchemaProfile for SqlparserProfile {
 
     fn type_facts<'a>(
         database: &'a ParserDB,
+        _ingestion: &'a Arc<ParserIngestion>,
         type_name: crate::structs::TargetName<'_>,
     ) -> Option<crate::structs::TypeFacts<'a>> {
         type_facts::type_facts(database, &type_name)
