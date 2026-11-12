@@ -95,13 +95,21 @@ pub struct TypeFacts<'db> {
     domain: Option<DomainFacts<'db>>,
     array_element: Option<TargetName<'db>>,
     array_type: Option<TargetName<'db>>,
+    collation: Option<TargetName<'db>>,
 }
 
 impl<'db> TypeFacts<'db> {
     /// Creates the facts of a type that is neither a domain nor an array.
     #[must_use]
     pub const fn new(category: TypeCategory, preferred: bool) -> Self {
-        Self { category, preferred, domain: None, array_element: None, array_type: None }
+        Self {
+            category,
+            preferred,
+            domain: None,
+            array_element: None,
+            array_type: None,
+            collation: None,
+        }
     }
 
     /// Records that the type is a domain.
@@ -122,6 +130,13 @@ impl<'db> TypeFacts<'db> {
     #[must_use]
     pub fn with_array_type(mut self, array: TargetName<'db>) -> Self {
         self.array_type = Some(array);
+        self
+    }
+
+    /// Records the collation the type's values take, `pg_type.typcollation`.
+    #[must_use]
+    pub fn with_collation(mut self, collation: TargetName<'db>) -> Self {
+        self.collation = Some(collation);
         self
     }
 
@@ -160,5 +175,19 @@ impl<'db> TypeFacts<'db> {
     #[must_use]
     pub const fn array_type(&self) -> Option<&TargetName<'db>> {
         self.array_type.as_ref()
+    }
+
+    /// Returns the collation the type's values take, `pg_type.typcollation`,
+    /// or `None` for a type that is not collatable.
+    #[must_use]
+    pub const fn collation(&self) -> Option<&TargetName<'db>> {
+        self.collation.as_ref()
+    }
+
+    /// Returns the collation the type's values take, consuming the facts, or
+    /// `None` for a type that is not collatable.
+    #[must_use]
+    pub fn into_collation(self) -> Option<TargetName<'db>> {
+        self.collation
     }
 }
