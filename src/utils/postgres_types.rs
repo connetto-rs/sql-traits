@@ -348,10 +348,15 @@ impl PgType {
             DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => catalog("numeric"),
             DataType::Bool | DataType::Boolean => catalog("bool"),
             DataType::Text => catalog("text"),
-            DataType::Varchar(_) | DataType::CharacterVarying(_) | DataType::CharVarying(_) => {
-                catalog("varchar")
-            }
-            DataType::Char(_) | DataType::Character(_) => catalog("bpchar"),
+            DataType::Varchar(_)
+            | DataType::CharacterVarying(_)
+            | DataType::CharVarying(_)
+            | DataType::NationalCharacterVarying(_)
+            | DataType::NationalCharVarying(_) => catalog("varchar"),
+            DataType::Char(_)
+            | DataType::Character(_)
+            | DataType::NationalCharacter(_)
+            | DataType::NationalChar(_) => catalog("bpchar"),
             DataType::Bytea => catalog("bytea"),
             DataType::Uuid => catalog("uuid"),
             DataType::Date => catalog("date"),
@@ -648,6 +653,10 @@ mod tests {
             ("FLOAT(30)", "float8"),
             ("BOOL", "bool"),
             ("CHAR(3)", "bpchar"),
+            ("NATIONAL CHARACTER(3)", "bpchar"),
+            ("NATIONAL CHAR", "bpchar"),
+            ("NATIONAL CHARACTER VARYING(3)", "varchar"),
+            ("NATIONAL CHAR VARYING", "varchar"),
             ("TIME", "time"),
             ("TIME WITH TIME ZONE", "timetz"),
             ("TIMETZ", "timetz"),

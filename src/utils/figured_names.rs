@@ -153,9 +153,11 @@ fn type_figure(data_type: &DataType) -> Figure {
         DataType::BigInt(_) | DataType::Int8(_) => "int8",
         DataType::SmallInt(_) | DataType::Int2(_) => "int2",
         DataType::Text => "text",
-        DataType::Varchar(_) | DataType::CharacterVarying(_) | DataType::CharVarying(_) => {
-            "varchar"
-        }
+        DataType::Varchar(_)
+        | DataType::CharacterVarying(_)
+        | DataType::CharVarying(_)
+        | DataType::NationalCharacterVarying(_)
+        | DataType::NationalCharVarying(_) => "varchar",
         DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => "numeric",
         DataType::Boolean | DataType::Bool => "bool",
         DataType::Float(ExactNumberInfo::Precision(precision)) if *precision <= 24 => "float4",
@@ -166,7 +168,10 @@ fn type_figure(data_type: &DataType) -> Figure {
         DataType::Date => "date",
         DataType::JSON => "json",
         DataType::JSONB => "jsonb",
-        DataType::Char(_) | DataType::Character(_) => "bpchar",
+        DataType::Char(_)
+        | DataType::Character(_)
+        | DataType::NationalCharacter(_)
+        | DataType::NationalChar(_) => "bpchar",
         DataType::Bytea => "bytea",
         DataType::Uuid => "uuid",
         DataType::Interval { .. } => "interval",

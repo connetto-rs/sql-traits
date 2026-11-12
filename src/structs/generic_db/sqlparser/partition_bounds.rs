@@ -192,9 +192,12 @@ fn key_kind(column: &ColumnDef) -> Option<KeyKind> {
         DataType::Timestamp(None, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             Some(KeyKind::Timestamp)
         }
-        DataType::Text | DataType::Varchar(None) | DataType::CharacterVarying(None) => {
-            orders_by_byte(column).then_some(KeyKind::Text)
-        }
+        DataType::Text
+        | DataType::Varchar(None)
+        | DataType::CharacterVarying(None)
+        | DataType::CharVarying(None)
+        | DataType::NationalCharacterVarying(None)
+        | DataType::NationalCharVarying(None) => orders_by_byte(column).then_some(KeyKind::Text),
         _ => None,
     }
 }

@@ -593,8 +593,13 @@ fn type_identity(builder: &ParserDBBuilder, data_type: &DataType) -> Option<Stri
         DataType::Bytea => "bytea".to_string(),
         DataType::Varchar(length)
         | DataType::CharacterVarying(length)
-        | DataType::CharVarying(length) => charlen("varchar", *length),
-        DataType::Char(length) | DataType::Character(length) => charlen("bpchar", *length),
+        | DataType::CharVarying(length)
+        | DataType::NationalCharacterVarying(length)
+        | DataType::NationalCharVarying(length) => charlen("varchar", *length),
+        DataType::Char(length)
+        | DataType::Character(length)
+        | DataType::NationalCharacter(length)
+        | DataType::NationalChar(length) => charlen("bpchar", *length),
         DataType::Timestamp(precision, timezone) => {
             let base = match timezone {
                 TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => "timestamptz",

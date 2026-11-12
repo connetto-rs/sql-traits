@@ -1011,7 +1011,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#bac1468b7af0be921c2f14d349246b4a4ba6c6e8"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#a5a9bbcf7188af28b60436f185f317e1196e31a1"
 dependencies = [
  "log",
  "recursive",
@@ -1021,7 +1021,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#38ab83fef09c28244c49a1693d3f6f42120c73c6"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#131423cdac80ceadb72f6a72c9f9faad291fc5d3"
 dependencies = [
  "sqlparser",
  "thiserror",
@@ -1030,7 +1030,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#bac1468b7af0be921c2f14d349246b4a4ba6c6e8"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#a5a9bbcf7188af28b60436f185f317e1196e31a1"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -172,6 +172,8 @@ fn keeps_characters(data_type: &DataType) -> bool {
             | DataType::Varchar(None)
             | DataType::CharacterVarying(None)
             | DataType::CharVarying(None)
+            | DataType::NationalCharacterVarying(None)
+            | DataType::NationalCharVarying(None)
     )
 }
 
