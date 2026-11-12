@@ -20,6 +20,7 @@ use crate::{
             PG_CATALOG, Qualifier, object_name_last_part, qualifier_of, relation_search_path,
         },
         postgres_types::PgType,
+        scalar_family::ScalarFamily,
     },
 };
 
@@ -122,6 +123,15 @@ impl DataTypeLike for DataType {
     #[inline]
     fn numeric_scale(&self, database: &Self::DB) -> Option<i64> {
         super::dialect::numeric_scale(*database.dialect(), self)
+    }
+
+    fn is_unsigned(&self, database: &Self::DB) -> Option<bool> {
+        let declared = self.base_type(database).unwrap_or(self);
+        matches!(
+            declared.scalar_family(database),
+            Some(ScalarFamily::Int | ScalarFamily::Float | ScalarFamily::Decimal)
+        )
+        .then(|| super::dialect::is_unsigned(*database.dialect(), declared))
     }
 
     #[inline]

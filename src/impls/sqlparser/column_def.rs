@@ -1114,6 +1114,127 @@ mod tests {
         }
     }
 
+    mod is_unsigned {
+        use sqlparser::dialect::{
+            ClickHouseDialect, Dialect, DuckDbDialect, GenericDialect, MySqlDialect,
+            PostgreSqlDialect, SQLiteDialect,
+        };
+
+        use super::{ColumnLike, DataTypeLike, column_named, parse_with};
+
+        /// Asserts the signedness of a column declared with each type.
+        fn assert_unsigned<D: Dialect + Default + 'static>(cases: &[(&str, Option<bool>)]) {
+            let columns: Vec<String> =
+                cases.iter().enumerate().map(|(index, (ty, _))| format!("c{index} {ty}")).collect();
+            let db = parse_with::<D>(&format!("CREATE TABLE t ({});", columns.join(", ")));
+            for (index, (ty, expected)) in cases.iter().enumerate() {
+                let column = column_named(&db, &format!("c{index}"));
+                assert_eq!(column.data_type(&db).is_unsigned(&db), *expected, "{ty}");
+            }
+        }
+
+        /// MySQL 8.4 spellings with and without `UNSIGNED`, and the attributes
+        /// that imply it.
+        const MYSQL: [(&str, Option<bool>); 22] = [
+            ("TINYINT", Some(false)),
+            ("TINYINT UNSIGNED", Some(true)),
+            ("SMALLINT UNSIGNED", Some(true)),
+            ("MEDIUMINT UNSIGNED", Some(true)),
+            ("INT", Some(false)),
+            ("INT UNSIGNED", Some(true)),
+            ("INTEGER UNSIGNED", Some(true)),
+            ("BIGINT UNSIGNED", Some(true)),
+            ("DECIMAL(10,2)", Some(false)),
+            ("DECIMAL(10,2) UNSIGNED", Some(true)),
+            ("DEC UNSIGNED", Some(true)),
+            ("FLOAT UNSIGNED", Some(true)),
+            ("REAL UNSIGNED", Some(true)),
+            ("DOUBLE", Some(false)),
+            ("DOUBLE UNSIGNED", Some(true)),
+            ("DOUBLE PRECISION UNSIGNED", Some(true)),
+            ("INT ZEROFILL", Some(true)),
+            ("DECIMAL(8,2) ZEROFILL", Some(true)),
+            ("INT UNSIGNED ZEROFILL", Some(true)),
+            ("BOOL", None),
+            ("VARCHAR(10)", None),
+            ("DATE", None),
+        ];
+
+        #[test]
+        fn mysql_unsigned_and_zerofill_numerics_are_unsigned() {
+            assert_unsigned::<MySqlDialect>(&MYSQL);
+            assert_unsigned::<GenericDialect>(&MYSQL);
+        }
+
+        #[test]
+        fn mysql_serial_is_an_unsigned_bigint() {
+            assert_unsigned::<MySqlDialect>(&[("SERIAL", Some(true))]);
+            assert_unsigned::<PostgreSqlDialect>(&[("SERIAL", Some(false))]);
+            assert_unsigned::<GenericDialect>(&[("SERIAL", Some(false))]);
+        }
+
+        #[test]
+        fn duckdb_unsigned_integer_names_are_unsigned() {
+            assert_unsigned::<DuckDbDialect>(&[
+                ("UTINYINT", Some(true)),
+                ("USMALLINT", Some(true)),
+                ("UBIGINT", Some(true)),
+                ("UHUGEINT", Some(true)),
+                ("TINYINT", Some(false)),
+                ("HUGEINT", Some(false)),
+            ]);
+        }
+
+        #[test]
+        fn clickhouse_uint_widths_are_unsigned_through_wrappers() {
+            assert_unsigned::<ClickHouseDialect>(&[
+                ("UInt8", Some(true)),
+                ("UInt16", Some(true)),
+                ("UInt32", Some(true)),
+                ("UInt64", Some(true)),
+                ("UInt128", Some(true)),
+                ("UInt256", Some(true)),
+                ("Nullable(UInt32)", Some(true)),
+                ("LowCardinality(UInt8)", Some(true)),
+                ("Int32", Some(false)),
+                ("Float64", Some(false)),
+                ("String", None),
+            ]);
+        }
+
+        #[test]
+        fn postgres_numerics_are_signed_and_arrays_are_not_numeric() {
+            assert_unsigned::<PostgreSqlDialect>(&[
+                ("INT", Some(false)),
+                ("NUMERIC(10,2)", Some(false)),
+                ("DOUBLE PRECISION", Some(false)),
+                ("MONEY", Some(false)),
+                ("INT[]", None),
+                ("TEXT", None),
+            ]);
+        }
+
+        #[test]
+        fn sqlite_stores_negative_values_whatever_the_declared_type() {
+            assert_unsigned::<SQLiteDialect>(&[
+                ("INT UNSIGNED", Some(false)),
+                ("DECIMAL(10,2) UNSIGNED", Some(false)),
+                ("INT", Some(false)),
+                ("TEXT", None),
+            ]);
+        }
+
+        #[test]
+        fn a_domain_answers_as_its_base_type() {
+            let db = parse_with::<GenericDialect>(
+                "CREATE DOMAIN counter AS INT UNSIGNED; CREATE DOMAIN label AS TEXT; \
+                 CREATE TABLE t (hits counter, name label);",
+            );
+            assert_eq!(column_named(&db, "hits").data_type(&db).is_unsigned(&db), Some(true));
+            assert_eq!(column_named(&db, "name").data_type(&db).is_unsigned(&db), None);
+        }
+    }
+
     mod identity_and_serial {
         use sqlparser::dialect::{
             Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect,
