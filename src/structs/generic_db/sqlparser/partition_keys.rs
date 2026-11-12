@@ -6,13 +6,14 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateIndex, CreateTable, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Ident, IndexColumn, TableConstraint, Visit, Visitor,
+    FunctionArgExpr, FunctionArguments, Ident, IndexColumn, TableConstraint, Visitor,
 };
 
 use crate::{
     errors::Error,
     structs::IdentifierCase,
     traits::{PartitionStrategy, TableLike},
+    utils::walk::walk,
 };
 
 /// One entry of a `PARTITION BY` key.
@@ -112,7 +113,7 @@ fn identifiers(expr: &Expr) -> Vec<Ident> {
         }
     }
     let mut collect = Collect(Vec::new());
-    let _: ControlFlow<()> = expr.visit(&mut collect);
+    let _: ControlFlow<()> = walk(expr, &mut collect);
     collect.0
 }
 

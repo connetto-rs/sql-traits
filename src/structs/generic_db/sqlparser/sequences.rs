@@ -43,7 +43,7 @@ use sqlparser::{
         CastKind, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType, Expr, Function,
         FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Grant, GrantObjects,
         Ident, ObjectName, ObjectNamePart, Owner, SequenceOptions, TypedString, Value,
-        ValueWithSpan, visit_expressions, visit_expressions_mut,
+        ValueWithSpan,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -72,6 +72,7 @@ use crate::{
             object_name_identifiers, qualifier_of, require_static_object_name,
             resolve_sequence_on_search_path_in_iter, stored_sequence_key, target_name_of_idents,
         },
+        walk::{walk_expressions, walk_expressions_mut},
     },
 };
 
@@ -955,7 +956,7 @@ pub(super) fn bind_default(
     if *builder.dialect() != SqlparserDialect::PostgreSql {
         return Ok(());
     }
-    let refusal = visit_expressions_mut(default, |node| {
+    let refusal = walk_expressions_mut(default, |node| {
         let Some(text) = regclass_constant_mut(node) else {
             return ControlFlow::Continue(());
         };
@@ -1012,7 +1013,7 @@ fn drawn_by_default<'sequence>(
     default: &Expr,
     sequences: &'sequence [Arc<Sequence>],
 ) -> Option<&'sequence Sequence> {
-    let found = visit_expressions(default, |node| {
+    let found = walk_expressions(default, |node| {
         let named = regclass_constant(node).and_then(|text| TargetName::parse(text).ok()).and_then(
             |target| sequences.iter().find(|sequence| names_by_target(&target, sequence)),
         );
@@ -1085,7 +1086,7 @@ impl ParserDB {
             let ColumnOption::Default(default) = &option.option else {
                 return false;
             };
-            visit_expressions(default, |node| {
+            walk_expressions(default, |node| {
                 if regclass_constant(node)
                     .and_then(|text| TargetName::parse(text).ok())
                     .is_some_and(|target| owned(&target))
@@ -1232,7 +1233,7 @@ pub(super) fn move_sequences(
 /// Points every `regclass` constant in `default` naming `previous` at
 /// `bound`.
 fn redirect_regclass(default: &mut Expr, previous: &Sequence, bound: &str) {
-    let _ = visit_expressions_mut(default, |node| {
+    let _ = walk_expressions_mut(default, |node| {
         if let Some(text) = regclass_constant_mut(node)
             && TargetName::parse(text).is_ok_and(|target| names_by_target(&target, previous))
         {

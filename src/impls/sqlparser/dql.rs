@@ -30,18 +30,21 @@ use sqlparser::ast::{
     PivotValueSource, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
     SetOperator, SetQuantifier, Subscript, SymbolDefinition, TableAlias, TableAliasColumnDef,
     TableFactor, TableFunctionArgs, TableInheritance, TableSample, TableSampleKind, TableVersion,
-    TableWithJoins, TopQuantity, Values, Visit, Visitor, WildcardAdditionalOptions,
-    WindowFrameBound, WindowSpec, WindowType, With, XmlNamespaceDefinition, XmlPassingClause,
-    XmlTableColumn, XmlTableColumnOption,
+    TableWithJoins, TopQuantity, Values, Visitor, WildcardAdditionalOptions, WindowFrameBound,
+    WindowSpec, WindowType, With, XmlNamespaceDefinition, XmlPassingClause, XmlTableColumn,
+    XmlTableColumnOption,
 };
 
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
     traits::{ColumnLike, DQLLike, DatabaseLike, TableLike, ViewLike},
-    utils::object_name::{
-        object_name_last_part, render_table_candidate, resolve_bound_table, resolve_object_name,
-        target_name_from_object_name,
+    utils::{
+        object_name::{
+            object_name_last_part, render_table_candidate, resolve_bound_table,
+            resolve_object_name, target_name_from_object_name,
+        },
+        walk::walk,
     },
 };
 
@@ -421,7 +424,7 @@ fn cte_dependencies(cte: &Cte, candidates: &[Cte], case: IdentifierCase) -> Vec<
         dependencies: vec![false; candidates.len()],
         case,
     };
-    let _: ControlFlow<()> = cte.query.visit(&mut visitor);
+    let _: ControlFlow<()> = walk(&cte.query, &mut visitor);
     visitor.dependencies
 }
 

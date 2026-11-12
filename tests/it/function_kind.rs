@@ -1,6 +1,10 @@
 //! Tests that a function answers its `pg_proc.prokind`, so a caller can tell
 //! the aggregate a call reaches from a plain function.
 #![expect(clippy::expect_used, reason = "a test fails loudly on a broken premise")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test code ships in no binary, so walking the tree directly costs nothing"
+)]
 
 use core::{convert::Infallible, ops::ControlFlow};
 

@@ -1,5 +1,9 @@
 //! Integration tests for derived column definitions.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable)]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test code ships in no binary, so walking the tree directly costs nothing"
+)]
 
 use core::{fmt::Write as _, ops::ControlFlow};
 

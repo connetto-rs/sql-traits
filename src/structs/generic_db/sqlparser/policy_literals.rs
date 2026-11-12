@@ -21,8 +21,7 @@ use sql_values::{
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, InTarget, ObjectName, ObjectNamePart, Query, Select, TableFactor,
-    TableWithJoins, TimezoneInfo, TypedString, Value, ValueWithSpan, Visit, VisitMut, Visitor,
-    VisitorMut, visit_expressions,
+    TableWithJoins, TimezoneInfo, TypedString, Value, ValueWithSpan, Visitor, VisitorMut,
 };
 
 use super::{
@@ -36,6 +35,7 @@ use crate::{
         metadata::{ClauseLiterals, UnreadableLiteral},
     },
     traits::ColumnLike,
+    utils::walk::{walk, walk_expressions, walk_mut},
 };
 
 /// The session state a policy's literals are read under.
@@ -265,7 +265,7 @@ fn row_pure(function: &Function) -> Option<(RowPure, Vec<&Expr>)> {
 /// Whether `expr` reads a column of its own query level, which keeps an `IN`
 /// list item out of the common type PostgreSQL gives the list's constants.
 fn reads_columns(expr: &Expr) -> bool {
-    expr.visit(&mut OwnLevelColumns { queries: 0 }).is_break()
+    walk(expr, &mut OwnLevelColumns { queries: 0 }).is_break()
 }
 
 /// Breaks at a column reference outside every subquery, as
@@ -594,7 +594,7 @@ impl VisitorMut for Respell {
 
 /// Whether `expr` holds a quoted literal anywhere.
 fn holds_quoted_literal(expr: &Expr) -> bool {
-    visit_expressions(expr, |node| {
+    walk_expressions(expr, |node| {
         match node {
             Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(_), .. })
             | Expr::TypedString(_) => ControlFlow::Break(()),
@@ -612,8 +612,8 @@ fn coercions(
     session: LiteralSession<'_>,
 ) -> Result<Vec<Coercion>, UnreadableLiteral> {
     let mut unscoped = Coercions::new(None, session);
-    let walk = query.visit(&mut unscoped);
-    debug_assert!(walk.is_continue(), "the walk never breaks");
+    let walked = walk(query, &mut unscoped);
+    debug_assert!(walked.is_continue(), "the walk never breaks");
     if !unscoped.wants_columns {
         return unscoped.finish();
     }
@@ -621,8 +621,8 @@ fn coercions(
     // A query whose scopes cannot be derived types only its casts.
     let scope = ColumnScope::from_query(query, &read, IdentifierCase::AsWritten).ok();
     let mut scoped = Coercions::new(scope.as_ref().map(|scope| (scope, &read)), session);
-    let walk = query.visit(&mut scoped);
-    debug_assert!(walk.is_continue(), "the walk never breaks");
+    let walked = walk(query, &mut scoped);
+    debug_assert!(walked.is_continue(), "the walk never breaks");
     scoped.finish()
 }
 
@@ -662,16 +662,16 @@ pub(super) fn bind(
         Ok(coercions) => {
             // The clause is the first expression of the wrapper query.
             let written =
-                visit_expressions(&query, |clause| ControlFlow::Break(Box::new(clause.clone())))
+                walk_expressions(&query, |clause| ControlFlow::Break(Box::new(clause.clone())))
                     .break_value();
-            let walk = VisitMut::visit(&mut query, &mut Respell { coercions });
-            debug_assert!(walk.is_continue(), "the respelling never breaks");
+            let walked = walk_mut(&mut query, &mut Respell { coercions });
+            debug_assert!(walked.is_continue(), "the respelling never breaks");
             written.map_or(ClauseLiterals::AsWritten, ClauseLiterals::Stored)
         }
         Err(unreadable) => ClauseLiterals::Unreadable(unreadable),
     };
-    let walk = VisitMut::visit(&mut query, &mut Restore { target: expression });
-    debug_assert!(walk.is_break(), "the clause is the first expression of the wrapper query");
+    let walked = walk_mut(&mut query, &mut Restore { target: expression });
+    debug_assert!(walked.is_break(), "the clause is the first expression of the wrapper query");
     match literals {
         // A typed literal can store the very text it was written with.
         ClauseLiterals::Stored(written) if *written == *expression => ClauseLiterals::AsWritten,

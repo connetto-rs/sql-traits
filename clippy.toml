@@ -1,0 +1,10 @@
+disallowed-methods = [
+    { path = "sqlparser::ast::Visit::visit", reason = "walk through utils::walk::walk, which compiles the traversal once per break type" },
+    { path = "sqlparser::ast::VisitMut::visit", reason = "walk through utils::walk::walk_mut, which compiles the traversal once per break type" },
+    { path = "sqlparser::ast::visit_expressions", reason = "use utils::walk::walk_expressions, which compiles the traversal once per break type" },
+    { path = "sqlparser::ast::visit_expressions_mut", reason = "use utils::walk::walk_expressions_mut, which compiles the traversal once per break type" },
+    { path = "sqlparser::ast::visit_relations", reason = "use utils::walk::walk_relations, which compiles the traversal once per break type" },
+    { path = "sqlparser::ast::visit_relations_mut", reason = "walk through utils::walk::walk_mut, which compiles the traversal once per break type" },
+    { path = "sqlparser::ast::visit_statements", reason = "walk through utils::walk::walk, which compiles the traversal once per break type" },
+    { path = "sqlparser::ast::visit_statements_mut", reason = "walk through utils::walk::walk_mut, which compiles the traversal once per break type" },
+]
