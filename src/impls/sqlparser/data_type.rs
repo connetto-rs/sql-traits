@@ -1,13 +1,18 @@
 //! Submodule implementing the [`DataTypeLike`] trait for `sqlparser`'s
 //! [`DataType`] enum.
 
-use alloc::{borrow::Cow, string::ToString};
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use core::{num::NonZeroU32, slice};
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, ColumnDef, ColumnOption, DataType, ExactNumberInfo, Expr, MapBracketKind,
-    ObjectName, ObjectNamePart, SqlOption, StructField, TimezoneInfo, TypeModifier, UnionField,
-    UserDefinedTypeCompositeAttributeDef, UserDefinedTypeRepresentation,
+    ArrayElemTypeDef, ColumnDef, ColumnOption, DataType, EnumMember, ExactNumberInfo, Expr, Ident,
+    MapBracketKind, ObjectName, ObjectNamePart, SqlOption, StructField, TimezoneInfo, TypeModifier,
+    UnaryOperator, UnionField, UserDefinedTypeCompositeAttributeDef, UserDefinedTypeRepresentation,
     UserDefinedTypeSqlDefinitionOption, Value, ValueWithSpan,
 };
 
@@ -15,8 +20,9 @@ use crate::{
     impls::sqlparser::{SqlparserDialect, bound_domain, bound_user_type},
     structs::{ParserDB, UserDefinedType},
     traits::{
-        ColumnCollation, DataTypeLike, DatabaseLike, ExtensionLike, IntervalFields, MapEntry,
-        NamedColumnCollation, StructureKind, StructuredField, VectorKind, VectorType,
+        ColumnCollation, DataTypeLike, DatabaseLike, EnumWidth, Enumeration, EnumerationKind,
+        EnumerationMember, ExtensionLike, IntervalFields, MapEntry, NamedColumnCollation,
+        StructureKind, StructuredField, VectorKind, VectorType,
     },
     utils::{
         identifier_resolution::{identifiers_match, stored_identifier},
@@ -315,6 +321,13 @@ impl DataTypeLike for DataType {
             !matches!(bracket, MapBracketKind::ParenthesesNotNull) && value.admits_null(database);
         Some(MapEntry::new(key, value, value_nullable))
     }
+
+    fn enumeration<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'db>>>> {
+        enumeration_of(self, database)
+    }
 }
 
 /// The type a value is stored as, through ClickHouse's `LowCardinality`, which
@@ -406,6 +419,48 @@ impl<'db> Iterator for FieldsOf<'db> {
     }
 }
 
+/// The members of an enumerated type, as each representation stores them.
+#[derive(Debug, Clone)]
+enum Members<'db> {
+    /// The members of an `ENUM` whose engine stores positions.
+    Positional(slice::Iter<'db, EnumMember>),
+    /// The members of a `SET`.
+    Set(slice::Iter<'db, String>),
+    /// The labels of a PostgreSQL enum type.
+    Labels(slice::Iter<'db, Ident>),
+    /// The members of a ClickHouse enum, in the order of their values.
+    Valued(vec::IntoIter<EnumerationMember<'db>>),
+}
+
+impl<'db> Iterator for Members<'db> {
+    type Item = EnumerationMember<'db>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Positional(members) => {
+                members.next().map(|member| {
+                    let (EnumMember::Name(label) | EnumMember::NamedValue(label, _)) = member;
+                    EnumerationMember::new(label, None)
+                })
+            }
+            Self::Set(labels) => labels.next().map(|label| EnumerationMember::new(label, None)),
+            Self::Labels(labels) => {
+                labels.next().map(|label| EnumerationMember::new(&label.value, None))
+            }
+            Self::Valued(members) => members.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Positional(members) => members.size_hint(),
+            Self::Set(labels) => labels.size_hint(),
+            Self::Labels(labels) => labels.size_hint(),
+            Self::Valued(members) => members.size_hint(),
+        }
+    }
+}
+
 /// The type a field declares, without the `COLLATE` written after it, and
 /// the collation that names.
 fn collated(written: &DataType) -> (&DataType, ColumnCollation<'_>) {
@@ -452,6 +507,95 @@ fn option_entry(option: &SqlOption) -> (Cow<'_, str>, Cow<'_, str>) {
         _ => Cow::Owned(value.to_string()),
     };
     (key, value)
+}
+
+/// The enumeration `data_type` declares or names, read through the
+/// wrappers [`stored_as`] reads through.
+fn enumeration_of<'db>(
+    data_type: &'db DataType,
+    database: &'db ParserDB,
+) -> Option<Enumeration<Members<'db>>> {
+    match stored_as(data_type) {
+        DataType::Enum(members, width) => {
+            let valued = width.is_some()
+                || *database.dialect() == SqlparserDialect::ClickHouse
+                || members.iter().any(|member| matches!(member, EnumMember::NamedValue(..)));
+            if !valued {
+                return Some(Enumeration::new(
+                    EnumerationKind::Enum,
+                    None,
+                    Members::Positional(members.iter()),
+                ));
+            }
+            let (width, members) = clickhouse_members(members, *width)?;
+            Some(Enumeration::new(
+                EnumerationKind::Enum,
+                Some(width),
+                Members::Valued(members.into_iter()),
+            ))
+        }
+        DataType::Set(labels) => {
+            Some(Enumeration::new(EnumerationKind::Set, None, Members::Set(labels.iter())))
+        }
+        stored @ DataType::Custom(..) => {
+            let (user_type, _) = user_type_of(stored, database)?;
+            let Some(UserDefinedTypeRepresentation::Enum { labels }) = user_type.representation()
+            else {
+                return None;
+            };
+            Some(Enumeration::new(EnumerationKind::Enum, None, Members::Labels(labels.iter())))
+        }
+        _ => None,
+    }
+}
+
+/// The width and the members, sorted by value, ClickHouse stores for an enum
+/// declared with `members` and the width written, or `None` for a declaration
+/// ClickHouse refuses for its values.
+fn clickhouse_members(
+    members: &[EnumMember],
+    written_width: Option<u8>,
+) -> Option<(EnumWidth, Vec<EnumerationMember<'_>>)> {
+    let (first, rest) = members.split_first()?;
+    let base = match first {
+        EnumMember::Name(_) => 1,
+        EnumMember::NamedValue(_, value) => integer(value)?,
+    };
+    let written_after_first =
+        rest.iter().filter(|member| matches!(member, EnumMember::NamedValue(..))).count();
+    if written_after_first != 0 && written_after_first != rest.len() {
+        return None;
+    }
+    let mut stored = Vec::with_capacity(members.len());
+    for (position, member) in (0_i64..).zip(members) {
+        let (label, value) = match member {
+            EnumMember::Name(label) => (label, base.checked_add(position)?),
+            EnumMember::NamedValue(label, value) => (label, integer(value)?),
+        };
+        stored.push(EnumerationMember::new(label, Some(i16::try_from(value).ok()?)));
+    }
+    let fits_enum8 =
+        stored.iter().all(|member| member.value().is_some_and(|value| i8::try_from(value).is_ok()));
+    let width = match (written_width, fits_enum8) {
+        (Some(8) | None, true) => EnumWidth::Enum8,
+        (Some(16), _) | (None, false) => EnumWidth::Enum16,
+        _ => return None,
+    };
+    stored.sort_by_key(|member| member.value());
+    Some((width, stored))
+}
+
+/// The integer a ClickHouse enum value literal writes, or `None` for one that
+/// is not an integer.
+fn integer(value: &Expr) -> Option<i64> {
+    match value {
+        Expr::Value(ValueWithSpan { value: Value::Number(digits, false), .. }) => {
+            digits.parse().ok()
+        }
+        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => integer(expr),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => integer(expr)?.checked_neg(),
+        _ => None,
+    }
 }
 
 /// The user-defined type a type name reaches, with whether the name is its
