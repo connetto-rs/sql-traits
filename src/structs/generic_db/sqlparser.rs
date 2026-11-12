@@ -906,11 +906,13 @@ fn postgres_builtin_type_name(data_type: &DataType) -> Option<&'static str> {
         | DataType::CharacterVarying(_)
         | DataType::CharVarying(_)
         | DataType::NationalCharacterVarying(_)
-        | DataType::NationalCharVarying(_) => Some("varchar"),
+        | DataType::NationalCharVarying(_)
+        | DataType::NcharVarying(_) => Some("varchar"),
         DataType::Char(_)
         | DataType::Character(_)
         | DataType::NationalCharacter(_)
-        | DataType::NationalChar(_) => Some("bpchar"),
+        | DataType::NationalChar(_)
+        | DataType::Nchar(_) => Some("bpchar"),
         _ => None,
     }
 }

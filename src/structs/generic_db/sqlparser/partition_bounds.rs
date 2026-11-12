@@ -197,7 +197,8 @@ fn key_kind(column: &ColumnDef) -> Option<KeyKind> {
         | DataType::CharacterVarying(None)
         | DataType::CharVarying(None)
         | DataType::NationalCharacterVarying(None)
-        | DataType::NationalCharVarying(None) => orders_by_byte(column).then_some(KeyKind::Text),
+        | DataType::NationalCharVarying(None)
+        | DataType::NcharVarying(None) => orders_by_byte(column).then_some(KeyKind::Text),
         _ => None,
     }
 }

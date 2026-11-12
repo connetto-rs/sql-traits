@@ -595,11 +595,13 @@ fn type_identity(builder: &ParserDBBuilder, data_type: &DataType) -> Option<Stri
         | DataType::CharacterVarying(length)
         | DataType::CharVarying(length)
         | DataType::NationalCharacterVarying(length)
-        | DataType::NationalCharVarying(length) => charlen("varchar", *length),
+        | DataType::NationalCharVarying(length)
+        | DataType::NcharVarying(length) => charlen("varchar", *length),
         DataType::Char(length)
         | DataType::Character(length)
         | DataType::NationalCharacter(length)
-        | DataType::NationalChar(length) => charlen("bpchar", *length),
+        | DataType::NationalChar(length)
+        | DataType::Nchar(length) => charlen("bpchar", *length),
         DataType::Timestamp(precision, timezone) => {
             let base = match timezone {
                 TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => "timestamptz",

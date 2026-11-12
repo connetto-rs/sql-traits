@@ -352,11 +352,13 @@ impl PgType {
             | DataType::CharacterVarying(_)
             | DataType::CharVarying(_)
             | DataType::NationalCharacterVarying(_)
-            | DataType::NationalCharVarying(_) => catalog("varchar"),
+            | DataType::NationalCharVarying(_)
+            | DataType::NcharVarying(_) => catalog("varchar"),
             DataType::Char(_)
             | DataType::Character(_)
             | DataType::NationalCharacter(_)
-            | DataType::NationalChar(_) => catalog("bpchar"),
+            | DataType::NationalChar(_)
+            | DataType::Nchar(_) => catalog("bpchar"),
             DataType::Bytea => catalog("bytea"),
             DataType::Uuid => catalog("uuid"),
             DataType::Date => catalog("date"),
@@ -657,6 +659,8 @@ mod tests {
             ("NATIONAL CHAR", "bpchar"),
             ("NATIONAL CHARACTER VARYING(3)", "varchar"),
             ("NATIONAL CHAR VARYING", "varchar"),
+            ("NCHAR(3)", "bpchar"),
+            ("NCHAR VARYING(3)", "varchar"),
             ("TIME", "time"),
             ("TIME WITH TIME ZONE", "timetz"),
             ("TIMETZ", "timetz"),

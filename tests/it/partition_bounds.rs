@@ -470,7 +470,9 @@ fn other_literal_spellings_read_or_stay_undecided() {
         "v2",
         "v1",
     );
-    for spelling in ["CHAR VARYING", "NATIONAL CHARACTER VARYING", "NATIONAL CHAR VARYING"] {
+    for spelling in
+        ["CHAR VARYING", "NATIONAL CHARACTER VARYING", "NATIONAL CHAR VARYING", "NCHAR VARYING"]
+    {
         overlaps(
             &format!(
                 "CREATE TABLE nv (s {spelling} COLLATE \"C\") PARTITION BY RANGE (s);

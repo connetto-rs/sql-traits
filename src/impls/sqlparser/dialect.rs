@@ -258,11 +258,13 @@ fn classify_uuid(dialect: SqlparserDialect, ty: &DataType) -> TypeMatch {
         | DataType::Character(spec)
         | DataType::NationalCharacter(spec)
         | DataType::NationalChar(spec)
+        | DataType::Nchar(spec)
         | DataType::Varchar(spec)
         | DataType::CharacterVarying(spec)
         | DataType::CharVarying(spec)
         | DataType::NationalCharacterVarying(spec)
         | DataType::NationalCharVarying(spec)
+        | DataType::NcharVarying(spec)
             if dialect.is_mysql_family() && char_length(spec.as_ref()) == Some(36) =>
         {
             TypeMatch::Maybe
@@ -315,12 +317,14 @@ pub(super) fn max_character_length(dialect: SqlparserDialect, ty: &DataType) -> 
         DataType::Char(spec)
         | DataType::Character(spec)
         | DataType::NationalCharacter(spec)
-        | DataType::NationalChar(spec) => (spec, Some(1)),
+        | DataType::NationalChar(spec)
+        | DataType::Nchar(spec) => (spec, Some(1)),
         DataType::Varchar(spec)
         | DataType::CharacterVarying(spec)
         | DataType::CharVarying(spec)
         | DataType::NationalCharacterVarying(spec)
         | DataType::NationalCharVarying(spec)
+        | DataType::NcharVarying(spec)
         | DataType::Nvarchar(spec) => (spec, bare_varying),
         DataType::String(length) => return *length,
         _ => return None,
@@ -1074,6 +1078,8 @@ mod tests {
             DataType::NationalChar(length()),
             DataType::NationalCharacterVarying(length()),
             DataType::NationalCharVarying(length()),
+            DataType::Nchar(length()),
+            DataType::NcharVarying(length()),
         ] {
             assert_eq!(classify_uuid(SqlparserDialect::MySql, &ty), TypeMatch::Maybe, "{ty}");
             assert_eq!(classify_uuid(SqlparserDialect::PostgreSql, &ty), TypeMatch::No, "{ty}");

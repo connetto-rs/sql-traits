@@ -174,6 +174,7 @@ fn keeps_characters(data_type: &DataType) -> bool {
             | DataType::CharVarying(None)
             | DataType::NationalCharacterVarying(None)
             | DataType::NationalCharVarying(None)
+            | DataType::NcharVarying(None)
     )
 }
 

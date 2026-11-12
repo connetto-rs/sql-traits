@@ -163,6 +163,8 @@ const MODIFIED_COLUMNS: &[(&str, &str)] = &[
     ("national character varying(10)", "character varying(10)"),
     ("NATIONAL CHAR VARYING(5)", "character varying(5)"),
     ("national char varying", "character varying"),
+    ("NCHAR VARYING(6)", "character varying(6)"),
+    ("nchar varying", "character varying"),
     ("bpchar", "bpchar"),
     ("\"char\"", "\"char\""),
     ("varchar(10)", "character varying(10)"),

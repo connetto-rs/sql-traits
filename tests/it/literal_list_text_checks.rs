@@ -69,9 +69,11 @@ fn the_spellings_postgres_stores_are_read_through_their_text_casts() -> Result<(
             v VARCHAR(9) CHECK (((v)::text = ANY ((ARRAY['read'::character varying, 'write'::character varying])::text[]))),
             c VARCHAR CHECK ((((c)::text = 'read'::text) OR ((c)::text = 'write'::text))),
             d TEXT CHECK (d IN (CAST('read' AS TEXT), 'write'::varchar)),
-            n VARCHAR CHECK ((((n)::national character varying = 'read'::text) OR ((n)::national char varying = 'write'::text)))
+            n VARCHAR CHECK ((((n)::national character varying = 'read'::text) OR ((n)::national char varying = 'write'::text))),
+            m VARCHAR CHECK ((((m)::nchar varying = 'read'::text) OR ((m)::nchar varying = 'write'::text)))
         );",
         &[
+            (Some(6), Some(4), true),
             (Some(6), Some(4), true),
             (Some(6), Some(4), true),
             (Some(6), Some(4), true),

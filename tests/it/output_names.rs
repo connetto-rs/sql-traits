@@ -240,6 +240,8 @@ fn unaliased_expressions_carry_postgres_implicit_names() {
         ("'a'::national char varying", "varchar"),
         ("'a'::national character(2)", "bpchar"),
         ("'a'::national char", "bpchar"),
+        ("'a'::nchar(2)", "bpchar"),
+        ("'a'::nchar varying", "varchar"),
         ("'{}'::text[]", "text"),
         ("id::text", "id"),
         ("(id + 1)::text", "text"),

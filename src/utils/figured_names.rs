@@ -157,7 +157,8 @@ fn type_figure(data_type: &DataType) -> Figure {
         | DataType::CharacterVarying(_)
         | DataType::CharVarying(_)
         | DataType::NationalCharacterVarying(_)
-        | DataType::NationalCharVarying(_) => "varchar",
+        | DataType::NationalCharVarying(_)
+        | DataType::NcharVarying(_) => "varchar",
         DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => "numeric",
         DataType::Boolean | DataType::Bool => "bool",
         DataType::Float(ExactNumberInfo::Precision(precision)) if *precision <= 24 => "float4",
@@ -171,7 +172,8 @@ fn type_figure(data_type: &DataType) -> Figure {
         DataType::Char(_)
         | DataType::Character(_)
         | DataType::NationalCharacter(_)
-        | DataType::NationalChar(_) => "bpchar",
+        | DataType::NationalChar(_)
+        | DataType::Nchar(_) => "bpchar",
         DataType::Bytea => "bytea",
         DataType::Uuid => "uuid",
         DataType::Interval { .. } => "interval",
