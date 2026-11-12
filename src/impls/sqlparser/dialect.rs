@@ -13,8 +13,8 @@ use core::any::TypeId;
 
 use sqlparser::{
     ast::{
-        BinaryLength, CharLengthUnits, CharacterLength, ColumnDef, CreateTable, DataType,
-        ExactNumberInfo, ObjectName, ObjectNamePart, TimezoneInfo, TypeModifier,
+        ArrayElemTypeDef, BinaryLength, CharLengthUnits, CharacterLength, ColumnDef, CreateTable,
+        DataType, ExactNumberInfo, ObjectName, ObjectNamePart, TimezoneInfo, TypeModifier,
     },
     dialect::{
         AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
@@ -23,10 +23,10 @@ use sqlparser::{
     },
 };
 
-use super::data_type::interval_fields;
+use super::data_type::{interval_fields, written_element};
 use crate::{
     structs::{ParserDB, TableAttribute},
-    traits::{CharacterLengthUnit, DialectLike, TypeMatch},
+    traits::{ArrayDimension, CharacterLengthUnit, DialectLike, TypeMatch},
 };
 
 /// Closed enumeration of every stock `sqlparser` dialect.
@@ -296,6 +296,40 @@ pub(super) fn fixed_binary_length(dialect: SqlparserDialect, ty: &DataType) -> O
         DataType::FixedString(width) => Some(*width),
         _ => None,
     }
+}
+
+/// The dimension an array declaration adds around its element, of which
+/// `element_admits_null` tells whether it admits `NULL`.
+///
+/// DuckDB fixes the length of an `ARRAY` and the standard bounds its
+/// cardinality, so both keep a written size, as the generic dialect does.
+/// PostgreSQL ignores one and no other engine takes one. A written `NOT NULL`
+/// refuses `NULL` elements, and BigQuery refuses to store an array holding
+/// one. A multidimensional PostgreSQL array is rectangular, so none of its
+/// subarrays can be `NULL`.
+pub(super) fn array_dimension(
+    dialect: SqlparserDialect,
+    definition: &ArrayElemTypeDef,
+    element_admits_null: bool,
+) -> ArrayDimension {
+    let size = match definition {
+        ArrayElemTypeDef::SquareBracket(_, size) | ArrayElemTypeDef::Qualified(_, size)
+            if matches!(
+                dialect,
+                SqlparserDialect::DuckDb | SqlparserDialect::Ansi | SqlparserDialect::Generic
+            ) =>
+        {
+            *size
+        }
+        _ => None,
+    };
+    let rectangular = dialect == SqlparserDialect::PostgreSql
+        && matches!(written_element(definition), Some(DataType::Array(_)));
+    let admits_null_elements = element_admits_null
+        && !rectangular
+        && dialect != SqlparserDialect::BigQuery
+        && !matches!(definition, ArrayElemTypeDef::ParenthesisNotNull(_));
+    ArrayDimension::new(size, admits_null_elements)
 }
 
 /// Most characters a value of a character type can hold, where the engine

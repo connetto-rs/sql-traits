@@ -138,6 +138,13 @@ impl DataTypeLike for Forwarded<'_> {
         self.element.as_deref()
     }
 
+    fn array_dimension_declarations<'db>(
+        &'db self,
+        database: &'db ParserDB,
+    ) -> Option<impl Iterator<Item = ArrayDimension>> {
+        self.declared.array_dimension_declarations(database)
+    }
+
     fn range_subtype<'db>(&'db self, _database: &'db ParserDB) -> Option<&'db Self> {
         None
     }

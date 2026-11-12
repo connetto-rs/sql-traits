@@ -6,7 +6,10 @@
 use core::num::NonZeroU32;
 
 use sql_traits::{prelude::*, utils::scalar_family::ScalarFamily};
-use sqlparser::dialect::{PostgreSqlDialect, SnowflakeDialect};
+use sqlparser::dialect::{
+    BigQueryDialect, ClickHouseDialect, Dialect, DuckDbDialect, GenericDialect, PostgreSqlDialect,
+    SnowflakeDialect,
+};
 
 /// The declared type of column `name` of table `t`.
 fn data_type<'db>(database: &'db ParserDB, name: &str) -> &'db sqlparser::ast::DataType {
@@ -227,4 +230,107 @@ fn a_vector_type_answers_only_where_the_extension_puts_it() {
         Some(VectorType::new(VectorKind::Vector, Some(3)))
     );
     assert_eq!(data_type(&quoted, "other").vector(&quoted), None, "a quoted name keeps its case");
+}
+
+/// The `(size, admits null elements)` pairs a column's type answers, or
+/// `None` for a type that is not an array.
+type Dimensions = Option<Vec<(Option<u64>, bool)>>;
+
+/// The declared dimensions of each column of table `t`, written in `sql`
+/// under dialect `D`.
+fn declared_dimensions<D: Dialect + Default + 'static>(
+    sql: &str,
+    columns: &[&str],
+) -> Vec<Dimensions> {
+    let db = ParserDB::parse::<D>(sql).expect("schema builds");
+    columns
+        .iter()
+        .map(|name| {
+            data_type(&db, name).array_dimension_declarations(&db).map(|dimensions| {
+                dimensions
+                    .map(|dimension| (dimension.size(), dimension.admits_null_elements()))
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+/// A size binds only where the engine enforces it, and each dimension
+/// answers it outermost first: DuckDB's `INTEGER[3][2]` holds two arrays of
+/// three integers, and `INTEGER[]` is a `LIST` of any length. PostgreSQL's
+/// rectangular arrays hold no `NULL` subarray, where DuckDB's nested ones may.
+#[test]
+fn array_sizes_answer_the_engine_enforced_bound_outermost_first() {
+    let sql = "CREATE TABLE t (grid INTEGER[3][2], lists INTEGER[3][], arrays INTEGER[][2], \
+               fixed INTEGER ARRAY[3], list INTEGER[], n INTEGER);";
+    let columns = ["grid", "lists", "arrays", "fixed", "list", "n"];
+
+    assert_eq!(
+        declared_dimensions::<DuckDbDialect>(sql, &columns),
+        [
+            Some(vec![(Some(2), true), (Some(3), true)]),
+            Some(vec![(None, true), (Some(3), true)]),
+            Some(vec![(Some(2), true), (None, true)]),
+            Some(vec![(Some(3), true)]),
+            Some(vec![(None, true)]),
+            None,
+        ]
+    );
+    assert_eq!(
+        declared_dimensions::<GenericDialect>(sql, &columns),
+        declared_dimensions::<DuckDbDialect>(sql, &columns),
+        "the generic dialect answers a written size"
+    );
+    assert_eq!(
+        declared_dimensions::<PostgreSqlDialect>(sql, &columns),
+        [
+            Some(vec![(None, false), (None, true)]),
+            Some(vec![(None, false), (None, true)]),
+            Some(vec![(None, false), (None, true)]),
+            Some(vec![(None, true)]),
+            Some(vec![(None, true)]),
+            None,
+        ],
+        "PostgreSQL ignores every declared size, and its arrays are rectangular, so no subarray \
+         is NULL"
+    );
+}
+
+/// Whether a dimension's elements admit `NULL` is declared per nesting level
+/// in Snowflake, by the element type in ClickHouse, and never in BigQuery.
+#[test]
+fn array_element_nullability_answers_per_dimension() {
+    assert_eq!(
+        declared_dimensions::<SnowflakeDialect>(
+            "CREATE TABLE t (outer_strict ARRAY(ARRAY(INT) NOT NULL), \
+             inner_strict ARRAY(ARRAY(INT NOT NULL)), loose ARRAY(INT), bare ARRAY);",
+            &["outer_strict", "inner_strict", "loose", "bare"],
+        ),
+        [
+            Some(vec![(None, false), (None, true)]),
+            Some(vec![(None, true), (None, false)]),
+            Some(vec![(None, true)]),
+            Some(vec![(None, true)]),
+        ]
+    );
+    assert_eq!(
+        declared_dimensions::<ClickHouseDialect>(
+            "CREATE TABLE t (nullable Array(Nullable(Int32)), strict Array(Int32), \
+             nested Array(Array(Nullable(Int32))), tokens Array(LowCardinality(Nullable(String))), \
+             variants Array(Variant(UInt64, String)), dynamic Array(Dynamic));",
+            &["nullable", "strict", "nested", "tokens", "variants", "dynamic"],
+        ),
+        [
+            Some(vec![(None, true)]),
+            Some(vec![(None, false)]),
+            Some(vec![(None, false), (None, true)]),
+            Some(vec![(None, true)]),
+            Some(vec![(None, true)]),
+            Some(vec![(None, true)]),
+        ]
+    );
+    assert_eq!(
+        declared_dimensions::<BigQueryDialect>("CREATE TABLE t (ids ARRAY<INT64>);", &["ids"]),
+        [Some(vec![(None, false)])]
+    );
 }

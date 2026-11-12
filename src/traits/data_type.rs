@@ -245,6 +245,40 @@ impl<I> Enumeration<I> {
     }
 }
 
+/// One dimension of an array type, as
+/// [`DataTypeLike::array_dimension_declarations`] answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArrayDimension {
+    size: Option<u64>,
+    admits_null_elements: bool,
+}
+
+impl ArrayDimension {
+    /// Creates a dimension holding `size` elements, or any number of them
+    /// when `size` is `None`, which admits `NULL` elements when
+    /// `admits_null_elements` holds.
+    #[must_use]
+    #[inline]
+    pub const fn new(size: Option<u64>, admits_null_elements: bool) -> Self {
+        Self { size, admits_null_elements }
+    }
+
+    /// Returns how many elements the engine lets the dimension hold, or
+    /// `None` when it bounds no length.
+    #[must_use]
+    #[inline]
+    pub const fn size(self) -> Option<u64> {
+        self.size
+    }
+
+    /// Returns whether an element of the dimension may be `NULL`.
+    #[must_use]
+    #[inline]
+    pub const fn admits_null_elements(self) -> bool {
+        self.admits_null_elements
+    }
+}
+
 /// What PostgreSQL's `pgoutput` does with a value of a type under the `binary`
 /// option, as [`DataTypeLike::binary_send`] answers it.
 #[derive(Debug)]
@@ -1064,8 +1098,7 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// stores a value of any dimensions in any array column, so this is the
     /// count as written.
     ///
-    /// The default answers `None`, so an implementation over a backend with
-    /// array types must override it.
+    /// The default counts [`Self::array_dimension_declarations`].
     ///
     /// # Example
     ///
@@ -1090,8 +1123,9 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// # }
     /// ```
     #[inline]
-    fn array_dimensions(&self, _database: &Self::DB) -> Option<NonZeroU32> {
-        None
+    fn array_dimensions(&self, database: &Self::DB) -> Option<NonZeroU32> {
+        let dimensions = self.array_dimension_declarations(database)?.count();
+        NonZeroU32::new(u32::try_from(dimensions).unwrap_or(u32::MAX))
     }
 
     /// Returns whether a value of the type itself may be `NULL`.
@@ -1130,6 +1164,58 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// # }
     /// ```
     fn admits_null(&self, database: &Self::DB) -> bool;
+
+    /// Returns each dimension an array type declares, outermost first, or
+    /// `None` for a type that is not an array.
+    ///
+    /// The elements of a dimension are the arrays of the next one, and those
+    /// of the innermost are values of [`Self::array_element`], so there are as
+    /// many dimensions as [`Self::array_dimensions`] counts. Each answers the
+    /// size the engine enforces and whether its elements admit `NULL`.
+    ///
+    /// DuckDB fixes the size of an `ARRAY`, so `INTEGER[3][2]`, which holds
+    /// two arrays of three integers, answers `2` and then `3`, while
+    /// `INTEGER[]` is a `LIST` of any length. PostgreSQL ignores a declared
+    /// size, so every one of its dimensions answers `None`. A dimension
+    /// admits `NULL` elements unless its element type refuses them, as
+    /// [`Self::admits_null`] answers, or the dimension does, as Snowflake's
+    /// `ARRAY(INT NOT NULL)` and every BigQuery array do. A multidimensional
+    /// PostgreSQL array is rectangular, so only its innermost dimension admits
+    /// `NULL` elements, while DuckDB stores a `NULL` in place of any nested
+    /// array.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::{DuckDbDialect, SnowflakeDialect};
+    ///
+    /// let dimensions = |db: &ParserDB| -> Result<Vec<_>, sql_traits::errors::Error> {
+    ///     let table =
+    ///         db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    ///     let column = table.column("a", db, IdentifierCase::AsWritten)?.unwrap();
+    ///     Ok(column.data_type(db).array_dimension_declarations(db).unwrap().collect())
+    /// };
+    ///
+    /// let duckdb = ParserDB::parse::<DuckDbDialect>("CREATE TABLE t (a INTEGER[3][]);")?;
+    /// assert_eq!(
+    ///     dimensions(&duckdb)?,
+    ///     [ArrayDimension::new(None, true), ArrayDimension::new(Some(3), true)]
+    /// );
+    /// let snowflake =
+    ///     ParserDB::parse::<SnowflakeDialect>("CREATE TABLE t (a ARRAY(ARRAY(INT) NOT NULL));")?;
+    /// assert_eq!(
+    ///     dimensions(&snowflake)?,
+    ///     [ArrayDimension::new(None, false), ArrayDimension::new(None, true)]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn array_dimension_declarations<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<impl Iterator<Item = ArrayDimension>>;
 
     /// Returns the type a domain is defined over, followed through every
     /// domain in between, or `None` for a type that names no domain.

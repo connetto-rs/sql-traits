@@ -7,7 +7,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{num::NonZeroU32, slice};
+use core::{iter, slice};
 
 use sqlparser::ast::{
     ArrayElemTypeDef, ColumnDef, ColumnOption, DataType, EnumMember, ExactNumberInfo, Expr, Ident,
@@ -20,9 +20,9 @@ use crate::{
     impls::sqlparser::{SqlparserDialect, bound_domain, bound_user_type},
     structs::{ParserDB, UserDefinedType},
     traits::{
-        CharacterLengthUnit, ColumnCollation, DataTypeLike, DatabaseLike, EnumWidth, Enumeration,
-        EnumerationKind, EnumerationMember, ExtensionLike, IntervalFields, MapEntry,
-        NamedColumnCollation, StructureKind, StructuredField, VectorKind, VectorType,
+        ArrayDimension, CharacterLengthUnit, ColumnCollation, DataTypeLike, DatabaseLike,
+        EnumWidth, Enumeration, EnumerationKind, EnumerationMember, ExtensionLike, IntervalFields,
+        MapEntry, NamedColumnCollation, StructureKind, StructuredField, VectorKind, VectorType,
     },
     utils::{
         identifier_resolution::{identifiers_match, stored_identifier},
@@ -84,7 +84,7 @@ pub(super) const fn interval_fields(fields: sqlparser::ast::IntervalFields) -> I
 
 /// The element type an array declaration writes, or `None` for an array
 /// declared without one.
-fn written_element(definition: &ArrayElemTypeDef) -> Option<&DataType> {
+pub(super) fn written_element(definition: &ArrayElemTypeDef) -> Option<&DataType> {
     match definition {
         ArrayElemTypeDef::None => None,
         ArrayElemTypeDef::AngleBracket(element)
@@ -223,14 +223,25 @@ impl DataTypeLike for DataType {
         Some(element)
     }
 
-    fn array_dimensions(&self, _database: &Self::DB) -> Option<NonZeroU32> {
-        let mut dimensions = 0_u32;
-        let mut current = Some(stored_as(self));
-        while let Some(Self::Array(definition)) = current {
-            dimensions = dimensions.saturating_add(1);
-            current = written_element(definition);
-        }
-        NonZeroU32::new(dimensions)
+    fn array_dimension_declarations<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<impl Iterator<Item = ArrayDimension>> {
+        let Self::Array(outermost) = stored_as(self) else {
+            return None;
+        };
+        let dialect = *database.dialect();
+        let definitions = iter::successors(Some(outermost), |definition| {
+            match written_element(definition) {
+                Some(Self::Array(inner)) => Some(inner),
+                _ => None,
+            }
+        });
+        Some(definitions.map(move |definition| {
+            let element_admits_null =
+                written_element(definition).is_none_or(|element| element.admits_null(database));
+            super::dialect::array_dimension(dialect, definition, element_admits_null)
+        }))
     }
 
     fn admits_null(&self, database: &Self::DB) -> bool {
