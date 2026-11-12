@@ -407,15 +407,16 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// arguments bind as PostgreSQL's `enforce_generic_type_consistency`
     /// decides, so `anyelement` takes the type its arguments share,
     /// `anycompatible` their common type by
-    /// [`common_type_name`](crate::utils::common_type_name), and the array
-    /// forms the array over it. The answer reuses the caller's
-    /// spelling where it can and otherwise spells the type as sqlparser
-    /// writes it, so it parses back as a type with the PostgreSQL dialect.
+    /// [`DatabaseLike::common_type_name`], and the array forms the array over
+    /// it. The answer reuses the caller's spelling where it can and otherwise
+    /// spells the type as sqlparser writes it, so it parses back as a type
+    /// with the PostgreSQL dialect.
     ///
-    /// Answers [`None`] when the function cannot take the call, an argument
-    /// of a known type converting to its parameter by no implicit cast, when
-    /// an argument the result depends on has no known type, and when the
-    /// function declares no result.
+    /// Answers [`None`] when the database proves the function cannot take
+    /// the call, an argument of a known type converting to its parameter by
+    /// no implicit cast, when an argument the result depends on has no known
+    /// type or the database's casts and type facts leave the result open, and
+    /// when the function declares no result.
     ///
     /// # Errors
     ///
@@ -476,7 +477,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         let Some(written) = written_argument_names(call) else { return Ok(None) };
         check_argument_count(call, written.len(), argument_types.len())?;
         let Some(declared) = declared_at_call(self, database, &written) else { return Ok(None) };
-        let Some(binding) = bind(declared, &actuals(argument_types)) else { return Ok(None) };
+        let actuals = actuals(database, argument_types);
+        let Some(binding) = bind(database, declared, &actuals) else { return Ok(None) };
         Ok(self.result_type_name(database).and_then(|result| binding.result(result)))
     }
 

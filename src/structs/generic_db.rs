@@ -17,7 +17,7 @@ pub use sqlparser::{
     PostgresCatalog, PostgresCatalogCast, PostgresCatalogCollation, PostgresCatalogOperator,
     PostgresCatalogType, SqlparserProfile, UnresolvedAccessReference,
 };
-pub(crate) use sqlparser::{ConstraintObject, built_in_implicit_cast, table_not_null};
+pub(crate) use sqlparser::{ConstraintObject, table_not_null};
 
 use crate::{
     structs::{ColumnIdentity, IdentifierCase, IdentityCounter, RelationIdentity, RoleSetting},

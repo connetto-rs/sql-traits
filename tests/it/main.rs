@@ -18,6 +18,7 @@ mod cast_metadata;
 mod catalog_navigation;
 mod check_constraint_columns;
 mod clause_bindings;
+mod coercion;
 mod collation_name_cost;
 mod column_alterations;
 mod column_definitions;

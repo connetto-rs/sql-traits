@@ -2,7 +2,7 @@
 //! PostgreSQL runs and answers the type it returns.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 
-use sql_traits::{errors::LookupError, prelude::*, utils::common_type_name};
+use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{Expr, Function, SelectItem, SetExpr, Statement},
     dialect::PostgreSqlDialect,
@@ -104,7 +104,7 @@ fn compatible_arguments_take_their_common_type() {
     for (types, expected) in cases {
         assert_eq!(returns(&db, "pick(x, y)", types).as_deref(), *expected, "{types:?}");
         assert_eq!(returns(&db, "coalesce(x, y)", types).as_deref(), *expected, "{types:?}");
-        assert_eq!(common_type_name(types).as_deref(), *expected, "{types:?}");
+        assert_eq!(db.common_type_name(types).as_deref(), *expected, "{types:?}");
     }
 }
 
@@ -216,7 +216,13 @@ fn row_results_return_their_column_type() {
 /// the type it names, custom types and arrays included.
 #[test]
 fn every_answered_name_parses_back_as_its_type() {
-    let db = db(SCHEMA);
+    let db = db(&format!(
+        "{SCHEMA}
+         CREATE SCHEMA app;
+         CREATE TYPE app.\"Mood\" AS ENUM ('calm');
+         CREATE TYPE vector;
+         CREATE TYPE geometry;"
+    ));
     let parses = |name: &str| {
         let mut parser = Parser::new(&PostgreSqlDialect {}).try_with_sql(name).expect("tokenizes");
         let parsed = parser.parse_data_type().expect("parses as a type");
