@@ -183,6 +183,58 @@ fn a_string_entry_does_not_fold() {
     assert!(!reaches("folded"));
 }
 
+/// The builder for an empty PostgreSQL database answering `search_path`.
+fn builder_on_path(search_path: &[(&str, bool)]) -> ParserDBBuilder {
+    let empty = parse("");
+    ParserDBBuilder::new("built".to_owned(), *empty.dialect())
+        .with_search_path(search_path.iter().map(|&(schema, quoted)| (schema.to_owned(), quoted)))
+}
+
+/// A profile loading a live session hands the builder that session's path,
+/// which the database answers in order with its quote flags, an empty path
+/// included, and keeps when ingestion resumes.
+#[test]
+fn a_builder_supplies_the_path() {
+    for supplied in [&[("Types", true), ("pg_catalog", false)][..], &[("app", false)], &[]] {
+        let db: ParserDB = builder_on_path(supplied).into();
+        assert_eq!(db.search_path().collect::<Vec<_>>(), supplied);
+
+        let resumed = Parser::parse_sql(&PostgreSqlDialect {}, "CREATE SCHEMA later;")
+            .expect("SQL parses")
+            .into_iter()
+            .try_fold(db.into_ingestor(), ParserDBIngestor::apply_statement)
+            .expect("the statement applies")
+            .finish();
+        assert_eq!(resumed.search_path().collect::<Vec<_>>(), supplied);
+    }
+}
+
+/// A supplied path decides which of two same-named tables a bare name reaches,
+/// the first entry winning and a quoted entry matching its schema exactly.
+#[test]
+fn a_supplied_path_resolves_a_shadowed_name() {
+    let db = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "CREATE SCHEMA \"Types\";
+         CREATE TABLE \"Types\".docs (id INT);
+         CREATE TABLE public.docs (id INT);",
+    )
+    .expect("SQL parses")
+    .into_iter()
+    .try_fold(
+        ParserDB::from(builder_on_path(&[("Types", true), ("public", false)])).into_ingestor(),
+        ParserDBIngestor::apply_statement,
+    )
+    .expect("the schema builds")
+    .finish();
+
+    let docs = db
+        .resolve_target_table(TargetName::new("docs", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("docs is on the path");
+    assert_eq!(docs.table_schema(), Some("Types"));
+}
+
 /// Every value PostgreSQL keeps names a schema spelled as it prints the value.
 #[test]
 fn non_identifier_entries_are_spelled_as_postgresql_prints_them() {
