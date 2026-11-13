@@ -52,6 +52,7 @@ mod extensions;
 mod foreign_tables;
 mod function_body_binding;
 mod function_creation_access;
+mod function_drop_cascade;
 mod function_kind;
 mod function_moves;
 mod function_null_input;

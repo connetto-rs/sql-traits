@@ -190,19 +190,19 @@ fn a_cascade_reaches_the_functions_naming_what_it_takes() {
     assert!(!database.functions().any(|function| function.name() == "f"));
 }
 
-/// A cascade refuses to take a function something still calls, as every
-/// function drop in this model does.
+/// A cascade takes a function naming the type along with what calls it, as
+/// PostgreSQL 18 takes `function f(e)` and `constraint t_check`.
 #[test]
-fn a_cascade_refuses_a_function_something_calls() {
-    assert!(matches!(
-        parse(
-            "CREATE TYPE e AS ENUM ('a');
-             CREATE FUNCTION f(x e) RETURNS int4 LANGUAGE sql AS 'SELECT 1';
-             CREATE TABLE t (x int4 CHECK (f('a') = 1));
-             DROP TYPE e CASCADE;",
-        ),
-        Err(Error::FunctionReferenced { function_name, .. }) if function_name == "f"
-    ));
+fn a_cascade_takes_what_calls_a_function_it_takes() {
+    parse(
+        "CREATE TYPE e AS ENUM ('a');
+         CREATE FUNCTION f(x e) RETURNS int4 LANGUAGE sql AS 'SELECT 1';
+         CREATE TABLE t (x int4 CHECK (f('a') = 1));
+         DROP TYPE e CASCADE;
+         CREATE FUNCTION f() RETURNS int4 LANGUAGE sql AS 'SELECT 1';
+         ALTER TABLE t ADD CONSTRAINT t_check CHECK (x > 0);",
+    )
+    .expect("the cascade takes f and the check calling it");
 }
 
 /// A range's own constructors name the range and go with it, holding nothing

@@ -4,6 +4,7 @@
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 use core::ops::ControlFlow;
@@ -35,8 +36,8 @@ use crate::{
         last_str,
         object_name::{
             RelationKey, TEMPORARY_SCHEMA, overqualified_object_name, relation_name_is_claimed,
-            resolve_view_on_search_path_in_iter, stored_function_key, stored_table_key,
-            stored_view_key, table_matches_key, target_key, target_name_from_object_name,
+            resolve_view_on_search_path_in_iter, stored_table_key, stored_view_key,
+            table_matches_key, target_key, target_name_from_object_name,
             target_name_of_object_name, view_matches_key,
         },
         walk::{walk, walk_mut},
@@ -400,10 +401,7 @@ fn slot_reader(builder: &ParserDBBuilder, slot: Slot) -> Dependent {
             )
         }
         Slot::Function(position) => {
-            Dependent::Reader(
-                ObjectKind::Function,
-                stored_function_key(builder.functions()[position].0.as_ref(), CASE),
-            )
+            Dependent::Function(Arc::clone(&builder.functions()[position].0))
         }
         Slot::Rule(position) => rules::dependent(&builder.rules()[position].0),
     }

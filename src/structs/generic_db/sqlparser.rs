@@ -89,6 +89,7 @@ mod existing_child;
 mod extensions;
 mod foreign_options;
 mod function_bodies;
+mod function_cascade;
 mod function_dependents;
 mod function_moves;
 mod generated_names;
@@ -1216,11 +1217,7 @@ impl ParserDBBuilder {
     }
 
     /// Drops the stored functions `dropping`, refusing while anything but
-    /// them and the functions `alongside`, which the same statement drops
-    /// later, still calls one.
-    ///
-    /// PostgreSQL drops such a caller under `CASCADE`, which this model does
-    /// for no function drop.
+    /// them still calls one, as a drop without `CASCADE` does.
     ///
     /// # Errors
     ///
@@ -1229,14 +1226,9 @@ impl ParserDBBuilder {
     fn drop_function_nodes(
         &mut self,
         dropping: &[Arc<CreateFunction>],
-        alongside: &[Arc<CreateFunction>],
     ) -> Result<(), crate::errors::Error> {
-        if dropping.is_empty() {
-            return Ok(());
-        }
-        let doomed: Vec<Arc<CreateFunction>> = dropping.iter().chain(alongside).cloned().collect();
         for function in dropping {
-            if let Some(dependent) = self.function_dependent(function, &doomed) {
+            if let Some(dependent) = self.function_dependent(function, dropping) {
                 return Err(function_dependents::referenced(function, dependent));
             }
         }
@@ -2048,6 +2040,15 @@ impl ParserDBBuilder {
                     actual_kind,
                 })
             }
+        }
+    }
+
+    /// Removes the index at `position`, from the index store and from the
+    /// metadata of the table it is on.
+    fn remove_index_at(&mut self, position: usize) {
+        let (removed, _) = self.indices_mut().remove(position);
+        for (_, table_meta, _) in self.tables_mut() {
+            table_meta.retain_indices(|index| !Arc::ptr_eq(index, &removed));
         }
     }
 
@@ -7794,6 +7795,85 @@ impl ParserDB {
         Ok(())
     }
 
+    /// Drops the tables `targets` names, each with the partitions below it
+    /// and, under `CASCADE`, the readers of each and the tables inheriting
+    /// it. `refusing` holds the catalog a drop without `CASCADE` consults for
+    /// an operator or cast naming a row type, and is `None` under `CASCADE`.
+    ///
+    /// Returns the builder alongside the row types and functions the drop
+    /// took, whose own dependents are left for the caller to take.
+    ///
+    /// # Errors
+    ///
+    /// Without `CASCADE`, refuses a table something reads, one a table
+    /// inherits from, one an operator or cast names the row type of, and one
+    /// a foreign key outside the drop references.
+    fn drop_tables(
+        mut builder: ParserDBBuilder,
+        targets: Vec<StoredTable>,
+        expected_kind: ObjectKind,
+        refusing: Option<&PostgresCatalog>,
+        arrays: &mut Arc<TypeArrays>,
+    ) -> Result<(ParserDBBuilder, user_defined_types::TypeDrop), crate::errors::Error> {
+        let cascade = refusing.is_none();
+        let mut removed = user_defined_types::TypeDrop::default();
+        for dropped in targets {
+            let case = builder.identifier_case();
+            if !builder.tables().iter().any(|(table, _, _)| dropped.matches(table, case)) {
+                continue;
+            }
+
+            let reader_rowtypes =
+                Self::release_dependent_views(&mut builder, &dropped, &dropped, cascade, arrays)?;
+            removed.types.extend(reader_rowtypes.types);
+            removed.functions.extend(reader_rowtypes.functions);
+
+            // An `INHERITS` child builds its column list out of its parents,
+            // so only `CASCADE` takes it along, while a partition always goes
+            // with its partitioned table.
+            if !cascade && let Some(child) = inheritance::first_inheritor_below(&builder, &dropped)
+            {
+                return Err(crate::errors::Error::DropTableInheritedFrom {
+                    parent_table: dropped.name.clone(),
+                    child_table: child.name,
+                });
+            }
+
+            let mut doomed = inheritance::descendants(&builder, &dropped);
+            for table in &doomed {
+                let reader_rowtypes =
+                    Self::release_dependent_views(&mut builder, table, &dropped, cascade, arrays)?;
+                removed.types.extend(reader_rowtypes.types);
+                removed.functions.extend(reader_rowtypes.functions);
+            }
+            let table_name = dropped.name.clone();
+            doomed.push(dropped);
+            for table in &doomed {
+                let node = Self::stored_node(&builder, table)?;
+                for name in core::iter::once(&node.name).chain(arrays.array(&node.name)) {
+                    if let Some(dependent) =
+                        refusing.and_then(|catalog| catalog.dependent_naming_type(name))
+                    {
+                        return Err(crate::errors::Error::RelationHasDependents {
+                            object_kind: expected_kind,
+                            object_name: table_name,
+                            dependent_kind: dependent.kind,
+                            dependent_name: dependent.name,
+                        });
+                    }
+                    removed.types.push(name.clone());
+                }
+            }
+
+            if !cascade && builder.is_referenced_from_outside(&doomed) {
+                return Err(crate::errors::Error::TableReferenced { table_name });
+            }
+
+            builder = Self::remove_tables(builder, &doomed, arrays)?;
+        }
+        Ok((builder, removed))
+    }
+
     /// Removes the views reading `table` under `CASCADE`, and otherwise refuses
     /// the drop of `dropped` that would take `table` away from under them.
     ///
@@ -9121,6 +9201,8 @@ impl ParserDB {
                             Some(Arc::clone(&builder.functions()[position].0))
                         })
                         .collect();
+                    let cascade = drop_function.drop_behavior == Some(DropBehavior::Cascade);
+                    let mut removed = user_defined_types::TypeDrop::default();
                     for func_desc in &drop_function.func_desc {
                         let function_name = last_str(&func_desc.name);
                         let matching = Self::functions_named(&builder, func_desc, &type_arrays);
@@ -9164,32 +9246,32 @@ impl ParserDB {
                                 dependent_name,
                             }
                         };
-                        if let Some(dependent) = builder.function_dependent(function, &dropping) {
-                            return Err(refused(dependent));
-                        }
                         // An operator or cast the catalog runs on this
-                        // function holds it in place, and goes with it under
-                        // CASCADE.
-                        if let Some(fact) = active_postgres_catalog.fact_running_function(
-                            &type_arrays,
-                            &function.name,
-                            function.args.as_deref(),
-                            builder.identifier_case(),
-                        ) {
-                            if drop_function.drop_behavior != Some(DropBehavior::Cascade) {
+                        // function holds it in place as any other dependent
+                        // does, and goes with it under `CASCADE`.
+                        if !cascade {
+                            if let Some(dependent) = builder.function_dependent(function, &dropping)
+                            {
+                                return Err(refused(dependent));
+                            }
+                            if let Some(fact) = active_postgres_catalog.fact_running_function(
+                                &type_arrays,
+                                &function.name,
+                                function.args.as_deref(),
+                                builder.identifier_case(),
+                            ) {
                                 return Err(refused((fact.kind, fact.name)));
                             }
-                            Arc::make_mut(&mut active_postgres_catalog)
-                                .drop_facts_declaring_function(
-                                    &type_arrays,
-                                    &function.name,
-                                    function.args.as_deref(),
-                                    builder.identifier_case(),
-                                );
                         }
 
-                        builder.functions_mut().remove(position);
+                        removed.functions.push(builder.functions_mut().remove(position).0);
                     }
+                    builder = Self::finish_drop(
+                        builder,
+                        removed,
+                        &mut type_arrays,
+                        &mut active_postgres_catalog,
+                    )?;
                 }
                 Statement::Drop {
                     object_type:
@@ -9227,86 +9309,20 @@ impl ParserDB {
                         }
                     }
 
-                    let mut removed = user_defined_types::TypeDrop::default();
-                    for dropped in targets {
-                        let case = builder.identifier_case();
-                        if !builder
-                            .tables()
-                            .iter()
-                            .any(|(table, _, _)| dropped.matches(table, case))
-                        {
-                            continue;
-                        }
-
-                        let reader_rowtypes = Self::release_dependent_views(
-                            &mut builder,
-                            &dropped,
-                            &dropped,
-                            cascade,
-                            &mut type_arrays,
-                        )?;
-                        removed.types.extend(reader_rowtypes.types);
-                        removed.functions.extend(reader_rowtypes.functions);
-
-                        // An `INHERITS` child builds its column list out of its
-                        // parents, so only `CASCADE` takes it along, while a
-                        // partition always goes with its partitioned table.
-                        if !cascade
-                            && let Some(child) =
-                                inheritance::first_inheritor_below(&builder, &dropped)
-                        {
-                            return Err(crate::errors::Error::DropTableInheritedFrom {
-                                parent_table: dropped.name.clone(),
-                                child_table: child.name,
-                            });
-                        }
-
-                        let mut doomed = inheritance::descendants(&builder, &dropped);
-                        for table in &doomed {
-                            let reader_rowtypes = Self::release_dependent_views(
-                                &mut builder,
-                                table,
-                                &dropped,
-                                cascade,
-                                &mut type_arrays,
-                            )?;
-                            removed.types.extend(reader_rowtypes.types);
-                            removed.functions.extend(reader_rowtypes.functions);
-                        }
-                        let table_name = dropped.name.clone();
-                        doomed.push(dropped);
-                        for table in &doomed {
-                            let node = Self::stored_node(&builder, table)?;
-                            for name in
-                                core::iter::once(&node.name).chain(type_arrays.array(&node.name))
-                            {
-                                if !cascade
-                                    && let Some(dependent) =
-                                        active_postgres_catalog.dependent_naming_type(name)
-                                {
-                                    return Err(crate::errors::Error::RelationHasDependents {
-                                        object_kind: expected_kind,
-                                        object_name: table_name.clone(),
-                                        dependent_kind: dependent.kind,
-                                        dependent_name: dependent.name,
-                                    });
-                                }
-                                removed.types.push(name.clone());
-                            }
-                        }
-
-                        if !cascade && builder.is_referenced_from_outside(&doomed) {
-                            return Err(crate::errors::Error::TableReferenced { table_name });
-                        }
-
-                        builder = Self::remove_tables(builder, &doomed, &mut type_arrays)?;
-                    }
-                    Self::drop_facts_for_type_drop(
+                    let refusing = (!cascade).then_some(active_postgres_catalog.as_ref());
+                    let (next_builder, removed) = Self::drop_tables(
+                        builder,
+                        targets,
+                        expected_kind,
+                        refusing,
+                        &mut type_arrays,
+                    )?;
+                    builder = Self::finish_drop(
+                        next_builder,
+                        removed,
+                        &mut type_arrays,
                         &mut active_postgres_catalog,
-                        &builder,
-                        &removed,
-                        &type_arrays,
-                    );
+                    )?;
                 }
                 Statement::Drop {
                     object_type:
@@ -9328,13 +9344,12 @@ impl ParserDB {
                         &mut type_arrays,
                         &dependent_holding,
                     )?;
-                    builder = next_builder;
-                    Self::drop_facts_for_type_drop(
+                    builder = Self::finish_drop(
+                        next_builder,
+                        removed,
+                        &mut type_arrays,
                         &mut active_postgres_catalog,
-                        &builder,
-                        &removed,
-                        &type_arrays,
-                    );
+                    )?;
                 }
                 Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Index,
@@ -9352,10 +9367,7 @@ impl ParserDB {
                             });
                         };
 
-                        let (removed, _) = builder.indices_mut().remove(position);
-                        for (_, table_meta, _) in builder.tables_mut() {
-                            table_meta.retain_indices(|index| !Arc::ptr_eq(index, &removed));
-                        }
+                        builder.remove_index_at(position);
                     }
                 }
                 Statement::AlterIndex {
@@ -9789,13 +9801,16 @@ impl ParserDB {
                             let (next_builder, types) = user_defined_types::drop_types_in(
                                 builder,
                                 schema,
-                                &doomed_functions,
                                 &mut type_arrays,
                             )?;
-                            builder = next_builder;
                             removed.types.extend(types.types);
                             removed.functions.extend(types.functions);
-                            builder.drop_function_nodes(&doomed_functions, &[])?;
+                            builder = Self::take_function_dependents(
+                                next_builder,
+                                &mut removed,
+                                &mut type_arrays,
+                            )?;
+                            builder.drop_function_nodes(&doomed_functions)?;
                             removed.functions.extend(doomed_functions);
                             Self::drop_facts_for_type_drop(
                                 &mut active_postgres_catalog,
@@ -10083,10 +10098,12 @@ impl ParserDB {
                                     drop_behavior == Some(DropBehavior::Cascade),
                                     &mut type_arrays,
                                 )?;
-                                builder = next;
-                                Self::drop_facts_for_type_drop(
-                                    &mut active_postgres_catalog, &builder, &removed, &type_arrays,
-                                );
+                                builder = Self::finish_drop(
+                                    next,
+                                    removed,
+                                    &mut type_arrays,
+                                    &mut active_postgres_catalog,
+                                )?;
                             }
                             AlterTableOperation::RenameColumn {
                                 old_column_name,
@@ -10657,13 +10674,12 @@ impl ParserDB {
                         cascade,
                         &mut type_arrays,
                     )?;
-                    builder = next_builder;
-                    Self::drop_facts_for_type_drop(
+                    builder = Self::finish_drop(
+                        next_builder,
+                        removed,
+                        &mut type_arrays,
                         &mut active_postgres_catalog,
-                        &builder,
-                        &removed,
-                        &type_arrays,
-                    );
+                    )?;
                 }
                 Statement::CreateDomain(create_domain) => {
                     builder = domains::create_domain(
@@ -10710,13 +10726,12 @@ impl ParserDB {
                         &mut type_arrays,
                         &dependent_holding,
                     )?;
-                    builder = next_builder;
-                    Self::drop_facts_for_type_drop(
+                    builder = Self::finish_drop(
+                        next_builder,
+                        drop,
+                        &mut type_arrays,
                         &mut active_postgres_catalog,
-                        &builder,
-                        &drop,
-                        &type_arrays,
-                    );
+                    )?;
                 }
                 Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Type,
@@ -10739,13 +10754,12 @@ impl ParserDB {
                         &mut type_arrays,
                         &dependent_holding,
                     )?;
-                    builder = next_builder;
-                    Self::drop_facts_for_type_drop(
+                    builder = Self::finish_drop(
+                        next_builder,
+                        drop,
+                        &mut type_arrays,
                         &mut active_postgres_catalog,
-                        &builder,
-                        &drop,
-                        &type_arrays,
-                    );
+                    )?;
                 }
                 Statement::CreateView(create_view) => {
                     let creator = Creator::session(&session_roles, &default_privileges);
