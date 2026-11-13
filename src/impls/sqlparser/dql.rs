@@ -464,14 +464,15 @@ fn mutually_recursive_ctes(with: &With, case: IdentifierCase) -> Vec<bool> {
         })
         .collect()
 }
-/// A column name merged by a `USING` or `NATURAL` join. `subsumed` is the
-/// number of `FROM` entries the merge consumed: relations collected before
-/// that boundary pass their exposure of the name into the merged column and
-/// no longer count individually, while relations joined in afterwards collide
-/// with it, as PostgreSQL reports for a bare reference.
+/// A column name merged by a `USING` or `NATURAL` join. The merge consumed
+/// the `FROM` entries from `start` up to `subsumed`, the entries of its own
+/// join tree: those relations pass their exposure of the name into the
+/// merged column and no longer count individually, while relations outside
+/// that range collide with it, as PostgreSQL reports for a bare reference.
 struct MergedName {
     name: String,
     quoted: bool,
+    start: usize,
     subsumed: usize,
 }
 
@@ -835,9 +836,9 @@ where
     P: DerivationProfile<'query, 'db, DB>,
 {
     for table_with_joins in from.iter() {
-        let (entry_bases, entry_derived) = {
+        let (entry_start, entry_bases, entry_derived) = {
             let data = profile.scope(scope);
-            (data.bases.len(), data.derived.len())
+            (data.from_entry_count, data.bases.len(), data.derived.len())
         };
         let (mut accumulated, mut plan) = match collect_entry_factor(
             table_with_joins.map(|entry| &entry.relation),
@@ -901,7 +902,7 @@ where
                 right_names.as_deref(),
                 data.case,
             ) {
-                merged = record_merge(data, join.get(), names);
+                merged = record_merge(data, join.get(), names, entry_start);
             } else {
                 data.unqualified_poison = true;
             }
@@ -1210,16 +1211,18 @@ fn using_alias_relation<'query, 'db, DB: DatabaseLike, D: Copy>(
     }
 }
 
-/// Records the names a join merged, remembering the ones a `NATURAL` join
-/// merged so the join can be spelled out, and hands them back.
+/// Records the names a join whose tree starts at entry `start` merged,
+/// remembering the ones a `NATURAL` join merged so the join can be spelled
+/// out, and hands them back.
 fn record_merge<DB: DatabaseLike, D: Copy>(
     data: &mut FromScope<'_, '_, DB, D>,
     join: &Join,
     names: Vec<(String, bool)>,
+    start: usize,
 ) -> Vec<(String, bool)> {
-    let boundary = data.from_entry_count;
+    let subsumed = data.from_entry_count;
     for (name, quoted) in &names {
-        merge_name(&mut data.merged, name.clone(), *quoted, boundary, data.case);
+        merge_name(&mut data.merged, name.clone(), *quoted, start..subsumed, data.case);
     }
     if matches!(join_constraint(&join.join_operator), Some(JoinConstraint::Natural)) {
         data.natural_merges.push((join_address(join), names.clone()));
@@ -1227,40 +1230,31 @@ fn record_merge<DB: DatabaseLike, D: Copy>(
     names
 }
 
-/// Records a merged name, moving its subsumption boundary to the latest
-/// merge of that name.
+/// Records a merged name over the entries `range`, replacing the merges of
+/// that name it covers, as a chained join merging the name again does.
 fn merge_name(
     merged: &mut Vec<MergedName>,
     name: String,
     quoted: bool,
-    subsumed: usize,
+    range: core::ops::Range<usize>,
     case: IdentifierCase,
 ) {
-    match merged
-        .iter_mut()
-        .find(|merged| case.identifiers_match(&merged.name, merged.quoted, &name, quoted))
-    {
-        Some(existing) => existing.subsumed = subsumed,
-        None => merged.push(MergedName { name, quoted, subsumed }),
-    }
+    merged.retain(|merged| {
+        merged.start < range.start
+            || !case.identifiers_match(&merged.name, merged.quoted, &name, quoted)
+    });
+    merged.push(MergedName { name, quoted, start: range.start, subsumed: range.end });
 }
 
-/// The subsumption boundary for this identifier if it is merged.
-fn merged_boundary(
-    merged: &[MergedName],
-    name: &str,
-    quoted: bool,
-    case: IdentifierCase,
-) -> Option<usize> {
-    merged
-        .iter()
-        .find(|merged| case.identifiers_match(&merged.name, merged.quoted, name, quoted))
-        .map(|merged| merged.subsumed)
+/// Whether the merge `merged` absorbs the copy of its name the relation at
+/// `entry_index` exposes.
+fn absorbs(merged: &MergedName, entry_index: usize) -> bool {
+    (merged.start..merged.subsumed).contains(&entry_index)
 }
 
 /// Whether a relation's own copy of this column name is absorbed into a
-/// merged join column: true when the relation was collected before that
-/// name's merge.
+/// merged join column: true when a merge of that name covers the relation's
+/// entry.
 fn subsumed_exposure(
     merged: &[MergedName],
     entry_index: usize,
@@ -1268,7 +1262,10 @@ fn subsumed_exposure(
     quoted: bool,
     case: IdentifierCase,
 ) -> bool {
-    merged_boundary(merged, name, quoted, case).is_some_and(|boundary| entry_index < boundary)
+    merged.iter().any(|merged| {
+        absorbs(merged, entry_index)
+            && case.identifiers_match(&merged.name, merged.quoted, name, quoted)
+    })
 }
 
 /// Derives the shapes of a `WITH` clause's CTEs in order. A recursive list
@@ -3663,20 +3660,22 @@ enum LookupOutcome<T> {
     Stop,
 }
 
-/// The matched merge record for a column name, if it is merged and visible.
-fn visible_merged_name<'scope>(
+/// The merges of a column name that are complete among the first
+/// `visible_entries` entries.
+fn visible_merges<'scope>(
     merged: &'scope [MergedName],
     column: &Ident,
     visible_entries: usize,
     case: IdentifierCase,
-) -> Option<&'scope MergedName> {
-    merged.iter().filter(|merged| merged.subsumed <= visible_entries).rev().find(|merged| {
-        case.identifiers_match(
-            &merged.name,
-            merged.quoted,
-            column.value.as_str(),
-            column.quote_style.is_some(),
-        )
+) -> impl Iterator<Item = &'scope MergedName> + Clone {
+    merged.iter().filter(move |merged| {
+        merged.subsumed <= visible_entries
+            && case.identifiers_match(
+                &merged.name,
+                merged.quoted,
+                column.value.as_str(),
+                column.quote_style.is_some(),
+            )
     })
 }
 
@@ -3745,8 +3744,8 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
     }
     let mut definitions = Vec::new();
     let mut candidates = Vec::new();
-    let merged_match = visible_merged_name(&scope.merged, column, visible_entries, case);
-    if let Some(merged) = merged_match {
+    let merges = visible_merges(&scope.merged, column, visible_entries, case);
+    for merged in merges.clone() {
         definitions.push(ResolvedColumn {
             source: None,
             definition: opaque,
@@ -3755,12 +3754,10 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
             origin: ColumnOrigin::Merged,
         });
     }
-    let start = merged_match.map_or(0, |merged| merged.subsumed);
-    for base in scope
-        .bases
-        .iter()
-        .filter(|base| base.entry_index >= start && base.entry_index < visible_entries)
-    {
+    let exposed = |entry_index: usize| {
+        entry_index < visible_entries && !merges.clone().any(|merged| absorbs(merged, entry_index))
+    };
+    for base in scope.bases.iter().filter(|base| exposed(base.entry_index)) {
         if let Some((ordinal, base_column)) = find_base_column(base, column, case) {
             definitions.push(ResolvedColumn {
                 source: (!require_row_identity || base.yields_source_rows()).then_some(base.table),
@@ -3772,11 +3769,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
             candidates.push(render_table_candidate(base.table));
         }
     }
-    for relation in scope
-        .derived
-        .iter()
-        .filter(|relation| relation.entry_index >= start && relation.entry_index < visible_entries)
-    {
+    for relation in scope.derived.iter().filter(|relation| exposed(relation.entry_index)) {
         match find_derived_column(&relation.shape.columns, column, case) {
             Some(DerivedMatch::Column(ordinal, found)) => {
                 definitions.push(ResolvedColumn {
