@@ -17,7 +17,7 @@ use super::{
         wildcard_reshapes_output,
     },
     Bound, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
-    output_columns::unwrap_nested,
+    output_columns::{QueryId, unwrap_nested},
 };
 use crate::{
     errors::LookupError, structs::IdentifierCase, traits::DatabaseLike, utils::walk::walk,
@@ -78,6 +78,44 @@ impl QueryReferences {
     }
 }
 
+/// How the clause holding a column reference resolves it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SiteRule {
+    /// Through the scope the cursor names, as an ordinary reference.
+    Scope(ScopeCursor),
+    /// As an `ORDER BY` key of the query, a select-list output first.
+    OrderBy(QueryId),
+    /// A select-list output first, then the input, as a `DISTINCT ON` key.
+    OutputFirst(ScopeCursor),
+    /// The input first, then a select-list output, as a `GROUP BY` key.
+    InputFirst(ScopeCursor),
+}
+
+impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
+    /// Resolves `reference` as `rule` says its clause resolves it.
+    pub(crate) fn resolve_site<'scope>(
+        &'scope self,
+        rule: SiteRule,
+        reference: &Expr,
+    ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
+        match rule {
+            SiteRule::Scope(cursor) => self.resolve_binding(cursor, reference),
+            SiteRule::OrderBy(query) => self.resolve_order_by(query, reference),
+            SiteRule::OutputFirst(cursor) => self.resolve_output_first(cursor, reference),
+            SiteRule::InputFirst(cursor) => self.resolve_input_first(cursor, reference),
+        }
+    }
+
+    /// The rule resolving each column reference of `query`, by the address of
+    /// its expression, `None` for one sitting where no scope was derived.
+    pub(crate) fn site_rules(&self, query: &Query) -> Vec<(usize, Option<SiteRule>)> {
+        let mut rules = Vec::new();
+        let mut sink = |expression: &Expr, rule| rules.push((expression_address(expression), rule));
+        Walk { graph: self, references: QueryReferences::default(), sink: &mut sink }.query(query);
+        rules
+    }
+}
+
 /// Walks `query` against `database`, or answers `None` when the query's
 /// scopes cannot be derived at all.
 pub(crate) fn query_references<DB: DatabaseLike>(
@@ -86,10 +124,17 @@ pub(crate) fn query_references<DB: DatabaseLike>(
     case: IdentifierCase,
 ) -> Option<QueryReferences> {
     let (graph, _) = build_definition_graph(query, database, case).ok()?;
-    let mut walk =
-        Walk { graph: &graph, references: QueryReferences::default(), origins: Vec::new() };
+    let mut origins = Vec::new();
+    let mut sink = |expression: &Expr, rule: Option<SiteRule>| {
+        let reached = match rule {
+            Some(rule) => Reached::of(&graph.resolve_site(rule, expression)),
+            None => Reached::Unknown,
+        };
+        origins.push((expression_address(expression), reached));
+    };
+    let mut walk = Walk { graph: &graph, references: QueryReferences::default(), sink: &mut sink };
     walk.query(query);
-    let Walk { mut references, origins, .. } = walk;
+    let mut references = walk.references;
     references.sites = origins
         .into_iter()
         .map(|(expression, origin)| {
@@ -133,10 +178,11 @@ impl Reached {
     }
 }
 
-struct Walk<'graph, 'query, 'db, DB: DatabaseLike> {
+struct Walk<'graph, 'sink, 'query, 'db, DB: DatabaseLike> {
     graph: &'graph DefinitionGraph<'query, 'db, DB>,
     references: QueryReferences,
-    origins: Vec<(usize, Reached)>,
+    /// Takes each column reference with the rule its clause resolves it by.
+    sink: &'sink mut dyn FnMut(&Expr, Option<SiteRule>),
 }
 
 fn expression_address(expression: &Expr) -> usize {
@@ -153,9 +199,9 @@ fn is_column_name(expression: &Expr) -> bool {
     matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
 }
 
-impl<DB: DatabaseLike> Walk<'_, '_, '_, DB> {
-    fn record(&mut self, expression: &Expr, reached: Reached) {
-        self.origins.push((expression_address(expression), reached));
+impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
+    fn record(&mut self, expression: &Expr, rule: Option<SiteRule>) {
+        (self.sink)(expression, rule);
     }
 
     fn cursor(&self, scope: Option<ScopeId>) -> Option<ScopeCursor> {
@@ -200,8 +246,7 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, DB> {
                     let bare = unwrap_nested(&key.expr);
                     match query_id {
                         Some(query_id) if is_column_name(bare) => {
-                            let reached = Reached::of(&self.graph.resolve_order_by(query_id, bare));
-                            self.record(bare, reached);
+                            self.record(bare, Some(SiteRule::OrderBy(query_id)));
                         }
                         _ => self.node(&key.expr, body_cursor),
                     }
@@ -283,8 +328,7 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, DB> {
                 let bare = unwrap_nested(key);
                 match cursor {
                     Some(cursor) if is_column_name(bare) => {
-                        let reached = Reached::of(&self.graph.resolve_output_first(cursor, bare));
-                        self.record(bare, reached);
+                        self.record(bare, Some(SiteRule::OutputFirst(cursor)));
                     }
                     _ => self.node(key, cursor),
                 }
@@ -307,8 +351,7 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, DB> {
                 let bare = unwrap_nested(key);
                 match cursor {
                     Some(cursor) if is_column_name(bare) => {
-                        let reached = Reached::of(&self.graph.resolve_input_first(cursor, bare));
-                        self.record(bare, reached);
+                        self.record(bare, Some(SiteRule::InputFirst(cursor)));
                     }
                     _ => self.node(key, cursor),
                 }
@@ -501,15 +544,15 @@ fn qualified_wildcard_items<DB: DatabaseLike>(
 
 /// Records every column reference a node holds outside nested queries, and
 /// hands each nested query to the walk whole.
-struct Sites<'walk, 'graph, 'query, 'db, DB: DatabaseLike> {
-    walk: &'walk mut Walk<'graph, 'query, 'db, DB>,
+struct Sites<'walk, 'graph, 'sink, 'query, 'db, DB: DatabaseLike> {
+    walk: &'walk mut Walk<'graph, 'sink, 'query, 'db, DB>,
     cursor: Option<ScopeCursor>,
     /// How many queries deep the visitor stands below the node it started
     /// from, whose references the nested walk records instead.
     depth: usize,
 }
 
-impl<DB: DatabaseLike> Visitor for Sites<'_, '_, '_, '_, DB> {
+impl<DB: DatabaseLike> Visitor for Sites<'_, '_, '_, '_, '_, DB> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
@@ -531,17 +574,11 @@ impl<DB: DatabaseLike> Visitor for Sites<'_, '_, '_, '_, DB> {
         }
         match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                let reached = match self.cursor {
-                    Some(cursor) => {
-                        Reached::of(&self.walk.graph.resolve_binding(cursor, expression))
-                    }
-                    None => Reached::Unknown,
-                };
-                self.walk.record(expression, reached);
+                self.walk.record(expression, self.cursor.map(SiteRule::Scope));
             }
             // A whole-row reference names a relation the resolver does not
             // follow.
-            Expr::QualifiedWildcard(..) => self.walk.record(expression, Reached::Unknown),
+            Expr::QualifiedWildcard(..) => self.walk.record(expression, None),
             _ => {}
         }
         ControlFlow::Continue(())
