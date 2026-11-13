@@ -2,6 +2,7 @@
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod absent;
+mod call_resolution;
 mod column_scope;
 mod deployment;
 mod expression_context;
@@ -41,6 +42,7 @@ mod user_defined_type;
 mod view;
 
 pub use absent::Absent;
+pub use call_resolution::{ArgumentEvidence, CallResolution, SelectedFunction};
 pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
     ColumnScope, QueryOutput, RangeTableEntry, RelationBinding,
@@ -49,7 +51,9 @@ pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
     SettingContent, SettingPresence, SettingValue, TimeZoneSource,
 };
-pub use expression_context::{ArraySource, ExpressionContext, Operand, OperatorApplication};
+pub use expression_context::{
+    ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
+};
 pub use expression_scope::ExpressionScope;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;

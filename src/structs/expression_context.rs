@@ -1,6 +1,6 @@
 //! The facts each expression node of one query takes.
 
-use alloc::{borrow::Cow, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -16,11 +16,16 @@ use crate::{
         scoped_roots::{ScopedRoot, is_input},
     },
     structs::{
-        ColumnBinding, ColumnDefinition, ColumnScope, ExpressionScope, IdentifierCase, OperandType,
-        OperatorResolution, SelectedOperator, TargetName,
+        CallResolution, ColumnBinding, ColumnDefinition, ColumnScope, ExpressionScope,
+        FunctionKind, IdentifierCase, OperandType, OperatorResolution, SelectedOperator,
+        TargetName,
     },
     traits::{ColumnLike, DataTypeLike, DatabaseLike, FunctionLike},
     utils::{
+        call_sites::expression_form,
+        call_typing::{
+            Matched, called_name, reached_by_name, resolve_function, written_argument_names,
+        },
         coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
         object_name::PG_CATALOG,
         operator_typing::resolve_operator,
@@ -92,13 +97,13 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
 pub struct OperatorApplication<'node, 'db, DB: DatabaseLike> {
     name: TargetName<'node>,
     left: Option<&'node Expr>,
-    right: Operand<'node>,
+    right: Operand<'node, 'db, DB>,
     resolution: OperatorResolution<'db, DB>,
 }
 
 /// Where the right operand of an operator application comes from.
 #[derive(Debug, Clone)]
-pub enum Operand<'node> {
+pub enum Operand<'node, 'db, DB: DatabaseLike> {
     /// The value of this node.
     Node(&'node Expr),
     /// Each element of an array, the application holding when it holds for
@@ -108,6 +113,42 @@ pub enum Operand<'node> {
     /// all of them, as `op ALL (array)` and a collapsed `NOT IN` list apply
     /// it.
     All(ArraySource<'node>),
+    /// What a call PostgreSQL's grammar inserts returns, as the
+    /// `pg_catalog.like_escape` over the pattern of `LIKE ... ESCAPE` and the
+    /// `pg_catalog.similar_to_escape` over the pattern of `SIMILAR TO`.
+    Call(Box<CallApplication<'node, 'db, DB>>),
+}
+
+/// One function PostgreSQL calls to evaluate an expression node, with the
+/// nodes its arguments come from and the function it selects.
+#[derive(Debug, Clone)]
+pub struct CallApplication<'node, 'db, DB: DatabaseLike> {
+    name: TargetName<'node>,
+    arguments: Vec<&'node Expr>,
+    resolution: CallResolution<'db, DB>,
+}
+
+impl<'node, 'db, DB: DatabaseLike> CallApplication<'node, 'db, DB> {
+    /// Returns the function name PostgreSQL looks up, as the query writes it
+    /// or, for a call its grammar inserts, qualified with `pg_catalog`.
+    #[must_use]
+    pub const fn name(&self) -> &TargetName<'node> {
+        &self.name
+    }
+
+    /// Returns the nodes the arguments come from, in the order the call
+    /// writes them.
+    #[must_use]
+    pub fn arguments(&self) -> &[&'node Expr] {
+        &self.arguments
+    }
+
+    /// Returns what PostgreSQL does with the call, its arguments typed as
+    /// [`ExpressionContext::type_of`] types their nodes.
+    #[must_use]
+    pub const fn resolution(&self) -> &CallResolution<'db, DB> {
+        &self.resolution
+    }
 }
 
 /// The array an [`Operand::Any`] or [`Operand::All`] compares against.
@@ -137,7 +178,7 @@ impl<'node, 'db, DB: DatabaseLike> OperatorApplication<'node, 'db, DB> {
 
     /// Returns where the right operand comes from.
     #[must_use]
-    pub const fn right(&self) -> &Operand<'node> {
+    pub const fn right(&self) -> &Operand<'node, 'db, DB> {
         &self.right
     }
 
@@ -199,18 +240,25 @@ enum Collapse<'a> {
 struct Applied<'node> {
     name: TargetName<'node>,
     left: Option<&'node Expr>,
-    right: &'node Expr,
-    /// How the operator applies to the elements of the array `right`
-    /// evaluates to, `None` when it applies to that value itself.
-    quantifier: Option<Quantifier>,
+    right: Right<'node>,
 }
 
 impl<'node> Applied<'node> {
     /// `name`, from `pg_catalog` or the search path, applied to `left` and
     /// `right`.
     fn named(name: &'static str, left: Option<&'node Expr>, right: &'node Expr) -> Self {
-        Self { name: TargetName::new(name, false), left, right, quantifier: None }
+        Self { name: TargetName::new(name, false), left, right: Right::Node(right) }
     }
+}
+
+/// Where the right operand of an applied operator comes from.
+enum Right<'node> {
+    /// The value of this node.
+    Node(&'node Expr),
+    /// Each element of the array this node evaluates to.
+    Elements(&'node Expr, Quantifier),
+    /// What the `pg_catalog` function of this name returns of these nodes.
+    Call(&'static str, Vec<&'node Expr>),
 }
 
 /// Whether an operator applied to an array's elements must hold for one of
@@ -223,7 +271,7 @@ enum Quantifier {
 
 impl Quantifier {
     /// The operand comparing with each element of `source`.
-    const fn over(self, source: ArraySource<'_>) -> Operand<'_> {
+    const fn over<'db, DB: DatabaseLike>(self, source: ArraySource<'_>) -> Operand<'_, 'db, DB> {
         match self {
             Self::Any => Operand::Any(source),
             Self::All => Operand::All(source),
@@ -396,8 +444,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     ///
     /// An operator node takes the result of the operator PostgreSQL selects,
     /// `IS [NOT] DISTINCT FROM` is `bool`, and `NULLIF` takes its first
-    /// operand's type as `=` converts it. A `-` over a numeric literal is
-    /// the negative constant PostgreSQL's grammar folds it into.
+    /// operand's type as `=` converts it. A call [`Self::call`] answers takes
+    /// the result of the function PostgreSQL selects. A `-` over a numeric
+    /// literal is the negative constant PostgreSQL's grammar folds it into.
     ///
     /// # Errors
     ///
@@ -444,7 +493,15 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                             Some((applications, returns)) => {
                                 self.returned(applications, returns)?
                             }
-                            None => OperandType::Unknown,
+                            None => {
+                                match self.call(expression)? {
+                                    Some(CallApplication {
+                                        resolution: CallResolution::Selected(selected),
+                                        ..
+                                    }) => without_typmod(selected.into_result_type()),
+                                    _ => OperandType::Unknown,
+                                }
+                            }
                         }
                     }
                 }
@@ -462,6 +519,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// (`~~`, `!~~`, `~~*`, `!~~*`), and `IS [NOT] DISTINCT FROM` and
     /// `NULLIF` apply `=`, except that `IS [NOT] DISTINCT FROM` an
     /// undecorated `NULL` tests the other operand for null and applies none.
+    /// With `ESCAPE` the `LIKE` operator compares with [`Operand::Call`], the
+    /// `pg_catalog.like_escape` call over the pattern and the escape, and
+    /// `[NOT] SIMILAR TO` applies `~` or `!~` to the
+    /// `pg_catalog.similar_to_escape` call over the pattern and any escape.
     /// `op ANY|SOME|ALL (array)` and `[NOT] [I]LIKE ANY (array)` apply their
     /// operator to each element of the array. `[NOT] BETWEEN` applies `>=`
     /// and `<=`, or `<` and `>`, one per bound. `IN` applies `=`, and `NOT
@@ -469,8 +530,8 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// reference of the list's own query level, when there are several and
     /// they have a common type with an array type, and once to each other
     /// element. A parenthesized node answers for its content. Row
-    /// comparisons, `LIKE ... ESCAPE`, `SIMILAR TO`, comparisons with a
-    /// subquery, the boolean connectives and calls answer `None`.
+    /// comparisons, comparisons with a subquery, the boolean connectives and
+    /// calls answer `None`.
     ///
     /// # Errors
     ///
@@ -517,6 +578,101 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         Ok(self.applications(expression)?.map(|(applications, _)| applications))
     }
 
+    /// Returns the function PostgreSQL calls to evaluate `expression`, or
+    /// `None` for a node that is no plain call.
+    ///
+    /// A call answers with the function it selects among those its name
+    /// reaches, each argument converted to the parameter it passes. An
+    /// aggregate or window call, a call reaching an aggregate or window
+    /// function, `ROW(...)` and the expressions PostgreSQL's grammar writes
+    /// like a call, such as `COALESCE`, `NULLIF` and `CURRENT_DATE`, answer
+    /// `None`. A parenthesized node answers for its content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
+    /// query, [`LookupError::InvalidObjectName`] for a called name with more
+    /// than two parts or a part built at run time, and the lookup errors
+    /// typing an argument or reading a reached function's kind return.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{SelectItem, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (i INT4);")?;
+    /// let parsed = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT round(i, 2) FROM t")?;
+    /// let Statement::Query(query) = &parsed[0] else { unreachable!() };
+    /// let context = ExpressionContext::new(query, &db, IdentifierCase::Folded)?;
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// let SelectItem::UnnamedExpr(round) = &select.projection[0] else { unreachable!() };
+    ///
+    /// let call = context.call(round)?.expect("`round` is a plain call");
+    /// // `i` converts to `numeric`, so `round(numeric, int4)` runs.
+    /// let CallResolution::Selected(selected) = call.resolution() else { unreachable!() };
+    /// assert_eq!(selected.arguments()[0].evidence().target().name(), "numeric");
+    /// assert_eq!(selected.result_type().map(TargetName::name), Some("numeric"));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn call<'node>(
+        &self,
+        expression: &'node Expr,
+    ) -> Result<Option<CallApplication<'node, 'db, DB>>, LookupError> {
+        self.check(expression)?;
+        let function = match expression {
+            Expr::Nested(inner) => return self.call(inner),
+            Expr::Function(function) => function,
+            _ => return Ok(None),
+        };
+        let Some(arguments) = plain_arguments(function) else { return Ok(None) };
+        let name = called_name(function)?;
+        if expression_form(&function.name).is_some() || is_row(expression) {
+            return Ok(None);
+        }
+        let Some(written) = written_argument_names(function) else { return Ok(None) };
+        let reached = reached_by_name(self.database, &name, &written, self.case);
+        for (reached, _) in &reached {
+            if reached.kind(self.database)? != FunctionKind::Normal {
+                return Ok(None);
+            }
+        }
+        self.applied_call(name, arguments, &reached).map(Some)
+    }
+
+    /// The call of `name` passing `arguments`, one of the `reached`
+    /// functions selected by the arguments' types.
+    fn applied_call<'node>(
+        &self,
+        name: TargetName<'node>,
+        arguments: Vec<&'node Expr>,
+        reached: &[(&'db DB::Function, Matched)],
+    ) -> Result<CallApplication<'node, 'db, DB>, LookupError> {
+        let types = arguments
+            .iter()
+            .map(|argument| self.type_of(argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let resolution = resolve_function(self.database, reached, &types);
+        Ok(CallApplication { name, arguments, resolution })
+    }
+
+    /// The call of the `pg_catalog` function `function` PostgreSQL's grammar
+    /// inserts over `arguments`, passed positionally.
+    fn inserted_call<'node>(
+        &self,
+        function: &'static str,
+        arguments: Vec<&'node Expr>,
+    ) -> Result<CallApplication<'node, 'db, DB>, LookupError> {
+        let name = TargetName::new(function, false).with_schema(PG_CATALOG, false);
+        let written = Vec::from_iter(core::iter::repeat_n(None, arguments.len()));
+        let reached = reached_by_name(self.database, &name, &written, self.case);
+        self.applied_call(name, arguments, &reached)
+    }
+
     /// The applications PostgreSQL builds for `expression` and what the node
     /// returns of them, `None` for a form the context does not derive.
     fn applications<'node>(
@@ -532,15 +688,24 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             Some(Form::Applies(applied, returns)) => (applied, returns),
         };
         let mut applications = Vec::with_capacity(applied.len());
-        for Applied { name, left, right, quantifier } in applied {
-            let right_type = self.type_of(right)?;
-            let (right, right_type) = match quantifier {
-                None => (Operand::Node(right), right_type),
-                Some(quantifier) => {
+        for Applied { name, left, right } in applied {
+            let (right, right_type) = match right {
+                Right::Node(node) => (Operand::Node(node), self.type_of(node)?),
+                Right::Elements(node, quantifier) => {
                     (
-                        quantifier.over(ArraySource::Node(right)),
-                        element_type(self.database, right_type),
+                        quantifier.over(ArraySource::Node(node)),
+                        element_type(self.database, self.type_of(node)?),
                     )
+                }
+                Right::Call(function, arguments) => {
+                    let call = self.inserted_call(function, arguments)?;
+                    let call_type = match &call.resolution {
+                        CallResolution::Selected(selected) => {
+                            without_typmod(selected.result_type().cloned())
+                        }
+                        _ => OperandType::Unknown,
+                    };
+                    (Operand::Call(Box::new(call)), call_type)
                 }
             };
             applications.push(self.resolved(name, left, right, &right_type)?);
@@ -554,7 +719,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         &self,
         name: TargetName<'node>,
         left: Option<&'node Expr>,
-        right: Operand<'node>,
+        right: Operand<'node, 'db, DB>,
         right_type: &OperandType<'_>,
     ) -> Result<OperatorApplication<'node, 'db, DB>, LookupError> {
         let left_type = left.map(|left| self.type_of(left)).transpose()?;
@@ -603,9 +768,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             Returns::Result => {
                 match applications.pop().map(|application| application.resolution) {
                     Some(OperatorResolution::Selected(selected)) => {
-                        selected.into_result_type().map_or(OperandType::Unknown, |type_name| {
-                            OperandType::Known { type_name, typmod: None }
-                        })
+                        without_typmod(selected.into_result_type())
                     }
                     _ => OperandType::Unknown,
                 }
@@ -893,19 +1056,33 @@ fn form(expression: &Expr) -> Option<Form<'_>> {
         | Expr::Collate { .. } => (Vec::new(), Returns::Result),
         Expr::BinaryOp { left, op, right } if !is_row(left) && !is_row(right) => {
             let name = binary_operator_name(op)?;
-            (
-                Vec::from([Applied { name, left: Some(left), right, quantifier: None }]),
-                Returns::Result,
-            )
+            let applied = Applied { name, left: Some(left), right: Right::Node(right) };
+            (Vec::from([applied]), Returns::Result)
         }
         Expr::UnaryOp { op, expr } => {
             (Vec::from([Applied::named(prefix_operator_name(*op)?, None, expr)]), Returns::Result)
         }
-        Expr::Like { negated, any, expr, pattern, escape_char: None } => {
-            like(if *negated { "!~~" } else { "~~" }, *any, expr, pattern)
+        Expr::Like { negated, any, expr, pattern, escape_char } => {
+            like(if *negated { "!~~" } else { "~~" }, *any, expr, pattern, escape_char.as_deref())?
         }
-        Expr::ILike { negated, any, expr, pattern, escape_char: None } => {
-            like(if *negated { "!~~*" } else { "~~*" }, *any, expr, pattern)
+        Expr::ILike { negated, any, expr, pattern, escape_char } => {
+            like(
+                if *negated { "!~~*" } else { "~~*" },
+                *any,
+                expr,
+                pattern,
+                escape_char.as_deref(),
+            )?
+        }
+        Expr::SimilarTo { negated, expr, pattern, escape_char } => {
+            let arguments =
+                core::iter::once(pattern.as_ref()).chain(escape_char.as_deref()).collect();
+            let applied = Applied {
+                name: TargetName::new(if *negated { "!~" } else { "~" }, false),
+                left: Some(expr),
+                right: Right::Call("similar_to_escape", arguments),
+            };
+            (Vec::from([applied]), Returns::Result)
         }
         // An undecorated `NULL` on either side turns the comparison into a
         // null test on the other operand, rows included.
@@ -945,22 +1122,26 @@ fn form(expression: &Expr) -> Option<Form<'_>> {
     Some(Form::Applies(applied, returns))
 }
 
-/// The applications of `expr [NOT] [I]LIKE pattern` under the operator
-/// `name`, or of `expr [NOT] [I]LIKE ANY (pattern)` when `any`.
+/// The applications of `expr [NOT] [I]LIKE pattern [ESCAPE escape]` under
+/// the operator `name`, or of `expr [NOT] [I]LIKE ANY (pattern)` when `any`.
 fn like<'node>(
     name: &'static str,
     any: bool,
     expr: &'node Expr,
     pattern: &'node Expr,
-) -> (Vec<Applied<'node>>, Returns) {
-    let quantifier = any.then_some(Quantifier::Any);
-    let applied = Applied {
-        name: TargetName::new(name, false),
-        left: Some(expr),
-        right: pattern,
-        quantifier,
+    escape: Option<&'node Expr>,
+) -> Option<(Vec<Applied<'node>>, Returns)> {
+    let (right, returns) = match (any, escape) {
+        (false, None) => (Right::Node(pattern), Returns::Result),
+        (false, Some(escape)) => {
+            (Right::Call("like_escape", Vec::from([pattern, escape])), Returns::Result)
+        }
+        (true, None) => (Right::Elements(pattern, Quantifier::Any), Returns::Bool),
+        // PostgreSQL's grammar takes no `ESCAPE` after `LIKE ANY`.
+        (true, Some(_)) => return None,
     };
-    (Vec::from([applied]), if any { Returns::Bool } else { Returns::Result })
+    let applied = Applied { name: TargetName::new(name, false), left: Some(expr), right };
+    Some((Vec::from([applied]), returns))
 }
 
 /// The application of `left op ANY|ALL (right)` over an array, `None` for a
@@ -975,7 +1156,7 @@ fn quantified<'node>(
         return None;
     }
     let name = binary_operator_name(op)?;
-    let applied = Applied { name, left: Some(left), right, quantifier: Some(quantifier) };
+    let applied = Applied { name, left: Some(left), right: Right::Elements(right, quantifier) };
     Some((Vec::from([applied]), Returns::Bool))
 }
 
@@ -1073,26 +1254,61 @@ fn unquoted_name(function: &Function) -> Option<&str> {
     }
 }
 
-/// The operands of `function` when it is the `NULLIF` expression, which
-/// PostgreSQL's grammar reads only unqualified, unquoted and with two plain
-/// arguments.
-fn nullif_operands(function: &Function) -> Option<(&Expr, &Expr)> {
-    let FunctionArguments::List(list) = &function.args else { return None };
-    let plain = unquoted_name(function).is_some_and(|name| name.eq_ignore_ascii_case("nullif"))
-        && matches!(function.parameters, FunctionArguments::None)
+/// The nodes the arguments of `function` come from, in the order it writes
+/// them, or `None` for a call written with an aggregate's or a window
+/// function's clauses, with a subquery or with a `*` argument.
+fn plain_arguments(function: &Function) -> Option<Vec<&Expr>> {
+    let plain = matches!(function.parameters, FunctionArguments::None)
         && function.filter.is_none()
         && function.null_treatment.is_none()
         && function.over.is_none()
-        && function.within_group.is_empty()
-        && list.duplicate_treatment.is_none()
-        && list.clauses.is_empty();
-    match list.args.as_slice() {
-        [
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(left)),
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(right)),
-        ] if plain => Some((left, right)),
+        && function.within_group.is_empty();
+    match &function.args {
+        _ if !plain => None,
+        FunctionArguments::None => Some(Vec::new()),
+        FunctionArguments::Subquery(_) => None,
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return None;
+            }
+            list.args
+                .iter()
+                .map(|argument| {
+                    match argument {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))
+                        | FunctionArg::Named { arg: FunctionArgExpr::Expr(argument), .. }
+                        | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(argument), .. } => {
+                            Some(argument)
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+/// The operands of `function` when it is the `NULLIF` expression, which
+/// PostgreSQL's grammar reads only unqualified, unquoted and with two plain
+/// positional arguments.
+fn nullif_operands(function: &Function) -> Option<(&Expr, &Expr)> {
+    if !unquoted_name(function).is_some_and(|name| name.eq_ignore_ascii_case("nullif")) {
+        return None;
+    }
+    let FunctionArguments::List(list) = &function.args else { return None };
+    if !list.args.iter().all(|argument| matches!(argument, FunctionArg::Unnamed(_))) {
+        return None;
+    }
+    match *plain_arguments(function)?.as_slice() {
+        [left, right] => Some((left, right)),
         _ => None,
     }
+}
+
+/// The type of a value of type `type_name`, which carries no modifier.
+fn without_typmod(type_name: Option<TargetName<'_>>) -> OperandType<'_> {
+    type_name
+        .map_or(OperandType::Unknown, |type_name| OperandType::Known { type_name, typmod: None })
 }
 
 /// Whether the selected operator returns `bool`, as PostgreSQL requires of
