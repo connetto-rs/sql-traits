@@ -781,6 +781,61 @@ fn natural_join_merges_shared_name() {
     assert_eq!(qualified.as_deref(), Some("a"));
 }
 
+fn merge_trees_db() -> ParserDB {
+    ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE p(a INT, x INT); CREATE TABLE q(a BIGINT, y NUMERIC);",
+    )
+    .expect("schema parses")
+}
+
+// Measured on PostgreSQL 18: a `USING` merge absorbs only the columns of its
+// own join tree, so another comma item, or another tree's merge, still
+// exposes the name and a bare reference meeting both is ambiguous.
+#[test]
+fn a_merge_absorbs_only_its_own_join_tree() {
+    let db = merge_trees_db();
+    for sql in [
+        "SELECT a FROM p AS o, p AS s JOIN q AS u USING (a)",
+        "SELECT a FROM p AS s JOIN q AS u USING (a), p AS o",
+        "SELECT a FROM p AS s JOIN q AS u USING (a), p AS r JOIN q AS w USING (a)",
+    ] {
+        assert!(
+            matches!(resolve_projection(sql, &db), Err(LookupError::AmbiguousTableLookup { .. })),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        resolve_projection("SELECT a FROM p AS s JOIN q AS u USING (a) JOIN p AS r USING (a)", &db),
+        Ok(None),
+        "a chained merge stands once"
+    );
+    assert_eq!(
+        resolve_projection("SELECT o.a FROM p AS o, p AS s JOIN q AS u USING (a)", &db),
+        Ok(Some("p".to_owned()))
+    );
+}
+
+// Measured on PostgreSQL 18: a wildcard keeps the columns of a comma item
+// outside a merge's join tree, and each tree's merged column once.
+#[test]
+fn a_wildcard_keeps_columns_outside_each_merge() {
+    let db = merge_trees_db();
+    let column = |sql: &str| resolve_projection(sql, &db).expect("resolves");
+    let outside =
+        "WITH v(c1, c2, c3, c4, c5) AS (SELECT * FROM p AS o, p AS s JOIN q AS u USING (a))";
+    assert_eq!(column(&format!("{outside} SELECT v.c1 FROM v")).as_deref(), Some("p"));
+    assert_eq!(column(&format!("{outside} SELECT v.c3 FROM v")), None);
+    assert_eq!(column(&format!("{outside} SELECT v.c5 FROM v")).as_deref(), Some("q"));
+    let qualified =
+        "WITH v AS (SELECT o.* FROM p AS o, p AS s JOIN q AS u USING (a)) SELECT v.a FROM v";
+    assert_eq!(column(qualified).as_deref(), Some("p"));
+    let two = "WITH v(c1, c2, c3, c4, c5, c6) AS
+        (SELECT * FROM p AS s JOIN q AS u USING (a), p AS r JOIN q AS w USING (a))";
+    assert_eq!(column(&format!("{two} SELECT v.c1 FROM v")), None);
+    assert_eq!(column(&format!("{two} SELECT v.c4 FROM v")), None);
+    assert_eq!(column(&format!("{two} SELECT v.c6 FROM v")).as_deref(), Some("q"));
+}
+
 // Measured on PostgreSQL 18.4: a relation whose output exposes one name twice
 // answers neither a qualified nor a bare reference to it (`column reference
 // ... is ambiguous`).
