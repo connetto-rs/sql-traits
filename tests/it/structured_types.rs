@@ -207,6 +207,29 @@ fn clickhouse_wrappers_answer_the_wrapped_facts() {
 }
 
 #[test]
+fn collated_elements_keys_and_values_answer_the_collated_facts() {
+    let database = declaring::<DatabricksDialect>("ARRAY<VARCHAR(8) COLLATE UTF8_LCASE>");
+    let element = column_type(&database).array_element(&database).expect("an array");
+    assert_eq!(element.max_character_length(&database), Some(8));
+    assert_eq!(element.character_length_unit(&database), Some(CharacterLengthUnit::Characters));
+
+    let database = declaring::<DatabricksDialect>("ARRAY<CHAR(8) COLLATE UNICODE_CI>");
+    let element = column_type(&database).array_element(&database).expect("an array");
+    assert_eq!(element.max_character_length(&database), Some(8));
+
+    let database = declaring::<DatabricksDialect>(
+        "MAP<VARCHAR(2) COLLATE UTF8_BINARY, VARCHAR(4) COLLATE UNICODE>",
+    );
+    let entry = column_type(&database).map_entry(&database).expect("a map answers its entry");
+    assert_eq!(entry.key().max_character_length(&database), Some(2));
+    assert_eq!(entry.value().max_character_length(&database), Some(4));
+    assert_eq!(
+        entry.value().character_length_unit(&database),
+        Some(CharacterLengthUnit::Characters)
+    );
+}
+
+#[test]
 fn fields_answer_names_types_nullability_options_and_collations() {
     let database = declaring::<BigQueryDialect>(
         "STRUCT<`Code` INT64, amount NUMERIC(10, 2) OPTIONS(rounding_mode = 'ROUND_HALF_EVEN')>",
