@@ -128,6 +128,9 @@ enum Form<'node> {
     /// `NULLIF`, a `NullIfExpr` applying `=` and returning its first operand
     /// as `=` converts it.
     NullIf(Applied<'node>),
+    /// `IS [NOT] DISTINCT FROM` an undecorated `NULL`, a `NullTest` on the
+    /// other operand, applying no operator and returning `bool`.
+    NullTest,
 }
 
 /// An operator name applied to operand nodes.
@@ -258,6 +261,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                         }
                     }
                     (None, Some(Form::NullIf(applied))) => self.nullif_type(&applied)?,
+                    (None, Some(Form::NullTest)) => catalog("bool"),
                     (None, Some(Form::Plain) | None) => OperandType::Unknown,
                 }
             }
@@ -272,7 +276,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// and a `-` folded into a numeric literal apply none. A binary or
     /// prefix operator, `[NOT] LIKE` and `[NOT] ILIKE` apply one operator
     /// (`~~`, `!~~`, `~~*`, `!~~*`), and `IS [NOT] DISTINCT FROM` and
-    /// `NULLIF` apply `=`. A parenthesized node answers for its content.
+    /// `NULLIF` apply `=`, except that `IS [NOT] DISTINCT FROM` an
+    /// undecorated `NULL` tests the other operand for null and applies none.
+    /// A parenthesized node answers for its content.
     /// Row comparisons, `LIKE ... ESCAPE`, `IN`, `BETWEEN`, `SIMILAR TO`,
     /// `ANY`, `ALL`, the boolean connectives and calls answer `None`.
     ///
@@ -320,7 +326,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         }
         let applied = match form(expression) {
             None => return Ok(None),
-            Some(Form::Plain) => return Ok(Some(Vec::new())),
+            Some(Form::Plain | Form::NullTest) => return Ok(Some(Vec::new())),
             Some(Form::Operator(applied) | Form::Distinct(applied) | Form::NullIf(applied)) => {
                 applied
             }
@@ -520,6 +526,13 @@ fn form(expression: &Expr) -> Option<Form<'_>> {
                 pattern,
             ))
         }
+        // An undecorated `NULL` on either side turns the comparison into a
+        // null test on the other operand, rows included.
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right)
+            if is_null(left) || is_null(right) =>
+        {
+            Form::NullTest
+        }
         Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right)
             if !is_row(left) && !is_row(right) =>
         {
@@ -531,6 +544,12 @@ fn form(expression: &Expr) -> Option<Form<'_>> {
         }
         _ => return None,
     })
+}
+
+/// Whether `expression` is the undecorated `NULL` literal, parentheses
+/// aside, as `exprIsNullConstant` reads it.
+fn is_null(expression: &Expr) -> bool {
+    matches!(unparenthesized(expression), Expr::Value(value) if value.value == Value::Null)
 }
 
 /// Whether `expression` is a row constructor, which turns a comparison into a

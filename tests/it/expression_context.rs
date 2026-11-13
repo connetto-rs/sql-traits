@@ -470,3 +470,24 @@ fn parentheses_answer_for_their_content() {
     let greater = Some(Vec::from([">".to_owned()]));
     assert_eq!(applied(&context, &nodes), [greater, Some(Vec::new()), Some(Vec::new())]);
 }
+
+/// `IS [NOT] DISTINCT FROM` an undecorated `NULL`, parenthesized or not, is a
+/// null test on the other operand, which applies no `=` even for a type that
+/// has none, while a typed `NULL` still compares through `=`.
+#[test]
+fn distinct_from_a_bare_null_applies_no_operator() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (i INT4, x XML);").unwrap();
+    let query = query(
+        "SELECT NULL IS DISTINCT FROM i, i IS NOT DISTINCT FROM (NULL), NULL IS DISTINCT FROM NULL,
+                x IS DISTINCT FROM NULL, (1, 2) IS DISTINCT FROM NULL, i IS DISTINCT FROM NULL::int4
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    assert!(nodes.iter().all(|node| context.type_of(node).unwrap() == pg("bool")));
+    let none = Some(Vec::new());
+    assert_eq!(
+        applied(&context, &nodes),
+        [none.clone(), none.clone(), none.clone(), none.clone(), none, Some(vec!["=".to_owned()])]
+    );
+}
