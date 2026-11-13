@@ -48,7 +48,7 @@ pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
     SettingContent, SettingPresence, SettingValue, TimeZoneSource,
 };
-pub use expression_context::ExpressionContext;
+pub use expression_context::{ArraySource, ExpressionContext, Operand, OperatorApplication};
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;

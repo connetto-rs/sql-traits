@@ -252,9 +252,33 @@ fn selected<'db, D: DatabaseLike>(
         .and_then(|left| Ok((operand(usize::from(left.is_some()), &candidate.right)?, left)));
     match operands {
         Ok((right, left)) => {
-            OperatorResolution::Selected(SelectedOperator::new(candidate.operator, left, right))
+            OperatorResolution::Selected(SelectedOperator::new(
+                candidate.operator,
+                left,
+                right,
+                result_type(database, candidate.operator, binding),
+            ))
         }
         Err(Refusal::Unbound) => OperatorResolution::UnboundPolymorphic(candidate.operator),
         Err(Refusal::Undetermined) => OperatorResolution::Undetermined,
+    }
+}
+
+/// The type `operator` returns, its declared result named canonically or the
+/// type `binding` binds a polymorphic result to, [`None`] when the database
+/// does not answer it or the binding leaves it open.
+fn result_type<'db, D: DatabaseLike>(
+    database: &'db D,
+    operator: &'db D::Operator,
+    binding: Option<&Binding<'_>>,
+) -> Option<TargetName<'db>> {
+    let declared = canonical_owned(database, PgType::from_target(&operator.result_type(database)?));
+    let Some(polymorphic) = declared.polymorphic() else {
+        return type_name(database, &declared);
+    };
+    match binding?.bound(polymorphic) {
+        BoundType::Type(bound) => type_name(database, &bound.pg_type),
+        BoundType::ArrayOf(bound) => array_type_name(database, &bound.pg_type),
+        BoundType::Unbound | BoundType::Undetermined => None,
     }
 }

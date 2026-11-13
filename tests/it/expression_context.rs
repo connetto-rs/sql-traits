@@ -149,16 +149,14 @@ fn references_bind_and_type_in_their_own_scope() {
     assert!(context.reference(comparison).unwrap().is_none());
 }
 
-/// A reference that reaches no column, and an expression this context does
-/// not type, take no type.
+/// A reference that reaches no column takes no type.
 #[test]
-fn unresolved_and_untyped_nodes_take_no_type() {
+fn unresolved_references_take_no_type() {
     let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE shares (weight INT);").unwrap();
-    let query = query("SELECT nope, weight + 1 FROM shares");
+    let query = query("SELECT nope FROM shares");
     let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
-    let [missing, sum] = projected(&query)[..] else { unreachable!() };
+    let [missing] = projected(&query)[..] else { unreachable!() };
     assert_eq!(context.type_of(missing).unwrap(), OperandType::Unknown);
-    assert_eq!(context.type_of(sum).unwrap(), OperandType::Unknown);
 }
 
 /// An output of a derived table takes the type of the expression defining
@@ -272,4 +270,226 @@ fn references_bind_as_their_clause_binds_them() {
     };
     assert!(context.reference(z).unwrap().is_none());
     assert_eq!(context.type_of(z).unwrap(), OperandType::Unknown);
+}
+
+const OPERANDS: &str = "CREATE TABLE t (i INT4, s INT2, v VARCHAR(5), n NUMERIC(6, 2), a INT4[]);";
+
+/// The operator names each node applies, in order, `None` for a node whose
+/// applications the context does not derive.
+fn applied<DB: DatabaseLike>(
+    context: &ExpressionContext<'_, '_, DB>,
+    nodes: &[&Expr],
+) -> Vec<Option<Vec<String>>> {
+    nodes
+        .iter()
+        .map(|node| {
+            context.operators(node).unwrap().map(|applications| {
+                applications.iter().map(|application| application.name().to_string()).collect()
+            })
+        })
+        .collect()
+}
+
+/// An operator node takes the result type of the operator PostgreSQL 18
+/// selects for it, as a view over the same expressions reports.
+#[test]
+fn operators_take_the_selected_operators_result_type() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(OPERANDS).unwrap();
+    let query = query(
+        "SELECT i > 1.5, n + 1, v || 'x', a || 5, i = s, -i, +1, v NOT LIKE 'a%', v ILIKE 'a',
+                v IS DISTINCT FROM 'x', v IS NOT DISTINCT FROM 'x', i OPERATOR(pg_catalog.+) 1
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let types: Vec<_> = nodes.iter().map(|node| context.type_of(node).unwrap()).collect();
+    let Expr::BinaryOp { left: array, .. } = nodes[3] else { unreachable!() };
+    let int4_array = context.type_of(array).unwrap();
+    assert_eq!(
+        types,
+        [
+            pg("bool"),
+            pg("numeric"),
+            pg("text"),
+            int4_array,
+            pg("bool"),
+            pg("int4"),
+            pg("int4"),
+            pg("bool"),
+            pg("bool"),
+            pg("bool"),
+            pg("bool"),
+            pg("int4"),
+        ]
+    );
+    let names = |names: &[&str]| Some(names.iter().map(ToString::to_string).collect());
+    assert_eq!(
+        applied(&context, &nodes),
+        [
+            names(&[">"]),
+            names(&["+"]),
+            names(&["||"]),
+            names(&["||"]),
+            names(&["="]),
+            names(&["-"]),
+            names(&["+"]),
+            names(&["!~~"]),
+            names(&["~~*"]),
+            names(&["="]),
+            names(&["="]),
+            names(&["pg_catalog.+"]),
+        ]
+    );
+
+    // `i > 1.5` converts `i` to `numeric` by a cast function.
+    let Expr::BinaryOp { left: i, right: literal, .. } = nodes[0] else { unreachable!() };
+    let applications = context.operators(nodes[0]).unwrap().unwrap();
+    assert!(applications[0].left().is_some_and(|left| core::ptr::eq(left, i.as_ref())));
+    assert!(
+        matches!(applications[0].right(), Operand::Node(right) if core::ptr::eq(*right, literal.as_ref()))
+    );
+    let OperatorResolution::Selected(greater) = applications[0].resolution() else {
+        unreachable!()
+    };
+    assert!(matches!(
+        greater.left().map(OperandEvidence::conversion),
+        Some([CoercionStep::Function(_)])
+    ));
+    assert_eq!(greater.result_type().map(TargetName::name), Some("bool"));
+
+    // The prefix `-` over a column applies to that column alone.
+    let applications = context.operators(nodes[5]).unwrap().unwrap();
+    assert!(applications[0].left().is_none());
+}
+
+/// A `-` over a numeric literal folds into the constant, as PostgreSQL's
+/// grammar does, so it selects no operator and the sign decides the type.
+#[test]
+fn negated_numeric_literals_fold_into_constants() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("").unwrap();
+    let query = query(
+        "SELECT -2147483648, -(2147483648), - -1, -9223372036854775808, -1.5, -0x80000000,
+                -2147483649",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let types: Vec<_> = nodes.iter().map(|node| context.type_of(node).unwrap()).collect();
+    assert_eq!(
+        types,
+        [pg("int4"), pg("int4"), pg("int4"), pg("int8"), pg("numeric"), pg("int4"), pg("int8"),]
+    );
+    assert!(
+        applied(&context, &nodes).iter().all(|names| names.as_ref().is_some_and(Vec::is_empty))
+    );
+}
+
+/// `NULLIF` applies `=` and takes its first operand's type as `=` converts
+/// it, keeping the operand's modifier only when nothing converts it.
+#[test]
+fn nullif_takes_its_first_operand_as_equality_converts_it() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(OPERANDS).unwrap();
+    let query = query("SELECT NULLIF(i, 1.5), NULLIF(v, 'x'), NULLIF(n, 1), NULLIF(s, 1) FROM t");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let types: Vec<_> = nodes.iter().map(|node| context.type_of(node).unwrap()).collect();
+    let numeric_6_2 = OperandType::Known {
+        type_name: TargetName::new("numeric", false).with_schema("pg_catalog", false),
+        typmod: Some((6 << 16 | 2) + 4),
+    };
+    assert_eq!(types, [pg("numeric"), pg("text"), numeric_6_2, pg("int2")]);
+    let equals = Some(Vec::from(["=".to_owned()]));
+    assert_eq!(applied(&context, &nodes), [equals.clone(), equals.clone(), equals.clone(), equals]);
+}
+
+/// The forms whose operators a later slice derives answer `None`, never an
+/// empty list that would claim they apply none.
+#[test]
+fn forms_not_yet_derived_answer_none() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(OPERANDS).unwrap();
+    let query = query(
+        "SELECT i IN (1, 2), i BETWEEN 1 AND 2, v LIKE 'a' ESCAPE '!', (1, 2) = (1, 2),
+                ROW(1, 2) = ROW(1, 2), i > 0 AND i < 9, NOT true, length(v),
+                pg_catalog.length(v), 1 OPERATOR(a.b.+) 1, 5 !
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    assert!(applied(&context, &nodes).iter().all(Option::is_none));
+    assert!(nodes.iter().all(|node| context.type_of(node).unwrap() == OperandType::Unknown));
+}
+
+/// Every operator symbol PostgreSQL's dialect writes is looked up by that
+/// symbol, prefix and binary alike, and `OPERATOR(op)` by the name inside.
+#[test]
+fn operators_are_looked_up_by_the_symbol_written() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("").unwrap();
+    let binary = [
+        "+", "-", "*", "/", "%", "||", ">", "<", ">=", "<=", "=", "<>", "<=>", "|", "&", "^", "#",
+        "<<", ">>", "&&", "~", "~*", "!~", "!~*", "~~", "~~*", "!~~", "!~~*", "^@", "->", "->>",
+        "#>", "#>>", "@@", "@>", "<@", "#-", "@?", "?", "?&", "?|", "##", "<->", "&<", "&>", "<<|",
+        "|>>", "&<|", "|&>", "<^", ">^", "?#", "?-", "?-|", "?||", "@", "~=", "%%",
+    ];
+    let prefix = ["-", "+", "~", "@", "|/", "||/", "!!", "@-@", "@@", "#", "?-", "?|"];
+    let sql = binary
+        .iter()
+        .map(|symbol| format!("1 {symbol} 1"))
+        .chain(prefix.iter().map(|symbol| format!("{symbol} x")))
+        .chain([String::from("1 OPERATOR(+) 1")])
+        .collect::<Vec<_>>();
+    let query = query(&format!("SELECT {}", sql.join(", ")));
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let written: Vec<_> = binary
+        .iter()
+        .chain(&prefix)
+        .chain(&["+"])
+        .map(|symbol| Some(vec![(*symbol).to_owned()]))
+        .collect();
+    assert_eq!(applied(&context, &projected(&query)), written);
+}
+
+/// An operator no overload takes leaves its node untyped, and the node still
+/// reports the operator it applies.
+#[test]
+fn unresolved_operators_leave_their_nodes_untyped() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(OPERANDS).unwrap();
+    let query = query("SELECT -true, v IS DISTINCT FROM a, NULLIF(v, a) FROM t");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    for node in projected(&query) {
+        assert_eq!(context.type_of(node).unwrap(), OperandType::Unknown, "{node}");
+        let applications = context.operators(node).unwrap().unwrap();
+        assert!(matches!(applications[0].resolution(), OperatorResolution::NotFound), "{node}");
+    }
+}
+
+/// A parenthesized node applies what its content applies, and a column
+/// reference or a `COLLATE` applies no operator of its own.
+#[test]
+fn parentheses_answer_for_their_content() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(OPERANDS).unwrap();
+    let query = query("SELECT (i > 1), i, v COLLATE \"C\" FROM t");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let greater = Some(Vec::from([">".to_owned()]));
+    assert_eq!(applied(&context, &nodes), [greater, Some(Vec::new()), Some(Vec::new())]);
+}
+
+/// `IS [NOT] DISTINCT FROM` an undecorated `NULL`, parenthesized or not, is a
+/// null test on the other operand, which applies no `=` even for a type that
+/// has none, while a typed `NULL` still compares through `=`.
+#[test]
+fn distinct_from_a_bare_null_applies_no_operator() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (i INT4, x XML);").unwrap();
+    let query = query(
+        "SELECT NULL IS DISTINCT FROM i, i IS NOT DISTINCT FROM (NULL), NULL IS DISTINCT FROM NULL,
+                x IS DISTINCT FROM NULL, (1, 2) IS DISTINCT FROM NULL, i IS DISTINCT FROM NULL::int4
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    assert!(nodes.iter().all(|node| context.type_of(node).unwrap() == pg("bool")));
+    let none = Some(Vec::new());
+    assert_eq!(
+        applied(&context, &nodes),
+        [none.clone(), none.clone(), none.clone(), none.clone(), none, Some(vec!["=".to_owned()])]
+    );
 }

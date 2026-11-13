@@ -24,6 +24,11 @@ pub enum OperandType<'a> {
 
 /// What PostgreSQL does with an operator invocation.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "A resolution is returned once per invocation and moved, so boxing the selection \
+              would add a heap allocation to every invocation."
+)]
 pub enum OperatorResolution<'db, DB: DatabaseLike> {
     /// PostgreSQL runs this operator.
     Selected(SelectedOperator<'db, DB>),
@@ -45,16 +50,19 @@ pub struct SelectedOperator<'db, DB: DatabaseLike> {
     operator: &'db DB::Operator,
     left: Option<OperandEvidence<'db, DB>>,
     right: OperandEvidence<'db, DB>,
+    result: Option<TargetName<'db>>,
 }
 
 impl<'db, DB: DatabaseLike> SelectedOperator<'db, DB> {
-    /// Creates the selection of `operator` with the evidence of each operand.
+    /// Creates the selection of `operator` with the evidence of each operand
+    /// and the type it returns.
     pub(crate) const fn new(
         operator: &'db DB::Operator,
         left: Option<OperandEvidence<'db, DB>>,
         right: OperandEvidence<'db, DB>,
+        result: Option<TargetName<'db>>,
     ) -> Self {
-        Self { operator, left, right }
+        Self { operator, left, right, result }
     }
 
     /// Returns the selected operator.
@@ -73,6 +81,24 @@ impl<'db, DB: DatabaseLike> SelectedOperator<'db, DB> {
     #[must_use]
     pub const fn right(&self) -> &OperandEvidence<'db, DB> {
         &self.right
+    }
+
+    /// Returns the type the invocation returns, the operator's declared
+    /// result or, for a polymorphic one, the type the operands bind it to,
+    /// or `None` when the database does not answer it.
+    #[must_use]
+    pub const fn result_type(&self) -> Option<&TargetName<'db>> {
+        self.result.as_ref()
+    }
+
+    /// Moves out the type the invocation returns.
+    pub(crate) fn into_result_type(self) -> Option<TargetName<'db>> {
+        self.result
+    }
+
+    /// Moves out what the left operand takes.
+    pub(crate) fn into_left(self) -> Option<OperandEvidence<'db, DB>> {
+        self.left
     }
 }
 
@@ -114,6 +140,11 @@ impl<'db, DB: DatabaseLike> OperandEvidence<'db, DB> {
     #[must_use]
     pub fn conversion(&self) -> &[CoercionStep<'db, DB>] {
         &self.conversion
+    }
+
+    /// Moves out the type the operand takes.
+    pub(crate) fn into_target(self) -> TargetName<'db> {
+        self.target
     }
 }
 
