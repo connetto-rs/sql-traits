@@ -11,7 +11,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::{IdentifierCase, TargetName, TypeCategory},
+    structs::{IdentifierCase, TargetName, TypeCategory, TypeKind},
     traits::{DatabaseLike, FunctionLike},
     utils::{
         call_sites::{ExpressionForm, expression_form},
@@ -24,7 +24,7 @@ use crate::{
             function_search_path, overqualified_object_name, run_time_object_name,
             target_name_from_object_name,
         },
-        postgres_types::{PgType, Polymorphic, parse_data_type},
+        postgres_types::{ElementForm, PgType, Polymorphic, parse_data_type},
     },
 };
 
@@ -369,7 +369,7 @@ fn bind_families<'a, D: DatabaseLike>(
     let mut element: Option<Bound<'a>> = None;
     let mut array: Option<Bound<'a>> = None;
     let mut element_undetermined = false;
-    let mut nonarray = false;
+    let mut element_form = ElementForm::Any;
     let mut compatible: Vec<Bound<'a>> = Vec::new();
     let mut compatible_undetermined = false;
     let mut compatible_nonarray = false;
@@ -406,8 +406,8 @@ fn bind_families<'a, D: DatabaseLike>(
                     }
                 }
             }
-            Some(Polymorphic::Element { nonarray: refuses_arrays }) => {
-                nonarray |= refuses_arrays;
+            Some(Polymorphic::Element(form)) => {
+                element_form = element_form.max(form);
                 match (actual, known) {
                     (None, _) => element_undetermined = true,
                     (Some(_), None) => {}
@@ -464,7 +464,7 @@ fn bind_families<'a, D: DatabaseLike>(
     }
 
     let (element, element_uncertain) =
-        element_family(database, element, array.as_ref(), element_undetermined, nonarray)?;
+        element_family(database, element, array.as_ref(), element_undetermined, element_form)?;
     let (compatible, compatible_uncertain) =
         compatible_family(database, compatible, compatible_undetermined, compatible_nonarray)?;
     Some((
@@ -483,15 +483,37 @@ fn takes_as_nonarray<D: DatabaseLike>(database: &D, bound: &Bound<'_>) -> Option
     }
 }
 
+/// How `anyenum` takes the bound type, [`None`] when the type is not of the
+/// enum kind, as a domain over an enum and a base type of the enum category
+/// are not, and otherwise whether the database's facts leave that open.
+///
+/// A bound pseudo-type, an operand typed as `anyenum` itself among them,
+/// stays open as its exact match does elsewhere.
+fn takes_as_enum<D: DatabaseLike>(database: &D, bound: &Bound<'_>) -> Option<bool> {
+    if bound.pg_type.polymorphic().is_some() {
+        return Some(true);
+    }
+    let Some(facts) = facts(database, &bound.pg_type) else { return Some(true) };
+    // Every enum is in the enum category, whatever a base type declares.
+    if facts.category() != TypeCategory::ENUM {
+        return None;
+    }
+    match facts.kind() {
+        Some(TypeKind::Enum) => Some(false),
+        Some(_) => None,
+        None => Some(true),
+    }
+}
+
 /// What `anyelement` binds to, the element of the `anyarray` argument when no
 /// `anyelement` argument decides it, with whether the database's facts leave
-/// it open, or [`None`] when the two disagree.
+/// it open, or [`None`] when the two disagree or `form` refuses the type.
 fn element_family<'a, D: DatabaseLike>(
     database: &D,
     element: Option<Bound<'a>>,
     array: Option<&Bound<'a>>,
     undetermined: bool,
-    nonarray: bool,
+    form: ElementForm,
 ) -> Option<(Family<Bound<'a>>, bool)> {
     let from_array = match array {
         Some(array) => Some(array.element()?),
@@ -502,9 +524,10 @@ fn element_family<'a, D: DatabaseLike>(
         (Some(element), _) => Some(element),
         (None, from_array) => from_array,
     };
-    let uncertain = match &element {
-        Some(bound) if nonarray => takes_as_nonarray(database, bound)?,
-        _ => false,
+    let uncertain = match (&element, form) {
+        (Some(bound), ElementForm::Enum) => takes_as_enum(database, bound)?,
+        (Some(bound), ElementForm::NonArray) => takes_as_nonarray(database, bound)?,
+        (_, _) => false,
     };
     Some((
         match element {
@@ -562,7 +585,7 @@ impl<'a> Binding<'a> {
     /// What a parameter declared `polymorphic` binds to for the call.
     pub(crate) fn bound(&self, polymorphic: Polymorphic) -> BoundType<'_, 'a> {
         let (family, array) = match polymorphic {
-            Polymorphic::Element { .. } => (&self.element, false),
+            Polymorphic::Element(_) => (&self.element, false),
             Polymorphic::Array => {
                 if let (Some(array), Family::Decided(_)) = (&self.array, &self.element) {
                     return BoundType::Type(Cow::Borrowed(array));

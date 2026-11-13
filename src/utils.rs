@@ -25,6 +25,7 @@ pub(crate) mod object_name;
 pub(crate) mod operator_typing;
 mod postgres_null_returning;
 pub(crate) mod postgres_types;
+pub(crate) mod type_modifier;
 pub(crate) use postgres_null_returning::null_returning_positions;
 pub use postgres_null_returning::postgres_null_returning_arguments;
 mod output_from_wildcard;

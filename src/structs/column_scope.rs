@@ -8,7 +8,10 @@ use crate::{
     errors::LookupError,
     impls::dql::{
         ColumnOrigin, build_definition_graph,
-        definition_graph::{DefinitionGraph, DefinitionId, QueryId, ScopeCursor, table_graph},
+        definition_graph::{
+            DefinitionGraph, DefinitionId, QueryId, ScopeCursor, reference_sites::SiteRule,
+            table_graph,
+        },
     },
     structs::IdentifierCase,
     traits::DatabaseLike,
@@ -1118,6 +1121,22 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
     {
         self.graph.resolve_binding(self.root, reference)
+    }
+
+    /// The rule resolving each column reference of `query`, by the address
+    /// of its expression, `None` for one sitting where no scope was derived.
+    pub(crate) fn site_rules(&self, query: &Query) -> alloc::vec::Vec<(usize, Option<SiteRule>)> {
+        self.graph.site_rules(query)
+    }
+
+    /// Resolves `reference` as `rule` says its clause resolves it.
+    pub(crate) fn resolve_site(
+        &self,
+        rule: SiteRule,
+        reference: &Expr,
+    ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
+    {
+        self.graph.resolve_site(rule, reference)
     }
 
     /// Resolves a relation qualifier with no column, such as a qualified

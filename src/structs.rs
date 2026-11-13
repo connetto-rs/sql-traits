@@ -4,6 +4,7 @@
 mod absent;
 mod column_scope;
 mod deployment;
+mod expression_context;
 pub(crate) mod fingerprint;
 mod foreign_table_source;
 pub mod generic_db;
@@ -47,6 +48,7 @@ pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
     SettingContent, SettingPresence, SettingValue, TimeZoneSource,
 };
+pub use expression_context::ExpressionContext;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
@@ -76,7 +78,7 @@ pub(crate) use sequence::StoredSequenceOwner;
 pub use sequence_parameters::{SequenceParameters, SequenceType};
 pub use table_privileges::{ColumnPrivilege, TablePrivileges};
 pub use target_name::TargetName;
-pub use type_facts::{DomainFacts, TypeCategory, TypeFacts};
+pub use type_facts::{DomainFacts, TypeCategory, TypeFacts, TypeKind};
 pub(crate) use user_defined_type::AttributeCollation;
 pub use user_defined_type::UserDefinedType;
 pub use view::{MaterializedView, View, ViewDeclaration};

@@ -237,7 +237,7 @@ fn every_answered_name_parses_back_as_its_type() {
         ("array_agg(x)", [Some("vector(3)")]),
         ("array_agg(x)", [Some("geometry")]),
         ("array_agg(x)", [Some("app.\"Mood\"")]),
-        ("min(x)", [Some("vector(3)")]),
+        ("min(x)", [Some("app.\"Mood\"")]),
         ("array_agg(x)", [Some("TIMESTAMP(3) WITH TIME ZONE")]),
     ] {
         let answer = returns(&db, expression, &types).expect("the call has a result type");
@@ -354,7 +354,8 @@ fn named_notation_maps_every_argument_once() -> Result<(), LookupError> {
     Ok(())
 }
 
-/// The `anyelement` family binds one type, and `anyarray` the array over it.
+/// The `anyelement` family binds one type, `anyarray` the array over it, and
+/// `anyenum` only an enum type.
 #[test]
 fn the_element_family_binds_one_type() {
     let db = db("CREATE FUNCTION first_of(xs anyarray) RETURNS anyelement LANGUAGE sql AS 'SELECT xs[1]';
@@ -362,7 +363,9 @@ fn the_element_family_binds_one_type() {
          CREATE FUNCTION both(x anyelement, xs anyarray) RETURNS anyelement LANGUAGE sql AS 'SELECT x';
          CREATE FUNCTION same(a anyelement, b anyelement) RETURNS anyelement LANGUAGE sql AS 'SELECT a';
          CREATE FUNCTION firsts(VARIADIC xs anyarray) RETURNS anyelement LANGUAGE sql AS 'SELECT xs[1]';
-         CREATE FUNCTION ranged(x anyelement) RETURNS anyrange LANGUAGE sql AS 'SELECT NULL';");
+         CREATE FUNCTION ranged(x anyelement) RETURNS anyrange LANGUAGE sql AS 'SELECT NULL';
+         CREATE TYPE mood AS ENUM ('calm');
+         CREATE DOMAIN dmood AS mood;");
     let cases: &[Case<'_>] = &[
         ("first_of(xs)", &[Some("INT[]")], Some("INT")),
         ("first_of(xs)", &[Some("INT[][]")], Some("INT")),
@@ -381,6 +384,10 @@ fn the_element_family_binds_one_type() {
         ("firsts(1, 2)", &[Some("INT"), Some("BIGINT")], None),
         ("ranged(x)", &[Some("INT")], None),
         ("rank(x)", &[Some("TEXT")], Some("BIGINT")),
+        ("enum_first(x)", &[Some("mood")], Some("mood")),
+        ("enum_range(x)", &[Some("mood")], Some("mood[]")),
+        ("enum_first(x)", &[Some("INT")], None),
+        ("enum_first(x)", &[Some("dmood")], None),
     ];
     for (expression, types, expected) in cases {
         assert_eq!(returns(&db, expression, types).as_deref(), *expected, "{expression} {types:?}");

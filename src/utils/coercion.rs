@@ -10,7 +10,7 @@
 use alloc::{borrow::Cow, vec::Vec};
 
 use crate::{
-    structs::{CoercionStep, IdentifierCase, TargetName, TypeCategory, TypeFacts},
+    structs::{CoercionStep, IdentifierCase, TargetName, TypeCategory, TypeFacts, TypeKind},
     traits::{CastContext, CastLike, CastMethod, DatabaseLike, Relation, TableLike},
     utils::{
         object_name::{PG_CATALOG, type_search_path},
@@ -114,9 +114,11 @@ pub(crate) fn facts<'db, D: DatabaseLike>(
         PgType::Catalog(name) => {
             database.type_facts(TargetName::new(name, true).with_schema(PG_CATALOG, false))
         }
-        // Every array type is in the array category and none is preferred.
+        // Every array type is a base type in the array category, none
+        // preferred.
         PgType::Array(element) => {
-            facts(database, element).map(|_| TypeFacts::new(TypeCategory::ARRAY, false))
+            facts(database, element)
+                .map(|_| TypeFacts::new(TypeCategory::ARRAY, false).with_kind(TypeKind::Base))
         }
         PgType::Named(name) => database.type_facts(view(name)),
         PgType::Other(_) => None,

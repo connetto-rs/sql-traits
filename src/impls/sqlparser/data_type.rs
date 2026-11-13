@@ -176,6 +176,11 @@ impl DataTypeLike for DataType {
         }
     }
 
+    #[inline]
+    fn typmod(&self, _database: &Self::DB) -> Option<crate::traits::TypeModifier> {
+        crate::utils::type_modifier::declared(stored_as(self))
+    }
+
     fn vector(&self, database: &Self::DB) -> Option<VectorType> {
         let Self::Custom(name, modifiers) = self else {
             return None;

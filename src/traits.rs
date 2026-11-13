@@ -15,8 +15,8 @@ pub use column::{
 };
 pub use data_type::{
     BinarySend, CharacterLengthUnit, DataTypeLike, EnumWidth, Enumeration, EnumerationKind,
-    EnumerationMember, IntervalFields, MapEntry, StructureKind, StructuredField, VectorKind,
-    VectorType,
+    EnumerationMember, IntervalFields, MapEntry, StructureKind, StructuredField, TypeModifier,
+    VectorKind, VectorType,
 };
 pub mod index;
 pub use database::{DatabaseLike, Relation};

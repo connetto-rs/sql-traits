@@ -533,6 +533,14 @@ pub enum LookupError {
         /// The call as rendered by sqlparser.
         call: String,
     },
+    /// An expression handed to an expression context is not a node of the
+    /// query it was built over, for instance because it was borrowed from a
+    /// copy of that query.
+    #[error("Expression `{expression}` is not a node of the context's query.")]
+    ExpressionNotInQuery {
+        /// The expression as rendered by sqlparser.
+        expression: String,
+    },
     /// The argument types handed in with a call do not give one type per
     /// argument the call writes.
     #[error("Call `{call}` writes {arguments} arguments, but {types} argument types were given.")]

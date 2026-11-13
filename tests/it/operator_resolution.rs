@@ -198,6 +198,34 @@ fn polymorphic_operators_bind_their_operands() {
     );
 }
 
+/// `anyenum` binds only an enum type, refusing a domain over one and a base
+/// type of the enum category, as PostgreSQL 18 refuses `#? 1`,
+/// `#? 'calm'::dmood` and `#? '1'::fake`.
+#[test]
+fn enum_operators_take_only_enum_operands() {
+    let catalog = PostgresCatalog::default().with_operator(
+        PostgresCatalogOperator::new("#?", None, pg("anyenum")).with_schema("public", false),
+    );
+    let db = ParseOptions::default()
+        .with_postgres_catalog(catalog)
+        .parse::<PostgreSqlDialect>(
+            "CREATE TYPE mood AS ENUM ('calm'); CREATE DOMAIN dmood AS mood;
+             CREATE TYPE fake (INPUT = fake_in, OUTPUT = fake_out, CATEGORY = 'E');",
+        )
+        .unwrap();
+    assert_eq!(resolved(&db, op("#?"), None, known("int4")), "not found");
+    assert_eq!(resolved(&db, op("#?"), None, known("dmood")), "not found");
+    assert_eq!(resolved(&db, op("#?"), None, known("mood[]")), "not found");
+    assert_eq!(resolved(&db, op("#?"), None, known("fake")), "not found");
+    assert_eq!(
+        resolved(&db, op("#?"), None, known("mood")),
+        "public.#?(,pg_catalog.anyenum) as ,\"public\".\"mood\"*"
+    );
+    assert_eq!(resolved(&db, op("#?"), None, known("missing")), "undetermined");
+    // An operand typed as the pseudo-type itself binds nothing.
+    assert_eq!(resolved(&db, op("#?"), None, known("anyenum")), "undetermined");
+}
+
 /// `pg_catalog` comes before a path that does not name it, a path naming it
 /// later lets an earlier schema win, and a qualified name searches its
 /// schema alone.

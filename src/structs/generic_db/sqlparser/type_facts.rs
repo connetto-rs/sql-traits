@@ -3,24 +3,22 @@
 use alloc::format;
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, CharacterLength, CreateDomain, DataType, ExactNumberInfo, IntervalFields,
-    UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption,
+    ArrayElemTypeDef, CreateDomain, DataType, UserDefinedTypeRepresentation,
+    UserDefinedTypeSqlDefinitionOption,
 };
 
 use super::ParserDB;
 use crate::{
     impls::{SqlparserDialect, domain_in_schema, domain_named, user_type_holds},
-    structs::{DomainFacts, TargetName, TypeCategory, TypeFacts},
+    structs::{DomainFacts, TargetName, TypeCategory, TypeFacts, TypeKind},
     traits::{DatabaseLike, Relation},
     utils::{
         identifier_resolution::{identifiers_match, stored_identifier},
         object_name::{PG_CATALOG, target_name_from_object_name, type_search_path},
         postgres_types::{PgType, built_in_type},
+        type_modifier,
     },
 };
-
-/// `VARHDRSZ`, the header length a variable-length typmod counts.
-const VARHDRSZ: i32 = 4;
 
 /// The facts of the type `name` names, unqualified names read through the
 /// type search path.
@@ -101,7 +99,9 @@ fn declared_facts_in_schema<'db>(
         Relation::Table(_)
         | Relation::ForeignTable(_)
         | Relation::View(_)
-        | Relation::MaterializedView(_) => Some(TypeFacts::new(TypeCategory::COMPOSITE, false)),
+        | Relation::MaterializedView(_) => {
+            Some(TypeFacts::new(TypeCategory::COMPOSITE, false).with_kind(TypeKind::Composite))
+        }
         Relation::Sequence(_) => None,
     }
 }
@@ -110,13 +110,26 @@ fn declared_facts_in_schema<'db>(
 /// its element with a leading underscore.
 fn built_in_facts<'db>(database: &ParserDB, name: &str) -> Option<TypeFacts<'db>> {
     let facts = if let Some((_, category, preferred)) = built_in_type(name) {
-        TypeFacts::new(TypeCategory::new(category), preferred)
+        let kind = built_in_kind(name, category);
+        TypeFacts::new(TypeCategory::new(category), preferred).with_kind(kind)
     } else {
         let (element, _, _) = name.strip_prefix('_').and_then(built_in_type)?;
         TypeFacts::new(TypeCategory::ARRAY, false)
             .with_array_element(TargetName::new(element, false).with_schema(PG_CATALOG, false))
     };
     Some(collated(facts, built_in_collation(database, name)))
+}
+
+/// The kind of the `pg_catalog` type stored as `name`, of the `category`
+/// code. No type this model reads there is an enum, a composite or a domain,
+/// and `unknown` is the one pseudo-type outside the pseudo category.
+fn built_in_kind(name: &str, category: u8) -> TypeKind {
+    match category {
+        b'P' | b'X' => TypeKind::Pseudo,
+        b'R' if name.ends_with("multirange") => TypeKind::Multirange,
+        b'R' => TypeKind::Range,
+        _ => TypeKind::Base,
+    }
 }
 
 /// The collation of the `pg_catalog` type stored as `name`, or `None` when
@@ -146,16 +159,20 @@ fn user_type_facts<'db>(
     representation: Option<&UserDefinedTypeRepresentation>,
     is_multirange: bool,
 ) -> TypeFacts<'db> {
-    let (category, preferred, collatable) = match representation {
-        _ if is_multirange => (TypeCategory::RANGE, false, false),
-        None => (TypeCategory::PSEUDO, false, false),
-        Some(UserDefinedTypeRepresentation::Enum { .. }) => (TypeCategory::ENUM, false, false),
-        Some(UserDefinedTypeRepresentation::Composite { .. }) => {
-            (TypeCategory::COMPOSITE, false, false)
+    let (kind, category, preferred, collatable) = match representation {
+        _ if is_multirange => (TypeKind::Multirange, TypeCategory::RANGE, false, false),
+        None => (TypeKind::Pseudo, TypeCategory::PSEUDO, false, false),
+        Some(UserDefinedTypeRepresentation::Enum { .. }) => {
+            (TypeKind::Enum, TypeCategory::ENUM, false, false)
         }
-        Some(UserDefinedTypeRepresentation::Range { .. }) => (TypeCategory::RANGE, false, false),
+        Some(UserDefinedTypeRepresentation::Composite { .. }) => {
+            (TypeKind::Composite, TypeCategory::COMPOSITE, false, false)
+        }
+        Some(UserDefinedTypeRepresentation::Range { .. }) => {
+            (TypeKind::Range, TypeCategory::RANGE, false, false)
+        }
         Some(UserDefinedTypeRepresentation::SqlDefinition { options }) => {
-            options.iter().fold(
+            let (category, preferred, collatable) = options.iter().fold(
                 (TypeCategory::USER_DEFINED, false, false),
                 |(category, preferred, collatable), option| {
                     match option {
@@ -172,13 +189,14 @@ fn user_type_facts<'db>(
                         _ => (category, preferred, collatable),
                     }
                 },
-            )
+            );
+            (TypeKind::Base, category, preferred, collatable)
         }
     };
     // A collatable base type's values take the database's collation.
     let collation =
         collatable.then(|| TargetName::new("default", true).with_schema(PG_CATALOG, false));
-    collated(TypeFacts::new(category, preferred), collation)
+    collated(TypeFacts::new(category, preferred).with_kind(kind), collation)
 }
 
 /// The facts of `domain`, which takes the category of its base type, is
@@ -214,7 +232,7 @@ fn domain_over<'db>(
         let facts = TypeFacts::new(base.category(), false).with_domain(domain);
         return Some((facts, base.into_collation()));
     }
-    let typmod = typmod(data_type).ok()?;
+    let typmod = type_modifier::declared(data_type)?.value();
     let (base, category) = match data_type {
         DataType::Array(
             ArrayElemTypeDef::AngleBracket(element)
@@ -245,104 +263,4 @@ fn array_of<'db>(database: &'db ParserDB, element: &'db DataType) -> Option<Targ
     let PgType::Catalog(name) = PgType::of(element) else { return None };
     let array = format!("_{name}");
     Some(TargetName::new(&array, false).with_schema(PG_CATALOG, false).into_owned())
-}
-
-/// The modifier `data_type` declares as `pg_type.typtypmod` stores it,
-/// `Ok(None)` when it declares none, and `Err` for a modifier this model
-/// does not encode.
-fn typmod(data_type: &DataType) -> Result<Option<i32>, ()> {
-    // A length without a modifier, `VARCHAR(MAX)` included, declares none.
-    let length = |length: &Option<CharacterLength>, default: Option<u64>| {
-        match length {
-            Some(CharacterLength::IntegerLength { length, .. }) => encode(*length + 4),
-            Some(CharacterLength::Max) | None => {
-                default.map_or(Ok(None), |length| encode(length + 4))
-            }
-        }
-    };
-    match data_type {
-        DataType::Varchar(declared)
-        | DataType::CharacterVarying(declared)
-        | DataType::CharVarying(declared)
-        | DataType::NationalCharacterVarying(declared)
-        | DataType::NationalCharVarying(declared)
-        | DataType::NcharVarying(declared) => length(declared, None),
-        // A `char` without a length holds one character.
-        DataType::Char(declared)
-        | DataType::Character(declared)
-        | DataType::NationalCharacter(declared)
-        | DataType::NationalChar(declared)
-        | DataType::Nchar(declared) => length(declared, Some(1)),
-        DataType::Numeric(info) | DataType::Decimal(info) | DataType::Dec(info) => {
-            match info {
-                ExactNumberInfo::None => Ok(None),
-                ExactNumberInfo::Precision(precision) => numeric(*precision, 0),
-                ExactNumberInfo::PrecisionAndScale(precision, scale) => numeric(*precision, *scale),
-            }
-        }
-        // A `bit` without a length holds one bit.
-        DataType::Bit(declared) => encode(declared.unwrap_or(1)),
-        DataType::BitVarying(declared) | DataType::VarBit(declared) => {
-            declared.map_or(Ok(None), encode)
-        }
-        DataType::Time(precision, _) | DataType::Timestamp(precision, _) => {
-            precision.map_or(Ok(None), encode)
-        }
-        DataType::Interval { fields, precision } => interval(*fields, *precision),
-        // An array declaration applies its element's modifier.
-        DataType::Array(
-            ArrayElemTypeDef::AngleBracket(element)
-            | ArrayElemTypeDef::SquareBracket(element, _)
-            | ArrayElemTypeDef::Parenthesis(element)
-            | ArrayElemTypeDef::ParenthesisNotNull(element)
-            | ArrayElemTypeDef::Qualified(element, _),
-        ) => typmod(element),
-        _ => Ok(None),
-    }
-}
-
-/// Encodes a plain length or precision typmod.
-fn encode(value: u64) -> Result<Option<i32>, ()> {
-    i32::try_from(value).map(Some).map_err(|_| ())
-}
-
-/// Encodes `numeric(precision, scale)` as `make_numeric_typmod` does.
-fn numeric(precision: u64, scale: i64) -> Result<Option<i32>, ()> {
-    let precision = i32::try_from(precision).map_err(|_| ())?;
-    let scale = i32::try_from(scale).map_err(|_| ())?;
-    Ok(Some(((precision << 16) | (scale & 0x7ff)) + VARHDRSZ))
-}
-
-/// Encodes an interval's fields and precision as `INTERVAL_TYPMOD` does.
-fn interval(fields: Option<IntervalFields>, precision: Option<u64>) -> Result<Option<i32>, ()> {
-    const MONTH: i32 = 1 << 1;
-    const YEAR: i32 = 1 << 2;
-    const DAY: i32 = 1 << 3;
-    const HOUR: i32 = 1 << 10;
-    const MINUTE: i32 = 1 << 11;
-    const SECOND: i32 = 1 << 12;
-    const FULL_RANGE: i32 = 0x7fff;
-    const FULL_PRECISION: i32 = 0xffff;
-    let range = match fields {
-        None if precision.is_none() => return Ok(None),
-        None => FULL_RANGE,
-        Some(IntervalFields::Year) => YEAR,
-        Some(IntervalFields::Month) => MONTH,
-        Some(IntervalFields::Day) => DAY,
-        Some(IntervalFields::Hour) => HOUR,
-        Some(IntervalFields::Minute) => MINUTE,
-        Some(IntervalFields::Second) => SECOND,
-        Some(IntervalFields::YearToMonth) => YEAR | MONTH,
-        Some(IntervalFields::DayToHour) => DAY | HOUR,
-        Some(IntervalFields::DayToMinute) => DAY | HOUR | MINUTE,
-        Some(IntervalFields::DayToSecond) => DAY | HOUR | MINUTE | SECOND,
-        Some(IntervalFields::HourToMinute) => HOUR | MINUTE,
-        Some(IntervalFields::HourToSecond) => HOUR | MINUTE | SECOND,
-        Some(IntervalFields::MinuteToSecond) => MINUTE | SECOND,
-    };
-    let precision = match precision {
-        Some(precision) => i32::try_from(precision).map_err(|_| ())?,
-        None => FULL_PRECISION,
-    };
-    Ok(Some((range << 16) | precision))
 }
