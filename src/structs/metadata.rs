@@ -15,6 +15,8 @@ pub use function_metadata::FunctionMetadata;
 pub(crate) use function_metadata::RangeConstructor;
 mod check_metadata;
 pub use check_metadata::CheckMetadata;
+mod domain_metadata;
+pub use domain_metadata::DomainMetadata;
 mod expression_calls;
 pub use expression_calls::ExpressionCalls;
 mod policy_metadata;

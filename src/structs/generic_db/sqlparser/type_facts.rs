@@ -3,11 +3,11 @@
 use alloc::format;
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, CreateDomain, DataType, Ident, UserDefinedTypeRepresentation,
+    ArrayElemTypeDef, CreateDomain, DataType, UserDefinedTypeRepresentation,
     UserDefinedTypeSqlDefinitionOption,
 };
 
-use super::{ParserDB, collation_resolution_for_schema};
+use super::ParserDB;
 use crate::{
     impls::{SqlparserDialect, domain_in_schema, domain_named, user_type_holds},
     structs::{DomainFacts, TargetName, TypeCategory, TypeFacts, TypeKind},
@@ -203,28 +203,18 @@ fn user_type_facts<'db>(
 /// never preferred and takes the collation it declares or its base type's.
 fn domain_facts<'db>(database: &'db ParserDB, domain: &'db CreateDomain) -> Option<TypeFacts<'db>> {
     let (facts, base_collation) = domain_over(database, &domain.data_type)?;
-    let collation = match &domain.collation {
-        Some(declared) => Some(declared_collation(database, declared)?),
+    let collation = match domain.collation {
+        // The collation was bound when the domain was created, and one that
+        // named none the database knew then leaves the facts open.
+        Some(_) => {
+            // Ingestion records the collation qualified with its schema.
+            let declared = database.domain_metadata(domain)?.collation()?;
+            let name = TargetName::new(declared.name(), declared.name_is_quoted());
+            Some(name.with_schema(declared.schema()?, declared.schema_is_quoted()))
+        }
         None => base_collation,
     };
     Some(collated(facts, collation))
-}
-
-/// The collation the unqualified `collation` names on the search path, or
-/// `None` when it names none.
-fn declared_collation<'db>(database: &'db ParserDB, collation: &Ident) -> Option<TargetName<'db>> {
-    let lookup = (collation.value.as_str(), collation.quote_style.is_some());
-    type_search_path(|| database.search_path())
-        .find_map(|(schema, schema_quoted)| {
-            collation_resolution_for_schema(
-                lookup,
-                &database.ingestion.collation_metadata,
-                &database.ingestion.active_postgres_catalog,
-                schema,
-                schema_quoted,
-            )
-        })?
-        .into_target_name()
 }
 
 /// The facts of a domain over `data_type` before its own collation, with the

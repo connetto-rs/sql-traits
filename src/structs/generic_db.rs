@@ -578,6 +578,29 @@ impl<P: SchemaProfile> GenericDB<P> {
             .map(|index| &self.triggers[index].1)
     }
 
+    /// Returns a reference to the metadata of the specified domain, if it
+    /// exists in the database.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE DOMAIN code AS TEXT;")?;
+    /// let domain = db.domains().next().expect("the domain is recorded");
+    /// assert!(db.domain_metadata(domain).is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn domain_metadata(&self, domain: &P::Domain) -> Option<&Meta<P::Domain>> {
+        self.domains
+            .iter()
+            .find(|(candidate, _)| core::ptr::eq(candidate.as_ref(), domain))
+            .map(|(_, metadata)| metadata)
+    }
+
     /// Returns a reference to the metadata of the specified policy, if it
     /// exists in the database.
     ///
