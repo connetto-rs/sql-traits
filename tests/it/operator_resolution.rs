@@ -410,3 +410,40 @@ fn row_and_text_conversions_name_their_steps() {
     );
     assert_eq!(converted(&db, op("<$>"), None, known("app.celsius")), "io celsius->fahrenheit");
 }
+
+/// A polymorphic result takes the type the operands bind its family to, and
+/// stays unanswered when the operands bind no type of that family.
+#[test]
+fn polymorphic_results_take_the_type_their_family_binds() {
+    let operator = |name: &str, result: &str| {
+        PostgresCatalogOperator::new(name, Some(pg("anyelement")), pg("anyelement"))
+            .with_schema("public", false)
+            .with_implementation(
+                TargetName::new("pick", false).with_schema("public", false),
+                pg(result),
+            )
+    };
+    let catalog = PostgresCatalog::default()
+        .with_operator(operator("===", "anyelement"))
+        .with_operator(operator("@@@", "anyrange"));
+    let db = ParseOptions::default()
+        .with_postgres_catalog(catalog)
+        .parse::<PostgreSqlDialect>("")
+        .unwrap();
+    // The result of the selected operator, `None` when nothing is selected.
+    let result = |name| {
+        match db.resolve_operator(
+            op(name),
+            Some(known("int4")),
+            known("int4"),
+            IdentifierCase::AsWritten,
+        ) {
+            OperatorResolution::Selected(selected) => {
+                Some(selected.result_type().map(ToString::to_string))
+            }
+            _ => None,
+        }
+    };
+    assert_eq!(result("==="), Some(Some("pg_catalog.int4".to_owned())));
+    assert_eq!(result("@@@"), Some(None));
+}
