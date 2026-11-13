@@ -150,6 +150,9 @@ struct ScopeNode<'query, 'db, DB: DatabaseLike> {
     select: Option<AstRef<'query, 'db, Select>>,
     parent: Option<ScopeCursor>,
     owner: Option<ScopeId>,
+    /// Whether the scope holds the items of a parenthesized join under an
+    /// alias, which belong to the query level of the scope owning it.
+    join: bool,
     data: FromScope<'query, 'db, DB, DefinitionId>,
     outputs: Vec<OutputEntry<'query, 'db>>,
 }
@@ -189,6 +192,9 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     /// The scopes the clauses of every data-modifying statement resolve in,
     /// by the statement's address.
     modifying: Vec<(usize, ModifyingScopes)>,
+    /// The scope of every parenthesized join under an alias, by the join's
+    /// address.
+    joins: Vec<(usize, ScopeId)>,
     case: IdentifierCase,
 }
 
@@ -279,11 +285,32 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         reference: &Expr,
         levels_up: usize,
     ) -> Result<Option<bool>, LookupError> {
-        let level = (0..levels_up).try_fold(cursor.scope, |scope, _| self.scopes[scope.0].owner);
+        let level = self.level_scope(cursor.scope).and_then(|start| {
+            (0..levels_up).try_fold(start, |scope, _| self.level_scope(self.scopes[scope.0].owner?))
+        });
         Ok(self
             .resolve_definition_in(cursor, reference)?
             .zip(level)
-            .map(|((_, found), level)| found == level))
+            .map(|((_, found), level)| self.level_scope(found) == Some(level)))
+    }
+
+    /// The scope standing for the query level `scope` belongs to: `scope`
+    /// itself, or for the scope of a parenthesized join the scope of the
+    /// query holding the join.
+    fn level_scope(&self, mut scope: ScopeId) -> Option<ScopeId> {
+        while self.scopes[scope.0].join {
+            scope = self.scopes[scope.0].owner?;
+        }
+        Some(scope)
+    }
+
+    /// The scope the items of `join`, a parenthesized join under an alias,
+    /// resolve in, among the joins of the scope `enclosing`.
+    pub(super) fn join_scope(&self, join: &TableFactor, enclosing: ScopeId) -> Option<ScopeId> {
+        let address = factor_address(join);
+        self.joins.iter().find_map(|(held, scope)| {
+            (*held == address && self.scopes[scope.0].owner == Some(enclosing)).then_some(*scope)
+        })
     }
 
     pub(crate) fn resolve_definition<'scope>(
@@ -415,6 +442,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 from_items: Vec::new(),
                 queries: Vec::new(),
                 modifying: Vec::new(),
+                joins: Vec::new(),
                 case,
             },
             created: Vec::new(),
@@ -481,6 +509,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             select: None,
             parent,
             owner: parent.map(|parent| parent.scope),
+            join: false,
             data: FromScope::new(self.graph.case),
             outputs: Vec::new(),
         });
@@ -493,11 +522,15 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
         each_from_item(tables, &mut |item| self.graph.from_items.push(AstRef::Query(item)));
     }
 
-    /// Records a `MERGE` target or source, which a binding's origin names. A
-    /// parenthesized join source stands as one opaque relation, as in a
-    /// `FROM` clause, so no origin names an item inside it.
+    /// Records a `MERGE` target or source, and the items inside a
+    /// parenthesized join source, which a binding's origin names.
     pub(super) fn record_factor(&mut self, factor: &'query TableFactor) {
         self.graph.from_items.push(AstRef::Query(factor));
+        if let TableFactor::NestedJoin { table_with_joins, .. } = factor {
+            each_from_item(slice::from_ref(table_with_joins.as_ref()), &mut |item| {
+                self.graph.from_items.push(AstRef::Query(item));
+            });
+        }
     }
 
     /// Records the scopes the clauses of `statement` resolve in.
@@ -602,6 +635,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             select: Some(select),
             parent,
             owner,
+            join: false,
             data: FromScope::new(match select {
                 AstRef::Query(_) => self.graph.case,
                 AstRef::Database(_) => IdentifierCase::AsWritten,
@@ -621,6 +655,27 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
                 });
             }
         }
+        scope
+    }
+
+    fn begin_join_scope(
+        &mut self,
+        join: AstRef<'query, 'db, TableFactor>,
+        parent: Self::Cursor,
+    ) -> Self::Scope {
+        let scope = ScopeId(self.graph.scopes.len());
+        self.graph.scopes.push(ScopeNode {
+            select: None,
+            parent,
+            owner: parent.map(|parent| parent.scope),
+            join: true,
+            data: FromScope::new(match join {
+                AstRef::Query(_) => self.graph.case,
+                AstRef::Database(_) => IdentifierCase::AsWritten,
+            }),
+            outputs: Vec::new(),
+        });
+        self.graph.joins.push((factor_address(join.get()), scope));
         scope
     }
 

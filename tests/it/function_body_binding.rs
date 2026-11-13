@@ -1395,15 +1395,15 @@ fn a_block_body_query_part_follows_renames_on_its_own() {
         "CREATE TABLE q2t (a INT, c INT);
          CREATE TABLE q2s (d INT);
          CREATE FUNCTION f() RETURNS INT LANGUAGE sql BEGIN ATOMIC
-             SELECT a FROM (q2t JOIN q2s ON q2t.c = q2s.d);
+             SELECT a FROM q2t CROSS JOIN generate_series(1, 3) AS g;
          END;
          ALTER TABLE q2t RENAME TO q2u;",
     )
     .expect("the rename is accepted");
     assert_eq!(
         text(&db, "f"),
-        "CREATE FUNCTION f() RETURNS INT LANGUAGE sql BEGIN ATOMIC SELECT a FROM (q2u AS q2t JOIN q2s ON q2t.c = q2s.d); END",
-        "the parenthesized join is not certain enough to respell, so it is shielded"
+        "CREATE FUNCTION f() RETURNS INT LANGUAGE sql BEGIN ATOMIC SELECT a FROM q2u AS q2t CROSS JOIN generate_series(1, 3) AS g; END",
+        "a bare name the table function could expose is not certain enough to respell, so it is shielded"
     );
 
     let db = parse(

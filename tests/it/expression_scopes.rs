@@ -560,6 +560,45 @@ fn merge_clauses_read_the_side_their_kind_names() {
     assert_eq!(context.type_of(projected(query)[0]).unwrap(), pg("numeric"));
 }
 
+/// A `MERGE` source written as a parenthesized join exposes its items, after
+/// which the target stands, and under an alias only the join's own columns.
+#[test]
+fn a_merge_source_join_exposes_its_items() {
+    let db = db();
+    let root = statement(
+        "MERGE INTO t USING (logt AS s JOIN logt AS u ON s.a = u.a) ON t.a = u.a \
+         WHEN MATCHED AND t.b > u.a THEN UPDATE SET b = u.a \
+         RETURNING u.a, t.b, s.a",
+    );
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Merge(Merge { on, clauses, output, .. }) = &root else { unreachable!() };
+    assert_eq!(both(&context, on).unwrap(), [pg("int4"), pg("int8")]);
+    let MergeClause { predicate, action, .. } = &clauses[0];
+    assert_eq!(both(&context, predicate.as_ref().unwrap()).unwrap(), [pg("numeric"), pg("int8")]);
+    let MergeAction::Update(MergeUpdateExpr { kind: MergeUpdateKind::Set(assignments), .. }) =
+        action
+    else {
+        unreachable!()
+    };
+    assert_eq!(context.type_of(&assignments[0].value).unwrap(), pg("int8"));
+    let Some(OutputClause::Returning { select_items, .. }) = output else { unreachable!() };
+    let returned: Vec<_> =
+        returned(select_items).into_iter().map(|node| context.type_of(node).unwrap()).collect();
+    assert_eq!(returned, [pg("int8"), pg("numeric"), pg("int8")]);
+
+    let root = statement(
+        "MERGE INTO t USING (logt AS s JOIN logt AS u ON s.a = u.a) AS j ON t.a = u.a \
+         WHEN MATCHED THEN DELETE",
+    );
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Merge(Merge { on, .. }) = &root else { unreachable!() };
+    assert_eq!(
+        both(&context, on).unwrap(),
+        [pg("int4"), OperandType::Unknown],
+        "the alias hides the names inside the join"
+    );
+}
+
 #[test]
 fn returning_reads_old_and_new_unless_a_relation_takes_the_name() {
     let db = db();

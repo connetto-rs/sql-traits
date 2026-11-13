@@ -1166,7 +1166,7 @@ fn factor_shapes(query: &Query) -> BTreeMap<usize, FactorShape> {
                             alias: alias.clone(),
                         }
                     }
-                    TableFactor::Derived { alias, .. } => {
+                    TableFactor::Derived { alias, .. } | TableFactor::NestedJoin { alias, .. } => {
                         FactorShape { relation: None, alias: alias.clone() }
                     }
                     _ => FactorShape { relation: None, alias: None },
@@ -1259,16 +1259,28 @@ fn respell(query: &mut Query, before: &ParserDB, renames: &[Rename]) -> Option<Q
     }
 
     for site in &references.sites {
-        let SiteOutcome::Entry { factor, ordinal } = site.outcome else {
+        let SiteOutcome::Entry { mut factor, mut ordinal } = site.outcome else {
             continue;
         };
+        // A reference through a parenthesized join's alias reads the column
+        // of the item inside it, under the name that item gives it unless
+        // an alias column list on the way renames it.
+        let mut through_join = false;
+        while let Some(SiteOutcome::Entry { factor: inner, ordinal: inner_ordinal }) =
+            references.join_column(factor, ordinal)
+            && !shapes
+                .get(&references.factors[factor])
+                .is_some_and(|shape| shape.renames_column(ordinal))
+        {
+            (factor, ordinal, through_join) = (inner, inner_ordinal, true);
+        }
         let address = references.factors[factor];
         let (Some(rename), Some(shape)) = (reading.get(&address), shapes.get(&address)) else {
             continue;
         };
         match &renames[*rename] {
             Rename::Relation { to, .. } => {
-                if shape.alias.is_none() {
+                if shape.alias.is_none() && !through_join {
                     edits.qualifiers.insert(site.expression, last_part_as_ident(to));
                 }
             }
