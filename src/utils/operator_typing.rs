@@ -1,17 +1,17 @@
 //! Resolves an operator invocation to the `pg_operator` overload PostgreSQL
 //! selects, as `oper`, `binary_oper_exact` and `oper_select_candidate` do.
 
-use alloc::{borrow::Cow, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, vec::Vec};
 
 use crate::{
-    structs::{
-        IdentifierCase, OperandEvidence, OperandType, OperatorResolution, SelectedOperator,
-        TargetName,
-    },
+    structs::{IdentifierCase, OperandType, OperatorResolution, SelectedOperator, TargetName},
     traits::{DatabaseLike, OperatorKind, OperatorLike},
     utils::{
-        call_typing::{Actual, Binding, BoundType, Declared, Selection, bind, select},
-        coercion::{array_type_name, base, canonical_owned, conversion, type_name},
+        call_typing::{
+            Actual, Binding, Declared, Refusal, Selection, bind, bound_type_name,
+            parameter_evidence, select, typed_input,
+        },
+        coercion::{base, canonical_owned},
         object_name::function_search_path,
         postgres_types::PgType,
     },
@@ -42,19 +42,6 @@ impl<'db, O: OperatorLike> Candidate<'db, O> {
             }
         };
         Some(Self { operator, left, right, declared })
-    }
-}
-
-/// The type an operand of the invocation has, [`None`] when the caller does
-/// not know it or names no type.
-fn input(database: &impl DatabaseLike, operand: &OperandType<'_>) -> Option<(PgType, Option<i32>)> {
-    match operand {
-        OperandType::Known { type_name, typmod } => {
-            let parsed = PgType::parse(&type_name.to_string())?;
-            Some((canonical_owned(database, parsed), *typmod))
-        }
-        OperandType::UntypedLiteral => Some((PgType::UNKNOWN, None)),
-        OperandType::Unknown => None,
     }
 }
 
@@ -112,7 +99,7 @@ pub(crate) fn resolve_operator<'db, D: DatabaseLike>(
     let Some((inputs, typmods)) = left
         .into_iter()
         .chain(core::iter::once(right))
-        .map(|operand| input(database, operand))
+        .map(|operand| typed_input(database, operand))
         .collect::<Option<(Vec<PgType>, Vec<Option<i32>>)>>()
     else {
         return OperatorResolution::Undetermined;
@@ -197,14 +184,6 @@ fn exact<'c, 'db, D: DatabaseLike>(
     })
 }
 
-/// Why an operand of the selected operator takes no type.
-enum Refusal {
-    /// Only untyped literals reach a polymorphic operand.
-    Unbound,
-    /// The facts the operand's type needs are missing.
-    Undetermined,
-}
-
 /// The selection of `candidate`, each operand of type `sources` with the
 /// modifiers `typmods` taking its declared type or what `binding` binds a
 /// polymorphic declaration to, with the conversion that carries it there.
@@ -216,33 +195,14 @@ fn selected<'db, D: DatabaseLike>(
     typmods: &[Option<i32>],
 ) -> OperatorResolution<'db, D> {
     let operand = |position: usize, name: &TargetName<'db>| {
-        let convert = |target: &PgType| {
-            conversion(database, sources[position], typmods[position], target)
-                .ok_or(Refusal::Undetermined)
-        };
-        let declared = candidate.declared[position].as_ref().ok_or(Refusal::Undetermined)?;
-        // `"any"` keeps the operand's own type, as `coerce_type` returns it.
-        if declared.is_any() {
-            let source = type_name(database, sources[position]).ok_or(Refusal::Undetermined)?;
-            return Ok(OperandEvidence::new(source, false, convert(declared)?));
-        }
-        let Some(polymorphic) = declared.polymorphic() else {
-            return Ok(OperandEvidence::new(name.clone(), false, convert(declared)?));
-        };
-        let bound_to = |target: &PgType, name: Option<TargetName<'db>>| {
-            let name = name.ok_or(Refusal::Undetermined)?;
-            Ok(OperandEvidence::new(name, true, convert(target)?))
-        };
-        // An exact match of a pseudo-type operand binds nothing.
-        match binding.map_or(BoundType::Undetermined, |binding| binding.bound(polymorphic)) {
-            BoundType::Type(bound) => bound_to(&bound.pg_type, type_name(database, &bound.pg_type)),
-            BoundType::ArrayOf(bound) => {
-                let array = bound.pg_type.clone().array();
-                bound_to(&array, array_type_name(database, &bound.pg_type))
-            }
-            BoundType::Unbound => Err(Refusal::Unbound),
-            BoundType::Undetermined => Err(Refusal::Undetermined),
-        }
+        parameter_evidence(
+            database,
+            candidate.declared[position].as_ref(),
+            Some(name),
+            binding,
+            sources[position],
+            typmods[position],
+        )
     };
     let operands = candidate
         .left
@@ -273,12 +233,5 @@ fn result_type<'db, D: DatabaseLike>(
     binding: Option<&Binding<'_>>,
 ) -> Option<TargetName<'db>> {
     let declared = canonical_owned(database, PgType::from_target(&operator.result_type(database)?));
-    let Some(polymorphic) = declared.polymorphic() else {
-        return type_name(database, &declared);
-    };
-    match binding?.bound(polymorphic) {
-        BoundType::Type(bound) => type_name(database, &bound.pg_type),
-        BoundType::ArrayOf(bound) => array_type_name(database, &bound.pg_type),
-        BoundType::Unbound | BoundType::Undetermined => None,
-    }
+    bound_type_name(database, &declared, binding)
 }

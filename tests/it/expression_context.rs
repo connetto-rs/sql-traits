@@ -407,11 +407,11 @@ fn nullif_takes_its_first_operand_as_equality_converts_it() {
 fn forms_not_yet_derived_answer_none() {
     let db = ParserDB::parse::<PostgreSqlDialect>(OPERANDS).unwrap();
     let query = query(
-        "SELECT i IN (SELECT i FROM t), i = ANY (SELECT i FROM t), v SIMILAR TO 'a%',
+        "SELECT i IN (SELECT i FROM t), i = ANY (SELECT i FROM t),
                 (1, 2) BETWEEN (0, 0) AND (3, 3), (1, 2) IN ((1, 2), (3, 4)),
-                v LIKE ANY (ARRAY['a']) ESCAPE '!', v LIKE 'a' ESCAPE '!', (1, 2) = (1, 2),
-                ROW(1, 2) = ROW(1, 2), i > 0 AND i < 9, NOT true, length(v),
-                pg_catalog.length(v), 1 OPERATOR(a.b.+) 1, 5 !
+                v LIKE ANY (ARRAY['a']) ESCAPE '!', v ILIKE ANY (ARRAY['a']) ESCAPE '!',
+                (1, 2) = (1, 2), ROW(1, 2) = ROW(1, 2), i > 0 AND i < 9, NOT true,
+                1 OPERATOR(a.b.+) 1, 5 !, nullif(x => i, 1)
          FROM t",
     );
     let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
@@ -528,6 +528,11 @@ fn described<DB: DatabaseLike>(
                             Operand::Node(node) => node.to_string(),
                             Operand::Any(source) => format!("ANY {}", array(source)),
                             Operand::All(source) => format!("ALL {}", array(source)),
+                            Operand::Call(call) => {
+                                let arguments: Vec<_> =
+                                    call.arguments().iter().map(ToString::to_string).collect();
+                                format!("{}({})", call.name(), arguments.join(", "))
+                            }
                         };
                         format!("{} {right}", application.name())
                     })
@@ -713,4 +718,232 @@ fn quantified_comparisons_read_a_domain_as_its_base_array() {
         })
         .collect();
     assert_eq!(targets, ["int4", "numeric"]);
+}
+
+const CALLS: &str =
+    "CREATE TABLE t (i INT4, s INT2, v VARCHAR(5), n NUMERIC, ts TIMESTAMPTZ, a INT4[]);
+     CREATE FUNCTION f(x NUMERIC, y TEXT DEFAULT 'z') RETURNS TEXT LANGUAGE sql AS $$ SELECT y $$;
+     CREATE FUNCTION g(VARIADIC xs INT8[]) RETURNS INT8 LANGUAGE sql AS $$ SELECT 1::INT8 $$;";
+
+/// The function a call node runs, each argument's parameter and the type it
+/// converts to, as PostgreSQL 18 stores the call.
+fn selected_call<'c, DB: DatabaseLike>(
+    context: &'c ExpressionContext<'_, 'c, DB>,
+    node: &'c Expr,
+) -> (String, Vec<(usize, String)>, usize, Option<String>) {
+    let call = context.call(node).unwrap().unwrap();
+    let CallResolution::Selected(selected) = call.resolution() else {
+        panic!("{node} selects no function")
+    };
+    let arguments = selected
+        .arguments()
+        .iter()
+        .map(|argument| (argument.parameter(), argument.evidence().target().to_string()))
+        .collect();
+    (
+        call.name().to_string(),
+        arguments,
+        selected.defaulted(),
+        selected.variadic().map(ToString::to_string),
+    )
+}
+
+/// A call runs the function PostgreSQL selects, each argument converted to
+/// the parameter it binds by position or name, a `VARIADIC` tail packed into
+/// the parameter's array and an omitted parameter defaulted, and the node
+/// takes the function's result type.
+#[test]
+fn calls_select_their_function_and_convert_each_argument() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(CALLS).unwrap();
+    let query = query(
+        "SELECT lower(v), length(v), round(i, 2), f(i), f(y => 'q', x => s), g(i, s),
+                current_setting('app.user_id', true), date_trunc('day', ts), array_length(a, 1),
+                abs(s), now(), format('%s-%s', i, v)
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let types: Vec<_> = nodes.iter().map(|node| context.type_of(node).unwrap()).collect();
+    assert_eq!(
+        types,
+        [
+            pg("text"),
+            pg("int4"),
+            pg("numeric"),
+            pg("text"),
+            pg("text"),
+            pg("int8"),
+            pg("text"),
+            pg("timestamptz"),
+            pg("int4"),
+            pg("int2"),
+            pg("timestamptz"),
+            pg("text"),
+        ]
+    );
+    let text = "pg_catalog.text".to_owned();
+    let numeric = "pg_catalog.numeric".to_owned();
+    let int8 = "pg_catalog.int8".to_owned();
+    assert_eq!(
+        selected_call(&context, nodes[0]),
+        ("lower".into(), vec![(0, text.clone())], 0, None)
+    );
+    assert_eq!(
+        selected_call(&context, nodes[2]),
+        ("round".into(), vec![(0, numeric.clone()), (1, "pg_catalog.int4".into())], 0, None)
+    );
+    assert_eq!(
+        selected_call(&context, nodes[3]),
+        ("f".into(), vec![(0, numeric.clone())], 1, None)
+    );
+    assert_eq!(
+        selected_call(&context, nodes[4]),
+        ("f".into(), vec![(1, text.clone()), (0, numeric)], 0, None)
+    );
+    assert_eq!(
+        selected_call(&context, nodes[5]),
+        ("g".into(), vec![(0, int8.clone()), (0, int8)], 0, Some("pg_catalog._int8".into()))
+    );
+    assert_eq!(
+        selected_call(&context, nodes[6]),
+        ("current_setting".into(), vec![(0, text.clone()), (1, "pg_catalog.bool".into())], 0, None)
+    );
+    // `VARIADIC "any"` takes each argument apart, of its own type.
+    assert_eq!(
+        selected_call(&context, nodes[11]),
+        (
+            "format".into(),
+            vec![(0, text), (1, "pg_catalog.int4".into()), (1, "pg_catalog.varchar".into())],
+            0,
+            None
+        )
+    );
+
+    // `round(i, 2)` converts `i` by a cast function, and `lower(v)` relabels
+    // `v` as `text`.
+    let round = context.call(nodes[2]).unwrap().unwrap();
+    let CallResolution::Selected(selected) = round.resolution() else { unreachable!() };
+    assert_eq!(selected.function().name(), "round");
+    assert!(matches!(selected.arguments()[0].evidence().conversion(), [CoercionStep::Function(_)]));
+    let lower = context.call(nodes[0]).unwrap().unwrap();
+    let CallResolution::Selected(selected) = lower.resolution() else { unreachable!() };
+    assert!(matches!(selected.arguments()[0].evidence().conversion(), [CoercionStep::Relabel(_)]));
+}
+
+/// A node that is no call, an aggregate or window call, a row and an
+/// expression PostgreSQL types itself answer no call, and a parenthesized
+/// call answers for its content.
+#[test]
+fn only_plain_calls_answer_a_call() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(CALLS).unwrap();
+    let query = query(
+        "SELECT i, i + 1, count(*), sum(i), count(DISTINCT i), string_agg(v, ',' ORDER BY v),
+                count(i) FILTER (WHERE i > 0), row_number() OVER (),
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY n), ROW(i, s), ARRAY(SELECT 1),
+                coalesce(i, 1), current_date, (lower(v))
+         FROM t GROUP BY i",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let (parenthesized, others) = nodes.split_last().unwrap();
+    for node in others {
+        assert!(context.call(node).unwrap().is_none(), "{node}");
+    }
+    assert_eq!(context.call(parenthesized).unwrap().unwrap().name().name(), "lower");
+}
+
+/// A call PostgreSQL refuses answers why and leaves the node's type unknown,
+/// and a called name of more than two parts is refused, in an argument too.
+#[test]
+fn refused_calls_answer_why() {
+    let schema = [
+        CALLS,
+        "CREATE FUNCTION amb(x INT8) RETURNS INT4 LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION amb(x NUMERIC) RETURNS INT4 LANGUAGE sql AS 'SELECT 2';",
+    ]
+    .concat();
+    let db = ParserDB::parse::<PostgreSqlDialect>(&schema).unwrap();
+    let query = query(
+        "SELECT amb(s), array_length(NULL, 1), nosuch(i), lower('x'::nosuchtype),
+                format('%s', 'x'::nosuchtype[]), a.b.c.f(i), lower(a.b.c.f(i))
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let (refused, overqualified) = nodes.split_at(5);
+    let answers: Vec<_> = refused
+        .iter()
+        .map(|node| {
+            assert_eq!(context.type_of(node).unwrap(), OperandType::Unknown, "{node}");
+            match context.call(node).unwrap().unwrap().resolution() {
+                CallResolution::Ambiguous(functions) => {
+                    format!("ambiguous among {}", functions.len())
+                }
+                CallResolution::UnboundPolymorphic(function) => {
+                    format!("unbound {}", function.name())
+                }
+                CallResolution::NotFound => "not found".to_owned(),
+                CallResolution::Undetermined => "undetermined".to_owned(),
+                CallResolution::Selected(_) => panic!("{node} selects a function"),
+            }
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        ["ambiguous among 2", "unbound array_length", "not found", "undetermined", "undetermined"]
+    );
+    for node in overqualified {
+        assert!(
+            matches!(context.type_of(node), Err(LookupError::InvalidObjectName { .. })),
+            "{node}"
+        );
+    }
+}
+
+/// `LIKE ... ESCAPE` compares with the `like_escape` call PostgreSQL inserts
+/// over the pattern and escape, and `SIMILAR TO` uses `~` over the
+/// `similar_to_escape` call, as PostgreSQL 18 stores them.
+#[test]
+fn escaped_patterns_compare_with_the_call_postgres_inserts() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(CALLS).unwrap();
+    let query = query(
+        "SELECT v LIKE 'a!%' ESCAPE '!', v ILIKE 'a!%' ESCAPE '!', v NOT LIKE 'a' ESCAPE '',
+                v SIMILAR TO 'a%', v NOT SIMILAR TO 'a!%' ESCAPE '!',
+                v LIKE 'a' ESCAPE 'x'::nosuchtype
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let (unknown_escape, nodes) = nodes.split_last().unwrap();
+    // An escape of a type the database does not know leaves the call and
+    // the comparison undetermined.
+    assert_eq!(context.type_of(unknown_escape).unwrap(), OperandType::Unknown);
+    let applications = context.operators(unknown_escape).unwrap().unwrap();
+    assert!(matches!(
+        applications[0].right(),
+        Operand::Call(call) if matches!(call.resolution(), CallResolution::Undetermined)
+    ));
+    let shapes: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            assert_eq!(context.type_of(node).unwrap(), pg("bool"), "{node}");
+            let applications = context.operators(node).unwrap().unwrap();
+            let [application] = applications.as_slice() else { panic!("{node}") };
+            let Operand::Call(call) = application.right() else { panic!("{node}") };
+            let CallResolution::Selected(selected) = call.resolution() else { panic!("{node}") };
+            assert_eq!(selected.result_type().map(TargetName::name), Some("text"));
+            let arguments: Vec<_> = call.arguments().iter().map(ToString::to_string).collect();
+            format!("{} {}({})", application.name(), call.name(), arguments.join(", "))
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        [
+            "~~ pg_catalog.like_escape('a!%', '!')",
+            "~~* pg_catalog.like_escape('a!%', '!')",
+            "!~~ pg_catalog.like_escape('a', '')",
+            "~ pg_catalog.similar_to_escape('a%')",
+            "!~ pg_catalog.similar_to_escape('a!%', '!')",
+        ]
+    );
 }
