@@ -1,7 +1,7 @@
 use alloc::{borrow::ToOwned, vec::Vec};
-use core::{marker::PhantomData, ops::ControlFlow, slice};
+use core::{marker::PhantomData, slice};
 
-use sqlparser::ast::{Expr, ObjectName, Select, SetOperator, TableFactor, TableWithJoins, Visitor};
+use sqlparser::ast::{Expr, ObjectName, Select, SetOperator, TableFactor, TableWithJoins};
 
 use super::{
     BaseColumnRef, ColumnOrigin, DerivationProfile, Deriving, FromScope, LookupOutcome,
@@ -15,37 +15,7 @@ use crate::{
         IdentifierCase, RangeTableEntry, RelationBinding,
     },
     traits::{ColumnLike, CreatedFromQuery, DatabaseLike, TableLike},
-    utils::walk::walk,
 };
-
-/// Records each expression of one `SELECT` outside the `SELECT`s nested in
-/// it, by address.
-struct OwnExpressions<'found> {
-    depth: usize,
-    cursor: ScopeCursor,
-    found: &'found mut Vec<(usize, ScopeCursor)>,
-}
-
-impl Visitor for OwnExpressions<'_> {
-    type Break = ();
-
-    fn pre_visit_select(&mut self, _select: &Select) -> ControlFlow<()> {
-        self.depth += 1;
-        ControlFlow::Continue(())
-    }
-
-    fn post_visit_select(&mut self, _select: &Select) -> ControlFlow<()> {
-        self.depth -= 1;
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<()> {
-        if self.depth == 1 {
-            self.found.push((core::ptr::from_ref(expression).addr(), self.cursor));
-        }
-        ControlFlow::Continue(())
-    }
-}
 
 /// A resolved column's definition and the names it matched.
 pub(crate) type Bound<'scope, 'query, 'db, DB> =
@@ -347,27 +317,6 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                     },
                 )
             })
-    }
-
-    /// Every expression a scope's `SELECT` holds outside the `SELECT`s nested
-    /// in it, by address, with that scope.
-    pub(crate) fn expression_scopes(&self) -> Vec<(usize, ScopeCursor)> {
-        let mut found = Vec::new();
-        for (index, scope) in self.scopes.iter().enumerate() {
-            let Some(select) = scope.select else { continue };
-            let cursor =
-                ScopeCursor { scope: ScopeId(index), visible_entries: scope.data.from_entry_count };
-            let _ = walk(select.get(), &mut OwnExpressions { depth: 0, cursor, found: &mut found });
-        }
-        found
-    }
-
-    /// The resolver for the scope `cursor` names.
-    pub(crate) fn definition_scope(
-        &self,
-        cursor: ScopeCursor,
-    ) -> ColumnDefinitionScope<'_, 'query, 'db, DB> {
-        ColumnDefinitionScope::new(self, cursor)
     }
 
     fn descends_from(&self, mut candidate: ScopeId, ancestor: ScopeId) -> bool {

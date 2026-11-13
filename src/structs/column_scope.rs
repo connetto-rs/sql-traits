@@ -8,7 +8,10 @@ use crate::{
     errors::LookupError,
     impls::dql::{
         ColumnOrigin, build_definition_graph,
-        definition_graph::{DefinitionGraph, DefinitionId, QueryId, ScopeCursor, table_graph},
+        definition_graph::{
+            DefinitionGraph, DefinitionId, QueryId, ScopeCursor, reference_sites::SiteRule,
+            table_graph,
+        },
     },
     structs::IdentifierCase,
     traits::DatabaseLike,
@@ -1120,21 +1123,20 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
         self.graph.resolve_binding(self.root, reference)
     }
 
-    /// Every expression a `SELECT` of the query holds outside the `SELECT`s
-    /// nested in it, by address, with the scope it resolves in.
-    pub(crate) fn expression_scopes(&self) -> alloc::vec::Vec<(usize, ScopeCursor)> {
-        self.graph.expression_scopes()
+    /// The rule resolving each column reference of `query`, by the address
+    /// of its expression, `None` for one sitting where no scope was derived.
+    pub(crate) fn site_rules(&self, query: &Query) -> alloc::vec::Vec<(usize, Option<SiteRule>)> {
+        self.graph.site_rules(query)
     }
 
-    /// The resolver for the scope `cursor` names, the query's own scope for
-    /// `None`.
-    pub(crate) fn resolve_binding_in(
+    /// Resolves `reference` as `rule` says its clause resolves it.
+    pub(crate) fn resolve_site(
         &self,
-        cursor: Option<ScopeCursor>,
+        rule: SiteRule,
         reference: &Expr,
     ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
     {
-        self.graph.definition_scope(cursor.unwrap_or(self.root)).resolve_column_binding(reference)
+        self.graph.resolve_site(rule, reference)
     }
 
     /// Resolves a relation qualifier with no column, such as a qualified

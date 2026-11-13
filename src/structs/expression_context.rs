@@ -7,7 +7,7 @@ use sqlparser::ast::{CastKind, DataType, Expr, Query, Value};
 
 use crate::{
     errors::LookupError,
-    impls::dql::definition_graph::ScopeCursor,
+    impls::dql::definition_graph::reference_sites::SiteRule,
     structs::{
         ColumnBinding, ColumnDefinition, ColumnScope, IdentifierCase, OperandType, TargetName,
     },
@@ -66,9 +66,9 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     scope: ColumnScope<'query, 'db, DB>,
     /// The address of every expression node of the query, sorted.
     nodes: Vec<usize>,
-    /// The address of every expression a `SELECT` holds, with the scope of
-    /// that `SELECT`, sorted by address.
-    scopes: Vec<(usize, ScopeCursor)>,
+    /// The address of every column reference of the query, with the rule its
+    /// clause resolves it by, sorted by address.
+    sites: Vec<(usize, Option<SiteRule>)>,
 }
 
 impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
@@ -90,14 +90,14 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             ControlFlow::<()>::Continue(())
         });
         nodes.sort_unstable();
-        let mut scopes = scope.expression_scopes();
-        scopes.sort_unstable_by_key(|(address, _)| *address);
-        Ok(Self { database, scope, nodes, scopes })
+        let mut sites = scope.site_rules(query);
+        sites.sort_unstable_by_key(|(address, _)| *address);
+        Ok(Self { database, scope, nodes, sites })
     }
 
     /// Returns the definition and binding of the column `expression`
-    /// references, resolved in the scope it sits in, or `None` for a node that
-    /// is no column reference or binds nothing.
+    /// references, resolved as the clause holding it resolves it, or `None`
+    /// for a node that is no column reference or binds nothing.
     ///
     /// # Errors
     ///
@@ -108,10 +108,16 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         expression: &Expr,
     ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
     {
-        let cursor = self.cursor(expression)?;
-        match expression {
-            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                self.scope.resolve_binding_in(cursor, expression)
+        self.check(expression)?;
+        let address = address(expression);
+        let rule = self
+            .sites
+            .binary_search_by_key(&address, |(held, _)| *held)
+            .ok()
+            .and_then(|index| self.sites[index].1);
+        match (expression, rule) {
+            (Expr::Identifier(_) | Expr::CompoundIdentifier(_), Some(rule)) => {
+                self.scope.resolve_site(rule, expression)
             }
             _ => Ok(None),
         }
@@ -126,7 +132,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
     /// query, and the lookup errors resolving a column reference returns.
     pub fn type_of(&self, expression: &Expr) -> Result<OperandType<'_>, LookupError> {
-        self.cursor(expression)?;
+        self.check(expression)?;
         Ok(match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 match self.reference(expression)? {
@@ -158,17 +164,13 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         self.nodes.binary_search(&address(expression)).is_ok()
     }
 
-    /// The scope `expression` resolves in, `None` for the query's own.
-    fn cursor(&self, expression: &Expr) -> Result<Option<ScopeCursor>, LookupError> {
-        if !self.holds(expression) {
-            return Err(LookupError::ExpressionNotInQuery { expression: expression.to_string() });
+    /// Refuses `expression` unless it is a node of the query.
+    fn check(&self, expression: &Expr) -> Result<(), LookupError> {
+        if self.holds(expression) {
+            Ok(())
+        } else {
+            Err(LookupError::ExpressionNotInQuery { expression: expression.to_string() })
         }
-        let address = address(expression);
-        Ok(self
-            .scopes
-            .binary_search_by_key(&address, |(held, _)| *held)
-            .ok()
-            .map(|index| self.scopes[index].1))
     }
 }
 

@@ -216,3 +216,60 @@ fn a_node_of_another_query_is_refused() {
         Err(LookupError::ExpressionNotInQuery { .. })
     ));
 }
+
+/// A reference binds as its clause binds it: an `ORDER BY` or `DISTINCT ON`
+/// name reaches a select-list output first, a `GROUP BY` name the input
+/// first, a join condition only the items joined so far, and a whole-row
+/// reference binds no column.
+#[test]
+fn references_bind_as_their_clause_binds_them() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE t (x TEXT); CREATE TABLE a (id INT); CREATE TABLE b (id INT);
+         CREATE TABLE c (z INT);",
+    )
+    .unwrap();
+
+    let ordered = query("SELECT 1 AS x FROM t ORDER BY x");
+    let context = ExpressionContext::new(&ordered, &db, IdentifierCase::AsWritten).unwrap();
+    let key = &ordered.order_by.as_ref().unwrap();
+    let sqlparser::ast::OrderByKind::Expressions(keys) = &key.kind else { unreachable!() };
+    let (_, binding) = context.reference(&keys[0].expr).unwrap().unwrap();
+    assert_eq!(binding.entry(), None);
+    assert_eq!(context.type_of(&keys[0].expr).unwrap(), pg("int4"));
+
+    let grouped = query("SELECT length(x) AS x FROM t GROUP BY x");
+    let context = ExpressionContext::new(&grouped, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Select(select) = grouped.body.as_ref() else { unreachable!() };
+    let sqlparser::ast::GroupByExpr::Expressions(keys, _) = &select.group_by else {
+        unreachable!()
+    };
+    assert_eq!(context.type_of(&keys[0]).unwrap(), pg("text"));
+
+    let distinct = query("SELECT DISTINCT ON (x) 1 AS x FROM t");
+    let context = ExpressionContext::new(&distinct, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Select(select) = distinct.body.as_ref() else { unreachable!() };
+    let Some(sqlparser::ast::Distinct::On(keys)) = &select.distinct else { unreachable!() };
+    assert_eq!(context.reference(&keys[0]).unwrap().unwrap().1.entry(), None);
+    assert_eq!(context.type_of(&keys[0]).unwrap(), pg("int4"));
+
+    let whole_row = query("SELECT 1 FROM t WHERE t.* IS NULL");
+    let context = ExpressionContext::new(&whole_row, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Select(select) = whole_row.body.as_ref() else { unreachable!() };
+    let Some(Expr::IsNull(row)) = &select.selection else { unreachable!() };
+    assert!(matches!(row.as_ref(), Expr::QualifiedWildcard(..)));
+    assert!(context.reference(row).unwrap().is_none());
+    assert_eq!(context.type_of(row).unwrap(), OperandType::Unknown);
+
+    let joined = query("SELECT 1 FROM a JOIN b ON z = 1 CROSS JOIN c");
+    let context = ExpressionContext::new(&joined, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Select(select) = joined.body.as_ref() else { unreachable!() };
+    let sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(Expr::BinaryOp {
+        left: z,
+        ..
+    })) = &select.from[0].joins[0].join_operator
+    else {
+        unreachable!()
+    };
+    assert!(context.reference(z).unwrap().is_none());
+    assert_eq!(context.type_of(z).unwrap(), OperandType::Unknown);
+}
