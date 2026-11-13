@@ -1,14 +1,12 @@
 //! PostgreSQL casts and exact implementation links.
 
-use alloc::{borrow::Cow, format, string::String, vec::Vec};
+use alloc::{borrow::Cow, format, string::String};
 
 use sqlparser::ast::{CreateFunction, ObjectName, OperateFunctionArg};
 
 use super::{
     postgres_catalog::CatalogName,
-    postgres_operator::{
-        arguments_match, function_name_matches, identity_repeats, operand_spelling, operand_type,
-    },
+    postgres_operator::{function_name_matches, identity_repeats, operand_type, takes_exactly},
     type_arrays::TypeArrays,
 };
 use crate::{
@@ -180,7 +178,7 @@ impl PostgresCatalogCast {
             return false;
         };
         function_name_matches(&function.name, name, case)
-            && arguments_match(function.spelled_arguments(type_arrays), args)
+            && takes_exactly(function.arguments.iter(), type_arrays, args)
     }
 
     /// Repoints the function `from` declares with `from_args` at `to` when
@@ -195,7 +193,7 @@ impl PostgresCatalogCast {
     ) {
         if let CastImplementation::Function(function) = &mut self.implementation
             && function_name_matches(&function.name, from, case)
-            && arguments_match(function.spelled_arguments(type_arrays), from_args)
+            && takes_exactly(function.arguments.iter(), type_arrays, from_args)
         {
             function.name.set_object_name(to);
         }
@@ -217,16 +215,6 @@ impl PostgresCatalogCast {
             CastImplementation::InOut | CastImplementation::Binary => None,
         };
         [&self.source, &self.target].into_iter().chain(arguments.into_iter().flatten())
-    }
-}
-
-impl CastFunction {
-    /// The normalized spellings of the input types, in order.
-    fn spelled_arguments<'a>(
-        &'a self,
-        type_arrays: &'a TypeArrays,
-    ) -> impl Iterator<Item = Cow<'static, str>> + 'a {
-        self.arguments.iter().map(|argument| operand_spelling(argument, type_arrays))
     }
 }
 
@@ -259,10 +247,10 @@ impl CastLike for PostgresCatalogCast {
             return None;
         };
         let case = database.identifier_case();
-        let spelled: Vec<_> = function.spelled_arguments(&database.ingestion.type_arrays).collect();
+        let type_arrays = &database.ingestion.type_arrays;
         database.functions().find(|candidate| {
             function_name_matches(&function.name, &candidate.name, case)
-                && arguments_match(&spelled, candidate.args.as_deref())
+                && takes_exactly(function.arguments.iter(), type_arrays, candidate.args.as_deref())
         })
     }
 }

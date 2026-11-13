@@ -182,3 +182,39 @@ fn a_numeric_array_suffix_proves_the_stored_owner() {
         Some(vec!["app.token[]".into(), "app.token[]".into()])
     );
 }
+
+#[test]
+fn an_operator_over_a_default_schema_type_links_its_function() {
+    let public = |name| TargetName::new(name, false).with_schema("public", false);
+    let catalog = PostgresCatalog::empty().with_operator(
+        PostgresCatalogOperator::new("===", Some(public("token")), public("token"))
+            .with_schema("public", false)
+            .with_implementation(public("equal"), pg("bool")),
+    );
+    let db = ParseOptions::default()
+        .with_postgres_catalog(catalog)
+        .parse::<PostgreSqlDialect>(
+            "CREATE TYPE token AS ENUM ('a');
+             CREATE FUNCTION equal(a token, b token) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';",
+        )
+        .unwrap();
+    let function = db.operators().unwrap().next().unwrap().implementation(&db).unwrap();
+    assert_eq!(function.name(), "equal");
+}
+
+#[test]
+fn a_function_over_a_type_no_catalog_spells_links_no_operator() {
+    let catalog = PostgresCatalog::empty().with_operator(
+        PostgresCatalogOperator::new("===", Some(pg("int4")), pg("int4")).with_implementation(
+            TargetName::new("equal", false).with_schema("public", false),
+            pg("bool"),
+        ),
+    );
+    let db = ParseOptions::default()
+        .with_postgres_catalog(catalog)
+        .parse::<PostgreSqlDialect>(
+            "CREATE FUNCTION equal(a DATETIME, b DATETIME) RETURNS BOOL LANGUAGE SQL AS 'SELECT TRUE';",
+        )
+        .unwrap();
+    assert!(db.operators().unwrap().next().unwrap().implementation(&db).is_none());
+}
