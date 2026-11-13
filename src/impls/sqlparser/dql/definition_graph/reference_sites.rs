@@ -5,9 +5,10 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Distinct, Expr, GroupByExpr, Ident, ObjectName, ObjectNamePart, OrderByKind, Query, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, TableFactor, TableWithJoins, Visit,
-    Visitor,
+    Delete, Distinct, DoUpdate, Expr, FromTable, GroupByExpr, Ident, Insert, ObjectName,
+    ObjectNamePart, OnConflict, OnConflictAction, OnInsert, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableWithJoins, Update,
+    UpdateTableFromKind, Visit, Visitor,
 };
 
 use super::{
@@ -20,7 +21,11 @@ use super::{
     output_columns::{QueryId, unwrap_nested},
 };
 use crate::{
-    errors::LookupError, structs::IdentifierCase, traits::DatabaseLike, utils::walk::walk,
+    errors::LookupError,
+    impls::dql::scoped_roots::{RootScopes, ScopedRoot},
+    structs::IdentifierCase,
+    traits::DatabaseLike,
+    utils::walk::walk,
 };
 
 /// What one column reference reached.
@@ -91,6 +96,10 @@ pub(crate) enum SiteRule {
     InputFirst(ScopeCursor),
 }
 
+/// The rule resolving each column reference, by the address of its
+/// expression, `None` for one sitting where no scope was derived.
+pub(crate) type SiteRules = Vec<(usize, Option<SiteRule>)>;
+
 impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     /// Resolves `reference` as `rule` says its clause resolves it.
     pub(crate) fn resolve_site<'scope>(
@@ -112,6 +121,27 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         let mut rules = Vec::new();
         let mut sink = |expression: &Expr, rule| rules.push((expression_address(expression), rule));
         Walk { graph: self, references: QueryReferences::default(), sink: &mut sink }.query(query);
+        rules
+    }
+
+    /// The rule resolving each column reference of `root`, by the address of
+    /// its expression, `None` for one sitting where no scope was derived,
+    /// `scopes` naming the scopes [`scoped_graph`] built for it.
+    ///
+    /// [`scoped_graph`]: crate::impls::dql::scoped_roots::scoped_graph
+    pub(crate) fn root_site_rules(
+        &self,
+        root: ScopedRoot<'_>,
+        scopes: RootScopes,
+    ) -> Vec<(usize, Option<SiteRule>)> {
+        let mut rules = Vec::new();
+        let mut sink = |expression: &Expr, rule| rules.push((expression_address(expression), rule));
+        let mut walk =
+            Walk { graph: self, references: QueryReferences::default(), sink: &mut sink };
+        match root {
+            ScopedRoot::Expression(expression) => walk.node(expression, Some(scopes.outer)),
+            ScopedRoot::Statement(statement) => walk.statement(statement, scopes),
+        }
         rules
     }
 }
@@ -309,19 +339,7 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
         let scope = self.graph.select_scope(select);
         let cursor = self.cursor(scope);
 
-        let mut entries = 0;
-        for table in from {
-            self.factor(&table.relation, scope, entries);
-            entries += 1;
-            for join in &table.joins {
-                self.factor(&join.relation, scope, entries);
-                entries += 1;
-                if let Some(constraint) = join_constraint(&join.join_operator) {
-                    let joined = scope.map(|scope| ScopeCursor { scope, visible_entries: entries });
-                    self.node(constraint, joined);
-                }
-            }
-        }
+        self.relations(&[from], scope);
 
         if let Some(Distinct::On(keys)) = distinct {
             for key in keys {
@@ -388,6 +406,73 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
             if let Some(constraint) = join_constraint(&join.join_operator) {
                 self.node(constraint, None);
             }
+        }
+    }
+
+    /// Records the `FROM` items `lists` name, in order, as the entries of
+    /// `scope`, and walks what they and their join constraints hold.
+    fn relations(&mut self, lists: &[&[TableWithJoins]], scope: Option<ScopeId>) {
+        let mut entries = 0;
+        for table in lists.iter().copied().flatten() {
+            self.factor(&table.relation, scope, entries);
+            entries += 1;
+            for join in &table.joins {
+                self.factor(&join.relation, scope, entries);
+                entries += 1;
+                if let Some(constraint) = join_constraint(&join.join_operator) {
+                    let joined = scope.map(|scope| ScopeCursor { scope, visible_entries: entries });
+                    self.node(constraint, joined);
+                }
+            }
+        }
+    }
+
+    /// Walks a statement root, its own relations in the scopes `scopes`
+    /// names.
+    fn statement(&mut self, statement: &Statement, scopes: RootScopes) {
+        let cursor = scopes.statement;
+        let scope = cursor.map(|cursor| cursor.scope);
+        match statement {
+            Statement::Query(query) => self.query(query),
+            Statement::Update(Update {
+                table, from, assignments, selection, returning, ..
+            }) => {
+                let from = match from {
+                    Some(
+                        UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from),
+                    ) => from.as_slice(),
+                    None => &[],
+                };
+                self.relations(&[core::slice::from_ref(table), from], scope);
+                for assignment in assignments {
+                    self.node(&assignment.value, cursor);
+                }
+                self.node(selection, cursor);
+                self.node(returning, cursor);
+            }
+            Statement::Delete(Delete { from, using, selection, returning, .. }) => {
+                let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
+                self.relations(&[from, using.as_deref().unwrap_or_default()], scope);
+                self.node(selection, cursor);
+                self.node(returning, cursor);
+            }
+            Statement::Insert(Insert { source, returning, on, .. }) => {
+                if let Some(source) = source {
+                    self.query(source);
+                }
+                self.node(returning, cursor);
+                if let Some(OnInsert::OnConflict(OnConflict {
+                    action: OnConflictAction::DoUpdate(DoUpdate { assignments, selection }),
+                    ..
+                })) = on
+                {
+                    for assignment in assignments {
+                        self.node(&assignment.value, scopes.conflict);
+                    }
+                    self.node(selection, scopes.conflict);
+                }
+            }
+            other => self.node(other, None),
         }
     }
 

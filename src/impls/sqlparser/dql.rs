@@ -49,6 +49,7 @@ use crate::{
 };
 
 pub(crate) mod definition_graph;
+pub(crate) mod scoped_roots;
 
 use definition_graph::{AstRef, DefinitionDerivation, ScopeCursor};
 
@@ -743,12 +744,37 @@ where
     P: DerivationProfile<'query, 'db, DB>,
 {
     let mut scope = profile.begin_scope(select, parent);
-    for table_with_joins in select.map(|select| select.from.as_slice()).iter() {
+    collect_from_items(
+        select.map(|select| select.from.as_slice()),
+        &mut scope,
+        cte_scope,
+        deriving,
+        parent,
+        profile,
+    )?;
+    Ok(append_unmodeled_relations(select, profile, scope))
+}
+
+/// Appends the `FROM` items `from` lists to `scope`, each with the joins it
+/// carries, reading the queries nested in them under `parent`.
+fn collect_from_items<'query, 'db, DB, P>(
+    from: AstRef<'query, 'db, [TableWithJoins]>,
+    scope: &mut P::Scope,
+    cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
+    deriving: Deriving<'_, 'db, DB>,
+    parent: P::Cursor,
+    profile: &mut P,
+) -> Result<(), LookupError>
+where
+    DB: DatabaseLike,
+    P: DerivationProfile<'query, 'db, DB>,
+{
+    for table_with_joins in from.iter() {
         let (entry_bases, entry_derived) = {
-            let data = profile.scope(&scope);
+            let data = profile.scope(scope);
             (data.bases.len(), data.derived.len())
         };
-        let local_parent = profile.cursor(&scope);
+        let local_parent = profile.cursor(scope);
         if P::INDEX_NESTED_QUERIES {
             index_table_factor_expression_queries(
                 table_with_joins.map(|entry| &entry.relation),
@@ -767,16 +793,16 @@ where
             local_parent,
             profile,
         )?;
-        let (mut accumulated, mut plan) = match append_factor(profile, &mut scope, contribution) {
+        let (mut accumulated, mut plan) = match append_factor(profile, scope, contribution) {
             Some((names, entries)) => (Some(names), Some(entries)),
             None => (None, None),
         };
         for join in table_with_joins.map(|entry| entry.joins.as_slice()).iter() {
             let (bases_before, derived_before) = {
-                let data = profile.scope(&scope);
+                let data = profile.scope(scope);
                 (data.bases.len(), data.derived.len())
             };
-            let local_parent = profile.cursor(&scope);
+            let local_parent = profile.cursor(scope);
             if P::INDEX_NESTED_QUERIES {
                 index_table_factor_expression_queries(
                     join.map(|join| &join.relation),
@@ -795,18 +821,17 @@ where
                 local_parent,
                 profile,
             )?;
-            let (right_names, right_entries) =
-                match append_factor(profile, &mut scope, contribution) {
-                    Some((names, entries)) => (Some(names), Some(entries)),
-                    None => (None, None),
-                };
+            let (right_names, right_entries) = match append_factor(profile, scope, contribution) {
+                Some((names, entries)) => (Some(names), Some(entries)),
+                None => (None, None),
+            };
             if P::INDEX_NESTED_QUERIES {
-                let local_parent = profile.cursor(&scope);
+                let local_parent = profile.cursor(scope);
                 index_join_expression_queries(join, cte_scope, deriving, local_parent, profile)?;
             }
             let (left_nullable, right_nullable) = nullable_sides(&join.get().join_operator);
             let opaque = profile.opaque_definition();
-            let data = profile.scope_mut(&mut scope);
+            let data = profile.scope_mut(scope);
             mark_nullable_sides(
                 data,
                 left_nullable,
@@ -834,9 +859,9 @@ where
             plan = merge_plans(plan, right_entries, &merged, &join.get().join_operator, data);
             accumulated = merge_output_names(accumulated, right_names, &merged, data.case);
         }
-        profile.scope_mut(&mut scope).wildcard_plans.push(plan.unwrap_or_default());
+        profile.scope_mut(scope).wildcard_plans.push(plan.unwrap_or_default());
     }
-    Ok(append_unmodeled_relations(select, profile, scope))
+    Ok(())
 }
 
 /// Makes lookups opaque where `LATERAL VIEW` relations or `CONNECT BY`

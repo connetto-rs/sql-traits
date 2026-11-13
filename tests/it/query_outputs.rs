@@ -49,6 +49,7 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
                 describe(&recursive.definition())
             )
         }
+        ColumnDefinition::Parameter { ordinal, .. } => format!("parameter {ordinal}"),
         ColumnDefinition::Opaque => "opaque".to_owned(),
     }
 }

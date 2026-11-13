@@ -5,17 +5,21 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, InTarget, ObjectNamePart, Query, UnaryOperator, Value, Visitor,
+    FunctionArguments, Ident, InTarget, ObjectNamePart, Query, Statement, UnaryOperator, Value,
+    Visit, Visitor,
 };
 
 use crate::{
     errors::LookupError,
-    impls::dql::definition_graph::reference_sites::SiteRule,
+    impls::dql::{
+        definition_graph::reference_sites::SiteRule,
+        scoped_roots::{ScopedRoot, is_input},
+    },
     structs::{
-        ColumnBinding, ColumnDefinition, ColumnScope, IdentifierCase, OperandType,
+        ColumnBinding, ColumnDefinition, ColumnScope, ExpressionScope, IdentifierCase, OperandType,
         OperatorResolution, SelectedOperator, TargetName,
     },
-    traits::{ColumnLike, DataTypeLike, DatabaseLike},
+    traits::{ColumnLike, DataTypeLike, DatabaseLike, FunctionLike},
     utils::{
         coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
         object_name::PG_CATALOG,
@@ -75,6 +79,11 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     /// clause resolves it by, sorted by address.
     sites: Vec<(usize, Option<SiteRule>)>,
     case: IdentifierCase,
+    /// The type of each input parameter of the function whose body the
+    /// context types, in the order `$n` counts them.
+    parameters: Vec<OperandType<'db>>,
+    /// The type of `VALUE` in a domain constraint.
+    value: Option<OperandType<'db>>,
 }
 
 /// One operator PostgreSQL applies to evaluate an expression node, with the
@@ -235,15 +244,117 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
         let scope = ColumnScope::from_query(query, database, case)?;
+        let sites = scope.site_rules(query);
+        Ok(Self::assemble(query, scope, sites, database, case, Vec::new(), None))
+    }
+
+    /// Builds the context of `expression`, written outside a query, over
+    /// `database`, its column references reaching what `scope` names and the
+    /// relations of the queries it holds, comparing identifiers under
+    /// `case`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the relation-name lookup errors resolving the queries
+    /// `expression` holds runs into.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect, parser::Parser};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (a INT4, b NUMERIC);")?;
+    /// let table = db.table_by_target(TargetName::new("t", false), IdentifierCase::Folded)?;
+    /// let check = Parser::new(&PostgreSqlDialect {}).try_with_sql("t.a > b")?.parse_expr()?;
+    /// let scope = ExpressionScope::Table(table.expect("t exists"));
+    /// let context = ExpressionContext::for_expression(&check, &scope, &db, IdentifierCase::Folded)?;
+    /// let Expr::BinaryOp { left, .. } = &check else { unreachable!() };
+    /// let int4 = TargetName::new("int4", false).with_schema("pg_catalog", false);
+    /// assert_eq!(context.type_of(left)?, OperandType::Known { type_name: int4, typmod: None });
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn for_expression(
+        expression: &'query Expr,
+        scope: &ExpressionScope<'_, 'db, DB>,
+        database: &'db DB,
+        case: IdentifierCase,
+    ) -> Result<Self, LookupError> {
+        Self::scoped(ScopedRoot::Expression(expression), expression, scope, database, case)
+    }
+
+    /// Builds the context of `statement`, a query or an `INSERT`, `UPDATE`
+    /// or `DELETE` written outside a query, over `database`, its column
+    /// references reaching its own relations first and then what `scope`
+    /// names, comparing identifiers under `case`.
+    ///
+    /// An `UPDATE` reaches its target and its `FROM` relations, a `DELETE`
+    /// its target and its `USING` relations, and an `INSERT`'s `RETURNING`
+    /// its target, which its `ON CONFLICT DO UPDATE` reaches with the
+    /// `excluded` row. Any other statement binds no column reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns the relation-name lookup errors resolving the statement runs
+    /// into.
+    pub fn for_statement(
+        statement: &'query Statement,
+        scope: &ExpressionScope<'_, 'db, DB>,
+        database: &'db DB,
+        case: IdentifierCase,
+    ) -> Result<Self, LookupError> {
+        Self::scoped(ScopedRoot::Statement(statement), statement, scope, database, case)
+    }
+
+    /// Builds the context of `root`, which `node` is, under `scope`.
+    fn scoped<N: Visit + ?Sized>(
+        root: ScopedRoot<'query>,
+        node: &'query N,
+        scope: &ExpressionScope<'_, 'db, DB>,
+        database: &'db DB,
+        case: IdentifierCase,
+    ) -> Result<Self, LookupError> {
+        let (column_scope, sites) = ColumnScope::for_root(root, scope, database, case)?;
+        let parameters = match scope {
+            ExpressionScope::FunctionBody(function) => {
+                function
+                    .argument_modes()
+                    .zip(function.argument_type_names(database))
+                    .filter(|(mode, _)| is_input(mode))
+                    .map(|(_, name)| {
+                        PgType::parse(&name)
+                            .map_or(OperandType::Unknown, |pg_type| known(database, pg_type, None))
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let value = match scope {
+            ExpressionScope::DomainValue(data_type) => Some(declared_type(database, data_type)),
+            _ => None,
+        };
+        Ok(Self::assemble(node, column_scope, sites, database, case, parameters, value))
+    }
+
+    /// The context of the nodes of `root`, resolved in `scope` by the rules
+    /// `sites` holds.
+    fn assemble<N: Visit + ?Sized>(
+        root: &N,
+        scope: ColumnScope<'query, 'db, DB>,
+        mut sites: Vec<(usize, Option<SiteRule>)>,
+        database: &'db DB,
+        case: IdentifierCase,
+        parameters: Vec<OperandType<'db>>,
+        value: Option<OperandType<'db>>,
+    ) -> Self {
         let mut nodes = Vec::new();
-        let _ = walk_expressions(query, |expression| {
+        let _ = walk_expressions(root, |expression| {
             nodes.push(address(expression));
             ControlFlow::<()>::Continue(())
         });
         nodes.sort_unstable();
-        let mut sites = scope.site_rules(query);
         sites.sort_unstable_by_key(|(address, _)| *address);
-        Ok(Self { database, scope, nodes, sites, case })
+        Self { database, scope, nodes, sites, case, parameters, value }
     }
 
     /// Returns the definition and binding of the column `expression`
@@ -307,10 +418,19 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                     {
                         self.type_of(expression)?
                     }
+                    Some((ColumnDefinition::Parameter { ordinal, .. }, _)) => {
+                        self.parameters.get(ordinal).cloned().unwrap_or(OperandType::Unknown)
+                    }
+                    None => self.domain_value(expression).unwrap_or(OperandType::Unknown),
                     _ => OperandType::Unknown,
                 }
             }
-            Expr::Value(value) => literal_type(&value.value),
+            Expr::Value(value) => {
+                match &value.value {
+                    Value::Placeholder(placeholder) => self.positional(placeholder),
+                    other => literal_type(other),
+                }
+            }
             Expr::TypedString(typed) => declared_type(self.database, &typed.data_type),
             Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, data_type, .. } => {
                 declared_type(self.database, data_type)
@@ -602,6 +722,30 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// The type of `VALUE` when `expression` is that keyword in a domain
+    /// constraint's context.
+    fn domain_value(&self, expression: &Expr) -> Option<OperandType<'db>> {
+        match expression {
+            Expr::Identifier(Ident { value, quote_style: None, .. })
+                if value.eq_ignore_ascii_case("value") =>
+            {
+                self.value.clone()
+            }
+            _ => None,
+        }
+    }
+
+    /// The type of the parameter `$n` names in a function body's context,
+    /// and [`OperandType::Unknown`] outside one.
+    fn positional(&self, placeholder: &str) -> OperandType<'db> {
+        placeholder
+            .strip_prefix('$')
+            .and_then(|position| position.parse::<usize>().ok())
+            .and_then(|position| self.parameters.get(position.checked_sub(1)?))
+            .cloned()
+            .unwrap_or(OperandType::Unknown)
     }
 
     /// Whether `expression` is a node of the query.
