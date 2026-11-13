@@ -52,7 +52,7 @@ fn a_cascade_reaching_a_call_outside_the_schema_is_refused() {
         "{APP} CREATE TABLE public.o (b INT DEFAULT app.f()); DROP SCHEMA app CASCADE;"
     ));
     assert!(
-        matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "f"),
+        matches!(&result, Err(Error::FunctionReferenced { function_name, .. }) if function_name == "f"),
         "got {result:?}"
     );
 }

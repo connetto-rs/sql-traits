@@ -44,7 +44,6 @@ use crate::{
         ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
         IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
         Sequence, TableAttribute, TableMetadata, UserDefinedType, View,
-        generic_db::builtin_functions::Builtins,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -90,6 +89,7 @@ mod existing_child;
 mod extensions;
 mod foreign_options;
 mod function_bodies;
+mod function_dependents;
 mod function_moves;
 mod generated_names;
 mod grantors;
@@ -1207,6 +1207,12 @@ impl ParserDBBuilder {
         for (_, calls) in self.triggers_mut() {
             calls.replace_function(stale, fresh);
         }
+        for (_, metadata, _) in self.tables_mut() {
+            metadata.partition_key_calls_mut().replace_function(stale, fresh);
+            for calls in metadata.exclusion_calls_mut() {
+                calls.replace_function(stale, fresh);
+            }
+        }
     }
 
     /// Drops the stored functions `dropping`, refusing while anything but
@@ -1219,7 +1225,7 @@ impl ParserDBBuilder {
     /// # Errors
     ///
     /// Returns [`crate::errors::Error::FunctionReferenced`] for a function
-    /// something else still calls.
+    /// something else still calls, naming what calls it.
     fn drop_function_nodes(
         &mut self,
         dropping: &[Arc<CreateFunction>],
@@ -1229,67 +1235,14 @@ impl ParserDBBuilder {
             return Ok(());
         }
         let doomed: Vec<Arc<CreateFunction>> = dropping.iter().chain(alongside).cloned().collect();
-        if let Some(called) =
-            dropping.iter().find(|function| self.is_function_used(function, &doomed))
-        {
-            return Err(crate::errors::Error::FunctionReferenced {
-                function_name: last_str(&called.name).to_string(),
-            });
+        for function in dropping {
+            if let Some(dependent) = self.function_dependent(function, &doomed) {
+                return Err(function_dependents::referenced(function, dependent));
+            }
         }
         self.functions_mut()
             .retain(|(function, _)| !dropping.iter().any(|dropped| Arc::ptr_eq(dropped, function)));
         Ok(())
-    }
-
-    /// Whether an object still calls the stored function `dropped`, leaving
-    /// out the functions in `dropping`, which the same statement drops.
-    ///
-    /// Every call PostgreSQL binds holds the function it reached when it was
-    /// written, so the comparison is by node, and a body calling its own
-    /// function does not hold it in place. A trigger holds the name of the
-    /// function it runs, which reaches a function taking no arguments.
-    fn is_function_used(
-        &self,
-        dropped: &Arc<CreateFunction>,
-        dropping: &[Arc<CreateFunction>],
-    ) -> bool {
-        let is_dropped = |function: &CreateFunction| core::ptr::eq(function, dropped.as_ref());
-        let calls_dropped =
-            |calls: &ExpressionCalls<CreateFunction>| calls.functions().any(is_dropped);
-        // A bound name left bare is one in the default schema.
-        let trigger_scope = calls_in_expression::CallScope {
-            functions: &[],
-            builtins: &Builtins::none(),
-            search_path: &[("public", false)],
-            case: self.identifier_case(),
-        };
-
-        self.check_constraints().iter().any(|(_, metadata)| metadata.functions().any(is_dropped))
-            || self.policies().iter().any(|(_, metadata)| {
-                calls_dropped(metadata.using_calls()) || calls_dropped(metadata.check_calls())
-            })
-            || self.triggers().iter().any(|(trigger, calls)| {
-                calls_dropped(calls)
-                    || trigger.exec_body.as_ref().is_some_and(|body| {
-                        trigger_scope.reaches(dropped, &body.func_desc.name, 0)
-                            && function_argument_types(dropped.args.as_deref()).is_empty()
-                    })
-            })
-            || self.functions().iter().any(|(caller, metadata)| {
-                !is_dropped(caller)
-                    && !dropping.iter().any(|other| Arc::ptr_eq(other, caller))
-                    && calls_dropped(metadata.body_calls())
-            })
-            || self.columns().iter().any(|(_, metadata, _)| calls_dropped(metadata.calls()))
-            || self.indices().iter().any(|(_, metadata)| calls_dropped(metadata.calls()))
-            || self.views().iter().any(|(_, metadata, _)| calls_dropped(metadata.calls()))
-            || self
-                .materialized_views()
-                .iter()
-                .any(|(_, metadata, _)| calls_dropped(metadata.calls()))
-            || self.rules().iter().any(|(_, calls)| calls_dropped(calls))
-            || self.domains().iter().any(|(_, metadata)| calls_dropped(metadata.calls()))
-            || self.user_defined_types().iter().any(|(_, calls)| calls_dropped(calls))
     }
 
     /// The function a trigger written to run `called` runs, as of this
@@ -6050,6 +6003,14 @@ impl ParserDB {
             stored.schema.as_deref(),
             stored.schema_quoted,
         );
+        for (exclusion, calls) in
+            constraint_names::exclusions(&previous_node).zip(previous_metadata.exclusion_calls())
+        {
+            carried.record(exclusion, calls);
+        }
+        if let Some(entries) = partition_keys::key_entries(&previous_node) {
+            carried.record(entries, previous_metadata.partition_key_calls());
+        }
         carry(&mut carried);
 
         let replacement = Arc::new(replacement);
@@ -6560,6 +6521,13 @@ impl ParserDB {
             builder,
             &mut carried,
         )?;
+        let exclusion_calls = constraint_names::exclusions(&create_table)
+            .map(|exclusion| builder.calls_carried(exclusion, &mut carried))
+            .collect();
+        table_metadata.set_exclusion_calls(exclusion_calls);
+        if let Some(entries) = partition_keys::key_entries(&create_table) {
+            table_metadata.set_partition_key_calls(builder.calls_carried(entries, &mut carried));
+        }
         table_metadata.set_documentation(documentation);
         table_metadata.set_constraint_names_pending(true);
 
@@ -9189,24 +9157,27 @@ impl ParserDB {
                                 type_name,
                             });
                         }
-                        if builder.is_function_used(function, &dropping) {
-                            return Err(crate::errors::Error::FunctionReferenced {
+                        let refused = |(dependent_kind, dependent_name)| {
+                            crate::errors::Error::FunctionReferenced {
                                 function_name: function_name.to_string(),
-                            });
+                                dependent_kind,
+                                dependent_name,
+                            }
+                        };
+                        if let Some(dependent) = builder.function_dependent(function, &dropping) {
+                            return Err(refused(dependent));
                         }
                         // An operator or cast the catalog runs on this
                         // function holds it in place, and goes with it under
                         // CASCADE.
-                        if active_postgres_catalog.fact_declares_function(
+                        if let Some(fact) = active_postgres_catalog.fact_running_function(
                             &type_arrays,
                             &function.name,
                             function.args.as_deref(),
                             builder.identifier_case(),
                         ) {
                             if drop_function.drop_behavior != Some(DropBehavior::Cascade) {
-                                return Err(crate::errors::Error::FunctionReferenced {
-                                    function_name: function_name.to_string(),
-                                });
+                                return Err(refused((fact.kind, fact.name)));
                             }
                             Arc::make_mut(&mut active_postgres_catalog)
                                 .drop_facts_declaring_function(
@@ -12668,7 +12639,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::FunctionReferenced { function_name }) if function_name == "is_valid"
+                Err(Error::FunctionReferenced { function_name, .. }) if function_name == "is_valid"
             ));
         }
 
@@ -12692,7 +12663,7 @@ mod tests {
             // IF EXISTS doesn't bypass the reference check
             assert!(matches!(
                 result,
-                Err(Error::FunctionReferenced { function_name }) if function_name == "is_valid"
+                Err(Error::FunctionReferenced { function_name, .. }) if function_name == "is_valid"
             ));
         }
 
@@ -13157,7 +13128,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::FunctionReferenced { function_name }) if function_name == "FooBar"
+                Err(Error::FunctionReferenced { function_name, .. }) if function_name == "FooBar"
             ));
         }
 
@@ -13173,7 +13144,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::FunctionReferenced { function_name }) if function_name == "FooBar"
+                Err(Error::FunctionReferenced { function_name, .. }) if function_name == "FooBar"
             ));
         }
 
@@ -13189,7 +13160,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::FunctionReferenced { function_name }) if function_name == "FooBar"
+                Err(Error::FunctionReferenced { function_name, .. }) if function_name == "FooBar"
             ));
         }
     }

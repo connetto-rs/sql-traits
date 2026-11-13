@@ -276,7 +276,14 @@ fn a_cascading_drop_of_a_named_object_removes_the_cast() {
 #[test]
 fn a_restricted_drop_of_the_cast_function_is_refused() {
     let result = configured(app("celsius"), &with_types("DROP FUNCTION app.to_f(app.celsius);"));
-    assert!(matches!(result, Err(Error::FunctionReferenced { .. })));
+    assert!(
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced { dependent_kind: ObjectKind::Cast, dependent_name, .. })
+                if dependent_name == "(app.celsius AS app.fahrenheit)"
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]

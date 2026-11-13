@@ -137,14 +137,14 @@ fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Resu
             .chain(metadata.extension_dependencies())
             .any(|extension| case_idents_match(extension, name, case))
     };
-    if let Some((function, _)) = builder
-        .functions()
-        .iter()
-        .find(|(function, metadata)| belongs(metadata) && builder.is_function_used(function, &[]))
-    {
-        return Err(Error::FunctionReferenced {
-            function_name: last_str(&function.name).to_string(),
-        });
+    let held = builder.functions().iter().find_map(|(function, metadata)| {
+        belongs(metadata)
+            .then(|| builder.function_dependent(function, &[]))
+            .flatten()
+            .map(|dependent| super::function_dependents::referenced(function, dependent))
+    });
+    if let Some(error) = held {
+        return Err(error);
     }
     builder.functions_mut().retain(|(_, metadata)| !belongs(metadata));
     Ok(())

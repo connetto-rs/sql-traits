@@ -4,7 +4,10 @@
 //! same name in another schema or taking other arguments is free to drop.
 #![allow(clippy::expect_used)]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, ObjectKind},
+    prelude::*,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
@@ -13,7 +16,7 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
 
 fn assert_in_use(result: &Result<ParserDB, Error>) {
     assert!(
-        matches!(result, Err(Error::FunctionReferenced { function_name }) if function_name == "f"),
+        matches!(result, Err(Error::FunctionReferenced { function_name, .. }) if function_name == "f"),
         "got {result:?}"
     );
 }
@@ -172,35 +175,149 @@ const CALLED: &str = "CREATE FUNCTION f() RETURNS INT LANGUAGE sql IMMUTABLE AS 
      CREATE TABLE t (a INT);";
 
 /// A statement writing a call to `f` into each object PostgreSQL binds the
-/// call of at creation.
-const DEPENDENTS: [&str; 13] = [
-    "CREATE TABLE d (a INT DEFAULT f());",
-    "CREATE TABLE d (a INT GENERATED ALWAYS AS (f()) STORED);",
-    "ALTER TABLE t ALTER COLUMN a SET DEFAULT f();",
-    "ALTER TABLE t ADD COLUMN b INT DEFAULT f();",
-    "CREATE INDEX i ON t ((f() + a));",
-    "CREATE INDEX i ON t (a) WHERE f() > 0;",
-    "CREATE VIEW v AS SELECT f() AS one;",
-    "CREATE MATERIALIZED VIEW v AS SELECT f() AS one;",
-    "CREATE RULE r AS ON INSERT TO t WHERE f() > 0 DO INSTEAD NOTHING;",
-    "CREATE RULE r AS ON INSERT TO t DO INSTEAD SELECT f();",
-    "CREATE DOMAIN d AS INT CHECK (VALUE > f());",
-    "CREATE DOMAIN d AS INT DEFAULT f();",
-    "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN (f() > 0) EXECUTE FUNCTION trg();",
+/// call of at creation, with the object a refused drop names, as PostgreSQL
+/// 18 lists it.
+const DEPENDENTS: [(&str, ObjectKind, &str); 20] = [
+    ("CREATE TABLE d (a INT DEFAULT f());", ObjectKind::ColumnDefault, "d.a"),
+    ("CREATE TABLE d (a INT GENERATED ALWAYS AS (f()) STORED);", ObjectKind::Column, "d.a"),
+    ("CREATE TABLE d (a INT CONSTRAINT ck CHECK (a > f()));", ObjectKind::CheckConstraint, "d.ck"),
+    ("ALTER TABLE t ALTER COLUMN a SET DEFAULT f();", ObjectKind::ColumnDefault, "t.a"),
+    ("ALTER TABLE t ADD COLUMN b INT DEFAULT f();", ObjectKind::ColumnDefault, "t.b"),
+    ("CREATE TABLE d (a INT CHECK (a > f()));", ObjectKind::CheckConstraint, "d.d_a_check"),
+    ("ALTER TABLE t ADD CONSTRAINT ck CHECK (a > f());", ObjectKind::CheckConstraint, "t.ck"),
+    ("CREATE INDEX i ON t ((f() + a));", ObjectKind::Index, "i"),
+    ("CREATE INDEX i ON t (a) WHERE f() > 0;", ObjectKind::Index, "i"),
+    (
+        "CREATE TABLE x (a INT, CONSTRAINT xc EXCLUDE USING btree ((a + f()) WITH =));",
+        ObjectKind::Index,
+        "xc",
+    ),
+    ("CREATE VIEW v AS SELECT f() AS one;", ObjectKind::View, "v"),
+    ("CREATE MATERIALIZED VIEW v AS SELECT f() AS one;", ObjectKind::MaterializedView, "v"),
+    ("CREATE POLICY pol ON t USING (f() > 0);", ObjectKind::Policy, "pol"),
+    ("CREATE RULE r AS ON INSERT TO t WHERE f() > 0 DO INSTEAD NOTHING;", ObjectKind::Rule, "r"),
+    ("CREATE RULE r AS ON INSERT TO t DO INSTEAD SELECT f();", ObjectKind::Rule, "r"),
+    ("CREATE DOMAIN d AS INT CHECK (VALUE > f());", ObjectKind::Domain, "d"),
+    ("CREATE DOMAIN d AS INT DEFAULT f();", ObjectKind::Domain, "d"),
+    (
+        "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN (f() > 0) EXECUTE FUNCTION trg();",
+        ObjectKind::Trigger,
+        "tr",
+    ),
+    ("CREATE TABLE p (a INT) PARTITION BY RANGE ((a + f()));", ObjectKind::Table, "p"),
+    (
+        "CREATE FUNCTION caller() RETURNS INT LANGUAGE sql RETURN f();",
+        ObjectKind::Function,
+        "caller",
+    ),
 ];
 
 /// Each object a call is bound into holds the function, so dropping it is
-/// refused while the object remains.
+/// refused while the object remains, the refusal naming the object.
 #[test]
 fn every_bound_call_holds_its_function() {
-    for dependent in DEPENDENTS {
+    for (dependent, kind, name) in DEPENDENTS {
         parse(&format!("{CALLED} {dependent}")).expect(dependent);
         let result = parse(&format!("{CALLED} {dependent} DROP FUNCTION f();"));
         assert!(
-            matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "f"),
+            matches!(
+                &result,
+                Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                    if function_name == "f" && *dependent_kind == kind && dependent_name == name
+            ),
             "{dependent} got {result:?}"
         );
     }
+}
+
+/// A trigger holds the function it runs, and several functions dropped in
+/// one statement do not hold each other, the refusal naming the function
+/// something else still holds, as PostgreSQL 18 details it.
+#[test]
+fn a_refusal_names_the_function_held_and_what_holds_it() {
+    let triggered = format!(
+        "{CALLED} CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg();"
+    );
+    let result = parse(&format!("{triggered} DROP FUNCTION trg();"));
+    assert!(
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced {
+                function_name,
+                dependent_kind: ObjectKind::Trigger,
+                dependent_name,
+            }) if function_name == "trg" && dependent_name == "tr"
+        ),
+        "got {result:?}"
+    );
+
+    let together = "CREATE FUNCTION f() RETURNS INT LANGUAGE sql IMMUTABLE RETURN 1;
+         CREATE FUNCTION g() RETURNS INT LANGUAGE sql IMMUTABLE RETURN f();
+         CREATE TABLE t (a INT CHECK (a > g()));";
+    parse(&format!("{together} ALTER TABLE t DROP CONSTRAINT t_a_check; DROP FUNCTION f(), g();"))
+        .expect("g calling f goes with it");
+    let result = parse(&format!("{together} DROP FUNCTION f(), g();"));
+    assert!(
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced {
+                function_name,
+                dependent_kind: ObjectKind::CheckConstraint,
+                dependent_name,
+            }) if function_name == "g" && dependent_name == "t.t_a_check"
+        ),
+        "got {result:?}"
+    );
+
+    let defaulted = format!("{CALLED} CREATE TABLE d (a INT DEFAULT f()); DROP FUNCTION f();");
+    assert_eq!(
+        parse(&defaulted).expect_err("the default calls f").to_string(),
+        "Function `f` cannot be dropped because Column default `d.a` uses it."
+    );
+}
+
+/// An unnamed exclusion constraint is named as PostgreSQL 18 names it.
+#[test]
+fn an_unnamed_exclusion_is_named_as_postgresql_names_it() {
+    for (elements, name) in [
+        ("(a + f(a)) WITH =", "d_expr_excl"),
+        ("(f(a)) WITH =", "d_f_excl"),
+        ("(f(a)::TEXT) WITH =", "d_f_excl"),
+        ("a WITH =, (f(b)) WITH =", "d_a_f_excl"),
+    ] {
+        let result = parse(&format!(
+            "CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             CREATE TABLE d (a INT, b INT, EXCLUDE USING btree ({elements}));
+             DROP FUNCTION f(INT);"
+        ));
+        assert!(
+            matches!(
+                &result,
+                Err(Error::FunctionReferenced { dependent_kind: ObjectKind::Index, dependent_name, .. })
+                    if dependent_name == name
+            ),
+            "{elements} got {result:?}"
+        );
+    }
+}
+
+/// A dialect giving constraints written without a name none leaves the
+/// exclusion known by how it is written.
+#[test]
+fn an_exclusion_no_dialect_rule_names_is_named_as_written() {
+    let result = ParserDB::parse::<sqlparser::dialect::GenericDialect>(
+        "CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+         CREATE TABLE d (a INT, EXCLUDE USING btree ((f(a)) WITH =));
+         DROP FUNCTION f(INT);",
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced { dependent_kind: ObjectKind::Index, dependent_name, .. })
+                if dependent_name == "EXCLUDE USING btree ((f(a)) WITH =)"
+        ),
+        "got {result:?}"
+    );
 }
 
 /// The overloads `f(INT)` and `f(TEXT)`, the trigger function `trg` and the
@@ -221,11 +338,13 @@ const OVERLOADED: &str =
      CREATE RULE r0 AS ON UPDATE TO d0 DO ALSO SELECT g(new.a);
      CREATE TRIGGER tr0 BEFORE INSERT ON d0 FOR EACH ROW WHEN (g(NEW.a) > 0) EXECUTE FUNCTION trg();
      CREATE DOMAIN dd0 AS INT CHECK (VALUE > g(VALUE));
+     CREATE TABLE e0 (a INT, EXCLUDE USING btree ((a + g(a)) WITH =));
+     CREATE TABLE k0 (a INT) PARTITION BY RANGE ((a + g(a)));
      CREATE FUNCTION caller0(x INT) RETURNS INT LANGUAGE sql RETURN g(x);";
 
 /// A statement writing a call `f(INT)` answers into each object PostgreSQL
 /// binds the call of at creation.
-const SELECTING: [&str; 21] = [
+const SELECTING: [&str; 23] = [
     "CREATE TABLE d (a INT DEFAULT f(1));",
     "CREATE TABLE d (a INT, b INT GENERATED ALWAYS AS (f(a)) STORED);",
     "CREATE TABLE d (a INT CHECK (f(a) > 0));",
@@ -249,6 +368,8 @@ const SELECTING: [&str; 21] = [
     "CREATE FUNCTION caller() RETURNS INT LANGUAGE sql BEGIN ATOMIC
          WITH u AS (UPDATE t SET a = a RETURNING f(a) AS b) SELECT b FROM u;
      END;",
+    "CREATE TABLE d (a INT) PARTITION BY RANGE ((a + f(a)));",
+    "CREATE TABLE d (a INT, EXCLUDE USING btree ((a + f(a)) WITH =));",
 ];
 
 /// Each object holds the overload its call selects and leaves the other
@@ -300,14 +421,14 @@ fn a_retyped_column_has_its_calls_select_again() {
     parse(&format!("{later} DROP FUNCTION h(INT);")).expect("the check selects h(TEXT)");
     let result = parse(&format!("{later} DROP FUNCTION h(TEXT);"));
     assert!(
-        matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "h"),
+        matches!(&result, Err(Error::FunctionReferenced { function_name, .. }) if function_name == "h"),
         "got {result:?}"
     );
 }
 
 fn assert_in_use_by(result: &Result<ParserDB, Error>, dependent: &str) {
     assert!(
-        matches!(result, Err(Error::FunctionReferenced { function_name }) if function_name == "f"),
+        matches!(result, Err(Error::FunctionReferenced { function_name, .. }) if function_name == "f"),
         "{dependent} got {result:?}"
     );
 }
@@ -315,7 +436,7 @@ fn assert_in_use_by(result: &Result<ParserDB, Error>, dependent: &str) {
 /// Replacing or altering the function keeps it the one each object calls.
 #[test]
 fn a_replaced_function_stays_held() {
-    for dependent in DEPENDENTS {
+    for (dependent, _, _) in DEPENDENTS {
         for change in [
             "CREATE OR REPLACE FUNCTION f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 2';",
             "ALTER FUNCTION f() STABLE;",
@@ -324,6 +445,51 @@ fn a_replaced_function_stays_held() {
             assert!(
                 matches!(&result, Err(Error::FunctionReferenced { .. })),
                 "{dependent} {change} got {result:?}"
+            );
+        }
+    }
+}
+
+/// A partition key and an exclusion constraint keep the function their call
+/// reached under the path of the statement creating the table, through a
+/// rebuild of the table and a rename of the function, as PostgreSQL 18
+/// records it.
+#[test]
+fn a_table_holds_the_function_its_key_or_exclusion_reached() {
+    for (holder, kind, name) in [
+        (
+            "CREATE TABLE public.p (a INT) PARTITION BY RANGE ((f(a)));",
+            ObjectKind::Table,
+            "public.p",
+        ),
+        (
+            "CREATE TABLE public.p (a INT, CONSTRAINT pc EXCLUDE USING btree ((f(a)) WITH =));",
+            ObjectKind::Index,
+            "pc",
+        ),
+    ] {
+        let keyed = format!(
+            "CREATE SCHEMA app;
+             CREATE FUNCTION app.f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE RETURN x;
+             SET search_path TO app, public;
+             {holder}
+             RESET search_path;
+             CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE RETURN x;
+             ALTER TABLE p ADD COLUMN b INT;"
+        );
+        parse(&format!("{keyed} DROP FUNCTION public.f(INT);")).expect(holder);
+        for dropped in [
+            "DROP FUNCTION app.f(INT);",
+            "ALTER FUNCTION app.f(INT) RENAME TO g; DROP FUNCTION app.g(INT);",
+        ] {
+            let result = parse(&format!("{keyed} {dropped}"));
+            assert!(
+                matches!(
+                    &result,
+                    Err(Error::FunctionReferenced { dependent_kind, dependent_name, .. })
+                        if *dependent_kind == kind && dependent_name == name
+                ),
+                "{holder} {dropped} got {result:?}"
             );
         }
     }

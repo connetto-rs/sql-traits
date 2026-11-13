@@ -267,7 +267,7 @@ fn a_function_a_bound_body_calls_is_dropped_only_with_its_caller() {
     ";
     assert!(matches!(
         ParserDB::parse::<PostgreSqlDialect>(&format!("{schema} DROP FUNCTION f();")),
-        Err(Error::FunctionReferenced { function_name }) if function_name == "f"
+        Err(Error::FunctionReferenced { function_name, .. }) if function_name == "f"
     ));
     for drop in ["DROP FUNCTION g(), f();", "DROP FUNCTION f(), g();"] {
         let database = postgres(&format!("{schema} {drop}"));
