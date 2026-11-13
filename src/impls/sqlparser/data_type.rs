@@ -375,11 +375,15 @@ impl DataTypeLike for DataType {
 }
 
 /// The type a value is stored as, through ClickHouse's `LowCardinality`, which
-/// changes only how a column stores its values, and `Nullable`, which only
-/// lets a value be `NULL`.
+/// changes only how a column stores its values, `Nullable`, which only lets a
+/// value be `NULL`, and Databricks' `COLLATE`, which decides only how values
+/// compare.
 fn stored_as(data_type: &DataType) -> &DataType {
     let mut current = data_type;
-    while let DataType::LowCardinality(inner) | DataType::Nullable(inner) = current {
+    while let DataType::LowCardinality(inner)
+    | DataType::Nullable(inner)
+    | DataType::Collate(inner, _) = current
+    {
         current = inner;
     }
     current
