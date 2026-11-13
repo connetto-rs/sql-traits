@@ -55,8 +55,8 @@ fn an_unqualified_call_reaches_the_schemas_on_the_search_path() {
 }
 
 /// The number of arguments narrows a call to the overloads that accept it,
-/// and argument types are not inferred, so every overload taking that many
-/// arguments stays reachable.
+/// and among those PostgreSQL binds the one the argument types select, so
+/// another overload taking as many arguments is free to drop.
 #[test]
 fn a_call_reaches_the_overloads_that_accept_its_arguments() {
     let overloads = "CREATE FUNCTION f(x INT) RETURNS BOOL AS 'SELECT true';
@@ -66,7 +66,8 @@ fn a_call_reaches_the_overloads_that_accept_its_arguments() {
          CREATE POLICY p ON t USING (f(id));";
     parse(&format!("{overloads} DROP FUNCTION f(INT, INT);"))
         .expect("no call passes two arguments");
-    assert_in_use(&parse(&format!("{overloads} DROP FUNCTION f(TEXT);")));
+    parse(&format!("{overloads} DROP FUNCTION f(TEXT);")).expect("the call selects f(INT)");
+    assert_in_use(&parse(&format!("{overloads} DROP FUNCTION f(INT);")));
 
     let defaulted = parse(
         "CREATE FUNCTION f(x INT, y INT DEFAULT 0) RETURNS BOOL AS 'SELECT true';
@@ -200,6 +201,115 @@ fn every_bound_call_holds_its_function() {
             "{dependent} got {result:?}"
         );
     }
+}
+
+/// The overloads `f(INT)` and `f(TEXT)`, the trigger function `trg` and the
+/// table `t` every dependent below is written against, beside an object of
+/// every kind already holding the `g(INT)` its own call selected.
+const OVERLOADED: &str =
+    "CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+     CREATE FUNCTION f(x TEXT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 2';
+     CREATE FUNCTION g(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+     CREATE FUNCTION g(x TEXT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 2';
+     CREATE FUNCTION trg() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+     CREATE TABLE t (a INT);
+     CREATE TABLE d0 (a INT DEFAULT g(1), b INT GENERATED ALWAYS AS (g(a)) STORED, CHECK (g(a) > 0));
+     CREATE INDEX i0 ON d0 ((g(a)));
+     CREATE VIEW v0 AS SELECT g(1) AS one;
+     CREATE MATERIALIZED VIEW m0 AS SELECT g(1) AS one;
+     CREATE POLICY p0 ON d0 USING (g(a) > 0);
+     CREATE RULE r0 AS ON UPDATE TO d0 DO ALSO SELECT g(new.a);
+     CREATE TRIGGER tr0 BEFORE INSERT ON d0 FOR EACH ROW WHEN (g(NEW.a) > 0) EXECUTE FUNCTION trg();
+     CREATE DOMAIN dd0 AS INT CHECK (VALUE > g(VALUE));
+     CREATE FUNCTION caller0(x INT) RETURNS INT LANGUAGE sql RETURN g(x);";
+
+/// A statement writing a call `f(INT)` answers into each object PostgreSQL
+/// binds the call of at creation.
+const SELECTING: [&str; 21] = [
+    "CREATE TABLE d (a INT DEFAULT f(1));",
+    "CREATE TABLE d (a INT, b INT GENERATED ALWAYS AS (f(a)) STORED);",
+    "CREATE TABLE d (a INT CHECK (f(a) > 0));",
+    "CREATE TABLE d (a INT, CHECK (f(a) > 0));",
+    "ALTER TABLE t ADD CONSTRAINT c CHECK (f(a) > 0);",
+    "ALTER TABLE t ALTER COLUMN a SET DEFAULT f(1);",
+    "ALTER TABLE t ADD COLUMN b INT DEFAULT f(1);",
+    "CREATE INDEX i ON t ((f(a) + a));",
+    "CREATE INDEX i ON t (a) WHERE f(a) > 0;",
+    "CREATE VIEW v AS SELECT f(a) AS one FROM t;",
+    "CREATE MATERIALIZED VIEW v AS SELECT f(1) AS one;",
+    "CREATE POLICY p ON t USING (f(a) > 0);",
+    "CREATE POLICY p ON t WITH CHECK (f(a) > 0);",
+    "CREATE RULE r AS ON INSERT TO t WHERE f(new.a) > 0 DO INSTEAD NOTHING;",
+    "CREATE RULE r AS ON INSERT TO t DO INSTEAD SELECT f(new.a);",
+    "CREATE DOMAIN d AS INT CHECK (VALUE > f(VALUE));",
+    "CREATE DOMAIN d AS INT DEFAULT f(1);",
+    "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN (f(NEW.a) > 0) EXECUTE FUNCTION trg();",
+    "CREATE FUNCTION caller(x INT) RETURNS INT LANGUAGE sql RETURN f(x);",
+    "CREATE FUNCTION caller(x INT) RETURNS INT LANGUAGE sql BEGIN ATOMIC SELECT f(x); END;",
+    "CREATE FUNCTION caller() RETURNS INT LANGUAGE sql BEGIN ATOMIC
+         WITH u AS (UPDATE t SET a = a RETURNING f(a) AS b) SELECT b FROM u;
+     END;",
+];
+
+/// Each object holds the overload its call selects and leaves the other
+/// overload of the same arity free to drop, as PostgreSQL 18 records it.
+#[test]
+fn every_bound_call_holds_only_the_overload_it_selects() {
+    for dependent in SELECTING {
+        parse(&format!("{OVERLOADED} {dependent} DROP FUNCTION f(TEXT);")).expect(dependent);
+        let result = parse(&format!("{OVERLOADED} {dependent} DROP FUNCTION f(INT);"));
+        assert_in_use_by(&result, dependent);
+    }
+}
+
+/// A call whose argument types the model cannot settle on one overload holds
+/// every overload of its arity, so dropping any of them is refused. A scalar
+/// subquery argument is not typed yet, and a rule on a view sees rows no
+/// typing scope describes, where PostgreSQL 18 selects `f(INT)` for both.
+#[test]
+fn a_call_its_argument_types_do_not_settle_holds_every_overload() {
+    for unsettled in [
+        "CREATE VIEW v AS SELECT f((SELECT 1)) AS one;",
+        "CREATE VIEW tv AS SELECT a FROM t;
+         CREATE RULE rv AS ON INSERT TO tv DO INSTEAD SELECT f(new.a);",
+    ] {
+        for dropped in ["f(TEXT)", "f(INT)"] {
+            let result = parse(&format!("{OVERLOADED} {unsettled} DROP FUNCTION {dropped};"));
+            assert_in_use_by(&result, unsettled);
+        }
+    }
+}
+
+/// A column type change has PostgreSQL 18 parse the table's checks and
+/// indexes again, their calls selecting the overload the new type selects
+/// among the functions declared by then.
+#[test]
+fn a_retyped_column_has_its_calls_select_again() {
+    let retyped = format!(
+        "{OVERLOADED} CREATE TABLE d (a INT CHECK (f(a) > 0));
+         CREATE INDEX i ON d ((f(a)));
+         ALTER TABLE d ALTER COLUMN a TYPE TEXT;"
+    );
+    parse(&format!("{retyped} DROP FUNCTION f(INT);")).expect("both calls select f(TEXT)");
+    assert_in_use_by(&parse(&format!("{retyped} DROP FUNCTION f(TEXT);")), "f(TEXT)");
+
+    let later = "CREATE FUNCTION h(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+         CREATE TABLE d (a INT CHECK (h(a) > 0));
+         CREATE FUNCTION h(x TEXT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 2';
+         ALTER TABLE d ALTER COLUMN a TYPE TEXT;";
+    parse(&format!("{later} DROP FUNCTION h(INT);")).expect("the check selects h(TEXT)");
+    let result = parse(&format!("{later} DROP FUNCTION h(TEXT);"));
+    assert!(
+        matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "h"),
+        "got {result:?}"
+    );
+}
+
+fn assert_in_use_by(result: &Result<ParserDB, Error>, dependent: &str) {
+    assert!(
+        matches!(result, Err(Error::FunctionReferenced { function_name }) if function_name == "f"),
+        "{dependent} got {result:?}"
+    );
 }
 
 /// Replacing or altering the function keeps it the one each object calls.

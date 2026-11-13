@@ -19,7 +19,10 @@ use sqlparser::ast::{
 use super::{CarriedCalls, ParserDB, ParserDBBuilder, StoredTable, function_argument_types};
 use crate::{
     errors::Error,
-    structs::{TableAttribute, UserDefinedType, metadata::ExpressionCalls},
+    structs::{
+        TableAttribute, UserDefinedType,
+        metadata::{BoundCall, ExpressionCalls},
+    },
     traits::FunctionLike,
     utils::call_sites::{call_reaches, for_each_call_name_mut},
 };
@@ -87,8 +90,8 @@ fn respell<N: VisitMut + ?Sized>(
     calls: &ExpressionCalls<CreateFunction>,
     moves: &Moves,
 ) -> Result<(), Error> {
-    let mut sites = calls.sites().iter();
-    respell_each(node, |name, _| renamed_call(moves, sites.next().map(Vec::as_slice), name))
+    let mut sites = calls.sites();
+    respell_each(node, |name, _| renamed_call(moves, sites.next(), name))
 }
 
 /// The name a call written `call` and bound to `binding` is respelled to, or
@@ -121,9 +124,9 @@ fn respell_user_type(
     calls: &ExpressionCalls<CreateFunction>,
     moves: &Moves,
 ) -> Result<(), Error> {
-    let mut sites = calls.sites().iter();
+    let mut sites = calls.sites();
     let mut respell = |name: &mut ObjectName| -> Result<(), Error> {
-        renamed_call(moves, sites.next().map(Vec::as_slice), name).map(|renamed| {
+        renamed_call(moves, sites.next(), name).map(|renamed| {
             if let Some(renamed) = renamed {
                 *name = renamed;
             }
@@ -361,7 +364,8 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
             },
             |_, node| {
                 respell_each(node, |name, arguments| {
-                    renamed_call(moves, bound.take(name, arguments).as_deref(), name)
+                    let binding = bound.take_bound(name, arguments);
+                    renamed_call(moves, binding.as_ref().map(BoundCall::reached), name)
                 })
             },
         )?;

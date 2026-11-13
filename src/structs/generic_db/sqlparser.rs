@@ -76,6 +76,7 @@ use crate::{
 
 mod alter_inheritance;
 mod attach_partition;
+mod call_selection;
 mod calls_in_expression;
 use calls_in_expression::CarriedCalls;
 mod column_copy;
@@ -8453,6 +8454,7 @@ impl ParserDB {
         scope: AlterTableScope,
         column_name: &Ident,
         installs: &ColumnOption,
+        retyped: bool,
         edit: impl Fn(&mut ColumnDef),
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
@@ -8476,7 +8478,14 @@ impl ParserDB {
             }
         };
 
-        let mut builder = Self::replace_table_node(builder, &stored, |_, node| {
+        // A type change has PostgreSQL parse the table's expressions again,
+        // their calls choosing among their overloads anew.
+        let carry = |carried: &mut CarriedCalls| {
+            if retyped {
+                carried.rewrite();
+            }
+        };
+        let mut builder = Self::replace_table_node_carrying(builder, &stored, carry, |_, node| {
             apply(node);
             Ok(())
         })?;
@@ -8494,7 +8503,7 @@ impl ParserDB {
                     continue;
                 }
                 reached.push(child.clone());
-                builder = Self::replace_table_node(builder, &child, |_, node| {
+                builder = Self::replace_table_node_carrying(builder, &child, carry, |_, node| {
                     apply(node);
                     Ok(())
                 })?;
@@ -8590,6 +8599,7 @@ impl ParserDB {
             scope,
             column_name,
             &installs,
+            matches!(operation, AlterColumnOperation::SetDataType { .. }),
             |declared| {
                 Self::apply_alter_column(declared, operation.clone());
             },
@@ -10150,6 +10160,7 @@ impl ParserDB {
                                     scope,
                                     &new_name,
                                     &ColumnOption::NotNull,
+                                    true,
                                     |declared| {
                                         redeclare_column(
                                             declared,
@@ -10171,6 +10182,7 @@ impl ParserDB {
                                     scope,
                                     &col_name,
                                     &ColumnOption::NotNull,
+                                    true,
                                     |declared| {
                                         redeclare_column(
                                             declared,

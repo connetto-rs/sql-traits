@@ -131,10 +131,10 @@ fn calls_of_a_clause_with_an_unread_literal_reach_their_functions() {
     assert_eq!(calls, [("auth.uid".to_owned(), vec!["auth.uid".to_owned()])]);
 }
 
-/// Each call answers only for itself, and every overload accepting its
-/// argument count counts.
+/// Each call answers only for itself, the overload its argument types select
+/// among those accepting its argument count.
 #[test]
-fn each_call_reaches_the_overloads_accepting_its_arguments() {
+fn each_call_reaches_the_overload_its_arguments_select() {
     let db = parse(
         "CREATE FUNCTION f(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
          CREATE FUNCTION f(x TEXT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
@@ -154,7 +154,7 @@ fn each_call_reaches_the_overloads_accepting_its_arguments() {
     };
     assert_eq!(
         arities(policy.using_expression(&db).expect("literals read").expect("USING clause")),
-        [("f".to_owned(), vec!["INT".to_owned(), "TEXT".to_owned()])]
+        [("f".to_owned(), vec!["TEXT".to_owned()])]
     );
     assert_eq!(
         arities(policy.check_expression(&db).expect("literals read").expect("WITH CHECK clause")),

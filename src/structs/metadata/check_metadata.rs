@@ -102,6 +102,11 @@ impl<U: CheckConstraintLike> CheckMetadata<U> {
         &self.calls
     }
 
+    /// Returns the calls of the constraint's expression, to settle them.
+    pub(crate) fn calls_mut(&mut self) -> &mut ExpressionCalls<<U::DB as DatabaseLike>::Function> {
+        &mut self.calls
+    }
+
     /// Re-points every cached function still referencing the allocation
     /// `stale` names at `fresh` instead.
     ///
