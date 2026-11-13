@@ -2,7 +2,10 @@
 
 use alloc::borrow::Cow;
 
-use super::{postgres_catalog::CatalogName, postgres_operator::PostgresCatalogOperator};
+use super::{
+    postgres_catalog::CatalogName,
+    postgres_operator::{OperatorRow, PostgresCatalogOperator},
+};
 use crate::traits::OperatorKind;
 
 /// A `pg_catalog` name a row holds, `_` for none.
@@ -42,6 +45,7 @@ macro_rules! operator {
             can_merge: $merges,
             restriction_estimator: name!($restrict),
             join_estimator: name!($join),
+            row: OperatorRow::BuiltIn,
         }
     };
 }

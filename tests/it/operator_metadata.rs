@@ -591,6 +591,14 @@ fn a_configured_link_reaches_only_an_operator_the_catalog_holds() {
         .parse::<PostgreSqlDialect>("")
         .unwrap();
     let held = linked.operators().unwrap().find(|operator| operator.name() == "<<<").unwrap();
-    assert_eq!(held.commutator(&linked), Some(&greater));
-    assert_eq!(held.negator(&linked), Some(&negator));
+    // The catalog numbers the rows it takes, so each link is compared with
+    // the row holding the configured operator.
+    let row = |wanted: &PostgresCatalogOperator| {
+        linked.operators().unwrap().find(|operator| {
+            operator.target_name() == wanted.target_name()
+                && operator.left_type(&linked) == wanted.left_type(&linked)
+        })
+    };
+    assert_eq!(held.commutator(&linked), Some(row(&greater).unwrap()));
+    assert_eq!(held.negator(&linked), Some(row(&negator).unwrap()));
 }

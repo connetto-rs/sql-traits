@@ -26,6 +26,16 @@ pub(super) const RESTRICTION_ESTIMATOR_INPUTS: [&str; 4] = ["internal", "oid", "
 pub(super) const JOIN_ESTIMATOR_INPUTS: [&str; 5] =
     ["internal", "oid", "internal", "int2", "internal"];
 
+/// The `pg_operator` row an operator is, which `pg_depend` names it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum OperatorRow {
+    /// A row `initdb` creates, which PostgreSQL pins and never drops.
+    BuiltIn,
+    /// A row the catalog numbered when it took the operator, from 1, and 0
+    /// on an operator no catalog holds yet.
+    Added(u32),
+}
+
 /// A PostgreSQL operator's declared signature and optional implementation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PostgresCatalogOperator {
@@ -54,6 +64,9 @@ pub struct PostgresCatalogOperator {
     pub(super) restriction_estimator: Option<CatalogName>,
     /// The join selectivity estimator, `oprjoin`.
     pub(super) join_estimator: Option<CatalogName>,
+    /// The row the operator is, which survives every change of its name,
+    /// schema and operand types.
+    pub(super) row: OperatorRow,
 }
 
 impl Metadata for PostgresCatalogOperator {
@@ -85,6 +98,7 @@ impl PostgresCatalogOperator {
             can_merge: false,
             restriction_estimator: None,
             join_estimator: None,
+            row: OperatorRow::Added(0),
         }
     }
 

@@ -1510,6 +1510,16 @@ pub enum Error {
         /// Symbol of the operator as written.
         operator_name: Box<str>,
     },
+    #[error(
+        "Operator `{operator_name}` cannot be dropped because the database system requires it."
+    )]
+    /// Error indicating that `DROP OPERATOR` or `DROP SCHEMA` would drop a
+    /// built-in operator, which PostgreSQL pins wherever `ALTER OPERATOR ...
+    /// SET SCHEMA` moved it.
+    OperatorRequiredBySystem {
+        /// Symbol of the built-in operator.
+        operator_name: Box<str>,
+    },
     #[error("Operator attribute {attribute} of `{operator_name}` cannot be changed once set.")]
     /// Error indicating that `ALTER OPERATOR ... SET` names a commutator or
     /// negator other than the one the operator already links to.

@@ -304,6 +304,51 @@ fn set_schema_moves_the_negator_links_to_it() {
 }
 
 #[test]
+fn a_built_in_operator_is_required_by_the_database_system() {
+    let error = parse("DROP OPERATOR IF EXISTS pg_catalog.+ (int4, int4);").unwrap_err();
+    assert!(
+        matches!(&error, Error::OperatorRequiredBySystem { operator_name } if operator_name.as_ref() == "+"),
+        "{error:?}"
+    );
+    // A built-in moved out of `pg_catalog` stays required.
+    let error = parse(
+        "ALTER OPERATOR pg_catalog.+ (int4, int4) SET SCHEMA other;
+         DROP OPERATOR other.+ (int4, int4);",
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::OperatorRequiredBySystem { .. }), "{error:?}");
+    for drop in ["DROP SCHEMA other;", "DROP SCHEMA other CASCADE;"] {
+        let error =
+            parse(&format!("ALTER OPERATOR pg_catalog.+ (int4, int4) SET SCHEMA other; {drop}"))
+                .unwrap_err();
+        assert!(matches!(error, Error::OperatorRequiredBySystem { .. }), "{error:?}");
+    }
+    // A configured operator replacing a built-in one describes that row.
+    let error = ParseOptions::default()
+        .with_postgres_catalog(
+            PostgresCatalog::postgres_18().with_operator(
+                PostgresCatalogOperator::new("+", Some(pg("int4")), pg("int4"))
+                    .with_implementation(pg("int4pl"), pg("int4")),
+            ),
+        )
+        .parse::<PostgreSqlDialect>("DROP OPERATOR pg_catalog.+ (int4, int4);")
+        .unwrap_err();
+    assert!(matches!(error, Error::OperatorRequiredBySystem { .. }), "{error:?}");
+    // A configured operator in `pg_catalog` describing no built-in row is
+    // not.
+    let db = ParseOptions::default()
+        .with_postgres_catalog(
+            PostgresCatalog::postgres_18().with_operator(
+                PostgresCatalogOperator::new("<<<", Some(pg("int4")), pg("int8"))
+                    .with_implementation(pg("int48lt"), pg("bool")),
+            ),
+        )
+        .parse::<PostgreSqlDialect>("DROP OPERATOR pg_catalog.<<< (int4, int8);")
+        .unwrap();
+    assert!(find(&db, pg("<<<"), Some(pg("int4")), pg("int8")).is_none());
+}
+
+#[test]
 fn a_dropped_join_estimator_is_refused_while_an_operator_runs_it() {
     let error = parse(
         "CREATE FUNCTION app.joinsel(internal, oid, internal, INT2, internal) RETURNS FLOAT8 LANGUAGE internal STABLE STRICT AS 'eqjoinsel';

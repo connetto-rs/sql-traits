@@ -19,7 +19,7 @@ use super::{
     domains,
     postgres_catalog::{CatalogName, PostgresCatalog},
     postgres_operator::{
-        JOIN_ESTIMATOR_INPUTS, PostgresCatalogOperator, RESTRICTION_ESTIMATOR_INPUTS,
+        JOIN_ESTIMATOR_INPUTS, OperatorRow, PostgresCatalogOperator, RESTRICTION_ESTIMATOR_INPUTS,
         function_name_matches, takes_estimator_inputs, takes_exactly, type_identity,
     },
     search_path_qualifier,
@@ -95,6 +95,7 @@ pub(super) fn create(
         can_merge: attributes.merges,
         restriction_estimator: restriction_estimator.into_named(),
         join_estimator: join_estimator.into_named(),
+        row: OperatorRow::Added(0),
     };
     let held = catalog.operators().position(|held| held.repeats(&operator));
     if held.is_some_and(|position| catalog.operators_slice()[position].implementation.is_some()) {
@@ -138,11 +139,39 @@ pub(super) fn create(
         }
     }
 
-    let operators = Arc::make_mut(catalog).operators_mut();
+    store(
+        Arc::make_mut(catalog),
+        operator,
+        held,
+        [(commutator, OperatorAttribute::Commutator), (negator, OperatorAttribute::Negator)],
+    );
+    Ok(())
+}
+
+/// Stores `operator` over the shell held at `held`, or as a new row, with
+/// the shells its `links` create, and points each link and `operator` at
+/// one another.
+///
+/// Filling a shell keeps its row, as `OperatorCreate` updates the shell's
+/// tuple.
+fn store(
+    catalog: &mut PostgresCatalog,
+    mut operator: PostgresCatalogOperator,
+    held: Option<usize>,
+    mut links: [(Option<Link>, OperatorAttribute); 2],
+) {
+    operator.row = match held {
+        Some(position) => catalog.operators_slice()[position].row,
+        None => catalog.number_operator(),
+    };
+    for (link, _) in &mut links {
+        if let Some(Link::Shell(shell)) = link {
+            shell.row = catalog.number_operator();
+        }
+    }
+    let operators = catalog.operators_mut();
     let mut shells = Vec::new();
-    for (link, attribute) in
-        [(commutator, OperatorAttribute::Commutator), (negator, OperatorAttribute::Negator)]
-    {
+    for (link, attribute) in links {
         let linked = match link {
             None => continue,
             Some(Link::Held(position)) => {
@@ -163,7 +192,6 @@ pub(super) fn create(
         None => operators.push(operator),
     }
     operators.extend(shells);
-    Ok(())
 }
 
 /// Applies `ALTER OPERATOR`.
@@ -299,7 +327,7 @@ fn set(
 /// # Errors
 ///
 /// Returns [`Error::OperatorNotFound`] for an absent operator without `IF
-/// EXISTS`.
+/// EXISTS`, and [`Error::OperatorRequiredBySystem`] for a built-in one.
 pub(super) fn drop(
     builder: &ParserDBBuilder,
     catalog: &mut Arc<PostgresCatalog>,
@@ -313,6 +341,11 @@ pub(super) fn drop(
         let left = signature.left_type.map(|left| operand(builder, arrays, left)).transpose()?;
         let right = operand(builder, arrays, signature.right_type)?;
         match binder.lookup(catalog, &signature.name, left.as_ref(), &right) {
+            Some(position) if catalog.operators_slice()[position].row == OperatorRow::BuiltIn => {
+                return Err(Error::OperatorRequiredBySystem {
+                    operator_name: binder.symbol.into(),
+                });
+            }
             Some(position) => doomed.push(position),
             None if drop.if_exists => {}
             None => return Err(Error::OperatorNotFound { operator_name: binder.symbol.into() }),
@@ -601,6 +634,7 @@ impl Link {
             can_merge: false,
             restriction_estimator: None,
             join_estimator: None,
+            row: OperatorRow::Added(0),
         })))
     }
 

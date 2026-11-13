@@ -9720,6 +9720,16 @@ impl ParserDB {
                         };
                         let resolved_schema_name = schema.name().to_string();
                         let resolved_schema_quoted = schema.is_quoted();
+                        if let Some(operator_name) = active_postgres_catalog
+                            .built_in_operator_in_schema(
+                                &resolved_schema_name,
+                                resolved_schema_quoted,
+                            )
+                        {
+                            return Err(crate::errors::Error::OperatorRequiredBySystem {
+                                operator_name: operator_name.into(),
+                            });
+                        }
 
                         // Check for contained objects unless CASCADE is
                         // specified, the catalog's operators counting

@@ -6,7 +6,7 @@ use super::{
     postgres_18_collations::POSTGRES_18_COLLATIONS,
     postgres_18_operators::POSTGRES_18_OPERATORS,
     postgres_cast::{POSTGRES_18_CASTS, PostgresCatalogCast},
-    postgres_operator::PostgresCatalogOperator,
+    postgres_operator::{OperatorRow, PostgresCatalogOperator},
     type_arrays::TypeArrays,
 };
 use crate::{
@@ -44,6 +44,8 @@ pub struct PostgresCatalog {
     collatable_types: Cow<'static, [PostgresCatalogType]>,
     operators: Cow<'static, [PostgresCatalogOperator]>,
     casts: Cow<'static, [PostgresCatalogCast]>,
+    /// The number the last operator the catalog took was given.
+    numbered_operators: u32,
 }
 
 /// A catalog fact that keeps an object from dropping without `CASCADE`.
@@ -189,6 +191,7 @@ impl PostgresCatalog {
             collatable_types: Cow::Borrowed(&[]),
             operators: Cow::Borrowed(&[]),
             casts: Cow::Borrowed(&[]),
+            numbered_operators: 0,
         }
     }
 
@@ -200,6 +203,7 @@ impl PostgresCatalog {
             collatable_types: Cow::Borrowed(POSTGRES_18_COLLATABLE_TYPES),
             operators: Cow::Borrowed(POSTGRES_18_OPERATORS),
             casts: Cow::Borrowed(POSTGRES_18_CASTS),
+            numbered_operators: 0,
         }
     }
 
@@ -221,13 +225,24 @@ impl PostgresCatalog {
         self
     }
 
-    /// Adds or replaces the operator with the same symbol and operand types.
+    /// Adds or replaces the operator with the same symbol and operand types,
+    /// a replacement describing the row it replaces.
     #[must_use]
-    pub fn with_operator(mut self, operator: PostgresCatalogOperator) -> Self {
+    pub fn with_operator(mut self, mut operator: PostgresCatalogOperator) -> Self {
+        operator.row = match self.operators.iter().find(|held| held.repeats(&operator)) {
+            Some(held) => held.row,
+            None => self.number_operator(),
+        };
         let operators = self.operators.to_mut();
         operators.retain(|held| !held.repeats(&operator));
         operators.push(operator);
         self
+    }
+
+    /// The row of the next operator the catalog takes.
+    pub(super) const fn number_operator(&mut self) -> OperatorRow {
+        self.numbered_operators += 1;
+        OperatorRow::Added(self.numbered_operators)
     }
 
     /// The operator facts as an owned list, copying the borrowed table once.
@@ -323,6 +338,17 @@ impl PostgresCatalog {
     /// schema drop without `CASCADE` would leave behind.
     pub(crate) fn holds_operators_in_schema(&self, schema: &str, quoted: bool) -> bool {
         self.operators.iter().any(|operator| operator.lives_in_schema(schema, quoted))
+    }
+
+    /// The symbol of a built-in operator `ALTER OPERATOR ... SET SCHEMA`
+    /// moved into `schema`, which keeps the schema from dropping at all.
+    pub(crate) fn built_in_operator_in_schema(&self, schema: &str, quoted: bool) -> Option<&str> {
+        self.operators
+            .iter()
+            .find(|operator| {
+                operator.row == OperatorRow::BuiltIn && operator.lives_in_schema(schema, quoted)
+            })
+            .map(PostgresCatalogOperator::name)
     }
 
     /// Drops the operators of `schema` and every operator or cast a dropped
