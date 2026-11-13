@@ -1,11 +1,11 @@
 //! The facts each expression node of one query takes.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, ObjectNamePart, Query, UnaryOperator, Value,
+    FunctionArguments, Ident, InTarget, ObjectNamePart, Query, UnaryOperator, Value, Visitor,
 };
 
 use crate::{
@@ -17,12 +17,12 @@ use crate::{
     },
     traits::{ColumnLike, DataTypeLike, DatabaseLike},
     utils::{
-        coercion::{canonical_owned, type_name},
+        coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
         object_name::PG_CATALOG,
         operator_typing::resolve_operator,
         postgres_types::PgType,
         type_modifier,
-        walk::walk_expressions,
+        walk::{walk, walk_expressions},
     },
 };
 
@@ -140,21 +140,50 @@ impl<'node, 'db, DB: DatabaseLike> OperatorApplication<'node, 'db, DB> {
     }
 }
 
-/// How PostgreSQL evaluates a node, by the operator it applies.
+/// How PostgreSQL evaluates a node, by the operators it applies.
 enum Form<'node> {
-    /// The node applies no operator of its own.
-    Plain,
-    /// An `OpExpr`, returning the operator's result.
-    Operator(Applied<'node>),
-    /// `IS [NOT] DISTINCT FROM`, a `DistinctExpr` applying `=` and returning
-    /// `bool`.
-    Distinct(Applied<'node>),
-    /// `NULLIF`, a `NullIfExpr` applying `=` and returning its first operand
-    /// as `=` converts it.
-    NullIf(Applied<'node>),
-    /// `IS [NOT] DISTINCT FROM` an undecorated `NULL`, a `NullTest` on the
-    /// other operand, applying no operator and returning `bool`.
-    NullTest,
+    /// These applications, in the order PostgreSQL builds them, and what the
+    /// node returns of them.
+    Applies(Vec<Applied<'node>>, Returns),
+    /// `[NOT] IN` over a list, whose applications depend on the types of its
+    /// elements and the columns they reference.
+    InList {
+        /// The node tested for membership.
+        left: &'node Expr,
+        /// The listed nodes.
+        elements: &'node [Expr],
+        /// Whether the list is `NOT IN`.
+        negated: bool,
+    },
+}
+
+/// What a node returns of the operators it applies.
+#[derive(Clone, Copy)]
+enum Returns {
+    /// The result of its one operator, as an `OpExpr`, and nothing the
+    /// context derives for a node applying none.
+    Result,
+    /// `bool`, when every operator returns `bool`, as a `DistinctExpr`, a
+    /// `NullTest`, a `ScalarArrayOpExpr` and the `AND`/`OR` joining several
+    /// do.
+    Bool,
+    /// Its one operator's left operand as that operator converts it, as a
+    /// `NullIfExpr`.
+    FirstOperand,
+}
+
+/// The applications a node holds and what it returns of them.
+type Applications<'node, 'db, DB> = (Vec<OperatorApplication<'node, 'db, DB>>, Returns);
+
+/// What PostgreSQL does with the elements of an `IN` list it may build into
+/// one array.
+enum Collapse<'a> {
+    /// It builds them into one array of elements of this type.
+    Into(OperandType<'a>),
+    /// It compares with each of them apart.
+    Apart,
+    /// A type that decides it is unknown.
+    Unknown,
 }
 
 /// An operator name applied to operand nodes.
@@ -162,13 +191,34 @@ struct Applied<'node> {
     name: TargetName<'node>,
     left: Option<&'node Expr>,
     right: &'node Expr,
+    /// How the operator applies to the elements of the array `right`
+    /// evaluates to, `None` when it applies to that value itself.
+    quantifier: Option<Quantifier>,
 }
 
 impl<'node> Applied<'node> {
     /// `name`, from `pg_catalog` or the search path, applied to `left` and
     /// `right`.
     fn named(name: &'static str, left: Option<&'node Expr>, right: &'node Expr) -> Self {
-        Self { name: TargetName::new(name, false), left, right }
+        Self { name: TargetName::new(name, false), left, right, quantifier: None }
+    }
+}
+
+/// Whether an operator applied to an array's elements must hold for one of
+/// them or for all.
+#[derive(Clone, Copy)]
+enum Quantifier {
+    Any,
+    All,
+}
+
+impl Quantifier {
+    /// The operand comparing with each element of `source`.
+    const fn over(self, source: ArraySource<'_>) -> Operand<'_> {
+        match self {
+            Self::Any => Operand::Any(source),
+            Self::All => Operand::All(source),
+        }
     }
 }
 
@@ -210,18 +260,23 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
     {
         self.check(expression)?;
-        let address = address(expression);
-        let rule = self
-            .sites
-            .binary_search_by_key(&address, |(held, _)| *held)
-            .ok()
-            .and_then(|index| self.sites[index].1);
-        match (expression, rule) {
+        match (expression, self.rule(expression)) {
             (Expr::Identifier(_) | Expr::CompoundIdentifier(_), Some(rule)) => {
                 self.scope.resolve_site(rule, expression)
             }
             _ => Ok(None),
         }
+    }
+
+    /// The rule the clause holding the column reference `expression` resolves
+    /// it by, `None` for a node that is no column reference or sits where no
+    /// scope was derived.
+    fn rule(&self, expression: &Expr) -> Option<SiteRule> {
+        let address = address(expression);
+        self.sites
+            .binary_search_by_key(&address, |(held, _)| *held)
+            .ok()
+            .and_then(|index| self.sites[index].1)
     }
 
     /// Returns the type `expression` takes, with the modifier it carries,
@@ -262,31 +317,16 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             }
             Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => self.type_of(inner)?,
             _ => {
-                match (folded(expression), form(expression)) {
-                    (Some((digits, negative)), _) => catalog(number_type(digits, negative)),
-                    (None, Some(Form::Operator(applied))) => {
-                        match self.resolution(&applied)? {
-                            OperatorResolution::Selected(selected) => {
-                                selected
-                                    .into_result_type()
-                                    .map_or(OperandType::Unknown, |type_name| {
-                                        OperandType::Known { type_name, typmod: None }
-                                    })
+                match folded(expression) {
+                    Some((digits, negative)) => catalog(number_type(digits, negative)),
+                    None => {
+                        match self.applications(expression)? {
+                            Some((applications, returns)) => {
+                                self.returned(applications, returns)?
                             }
-                            _ => OperandType::Unknown,
+                            None => OperandType::Unknown,
                         }
                     }
-                    (None, Some(Form::Distinct(applied))) => {
-                        match self.resolution(&applied)? {
-                            OperatorResolution::Selected(selected) if returns_bool(&selected) => {
-                                catalog("bool")
-                            }
-                            _ => OperandType::Unknown,
-                        }
-                    }
-                    (None, Some(Form::NullIf(applied))) => self.nullif_type(&applied)?,
-                    (None, Some(Form::NullTest)) => catalog("bool"),
-                    (None, Some(Form::Plain) | None) => OperandType::Unknown,
                 }
             }
         })
@@ -302,9 +342,15 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// (`~~`, `!~~`, `~~*`, `!~~*`), and `IS [NOT] DISTINCT FROM` and
     /// `NULLIF` apply `=`, except that `IS [NOT] DISTINCT FROM` an
     /// undecorated `NULL` tests the other operand for null and applies none.
-    /// A parenthesized node answers for its content.
-    /// Row comparisons, `LIKE ... ESCAPE`, `IN`, `BETWEEN`, `SIMILAR TO`,
-    /// `ANY`, `ALL`, the boolean connectives and calls answer `None`.
+    /// `op ANY|SOME|ALL (array)` and `[NOT] [I]LIKE ANY (array)` apply their
+    /// operator to each element of the array. `[NOT] BETWEEN` applies `>=`
+    /// and `<=`, or `<` and `>`, one per bound. `IN` applies `=`, and `NOT
+    /// IN` `<>`, once to an array built from the elements holding no column
+    /// reference of the list's own query level, when there are several and
+    /// they have a common type with an array type, and once to each other
+    /// element. A parenthesized node answers for its content. Row
+    /// comparisons, `LIKE ... ESCAPE`, `SIMILAR TO`, comparisons with a
+    /// subquery, the boolean connectives and calls answer `None`.
     ///
     /// # Errors
     ///
@@ -348,52 +394,214 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         if folded(expression).is_some() {
             return Ok(Some(Vec::new()));
         }
-        let applied = match form(expression) {
-            None => return Ok(None),
-            Some(Form::Plain | Form::NullTest) => return Ok(Some(Vec::new())),
-            Some(Form::Operator(applied) | Form::Distinct(applied) | Form::NullIf(applied)) => {
-                applied
-            }
-        };
-        let resolution = self.resolution(&applied)?;
-        let Applied { name, left, right } = applied;
-        Ok(Some(Vec::from([OperatorApplication {
-            name,
-            left,
-            right: Operand::Node(right),
-            resolution,
-        }])))
+        Ok(self.applications(expression)?.map(|(applications, _)| applications))
     }
 
-    /// What PostgreSQL does with `applied`, its operands typed by their nodes.
-    fn resolution(
+    /// The applications PostgreSQL builds for `expression` and what the node
+    /// returns of them, `None` for a form the context does not derive.
+    fn applications<'node>(
         &self,
-        applied: &Applied<'_>,
-    ) -> Result<OperatorResolution<'db, DB>, LookupError> {
-        let left = applied.left.map(|left| self.type_of(left)).transpose()?;
-        let right = self.type_of(applied.right)?;
-        Ok(resolve_operator(self.database, &applied.name, left.as_ref(), &right, self.case))
+        expression: &'node Expr,
+    ) -> Result<Option<Applications<'node, 'db, DB>>, LookupError> {
+        let (applied, returns) = match form(expression) {
+            None => return Ok(None),
+            Some(Form::InList { left, elements, negated }) => {
+                let applications = self.in_list(left, elements, negated)?;
+                return Ok(applications.map(|applications| (applications, Returns::Bool)));
+            }
+            Some(Form::Applies(applied, returns)) => (applied, returns),
+        };
+        let mut applications = Vec::with_capacity(applied.len());
+        for Applied { name, left, right, quantifier } in applied {
+            let right_type = self.type_of(right)?;
+            let (right, right_type) = match quantifier {
+                None => (Operand::Node(right), right_type),
+                Some(quantifier) => {
+                    (
+                        quantifier.over(ArraySource::Node(right)),
+                        element_type(self.database, right_type),
+                    )
+                }
+            };
+            applications.push(self.resolved(name, left, right, &right_type)?);
+        }
+        Ok(Some((applications, returns)))
     }
 
-    /// The type of a `NULLIF` applying `applied`, its first operand's type as
-    /// `=` converts it, keeping the operand's modifier only when nothing
-    /// converts it.
-    fn nullif_type(&self, applied: &Applied<'_>) -> Result<OperandType<'_>, LookupError> {
-        let left_type = applied.left.map(|node| self.type_of(node)).transpose()?;
-        Ok(match self.resolution(applied)? {
-            OperatorResolution::Selected(selected) if returns_bool(&selected) => {
-                selected.into_left().map_or(OperandType::Unknown, |left| {
-                    let typmod = match left_type {
-                        Some(OperandType::Known { typmod, .. }) if left.conversion().is_empty() => {
-                            typmod
-                        }
-                        _ => None,
-                    };
-                    OperandType::Known { type_name: left.into_target(), typmod }
-                })
+    /// The application of `name` to `left` and `right`, whose value or
+    /// elements are of type `right_type`.
+    fn resolved<'node>(
+        &self,
+        name: TargetName<'node>,
+        left: Option<&'node Expr>,
+        right: Operand<'node>,
+        right_type: &OperandType<'_>,
+    ) -> Result<OperatorApplication<'node, 'db, DB>, LookupError> {
+        let left_type = left.map(|left| self.type_of(left)).transpose()?;
+        let resolution =
+            resolve_operator(self.database, &name, left_type.as_ref(), right_type, self.case);
+        Ok(OperatorApplication { name, left, right, resolution })
+    }
+
+    /// What a node applying `applications` returns, as `returns` says.
+    fn returned(
+        &self,
+        mut applications: Vec<OperatorApplication<'_, 'db, DB>>,
+        returns: Returns,
+    ) -> Result<OperandType<'_>, LookupError> {
+        Ok(match returns {
+            Returns::Bool => {
+                let all_bool = applications.iter().all(|application| {
+                    matches!(&application.resolution, OperatorResolution::Selected(selected)
+                        if returns_bool(selected))
+                });
+                if all_bool { catalog("bool") } else { OperandType::Unknown }
             }
-            _ => OperandType::Unknown,
+            Returns::FirstOperand => {
+                match applications.pop() {
+                    Some(OperatorApplication {
+                        left: Some(left),
+                        resolution: OperatorResolution::Selected(selected),
+                        ..
+                    }) if returns_bool(&selected) => {
+                        let left_type = self.type_of(left)?;
+                        selected.into_left().map_or(OperandType::Unknown, |evidence| {
+                            let typmod = match left_type {
+                                OperandType::Known { typmod, .. }
+                                    if evidence.conversion().is_empty() =>
+                                {
+                                    typmod
+                                }
+                                _ => None,
+                            };
+                            OperandType::Known { type_name: evidence.into_target(), typmod }
+                        })
+                    }
+                    _ => OperandType::Unknown,
+                }
+            }
+            Returns::Result => {
+                match applications.pop().map(|application| application.resolution) {
+                    Some(OperatorResolution::Selected(selected)) => {
+                        selected.into_result_type().map_or(OperandType::Unknown, |type_name| {
+                            OperandType::Known { type_name, typmod: None }
+                        })
+                    }
+                    _ => OperandType::Unknown,
+                }
+            }
         })
+    }
+
+    /// The applications of `left [NOT] IN (elements)`, `None` when a type or
+    /// a reference they depend on is unknown or a row is compared.
+    fn in_list<'node>(
+        &self,
+        left: &'node Expr,
+        elements: &'node [Expr],
+        negated: bool,
+    ) -> Result<Option<Vec<OperatorApplication<'node, 'db, DB>>>, LookupError> {
+        if is_row(left) || elements.iter().any(is_row) {
+            return Ok(None);
+        }
+        let (name, quantifier) =
+            if negated { ("<>", Quantifier::All) } else { ("=", Quantifier::Any) };
+        let mut kept = Vec::new();
+        let mut collapsible = Vec::new();
+        for element in elements {
+            match self.holds_own_columns(element)? {
+                Some(true) => kept.push(element),
+                Some(false) => collapsible.push(element),
+                None => return Ok(None),
+            }
+        }
+        let mut applications = Vec::with_capacity(elements.len());
+        let collapse = if collapsible.len() > 1 {
+            self.collapse(left, &collapsible)?
+        } else {
+            Collapse::Apart
+        };
+        let separate = match collapse {
+            Collapse::Unknown => return Ok(None),
+            Collapse::Into(element_type) => {
+                let built = quantifier.over(ArraySource::Built(collapsible));
+                let name = TargetName::new(name, false);
+                applications.push(self.resolved(name, Some(left), built, &element_type)?);
+                kept
+            }
+            Collapse::Apart => elements.iter().collect(),
+        };
+        for element in separate {
+            let element_type = self.type_of(element)?;
+            let name = TargetName::new(name, false);
+            applications.push(self.resolved(
+                name,
+                Some(left),
+                Operand::Node(element),
+                &element_type,
+            )?);
+        }
+        Ok(Some(applications))
+    }
+
+    /// What PostgreSQL does with the `IN` list elements `elements` it may
+    /// build into one array, deciding by the common type of `left` and the
+    /// elements.
+    fn collapse(&self, left: &Expr, elements: &[&Expr]) -> Result<Collapse<'_>, LookupError> {
+        let mut types = Vec::with_capacity(elements.len() + 1);
+        for node in core::iter::once(left).chain(elements.iter().copied()) {
+            types.push(match self.type_of(node)? {
+                OperandType::Known { type_name, .. } => PgType::from_target(&type_name),
+                OperandType::UntypedLiteral => PgType::UNKNOWN,
+                OperandType::Unknown => return Ok(Collapse::Unknown),
+            });
+        }
+        let common = select_common_type(self.database, &types, |pg_type| pg_type).ok();
+        Ok(common
+            .and_then(|common| {
+                let scalar = match common {
+                    None => return Some(Collapse::Apart),
+                    Some(CommonType::At(position)) => types.swap_remove(position),
+                    Some(CommonType::Base(base)) => base,
+                    Some(CommonType::AllUnknown) => PgType::TEXT,
+                };
+                let scalar = canonical_owned(self.database, scalar);
+                let arrays = facts(self.database, &scalar)?.array_type().is_some();
+                // `record` keeps its elements apart for the row comparisons.
+                Some(if arrays && scalar != PgType::RECORD {
+                    Collapse::Into(known(self.database, scalar, None))
+                } else {
+                    Collapse::Apart
+                })
+            })
+            .unwrap_or(Collapse::Unknown))
+    }
+
+    /// Whether `element` holds a column reference that binds in the query
+    /// level the element sits in, `None` when a reference in it binds nothing
+    /// or names a whole row.
+    fn holds_own_columns(&self, element: &Expr) -> Result<Option<bool>, LookupError> {
+        let mut visitor = OwnColumns { context: self, depth: 0 };
+        match walk(element, &mut visitor) {
+            ControlFlow::Continue(()) => Ok(Some(false)),
+            ControlFlow::Break(found) => found,
+        }
+    }
+
+    /// Whether the column reference `reference` binds `levels_up` query
+    /// levels out from where it sits, `None` when it binds nothing or names a
+    /// whole row.
+    fn binds_levels_up(
+        &self,
+        reference: &Expr,
+        levels_up: usize,
+    ) -> Result<Option<bool>, LookupError> {
+        match self.rule(reference) {
+            Some(SiteRule::Scope(cursor)) => {
+                self.scope.binds_levels_up(cursor, reference, levels_up)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Whether `expression` is a node of the query.
@@ -532,47 +740,167 @@ fn folded(expression: &Expr) -> Option<(&str, bool)> {
 /// How PostgreSQL evaluates `expression`, or `None` for a form the context
 /// does not derive.
 fn form(expression: &Expr) -> Option<Form<'_>> {
-    Some(match expression {
+    let (applied, returns) = match expression {
         Expr::Identifier(_)
         | Expr::CompoundIdentifier(_)
         | Expr::Value(_)
         | Expr::TypedString(_)
         | Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, .. }
-        | Expr::Collate { .. } => Form::Plain,
+        | Expr::Collate { .. } => (Vec::new(), Returns::Result),
         Expr::BinaryOp { left, op, right } if !is_row(left) && !is_row(right) => {
-            Form::Operator(Applied { name: binary_operator_name(op)?, left: Some(left), right })
+            let name = binary_operator_name(op)?;
+            (
+                Vec::from([Applied { name, left: Some(left), right, quantifier: None }]),
+                Returns::Result,
+            )
         }
         Expr::UnaryOp { op, expr } => {
-            Form::Operator(Applied::named(prefix_operator_name(*op)?, None, expr))
+            (Vec::from([Applied::named(prefix_operator_name(*op)?, None, expr)]), Returns::Result)
         }
-        Expr::Like { negated, any: false, expr, pattern, escape_char: None } => {
-            Form::Operator(Applied::named(if *negated { "!~~" } else { "~~" }, Some(expr), pattern))
+        Expr::Like { negated, any, expr, pattern, escape_char: None } => {
+            like(if *negated { "!~~" } else { "~~" }, *any, expr, pattern)
         }
-        Expr::ILike { negated, any: false, expr, pattern, escape_char: None } => {
-            Form::Operator(Applied::named(
-                if *negated { "!~~*" } else { "~~*" },
-                Some(expr),
-                pattern,
-            ))
+        Expr::ILike { negated, any, expr, pattern, escape_char: None } => {
+            like(if *negated { "!~~*" } else { "~~*" }, *any, expr, pattern)
         }
         // An undecorated `NULL` on either side turns the comparison into a
         // null test on the other operand, rows included.
         Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right)
             if is_null(left) || is_null(right) =>
         {
-            Form::NullTest
+            (Vec::new(), Returns::Bool)
         }
         Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right)
             if !is_row(left) && !is_row(right) =>
         {
-            Form::Distinct(Applied::named("=", Some(left), right))
+            (Vec::from([Applied::named("=", Some(left), right)]), Returns::Bool)
         }
         Expr::Function(function) => {
             let (left, right) = nullif_operands(function)?;
-            Form::NullIf(Applied::named("=", Some(left), right))
+            (Vec::from([Applied::named("=", Some(left), right)]), Returns::FirstOperand)
+        }
+        Expr::Between { expr, negated, low, high }
+            if !is_row(expr) && !is_row(low) && !is_row(high) =>
+        {
+            let (lower, upper) = if *negated { ("<", ">") } else { (">=", "<=") };
+            let bounds =
+                [Applied::named(lower, Some(expr), low), Applied::named(upper, Some(expr), high)];
+            (Vec::from(bounds), Returns::Bool)
+        }
+        Expr::AnyOp { left, compare_op, right, .. } => {
+            quantified(compare_op, Quantifier::Any, left, right)?
+        }
+        Expr::AllOp { left, compare_op, right } => {
+            quantified(compare_op, Quantifier::All, left, right)?
+        }
+        Expr::In { expr, target: InTarget::List(elements), negated, global: false } => {
+            return Some(Form::InList { left: expr, elements, negated: *negated });
         }
         _ => return None,
-    })
+    };
+    Some(Form::Applies(applied, returns))
+}
+
+/// The applications of `expr [NOT] [I]LIKE pattern` under the operator
+/// `name`, or of `expr [NOT] [I]LIKE ANY (pattern)` when `any`.
+fn like<'node>(
+    name: &'static str,
+    any: bool,
+    expr: &'node Expr,
+    pattern: &'node Expr,
+) -> (Vec<Applied<'node>>, Returns) {
+    let quantifier = any.then_some(Quantifier::Any);
+    let applied = Applied {
+        name: TargetName::new(name, false),
+        left: Some(expr),
+        right: pattern,
+        quantifier,
+    };
+    (Vec::from([applied]), if any { Returns::Bool } else { Returns::Result })
+}
+
+/// The application of `left op ANY|ALL (right)` over an array, `None` for a
+/// subquery on the right or an operator PostgreSQL does not name.
+fn quantified<'node>(
+    op: &'node BinaryOperator,
+    quantifier: Quantifier,
+    left: &'node Expr,
+    right: &'node Expr,
+) -> Option<(Vec<Applied<'node>>, Returns)> {
+    if matches!(unparenthesized(right), Expr::Subquery(_)) {
+        return None;
+    }
+    let name = binary_operator_name(op)?;
+    let applied = Applied { name, left: Some(left), right, quantifier: Some(quantifier) };
+    Some((Vec::from([applied]), Returns::Bool))
+}
+
+/// The type of each element of an array of type `array`, a domain read as
+/// its base type as `get_base_element_type` reads it, an untyped literal
+/// staying untyped as PostgreSQL resolves it against the operator's array
+/// type, and nothing for a value that is no array or whose domain base the
+/// database does not answer.
+fn element_type<'a, D: DatabaseLike>(database: &'a D, array: OperandType<'a>) -> OperandType<'a> {
+    let OperandType::Known { type_name, typmod } = array else { return array };
+    element_of(database, &type_name, typmod).unwrap_or(OperandType::Unknown)
+}
+
+/// The type of each element of the array type `array`, carrying `typmod`,
+/// a domain read as its base type.
+fn element_of<'a, D: DatabaseLike>(
+    database: &'a D,
+    array: &TargetName<'_>,
+    typmod: Option<i32>,
+) -> Option<OperandType<'a>> {
+    let declared = canonical_owned(database, PgType::from_target(array));
+    let domain_base = match base(database, &declared).ok()? {
+        Cow::Owned(base) => Some(base),
+        Cow::Borrowed(_) => None,
+    };
+    // The modifier a column of a domain carries is the domain's, not its
+    // elements'.
+    let (array, typmod) = match domain_base {
+        Some(base) => (base, None),
+        None => (declared, typmod),
+    };
+    Some(known(database, array.into_element()?, typmod))
+}
+
+/// Walks an `IN` list element for a column reference that binds in the
+/// list's own query level.
+struct OwnColumns<'c, 'query, 'db, DB: DatabaseLike> {
+    context: &'c ExpressionContext<'query, 'db, DB>,
+    /// How many queries nested in the element the walk is inside.
+    depth: usize,
+}
+
+impl<DB: DatabaseLike> Visitor for OwnColumns<'_, '_, '_, DB> {
+    /// Whether a reference of the list's own level was found, `None` when a
+    /// reference binds nothing.
+    type Break = Result<Option<bool>, LookupError>;
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        if !matches!(
+            expression,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::QualifiedWildcard(..)
+        ) {
+            return ControlFlow::Continue(());
+        }
+        match self.context.binds_levels_up(expression, self.depth) {
+            Ok(Some(false)) => ControlFlow::Continue(()),
+            found => ControlFlow::Break(found),
+        }
+    }
 }
 
 /// Whether `expression` is the undecorated `NULL` literal, parentheses

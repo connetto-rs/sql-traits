@@ -360,6 +360,15 @@ impl PgType {
         }
     }
 
+    /// Moves out the element type of an array type.
+    pub(crate) fn into_element(self) -> Option<Self> {
+        match self {
+            Self::Array(element) => Some(*element),
+            _ if self == Self::RECORD_ARRAY => Some(Self::RECORD),
+            Self::Catalog(_) | Self::Named(_) | Self::Other(_) => None,
+        }
+    }
+
     /// The polymorphic pseudo-type this is, when a declaration uses it to
     /// stand for the type of an argument.
     pub(crate) fn polymorphic(&self) -> Option<Polymorphic> {
