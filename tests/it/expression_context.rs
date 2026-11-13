@@ -407,7 +407,9 @@ fn nullif_takes_its_first_operand_as_equality_converts_it() {
 fn forms_not_yet_derived_answer_none() {
     let db = ParserDB::parse::<PostgreSqlDialect>(OPERANDS).unwrap();
     let query = query(
-        "SELECT i IN (1, 2), i BETWEEN 1 AND 2, v LIKE 'a' ESCAPE '!', (1, 2) = (1, 2),
+        "SELECT i IN (SELECT i FROM t), i = ANY (SELECT i FROM t), v SIMILAR TO 'a%',
+                (1, 2) BETWEEN (0, 0) AND (3, 3), (1, 2) IN ((1, 2), (3, 4)),
+                v LIKE ANY (ARRAY['a']) ESCAPE '!', v LIKE 'a' ESCAPE '!', (1, 2) = (1, 2),
                 ROW(1, 2) = ROW(1, 2), i > 0 AND i < 9, NOT true, length(v),
                 pg_catalog.length(v), 1 OPERATOR(a.b.+) 1, 5 !
          FROM t",
@@ -492,4 +494,198 @@ fn distinct_from_a_bare_null_applies_no_operator() {
         applied(&context, &nodes),
         [none.clone(), none.clone(), none.clone(), none.clone(), none, Some(vec!["=".to_owned()])]
     );
+}
+
+const LISTS: &str =
+    "CREATE TABLE t (i INT4, j INT4, v VARCHAR(5), a INT4[]); CREATE TABLE u (k INT4);";
+
+/// Each application a node holds, as its operator name and where its right
+/// operand comes from, `None` for a node whose applications the context does
+/// not derive.
+fn described<DB: DatabaseLike>(
+    context: &ExpressionContext<'_, '_, DB>,
+    nodes: &[&Expr],
+) -> Vec<Option<Vec<String>>> {
+    let array = |source: &ArraySource<'_>| {
+        match source {
+            ArraySource::Node(node) => node.to_string(),
+            ArraySource::Built(nodes) => {
+                format!(
+                    "[{}]",
+                    nodes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+                )
+            }
+        }
+    };
+    nodes
+        .iter()
+        .map(|node| {
+            context.operators(node).unwrap().map(|applications| {
+                applications
+                    .iter()
+                    .map(|application| {
+                        let right = match application.right() {
+                            Operand::Node(node) => node.to_string(),
+                            Operand::Any(source) => format!("ANY {}", array(source)),
+                            Operand::All(source) => format!("ALL {}", array(source)),
+                        };
+                        format!("{} {right}", application.name())
+                    })
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+/// What [`described`] answers for a node holding `applications`.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "It spells an expected `described` answer, which is an `Option`."
+)]
+fn some(applications: &[&str]) -> Option<Vec<String>> {
+    Some(applications.iter().map(ToString::to_string).collect())
+}
+
+/// An `IN` list compares against one array built from its elements that hold
+/// no column reference of its own query level, converted to their common
+/// type, and against each other element apart, as PostgreSQL 18 stores it.
+/// Elements with no common type all stay apart, and an untyped element
+/// leaves the collapse, and so the list, undecided.
+#[test]
+fn in_lists_collapse_the_elements_free_of_their_own_columns() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(LISTS).unwrap();
+    let query = query(
+        "SELECT i IN (1, 2, 3), i IN (1, j, 2), i IN (1, j), i IN (1, i + 1, 2), i NOT IN (1, 2),
+                i IN (1, 2.5), v IN ('a', 'b'), (SELECT u.k IN (1, t.j, 2) FROM u),
+                i IN (1, (SELECT j)::int4, 2), i IN (1, (SELECT u.k FROM u)::int4, 2),
+                i IN (1, 2, 'a'::text), i IN (1, (SELECT u.k FROM u), 2)
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let mut nodes = projected(&query);
+    let Expr::Subquery(inner) = nodes[7] else { unreachable!() };
+    nodes[7] = projected(inner)[0];
+    assert_eq!(
+        described(&context, &nodes),
+        [
+            some(&["= ANY [1, 2, 3]"]),
+            some(&["= ANY [1, 2]", "= j"]),
+            some(&["= 1", "= j"]),
+            some(&["= ANY [1, 2]", "= i + 1"]),
+            some(&["<> ALL [1, 2]"]),
+            some(&["= ANY [1, 2.5]"]),
+            some(&["= ANY ['a', 'b']"]),
+            some(&["= ANY [1, t.j, 2]"]),
+            some(&["= ANY [1, 2]", "= (SELECT j)::INT4"]),
+            some(&["= ANY [1, (SELECT u.k FROM u)::INT4, 2]"]),
+            some(&["= 1", "= 2", "= 'a'::TEXT"]),
+            None,
+        ]
+    );
+    let types: Vec<_> = nodes.iter().map(|node| context.type_of(node).unwrap()).collect();
+    assert!(types[..10].iter().all(|operand| *operand == pg("bool")));
+    // No `=` takes `int4` and `text`.
+    assert_eq!(types[10..], [OperandType::Unknown, OperandType::Unknown]);
+
+    // `i IN (1, 2.5)` compares `numeric` with `numeric`, converting `i`.
+    let applications = context.operators(nodes[5]).unwrap().unwrap();
+    let OperatorResolution::Selected(equals) = applications[0].resolution() else { unreachable!() };
+    assert_eq!(equals.left().map(|left| left.target().name()), Some("numeric"));
+    assert_eq!(equals.right().target().name(), "numeric");
+}
+
+/// `BETWEEN` applies `>=` and `<=`, and `NOT BETWEEN` `<` and `>`, each
+/// against its bound.
+#[test]
+fn between_compares_with_each_bound() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(LISTS).unwrap();
+    let query = query("SELECT i BETWEEN 1 AND 2.5, i NOT BETWEEN 1 AND 2 FROM t");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    assert_eq!(described(&context, &nodes), [some(&[">= 1", "<= 2.5"]), some(&["< 1", "> 2"])]);
+    assert!(nodes.iter().all(|node| context.type_of(node).unwrap() == pg("bool")));
+}
+
+/// `op ANY`, `op SOME` and `op ALL` over an array, and `[NOT] [I]LIKE ANY`,
+/// compare with each element, an untyped literal reading as the operator's
+/// array type, and a non-array right side takes no type.
+#[test]
+fn quantified_comparisons_compare_with_each_element() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(LISTS).unwrap();
+    let query = query(
+        "SELECT i = ANY (a), i = SOME (a), i < ALL (a), i = ANY ('{1,2}'),
+                v LIKE ANY ('{a%,b%}'::text[]), v NOT ILIKE ANY ('{a}'), i = ANY (j)
+         FROM t",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    assert_eq!(
+        described(&context, &nodes),
+        [
+            some(&["= ANY a"]),
+            some(&["= ANY a"]),
+            some(&["< ALL a"]),
+            some(&["= ANY '{1,2}'"]),
+            some(&["~~ ANY ('{a%,b%}'::TEXT[])"]),
+            some(&["!~~* ANY ('{a}')"]),
+            some(&["= ANY j"]),
+        ]
+    );
+    let types: Vec<_> = nodes.iter().map(|node| context.type_of(node).unwrap()).collect();
+    assert!(types[..6].iter().all(|operand| *operand == pg("bool")));
+    assert_eq!(types[6], OperandType::Unknown);
+    let applications = context.operators(nodes[3]).unwrap().unwrap();
+    let OperatorResolution::Selected(equals) = applications[0].resolution() else { unreachable!() };
+    assert_eq!(equals.right().target().name(), "int4");
+}
+
+/// The array an `IN` list builds takes `text` when every value is an
+/// untyped literal, and a domain's base type when a domain meets other
+/// types, and `=` then compares `text` with `text`.
+#[test]
+fn in_list_arrays_take_the_common_type_of_their_values() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE DOMAIN d3 AS VARCHAR(3); CREATE TABLE t (x d3);",
+    )
+    .unwrap();
+    let query = query("SELECT 'x' IN ('a', 'b'), x IN ('a', 'b') FROM t");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let built = some(&["= ANY ['a', 'b']"]);
+    assert_eq!(described(&context, &nodes), [built.clone(), built]);
+    for node in nodes {
+        assert_eq!(context.type_of(node).unwrap(), pg("bool"));
+        let applications = context.operators(node).unwrap().unwrap();
+        let OperatorResolution::Selected(equals) = applications[0].resolution() else {
+            unreachable!()
+        };
+        assert_eq!(equals.right().target().name(), "text");
+    }
+}
+
+/// Elements free of the list's own columns stay apart when their common
+/// type has no array type, as `pg_node_tree` has none in PostgreSQL 18.
+#[test]
+fn in_lists_without_an_array_type_compare_each_element_apart() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE t (x pg_node_tree, y pg_node_tree); CREATE TABLE u (z pg_node_tree);",
+    )
+    .unwrap();
+    let query = query("SELECT (SELECT u.z IN (t.x, t.y) FROM u) FROM t");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let Expr::Subquery(inner) = projected(&query)[0] else { unreachable!() };
+    let nodes = projected(inner);
+    assert_eq!(described(&context, &nodes), [some(&["= t.x", "= t.y"])]);
+}
+
+/// An element whose reference binds nothing, or names a whole row, leaves
+/// the list undecided.
+#[test]
+fn in_lists_with_unbound_elements_answer_none() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(LISTS).unwrap();
+    let query = query("SELECT 1 FROM t WHERE i IN (1, nope, 2) OR i IN (1, t.*, 2)");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    let Some(Expr::BinaryOp { left, right, .. }) = &select.selection else { unreachable!() };
+    assert_eq!(described(&context, &[left, right]), [None, None]);
 }

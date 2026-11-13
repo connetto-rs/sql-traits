@@ -21,6 +21,9 @@ use crate::{
 pub(crate) type Bound<'scope, 'query, 'db, DB> =
     (ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>);
 
+/// A resolved column with the scope it binds in.
+type FoundIn<'scope, 'db, DB> = (ResolvedColumn<'scope, 'db, DB, DefinitionId>, ScopeId);
+
 mod output_columns;
 pub(crate) mod reference_sites;
 
@@ -197,9 +200,19 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
 
     fn resolve_definition_id<'scope>(
         &'scope self,
-        mut cursor: ScopeCursor,
+        cursor: ScopeCursor,
         reference: &Expr,
     ) -> Result<Option<ResolvedColumn<'scope, 'db, DB, DefinitionId>>, LookupError> {
+        Ok(self.resolve_definition_in(cursor, reference)?.map(|(resolved, _)| resolved))
+    }
+
+    /// Resolves `reference` from the scope `cursor` names outwards, with the
+    /// scope it binds in.
+    fn resolve_definition_in<'scope>(
+        &'scope self,
+        mut cursor: ScopeCursor,
+        reference: &Expr,
+    ) -> Result<Option<FoundIn<'scope, 'db, DB>>, LookupError> {
         loop {
             match resolve_definition_local(
                 &self.scopes[cursor.scope.0].data,
@@ -209,7 +222,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                 false,
                 self.scopes[cursor.scope.0].data.case,
             )? {
-                LookupOutcome::Found(resolved) => return Ok(Some(resolved)),
+                LookupOutcome::Found(resolved) => return Ok(Some((resolved, cursor.scope))),
                 LookupOutcome::Stop => return Ok(None),
                 LookupOutcome::SearchParent => {
                     let Some(parent) = self.scopes[cursor.scope.0].parent else {
@@ -219,6 +232,22 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                 }
             }
         }
+    }
+
+    /// Whether `reference`, sitting in the scope `cursor` names, binds in the
+    /// query `levels_up` query levels out from that scope, [`None`] when it
+    /// binds nothing.
+    pub(crate) fn binds_levels_up(
+        &self,
+        cursor: ScopeCursor,
+        reference: &Expr,
+        levels_up: usize,
+    ) -> Result<Option<bool>, LookupError> {
+        let level = (0..levels_up).try_fold(cursor.scope, |scope, _| self.scopes[scope.0].owner);
+        Ok(self
+            .resolve_definition_in(cursor, reference)?
+            .zip(level)
+            .map(|((_, found), level)| found == level))
     }
 
     pub(crate) fn resolve_definition<'scope>(

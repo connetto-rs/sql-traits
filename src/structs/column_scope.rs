@@ -1139,6 +1139,18 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
         self.graph.resolve_site(rule, reference)
     }
 
+    /// Whether `reference`, sitting in the scope `cursor` names, binds in the
+    /// query `levels_up` query levels out from that scope, `None` when it
+    /// binds nothing.
+    pub(crate) fn binds_levels_up(
+        &self,
+        cursor: ScopeCursor,
+        reference: &Expr,
+        levels_up: usize,
+    ) -> Result<Option<bool>, LookupError> {
+        self.graph.binds_levels_up(cursor, reference, levels_up)
+    }
+
     /// Resolves a relation qualifier with no column, such as a qualified
     /// wildcard's, against the query's own `FROM` relations.
     ///
