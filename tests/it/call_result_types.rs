@@ -298,9 +298,15 @@ fn expression_forms_answer_their_own_types() -> Result<(), LookupError> {
     let cases: &[Case<'_>] = &[
         ("greatest(a, b)", &[int, Some("BIGINT")], Some("BIGINT")),
         ("least(a, 'x')", &[Some("TEXT"), literal], Some("TEXT")),
+        // `NULLIF` takes its first argument's type as the `=` it applies
+        // converts it.
         ("nullif(a, b)", &[int, Some("BIGINT")], Some("INT")),
-        // An untyped first argument takes the type it is compared under.
+        ("nullif(a, b)", &[int, Some("NUMERIC")], Some("NUMERIC")),
+        ("nullif(a, 'x')", &[Some("VARCHAR(5)"), literal], Some("text")),
         ("nullif('1', b)", &[literal, int], Some("INT")),
+        // No `=` takes `int4` and `bytea`, and an unknown type decides none.
+        ("nullif(a, b)", &[int, Some("BYTEA")], None),
+        ("nullif(a, b)", &[int, None], None),
         ("current_date", &[], Some("DATE")),
         ("current_time", &[], Some("TIME WITH TIME ZONE")),
         ("current_timestamp", &[], Some("TIMESTAMP WITH TIME ZONE")),

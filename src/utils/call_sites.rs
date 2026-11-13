@@ -121,8 +121,9 @@ pub(crate) enum ExpressionForm {
     /// `COALESCE`, `GREATEST` and `LEAST`, of the common type of their
     /// arguments.
     CommonType,
-    /// `NULLIF`, of the type of its first argument.
-    FirstArgument,
+    /// `NULLIF`, of the type of its first argument as the `=` it applies
+    /// converts it.
+    NullIf,
     /// A SQL value function such as `CURRENT_DATE`, of a fixed type, spelled
     /// as sqlparser writes it.
     Value(&'static str),
@@ -142,7 +143,7 @@ pub(crate) fn expression_form(called: &ObjectName) -> Option<ExpressionForm> {
     };
     let form = match value.to_ascii_lowercase().as_str() {
         "coalesce" | "greatest" | "least" => ExpressionForm::CommonType,
-        "nullif" => ExpressionForm::FirstArgument,
+        "nullif" => ExpressionForm::NullIf,
         "current_date" => ExpressionForm::Value("DATE"),
         "current_time" => ExpressionForm::Value("TIME WITH TIME ZONE"),
         "current_timestamp" => ExpressionForm::Value("TIMESTAMP WITH TIME ZONE"),
