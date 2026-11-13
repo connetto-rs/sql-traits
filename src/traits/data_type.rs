@@ -1094,9 +1094,8 @@ pub trait DataTypeLike: Debug + Send + Sync {
     /// type that is not an array.
     ///
     /// `INT[]` and `INT ARRAY` declare one dimension and `INT[][]` declares
-    /// two. PostgreSQL enforces neither the count nor a declared size, and
-    /// stores a value of any dimensions in any array column, so this is the
-    /// count as written.
+    /// two. This is the count as written, which binds the values stored only
+    /// where [`Self::enforces_array_dimensions`] answers `true`.
     ///
     /// The default counts [`Self::array_dimension_declarations`].
     ///
@@ -1127,6 +1126,47 @@ pub trait DataTypeLike: Debug + Send + Sync {
         let dimensions = self.array_dimension_declarations(database)?.count();
         NonZeroU32::new(u32::try_from(dimensions).unwrap_or(u32::MAX))
     }
+
+    /// Returns whether the engine refuses a value of an array type that has a
+    /// different number of dimensions than [`Self::array_dimensions`] counts,
+    /// or `None` for a type that is not an array.
+    ///
+    /// PostgreSQL considers every array of one element type a single type and
+    /// stores a value of any dimensions in any array column, so `INT[]` holds
+    /// `'{{1,2},{3,4}}'` and its arrays answer `false`. Its catalog keeps the
+    /// count only as `pg_attribute.attndims`, which a table made by
+    /// `CREATE TABLE AS` or `LIKE` records as `0`. Every other engine with
+    /// arrays makes a nested array a type of its own, as the standard does,
+    /// so DuckDB's `INTEGER[][]`, ClickHouse's `Array(Array(Int32))` and
+    /// Snowflake's `ARRAY(ARRAY(INT))` answer `true`. Snowflake's bare `ARRAY`
+    /// answers `true` as well, since each of its values is one array whose
+    /// elements are `VARIANT` values.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::{DuckDbDialect, PostgreSqlDialect};
+    ///
+    /// let enforced = |db: &ParserDB| -> Result<Vec<_>, sql_traits::errors::Error> {
+    ///     let table =
+    ///         db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    ///     Ok(table
+    ///         .columns(db)?
+    ///         .map(|column| column.data_type(db).enforces_array_dimensions(db))
+    ///         .collect())
+    /// };
+    ///
+    /// let sql = "CREATE TABLE t (one INTEGER[], two INTEGER[][], n INTEGER);";
+    /// let postgres = ParserDB::parse::<PostgreSqlDialect>(sql)?;
+    /// assert_eq!(enforced(&postgres)?, [Some(false), Some(false), None]);
+    /// let duckdb = ParserDB::parse::<DuckDbDialect>(sql)?;
+    /// assert_eq!(enforced(&duckdb)?, [Some(true), Some(true), None]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn enforces_array_dimensions(&self, database: &Self::DB) -> Option<bool>;
 
     /// Returns whether a value of the type itself may be `NULL`.
     ///

@@ -244,6 +244,11 @@ impl DataTypeLike for DataType {
         }))
     }
 
+    fn enforces_array_dimensions(&self, database: &Self::DB) -> Option<bool> {
+        matches!(stored_as(self), Self::Array(_))
+            .then(|| *database.dialect() != SqlparserDialect::PostgreSql)
+    }
+
     fn admits_null(&self, database: &Self::DB) -> bool {
         let mut current = self;
         while let Self::LowCardinality(inner) = current {

@@ -533,6 +533,10 @@ impl DataTypeLike for MemoryDataType {
     ) -> Option<impl Iterator<Item = ArrayDimension>> {
         None::<core::iter::Empty<ArrayDimension>>
     }
+
+    fn enforces_array_dimensions(&self, _database: &Self::DB) -> Option<bool> {
+        None
+    }
 }
 
 impl TableLike for MemoryTable {

@@ -145,6 +145,10 @@ impl DataTypeLike for Forwarded<'_> {
         self.declared.array_dimension_declarations(database)
     }
 
+    fn enforces_array_dimensions(&self, database: &ParserDB) -> Option<bool> {
+        self.declared.enforces_array_dimensions(database)
+    }
+
     fn range_subtype<'db>(&'db self, _database: &'db ParserDB) -> Option<&'db Self> {
         None
     }
