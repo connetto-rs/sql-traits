@@ -493,8 +493,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
         each_from_item(tables, &mut |item| self.graph.from_items.push(AstRef::Query(item)));
     }
 
-    /// Records a `MERGE` target or source, a table or a parenthesized query
-    /// standing alone, which a binding's origin names.
+    /// Records a `MERGE` target or source, which a binding's origin names. A
+    /// parenthesized join source stands as one opaque relation, as in a
+    /// `FROM` clause, so no origin names an item inside it.
     pub(super) fn record_factor(&mut self, factor: &'query TableFactor) {
         self.graph.from_items.push(AstRef::Query(factor));
     }
