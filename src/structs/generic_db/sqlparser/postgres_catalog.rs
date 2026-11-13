@@ -87,6 +87,16 @@ impl CatalogName {
         }
     }
 
+    /// The name `name` in the schema `schema`, each with its quoting.
+    pub(super) fn new(schema: (&str, bool), name: (&str, bool)) -> Self {
+        Self {
+            schema: Some(Cow::Owned(String::from(schema.0))),
+            schema_is_quoted: schema.1,
+            name: Cow::Owned(String::from(name.0)),
+            name_is_quoted: name.1,
+        }
+    }
+
     pub(super) fn set_schema(&mut self, schema: String, schema_is_quoted: bool) {
         self.schema = Some(Cow::Owned(schema));
         self.schema_is_quoted = schema_is_quoted;

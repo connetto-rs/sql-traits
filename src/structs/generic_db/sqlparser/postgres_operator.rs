@@ -1,19 +1,18 @@
 //! PostgreSQL operator declarations and exact implementation links.
 
-use alloc::{
-    borrow::Cow,
-    string::{String, ToString},
-};
+use alloc::{borrow::Cow, string::String};
+use core::borrow::Borrow;
 
-use sqlparser::ast::{ArgMode, CreateFunction, ObjectName, OperateFunctionArg};
+use sqlparser::ast::{ArgMode, CreateFunction, DataType, ObjectName, OperateFunctionArg};
 
 use super::{postgres_catalog::CatalogName, type_arrays::TypeArrays};
 use crate::{
     structs::{IdentifierCase, TargetName, generic_db::sqlparser::ParserDB},
     traits::{DatabaseLike, Metadata, OperatorKind, OperatorLike},
     utils::{
-        identifier_resolution::identifiers_match, normalize_postgres_type_cow,
-        normalize_sqlparser_type,
+        identifier_resolution::{identifiers_match, stored_identifier},
+        object_name::PG_CATALOG,
+        postgres_types::PgType,
     },
 };
 
@@ -194,7 +193,7 @@ impl PostgresCatalogOperator {
             return false;
         };
         function_name_matches(implementation, name, case)
-            && self.spelled_operands(type_arrays).arguments_match(args)
+            && takes_exactly(self.operands(), type_arrays, args)
     }
 
     /// Repoints the implementing function's stored identity.
@@ -214,11 +213,9 @@ impl PostgresCatalogOperator {
         }
     }
 
-    /// Normalizes operand identities against the model's generated-array
-    /// ownership.
-    fn spelled_operands(&self, type_arrays: &TypeArrays) -> SpelledOperands {
-        let left = self.left.as_ref().map(|identity| operand_spelling(identity, type_arrays));
-        SpelledOperands { left, right: operand_spelling(&self.right, type_arrays) }
+    /// The operand types, the left one first when there is one.
+    fn operands(&self) -> impl Iterator<Item = &CatalogName> {
+        self.left.iter().chain([&self.right])
     }
 }
 
@@ -249,10 +246,10 @@ impl OperatorLike for PostgresCatalogOperator {
     fn implementation<'db>(&'db self, database: &'db ParserDB) -> Option<&'db CreateFunction> {
         let implementation = self.implementation.as_ref()?;
         let case = database.identifier_case();
-        let spelled = self.spelled_operands(&database.ingestion.type_arrays);
+        let type_arrays = &database.ingestion.type_arrays;
         database.functions().find(|function| {
             function_name_matches(implementation, &function.name, case)
-                && spelled.arguments_match(function.args.as_deref())
+                && takes_exactly(self.operands(), type_arrays, function.args.as_deref())
         })
     }
 }
@@ -286,60 +283,22 @@ pub(super) fn function_name_matches(
         )
 }
 
-/// The normalized spelling of the identity PostgreSQL resolves it to, a
-/// generated array answering its element's type with a single pair of
-/// brackets.
-pub(super) fn operand_spelling(
-    identity: &CatalogName,
+/// Whether the input arguments of `args` take exactly the types `inputs`
+/// identifies, in order.
+pub(super) fn takes_exactly(
+    inputs: impl IntoIterator<Item = impl Borrow<CatalogName>>,
     type_arrays: &TypeArrays,
-) -> Cow<'static, str> {
-    let schema = identity.schema().unwrap_or(DEFAULT_SCHEMA);
-    let spelled = match type_arrays.element_in(
-        schema,
-        identity.schema_is_quoted(),
-        identity.name(),
-        identity.name_is_quoted(),
-    ) {
-        Some(element) => {
-            let mut spelled = element.to_string();
-            spelled.push_str("[]");
-            spelled
-        }
-        None => identity.target_name().to_string(),
-    };
-    normalize_postgres_type_cow(Cow::Owned(spelled))
-}
-
-/// The exact input signature, with the left operand absent for prefix
-/// operators.
-struct SpelledOperands {
-    left: Option<Cow<'static, str>>,
-    right: Cow<'static, str>,
-}
-
-impl SpelledOperands {
-    /// Whether `args` normalize to exactly the operand spellings held.
-    fn arguments_match(&self, args: Option<&[OperateFunctionArg]>) -> bool {
-        arguments_match([self.left.as_deref(), Some(&self.right)].into_iter().flatten(), args)
-    }
-}
-
-/// Whether the input arguments of `args` normalize to exactly `spelled`, in
-/// order.
-pub(super) fn arguments_match(
-    spelled: impl IntoIterator<Item = impl AsRef<str>>,
     args: Option<&[OperateFunctionArg]>,
 ) -> bool {
     let mut written =
         args.unwrap_or_default().iter().filter(|argument| argument.mode != Some(ArgMode::Out));
-    let mut spelled = spelled.into_iter();
+    let mut inputs = inputs.into_iter();
     loop {
-        match (written.next(), spelled.next()) {
+        match (written.next(), inputs.next()) {
             (None, None) => return true,
-            (Some(argument), Some(spelled)) => {
-                if normalize_postgres_type_cow(normalize_sqlparser_type(&argument.data_type))
-                    .as_ref()
-                    != spelled.as_ref()
+            (Some(argument), Some(input)) => {
+                if !type_identity(type_arrays, &argument.data_type)
+                    .is_some_and(|written| identity_repeats(&written, input.borrow()))
                 {
                     return false;
                 }
@@ -347,6 +306,48 @@ pub(super) fn arguments_match(
             _ => return false,
         }
     }
+}
+
+/// The `pg_type` identity a bound declaration names, or `None` for a spelling
+/// no stored type has.
+pub(super) fn type_identity(type_arrays: &TypeArrays, data_type: &DataType) -> Option<CatalogName> {
+    pg_type_identity(type_arrays, PgType::of(data_type))
+}
+
+/// The `pg_type` identity of `pg_type`, an array reaching the stored array
+/// type of its element.
+fn pg_type_identity(type_arrays: &TypeArrays, pg_type: PgType) -> Option<CatalogName> {
+    match pg_type {
+        PgType::Catalog(name) => Some(CatalogName::new((PG_CATALOG, false), (name, false))),
+        PgType::Named(target) => Some(target_identity(&target)),
+        PgType::Array(element) => {
+            let element = pg_type_identity(type_arrays, *element)?;
+            let array = type_arrays.array_in(
+                element.schema()?,
+                element.schema_is_quoted(),
+                element.name(),
+                element.name_is_quoted(),
+            )?;
+            Some(target_identity(&array))
+        }
+        PgType::Other(_) => None,
+    }
+}
+
+/// The identity `target` names in its canonical spelling, quoted only where
+/// folding would change it, an absent schema reading as `public`.
+fn target_identity(target: &TargetName<'_>) -> CatalogName {
+    let canonical = |name, quoted| {
+        let stored = stored_identifier(name, quoted);
+        let quoted = stored.bytes().any(|byte| byte.is_ascii_uppercase());
+        (stored, quoted)
+    };
+    let (schema, schema_quoted) =
+        target.schema().map_or((Cow::Borrowed(DEFAULT_SCHEMA), false), |schema| {
+            canonical(schema, target.schema_is_quoted())
+        });
+    let (name, name_quoted) = canonical(target.name(), target.name_is_quoted());
+    CatalogName::new((&schema, schema_quoted), (&name, name_quoted))
 }
 
 /// Compares schema identities using PostgreSQL identifier rules.

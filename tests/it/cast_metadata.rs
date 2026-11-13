@@ -406,3 +406,19 @@ fn rollback_restores_a_cast_a_cascade_removed() {
     assert_eq!(cast.source_type(&db), app("celsius"));
     assert_eq!(cast.function(&db).unwrap().target_name(), app("to_f"));
 }
+
+#[test]
+fn a_cast_from_a_default_schema_type_links_its_function() {
+    let celsius = || TargetName::new("celsius", false).with_schema("public", false);
+    let db = configured(
+        celsius(),
+        "CREATE SCHEMA app;
+         CREATE TYPE celsius AS ENUM ('c');
+         CREATE TYPE app.fahrenheit AS ENUM ('f');
+         CREATE FUNCTION app.to_f(celsius) RETURNS app.fahrenheit LANGUAGE SQL AS 'SELECT ''f''::app.fahrenheit';",
+    )
+    .unwrap();
+    let cast = the_cast(&db).unwrap();
+    assert_eq!(cast.source_type(&db), celsius());
+    assert_eq!(cast.function(&db).unwrap().target_name(), app("to_f"));
+}
