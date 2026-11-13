@@ -6,6 +6,7 @@ mod call_resolution;
 mod column_scope;
 mod deployment;
 mod expression_context;
+mod expression_scope;
 pub(crate) mod fingerprint;
 mod foreign_table_source;
 pub mod generic_db;
@@ -53,6 +54,7 @@ pub use deployment::{
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
+pub use expression_scope::ExpressionScope;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;

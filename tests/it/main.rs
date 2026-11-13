@@ -46,6 +46,7 @@ mod enumerated_types;
 mod exhaustive_alter_table;
 mod explicit_revokes;
 mod expression_context;
+mod expression_scopes;
 mod expression_truth;
 mod extensions;
 mod foreign_tables;

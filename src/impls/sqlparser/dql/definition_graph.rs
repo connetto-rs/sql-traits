@@ -1,11 +1,15 @@
 use alloc::{borrow::ToOwned, vec::Vec};
 use core::{marker::PhantomData, slice};
 
-use sqlparser::ast::{Expr, ObjectName, Select, SetOperator, TableFactor, TableWithJoins};
+use sqlparser::ast::{
+    Expr, Ident, ObjectName, Select, SetOperator, Statement, TableFactor, TableWithJoins,
+};
 
 use super::{
-    BaseColumnRef, ColumnOrigin, DerivationProfile, Deriving, FromScope, LookupOutcome,
-    OutputNameSource, RelationKey, ResolvedColumn, derive_query_shape, factor_address,
+    BaseColumnRef, ColumnOrigin, CteShape, DerivationProfile, DerivedShape, Deriving, FromScope,
+    LookupOutcome, OutputNameSource, RelationKey, ResolvedColumn, WildcardEntry,
+    derive_query_shape, factor_address,
+    modifying::{self, ModifyingScopes},
     resolve_definition_local, resolve_relation_local,
 };
 use crate::{
@@ -116,10 +120,29 @@ pub(super) struct GraphCheckpoint {
 }
 
 enum DefinitionNode<'query, 'db, DB: DatabaseLike> {
-    Base { table: &'db DB::Table, column: &'db DB::Column, database: &'db DB },
-    Expression { expression: AstRef<'query, 'db, Expr>, scope: ScopeCursor },
-    SetOperation { operator: SetOperator, left: DefinitionId, right: DefinitionId },
-    RecursiveUnion { anchor: DefinitionId, recursive: DefinitionId },
+    Base {
+        table: &'db DB::Table,
+        column: &'db DB::Column,
+        database: &'db DB,
+    },
+    Expression {
+        expression: AstRef<'query, 'db, Expr>,
+        scope: ScopeCursor,
+    },
+    SetOperation {
+        operator: SetOperator,
+        left: DefinitionId,
+        right: DefinitionId,
+    },
+    /// Input parameter `ordinal` of the function whose body is resolved.
+    Parameter {
+        function: &'db DB::Function,
+        ordinal: usize,
+    },
+    RecursiveUnion {
+        anchor: DefinitionId,
+        recursive: DefinitionId,
+    },
     Opaque,
 }
 
@@ -163,10 +186,20 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     /// address.
     from_items: Vec<AstRef<'query, 'db, TableFactor>>,
     queries: Vec<QueryNode<'query, 'db>>,
+    /// The scopes the clauses of every data-modifying statement resolve in,
+    /// by the statement's address.
+    modifying: Vec<(usize, ModifyingScopes)>,
     case: IdentifierCase,
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
+    /// The scopes the clauses of the data-modifying statement `statement`
+    /// resolve in, `None` for a statement the graph was not built over.
+    pub(crate) fn modifying_scopes(&self, statement: &Statement) -> Option<ModifyingScopes> {
+        let address = core::ptr::from_ref(statement).addr();
+        self.modifying.iter().find(|(held, _)| *held == address).map(|(_, scopes)| *scopes)
+    }
+
     pub(crate) fn definition<'scope>(
         &'scope self,
         id: DefinitionId,
@@ -193,6 +226,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                     anchor: ColumnDefinitionRef::new(self, *anchor),
                     recursive: ColumnDefinitionRef::new(self, *recursive),
                 }
+            }
+            DefinitionNode::Parameter { function, ordinal } => {
+                ColumnDefinition::Parameter { function, ordinal: *ordinal }
             }
             DefinitionNode::Opaque => ColumnDefinition::Opaque,
         }
@@ -378,6 +414,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 select_index: Vec::new(),
                 from_items: Vec::new(),
                 queries: Vec::new(),
+                modifying: Vec::new(),
                 case,
             },
             created: Vec::new(),
@@ -431,15 +468,112 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     }
 
     pub(super) fn empty_scope(mut self) -> (DefinitionGraph<'query, 'db, DB>, ScopeCursor) {
+        let scope = self.begin_unowned_scope(None);
+        self.finish(scope)
+    }
+
+    /// Opens a scope no `SELECT` owns, under `parent`: the names an
+    /// expression outside a query reaches, or a data-modifying statement's
+    /// relations.
+    pub(super) fn begin_unowned_scope(&mut self, parent: Option<ScopeCursor>) -> ScopeId {
         let scope = ScopeId(self.graph.scopes.len());
         self.graph.scopes.push(ScopeNode {
             select: None,
-            parent: None,
-            owner: None,
+            parent,
+            owner: parent.map(|parent| parent.scope),
             data: FromScope::new(self.graph.case),
             outputs: Vec::new(),
         });
-        self.finish(scope)
+        scope
+    }
+
+    /// Records the `FROM` items of a data-modifying statement, which a
+    /// binding's origin names.
+    pub(super) fn record_from_items(&mut self, tables: &'query [TableWithJoins]) {
+        each_from_item(tables, &mut |item| self.graph.from_items.push(AstRef::Query(item)));
+    }
+
+    /// Records a `MERGE` target or source, which a binding's origin names. A
+    /// parenthesized join source stands as one opaque relation, as in a
+    /// `FROM` clause, so no origin names an item inside it.
+    pub(super) fn record_factor(&mut self, factor: &'query TableFactor) {
+        self.graph.from_items.push(AstRef::Query(factor));
+    }
+
+    /// Records the scopes the clauses of `statement` resolve in.
+    pub(super) fn record_modifying(&mut self, statement: &Statement, scopes: ModifyingScopes) {
+        self.graph.modifying.push((core::ptr::from_ref(statement).addr(), scopes));
+    }
+
+    /// Whether a relation named `name`, unquoted, is in reach from `cursor`.
+    pub(super) fn reaches_relation(&self, cursor: Option<ScopeCursor>, name: &str) -> bool {
+        let qualifier = ObjectName::from(alloc::vec![Ident::new(name)]);
+        cursor.is_some_and(|cursor| self.graph.resolve_relation(cursor, &qualifier).is_some())
+    }
+
+    /// The definition of input parameter `ordinal` of `function`.
+    pub(super) fn parameter_definition(
+        &mut self,
+        function: &'db DB::Function,
+        ordinal: usize,
+    ) -> DefinitionId {
+        self.push_definition(DefinitionNode::Parameter { function, ordinal })
+    }
+
+    /// Appends `table` to `scope` as its next `FROM` entry, exposed under
+    /// the alias `alias` names with its quoting when one is given, and
+    /// otherwise under its own schema and name.
+    pub(super) fn push_table_entry(
+        &mut self,
+        scope: ScopeId,
+        table: &'db DB::Table,
+        database: &'db DB,
+        alias: Option<(&'query str, bool)>,
+    ) {
+        let output_columns: Vec<_> = table
+            .columns(database)
+            .into_iter()
+            .flatten()
+            .map(|column| {
+                BaseColumnRef {
+                    name: column.column_name().to_owned(),
+                    quoted: column.column_name_is_quoted(),
+                    definition: self.column_definition(table, column, database),
+                }
+            })
+            .collect();
+        let (key, schema_key) = if let Some((alias, quoted)) = alias {
+            (RelationKey { value: AstRef::Query(alias), quoted }, None)
+        } else {
+            let schema = table.table_schema().map_or(
+                RelationKey { value: AstRef::Database("public"), quoted: false },
+                |schema| {
+                    RelationKey {
+                        value: AstRef::Database(schema),
+                        quoted: table.table_schema_is_quoted(),
+                    }
+                },
+            );
+            let name = RelationKey {
+                value: AstRef::Database(table.table_name()),
+                quoted: table.table_name_is_quoted(),
+            };
+            (name, Some(schema))
+        };
+        let data = &mut self.graph.scopes[scope.0].data;
+        data.wildcard_plans.push(alloc::vec![WildcardEntry::Base(data.bases.len())]);
+        data.bases.push(super::FromTableRef {
+            key,
+            schema_key,
+            table,
+            has_alias: alias.is_some(),
+            nullable: false,
+            reads_inheritors: false,
+            entry_index: data.from_entry_count,
+            output_columns,
+            factor: 0,
+        });
+        data.from_entry_count += 1;
     }
 }
 
@@ -588,6 +722,16 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
     fn checkpoint(&self) -> Self::Checkpoint {
         GraphCheckpoint { scopes: self.graph.scopes.len() }
     }
+
+    fn modifying_shape(
+        &mut self,
+        statement: &'query Statement,
+        cte_scope: &[CteShape<'query, 'db, DB, Self::Definition>],
+        deriving: Deriving<'_, 'db, DB>,
+        parent: Self::Cursor,
+    ) -> Result<Option<DerivedShape<'query, 'db, DB, Self::Definition>>, LookupError> {
+        modifying::derive(self, statement, cte_scope, deriving, parent)
+    }
 }
 
 pub(crate) fn table_graph<'db, DB: DatabaseLike>(
@@ -596,45 +740,7 @@ pub(crate) fn table_graph<'db, DB: DatabaseLike>(
     case: IdentifierCase,
 ) -> (DefinitionGraph<'db, 'db, DB>, ScopeCursor) {
     let mut profile = DefinitionDerivation::new(case);
-    let scope = ScopeId(0);
-    profile.graph.scopes.push(ScopeNode {
-        select: None,
-        parent: None,
-        owner: None,
-        data: FromScope::new(case),
-        outputs: Vec::new(),
-    });
-    let mut output_columns = Vec::new();
-    if let Ok(columns) = table.columns(database) {
-        for column in columns {
-            let definition = profile.column_definition(table, column, database);
-            output_columns.push(BaseColumnRef {
-                name: column.column_name().to_owned(),
-                quoted: column.column_name_is_quoted(),
-                definition,
-            });
-        }
-    }
-    let schema_key = Some(match table.table_schema() {
-        Some(schema) => {
-            RelationKey { value: AstRef::Database(schema), quoted: table.table_schema_is_quoted() }
-        }
-        None => RelationKey { value: AstRef::Database("public"), quoted: false },
-    });
-    profile.graph.scopes[scope.0].data.bases.push(super::FromTableRef {
-        key: RelationKey {
-            value: AstRef::Database(table.table_name()),
-            quoted: table.table_name_is_quoted(),
-        },
-        schema_key,
-        table,
-        has_alias: false,
-        nullable: false,
-        reads_inheritors: false,
-        entry_index: 0,
-        output_columns,
-        factor: 0,
-    });
-    profile.graph.scopes[scope.0].data.from_entry_count = 1;
+    let scope = profile.begin_unowned_scope(None);
+    profile.push_table_entry(scope, table, database, None);
     profile.finish(scope)
 }

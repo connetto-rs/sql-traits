@@ -55,6 +55,7 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
         ColumnDefinition::Expression { expression, .. } => format!("expression {expression}"),
         ColumnDefinition::SetOperation { operator, .. } => format!("{operator}"),
         ColumnDefinition::RecursiveUnion { .. } => "recursive".to_owned(),
+        ColumnDefinition::Parameter { ordinal, .. } => format!("parameter {ordinal}"),
         ColumnDefinition::Opaque => "opaque".to_owned(),
     }
 }

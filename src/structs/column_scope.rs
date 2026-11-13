@@ -9,11 +9,13 @@ use crate::{
     impls::dql::{
         ColumnOrigin, build_definition_graph,
         definition_graph::{
-            DefinitionGraph, DefinitionId, QueryId, ScopeCursor, reference_sites::SiteRule,
+            DefinitionGraph, DefinitionId, QueryId, ScopeCursor,
+            reference_sites::{SiteRule, SiteRules},
             table_graph,
         },
+        scoped_roots::{ScopedRoot, scoped_graph},
     },
-    structs::IdentifierCase,
+    structs::{ExpressionScope, IdentifierCase},
     traits::DatabaseLike,
 };
 
@@ -52,6 +54,15 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
         anchor: ColumnDefinitionRef<'scope, 'query, 'db, DB>,
         /// The recursive definition.
         recursive: ColumnDefinitionRef<'scope, 'query, 'db, DB>,
+    },
+    /// An input parameter of the function whose body holds the reference,
+    /// read by name where no column of the same name is in reach.
+    Parameter {
+        /// The function the parameter belongs to.
+        function: &'scope DB::Function,
+        /// The parameter's position among the function's input parameters,
+        /// from 0, the one `$1` names first.
+        ordinal: usize,
     },
     /// A relation exposes the name without an inspectable definition.
     Opaque,
@@ -1127,6 +1138,24 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// of its expression, `None` for one sitting where no scope was derived.
     pub(crate) fn site_rules(&self, query: &Query) -> alloc::vec::Vec<(usize, Option<SiteRule>)> {
         self.graph.site_rules(query)
+    }
+
+    /// The scopes of `root` under the names `scope` reaches, with the rule
+    /// resolving each column reference of `root`, by the address of its
+    /// expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns the relation-name lookup errors resolving the root runs into.
+    pub(crate) fn for_root(
+        root: ScopedRoot<'query>,
+        scope: &ExpressionScope<'_, 'db, DB>,
+        database: &'db DB,
+        case: IdentifierCase,
+    ) -> Result<(Self, SiteRules), LookupError> {
+        let (graph, outer) = scoped_graph(root, scope, database, case)?;
+        let sites = graph.root_site_rules(root, outer);
+        Ok((Self { graph, root: outer }, sites))
     }
 
     /// Resolves `reference` as `rule` says its clause resolves it.
