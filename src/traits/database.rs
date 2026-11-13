@@ -1784,7 +1784,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// An expression PostgreSQL's grammar writes like a call reaches no
     /// function and answers its own type. `COALESCE`, `GREATEST` and `LEAST`
     /// answer the common type of their arguments, `NULLIF` the type of its
-    /// first, and a SQL value function such as `CURRENT_DATE` its fixed type.
+    /// first as the `=` it applies converts it, and a SQL value function such
+    /// as `CURRENT_DATE` its fixed type.
     ///
     /// # Errors
     ///
@@ -1842,7 +1843,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<Cow<'db, str>>, LookupError> {
         if let Some(form) = expression_form(&call.name) {
-            return expression_result(self, form, call, argument_types);
+            return expression_result(self, form, call, argument_types, case);
         }
         Ok(match resolve_call(self, call, argument_types, case)? {
             Selection::Chosen((_, result)) => result,

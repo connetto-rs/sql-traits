@@ -11,8 +11,10 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::{IdentifierCase, TargetName, TypeCategory, TypeKind},
-    traits::{DatabaseLike, FunctionLike},
+    structs::{
+        IdentifierCase, OperandType, OperatorResolution, TargetName, TypeCategory, TypeKind,
+    },
+    traits::{DatabaseLike, FunctionLike, OperatorLike},
     utils::{
         call_sites::{ExpressionForm, expression_form},
         coercion::{
@@ -21,9 +23,10 @@ use crate::{
         },
         identifier_resolution::identifiers_match,
         object_name::{
-            function_search_path, overqualified_object_name, run_time_object_name,
+            PG_CATALOG, function_search_path, overqualified_object_name, run_time_object_name,
             target_name_from_object_name,
         },
+        operator_typing::resolve_operator,
         postgres_types::{ElementForm, PgType, Polymorphic, parse_data_type},
     },
 };
@@ -963,7 +966,7 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
 }
 
 /// What `call`, an expression PostgreSQL's grammar writes as `form`, returns
-/// given its argument types.
+/// given its argument types, comparing identifiers under `case`.
 ///
 /// # Errors
 ///
@@ -974,20 +977,51 @@ pub(crate) fn expression_result<'a, D: DatabaseLike>(
     form: ExpressionForm,
     call: &Function,
     argument_types: &[Option<&'a str>],
+    case: IdentifierCase,
 ) -> Result<Option<Cow<'a, str>>, LookupError> {
     let written = written_argument_names(call).map_or(0, |written| written.len());
     check_argument_count(call, written, argument_types.len())?;
     Ok(match form {
         ExpressionForm::CommonType => common_type_name(database, argument_types),
-        // An untyped first argument takes the type `=` compares it under.
-        ExpressionForm::FirstArgument => {
-            match argument_types.first().copied().flatten() {
-                Some("unknown") => common_type_name(database, argument_types),
-                first => first.map(Cow::Borrowed),
-            }
-        }
+        ExpressionForm::NullIf => nullif_result(database, argument_types, case),
         ExpressionForm::Value(name) => Some(Cow::Borrowed(name)),
     })
+}
+
+/// What `NULLIF` returns given its argument types, its first argument's
+/// type as the `=` PostgreSQL applies converts it, spelled as the caller
+/// spelled that type when an argument has it, or [`None`] when no `=` that
+/// returns `bool` is known to take the arguments.
+fn nullif_result<'a, D: DatabaseLike>(
+    database: &D,
+    argument_types: &[Option<&'a str>],
+    case: IdentifierCase,
+) -> Option<Cow<'a, str>> {
+    let [Some(left), Some(right)] = *argument_types else { return None };
+    let operand = |name: &'a str| {
+        if name == "unknown" {
+            OperandType::UntypedLiteral
+        } else {
+            OperandType::Known { type_name: TargetName::new(name, false), typmod: None }
+        }
+    };
+    let equals = TargetName::new("=", false);
+    let OperatorResolution::Selected(selected) =
+        resolve_operator(database, &equals, Some(&operand(left)), &operand(right), case)
+    else {
+        return None;
+    };
+    let returns_bool = selected
+        .operator()
+        .result_type(database)
+        .is_some_and(|result| result.schema() == Some(PG_CATALOG) && result.name() == "bool");
+    let evidence = selected.left().filter(|_| returns_bool)?;
+    if evidence.conversion().is_empty() {
+        return Some(Cow::Borrowed(left));
+    }
+    let target = canonical_owned(database, PgType::from_target(evidence.target()));
+    let right_type = canonical_owned(database, PgType::parse(right)?);
+    Some(if target == right_type { Cow::Borrowed(right) } else { target.spelling() })
 }
 
 /// A function a call may run, with the type that call returns.
