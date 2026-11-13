@@ -30,7 +30,7 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
 
-      - uses: LucaCappelletti94/cargo-refquiem@827ed01a754ff72a074feef68b956bcbaeabac32 # v0.3.7
+      - uses: LucaCappelletti94/cargo-refquiem@d9769a84cc1ce415b99a7de027c744041cc2a8be # v0.3.9
         with:
           mode: post
           payload: ${{ runner.temp }}/refquiem-payload
