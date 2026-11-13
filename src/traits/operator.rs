@@ -44,4 +44,36 @@ pub trait OperatorLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         &'db self,
         database: &'db Self::DB,
     ) -> Option<&'db <Self::DB as DatabaseLike>::Function>;
+
+    /// Returns the commutator, the operator over the swapped operands that
+    /// `a op b` equals `b commutator a` under, or `None` when the operator
+    /// names none or the database holds no operator it names.
+    fn commutator<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self>;
+
+    /// Returns the negator, the operator over the same operands that
+    /// `a op b` equals `NOT (a negator b)` under, or `None` when the operator
+    /// names none or the database holds no operator it names.
+    fn negator<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self>;
+
+    /// Returns whether the operator supports hash joins.
+    fn can_hash(&self) -> bool;
+
+    /// Returns whether the operator supports merge joins.
+    fn can_merge(&self) -> bool;
+
+    /// Returns the function estimating the selectivity of a restriction
+    /// applying the operator, or `None` when the operator names none or the
+    /// database holds no function it names.
+    fn restriction_estimator<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<&'db <Self::DB as DatabaseLike>::Function>;
+
+    /// Returns the function estimating the selectivity of a join applying
+    /// the operator, or `None` when the operator names none or the database
+    /// holds no function it names.
+    fn join_estimator<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<&'db <Self::DB as DatabaseLike>::Function>;
 }

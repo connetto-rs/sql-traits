@@ -230,6 +230,16 @@ impl PostgresCatalog {
         self
     }
 
+    /// The operator facts as an owned list, copying the borrowed table once.
+    pub(super) fn operators_mut(&mut self) -> &mut Vec<PostgresCatalogOperator> {
+        self.operators.to_mut()
+    }
+
+    /// The operator facts in insertion order, as one slice.
+    pub(super) fn operators_slice(&self) -> &[PostgresCatalogOperator] {
+        &self.operators
+    }
+
     /// Adds or replaces the cast between the same source and target types.
     #[must_use]
     pub fn with_cast(mut self, cast: PostgresCatalogCast) -> Self {
@@ -295,7 +305,7 @@ impl PostgresCatalog {
                 }
             }
         }
-        if self.operators.iter().any(|operator| operator.touches_schema(from, from_quoted)) {
+        if self.operators.iter().any(|operator| operator.holds_schema(from, from_quoted)) {
             for operator in self.operators.to_mut() {
                 operator.follow_schema_rename(from, from_quoted, to, to_quoted);
             }
@@ -318,9 +328,7 @@ impl PostgresCatalog {
     /// Drops the operators of `schema` and every operator or cast a dropped
     /// object of the schema still runs, which PostgreSQL drops with it.
     pub(crate) fn drop_schema(&mut self, schema: &str, quoted: bool) {
-        if self.operators.iter().any(|operator| operator.touches_schema(schema, quoted)) {
-            self.operators.to_mut().retain(|operator| !operator.touches_schema(schema, quoted));
-        }
+        self.remove_operators(|_, operator| operator.touches_schema(schema, quoted));
         if self.casts.iter().any(|cast| cast.touches_schema(schema, quoted)) {
             self.casts.to_mut().retain(|cast| !cast.touches_schema(schema, quoted));
         }
@@ -344,11 +352,7 @@ impl PostgresCatalog {
     /// Drops the operators and casts naming a type of `names`, which
     /// PostgreSQL drops with the type under `CASCADE`.
     pub(crate) fn drop_facts_naming_types(&mut self, names: &[ObjectName]) {
-        let naming =
-            |operator: &PostgresCatalogOperator| names.iter().any(|name| operator.uses_type(name));
-        if self.operators.iter().any(naming) {
-            self.operators.to_mut().retain(|operator| !naming(operator));
-        }
+        self.remove_operators(|_, operator| names.iter().any(|name| operator.uses_type(name)));
         let cast_naming =
             |cast: &PostgresCatalogCast| names.iter().any(|name| cast.uses_type(name));
         if self.casts.iter().any(cast_naming) {
@@ -385,7 +389,7 @@ impl PostgresCatalog {
         };
         if self.operators.iter().any(moves) {
             for operator in self.operators.to_mut().iter_mut().filter(|operator| moves(operator)) {
-                operator.rename_implementation(to);
+                operator.follow_function_rename(type_arrays, from, from_args, to, case);
             }
         }
         if self.casts.iter().any(|cast| cast.declares_function(type_arrays, from, from_args, case))
@@ -445,14 +449,11 @@ impl PostgresCatalog {
         case: IdentifierCase,
         signatures: &(impl Iterator<Item = (&'f ObjectName, Option<&'f [OperateFunctionArg]>)> + Clone),
     ) {
-        let operator_runs = |operator: &PostgresCatalogOperator| {
+        self.remove_operators(|_, operator| {
             signatures
                 .clone()
                 .any(|(name, args)| operator.declares_function(type_arrays, name, args, case))
-        };
-        if self.operators.iter().any(operator_runs) {
-            self.operators.to_mut().retain(|operator| !operator_runs(operator));
-        }
+        });
         let cast_runs = |cast: &PostgresCatalogCast| {
             signatures
                 .clone()
@@ -460,6 +461,57 @@ impl PostgresCatalog {
         };
         if self.casts.iter().any(cast_runs) {
             self.casts.to_mut().retain(|cast| !cast_runs(cast));
+        }
+    }
+
+    /// Removes the operators `doomed` holds for, given each one's position,
+    /// clearing the commutator and negator links the others keep to them,
+    /// and leaves the borrowed list alone when it holds for none.
+    pub(super) fn remove_operators(
+        &mut self,
+        doomed: impl Fn(usize, &PostgresCatalogOperator) -> bool,
+    ) {
+        if !self.operators.iter().enumerate().any(|(position, operator)| doomed(position, operator))
+        {
+            return;
+        }
+        let operators = self.operators.to_mut();
+        let mut position = 0;
+        let removed: Vec<PostgresCatalogOperator> = operators
+            .extract_if(.., |operator| {
+                let gone = doomed(position, operator);
+                position += 1;
+                gone
+            })
+            .collect();
+        for operator in operators.iter_mut() {
+            if removed.iter().any(|gone| operator.commutes_with(gone)) {
+                operator.commutator = None;
+            }
+            if removed.iter().any(|gone| operator.negates(gone)) {
+                operator.negator = None;
+            }
+        }
+    }
+
+    /// Moves the operator at `position` to `schema`, the commutator and
+    /// negator links the others keep to it following.
+    pub(super) fn move_operator(&mut self, position: usize, schema: (&str, bool)) {
+        let operators = self.operators.to_mut();
+        let moved = &operators[position];
+        let linking: Vec<(bool, bool)> = operators
+            .iter()
+            .map(|operator| (operator.commutes_with(moved), operator.negates(moved)))
+            .collect();
+        operators[position].target.set_schema(String::from(schema.0), schema.1);
+        for (operator, (commutes, negates)) in operators.iter_mut().zip(linking) {
+            let links = [
+                commutes.then_some(&mut operator.commutator),
+                negates.then_some(&mut operator.negator),
+            ];
+            for link in links.into_iter().flatten().flatten() {
+                link.set_schema(String::from(schema.0), schema.1);
+            }
         }
     }
 }

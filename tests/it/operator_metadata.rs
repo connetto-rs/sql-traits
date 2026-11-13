@@ -485,3 +485,112 @@ fn unnamed_function_metadata_cannot_supply_an_operator_implementation() {
     );
     assert_eq!(named.implementation(&db).unwrap().name(), "equal");
 }
+
+/// The `pg_catalog` operator `name` over `left` and `right`, a `None` left
+/// finding the prefix one.
+fn builtin<'db>(
+    db: &'db ParserDB,
+    name: &str,
+    left: Option<&str>,
+    right: &str,
+) -> &'db PostgresCatalogOperator {
+    db.operators()
+        .unwrap()
+        .find(|operator| {
+            operator.target_name() == pg(name)
+                && operator.left_type(db) == left.map(pg)
+                && operator.right_type(db) == Some(pg(right))
+        })
+        .unwrap()
+}
+
+/// The symbol and operand types of `operator`.
+fn signature<'db>(
+    operator: &'db PostgresCatalogOperator,
+    db: &'db ParserDB,
+) -> (TargetName<'db>, Option<TargetName<'db>>, Option<TargetName<'db>>) {
+    (operator.target_name(), operator.left_type(db), operator.right_type(db))
+}
+
+#[test]
+fn a_builtin_comparison_links_its_commutator_negator_and_estimators() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("").unwrap();
+    let less = builtin(&db, "<", Some("int4"), "int8");
+    assert_eq!(
+        signature(less.commutator(&db).unwrap(), &db),
+        (pg(">"), Some(pg("int8")), Some(pg("int4")))
+    );
+    assert_eq!(
+        signature(less.negator(&db).unwrap(), &db),
+        (pg(">="), Some(pg("int4")), Some(pg("int8")))
+    );
+    assert!(!less.can_hash());
+    assert!(!less.can_merge());
+    assert_eq!(less.restriction_estimator(&db).unwrap().target_name(), pg("scalarltsel"));
+    assert_eq!(less.join_estimator(&db).unwrap().target_name(), pg("scalarltjoinsel"));
+
+    let equal = builtin(&db, "=", Some("int4"), "int4");
+    assert_eq!(equal.commutator(&db), Some(equal));
+    assert_eq!(
+        signature(equal.negator(&db).unwrap(), &db),
+        (pg("<>"), Some(pg("int4")), Some(pg("int4")))
+    );
+    assert!(equal.can_hash());
+    assert!(equal.can_merge());
+    assert_eq!(equal.restriction_estimator(&db).unwrap().target_name(), pg("eqsel"));
+    assert_eq!(equal.join_estimator(&db).unwrap().target_name(), pg("eqjoinsel"));
+
+    let negation = builtin(&db, "-", None, "int4");
+    assert_eq!(negation.commutator(&db), None);
+    assert_eq!(negation.negator(&db), None);
+    assert!(!negation.can_hash());
+    assert!(!negation.can_merge());
+    assert!(negation.restriction_estimator(&db).is_none());
+    assert!(negation.join_estimator(&db).is_none());
+}
+
+#[test]
+fn a_configured_link_reaches_only_an_operator_the_catalog_holds() {
+    let less = PostgresCatalogOperator::new("<<<", Some(pg("int4")), pg("int8"))
+        .with_schema("app", false)
+        .with_implementation(app("less"), pg("bool"))
+        .with_commutator(app(">>>"))
+        .with_negator(app(">>="))
+        .with_hashes()
+        .with_merges()
+        .with_restriction_estimator(pg("scalarltsel"))
+        .with_join_estimator(pg("scalarltjoinsel"));
+    let lone = ParseOptions::default()
+        .with_postgres_catalog(PostgresCatalog::empty().with_operator(less.clone()))
+        .parse::<PostgreSqlDialect>("")
+        .unwrap();
+    let held = lone.operators().unwrap().next().unwrap();
+    assert_eq!(held.commutator(&lone), None);
+    assert_eq!(held.negator(&lone), None);
+    assert!(held.can_hash());
+    assert!(held.can_merge());
+    assert_eq!(held.restriction_estimator(&lone).unwrap().target_name(), pg("scalarltsel"));
+    assert_eq!(held.join_estimator(&lone).unwrap().target_name(), pg("scalarltjoinsel"));
+
+    // A commutator takes the operands swapped, so the one over the same
+    // operands is no commutator.
+    let greater =
+        PostgresCatalogOperator::new(">>>", Some(pg("int8")), pg("int4")).with_schema("app", false);
+    let same_operands =
+        PostgresCatalogOperator::new(">>>", Some(pg("int4")), pg("int8")).with_schema("app", false);
+    let negator =
+        PostgresCatalogOperator::new(">>=", Some(pg("int4")), pg("int8")).with_schema("app", false);
+    let linked = ParseOptions::default()
+        .with_postgres_catalog(
+            PostgresCatalog::empty()
+                .with_operator(less)
+                .with_operator(same_operands)
+                .with_operator(greater.clone())
+                .with_operator(negator.clone()),
+        )
+        .parse::<PostgreSqlDialect>("")
+        .unwrap();
+    let held = linked.operators().unwrap().find(|operator| operator.name() == "<<<").unwrap();
+    assert_eq!(held.commutator(&linked), Some(&greater));
+    assert_eq!(held.negator(&linked), Some(&negator));
+}

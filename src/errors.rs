@@ -83,6 +83,37 @@ impl core::fmt::Display for ObjectKind {
     }
 }
 
+/// An attribute `CREATE OPERATOR` and `ALTER OPERATOR` set, a column of
+/// `pg_operator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperatorAttribute {
+    /// `COMMUTATOR`, `oprcom`.
+    Commutator,
+    /// `NEGATOR`, `oprnegate`.
+    Negator,
+    /// `HASHES`, `oprcanhash`.
+    Hashes,
+    /// `MERGES`, `oprcanmerge`.
+    Merges,
+    /// `RESTRICT`, `oprrest`.
+    Restrict,
+    /// `JOIN`, `oprjoin`.
+    Join,
+}
+
+impl core::fmt::Display for OperatorAttribute {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Commutator => "commutator",
+            Self::Negator => "negator",
+            Self::Hashes => "hashes",
+            Self::Merges => "merges",
+            Self::Restrict => "restrict",
+            Self::Join => "join",
+        })
+    }
+}
+
 /// A constraint PostgreSQL enforces against the rows a table stores, which a
 /// foreign table, storing none, cannot carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1395,6 +1426,99 @@ pub enum Error {
         /// Name of the collation the statement creates.
         collation_name: Box<str>,
     },
+    #[error("Operator `{operator_name}` declares no right operand type.")]
+    /// Error indicating that a `CREATE OPERATOR` names no `RIGHTARG`, which
+    /// every operator takes since PostgreSQL 14 dropped postfix operators.
+    OperatorRightArgumentRequired {
+        /// Symbol of the operator the statement creates.
+        operator_name: Box<str>,
+    },
+    #[error("Function `{function_name}` named by operator `{operator_name}` not found.")]
+    /// Error indicating that the function, restriction estimator or join
+    /// estimator an operator names takes no arguments of exactly the types the
+    /// operator requires.
+    OperatorFunctionNotFound {
+        /// Symbol of the operator the statement creates or alters.
+        operator_name: Box<str>,
+        /// Name of the function as written.
+        function_name: Box<str>,
+    },
+    #[error("Operator `{operator_name}` already exists.")]
+    /// Error indicating that an operator of the same schema, symbol and
+    /// operand types is already defined, a shell excepted.
+    OperatorAlreadyExists {
+        /// Symbol of the operator the statement creates or moves.
+        operator_name: Box<str>,
+    },
+    #[error("Operator `{operator_name}` cannot be its own negator.")]
+    /// Error indicating that an operator names itself as its negator.
+    OperatorOwnNegator {
+        /// Symbol of the operator the statement creates or alters.
+        operator_name: Box<str>,
+    },
+    #[error("Only boolean operators can carry the {attribute} attribute set on `{operator_name}`.")]
+    /// Error indicating that an operator returning no `bool` takes a negator,
+    /// `HASHES`, `MERGES` or an estimator.
+    OperatorAttributeNeedsBoolean {
+        /// Symbol of the operator the statement creates or alters.
+        operator_name: Box<str>,
+        /// The attribute refused.
+        attribute: OperatorAttribute,
+    },
+    #[error("Only binary operators can carry the {attribute} attribute set on `{operator_name}`.")]
+    /// Error indicating that a prefix operator takes a commutator, `HASHES`,
+    /// `MERGES` or a join estimator.
+    OperatorAttributeNeedsBinary {
+        /// Symbol of the operator the statement creates or alters.
+        operator_name: Box<str>,
+        /// The attribute refused.
+        attribute: OperatorAttribute,
+    },
+    #[error(
+        "The {attribute} operator `{linked_name}` of `{operator_name}` is already the {attribute} of operator `{linked_to}`."
+    )]
+    /// Error indicating that the commutator or negator an operator names
+    /// already links to another operator.
+    OperatorLinkTaken {
+        /// Symbol of the operator the statement creates or alters.
+        operator_name: Box<str>,
+        /// The link refused.
+        attribute: OperatorAttribute,
+        /// Symbol of the operator the link names.
+        linked_name: Box<str>,
+        /// Symbol of the operator that operator links to.
+        linked_to: Box<str>,
+    },
+    #[error(
+        "Role `{role_name}` creating operator `{operator_name}` cannot execute `{function_name}`."
+    )]
+    /// Error indicating that the role creating an operator holds no `EXECUTE`
+    /// on its function, which PostgreSQL checks as it creates the operator.
+    OperatorFunctionNotExecutable {
+        /// Symbol of the operator the statement creates.
+        operator_name: Box<str>,
+        /// Name of the function.
+        function_name: Box<str>,
+        /// Name of the creating role.
+        role_name: Box<str>,
+    },
+    #[error("Operator `{operator_name}` not found.")]
+    /// Error indicating that `ALTER OPERATOR`, `DROP OPERATOR` without `IF
+    /// EXISTS`, or a commutator or negator `ALTER OPERATOR` sets, names an
+    /// operator of operand types the catalog does not hold.
+    OperatorNotFound {
+        /// Symbol of the operator as written.
+        operator_name: Box<str>,
+    },
+    #[error("Operator attribute {attribute} of `{operator_name}` cannot be changed once set.")]
+    /// Error indicating that `ALTER OPERATOR ... SET` names a commutator or
+    /// negator other than the one the operator already links to.
+    OperatorAttributeAlreadySet {
+        /// Symbol of the operator the statement alters.
+        operator_name: Box<str>,
+        /// The attribute refused.
+        attribute: OperatorAttribute,
+    },
     #[error("Invalid value `{option_value}` for collation option `{option_name}`.")]
     /// Error indicating that a `CREATE COLLATION` option is malformed.
     InvalidCollationOption {
@@ -2699,7 +2823,8 @@ pub enum Error {
     #[error("Type `{type_name}` not found.")]
     /// Error indicating that a `DROP TYPE` statement without `IF EXISTS`, or
     /// an `ALTER TYPE` statement, names a type the input never creates, or a
-    /// type of the database system.
+    /// type of the database system, or that an operator statement names an
+    /// operand type no stored type spells.
     TypeNotFound {
         /// Name the statement wrote.
         type_name: String,

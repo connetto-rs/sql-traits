@@ -115,6 +115,30 @@ impl<DB: DatabaseLike<Operator = Self>> OperatorLike for Absent<DB> {
     fn implementation<'db>(&'db self, _: &'db DB) -> Option<&'db DB::Function> {
         self.unreachable()
     }
+
+    fn commutator<'db>(&'db self, _: &'db DB) -> Option<&'db Self> {
+        self.unreachable()
+    }
+
+    fn negator<'db>(&'db self, _: &'db DB) -> Option<&'db Self> {
+        self.unreachable()
+    }
+
+    fn can_hash(&self) -> bool {
+        self.unreachable()
+    }
+
+    fn can_merge(&self) -> bool {
+        self.unreachable()
+    }
+
+    fn restriction_estimator<'db>(&'db self, _: &'db DB) -> Option<&'db DB::Function> {
+        self.unreachable()
+    }
+
+    fn join_estimator<'db>(&'db self, _: &'db DB) -> Option<&'db DB::Function> {
+        self.unreachable()
+    }
 }
 
 impl<DB: DatabaseLike<Cast = Self>> CastLike for Absent<DB> {
