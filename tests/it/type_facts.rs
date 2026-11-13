@@ -95,6 +95,45 @@ fn a_base_type_keeps_its_declared_category_and_preference() {
     assert!(!plain.is_preferred());
 }
 
+/// Each type answers its `pg_type.typtype` as PostgreSQL 18 stores it, a
+/// base type of the enum category staying a base type.
+#[test]
+fn types_answer_the_kind_of_their_definition() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA app;
+         CREATE TYPE app.mood AS ENUM ('happy');
+         CREATE TYPE app.pair AS (a INT, b INT);
+         CREATE TYPE app.span AS RANGE (SUBTYPE = INT4);
+         CREATE TABLE app.readings (a INT);
+         CREATE TYPE app.pending;
+         CREATE TYPE app.fake (INPUT = fake_in, OUTPUT = fake_out, CATEGORY = 'E');
+         CREATE DOMAIN app.calm AS app.mood;",
+    )
+    .unwrap();
+    let kinds = [
+        (pg("int4"), TypeKind::Base),
+        (pg("_int4"), TypeKind::Base),
+        (pg("int4range"), TypeKind::Range),
+        (pg("int4multirange"), TypeKind::Multirange),
+        (pg("anyenum"), TypeKind::Pseudo),
+        (pg("unknown"), TypeKind::Pseudo),
+        (app("mood"), TypeKind::Enum),
+        (app("_mood"), TypeKind::Base),
+        (app("pair"), TypeKind::Composite),
+        (app("span"), TypeKind::Range),
+        (app("span_multirange"), TypeKind::Multirange),
+        (app("readings"), TypeKind::Composite),
+        (app("pending"), TypeKind::Pseudo),
+        (app("fake"), TypeKind::Base),
+        (app("calm"), TypeKind::Domain),
+    ];
+    for (name, kind) in kinds {
+        let label = name.to_string();
+        assert_eq!(facts(&db, name).kind(), Some(kind), "{label}");
+    }
+    assert_eq!(facts(&db, app("fake")).category(), TypeCategory::ENUM);
+}
+
 #[test]
 fn a_domain_takes_its_base_category_and_reports_the_base_typmod() {
     let db = ParserDB::parse::<PostgreSqlDialect>(
