@@ -9,7 +9,10 @@
 
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
-    ast::{BinaryOperator, Expr, Query, SelectItem, SetExpr, Statement},
+    ast::{
+        BinaryOperator, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement,
+        TableFactor,
+    },
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
@@ -597,6 +600,35 @@ fn in_lists_collapse_the_elements_free_of_their_own_columns() {
     let OperatorResolution::Selected(equals) = applications[0].resolution() else { unreachable!() };
     assert_eq!(equals.left().map(|left| left.target().name()), Some("numeric"));
     assert_eq!(equals.right().target().name(), "numeric");
+}
+
+/// An `IN` list in a function argument inside an aliased parenthesized join
+/// keeps apart an element reading an item before the join, which sits at the
+/// same query level, as PostgreSQL 18 stores it.
+#[test]
+fn in_lists_inside_an_aliased_join_keep_their_own_level_apart() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(LISTS).unwrap();
+    let query = query(
+        "SELECT 1 FROM t AS o,
+             (u CROSS JOIN LATERAL generate_series(1, CASE WHEN o.i IN (1, o.j, 2) THEN 3 END) AS g)
+                 AS w",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    let TableFactor::NestedJoin { table_with_joins, .. } = &select.from[1].relation else {
+        unreachable!()
+    };
+    let TableFactor::Function { args, .. } = &table_with_joins.joins[0].relation else {
+        unreachable!()
+    };
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Case { conditions, .. })) = &args[1]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        described(&context, &[&conditions[0].condition]),
+        [some(&["= ANY [1, 2]", "= o.j"])]
+    );
 }
 
 /// `BETWEEN` applies `>=` and `<=`, and `NOT BETWEEN` `<` and `>`, each

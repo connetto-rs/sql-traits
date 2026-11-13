@@ -16,7 +16,7 @@ use super::{
     super::{
         ColumnOrigin, FromScope, RelationKey, WildcardEntry, build_definition_graph,
         expand_qualified_wildcard, factor_address, join_constraint, subsumed_exposure,
-        wildcard_reshapes_output,
+        wildcard_origins, wildcard_reshapes_output,
     },
     Bound, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
     output_columns::{QueryId, unwrap_nested},
@@ -72,12 +72,25 @@ pub(crate) struct QueryReferences {
     /// Each `NATURAL` join whose sides' columns could be enumerated, by the
     /// address of the join, with the names it merges.
     pub(crate) natural_joins: Vec<(usize, Vec<Ident>)>,
+    /// Each parenthesized join under an alias whose columns could be
+    /// enumerated, by its position in [`QueryReferences::factors`], with what
+    /// each of its output columns reads.
+    pub(crate) joins: Vec<(usize, Vec<SiteOutcome>)>,
 }
 
 impl QueryReferences {
     /// Whether every reference reached something certain.
     pub(crate) fn certain(&self) -> bool {
         self.sites.iter().all(|site| site.outcome != SiteOutcome::Unknown)
+    }
+
+    /// What output column `ordinal` of the `FROM` item at position `factor`
+    /// reads, when the item is a parenthesized join under an alias.
+    pub(crate) fn join_column(&self, factor: usize, ordinal: usize) -> Option<SiteOutcome> {
+        self.joins
+            .iter()
+            .find(|(join, _)| *join == factor)
+            .and_then(|(_, origins)| origins.get(ordinal).copied())
     }
 }
 
@@ -182,25 +195,40 @@ pub(crate) fn query_references<DB: DatabaseLike>(
     };
     walk.query(query);
     let mut references = walk.references;
+    let outcome = |origin: Reached, factors: &[usize]| {
+        match origin {
+            Reached::Origin(ColumnOrigin::Entry { factor, ordinal }) => {
+                factors
+                    .iter()
+                    .position(|address| *address == factor)
+                    .map_or(SiteOutcome::Unknown, |factor| SiteOutcome::Entry { factor, ordinal })
+            }
+            Reached::Origin(ColumnOrigin::Merged) => SiteOutcome::Merged,
+            Reached::Origin(ColumnOrigin::Output) => SiteOutcome::Output,
+            Reached::Origin(ColumnOrigin::Unknown) | Reached::Unknown => SiteOutcome::Unknown,
+            Reached::Absent => SiteOutcome::Absent,
+        }
+    };
     references.sites = origins
         .into_iter()
         .map(|(expression, origin)| {
-            let outcome = match origin {
-                Reached::Origin(ColumnOrigin::Entry { factor, ordinal }) => {
-                    references
-                        .factors
-                        .iter()
-                        .position(|address| *address == factor)
-                        .map_or(SiteOutcome::Unknown, |factor| {
-                            SiteOutcome::Entry { factor, ordinal }
-                        })
-                }
-                Reached::Origin(ColumnOrigin::Merged) => SiteOutcome::Merged,
-                Reached::Origin(ColumnOrigin::Output) => SiteOutcome::Output,
-                Reached::Origin(ColumnOrigin::Unknown) | Reached::Unknown => SiteOutcome::Unknown,
-                Reached::Absent => SiteOutcome::Absent,
-            };
-            ReferenceSite { expression, outcome }
+            ReferenceSite { expression, outcome: outcome(origin, &references.factors) }
+        })
+        .collect();
+    references.joins = references
+        .factors
+        .iter()
+        .enumerate()
+        .filter_map(|(position, address)| {
+            let (_, scope) = graph.joins.iter().find(|(held, _)| held == address)?;
+            let data = &graph.scopes[scope.0].data;
+            (!data.has_opaque()).then(|| {
+                let columns = wildcard_origins(data)
+                    .into_iter()
+                    .map(|origin| outcome(Reached::Origin(origin), &references.factors))
+                    .collect();
+                (position, columns)
+            })
         })
         .collect();
     Some(references)
@@ -409,27 +437,44 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
         self.node(qualify, cursor);
     }
 
-    /// Records a `FROM` item and walks what it holds. `entries` counts the
-    /// items before it, which is what a function argument may read.
-    fn factor(&mut self, factor: &TableFactor, scope: Option<ScopeId>, entries: usize) {
+    /// Records a `FROM` item and walks what it holds as the entries of
+    /// `scope` from `entries` on, counting them into `entries`. The items
+    /// before it are what a function argument may read.
+    fn factor(&mut self, factor: &TableFactor, scope: Option<ScopeId>, entries: &mut usize) {
         self.references.factors.push(factor_address(factor));
         match factor {
+            TableFactor::NestedJoin { table_with_joins, alias: None } => {
+                self.joined(table_with_joins, scope, entries);
+                return;
+            }
+            TableFactor::NestedJoin { table_with_joins, alias: Some(_) } => {
+                let inner = scope.and_then(|scope| self.graph.join_scope(factor, scope));
+                self.joined(table_with_joins, inner, &mut 0);
+                let graph = self.graph;
+                if let Some(inner) = inner
+                    && !graph.scopes[inner.0].data.has_opaque()
+                {
+                    self.natural_joins(&graph.scopes[inner.0].data);
+                }
+            }
             TableFactor::Derived { subquery, .. } => self.query(subquery),
-            // The resolver reads a parenthesized join as one opaque relation.
-            TableFactor::NestedJoin { table_with_joins, .. } => self.nested_join(table_with_joins),
             other => {
-                let preceding = scope.map(|scope| ScopeCursor { scope, visible_entries: entries });
+                let preceding = scope.map(|scope| ScopeCursor { scope, visible_entries: *entries });
                 self.node(other, preceding);
             }
         }
+        *entries += 1;
     }
 
-    fn nested_join(&mut self, table: &TableWithJoins) {
-        self.factor(&table.relation, None, 0);
+    /// Walks `table` and the relations it joins, with their join
+    /// constraints, as the entries of `scope` from `entries` on.
+    fn joined(&mut self, table: &TableWithJoins, scope: Option<ScopeId>, entries: &mut usize) {
+        self.factor(&table.relation, scope, entries);
         for join in &table.joins {
-            self.factor(&join.relation, None, 0);
+            self.factor(&join.relation, scope, entries);
             if let Some(constraint) = join_constraint(&join.join_operator) {
-                self.node(constraint, None);
+                let joined = scope.map(|scope| ScopeCursor { scope, visible_entries: *entries });
+                self.node(constraint, joined);
             }
         }
     }
@@ -439,16 +484,7 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
     fn relations(&mut self, lists: &[&[TableWithJoins]], scope: Option<ScopeId>) {
         let mut entries = 0;
         for table in lists.iter().copied().flatten() {
-            self.factor(&table.relation, scope, entries);
-            entries += 1;
-            for join in &table.joins {
-                self.factor(&join.relation, scope, entries);
-                entries += 1;
-                if let Some(constraint) = join_constraint(&join.join_operator) {
-                    let joined = scope.map(|scope| ScopeCursor { scope, visible_entries: entries });
-                    self.node(constraint, joined);
-                }
-            }
+            self.joined(table, scope, &mut entries);
         }
     }
 
@@ -498,8 +534,9 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
                 }
             }
             Statement::Merge(Merge { table, source, on, clauses, output, .. }) => {
-                self.factor(source, scope, 0);
-                self.factor(table, scope, 1);
+                let mut entries = 0;
+                self.factor(source, scope, &mut entries);
+                self.factor(table, scope, &mut entries);
                 self.node(on, cursor);
                 for MergeClause { clause_kind, predicate, action, .. } in clauses {
                     let clause = scopes.clause(*clause_kind);
@@ -564,6 +601,11 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
                 self.references.wildcards.push((item_address(item), items));
             }
         }
+        self.natural_joins(data);
+    }
+
+    /// Records how each `NATURAL` join of a scope would be spelled out.
+    fn natural_joins(&mut self, data: &FromScope<'_, '_, DB, DefinitionId>) {
         for (join, names) in &data.natural_merges {
             if !names.is_empty() {
                 self.references.natural_joins.push((

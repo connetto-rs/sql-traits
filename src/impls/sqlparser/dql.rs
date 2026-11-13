@@ -20,7 +20,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::ops::ControlFlow;
+use core::{ops::ControlFlow, slice};
 
 use sqlparser::ast::{
     AccessExpr, CaseWhen, ConnectByKind, Cte, DictionaryField, Distinct, Expr, ExprWithAlias,
@@ -354,15 +354,8 @@ impl<DB: DatabaseLike, D: Copy> Clone for CteShape<'_, '_, DB, D> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct OpaqueQualifier<'query, 'db> {
-    key: RelationKey<'query, 'db>,
-    schema: Option<RelationKey<'query, 'db>>,
-}
-
 enum OpaqueIdentity<'query, 'db> {
     Known { key: RelationKey<'query, 'db>, schema: Option<RelationKey<'query, 'db>> },
-    Multiple(Vec<OpaqueQualifier<'query, 'db>>),
     Anonymous,
 }
 
@@ -542,6 +535,13 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         select: AstRef<'query, 'db, Select>,
         parent: Self::Cursor,
     ) -> Self::Scope;
+    /// Opens the scope the items of `join`, a parenthesized join under an
+    /// alias, resolve in, under `parent`.
+    fn begin_join_scope(
+        &mut self,
+        join: AstRef<'query, 'db, TableFactor>,
+        parent: Self::Cursor,
+    ) -> Self::Scope;
     fn scope<'scope>(
         &'scope self,
         scope: &'scope Self::Scope,
@@ -619,6 +619,14 @@ where
     fn begin_scope(
         &mut self,
         _select: AstRef<'query, 'db, Select>,
+        _parent: Self::Cursor,
+    ) -> Self::Scope {
+        FromScope::new(IdentifierCase::AsWritten)
+    }
+
+    fn begin_join_scope(
+        &mut self,
+        _join: AstRef<'query, 'db, TableFactor>,
         _parent: Self::Cursor,
     ) -> Self::Scope {
         FromScope::new(IdentifierCase::AsWritten)
@@ -773,7 +781,8 @@ where
 
 /// Appends `factor` to `scope` as the next `FROM` entry, reading the queries
 /// nested in it under `parent`, and answers the names it outputs and its
-/// wildcard plan, `None` when its columns cannot be enumerated.
+/// wildcard plan, `None` when its columns cannot be enumerated. The items of
+/// a parenthesized join without an alias become entries of `scope` in turn.
 fn collect_entry_factor<'query, 'db, DB, P>(
     factor: AstRef<'query, 'db, TableFactor>,
     scope: &mut P::Scope,
@@ -786,6 +795,21 @@ where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
 {
+    if let Some(table) = factor.try_map(|factor| {
+        match factor {
+            TableFactor::NestedJoin { table_with_joins, .. } => Some(table_with_joins.as_ref()),
+            _ => None,
+        }
+    }) {
+        let Some(alias) = factor_alias(factor) else {
+            return collect_joined(table, scope, cte_scope, deriving, parent, profile);
+        };
+        let local_parent = profile.cursor(scope);
+        let join = AliasedJoin { factor, table, alias };
+        let contribution =
+            collect_aliased_join(join, deriving, cte_scope, parent, local_parent, profile)?;
+        return Ok(append_factor(profile, scope, contribution));
+    }
     let local_parent = profile.cursor(scope);
     if P::INDEX_NESTED_QUERIES {
         index_table_factor_expression_queries(
@@ -836,86 +860,92 @@ where
     P: DerivationProfile<'query, 'db, DB>,
 {
     for table_with_joins in from.iter() {
-        let (entry_start, entry_bases, entry_derived) = {
+        let plan = collect_joined(table_with_joins, scope, cte_scope, deriving, parent, profile)?;
+        let plan = plan.map(|(_, entries)| entries).unwrap_or_default();
+        profile.scope_mut(scope).wildcard_plans.push(plan);
+    }
+    Ok(())
+}
+
+/// Appends the relation of `table` and the relations it joins to `scope`,
+/// reading the queries nested in them under `parent`, and answers the names
+/// the joined relation outputs and its wildcard plan, `None` when its columns
+/// cannot be enumerated. A merge among these joins absorbs only the entries
+/// `table` itself appended.
+fn collect_joined<'query, 'db, DB, P>(
+    table: AstRef<'query, 'db, TableWithJoins>,
+    scope: &mut P::Scope,
+    cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
+    deriving: Deriving<'_, 'db, DB>,
+    parent: P::Cursor,
+    profile: &mut P,
+) -> Result<Option<FactorOutput>, LookupError>
+where
+    DB: DatabaseLike,
+    P: DerivationProfile<'query, 'db, DB>,
+{
+    let (entry_start, entry_bases, entry_derived) = {
+        let data = profile.scope(scope);
+        (data.from_entry_count, data.bases.len(), data.derived.len())
+    };
+    let left = collect_entry_factor(
+        table.map(|table| &table.relation),
+        scope,
+        cte_scope,
+        deriving,
+        parent,
+        profile,
+    )?;
+    let (mut accumulated, mut plan) = left.unzip();
+    for join in table.map(|table| table.joins.as_slice()).iter() {
+        let (bases_before, derived_before) = {
             let data = profile.scope(scope);
-            (data.from_entry_count, data.bases.len(), data.derived.len())
+            (data.bases.len(), data.derived.len())
         };
-        let (mut accumulated, mut plan) = match collect_entry_factor(
-            table_with_joins.map(|entry| &entry.relation),
+        let right = collect_entry_factor(
+            join.map(|join| &join.relation),
             scope,
             cte_scope,
             deriving,
             parent,
             profile,
-        )? {
-            Some((names, entries)) => (Some(names), Some(entries)),
-            None => (None, None),
-        };
-        for join in table_with_joins.map(|entry| entry.joins.as_slice()).iter() {
-            let (bases_before, derived_before) = {
-                let data = profile.scope(scope);
-                (data.bases.len(), data.derived.len())
-            };
+        )?;
+        let (right_names, right_entries) = right.unzip();
+        if P::INDEX_NESTED_QUERIES {
             let local_parent = profile.cursor(scope);
-            if P::INDEX_NESTED_QUERIES {
-                index_table_factor_expression_queries(
-                    join.map(|join| &join.relation),
-                    cte_scope,
-                    deriving,
-                    parent,
-                    local_parent,
-                    profile,
-                )?;
-            }
-            let contribution = collect_factor(
-                join.map(|join| &join.relation),
-                deriving,
-                cte_scope,
-                parent,
-                local_parent,
-                profile,
-            )?;
-            let (right_names, right_entries) = match append_factor(profile, scope, contribution) {
-                Some((names, entries)) => (Some(names), Some(entries)),
-                None => (None, None),
-            };
-            if P::INDEX_NESTED_QUERIES {
-                let local_parent = profile.cursor(scope);
-                index_join_expression_queries(join, cte_scope, deriving, local_parent, profile)?;
-            }
-            let (left_nullable, right_nullable) = nullable_sides(&join.get().join_operator);
-            let opaque = profile.opaque_definition();
-            let data = profile.scope_mut(scope);
-            mark_nullable_sides(
-                data,
-                left_nullable,
-                right_nullable,
-                entry_bases..bases_before,
-                entry_derived..derived_before,
-                bases_before,
-                derived_before,
-            );
-            let mut merged = Vec::new();
-            if let Some(names) = merge_names(
-                &join.get().join_operator,
-                accumulated.as_deref(),
-                right_names.as_deref(),
-                data.case,
-            ) {
-                merged = record_merge(data, join.get(), names, entry_start);
-            } else {
-                data.unqualified_poison = true;
-            }
-            if let Some(alias) = join.try_map(|join| using_alias(&join.join_operator)) {
-                let entry_index = data.from_entry_count - 1;
-                data.derived.push(using_alias_relation(alias, &merged, opaque, entry_index));
-            }
-            plan = merge_plans(plan, right_entries, &merged, &join.get().join_operator, data);
-            accumulated = merge_output_names(accumulated, right_names, &merged, data.case);
+            index_join_expression_queries(join, cte_scope, deriving, local_parent, profile)?;
         }
-        profile.scope_mut(scope).wildcard_plans.push(plan.unwrap_or_default());
+        let (left_nullable, right_nullable) = nullable_sides(&join.get().join_operator);
+        let opaque = profile.opaque_definition();
+        let data = profile.scope_mut(scope);
+        mark_nullable_sides(
+            data,
+            left_nullable,
+            right_nullable,
+            entry_bases..bases_before,
+            entry_derived..derived_before,
+            bases_before,
+            derived_before,
+        );
+        let mut merged = Vec::new();
+        if let Some(names) = merge_names(
+            &join.get().join_operator,
+            accumulated.as_deref(),
+            right_names.as_deref(),
+            data.case,
+        ) {
+            merged = record_merge(data, join.get(), names, entry_start);
+        } else {
+            data.unqualified_poison = true;
+        }
+        if let Some(alias) = join.try_map(|join| using_alias(&join.join_operator)) {
+            let entry_index = data.from_entry_count - 1;
+            data.derived.push(using_alias_relation(alias, &merged, opaque, entry_index));
+        }
+        plan = merge_plans(plan, right_entries, &merged, &join.get().join_operator, data);
+        accumulated = merge_output_names(accumulated, right_names, &merged, data.case);
     }
-    Ok(())
+    Ok(accumulated.zip(plan))
 }
 
 /// Makes lookups opaque where `LATERAL VIEW` relations or `CONNECT BY`
@@ -1661,62 +1691,90 @@ where
     Some(DerivedShape { columns, row_preserving })
 }
 
-/// Expands a `*` projection by materializing each `FROM` item's plan in
-/// PostgreSQL's join output order. A relation contributes its own columns
-/// except those a merge absorbed (relations collected before that name's
-/// merge). A merged name stands once per join with no source, and a repeated
-/// merge of the same name stands once at its latest position.
+/// One column a `*` over a scope lists: output column `ordinal` of a base or
+/// derived relation, or a column a join merged.
+enum WildcardColumn<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> {
+    Base(&'scope FromTableRef<'query, 'db, DB, D>, usize),
+    Derived(&'scope DerivedRelationRef<'query, 'db, DB, D>, usize),
+    Merged(&'scope str, bool),
+}
+
+/// Calls `visit` with each column a `*` over `scope` lists, materializing
+/// each `FROM` item's plan in PostgreSQL's join output order. A relation
+/// contributes its own columns except those a merge absorbed (relations
+/// collected before that name's merge). A merged name stands once per join,
+/// and a repeated merge of the same name stands once at its latest position.
+fn each_wildcard_column<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
+    scope: &'scope FromScope<'query, 'db, DB, D>,
+    mut visit: impl FnMut(WildcardColumn<'scope, 'query, 'db, DB, D>),
+) {
+    let kept = |entry_index: usize, name: &str, quoted: bool| {
+        !subsumed_exposure(&scope.merged, entry_index, name, quoted, scope.case)
+    };
+    for entry in scope.wildcard_plans.iter().flatten() {
+        match entry {
+            WildcardEntry::Base(index) => {
+                let base = &scope.bases[*index];
+                for (ordinal, column) in base.output_columns.iter().enumerate() {
+                    if kept(base.entry_index, &column.name, column.quoted) {
+                        visit(WildcardColumn::Base(base, ordinal));
+                    }
+                }
+            }
+            WildcardEntry::Derived(index) => {
+                let relation = &scope.derived[*index];
+                for (ordinal, column) in relation.shape.columns.iter().enumerate() {
+                    if kept(relation.entry_index, &column.name, column.quoted) {
+                        visit(WildcardColumn::Derived(relation, ordinal));
+                    }
+                }
+            }
+            WildcardEntry::Merged { name, quoted, .. } => {
+                visit(WildcardColumn::Merged(name, *quoted));
+            }
+        }
+    }
+}
+
+/// Expands a `*` projection over `scope`, a merged column with no source.
 fn push_wildcard_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
     scope: &FromScope<'query, 'db, DB, D>,
     columns: &mut Vec<DerivedColumn<'query, 'db, DB, D>>,
     opaque: D,
 ) {
-    for plan in &scope.wildcard_plans {
-        for entry in plan {
-            match entry {
-                WildcardEntry::Base(index) => {
-                    let base = &scope.bases[*index];
-                    columns.extend(base_columns(base).into_iter().filter(|column| {
-                        !subsumed_exposure(
-                            &scope.merged,
-                            base.entry_index,
-                            &column.name,
-                            column.quoted,
-                            scope.case,
-                        )
-                    }));
-                }
-                WildcardEntry::Derived(index) => {
-                    let relation = &scope.derived[*index];
-                    columns.extend(
-                        relation
-                            .shape
-                            .columns
-                            .iter()
-                            .filter(|column| {
-                                !subsumed_exposure(
-                                    &scope.merged,
-                                    relation.entry_index,
-                                    &column.name,
-                                    column.quoted,
-                                    scope.case,
-                                )
-                            })
-                            .cloned(),
-                    );
-                }
-                WildcardEntry::Merged { name, quoted, .. } => {
-                    columns.push(DerivedColumn {
-                        name: name.clone(),
-                        quoted: *quoted,
-                        source: None,
-                        definition: opaque,
-                        marker: core::marker::PhantomData,
-                    });
+    each_wildcard_column(scope, |column| {
+        columns.push(match column {
+            WildcardColumn::Base(base, ordinal) => base_column(base, ordinal),
+            WildcardColumn::Derived(relation, ordinal) => relation.shape.columns[ordinal].clone(),
+            WildcardColumn::Merged(name, quoted) => {
+                DerivedColumn {
+                    name: name.to_owned(),
+                    quoted,
+                    source: None,
+                    definition: opaque,
+                    marker: core::marker::PhantomData,
                 }
             }
-        }
-    }
+        });
+    });
+}
+
+/// What each column a `*` over `scope` lists reads, in the order it lists
+/// them.
+fn wildcard_origins<DB: DatabaseLike, D: Copy>(
+    scope: &FromScope<'_, '_, DB, D>,
+) -> Vec<ColumnOrigin> {
+    let mut origins = Vec::new();
+    each_wildcard_column(scope, |column| {
+        origins.push(match column {
+            WildcardColumn::Base(base, ordinal) => {
+                ColumnOrigin::Entry { factor: base.factor, ordinal }
+            }
+            WildcardColumn::Derived(relation, ordinal) => derived_origin(relation, ordinal),
+            WildcardColumn::Merged(..) => ColumnOrigin::Merged,
+        });
+    });
+    origins
 }
 
 /// Resource guard for pathological `SELECT *` chains: a derivation whose
@@ -3270,10 +3328,7 @@ where
         GroupByExpr::All(_) => true,
         GroupByExpr::Expressions(expressions, _) => !expressions.is_empty(),
     };
-    let outer_join = select.get().from.iter().flat_map(|entry| &entry.joins).any(|join| {
-        let (left_nullable, right_nullable) = nullable_sides(&join.join_operator);
-        left_nullable || right_nullable
-    });
+    let outer_join = has_outer_join(&select.get().from);
     let reads_non_preserving =
         profile.scope(&scope).derived.iter().any(|relation| !relation.shape.row_preserving);
     let row_preserving = select.get().distinct.is_none()
@@ -3339,18 +3394,23 @@ fn three_part_output_name<DB: DatabaseLike, D: Copy>(
 fn base_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
     base: &FromTableRef<'query, 'db, DB, D>,
 ) -> Vec<DerivedColumn<'query, 'db, DB, D>> {
-    base.output_columns
-        .iter()
-        .map(|column| {
-            DerivedColumn {
-                name: column.name.clone(),
-                quoted: column.quoted,
-                source: Some(base.table),
-                definition: column.definition,
-                marker: core::marker::PhantomData,
-            }
-        })
-        .collect()
+    (0..base.output_columns.len()).map(|ordinal| base_column(base, ordinal)).collect()
+}
+
+/// Output column `ordinal` of a base relation as a derived column sourced by
+/// that table.
+fn base_column<'query, 'db, DB: DatabaseLike, D: Copy>(
+    base: &FromTableRef<'query, 'db, DB, D>,
+    ordinal: usize,
+) -> DerivedColumn<'query, 'db, DB, D> {
+    let column = &base.output_columns[ordinal];
+    DerivedColumn {
+        name: column.name.clone(),
+        quoted: column.quoted,
+        source: Some(base.table),
+        definition: column.definition,
+        marker: core::marker::PhantomData,
+    }
 }
 
 /// The relation a qualifier names.
@@ -3699,11 +3759,6 @@ fn opaque_qualifier_matches(
     match identity {
         OpaqueIdentity::Known { key, schema } => {
             opaque_qualifier_matches_key(*key, *schema, qualifier, case)
-        }
-        OpaqueIdentity::Multiple(qualifiers) => {
-            qualifiers.iter().any(|candidate| {
-                opaque_qualifier_matches_key(candidate.key, candidate.schema, qualifier, case)
-            })
         }
         OpaqueIdentity::Anonymous => false,
     }
@@ -4316,104 +4371,6 @@ fn opaque_identity_from_alias<'query, 'db>(
     })
 }
 
-fn push_opaque_qualifier<'query, 'db>(
-    first: &mut Option<OpaqueQualifier<'query, 'db>>,
-    additional: &mut Vec<OpaqueQualifier<'query, 'db>>,
-    qualifier: OpaqueQualifier<'query, 'db>,
-) {
-    if first.is_none() {
-        *first = Some(qualifier);
-    } else {
-        additional.push(qualifier);
-    }
-}
-
-fn collect_nested_factor_qualifiers<'query, 'db>(
-    factor: AstRef<'query, 'db, TableFactor>,
-    first: &mut Option<OpaqueQualifier<'query, 'db>>,
-    additional: &mut Vec<OpaqueQualifier<'query, 'db>>,
-) {
-    if let Some(alias) = factor_alias(factor) {
-        push_opaque_qualifier(
-            first,
-            additional,
-            OpaqueQualifier { key: alias_key(alias), schema: None },
-        );
-        return;
-    }
-    match factor.get() {
-        TableFactor::Table { .. } => {
-            let Some(name) = factor_name(factor) else { return };
-            let Some(key) = object_name_key(name) else { return };
-            push_opaque_qualifier(
-                first,
-                additional,
-                OpaqueQualifier { key, schema: object_name_schema(name) },
-            );
-        }
-        TableFactor::TableFunction { .. } => {
-            let Some(key) = table_function_name(factor).and_then(object_name_key) else {
-                return;
-            };
-            push_opaque_qualifier(first, additional, OpaqueQualifier { key, schema: None });
-        }
-        TableFactor::Function { .. } => {
-            let Some(key) = factor_name(factor).and_then(object_name_key) else { return };
-            push_opaque_qualifier(first, additional, OpaqueQualifier { key, schema: None });
-        }
-        TableFactor::NestedJoin { .. } => {
-            let Some(table) = factor.try_map(|factor| {
-                let TableFactor::NestedJoin { table_with_joins, .. } = factor else { return None };
-                Some(table_with_joins.as_ref())
-            }) else {
-                return;
-            };
-            collect_nested_factor_qualifiers(table.map(|table| &table.relation), first, additional);
-            for join in table.map(|table| table.joins.as_slice()).iter() {
-                collect_nested_factor_qualifiers(
-                    join.map(|join| &join.relation),
-                    first,
-                    additional,
-                );
-                if let Some(alias) = join.try_map(|join| using_alias(&join.join_operator)) {
-                    push_opaque_qualifier(
-                        first,
-                        additional,
-                        OpaqueQualifier { key: ident_key(alias), schema: None },
-                    );
-                }
-            }
-        }
-        TableFactor::Derived { .. }
-        | TableFactor::UNNEST { .. }
-        | TableFactor::JsonTable { .. }
-        | TableFactor::OpenJsonTable { .. }
-        | TableFactor::Pivot { .. }
-        | TableFactor::Unpivot { .. }
-        | TableFactor::UnpivotExpr { .. }
-        | TableFactor::MatchRecognize { .. }
-        | TableFactor::XmlTable { .. }
-        | TableFactor::SemanticView { .. } => {}
-    }
-}
-
-fn nested_join_identity<'query, 'db>(
-    factor: AstRef<'query, 'db, TableFactor>,
-) -> OpaqueIdentity<'query, 'db> {
-    if let Some(alias) = factor_alias(factor) {
-        return opaque_identity_from_alias(Some(alias));
-    }
-    let mut first = None;
-    let mut additional = Vec::new();
-    collect_nested_factor_qualifiers(factor, &mut first, &mut additional);
-    let Some(first) = first else { return OpaqueIdentity::Anonymous };
-    if additional.is_empty() {
-        return OpaqueIdentity::Known { key: first.key, schema: first.schema };
-    }
-    additional.insert(0, first);
-    OpaqueIdentity::Multiple(additional)
-}
-
 fn collect_table_factor<'query, 'db, DB, P>(
     factor: AstRef<'query, 'db, TableFactor>,
     has_arguments: bool,
@@ -4555,9 +4512,82 @@ where
                 OpaqueIdentity::Known { key, schema: None }
             })))
         }
-        TableFactor::NestedJoin { .. } => Ok(opaque_factor(nested_join_identity(factor))),
         _ => Ok(opaque_factor(opaque_identity_from_alias(factor_alias(factor)))),
     }
+}
+
+/// A parenthesized join under an alias, with the item and joins it holds.
+#[derive(Clone, Copy)]
+struct AliasedJoin<'query, 'db> {
+    factor: AstRef<'query, 'db, TableFactor>,
+    table: AstRef<'query, 'db, TableWithJoins>,
+    alias: AstRef<'query, 'db, TableAlias>,
+}
+
+/// What `join` contributes: the columns a `*` over its items lists, renamed
+/// by the alias column list, under the alias alone. Its items resolve in a
+/// scope of their own under `local_parent`, so a `LATERAL` item among them
+/// reaches the items before the join while the alias hides their names from
+/// everything outside.
+fn collect_aliased_join<'query, 'db, DB, P>(
+    join: AliasedJoin<'query, 'db>,
+    deriving: Deriving<'_, 'db, DB>,
+    cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
+    inherited_parent: P::Cursor,
+    local_parent: P::Cursor,
+    profile: &mut P,
+) -> Result<FactorContribution<'query, 'db, DB, P::Definition>, LookupError>
+where
+    DB: DatabaseLike,
+    P: DerivationProfile<'query, 'db, DB>,
+{
+    let opaque_join = || opaque_factor(opaque_identity_from_alias(Some(join.alias)));
+    let mut scope = profile.begin_join_scope(join.factor, local_parent);
+    let plan =
+        collect_joined(join.table, &mut scope, cte_scope, deriving, inherited_parent, profile)?;
+    let opaque = profile.opaque_definition();
+    let data = profile.scope_mut(&mut scope);
+    data.wildcard_plans.push(plan.map(|(_, entries)| entries).unwrap_or_default());
+    if data.has_opaque() {
+        return Ok(opaque_join());
+    }
+    let mut columns = Vec::new();
+    push_wildcard_columns(data, &mut columns, opaque);
+    let row_preserving = !has_outer_join(slice::from_ref(join.table.get()))
+        && data.derived.iter().all(|relation| relation.shape.row_preserving);
+    let shape = DerivedShape { columns, row_preserving };
+    let Some(shape) = apply_alias_columns(Some(shape), join.alias.get()) else {
+        return Ok(opaque_join());
+    };
+    let names = derived_column_names(&shape.columns);
+    let key = Some(alias_key(join.alias));
+    Ok(FactorContribution {
+        relation: RelationContribution::Derived(DerivedRelationRef {
+            key,
+            identity: key,
+            shape,
+            nullable: false,
+            entry_index: 0,
+            factor: factor_address(join.factor.get()),
+        }),
+        names: Some(names),
+    })
+}
+
+/// Whether a join among `tables`, those inside parenthesized joins included,
+/// can null-extend one of its sides.
+fn has_outer_join(tables: &[TableWithJoins]) -> bool {
+    tables.iter().any(|table| {
+        core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation)).any(
+            |factor| {
+                matches!(factor, TableFactor::NestedJoin { table_with_joins, .. }
+                    if has_outer_join(slice::from_ref(table_with_joins.as_ref())))
+            },
+        ) || table.joins.iter().any(|join| {
+            let (left_nullable, right_nullable) = nullable_sides(&join.join_operator);
+            left_nullable || right_nullable
+        })
+    })
 }
 
 /// The names `query` outputs, in order, named the way PostgreSQL names an

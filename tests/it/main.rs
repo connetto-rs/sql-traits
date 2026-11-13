@@ -99,6 +99,7 @@ mod operator_resolution;
 mod ordered_index_columns;
 mod output_names;
 mod owned_collations;
+mod parenthesized_joins;
 mod parsed_name_resolution_rules;
 mod parser_free_database;
 mod partition_alterations;

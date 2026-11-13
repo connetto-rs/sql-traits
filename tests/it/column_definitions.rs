@@ -435,25 +435,6 @@ fn unaliased_nested_join_preserves_outer_correlation() {
 }
 
 #[test]
-fn nested_join_opaque_qualifiers_match_exactly() {
-    for (reference_sql, expected) in
-        [("b.value", true), ("b2.value", true), ("unknown.value", false)]
-    {
-        assert_opaque_resolution("(b JOIN b AS b2 ON true)", reference_sql, expected);
-    }
-    for (reference_sql, expected) in
-        [("joined.value", true), ("b.value", false), ("b2.value", false)]
-    {
-        assert_opaque_resolution("(b JOIN b AS b2 ON true) AS joined", reference_sql, expected);
-    }
-    for (reference_sql, expected) in
-        [("\"B2\".value", true), ("B2.value", false), ("b2.value", false)]
-    {
-        assert_opaque_resolution("(b JOIN b AS \"B2\" ON true)", reference_sql, expected);
-    }
-}
-
-#[test]
 fn three_part_opaque_qualifiers_require_matching_schema_and_relation() {
     for (from_clause, reference_sql, expected) in [
         ("generate_series(1, 10) AS g", "public.g.value", false),

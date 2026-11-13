@@ -211,6 +211,29 @@ fn a_natural_join_is_spelled_out_when_the_view_is_created() {
     );
 }
 
+/// A `NATURAL` join inside a parenthesized join is spelled out as well,
+/// aliased or not, merging the names PostgreSQL 18 merges.
+#[test]
+fn a_parenthesized_natural_join_is_spelled_out_when_the_view_is_created() {
+    let schema = "CREATE TABLE j1 (k INT, x INT); CREATE TABLE j2 (k INT, y INT);";
+    assert_definition(
+        &format!(
+            "{schema} CREATE VIEW v AS SELECT * FROM (j1 NATURAL JOIN j2) AS j;
+             ALTER TABLE j2 RENAME COLUMN k TO kk;"
+        ),
+        "v",
+        "SELECT k, x, y FROM (j1 JOIN j2 AS j2 (k, y) USING (k)) AS j",
+    );
+    assert_definition(
+        &format!(
+            "{schema} CREATE VIEW v AS SELECT * FROM (j1 NATURAL JOIN j2);
+             ALTER TABLE j2 RENAME COLUMN k TO kk;"
+        ),
+        "v",
+        "SELECT j1.k, j1.x, j2.y FROM (j1 JOIN j2 AS j2 (k, y) USING (k))",
+    );
+}
+
 #[test]
 fn a_view_follows_a_renamed_view_and_view_column() {
     let schema = "CREATE TABLE p (a INT, c INT);
@@ -295,20 +318,77 @@ fn a_renamed_table_still_refuses_a_drop_while_a_view_reads_it() {
 
 #[test]
 fn a_definition_whose_bindings_are_uncertain_keeps_its_old_names() {
-    // The resolver reads a parenthesized join as a relation it cannot see into.
+    // A bare name could come from the table function, whose columns the
+    // resolver cannot see.
     assert_definition(
-        "CREATE TABLE t (a INT, c INT); CREATE TABLE s (d INT);
-         CREATE VIEW v AS SELECT a, d FROM (t JOIN s ON t.c = s.d);
+        "CREATE TABLE t (a INT, c INT);
+         CREATE VIEW v AS SELECT a FROM t CROSS JOIN generate_series(1, 3) AS g;
          ALTER TABLE t RENAME COLUMN a TO b;",
         "v",
-        "SELECT a, d FROM (t AS t (a, c) JOIN s ON t.c = s.d)",
+        "SELECT a FROM t AS t (a, c) CROSS JOIN generate_series(1, 3) AS g",
     );
     assert_definition(
-        "CREATE TABLE t (a INT, c INT); CREATE TABLE s (d INT);
-         CREATE VIEW v AS SELECT t.a, d FROM (t JOIN s ON t.c = s.d);
+        "CREATE TABLE t (a INT, c INT);
+         CREATE VIEW v AS SELECT a FROM t CROSS JOIN generate_series(1, 3) AS g;
          ALTER TABLE t RENAME TO u;",
         "v",
-        "SELECT t.a, d FROM (u AS t JOIN s ON t.c = s.d)",
+        "SELECT a FROM u AS t CROSS JOIN generate_series(1, 3) AS g",
+    );
+}
+
+/// A rename respells references through a parenthesized join, the way
+/// PostgreSQL 18 deparses the view after it.
+#[test]
+fn a_parenthesized_join_follows_renames() {
+    let schema = "CREATE TABLE t (a INT, c INT); CREATE TABLE s (d INT);";
+    assert_definition(
+        &format!(
+            "{schema} CREATE VIEW v AS SELECT a, d FROM (t JOIN s ON t.c = s.d);
+             ALTER TABLE t RENAME COLUMN a TO b;"
+        ),
+        "v",
+        "SELECT b AS a, d FROM (t JOIN s ON t.c = s.d)",
+    );
+    assert_definition(
+        &format!(
+            "{schema} CREATE VIEW v AS SELECT t.a, d FROM (t JOIN s ON t.c = s.d);
+             ALTER TABLE t RENAME TO u;"
+        ),
+        "v",
+        "SELECT u.a, d FROM (u JOIN s ON u.c = s.d)",
+    );
+    assert_definition(
+        &format!(
+            "{schema} CREATE VIEW v AS SELECT j.a FROM (t JOIN s ON t.c = s.d) AS j;
+             ALTER TABLE t RENAME COLUMN a TO b;"
+        ),
+        "v",
+        "SELECT j.b AS a FROM (t JOIN s ON t.c = s.d) AS j",
+    );
+    assert_definition(
+        &format!(
+            "{schema} CREATE VIEW v AS SELECT j.a FROM (t JOIN s ON t.c = s.d) AS j;
+             ALTER TABLE t RENAME TO u;"
+        ),
+        "v",
+        "SELECT j.a FROM (u JOIN s ON u.c = s.d) AS j",
+    );
+    assert_definition(
+        &format!(
+            "{schema} CREATE VIEW v AS SELECT j.x FROM (t JOIN s ON t.c = s.d) AS j(x);
+             ALTER TABLE t RENAME COLUMN a TO b;"
+        ),
+        "v",
+        "SELECT j.x FROM (t JOIN s ON t.c = s.d) AS j (x)",
+    );
+    assert_definition(
+        &format!(
+            "{schema} CREATE VIEW v AS
+                 SELECT k.a FROM ((t JOIN s ON t.c = s.d) AS j JOIN s AS s2 ON j.d = s2.d) AS k;
+             ALTER TABLE t RENAME COLUMN a TO b;"
+        ),
+        "v",
+        "SELECT k.b AS a FROM ((t JOIN s ON t.c = s.d) AS j JOIN s AS s2 ON j.d = s2.d) AS k",
     );
 }
 

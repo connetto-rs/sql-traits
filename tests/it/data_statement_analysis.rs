@@ -130,6 +130,44 @@ fn wildcard_over_join_is_not_eligible() {
     );
 }
 
+/// A parenthesized join, aliased or not, answers row identity as the same
+/// join written without parentheses.
+#[test]
+fn parenthesized_join_answers_as_the_flat_join() {
+    let db = schema_db();
+    for (flat, parenthesized) in [
+        (
+            "SELECT o.id, o.total FROM orders o JOIN users u ON o.user_id = u.id",
+            "SELECT o.id, o.total FROM (orders o JOIN users u ON o.user_id = u.id)",
+        ),
+        (
+            "SELECT o.total FROM orders o JOIN users u ON o.user_id = u.id",
+            "SELECT j.total FROM (orders o JOIN users u ON o.user_id = u.id) AS j",
+        ),
+        (
+            "SELECT o.total FROM users u LEFT JOIN orders o ON o.user_id = u.id",
+            "SELECT o.total FROM (users u LEFT JOIN orders o ON o.user_id = u.id)",
+        ),
+        (
+            "SELECT o.total FROM users u LEFT JOIN orders o ON o.user_id = u.id",
+            "SELECT j.total FROM (users u LEFT JOIN orders o ON o.user_id = u.id) AS j",
+        ),
+    ] {
+        assert_eq!(
+            projection_name(parenthesized, &db),
+            projection_name(flat, &db),
+            "{parenthesized}"
+        );
+    }
+    assert_eq!(
+        projection_name(
+            "SELECT j.total FROM (orders o JOIN users u ON o.user_id = u.id) AS j",
+            &db
+        ),
+        Some("orders".to_string())
+    );
+}
+
 #[test]
 fn aggregate_and_group_by_are_not_eligible() {
     let db = schema_db();
