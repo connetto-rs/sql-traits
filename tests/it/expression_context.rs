@@ -689,3 +689,28 @@ fn in_lists_with_unbound_elements_answer_none() {
     let Some(Expr::BinaryOp { left, right, .. }) = &select.selection else { unreachable!() };
     assert_eq!(described(&context, &[left, right]), [None, None]);
 }
+
+/// A domain over an array compares with each element of its base array, as
+/// `get_base_element_type` unwraps it.
+#[test]
+fn quantified_comparisons_read_a_domain_as_its_base_array() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE DOMAIN ints AS INT4[]; CREATE TABLE t (i INT4, a ints, n NUMERIC);",
+    )
+    .unwrap();
+    let query = query("SELECT i = ANY (a), n < ALL (a) FROM t");
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let nodes = projected(&query);
+    let targets: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            assert_eq!(context.type_of(node).unwrap(), pg("bool"));
+            let applications = context.operators(node).unwrap().unwrap();
+            let OperatorResolution::Selected(selected) = applications[0].resolution() else {
+                unreachable!()
+            };
+            selected.right().target().name().to_owned()
+        })
+        .collect();
+    assert_eq!(targets, ["int4", "numeric"]);
+}

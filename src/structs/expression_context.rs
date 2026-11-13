@@ -1,6 +1,6 @@
 //! The facts each expression node of one query takes.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -17,7 +17,7 @@ use crate::{
     },
     traits::{ColumnLike, DataTypeLike, DatabaseLike},
     utils::{
-        coercion::{CommonType, canonical_owned, facts, select_common_type, type_name},
+        coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
         object_name::PG_CATALOG,
         operator_typing::resolve_operator,
         postgres_types::PgType,
@@ -835,19 +835,35 @@ fn quantified<'node>(
     Some((Vec::from([applied]), Returns::Bool))
 }
 
-/// The type of each element of an array of type `array`, an untyped literal
+/// The type of each element of an array of type `array`, a domain read as
+/// its base type as `get_base_element_type` reads it, an untyped literal
 /// staying untyped as PostgreSQL resolves it against the operator's array
-/// type, and nothing for a value that is no array.
+/// type, and nothing for a value that is no array or whose domain base the
+/// database does not answer.
 fn element_type<'a, D: DatabaseLike>(database: &'a D, array: OperandType<'a>) -> OperandType<'a> {
-    match array {
-        OperandType::Known { type_name, typmod } => {
-            match canonical_owned(database, PgType::from_target(&type_name)).into_element() {
-                Some(element) => known(database, element, typmod),
-                None => OperandType::Unknown,
-            }
-        }
-        other => other,
-    }
+    let OperandType::Known { type_name, typmod } = array else { return array };
+    element_of(database, &type_name, typmod).unwrap_or(OperandType::Unknown)
+}
+
+/// The type of each element of the array type `array`, carrying `typmod`,
+/// a domain read as its base type.
+fn element_of<'a, D: DatabaseLike>(
+    database: &'a D,
+    array: &TargetName<'_>,
+    typmod: Option<i32>,
+) -> Option<OperandType<'a>> {
+    let declared = canonical_owned(database, PgType::from_target(array));
+    let domain_base = match base(database, &declared).ok()? {
+        Cow::Owned(base) => Some(base),
+        Cow::Borrowed(_) => None,
+    };
+    // The modifier a column of a domain carries is the domain's, not its
+    // elements'.
+    let (array, typmod) = match domain_base {
+        Some(base) => (base, None),
+        None => (declared, typmod),
+    };
+    Some(known(database, array.into_element()?, typmod))
 }
 
 /// Walks an `IN` list element for a column reference that binds in the
