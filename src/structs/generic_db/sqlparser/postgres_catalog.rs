@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, string::String, sync::Arc};
+use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
 
 use sqlparser::ast::{CreateFunction, ObjectName, OperateFunctionArg};
 
