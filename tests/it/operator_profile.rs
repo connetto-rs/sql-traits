@@ -904,6 +904,36 @@ impl OperatorLike for CatalogOperator {
     ) -> Option<&'db <Self::DB as DatabaseLike>::Function> {
         None
     }
+
+    fn commutator<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
+        None
+    }
+
+    fn negator<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
+        None
+    }
+
+    fn can_hash(&self) -> bool {
+        false
+    }
+
+    fn can_merge(&self) -> bool {
+        false
+    }
+
+    fn restriction_estimator<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<&'db <Self::DB as DatabaseLike>::Function> {
+        None
+    }
+
+    fn join_estimator<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<&'db <Self::DB as DatabaseLike>::Function> {
+        None
+    }
 }
 
 /// A type the profile loads, with the array type over it.

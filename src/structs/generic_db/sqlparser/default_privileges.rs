@@ -1013,22 +1013,16 @@ impl<'a> Creator<'a> {
 /// Refuses a function the role creating it could not execute, as the `sql`
 /// and `plpgsql` validators do through `CheckFunctionValidatorAccess`.
 ///
-/// Only a role the input names and declares as no superuser is checked, and
-/// only when every role it inherits from is declared, since any other role
-/// may hold a privilege the input does not show.
-///
 /// # Errors
 ///
-/// Returns [`Error::FunctionNotExecutableByCreator`] when neither the role
-/// nor any role it inherits from may execute the function.
+/// Returns [`Error::FunctionNotExecutableByCreator`] when
+/// [`creator_lacking_execute`] names the creating role.
 pub(super) fn require_creator_executes(
     builder: &ParserDBBuilder,
     session: &SessionRoles,
     function: &CreateFunction,
     metadata: &FunctionMetadata,
 ) -> Result<(), Error> {
-    use crate::traits::RoleLike as _;
-
     // Without `LANGUAGE`, only a `RETURN` or `BEGIN ATOMIC` body parses, which
     // is `sql`.
     let validated = function.language.as_ref().is_none_or(|language| {
@@ -1037,9 +1031,35 @@ pub(super) fn require_creator_executes(
             "sql" | "plpgsql"
         )
     });
-    let Some(creator) = session.creating_role().filter(|_| validated) else {
+    if !validated {
         return Ok(());
-    };
+    }
+    match creator_lacking_execute(builder, session, metadata) {
+        Some(creator) => {
+            Err(Error::FunctionNotExecutableByCreator {
+                function_name: last_str(&function.name).to_string(),
+                role_name: creator.to_string(),
+            })
+        }
+        None => Ok(()),
+    }
+}
+
+/// The role creating objects in `session` when it may not execute the
+/// function `metadata` describes, neither itself nor through a role it
+/// inherits from.
+///
+/// Only a role the input names and declares as no superuser is checked, and
+/// only when every role it inherits from is declared, since any other role
+/// may hold a privilege the input does not show.
+pub(super) fn creator_lacking_execute<'s>(
+    builder: &ParserDBBuilder,
+    session: &'s SessionRoles,
+    metadata: &FunctionMetadata,
+) -> Option<&'s str> {
+    use crate::traits::RoleLike as _;
+
+    let creator = session.creating_role()?;
     let declared = |name: &str| {
         builder
             .roles()
@@ -1047,9 +1067,7 @@ pub(super) fn require_creator_executes(
             .map(|(role, ())| role.as_ref())
             .find(|role| role.stored_name() == name)
     };
-    let Some(role) = declared(creator).filter(|role| !role.is_superuser()) else {
-        return Ok(());
-    };
+    let role = declared(creator).filter(|role| !role.is_superuser())?;
 
     let mut holders = vec![role];
     let mut next = 0;
@@ -1062,20 +1080,12 @@ pub(super) fn require_creator_executes(
             {
                 continue;
             }
-            let Some(granted) = declared(&stored_role_name(&membership.role)) else {
-                return Ok(());
-            };
+            let granted = declared(&stored_role_name(&membership.role))?;
             if !holders.iter().any(|held| core::ptr::eq(*held, granted)) {
                 holders.push(granted);
             }
         }
     }
 
-    if holders.iter().any(|holder| metadata.can_execute(holder)) {
-        return Ok(());
-    }
-    Err(Error::FunctionNotExecutableByCreator {
-        function_name: last_str(&function.name).to_string(),
-        role_name: creator.to_string(),
-    })
+    (!holders.iter().any(|holder| metadata.can_execute(holder))).then_some(creator)
 }

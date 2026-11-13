@@ -19,21 +19,54 @@ use crate::{
 /// The schema an operand identity stored without one lives in.
 const DEFAULT_SCHEMA: &str = "public";
 
+/// The input types of a restriction estimator, `oprrest` in `pg_operator`.
+pub(super) const RESTRICTION_ESTIMATOR_INPUTS: [&str; 4] = ["internal", "oid", "internal", "int4"];
+
+/// The input types of a join estimator, `oprjoin` in `pg_operator`.
+pub(super) const JOIN_ESTIMATOR_INPUTS: [&str; 5] =
+    ["internal", "oid", "internal", "int2", "internal"];
+
+/// The `pg_operator` row an operator is, which `pg_depend` names it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum OperatorRow {
+    /// A row `initdb` creates, which PostgreSQL pins and never drops.
+    BuiltIn,
+    /// A row the catalog numbered when it took the operator, from 1, and 0
+    /// on an operator no catalog holds yet.
+    Added(u32),
+}
+
 /// A PostgreSQL operator's declared signature and optional implementation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PostgresCatalogOperator {
     /// The operator's schema-qualified symbol.
-    target: CatalogName,
+    pub(super) target: CatalogName,
     /// The operand positions, as the stored row has them.
-    kind: OperatorKind,
+    pub(super) kind: OperatorKind,
     /// The left operand's type, absent on a prefix operator.
-    left: Option<CatalogName>,
+    pub(super) left: Option<CatalogName>,
     /// The right operand's type.
-    right: CatalogName,
+    pub(super) right: CatalogName,
     /// The result's type, absent on a shell.
-    result: Option<CatalogName>,
+    pub(super) result: Option<CatalogName>,
     /// The implementing function, absent on a shell.
-    implementation: Option<CatalogName>,
+    pub(super) implementation: Option<CatalogName>,
+    /// The commutator's schema-qualified symbol, its operands this one's
+    /// swapped.
+    pub(super) commutator: Option<CatalogName>,
+    /// The negator's schema-qualified symbol, its operands this one's.
+    pub(super) negator: Option<CatalogName>,
+    /// Whether the operator supports hash joins, `oprcanhash`.
+    pub(super) can_hash: bool,
+    /// Whether the operator supports merge joins, `oprcanmerge`.
+    pub(super) can_merge: bool,
+    /// The restriction selectivity estimator, `oprrest`.
+    pub(super) restriction_estimator: Option<CatalogName>,
+    /// The join selectivity estimator, `oprjoin`.
+    pub(super) join_estimator: Option<CatalogName>,
+    /// The row the operator is, which survives every change of its name,
+    /// schema and operand types.
+    pub(super) row: OperatorRow,
 }
 
 impl Metadata for PostgresCatalogOperator {
@@ -59,6 +92,13 @@ impl PostgresCatalogOperator {
             right: operand_type(right),
             result: None,
             implementation: None,
+            commutator: None,
+            negator: None,
+            can_hash: false,
+            can_merge: false,
+            restriction_estimator: None,
+            join_estimator: None,
+            row: OperatorRow::Added(0),
         }
     }
 
@@ -77,28 +117,48 @@ impl PostgresCatalogOperator {
         self
     }
 
-    /// Creates a built-in declaration with borrowed names.
-    pub(super) const fn built_in(
-        name: &'static str,
-        left: Option<&'static str>,
-        right: &'static str,
-        result: &'static str,
-        function: &'static str,
-    ) -> Self {
-        Self {
-            target: CatalogName::in_pg_catalog(Cow::Borrowed(name), false),
-            kind: match left {
-                Some(_) => OperatorKind::Binary,
-                None => OperatorKind::Prefix,
-            },
-            left: match left {
-                Some(left) => Some(CatalogName::in_pg_catalog(Cow::Borrowed(left), false)),
-                None => None,
-            },
-            right: CatalogName::in_pg_catalog(Cow::Borrowed(right), false),
-            result: Some(CatalogName::in_pg_catalog(Cow::Borrowed(result), false)),
-            implementation: Some(CatalogName::in_pg_catalog(Cow::Borrowed(function), false)),
-        }
+    /// Sets the commutator, the operator over the swapped operands that
+    /// `target` names.
+    #[must_use]
+    pub fn with_commutator(mut self, target: TargetName<'_>) -> Self {
+        self.commutator = Some(operand_type(target));
+        self
+    }
+
+    /// Sets the negator, the operator over the same operands that `target`
+    /// names.
+    #[must_use]
+    pub fn with_negator(mut self, target: TargetName<'_>) -> Self {
+        self.negator = Some(operand_type(target));
+        self
+    }
+
+    /// Marks the operator as supporting hash joins.
+    #[must_use]
+    pub const fn with_hashes(mut self) -> Self {
+        self.can_hash = true;
+        self
+    }
+
+    /// Marks the operator as supporting merge joins.
+    #[must_use]
+    pub const fn with_merges(mut self) -> Self {
+        self.can_merge = true;
+        self
+    }
+
+    /// Sets the restriction selectivity estimator `function` names.
+    #[must_use]
+    pub fn with_restriction_estimator(mut self, function: TargetName<'_>) -> Self {
+        self.restriction_estimator = Some(operand_type(function));
+        self
+    }
+
+    /// Sets the join selectivity estimator `function` names.
+    #[must_use]
+    pub fn with_join_estimator(mut self, function: TargetName<'_>) -> Self {
+        self.join_estimator = Some(operand_type(function));
+        self
     }
 
     /// Returns the schema that owns the operator.
@@ -139,16 +199,24 @@ impl PostgresCatalogOperator {
         self.target.schema_matches(schema, quoted)
     }
 
-    /// Whether any identity the fact holds lives in `schema`.
+    /// Whether an identity the operator depends on lives in `schema`, its
+    /// own, an operand's, its result's, its function's or an estimator's.
     pub(super) fn touches_schema(&self, schema: &str, quoted: bool) -> bool {
         self.target.schema_matches(schema, quoted)
             || self.left.as_ref().is_some_and(|type_| type_.schema_matches(schema, quoted))
             || self.right.schema_matches(schema, quoted)
             || self.result.as_ref().is_some_and(|type_| type_.schema_matches(schema, quoted))
-            || self
-                .implementation
-                .as_ref()
-                .is_some_and(|function| function.schema_matches(schema, quoted))
+            || self.functions().any(|function| function.schema_matches(schema, quoted))
+    }
+
+    /// Whether any identity the fact holds lives in `schema`, a commutator's
+    /// or a negator's included.
+    pub(super) fn holds_schema(&self, schema: &str, quoted: bool) -> bool {
+        self.touches_schema(schema, quoted)
+            || [self.commutator.as_ref(), self.negator.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|link| link.schema_matches(schema, quoted))
     }
 
     /// Moves every identity the fact holds in `from` to `to`.
@@ -160,16 +228,32 @@ impl PostgresCatalogOperator {
         to_quoted: bool,
     ) {
         self.target.rename_schema(from, from_quoted, to, to_quoted);
-        if let Some(left) = &mut self.left {
-            left.rename_schema(from, from_quoted, to, to_quoted);
-        }
         self.right.rename_schema(from, from_quoted, to, to_quoted);
-        if let Some(result) = &mut self.result {
-            result.rename_schema(from, from_quoted, to, to_quoted);
+        for identity in [
+            self.left.as_mut(),
+            self.result.as_mut(),
+            self.implementation.as_mut(),
+            self.commutator.as_mut(),
+            self.negator.as_mut(),
+            self.restriction_estimator.as_mut(),
+            self.join_estimator.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            identity.rename_schema(from, from_quoted, to, to_quoted);
         }
-        if let Some(implementation) = &mut self.implementation {
-            implementation.rename_schema(from, from_quoted, to, to_quoted);
-        }
+    }
+
+    /// The implementing function and the estimators, those held.
+    fn functions(&self) -> impl Iterator<Item = &CatalogName> {
+        [
+            self.implementation.as_ref(),
+            self.restriction_estimator.as_ref(),
+            self.join_estimator.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
     }
 
     /// Tests whether an operand or result names `name`, defaulting its schema
@@ -181,7 +265,8 @@ impl PostgresCatalogOperator {
             .any(|type_| type_.names_type(name))
     }
 
-    /// Matches the declared function's identity and input signature.
+    /// Whether the implementing function or an estimator has the identity and
+    /// input signature of `name` and `args`.
     pub(super) fn declares_function(
         &self,
         type_arrays: &TypeArrays,
@@ -189,17 +274,47 @@ impl PostgresCatalogOperator {
         args: Option<&[OperateFunctionArg]>,
         case: IdentifierCase,
     ) -> bool {
-        let Some(implementation) = self.implementation.as_ref() else {
-            return false;
-        };
-        function_name_matches(implementation, name, case)
-            && takes_exactly(self.operands(), type_arrays, args)
+        self.implementation.as_ref().is_some_and(|implementation| {
+            function_name_matches(implementation, name, case)
+                && takes_exactly(self.operands(), type_arrays, args)
+        }) || self.restriction_estimator.as_ref().is_some_and(|estimator| {
+            function_name_matches(estimator, name, case)
+                && takes_estimator_inputs(&RESTRICTION_ESTIMATOR_INPUTS, type_arrays, args)
+        }) || self.join_estimator.as_ref().is_some_and(|estimator| {
+            function_name_matches(estimator, name, case)
+                && takes_estimator_inputs(&JOIN_ESTIMATOR_INPUTS, type_arrays, args)
+        })
     }
 
-    /// Repoints the implementing function's stored identity.
-    pub(super) fn rename_implementation(&mut self, to: &ObjectName) {
-        if let Some(implementation) = self.implementation.as_mut() {
+    /// Repoints the function or estimators matching `from` and `from_args` at
+    /// `to`.
+    pub(super) fn follow_function_rename(
+        &mut self,
+        type_arrays: &TypeArrays,
+        from: &ObjectName,
+        from_args: Option<&[OperateFunctionArg]>,
+        to: &ObjectName,
+        case: IdentifierCase,
+    ) {
+        let implementation_follows = self.implementation.as_ref().is_some_and(|implementation| {
+            function_name_matches(implementation, from, case)
+                && takes_exactly(self.operands(), type_arrays, from_args)
+        });
+        if let Some(implementation) =
+            self.implementation.as_mut().filter(|_| implementation_follows)
+        {
             implementation.set_object_name(to);
+        }
+        for (estimator, inputs) in [
+            (self.restriction_estimator.as_mut(), &RESTRICTION_ESTIMATOR_INPUTS[..]),
+            (self.join_estimator.as_mut(), &JOIN_ESTIMATOR_INPUTS[..]),
+        ] {
+            if let Some(estimator) = estimator.filter(|estimator| {
+                function_name_matches(estimator, from, case)
+                    && takes_estimator_inputs(inputs, type_arrays, from_args)
+            }) {
+                estimator.set_object_name(to);
+            }
         }
     }
 
@@ -216,6 +331,49 @@ impl PostgresCatalogOperator {
     /// The operand types, the left one first when there is one.
     fn operands(&self) -> impl Iterator<Item = &CatalogName> {
         self.left.iter().chain([&self.right])
+    }
+
+    /// Whether this is the operator `link` names over `left` and `right`.
+    pub(super) fn is_named_by(
+        &self,
+        link: &CatalogName,
+        left: Option<&CatalogName>,
+        right: &CatalogName,
+    ) -> bool {
+        identity_repeats(&self.target, link)
+            && operand_repeats(self.left.as_ref(), left)
+            && identity_repeats(&self.right, right)
+    }
+
+    /// Whether the commutator link names `other`, an operator over this
+    /// one's operands swapped.
+    pub(super) fn commutes_with(&self, other: &Self) -> bool {
+        self.commutator
+            .as_ref()
+            .zip(self.left.as_ref())
+            .is_some_and(|(link, left)| other.is_named_by(link, Some(&self.right), left))
+    }
+
+    /// Whether the negator link names `other`, an operator over this one's
+    /// operands.
+    pub(super) fn negates(&self, other: &Self) -> bool {
+        self.negator
+            .as_ref()
+            .is_some_and(|link| other.is_named_by(link, self.left.as_ref(), &self.right))
+    }
+
+    /// The function `estimator` names taking `inputs`.
+    fn estimator<'db>(
+        database: &'db ParserDB,
+        estimator: &CatalogName,
+        inputs: &[&'static str],
+    ) -> Option<&'db CreateFunction> {
+        let case = database.identifier_case();
+        let type_arrays = &database.ingestion.type_arrays;
+        database.functions().find(|function| {
+            function_name_matches(estimator, &function.name, case)
+                && takes_estimator_inputs(inputs, type_arrays, function.args.as_deref())
+        })
     }
 }
 
@@ -252,6 +410,50 @@ impl OperatorLike for PostgresCatalogOperator {
                 && takes_exactly(self.operands(), type_arrays, function.args.as_deref())
         })
     }
+
+    fn commutator<'db>(&'db self, database: &'db ParserDB) -> Option<&'db Self> {
+        database.operators()?.find(|operator| self.commutes_with(operator))
+    }
+
+    fn negator<'db>(&'db self, database: &'db ParserDB) -> Option<&'db Self> {
+        database.operators()?.find(|operator| self.negates(operator))
+    }
+
+    fn can_hash(&self) -> bool {
+        self.can_hash
+    }
+
+    fn can_merge(&self) -> bool {
+        self.can_merge
+    }
+
+    fn restriction_estimator<'db>(
+        &'db self,
+        database: &'db ParserDB,
+    ) -> Option<&'db CreateFunction> {
+        Self::estimator(
+            database,
+            self.restriction_estimator.as_ref()?,
+            &RESTRICTION_ESTIMATOR_INPUTS,
+        )
+    }
+
+    fn join_estimator<'db>(&'db self, database: &'db ParserDB) -> Option<&'db CreateFunction> {
+        Self::estimator(database, self.join_estimator.as_ref()?, &JOIN_ESTIMATOR_INPUTS)
+    }
+}
+
+/// Whether `args` take exactly the `pg_catalog` types `inputs` names.
+pub(super) fn takes_estimator_inputs(
+    inputs: &[&'static str],
+    type_arrays: &TypeArrays,
+    args: Option<&[OperateFunctionArg]>,
+) -> bool {
+    takes_exactly(
+        inputs.iter().map(|input| CatalogName::in_pg_catalog(Cow::Borrowed(input), false)),
+        type_arrays,
+        args,
+    )
 }
 
 /// Stores a supplied identity, defaulting its schema to `pg_catalog`.
@@ -373,7 +575,7 @@ pub(super) fn identity_repeats(left: &CatalogName, right: &CatalogName) -> bool 
 }
 
 /// Whether two operand identities hold the same type, or both hold none.
-fn operand_repeats(left: Option<&CatalogName>, right: Option<&CatalogName>) -> bool {
+pub(super) fn operand_repeats(left: Option<&CatalogName>, right: Option<&CatalogName>) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => identity_repeats(left, right),
         (None, None) => true,

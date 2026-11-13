@@ -95,6 +95,7 @@ mod grantors;
 mod inheritance;
 mod leading_comments;
 mod like;
+mod operator_ddl;
 mod parse_options;
 mod parsed_source;
 mod partition_bounds;
@@ -3595,6 +3596,24 @@ fn take_builtins_named_by(builder: &mut ParserDBBuilder, statement: &Statement) 
             }
             return;
         }
+        Statement::CreateOperator(operator) => {
+            for name in core::iter::once(&operator.function)
+                .chain(operator.options.iter().filter_map(estimator_named))
+                .filter_map(named)
+            {
+                builder.take_builtins_named(name);
+            }
+            return;
+        }
+        Statement::AlterOperator(sqlparser::ast::AlterOperator {
+            operation: sqlparser::ast::AlterOperatorOperation::Set { options },
+            ..
+        }) => {
+            for name in options.iter().filter_map(estimator_named).filter_map(named) {
+                builder.take_builtins_named(name);
+            }
+            return;
+        }
         Statement::AlterFunction(alter) => core::slice::from_ref(&alter.function),
         Statement::DropFunction(drop) => &drop.func_desc,
         // This model holds no procedure, so `DROP PROCEDURE` and a grant on
@@ -3624,6 +3643,15 @@ fn take_builtins_named_by(builder: &mut ParserDBBuilder, statement: &Statement) 
     };
     for name in signatures.iter().filter_map(|signature| named(&signature.name)) {
         builder.take_builtins_named(name);
+    }
+}
+
+/// The function a `RESTRICT` or `JOIN` attribute names, when it names one.
+fn estimator_named(option: &sqlparser::ast::OperatorOption) -> Option<&ObjectName> {
+    match option {
+        sqlparser::ast::OperatorOption::Restrict(name)
+        | sqlparser::ast::OperatorOption::Join(name) => name.as_ref(),
+        _ => None,
     }
 }
 
@@ -4150,7 +4178,7 @@ fn refuse_system_schema_relation(
     object_kind: crate::errors::ObjectKind,
     relation_name: &str,
 ) -> Result<(), crate::errors::Error> {
-    if matches!(object_kind, ObjectKind::Function | ObjectKind::Domain) {
+    if matches!(object_kind, ObjectKind::Function | ObjectKind::Domain | ObjectKind::Operator) {
         return Ok(());
     }
     Err(crate::errors::Error::SystemSchemaRelationRefused {
@@ -9692,6 +9720,16 @@ impl ParserDB {
                         };
                         let resolved_schema_name = schema.name().to_string();
                         let resolved_schema_quoted = schema.is_quoted();
+                        if let Some(operator_name) = active_postgres_catalog
+                            .built_in_operator_in_schema(
+                                &resolved_schema_name,
+                                resolved_schema_quoted,
+                            )
+                        {
+                            return Err(crate::errors::Error::OperatorRequiredBySystem {
+                                operator_name: operator_name.into(),
+                            });
+                        }
 
                         // Check for contained objects unless CASCADE is
                         // specified, the catalog's operators counting
@@ -10375,6 +10413,40 @@ impl ParserDB {
                 }
                 Statement::DropExtension(drop_extension) => {
                     builder = extensions::drop_extensions(builder, drop_extension)?;
+                }
+                Statement::CreateOperator(create_operator)
+                    if matches!(dialect, SqlparserDialect::PostgreSql) =>
+                {
+                    operator_ddl::create(
+                        &builder,
+                        &mut active_postgres_catalog,
+                        &type_arrays,
+                        &session_roles,
+                        create_operator,
+                    )?;
+                }
+                Statement::AlterOperator(alter_operator)
+                    if matches!(dialect, SqlparserDialect::PostgreSql) =>
+                {
+                    operator_ddl::alter(
+                        &builder,
+                        &mut active_postgres_catalog,
+                        &type_arrays,
+                        &session_roles,
+                        access_resolution == AccessResolution::ClosedWorld,
+                        alter_operator,
+                    )?;
+                }
+                Statement::DropOperator(drop_operator)
+                    if matches!(dialect, SqlparserDialect::PostgreSql) =>
+                {
+                    operator_ddl::drop(
+                        &builder,
+                        &mut active_postgres_catalog,
+                        &type_arrays,
+                        &session_roles,
+                        drop_operator,
+                    )?;
                 }
                 Statement::CreateCollation(create_collation) => {
                     if matches!(dialect, SqlparserDialect::PostgreSql) {
