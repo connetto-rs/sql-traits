@@ -9740,9 +9740,8 @@ impl ParserDB {
                             });
                         }
 
-                        // If CASCADE, remove everything the schema holds
-                        // first, the functions last so nothing else in it
-                        // still calls them.
+                        // If CASCADE, remove everything the schema holds, and
+                        // then what elsewhere still calls its functions.
                         if cascade {
                             let schema = (resolved_schema_name.as_str(), resolved_schema_quoted);
                             // Read while the schema's types are there to name.
@@ -9803,21 +9802,19 @@ impl ParserDB {
                                 schema,
                                 &mut type_arrays,
                             )?;
+                            builder = next_builder;
                             removed.types.extend(types.types);
                             removed.functions.extend(types.functions);
-                            builder = Self::take_function_dependents(
-                                next_builder,
-                                &mut removed,
-                                &mut type_arrays,
-                            )?;
-                            builder.drop_function_nodes(&doomed_functions)?;
+                            builder.functions_mut().retain(|(function, _)| {
+                                !doomed_functions.iter().any(|doomed| Arc::ptr_eq(doomed, function))
+                            });
                             removed.functions.extend(doomed_functions);
-                            Self::drop_facts_for_type_drop(
+                            builder = Self::finish_drop(
+                                builder,
+                                removed,
+                                &mut type_arrays,
                                 &mut active_postgres_catalog,
-                                &builder,
-                                &removed,
-                                &type_arrays,
-                            );
+                            )?;
                         }
 
                         // Remove the schema
