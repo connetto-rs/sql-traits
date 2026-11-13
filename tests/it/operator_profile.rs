@@ -347,6 +347,10 @@ impl DataTypeLike for NoneKind {
     ) -> Option<impl Iterator<Item = ArrayDimension>> {
         self.unreach::<Option<core::iter::Empty<ArrayDimension>>>()
     }
+
+    fn enforces_array_dimensions(&self, _database: &Self::DB) -> Option<bool> {
+        self.unreach()
+    }
 }
 
 impl IndexLike for NoneKind {

@@ -334,3 +334,52 @@ fn array_element_nullability_answers_per_dimension() {
         [Some(vec![(None, false)])]
     );
 }
+
+/// Whether the type of each column of table `t`, written in `sql` under
+/// dialect `D`, has the engine enforce its dimension count.
+fn enforced_dimensions<D: Dialect + Default + 'static>(
+    sql: &str,
+    columns: &[&str],
+) -> Vec<Option<bool>> {
+    let db = ParserDB::parse::<D>(sql).expect("schema builds");
+    columns.iter().map(|name| data_type(&db, name).enforces_array_dimensions(&db)).collect()
+}
+
+/// PostgreSQL stores a value of any dimensions in any array column, so none
+/// of its arrays binds the count written, while every other engine's nested
+/// array is a type of its own.
+#[test]
+fn only_postgresql_leaves_the_dimension_count_unenforced() {
+    assert_eq!(
+        enforced_dimensions::<PostgreSqlDialect>(
+            "CREATE TABLE t (one INT[], two INT[][], sized INT[3], keyword INT ARRAY, n INT);",
+            &["one", "two", "sized", "keyword", "n"],
+        ),
+        [Some(false), Some(false), Some(false), Some(false), None]
+    );
+    let sql =
+        "CREATE TABLE t (list INTEGER[], nested INTEGER[][], fixed INTEGER[3][2], n INTEGER);";
+    let columns = ["list", "nested", "fixed", "n"];
+    let enforced = [Some(true), Some(true), Some(true), None];
+    assert_eq!(enforced_dimensions::<DuckDbDialect>(sql, &columns), enforced);
+    assert_eq!(
+        enforced_dimensions::<GenericDialect>(sql, &columns),
+        enforced,
+        "the generic dialect follows the standard, where a nested array is a type of its own"
+    );
+    assert_eq!(
+        enforced_dimensions::<ClickHouseDialect>(
+            "CREATE TABLE t (id Int32, flat Array(Int32), nested Array(Array(Nullable(Int32)))) \
+             ENGINE = MergeTree ORDER BY id;",
+            &["id", "flat", "nested"],
+        ),
+        [None, Some(true), Some(true)]
+    );
+    assert_eq!(
+        enforced_dimensions::<SnowflakeDialect>(
+            "CREATE TABLE t (nested ARRAY(ARRAY(INT)), bare ARRAY, n INT);",
+            &["nested", "bare", "n"],
+        ),
+        [Some(true), Some(true), None]
+    );
+}
