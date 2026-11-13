@@ -345,7 +345,9 @@ fn operators_take_the_selected_operators_result_type() {
     let Expr::BinaryOp { left: i, right: literal, .. } = nodes[0] else { unreachable!() };
     let applications = context.operators(nodes[0]).unwrap().unwrap();
     assert!(applications[0].left().is_some_and(|left| core::ptr::eq(left, i.as_ref())));
-    assert!(core::ptr::eq(applications[0].right(), literal.as_ref()));
+    assert!(
+        matches!(applications[0].right(), Operand::Node(right) if core::ptr::eq(*right, literal.as_ref()))
+    );
     let OperatorResolution::Selected(greater) = applications[0].resolution() else {
         unreachable!()
     };

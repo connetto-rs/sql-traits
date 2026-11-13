@@ -83,8 +83,32 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
 pub struct OperatorApplication<'node, 'db, DB: DatabaseLike> {
     name: TargetName<'node>,
     left: Option<&'node Expr>,
-    right: &'node Expr,
+    right: Operand<'node>,
     resolution: OperatorResolution<'db, DB>,
+}
+
+/// Where the right operand of an operator application comes from.
+#[derive(Debug, Clone)]
+pub enum Operand<'node> {
+    /// The value of this node.
+    Node(&'node Expr),
+    /// Each element of an array, the application holding when it holds for
+    /// any of them, as `op ANY (array)` and a collapsed `IN` list apply it.
+    Any(ArraySource<'node>),
+    /// Each element of an array, the application holding when it holds for
+    /// all of them, as `op ALL (array)` and a collapsed `NOT IN` list apply
+    /// it.
+    All(ArraySource<'node>),
+}
+
+/// The array an [`Operand::Any`] or [`Operand::All`] compares against.
+#[derive(Debug, Clone)]
+pub enum ArraySource<'node> {
+    /// The array this node evaluates to.
+    Node(&'node Expr),
+    /// The array PostgreSQL builds from these nodes, each converted to their
+    /// common type, as it collapses the constant elements of an `IN` list.
+    Built(Vec<&'node Expr>),
 }
 
 impl<'node, 'db, DB: DatabaseLike> OperatorApplication<'node, 'db, DB> {
@@ -102,10 +126,10 @@ impl<'node, 'db, DB: DatabaseLike> OperatorApplication<'node, 'db, DB> {
         self.left
     }
 
-    /// Returns the node the right operand comes from.
+    /// Returns where the right operand comes from.
     #[must_use]
-    pub const fn right(&self) -> &'node Expr {
-        self.right
+    pub const fn right(&self) -> &Operand<'node> {
+        &self.right
     }
 
     /// Returns what PostgreSQL does with the invocation, its operands typed
@@ -333,7 +357,12 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         };
         let resolution = self.resolution(&applied)?;
         let Applied { name, left, right } = applied;
-        Ok(Some(Vec::from([OperatorApplication { name, left, right, resolution }])))
+        Ok(Some(Vec::from([OperatorApplication {
+            name,
+            left,
+            right: Operand::Node(right),
+            resolution,
+        }])))
     }
 
     /// What PostgreSQL does with `applied`, its operands typed by their nodes.
