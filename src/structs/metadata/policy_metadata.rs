@@ -125,6 +125,14 @@ impl<U: PolicyLike> PolicyMetadata<U> {
         self.check_calls = calls;
     }
 
+    /// Returns the calls of the using and the check expressions, to settle
+    /// them.
+    pub(crate) fn calls_mut(
+        &mut self,
+    ) -> [&mut ExpressionCalls<<U::DB as DatabaseLike>::Function>; 2] {
+        [&mut self.using_calls, &mut self.check_calls]
+    }
+
     /// How the literals of the using expression were read.
     pub(crate) fn using_literals(&self) -> &ClauseLiterals {
         &self.using_literals

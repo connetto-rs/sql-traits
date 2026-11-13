@@ -6,7 +6,7 @@ use core::{convert::Infallible, ops::ControlFlow};
 use sqlparser::ast::{Expr, Function, ObjectName, Visit};
 
 use crate::{
-    structs::IdentifierCase,
+    structs::{IdentifierCase, TargetName},
     traits::FunctionLike,
     utils::{
         call_sites::{Call, Site, call_reaches, for_each_call, for_each_site},
@@ -18,47 +18,165 @@ use crate::{
 /// callback, one at a time.
 pub(crate) type Provided<'a, F> = &'a dyn Fn(&str, &mut dyn FnMut(&Arc<F>));
 
-/// The functions each call of an expression or a bound function body may
-/// reach, resolved under the search path of the statement that wrote it.
+/// The functions each call of an expression or a bound function body
+/// reaches, resolved under the search path of the statement that wrote it.
 ///
-/// A call reaches every overload accepting its argument count, since argument
-/// types are not inferred.
+/// A call reaches the overloads accepting its argument count. Where those
+/// include a function the schema declares, a parsed script records the one
+/// the argument types select, as PostgreSQL binds it, and keeps every
+/// overload when the types do not decide one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExpressionCalls<F> {
-    /// The functions each call may reach, in the order a pre-order walk of
-    /// the expression meets the calls.
-    sites: Vec<Vec<Arc<F>>>,
-    /// Every function some call may reach, each once, first reached first.
+    /// Each call, in the order a pre-order walk of the expression meets the
+    /// calls.
+    calls: Vec<BoundCall<F>>,
+    /// Every function some call reaches, each once, first reached first.
     functions: Vec<Arc<F>>,
 }
 
+/// One call of an expression and the functions it reaches.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BoundCall<F> {
+    /// The functions the call reaches.
+    reached: Vec<Arc<F>>,
+    /// The overloads the call's argument types choose among, for a call
+    /// reaching more than one function, one of them declared by the schema.
+    overloads: Option<Vec<Arc<F>>>,
+    /// Whether `reached` no longer waits for the argument types to choose
+    /// among `overloads`.
+    settled: bool,
+}
+
+impl<F> BoundCall<F> {
+    /// A call reaching `reached`, the argument types left to choose among
+    /// them when more than one is reached and `declared` says one of them
+    /// is a function the schema declares.
+    fn new(reached: Vec<Arc<F>>, declared: bool) -> Self {
+        let overloads = (declared && reached.len() > 1).then(|| reached.clone());
+        Self { settled: overloads.is_none(), reached, overloads }
+    }
+
+    /// Returns the functions the call reaches.
+    pub(crate) fn reached(&self) -> &[Arc<F>] {
+        &self.reached
+    }
+
+    /// The same call written again, to be resolved anew in the schemas of the
+    /// functions it could reach, the way PostgreSQL parses again the text
+    /// it deparsed the call to.
+    pub(crate) fn rewritten(self) -> Carried<F> {
+        Carried::Rewritten(self.overloads.unwrap_or(self.reached))
+    }
+}
+
+/// What a call carried over a rebuild keeps.
+pub(crate) enum Carried<F> {
+    /// The binding it held.
+    Bound(BoundCall<F>),
+    /// Nothing but the functions it could reach, the call being resolved anew
+    /// among the functions now declared in their schemas.
+    Rewritten(Vec<Arc<F>>),
+}
+
+impl<F> Clone for BoundCall<F> {
+    fn clone(&self) -> Self {
+        Self {
+            reached: self.reached.clone(),
+            overloads: self.overloads.clone(),
+            settled: self.settled,
+        }
+    }
+}
+
 impl<F> ExpressionCalls<F> {
-    /// Creates the record from the functions each call may reach, given in
-    /// the order a pre-order walk of the expression meets the calls.
+    /// Creates the record from the functions each call reaches, given in the
+    /// order a pre-order walk of the expression meets the calls.
     #[must_use]
     pub fn new(sites: Vec<Vec<Arc<F>>>) -> Self {
+        Self::of_calls(
+            sites
+                .into_iter()
+                .map(|reached| BoundCall { reached, overloads: None, settled: true })
+                .collect(),
+        )
+    }
+
+    /// The record holding `calls`.
+    fn of_calls(calls: Vec<BoundCall<F>>) -> Self {
+        let mut record = Self { calls, functions: Vec::new() };
+        record.collect_functions();
+        record
+    }
+
+    /// Lists every function some call reaches, each once.
+    fn collect_functions(&mut self) {
         let mut seen = BTreeSet::new();
-        let functions = sites
+        self.functions = self
+            .calls
             .iter()
-            .flatten()
+            .flat_map(BoundCall::reached)
             .filter(|function| seen.insert(Arc::as_ptr(function)))
             .map(Arc::clone)
             .collect();
-        Self { sites, functions }
     }
 
-    /// Returns every function some call may reach, each once.
+    /// Returns every function some call reaches, each once.
     pub fn functions(&self) -> impl Iterator<Item = &F> {
         self.functions.iter().map(AsRef::as_ref)
     }
 
-    /// Returns the functions each call may reach, in the order a pre-order
-    /// walk of the expression meets the calls.
-    pub(crate) fn sites(&self) -> &[Vec<Arc<F>>] {
-        &self.sites
+    /// Returns the functions each call reaches, in the order a pre-order walk
+    /// of the expression meets the calls.
+    pub(crate) fn sites(&self) -> impl Iterator<Item = &[Arc<F>]> {
+        self.calls.iter().map(BoundCall::reached)
     }
 
-    /// Returns the functions `call` may reach, or `None` when `call` is not a
+    /// Returns each call, in the order a pre-order walk of the expression
+    /// meets the calls.
+    pub(crate) fn bound_calls(&self) -> &[BoundCall<F>] {
+        &self.calls
+    }
+
+    /// Whether some call still waits for its argument types to choose among
+    /// its overloads.
+    pub(crate) fn is_unsettled(&self) -> bool {
+        self.calls.iter().any(|call| !call.settled)
+    }
+
+    /// Settles every call of `node`, the node this record was built from,
+    /// that waits for its argument types: one `selected` answers the address
+    /// of the function it runs for keeps that function alone, and any other
+    /// keeps every overload.
+    pub(crate) fn settle<N: Visit + ?Sized>(
+        &mut self,
+        node: &N,
+        selected: impl Fn(&Function) -> Option<usize>,
+    ) {
+        let mut calls = self.calls.iter_mut();
+        let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
+            let Some(bound) = calls.next() else { return ControlFlow::Continue(()) };
+            if bound.settled {
+                return ControlFlow::Continue(());
+            }
+            let chosen = call.node.and_then(&selected).and_then(|address| {
+                bound
+                    .overloads
+                    .iter()
+                    .flatten()
+                    .find(|function| Arc::as_ptr(function).addr() == address)
+            });
+            if let Some(function) = chosen {
+                bound.reached = alloc::vec![Arc::clone(function)];
+            }
+            ControlFlow::Continue(())
+        });
+        for bound in &mut self.calls {
+            bound.settled = true;
+        }
+        self.collect_functions();
+    }
+
+    /// Returns the functions `call` reaches, or `None` when `call` is not a
     /// node of `expression`, the expression this record was built from.
     ///
     /// `call` is matched by address, so it has to be borrowed from
@@ -86,7 +204,7 @@ impl<F> ExpressionCalls<F> {
             return None;
         };
         let reached: &[Arc<F>] = match position {
-            Some(position) => self.sites.get(position)?,
+            Some(position) => self.calls.get(position)?.reached(),
             None => &[],
         };
         Some(reached.iter().map(AsRef::as_ref))
@@ -94,7 +212,11 @@ impl<F> ExpressionCalls<F> {
 
     /// Re-points every function referencing the allocation `stale` at `fresh`.
     pub fn replace_function(&mut self, stale: &Arc<F>, fresh: &Arc<F>) {
-        for slot in self.sites.iter_mut().flatten().chain(self.functions.iter_mut()) {
+        let slots = self
+            .calls
+            .iter_mut()
+            .flat_map(|call| call.reached.iter_mut().chain(call.overloads.iter_mut().flatten()));
+        for slot in slots.chain(self.functions.iter_mut()) {
             if Arc::ptr_eq(slot, stale) {
                 *slot = Arc::clone(fresh);
             }
@@ -104,13 +226,13 @@ impl<F> ExpressionCalls<F> {
 
 impl<F> Default for ExpressionCalls<F> {
     fn default() -> Self {
-        Self { sites: Vec::new(), functions: Vec::new() }
+        Self { calls: Vec::new(), functions: Vec::new() }
     }
 }
 
 impl<F> Clone for ExpressionCalls<F> {
     fn clone(&self) -> Self {
-        Self { sites: self.sites.clone(), functions: self.functions.clone() }
+        Self { calls: self.calls.clone(), functions: self.functions.clone() }
     }
 }
 
@@ -124,7 +246,8 @@ impl<F: FunctionLike> ExpressionCalls<F> {
     /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by)
     /// describes, and every overload accepting the call's argument count
     /// counts. `case` decides how schema names compare. A parsed script
-    /// records the calls of its checks, policies and bound bodies this way.
+    /// records the calls of its checks, policies and bound bodies this way,
+    /// and then keeps the overload the argument types select.
     ///
     /// # Example
     ///
@@ -181,28 +304,46 @@ impl<F: FunctionLike> ExpressionCalls<F> {
         provided: Provided<'_, F>,
         search_path: &[(&str, bool)],
         case: IdentifierCase,
-        mut carried: impl FnMut(&ObjectName, usize) -> Option<Vec<Arc<F>>>,
+        mut carried: impl FnMut(&ObjectName, usize) -> Option<Carried<F>>,
     ) -> Self {
-        let path = || search_path.iter().copied();
-        let mut sites = Vec::new();
+        let mut calls = Vec::new();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
-            let site = carried(call.name, call.arguments).unwrap_or_else(|| {
+            let resolve = |path: &[(&str, bool)]| {
+                let path = || path.iter().copied();
                 let reaches = |function: &Arc<F>| {
                     call_reaches(function.as_ref(), call.name, call.arguments, path, case)
                 };
                 let mut site: Vec<Arc<F>> =
                     functions.iter().filter(|function| reaches(function)).cloned().collect();
+                let declared = !site.is_empty();
                 let named = object_name_last_part(call.name).map_or("", |(name, _)| name);
                 provided(named, &mut |function| {
                     if reaches(function) {
                         site.push(Arc::clone(function));
                     }
                 });
-                site
-            });
-            sites.push(site);
+                BoundCall::new(site, declared)
+            };
+            let bound = match carried(call.name, call.arguments) {
+                Some(Carried::Bound(bound)) => bound,
+                Some(Carried::Rewritten(previous)) => {
+                    let schemas: Vec<TargetName<'_>> =
+                        previous.iter().map(|function| function.target_name()).collect();
+                    let path: Vec<(&str, bool)> = schemas
+                        .iter()
+                        .map(|name| {
+                            name.schema().map_or(("public", false), |schema| {
+                                (schema, name.schema_is_quoted())
+                            })
+                        })
+                        .collect();
+                    resolve(&path)
+                }
+                None => resolve(search_path),
+            };
+            calls.push(bound);
             ControlFlow::Continue(())
         });
-        Self::new(sites)
+        Self::of_calls(calls)
     }
 }

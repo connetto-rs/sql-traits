@@ -6,7 +6,11 @@ use core::{convert::Infallible, ops::ControlFlow};
 use sqlparser::ast::{CreateFunction, ObjectName, Visit};
 
 use crate::{
-    structs::{IdentifierCase, generic_db::builtin_functions::Builtins, metadata::ExpressionCalls},
+    structs::{
+        IdentifierCase,
+        generic_db::builtin_functions::Builtins,
+        metadata::{BoundCall, Carried, ExpressionCalls},
+    },
     utils::{
         call_sites::{call_reaches, for_each_call},
         object_name::object_name_last_part,
@@ -79,12 +83,16 @@ pub(super) fn calls_in<N: Visit + ?Sized>(
 /// PostgreSQL binds a call once, when it is written, so a call a rebuild
 /// leaves written as it was keeps its function whatever search path the
 /// rebuilding statement runs under. Each recorded binding is taken once, by
-/// the first call written with the same name and argument count.
+/// the first call written with the same name and argument count. A column
+/// type change has PostgreSQL parse the derived expressions again, so there
+/// the argument types choose among the call's overloads anew.
 #[derive(Default)]
 pub(super) struct CarriedCalls {
     /// Each call's written name and argument count, with the functions it
     /// was bound to.
-    sites: Vec<(ObjectName, usize, Vec<Arc<CreateFunction>>)>,
+    sites: Vec<(ObjectName, usize, BoundCall<CreateFunction>)>,
+    /// Whether the carried calls are written again, choosing anew.
+    rewritten: bool,
 }
 
 impl CarriedCalls {
@@ -95,23 +103,39 @@ impl CarriedCalls {
         node: &N,
         calls: &ExpressionCalls<CreateFunction>,
     ) {
-        let mut bound = calls.sites().iter();
+        let mut bound = calls.bound_calls().iter();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
-            let site = bound
-                .next()
-                .map(|functions| (call.name.clone(), call.arguments, functions.clone()));
+            let site = bound.next().map(|bound| (call.name.clone(), call.arguments, bound.clone()));
             self.sites.extend(site);
             ControlFlow::Continue(())
         });
     }
 
-    /// Takes the first recorded binding of a call written `name` passing
-    /// `arguments` arguments.
+    /// Has every carried call written again, its argument types choosing
+    /// among its overloads anew.
+    pub(super) fn rewrite(&mut self) {
+        self.rewritten = true;
+    }
+
+    /// Takes the first recorded call written `name` passing `arguments`
+    /// arguments, anew when the calls are written again.
     pub(super) fn take(
         &mut self,
         name: &ObjectName,
         arguments: usize,
-    ) -> Option<Vec<Arc<CreateFunction>>> {
+    ) -> Option<Carried<CreateFunction>> {
+        let rewritten = self.rewritten;
+        self.take_bound(name, arguments)
+            .map(|bound| if rewritten { bound.rewritten() } else { Carried::Bound(bound) })
+    }
+
+    /// Takes the first recorded binding of a call written `name` passing
+    /// `arguments` arguments.
+    pub(super) fn take_bound(
+        &mut self,
+        name: &ObjectName,
+        arguments: usize,
+    ) -> Option<BoundCall<CreateFunction>> {
         let position = self
             .sites
             .iter()
@@ -126,7 +150,7 @@ impl CarriedCalls {
         renamed: impl Fn(&[Arc<CreateFunction>]) -> Option<ObjectName>,
     ) {
         for (name, _, binding) in &mut self.sites {
-            if let Some(respelled) = renamed(binding) {
+            if let Some(respelled) = renamed(binding.reached()) {
                 *name = respelled;
             }
         }

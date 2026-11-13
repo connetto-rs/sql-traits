@@ -68,6 +68,11 @@ impl ViewMetadata {
         &self.calls
     }
 
+    /// Returns the calls of the view's definition, to settle them.
+    pub(crate) fn calls_mut(&mut self) -> &mut ExpressionCalls<CreateFunction> {
+        &mut self.calls
+    }
+
     /// Re-points every call reaching the function node `stale` at `fresh`.
     pub(crate) fn replace_function(
         &mut self,

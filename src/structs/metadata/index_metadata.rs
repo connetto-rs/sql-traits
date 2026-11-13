@@ -40,6 +40,12 @@ impl<I: IndexLike> IndexMetadata<I> {
         &self.calls
     }
 
+    /// Returns the calls of the index's expressions and predicate, to settle
+    /// them.
+    pub(crate) fn calls_mut(&mut self) -> &mut ExpressionCalls<<I::DB as DatabaseLike>::Function> {
+        &mut self.calls
+    }
+
     /// Re-points every call reaching the function node `stale` at `fresh`.
     pub(crate) fn replace_function(
         &mut self,

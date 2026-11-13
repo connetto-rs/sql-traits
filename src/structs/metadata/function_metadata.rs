@@ -179,6 +179,11 @@ impl FunctionMetadata {
         self.body_calls = calls;
     }
 
+    /// Returns the calls of the function's body, to settle them.
+    pub(crate) fn body_calls_mut(&mut self) -> &mut ExpressionCalls<CreateFunction> {
+        &mut self.body_calls
+    }
+
     /// Re-points every call of the body reaching the node `stale` at
     /// `fresh`.
     #[inline]

@@ -203,27 +203,39 @@ fn a_move_postgresql_refuses_is_refused() {
     refused("ALTER FUNCTION e.a() SET SCHEMA e;").expect("a function may stay where it is");
 }
 
-/// A call arity alone cannot pin to one overload stays ambiguous, so moving
-/// only some of the functions it may reach is refused.
+/// A call whose argument types settle no overload stays ambiguous, so moving
+/// only some of the functions it may reach is refused. A call settled on one
+/// overload follows that overload alone, as PostgreSQL 18 respells it.
 #[test]
 fn a_call_reaching_a_moved_and_a_staying_function_is_refused() {
     let overloads = "CREATE SCHEMA s;
          CREATE FUNCTION s.f(x INT) RETURNS INT AS 'SELECT x';
-         CREATE FUNCTION s.f(x TEXT) RETURNS INT AS 'SELECT 1';
-         CREATE TABLE t (a INT DEFAULT s.f(1));";
-    let result = parse(&format!("{overloads} ALTER FUNCTION s.f(INT) RENAME TO g;"));
+         CREATE FUNCTION s.f(x TEXT) RETURNS INT AS 'SELECT 1';";
+    let unsettled = format!("{overloads} CREATE VIEW v AS SELECT s.f((SELECT 1)) AS one;");
+    let result = parse(&format!("{unsettled} ALTER FUNCTION s.f(INT) RENAME TO g;"));
     assert!(
         matches!(&result, Err(Error::MovedFunctionCallAmbiguous { function_name, .. }) if function_name == "f"),
         "got {result:?}"
     );
-    parse(&format!("{overloads} ALTER SCHEMA s RENAME TO s2;")).expect("both overloads move");
+    parse(&format!("{unsettled} ALTER SCHEMA s RENAME TO s2;")).expect("both overloads move");
 
+    let settled = format!(
+        "{overloads} CREATE TABLE t (a INT DEFAULT s.f(1)); ALTER FUNCTION s.f(INT) RENAME TO g;"
+    );
+    parse(&format!("{settled} DROP FUNCTION s.f(TEXT);")).expect("the default calls s.g(1)");
+    let result = parse(&format!("{settled} DROP FUNCTION s.g(INT);"));
+    assert!(matches!(&result, Err(Error::FunctionReferenced { .. })), "got {result:?}");
+
+    // The path the view is created under selects `app.f`, which the view
+    // follows into `app2` (`SELECT app2.f() AS one`).
     let across_schemas = "CREATE SCHEMA app;
          CREATE FUNCTION app.f() RETURNS INT AS 'SELECT 1';
          CREATE FUNCTION public.f() RETURNS INT AS 'SELECT 2';
          SET search_path TO app, public;
          CREATE VIEW public.v AS SELECT f() AS one;
-         RESET search_path;";
-    let result = parse(&format!("{across_schemas} ALTER SCHEMA app RENAME TO app2;"));
-    assert!(matches!(result, Err(Error::MovedFunctionCallAmbiguous { .. })), "got {result:?}");
+         RESET search_path;
+         ALTER SCHEMA app RENAME TO app2;";
+    parse(&format!("{across_schemas} DROP FUNCTION public.f();")).expect("the view calls app2.f");
+    let result = parse(&format!("{across_schemas} DROP FUNCTION app2.f();"));
+    assert!(matches!(&result, Err(Error::FunctionReferenced { .. })), "got {result:?}");
 }
