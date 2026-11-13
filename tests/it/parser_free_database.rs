@@ -526,6 +526,13 @@ impl DataTypeLike for MemoryDataType {
     ) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'db>>>> {
         None::<Enumeration<core::iter::Empty<EnumerationMember<'db>>>>
     }
+
+    fn array_dimension_declarations<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<impl Iterator<Item = ArrayDimension>> {
+        None::<core::iter::Empty<ArrayDimension>>
+    }
 }
 
 impl TableLike for MemoryTable {

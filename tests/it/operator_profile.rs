@@ -340,6 +340,13 @@ impl DataTypeLike for NoneKind {
     ) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'db>>>> {
         self.unreach::<Option<Enumeration<core::iter::Empty<EnumerationMember<'db>>>>>()
     }
+
+    fn array_dimension_declarations<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<impl Iterator<Item = ArrayDimension>> {
+        self.unreach::<Option<core::iter::Empty<ArrayDimension>>>()
+    }
 }
 
 impl IndexLike for NoneKind {
