@@ -359,15 +359,25 @@ pub(super) fn locate(
 /// Carries the generated names across a rebuild of the node.
 ///
 /// An edit that rewrites constraints in place, which is what a column rename
-/// does, keeps the number of slots, so the names follow position. An edit that
-/// adds or removes one leaves the survivors' renderings alone, so those are
-/// recognised by key.
+/// does, keeps the number of slots, so the names follow position, and so do
+/// the survivors of an edit removing the slot at `removed`, which leaves them
+/// in order. An edit that otherwise adds or removes one leaves the
+/// survivors' renderings alone, so those are recognised by key.
 pub(super) fn follow(
     recorded: &[GeneratedConstraintName],
     previous: &CreateTable,
     replacement: &CreateTable,
+    removed: Option<Position>,
 ) -> Vec<GeneratedConstraintName> {
-    let before = keys(&slots(previous));
+    let previous_slots = slots(previous);
+    let gone = removed
+        .and_then(|removed| previous_slots.iter().position(|slot| slot.position() == removed));
+    let before: Vec<String> = keys(&previous_slots)
+        .into_iter()
+        .enumerate()
+        .filter(|(position, _)| Some(*position) != gone)
+        .map(|(_, key)| key)
+        .collect();
     let after = keys(&slots(replacement));
     if before.len() == after.len() {
         before
