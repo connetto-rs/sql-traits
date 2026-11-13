@@ -185,7 +185,7 @@ pub(crate) enum PgType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Polymorphic {
     /// `anyelement`, `anynonarray` and `anyenum`.
-    Element { nonarray: bool },
+    Element(ElementForm),
     /// `anyarray`.
     Array,
     /// `anycompatible` and `anycompatiblenonarray`.
@@ -195,6 +195,19 @@ pub(crate) enum Polymorphic {
     /// `anyrange`, `anymultirange` and their `anycompatible` forms, which
     /// need range types this model does not hold.
     Range,
+}
+
+/// What a pseudo-type of the `anyelement` family demands of the type its
+/// family binds, ordered so each form demands all an earlier one does, since
+/// no enum is an array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ElementForm {
+    /// `anyelement`, any type.
+    Any,
+    /// `anynonarray`, a type that is neither an array nor a domain over one.
+    NonArray,
+    /// `anyenum`, an enum type, a domain over one refused.
+    Enum,
 }
 
 impl PgType {
@@ -352,8 +365,9 @@ impl PgType {
     pub(crate) fn polymorphic(&self) -> Option<Polymorphic> {
         let Self::Catalog(name) = self else { return None };
         Some(match *name {
-            "anyelement" | "anyenum" => Polymorphic::Element { nonarray: false },
-            "anynonarray" => Polymorphic::Element { nonarray: true },
+            "anyelement" => Polymorphic::Element(ElementForm::Any),
+            "anynonarray" => Polymorphic::Element(ElementForm::NonArray),
+            "anyenum" => Polymorphic::Element(ElementForm::Enum),
             "anyarray" => Polymorphic::Array,
             "anycompatible" => Polymorphic::Compatible { nonarray: false },
             "anycompatiblenonarray" => Polymorphic::Compatible { nonarray: true },

@@ -855,6 +855,9 @@ struct CatalogOperator {
     schema: &'static str,
     /// Operator symbol.
     name: &'static str,
+    /// The `pg_catalog` type of the operand of a prefix operator, `None` for
+    /// a binary operator of unknown operand types.
+    right: Option<&'static str>,
 }
 
 impl Metadata for CatalogOperator {
@@ -869,7 +872,7 @@ impl OperatorLike for CatalogOperator {
     }
 
     fn kind(&self) -> OperatorKind {
-        OperatorKind::Binary
+        if self.right.is_some() { OperatorKind::Prefix } else { OperatorKind::Binary }
     }
 
     fn left_type<'db>(&'db self, _database: &'db Self::DB) -> Option<TargetName<'db>> {
@@ -877,7 +880,7 @@ impl OperatorLike for CatalogOperator {
     }
 
     fn right_type<'db>(&'db self, _database: &'db Self::DB) -> Option<TargetName<'db>> {
-        None
+        self.right.map(|right| TargetName::new(right, false).with_schema("pg_catalog", false))
     }
 
     fn result_type<'db>(&'db self, _database: &'db Self::DB) -> Option<TargetName<'db>> {
@@ -901,6 +904,8 @@ struct CatalogType {
     category: TypeCategory,
     /// The name of the array type over the type.
     array: String,
+    /// The type's `pg_type.typtype`, `None` when the catalog leaves it out.
+    kind: Option<TypeKind>,
 }
 
 /// The catalogs the profile loads, each `None` when it is unavailable.
@@ -1003,10 +1008,12 @@ impl SchemaProfile for AlternateProfile {
     ) -> Option<TypeFacts<'a>> {
         let loaded =
             ingestion.types.as_deref()?.iter().find(|loaded| loaded.name == type_name.name())?;
-        Some(
-            TypeFacts::new(loaded.category, false)
-                .with_array_type(TargetName::new(&loaded.array, false)),
-        )
+        let facts = TypeFacts::new(loaded.category, false)
+            .with_array_type(TargetName::new(&loaded.array, false));
+        Some(match loaded.kind {
+            Some(kind) => facts.with_kind(kind),
+            None => facts,
+        })
     }
 
     fn initial_schemas(
@@ -1053,8 +1060,8 @@ fn alternate_builder() -> GenericDBBuilder<AlternateProfile> {
 #[test]
 fn a_loaded_catalog_reaches_the_database_and_its_clones() {
     let catalog: Arc<[CatalogOperator]> = Arc::from([
-        CatalogOperator { schema: "pg_catalog", name: "+" },
-        CatalogOperator { schema: "public", name: "+" },
+        CatalogOperator { schema: "pg_catalog", name: "+", right: None },
+        CatalogOperator { schema: "public", name: "+", right: None },
     ]);
     let database =
         alternate_builder().into_database(AlternateCatalog::of_operators(Arc::clone(&catalog)));
@@ -1074,7 +1081,7 @@ fn a_loaded_catalog_reaches_the_database_and_its_clones() {
 #[test]
 fn operators_of_unknown_operand_types_leave_an_invocation_open() {
     let catalog: Arc<[CatalogOperator]> =
-        Arc::from([CatalogOperator { schema: "pg_catalog", name: "+" }]);
+        Arc::from([CatalogOperator { schema: "pg_catalog", name: "+", right: None }]);
     let database = alternate_builder().into_database(AlternateCatalog::of_operators(catalog));
     let int4 = || OperandType::Known { type_name: TargetName::new("int4", false), typmod: None };
     assert!(matches!(
@@ -1086,6 +1093,43 @@ fn operators_of_unknown_operand_types_leave_an_invocation_open() {
         ),
         OperatorResolution::Undetermined
     ));
+}
+
+/// `anyenum` takes a type of the enum category only on evidence of the enum
+/// kind, since a base type may declare that category too.
+#[test]
+fn enum_operands_need_the_enum_kind() {
+    let resolution = |kind: Option<TypeKind>| {
+        let operators = Arc::from([CatalogOperator {
+            schema: "pg_catalog",
+            name: "#?",
+            right: Some("anyenum"),
+        }]);
+        let types = Arc::from([CatalogType {
+            name: String::from("mood"),
+            category: TypeCategory::ENUM,
+            array: String::from("_mood"),
+            kind,
+        }]);
+        let database = alternate_builder()
+            .into_database(AlternateCatalog { operators: Some(operators), types: Some(types) });
+        let mood = OperandType::Known { type_name: TargetName::new("mood", false), typmod: None };
+        match database.resolve_operator(
+            TargetName::new("#?", false),
+            None,
+            mood,
+            IdentifierCase::AsWritten,
+        ) {
+            OperatorResolution::Selected(_) => "selected",
+            OperatorResolution::NotFound => "not found",
+            OperatorResolution::Ambiguous(_) => "ambiguous",
+            OperatorResolution::UnboundPolymorphic(_) => "unbound",
+            OperatorResolution::Undetermined => "undetermined",
+        }
+    };
+    assert_eq!(resolution(Some(TypeKind::Enum)), "selected");
+    assert_eq!(resolution(Some(TypeKind::Base)), "not found");
+    assert_eq!(resolution(None), "undetermined");
 }
 
 /// A loaded catalog without entries answers an empty catalog, which the
@@ -1105,7 +1149,12 @@ fn database_of_types(types: &[(&str, TypeCategory, &str)]) -> AlternateDB {
     let types = types
         .iter()
         .map(|&(name, category, array)| {
-            CatalogType { name: String::from(name), category, array: String::from(array) }
+            CatalogType {
+                name: String::from(name),
+                category,
+                array: String::from(array),
+                kind: None,
+            }
         })
         .collect();
     alternate_builder().into_database(AlternateCatalog { operators: None, types: Some(types) })

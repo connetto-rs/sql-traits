@@ -53,6 +53,28 @@ impl TypeCategory {
     }
 }
 
+/// A type's `pg_type.typtype`, the kind of definition it comes from.
+///
+/// The kind and the category are independent, since a base type may declare
+/// any category, the enum category among them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TypeKind {
+    /// `b`, a base type, arrays included.
+    Base,
+    /// `c`, the row type of a relation or a composite type.
+    Composite,
+    /// `d`, a domain.
+    Domain,
+    /// `e`, an enum type.
+    Enum,
+    /// `m`, a multirange type.
+    Multirange,
+    /// `p`, a pseudo-type, shell types included.
+    Pseudo,
+    /// `r`, a range type.
+    Range,
+}
+
 /// The base type a domain coerces through, with the typmod it applies.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DomainFacts<'db> {
@@ -92,6 +114,7 @@ impl<'db> DomainFacts<'db> {
 pub struct TypeFacts<'db> {
     category: TypeCategory,
     preferred: bool,
+    kind: Option<TypeKind>,
     domain: Option<DomainFacts<'db>>,
     array_element: Option<TargetName<'db>>,
     array_type: Option<TargetName<'db>>,
@@ -99,12 +122,14 @@ pub struct TypeFacts<'db> {
 }
 
 impl<'db> TypeFacts<'db> {
-    /// Creates the facts of a type that is neither a domain nor an array.
+    /// Creates the facts of a type that is neither a domain nor an array, its
+    /// kind unknown.
     #[must_use]
     pub const fn new(category: TypeCategory, preferred: bool) -> Self {
         Self {
             category,
             preferred,
+            kind: None,
             domain: None,
             array_element: None,
             array_type: None,
@@ -112,16 +137,25 @@ impl<'db> TypeFacts<'db> {
         }
     }
 
-    /// Records that the type is a domain.
+    /// Records the type's kind, `pg_type.typtype`.
+    #[must_use]
+    pub const fn with_kind(mut self, kind: TypeKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    /// Records that the type is a domain, of the domain kind.
     #[must_use]
     pub fn with_domain(mut self, domain: DomainFacts<'db>) -> Self {
+        self.kind = Some(TypeKind::Domain);
         self.domain = Some(domain);
         self
     }
 
-    /// Records that the type is the array over `element`.
+    /// Records that the type is the array over `element`, of the base kind.
     #[must_use]
     pub fn with_array_element(mut self, element: TargetName<'db>) -> Self {
+        self.kind = Some(TypeKind::Base);
         self.array_element = Some(element);
         self
     }
@@ -150,6 +184,13 @@ impl<'db> TypeFacts<'db> {
     #[must_use]
     pub const fn is_preferred(&self) -> bool {
         self.preferred
+    }
+
+    /// Returns `pg_type.typtype`, or `None` when the database does not know
+    /// the type's kind.
+    #[must_use]
+    pub const fn kind(&self) -> Option<TypeKind> {
+        self.kind
     }
 
     /// Returns the domain facts, or `None` when the type is no domain.

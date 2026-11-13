@@ -10,7 +10,7 @@ use sqlparser::ast::{
 use super::{ParserDB, collation_resolution_for_schema};
 use crate::{
     impls::{SqlparserDialect, domain_in_schema, domain_named, user_type_holds},
-    structs::{DomainFacts, TargetName, TypeCategory, TypeFacts},
+    structs::{DomainFacts, TargetName, TypeCategory, TypeFacts, TypeKind},
     traits::{DatabaseLike, Relation},
     utils::{
         identifier_resolution::{identifiers_match, stored_identifier},
@@ -101,7 +101,9 @@ fn declared_facts_in_schema<'db>(
         Relation::Table(_)
         | Relation::ForeignTable(_)
         | Relation::View(_)
-        | Relation::MaterializedView(_) => Some(TypeFacts::new(TypeCategory::COMPOSITE, false)),
+        | Relation::MaterializedView(_) => {
+            Some(TypeFacts::new(TypeCategory::COMPOSITE, false).with_kind(TypeKind::Composite))
+        }
         Relation::Sequence(_) => None,
     }
 }
@@ -110,13 +112,26 @@ fn declared_facts_in_schema<'db>(
 /// its element with a leading underscore.
 fn built_in_facts<'db>(database: &ParserDB, name: &str) -> Option<TypeFacts<'db>> {
     let facts = if let Some((_, category, preferred)) = built_in_type(name) {
-        TypeFacts::new(TypeCategory::new(category), preferred)
+        let kind = built_in_kind(name, category);
+        TypeFacts::new(TypeCategory::new(category), preferred).with_kind(kind)
     } else {
         let (element, _, _) = name.strip_prefix('_').and_then(built_in_type)?;
         TypeFacts::new(TypeCategory::ARRAY, false)
             .with_array_element(TargetName::new(element, false).with_schema(PG_CATALOG, false))
     };
     Some(collated(facts, built_in_collation(database, name)))
+}
+
+/// The kind of the `pg_catalog` type stored as `name`, of the `category`
+/// code. No type this model reads there is an enum, a composite or a domain,
+/// and `unknown` is the one pseudo-type outside the pseudo category.
+fn built_in_kind(name: &str, category: u8) -> TypeKind {
+    match category {
+        b'P' | b'X' => TypeKind::Pseudo,
+        b'R' if name.ends_with("multirange") => TypeKind::Multirange,
+        b'R' => TypeKind::Range,
+        _ => TypeKind::Base,
+    }
 }
 
 /// The collation of the `pg_catalog` type stored as `name`, or `None` when
@@ -146,16 +161,20 @@ fn user_type_facts<'db>(
     representation: Option<&UserDefinedTypeRepresentation>,
     is_multirange: bool,
 ) -> TypeFacts<'db> {
-    let (category, preferred, collatable) = match representation {
-        _ if is_multirange => (TypeCategory::RANGE, false, false),
-        None => (TypeCategory::PSEUDO, false, false),
-        Some(UserDefinedTypeRepresentation::Enum { .. }) => (TypeCategory::ENUM, false, false),
-        Some(UserDefinedTypeRepresentation::Composite { .. }) => {
-            (TypeCategory::COMPOSITE, false, false)
+    let (kind, category, preferred, collatable) = match representation {
+        _ if is_multirange => (TypeKind::Multirange, TypeCategory::RANGE, false, false),
+        None => (TypeKind::Pseudo, TypeCategory::PSEUDO, false, false),
+        Some(UserDefinedTypeRepresentation::Enum { .. }) => {
+            (TypeKind::Enum, TypeCategory::ENUM, false, false)
         }
-        Some(UserDefinedTypeRepresentation::Range { .. }) => (TypeCategory::RANGE, false, false),
+        Some(UserDefinedTypeRepresentation::Composite { .. }) => {
+            (TypeKind::Composite, TypeCategory::COMPOSITE, false, false)
+        }
+        Some(UserDefinedTypeRepresentation::Range { .. }) => {
+            (TypeKind::Range, TypeCategory::RANGE, false, false)
+        }
         Some(UserDefinedTypeRepresentation::SqlDefinition { options }) => {
-            options.iter().fold(
+            let (category, preferred, collatable) = options.iter().fold(
                 (TypeCategory::USER_DEFINED, false, false),
                 |(category, preferred, collatable), option| {
                     match option {
@@ -172,13 +191,14 @@ fn user_type_facts<'db>(
                         _ => (category, preferred, collatable),
                     }
                 },
-            )
+            );
+            (TypeKind::Base, category, preferred, collatable)
         }
     };
     // A collatable base type's values take the database's collation.
     let collation =
         collatable.then(|| TargetName::new("default", true).with_schema(PG_CATALOG, false));
-    collated(TypeFacts::new(category, preferred), collation)
+    collated(TypeFacts::new(category, preferred).with_kind(kind), collation)
 }
 
 /// The facts of `domain`, which takes the category of its base type, is
