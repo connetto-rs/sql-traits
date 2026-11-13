@@ -12,14 +12,15 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     structs::{
-        IdentifierCase, OperandType, OperatorResolution, TargetName, TypeCategory, TypeKind,
+        ArgumentEvidence, CallResolution, IdentifierCase, OperandEvidence, OperandType,
+        OperatorResolution, SelectedFunction, TargetName, TypeCategory, TypeKind,
     },
     traits::{DatabaseLike, FunctionLike, OperatorLike},
     utils::{
         call_sites::{ExpressionForm, expression_form},
         coercion::{
-            CommonType, Proof, Undetermined, base, can_coerce, canonical_owned, common_type_name,
-            facts, select_common_type,
+            CommonType, Proof, Undetermined, array_type_name, base, can_coerce, canonical_owned,
+            common_type_name, conversion, facts, select_common_type, type_name,
         },
         identifier_resolution::identifiers_match,
         object_name::{
@@ -32,7 +33,7 @@ use crate::{
 };
 
 /// The name an argument is passed under in named notation.
-type WrittenName<'c> = Option<(&'c str, bool)>;
+pub(crate) type WrittenName<'c> = Option<(&'c str, bool)>;
 
 /// The arguments a call writes, by the name each is passed under.
 ///
@@ -101,16 +102,30 @@ fn variadic_element(declared: &PgType) -> Option<PgType> {
 /// declaration does not parse.
 pub(crate) type Declared = Vec<Option<PgType>>;
 
-/// The type each written argument is declared to take, by PostgreSQL's
-/// `MatchNamedCall` rules, or [`None`] when the function does not take the
-/// call.
+/// How a call's written arguments meet a function's input parameters.
+pub(crate) struct Matched {
+    /// The type each written argument is declared to take.
+    pub(crate) declared: Declared,
+    /// The input parameter each written argument passes.
+    pub(crate) parameters: Vec<usize>,
+    /// How many input parameters a default fills.
+    pub(crate) defaulted: usize,
+    /// The array type the `VARIADIC` parameter declares, when it collects
+    /// the trailing positional arguments, [`None`] where the declaration
+    /// does not parse.
+    pub(crate) variadic: Option<PgType>,
+}
+
+/// How the written arguments meet the function's input parameters, by
+/// PostgreSQL's `MatchNamedCall` rules, or [`None`] when the function does
+/// not take the call.
 pub(crate) fn declared_at_call<F: FunctionLike>(
     function: &F,
     database: &F::DB,
     written: &[WrittenName<'_>],
-) -> Option<Declared> {
+) -> Option<Matched> {
     let modes: Vec<ArgMode> = function.argument_modes().collect();
-    let inputs: Vec<Input<'_>> = function
+    let mut inputs: Vec<Input<'_>> = function
         .argument_type_names(database)
         .zip(function.argument_names(database))
         .zip(&modes)
@@ -134,25 +149,32 @@ pub(crate) fn declared_at_call<F: FunctionLike>(
         }
         let variadic = input_modes.last() == Some(&ArgMode::Variadic);
         let fixed = if variadic { inputs.len() - 1 } else { inputs.len() };
-        return Some(
-            (0..written.len())
-                .map(|position| {
-                    if position < fixed {
-                        inputs[position].declared.clone()
-                    } else {
-                        inputs
-                            .last()
-                            .and_then(|input| input.declared.as_ref())
-                            .and_then(variadic_element)
-                    }
-                })
-                .collect(),
-        );
+        let declared = (0..written.len())
+            .map(|position| {
+                if position < fixed {
+                    inputs[position].declared.clone()
+                } else {
+                    inputs
+                        .last()
+                        .and_then(|input| input.declared.as_ref())
+                        .and_then(variadic_element)
+                }
+            })
+            .collect();
+        let defaulted = inputs.len().saturating_sub(written.len());
+        let collects = variadic && written.len() > fixed;
+        return Some(Matched {
+            declared,
+            parameters: (0..written.len()).map(|position| position.min(fixed)).collect(),
+            defaulted,
+            variadic: if collects { inputs.pop().and_then(|input| input.declared) } else { None },
+        });
     }
 
     // Named notation passes a `VARIADIC` parameter its array whole.
     let mut filled = vec![false; inputs.len()];
     let mut declared = Vec::with_capacity(written.len());
+    let mut parameters = Vec::with_capacity(written.len());
     for (position, name) in written.iter().enumerate() {
         let index = match name {
             None => position,
@@ -170,9 +192,12 @@ pub(crate) fn declared_at_call<F: FunctionLike>(
         }
         *slot = true;
         declared.push(inputs[index].declared.clone());
+        parameters.push(index);
     }
     let required = inputs.len().saturating_sub(defaults);
-    filled[..required].iter().all(|filled| *filled).then_some(declared)
+    filled[..required].iter().all(|filled| *filled).then(|| {
+        Matched { declared, parameters, defaulted: inputs.len() - written.len(), variadic: None }
+    })
 }
 
 /// The type of one argument, as the caller gave it.
@@ -905,7 +930,7 @@ fn input_signature<F: FunctionLike>(
 }
 
 /// The functions a call may run, gathered and hidden as `FuncnameGetCandidates`
-/// does, each with the type every written argument is declared to take.
+/// does, each with how the written arguments meet its parameters.
 ///
 /// # Errors
 ///
@@ -915,22 +940,42 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
     database: &'db D,
     call: &Function,
     case: IdentifierCase,
-) -> Result<Vec<(&'db D::Function, Declared)>, LookupError> {
-    if call.name.0.len() > 2 {
-        return Err(overqualified_object_name(&call.name));
-    }
-    let target =
-        target_name_from_object_name(&call.name).ok_or_else(|| run_time_object_name(&call.name))?;
+) -> Result<Vec<(&'db D::Function, Matched)>, LookupError> {
+    let target = called_name(call)?;
     if expression_form(&call.name).is_some() {
         return Ok(Vec::new());
     }
     let Some(written) = written_argument_names(call) else { return Ok(Vec::new()) };
+    Ok(reached_by_name(database, &target, &written, case))
+}
+
+/// The name `call` calls.
+///
+/// # Errors
+///
+/// Returns [`LookupError::InvalidObjectName`] when the name has more than two
+/// parts or a part built at run time.
+pub(crate) fn called_name(call: &Function) -> Result<TargetName<'_>, LookupError> {
+    if call.name.0.len() > 2 {
+        return Err(overqualified_object_name(&call.name));
+    }
+    target_name_from_object_name(&call.name).ok_or_else(|| run_time_object_name(&call.name))
+}
+
+/// The functions a call of `target` passing arguments under the names
+/// `written` may run, gathered and hidden as `FuncnameGetCandidates` does.
+pub(crate) fn reached_by_name<'db, D: DatabaseLike>(
+    database: &'db D,
+    target: &TargetName<'_>,
+    written: &[WrittenName<'_>],
+    case: IdentifierCase,
+) -> Vec<(&'db D::Function, Matched)> {
     let path: Vec<(&str, bool)> = match target.schema() {
         Some(schema) => vec![(schema, target.schema_is_quoted())],
         None => function_search_path(|| database.search_path()).collect(),
     };
 
-    let mut reached: Vec<(usize, &'db D::Function, Declared)> = database
+    let mut reached: Vec<(usize, &'db D::Function, Matched)> = database
         .functions_named(target.name())
         .filter(|function| {
             case.identifiers_match(
@@ -948,21 +993,21 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
             let rank = path.iter().position(|&(entry, entry_quoted)| {
                 case.identifiers_match(schema, quoted, entry, entry_quoted)
             })?;
-            Some((rank, function, declared_at_call(function, database, &written)?))
+            Some((rank, function, declared_at_call(function, database, written)?))
         })
         .collect();
     reached.sort_by_key(|(rank, _, _)| *rank);
 
     let mut signatures: Vec<Vec<(ArgMode, Option<PgType>)>> = Vec::with_capacity(reached.len());
     let mut functions = Vec::with_capacity(reached.len());
-    for (_, function, declared) in reached {
+    for (_, function, matched) in reached {
         let signature = input_signature(function, database);
         if !signatures.contains(&signature) {
             signatures.push(signature);
-            functions.push((function, declared));
+            functions.push((function, matched));
         }
     }
-    Ok(functions)
+    functions
 }
 
 /// What `call`, an expression PostgreSQL's grammar writes as `form`, returns
@@ -1045,8 +1090,8 @@ pub(crate) fn resolve_call<'a, D: DatabaseLike>(
     let actuals = actuals(database, argument_types);
     let mut answers: Vec<Resolved<'a, D::Function>> = Vec::new();
     let mut bound: Vec<(usize, Binding<'a>)> = Vec::new();
-    for (function, declared) in reached_functions(database, call, case)? {
-        let Some(binding) = bind(database, declared, &actuals) else { continue };
+    for (function, matched) in reached_functions(database, call, case)? {
+        let Some(binding) = bind(database, matched.declared, &actuals) else { continue };
         let result = function.result_type_name(database).and_then(|result| binding.result(result));
         bound.push((answers.len(), binding));
         answers.push((function, result));
@@ -1067,4 +1112,174 @@ pub(crate) fn resolve_call<'a, D: DatabaseLike>(
             )
         }
     })
+}
+
+/// The type an operand or argument has, [`None`] when the caller does not
+/// know it or names no type.
+pub(crate) fn typed_input(
+    database: &impl DatabaseLike,
+    operand: &OperandType<'_>,
+) -> Option<(PgType, Option<i32>)> {
+    match operand {
+        OperandType::Known { type_name, typmod } => {
+            let parsed = PgType::parse(&type_name.to_string())?;
+            Some((canonical_owned(database, parsed), *typmod))
+        }
+        OperandType::UntypedLiteral => Some((PgType::UNKNOWN, None)),
+        OperandType::Unknown => None,
+    }
+}
+
+/// Why an operand or argument of the selected operator or function takes no
+/// type.
+pub(crate) enum Refusal {
+    /// Only untyped literals reach a polymorphic parameter.
+    Unbound,
+    /// The facts the type needs are missing.
+    Undetermined,
+}
+
+/// What a value of type `source` carrying `typmod` takes at a parameter
+/// declared `declared`, the declared type, named `name` when the catalog
+/// names it, or what `binding` binds a polymorphic declaration to, with the
+/// conversion that carries it there.
+pub(crate) fn parameter_evidence<'db, D: DatabaseLike>(
+    database: &'db D,
+    declared: Option<&PgType>,
+    name: Option<&TargetName<'db>>,
+    binding: Option<&Binding<'_>>,
+    source: &PgType,
+    typmod: Option<i32>,
+) -> Result<OperandEvidence<'db, D>, Refusal> {
+    let convert =
+        |target: &PgType| conversion(database, source, typmod, target).ok_or(Refusal::Undetermined);
+    let declared = declared.ok_or(Refusal::Undetermined)?;
+    // `"any"` keeps the value's own type, as `coerce_type` returns it.
+    if declared.is_any() {
+        let source_name = type_name(database, source).ok_or(Refusal::Undetermined)?;
+        return Ok(OperandEvidence::new(source_name, false, convert(declared)?));
+    }
+    let Some(polymorphic) = declared.polymorphic() else {
+        let name = match name {
+            Some(name) => name.clone(),
+            None => type_name(database, declared).ok_or(Refusal::Undetermined)?,
+        };
+        return Ok(OperandEvidence::new(name, false, convert(declared)?));
+    };
+    let bound_to = |target: &PgType, name: Option<TargetName<'db>>| {
+        let name = name.ok_or(Refusal::Undetermined)?;
+        Ok(OperandEvidence::new(name, true, convert(target)?))
+    };
+    // An exact match of a pseudo-type parameter binds nothing.
+    match binding.map_or(BoundType::Undetermined, |binding| binding.bound(polymorphic)) {
+        BoundType::Type(bound) => bound_to(&bound.pg_type, type_name(database, &bound.pg_type)),
+        BoundType::ArrayOf(bound) => {
+            let array = bound.pg_type.clone().array();
+            bound_to(&array, array_type_name(database, &bound.pg_type))
+        }
+        BoundType::Unbound => Err(Refusal::Unbound),
+        BoundType::Undetermined => Err(Refusal::Undetermined),
+    }
+}
+
+/// The type `declared` names, or the type `binding` binds a polymorphic
+/// declaration to, [`None`] when the database does not answer it or the
+/// binding leaves it open.
+pub(crate) fn bound_type_name<'db, D: DatabaseLike>(
+    database: &'db D,
+    declared: &PgType,
+    binding: Option<&Binding<'_>>,
+) -> Option<TargetName<'db>> {
+    let Some(polymorphic) = declared.polymorphic() else {
+        return type_name(database, declared);
+    };
+    match binding?.bound(polymorphic) {
+        BoundType::Type(bound) => type_name(database, &bound.pg_type),
+        BoundType::ArrayOf(bound) => array_type_name(database, &bound.pg_type),
+        BoundType::Unbound | BoundType::Undetermined => None,
+    }
+}
+
+/// What PostgreSQL does with a call of one of the `reached` functions whose
+/// written arguments are of types `arguments`, as `func_get_detail` selects
+/// the function and `make_fn_arguments` converts each argument.
+pub(crate) fn resolve_function<'db, D: DatabaseLike>(
+    database: &'db D,
+    reached: &[(&'db D::Function, Matched)],
+    arguments: &[OperandType<'_>],
+) -> CallResolution<'db, D> {
+    let inputs: Vec<Option<(PgType, Option<i32>)>> =
+        arguments.iter().map(|argument| typed_input(database, argument)).collect();
+    let actuals: Vec<Option<Actual<'_>>> = inputs
+        .iter()
+        .map(|input| {
+            input.as_ref().map(|(pg_type, _)| Actual { pg_type: pg_type.clone(), spelling: "" })
+        })
+        .collect();
+    let bound: Vec<(usize, Binding<'_>)> = reached
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (_, matched))| {
+            Some((position, bind(database, matched.declared.as_slice(), &actuals)?))
+        })
+        .collect();
+    if bound.is_empty() {
+        return CallResolution::NotFound;
+    }
+    match select(database, &bound, &actuals) {
+        Selection::Chosen(position) => {
+            let binding =
+                bound.iter().find(|(held, _)| *held == position).map(|(_, binding)| binding);
+            let (function, matched) = (reached[position].0, &reached[position].1);
+            match binding
+                .map(|binding| selected_function(database, function, matched, binding, &inputs))
+            {
+                Some(Ok(selected)) => CallResolution::Selected(selected),
+                Some(Err(Refusal::Unbound)) => CallResolution::UnboundPolymorphic(function),
+                Some(Err(Refusal::Undetermined)) | None => CallResolution::Undetermined,
+            }
+        }
+        Selection::Undetermined(_) => CallResolution::Undetermined,
+        Selection::Refused => {
+            CallResolution::Ambiguous(
+                bound.iter().map(|(position, _)| reached[*position].0).collect(),
+            )
+        }
+    }
+}
+
+/// The selection of `function`, whose parameters the written arguments of
+/// types `inputs` meet as `matched` says, polymorphic ones bound by
+/// `binding`.
+fn selected_function<'db, D: DatabaseLike>(
+    database: &'db D,
+    function: &'db D::Function,
+    matched: &Matched,
+    binding: &Binding<'_>,
+    inputs: &[Option<(PgType, Option<i32>)>],
+) -> Result<SelectedFunction<'db, D>, Refusal> {
+    let arguments = inputs
+        .iter()
+        .zip(&matched.parameters)
+        .enumerate()
+        .map(|(position, (input, parameter))| {
+            let (source, typmod) = input.as_ref().ok_or(Refusal::Undetermined)?;
+            let declared = binding.declared.get(position).and_then(Option::as_ref);
+            let evidence =
+                parameter_evidence(database, declared, None, Some(binding), source, *typmod)?;
+            Ok(ArgumentEvidence::new(*parameter, evidence))
+        })
+        .collect::<Result<Vec<_>, Refusal>>()?;
+    // A `VARIADIC "any"` parameter takes each argument apart.
+    let variadic = match &matched.variadic {
+        Some(array) if !array.is_any() => {
+            Some(bound_type_name(database, array, Some(binding)).ok_or(Refusal::Undetermined)?)
+        }
+        _ => None,
+    };
+    let result = function.result_type_name(database).and_then(|result| {
+        let declared = canonical_owned(database, PgType::parse(&result)?);
+        bound_type_name(database, &declared, Some(binding))
+    });
+    Ok(SelectedFunction::new(function, arguments, matched.defaulted, variadic, result))
 }

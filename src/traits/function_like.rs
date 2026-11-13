@@ -476,9 +476,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ) -> Result<Option<Cow<'a, str>>, LookupError> {
         let Some(written) = written_argument_names(call) else { return Ok(None) };
         check_argument_count(call, written.len(), argument_types.len())?;
-        let Some(declared) = declared_at_call(self, database, &written) else { return Ok(None) };
+        let Some(matched) = declared_at_call(self, database, &written) else { return Ok(None) };
         let actuals = actuals(database, argument_types);
-        let Some(binding) = bind(database, declared, &actuals) else { return Ok(None) };
+        let Some(binding) = bind(database, matched.declared, &actuals) else { return Ok(None) };
         Ok(self.result_type_name(database).and_then(|result| binding.result(result)))
     }
 
