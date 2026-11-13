@@ -331,15 +331,21 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         Self::scoped(ScopedRoot::Expression(expression), expression, scope, database, case)
     }
 
-    /// Builds the context of `statement`, a query or an `INSERT`, `UPDATE`
-    /// or `DELETE` written outside a query, over `database`, its column
-    /// references reaching its own relations first and then what `scope`
-    /// names, comparing identifiers under `case`.
+    /// Builds the context of `statement`, a query or an `INSERT`, `UPDATE`,
+    /// `DELETE` or `MERGE` written outside a query, over `database`, its
+    /// column references reaching its own relations first and then what
+    /// `scope` names, comparing identifiers under `case`.
     ///
     /// An `UPDATE` reaches its target and its `FROM` relations, a `DELETE`
     /// its target and its `USING` relations, and an `INSERT`'s `RETURNING`
     /// its target, which its `ON CONFLICT DO UPDATE` reaches with the
-    /// `excluded` row. Any other statement binds no column reference.
+    /// `excluded` row. A `MERGE` reaches its source and target, except that
+    /// `WHEN NOT MATCHED` reaches the source alone and `WHEN NOT MATCHED BY
+    /// SOURCE` the target alone. `RETURNING` also reaches the target's `old`
+    /// and `new` rows when no relation in reach takes either name. A
+    /// statement holds the same scopes behind a `WITH` and as a
+    /// data-modifying CTE, whose output is its `RETURNING` list. Any other
+    /// statement binds no column reference.
     ///
     /// # Errors
     ///

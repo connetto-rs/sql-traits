@@ -5,8 +5,9 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Delete, Distinct, DoUpdate, Expr, FromTable, GroupByExpr, Ident, Insert, ObjectName,
-    ObjectNamePart, OnConflict, OnConflictAction, OnInsert, OrderByKind, Query, Select, SelectItem,
+    Delete, Distinct, DoUpdate, Expr, FromTable, GroupByExpr, Ident, Insert, Merge, MergeAction,
+    MergeClause, MergeInsertExpr, MergeUpdateExpr, MergeUpdateKind, ObjectName, ObjectNamePart,
+    OnConflict, OnConflictAction, OnInsert, OrderByKind, OutputClause, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableWithJoins, Update,
     UpdateTableFromKind, Visit, Visitor,
 };
@@ -21,11 +22,8 @@ use super::{
     output_columns::{QueryId, unwrap_nested},
 };
 use crate::{
-    errors::LookupError,
-    impls::dql::scoped_roots::{RootScopes, ScopedRoot},
-    structs::IdentifierCase,
-    traits::DatabaseLike,
-    utils::walk::walk,
+    errors::LookupError, impls::dql::scoped_roots::ScopedRoot, structs::IdentifierCase,
+    traits::DatabaseLike, utils::walk::walk,
 };
 
 /// What one column reference reached.
@@ -120,27 +118,39 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     pub(crate) fn site_rules(&self, query: &Query) -> Vec<(usize, Option<SiteRule>)> {
         let mut rules = Vec::new();
         let mut sink = |expression: &Expr, rule| rules.push((expression_address(expression), rule));
-        Walk { graph: self, references: QueryReferences::default(), sink: &mut sink }.query(query);
+        Walk {
+            graph: self,
+            references: QueryReferences::default(),
+            sink: &mut sink,
+            modifying_bodies: true,
+        }
+        .query(query);
         rules
     }
 
     /// The rule resolving each column reference of `root`, by the address of
     /// its expression, `None` for one sitting where no scope was derived,
-    /// `scopes` naming the scopes [`scoped_graph`] built for it.
+    /// `outer` naming the scope [`scoped_graph`] filled with what the root
+    /// reaches.
     ///
     /// [`scoped_graph`]: crate::impls::dql::scoped_roots::scoped_graph
     pub(crate) fn root_site_rules(
         &self,
         root: ScopedRoot<'_>,
-        scopes: RootScopes,
+        outer: ScopeCursor,
     ) -> Vec<(usize, Option<SiteRule>)> {
         let mut rules = Vec::new();
         let mut sink = |expression: &Expr, rule| rules.push((expression_address(expression), rule));
-        let mut walk =
-            Walk { graph: self, references: QueryReferences::default(), sink: &mut sink };
+        let mut walk = Walk {
+            graph: self,
+            references: QueryReferences::default(),
+            sink: &mut sink,
+            modifying_bodies: true,
+        };
         match root {
-            ScopedRoot::Expression(expression) => walk.node(expression, Some(scopes.outer)),
-            ScopedRoot::Statement(statement) => walk.statement(statement, scopes),
+            ScopedRoot::Expression(expression) => walk.node(expression, Some(outer)),
+            ScopedRoot::Statement(Statement::Query(query)) => walk.query(query),
+            ScopedRoot::Statement(statement) => walk.modifying(statement),
         }
         rules
     }
@@ -162,7 +172,14 @@ pub(crate) fn query_references<DB: DatabaseLike>(
         };
         origins.push((expression_address(expression), reached));
     };
-    let mut walk = Walk { graph: &graph, references: QueryReferences::default(), sink: &mut sink };
+    // A data-modifying body respells through the statement holding it, so
+    // its clauses stay out of the references a respelling reads.
+    let mut walk = Walk {
+        graph: &graph,
+        references: QueryReferences::default(),
+        sink: &mut sink,
+        modifying_bodies: false,
+    };
     walk.query(query);
     let mut references = walk.references;
     references.sites = origins
@@ -213,6 +230,9 @@ struct Walk<'graph, 'sink, 'query, 'db, DB: DatabaseLike> {
     references: QueryReferences,
     /// Takes each column reference with the rule its clause resolves it by.
     sink: &'sink mut dyn FnMut(&Expr, Option<SiteRule>),
+    /// Whether the clauses of a data-modifying statement a query body holds
+    /// are walked.
+    modifying_bodies: bool,
 }
 
 fn expression_address(expression: &Expr) -> usize {
@@ -302,9 +322,14 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
                 self.set_expr(left);
                 self.set_expr(right);
             }
-            // A data-modifying body's clauses respell through the statement
-            // that holds it, so the queries nested in it walk on their own.
-            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {}
+            SetExpr::Insert(statement)
+            | SetExpr::Update(statement)
+            | SetExpr::Delete(statement)
+            | SetExpr::Merge(statement) => {
+                if self.modifying_bodies {
+                    self.modifying(statement);
+                }
+            }
             other => self.node(other, None),
         }
     }
@@ -427,13 +452,13 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
         }
     }
 
-    /// Walks a statement root, its own relations in the scopes `scopes`
-    /// names.
-    fn statement(&mut self, statement: &Statement, scopes: RootScopes) {
-        let cursor = scopes.statement;
+    /// Walks a data-modifying statement, each clause in the scope it reads,
+    /// and anything else with no scope.
+    fn modifying(&mut self, statement: &Statement) {
+        let scopes = self.graph.modifying_scopes(statement).unwrap_or_default();
+        let cursor = scopes.relations;
         let scope = cursor.map(|cursor| cursor.scope);
         match statement {
-            Statement::Query(query) => self.query(query),
             Statement::Update(Update {
                 table, from, assignments, selection, returning, ..
             }) => {
@@ -472,7 +497,46 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
                     self.node(selection, scopes.conflict);
                 }
             }
+            Statement::Merge(Merge { table, source, on, clauses, output, .. }) => {
+                self.factor(source, scope, 0);
+                self.factor(table, scope, 1);
+                self.node(on, cursor);
+                for MergeClause { clause_kind, predicate, action, .. } in clauses {
+                    let clause = scopes.clause(*clause_kind);
+                    self.node(predicate, clause);
+                    self.merge_action(action, clause);
+                }
+                match output {
+                    Some(OutputClause::Returning { select_items, .. }) => {
+                        self.node(select_items, cursor);
+                    }
+                    other => self.node(other, None),
+                }
+            }
             other => self.node(other, None),
+        }
+    }
+
+    /// Walks what a `MERGE` clause's action computes in the scope `cursor`
+    /// names.
+    fn merge_action(&mut self, action: &MergeAction, cursor: Option<ScopeCursor>) {
+        match action {
+            MergeAction::Insert(MergeInsertExpr { kind, .. }) => self.node(kind, cursor),
+            MergeAction::Update(MergeUpdateExpr {
+                kind,
+                update_predicate,
+                delete_predicate,
+                ..
+            }) => {
+                if let MergeUpdateKind::Set(assignments) = kind {
+                    for assignment in assignments {
+                        self.node(&assignment.value, cursor);
+                    }
+                }
+                self.node(update_predicate, cursor);
+                self.node(delete_predicate, cursor);
+            }
+            MergeAction::Delete { .. } | MergeAction::DoNothing { .. } => {}
         }
     }
 

@@ -28,11 +28,11 @@ use sqlparser::ast::{
     Ident, InTarget, Join, JoinConstraint, JoinOperator, JsonPathElem, LimitClause, MapEntry,
     Measure, NamedWindowExpr, ObjectName, OrderBy, OrderByExpr, OrderByKind, PipeOperator,
     PivotValueSource, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
-    SetOperator, SetQuantifier, Subscript, SymbolDefinition, TableAlias, TableAliasColumnDef,
-    TableFactor, TableFunctionArgs, TableInheritance, TableSample, TableSampleKind, TableVersion,
-    TableWithJoins, TopQuantity, Values, Visitor, WildcardAdditionalOptions, WindowFrameBound,
-    WindowSpec, WindowType, With, XmlNamespaceDefinition, XmlPassingClause, XmlTableColumn,
-    XmlTableColumnOption,
+    SetOperator, SetQuantifier, Statement, Subscript, SymbolDefinition, TableAlias,
+    TableAliasColumnDef, TableFactor, TableFunctionArgs, TableInheritance, TableSample,
+    TableSampleKind, TableVersion, TableWithJoins, TopQuantity, Values, Visitor,
+    WildcardAdditionalOptions, WindowFrameBound, WindowSpec, WindowType, With,
+    XmlNamespaceDefinition, XmlPassingClause, XmlTableColumn, XmlTableColumnOption,
 };
 
 use crate::{
@@ -49,6 +49,7 @@ use crate::{
 };
 
 pub(crate) mod definition_graph;
+pub(crate) mod modifying;
 pub(crate) mod scoped_roots;
 
 use definition_graph::{AstRef, DefinitionDerivation, ScopeCursor};
@@ -582,6 +583,20 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         recursive: Self::Definition,
     ) -> Self::Definition;
     fn checkpoint(&self) -> Self::Checkpoint;
+    /// The columns the `RETURNING` list of `statement`, a data-modifying
+    /// statement a query body holds, outputs, its clauses resolved under
+    /// `parent` with `cte_scope` in reach, or `None` for a profile that
+    /// reads no data-modifying statement or a statement returning nothing.
+    fn modifying_shape(
+        &mut self,
+        statement: &'query Statement,
+        cte_scope: &[CteShape<'query, 'db, DB, Self::Definition>],
+        deriving: Deriving<'_, 'db, DB>,
+        parent: Self::Cursor,
+    ) -> Result<Option<DerivedShape<'query, 'db, DB, Self::Definition>>, LookupError> {
+        let _ = (statement, cte_scope, deriving, parent);
+        Ok(None)
+    }
 }
 
 struct SourceDerivation;
@@ -755,6 +770,56 @@ where
     Ok(append_unmodeled_relations(select, profile, scope))
 }
 
+/// Appends `factor` to `scope` as the next `FROM` entry, reading the queries
+/// nested in it under `parent`, and answers the names it outputs and its
+/// wildcard plan, `None` when its columns cannot be enumerated.
+fn collect_entry_factor<'query, 'db, DB, P>(
+    factor: AstRef<'query, 'db, TableFactor>,
+    scope: &mut P::Scope,
+    cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
+    deriving: Deriving<'_, 'db, DB>,
+    parent: P::Cursor,
+    profile: &mut P,
+) -> Result<Option<FactorOutput>, LookupError>
+where
+    DB: DatabaseLike,
+    P: DerivationProfile<'query, 'db, DB>,
+{
+    let local_parent = profile.cursor(scope);
+    if P::INDEX_NESTED_QUERIES {
+        index_table_factor_expression_queries(
+            factor,
+            cte_scope,
+            deriving,
+            parent,
+            local_parent,
+            profile,
+        )?;
+    }
+    let contribution = collect_factor(factor, deriving, cte_scope, parent, local_parent, profile)?;
+    Ok(append_factor(profile, scope, contribution))
+}
+
+/// Appends `factor` to `scope` as a `FROM` entry joined to nothing, as a
+/// `MERGE` target or source stands.
+fn collect_lone_factor<'query, 'db, DB, P>(
+    factor: AstRef<'query, 'db, TableFactor>,
+    scope: &mut P::Scope,
+    cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
+    deriving: Deriving<'_, 'db, DB>,
+    parent: P::Cursor,
+    profile: &mut P,
+) -> Result<(), LookupError>
+where
+    DB: DatabaseLike,
+    P: DerivationProfile<'query, 'db, DB>,
+{
+    let plan = collect_entry_factor(factor, scope, cte_scope, deriving, parent, profile)?;
+    let plan = plan.map(|(_, entries)| entries).unwrap_or_default();
+    profile.scope_mut(scope).wildcard_plans.push(plan);
+    Ok(())
+}
+
 /// Appends the `FROM` items `from` lists to `scope`, each with the joins it
 /// carries, reading the queries nested in them under `parent`.
 fn collect_from_items<'query, 'db, DB, P>(
@@ -774,26 +839,14 @@ where
             let data = profile.scope(scope);
             (data.bases.len(), data.derived.len())
         };
-        let local_parent = profile.cursor(scope);
-        if P::INDEX_NESTED_QUERIES {
-            index_table_factor_expression_queries(
-                table_with_joins.map(|entry| &entry.relation),
-                cte_scope,
-                deriving,
-                parent,
-                local_parent,
-                profile,
-            )?;
-        }
-        let contribution = collect_factor(
+        let (mut accumulated, mut plan) = match collect_entry_factor(
             table_with_joins.map(|entry| &entry.relation),
-            deriving,
+            scope,
             cte_scope,
+            deriving,
             parent,
-            local_parent,
             profile,
-        )?;
-        let (mut accumulated, mut plan) = match append_factor(profile, scope, contribution) {
+        )? {
             Some((names, entries)) => (Some(names), Some(entries)),
             None => (None, None),
         };
@@ -1312,6 +1365,9 @@ enum SetExprRef<'query, 'db> {
         left: AstRef<'query, 'db, SetExpr>,
         right: AstRef<'query, 'db, SetExpr>,
     },
+    /// A data-modifying statement a query the caller wrote holds. A stored
+    /// definition holds none, since PostgreSQL refuses one in a view.
+    Modifying(&'query Statement),
     Other,
 }
 
@@ -1340,12 +1396,12 @@ fn set_expr_ref<'query, 'db>(body: AstRef<'query, 'db, SetExpr>) -> SetExprRef<'
         AstRef::Query(SetExpr::Values(values)) => SetExprRef::Values(AstRef::Query(values)),
         AstRef::Database(SetExpr::Values(values)) => SetExprRef::Values(AstRef::Database(values)),
         AstRef::Query(
-            SetExpr::Insert(_)
-            | SetExpr::Update(_)
-            | SetExpr::Delete(_)
-            | SetExpr::Merge(_)
-            | SetExpr::Table(_),
-        )
+            SetExpr::Insert(statement)
+            | SetExpr::Update(statement)
+            | SetExpr::Delete(statement)
+            | SetExpr::Merge(statement),
+        ) => SetExprRef::Modifying(statement),
+        AstRef::Query(SetExpr::Table(_))
         | AstRef::Database(
             SetExpr::Insert(_)
             | SetExpr::Update(_)
@@ -1370,7 +1426,10 @@ where
         SetExprRef::Query(query) => {
             derived_body_cursor(query.map(|query| query.body.as_ref()), parent, profile)
         }
-        SetExprRef::Values(_) | SetExprRef::SetOperation { .. } | SetExprRef::Other => parent,
+        SetExprRef::Values(_)
+        | SetExprRef::SetOperation { .. }
+        | SetExprRef::Modifying(_)
+        | SetExprRef::Other => parent,
     }
 }
 
@@ -1549,6 +1608,9 @@ where
                 index_values_expression_queries(values, cte_scope, deriving, parent, profile)?;
             }
             Ok(None)
+        }
+        SetExprRef::Modifying(statement) => {
+            profile.modifying_shape(statement, cte_scope, deriving, parent)
         }
         SetExprRef::Other => Ok(None),
     }
@@ -1771,6 +1833,10 @@ where
         SetExprRef::SetOperation { left, right, .. } => {
             index_nested_set_scopes(left, cte_scope, deriving, parent, profile)?;
             index_nested_set_scopes(right, cte_scope, deriving, parent, profile)?;
+            Ok(parent)
+        }
+        SetExprRef::Modifying(statement) => {
+            profile.modifying_shape(statement, cte_scope, deriving, parent)?;
             Ok(parent)
         }
         SetExprRef::Other => Ok(parent),

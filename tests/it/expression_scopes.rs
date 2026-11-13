@@ -11,8 +11,10 @@
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{
-        Assignment, CreateRuleEvent, DataType, Delete, DoUpdate, Expr, Insert, OnConflictAction,
-        OnInsert, SelectItem, SetExpr, Statement, Update,
+        Assignment, CreateRuleEvent, Cte, DataType, Delete, DoUpdate, Expr, Insert, Merge,
+        MergeAction, MergeClause, MergeInsertExpr, MergeInsertKind, MergeUpdateExpr,
+        MergeUpdateKind, OnConflictAction, OnInsert, OutputClause, Query, SelectItem, SetExpr,
+        Statement, Update,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -390,4 +392,250 @@ fn a_node_outside_the_root_is_refused() {
     .unwrap();
     let error = context.type_of(&expression("a > 1")).unwrap_err();
     assert!(matches!(error, LookupError::ExpressionNotInQuery { .. }), "{error:?}");
+}
+
+/// The statement a query body holds.
+fn body_statement(query: &Query) -> &Statement {
+    match query.body.as_ref() {
+        SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Insert(statement)
+        | SetExpr::Merge(statement) => statement,
+        other => panic!("expected a data-modifying body, got {other:?}"),
+    }
+}
+
+/// The expressions a query's outermost `SELECT` projects.
+fn projected(query: &Query) -> Vec<&Expr> {
+    let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    select
+        .projection
+        .iter()
+        .map(|item| {
+            let SelectItem::UnnamedExpr(expression) = item else { unreachable!() };
+            expression
+        })
+        .collect()
+}
+
+/// The expressions a `RETURNING` list returns.
+fn returned(items: &[SelectItem]) -> Vec<&Expr> {
+    items
+        .iter()
+        .map(|item| {
+            let SelectItem::UnnamedExpr(expression) = item else { unreachable!() };
+            expression
+        })
+        .collect()
+}
+
+fn context_of<'q, 'db>(
+    root: &'q Statement,
+    scope: &ExpressionScope<'_, 'db, ParserDB>,
+    db: &'db ParserDB,
+) -> ExpressionContext<'q, 'db, ParserDB> {
+    ExpressionContext::for_statement(root, scope, db, IdentifierCase::AsWritten).unwrap()
+}
+
+#[test]
+fn a_with_prefixed_statement_reads_its_ctes_and_its_own_relations() {
+    let db = db();
+    let rule = ExpressionScope::Rule { table: table(&db, "t"), event: CreateRuleEvent::Insert };
+    let root = statement(
+        "WITH c AS (SELECT 1::int8 AS x) UPDATE logt SET a = c.x FROM c \
+         WHERE logt.a > c.x AND logt.a = new.a AND EXISTS (SELECT 1 FROM c AS d WHERE d.x > new.b)",
+    );
+    let context = context_of(&root, &rule, &db);
+    let Statement::Query(query) = &root else { unreachable!() };
+    let Statement::Update(Update { assignments, selection, .. }) = body_statement(query) else {
+        unreachable!()
+    };
+    assert_eq!(context.type_of(&assignments[0].value).unwrap(), pg("int8"));
+    let (conditions, exists) = operands(selection.as_ref().unwrap());
+    let (compared, joined) = operands(conditions);
+    assert_eq!(both(&context, compared).unwrap(), [pg("int8"), pg("int8")]);
+    assert_eq!(both(&context, joined).unwrap(), [pg("int8"), pg("int4")]);
+    let Expr::Exists { subquery, .. } = exists else { unreachable!() };
+    let SetExpr::Select(select) = subquery.body.as_ref() else { unreachable!() };
+    assert_eq!(
+        both(&context, select.selection.as_ref().unwrap()).unwrap(),
+        [pg("int8"), pg("numeric")]
+    );
+
+    let root = statement(
+        "WITH c AS (SELECT 1::int8 AS x) UPDATE t SET a = c.x FROM c WHERE t.a > c.x RETURNING t.a",
+    );
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Query(query) = &root else { unreachable!() };
+    let Statement::Update(Update { returning, .. }) = body_statement(query) else { unreachable!() };
+    let returned = returned(returning.as_ref().unwrap());
+    assert_eq!(context.type_of(returned[0]).unwrap(), pg("int4"));
+}
+
+#[test]
+fn a_data_modifying_cte_outputs_its_returning_list() {
+    let db = db();
+    let root = statement(
+        "WITH u AS (UPDATE t SET a = 1 WHERE b > 0 RETURNING a, b), \
+              i AS (INSERT INTO t VALUES (1, 2) RETURNING *), \
+              d AS (DELETE FROM logt WHERE a > 0) \
+         SELECT u.a, u.b, i.b, i.a FROM u, i",
+    );
+    let Statement::Query(query) = &root else { unreachable!() };
+    for context in [
+        context_of(&root, &ExpressionScope::Empty, &db),
+        ExpressionContext::new(query, &db, IdentifierCase::AsWritten).unwrap(),
+    ] {
+        let types: Vec<_> =
+            projected(query).into_iter().map(|node| context.type_of(node).unwrap()).collect();
+        assert_eq!(types, [pg("int4"), pg("numeric"), pg("numeric"), pg("int4")]);
+        let ctes = &query.with.as_ref().unwrap().cte_tables;
+        let [Cte { query: updating, .. }, _, Cte { query: deleting, .. }] = ctes.as_slice() else {
+            unreachable!()
+        };
+        let Statement::Update(Update { selection, .. }) = body_statement(updating) else {
+            unreachable!()
+        };
+        assert_eq!(
+            both(&context, selection.as_ref().unwrap()).unwrap(),
+            [pg("numeric"), pg("int4")]
+        );
+        let Statement::Delete(Delete { selection, .. }) = body_statement(deleting) else {
+            unreachable!()
+        };
+        assert_eq!(both(&context, selection.as_ref().unwrap()).unwrap(), [pg("int8"), pg("int4")]);
+    }
+}
+
+#[test]
+fn merge_clauses_read_the_side_their_kind_names() {
+    let db = db();
+    let root = statement(
+        "MERGE INTO t USING logt AS s ON t.a = s.a \
+         WHEN MATCHED AND t.b > s.a THEN UPDATE SET b = s.a \
+         WHEN NOT MATCHED AND a > 0 THEN INSERT VALUES (a, 0) \
+         WHEN NOT MATCHED BY SOURCE AND a > 1 THEN DELETE \
+         RETURNING s.a, b",
+    );
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Merge(Merge { on, clauses, output, .. }) = &root else { unreachable!() };
+    assert_eq!(both(&context, on).unwrap(), [pg("int4"), pg("int8")]);
+    let [matched, not_matched, by_source] = clauses.as_slice() else { unreachable!() };
+    let MergeClause { predicate, action, .. } = matched;
+    assert_eq!(both(&context, predicate.as_ref().unwrap()).unwrap(), [pg("numeric"), pg("int8")]);
+    let MergeAction::Update(MergeUpdateExpr { kind: MergeUpdateKind::Set(assignments), .. }) =
+        action
+    else {
+        unreachable!()
+    };
+    assert_eq!(context.type_of(&assignments[0].value).unwrap(), pg("int8"));
+    let MergeClause { predicate, action, .. } = not_matched;
+    assert_eq!(both(&context, predicate.as_ref().unwrap()).unwrap(), [pg("int8"), pg("int4")]);
+    let MergeAction::Insert(MergeInsertExpr { kind: MergeInsertKind::Values(values), .. }) = action
+    else {
+        unreachable!()
+    };
+    assert_eq!(context.type_of(&values.rows[0][0]).unwrap(), pg("int8"));
+    let MergeClause { predicate, .. } = by_source;
+    assert_eq!(both(&context, predicate.as_ref().unwrap()).unwrap(), [pg("int4"), pg("int4")]);
+    let Some(OutputClause::Returning { select_items, .. }) = output else { unreachable!() };
+    let returned = returned(select_items);
+    assert_eq!(context.type_of(returned[0]).unwrap(), pg("int8"));
+    assert_eq!(context.type_of(returned[1]).unwrap(), pg("numeric"));
+
+    // A name both sides hold is ambiguous where both are in reach.
+    let root = statement("MERGE INTO t USING logt AS s ON a > 0 WHEN MATCHED THEN DELETE");
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Merge(Merge { on, .. }) = &root else { unreachable!() };
+    let error = both(&context, on).unwrap_err();
+    assert!(matches!(error, LookupError::AmbiguousTableLookup { .. }), "{error:?}");
+
+    // `RETURNING *` lists the source's columns before the target's.
+    let root = statement(
+        "WITH m AS (MERGE INTO t USING logt AS s ON t.a = s.a WHEN MATCHED THEN DELETE \
+         RETURNING *) SELECT m.b FROM m",
+    );
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Query(query) = &root else { unreachable!() };
+    assert_eq!(context.type_of(projected(query)[0]).unwrap(), pg("numeric"));
+}
+
+#[test]
+fn returning_reads_old_and_new_unless_a_relation_takes_the_name() {
+    let db = db();
+    for (sql, scope, expected) in [
+        (
+            "UPDATE t SET a = 1 RETURNING old.a, new.b",
+            ExpressionScope::Empty,
+            [pg("int4"), pg("numeric")],
+        ),
+        (
+            "UPDATE t SET a = 1 FROM logt AS old RETURNING old.a, new.a",
+            ExpressionScope::Empty,
+            [pg("int8"), pg("int4")],
+        ),
+        (
+            "UPDATE logt SET a = 1 RETURNING old.a, new.a",
+            ExpressionScope::Rule { table: table(&db, "t"), event: CreateRuleEvent::Update },
+            [pg("int4"), pg("int4")],
+        ),
+    ] {
+        let root = statement(sql);
+        let context = context_of(&root, &scope, &db);
+        let Statement::Update(Update { returning, .. }) = &root else { unreachable!() };
+        let types: Vec<_> = returned(returning.as_ref().unwrap())
+            .into_iter()
+            .map(|node| context.type_of(node).unwrap())
+            .collect();
+        assert_eq!(types, expected, "{sql}");
+    }
+
+    let root = statement("INSERT INTO logt VALUES (1) RETURNING old.a, new.a");
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Insert(Insert { returning, .. }) = &root else { unreachable!() };
+    let types: Vec<_> = returned(returning.as_ref().unwrap())
+        .into_iter()
+        .map(|node| context.type_of(node).unwrap())
+        .collect();
+    assert_eq!(types, [pg("int8"), pg("int8")]);
+}
+
+#[test]
+fn a_target_outside_the_catalog_lends_no_rows() {
+    let db = db();
+    let root = statement(
+        "INSERT INTO missing VALUES (1) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE b > 1",
+    );
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Insert(Insert { on: Some(OnInsert::OnConflict(conflict)), .. }) = &root else {
+        unreachable!()
+    };
+    let OnConflictAction::DoUpdate(DoUpdate { assignments, .. }) = &conflict.action else {
+        unreachable!()
+    };
+    assert_eq!(context.type_of(&assignments[0].value).unwrap(), OperandType::Unknown);
+
+    let root = statement("UPDATE (SELECT 1::int4 AS a) AS s SET a = 1 RETURNING old.a, s.a");
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Update(Update { returning, .. }) = &root else { unreachable!() };
+    let types: Vec<_> = returned(returning.as_ref().unwrap())
+        .into_iter()
+        .map(|node| context.type_of(node).unwrap())
+        .collect();
+    assert_eq!(types, [OperandType::Unknown, pg("int4")]);
+}
+
+#[test]
+fn a_merge_update_of_every_column_still_reads_its_condition() {
+    let db = db();
+    let root = Parser::parse_sql(
+        &sqlparser::dialect::DatabricksDialect {},
+        "MERGE INTO t USING logt AS s ON t.a = s.a WHEN MATCHED AND t.b > s.a THEN UPDATE SET *",
+    )
+    .unwrap()
+    .remove(0);
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Merge(Merge { clauses, .. }) = &root else { unreachable!() };
+    let predicate = clauses[0].predicate.as_ref().unwrap();
+    assert_eq!(both(&context, predicate).unwrap(), [pg("numeric"), pg("int8")]);
 }

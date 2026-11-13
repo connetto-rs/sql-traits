@@ -173,6 +173,14 @@ fn grouped_cte_body_is_not_eligible() {
 }
 
 #[test]
+fn data_modifying_cte_body_is_not_eligible() {
+    let db = schema_db();
+    // Re-executing the query would run the `UPDATE` again.
+    let sql = "WITH u AS (UPDATE orders SET total = 0 RETURNING id) SELECT u.id FROM u";
+    assert_eq!(projection_name(sql, &db), None);
+}
+
+#[test]
 fn ambiguous_unqualified_column_is_an_error() {
     let db = schema_db();
     let result = query("SELECT id FROM users JOIN orders ON users.id = orders.user_id")

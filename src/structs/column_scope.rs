@@ -1153,9 +1153,9 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
         database: &'db DB,
         case: IdentifierCase,
     ) -> Result<(Self, SiteRules), LookupError> {
-        let (graph, scopes) = scoped_graph(root, scope, database, case)?;
-        let sites = graph.root_site_rules(root, scopes);
-        Ok((Self { graph, root: scopes.outer }, sites))
+        let (graph, outer) = scoped_graph(root, scope, database, case)?;
+        let sites = graph.root_site_rules(root, outer);
+        Ok((Self { graph, root: outer }, sites))
     }
 
     /// Resolves `reference` as `rule` says its clause resolves it.

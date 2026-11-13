@@ -1,11 +1,15 @@
 use alloc::{borrow::ToOwned, vec::Vec};
 use core::{marker::PhantomData, slice};
 
-use sqlparser::ast::{Expr, ObjectName, Select, SetOperator, TableFactor, TableWithJoins};
+use sqlparser::ast::{
+    Expr, Ident, ObjectName, Select, SetOperator, Statement, TableFactor, TableWithJoins,
+};
 
 use super::{
-    BaseColumnRef, ColumnOrigin, DerivationProfile, Deriving, FromScope, LookupOutcome,
-    OutputNameSource, RelationKey, ResolvedColumn, derive_query_shape, factor_address,
+    BaseColumnRef, ColumnOrigin, CteShape, DerivationProfile, DerivedShape, Deriving, FromScope,
+    LookupOutcome, OutputNameSource, RelationKey, ResolvedColumn, WildcardEntry,
+    derive_query_shape, factor_address,
+    modifying::{self, ModifyingScopes},
     resolve_definition_local, resolve_relation_local,
 };
 use crate::{
@@ -182,10 +186,20 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     /// address.
     from_items: Vec<AstRef<'query, 'db, TableFactor>>,
     queries: Vec<QueryNode<'query, 'db>>,
+    /// The scopes the clauses of every data-modifying statement resolve in,
+    /// by the statement's address.
+    modifying: Vec<(usize, ModifyingScopes)>,
     case: IdentifierCase,
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
+    /// The scopes the clauses of the data-modifying statement `statement`
+    /// resolve in, `None` for a statement the graph was not built over.
+    pub(crate) fn modifying_scopes(&self, statement: &Statement) -> Option<ModifyingScopes> {
+        let address = core::ptr::from_ref(statement).addr();
+        self.modifying.iter().find(|(held, _)| *held == address).map(|(_, scopes)| *scopes)
+    }
+
     pub(crate) fn definition<'scope>(
         &'scope self,
         id: DefinitionId,
@@ -400,6 +414,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 select_index: Vec::new(),
                 from_items: Vec::new(),
                 queries: Vec::new(),
+                modifying: Vec::new(),
                 case,
             },
             created: Vec::new(),
@@ -478,6 +493,23 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
         each_from_item(tables, &mut |item| self.graph.from_items.push(AstRef::Query(item)));
     }
 
+    /// Records a `MERGE` target or source, a table or a parenthesized query
+    /// standing alone, which a binding's origin names.
+    pub(super) fn record_factor(&mut self, factor: &'query TableFactor) {
+        self.graph.from_items.push(AstRef::Query(factor));
+    }
+
+    /// Records the scopes the clauses of `statement` resolve in.
+    pub(super) fn record_modifying(&mut self, statement: &Statement, scopes: ModifyingScopes) {
+        self.graph.modifying.push((core::ptr::from_ref(statement).addr(), scopes));
+    }
+
+    /// Whether a relation named `name`, unquoted, is in reach from `cursor`.
+    pub(super) fn reaches_relation(&self, cursor: Option<ScopeCursor>, name: &str) -> bool {
+        let qualifier = ObjectName::from(alloc::vec![Ident::new(name)]);
+        cursor.is_some_and(|cursor| self.graph.resolve_relation(cursor, &qualifier).is_some())
+    }
+
     /// The definition of input parameter `ordinal` of `function`.
     pub(super) fn parameter_definition(
         &mut self,
@@ -528,6 +560,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             (name, Some(schema))
         };
         let data = &mut self.graph.scopes[scope.0].data;
+        data.wildcard_plans.push(alloc::vec![WildcardEntry::Base(data.bases.len())]);
         data.bases.push(super::FromTableRef {
             key,
             schema_key,
@@ -687,6 +720,16 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
 
     fn checkpoint(&self) -> Self::Checkpoint {
         GraphCheckpoint { scopes: self.graph.scopes.len() }
+    }
+
+    fn modifying_shape(
+        &mut self,
+        statement: &'query Statement,
+        cte_scope: &[CteShape<'query, 'db, DB, Self::Definition>],
+        deriving: Deriving<'_, 'db, DB>,
+        parent: Self::Cursor,
+    ) -> Result<Option<DerivedShape<'query, 'db, DB, Self::Definition>>, LookupError> {
+        modifying::derive(self, statement, cte_scope, deriving, parent)
     }
 }
 
