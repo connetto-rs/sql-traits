@@ -253,6 +253,22 @@ impl<DB: DatabaseLike> DomainLike for Absent<DB> {
     fn data_type<'db>(&'db self, _: &'db Self::DB) -> &'db DB::DataType {
         self.unreachable()
     }
+
+    fn default_expression(&self) -> Option<&Expr> {
+        self.unreachable()
+    }
+
+    fn check_expressions(&self) -> impl Iterator<Item = &Expr> {
+        self.unreachable::<core::iter::Empty<_>>()
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        _: &Function,
+        _: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db DB::Function> + 'db, LookupError> {
+        self.unreachable::<Result<core::iter::Empty<_>, _>>()
+    }
 }
 
 impl<DB: DatabaseLike> UserDefinedTypeLike for Absent<DB> {

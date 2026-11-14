@@ -3,7 +3,7 @@
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
-use sqlparser::ast::Query;
+use sqlparser::ast::{Expr, Function, Query};
 
 use crate::{
     errors::LookupError,
@@ -595,7 +595,8 @@ pub trait ColumnLike:
     /// it does for a serial column and for an identity column.
     ///
     /// A computed `GENERATED ALWAYS AS (expression)` column is not generated
-    /// in this sense, since its value is derived from the rest of its row.
+    /// in this sense, since its value is derived from the rest of its row by
+    /// [`Self::generation_expression`].
     ///
     /// # Arguments
     ///
@@ -757,12 +758,12 @@ pub trait ColumnLike:
     /// ```
     fn is_nullable(&self, database: &Self::DB) -> Result<bool, LookupError>;
 
-    /// Returns the SQL default value of the column, if any.
+    /// Returns the expression the column defaults to, if any.
     ///
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
     ///
     /// let db = ParserDB::parse::<GenericDialect>(
@@ -770,28 +771,18 @@ pub trait ColumnLike:
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let id_column =
-    ///     table.column("id", &db, IdentifierCase::AsWritten)?.expect("Column 'id' should exist");
-    /// let name_column =
-    ///     table.column("name", &db, IdentifierCase::AsWritten)?.expect("Column 'name' should exist");
-    /// let created_at_column = table
-    ///     .column("created_at", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'created_at' should exist");
-    /// assert_eq!(
-    ///     id_column.default_value(),
-    ///     Some("0".to_string()),
-    ///     "id column should have default value 0"
-    /// );
-    /// assert_eq!(name_column.default_value(), None, "name column should not have a default value");
-    /// assert_eq!(
-    ///     created_at_column.default_value(),
-    ///     Some("NOW()".to_string()),
-    ///     "created_at column should have default value NOW()"
-    /// );
+    /// let default = |name| {
+    ///     table.column(name, &db, IdentifierCase::AsWritten).map(|column| {
+    ///         column.expect("column exists").default_expression().map(ToString::to_string)
+    ///     })
+    /// };
+    /// assert_eq!(default("id")?.as_deref(), Some("0"));
+    /// assert_eq!(default("name")?, None);
+    /// assert_eq!(default("created_at")?.as_deref(), Some("NOW()"));
     /// # Ok(())
     /// # }
     /// ```
-    fn default_value(&self) -> Option<String>;
+    fn default_expression(&self) -> Option<&Expr>;
 
     /// Returns whether the column has a default value.
     ///
@@ -820,8 +811,88 @@ pub trait ColumnLike:
     /// # }
     /// ```
     fn has_default(&self) -> bool {
-        self.default_value().is_some()
+        self.default_expression().is_some()
     }
+
+    /// Returns the expression a computed column derives its value from, the
+    /// one `GENERATED ALWAYS AS (expression)` writes, stored or virtual.
+    ///
+    /// An identity column has none, since a sequence supplies its values.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (
+    ///          price INT,
+    ///          doubled INT GENERATED ALWAYS AS (price * 2) STORED,
+    ///          identity INT GENERATED ALWAYS AS IDENTITY
+    ///      );",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let generation = |name| {
+    ///     table.column(name, &db, IdentifierCase::AsWritten).map(|column| {
+    ///         column.expect("column exists").generation_expression().map(ToString::to_string)
+    ///     })
+    /// };
+    /// assert_eq!(generation("doubled")?.as_deref(), Some("price * 2"));
+    /// assert_eq!(generation("identity")?, None);
+    /// assert_eq!(generation("price")?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn generation_expression(&self) -> Option<&Expr>;
+
+    /// Returns the functions one call in the column's default or generation
+    /// expression may reach, resolved under the search path of the statement
+    /// that wrote it.
+    ///
+    /// `call` is a node of [`Self::default_expression`] or
+    /// [`Self::generation_expression`] at any depth, subqueries included.
+    /// Resolution follows the rules of
+    /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by).
+    /// An expression PostgreSQL's grammar writes like a call, such as
+    /// `COALESCE` or `CURRENT_USER`, reaches no function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this column, and [`LookupError::CallNotInExpression`] when `call`
+    /// is not a node of its expressions, which is matched by address.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE SCHEMA app;
+    ///      CREATE FUNCTION app.twice(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 2 * x';
+    ///      SET search_path TO app, public;
+    ///      CREATE TABLE public.t (x INT, y INT GENERATED ALWAYS AS (twice(x)) STORED);
+    ///      SET search_path TO public;",
+    /// )?;
+    /// let table = db.tables().next().unwrap();
+    /// let y = table.column("y", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// let Some(Expr::Function(call)) = y.generation_expression() else { panic!() };
+    /// let reached: Vec<_> = y.functions_reached_by(call, &db)?.collect();
+    /// assert_eq!(reached.len(), 1);
+    /// assert_eq!(reached[0].target_name().to_string(), "app.twice");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
 
     /// Returns the options a foreign-data wrapper reads for the column, as
     /// PostgreSQL stores them in `pg_attribute.attfdwoptions`. Each key is
@@ -1780,8 +1851,23 @@ where
     }
 
     #[inline]
-    fn default_value(&self) -> Option<String> {
-        (*self).default_value()
+    fn default_expression(&self) -> Option<&Expr> {
+        (*self).default_expression()
+    }
+
+    #[inline]
+    fn generation_expression(&self) -> Option<&Expr> {
+        (*self).generation_expression()
+    }
+
+    #[inline]
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        (*self).functions_reached_by(call, database)
     }
 
     #[inline]
@@ -1876,8 +1962,23 @@ where
     }
 
     #[inline]
-    fn default_value(&self) -> Option<String> {
-        (**self).default_value()
+    fn default_expression(&self) -> Option<&Expr> {
+        (**self).default_expression()
+    }
+
+    #[inline]
+    fn generation_expression(&self) -> Option<&Expr> {
+        (**self).generation_expression()
+    }
+
+    #[inline]
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        (**self).functions_reached_by(call, database)
     }
 
     #[inline]
@@ -1926,7 +2027,8 @@ mod tests {
 
         #[test]
         fn test_all_methods() {
-            let sql = "CREATE TABLE users (id INT PRIMARY KEY, name TEXT DEFAULT 'val');";
+            let sql = "CREATE FUNCTION tag() RETURNS TEXT;
+                       CREATE TABLE users (id INT PRIMARY KEY, name TEXT DEFAULT tag());";
             let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
             let table = db
                 .table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)
@@ -1942,7 +2044,14 @@ mod tests {
             assert_eq!(<&_ as ColumnLike>::column_name(&col_ref), "name");
             assert_eq!(<&_ as ColumnLike>::data_type(&col_ref, &db).name(&db), "TEXT");
             assert!(<&_ as ColumnLike>::is_nullable(&col_ref, &db).expect("is_nullable failed"));
-            assert_eq!(<&_ as ColumnLike>::default_value(&col_ref).as_deref(), Some("'val'"));
+            let default = <&_ as ColumnLike>::default_expression(&col_ref);
+            let Some(Expr::Function(call)) = default else { panic!("the default calls tag") };
+            let reached: Vec<_> = <&_ as ColumnLike>::functions_reached_by(&col_ref, call, &db)
+                .expect("the call is in the default")
+                .map(|function| function.name().to_owned())
+                .collect();
+            assert_eq!(reached, ["tag"]);
+            assert_eq!(<&_ as ColumnLike>::generation_expression(&col_ref), None);
             assert!(!<&_ as ColumnLike>::is_generated(&col_ref, &db));
             assert_eq!(<&_ as ColumnLike>::table(&col_ref, &db).table_name(), "users");
             assert_eq!(
@@ -1969,7 +2078,8 @@ mod tests {
 
         #[test]
         fn test_all_methods() {
-            let sql = "CREATE TABLE products (id INT PRIMARY KEY, price INT DEFAULT 0);";
+            let sql = "CREATE FUNCTION zero() RETURNS INT;
+                       CREATE TABLE products (id INT PRIMARY KEY, price INT DEFAULT zero());";
             let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
             let table = db
                 .table_by_target(TargetName::new("products", false), IdentifierCase::AsWritten)
@@ -1987,7 +2097,14 @@ mod tests {
             assert!(
                 <Arc<_> as ColumnLike>::is_nullable(&col_arc, &db).expect("is_nullable failed")
             );
-            assert_eq!(<Arc<_> as ColumnLike>::default_value(&col_arc).as_deref(), Some("0"));
+            let default = <Arc<_> as ColumnLike>::default_expression(&col_arc);
+            let Some(Expr::Function(call)) = default else { panic!("the default calls zero") };
+            let reached: Vec<_> = <Arc<_> as ColumnLike>::functions_reached_by(&col_arc, call, &db)
+                .expect("the call is in the default")
+                .map(|function| function.name().to_owned())
+                .collect();
+            assert_eq!(reached, ["zero"]);
+            assert_eq!(<Arc<_> as ColumnLike>::generation_expression(&col_arc), None);
             assert!(!<Arc<_> as ColumnLike>::is_generated(&col_arc, &db));
             assert_eq!(<Arc<_> as ColumnLike>::table(&col_arc, &db).table_name(), "products");
             assert_eq!(

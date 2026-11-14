@@ -146,7 +146,8 @@ fn a_name_that_precedes_something_other_than_a_constraint_is_refused() {
             .column("id", &excused, IdentifierCase::AsWritten)
             .expect("lookup")
             .expect("column exists")
-            .default_value()
+            .default_expression()
+            .map(ToString::to_string)
             .as_deref(),
         Some("7")
     );

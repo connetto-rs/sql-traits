@@ -91,7 +91,7 @@ fn every_reference_follows_the_move() {
         .columns(&db)
         .expect("outside is held")
         .find(|column| column.column_name() == "id")
-        .and_then(ColumnLike::default_value)
+        .and_then(|column| column.default_expression().map(ToString::to_string))
         .expect("the default survives");
     assert!(default.contains("'s2.q'"), "{default}");
     for key in outside.foreign_keys(&db).expect("outside is held") {
@@ -124,7 +124,10 @@ fn every_reference_follows_the_move() {
         .column("id", &db, IdentifierCase::AsWritten)
         .expect("child is held")
         .expect("id survives");
-    assert_eq!(id.default_value().as_deref(), Some("nextval('s2.child_id_seq'::REGCLASS)"));
+    assert_eq!(
+        id.default_expression().map(ToString::to_string).as_deref(),
+        Some("nextval('s2.child_id_seq'::REGCLASS)")
+    );
     assert!(id.is_serial(&db));
 
     let pv = db.views().find(|view| view.view_name() == "pv").expect("pv stays");
