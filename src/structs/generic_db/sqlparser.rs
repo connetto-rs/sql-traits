@@ -4499,7 +4499,9 @@ fn validate_relation_names(
     Ok(())
 }
 
-/// Checks that every plain column an index names is declared by its table.
+/// Checks that every plain column an index names is declared by its table and,
+/// where the dialect refuses it, that no entry repeats an earlier one, each
+/// entry checked in turn as MySQL does.
 ///
 /// Entries that are expressions rather than plain columns name no single
 /// column, so they are left alone, matching how an index-shaped constraint is
@@ -4508,14 +4510,64 @@ fn validate_index_columns(
     columns: &[IndexColumn],
     include: &[Ident],
     create_table: &CreateTable,
-    case: IdentifierCase,
-) -> Result<(), LookupError> {
-    for column in columns {
+    builder: &ParserDBBuilder,
+) -> Result<(), crate::errors::Error> {
+    let case = builder.identifier_case();
+    let refuses_repeats = refuses_repeated_index_columns(*builder.dialect());
+    for (position, column) in columns.iter().enumerate() {
         if let Expr::Identifier(name) = &column.column.expr {
             validate_declared_column(name, create_table, case)?;
         }
+        if refuses_repeats && let Some(name) = repeated_key_column(columns, position, case) {
+            return Err(repeated_index_column(create_table, name));
+        }
     }
-    validate_include_columns(include, create_table, case)
+    Ok(validate_include_columns(include, create_table, case)?)
+}
+
+/// Whether the dialect refuses a primary key or unique constraint naming one
+/// column twice, as PostgreSQL and MySQL do while SQLite keeps it.
+fn refuses_repeated_key_columns(dialect: SqlparserDialect) -> bool {
+    matches!(dialect, SqlparserDialect::PostgreSql | SqlparserDialect::MySql)
+}
+
+/// Whether the dialect refuses an index naming one column twice, as MySQL
+/// does while PostgreSQL stores the column twice.
+fn refuses_repeated_index_columns(dialect: SqlparserDialect) -> bool {
+    dialect == SqlparserDialect::MySql
+}
+
+/// The entry at `position` of a key when an earlier entry names the same
+/// column, names compared as they are stored. An expression names no column
+/// and so repeats none.
+fn repeated_key_column(
+    columns: &[IndexColumn],
+    position: usize,
+    case: IdentifierCase,
+) -> Option<&Ident> {
+    let Expr::Identifier(name) = &columns[position].column.expr else {
+        return None;
+    };
+    columns[..position]
+        .iter()
+        .any(|earlier| {
+            matches!(&earlier.column.expr, Expr::Identifier(earlier) if case_idents_match(earlier, name, case))
+        })
+        .then_some(name)
+}
+
+/// The first entry of a key that repeats an earlier one, looking through the
+/// whole key.
+fn first_repeated_key_column(columns: &[IndexColumn], case: IdentifierCase) -> Option<&Ident> {
+    (0..columns.len()).find_map(|position| repeated_key_column(columns, position, case))
+}
+
+/// The refusal of an index on `create_table` naming the column `name` twice.
+fn repeated_index_column(create_table: &CreateTable, name: &Ident) -> crate::errors::Error {
+    crate::errors::Error::RepeatedIndexColumn {
+        table_name: create_table.name.to_string(),
+        column_name: name.value.clone(),
+    }
 }
 
 /// Checks that every column an `INCLUDE` list names is declared by its table,
@@ -5729,12 +5781,7 @@ impl ParserDB {
         if create_index.unique {
             Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
         }
-        validate_index_columns(
-            &create_index.columns,
-            &create_index.include,
-            table,
-            builder.identifier_case(),
-        )?;
+        validate_index_columns(&create_index.columns, &create_index.include, table, builder)?;
         partition_keys::validate_unique_index(&create_index, table, builder.identifier_case())?;
 
         let index_arc = Arc::new(TableAttribute::new(Arc::new(table.clone()), create_index));
@@ -6419,10 +6466,9 @@ impl ParserDB {
         carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         for constraint in constraints {
+            Self::validate_key_columns(constraint, create_table, table_metadata, &builder)?;
             match constraint {
                 TableConstraint::Unique(uc) => {
-                    Self::validate_constraint_columns(&uc.columns, create_table, table_metadata)?;
-                    validate_include_columns(&uc.include, create_table, builder.identifier_case())?;
                     if let Some((unique_index, unique_index_metadata)) =
                         Self::process_unique_constraint(uc.clone(), create_table)
                     {
@@ -6448,8 +6494,6 @@ impl ParserDB {
                     )?;
                 }
                 TableConstraint::PrimaryKey(pk) => {
-                    Self::validate_constraint_columns(&pk.columns, create_table, table_metadata)?;
-                    validate_include_columns(&pk.include, create_table, builder.identifier_case())?;
                     let mut primary_key_columns = Vec::new();
                     for col_name in &pk.columns {
                         let Expr::Identifier(column_name) = &col_name.column.expr else {
@@ -6520,17 +6564,40 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// Checks that every plain column an index-shaped constraint names is
-    /// declared by the table the constraint is attached to.
+    /// Checks the columns a key constraint names.
+    ///
+    /// Every plain key column must be declared by the table the constraint is
+    /// attached to and, where the dialect refuses it, repeat no earlier entry,
+    /// each entry checked in turn as `CREATE TABLE` does, and every `INCLUDE`
+    /// column must be declared too. An inline index is checked for a repeat
+    /// alone, where the dialect refuses one.
     ///
     /// Entries that are expressions rather than plain columns name no single
     /// column, so they are left alone.
-    fn validate_constraint_columns(
-        columns: &[IndexColumn],
+    fn validate_key_columns(
+        constraint: &TableConstraint,
         create_table: &CreateTable,
         table_metadata: &TableMetadata<CreateTable>,
-    ) -> Result<(), LookupError> {
-        for column in columns {
+        builder: &ParserDBBuilder,
+    ) -> Result<(), crate::errors::Error> {
+        let case = builder.identifier_case();
+        let (columns, include, kind) = match constraint {
+            TableConstraint::Unique(unique) => {
+                (&unique.columns, &unique.include, KeyConstraint::Unique)
+            }
+            TableConstraint::PrimaryKey(primary_key) => {
+                (&primary_key.columns, &primary_key.include, KeyConstraint::PrimaryKey)
+            }
+            TableConstraint::Index(index) if refuses_repeated_index_columns(*builder.dialect()) => {
+                return match first_repeated_key_column(&index.columns, case) {
+                    Some(name) => Err(repeated_index_column(create_table, name)),
+                    None => Ok(()),
+                };
+            }
+            _ => return Ok(()),
+        };
+        let refuses_repeats = refuses_repeated_key_columns(*builder.dialect());
+        for (position, column) in columns.iter().enumerate() {
             let Expr::Identifier(column_name) = &column.column.expr else {
                 continue;
             };
@@ -6546,10 +6613,18 @@ impl ParserDB {
                 return Err(LookupError::ColumnNotFound {
                     table_name: create_table.name.to_string(),
                     column_name: column_name.value.clone(),
+                }
+                .into());
+            }
+            if refuses_repeats && let Some(name) = repeated_key_column(columns, position, case) {
+                return Err(crate::errors::Error::RepeatedKeyColumn {
+                    table_name: create_table.name.to_string(),
+                    column_name: name.value.clone(),
+                    constraint: kind,
                 });
             }
         }
-        Ok(())
+        Ok(validate_include_columns(include, create_table, case)?)
     }
 
     /// Ingests a table with preserved identities and documentation.
@@ -6965,6 +7040,7 @@ impl ParserDB {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
+        Self::refuse_repeated_added_key_column(&builder, &stored, &constraint)?;
         stored_subqueries::refuse_in_constraint(&builder, &constraint)?;
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
         if let TableConstraint::NotNull(not_null) = &constraint
@@ -7080,6 +7156,40 @@ impl ParserDB {
         }
 
         Ok(builder)
+    }
+
+    /// Refuses a primary key or unique constraint that `ALTER TABLE ... ADD`
+    /// gives a table when its key names one column twice, looking through the
+    /// whole key before any of its columns is looked up, which is the order
+    /// PostgreSQL follows for that statement alone. A foreign table is left to
+    /// the refusal of any key on it, which PostgreSQL reports first.
+    fn refuse_repeated_added_key_column(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        constraint: &TableConstraint,
+    ) -> Result<(), crate::errors::Error> {
+        let (columns, kind) = match constraint {
+            TableConstraint::Unique(unique) => (&unique.columns, KeyConstraint::Unique),
+            TableConstraint::PrimaryKey(primary_key) => {
+                (&primary_key.columns, KeyConstraint::PrimaryKey)
+            }
+            _ => return Ok(()),
+        };
+        if *builder.dialect() != SqlparserDialect::PostgreSql
+            || builder.is_foreign_table(Self::stored_node(builder, stored)?)
+        {
+            return Ok(());
+        }
+        match first_repeated_key_column(columns, builder.identifier_case()) {
+            Some(name) => {
+                Err(crate::errors::Error::RepeatedKeyColumn {
+                    table_name: stored.name.clone(),
+                    column_name: name.value.clone(),
+                    constraint: kind,
+                })
+            }
+            None => Ok(()),
+        }
     }
 
     /// Drops a named constraint from a table, taking it out of every table that

@@ -3240,6 +3240,28 @@ pub enum Error {
         /// The kind of constraint refused.
         constraint: KeyConstraint,
     },
+    #[error("{constraint} constraint of table `{table_name}` names column `{column_name}` twice.")]
+    /// Error indicating that a primary key or unique constraint names one
+    /// column twice in its key, column names compared as they are stored,
+    /// which PostgreSQL and MySQL refuse.
+    RepeatedKeyColumn {
+        /// Name of the table the constraint is declared on.
+        table_name: String,
+        /// The repeating entry of the key, as written.
+        column_name: String,
+        /// Whether the constraint is a primary key or a unique constraint.
+        constraint: KeyConstraint,
+    },
+    #[error("Index on table `{table_name}` names column `{column_name}` twice.")]
+    /// Error indicating that an index names one column twice in its key,
+    /// column names compared as they are stored, which MySQL refuses while
+    /// PostgreSQL stores the column twice.
+    RepeatedIndexColumn {
+        /// Name of the table the index is declared on.
+        table_name: String,
+        /// The repeating entry of the key, as written.
+        column_name: String,
+    },
     #[error(
         "Column `{column_name}` of table `{table_name}` cannot take foreign-data wrapper options, because `{table_name}` is not a foreign table."
     )]
