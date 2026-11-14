@@ -98,27 +98,61 @@ fn recursive_cte_exposes_the_anchor_and_recursive_definitions() {
             if expression.to_string() == "0"
     ));
 }
+
+/// A definition as a short outline, `opaque` or `= expression`, with the arms
+/// of a set operation or recursive union in brackets.
+fn outline(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
+    match definition {
+        ColumnDefinition::Opaque => "opaque".to_owned(),
+        ColumnDefinition::Expression { expression, .. } => format!("= {expression}"),
+        ColumnDefinition::SetOperation { left, right, .. } => {
+            format!("[{} | {}]", outline(&left.definition()), outline(&right.definition()))
+        }
+        ColumnDefinition::RecursiveUnion { anchor, recursive } => {
+            format!("[{} rec {}]", outline(&anchor.definition()), outline(&recursive.definition()))
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 #[test]
-fn recursive_ctes_with_non_enumerable_arms_remain_opaque() {
+fn recursive_cte_arms_of_different_widths_remain_opaque() {
     let db = schema_db();
-    for sql in [
-        "WITH RECURSIVE c(x) AS (\
-             VALUES (1) UNION ALL SELECT x FROM c\
-         ) SELECT c.x FROM c",
-        "WITH RECURSIVE c(x) AS (\
-             SELECT 1 UNION ALL VALUES (2)\
-         ) SELECT c.x FROM c",
-        "WITH RECURSIVE c(x, y) AS (\
-             SELECT 1 UNION ALL SELECT x FROM c\
-         ) SELECT c.x FROM c",
+    let query =
+        query("WITH RECURSIVE c(x, y) AS (SELECT 1 UNION ALL SELECT x FROM c) SELECT c.x FROM c");
+    let scope =
+        ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
+    assert!(matches!(
+        scope.resolve_column_definition(&reference("c.x")).expect("definition resolves"),
+        Some(ColumnDefinition::Opaque)
+    ));
+}
+
+// A `VALUES` arm enumerates its columns, each with an opaque definition, so a
+// set operation or recursive union over it keeps the other arm's definition.
+#[test]
+fn values_arms_pair_with_opaque_definitions() {
+    let db = schema_db();
+    for (sql, expected) in [
+        (
+            "WITH RECURSIVE c(x) AS (VALUES (1) UNION ALL SELECT x FROM c) SELECT c.x FROM c",
+            "[opaque rec opaque]",
+        ),
+        (
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL VALUES (2)) SELECT c.x FROM c",
+            "[= 1 rec opaque]",
+        ),
+        ("SELECT c.x FROM (SELECT 1 AS x UNION ALL VALUES (2)) AS c", "[= 1 | opaque]"),
+        ("SELECT c.x FROM (VALUES (1) UNION ALL SELECT 2) AS c(x)", "[opaque | = 2]"),
     ] {
         let query = query(sql);
         let scope =
             ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
-        assert!(matches!(
-            scope.resolve_column_definition(&reference("c.x")).expect("definition resolves"),
-            Some(ColumnDefinition::Opaque)
-        ));
+        let definition = scope
+            .resolve_column_definition(&reference("c.x"))
+            .expect("definition resolves")
+            .expect("the column resolves");
+        assert_eq!(outline(&definition), expected, "{sql}");
     }
 }
 
@@ -444,14 +478,9 @@ fn three_part_opaque_qualifiers_require_matching_schema_and_relation() {
         assert_opaque_resolution(from_clause, reference_sql, expected);
     }
 }
-#[test]
-fn non_enumerable_set_bodies_remain_opaque() {
-    for from_clause in
-        ["(SELECT 1 AS x UNION ALL VALUES (2)) AS d", "(VALUES (1) UNION ALL SELECT 2) AS d(x)"]
-    {
-        assert_opaque_resolution(from_clause, "d.x", true);
-    }
 
+#[test]
+fn a_view_over_a_values_list_enumerates_opaque_columns() {
     let db =
         ParserDB::parse::<GenericDialect>("CREATE VIEW v(x) AS VALUES (1);").expect("view parses");
     let query = query("SELECT v.x FROM v");
@@ -461,6 +490,7 @@ fn non_enumerable_set_bodies_remain_opaque() {
         scope.resolve_column_definition(&reference("v.x")).expect("definition resolves"),
         Some(ColumnDefinition::Opaque)
     ));
+    assert!(scope.resolve_column_definition(&reference("v.y")).expect("lookup runs").is_none());
 }
 
 #[test]

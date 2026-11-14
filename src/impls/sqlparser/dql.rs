@@ -559,6 +559,11 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         owner: Self::Cursor,
     );
     fn opaque_definition(&self) -> Self::Definition;
+    /// A definition no other output shares, for a computed value whose
+    /// expression is not followed, such as a column of a `VALUES` list. Two
+    /// such columns are two values, while [`Self::opaque_definition`] is one
+    /// shared answer for every output that cannot be told apart.
+    fn computed_definition(&mut self) -> Self::Definition;
     /// The definition of a stored column, which for a column created from the
     /// query of `CREATE TABLE … AS` is that query's output.
     fn column_definition(
@@ -661,6 +666,8 @@ where
     }
 
     fn opaque_definition(&self) {}
+
+    fn computed_definition(&mut self) {}
 
     fn column_definition(
         &mut self,
@@ -1634,13 +1641,43 @@ where
             if P::INDEX_NESTED_QUERIES {
                 index_values_expression_queries(values, cte_scope, deriving, parent, profile)?;
             }
-            Ok(None)
+            Ok(values_shape(values.get(), profile))
         }
         SetExprRef::Modifying(statement) => {
             profile.modifying_shape(statement, cte_scope, deriving, parent)
         }
         SetExprRef::Other => Ok(None),
     }
+}
+
+/// The shape of a `VALUES` list, as wide as its first row, with its columns
+/// named `column1`, `column2`, … as PostgreSQL names them. Every column is a
+/// value of its own with no expression followed, so none carries a source and
+/// no output row is a stored row.
+fn values_shape<'query, 'db, DB, P>(
+    values: &Values,
+    profile: &mut P,
+) -> Option<DerivedShape<'query, 'db, DB, P::Definition>>
+where
+    DB: DatabaseLike,
+    P: DerivationProfile<'query, 'db, DB>,
+{
+    let width = values.rows.first().map_or(0, |row| row.len());
+    if width > MAX_DERIVED_COLUMNS {
+        return None;
+    }
+    let columns = (1..=width)
+        .map(|position| {
+            DerivedColumn {
+                name: format!("column{position}"),
+                quoted: true,
+                source: None,
+                definition: profile.computed_definition(),
+                marker: core::marker::PhantomData,
+            }
+        })
+        .collect();
+    Some(DerivedShape { columns, row_preserving: false })
 }
 
 fn merge_set_operation_shapes<'query, 'db, DB, P>(

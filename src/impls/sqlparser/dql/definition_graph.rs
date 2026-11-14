@@ -729,6 +729,10 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
         DefinitionId(0)
     }
 
+    fn computed_definition(&mut self) -> Self::Definition {
+        self.push_definition(DefinitionNode::Opaque)
+    }
+
     fn column_definition(
         &mut self,
         table: &'db DB::Table,
