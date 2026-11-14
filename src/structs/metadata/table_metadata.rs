@@ -4,6 +4,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 
 use sqlparser::ast::{Action, ColumnDef, CreateTable, Privileges};
 
+use super::ExpressionCalls;
 use crate::{
     impls::PrivilegeKind,
     structs::{ForeignTableSource, RevokedPrivilege, TableAttribute},
@@ -94,6 +95,12 @@ pub struct TableMetadata<T: TableLike> {
     /// The server and options a foreign table reads its rows through, absent
     /// for an ordinary table.
     foreign_source: Option<ForeignTableSource>,
+    /// The calls of the partition key's expressions, bound when the table was
+    /// written.
+    partition_key_calls: ExpressionCalls<<T::DB as DatabaseLike>::Function>,
+    /// The calls of each exclusion constraint, in the order the table lists
+    /// them, bound when the constraint was written.
+    exclusion_calls: Vec<ExpressionCalls<<T::DB as DatabaseLike>::Function>>,
 }
 
 impl<T: TableLike> Default for TableMetadata<T> {
@@ -119,6 +126,8 @@ impl<T: TableLike> Default for TableMetadata<T> {
             revoked_privileges: Vec::new(),
             documentation: None,
             foreign_source: None,
+            partition_key_calls: ExpressionCalls::default(),
+            exclusion_calls: Vec::new(),
         }
     }
 }
@@ -509,6 +518,57 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub(crate) fn foreign_source_mut(&mut self) -> Option<&mut ForeignTableSource> {
         self.foreign_source.as_mut()
+    }
+
+    /// The calls of the partition key's expressions.
+    #[inline]
+    pub(crate) fn partition_key_calls(
+        &self,
+    ) -> &ExpressionCalls<<T::DB as DatabaseLike>::Function> {
+        &self.partition_key_calls
+    }
+
+    /// The calls of the partition key's expressions, for settling or
+    /// re-pointing them.
+    #[inline]
+    pub(crate) fn partition_key_calls_mut(
+        &mut self,
+    ) -> &mut ExpressionCalls<<T::DB as DatabaseLike>::Function> {
+        &mut self.partition_key_calls
+    }
+
+    /// Sets the calls of the partition key's expressions.
+    #[inline]
+    pub(crate) fn set_partition_key_calls(
+        &mut self,
+        calls: ExpressionCalls<<T::DB as DatabaseLike>::Function>,
+    ) {
+        self.partition_key_calls = calls;
+    }
+
+    /// The calls of each exclusion constraint, in the order the table lists
+    /// them.
+    #[inline]
+    pub(crate) fn exclusion_calls(&self) -> &[ExpressionCalls<<T::DB as DatabaseLike>::Function>] {
+        &self.exclusion_calls
+    }
+
+    /// The calls of each exclusion constraint, for settling or re-pointing
+    /// them.
+    #[inline]
+    pub(crate) fn exclusion_calls_mut(
+        &mut self,
+    ) -> &mut [ExpressionCalls<<T::DB as DatabaseLike>::Function>] {
+        &mut self.exclusion_calls
+    }
+
+    /// Sets the calls of each exclusion constraint.
+    #[inline]
+    pub(crate) fn set_exclusion_calls(
+        &mut self,
+        calls: Vec<ExpressionCalls<<T::DB as DatabaseLike>::Function>>,
+    ) {
+        self.exclusion_calls = calls;
     }
 
     /// Adds a column to the table metadata.

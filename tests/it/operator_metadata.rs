@@ -281,7 +281,13 @@ fn operator_dependency_rejects_restricted_function_drop() {
     let result = custom_options().parse::<PostgreSqlDialect>(&format!(
         "{CUSTOM_SCHEMA} DROP FUNCTION app.equal(app.token, app.token);",
     ));
-    assert!(matches!(result, Err(Error::FunctionReferenced { .. })));
+    assert!(
+        matches!(
+            result,
+            Err(Error::FunctionReferenced { dependent_kind: ObjectKind::Operator, .. })
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]

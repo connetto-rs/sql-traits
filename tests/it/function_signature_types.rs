@@ -201,7 +201,7 @@ fn a_cascade_refuses_a_function_something_calls() {
              CREATE TABLE t (x int4 CHECK (f('a') = 1));
              DROP TYPE e CASCADE;",
         ),
-        Err(Error::FunctionReferenced { function_name }) if function_name == "f"
+        Err(Error::FunctionReferenced { function_name, .. }) if function_name == "f"
     ));
 }
 

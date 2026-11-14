@@ -23,6 +23,9 @@ pub enum ObjectKind {
     MaterializedView,
     /// A column declared inside a table.
     Column,
+    /// The default value of a column, which PostgreSQL holds apart from the
+    /// column itself.
+    ColumnDefault,
     /// An index declared by a `CREATE INDEX` statement.
     Index,
     /// A unique constraint declared inside a `CREATE TABLE` statement.
@@ -64,6 +67,7 @@ impl core::fmt::Display for ObjectKind {
             Self::View => "View",
             Self::MaterializedView => "Materialized view",
             Self::Column => "Column",
+            Self::ColumnDefault => "Column default",
             Self::Index => "Index",
             Self::UniqueIndex => "Unique index",
             Self::CheckConstraint => "Check constraint",
@@ -2068,13 +2072,30 @@ pub enum Error {
         /// Name of the function that was not found.
         function_name: String,
     },
-    #[error("Cannot drop function `{function_name}`: still referenced in the schema.")]
-    /// Error indicating that a DROP FUNCTION statement references a function
-    /// that is still used by other schema objects (check constraints, policies,
-    /// triggers, or functions whose `RETURN` or `BEGIN ATOMIC` body calls it).
+    #[error(
+        "Function `{function_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
+    )]
+    /// Error indicating that a statement drops a function another object of
+    /// the schema still calls or runs.
+    ///
+    /// PostgreSQL refuses without `CASCADE`, naming each object depending on
+    /// the function. Functions dropped by the same statement do not hold each
+    /// other, so the function named is the one something else holds.
     FunctionReferenced {
         /// Name of the function being dropped.
         function_name: String,
+        /// [`ObjectKind::Column`] for a generated column,
+        /// [`ObjectKind::ColumnDefault`], [`ObjectKind::CheckConstraint`],
+        /// [`ObjectKind::Index`], [`ObjectKind::View`],
+        /// [`ObjectKind::MaterializedView`], [`ObjectKind::Policy`],
+        /// [`ObjectKind::Rule`], [`ObjectKind::Trigger`],
+        /// [`ObjectKind::Function`], [`ObjectKind::Domain`],
+        /// [`ObjectKind::Type`], [`ObjectKind::Table`] for a partition key,
+        /// [`ObjectKind::Operator`] or [`ObjectKind::Cast`].
+        dependent_kind: ObjectKind,
+        /// The column or the check as `table.name`, or the name of the other
+        /// object.
+        dependent_name: String,
     },
     #[error("Cannot drop function `{function_name}`: extension `{extension_name}` requires it.")]
     /// Error indicating that a DROP FUNCTION statement names a function an
