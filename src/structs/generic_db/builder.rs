@@ -1254,44 +1254,38 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         // Tables, foreign tables, views, materialized views and sequences share
         // one pool of names, so one index answers all five. Slots of a kind
         // stay ascending because each kind is walked in storage order.
-        let mut relation_index: BTreeMap<_, Vec<RelationSlot>> = BTreeMap::new();
+        let mut relations = KeyIndex::default();
         let mut relation_identities = Vec::with_capacity(
             tables.len() + foreign_tables.len() + self.views.len() + self.materialized_views.len(),
         );
         for (position, (table, _, identity)) in tables.iter().enumerate() {
-            relation_index
-                .entry(stored_table_key(table.as_ref(), IdentifierCase::AsWritten))
-                .or_default()
-                .push(RelationSlot::Table(position));
+            relations
+                .file(RelationSlot::Table(position), |case| stored_table_key(table.as_ref(), case));
             relation_identities.push((*identity, RelationSlot::Table(position)));
         }
         for (position, (table, _, identity)) in foreign_tables.iter().enumerate() {
-            relation_index
-                .entry(stored_table_key(table.as_ref(), IdentifierCase::AsWritten))
-                .or_default()
-                .push(RelationSlot::ForeignTable(position));
+            relations.file(RelationSlot::ForeignTable(position), |case| {
+                stored_table_key(table.as_ref(), case)
+            });
             relation_identities.push((*identity, RelationSlot::ForeignTable(position)));
         }
         for (position, (view, _, identity)) in self.views.iter().enumerate() {
-            relation_index
-                .entry(stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
-                .or_default()
-                .push(RelationSlot::View(position));
+            relations
+                .file(RelationSlot::View(position), |case| stored_view_key(view.as_ref(), case));
             relation_identities.push((*identity, RelationSlot::View(position)));
         }
         for (position, (view, _, identity)) in self.materialized_views.iter().enumerate() {
-            relation_index
-                .entry(stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
-                .or_default()
-                .push(RelationSlot::MaterializedView(position));
+            relations.file(RelationSlot::MaterializedView(position), |case| {
+                stored_view_key(view.as_ref(), case)
+            });
             relation_identities.push((*identity, RelationSlot::MaterializedView(position)));
         }
         for (position, (sequence, _)) in self.sequences.iter().enumerate() {
-            relation_index
-                .entry(stored_sequence_key(sequence.as_ref(), IdentifierCase::AsWritten))
-                .or_default()
-                .push(RelationSlot::Sequence(position));
+            relations.file(RelationSlot::Sequence(position), |case| {
+                stored_sequence_key(sequence.as_ref(), case)
+            });
         }
+        let (relation_index, folded_relation_index) = relations.finish();
         relation_identities.sort_unstable_by_key(|(identity, _)| *identity);
         let mut column_identities: Vec<_> = self
             .columns
@@ -1303,16 +1297,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
 
         // Functions keep their own pool of names, and a name carrying several
         // argument lists holds several slots, ascending in storage order.
-        let mut function_index: BTreeMap<_, Vec<usize>> = BTreeMap::new();
+        let mut functions = KeyIndex::default();
         for (position, (function, _)) in self.functions.iter().enumerate() {
-            function_index
-                .entry(stored_function_key(function.as_ref(), IdentifierCase::AsWritten))
-                .or_default()
-                .push(position);
+            functions.file(position, |case| stored_function_key(function.as_ref(), case));
         }
-
-        let folded_relation_index = folded_key_index(relation_index.keys());
-        let folded_function_index = folded_key_index(function_index.keys());
+        let (function_index, folded_function_index) = functions.finish();
 
         GenericDB {
             dialect: self.dialect,
@@ -1355,19 +1344,46 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     }
 }
 
-/// Indexes the stored keys a folded lookup reaches, skipping every key that
-/// already equals its folded form.
-fn folded_key_index<'a>(
-    keys: impl Iterator<Item = &'a RelationKey>,
-) -> BTreeMap<RelationKey, Vec<RelationKey>> {
-    let mut folded: BTreeMap<RelationKey, Vec<RelationKey>> = BTreeMap::new();
-    for key in keys {
-        let folded_key = key.folded();
-        if folded_key != *key {
-            folded.entry(folded_key).or_default().push(key.clone());
-        }
+/// Slots by their key under PostgreSQL's rule, with the keys a folded lookup
+/// reaches them by.
+struct KeyIndex<S> {
+    /// Slots by key under PostgreSQL's rule.
+    slots: BTreeMap<RelationKey, Vec<S>>,
+    /// Folded key of each object to its key in `slots`, when the two differ.
+    aliases: BTreeMap<RelationKey, Vec<RelationKey>>,
+}
+
+impl<S> Default for KeyIndex<S> {
+    fn default() -> Self {
+        Self { slots: BTreeMap::new(), aliases: BTreeMap::new() }
     }
-    folded
+}
+
+impl<S> KeyIndex<S> {
+    /// Files `slot` under the object's key under PostgreSQL's rule.
+    ///
+    /// The folded alias is read from the object rather than from that key,
+    /// because PostgreSQL's rule cuts a name to 63 bytes and folding does not.
+    fn file(&mut self, slot: S, key_under: impl Fn(IdentifierCase) -> RelationKey) {
+        let key = key_under(IdentifierCase::AsWritten);
+        let folded = key_under(IdentifierCase::Folded);
+        if folded != key {
+            self.aliases.entry(folded).or_default().push(key.clone());
+        }
+        self.slots.entry(key).or_default().push(slot);
+    }
+
+    /// The slots and the aliases, each alias list ordered and without the
+    /// repeats several objects of one key leave.
+    fn finish(
+        mut self,
+    ) -> (BTreeMap<RelationKey, Vec<S>>, BTreeMap<RelationKey, Vec<RelationKey>>) {
+        for keys in self.aliases.values_mut() {
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        (self.slots, self.aliases)
+    }
 }
 
 impl<P: SchemaProfile> From<GenericDBBuilder<P>> for GenericDB<P> {
