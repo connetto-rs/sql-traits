@@ -364,7 +364,7 @@ pub(super) fn drop_sequences(
     cascade: bool,
     arrays: &mut Arc<TypeArrays>,
 ) -> Result<(ParserDBBuilder, TypeDrop), Error> {
-    let mut drop = TypeDrop { types: Vec::new(), functions: Vec::new() };
+    let mut drop = TypeDrop::default();
     for name in names {
         if object_name_last_identifier(name).is_none() {
             return Err(Error::UnnamedObject { object_kind: ObjectKind::Sequence });

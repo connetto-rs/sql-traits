@@ -46,7 +46,7 @@ impl<'db, O: OperatorLike> Candidate<'db, O> {
 }
 
 /// The operators of the invoked name and arity on the operator's search
-/// path, the earliest of identical signatures kept, as
+/// path that `admits` keeps, the earliest of identical signatures kept, as
 /// `OpernameGetCandidates` gathers them, or [`None`] when an operator's
 /// operand types are unknown.
 fn candidates<'db, D: DatabaseLike>(
@@ -55,13 +55,14 @@ fn candidates<'db, D: DatabaseLike>(
     name: &TargetName<'_>,
     kind: OperatorKind,
     case: IdentifierCase,
+    admits: &dyn Fn(&D::Operator) -> bool,
 ) -> Option<Vec<Candidate<'db, D::Operator>>> {
     let path: Vec<(&str, bool)> = match name.schema() {
         Some(schema) => Vec::from([(schema, name.schema_is_quoted())]),
         None => function_search_path(|| database.search_path()).collect(),
     };
     let mut reached: Vec<(usize, &'db D::Operator)> = operators
-        .filter(|operator| operator.kind() == kind)
+        .filter(|operator| operator.kind() == kind && admits(operator))
         .filter_map(|operator| {
             let declared_as = operator.target_name();
             if declared_as.name() != name.name() {
@@ -86,13 +87,14 @@ fn candidates<'db, D: DatabaseLike>(
 }
 
 /// The operator PostgreSQL runs for `operator` applied to `right`, and to
-/// `left` for a binary operator.
+/// `left` for a binary operator, among the operators `admits` keeps.
 pub(crate) fn resolve_operator<'db, D: DatabaseLike>(
     database: &'db D,
     operator: &TargetName<'_>,
     left: Option<&OperandType<'_>>,
     right: &OperandType<'_>,
     case: IdentifierCase,
+    admits: &dyn Fn(&D::Operator) -> bool,
 ) -> OperatorResolution<'db, D> {
     let Some(operators) = database.operators() else { return OperatorResolution::Undetermined };
     let kind = if left.is_some() { OperatorKind::Binary } else { OperatorKind::Prefix };
@@ -104,7 +106,7 @@ pub(crate) fn resolve_operator<'db, D: DatabaseLike>(
     else {
         return OperatorResolution::Undetermined;
     };
-    let Some(candidates) = candidates(database, operators, operator, kind, case) else {
+    let Some(candidates) = candidates(database, operators, operator, kind, case, admits) else {
         return OperatorResolution::Undetermined;
     };
     match exact(database, &candidates, &inputs) {

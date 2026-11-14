@@ -1524,6 +1524,31 @@ pub enum Error {
         /// Symbol of the built-in operator.
         operator_name: Box<str>,
     },
+    #[error(
+        "Operator `{operator_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
+    )]
+    /// Error indicating that `DROP OPERATOR` without `CASCADE` names an
+    /// operator a stored expression applies.
+    ///
+    /// PostgreSQL records the operator each application selects when the
+    /// expression is stored, and refuses the drop naming each object holding
+    /// one.
+    OperatorReferenced {
+        /// Symbol of the operator being dropped.
+        operator_name: Box<str>,
+        /// [`ObjectKind::Column`] for a generated column,
+        /// [`ObjectKind::ColumnDefault`], [`ObjectKind::CheckConstraint`],
+        /// [`ObjectKind::Index`] for an index or an exclusion constraint,
+        /// [`ObjectKind::View`], [`ObjectKind::MaterializedView`],
+        /// [`ObjectKind::Policy`], [`ObjectKind::Rule`],
+        /// [`ObjectKind::Trigger`], [`ObjectKind::Function`],
+        /// [`ObjectKind::Domain`] or [`ObjectKind::Table`] for a partition
+        /// key.
+        dependent_kind: ObjectKind,
+        /// The column or the check as `table.name`, or the name of the other
+        /// object.
+        dependent_name: String,
+    },
     #[error("Operator attribute {attribute} of `{operator_name}` cannot be changed once set.")]
     /// Error indicating that `ALTER OPERATOR ... SET` names a commutator or
     /// negator other than the one the operator already links to.

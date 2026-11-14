@@ -5,6 +5,7 @@ use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{CreateFunction, ObjectName, Visit};
 
+use super::operator_carry::CarriedOperators;
 use crate::{
     structs::{
         IdentifierCase,
@@ -93,6 +94,8 @@ pub(super) struct CarriedCalls {
     sites: Vec<(ObjectName, usize, BoundCall<CreateFunction>)>,
     /// Whether the carried calls are written again, choosing anew.
     rewritten: bool,
+    /// The operators each derived expression selected, by its owner.
+    pub(super) operators: CarriedOperators,
 }
 
 impl CarriedCalls {

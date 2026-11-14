@@ -19,7 +19,10 @@ mod domain_metadata;
 pub use domain_metadata::DomainMetadata;
 mod expression_calls;
 pub use expression_calls::ExpressionCalls;
-pub(crate) use expression_calls::{BoundCall, Carried};
+pub(crate) use expression_calls::{
+    BoundCall, Carried, CarriedNodes, NodeState, OperatorNode, for_each_operator_node,
+    operator_node_count,
+};
 mod policy_metadata;
 pub use policy_metadata::PolicyMetadata;
 pub(crate) use policy_metadata::{ClauseLiterals, UnreadableLiteral};

@@ -97,6 +97,7 @@ mod grantors;
 mod inheritance;
 mod leading_comments;
 mod like;
+mod operator_carry;
 mod operator_ddl;
 mod parse_options;
 mod parsed_source;
@@ -135,6 +136,7 @@ use postgres_catalog::CatalogName;
 mod postgres_cast;
 mod postgres_operator;
 pub use postgres_cast::PostgresCatalogCast;
+pub(crate) use postgres_operator::OperatorRow;
 pub use postgres_operator::PostgresCatalogOperator;
 mod postgres_18_operators;
 pub use postgres_catalog::{PostgresCatalog, PostgresCatalogCollation, PostgresCatalogType};
@@ -271,8 +273,8 @@ enum TableOrigin {
     /// query output each column without a declared type was created from.
     Declaration(TableDocumentation, Vec<(Ident, ColumnCreation)>),
     /// A rebuild of a stored table, keeping its identity and the bindings
-    /// its calls held.
-    Replacement(RelationIdentity, CarriedCalls),
+    /// and operator selections its expressions held.
+    Replacement(RelationIdentity, Box<CarriedCalls>),
 }
 
 /// The continuation state the parser carries inside every built database so
@@ -408,6 +410,10 @@ struct PreservedColumnMetadata {
     /// copied from another table, which is a column of its own.
     identity: Option<ColumnIdentity>,
 }
+
+/// An index a table rebuild detaches, with its expression and the operator
+/// selections it held.
+type DetachedIndex = (CreateIndex, Expr, operator_carry::Selections);
 
 fn qualify_created_collation_name(
     builder: &ParserDBBuilder,
@@ -1572,16 +1578,20 @@ impl ParserDBBuilder {
     /// Derived objects wrap the node they were built from, so a statement that
     /// edits the node has to rebuild them. Columns and constraint-implied
     /// objects follow from the node and are recomputed, while `CREATE INDEX`
-    /// indexes do not and are returned with their expressions so the caller can
-    /// re-attach them. The calls of the columns, checks and indexes are
-    /// returned with the bindings they held, which the rebuilt objects keep.
+    /// indexes do not and are returned with their expressions and operator
+    /// selections so the caller can re-attach them. The calls of the
+    /// columns, checks and indexes are returned with the bindings they held,
+    /// and their operator selections by the object owning each, each check
+    /// answering to the name of `check_names` at its position, which the
+    /// rebuilt objects keep.
     fn take_table_derived_objects(
         &mut self,
         table_name: &str,
         table_name_quoted: bool,
         schema_name: Option<&str>,
         schema_quoted: bool,
-    ) -> (Vec<(CreateIndex, Expr)>, CarriedCalls) {
+        mut check_names: Vec<Option<String>>,
+    ) -> (Vec<DetachedIndex>, CarriedCalls) {
         let case = self.identifier_case();
         let belongs_to = |table: &CreateTable| {
             table_matches_resolved_identity(
@@ -1594,30 +1604,69 @@ impl ParserDBBuilder {
             )
         };
 
+        let columns = self
+            .columns()
+            .iter()
+            .filter(|(column, _, _)| belongs_to(TableAttribute::table(column)))
+            .map(|(column, _, identity)| (column.attribute().name.clone(), *identity))
+            .collect();
         let mut carried = CarriedCalls::default();
+        carried.operators = operator_carry::CarriedOperators::recording(columns, case);
         let mut detached_indices = Vec::new();
-        self.indices_mut().retain(|(index, metadata)| {
+        self.indices_mut().retain_mut(|(index, metadata)| {
             if belongs_to(TableAttribute::table(index)) {
                 carried.record(index.attribute(), metadata.calls());
-                detached_indices.push((index.attribute().clone(), metadata.expression().clone()));
+                let selections = metadata.calls_mut().take_operator_nodes();
+                detached_indices.push((
+                    index.attribute().clone(),
+                    metadata.expression().clone(),
+                    selections,
+                ));
                 return false;
             }
             true
         });
 
-        self.columns_mut().retain(|(column, metadata, _)| {
+        self.columns_mut().retain_mut(|(column, metadata, identity)| {
             let detached = belongs_to(TableAttribute::table(column));
             if detached {
                 carried.record(column.attribute(), metadata.calls());
+                carried.operators.record_column(
+                    *identity,
+                    column.attribute(),
+                    metadata.calls_mut(),
+                );
             }
             !detached
         });
         self.unique_indices_mut().retain(|(index, _)| !belongs_to(TableAttribute::table(index)));
         self.foreign_keys_mut().retain(|(fk, ())| !belongs_to(TableAttribute::table(fk)));
-        self.check_constraints_mut().retain(|(check, metadata)| {
-            let detached = belongs_to(TableAttribute::table(check));
+        let mut position = 0;
+        self.check_constraints_mut().retain_mut(|(check, metadata)| {
+            let table = TableAttribute::table(check);
+            let detached = belongs_to(table);
             if detached {
                 carried.record(metadata.expression(), metadata.calls());
+                // A check written on a column belongs to the column.
+                let column = table.columns.iter().find(|column| {
+                    column.options.iter().any(|option| {
+                        matches!(&option.option, ColumnOption::Check(inline)
+                            if inline == check.attribute())
+                    })
+                });
+                let owner = column
+                    .and_then(|column| carried.operators.recorded_identity(&column.name))
+                    .map_or(operator_carry::Owner::Table, operator_carry::Owner::Column);
+                let declared = check.attribute();
+                let name = check_names.get_mut(position).and_then(Option::take);
+                position += 1;
+                carried.operators.record(
+                    owner,
+                    operator_carry::Kind::Check,
+                    name,
+                    &*declared.expr,
+                    metadata.calls_mut(),
+                );
             }
             !detached
         });
@@ -5607,13 +5656,14 @@ impl ParserDB {
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let check_arc = Arc::new(TableAttribute::new(create_table.clone(), check.clone()));
         table_metadata.add_check_constraint(check_arc.clone());
-        let (columns_in_expression, calls) = Self::process_check_constraint(
+        let (columns_in_expression, mut calls) = Self::process_check_constraint(
             &check.expr,
             create_table,
             table_metadata,
             &builder,
             carried,
         )?;
+        carried.operators.take_check(&check.expr, &mut calls);
         Ok(builder.add_check_constraint(
             check_arc,
             CheckMetadata::new(
@@ -5825,19 +5875,26 @@ impl ParserDB {
     }
 
     /// Removes operators and casts naming dropped types or running their
-    /// removed functions.
+    /// removed functions, the rows of the removed operators a statement added
+    /// joining `drop`.
     fn drop_facts_for_type_drop(
         catalog: &mut Arc<PostgresCatalog>,
         builder: &ParserDBBuilder,
-        drop: &user_defined_types::TypeDrop,
+        drop: &mut user_defined_types::TypeDrop,
         arrays: &TypeArrays,
     ) {
         if drop.types.is_empty() && drop.functions.is_empty() {
             return;
         }
         let catalog = Arc::make_mut(catalog);
-        catalog.drop_facts_naming_types(&drop.types);
-        catalog.drop_facts_declaring_functions(arrays, &drop.functions, builder.identifier_case());
+        let naming = catalog.drop_facts_naming_types(&drop.types);
+        let running = catalog.drop_facts_declaring_functions(
+            arrays,
+            &drop.functions,
+            builder.identifier_case(),
+        );
+        drop.operators.extend(naming);
+        drop.operators.extend(running);
     }
 
     /// Moves every function and relation stored in schema `from` to `to`,
@@ -6017,26 +6074,30 @@ impl ParserDB {
             preserved_column_metadata_for_table(&builder, &previous_node);
         preserve(&mut preserved_collations);
 
+        let check_names = constraint_names::check_names(
+            &previous_node,
+            previous_metadata.generated_constraint_names(),
+        );
         let (detached_indices, mut carried) = builder.take_table_derived_objects(
             &stored.name,
             stored.name_quoted,
             stored.schema.as_deref(),
             stored.schema_quoted,
+            check_names,
         );
-        for (exclusion, calls) in
-            constraint_names::exclusions(&previous_node).zip(previous_metadata.exclusion_calls())
-        {
-            carried.record(exclusion, calls);
-        }
-        if let Some(entries) = partition_keys::key_entries(&previous_node) {
-            carried.record(entries, previous_metadata.partition_key_calls());
-        }
+        Self::carry_table_operators(
+            &mut carried,
+            (&previous_node, &mut previous_metadata),
+            (&replacement, &metadata),
+            &preserved_collations,
+        );
+        // The hook may respell every recorded binding, the exclusions' too.
         carry(&mut carried);
 
         let replacement = Arc::new(replacement);
 
         let renamed = !stored.matches(&replacement, builder.identifier_case());
-        for (mut index, expression) in detached_indices {
+        for (mut index, expression, selections) in detached_indices {
             if renamed {
                 index.table_name = replacement.name.clone();
             }
@@ -6045,7 +6106,8 @@ impl ParserDB {
             let expression = Self::create_index_expression(&index.columns).unwrap_or(expression);
             let index = Arc::new(TableAttribute::new(replacement.clone(), index));
             metadata.add_index(index.clone());
-            let calls = builder.calls_carried(index.attribute(), &mut carried);
+            let mut calls = builder.calls_carried(index.attribute(), &mut carried);
+            carried.operators.take_index(index.attribute(), selections, &mut calls);
             builder = builder.add_index(
                 index,
                 IndexMetadata::new(expression, replacement.clone()).with_calls(calls),
@@ -6059,7 +6121,7 @@ impl ParserDB {
             collations,
             catalog,
             &preserved_collations,
-            TableOrigin::Replacement(identity, carried),
+            TableOrigin::Replacement(identity, Box::new(carried)),
         )?;
         builder.tables_mut().sort_by(|(a, _, _), (b, _, _)| {
             (a.table_schema(), a.table_name()).cmp(&(b.table_schema(), b.table_name()))
@@ -6070,6 +6132,48 @@ impl ParserDB {
         sequences::drop_orphaned_sequences(&mut builder);
         sequences::follow_identity_types(&mut builder)?;
         Ok(builder)
+    }
+
+    /// Has `carried` hold the operator selections of the exclusions and the
+    /// partition key of `previous`, and read the rebuilt expressions over the
+    /// columns `preserved` keeps and the check names `replacement` gives.
+    fn carry_table_operators(
+        carried: &mut CarriedCalls,
+        (previous, previous_metadata): (&CreateTable, &mut TableMetadata<CreateTable>),
+        (replacement, metadata): (&CreateTable, &TableMetadata<CreateTable>),
+        preserved: &[PreservedColumnMetadata],
+    ) {
+        let names = constraint_names::exclusion_names(
+            previous,
+            previous_metadata.generated_constraint_names(),
+        );
+        for ((exclusion, name), calls) in constraint_names::exclusions(previous)
+            .zip(names)
+            .zip(previous_metadata.exclusion_calls_mut())
+        {
+            carried.record(exclusion, calls);
+            let (owner, kind) = (operator_carry::Owner::Table, operator_carry::Kind::Exclusion);
+            carried.operators.record(owner, kind, name, exclusion, calls);
+        }
+        if let Some(entries) = partition_keys::key_entries(previous) {
+            let calls = previous_metadata.partition_key_calls_mut();
+            carried.record(entries, calls);
+            carried.operators.record_partition_key(calls);
+        }
+        let columns = preserved
+            .iter()
+            .filter_map(|preserved| {
+                let name = if preserved.column_name_quoted {
+                    Ident::with_quote('"', preserved.column_name.as_str())
+                } else {
+                    Ident::new(preserved.column_name.as_str())
+                };
+                Some((name, preserved.identity?))
+            })
+            .collect();
+        let check_names =
+            constraint_names::check_names(replacement, metadata.generated_constraint_names());
+        carried.operators.rebuild(columns, check_names);
     }
 
     /// Helper function to process column options.
@@ -6490,7 +6594,7 @@ impl ParserDB {
                 )
             }
             TableOrigin::Replacement(identity, carried) => {
-                (*identity, table_metadata.take_documentation(), core::mem::take(carried))
+                (*identity, table_metadata.take_documentation(), core::mem::take(&mut **carried))
             }
         };
         let search_path: Vec<_> =
@@ -6502,6 +6606,8 @@ impl ParserDB {
         }
 
         for column in table_metadata.clone().column_arcs() {
+            let preserved_identity = preserved_column_identity(column.attribute(), preserved);
+            carried.operators.build_column(preserved_identity);
             builder = Self::process_column_options(
                 column,
                 &create_table,
@@ -6509,6 +6615,9 @@ impl ParserDB {
                 builder,
                 &mut carried,
             )?;
+            carried.operators.build_column(None);
+            let mut calls = builder.calls_carried(column.attribute(), &mut carried);
+            carried.operators.take_column(preserved_identity, column.attribute(), &mut calls);
             let metadata = column_metadata_for_collations(
                 column.attribute(),
                 collations,
@@ -6517,7 +6626,7 @@ impl ParserDB {
                 preserved,
                 validate_missing,
             )?
-            .with_calls(builder.calls_carried(column.attribute(), &mut carried));
+            .with_calls(calls);
             let metadata = match &mut origin {
                 TableOrigin::Declaration(documentation, creations) => {
                     let name = &column.attribute().name;
@@ -6529,8 +6638,8 @@ impl ParserDB {
                 }
                 TableOrigin::Replacement(..) => metadata,
             };
-            let column_identity = preserved_column_identity(column.attribute(), preserved)
-                .unwrap_or_else(|| builder.draw_column_identity());
+            let column_identity =
+                preserved_identity.unwrap_or_else(|| builder.draw_column_identity());
             builder = builder.add_column_with_identity(column.clone(), metadata, column_identity);
         }
 
@@ -6541,17 +6650,41 @@ impl ParserDB {
             builder,
             &mut carried,
         )?;
-        let exclusion_calls = constraint_names::exclusions(&create_table)
-            .map(|exclusion| builder.calls_carried(exclusion, &mut carried))
-            .collect();
-        table_metadata.set_exclusion_calls(exclusion_calls);
-        if let Some(entries) = partition_keys::key_entries(&create_table) {
-            table_metadata.set_partition_key_calls(builder.calls_carried(entries, &mut carried));
-        }
+        Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
         table_metadata.set_documentation(documentation);
         table_metadata.set_constraint_names_pending(true);
 
         Ok(builder.add_table_with_identity(create_table, table_metadata, identity)?)
+    }
+
+    /// Records on `table_metadata` the calls and operator selections of the
+    /// exclusions and the partition key of `create_table`, a binding or a
+    /// selection `carried` holds kept.
+    fn record_table_expressions(
+        builder: &ParserDBBuilder,
+        create_table: &CreateTable,
+        table_metadata: &mut TableMetadata<CreateTable>,
+        carried: &mut CarriedCalls,
+    ) {
+        let names = constraint_names::exclusion_names(
+            create_table,
+            table_metadata.generated_constraint_names(),
+        );
+        let exclusion_calls = constraint_names::exclusions(create_table)
+            .zip(names)
+            .map(|(exclusion, name)| {
+                let mut calls = builder.calls_carried(exclusion, carried);
+                let (owner, kind) = (operator_carry::Owner::Table, operator_carry::Kind::Exclusion);
+                carried.operators.take(owner, kind, name.as_deref(), exclusion, &mut calls);
+                calls
+            })
+            .collect();
+        table_metadata.set_exclusion_calls(exclusion_calls);
+        if let Some(entries) = partition_keys::key_entries(create_table) {
+            let mut calls = builder.calls_carried(entries, carried);
+            carried.operators.take_partition_key(&mut calls);
+            table_metadata.set_partition_key_calls(calls);
+        }
     }
 
     /// Applies `edit` to the constraint list of the table an `ALTER TABLE`
@@ -8549,12 +8682,18 @@ impl ParserDB {
             }
         };
 
-        // A type change has PostgreSQL parse the table's expressions again,
-        // their calls choosing among their overloads anew.
+        let previous = Self::stored_node(&builder, &stored)?
+            .columns
+            .iter()
+            .find(|declared| column.matches(&declared.name))
+            .map(|declared| (declared.name.clone(), declared.data_type.clone()));
+        // A type change has PostgreSQL parse the column's dependents again.
         let carry = |carried: &mut CarriedCalls| {
-            if retyped {
+            if let (true, Some((name, data_type))) = (retyped, &previous) {
                 carried.rewrite();
+                carried.operators.retype(name.clone(), data_type.clone());
             }
+            carried.operators.write(column_name.clone(), installs);
         };
         let mut builder = Self::replace_table_node_carrying(builder, &stored, carry, |_, node| {
             apply(node);
@@ -9832,6 +9971,12 @@ impl ParserDB {
                                 !doomed_functions.iter().any(|doomed| Arc::ptr_eq(doomed, function))
                             });
                             removed.functions.extend(doomed_functions);
+                            // The schema's operators go now, so their
+                            // dependents elsewhere go with them.
+                            removed.operators.extend(
+                                Arc::make_mut(&mut active_postgres_catalog)
+                                    .drop_schema(&resolved_schema_name, resolved_schema_quoted),
+                            );
                             builder = Self::finish_drop(
                                 builder,
                                 removed,
@@ -10460,13 +10605,23 @@ impl ParserDB {
                 Statement::DropOperator(drop_operator)
                     if matches!(dialect, SqlparserDialect::PostgreSql) =>
                 {
-                    operator_ddl::drop(
+                    let operators = operator_ddl::drop(
                         &builder,
                         &mut active_postgres_catalog,
                         &type_arrays,
                         &session_roles,
                         drop_operator,
                     )?;
+                    // Without `CASCADE` a held operator was refused, so what
+                    // still applies a removed one goes with it.
+                    if !operators.is_empty() {
+                        builder = Self::finish_drop(
+                            builder,
+                            user_defined_types::TypeDrop { operators, ..Default::default() },
+                            &mut type_arrays,
+                            &mut active_postgres_catalog,
+                        )?;
+                    }
                 }
                 Statement::CreateCollation(create_collation) => {
                     if matches!(dialect, SqlparserDialect::PostgreSql) {

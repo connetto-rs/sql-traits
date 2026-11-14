@@ -647,6 +647,33 @@ pub(super) fn exclusion_name(
         .and_then(|(_, name)| name.map(Cow::into_owned))
 }
 
+/// The names the checks of `node` answer to, in the order of its slots,
+/// `recorded` holding the names PostgreSQL gave those written without one.
+pub(super) fn check_names(
+    node: &CreateTable,
+    recorded: &[GeneratedConstraintName],
+) -> Vec<Option<String>> {
+    names(node, recorded)
+        .into_iter()
+        .filter(|(slot, _)| check_of(*slot).is_some())
+        .map(|(_, name)| name.map(Cow::into_owned))
+        .collect()
+}
+
+/// The names the exclusion constraints of `node` answer to, in the order it
+/// lists them, `recorded` holding the names PostgreSQL gave those written
+/// without one.
+pub(super) fn exclusion_names(
+    node: &CreateTable,
+    recorded: &[GeneratedConstraintName],
+) -> Vec<Option<String>> {
+    names(node, recorded)
+        .into_iter()
+        .filter(|(slot, _)| matches!(slot, Slot::Table(_, TableConstraint::Exclude(_))))
+        .map(|(_, name)| name.map(Cow::into_owned))
+        .collect()
+}
+
 /// The exclusion constraints of `node`, in the order it lists them.
 pub(super) fn exclusions(node: &CreateTable) -> impl Iterator<Item = &ExcludeConstraint> {
     node.constraints.iter().filter_map(|constraint| {

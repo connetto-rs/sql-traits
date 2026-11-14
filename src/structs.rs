@@ -10,13 +10,13 @@ mod expression_scope;
 pub(crate) mod fingerprint;
 mod foreign_table_source;
 pub mod generic_db;
-pub(crate) use generic_db::ConstraintObject;
 pub use generic_db::{
     AccessResolution, GenericDB, Meta, ParseOptions, ParserDB, ParserDBBuilder, ParserDBIngestor,
     ParserIngestion, PostgresCatalog, PostgresCatalogCast, PostgresCatalogCollation,
     PostgresCatalogOperator, PostgresCatalogType, SchemaProfile, SqlparserProfile,
     UnresolvedAccessReference,
 };
+pub(crate) use generic_db::{ConstraintObject, OperatorRow};
 mod function_body;
 mod function_kind;
 mod helper_set;
@@ -54,6 +54,7 @@ pub use deployment::{
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
+pub(crate) use expression_context::{ReparsePins, Site, applies_operators};
 pub use expression_scope::ExpressionScope;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;

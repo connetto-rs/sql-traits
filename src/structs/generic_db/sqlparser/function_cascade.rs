@@ -1,6 +1,6 @@
-//! What a statement removing functions under `CASCADE` takes along: every
-//! object holding one of them, and what that object takes in turn, as
-//! PostgreSQL follows its dependencies.
+//! What a statement removing functions or operators under `CASCADE` takes
+//! along: every object holding one of them, and what that object takes in
+//! turn, as PostgreSQL follows its dependencies.
 
 use alloc::sync::Arc;
 
@@ -15,51 +15,45 @@ use super::{
     user_defined_types::{self, Doomed, TypeDrop},
     views,
 };
-use crate::errors::{Error, ObjectKind};
+use crate::{
+    errors::{Error, ObjectKind},
+    structs::metadata::operator_node_count,
+};
 
 /// Every part of a table a cascade reaches, the tables below it included.
 const WHOLE_TABLE: AlterTableScope = AlterTableScope { if_exists: false, only: false };
 
 impl ParserDB {
-    /// Takes along every object holding a function in `removed`, which the
-    /// builder no longer holds, and then drops the operators and casts naming
-    /// a removed type or running a removed function.
+    /// Takes along every object holding a function or an operator in
+    /// `removed`, which the builder and the catalog no longer hold, after
+    /// dropping the operators and casts naming a removed type or running a
+    /// removed function, until nothing holds anything removed.
     ///
     /// # Errors
     ///
     /// Returns the errors taking an object along meets.
     pub(super) fn finish_drop(
-        builder: ParserDBBuilder,
+        mut builder: ParserDBBuilder,
         mut removed: TypeDrop,
         arrays: &mut Arc<TypeArrays>,
         catalog: &mut Arc<PostgresCatalog>,
     ) -> Result<ParserDBBuilder, Error> {
-        let builder = Self::take_function_dependents(builder, &mut removed, arrays)?;
-        Self::drop_facts_for_type_drop(catalog, &builder, &removed, arrays);
-        Ok(builder)
-    }
-
-    /// Takes along every object holding a function in `removed`, and what
-    /// each takes in turn, until nothing holds a removed function. What the
-    /// cascade removes joins `removed`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors taking an object along meets.
-    pub(super) fn take_function_dependents(
-        mut builder: ParserDBBuilder,
-        removed: &mut TypeDrop,
-        arrays: &mut Arc<TypeArrays>,
-    ) -> Result<ParserDBBuilder, Error> {
-        while let Some(holder) =
-            removed.functions.iter().find_map(|function| builder.function_holder(function, &[]))
-        {
+        loop {
+            Self::drop_facts_for_type_drop(catalog, &builder, &mut removed, arrays);
+            let holder = removed
+                .functions
+                .iter()
+                .find_map(|function| builder.function_holder(function, &[]))
+                .or_else(|| builder.operator_holder(&removed.operators));
+            let Some(holder) = holder else {
+                return Ok(builder);
+            };
             let taken;
             (builder, taken) = Self::take_holder(builder, holder, arrays)?;
             removed.types.extend(taken.types);
             removed.functions.extend(taken.functions);
+            removed.operators.extend(taken.operators);
         }
-        Ok(builder)
     }
 
     /// Takes the object `holder` names, as PostgreSQL takes it along with a
@@ -133,11 +127,15 @@ impl ParserDB {
             Held::DomainCheck(domain, check) => {
                 let (node, metadata) = &mut builder.domains_mut()[domain];
                 let node = Arc::make_mut(node);
-                let first = call_count(&node.default)
-                    + node.constraints[..check].iter().map(call_count).sum::<usize>();
-                metadata
-                    .calls_mut()
-                    .remove_calls(first..first + call_count(&node.constraints[check]));
+                let (earlier, removed) = (&node.constraints[..check], &node.constraints[check]);
+                let calls =
+                    call_count(&node.default) + earlier.iter().map(call_count).sum::<usize>();
+                let operators = operator_node_count(&node.default)
+                    + earlier.iter().map(operator_node_count).sum::<usize>();
+                metadata.calls_mut().remove_part(
+                    calls..calls + call_count(removed),
+                    operators..operators + operator_node_count(removed),
+                );
                 node.constraints.remove(check);
             }
             Held::Domain(domain) => {
