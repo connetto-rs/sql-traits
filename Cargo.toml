@@ -27,6 +27,7 @@ std = [
     "geometric-traits/std",
     "thiserror/std",
     "sqlparser-plpgsql/std",
+    "sqlparser-canonicalize?/std",
 ]
 # Adds git-backed construction: `ParserDB::from_git_url*` clones a remote
 # repository into a temporary directory and parses the SQL it contains.
@@ -41,6 +42,10 @@ git = [
 # consumer persists: `TargetName`, `ColumnCollation`, `NamedColumnCollation`
 # and `MySqlCollationPadding`. Kept `no_std`-compatible through `serde/alloc`.
 serde = ["dep:serde"]
+# Implements sqlparser-canonicalize's `SemanticContext` through
+# `SemanticProofs`, so canonical text spells the casts and constants
+# PostgreSQL derives for an expression. Kept `no_std`-compatible.
+canonicalize = ["dep:sqlparser-canonicalize"]
 
 [dependencies]
 sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
@@ -54,6 +59,7 @@ unicode-normalization = { version = "0.1", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
 once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
 sql-values = { version = "0.5.1", default-features = false }
+sqlparser-canonicalize = { git = "https://github.com/connetto-rs/sqlparser-canonicalize", branch = "main", default-features = false, optional = true }
 
 # Follow upstream parser and comment APIs.
 [patch.crates-io]

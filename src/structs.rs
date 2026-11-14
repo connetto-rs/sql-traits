@@ -33,6 +33,8 @@ mod role_membership;
 mod role_setting;
 mod row_security;
 mod schema;
+#[cfg(feature = "canonicalize")]
+mod semantic_proofs;
 mod sequence;
 mod sequence_parameters;
 mod table_privileges;
@@ -80,6 +82,8 @@ pub use row_security::{
     RowSecurityExemption, RowStatement, RowVersion,
 };
 pub use schema::Schema;
+#[cfg(feature = "canonicalize")]
+pub use semantic_proofs::{SemanticProofView, SemanticProofs};
 pub use sequence::Sequence;
 pub(crate) use sequence::StoredSequenceOwner;
 pub use sequence_parameters::{SequenceParameters, SequenceType};

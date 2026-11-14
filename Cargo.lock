@@ -913,6 +913,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "seahash"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -992,6 +998,7 @@ dependencies = [
  "sha2",
  "sql-values",
  "sqlparser",
+ "sqlparser-canonicalize",
  "sqlparser-plpgsql",
  "tempfile",
  "thiserror",
@@ -1011,11 +1018,21 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#2ddee5541e55ca2d242204175b817f8648c324d2"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#96a5132234dda33aa75ab6d3ef045038f106703a"
 dependencies = [
  "log",
  "recursive",
  "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser-canonicalize"
+version = "0.2.1"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#189906ac24ccdf0df0eaaef3b3608a292a54df93"
+dependencies = [
+ "seahash",
+ "sqlparser",
+ "thiserror",
 ]
 
 [[package]]
@@ -1030,7 +1047,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#2ddee5541e55ca2d242204175b817f8648c324d2"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#96a5132234dda33aa75ab6d3ef045038f106703a"
 dependencies = [
  "proc-macro2",
  "quote",
