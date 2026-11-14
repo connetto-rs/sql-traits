@@ -301,7 +301,7 @@ type Applications<'node, 'db, DB> = (Vec<OperatorApplication<'node, 'db, DB>>, R
 
 /// What PostgreSQL does with the elements of an `IN` list it may build into
 /// one array.
-enum Collapse<'a> {
+pub(crate) enum Collapse<'a> {
     /// It builds them into one array of elements of this type.
     Into(OperandType<'a>),
     /// It compares with each of them apart.
@@ -1086,7 +1086,11 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// What PostgreSQL does with the `IN` list elements `elements` it may
     /// build into one array, deciding by the common type of `left` and the
     /// elements.
-    fn collapse(&self, left: &Expr, elements: &[&Expr]) -> Result<Collapse<'_>, LookupError> {
+    pub(crate) fn collapse(
+        &self,
+        left: &Expr,
+        elements: &[&Expr],
+    ) -> Result<Collapse<'_>, LookupError> {
         let mut types = Vec::with_capacity(elements.len() + 1);
         for node in core::iter::once(left).chain(elements.iter().copied()) {
             types.push(match self.type_of(node)? {

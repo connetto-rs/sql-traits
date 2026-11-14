@@ -149,6 +149,8 @@ mod schema_usage;
 mod scope_identifier_context;
 mod search_path;
 mod search_path_creation;
+#[cfg(feature = "canonicalize")]
+mod semantic_proofs;
 mod sequence_defaults;
 mod sequence_parameters;
 mod sequences;
