@@ -73,7 +73,7 @@ fn schema_ident(name: &str, quoted: bool) -> Ident {
 
 /// A stored object a `DROP TYPE` or `DROP DOMAIN` statement dooms.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Doomed {
+pub(super) enum Doomed {
     /// The domain at this position among the stored domains.
     Domain(usize),
     /// The user-defined type at this position.
@@ -816,12 +816,29 @@ pub(super) fn drop_types(
             }
         }
     }
-    drop_positions(builder, &doomed, cascade, &[], arrays)
+    drop_positions(builder, &doomed, cascade, arrays)
+}
+
+/// Drops the domain or user-defined type `doomed` with everything a
+/// `CASCADE` takes along with it.
+///
+/// Returns the builder alongside the identities and functions the drop took,
+/// whose own dependents are left for the caller to take.
+///
+/// # Errors
+///
+/// Returns the errors dropping a column of the type returns.
+pub(super) fn drop_cascade(
+    builder: ParserDBBuilder,
+    doomed: Doomed,
+    arrays: &mut Arc<TypeArrays>,
+) -> Result<(ParserDBBuilder, TypeDrop), Error> {
+    drop_positions(builder, &[doomed], true, arrays)
 }
 
 /// The name a stored table is stored under, with the default schema written
 /// out so a lookup reaches it whatever the session's path holds.
-fn qualified_table_name(name: &ObjectName) -> ObjectName {
+pub(super) fn qualified_table_name(name: &ObjectName) -> ObjectName {
     let mut qualified = name.clone();
     if matches!(qualifier_of(name), Qualifier::Absent) {
         bind_reference(&mut qualified, Some(Ident::new(DEFAULT_SCHEMA)));
@@ -896,17 +913,15 @@ fn extend_doomed_by_dependents(
 
 /// Drops the objects at `doomed`, refusing what uses them unless `cascade`,
 /// in which case the columns, composite attributes, domains, ranges and
-/// functions using them go too. `alongside` holds the functions the same
-/// statement drops later, whose calls hold nothing in place.
+/// functions using them go too.
 ///
 /// Returns the builder alongside the identities the doomed types hold, each
 /// with its stored array, and the functions the drop removes, read before the
-/// removal.
+/// removal, whose own dependents are left for the caller to take.
 fn drop_positions(
     mut builder: ParserDBBuilder,
     doomed: &[Doomed],
     cascade: bool,
-    alongside: &[Arc<CreateFunction>],
     arrays: &mut Arc<TypeArrays>,
 ) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     if doomed.is_empty() {
@@ -965,7 +980,7 @@ fn drop_positions(
     removed.functions.extend(range_constructors::drop_range_constructors(
         &mut builder,
         |position| doomed_user_type(&doomed_owned, position),
-        alongside,
+        cascade,
     )?);
     // Any other function whose signature names a doomed type holds it in
     // place, and goes with it under `CASCADE`.
@@ -990,7 +1005,9 @@ fn drop_positions(
     }
     let naming: Vec<Arc<CreateFunction>> =
         naming.into_iter().map(|(function, _)| function).collect();
-    builder.drop_function_nodes(&naming, alongside)?;
+    builder
+        .functions_mut()
+        .retain(|(function, _)| !naming.iter().any(|doomed| Arc::ptr_eq(doomed, function)));
     removed.functions.extend(naming);
     removed.types.extend(doomed_type_identities(&builder, arrays, &doomed_owned));
 
@@ -1097,22 +1114,18 @@ fn drop_dependents_cascade(
 }
 
 /// Drops every type of a schema `DROP SCHEMA ... CASCADE` removes, with what a
-/// cascading drop of each takes, `alongside` holding the functions the schema
-/// drop takes afterwards.
+/// cascading drop of each takes.
 ///
 /// Returns the builder alongside the identities the doomed types hold, each
 /// with its stored array, and the functions the drop removes, read before the
-/// removal.
+/// removal, whose own dependents are left for the caller to take.
 ///
 /// # Errors
 ///
-/// Returns the errors dropping a column a type declares returns, and
-/// [`Error::FunctionReferenced`] for a function naming one of the types that
-/// something outside the drop still calls.
+/// Returns the errors dropping a column a type declares returns.
 pub(super) fn drop_types_in(
     builder: ParserDBBuilder,
     schema: (&str, bool),
-    alongside: &[Arc<CreateFunction>],
     arrays: &mut Arc<TypeArrays>,
 ) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let case = builder.identifier_case();
@@ -1132,7 +1145,7 @@ pub(super) fn drop_types_in(
         .collect();
     let mut doomed = doomed_domains;
     doomed.extend(doomed_types);
-    drop_positions(builder, &doomed, true, alongside, arrays)
+    drop_positions(builder, &doomed, true, arrays)
 }
 
 /// Retargets a matching type reference while preserving qualification within

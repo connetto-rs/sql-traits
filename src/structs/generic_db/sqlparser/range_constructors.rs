@@ -198,18 +198,19 @@ pub(super) fn requiring_type(
 
 /// Drops the constructors of the ranges at the positions `doomed` accepts,
 /// which PostgreSQL drops with the range whatever the statement says about
-/// `CASCADE`, `alongside` holding the functions the same statement drops
-/// later.
+/// `CASCADE`.
+///
+/// Returns the constructors it removes, whose own dependents are left for
+/// the caller to take under `CASCADE`.
 ///
 /// # Errors
 ///
-/// Returns the constructors it removes alongside the builder, and
-/// [`Error::FunctionReferenced`] when something still calls one, as dropping
-/// the function itself does.
+/// Returns [`Error::FunctionReferenced`] when something still calls one
+/// without `CASCADE`, as dropping the function itself does.
 pub(super) fn drop_range_constructors(
     builder: &mut ParserDBBuilder,
     doomed: impl Fn(usize) -> bool,
-    alongside: &[Arc<CreateFunction>],
+    cascade: bool,
 ) -> Result<Vec<Arc<CreateFunction>>, Error> {
     let case = builder.identifier_case();
     let ranges: Vec<&UserDefinedType> = builder
@@ -229,7 +230,13 @@ pub(super) fn drop_range_constructors(
         })
         .map(|(function, _)| Arc::clone(function))
         .collect();
-    builder.drop_function_nodes(&dropping, alongside)?;
+    if cascade {
+        builder
+            .functions_mut()
+            .retain(|(function, _)| !dropping.iter().any(|doomed| Arc::ptr_eq(doomed, function)));
+    } else {
+        builder.drop_function_nodes(&dropping)?;
+    }
     Ok(dropping)
 }
 
