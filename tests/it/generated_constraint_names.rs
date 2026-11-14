@@ -406,3 +406,29 @@ fn a_child_writing_its_parents_generated_name_holds_the_parents_copy() {
         Err(Error::InheritedConstraintNotDroppable { .. })
     ));
 }
+
+/// Dropping one of the constraints written alike leaves every other one its
+/// generated name, on the table and on a column, wherever the dropped one
+/// sits among them.
+#[test]
+fn a_dropped_constraint_leaves_those_written_alike_their_names() {
+    for (setup, dropped, kept) in [
+        (
+            "CREATE TABLE p (a INT, CHECK (a > 1)); ALTER TABLE p ADD CHECK (a > 1);",
+            "p_a_check",
+            ["p_a_check1"].as_slice(),
+        ),
+        ("CREATE TABLE p (a INT CHECK (a > 1) CHECK (a > 1));", "p_a_check", &["p_a_check1"]),
+        (
+            "CREATE TABLE p (a INT, CHECK (a > 1), CHECK (a > 1), CHECK (a > 1));",
+            "p_a_check1",
+            &["p_a_check", "p_a_check2"],
+        ),
+    ] {
+        let after = format!("{setup} ALTER TABLE p DROP CONSTRAINT {dropped};");
+        for name in kept {
+            assert!(drops(&after, name), "{after} keeps {name}");
+        }
+        assert!(!drops(&after, dropped), "{after} forgets {dropped}");
+    }
+}
