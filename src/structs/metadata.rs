@@ -20,8 +20,8 @@ pub use domain_metadata::DomainMetadata;
 mod expression_calls;
 pub use expression_calls::ExpressionCalls;
 pub(crate) use expression_calls::{
-    BoundCall, CallChoice, Carried, CarriedNodes, NodeState, OperatorNode, for_each_operator_node,
-    operator_node_count,
+    BoundCall, CallChoice, Carried, CarriedNodes, NodeState, OperatorNode, WrittenPins,
+    for_each_operator_node, operator_node_count,
 };
 mod policy_metadata;
 pub use policy_metadata::PolicyMetadata;
