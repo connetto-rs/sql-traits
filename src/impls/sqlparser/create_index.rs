@@ -2,7 +2,7 @@
 
 use alloc::{borrow::Cow, string::ToString};
 
-use sqlparser::ast::{ColumnDef, CreateIndex, CreateTable, Expr, IndexType};
+use sqlparser::ast::{ColumnDef, CreateIndex, CreateTable, Expr, Function, IndexType};
 
 use super::index_clauses::{included_columns, written_access_method};
 use crate::{
@@ -110,6 +110,19 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
     #[inline]
     fn predicate(&self) -> Option<&Expr> {
         self.attribute().predicate.as_ref()
+    }
+
+    /// The calls of the whole statement are bound in one record, so a call
+    /// of the predicate is counted after every call of the key.
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        self.metadata(database)?
+            .reached_by(self.attribute(), call)
+            .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })
     }
 
     #[inline]

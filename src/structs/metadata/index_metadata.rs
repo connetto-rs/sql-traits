@@ -2,9 +2,9 @@
 
 use alloc::sync::Arc;
 
-use sqlparser::ast::Expr;
+use sqlparser::ast::{Expr, Function, Visit};
 
-use super::ExpressionCalls;
+use super::{ExpressionCalls, expression_calls::call_site};
 use crate::traits::{DatabaseLike, IndexLike};
 
 #[derive(Debug, Clone)]
@@ -38,6 +38,22 @@ impl<I: IndexLike> IndexMetadata<I> {
     /// Returns the calls of the index's expressions and predicate.
     pub(crate) fn calls(&self) -> &ExpressionCalls<<I::DB as DatabaseLike>::Function> {
         &self.calls
+    }
+
+    /// Returns the functions `call` reaches, or `None` when `call` is a node
+    /// of neither [`Self::expression`] nor `statement`, the node the calls
+    /// were bound from.
+    ///
+    /// The expression copies the key of `statement`, which a walk of
+    /// `statement` meets before any other call, so a call counts from the
+    /// start of whichever of the two holds it.
+    pub(crate) fn reached_by<'s, N: Visit + ?Sized>(
+        &'s self,
+        statement: &N,
+        call: &Function,
+    ) -> Option<impl Iterator<Item = &'s <I::DB as DatabaseLike>::Function> + use<'s, I, N>> {
+        let site = call_site(&self.expression, call).or_else(|| call_site(statement, call))?;
+        self.calls.reached_at(site)
     }
 
     /// Returns the calls of the index's expressions and predicate, to settle

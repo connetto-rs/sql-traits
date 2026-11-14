@@ -335,6 +335,11 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
             held(TableAttribute::table(index.as_ref()));
         }
     }
+    for (unique_key, metadata) in builder.unique_indices() {
+        if moves.reached_by(metadata.calls()) {
+            held(TableAttribute::table(unique_key.as_ref()));
+        }
+    }
     for (table, metadata, _) in builder.tables() {
         if moves.reached_by(metadata.partition_key_calls())
             || metadata.exclusion_calls().iter().any(|calls| moves.reached_by(calls))
@@ -352,9 +357,7 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
                 respell(Arc::make_mut(index).attribute_mut(), metadata.calls(), moves)?;
             }
         }
-        // The table node spells the calls its columns, checks, partition key
-        // and exclusion constraints were bound from, each found by its
-        // written name and argument count, the way the rebuild finds it.
+        // The rebuild finds each bound call by name and argument count.
         let mut bound = CarriedCalls::default();
         for (column, metadata, _) in builder.columns() {
             if stored.matches(TableAttribute::table(column.as_ref()), case) {
@@ -364,6 +367,11 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
         for (check, metadata) in builder.check_constraints() {
             if stored.matches(TableAttribute::table(check.as_ref()), case) {
                 bound.record(metadata.expression(), metadata.calls());
+            }
+        }
+        for (unique_key, metadata) in builder.unique_indices() {
+            if stored.matches(TableAttribute::table(unique_key.as_ref()), case) {
+                bound.record(unique_key.attribute(), metadata.calls());
             }
         }
         for (table, metadata, _) in builder.tables() {

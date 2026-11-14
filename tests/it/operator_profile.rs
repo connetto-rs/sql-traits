@@ -435,6 +435,15 @@ impl<P: EmptyKinds> IndexLike for NoneKind<P> {
     fn is_unique(&self) -> bool {
         self.unreach()
     }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        _call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
+    }
 }
 
 impl<P: EmptyKinds> ForeignKeyLike for NoneKind<P> {
