@@ -803,14 +803,10 @@ impl Deparsed {
     ) {
         let Ok(Some(call)) = context.call(expression) else { return };
         let node = address(function);
-        let selected = match call.resolution() {
-            CallResolution::Selected(selected) => selected,
-            CallResolution::Cast(target) => {
-                self.casts.insert(node, target.clone().into_owned());
-                return;
-            }
-            _ => return,
-        };
+        if let CallResolution::Cast(target) = call.resolution() {
+            self.casts.insert(node, target.clone().into_owned());
+        }
+        let CallResolution::Selected(selected) = call.resolution() else { return };
         for (position, argument) in selected.arguments().iter().enumerate() {
             let evidence = argument.evidence();
             if !evidence.conversion().is_empty() {
