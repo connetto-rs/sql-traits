@@ -23,7 +23,7 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
-    traits::{DatabaseLike, FunctionLike, Relation, SequenceLike, TableLike, ViewLike},
+    traits::{DatabaseLike, FunctionLike, Relation, SchemaLike, SequenceLike, TableLike, ViewLike},
     utils::identifier_resolution::{
         SearchPath, identifiers_match, is_temporary_schema, stored_identifier,
     },
@@ -68,6 +68,32 @@ where
         .then_some((PG_CATALOG, false))
         .into_iter()
         .chain(search_path().filter(|&(schema, quoted)| !is_temporary_schema(schema, quoted)))
+}
+
+/// Whether a function or operator lookup of `name` may land in a schema
+/// `database` does not hold, whose functions and operators the database
+/// cannot know. `pg_catalog` and the temporary schema are always held, and
+/// neither `"$user"` nor an empty entry on the search path names a schema.
+pub(crate) fn reaches_unheld_schema<D: DatabaseLike>(
+    database: &D,
+    name: &TargetName<'_>,
+    case: IdentifierCase,
+) -> bool {
+    let held = |schema: &str, quoted: bool| {
+        identifiers_match(schema, quoted, PG_CATALOG, false)
+            || is_temporary_schema(schema, quoted)
+            || database.schemas().any(|declared| {
+                case.identifiers_match(declared.name(), declared.name_is_quoted(), schema, quoted)
+            })
+    };
+    match name.schema() {
+        Some(schema) => !held(schema, name.schema_is_quoted()),
+        None => {
+            function_search_path(|| database.search_path()).any(|(schema, quoted)| {
+                !schema.is_empty() && schema != "$user" && !held(schema, quoted)
+            })
+        }
+    }
 }
 
 /// The schemas a type lookup walks for an unqualified name.

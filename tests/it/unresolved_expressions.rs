@@ -380,3 +380,88 @@ fn an_extension_leaves_a_converted_argument_pinned() {
         "got {result:?}"
     );
 }
+
+/// A table whose rows a policy keeps to their owner.
+const DOCS: &str =
+    "CREATE TABLE docs (owner UUID, a text); ALTER TABLE docs ENABLE ROW LEVEL SECURITY;";
+
+/// A lookup that may land in a schema the input never creates, whose
+/// functions and operators the model cannot know, refuses nothing, whether
+/// the name is qualified with it or the search path names it.
+#[test]
+fn a_lookup_reaching_an_unheld_schema_is_not_refused() {
+    for sql in [
+        format!("{DOCS} CREATE POLICY own ON docs USING (owner = (SELECT auth.uid()));"),
+        format!(
+            "{DOCS} CREATE POLICY admin ON docs USING (auth.jwt() -> 'user_metadata' ->> 'role' = 'admin');"
+        ),
+        format!("{DOCS} CREATE POLICY own ON docs USING (owner = auth.uid());"),
+        format!(
+            "{DOCS} CREATE POLICY listed ON docs USING (owner IN (SELECT x FROM auth.owners() AS x));"
+        ),
+        "CREATE VIEW v AS SELECT x FROM ext.rows(1) AS x;".to_string(),
+        "CREATE TABLE d (a text CHECK (ext.valid(a)));".to_string(),
+        "CREATE TABLE d (a text CHECK (a OPERATOR(ext.%) 'x'));".to_string(),
+        "SET search_path = \"$user\", public, extensions;
+         CREATE TABLE d (a text CHECK (valid(a)));"
+            .to_string(),
+        "SET search_path = \"$user\", public, extensions;
+         CREATE TABLE d (a text CHECK (a % 'x'));"
+            .to_string(),
+    ] {
+        let result = parse(&sql);
+        assert!(result.is_ok(), "{sql}\ngot {result:?}");
+    }
+}
+
+/// A lookup reaching only schemas the model holds is refused, `pg_catalog`
+/// and the temporary schema always among them, and neither `"$user"` nor an
+/// empty entry on the search path naming one.
+#[test]
+fn a_lookup_reaching_only_held_schemas_is_refused() {
+    for (sql, function, arguments) in [
+        (
+            format!(
+                "CREATE SCHEMA auth; {DOCS} CREATE POLICY own ON docs USING (owner = (SELECT auth.uid()));"
+            ),
+            "auth.uid",
+            &[][..],
+        ),
+        (
+            "CREATE SCHEMA ext; CREATE VIEW v AS SELECT x FROM ext.rows(1) AS x;".to_string(),
+            "ext.rows",
+            &["int4"],
+        ),
+        (
+            "CREATE TABLE d (a text CHECK (pg_catalog.valid(a)));".to_string(),
+            "pg_catalog.valid",
+            &["text"],
+        ),
+        (
+            "CREATE TABLE d (a text CHECK (pg_temp.valid(a)));".to_string(),
+            "pg_temp.valid",
+            &["text"],
+        ),
+        ("CREATE TABLE d (a text CHECK (public.valid(a)));".to_string(), "public.valid", &["text"]),
+        (
+            "SET search_path = \"$user\", public, pg_temp;
+             CREATE TABLE d (a text CHECK (valid(a)));"
+                .to_string(),
+            "valid",
+            &["text"],
+        ),
+        (
+            "SET search_path = ''; CREATE TABLE public.d (a text CHECK (valid(a)));".to_string(),
+            "valid",
+            &["text"],
+        ),
+    ] {
+        assert_call_refused(&sql, function, arguments, Unresolved::DoesNotExist);
+    }
+    for sql in [
+        "CREATE SCHEMA ext; CREATE TABLE d (a text CHECK (a OPERATOR(ext.%) 'x'));",
+        "SET search_path = \"$user\", public; CREATE TABLE d (a text CHECK (a % 'x'));",
+    ] {
+        assert_operator_refused(sql, "%", &["text", "unknown"], Unresolved::DoesNotExist);
+    }
+}

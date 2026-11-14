@@ -1738,8 +1738,10 @@ pub enum Error {
     ///
     /// PostgreSQL types an expression when the statement storing it runs,
     /// and again when `ALTER COLUMN ... TYPE` parses it over the column's
-    /// new type. A database holding an extension never raises it, since the
-    /// extension may supply the operator.
+    /// new type. A database holding an extension never raises it, and
+    /// neither does an operator whose lookup may land in a schema the
+    /// database does not hold, qualified with it or on the search path,
+    /// since the extension or the schema may supply the operator.
     UnresolvedOperator {
         /// Symbol of the operator as written.
         operator_name: Box<str>,
@@ -1755,8 +1757,10 @@ pub enum Error {
     ///
     /// PostgreSQL types an expression when the statement storing it runs,
     /// and again when `ALTER COLUMN ... TYPE` parses it over the column's
-    /// new type. A database holding an extension never raises it, since the
-    /// extension may supply the function.
+    /// new type. A database holding an extension never raises it, and
+    /// neither does a call whose lookup may land in a schema the database
+    /// does not hold, qualified with it or on the search path, since the
+    /// extension or the schema may supply the function.
     UnresolvedCall {
         /// Name of the function as written.
         function_name: String,
@@ -1772,7 +1776,9 @@ pub enum Error {
     ///
     /// PostgreSQL checks a call's clauses when the statement storing the
     /// expression runs, and again when `ALTER COLUMN ... TYPE` parses it
-    /// over the column's new type.
+    /// over the column's new type. A call whose lookup may land in a schema
+    /// the database does not hold is refused only for clauses no function
+    /// combines, since that schema may supply a function of another kind.
     MisappliedCall {
         /// Name of the function as written, each part unquoted.
         function_name: String,
