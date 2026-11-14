@@ -1,11 +1,13 @@
 //! Keeps, for each call a statement stores, the overload its argument types
-//! select, the function PostgreSQL records the call's dependency on.
+//! select, the function PostgreSQL records the call's dependency on, or
+//! none for a call PostgreSQL reads as a cast.
 //!
 //! A call is resolved by name and argument count when its statement runs,
 //! and one reaching several overloads, one of them declared by the schema,
-//! waits for its argument types. Once the statement has run, each waiting
-//! call is typed in the scope its expression sees, over the catalog as the
-//! statement left it, and keeps the function selected or, when the types
+//! or a declared one by one argument waits for its argument types. Once the
+//! statement has run, each waiting call is typed in the scope its
+//! expression sees, over the catalog as the statement left it, and keeps
+//! the function selected, none when read as a cast, or, when the types
 //! select none, every overload.
 
 use alloc::collections::BTreeMap;
@@ -15,14 +17,16 @@ use sqlparser::ast::{ColumnOption, Expr, Function, Query, Statement, Visit, Visi
 
 use super::{ParserDB, ParserDBBuilder};
 use crate::{
-    structs::{CallResolution, ExpressionContext, ExpressionScope, IdentifierCase, TableAttribute},
+    structs::{
+        CallResolution, ExpressionContext, ExpressionScope, IdentifierCase, TableAttribute,
+        metadata::CallChoice,
+    },
     traits::{PolicyLike, Relation, RuleLike, TriggerLike},
     utils::walk::walk,
 };
 
-/// The function each typed call selects, by the address of the call's node,
-/// as the address of the function's node.
-type Selections = BTreeMap<usize, usize>;
+/// What each typed call chooses, by the address of the call's node.
+type Selections = BTreeMap<usize, CallChoice>;
 
 impl ParserDBBuilder {
     /// Whether some stored call still waits for its argument types to choose
@@ -287,9 +291,17 @@ impl Visitor for Calls<'_, '_, '_> {
         if let Expr::Function(function) = expression
             && let Some(context) = self.context
             && let Ok(Some(call)) = context.call(expression)
-            && let CallResolution::Selected(selected) = call.resolution()
         {
-            self.selections.insert(address(function), address(selected.function()));
+            let choice = match call.resolution() {
+                CallResolution::Selected(selected) => {
+                    Some(CallChoice::Function(address(selected.function())))
+                }
+                CallResolution::Cast(_) => Some(CallChoice::Cast),
+                _ => None,
+            };
+            if let Some(choice) = choice {
+                self.selections.insert(address(function), choice);
+            }
         }
         ControlFlow::Continue(())
     }
