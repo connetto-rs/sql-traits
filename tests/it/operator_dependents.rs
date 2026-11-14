@@ -428,6 +428,52 @@ fn a_type_change_keeps_a_converted_argument() {
     );
 }
 
+/// A check the statement retyping its column adds is typed over the new
+/// type, since PostgreSQL adds constraints after it changes column types.
+#[test]
+fn a_check_added_beside_a_type_change_reads_the_new_type() {
+    let check = format!(
+        "{INT4} {INT8_INT4}
+         CREATE FUNCTION app.f(int4) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         CREATE FUNCTION app.f(int8) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         CREATE TABLE d (a INT4);
+         ALTER TABLE d ADD CONSTRAINT ck CHECK (a <<< 5 AND f(a)), ALTER COLUMN a TYPE int8;"
+    );
+    parse(&format!("{FUNCTIONS} {check} DROP OPERATOR app.<<< (int4, int4);"))
+        .expect("the check applies `<<<(int8, int4)`");
+    parse(&format!("{FUNCTIONS} {check} DROP FUNCTION app.f(int4);"))
+        .expect("the check calls `f(int8)`");
+    assert_held(
+        &format!("{FUNCTIONS} {check} DROP OPERATOR app.<<< (int8, int4);"),
+        ObjectKind::CheckConstraint,
+        "d.ck",
+    );
+    let result = parse(&format!("{FUNCTIONS} {check} DROP FUNCTION app.f(int8);"));
+    assert!(
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                if function_name == "f"
+                    && *dependent_kind == ObjectKind::CheckConstraint
+                    && dependent_name == "d.ck"
+        ),
+        "got {result:?}"
+    );
+}
+
+/// A call read as a cast is deparsed as the cast, so a column type change
+/// keeps it a cast even where a function now takes the new type exactly.
+#[test]
+fn a_type_change_keeps_a_call_read_as_a_cast() {
+    parse(
+        "CREATE FUNCTION public.text(int4) RETURNS TEXT LANGUAGE sql IMMUTABLE AS 'SELECT $1::text';
+         CREATE TABLE d (a VARCHAR CONSTRAINT ck CHECK (text(a) <> ''));
+         ALTER TABLE d ALTER COLUMN a TYPE int4 USING a::int4;
+         DROP FUNCTION public.text(int4);",
+    )
+    .expect("the check casts to `text` and calls no function");
+}
+
 /// An application the model cannot type, such as a comparison of a
 /// composite field, leaves the casts the deparse writes elsewhere in the
 /// expression in place.

@@ -103,8 +103,9 @@ pub(crate) type Site = (usize, usize);
 /// retyped column while the old selections are read, the operator each
 /// application and the function each call selected then, the casts the
 /// deparse writes around the operands and arguments those selections
-/// converted, and the schema it qualifies an operator or a function with
-/// that its name alone would not reach.
+/// converted and in place of a call read as a cast, and the schema it
+/// qualifies an operator or a function with that its name alone would not
+/// reach.
 pub(crate) trait ReparsePins<DB: DatabaseLike> {
     /// The type a reference to the column `column` reads as, in place of
     /// the column's own.
@@ -125,6 +126,9 @@ pub(crate) trait ReparsePins<DB: DatabaseLike> {
     /// The schema the called name of the call whose node sits at `call` is
     /// qualified with.
     fn call_schema(&self, call: usize) -> Option<(&str, bool)>;
+    /// The type the call whose node sits at `call` is deparsed as a cast to,
+    /// for a call read as a cast.
+    fn cast(&self, call: usize) -> Option<&TargetName<'static>>;
 }
 
 /// One operator PostgreSQL applies to evaluate an expression node, with the
@@ -721,6 +725,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         }
         let Some(written) = written_argument_names(function) else { return Ok(None) };
         let call = core::ptr::from_ref(function).addr();
+        if let Some(target) = self.pins.and_then(|pins| pins.cast(call)) {
+            let resolution = CallResolution::Cast(target.clone());
+            return Ok(Some(CallApplication { name, arguments, resolution, refused: None }));
+        }
         let qualified;
         let lookup = match self.pins.and_then(|pins| pins.call_schema(call)) {
             Some((schema, quoted)) if name.schema().is_none() => {
