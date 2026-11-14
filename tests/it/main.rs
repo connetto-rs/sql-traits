@@ -8,6 +8,7 @@ mod support;
 mod absent_object_metadata;
 mod absent_object_references;
 mod absent_table_alterations;
+mod aggregate_window_from_calls;
 mod altered_policies;
 mod array_column_types;
 mod array_vector_interval_types;

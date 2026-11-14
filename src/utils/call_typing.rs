@@ -6,7 +6,7 @@ use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
     ArgMode, ArrayElemTypeDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments,
+    FunctionArguments, ObjectName,
 };
 
 use crate::{
@@ -35,38 +35,41 @@ use crate::{
 /// The name an argument is passed under in named notation.
 pub(crate) type WrittenName<'c> = Option<(&'c str, bool)>;
 
-/// The arguments a call writes, by the name each is passed under.
+/// The arguments a call writes, by the name each is passed under, the
+/// ordering arguments of `WITHIN GROUP` after its own, which PostgreSQL
+/// passes to an ordered-set aggregate.
 ///
 /// [`None`] when an argument is named by something other than an identifier,
 /// which no parameter answers. `count(*)` passes nothing.
 pub(crate) fn written_argument_names(call: &Function) -> Option<Vec<WrittenName<'_>>> {
-    match &call.args {
-        FunctionArguments::None => Some(Vec::new()),
-        FunctionArguments::Subquery(_) => Some(vec![None]),
-        FunctionArguments::List(list)
-            if matches!(
-                list.args.as_slice(),
-                [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
-            ) =>
-        {
-            Some(Vec::new())
-        }
-        FunctionArguments::List(list) => {
-            list.args
-                .iter()
-                .map(|argument| {
-                    match argument {
-                        FunctionArg::Unnamed(_) => Some(None),
-                        FunctionArg::Named { name, .. }
-                        | FunctionArg::ExprNamed { name: Expr::Identifier(name), .. } => {
-                            Some(Some((name.value.as_str(), name.quote_style.is_some())))
-                        }
-                        FunctionArg::ExprNamed { .. } => None,
-                    }
-                })
-                .collect()
-        }
+    let mut written = match &call.args {
+        FunctionArguments::None => Vec::new(),
+        FunctionArguments::Subquery(_) => vec![None],
+        FunctionArguments::List(list) => written_names(&list.args)?,
+    };
+    written.extend(call.within_group.iter().map(|_| None));
+    Some(written)
+}
+
+/// The arguments `arguments` writes, by the name each is passed under, as
+/// [`written_argument_names`] reads them.
+pub(crate) fn written_names(arguments: &[FunctionArg]) -> Option<Vec<WrittenName<'_>>> {
+    if matches!(arguments, [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) {
+        return Some(Vec::new());
     }
+    arguments
+        .iter()
+        .map(|argument| {
+            match argument {
+                FunctionArg::Unnamed(_) => Some(None),
+                FunctionArg::Named { name, .. }
+                | FunctionArg::ExprNamed { name: Expr::Identifier(name), .. } => {
+                    Some(Some((name.value.as_str(), name.quote_style.is_some())))
+                }
+                FunctionArg::ExprNamed { .. } => None,
+            }
+        })
+        .collect()
 }
 
 /// Whether input parameters of `modes`, the last `defaults` defaulted, take
@@ -956,10 +959,20 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
 /// Returns [`LookupError::InvalidObjectName`] when the name has more than two
 /// parts or a part built at run time.
 pub(crate) fn called_name(call: &Function) -> Result<TargetName<'_>, LookupError> {
-    if call.name.0.len() > 2 {
-        return Err(overqualified_object_name(&call.name));
+    called_object_name(&call.name)
+}
+
+/// The function `name` names, as a call writes it.
+///
+/// # Errors
+///
+/// Returns [`LookupError::InvalidObjectName`] when the name has more than two
+/// parts or a part built at run time.
+pub(crate) fn called_object_name(name: &ObjectName) -> Result<TargetName<'_>, LookupError> {
+    if name.0.len() > 2 {
+        return Err(overqualified_object_name(name));
     }
-    target_name_from_object_name(&call.name).ok_or_else(|| run_time_object_name(&call.name))
+    target_name_from_object_name(name).ok_or_else(|| run_time_object_name(name))
 }
 
 /// The functions a call of `target` passing arguments under the names
