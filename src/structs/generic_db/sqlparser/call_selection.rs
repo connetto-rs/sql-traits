@@ -1,13 +1,16 @@
 //! Keeps, for each call a statement stores, the overload its argument types
-//! select, and for each operator application the operator its operand types
-//! select, which is what PostgreSQL records the dependencies on.
+//! select, the function PostgreSQL records the call's dependency on or none
+//! for a call PostgreSQL reads as a cast, and for each operator application
+//! the operator its operand types select, which is what PostgreSQL records
+//! the dependencies on.
 //!
 //! A call is resolved by name and argument count when its statement runs,
 //! and one reaching several overloads, one of them declared by the schema,
-//! waits for its argument types, as every new operator node waits for its
-//! operand types. Once the statement has run, each waiting node is typed in
-//! the scope its expression sees, over the catalog as the statement left
-//! it. A call keeps the function selected or, when the types select none,
+//! or a declared one by one argument waits for its argument types, as every
+//! new operator node waits for its operand types. Once the statement has
+//! run, each waiting node is typed in the scope its expression sees, over
+//! the catalog as the statement left it. A call keeps the function
+//! selected, none when read as a cast, or, when the types select none,
 //! every overload, and an operator node the operators a statement added
 //! that its applications select.
 //!
@@ -25,17 +28,18 @@ use alloc::{
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{
-    ColumnOption, CreateFunction, DataType, Expr, Function, Ident, Query, Statement, Visit, Visitor,
+    ColumnOption, CreateFunction, DataType, Expr, Function, Ident, ObjectName, Query, Statement,
+    TableFactor, Visit, Visitor,
 };
 
 use super::{ParserDB, ParserDBBuilder, PostgresCatalogOperator, constraint_names, partition_keys};
 use crate::{
     errors::Error,
     structs::{
-        ArraySource, CallResolution, ExpressionContext, ExpressionScope, IdentifierCase, Operand,
-        OperandEvidence, OperandType, OperatorResolution, OperatorRow, ReparsePins, Site,
-        TableAttribute, TargetName, applies_operators,
-        metadata::{ExpressionCalls, NodeState, OperatorNode, for_each_operator_node},
+        ArraySource, CallApplication, CallResolution, ExpressionContext, ExpressionScope,
+        IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution, OperatorRow,
+        ReparsePins, Site, TableAttribute, TargetName, applies_operators,
+        metadata::{CallChoice, ExpressionCalls, NodeState, OperatorNode, for_each_operator_node},
     },
     traits::{DatabaseLike, OperatorLike, PolicyLike, Relation, RuleLike, TriggerLike},
     utils::{
@@ -49,13 +53,12 @@ use crate::{
 /// The schema a function stored without one lives in.
 const DEFAULT_SCHEMA: &str = "public";
 
-/// What each typed call and operator application selects, by the address
-/// of its node.
+/// What each typed call and operator application selects.
 #[derive(Default)]
 struct Selections {
-    /// The function each call selects, by the address of the call's node, as
-    /// the address of the function's node.
-    calls: BTreeMap<usize, usize>,
+    /// What each call chooses, by the address of the name it calls, which a
+    /// function expression and a function in `FROM` both hold.
+    calls: BTreeMap<usize, CallChoice>,
     /// The operators a statement added that each node's applications select,
     /// by the address of the node, with each application's position.
     operators: BTreeMap<usize, Vec<(usize, OperatorRow)>>,
@@ -116,7 +119,7 @@ fn settle<N: Visit + ?Sized>(
         return Err(refused);
     }
     if calls.is_unsettled() {
-        calls.settle(node, |call| selections.calls.get(&address(call)).copied());
+        calls.settle(node, |name: &ObjectName| selections.calls.get(&address(name)).copied());
     }
     if calls.has_pending_operators() {
         calls.settle_operators(node, |node| selections.operators.remove(&node).unwrap_or_default());
@@ -516,6 +519,18 @@ struct Nodes<'c, 'q, 'db> {
 }
 
 impl Nodes<'_, '_, '_> {
+    /// Records what the call of `name`, resolved as `resolution`, chooses.
+    fn record(&mut self, name: &ObjectName, resolution: Option<&CallResolution<'_, ParserDB>>) {
+        let choice = match resolution {
+            Some(CallResolution::Selected(selected)) => {
+                CallChoice::Function(address(selected.function()))
+            }
+            Some(CallResolution::Cast(_)) => CallChoice::Cast,
+            _ => return,
+        };
+        self.selections.calls.insert(address(name), choice);
+    }
+
     /// Records the operators a statement added that the applications of
     /// `expression` select, and the refusal of the first one PostgreSQL
     /// refuses.
@@ -543,13 +558,14 @@ impl Nodes<'_, '_, '_> {
         }
     }
 
-    /// Records the function `call`, the node of `expression`, selects, or
-    /// the refusal PostgreSQL gives it.
+    /// Records what `call`, the node of `expression`, chooses, or the
+    /// refusal PostgreSQL gives it.
     fn select_call(&mut self, call: &Function, expression: &Expr) {
-        let Ok(Some(application)) = self.context.call(expression) else { return };
-        if let CallResolution::Selected(selected) = application.resolution() {
-            self.selections.calls.insert(address(call), address(selected.function()));
-        } else if let Some((name, (reason, argument_types))) = application.into_refusal() {
+        let Ok(application) = self.context.call(expression) else { return };
+        self.record(&call.name, application.as_ref().map(CallApplication::resolution));
+        if let Some((name, (reason, argument_types))) =
+            application.and_then(CallApplication::into_refusal)
+        {
             self.selections.refused_calls.insert(
                 address(call),
                 Error::UnresolvedCall { function_name: name.to_string(), argument_types, reason },
@@ -576,6 +592,17 @@ impl Visitor for Nodes<'_, '_, '_> {
         }
         if applies_operators(expression) {
             self.select_operators(expression);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        // No expression parsed again holds a `FROM` item.
+        if self.deparsed.is_none()
+            && let TableFactor::Table { name, .. } | TableFactor::Function { name, .. } = factor
+            && let Ok(call) = self.context.relation_call(factor)
+        {
+            self.record(name, call.as_ref().map(CallApplication::resolution));
         }
         ControlFlow::Continue(())
     }

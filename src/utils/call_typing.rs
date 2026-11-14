@@ -6,7 +6,7 @@ use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
     ArgMode, ArrayElemTypeDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments,
+    FunctionArguments, ObjectName,
 };
 
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
         call_sites::{ExpressionForm, expression_form},
         coercion::{
             CommonType, Proof, Undetermined, array_type_name, base, can_coerce, canonical_owned,
-            common_type_name, conversion, facts, select_common_type, type_name,
+            common_type_name, conversion, facts, functional_cast, select_common_type, type_name,
         },
         identifier_resolution::identifiers_match,
         object_name::{
@@ -35,38 +35,41 @@ use crate::{
 /// The name an argument is passed under in named notation.
 pub(crate) type WrittenName<'c> = Option<(&'c str, bool)>;
 
-/// The arguments a call writes, by the name each is passed under.
+/// The arguments a call writes, by the name each is passed under, the
+/// ordering arguments of `WITHIN GROUP` after its own, which PostgreSQL
+/// passes to an ordered-set aggregate.
 ///
 /// [`None`] when an argument is named by something other than an identifier,
 /// which no parameter answers. `count(*)` passes nothing.
 pub(crate) fn written_argument_names(call: &Function) -> Option<Vec<WrittenName<'_>>> {
-    match &call.args {
-        FunctionArguments::None => Some(Vec::new()),
-        FunctionArguments::Subquery(_) => Some(vec![None]),
-        FunctionArguments::List(list)
-            if matches!(
-                list.args.as_slice(),
-                [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
-            ) =>
-        {
-            Some(Vec::new())
-        }
-        FunctionArguments::List(list) => {
-            list.args
-                .iter()
-                .map(|argument| {
-                    match argument {
-                        FunctionArg::Unnamed(_) => Some(None),
-                        FunctionArg::Named { name, .. }
-                        | FunctionArg::ExprNamed { name: Expr::Identifier(name), .. } => {
-                            Some(Some((name.value.as_str(), name.quote_style.is_some())))
-                        }
-                        FunctionArg::ExprNamed { .. } => None,
-                    }
-                })
-                .collect()
-        }
+    let mut written = match &call.args {
+        FunctionArguments::None => Vec::new(),
+        FunctionArguments::Subquery(_) => vec![None],
+        FunctionArguments::List(list) => written_names(&list.args)?,
+    };
+    written.extend(call.within_group.iter().map(|_| None));
+    Some(written)
+}
+
+/// The arguments `arguments` writes, by the name each is passed under, as
+/// [`written_argument_names`] reads them.
+pub(crate) fn written_names(arguments: &[FunctionArg]) -> Option<Vec<WrittenName<'_>>> {
+    if matches!(arguments, [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) {
+        return Some(Vec::new());
     }
+    arguments
+        .iter()
+        .map(|argument| {
+            match argument {
+                FunctionArg::Unnamed(_) => Some(None),
+                FunctionArg::Named { name, .. }
+                | FunctionArg::ExprNamed { name: Expr::Identifier(name), .. } => {
+                    Some(Some((name.value.as_str(), name.quote_style.is_some())))
+                }
+                FunctionArg::ExprNamed { .. } => None,
+            }
+        })
+        .collect()
 }
 
 /// Whether input parameters of `modes`, the last `defaults` defaulted, take
@@ -956,10 +959,20 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
 /// Returns [`LookupError::InvalidObjectName`] when the name has more than two
 /// parts or a part built at run time.
 pub(crate) fn called_name(call: &Function) -> Result<TargetName<'_>, LookupError> {
-    if call.name.0.len() > 2 {
-        return Err(overqualified_object_name(&call.name));
+    called_object_name(&call.name)
+}
+
+/// The function `name` names, as a call writes it.
+///
+/// # Errors
+///
+/// Returns [`LookupError::InvalidObjectName`] when the name has more than two
+/// parts or a part built at run time.
+pub(crate) fn called_object_name(name: &ObjectName) -> Result<TargetName<'_>, LookupError> {
+    if name.0.len() > 2 {
+        return Err(overqualified_object_name(name));
     }
-    target_name_from_object_name(&call.name).ok_or_else(|| run_time_object_name(&call.name))
+    target_name_from_object_name(name).ok_or_else(|| run_time_object_name(name))
 }
 
 /// The functions a call of `target` passing arguments under the names
@@ -1072,7 +1085,37 @@ fn nullif_result<'a, D: DatabaseLike>(
 /// A function a call may run, with the type that call returns.
 pub(crate) type Resolved<'a, F> = (&'a F, Option<Cow<'a, str>>);
 
-/// The function a call runs and what it returns, given its argument types.
+/// What a call written in any statement does, given its argument types.
+pub(crate) enum Called<'a, F> {
+    /// It runs the function the selection picks.
+    Function(Selection<Resolved<'a, F>>),
+    /// PostgreSQL reads it as a cast of its one argument to this type.
+    Cast(PgType),
+}
+
+/// Whether a function the written arguments meet as `declared` takes the
+/// one argument of type `input` exactly, which PostgreSQL prefers to reading
+/// the call as a cast.
+fn declares_exactly(declared: &Declared, input: &PgType) -> bool {
+    matches!(declared.as_slice(), [Some(declared)] if declared == input)
+}
+
+/// What a call of `name` passing one argument of type `input` under no
+/// name, which none of the `candidates` takes exactly, reads as: `Ok(None)`
+/// to select among the candidates, the cast type, or [`Undetermined`].
+fn cast_reading<'m, D: DatabaseLike>(
+    database: &D,
+    name: &TargetName<'_>,
+    mut candidates: impl Iterator<Item = &'m Matched>,
+    input: Option<&PgType>,
+) -> Result<Option<PgType>, Undetermined> {
+    let exact = input
+        .is_some_and(|input| candidates.any(|matched| declares_exactly(&matched.declared, input)));
+    if exact { Ok(None) } else { functional_cast(database, name, input) }
+}
+
+/// The function a call runs and what it returns, given its argument types,
+/// or the cast PostgreSQL reads it as.
 ///
 /// # Errors
 ///
@@ -1084,19 +1127,31 @@ pub(crate) fn resolve_call<'a, D: DatabaseLike>(
     call: &Function,
     argument_types: &[Option<&'a str>],
     case: IdentifierCase,
-) -> Result<Selection<Resolved<'a, D::Function>>, LookupError> {
-    let Some(written) = written_argument_names(call) else { return Ok(Selection::Refused) };
+) -> Result<Called<'a, D::Function>, LookupError> {
+    let Some(written) = written_argument_names(call) else {
+        return Ok(Called::Function(Selection::Refused));
+    };
     check_argument_count(call, written.len(), argument_types.len())?;
     let actuals = actuals(database, argument_types);
+    let reached = reached_functions(database, call, case)?;
+    if let ([None], [input]) = (written.as_slice(), actuals.as_slice()) {
+        let input = input.as_ref().map(|actual| &actual.pg_type);
+        let candidates = reached.iter().map(|(_, matched)| matched);
+        match cast_reading(database, &called_name(call)?, candidates, input) {
+            Ok(Some(target)) => return Ok(Called::Cast(target)),
+            Ok(None) => {}
+            Err(Undetermined) => return Ok(Called::Function(Selection::Undetermined(Vec::new()))),
+        }
+    }
     let mut answers: Vec<Resolved<'a, D::Function>> = Vec::new();
     let mut bound: Vec<(usize, Binding<'a>)> = Vec::new();
-    for (function, matched) in reached_functions(database, call, case)? {
+    for (function, matched) in reached {
         let Some(binding) = bind(database, matched.declared, &actuals) else { continue };
         let result = function.result_type_name(database).and_then(|result| binding.result(result));
         bound.push((answers.len(), binding));
         answers.push((function, result));
     }
-    Ok(match select(database, &bound, &actuals) {
+    Ok(Called::Function(match select(database, &bound, &actuals) {
         Selection::Chosen(position) => {
             answers.into_iter().nth(position).map_or(Selection::Refused, Selection::Chosen)
         }
@@ -1111,7 +1166,7 @@ pub(crate) fn resolve_call<'a, D: DatabaseLike>(
                     .collect(),
             )
         }
-    })
+    }))
 }
 
 /// The type an operand or argument has, [`None`] when the caller does not
@@ -1202,14 +1257,29 @@ pub(crate) fn bound_type_name<'db, D: DatabaseLike>(
 
 /// What PostgreSQL does with a call of one of the `reached` functions whose
 /// written arguments are of types `arguments`, as `func_get_detail` selects
-/// the function and `make_fn_arguments` converts each argument.
+/// the function or reads the call as a cast and `make_fn_arguments`
+/// converts each argument. `cast` is the called name of a call passing one
+/// argument under no name, which may be a cast.
 pub(crate) fn resolve_function<'db, D: DatabaseLike>(
     database: &'db D,
     reached: &[(&'db D::Function, Matched)],
     arguments: &[OperandType<'_>],
+    cast: Option<&TargetName<'_>>,
 ) -> CallResolution<'db, D> {
     let inputs: Vec<Option<(PgType, Option<i32>)>> =
         arguments.iter().map(|argument| typed_input(database, argument)).collect();
+    if let (Some(name), [input]) = (cast, inputs.as_slice()) {
+        let input = input.as_ref().map(|(pg_type, _)| pg_type);
+        let candidates = reached.iter().map(|(_, matched)| matched);
+        match cast_reading(database, name, candidates, input) {
+            Ok(Some(target)) => {
+                return type_name(database, &target)
+                    .map_or(CallResolution::Undetermined, CallResolution::Cast);
+            }
+            Ok(None) => {}
+            Err(Undetermined) => return CallResolution::Undetermined,
+        }
+    }
     let actuals: Vec<Option<Actual<'_>>> = inputs
         .iter()
         .map(|input| {

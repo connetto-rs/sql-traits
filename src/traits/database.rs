@@ -23,7 +23,7 @@ use crate::{
     },
     utils::{
         call_sites::expression_form,
-        call_typing::{Selection, expression_result, reached_functions, resolve_call},
+        call_typing::{Called, Selection, expression_result, reached_functions, resolve_call},
         coercion::common_type_name,
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
@@ -1718,8 +1718,11 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// Each entry of `argument_types` names a type, `unknown` for an untyped
     /// literal such as `NULL` or `'abc'`, or is [`None`] for an argument whose
     /// type the caller does not know. Answers [`None`] when PostgreSQL would
-    /// refuse the call as matching no function or several alike, and when
-    /// the unknown argument types leave more than one function possible.
+    /// refuse the call as matching no function or several alike, when the
+    /// unknown argument types leave more than one function possible, and
+    /// when PostgreSQL reads the call as a cast, which runs no function: a
+    /// call of one unnamed argument named after a type that no function
+    /// takes exactly, as `int8('5')`.
     ///
     /// # Errors
     ///
@@ -1766,15 +1769,18 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&'db Self::Function>, LookupError> {
         Ok(match resolve_call(self, call, argument_types, case)? {
-            Selection::Chosen((function, _)) => Some(function),
-            Selection::Refused | Selection::Undetermined(_) => None,
+            Called::Function(Selection::Chosen((function, _))) => Some(function),
+            Called::Function(Selection::Refused | Selection::Undetermined(_)) | Called::Cast(_) => {
+                None
+            }
         })
     }
 
     /// Returns the type a call written in any statement returns, given the
     /// type of each argument it writes. It is the result of the function
     /// [`Self::resolve_call`] picks, as
-    /// [`FunctionLike::call_result_type_name`] answers it for the call.
+    /// [`FunctionLike::call_result_type_name`] answers it for the call, or
+    /// the type a call PostgreSQL reads as a cast converts to.
     ///
     /// When the arguments whose types the caller does not know leave several
     /// functions possible, the answer is the type they all return, if they
@@ -1846,9 +1852,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             return expression_result(self, form, call, argument_types, case);
         }
         Ok(match resolve_call(self, call, argument_types, case)? {
-            Selection::Chosen((_, result)) => result,
-            Selection::Refused => None,
-            Selection::Undetermined(possible) => {
+            Called::Cast(target) => Some(target.spelling()),
+            Called::Function(Selection::Chosen((_, result))) => result,
+            Called::Function(Selection::Refused) => None,
+            Called::Function(Selection::Undetermined(possible)) => {
                 let mut results = possible.into_iter().map(|(_, result)| result);
                 let first = results.next().flatten();
                 let agreed = first.as_ref().and_then(|first| PgType::parse(first));

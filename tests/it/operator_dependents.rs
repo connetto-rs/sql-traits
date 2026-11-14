@@ -428,6 +428,25 @@ fn a_type_change_keeps_a_converted_argument() {
     );
 }
 
+/// An application the model cannot type, such as a comparison of a
+/// composite field, leaves the casts the deparse writes elsewhere in the
+/// expression in place.
+#[test]
+fn an_untyped_application_leaves_the_other_casts() {
+    let check = format!(
+        "CREATE TYPE pair AS (x INT4, y INT4);
+         CREATE TABLE d (a INT4, p pair, CONSTRAINT ck CHECK (a <<< 1 AND (p).x > 0)); {INT4}
+         ALTER TABLE d ALTER COLUMN a TYPE int2;"
+    );
+    parse(&format!("{FUNCTIONS} {INT8} {check} DROP OPERATOR app.<<< (int4, int4);"))
+        .expect("the check still applies `<<<(int8, int8)`");
+    assert_held(
+        &format!("{FUNCTIONS} {INT8} {check} DROP OPERATOR app.<<< (int8, int8);"),
+        ObjectKind::CheckConstraint,
+        "d.ck",
+    );
+}
+
 /// Retyping both operands in one statement keeps the casts the first
 /// selection's deparse wrote around them.
 #[test]
