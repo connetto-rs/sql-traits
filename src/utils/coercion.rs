@@ -82,18 +82,37 @@ pub(crate) fn canonical<'p, D: DatabaseLike>(database: &D, pg_type: &'p PgType) 
 /// The type the stored `name` denotes when the database's facts spell it
 /// otherwise, qualified or as an array, and [`None`] when they do not.
 fn located<D: DatabaseLike>(database: &D, name: &TargetName<'_>) -> Option<PgType> {
-    let (qualified, facts) = match name.schema() {
-        Some(_) => (None, database.type_facts(view(name))?),
+    let (qualified, facts) = found(database, name)?;
+    match facts.array_element() {
+        Some(element) => Some(canonical_owned(database, PgType::from_target(element)).array()),
+        None => name.schema().is_none().then(|| PgType::from_target(&qualified)),
+    }
+}
+
+/// The canonical type the written `name` denotes in `database`, as
+/// `LookupTypeName` finds it, or [`None`] when no type has that name.
+fn looked_up<D: DatabaseLike>(database: &D, name: &TargetName<'_>) -> Option<PgType> {
+    let (qualified, facts) = found(database, name)?;
+    Some(match facts.array_element() {
+        Some(element) => canonical_owned(database, PgType::from_target(element)).array(),
+        None => PgType::from_target(&qualified),
+    })
+}
+
+/// The type `name` names, qualified with the schema the type search path
+/// finds it in, and its facts.
+fn found<'a, D: DatabaseLike>(
+    database: &'a D,
+    name: &'a TargetName<'_>,
+) -> Option<(TargetName<'a>, TypeFacts<'a>)> {
+    match name.schema() {
+        Some(_) => Some((view(name), database.type_facts(view(name))?)),
         None => {
             type_search_path(|| database.search_path()).find_map(|(schema, quoted)| {
                 let qualified = view(name).with_schema(schema, quoted);
-                database.type_facts(qualified.clone()).map(|facts| (Some(qualified), facts))
-            })?
+                database.type_facts(qualified.clone()).map(|facts| (qualified, facts))
+            })
         }
-    };
-    match facts.array_element() {
-        Some(element) => Some(canonical_owned(database, PgType::from_target(element)).array()),
-        None => qualified.map(|qualified| PgType::from_target(&qualified)),
     }
 }
 
@@ -504,6 +523,90 @@ fn descends<D: DatabaseLike>(
         }
     }
     Ok(false)
+}
+
+/// The type a call of `name` passing one argument of type `argument`, under
+/// no name, is a cast to, as `func_get_detail` reads a call no candidate
+/// takes exactly, or [`None`] when the call is no cast.
+///
+/// The name has to name a type that is not a row type, looked up as a type
+/// name on the type search path, and the argument has to be an untyped
+/// literal or reach the type as `find_coercion_pathway` does under
+/// `COERCION_EXPLICIT` by a binary relabel or through text, but from a row
+/// to a string. A database answering no casts reads no call as a cast.
+pub(crate) fn functional_cast<D: DatabaseLike>(
+    database: &D,
+    name: &TargetName<'_>,
+    argument: Option<&PgType>,
+) -> Result<Option<PgType>, Undetermined> {
+    if database.casts().is_none() {
+        return Ok(None);
+    }
+    let Some(target) = looked_up(database, name) else {
+        return Ok(None);
+    };
+    if proven(is_complex(database, &target))? {
+        return Ok(None);
+    }
+    let source = argument.ok_or(Undetermined)?;
+    if source.is_unknown() {
+        return Ok(Some(target));
+    }
+    let cast = match explicit_pathway(database, source, &target)? {
+        Pathway::Relabel => true,
+        Pathway::InOut => {
+            let row = *source == PgType::RECORD || proven(is_complex(database, source))?;
+            !row || category(database, &target)? != TypeCategory::STRING
+        }
+        Pathway::Function | Pathway::None => false,
+    };
+    Ok(cast.then_some(target))
+}
+
+/// How `find_coercion_pathway` converts a value under `COERCION_EXPLICIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pathway {
+    /// The binary representation is kept.
+    Relabel,
+    /// Through the output function of the source and the input function of
+    /// the target.
+    InOut,
+    /// By a cast function, or element by element for arrays.
+    Function,
+    /// No conversion.
+    None,
+}
+
+/// The pathway `find_coercion_pathway` finds under `COERCION_EXPLICIT`
+/// between two canonical types, of a database answering casts.
+fn explicit_pathway<D: DatabaseLike>(
+    database: &D,
+    source: &PgType,
+    target: &PgType,
+) -> Result<Pathway, Undetermined> {
+    let (source, target) = (base(database, source)?, base(database, target)?);
+    if source == target {
+        return Ok(Pathway::Relabel);
+    }
+    if let Some(cast) = cast(database, &source, &target) {
+        return Ok(match cast.method() {
+            CastMethod::Binary => Pathway::Relabel,
+            CastMethod::InOut => Pathway::InOut,
+            CastMethod::Function => Pathway::Function,
+        });
+    }
+    if let (Some(source), Some(target)) = (source.element(), target.element())
+        && explicit_pathway(database, source, target)? != Pathway::None
+    {
+        return Ok(Pathway::Function);
+    }
+    let string = |pg_type: &PgType| Ok(category(database, pg_type)? == TypeCategory::STRING);
+    Ok(if string(&target)? || string(&source)? { Pathway::InOut } else { Pathway::None })
+}
+
+/// The category of a canonical type.
+fn category<D: DatabaseLike>(database: &D, pg_type: &PgType) -> Result<TypeCategory, Undetermined> {
+    facts(database, pg_type).map(|facts| facts.category()).ok_or(Undetermined)
 }
 
 /// The type `select_common_type` settles on.

@@ -5,8 +5,8 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, InTarget, ObjectNamePart, Query, Statement, UnaryOperator, Value,
-    Visit, Visitor,
+    FunctionArgumentClause, FunctionArguments, Ident, InTarget, ObjectNamePart, Query, Statement,
+    TableFactor, UnaryOperator, Value, Visit, Visitor,
 };
 
 use crate::{
@@ -17,14 +17,14 @@ use crate::{
     },
     structs::{
         CallResolution, ColumnBinding, ColumnDefinition, ColumnScope, ExpressionScope,
-        FunctionKind, IdentifierCase, OperandType, OperatorResolution, SelectedOperator,
-        TargetName,
+        IdentifierCase, OperandType, OperatorResolution, SelectedOperator, TargetName,
     },
     traits::{ColumnLike, DataTypeLike, DatabaseLike, FunctionLike},
     utils::{
         call_sites::expression_form,
         call_typing::{
-            Matched, called_name, reached_by_name, resolve_function, written_argument_names,
+            Matched, called_name, called_object_name, reached_by_name, resolve_function,
+            written_argument_names, written_names,
         },
         coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
         object_name::PG_CATALOG,
@@ -553,6 +553,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                                         resolution: CallResolution::Selected(selected),
                                         ..
                                     }) => without_typmod(selected.into_result_type()),
+                                    Some(CallApplication {
+                                        resolution: CallResolution::Cast(target),
+                                        ..
+                                    }) => without_typmod(Some(target)),
                                     _ => OperandType::Unknown,
                                 }
                             }
@@ -633,21 +637,25 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     }
 
     /// Returns the function PostgreSQL calls to evaluate `expression`, or
-    /// `None` for a node that is no plain call.
+    /// `None` for a node that is no call.
     ///
     /// A call answers with the function it selects among those its name
-    /// reaches, each argument converted to the parameter it passes. An
-    /// aggregate or window call, a call reaching an aggregate or window
-    /// function, `ROW(...)` and the expressions PostgreSQL's grammar writes
-    /// like a call, such as `COALESCE`, `NULLIF` and `CURRENT_DATE`, answer
-    /// `None`. A parenthesized node answers for its content.
+    /// reaches, each argument converted to the parameter it passes, or the
+    /// cast PostgreSQL reads it as. An aggregate or window call is one too:
+    /// its arguments are those it writes, `DISTINCT`, `ORDER BY`, `FILTER`
+    /// and `OVER` aside, followed by the ordering arguments of `WITHIN
+    /// GROUP`, and `count(*)` passes none. `ROW(...)`, the expressions
+    /// PostgreSQL's grammar writes like a call, such as `COALESCE`, `NULLIF`
+    /// and `CURRENT_DATE`, and a call written with clauses PostgreSQL has no
+    /// grammar for answer `None`. A parenthesized node answers for its
+    /// content.
     ///
     /// # Errors
     ///
     /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
     /// query, [`LookupError::InvalidObjectName`] for a called name with more
     /// than two parts or a part built at run time, and the lookup errors
-    /// typing an argument or reading a reached function's kind return.
+    /// typing an argument return.
     ///
     /// # Example
     ///
@@ -683,7 +691,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             Expr::Function(function) => function,
             _ => return Ok(None),
         };
-        let Some(arguments) = plain_arguments(function) else { return Ok(None) };
+        let Some(arguments) = call_arguments(function) else { return Ok(None) };
         let name = called_name(function)?;
         if expression_form(&function.name).is_some() || is_row(expression) {
             return Ok(None);
@@ -703,22 +711,79 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         if let Some(pins) = self.pins {
             reached.retain(|(function, _)| pins.admits_call(call, function));
         }
-        for (reached, _) in &reached {
-            if reached.kind(self.database)? != FunctionKind::Normal {
-                return Ok(None);
-            }
+        let castable = matches!(written.as_slice(), [None]);
+        self.applied_call(name, arguments, &reached, castable, Some(call)).map(Some)
+    }
+
+    /// Returns the function PostgreSQL calls for `factor`, a `FROM` item
+    /// written as a call such as `generate_series(1, n)`, `LATERAL`
+    /// or not, or `None` for any other item.
+    ///
+    /// The call is resolved as [`Self::call`] resolves one, its arguments
+    /// typed in the scope the item sees.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ExpressionNotInQuery`] for an argument of
+    /// another query, [`LookupError::InvalidObjectName`] for a called name
+    /// with more than two parts or a part built at run time, and the lookup
+    /// errors typing an argument return.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let parsed =
+    ///     Parser::parse_sql(&PostgreSqlDialect {}, "SELECT g FROM generate_series(1, 3) AS g")?;
+    /// let Statement::Query(query) = &parsed[0] else { unreachable!() };
+    /// let context = ExpressionContext::new(query, &db, IdentifierCase::Folded)?;
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    ///
+    /// let call = context.relation_call(&select.from[0].relation)?.expect("a function in `FROM`");
+    /// let CallResolution::Selected(selected) = call.resolution() else { unreachable!() };
+    /// assert_eq!(selected.result_type().map(TargetName::name), Some("int4"));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn relation_call<'node>(
+        &self,
+        factor: &'node TableFactor,
+    ) -> Result<Option<CallApplication<'node, 'db, DB>>, LookupError> {
+        let (name, listed) = match factor {
+            TableFactor::Table { name, args: Some(args), .. } => (name, args.args.as_slice()),
+            TableFactor::Function { name, args, .. } => (name, args.as_slice()),
+            _ => return Ok(None),
+        };
+        if expression_form(name).is_some() {
+            return Ok(None);
         }
-        self.applied_call(name, arguments, &reached, Some(call)).map(Some)
+        let (Some(arguments), Some(written)) = (listed_arguments(listed), written_names(listed))
+        else {
+            return Ok(None);
+        };
+        let target = called_object_name(name)?;
+        let reached = reached_by_name(self.database, &target, &written, self.case);
+        let castable = matches!(written.as_slice(), [None]);
+        self.applied_call(target, arguments, &reached, castable, None).map(Some)
     }
 
     /// The call of `name` passing `arguments`, one of the `reached`
-    /// functions selected by the arguments' types, the arguments of the call
-    /// whose node sits at `call` typed as the pins have them.
+    /// functions selected by the arguments' types or, when `castable` says
+    /// the call passes one argument under no name, the cast it may read as,
+    /// the arguments of the call whose node sits at `call` typed as the pins
+    /// have them.
     fn applied_call<'node>(
         &self,
         name: TargetName<'node>,
         arguments: Vec<&'node Expr>,
         reached: &[(&'db DB::Function, Matched)],
+        castable: bool,
         call: Option<usize>,
     ) -> Result<CallApplication<'node, 'db, DB>, LookupError> {
         let pinned = |index| {
@@ -735,7 +800,8 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let resolution = resolve_function(self.database, reached, &types);
+        let resolution =
+            resolve_function(self.database, reached, &types, castable.then_some(&name));
         Ok(CallApplication { name, arguments, resolution })
     }
 
@@ -749,7 +815,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let name = TargetName::new(function, false).with_schema(PG_CATALOG, false);
         let written = Vec::from_iter(core::iter::repeat_n(None, arguments.len()));
         let reached = reached_by_name(self.database, &name, &written, self.case);
-        self.applied_call(name, arguments, &reached, None)
+        self.applied_call(name, arguments, &reached, false, None)
     }
 
     /// The applications PostgreSQL builds for `expression` and what the node
@@ -1387,20 +1453,53 @@ fn plain_arguments(function: &Function) -> Option<Vec<&Expr>> {
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
                 return None;
             }
-            list.args
-                .iter()
-                .map(|argument| {
-                    match argument {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))
-                        | FunctionArg::Named { arg: FunctionArgExpr::Expr(argument), .. }
-                        | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(argument), .. } => {
-                            Some(argument)
-                        }
-                        _ => None,
-                    }
-                })
-                .collect()
+            list.args.iter().map(argument_node).collect()
         }
+    }
+}
+
+/// The nodes the arguments of a call come from, those it writes followed by
+/// the ordering arguments of `WITHIN GROUP`, or `None` for a call written
+/// with a subquery, a `*` but `count(*)`'s, or a clause PostgreSQL has no
+/// grammar for. `DISTINCT`, `ORDER BY`, `FILTER` and `OVER` pass nothing.
+fn call_arguments(function: &Function) -> Option<Vec<&Expr>> {
+    if !matches!(function.parameters, FunctionArguments::None) || function.null_treatment.is_some()
+    {
+        return None;
+    }
+    let mut arguments = match &function.args {
+        FunctionArguments::None => Vec::new(),
+        FunctionArguments::Subquery(_) => return None,
+        FunctionArguments::List(list) => {
+            let ordered = |clause: &FunctionArgumentClause| {
+                matches!(clause, FunctionArgumentClause::OrderBy(_))
+            };
+            if !list.clauses.iter().all(ordered) {
+                return None;
+            }
+            listed_arguments(&list.args)?
+        }
+    };
+    arguments.extend(function.within_group.iter().map(|ordering| &ordering.expr));
+    Some(arguments)
+}
+
+/// The nodes `arguments` pass, none for the lone `*` of `count(*)`, or
+/// `None` for another `*`.
+fn listed_arguments(arguments: &[FunctionArg]) -> Option<Vec<&Expr>> {
+    if matches!(arguments, [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) {
+        return Some(Vec::new());
+    }
+    arguments.iter().map(argument_node).collect()
+}
+
+/// The node an argument passes, `None` for a `*`.
+const fn argument_node(argument: &FunctionArg) -> Option<&Expr> {
+    match argument {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))
+        | FunctionArg::Named { arg: FunctionArgExpr::Expr(argument), .. }
+        | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(argument), .. } => Some(argument),
+        _ => None,
     }
 }
 

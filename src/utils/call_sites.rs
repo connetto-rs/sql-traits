@@ -171,7 +171,7 @@ impl<B> Visitor for Sites<'_, B> {
                 (self.each)(Site::ExpressionForm(function))
             }
             Expr::Function(function) => {
-                let arguments = argument_count(&function.args);
+                let arguments = argument_count(function);
                 (self.each)(Site::Call(Call {
                     name: &function.name,
                     arguments,
@@ -198,9 +198,10 @@ impl<B> Visitor for Sites<'_, B> {
     }
 }
 
-/// How many arguments a function expression passes.
-fn argument_count(arguments: &FunctionArguments) -> usize {
-    match arguments {
+/// How many arguments a function expression passes, the ordering arguments
+/// of `WITHIN GROUP` included.
+fn argument_count(function: &Function) -> usize {
+    let written = match &function.args {
         FunctionArguments::None => 0,
         FunctionArguments::Subquery(_) => 1,
         // PostgreSQL reads `count(*)` as a call passing nothing.
@@ -213,7 +214,8 @@ fn argument_count(arguments: &FunctionArguments) -> usize {
             0
         }
         FunctionArguments::List(list) => list.args.len(),
-    }
+    };
+    written + function.within_group.len()
 }
 
 /// Hands the name and argument count of each call the walk meets to `each`.
@@ -227,7 +229,7 @@ impl<B> VisitorMut for CallNames<'_, B> {
     fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<B> {
         match expression {
             Expr::Function(function) if expression_form(&function.name).is_none() => {
-                let arguments = argument_count(&function.args);
+                let arguments = argument_count(function);
                 (self.each)(&mut function.name, arguments)
             }
             Expr::In { target: InTarget::Table { name, args: Some(args) }, .. } => {
