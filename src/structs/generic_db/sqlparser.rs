@@ -4143,31 +4143,36 @@ fn refuse_system_schema_relation(
     })
 }
 
+/// The first of `names` an earlier one already takes, each name with its
+/// quote state, compared in the form `case` compares names under.
+fn first_repeated_column<'a>(
+    mut names: impl Iterator<Item = (&'a str, bool)>,
+    case: IdentifierCase,
+) -> Option<&'a str> {
+    let mut compared = BTreeSet::new();
+    names
+        .find(|&(name, quoted)| !compared.insert(case.compared_form(name, quoted)))
+        .map(|(name, _)| name)
+}
+
 /// Checks that a table declares no column name twice.
-///
-/// PostgreSQL folds an unquoted identifier, so `a` and `A` are one column while
-/// `a` and `"A"` are two.
 fn validate_distinct_columns(
     create_table: &CreateTable,
     case: IdentifierCase,
 ) -> Result<(), crate::errors::Error> {
-    for (position, column) in create_table.columns.iter().enumerate() {
-        let repeated = create_table.columns[..position].iter().any(|earlier| {
-            case.identifiers_match(
-                earlier.name.value.as_str(),
-                earlier.name.quote_style.is_some(),
-                column.name.value.as_str(),
-                column.name.quote_style.is_some(),
-            )
-        });
-        if repeated {
-            return Err(crate::errors::Error::ColumnAlreadyExists {
+    let names = create_table
+        .columns
+        .iter()
+        .map(|column| (column.name.value.as_str(), column.name.quote_style.is_some()));
+    match first_repeated_column(names, case) {
+        Some(column_name) => {
+            Err(crate::errors::Error::ColumnAlreadyExists {
                 table_name: create_table.table_name().to_string(),
-                column_name: column.name.value.clone(),
-            });
+                column_name: column_name.to_string(),
+            })
         }
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// A schema qualifier together with whether it was quoted.

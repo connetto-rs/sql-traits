@@ -1,10 +1,10 @@
 //! Tests that a name a schema already uses cannot be taken twice.
 //!
-//! Six kinds of object are covered: a column within a table, an index, a policy
-//! on a table, a trigger on a table, a role, and a function signature. Every
-//! expectation here was run against a real PostgreSQL 16 first, including the
-//! ones that look like duplicates and are not, since a check that refuses valid
-//! input is the worse of the two failures.
+//! Six kinds of object are covered: a column within a table or a view, an
+//! index, a policy on a table, a trigger on a table, a role, and a function
+//! signature. Every expectation here was run against a real PostgreSQL 16 or
+//! 18.6 first, including the ones that look like duplicates and are not, since
+//! a check that refuses valid input is the worse of the two failures.
 #![allow(clippy::expect_used)]
 
 use sql_traits::{
@@ -40,6 +40,33 @@ fn column_folding_decides_what_counts_as_the_same_column() {
     parse("CREATE TABLE docs (id INT, \"ID\" INT);").expect("the quoted one is a second column");
 }
 
+/// Columns collide on the name PostgreSQL stores, which keeps surrounding
+/// spaces and Unicode composition and clips a long name to 63 bytes, in a table
+/// and in a view alike.
+#[test]
+fn columns_collide_on_the_name_postgres_stores() {
+    let long = "r".repeat(63);
+    let relations = |first: &str, second: &str| {
+        [
+            format!("CREATE TABLE t ({first} INT, {second} INT);"),
+            format!("CREATE VIEW v AS SELECT 1 AS {first}, 2 AS {second};"),
+        ]
+    };
+    for (first, second) in [("\" a\"", "a"), ("\"\u{e9}\"", "\"e\u{301}\"")] {
+        for sql in relations(first, second) {
+            let accepted = parse(&sql);
+            assert!(accepted.is_ok(), "{sql} got {accepted:?}");
+        }
+    }
+    for sql in relations(&format!("{long}x"), &format!("{long}y")) {
+        let refused = parse(&sql);
+        assert!(
+            matches!(&refused, Err(Error::ColumnAlreadyExists { .. })),
+            "{sql} got {refused:?}"
+        );
+    }
+}
+
 /// The database reports the repeated column rather than the repeated table, so
 /// this crate has to check the node before it offers it to the store.
 #[test]
@@ -59,6 +86,96 @@ fn a_column_name_freed_by_a_rename_can_be_taken_again() {
          ALTER TABLE docs ADD COLUMN id INT;",
     )
     .expect("the rename frees the name");
+}
+
+// View columns.
+
+/// Every place a view's column name comes from counts, the column list and the
+/// definition's aliases, stored columns, spelled-out wildcards and the names
+/// PostgreSQL derives for unaliased outputs alike.
+#[test]
+fn a_view_exposing_a_column_twice_is_refused() {
+    for (sql, view, column) in [
+        ("CREATE VIEW v (a, a) AS SELECT 1, 2;", "v", "a"),
+        ("CREATE VIEW v AS SELECT 1 AS c, 2 AS c;", "v", "c"),
+        ("CREATE VIEW v AS SELECT 1 AS c, 2 AS C;", "v", "C"),
+        ("CREATE TABLE s (a INT); CREATE VIEW v AS SELECT a, a FROM s;", "v", "a"),
+        ("CREATE TABLE s (a INT); CREATE VIEW v AS SELECT *, a FROM s;", "v", "a"),
+        ("CREATE VIEW v AS SELECT 1, 2;", "v", "?column?"),
+        ("CREATE VIEW v AS SELECT lower('a'), lower('b');", "v", "lower"),
+        ("CREATE VIEW v (c) AS SELECT 1 AS a, 2 AS c;", "v", "c"),
+        ("CREATE TEMPORARY VIEW v AS SELECT 1 AS c, 2 AS c;", "v", "c"),
+        ("CREATE MATERIALIZED VIEW m AS SELECT 1 AS c, 2 AS c;", "m", "c"),
+        ("CREATE MATERIALIZED VIEW m (a, a) AS SELECT 1, 2;", "m", "a"),
+    ] {
+        let refused = parse(sql);
+        assert!(
+            matches!(&refused, Err(Error::ColumnAlreadyExists { table_name, column_name })
+                if table_name == view && column_name == column),
+            "{sql} got {refused:?}"
+        );
+    }
+}
+
+/// A column list renames the outputs it covers, so repeated names it covers
+/// are gone, and a quoted name keeps its case apart from a folded one.
+#[test]
+fn a_view_whose_exposed_names_differ_is_accepted() {
+    for sql in [
+        "CREATE VIEW v (x, y) AS SELECT 1 AS c, 2 AS c;",
+        "CREATE VIEW v (x) AS SELECT 1 AS c, 2 AS c;",
+        "CREATE VIEW v AS SELECT 1 AS a, 2 AS \"A\";",
+        "CREATE VIEW v AS SELECT 1 AS a UNION SELECT 2 AS a;",
+        "CREATE MATERIALIZED VIEW m (x, y) AS SELECT 1 AS c, 2 AS c;",
+    ] {
+        let accepted = parse(sql);
+        assert!(accepted.is_ok(), "{sql} got {accepted:?}");
+    }
+}
+
+/// A plain view reports its repeated column before a taken name, and a
+/// materialized view the taken name first, skipping silently under `IF NOT
+/// EXISTS` over a materialized view of that name.
+#[test]
+fn the_view_kinds_order_a_repeated_column_and_a_taken_name_as_postgres_does() {
+    let plain = parse("CREATE TABLE v (x INT); CREATE VIEW v AS SELECT 1 AS c, 2 AS c;");
+    assert!(
+        matches!(&plain, Err(Error::ColumnAlreadyExists { column_name, .. }) if column_name == "c"),
+        "got {plain:?}"
+    );
+    let materialized =
+        parse("CREATE TABLE m (x INT); CREATE MATERIALIZED VIEW m AS SELECT 1 AS c, 2 AS c;");
+    assert!(
+        matches!(&materialized, Err(Error::RelationNameAlreadyTaken { .. })),
+        "got {materialized:?}"
+    );
+    parse(
+        "CREATE MATERIALIZED VIEW m AS SELECT 1 AS c;
+         CREATE MATERIALIZED VIEW IF NOT EXISTS m AS SELECT 1 AS c, 2 AS c;",
+    )
+    .expect("the existing materialized view skips the statement");
+}
+
+/// A replacement may add columns on the end, and an added one may not repeat a
+/// name, while a repeat over a kept position is the rename it already refuses.
+#[test]
+fn a_view_replacement_cannot_repeat_a_column() {
+    for sql in [
+        "CREATE VIEW v AS SELECT 1 AS a; CREATE OR REPLACE VIEW v AS SELECT 1 AS a, 2 AS a;",
+        "CREATE VIEW v AS SELECT 1 AS a;
+         CREATE OR REPLACE VIEW v AS SELECT 1 AS a, 2 AS b, 3 AS b;",
+    ] {
+        let refused = parse(sql);
+        assert!(
+            matches!(&refused, Err(Error::ColumnAlreadyExists { table_name, .. }) if table_name == "v"),
+            "{sql} got {refused:?}"
+        );
+    }
+    let renamed = parse(
+        "CREATE VIEW v AS SELECT 1 AS a, 2 AS b;
+         CREATE OR REPLACE VIEW v AS SELECT 1 AS a, 2 AS a;",
+    );
+    assert!(matches!(&renamed, Err(Error::ViewColumnRenamedByReplace { .. })), "got {renamed:?}");
 }
 
 // Indexes.
