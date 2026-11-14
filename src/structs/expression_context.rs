@@ -505,6 +505,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                                         resolution: CallResolution::Selected(selected),
                                         ..
                                     }) => without_typmod(selected.into_result_type()),
+                                    Some(CallApplication {
+                                        resolution: CallResolution::Cast(target),
+                                        ..
+                                    }) => without_typmod(Some(target)),
                                     _ => OperandType::Unknown,
                                 }
                             }
@@ -647,22 +651,26 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                 return Ok(None);
             }
         }
-        self.applied_call(name, arguments, &reached).map(Some)
+        let castable = matches!(written.as_slice(), [None]);
+        self.applied_call(name, arguments, &reached, castable).map(Some)
     }
 
     /// The call of `name` passing `arguments`, one of the `reached`
-    /// functions selected by the arguments' types.
+    /// functions selected by the arguments' types or, when `castable` says
+    /// the call passes one argument under no name, the cast it may read as.
     fn applied_call<'node>(
         &self,
         name: TargetName<'node>,
         arguments: Vec<&'node Expr>,
         reached: &[(&'db DB::Function, Matched)],
+        castable: bool,
     ) -> Result<CallApplication<'node, 'db, DB>, LookupError> {
         let types = arguments
             .iter()
             .map(|argument| self.type_of(argument))
             .collect::<Result<Vec<_>, _>>()?;
-        let resolution = resolve_function(self.database, reached, &types);
+        let resolution =
+            resolve_function(self.database, reached, &types, castable.then_some(&name));
         Ok(CallApplication { name, arguments, resolution })
     }
 
@@ -676,7 +684,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let name = TargetName::new(function, false).with_schema(PG_CATALOG, false);
         let written = Vec::from_iter(core::iter::repeat_n(None, arguments.len()));
         let reached = reached_by_name(self.database, &name, &written, self.case);
-        self.applied_call(name, arguments, &reached)
+        self.applied_call(name, arguments, &reached, false)
     }
 
     /// The applications PostgreSQL builds for `expression` and what the node

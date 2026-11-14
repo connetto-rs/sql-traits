@@ -917,6 +917,7 @@ fn refused_calls_answer_why() {
                 CallResolution::NotFound => "not found".to_owned(),
                 CallResolution::Undetermined => "undetermined".to_owned(),
                 CallResolution::Selected(_) => panic!("{node} selects a function"),
+                CallResolution::Cast(_) => panic!("{node} is a cast"),
             }
         })
         .collect();
