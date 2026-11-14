@@ -507,16 +507,6 @@ pub(crate) struct RelationKey {
     pub name: String,
 }
 
-impl RelationKey {
-    /// The key a folded lookup reaches this one by.
-    pub(crate) fn folded(&self) -> Self {
-        Self {
-            schema: IdentifierCase::Folded.compared_form(&self.schema, false).into_owned(),
-            name: IdentifierCase::Folded.compared_form(&self.name, false).into_owned(),
-        }
-    }
-}
-
 /// Normalizes a stored schema under `case`, folding a schema-less table into
 /// `public`.
 fn stored_schema_key<T: TableLike>(table: &T, case: IdentifierCase) -> Cow<'_, str> {

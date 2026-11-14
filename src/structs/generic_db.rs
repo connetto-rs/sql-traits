@@ -78,9 +78,9 @@ pub struct GenericDB<P: SchemaProfile> {
     /// hold every relation a key matched, ascending within a kind, so lookup
     /// answers and ambiguity reporting agree with scanning the list.
     relation_index: BTreeMap<RelationKey, Vec<RelationSlot>>,
-    /// Folded key to the stored keys reaching it, holding only the keys that
-    /// fold to something other than themselves, so an all-lowercase catalog
-    /// stores nothing here.
+    /// Folded key of each stored relation to the keys it is indexed under,
+    /// holding only the keys that differ from it, so a catalog of lowercase
+    /// names within 63 bytes stores nothing here.
     folded_relation_index: BTreeMap<RelationKey, Vec<RelationKey>>,
     /// List of columns in the database.
     columns: Vec<Identified<P::Column, ColumnIdentity>>,
