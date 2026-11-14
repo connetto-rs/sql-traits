@@ -5914,7 +5914,19 @@ impl ParserDB {
         carry: impl FnOnce(&mut CarriedCalls),
         edit: impl FnOnce(&CreateTable, &mut CreateTable) -> Result<(), crate::errors::Error>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        Self::rebuild_table_node(builder, stored, &[], None, |_| {}, carry, edit)
+        Self::rebuild_table_node(builder, stored, &[], None, None, |_| {}, carry, edit)
+    }
+
+    /// Replaces the stored node of a table as [`Self::replace_table_node`]
+    /// does, `edit` removing the constraint at `removed`, whose generated name
+    /// goes while every other one keeps its own.
+    fn replace_table_node_removing(
+        builder: ParserDBBuilder,
+        stored: &StoredTable,
+        removed: constraint_names::Position,
+        edit: impl FnOnce(&CreateTable, &mut CreateTable) -> Result<(), crate::errors::Error>,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        Self::rebuild_table_node(builder, stored, &[], None, Some(removed), |_| {}, |_| {}, edit)
     }
 
     fn replace_table_node_with_collations(
@@ -5925,17 +5937,23 @@ impl ParserDB {
         preserve: impl FnOnce(&mut Vec<PreservedColumnMetadata>),
         edit: impl FnOnce(&CreateTable, &mut CreateTable) -> Result<(), crate::errors::Error>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        Self::rebuild_table_node(builder, stored, collations, catalog, preserve, |_| {}, edit)
+        Self::rebuild_table_node(builder, stored, collations, catalog, None, preserve, |_| {}, edit)
     }
 
     /// Rebuilds a table from the node `edit` makes of its stored one,
+    /// `removed` naming the constraint the edit removes, if it removes one,
     /// `preserve` adjusting the column metadata the rebuild keeps and `carry`
     /// the call bindings.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent aspect of the one rebuild"
+    )]
     fn rebuild_table_node(
         mut builder: ParserDBBuilder,
         stored: &StoredTable,
         collations: &[CreatedCollationMetadata],
         catalog: Option<&PostgresCatalog>,
+        removed: Option<constraint_names::Position>,
         preserve: impl FnOnce(&mut Vec<PreservedColumnMetadata>),
         carry: impl FnOnce(&mut CarriedCalls),
         edit: impl FnOnce(&CreateTable, &mut CreateTable) -> Result<(), crate::errors::Error>,
@@ -5991,6 +6009,7 @@ impl ParserDB {
             previous_metadata.generated_constraint_names(),
             &previous_node,
             &replacement,
+            removed,
         ));
 
         let mut preserved_collations =
@@ -7005,10 +7024,12 @@ impl ParserDB {
             });
         }
 
-        let mut builder = Self::alter_table_constraints(builder, stored, |_, constraints| {
-            constraints.remove(position);
-            Ok(())
-        })?;
+        let removed = constraint_names::Position::Table(position);
+        let mut builder =
+            Self::replace_table_node_removing(builder, stored, removed, |_, node| {
+                node.constraints.remove(position);
+                Ok(())
+            })?;
 
         if scope.only {
             // The tables below keep their copies, and each becomes the holder's
@@ -7268,10 +7289,12 @@ impl ParserDB {
             });
         }
 
-        let mut builder = Self::replace_table_node(builder, stored, |_, node| {
-            node.columns[column].options.remove(position);
-            Ok(())
-        })?;
+        let removed = constraint_names::Position::Column(column, position);
+        let mut builder =
+            Self::replace_table_node_removing(builder, stored, removed, |_, node| {
+                node.columns[column].options.remove(position);
+                Ok(())
+            })?;
 
         if scope.only {
             return Ok(builder);

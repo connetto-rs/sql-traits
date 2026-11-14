@@ -4,7 +4,7 @@
 extern crate alloc;
 
 use alloc::{borrow::Cow, sync::Arc};
-use core::convert::Infallible;
+use core::{convert::Infallible, marker::PhantomData};
 
 use sql_traits::{
     errors::{Error, LookupError},
@@ -22,26 +22,60 @@ use sqlparser::{
     dialect::{Dialect, PostgreSqlDialect},
 };
 
-/// An uninhabited schema object.
+/// An uninhabited schema object of the profile `P`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct NoneKind {
+struct NoneKind<P> {
     /// Leaves the type without values.
     never: Infallible,
+    /// The profile the object belongs to.
+    profile: PhantomData<P>,
 }
 
-impl NoneKind {
+impl<P> NoneKind<P> {
     /// Returns any type, since no value exists to call this on.
     const fn unreach<T>(&self) -> T {
         match self.never {}
     }
 }
 
-impl Metadata for NoneKind {
+impl<P> Metadata for NoneKind<P> {
     type Meta = ();
 }
 
-impl TableLike for NoneKind {
-    type DB = AlternateDB;
+/// A profile whose schema objects are all uninhabited, so only its catalog
+/// hooks answer anything.
+trait EmptyKinds:
+    SchemaProfile<
+        Table = NoneKind<Self>,
+        Column = NoneKind<Self>,
+        DataType = NoneKind<Self>,
+        Index = NoneKind<Self>,
+        UniqueIndex = NoneKind<Self>,
+        ForeignKey = NoneKind<Self>,
+        Function = NoneKind<Self>,
+        CheckConstraint = NoneKind<Self>,
+        Trigger = NoneKind<Self>,
+        Policy = Absent<GenericDB<Self>>,
+        Role = NoneKind<Self>,
+        RoleMembership = NoneKind<Self>,
+        Schema = NoneKind<Self>,
+        TableGrant = NoneKind<Self>,
+        ColumnGrant = NoneKind<Self>,
+        Dialect = AlternateDialect<Self>,
+    > + core::fmt::Debug
+    + Clone
+    + Copy
+    + Default
+    + Ord
+    + core::hash::Hash
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+impl<P: EmptyKinds> TableLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn table_name(&self) -> &str {
         self.unreach()
@@ -84,7 +118,7 @@ impl TableLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn local_columns<'db>(
@@ -94,7 +128,7 @@ impl TableLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn inherits_from<'db>(
@@ -104,7 +138,7 @@ impl TableLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn partition_root<'db>(
@@ -132,7 +166,7 @@ impl TableLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn check_constraints<'db>(
@@ -142,7 +176,7 @@ impl TableLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn indices<'db>(
@@ -152,7 +186,7 @@ impl TableLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn unique_indices<'db>(
@@ -162,7 +196,7 @@ impl TableLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn foreign_keys<'db>(
@@ -172,7 +206,7 @@ impl TableLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn has_row_level_security(&self, _database: &Self::DB) -> Result<bool, LookupError> {
@@ -206,8 +240,8 @@ impl TableLike for NoneKind {
     }
 }
 
-impl ColumnLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> ColumnLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn column_name(&self) -> &str {
         self.unreach()
@@ -276,8 +310,8 @@ impl ColumnLike for NoneKind {
     }
 }
 
-impl DataTypeLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> DataTypeLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn name<'db>(&'db self, _database: &'db Self::DB) -> Cow<'db, str> {
         self.unreach()
@@ -353,8 +387,8 @@ impl DataTypeLike for NoneKind {
     }
 }
 
-impl IndexLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> IndexLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn name(&self) -> Option<&str> {
         self.unreach()
@@ -390,8 +424,8 @@ impl IndexLike for NoneKind {
     }
 }
 
-impl ForeignKeyLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> ForeignKeyLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn foreign_key_name(&self) -> Option<&str> {
         self.unreach()
@@ -440,7 +474,7 @@ impl ForeignKeyLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn match_kind(&self, _database: &Self::DB) -> ConstraintReferenceMatchKind {
@@ -454,12 +488,12 @@ impl ForeignKeyLike for NoneKind {
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 }
 
-impl FunctionLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn name(&self) -> &str {
         self.unreach()
@@ -534,13 +568,13 @@ impl FunctionLike for NoneKind {
         &self,
         _database: &'db Self::DB,
     ) -> Result<
-        impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + use<'db>,
+        impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + use<'db, P>,
         LookupError,
     >
     where
         Self: 'db,
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn null_input_behavior(&self) -> FunctionCalledOnNull {
@@ -587,8 +621,8 @@ impl FunctionLike for NoneKind {
     }
 }
 
-impl CheckConstraintLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> CheckConstraintLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn expression<'db>(&'db self, _database: &'db Self::DB) -> &'db Expr {
         self.unreach()
@@ -612,7 +646,7 @@ impl CheckConstraintLike for NoneKind {
         &'db self,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Column>, LookupError> {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn functions<'db>(
@@ -620,7 +654,7 @@ impl CheckConstraintLike for NoneKind {
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn functions_reached_by<'db>(
@@ -629,12 +663,12 @@ impl CheckConstraintLike for NoneKind {
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
-        self.unreach::<Result<core::iter::Empty<&'db NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 }
 
-impl TriggerLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn name(&self) -> &str {
         self.unreach()
@@ -681,8 +715,8 @@ impl TriggerLike for NoneKind {
     }
 }
 
-impl RoleLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> RoleLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn name(&self) -> &str {
         self.unreach()
@@ -724,12 +758,12 @@ impl RoleLike for NoneKind {
         &'db self,
         _database: &'db Self::DB,
     ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Policy> {
-        self.unreach::<core::iter::Empty<&'db Absent<AlternateDB>>>()
+        self.unreach::<core::iter::Empty<&'db Absent<GenericDB<P>>>>()
     }
 }
 
-impl RoleMembershipLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> RoleMembershipLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn role_name(&self) -> &str {
         self.unreach()
@@ -752,8 +786,8 @@ impl RoleMembershipLike for NoneKind {
     }
 }
 
-impl SchemaLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> SchemaLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn name(&self) -> &str {
         self.unreach()
@@ -772,8 +806,8 @@ impl SchemaLike for NoneKind {
     }
 }
 
-impl GrantLike for NoneKind {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> GrantLike for NoneKind<P> {
+    type DB = GenericDB<P>;
 
     fn privileges<'db>(&'db self, _database: &'db Self::DB) -> impl Iterator<Item = &'db Action>
     where
@@ -814,19 +848,19 @@ impl GrantLike for NoneKind {
     }
 }
 
-impl TableGrantLike for NoneKind {
+impl<P: EmptyKinds> TableGrantLike for NoneKind<P> {
     fn tables<'a>(
         &'a self,
         _database: &'a Self::DB,
     ) -> impl Iterator<Item = &'a <Self::DB as DatabaseLike>::Table> {
-        self.unreach::<core::iter::Empty<&'a NoneKind>>()
+        self.unreach::<core::iter::Empty<&'a Self>>()
     }
 
     fn relations<'a>(
         &'a self,
         _database: &'a Self::DB,
     ) -> impl Iterator<Item = Relation<'a, Self::DB>> {
-        self.unreach::<core::iter::Empty<Relation<'a, AlternateDB>>>()
+        self.unreach::<core::iter::Empty<Relation<'a, GenericDB<P>>>>()
     }
 
     fn applies_to_table(
@@ -838,13 +872,13 @@ impl TableGrantLike for NoneKind {
     }
 }
 
-impl ColumnGrantLike for NoneKind {
+impl<P: EmptyKinds> ColumnGrantLike for NoneKind<P> {
     fn columns<'a>(
         &'a self,
         _table: &'a <Self::DB as DatabaseLike>::Table,
         _database: &'a Self::DB,
     ) -> Result<impl Iterator<Item = &'a <Self::DB as DatabaseLike>::Column>, LookupError> {
-        self.unreach::<Result<core::iter::Empty<&'a NoneKind>, LookupError>>()
+        self.unreach::<Result<core::iter::Empty<&'a Self>, LookupError>>()
     }
 
     fn table<'a>(
@@ -965,12 +999,12 @@ impl AlternateCatalog {
     }
 }
 
-/// PostgreSQL syntax for an empty schema profile.
+/// PostgreSQL syntax for a profile of uninhabited schema objects.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct AlternateDialect;
+struct AlternateDialect<P>(PhantomData<P>);
 
-impl DialectLike for AlternateDialect {
-    type DB = AlternateDB;
+impl<P: EmptyKinds> DialectLike for AlternateDialect<P> {
+    type DB = GenericDB<P>;
     type Match = TypeMatch;
 
     fn is_bool(
@@ -995,37 +1029,40 @@ impl DialectLike for AlternateDialect {
 }
 
 /// A profile whose operator catalog is loaded outside the parser.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct AlternateProfile;
+
+impl EmptyKinds for AlternateProfile {}
 
 /// The database the profile describes.
 type AlternateDB = GenericDB<AlternateProfile>;
 
 impl SchemaProfile for AlternateProfile {
-    type Table = NoneKind;
+    type Table = NoneKind<Self>;
     type View = Absent<AlternateDB>;
     type MaterializedView = Absent<AlternateDB>;
     type Sequence = Absent<AlternateDB>;
-    type Column = NoneKind;
-    type DataType = NoneKind;
-    type Index = NoneKind;
-    type UniqueIndex = NoneKind;
-    type ForeignKey = NoneKind;
-    type Function = NoneKind;
+    type Column = NoneKind<Self>;
+    type DataType = NoneKind<Self>;
+    type Index = NoneKind<Self>;
+    type UniqueIndex = NoneKind<Self>;
+    type ForeignKey = NoneKind<Self>;
+    type Function = NoneKind<Self>;
     type Operator = CatalogOperator;
     type Cast = Absent<AlternateDB>;
-    type CheckConstraint = NoneKind;
-    type Trigger = NoneKind;
+    type CheckConstraint = NoneKind<Self>;
+    type Trigger = NoneKind<Self>;
     type Rule = Absent<AlternateDB>;
     type Extension = Absent<AlternateDB>;
     type Domain = Absent<AlternateDB>;
     type UserDefinedType = Absent<AlternateDB>;
     type Policy = Absent<AlternateDB>;
-    type Role = NoneKind;
-    type RoleMembership = NoneKind;
-    type Schema = NoneKind;
-    type TableGrant = NoneKind;
-    type ColumnGrant = NoneKind;
-    type Dialect = AlternateDialect;
+    type Role = NoneKind<Self>;
+    type RoleMembership = NoneKind<Self>;
+    type Schema = NoneKind<Self>;
+    type TableGrant = NoneKind<Self>;
+    type ColumnGrant = NoneKind<Self>;
+    type Dialect = AlternateDialect<Self>;
     type Ingestion = AlternateCatalog;
 
     fn default_ingestion(_dialect: &Self::Dialect) -> Self::Ingestion {
@@ -1060,7 +1097,7 @@ impl SchemaProfile for AlternateProfile {
     fn initial_schemas(
         _dialect: &Self::Dialect,
     ) -> impl IntoIterator<Item = (Arc<Self::Schema>, Meta<Self::Schema>)> {
-        core::iter::empty::<(Arc<NoneKind>, ())>()
+        core::iter::empty::<(Arc<NoneKind<Self>>, ())>()
     }
 
     fn is_foreign_table(_metadata: &Meta<Self::Table>) -> bool {
@@ -1068,13 +1105,59 @@ impl SchemaProfile for AlternateProfile {
     }
 }
 
-/// The inherited operator and cast catalogs and type facts remain
-/// unavailable under PostgreSQL syntax.
+/// A profile leaving every catalog hook to the trait's defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct HooklessProfile;
+
+impl EmptyKinds for HooklessProfile {}
+
+impl SchemaProfile for HooklessProfile {
+    type Table = NoneKind<Self>;
+    type View = Absent<GenericDB<Self>>;
+    type MaterializedView = Absent<GenericDB<Self>>;
+    type Sequence = Absent<GenericDB<Self>>;
+    type Column = NoneKind<Self>;
+    type DataType = NoneKind<Self>;
+    type Index = NoneKind<Self>;
+    type UniqueIndex = NoneKind<Self>;
+    type ForeignKey = NoneKind<Self>;
+    type Function = NoneKind<Self>;
+    type Operator = Absent<GenericDB<Self>>;
+    type Cast = Absent<GenericDB<Self>>;
+    type CheckConstraint = NoneKind<Self>;
+    type Trigger = NoneKind<Self>;
+    type Rule = Absent<GenericDB<Self>>;
+    type Extension = Absent<GenericDB<Self>>;
+    type Domain = Absent<GenericDB<Self>>;
+    type UserDefinedType = Absent<GenericDB<Self>>;
+    type Policy = Absent<GenericDB<Self>>;
+    type Role = NoneKind<Self>;
+    type RoleMembership = NoneKind<Self>;
+    type Schema = NoneKind<Self>;
+    type TableGrant = NoneKind<Self>;
+    type ColumnGrant = NoneKind<Self>;
+    type Dialect = AlternateDialect<Self>;
+    type Ingestion = ();
+
+    fn default_ingestion(_dialect: &Self::Dialect) -> Self::Ingestion {}
+
+    fn initial_schemas(
+        _dialect: &Self::Dialect,
+    ) -> impl IntoIterator<Item = (Arc<Self::Schema>, Meta<Self::Schema>)> {
+        core::iter::empty::<(Arc<NoneKind<Self>>, ())>()
+    }
+
+    fn is_foreign_table(_metadata: &Meta<Self::Table>) -> bool {
+        false
+    }
+}
+
+/// The operator and cast catalogs and type facts a profile leaves to the
+/// trait remain unavailable under PostgreSQL syntax.
 #[test]
 fn unavailable_catalogs_stay_distinct_from_empty_ones() -> Result<(), Error> {
-    let catalog_name = String::from("profile");
-    let database: GenericDB<AlternateProfile> =
-        GenericDBBuilder::<AlternateProfile>::new(catalog_name, AlternateDialect).into();
+    let database: GenericDB<HooklessProfile> =
+        GenericDBBuilder::new(String::from("profile"), AlternateDialect::default()).into();
     assert!(database.operators().is_none());
     assert!(database.casts().is_none());
     assert!(
@@ -1093,7 +1176,7 @@ fn unavailable_catalogs_stay_distinct_from_empty_ones() -> Result<(), Error> {
 
 /// The builder for an empty database of the profile.
 fn alternate_builder() -> GenericDBBuilder<AlternateProfile> {
-    GenericDBBuilder::new(String::from("profile"), AlternateDialect)
+    GenericDBBuilder::new(String::from("profile"), AlternateDialect::default())
 }
 
 /// A loaded catalog is read back entry by entry, by the database and by its
