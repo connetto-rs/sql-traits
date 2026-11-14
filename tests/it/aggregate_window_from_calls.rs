@@ -2,7 +2,10 @@
 //! are resolved as PostgreSQL 18 resolves them.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, ObjectKind},
+    prelude::*,
+};
 use sqlparser::{
     ast::{Query, SelectItem, SetExpr, Statement},
     dialect::PostgreSqlDialect,
@@ -162,7 +165,13 @@ fn a_view_holds_the_overload_its_from_call_runs() {
     let result =
         ParserDB::parse::<PostgreSqlDialect>(&format!("{functions} DROP FUNCTION f(int4);"));
     assert!(
-        matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "f"),
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                if function_name == "f"
+                    && *dependent_kind == ObjectKind::View
+                    && dependent_name == "v"
+        ),
         "got {result:?}"
     );
 }

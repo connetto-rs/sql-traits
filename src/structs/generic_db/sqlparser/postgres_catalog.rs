@@ -386,18 +386,29 @@ impl PostgresCatalog {
         }
     }
 
-    /// Tests whether an operator or a cast runs this exact function signature.
-    pub(super) fn fact_declares_function(
+    /// The operator or cast running this exact function signature, which a
+    /// drop without `CASCADE` of the function would leave behind.
+    pub(super) fn fact_running_function(
         &self,
         type_arrays: &TypeArrays,
         name: &ObjectName,
         args: Option<&[OperateFunctionArg]>,
         case: IdentifierCase,
-    ) -> bool {
-        self.operators
+    ) -> Option<CatalogDependent> {
+        if let Some(operator) = self
+            .operators
             .iter()
-            .any(|operator| operator.declares_function(type_arrays, name, args, case))
-            || self.casts.iter().any(|cast| cast.declares_function(type_arrays, name, args, case))
+            .find(|operator| operator.declares_function(type_arrays, name, args, case))
+        {
+            return Some(CatalogDependent {
+                kind: ObjectKind::Operator,
+                name: String::from(operator.name()),
+            });
+        }
+        self.casts
+            .iter()
+            .find(|cast| cast.declares_function(type_arrays, name, args, case))
+            .map(|cast| CatalogDependent { kind: ObjectKind::Cast, name: cast.described() })
     }
 
     /// Repoints operators and casts running the renamed function's exact

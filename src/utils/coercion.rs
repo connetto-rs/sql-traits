@@ -82,18 +82,37 @@ pub(crate) fn canonical<'p, D: DatabaseLike>(database: &D, pg_type: &'p PgType) 
 /// The type the stored `name` denotes when the database's facts spell it
 /// otherwise, qualified or as an array, and [`None`] when they do not.
 fn located<D: DatabaseLike>(database: &D, name: &TargetName<'_>) -> Option<PgType> {
-    let (qualified, facts) = match name.schema() {
-        Some(_) => (None, database.type_facts(view(name))?),
+    let (qualified, facts) = found(database, name)?;
+    match facts.array_element() {
+        Some(element) => Some(canonical_owned(database, PgType::from_target(element)).array()),
+        None => name.schema().is_none().then(|| PgType::from_target(&qualified)),
+    }
+}
+
+/// The canonical type the written `name` denotes in `database`, as
+/// `LookupTypeName` finds it, or [`None`] when no type has that name.
+fn looked_up<D: DatabaseLike>(database: &D, name: &TargetName<'_>) -> Option<PgType> {
+    let (qualified, facts) = found(database, name)?;
+    Some(match facts.array_element() {
+        Some(element) => canonical_owned(database, PgType::from_target(element)).array(),
+        None => PgType::from_target(&qualified),
+    })
+}
+
+/// The type `name` names, qualified with the schema the type search path
+/// finds it in, and its facts.
+fn found<'a, D: DatabaseLike>(
+    database: &'a D,
+    name: &'a TargetName<'_>,
+) -> Option<(TargetName<'a>, TypeFacts<'a>)> {
+    match name.schema() {
+        Some(_) => Some((view(name), database.type_facts(view(name))?)),
         None => {
             type_search_path(|| database.search_path()).find_map(|(schema, quoted)| {
                 let qualified = view(name).with_schema(schema, quoted);
-                database.type_facts(qualified.clone()).map(|facts| (Some(qualified), facts))
-            })?
+                database.type_facts(qualified.clone()).map(|facts| (qualified, facts))
+            })
         }
-    };
-    match facts.array_element() {
-        Some(element) => Some(canonical_owned(database, PgType::from_target(element)).array()),
-        None => qualified.map(|qualified| PgType::from_target(&qualified)),
     }
 }
 
@@ -510,11 +529,11 @@ fn descends<D: DatabaseLike>(
 /// no name, is a cast to, as `func_get_detail` reads a call no candidate
 /// takes exactly, or [`None`] when the call is no cast.
 ///
-/// The name has to name a type that is not a row type, and the argument
-/// has to be an untyped literal or reach the type as `find_coercion_pathway`
-/// does under `COERCION_EXPLICIT` by a binary relabel or through text, but
-/// from a row to a string. A database answering no casts reads no call as a
-/// cast.
+/// The name has to name a type that is not a row type, looked up as a type
+/// name on the type search path, and the argument has to be an untyped
+/// literal or reach the type as `find_coercion_pathway` does under
+/// `COERCION_EXPLICIT` by a binary relabel or through text, but from a row
+/// to a string. A database answering no casts reads no call as a cast.
 pub(crate) fn functional_cast<D: DatabaseLike>(
     database: &D,
     name: &TargetName<'_>,
@@ -523,10 +542,10 @@ pub(crate) fn functional_cast<D: DatabaseLike>(
     if database.casts().is_none() {
         return Ok(None);
     }
-    let target = canonical_owned(database, PgType::from_target(name));
-    let named = matches!(target, PgType::Catalog(_) | PgType::Array(_))
-        || facts(database, &target).is_some();
-    if !named || proven(is_complex(database, &target))? {
+    let Some(target) = looked_up(database, name) else {
+        return Ok(None);
+    };
+    if proven(is_complex(database, &target))? {
         return Ok(None);
     }
     let source = argument.ok_or(Undetermined)?;

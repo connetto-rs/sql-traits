@@ -24,6 +24,22 @@ enum KeyItem<'a> {
     Expression(&'a Expr),
 }
 
+/// The entries of the key `table` partitions by, as written, or `None` for a
+/// table that is not partitioned.
+///
+/// PostgreSQL binds the calls of the entries when the table is created, and
+/// the function the key is written as names the strategy, which is no call.
+pub(super) fn key_entries(table: &CreateTable) -> Option<&Vec<FunctionArg>> {
+    match table.partition_by.as_deref() {
+        Some(Expr::Function(Function { args: FunctionArguments::List(list), .. }))
+            if table.partition_strategy().is_some() =>
+        {
+            Some(&list.args)
+        }
+        _ => None,
+    }
+}
+
 /// The strategy and the entries of the key `table` partitions by, or `None`
 /// for a table that is not partitioned.
 fn partition_key(table: &CreateTable) -> Option<(PartitionStrategy, Vec<KeyItem<'_>>)> {

@@ -177,7 +177,7 @@ fn calls_reach_the_constructors() {
              CREATE TABLE t (x int4 CHECK (span(x, x + 1) IS NOT NULL));
              DROP TYPE span CASCADE;",
         ),
-        Err(Error::FunctionReferenced { function_name }) if function_name == "span"
+        Err(Error::FunctionReferenced { function_name, .. }) if function_name == "span"
     ));
 }
 

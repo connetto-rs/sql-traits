@@ -357,7 +357,7 @@ fn uuid_ossp_functions_go_with_the_extension() {
              CREATE TABLE t (id UUID CHECK (id <> uuid_nil()));
              DROP EXTENSION \"uuid-ossp\";",
         ),
-        Err(Error::FunctionReferenced { function_name }) if function_name == "uuid_nil"
+        Err(Error::FunctionReferenced { function_name, .. }) if function_name == "uuid_nil"
     ));
     assert!(matches!(
         parse(
@@ -445,7 +445,7 @@ fn a_call_to_a_dependent_function_keeps_its_extension() {
     let result =
         parse(&format!("{DEPENDENT} CREATE VIEW gv AS SELECT g() AS one; DROP EXTENSION pg_trgm;"));
     assert!(
-        matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "g"),
+        matches!(&result, Err(Error::FunctionReferenced { function_name, .. }) if function_name == "g"),
         "got {result:?}"
     );
 }

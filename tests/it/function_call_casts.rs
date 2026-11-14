@@ -2,7 +2,10 @@
 //! takes exactly, is the cast PostgreSQL 18 reads it as.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, ObjectKind},
+    prelude::*,
+};
 use sqlparser::{
     ast::{Expr, SelectItem, SetExpr, Statement},
     dialect::PostgreSqlDialect,
@@ -106,13 +109,50 @@ fn other_calls_select_among_functions() {
     let schema = "CREATE TYPE mood AS ENUM ('a');
                   CREATE TYPE pair AS (x INT4, y INT4);
                   CREATE TABLE t (a INT4, b BOOL, p pair, s TEXT, arr INT4[]);";
-    // `boolean` reaches `character` by the cast function `text(boolean)`.
-    for call in ["bpchar(b)", "_text(arr)", "mood(a)", "text(p)", "pair(s)", "text(x => a)"] {
+    // `boolean` reaches `character` by the cast function `text(boolean)`,
+    // and `serial` is shorthand of column declarations, no type name.
+    for call in
+        ["bpchar(b)", "_text(arr)", "mood(a)", "text(p)", "pair(s)", "text(x => a)", "serial(s)"]
+    {
         assert_eq!(read(schema, call), ("not found".to_owned(), None), "{call}");
     }
     // A field of a composite column has no type the model knows, so the
     // call may be a cast or a function.
     assert_eq!(read(schema, "text((p).x)"), ("undetermined".to_owned(), None));
+}
+
+/// The function name is looked up as a type on the type search path, so a
+/// domain earlier on the path than `pg_catalog` is the type cast to.
+#[test]
+fn the_name_is_looked_up_on_the_type_search_path() {
+    let domain = "CREATE DOMAIN public.int8 AS pg_catalog.int8 CHECK (VALUE > 0);";
+    assert_cast(
+        &format!("{domain} SET search_path = public, pg_catalog; CREATE TABLE t (a INT4);"),
+        "int8('5')",
+        "\"public\".\"int8\"",
+    );
+    assert_cast(&format!("{domain} CREATE TABLE t (a INT4);"), "int8('5')", "pg_catalog.int8");
+}
+
+/// A call of a function named like `serial`, which names no type, runs the
+/// function and holds it.
+#[test]
+fn a_name_that_is_no_type_runs_its_function() {
+    let result = parse(
+        "CREATE FUNCTION serial(text) RETURNS INT4 LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+         CREATE TABLE d (a INT4 DEFAULT serial('5'));
+         DROP FUNCTION serial(text);",
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                if function_name == "serial"
+                    && *dependent_kind == ObjectKind::ColumnDefault
+                    && dependent_name == "d.a"
+        ),
+        "got {result:?}"
+    );
 }
 
 /// The type a call written in any statement returns is the type it is cast
@@ -154,7 +194,13 @@ fn a_cast_holds_no_function() {
          DROP FUNCTION uuid(text);"
     ));
     assert!(
-        matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "uuid"),
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                if function_name == "uuid"
+                    && *dependent_kind == ObjectKind::CheckConstraint
+                    && dependent_name == "d.ck"
+        ),
         "got {result:?}"
     );
 }
