@@ -513,26 +513,18 @@ impl<F> ExpressionCalls<F> {
         node: &N,
         call: &Function,
     ) -> Option<impl Iterator<Item = &'s F> + use<'s, F, N>> {
-        let mut position = 0;
-        let found = for_each_site(node, |site| {
-            match site {
-                Site::Call(Call { node: Some(node), .. }) if core::ptr::eq(node, call) => {
-                    ControlFlow::Break(Some(position))
-                }
-                Site::ExpressionForm(node) if core::ptr::eq(node, call) => ControlFlow::Break(None),
-                Site::Call(_) => {
-                    position += 1;
-                    ControlFlow::Continue(())
-                }
-                Site::ExpressionForm(_) => ControlFlow::Continue(()),
-            }
-        });
-        let ControlFlow::Break(position) = found else {
-            return None;
-        };
-        let reached: &[Arc<F>] = match position {
-            Some(position) => self.calls.get(position)?.reached(),
-            None => &[],
+        self.reached_at(call_site(node, call)?)
+    }
+
+    /// Returns the functions the call at `site` reaches, or `None` when the
+    /// record holds no call at its position.
+    pub(crate) fn reached_at(
+        &self,
+        site: CallSite,
+    ) -> Option<impl Iterator<Item = &F> + use<'_, F>> {
+        let reached: &[Arc<F>] = match site {
+            CallSite::Call(position) => self.calls.get(position)?.reached(),
+            CallSite::ExpressionForm => &[],
         };
         Some(reached.iter().map(AsRef::as_ref))
     }
@@ -550,6 +542,41 @@ impl<F> ExpressionCalls<F> {
                 *slot = Arc::clone(fresh);
             }
         }
+    }
+}
+
+/// Where a node written with the syntax of a call sits among the calls of
+/// the node holding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallSite {
+    /// A call, at its position in the order a pre-order walk meets them.
+    Call(usize),
+    /// An expression form, which runs no function.
+    ExpressionForm,
+}
+
+/// Returns where `call` sits among the calls of `node`, or `None` when
+/// `call` is not a node of `node`, which is matched by address.
+pub(crate) fn call_site<N: Visit + ?Sized>(node: &N, call: &Function) -> Option<CallSite> {
+    let mut position = 0;
+    let found = for_each_site(node, |site| {
+        match site {
+            Site::Call(Call { node: Some(node), .. }) if core::ptr::eq(node, call) => {
+                ControlFlow::Break(CallSite::Call(position))
+            }
+            Site::ExpressionForm(node) if core::ptr::eq(node, call) => {
+                ControlFlow::Break(CallSite::ExpressionForm)
+            }
+            Site::Call(_) => {
+                position += 1;
+                ControlFlow::Continue(())
+            }
+            Site::ExpressionForm(_) => ControlFlow::Continue(()),
+        }
+    });
+    match found {
+        ControlFlow::Break(site) => Some(site),
+        ControlFlow::Continue(()) => None,
     }
 }
 

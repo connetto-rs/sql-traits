@@ -1,5 +1,5 @@
-//! Tests that each call in a policy, check, column or domain expression
-//! answers the functions it may reach, wherever it is nested.
+//! Tests that each call in a policy, check, column, domain or index
+//! expression answers the functions it may reach, wherever it is nested.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 #![expect(
     clippy::disallowed_methods,
@@ -537,4 +537,81 @@ fn a_domain_from_another_database_is_refused() {
         }
     });
     assert_eq!(refusals, [("ok".to_owned(), vec!["`checked`".to_owned()])]);
+}
+
+/// The schema of the index tests, whose index binds its calls under a path
+/// the script then leaves.
+const MOVED_PATH_INDEX: &str = "CREATE SCHEMA earlier;
+     CREATE SCHEMA later;
+     CREATE FUNCTION earlier.norm(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x';
+     CREATE FUNCTION later.norm(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT -x';
+     CREATE FUNCTION earlier.keep(x INT) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT true';
+     CREATE FUNCTION later.keep(x INT) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT true';
+     CREATE TABLE public.t (x INT, y INT);
+     SET search_path = earlier, public;
+     CREATE INDEX keyed ON public.t (norm(x), y, (norm(y) + 1)) WHERE keep(x) AND norm(y) > 0;
+     CREATE INDEX plain ON public.t (norm(x));
+     SET search_path = later, public;";
+
+/// Each call of an expression, in walk order, with the qualified names of
+/// the functions it reaches.
+type CallsReached = Vec<(String, Vec<String>)>;
+
+/// The calls of `index`'s key and predicate, each with the functions it
+/// reaches in `db`.
+fn index_calls(
+    db: &ParserDB,
+    index: &<ParserDB as DatabaseLike>::Index,
+) -> (CallsReached, CallsReached) {
+    let expression = index.expression(db).expect("the index is held");
+    let predicate = index.predicate().expect("the index is partial");
+    let lookup = |call: &sqlparser::ast::Function| index.functions_reached_by(call, db).map(names);
+    (names_per_call(expression, lookup), names_per_call(predicate, lookup))
+}
+
+/// The key and the predicate of an index answer per call under the path in
+/// force at `CREATE INDEX`, whatever path the script ends on, the predicate
+/// counting its calls after every call of the key.
+#[test]
+fn index_calls_resolve_under_the_statement_search_path() {
+    let db = parse(MOVED_PATH_INDEX);
+    let index = db.indexes().find(|index| index.name() == Some("keyed")).expect("index exists");
+    let norm = || ("norm".to_owned(), vec!["earlier.norm".to_owned()]);
+    let keep = ("keep".to_owned(), vec!["earlier.keep".to_owned()]);
+    assert_eq!(index_calls(&db, index), (vec![norm(), norm()], vec![keep, norm()]));
+}
+
+/// A column rename rewrites the key of an index over it, whose calls keep
+/// the functions they were bound to whatever path the rename runs under.
+#[test]
+fn index_calls_survive_a_rename_under_another_path() {
+    let db = parse(&format!("{MOVED_PATH_INDEX} ALTER TABLE public.t RENAME COLUMN y TO z;"));
+    let index = db.indexes().find(|index| index.name() == Some("keyed")).expect("index exists");
+    let norm = || ("norm".to_owned(), vec!["earlier.norm".to_owned()]);
+    let keep = ("keep".to_owned(), vec!["earlier.keep".to_owned()]);
+    assert_eq!(index_calls(&db, index), (vec![norm(), norm()], vec![keep, norm()]));
+}
+
+/// A call copied out of an index, or borrowed from another index, is refused
+/// as no node of the index asked.
+#[test]
+fn an_index_refuses_calls_it_does_not_hold() {
+    let db = parse(MOVED_PATH_INDEX);
+    let index =
+        |name: &str| db.indexes().find(|index| index.name() == Some(name)).expect("index exists");
+    let (keyed, plain) = (index("keyed"), index("plain"));
+    let copy = keyed.predicate().expect("the index is partial").clone();
+    let refusals =
+        refusals_per_call(&copy, |call| keyed.functions_reached_by(call, &db).map(names));
+    assert_eq!(
+        refusals,
+        [
+            ("keep".to_owned(), vec!["keep(x)".to_owned()]),
+            ("norm".to_owned(), vec!["norm(y)".to_owned()])
+        ]
+    );
+    let other = plain.expression(&db).expect("the index is held");
+    let refusals =
+        refusals_per_call(other, |call| keyed.functions_reached_by(call, &db).map(names));
+    assert_eq!(refusals, [("norm".to_owned(), vec!["norm(x)".to_owned()])]);
 }

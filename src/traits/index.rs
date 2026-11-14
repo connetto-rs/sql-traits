@@ -3,7 +3,7 @@
 use alloc::{borrow::Cow, vec::Vec};
 use core::fmt::Debug;
 
-use sqlparser::ast::{Expr, IndexType};
+use sqlparser::ast::{Expr, Function, IndexType};
 
 use crate::{
     errors::LookupError,
@@ -387,6 +387,51 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     fn predicate(&self) -> Option<&Expr> {
         None
     }
+
+    /// Returns the functions one call in the index's key or predicate may
+    /// reach, resolved under the search path of the statement that created
+    /// the index.
+    ///
+    /// `call` is a node of [`Self::expression`] or of [`Self::predicate`] at
+    /// any depth, subqueries included. Resolution follows the rules of
+    /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by).
+    /// An expression PostgreSQL's grammar writes like a call, such as
+    /// `COALESCE` or `CURRENT_USER`, reaches no function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index, and [`LookupError::CallNotInExpression`] when `call`
+    /// is not a node of its key or predicate, which is matched by address.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE SCHEMA app;
+    ///      CREATE FUNCTION app.ok(x INT) RETURNS BOOLEAN LANGUAGE sql IMMUTABLE AS 'SELECT x > 0';
+    ///      CREATE TABLE public.t (x INT);
+    ///      SET search_path TO app, public;
+    ///      CREATE INDEX positive ON public.t (x) WHERE ok(x);
+    ///      SET search_path TO public;",
+    /// )?;
+    /// let index = db.indexes().next().unwrap();
+    /// let Some(Expr::Function(call)) = index.predicate() else { panic!() };
+    /// let reached: Vec<_> = index.functions_reached_by(call, &db)?.collect();
+    /// assert_eq!(reached.len(), 1);
+    /// assert_eq!(reached[0].target_name().to_string(), "app.ok");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
 
     /// Returns whether the index treats null values as distinct from one
     /// another, so that a unique index admits any number of rows holding

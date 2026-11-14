@@ -151,6 +151,7 @@ impl ParserDBBuilder {
         let checks = self.check_constraints().iter().map(|(_, metadata)| metadata.calls());
         let columns = self.columns().iter().map(|(_, metadata, _)| metadata.calls());
         let indices = self.indices().iter().map(|(_, metadata)| metadata.calls());
+        let unique_keys = self.unique_indices().iter().map(|(_, metadata)| metadata.calls());
         let views = self.views().iter().map(|(_, metadata, _)| metadata.calls());
         let materialized =
             self.materialized_views().iter().map(|(_, metadata, _)| metadata.calls());
@@ -168,6 +169,7 @@ impl ParserDBBuilder {
         checks
             .chain(columns)
             .chain(indices)
+            .chain(unique_keys)
             .chain(views)
             .chain(materialized)
             .chain(policies)
@@ -195,6 +197,9 @@ impl ParserDBBuilder {
             metadata.calls_mut().settle_on_built_ins();
         }
         for (_, metadata) in self.indices_mut() {
+            metadata.calls_mut().settle_on_built_ins();
+        }
+        for (_, metadata) in self.unique_indices_mut() {
             metadata.calls_mut().settle_on_built_ins();
         }
         for (_, metadata, _) in self.views_mut() {
@@ -249,6 +254,9 @@ impl ParserDBBuilder {
         }
         for (index, metadata) in self.indices_mut() {
             settle(metadata.calls_mut(), index.attribute(), selections, refuse)?;
+        }
+        for (unique_key, metadata) in self.unique_indices_mut() {
+            settle(metadata.calls_mut(), unique_key.attribute(), selections, refuse)?;
         }
         for (view, metadata, _) in self.views_mut() {
             settle(metadata.calls_mut(), view.declaration().query(), selections, refuse)?;
@@ -318,6 +326,12 @@ impl ParserDBBuilder {
             let scope = ExpressionScope::Table(TableAttribute::table(index));
             select.typed(index.attribute(), metadata.calls(), |select| {
                 select.roots(index.attribute(), &scope);
+            });
+        }
+        for (unique_key, metadata) in self.unique_indices() {
+            let scope = ExpressionScope::Table(TableAttribute::table(unique_key));
+            select.typed(unique_key.attribute(), metadata.calls(), |select| {
+                select.roots(unique_key.attribute(), &scope);
             });
         }
         for (view, metadata, _) in self.views() {

@@ -943,6 +943,15 @@ impl IndexLike for MemoryIndex {
     fn is_unique(&self) -> bool {
         false
     }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        // The key names a column alone, so no call is one of its nodes.
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
+    }
 }
 
 impl IndexLike for MemoryUniqueIndex {
@@ -979,6 +988,14 @@ impl IndexLike for MemoryUniqueIndex {
 
     fn is_unique(&self) -> bool {
         true
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        self.0.functions_reached_by(call, database)
     }
 }
 
