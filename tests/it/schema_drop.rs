@@ -1,8 +1,8 @@
 //! Tests that `DROP SCHEMA` counts the functions and views a schema holds.
 //!
-//! PostgreSQL 16 refuses to drop a schema holding a function unless the
+//! PostgreSQL refuses to drop a schema holding a function unless the
 //! statement says `CASCADE`, which drops its tables, views, materialized views
-//! and functions alike, with the views elsewhere reading them.
+//! and functions alike, with what elsewhere reads or calls them.
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
@@ -43,16 +43,17 @@ fn a_cascade_drops_the_functions_and_views_of_the_schema() {
     assert_eq!(db.tables().count(), 0);
 }
 
-/// PostgreSQL also drops a caller outside the schema, which this model does
-/// for no function drop, so the cascade is refused rather than leaving the
-/// call bound to a function that is gone.
+/// A caller outside the schema goes with the function it calls, as
+/// PostgreSQL 18 takes the default of `o.b`, `function g()` and `index oi`.
 #[test]
-fn a_cascade_reaching_a_call_outside_the_schema_is_refused() {
-    let result = parse(&format!(
-        "{APP} CREATE TABLE public.o (b INT DEFAULT app.f()); DROP SCHEMA app CASCADE;"
-    ));
-    assert!(
-        matches!(&result, Err(Error::FunctionReferenced { function_name, .. }) if function_name == "f"),
-        "got {result:?}"
-    );
+fn a_cascade_takes_what_outside_the_schema_calls_its_functions() {
+    parse(&format!(
+        "{APP} CREATE TABLE public.o (b INT DEFAULT app.f(), c INT);
+         CREATE FUNCTION public.g() RETURNS INT LANGUAGE sql IMMUTABLE RETURN app.f();
+         CREATE INDEX oi ON public.o ((c + public.g()));
+         DROP SCHEMA app CASCADE;
+         CREATE FUNCTION public.g() RETURNS INT LANGUAGE sql RETURN 1;
+         CREATE INDEX oi ON public.o (c);"
+    ))
+    .expect("the cascade takes the default, g and oi");
 }
