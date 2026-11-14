@@ -276,25 +276,39 @@ pub(crate) fn body_unqualified_names<'db, F: FunctionLike>(
     database: &'db F::DB,
 ) -> Result<Vec<UnqualifiedName<'db, F::DB>>, LookupError> {
     let (body, procedural) = checked_body(function)?;
-    // A bound body reaches what it reached at creation, whatever the path.
-    if body.is_bound() && !procedural {
-        return Ok(Vec::new());
-    }
-    let sql = parsed_body(function, body, procedural, database)?;
+    // A bound body is never parsed here, since the path decides none of its
+    // names.
+    let sql = if body.is_bound() && !procedural {
+        None
+    } else {
+        Some(parsed_body(function, body, procedural, database)?)
+    };
     let hex_strings_may_be_integers = hex_strings_may_be_integers(database);
-    let mut names = NameCollector::new(database, run_time_path(function, database)?);
-    match &sql {
-        SqlBody::Statements(statements) => {
-            let body = RunTimeBody::Sql(statements);
+    let start = || run_time_path(function, database).map(|path| NameCollector::new(database, path));
+    Ok(match sql {
+        Some(SqlBody::Statements(statements)) => {
+            let mut names = start()?;
+            let body = RunTimeBody::Sql(&statements);
             walk_body(function.name(), body, &mut names, hex_strings_may_be_integers)?;
+            names.into_names()
         }
-        SqlBody::PlPgSql(block) => {
-            let body = RunTimeBody::PlPgSql(block);
+        Some(SqlBody::PlPgSql(block)) => {
+            let mut names = start()?;
+            let body = RunTimeBody::PlPgSql(&block);
             walk_body(function.name(), body, &mut names, hex_strings_may_be_integers)?;
+            names.into_names()
         }
-        SqlBody::Expression(expression) => names.collect(*expression)?,
-        SqlBody::Select(select) => names.collect(*select)?,
-        SqlBody::Return(_) | SqlBody::Atomic(_) => {}
-    }
-    Ok(names.into_names())
+        Some(SqlBody::Expression(expression)) => {
+            let mut names = start()?;
+            names.collect(expression)?;
+            names.into_names()
+        }
+        Some(SqlBody::Select(select)) => {
+            let mut names = start()?;
+            names.collect(select)?;
+            names.into_names()
+        }
+        // Bound at creation, keeping what it reached then.
+        None | Some(SqlBody::Return(_) | SqlBody::Atomic(_)) => Vec::new(),
+    })
 }

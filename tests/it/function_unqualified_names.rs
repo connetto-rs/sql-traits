@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use sql_traits::{errors::LookupError, prelude::*};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{BigQueryDialect, MsSqlDialect, PostgreSqlDialect};
 
 use crate::support::relation_labels::relation_label;
 
@@ -216,4 +216,63 @@ fn quoting_is_kept_as_written() {
     let names = function(&database, "quoted").unqualified_names(&database).unwrap();
     let [unqualified] = names.as_slice() else { panic!("one name, got {names:?}") };
     assert_eq!(unqualified.name(), &TargetName::new("Rows", true));
+}
+
+/// A name written again reaching the same objects is answered once, and one
+/// reaching other objects after a `SET search_path` is answered again.
+#[test]
+fn a_name_is_answered_once_for_each_object_it_reaches() {
+    let database = postgres(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.items (v INT);
+         CREATE TABLE public.items (v INT);
+         CREATE FUNCTION helper() RETURNS INT LANGUAGE sql RETURN 1;
+         CREATE FUNCTION repeated() RETURNS VOID LANGUAGE sql AS $$
+             SELECT helper() FROM items, gone;
+             SELECT helper() FROM items, gone;
+             SET search_path = app;
+             DELETE FROM items;
+         $$;",
+    );
+    let names = function(&database, "repeated").unqualified_names(&database).unwrap();
+    let reached: Vec<String> = names
+        .iter()
+        .map(|unqualified| {
+            match unqualified {
+                UnqualifiedName::Relation { name, relation: Some(Relation::Table(table)) } => {
+                    let schema = table.table_schema().unwrap_or("public");
+                    format!("{name}: {schema}.{}", table.table_name())
+                }
+                UnqualifiedName::Relation { name, relation } => format!("{name}: {relation:?}"),
+                UnqualifiedName::Function { name, functions } => {
+                    format!("{name}(): {} reached", functions.len())
+                }
+            }
+        })
+        .collect();
+    assert_eq!(
+        reached,
+        ["items: public.items", "gone: None", "helper(): 1 reached", "items: app.items"]
+    );
+}
+
+#[test]
+fn an_expression_or_query_body_answers_its_names() {
+    let sql_server = ParserDB::parse::<MsSqlDialect>(
+        "CREATE TABLE items (v INT);
+         CREATE FUNCTION helper() RETURNS INT AS BEGIN RETURN 1; END;
+         CREATE FUNCTION listed() RETURNS TABLE AS RETURN SELECT helper() AS h FROM items;",
+    )
+    .unwrap();
+    assert_eq!(
+        unqualified_in(&sql_server, "listed").unwrap(),
+        ["relation items: table items", "function helper: public.helper"],
+    );
+
+    let big_query = ParserDB::parse::<BigQueryDialect>(
+        "CREATE FUNCTION helper() RETURNS INT64 AS (1);
+         CREATE FUNCTION counted() RETURNS INT64 AS (helper() + 1);",
+    )
+    .unwrap();
+    assert_eq!(unqualified_in(&big_query, "counted").unwrap(), ["function helper: public.helper"]);
 }
