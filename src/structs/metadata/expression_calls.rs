@@ -157,13 +157,13 @@ impl<F> ExpressionCalls<F> {
     }
 
     /// Settles every call of `node`, the node this record was built from,
-    /// that waits for its argument types: one `selected` answers a function
-    /// for keeps that function alone, one read as a cast reaches none, and
-    /// any other keeps every overload.
+    /// that waits for its argument types, each looked up by its called name:
+    /// one `selected` answers a function for keeps that function alone, one
+    /// read as a cast reaches none, and any other keeps every overload.
     pub(crate) fn settle<N: Visit + ?Sized>(
         &mut self,
         node: &N,
-        selected: impl Fn(&Function) -> Option<CallChoice>,
+        selected: impl Fn(&ObjectName) -> Option<CallChoice>,
     ) {
         let mut calls = self.calls.iter_mut();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
@@ -171,7 +171,7 @@ impl<F> ExpressionCalls<F> {
             if bound.settled {
                 return ControlFlow::Continue(());
             }
-            match call.node.and_then(&selected) {
+            match selected(call.name) {
                 // A waiting call still reaches every overload.
                 Some(CallChoice::Function(address)) => {
                     bound.reached.retain(|function| Arc::as_ptr(function).addr() == address);

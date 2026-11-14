@@ -13,19 +13,22 @@
 use alloc::collections::BTreeMap;
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{ColumnOption, Expr, Function, Query, Statement, Visit, Visitor};
+use sqlparser::ast::{
+    ColumnOption, Expr, ObjectName, Query, Statement, TableFactor, Visit, Visitor,
+};
 
 use super::{ParserDB, ParserDBBuilder};
 use crate::{
     structs::{
-        CallResolution, ExpressionContext, ExpressionScope, IdentifierCase, TableAttribute,
-        metadata::CallChoice,
+        CallApplication, CallResolution, ExpressionContext, ExpressionScope, IdentifierCase,
+        TableAttribute, metadata::CallChoice,
     },
     traits::{PolicyLike, Relation, RuleLike, TriggerLike},
     utils::walk::walk,
 };
 
-/// What each typed call chooses, by the address of the call's node.
+/// What each typed call chooses, by the address of the name it calls, which
+/// a function expression and a function in `FROM` both hold.
 type Selections = BTreeMap<usize, CallChoice>;
 
 impl ParserDBBuilder {
@@ -53,7 +56,7 @@ impl ParserDBBuilder {
     /// builder holds.
     pub(super) fn settle_calls(&mut self, database: &ParserDB) {
         let selections = self.selections(database);
-        let selected = |call: &Function| selections.get(&address(call)).copied();
+        let selected = |name: &ObjectName| selections.get(&address(name)).copied();
         for (check, metadata) in self.check_constraints_mut() {
             if metadata.calls().is_unsettled() {
                 metadata.calls_mut().settle(&*check.attribute().expr, selected);
@@ -284,24 +287,39 @@ struct Calls<'c, 'q, 'db> {
     selections: &'c mut Selections,
 }
 
+impl Calls<'_, '_, '_> {
+    /// Records what the call of `name`, resolved as `resolution`, chooses.
+    fn record(&mut self, name: &ObjectName, resolution: Option<&CallResolution<'_, ParserDB>>) {
+        let choice = match resolution {
+            Some(CallResolution::Selected(selected)) => {
+                CallChoice::Function(address(selected.function()))
+            }
+            Some(CallResolution::Cast(_)) => CallChoice::Cast,
+            _ => return,
+        };
+        self.selections.insert(address(name), choice);
+    }
+}
+
 impl Visitor for Calls<'_, '_, '_> {
     type Break = core::convert::Infallible;
 
     fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
         if let Expr::Function(function) = expression
             && let Some(context) = self.context
-            && let Ok(Some(call)) = context.call(expression)
+            && let Ok(call) = context.call(expression)
         {
-            let choice = match call.resolution() {
-                CallResolution::Selected(selected) => {
-                    Some(CallChoice::Function(address(selected.function())))
-                }
-                CallResolution::Cast(_) => Some(CallChoice::Cast),
-                _ => None,
-            };
-            if let Some(choice) = choice {
-                self.selections.insert(address(function), choice);
-            }
+            self.record(&function.name, call.as_ref().map(CallApplication::resolution));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Table { name, .. } | TableFactor::Function { name, .. } = factor
+            && let Some(context) = self.context
+            && let Ok(call) = context.relation_call(factor)
+        {
+            self.record(name, call.as_ref().map(CallApplication::resolution));
         }
         ControlFlow::Continue(())
     }

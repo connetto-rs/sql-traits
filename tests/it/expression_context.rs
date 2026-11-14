@@ -862,26 +862,33 @@ fn calls_select_their_function_and_convert_each_argument() {
     assert!(matches!(selected.arguments()[0].evidence().conversion(), [CoercionStep::Relabel(_)]));
 }
 
-/// A node that is no call, an aggregate or window call, a row and an
-/// expression PostgreSQL types itself answer no call, and a parenthesized
-/// call answers for its content.
+/// A node that is no call, a row and an expression PostgreSQL types itself
+/// answer no call, aggregate and window calls answer theirs, and a
+/// parenthesized call answers for its content.
 #[test]
-fn only_plain_calls_answer_a_call() {
+fn only_calls_answer_a_call() {
     let db = ParserDB::parse::<PostgreSqlDialect>(CALLS).unwrap();
     let query = query(
-        "SELECT i, i + 1, count(*), sum(i), count(DISTINCT i), string_agg(v, ',' ORDER BY v),
+        "SELECT i, i + 1, ROW(i, s), ARRAY(SELECT 1), coalesce(i, 1), current_date,
+                count(*), sum(i), count(DISTINCT i), string_agg(v, ',' ORDER BY v),
                 count(i) FILTER (WHERE i > 0), row_number() OVER (),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY n), ROW(i, s), ARRAY(SELECT 1),
-                coalesce(i, 1), current_date, (lower(v))
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY n), (lower(v))
          FROM t GROUP BY i",
     );
     let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
     let nodes = projected(&query);
-    let (parenthesized, others) = nodes.split_last().unwrap();
-    for node in others {
+    let (none, calls) = nodes.split_at(6);
+    for node in none {
         assert!(context.call(node).unwrap().is_none(), "{node}");
     }
-    assert_eq!(context.call(parenthesized).unwrap().unwrap().name().name(), "lower");
+    let names: Vec<_> = calls
+        .iter()
+        .map(|node| context.call(node).unwrap().unwrap().name().name().to_owned())
+        .collect();
+    assert_eq!(
+        names,
+        ["count", "sum", "count", "string_agg", "count", "row_number", "percentile_cont", "lower"]
+    );
 }
 
 /// A call PostgreSQL refuses answers why and leaves the node's type unknown,
