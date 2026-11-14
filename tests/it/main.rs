@@ -176,6 +176,7 @@ mod type_array_identities;
 mod type_facts;
 mod type_modifiers;
 mod type_name_normalization;
+mod unresolved_expressions;
 mod user_defined_types;
 mod view_options;
 mod views;

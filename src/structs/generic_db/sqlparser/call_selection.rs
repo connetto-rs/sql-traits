@@ -19,7 +19,12 @@
 //! the operators selected then, to read what the deparse pins, and once more
 //! honouring those pins.
 
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{
@@ -29,11 +34,15 @@ use sqlparser::ast::{
 
 use super::{ParserDB, ParserDBBuilder, PostgresCatalogOperator, constraint_names, partition_keys};
 use crate::{
+    errors::Error,
     structs::{
         ArraySource, CallApplication, CallResolution, ExpressionContext, ExpressionScope,
         IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution, OperatorRow,
         ReparsePins, Site, TableAttribute, TargetName, applies_operators,
-        metadata::{CallChoice, ExpressionCalls, NodeState, WrittenPins, for_each_operator_node},
+        metadata::{
+            CallChoice, ExpressionCalls, NodeState, OperatorNode, WrittenPins,
+            for_each_operator_node,
+        },
     },
     traits::{DatabaseLike, OperatorLike, PolicyLike, Relation, RuleLike, TriggerLike},
     utils::{
@@ -56,34 +65,75 @@ struct Selections {
     /// The operators a statement added that each node's applications select,
     /// by the address of the node, with each application's position.
     operators: BTreeMap<usize, Vec<(usize, OperatorRow)>>,
+    /// The refusal of the first application of each node PostgreSQL
+    /// refuses, by the address of the node.
+    refused_operators: BTreeMap<usize, Error>,
+    /// The refusal of each call PostgreSQL refuses, by the address of the
+    /// name it calls, which a function expression and a function in `FROM`
+    /// both hold.
+    refused_calls: BTreeMap<usize, Error>,
     /// What the text each expression a type change parsed again was
     /// deparsed into writes, by the address of the expression.
     written: BTreeMap<usize, WrittenPins>,
 }
 
+impl Selections {
+    /// The refusal of the first node or call of `node`, whose record is
+    /// `calls`, the statement writes or parses again and PostgreSQL refuses.
+    fn refusal<N: Visit + ?Sized>(
+        &mut self,
+        calls: &ExpressionCalls<CreateFunction>,
+        node: &N,
+    ) -> Option<Error> {
+        let mut refused = None;
+        let mut states = calls.operator_nodes().iter().map(OperatorNode::state);
+        for_each_operator_node(node, |expression| {
+            let typed = states.next().is_some_and(|state| state != NodeState::Settled);
+            if typed && refused.is_none() {
+                refused = self.refused_operators.remove(&address(expression));
+            }
+        });
+        let mut states = calls.call_states();
+        let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
+            let typed = states.next().is_some_and(|state| state != NodeState::Settled);
+            if typed && refused.is_none() {
+                refused = self.refused_calls.remove(&address(call.name));
+            }
+            ControlFlow::Continue(())
+        });
+        refused
+    }
+}
+
 /// Whether `calls` holds a call or an operator node still to type.
 fn is_waiting(calls: &ExpressionCalls<CreateFunction>) -> bool {
-    calls.is_unsettled() || calls.has_pending_operators() || calls.is_rewritten()
+    calls.is_unsettled() || calls.has_pending_operators() || calls.has_untyped_calls()
 }
 
 /// Settles every waiting call and operator node of `calls`, the record of
-/// `node`, as `selections` has them.
+/// `node`, as `selections` has them, refusing first, when `refuse`, a node
+/// or a call the statement writes or parses again that PostgreSQL refuses.
 fn settle<N: Visit + ?Sized>(
     calls: &mut ExpressionCalls<CreateFunction>,
     node: &N,
     selections: &mut Selections,
-) {
+    refuse: bool,
+) -> Result<(), Error> {
+    if let Some(refused) = refuse.then(|| selections.refusal(calls, node)).flatten() {
+        return Err(refused);
+    }
     if calls.is_unsettled() {
         calls.settle(node, |name: &ObjectName| selections.calls.get(&address(name)).copied());
     }
     if calls.has_pending_operators() {
         calls.settle_operators(node, |node| selections.operators.remove(&node).unwrap_or_default());
-    } else if calls.is_rewritten() {
+    } else if calls.has_untyped_calls() {
         calls.settle_remaining_operators();
     }
     if let Some(written) = selections.written.remove(&root_address(node)) {
         calls.write(written);
     }
+    Ok(())
 }
 
 /// Where `node`, a whole expression or statement, sits in memory, which
@@ -177,51 +227,60 @@ impl ParserDBBuilder {
     }
 
     /// Settles every waiting call and operator node against `database`, the
-    /// catalog this builder holds.
-    pub(super) fn settle_calls(&mut self, database: &ParserDB) {
+    /// catalog this builder holds, refusing, when `refuse`, an expression a
+    /// statement writes or parses again whose operator or call PostgreSQL
+    /// refuses. A function body is not refused, since PostgreSQL validates
+    /// one only under `check_function_bodies`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnresolvedOperator`] or [`Error::UnresolvedCall`]
+    /// for the first expression refused.
+    pub(super) fn settle_calls(&mut self, database: &ParserDB, refuse: bool) -> Result<(), Error> {
         let mut selections = self.selections(database);
         let selections = &mut selections;
         for (check, metadata) in self.check_constraints_mut() {
-            settle(metadata.calls_mut(), &*check.attribute().expr, selections);
+            settle(metadata.calls_mut(), &*check.attribute().expr, selections, refuse)?;
         }
         for (column, metadata, _) in self.columns_mut() {
-            settle(metadata.calls_mut(), column.attribute(), selections);
+            settle(metadata.calls_mut(), column.attribute(), selections, refuse)?;
         }
         for (index, metadata) in self.indices_mut() {
-            settle(metadata.calls_mut(), index.attribute(), selections);
+            settle(metadata.calls_mut(), index.attribute(), selections, refuse)?;
         }
         for (view, metadata, _) in self.views_mut() {
-            settle(metadata.calls_mut(), view.declaration().query(), selections);
+            settle(metadata.calls_mut(), view.declaration().query(), selections, refuse)?;
         }
         for (view, metadata, _) in self.materialized_views_mut() {
-            settle(metadata.calls_mut(), view.declaration().query(), selections);
+            settle(metadata.calls_mut(), view.declaration().query(), selections, refuse)?;
         }
         for (policy, metadata) in self.policies_mut() {
             let [using, check] = metadata.calls_mut();
-            settle(using, &policy.using, selections);
-            settle(check, &policy.with_check, selections);
+            settle(using, &policy.using, selections, refuse)?;
+            settle(check, &policy.with_check, selections, refuse)?;
         }
         for (rule, calls) in self.rules_mut() {
-            settle(calls, &**rule, selections);
+            settle(calls, &**rule, selections, refuse)?;
         }
         for (trigger, calls) in self.triggers_mut() {
-            settle(calls, &trigger.condition, selections);
+            settle(calls, &trigger.condition, selections, refuse)?;
         }
         for (function, metadata) in self.functions_mut() {
-            settle(metadata.body_calls_mut(), &function.function_body, selections);
+            settle(metadata.body_calls_mut(), &function.function_body, selections, false)?;
         }
         for (domain, metadata) in self.domains_mut() {
-            settle(metadata.calls_mut(), &**domain, selections);
+            settle(metadata.calls_mut(), &**domain, selections, refuse)?;
         }
         for (table, metadata, _) in self.tables_mut() {
             if let Some(entries) = partition_keys::key_entries(table) {
-                settle(metadata.partition_key_calls_mut(), entries, selections);
+                settle(metadata.partition_key_calls_mut(), entries, selections, refuse)?;
             }
             let exclusions = constraint_names::exclusions(table);
             for (exclusion, calls) in exclusions.zip(metadata.exclusion_calls_mut()) {
-                settle(calls, exclusion, selections);
+                settle(calls, exclusion, selections, refuse)?;
             }
         }
+        Ok(())
     }
 
     /// The function each waiting call and the operators each waiting
@@ -475,35 +534,55 @@ struct Nodes<'c, 'q, 'db> {
 }
 
 impl Nodes<'_, '_, '_> {
-    /// Records what the call of `name`, resolved as `resolution`, chooses.
-    fn record(&mut self, name: &ObjectName, resolution: Option<&CallResolution<'_, ParserDB>>) {
-        let choice = match resolution {
+    /// Records what the call of `name`, applied as `application`, chooses,
+    /// or the refusal PostgreSQL gives it.
+    fn select_call(
+        &mut self,
+        name: &ObjectName,
+        application: Option<CallApplication<'_, '_, ParserDB>>,
+    ) {
+        let choice = match application.as_ref().map(CallApplication::resolution) {
             Some(CallResolution::Selected(selected)) => {
-                CallChoice::Function(address(selected.function()))
+                Some(CallChoice::Function(address(selected.function())))
             }
-            Some(CallResolution::Cast(_)) => CallChoice::Cast,
-            _ => return,
+            Some(CallResolution::Cast(_)) => Some(CallChoice::Cast),
+            _ => None,
         };
-        self.selections.calls.insert(address(name), choice);
+        if let Some(choice) = choice {
+            self.selections.calls.insert(address(name), choice);
+        }
+        if let Some((called, (reason, argument_types))) =
+            application.and_then(CallApplication::into_refusal)
+        {
+            self.selections.refused_calls.insert(
+                address(name),
+                Error::UnresolvedCall { function_name: called.to_string(), argument_types, reason },
+            );
+        }
     }
 
     /// Records the operators a statement added that the applications of
-    /// `expression` select.
+    /// `expression` select, and the refusal of the first one PostgreSQL
+    /// refuses.
     fn select_operators(&mut self, expression: &Expr) {
         let Ok(Some(applications)) = self.context.operators(expression) else { return };
-        let selected: Vec<(usize, OperatorRow)> = applications
-            .iter()
-            .enumerate()
-            .filter_map(|(position, application)| {
-                match application.resolution() {
-                    OperatorResolution::Selected(selected) => {
-                        let row = selected.operator().row;
-                        matches!(row, OperatorRow::Added(_)).then_some((position, row))
-                    }
-                    _ => None,
+        let mut selected = Vec::new();
+        for (position, application) in applications.into_iter().enumerate() {
+            if let OperatorResolution::Selected(chosen) = application.resolution() {
+                let row = chosen.operator().row;
+                if matches!(row, OperatorRow::Added(_)) {
+                    selected.push((position, row));
                 }
-            })
-            .collect();
+            } else if let Some((name, (reason, operand_types))) = application.into_refusal() {
+                self.selections.refused_operators.entry(address(expression)).or_insert_with(|| {
+                    Error::UnresolvedOperator {
+                        operator_name: name.name().into(),
+                        operand_types,
+                        reason,
+                    }
+                });
+            }
+        }
         if !selected.is_empty() {
             self.selections.operators.insert(address(expression), selected);
         }
@@ -524,9 +603,9 @@ impl Visitor for Nodes<'_, '_, '_> {
             return ControlFlow::Continue(());
         }
         if let Expr::Function(function) = expression
-            && let Ok(call) = self.context.call(expression)
+            && let Ok(application) = self.context.call(expression)
         {
-            self.record(&function.name, call.as_ref().map(CallApplication::resolution));
+            self.select_call(&function.name, application);
         }
         if applies_operators(expression) {
             self.select_operators(expression);
@@ -538,9 +617,9 @@ impl Visitor for Nodes<'_, '_, '_> {
         // No expression parsed again holds a `FROM` item.
         if self.deparsed.is_none()
             && let TableFactor::Table { name, .. } | TableFactor::Function { name, .. } = factor
-            && let Ok(call) = self.context.relation_call(factor)
+            && let Ok(application) = self.context.relation_call(factor)
         {
-            self.record(name, call.as_ref().map(CallApplication::resolution));
+            self.select_call(name, application);
         }
         ControlFlow::Continue(())
     }

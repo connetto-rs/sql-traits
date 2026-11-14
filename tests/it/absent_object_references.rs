@@ -90,7 +90,7 @@ fn a_key_constraint_including_an_absent_column_is_refused() {
 #[test]
 fn an_expression_index_is_left_alone() {
     let database = parse(
-        "CREATE TABLE t (id INT PRIMARY KEY, a INT);
+        "CREATE TABLE t (id INT PRIMARY KEY, a TEXT);
          CREATE INDEX i ON t (lower(a));",
     )
     .expect("an expression names no single column");

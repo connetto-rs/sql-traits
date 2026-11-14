@@ -45,6 +45,14 @@ pub(super) fn plpgsql() -> CreateExtension {
     }
 }
 
+/// Whether `builder` holds no extension but PL/pgSQL, which supplies no
+/// operator and no function an expression calls.
+pub(super) fn holds_only_plpgsql(builder: &ParserDBBuilder) -> bool {
+    builder.extensions().iter().all(|(extension, ())| {
+        stored_identifier(&extension.name.value, extension.name.quote_style.is_some()) == "plpgsql"
+    })
+}
+
 /// One function an extension's install script creates, by name, parameters
 /// and result as PostgreSQL prints them, and volatility. Every one modelled
 /// here is strict and written in C.
