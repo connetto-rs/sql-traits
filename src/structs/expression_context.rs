@@ -734,14 +734,16 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         if expression_form(&function.name).is_some() || is_row(expression) {
             return Ok(None);
         }
+        if let Some(rule) = clauses.written_rule() {
+            let refused = Some(CallRefusal::Misapplied(rule));
+            let resolution = CallResolution::Undetermined;
+            return Ok(Some(CallApplication { name, arguments, resolution, refused }));
+        }
         let Some(written) = written_argument_names(function) else { return Ok(None) };
         let call = core::ptr::from_ref(function).addr();
         if let Some(target) = self.pins.and_then(|pins| pins.cast(call)) {
             let resolution = CallResolution::Cast(target.clone());
-            let refused = clauses
-                .written_rule()
-                .or_else(|| clauses.plain_rule())
-                .map(CallRefusal::Misapplied);
+            let refused = clauses.plain_rule().map(CallRefusal::Misapplied);
             return Ok(Some(CallApplication { name, arguments, resolution, refused }));
         }
         let qualified;
@@ -864,21 +866,17 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             let divided = divides(called, aggregate, types.len(), clauses.within_group);
             Ok((!divided).then(|| unresolved(Unresolved::DoesNotExist)))
         };
-        let refused = if let Some(rule) = clauses.and_then(CallClauses::written_rule) {
-            Some(CallRefusal::Misapplied(rule))
-        } else {
-            match &resolution {
-                CallResolution::NotFound => Some(unresolved(Unresolved::DoesNotExist)),
-                CallResolution::Ambiguous(_) => Some(unresolved(Unresolved::NotUnique)),
-                CallResolution::Selected(selected) => of_kind(selected.function())?,
-                CallResolution::UnboundPolymorphic(function) => {
-                    of_kind(function)?.or_else(|| Some(unresolved(Unresolved::PolymorphicUnknown)))
-                }
-                CallResolution::Cast(_) => {
-                    clauses.and_then(CallClauses::plain_rule).map(CallRefusal::Misapplied)
-                }
-                CallResolution::Undetermined => None,
+        let refused = match &resolution {
+            CallResolution::NotFound => Some(unresolved(Unresolved::DoesNotExist)),
+            CallResolution::Ambiguous(_) => Some(unresolved(Unresolved::NotUnique)),
+            CallResolution::Selected(selected) => of_kind(selected.function())?,
+            CallResolution::UnboundPolymorphic(function) => {
+                of_kind(function)?.or_else(|| Some(unresolved(Unresolved::PolymorphicUnknown)))
             }
+            CallResolution::Cast(_) => {
+                clauses.and_then(CallClauses::plain_rule).map(CallRefusal::Misapplied)
+            }
+            CallResolution::Undetermined => None,
         };
         Ok(CallApplication { name, arguments, resolution, refused })
     }

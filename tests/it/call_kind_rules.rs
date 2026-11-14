@@ -165,6 +165,23 @@ fn within_group_refuses_distinct_and_order_by() {
     }
 }
 
+/// The grammar refuses `DISTINCT` beside `WITHIN GROUP` before any argument
+/// is bound, so an argument naming a column of two tables changes nothing.
+#[test]
+fn within_group_refuses_distinct_before_binding_arguments() {
+    let result = parse(
+        "CREATE TABLE t (a int);
+         CREATE TABLE u (a int);
+         CREATE VIEW w AS SELECT sum(DISTINCT a) WITHIN GROUP (ORDER BY t.a) AS x FROM t, u;",
+    );
+    match result {
+        Err(error @ Error::MisappliedCall { .. }) => {
+            assert_eq!(error.to_string(), "cannot use DISTINCT with WITHIN GROUP");
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
 /// A function in `FROM` writes no clause, so a window function, an
 /// ordered-set aggregate and a parameterless aggregate called there are
 /// refused as without one.
