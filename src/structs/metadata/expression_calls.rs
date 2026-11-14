@@ -40,19 +40,32 @@ pub(crate) struct BoundCall<F> {
     /// The functions the call reaches.
     reached: Vec<Arc<F>>,
     /// The overloads the call's argument types choose among, for a call
-    /// reaching more than one function, one of them declared by the schema.
+    /// reaching more than one function, one of them declared by the schema,
+    /// or a declared one by one argument, which PostgreSQL may read as a
+    /// cast instead.
     overloads: Option<Vec<Arc<F>>>,
     /// Whether `reached` no longer waits for the argument types to choose
     /// among `overloads`.
     settled: bool,
 }
 
+/// What the argument types of a waiting call choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallChoice {
+    /// The function whose node sits at this address runs.
+    Function(usize),
+    /// PostgreSQL reads the call as a cast, which runs no function.
+    Cast,
+}
+
 impl<F> BoundCall<F> {
-    /// A call reaching `reached`, the argument types left to choose among
-    /// them when more than one is reached and `declared` says one of them
-    /// is a function the schema declares.
-    fn new(reached: Vec<Arc<F>>, declared: bool) -> Self {
-        let overloads = (declared && reached.len() > 1).then(|| reached.clone());
+    /// A call passing `arguments` arguments reaching `reached`, the argument
+    /// types left to choose among them when `declared` says one of them is
+    /// a function the schema declares and more than one is reached or the
+    /// call passes one argument.
+    fn new(reached: Vec<Arc<F>>, declared: bool, arguments: usize) -> Self {
+        let overloads =
+            (declared && (reached.len() > 1 || arguments == 1)).then(|| reached.clone());
         Self { settled: overloads.is_none(), reached, overloads }
     }
 
@@ -151,13 +164,13 @@ impl<F> ExpressionCalls<F> {
     }
 
     /// Settles every call of `node`, the node this record was built from,
-    /// that waits for its argument types: one `selected` answers the address
-    /// of the function it runs for keeps that function alone, and any other
-    /// keeps every overload.
+    /// that waits for its argument types: one `selected` answers a function
+    /// for keeps that function alone, one read as a cast reaches none, and
+    /// any other keeps every overload.
     pub(crate) fn settle<N: Visit + ?Sized>(
         &mut self,
         node: &N,
-        selected: impl Fn(&Function) -> Option<usize>,
+        selected: impl Fn(&Function) -> Option<CallChoice>,
     ) {
         let mut calls = self.calls.iter_mut();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
@@ -165,15 +178,13 @@ impl<F> ExpressionCalls<F> {
             if bound.settled {
                 return ControlFlow::Continue(());
             }
-            let chosen = call.node.and_then(&selected).and_then(|address| {
-                bound
-                    .overloads
-                    .iter()
-                    .flatten()
-                    .find(|function| Arc::as_ptr(function).addr() == address)
-            });
-            if let Some(function) = chosen {
-                bound.reached = alloc::vec![Arc::clone(function)];
+            match call.node.and_then(&selected) {
+                // A waiting call still reaches every overload.
+                Some(CallChoice::Function(address)) => {
+                    bound.reached.retain(|function| Arc::as_ptr(function).addr() == address);
+                }
+                Some(CallChoice::Cast) => bound.reached.clear(),
+                None => {}
             }
             ControlFlow::Continue(())
         });
@@ -329,7 +340,7 @@ impl<F: FunctionLike> ExpressionCalls<F> {
                         site.push(Arc::clone(function));
                     }
                 });
-                BoundCall::new(site, declared)
+                BoundCall::new(site, declared, call.arguments)
             };
             let bound = match carried(call.name, call.arguments) {
                 Some(Carried::Bound(bound)) => bound,
