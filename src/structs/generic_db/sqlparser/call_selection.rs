@@ -39,7 +39,10 @@ use crate::{
         ArraySource, CallApplication, CallResolution, ExpressionContext, ExpressionScope,
         IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution, OperatorRow,
         ReparsePins, Site, TableAttribute, TargetName, applies_operators,
-        metadata::{CallChoice, ExpressionCalls, NodeState, OperatorNode, for_each_operator_node},
+        metadata::{
+            CallChoice, ExpressionCalls, NodeState, OperatorNode, WrittenPins,
+            for_each_operator_node,
+        },
     },
     traits::{DatabaseLike, OperatorLike, PolicyLike, Relation, RuleLike, TriggerLike},
     utils::{
@@ -69,6 +72,9 @@ struct Selections {
     /// name it calls, which a function expression and a function in `FROM`
     /// both hold.
     refused_calls: BTreeMap<usize, Error>,
+    /// What the text each expression a type change parsed again was
+    /// deparsed into writes, by the address of the expression.
+    written: BTreeMap<usize, WrittenPins>,
 }
 
 impl Selections {
@@ -124,7 +130,16 @@ fn settle<N: Visit + ?Sized>(
     } else if calls.has_untyped_calls() {
         calls.settle_remaining_operators();
     }
+    if let Some(written) = selections.written.remove(&root_address(node)) {
+        calls.write(written);
+    }
     Ok(())
+}
+
+/// Where `node`, a whole expression or statement, sits in memory, which
+/// identifies it between typing it and settling its record.
+fn root_address<N: ?Sized>(node: &N) -> usize {
+    core::ptr::from_ref(node).cast::<()>().addr()
 }
 
 impl ParserDBBuilder {
@@ -395,7 +410,7 @@ impl<'s> Select<'s> {
     ) {
         if calls.is_rewritten() {
             let recorded = Recorded::of(node, calls, self.database, self.case);
-            let mut deparsed = Deparsed::default();
+            let mut deparsed = Deparsed::of(calls.written(), &recorded.positions);
             roots(&mut Select {
                 database: self.database,
                 case: self.case,
@@ -410,6 +425,8 @@ impl<'s> Select<'s> {
                 pins: Some(&deparsed),
                 deparsed: None,
             });
+            let written = deparsed.into_written(&recorded.positions);
+            self.selections.written.insert(root_address(node), written);
         } else if is_waiting(calls) {
             roots(self);
         }
@@ -608,16 +625,35 @@ impl Visitor for Nodes<'_, '_, '_> {
     }
 }
 
+/// Where each operator node and each call of an expression sits, both by
+/// its position in a pre-order walk and by its address.
+struct Positions {
+    /// The address of each operator node, by its position.
+    nodes: Vec<usize>,
+    /// The position of each operator node, by its address.
+    node_at: BTreeMap<usize, usize>,
+    /// The address of each call's node, by the call's position, `None` for
+    /// a call written without one.
+    calls: Vec<Option<usize>>,
+    /// The position of each call, by the address of its node.
+    call_at: BTreeMap<usize, usize>,
+}
+
 /// What an expression parsed again selected before: the previous type of
 /// each retyped column, the operators a statement added each rewritten
-/// node's applications selected, the others selecting built-in ones, and the
-/// functions each call reached.
+/// node's applications selected, the others selecting built-in ones, the
+/// functions each call reached, and what the text an earlier type change
+/// deparsed it into writes.
 struct Recorded<'r> {
     retyped: &'r [(Ident, DataType)],
     /// The selections of each rewritten node, by its address.
     rewritten: BTreeMap<usize, &'r [(usize, OperatorRow)]>,
     /// The functions each call reached, by the address of its node.
     calls: BTreeMap<usize, &'r [Arc<CreateFunction>]>,
+    /// What the expression's text writes, by position.
+    written: &'r WrittenPins,
+    /// Where the expression's operator nodes and calls sit.
+    positions: Positions,
     /// The catalog the selected operators are looked up in.
     database: &'r ParserDB,
     case: IdentifierCase,
@@ -632,6 +668,7 @@ impl<'r> Recorded<'r> {
         case: IdentifierCase,
     ) -> Self {
         let mut rewritten = BTreeMap::new();
+        let mut nodes = Vec::new();
         let mut held = calls.operator_nodes().iter();
         for_each_operator_node(node, |expression| {
             if let Some(held) = held.next()
@@ -639,16 +676,33 @@ impl<'r> Recorded<'r> {
             {
                 rewritten.insert(address(expression), held.selected());
             }
+            nodes.push(address(expression));
         });
         let mut reached = BTreeMap::new();
+        let mut written_calls = Vec::new();
         let mut previous = calls.previous_calls().iter();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
             if let (Some(previous), Some(written)) = (previous.next(), call.node) {
                 reached.insert(address(written), previous.as_slice());
             }
+            written_calls.push(call.node.map(address));
             ControlFlow::Continue(())
         });
-        Self { retyped: calls.retyped(), rewritten, calls: reached, database, case }
+        let node_at = nodes.iter().enumerate().map(|(at, node)| (*node, at)).collect();
+        let call_at = written_calls
+            .iter()
+            .enumerate()
+            .filter_map(|(at, call)| call.map(|call| (call, at)))
+            .collect();
+        Self {
+            retyped: calls.retyped(),
+            rewritten,
+            calls: reached,
+            written: calls.written(),
+            positions: Positions { nodes, node_at, calls: written_calls, call_at },
+            database,
+            case,
+        }
     }
 
     /// The operator a statement added that the application at `site`
@@ -679,13 +733,24 @@ impl ReparsePins<ParserDB> for Recorded<'_> {
             || operator.row == self.recorded(site).unwrap_or(OperatorRow::BuiltIn)
     }
 
-    fn operand(&self, _site: Site, _left: bool) -> Option<&OperandType<'static>> {
-        None
+    fn operand(&self, (node, at): Site, left: bool) -> Option<&OperandType<'static>> {
+        let node = self.positions.node_at.get(&node)?;
+        self.written.operands.get(&(*node, at, left))
     }
 
-    /// The schema the operator selected before lives in now, wherever the
-    /// path in force leaves it, since the old selection is read in full.
+    /// The schema the text writes, or else the schema the operator selected
+    /// before lives in now, wherever the path in force leaves it, since the
+    /// old selection is read in full.
     fn schema(&self, site: Site) -> Option<(&str, bool)> {
+        let written = self.positions.node_at.get(&site.0).and_then(|node| {
+            self.written
+                .schemas
+                .get(&(*node, site.1))
+                .map(|(schema, quoted)| (schema.as_str(), *quoted))
+        });
+        if written.is_some() {
+            return written;
+        }
         let row = self.recorded(site)?;
         let operator = self.database.operators()?.find(|operator| operator.row == row)?;
         Some((operator.target.schema()?, operator.target.schema_is_quoted()))
@@ -697,19 +762,28 @@ impl ReparsePins<ParserDB> for Recorded<'_> {
             .is_none_or(|reached| reached.iter().any(|held| core::ptr::eq(held.as_ref(), function)))
     }
 
-    fn argument(&self, _call: usize, _index: usize) -> Option<&OperandType<'static>> {
-        None
+    fn argument(&self, call: usize, index: usize) -> Option<&OperandType<'static>> {
+        let call = self.positions.call_at.get(&call)?;
+        self.written.arguments.get(&(*call, index))
     }
 
-    /// The schema of the one function the call reached before, wherever the
-    /// path in force leaves it, a function stored bare living in `public`.
+    /// The schema the text writes, or else the schema of the one function
+    /// the call reached before, wherever the path in force leaves it, a
+    /// function stored bare living in `public`.
     fn call_schema(&self, call: usize) -> Option<(&str, bool)> {
+        let written = self.positions.call_at.get(&call).and_then(|at| {
+            self.written.call_schemas.get(at).map(|(schema, quoted)| (schema.as_str(), *quoted))
+        });
+        if written.is_some() {
+            return written;
+        }
         let [function] = self.calls.get(&call)? else { return None };
         Some(qualifier_of(&function.name).named().unwrap_or((DEFAULT_SCHEMA, false)))
     }
 
-    fn cast(&self, _call: usize) -> Option<&TargetName<'static>> {
-        None
+    fn cast(&self, call: usize) -> Option<&TargetName<'static>> {
+        let call = self.positions.call_at.get(&call)?;
+        self.written.casts.get(call)
     }
 }
 
@@ -736,6 +810,77 @@ struct Deparsed {
 }
 
 impl Deparsed {
+    /// The pins of the text an expression whose operator nodes and calls sit
+    /// at `positions` was deparsed into before, which `written` holds, so a
+    /// deparse of that text writes them again.
+    fn of(written: &WrittenPins, positions: &Positions) -> Self {
+        let node = |at: &usize| positions.nodes.get(*at).copied();
+        let call = |at: &usize| positions.calls.get(*at).copied().flatten();
+        Self {
+            operands: written
+                .operands
+                .iter()
+                .filter_map(|((at, application, left), pin)| {
+                    Some((((node(at)?, *application), *left), pin.clone()))
+                })
+                .collect(),
+            schemas: written
+                .schemas
+                .iter()
+                .filter_map(|((at, application), pin)| {
+                    Some(((node(at)?, *application), pin.clone()))
+                })
+                .collect(),
+            arguments: written
+                .arguments
+                .iter()
+                .filter_map(|((at, index), pin)| Some(((call(at)?, *index), pin.clone())))
+                .collect(),
+            call_schemas: written
+                .call_schemas
+                .iter()
+                .filter_map(|(at, pin)| Some((call(at)?, pin.clone())))
+                .collect(),
+            casts: written
+                .casts
+                .iter()
+                .filter_map(|(at, pin)| Some((call(at)?, pin.clone())))
+                .collect(),
+        }
+    }
+
+    /// What this deparse writes, by the positions `positions` gives the
+    /// operator nodes and calls it was read from.
+    fn into_written(self, positions: &Positions) -> WrittenPins {
+        let node = |address: usize| positions.node_at.get(&address).copied();
+        let call = |address: usize| positions.call_at.get(&address).copied();
+        WrittenPins {
+            operands: self
+                .operands
+                .into_iter()
+                .filter_map(|(((at, application), left), pin)| {
+                    Some(((node(at)?, application, left), pin))
+                })
+                .collect(),
+            schemas: self
+                .schemas
+                .into_iter()
+                .filter_map(|((at, application), pin)| Some(((node(at)?, application), pin)))
+                .collect(),
+            arguments: self
+                .arguments
+                .into_iter()
+                .filter_map(|((at, index), pin)| Some(((call(at)?, index), pin)))
+                .collect(),
+            call_schemas: self
+                .call_schemas
+                .into_iter()
+                .filter_map(|(at, pin)| Some((call(at)?, pin)))
+                .collect(),
+            casts: self.casts.into_iter().filter_map(|(at, pin)| Some((call(at)?, pin))).collect(),
+        }
+    }
+
     /// Reads what the deparse of the applications of `expression`, typed by
     /// `context` over its previous selections, pins.
     fn read(

@@ -1,13 +1,18 @@
 //! Submodule defining the functions each call of an expression may reach,
 //! and the operators its applications select.
 
-use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{DataType, Expr, Function, Ident, ObjectName, Visit};
 
 use crate::{
-    structs::{IdentifierCase, OperatorRow, TargetName, applies_operators},
+    structs::{IdentifierCase, OperandType, OperatorRow, TargetName, applies_operators},
     traits::FunctionLike,
     utils::{
         call_sites::{Call, Site, call_reaches, for_each_call, for_each_site},
@@ -45,6 +50,32 @@ pub struct ExpressionCalls<F> {
     /// again, by the call's position in a pre-order walk, which a rewritten
     /// node's previous selections were typed with.
     previous_calls: Vec<Vec<Arc<F>>>,
+    /// What the text PostgreSQL deparsed the expression into when a type
+    /// change last parsed it again keeps written.
+    written: WrittenPins,
+}
+
+/// What the text PostgreSQL deparses an expression into writes beyond the
+/// expression as first stored, by the position of each operator node and
+/// call in a pre-order walk: the cast around each operand and argument a
+/// selection converted, the cast a call read as one becomes, and the schema
+/// an operator or a function name is qualified with. A later type change
+/// parses that same text again, so all of it holds from then on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WrittenPins {
+    /// The type each converted operand is cast to, by its node, its
+    /// application among the node's and whether it is the left operand.
+    pub(crate) operands: BTreeMap<(usize, usize, bool), OperandType<'static>>,
+    /// The schema each qualified operator name is written in, by its node and
+    /// its application among the node's.
+    pub(crate) schemas: BTreeMap<(usize, usize), (String, bool)>,
+    /// The type each converted argument is cast to, by its call and its
+    /// position among the call's arguments.
+    pub(crate) arguments: BTreeMap<(usize, usize), OperandType<'static>>,
+    /// The schema each qualified called name is written in, by its call.
+    pub(crate) call_schemas: BTreeMap<usize, (String, bool)>,
+    /// The type each call read as a cast is written as a cast to, by its call.
+    pub(crate) casts: BTreeMap<usize, TargetName<'static>>,
 }
 
 /// What a rebuild carries of the operator nodes of a record to the
@@ -56,6 +87,8 @@ pub(crate) struct CarriedNodes<F> {
     pub(crate) retyped: Vec<(Ident, DataType)>,
     /// The functions each call reached when the nodes were selected.
     pub(crate) calls: Vec<Vec<Arc<F>>>,
+    /// What the text the expression was last deparsed into writes.
+    pub(crate) written: WrittenPins,
 }
 
 /// What one node applying operators selects.
@@ -207,6 +240,7 @@ impl<F> ExpressionCalls<F> {
             operators: Vec::new(),
             retyped: Vec::new(),
             previous_calls: Vec::new(),
+            written: WrittenPins::default(),
         };
         record.collect_functions();
         record
@@ -250,11 +284,20 @@ impl<F> ExpressionCalls<F> {
     /// Forgets the calls at the positions `calls` and the operator nodes at
     /// the positions `operators`, counted in the order a pre-order walk meets
     /// them, which a part removed from the node held.
+    ///
+    /// Only a domain loses a part of its record, a check `CASCADE` takes,
+    /// and no type change parses a domain's expressions again, so the record
+    /// holds no written pins whose positions the removal would move.
     pub(crate) fn remove_part(
         &mut self,
         calls: core::ops::Range<usize>,
         operators: core::ops::Range<usize>,
     ) {
+        debug_assert_eq!(
+            self.written,
+            WrittenPins::default(),
+            "a part is removed only from a record never parsed again"
+        );
         self.calls.drain(calls);
         self.collect_functions();
         let end = operators.end.min(self.operators.len());
@@ -384,6 +427,7 @@ impl<F> ExpressionCalls<F> {
             nodes: core::mem::take(&mut self.operators),
             retyped: core::mem::take(&mut self.retyped),
             calls,
+            written: core::mem::take(&mut self.written),
         }
     }
 
@@ -393,6 +437,18 @@ impl<F> ExpressionCalls<F> {
         self.operators = carried.nodes;
         self.retyped = carried.retyped;
         self.previous_calls = carried.calls;
+        self.written = carried.written;
+    }
+
+    /// Returns what the text the expression was last deparsed into writes.
+    pub(crate) const fn written(&self) -> &WrittenPins {
+        &self.written
+    }
+
+    /// Has the expression written as `written` says, the text a type change
+    /// just deparsed it into.
+    pub(crate) fn write(&mut self, written: WrittenPins) {
+        self.written = written;
     }
 
     /// Forgets the functions the calls reached before the rebuild unless a
@@ -511,6 +567,7 @@ impl<F> Clone for ExpressionCalls<F> {
             operators: self.operators.clone(),
             retyped: self.retyped.clone(),
             previous_calls: self.previous_calls.clone(),
+            written: self.written.clone(),
         }
     }
 }

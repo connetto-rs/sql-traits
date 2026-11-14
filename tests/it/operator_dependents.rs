@@ -428,6 +428,98 @@ fn a_type_change_keeps_a_converted_argument() {
     );
 }
 
+/// A conversion the deparse wrote as a cast stays part of the stored
+/// expression, so a second type change keeps the function and the operator
+/// the first conversion selected, though an overload over the new type
+/// matches exactly.
+#[test]
+fn successive_type_changes_keep_a_converted_selection() {
+    let call = "CREATE FUNCTION f8(int8) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+         CREATE TABLE d (a INT4, CONSTRAINT ck CHECK (f8(a)));
+         CREATE FUNCTION f8(text) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         ALTER TABLE d ALTER COLUMN a TYPE text USING a::text;
+         CREATE FUNCTION f8(int2) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         ALTER TABLE d ALTER COLUMN a TYPE int2 USING a::int2;";
+    parse(&format!("{call} DROP FUNCTION f8(int2);")).expect("the check still calls `f8(int8)`");
+    let result = parse(&format!("{call} DROP FUNCTION f8(int8);"));
+    assert!(
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                if function_name == "f8"
+                    && *dependent_kind == ObjectKind::CheckConstraint
+                    && dependent_name == "d.ck"
+        ),
+        "got {result:?}"
+    );
+    let applied = format!(
+        "{FUNCTIONS} {INT8}
+         CREATE FUNCTION app.lt2(int2, int2) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT $1 < $2';
+         CREATE TABLE d (a INT4, CONSTRAINT ck CHECK (a <<< 1)); {TEXT}
+         ALTER TABLE d ALTER COLUMN a TYPE text USING a::text;
+         CREATE OPERATOR app.<<< (LEFTARG = int2, RIGHTARG = int2, FUNCTION = app.lt2);
+         ALTER TABLE d ALTER COLUMN a TYPE int2 USING a::int2;"
+    );
+    parse(&format!("{applied} DROP OPERATOR app.<<< (int2, int2);"))
+        .expect("the check still applies `<<<(int8, int8)`");
+    assert_held(
+        &format!("{applied} DROP OPERATOR app.<<< (int8, int8);"),
+        ObjectKind::CheckConstraint,
+        "d.ck",
+    );
+}
+
+/// The qualification a deparse wrote on an operator or a function name and
+/// the cast a call read as one became stay in the stored text, so a second
+/// type change reads them again.
+#[test]
+fn successive_type_changes_keep_what_the_deparse_wrote() {
+    let qualified = format!(
+        "{FUNCTIONS} {INT4} {INT8_INT4}
+         CREATE TABLE d (a INT, CONSTRAINT ck CHECK (a <<< 5));
+         SET search_path = public;
+         ALTER TABLE d ALTER COLUMN a TYPE int8;
+         ALTER TABLE d ALTER COLUMN a TYPE int4;"
+    );
+    parse(&format!("{qualified} DROP OPERATOR app.<<< (int8, int4);"))
+        .expect("the check applies `app.<<<(int4, int4)` again");
+    assert_held(
+        &format!("{qualified} DROP OPERATOR app.<<< (int4, int4);"),
+        ObjectKind::CheckConstraint,
+        "d.ck",
+    );
+    let called = parse(
+        "CREATE SCHEMA app;
+         SET search_path = public, app;
+         CREATE FUNCTION app.fx(int8) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+         CREATE TABLE d (a INT4, CONSTRAINT ck CHECK (fx(a)));
+         SET search_path = public;
+         ALTER TABLE d ALTER COLUMN a TYPE int2;
+         ALTER TABLE d ALTER COLUMN a TYPE int8;
+         DROP FUNCTION app.fx(int8);",
+    );
+    assert!(
+        matches!(
+            &called,
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                if function_name == "fx"
+                    && *dependent_kind == ObjectKind::CheckConstraint
+                    && dependent_name == "d.ck"
+        ),
+        "got {called:?}"
+    );
+    parse(
+        "CREATE FUNCTION public.text(int4) RETURNS TEXT LANGUAGE sql IMMUTABLE AS 'SELECT $1::text';
+         CREATE TABLE d (a VARCHAR CONSTRAINT ck CHECK (text(a) <> ''));
+         ALTER TABLE d ALTER COLUMN a TYPE int4 USING a::int4;
+         CREATE FUNCTION public.text(int8) RETURNS TEXT LANGUAGE sql IMMUTABLE AS 'SELECT $1::text';
+         ALTER TABLE d ALTER COLUMN a TYPE int8;
+         DROP FUNCTION public.text(int8);
+         DROP FUNCTION public.text(int4);",
+    )
+    .expect("the check casts to `text` and calls no function");
+}
+
 /// A check the statement retyping its column adds is typed over the new
 /// type, since PostgreSQL adds constraints after it changes column types.
 #[test]

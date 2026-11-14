@@ -24,7 +24,10 @@ use super::function_dependents::call_count;
 use crate::{
     structs::{
         ColumnIdentity, IdentifierCase,
-        metadata::{CarriedNodes, ExpressionCalls, NodeState, OperatorNode, operator_node_count},
+        metadata::{
+            CarriedNodes, ExpressionCalls, NodeState, OperatorNode, WrittenPins,
+            operator_node_count,
+        },
     },
     utils::walk::{walk_expressions, walk_mut},
 };
@@ -154,6 +157,7 @@ impl CarriedOperators {
                     nodes: core::mem::replace(&mut nodes, rest),
                     retyped: Vec::new(),
                     calls: Vec::new(),
+                    written: WrittenPins::default(),
                 },
             });
         }
@@ -259,7 +263,12 @@ impl CarriedOperators {
             calls.set_call_states(first_call..last_call, carried);
             first_call = last_call;
         }
-        calls.carry_operator_nodes(CarriedNodes { nodes, retyped: Vec::new(), calls: Vec::new() });
+        calls.carry_operator_nodes(CarriedNodes {
+            nodes,
+            retyped: Vec::new(),
+            calls: Vec::new(),
+            written: WrittenPins::default(),
+        });
     }
 
     /// Gives `calls`, the record of the check over `node` the rebuild builds
