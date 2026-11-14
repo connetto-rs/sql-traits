@@ -712,8 +712,8 @@ pub enum LookupError {
 /// [`TargetName::parse`](crate::structs::TargetName::parse).
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum TargetNameParseError {
-    /// The text was empty, so it names nothing.
-    #[error("cannot parse a target name from empty text")]
+    /// The text was empty or only whitespace, so it names nothing.
+    #[error("cannot parse a target name from empty or blank text")]
     Empty,
     /// A part of the name was empty, as in `app.`, `.docs` or `""`.
     #[error("target name `{text}` has an empty identifier part")]
@@ -728,7 +728,7 @@ pub enum TargetNameParseError {
         text: String,
     },
     /// Text followed an identifier where a separating dot or the end of the
-    /// name was required, as in `a"b` or `"a"x`.
+    /// name was required, as in `a"b`, `"a"x` or `ord ers`.
     #[error("target name `{text}` has unexpected text `{found}` after an identifier")]
     UnexpectedText {
         /// The full text that was being parsed.
