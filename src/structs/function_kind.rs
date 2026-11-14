@@ -43,3 +43,51 @@ pub enum FunctionKind {
     /// window.
     Window,
 }
+
+/// How an aggregate takes its arguments, mirroring `pg_aggregate.aggkind`
+/// and, for an ordered-set aggregate, `pg_aggregate.aggnumdirectargs`, as
+/// [the catalog](https://www.postgresql.org/docs/18/catalog-pg-aggregate.html)
+/// records them.
+///
+/// An ordered-set aggregate takes its direct arguments in parentheses and
+/// the values it aggregates in `WITHIN GROUP (ORDER BY ...)`, so a call
+/// needs the clause and cannot run over a window. A hypothetical-set
+/// aggregate is an ordered-set one whose direct arguments are one row
+/// ranked among the ones it aggregates, as many values as `ORDER BY` lists.
+///
+/// # Example
+///
+/// ```rust
+/// # fn main() -> Result<(), sql_traits::errors::Error> {
+/// use sql_traits::prelude::*;
+/// use sqlparser::dialect::PostgreSqlDialect;
+///
+/// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
+/// let mut kinds = Vec::new();
+/// for function in db.functions().filter(|function| function.name() == "percentile_disc") {
+///     kinds.push(function.aggregate_kind(&db)?);
+/// }
+/// let kind = Some(AggregateKind::OrderedSet { direct_arguments: 1 });
+/// assert_eq!(kinds, [kind, kind]);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AggregateKind {
+    /// `aggkind = 'n'`, an aggregate of the values its arguments take.
+    Normal,
+    /// `aggkind = 'o'`, an aggregate whose first `direct_arguments`
+    /// arguments are passed once per call and whose others are what
+    /// `WITHIN GROUP` orders.
+    OrderedSet {
+        /// How many arguments come before those `WITHIN GROUP` orders.
+        direct_arguments: usize,
+    },
+    /// `aggkind = 'h'`, an ordered-set aggregate whose direct arguments name
+    /// a hypothetical row of the values `WITHIN GROUP` orders.
+    HypotheticalSet {
+        /// How many arguments the catalog counts as direct, all of them
+        /// variadic for every built-in one.
+        direct_arguments: usize,
+    },
+}

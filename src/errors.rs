@@ -1,6 +1,6 @@
 //! Error enumeration used in the `sql_traits` crate.
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 
 use sqlparser::{ast::FunctionBehavior, parser::ParserError};
 
@@ -140,6 +140,115 @@ impl core::fmt::Display for Unresolved {
             Self::NotUnique => "is not unique",
             Self::PolymorphicUnknown => "cannot bind a polymorphic type to `unknown`",
         })
+    }
+}
+
+/// A call PostgreSQL refuses for the clauses it writes, given the kind of
+/// function it selects, or for clauses no call may combine.
+///
+/// Each variant names the rule `ParseFuncOrColumn` or the grammar enforces,
+/// and [`Misapplied::message`] gives PostgreSQL's wording for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Misapplied {
+    /// `f(*)` selecting no aggregate or window function.
+    StarOnPlainFunction,
+    /// `DISTINCT` among the arguments of no aggregate or window function.
+    DistinctOnPlainFunction,
+    /// `WITHIN GROUP` on no aggregate or window function.
+    WithinGroupOnPlainFunction,
+    /// An argument `ORDER BY` on no aggregate or window function.
+    OrderByOnPlainFunction,
+    /// `FILTER` on no aggregate or window function.
+    FilterOnPlainFunction,
+    /// `OVER` on no aggregate or window function.
+    OverOnPlainFunction,
+    /// An ordered-set aggregate called without `WITHIN GROUP`.
+    WithinGroupRequired,
+    /// An ordered-set aggregate called over a window.
+    OverOnOrderedSetAggregate,
+    /// `WITHIN GROUP` on an aggregate that is no ordered-set one.
+    WithinGroupOnNormalAggregate,
+    /// A window function called without `OVER`.
+    OverRequired,
+    /// `WITHIN GROUP` on a window function.
+    WithinGroupOnWindowFunction,
+    /// An aggregate called with no arguments and no `*`.
+    StarRequired,
+    /// An aggregate called without `OVER` and with an argument by name.
+    NamedArgumentOnAggregate,
+    /// `DISTINCT` among the arguments of a call over a window.
+    DistinctOverWindow,
+    /// An argument `ORDER BY` in a call over a window.
+    OrderByOverWindow,
+    /// `FILTER` on a window function.
+    FilterOnWindowFunction,
+    /// An argument `ORDER BY` beside `WITHIN GROUP`.
+    OrderByWithinGroup,
+    /// `DISTINCT` beside `WITHIN GROUP`.
+    DistinctWithinGroup,
+}
+
+impl Misapplied {
+    /// Returns the message PostgreSQL 18 refuses a call of `function`
+    /// with, the function named as the call writes it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::errors::Misapplied;
+    ///
+    /// assert_eq!(
+    ///     Misapplied::OverRequired.message("row_number"),
+    ///     "window function row_number requires an OVER clause",
+    /// );
+    /// ```
+    #[must_use]
+    pub fn message(self, function: &str) -> String {
+        let not_aggregate = |clause: &str| {
+            format!("{clause} specified, but {function} is not an aggregate function")
+        };
+        match self {
+            Self::StarOnPlainFunction => not_aggregate(&format!("{function}(*)")),
+            Self::DistinctOnPlainFunction => not_aggregate("DISTINCT"),
+            Self::WithinGroupOnPlainFunction => not_aggregate("WITHIN GROUP"),
+            Self::OrderByOnPlainFunction => not_aggregate("ORDER BY"),
+            Self::FilterOnPlainFunction => not_aggregate("FILTER"),
+            Self::OverOnPlainFunction => {
+                format!(
+                    "OVER specified, but {function} is not a window function nor an aggregate function"
+                )
+            }
+            Self::WithinGroupRequired => {
+                format!("WITHIN GROUP is required for ordered-set aggregate {function}")
+            }
+            Self::OverOnOrderedSetAggregate => {
+                format!("OVER is not supported for ordered-set aggregate {function}")
+            }
+            Self::WithinGroupOnNormalAggregate => {
+                format!(
+                    "{function} is not an ordered-set aggregate, so it cannot have WITHIN GROUP"
+                )
+            }
+            Self::OverRequired => format!("window function {function} requires an OVER clause"),
+            Self::WithinGroupOnWindowFunction => {
+                format!("window function {function} cannot have WITHIN GROUP")
+            }
+            Self::StarRequired => {
+                format!("{function}(*) must be used to call a parameterless aggregate function")
+            }
+            Self::NamedArgumentOnAggregate => "aggregates cannot use named arguments".into(),
+            Self::DistinctOverWindow => "DISTINCT is not implemented for window functions".into(),
+            Self::OrderByOverWindow => {
+                "aggregate ORDER BY is not implemented for window functions".into()
+            }
+            Self::FilterOnWindowFunction => {
+                "FILTER is not implemented for non-aggregate window functions".into()
+            }
+            Self::OrderByWithinGroup => {
+                "cannot use multiple ORDER BY clauses with WITHIN GROUP".into()
+            }
+            Self::DistinctWithinGroup => "cannot use DISTINCT with WITHIN GROUP".into(),
+        }
     }
 }
 
@@ -1655,6 +1764,20 @@ pub enum Error {
         argument_types: Vec<Box<str>>,
         /// Why PostgreSQL refuses the call.
         reason: Unresolved,
+    },
+    #[error("{}", .rule.message(.function_name))]
+    /// Error indicating that a stored expression calls a function with
+    /// clauses PostgreSQL refuses for the kind of function the call selects,
+    /// or with clauses no call may combine.
+    ///
+    /// PostgreSQL checks a call's clauses when the statement storing the
+    /// expression runs, and again when `ALTER COLUMN ... TYPE` parses it
+    /// over the column's new type.
+    MisappliedCall {
+        /// Name of the function as written, each part unquoted.
+        function_name: String,
+        /// The rule the call breaks.
+        rule: Misapplied,
     },
     #[error("Invalid value `{option_value}` for collation option `{option_name}`.")]
     /// Error indicating that a `CREATE COLLATION` option is malformed.

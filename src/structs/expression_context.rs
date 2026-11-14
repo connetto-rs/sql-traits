@@ -4,20 +4,21 @@ use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArguments, Ident, InTarget, ObjectNamePart, Query, Statement,
-    TableFactor, UnaryOperator, Value, Visit, Visitor,
+    ArgMode, BinaryOperator, CastKind, DataType, DuplicateTreatment, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Ident, InTarget, ObjectNamePart,
+    Query, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
 };
 
 use crate::{
-    errors::{LookupError, Unresolved},
+    errors::{LookupError, Misapplied, Unresolved},
     impls::dql::{
         definition_graph::reference_sites::SiteRule,
         scoped_roots::{ScopedRoot, is_input},
     },
     structs::{
-        CallResolution, ColumnBinding, ColumnDefinition, ColumnScope, ExpressionScope,
-        IdentifierCase, OperandType, OperatorResolution, SelectedOperator, TargetName,
+        AggregateKind, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope,
+        ExpressionScope, FunctionKind, IdentifierCase, OperandType, OperatorResolution,
+        SelectedOperator, TargetName,
     },
     traits::{ColumnLike, DataTypeLike, DatabaseLike, FunctionLike},
     utils::{
@@ -169,9 +170,8 @@ pub struct CallApplication<'node, 'db, DB: DatabaseLike> {
     name: TargetName<'node>,
     arguments: Vec<&'node Expr>,
     resolution: CallResolution<'db, DB>,
-    /// Why PostgreSQL refuses the call, with the type of each argument the
-    /// selection weighed.
-    refused: Option<Refused>,
+    /// Why PostgreSQL refuses the call.
+    refused: Option<CallRefusal>,
 }
 
 impl<'node, 'db, DB: DatabaseLike> CallApplication<'node, 'db, DB> {
@@ -196,9 +196,9 @@ impl<'node, 'db, DB: DatabaseLike> CallApplication<'node, 'db, DB> {
         &self.resolution
     }
 
-    /// The name looked up, why PostgreSQL refuses the call and the type of
-    /// each argument the selection weighed, for a call PostgreSQL refuses.
-    pub(crate) fn into_refusal(self) -> Option<(TargetName<'node>, Refused)> {
+    /// The name looked up and why PostgreSQL refuses the call, for a call
+    /// PostgreSQL refuses.
+    pub(crate) fn into_refusal(self) -> Option<(TargetName<'node>, CallRefusal)> {
         Some((self.name, self.refused?))
     }
 }
@@ -252,6 +252,17 @@ impl<'node, 'db, DB: DatabaseLike> OperatorApplication<'node, 'db, DB> {
 /// Why PostgreSQL refuses an application or a call, and the type of each
 /// operand or argument it weighed.
 pub(crate) type Refused = (Unresolved, Vec<Box<str>>);
+
+/// Why PostgreSQL refuses a call.
+#[derive(Debug, Clone)]
+pub(crate) enum CallRefusal {
+    /// No function, or no single one, takes the arguments, typed as the
+    /// selection weighed them.
+    Unresolved(Refused),
+    /// The call writes clauses the function it selects refuses, or clauses
+    /// no call may combine.
+    Misapplied(Misapplied),
+}
 
 /// How PostgreSQL evaluates a node, by the operators it applies.
 enum Form<'node> {
@@ -718,7 +729,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             Expr::Function(function) => function,
             _ => return Ok(None),
         };
-        let Some(arguments) = call_arguments(function) else { return Ok(None) };
+        let Some((arguments, clauses)) = call_arguments(function) else { return Ok(None) };
         let name = called_name(function)?;
         if expression_form(&function.name).is_some() || is_row(expression) {
             return Ok(None);
@@ -727,7 +738,11 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let call = core::ptr::from_ref(function).addr();
         if let Some(target) = self.pins.and_then(|pins| pins.cast(call)) {
             let resolution = CallResolution::Cast(target.clone());
-            return Ok(Some(CallApplication { name, arguments, resolution, refused: None }));
+            let refused = clauses
+                .written_rule()
+                .or_else(|| clauses.plain_rule())
+                .map(CallRefusal::Misapplied);
+            return Ok(Some(CallApplication { name, arguments, resolution, refused }));
         }
         let qualified;
         let lookup = match self.pins.and_then(|pins| pins.call_schema(call)) {
@@ -743,7 +758,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             reached.retain(|(function, _)| pins.admits_call(call, function));
         }
         let castable = matches!(written.as_slice(), [None]);
-        self.applied_call(name, arguments, &reached, castable, Some(call)).map(Some)
+        self.applied_call(name, arguments, &reached, castable, Some(call), Some(clauses)).map(Some)
     }
 
     /// Returns the function PostgreSQL calls for `factor`, a `FROM` item
@@ -801,14 +816,16 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let target = called_object_name(name)?;
         let reached = reached_by_name(self.database, &target, &written, self.case);
         let castable = matches!(written.as_slice(), [None]);
-        self.applied_call(target, arguments, &reached, castable, None).map(Some)
+        let clauses = CallClauses::listed(listed);
+        self.applied_call(target, arguments, &reached, castable, None, Some(clauses)).map(Some)
     }
 
     /// The call of `name` passing `arguments`, one of the `reached`
     /// functions selected by the arguments' types or, when `castable` says
     /// the call passes one argument under no name, the cast it may read as,
     /// the arguments of the call whose node sits at `call` typed as the pins
-    /// have them.
+    /// have them, refused for the `clauses` it writes as PostgreSQL refuses
+    /// them, which a call PostgreSQL's grammar inserts has none of.
     fn applied_call<'node>(
         &self,
         name: TargetName<'node>,
@@ -816,6 +833,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         reached: &[(&'db DB::Function, Matched)],
         castable: bool,
         call: Option<usize>,
+        clauses: Option<CallClauses>,
     ) -> Result<CallApplication<'node, 'db, DB>, LookupError> {
         let pinned = |index| {
             let pins = self.pins?;
@@ -833,15 +851,35 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             .collect::<Result<Vec<_>, _>>()?;
         let resolution =
             resolve_function(self.database, reached, &types, castable.then_some(&name));
-        let reason = match resolution {
-            CallResolution::NotFound => Some(Unresolved::DoesNotExist),
-            CallResolution::Ambiguous(_) => Some(Unresolved::NotUnique),
-            CallResolution::UnboundPolymorphic(_) => Some(Unresolved::PolymorphicUnknown),
-            CallResolution::Selected(_)
-            | CallResolution::Cast(_)
-            | CallResolution::Undetermined => None,
+        let unresolved =
+            |reason| CallRefusal::Unresolved((reason, types.iter().map(weighed_name).collect()));
+        let of_kind = |called: &DB::Function| -> Result<Option<CallRefusal>, LookupError> {
+            let Some(clauses) = clauses else { return Ok(None) };
+            let aggregate = called.aggregate_kind(self.database)?;
+            if let Some(rule) =
+                clauses.kind_rule(called.kind(self.database)?, aggregate, types.len())
+            {
+                return Ok(Some(CallRefusal::Misapplied(rule)));
+            }
+            let divided = divides(called, aggregate, types.len(), clauses.within_group);
+            Ok((!divided).then(|| unresolved(Unresolved::DoesNotExist)))
         };
-        let refused = reason.map(|reason| (reason, types.iter().map(weighed_name).collect()));
+        let refused = if let Some(rule) = clauses.and_then(CallClauses::written_rule) {
+            Some(CallRefusal::Misapplied(rule))
+        } else {
+            match &resolution {
+                CallResolution::NotFound => Some(unresolved(Unresolved::DoesNotExist)),
+                CallResolution::Ambiguous(_) => Some(unresolved(Unresolved::NotUnique)),
+                CallResolution::Selected(selected) => of_kind(selected.function())?,
+                CallResolution::UnboundPolymorphic(function) => {
+                    of_kind(function)?.or_else(|| Some(unresolved(Unresolved::PolymorphicUnknown)))
+                }
+                CallResolution::Cast(_) => {
+                    clauses.and_then(CallClauses::plain_rule).map(CallRefusal::Misapplied)
+                }
+                CallResolution::Undetermined => None,
+            }
+        };
         Ok(CallApplication { name, arguments, resolution, refused })
     }
 
@@ -855,7 +893,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let name = TargetName::new(function, false).with_schema(PG_CATALOG, false);
         let written = Vec::from_iter(core::iter::repeat_n(None, arguments.len()));
         let reached = reached_by_name(self.database, &name, &written, self.case);
-        self.applied_call(name, arguments, &reached, false, None)
+        self.applied_call(name, arguments, &reached, false, None, None)
     }
 
     /// The applications PostgreSQL builds for `expression` and what the node
@@ -1507,17 +1545,177 @@ fn plain_arguments(function: &Function) -> Option<Vec<&Expr>> {
     }
 }
 
+/// The clauses a call writes that PostgreSQL checks against the kind of
+/// function the call selects.
+#[derive(Debug, Clone, Copy)]
+struct CallClauses {
+    /// The call passes `*`.
+    star: bool,
+    /// An argument is passed by name.
+    named: bool,
+    /// `DISTINCT` precedes the arguments.
+    distinct: bool,
+    /// The arguments end in `ORDER BY`.
+    ordered: bool,
+    /// How many values `WITHIN GROUP` orders by.
+    within_group: usize,
+    /// The call writes `FILTER`.
+    filter: bool,
+    /// The call writes `OVER`.
+    over: bool,
+}
+
+impl CallClauses {
+    /// The clauses of a call passing `arguments` and writing nothing else,
+    /// as a function in `FROM` does.
+    fn listed(arguments: &[FunctionArg]) -> Self {
+        Self {
+            star: matches!(arguments, [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]),
+            named: arguments.iter().any(|argument| !matches!(argument, FunctionArg::Unnamed(_))),
+            distinct: false,
+            ordered: false,
+            within_group: 0,
+            filter: false,
+            over: false,
+        }
+    }
+
+    /// The rule PostgreSQL's grammar refuses the clauses by, whatever
+    /// function the call names.
+    const fn written_rule(self) -> Option<Misapplied> {
+        if self.within_group == 0 {
+            None
+        } else if self.ordered {
+            Some(Misapplied::OrderByWithinGroup)
+        } else if self.distinct {
+            Some(Misapplied::DistinctWithinGroup)
+        } else {
+            None
+        }
+    }
+
+    /// The rule the clauses break on a call of a function that is neither
+    /// an aggregate nor a window function, or a call read as a cast.
+    const fn plain_rule(self) -> Option<Misapplied> {
+        if self.star {
+            Some(Misapplied::StarOnPlainFunction)
+        } else if self.distinct {
+            Some(Misapplied::DistinctOnPlainFunction)
+        } else if self.within_group > 0 {
+            Some(Misapplied::WithinGroupOnPlainFunction)
+        } else if self.ordered {
+            Some(Misapplied::OrderByOnPlainFunction)
+        } else if self.filter {
+            Some(Misapplied::FilterOnPlainFunction)
+        } else if self.over {
+            Some(Misapplied::OverOnPlainFunction)
+        } else {
+            None
+        }
+    }
+
+    /// The rule the clauses break on a call passing `arguments` arguments
+    /// to a function of `kind`, an aggregate of `aggregate`, in the order
+    /// `ParseFuncOrColumn` checks them.
+    const fn kind_rule(
+        self,
+        kind: FunctionKind,
+        aggregate: Option<AggregateKind>,
+        arguments: usize,
+    ) -> Option<Misapplied> {
+        let ordered_set = matches!(
+            aggregate,
+            Some(AggregateKind::OrderedSet { .. } | AggregateKind::HypotheticalSet { .. })
+        );
+        let rule = match kind {
+            FunctionKind::Normal => return self.plain_rule(),
+            FunctionKind::Aggregate if ordered_set => {
+                if self.within_group == 0 {
+                    Some(Misapplied::WithinGroupRequired)
+                } else if self.over {
+                    Some(Misapplied::OverOnOrderedSetAggregate)
+                } else {
+                    None
+                }
+            }
+            FunctionKind::Aggregate if self.within_group > 0 => {
+                Some(Misapplied::WithinGroupOnNormalAggregate)
+            }
+            FunctionKind::Window if !self.over => Some(Misapplied::OverRequired),
+            FunctionKind::Window if self.within_group > 0 => {
+                Some(Misapplied::WithinGroupOnWindowFunction)
+            }
+            FunctionKind::Aggregate | FunctionKind::Window => None,
+        };
+        if rule.is_some() {
+            return rule;
+        }
+        let aggregate = matches!(kind, FunctionKind::Aggregate);
+        let starless = aggregate && arguments == 0 && !self.star;
+        if !self.over {
+            if starless {
+                Some(Misapplied::StarRequired)
+            } else if self.named {
+                Some(Misapplied::NamedArgumentOnAggregate)
+            } else {
+                None
+            }
+        } else if self.distinct {
+            Some(Misapplied::DistinctOverWindow)
+        } else if starless {
+            Some(Misapplied::StarRequired)
+        } else if self.ordered {
+            Some(Misapplied::OrderByOverWindow)
+        } else if !aggregate && self.filter {
+            Some(Misapplied::FilterOnWindowFunction)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether `arguments` arguments, the last `ordered` of them those `WITHIN
+/// GROUP` orders by, split into direct and ordered ones as `called`, an
+/// aggregate of `aggregate`, declares, which holds for any call of a
+/// function no ordered-set aggregate.
+///
+/// A hypothetical-set aggregate whose direct and ordered arguments are all
+/// variadic takes as many direct ones as ordered ones, and an ordered-set
+/// one of that shape at least one direct one more than ordered ones.
+fn divides<F: FunctionLike>(
+    called: &F,
+    aggregate: Option<AggregateKind>,
+    arguments: usize,
+    ordered: usize,
+) -> bool {
+    let (direct, hypothetical) = match aggregate {
+        Some(AggregateKind::OrderedSet { direct_arguments }) => (direct_arguments, false),
+        Some(AggregateKind::HypotheticalSet { direct_arguments }) => (direct_arguments, true),
+        Some(AggregateKind::Normal) | None => return true,
+    };
+    let (inputs, variadic) = called
+        .argument_modes()
+        .filter(|mode| !matches!(mode, ArgMode::Out))
+        .fold((0, false), |(inputs, _), mode| (inputs + 1, matches!(mode, ArgMode::Variadic)));
+    if !variadic || direct < inputs {
+        return arguments - ordered == direct;
+    }
+    let collected = (arguments + 1).saturating_sub(inputs);
+    if hypothetical { collected == 2 * ordered } else { collected > ordered }
+}
+
 /// The nodes the arguments of a call come from, those it writes followed by
-/// the ordering arguments of `WITHIN GROUP`, or `None` for a call written
-/// with a subquery, a `*` but `count(*)`'s, or a clause PostgreSQL has no
-/// grammar for. `DISTINCT`, `ORDER BY`, `FILTER` and `OVER` pass nothing.
-fn call_arguments(function: &Function) -> Option<Vec<&Expr>> {
+/// the ordering arguments of `WITHIN GROUP`, with the clauses the call
+/// writes, or `None` for a call written with a subquery, a `*` but
+/// `count(*)`'s, or a clause PostgreSQL has no grammar for. `DISTINCT`,
+/// `ORDER BY`, `FILTER` and `OVER` pass nothing.
+fn call_arguments(function: &Function) -> Option<(Vec<&Expr>, CallClauses)> {
     if !matches!(function.parameters, FunctionArguments::None) || function.null_treatment.is_some()
     {
         return None;
     }
-    let mut arguments = match &function.args {
-        FunctionArguments::None => Vec::new(),
+    let (mut arguments, mut clauses) = match &function.args {
+        FunctionArguments::None => (Vec::new(), CallClauses::listed(&[])),
         FunctionArguments::Subquery(_) => return None,
         FunctionArguments::List(list) => {
             let ordered = |clause: &FunctionArgumentClause| {
@@ -1526,11 +1724,17 @@ fn call_arguments(function: &Function) -> Option<Vec<&Expr>> {
             if !list.clauses.iter().all(ordered) {
                 return None;
             }
-            listed_arguments(&list.args)?
+            let mut clauses = CallClauses::listed(&list.args);
+            clauses.distinct = list.duplicate_treatment == Some(DuplicateTreatment::Distinct);
+            clauses.ordered = !list.clauses.is_empty();
+            (listed_arguments(&list.args)?, clauses)
         }
     };
     arguments.extend(function.within_group.iter().map(|ordering| &ordering.expr));
-    Some(arguments)
+    clauses.within_group = function.within_group.len();
+    clauses.filter = function.filter.is_some();
+    clauses.over = function.over.is_some();
+    Some((arguments, clauses))
 }
 
 /// The nodes `arguments` pass, none for the lone `*` of `count(*)`, or

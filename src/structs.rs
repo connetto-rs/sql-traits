@@ -54,12 +54,12 @@ pub use deployment::{
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
-pub(crate) use expression_context::{ReparsePins, Site, applies_operators};
+pub(crate) use expression_context::{CallRefusal, ReparsePins, Site, applies_operators};
 pub use expression_scope::ExpressionScope;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
-pub use function_kind::FunctionKind;
+pub use function_kind::{AggregateKind, FunctionKind};
 pub use helper_set::{GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm};
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;

@@ -21,6 +21,7 @@
 
 use alloc::{
     collections::BTreeMap,
+    format,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -36,9 +37,9 @@ use super::{ParserDB, ParserDBBuilder, PostgresCatalogOperator, constraint_names
 use crate::{
     errors::Error,
     structs::{
-        ArraySource, CallApplication, CallResolution, ExpressionContext, ExpressionScope,
-        IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution, OperatorRow,
-        ReparsePins, Site, TableAttribute, TargetName, applies_operators,
+        ArraySource, CallApplication, CallRefusal, CallResolution, ExpressionContext,
+        ExpressionScope, IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution,
+        OperatorRow, ReparsePins, Site, TableAttribute, TargetName, applies_operators,
         metadata::{
             CallChoice, ExpressionCalls, NodeState, OperatorNode, WrittenPins,
             for_each_operator_node,
@@ -48,6 +49,7 @@ use crate::{
     utils::{
         call_sites::for_each_call,
         call_typing::{reached_by_name, written_argument_names},
+        identifier_resolution::stored_identifier,
         object_name::qualifier_of,
         walk::walk,
     },
@@ -551,14 +553,18 @@ impl Nodes<'_, '_, '_> {
         if let Some(choice) = choice {
             self.selections.calls.insert(address(name), choice);
         }
-        if let Some((called, (reason, argument_types))) =
-            application.and_then(CallApplication::into_refusal)
-        {
-            self.selections.refused_calls.insert(
-                address(name),
-                Error::UnresolvedCall { function_name: called.to_string(), argument_types, reason },
-            );
-        }
+        let Some((called, refusal)) = application.and_then(CallApplication::into_refusal) else {
+            return;
+        };
+        let refused = match refusal {
+            CallRefusal::Unresolved((reason, argument_types)) => {
+                Error::UnresolvedCall { function_name: called.to_string(), argument_types, reason }
+            }
+            CallRefusal::Misapplied(rule) => {
+                Error::MisappliedCall { function_name: stored_name(&called), rule }
+            }
+        };
+        self.selections.refused_calls.insert(address(name), refused);
     }
 
     /// Records the operators a statement added that the applications of
@@ -1007,5 +1013,17 @@ impl ReparsePins<ParserDB> for Deparsed {
 
     fn cast(&self, call: usize) -> Option<&TargetName<'static>> {
         self.casts.get(&call)
+    }
+}
+
+/// The name PostgreSQL gives `name` in a message, each part as it stores
+/// it.
+fn stored_name(name: &TargetName<'_>) -> String {
+    let function = stored_identifier(name.name(), name.name_is_quoted());
+    match name.schema() {
+        Some(schema) => {
+            format!("{}.{function}", stored_identifier(schema, name.schema_is_quoted()))
+        }
+        None => function.into_owned(),
     }
 }
