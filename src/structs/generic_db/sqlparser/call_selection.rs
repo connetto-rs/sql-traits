@@ -631,11 +631,16 @@ impl ReparsePins<ParserDB> for Recorded<'_> {
         let [function] = self.calls.get(&call)? else { return None };
         Some(qualifier_of(&function.name).named().unwrap_or((DEFAULT_SCHEMA, false)))
     }
+
+    fn cast(&self, _call: usize) -> Option<&TargetName<'static>> {
+        None
+    }
 }
 
 /// What the text PostgreSQL deparses an expression into pins: the cast
-/// around each operand and argument a selection converted, and the schema of
-/// an operator or a function its name alone does not reach.
+/// around each operand and argument a selection converted, the cast written
+/// for a call read as one, and the schema of an operator or a function its
+/// name alone does not reach.
 #[derive(Default)]
 struct Deparsed {
     /// The type each converted operand is cast to, by its application and
@@ -649,6 +654,9 @@ struct Deparsed {
     /// The schema each qualified called name is written in, by the address
     /// of the call's node.
     call_schemas: BTreeMap<usize, (String, bool)>,
+    /// The type each call read as a cast is deparsed as a cast to, by the
+    /// address of the call's node.
+    casts: BTreeMap<usize, TargetName<'static>>,
 }
 
 impl Deparsed {
@@ -718,8 +726,15 @@ impl Deparsed {
         expression: &Expr,
     ) {
         let Ok(Some(call)) = context.call(expression) else { return };
-        let CallResolution::Selected(selected) = call.resolution() else { return };
         let node = address(function);
+        let selected = match call.resolution() {
+            CallResolution::Selected(selected) => selected,
+            CallResolution::Cast(target) => {
+                self.casts.insert(node, target.clone().into_owned());
+                return;
+            }
+            _ => return,
+        };
         for (position, argument) in selected.arguments().iter().enumerate() {
             let evidence = argument.evidence();
             if !evidence.conversion().is_empty() {
@@ -771,5 +786,9 @@ impl ReparsePins<ParserDB> for Deparsed {
 
     fn call_schema(&self, call: usize) -> Option<(&str, bool)> {
         self.call_schemas.get(&call).map(|(schema, quoted)| (schema.as_str(), *quoted))
+    }
+
+    fn cast(&self, call: usize) -> Option<&TargetName<'static>> {
+        self.casts.get(&call)
     }
 }
