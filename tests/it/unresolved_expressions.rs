@@ -232,6 +232,113 @@ fn an_unresolved_call_is_refused() {
     }
 }
 
+/// Asserts that `sql` ends refused because a call of `function` passing
+/// `arguments` selects nothing for `reason`.
+#[track_caller]
+fn assert_call_refused(sql: &str, function: &str, arguments: &[&str], reason: Unresolved) {
+    let result = parse(sql);
+    assert!(
+        matches!(
+            &result,
+            Err(Error::UnresolvedCall { function_name, argument_types, reason: refused })
+                if function_name == function
+                    && argument_types.iter().map(AsRef::as_ref).eq(arguments.iter().copied())
+                    && *refused == reason
+        ),
+        "{sql}\ngot {result:?}"
+    );
+}
+
+/// Two overloads of `srf` and of `g` that two `int4` arguments reach
+/// equally well.
+const CROSSED: &str =
+    "CREATE FUNCTION srf(int4, int8) RETURNS SETOF INT4 LANGUAGE sql AS 'SELECT 1';
+     CREATE FUNCTION srf(int8, int4) RETURNS SETOF INT4 LANGUAGE sql AS 'SELECT 1';
+     CREATE FUNCTION g(int4, int8) RETURNS INT4 LANGUAGE sql AS 'SELECT 1';
+     CREATE FUNCTION g(int8, int4) RETURNS INT4 LANGUAGE sql AS 'SELECT 1';
+     CREATE TABLE t (a INT4, b TEXT);";
+
+/// A function in `FROM` that no function takes is refused, in a view and in
+/// a policy's subquery alike.
+#[test]
+fn an_unresolved_from_call_is_refused() {
+    let refused = [
+        ("CREATE VIEW v AS SELECT x FROM nosuchfn(1) AS x;", "nosuchfn", &["int4"][..]),
+        ("CREATE VIEW v AS SELECT x FROM t, LATERAL nosuchfn(t.a) AS x;", "nosuchfn", &["int4"]),
+        (
+            "CREATE VIEW v AS SELECT x FROM generate_series('a'::text, 'b'::text) AS x;",
+            "generate_series",
+            &["text", "text"],
+        ),
+        (
+            "ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY p ON t USING (a IN (SELECT x FROM nosuchfn(1) AS x));",
+            "nosuchfn",
+            &["int4"],
+        ),
+    ];
+    for (sql, function, arguments) in refused {
+        assert_call_refused(
+            &format!("{CROSSED} {sql}"),
+            function,
+            arguments,
+            Unresolved::DoesNotExist,
+        );
+    }
+    assert_call_refused(
+        &format!("{CROSSED} CREATE VIEW v AS SELECT x FROM srf(1, 1) AS x;"),
+        "srf",
+        &["int4", "int4"],
+        Unresolved::NotUnique,
+    );
+}
+
+/// An aggregate or window call no function takes is refused.
+#[test]
+fn an_unresolved_aggregate_or_window_call_is_refused() {
+    let refused = [
+        ("CREATE VIEW v AS SELECT nosuchagg(a) FROM t;", "nosuchagg", &["int4"][..]),
+        ("CREATE VIEW v AS SELECT sum(b) FROM t;", "sum", &["text"]),
+        ("CREATE VIEW v AS SELECT nosuchwin() OVER () FROM t;", "nosuchwin", &[]),
+        ("CREATE VIEW v AS SELECT ntile('x'::text) OVER () FROM t;", "ntile", &["text"]),
+    ];
+    for (sql, function, arguments) in refused {
+        assert_call_refused(
+            &format!("{CROSSED} {sql}"),
+            function,
+            arguments,
+            Unresolved::DoesNotExist,
+        );
+    }
+    assert_call_refused(
+        &format!("{CROSSED} CREATE VIEW v AS SELECT g(1, 1) OVER () FROM t;"),
+        "g",
+        &["int4", "int4"],
+        Unresolved::NotUnique,
+    );
+}
+
+/// The aggregates, window functions and functions in `FROM` PostgreSQL
+/// resolves stay accepted, in every argument form it reads.
+#[test]
+fn a_resolved_aggregate_window_or_from_call_stays() {
+    for sql in [
+        "CREATE VIEW v AS SELECT x FROM generate_series(1, 3) AS x;",
+        "CREATE VIEW v AS SELECT x FROM unnest(ARRAY[1, 2]) AS x;",
+        "CREATE VIEW v AS SELECT count(*), count(DISTINCT a), sum(a) FILTER (WHERE a > 0) FROM t;",
+        "CREATE VIEW v AS SELECT string_agg(b, ',' ORDER BY b) FROM t;",
+        "CREATE VIEW v AS SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a),
+             mode() WITHIN GROUP (ORDER BY b) FROM t;",
+        "CREATE VIEW v AS SELECT row_number() OVER (ORDER BY a), rank() OVER (),
+             dense_rank() OVER (), ntile(2) OVER (), lag(a) OVER (), lead(a, 1, 0) OVER (),
+             first_value(a) OVER (), nth_value(a, 2) OVER (), percent_rank() OVER (),
+             cume_dist() OVER (), sum(a) OVER (PARTITION BY b) FROM t;",
+    ] {
+        let result = parse(&format!("{CROSSED} {sql}"));
+        assert!(result.is_ok(), "{sql}\ngot {result:?}");
+    }
+}
+
 /// A call a rebuild carries is not typed again, so the path it was written
 /// under keeps holding it.
 #[test]

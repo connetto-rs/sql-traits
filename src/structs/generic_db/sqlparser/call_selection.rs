@@ -66,7 +66,8 @@ struct Selections {
     /// refuses, by the address of the node.
     refused_operators: BTreeMap<usize, Error>,
     /// The refusal of each call PostgreSQL refuses, by the address of the
-    /// call's node.
+    /// name it calls, which a function expression and a function in `FROM`
+    /// both hold.
     refused_calls: BTreeMap<usize, Error>,
 }
 
@@ -89,11 +90,8 @@ impl Selections {
         let mut states = calls.call_states();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
             let typed = states.next().is_some_and(|state| state != NodeState::Settled);
-            if typed
-                && refused.is_none()
-                && let Some(written) = call.node
-            {
-                refused = self.refused_calls.remove(&address(written));
+            if typed && refused.is_none() {
+                refused = self.refused_calls.remove(&address(call.name));
             }
             ControlFlow::Continue(())
         });
@@ -519,16 +517,31 @@ struct Nodes<'c, 'q, 'db> {
 }
 
 impl Nodes<'_, '_, '_> {
-    /// Records what the call of `name`, resolved as `resolution`, chooses.
-    fn record(&mut self, name: &ObjectName, resolution: Option<&CallResolution<'_, ParserDB>>) {
-        let choice = match resolution {
+    /// Records what the call of `name`, applied as `application`, chooses,
+    /// or the refusal PostgreSQL gives it.
+    fn select_call(
+        &mut self,
+        name: &ObjectName,
+        application: Option<CallApplication<'_, '_, ParserDB>>,
+    ) {
+        let choice = match application.as_ref().map(CallApplication::resolution) {
             Some(CallResolution::Selected(selected)) => {
-                CallChoice::Function(address(selected.function()))
+                Some(CallChoice::Function(address(selected.function())))
             }
-            Some(CallResolution::Cast(_)) => CallChoice::Cast,
-            _ => return,
+            Some(CallResolution::Cast(_)) => Some(CallChoice::Cast),
+            _ => None,
         };
-        self.selections.calls.insert(address(name), choice);
+        if let Some(choice) = choice {
+            self.selections.calls.insert(address(name), choice);
+        }
+        if let Some((called, (reason, argument_types))) =
+            application.and_then(CallApplication::into_refusal)
+        {
+            self.selections.refused_calls.insert(
+                address(name),
+                Error::UnresolvedCall { function_name: called.to_string(), argument_types, reason },
+            );
+        }
     }
 
     /// Records the operators a statement added that the applications of
@@ -557,21 +570,6 @@ impl Nodes<'_, '_, '_> {
             self.selections.operators.insert(address(expression), selected);
         }
     }
-
-    /// Records what `call`, the node of `expression`, chooses, or the
-    /// refusal PostgreSQL gives it.
-    fn select_call(&mut self, call: &Function, expression: &Expr) {
-        let Ok(application) = self.context.call(expression) else { return };
-        self.record(&call.name, application.as_ref().map(CallApplication::resolution));
-        if let Some((name, (reason, argument_types))) =
-            application.and_then(CallApplication::into_refusal)
-        {
-            self.selections.refused_calls.insert(
-                address(call),
-                Error::UnresolvedCall { function_name: name.to_string(), argument_types, reason },
-            );
-        }
-    }
 }
 
 impl Visitor for Nodes<'_, '_, '_> {
@@ -587,8 +585,10 @@ impl Visitor for Nodes<'_, '_, '_> {
             }
             return ControlFlow::Continue(());
         }
-        if let Expr::Function(function) = expression {
-            self.select_call(function, expression);
+        if let Expr::Function(function) = expression
+            && let Ok(application) = self.context.call(expression)
+        {
+            self.select_call(&function.name, application);
         }
         if applies_operators(expression) {
             self.select_operators(expression);
@@ -600,9 +600,9 @@ impl Visitor for Nodes<'_, '_, '_> {
         // No expression parsed again holds a `FROM` item.
         if self.deparsed.is_none()
             && let TableFactor::Table { name, .. } | TableFactor::Function { name, .. } = factor
-            && let Ok(call) = self.context.relation_call(factor)
+            && let Ok(application) = self.context.relation_call(factor)
         {
-            self.record(name, call.as_ref().map(CallApplication::resolution));
+            self.select_call(name, application);
         }
         ControlFlow::Continue(())
     }
