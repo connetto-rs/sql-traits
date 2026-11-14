@@ -76,11 +76,17 @@ impl TakeError {
     }
 }
 
+/// The whitespace PostgreSQL's name input skips between tokens, which is the
+/// space, tab, newline, carriage return, vertical tab and form feed.
+const NAME_SPACE: [char; 6] = [' ', '\t', '\n', '\r', '\u{b}', '\u{c}'];
+
 /// Takes one identifier off the front of `text`, returning it with its quote
-/// state and whatever text is left over. A quoted part runs to its closing
-/// quote with `""` standing for one quote, and a bare part runs to the next
-/// dot or quote.
+/// state and whatever text is left over. Whitespace before and after the
+/// identifier is skipped. A quoted part runs to its closing quote with `""`
+/// standing for one quote, and a bare part runs to the next dot, quote or
+/// whitespace.
 fn take_identifier(text: &str) -> Result<(Cow<'_, str>, bool, &str), TakeError> {
+    let text = text.trim_start_matches(NAME_SPACE);
     let bytes = text.as_bytes();
     if bytes.first() == Some(&b'"') {
         let mut index = 1;
@@ -101,13 +107,14 @@ fn take_identifier(text: &str) -> Result<(Cow<'_, str>, bool, &str), TakeError> 
         } else {
             Cow::Borrowed(inner)
         };
-        return Ok((value, true, &text[index + 1..]));
+        return Ok((value, true, text[index + 1..].trim_start_matches(NAME_SPACE)));
     }
-    let end = bytes.iter().position(|byte| *byte == b'.' || *byte == b'"').unwrap_or(text.len());
+    let end =
+        text.find(|c: char| c == '.' || c == '"' || NAME_SPACE.contains(&c)).unwrap_or(text.len());
     if end == 0 {
         return Err(TakeError::Empty);
     }
-    Ok((Cow::Borrowed(&text[..end]), false, &text[end..]))
+    Ok((Cow::Borrowed(&text[..end]), false, text[end..].trim_start_matches(NAME_SPACE)))
 }
 
 impl<'a> TargetName<'a> {
@@ -123,18 +130,30 @@ impl<'a> TargetName<'a> {
         Self { schema: Some(Cow::Borrowed(schema)), schema_is_quoted, ..self }
     }
 
-    /// Reads a name back from the text [`Display`] writes, the inverse of it.
+    /// Reads a name from text, separating its tokens as PostgreSQL's
+    /// `regclass` input does, the inverse of [`Display`]. Case stays as
+    /// written, since folding is the lookup's job under
+    /// [`IdentifierCase`](crate::structs::IdentifierCase).
     ///
     /// A dot separates the qualifier from the name only when it sits outside
     /// quotes. A part wrapped in double quotes keeps everything written
-    /// between them, with a doubled quote (`""`) standing for one, and
-    /// reports itself quoted. Every other part keeps its text and reports
-    /// itself unquoted.
+    /// between them, whitespace included, with a doubled quote (`""`)
+    /// standing for one, and reports itself quoted. Every other part runs to
+    /// the next dot, quote or whitespace, keeps that text and reports itself
+    /// unquoted. Whitespace before and after each part and around the dot
+    /// separates tokens and belongs to no identifier. Whitespace is the
+    /// ASCII space, tab, newline, carriage return, vertical tab and form feed
+    /// PostgreSQL skips, so any other space character is identifier text.
     ///
     /// The parse is strict the way the rest of the crate refuses bad SQL:
-    /// empty text, an empty part, a quote that never closes, text following
-    /// an identifier without a separating dot, and more than one dot each
-    /// return an error instead of a name that would resolve to nothing.
+    /// text that is empty or only whitespace, an empty part, a quote that
+    /// never closes, text following an identifier without a separating dot,
+    /// whitespace inside an unquoted part, and more than one dot each return
+    /// an error instead of a name that would resolve to nothing.
+    ///
+    /// An unquoted part holding whitespace or a dot has no text SQL could
+    /// write, so a [`TargetName`] built by hand with one does not parse back
+    /// from its [`Display`] text.
     ///
     /// Text with nothing to unescape borrows from `text`, and only a part
     /// carrying a doubled quote allocates.
@@ -154,12 +173,19 @@ impl<'a> TargetName<'a> {
     /// assert_eq!(target.name(), r#"we"ird"#);
     /// assert!(target.name_is_quoted());
     ///
+    /// // Whitespace between tokens is skipped, and whitespace inside an
+    /// // unquoted part splits it in two.
+    /// let padded = TargetName::parse(" public . orders ").expect("padding separates tokens");
+    /// assert_eq!(padded.schema(), Some("public"));
+    /// assert_eq!(padded.name(), "orders");
+    /// assert!(TargetName::parse("ord ers").is_err());
+    ///
     /// // Anything the grammar cannot read is refused, not tolerated.
     /// assert!(TargetName::parse("app.").is_err());
     /// assert!(TargetName::parse("database.app.docs").is_err());
     /// ```
     pub fn parse(text: &'a str) -> Result<Self, TargetNameParseError> {
-        if text.is_empty() {
+        if text.trim_start_matches(NAME_SPACE).is_empty() {
             return Err(TargetNameParseError::Empty);
         }
         let (first, first_quoted, rest) =
@@ -384,7 +410,6 @@ mod tests {
             TargetName::new("docs", false),
             TargetName::new("Docs", true),
             TargetName::new("a\"b", true),
-            TargetName::new("Tab le", false),
             TargetName::new("T\"1", true).with_schema("S\"2", true),
         ];
         for name in built {
@@ -467,6 +492,83 @@ mod tests {
         ));
         assert!(matches!(
             TargetName::parse(r#""a"."b"."c""#),
+            Err(TargetNameParseError::TooManyParts { .. })
+        ));
+    }
+
+    /// Whitespace before and after each part and around the dot separates
+    /// tokens and belongs to neither, as PostgreSQL's name input reads it.
+    #[test]
+    fn whitespace_between_tokens_is_skipped() {
+        for text in [" orders", "orders ", "\t orders\n", "\u{b}orders\u{c}\r"] {
+            let bare = parts(text);
+            assert_eq!(bare.name(), "orders", "{text:?}");
+            assert!(!bare.name_is_quoted(), "{text:?}");
+            assert_eq!(bare.schema(), None, "{text:?}");
+        }
+        for text in ["public . orders", " public. orders ", "public .orders", "public\t.\norders"] {
+            let qualified = parts(text);
+            assert_eq!(qualified.schema(), Some("public"), "{text:?}");
+            assert_eq!(qualified.name(), "orders", "{text:?}");
+        }
+        let quoted = parts(r#" "my schema" . "Docs" "#);
+        assert_eq!(quoted.schema(), Some("my schema"));
+        assert!(quoted.schema_is_quoted());
+        assert_eq!(quoted.name(), "Docs");
+        assert!(quoted.name_is_quoted());
+        assert!(matches!(quoted.name, Cow::Borrowed(_)));
+    }
+
+    /// Whitespace written between quotes is part of the identifier.
+    #[test]
+    fn whitespace_inside_quotes_is_kept() {
+        let padded = parts(r#"" orders ""#);
+        assert_eq!(padded.name(), " orders ");
+        assert!(padded.name_is_quoted());
+    }
+
+    /// Only the ASCII whitespace PostgreSQL skips separates tokens, so a
+    /// no-break space stays part of an unquoted identifier.
+    #[test]
+    fn other_unicode_spaces_are_identifier_text() {
+        assert_eq!(parts("\u{a0}orders").name(), "\u{a0}orders");
+        assert_eq!(parts("orders\u{2003}").name(), "orders\u{2003}");
+    }
+
+    /// Whitespace inside an unquoted part splits it into two tokens with no
+    /// dot between them, which PostgreSQL refuses as invalid name syntax.
+    #[test]
+    fn whitespace_inside_an_unquoted_part_is_refused() {
+        assert_eq!(
+            TargetName::parse("ord ers"),
+            Err(TargetNameParseError::UnexpectedText {
+                text: "ord ers".to_string(),
+                found: "ers".to_string(),
+            })
+        );
+        assert!(matches!(
+            TargetName::parse("public.ord ers"),
+            Err(TargetNameParseError::UnexpectedText { .. })
+        ));
+        assert!(matches!(
+            TargetName::parse(r#""a" x"#),
+            Err(TargetNameParseError::UnexpectedText { .. })
+        ));
+    }
+
+    /// Text holding only whitespace names nothing, and whitespace standing
+    /// where a part belongs leaves that part empty.
+    #[test]
+    fn whitespace_alone_names_nothing() {
+        assert_eq!(TargetName::parse(" \t\n"), Err(TargetNameParseError::Empty));
+        for text in ["app . ", " . docs", "app. .docs"] {
+            assert!(
+                matches!(TargetName::parse(text), Err(TargetNameParseError::EmptyPart { .. })),
+                "`{text}` should report an empty part"
+            );
+        }
+        assert!(matches!(
+            TargetName::parse("a . b . c"),
             Err(TargetNameParseError::TooManyParts { .. })
         ));
     }
