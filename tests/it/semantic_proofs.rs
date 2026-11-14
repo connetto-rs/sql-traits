@@ -17,7 +17,7 @@ CREATE DOMAIN dv AS VARCHAR(5);
 CREATE TABLE u (x TEXT);
 CREATE TABLE t (
     id INT PRIMARY KEY, s TEXT, i INT4, v VARCHAR(5), c CHAR(3), b INT8, h INT2, d dt, e dv,
-    \"Mixed\" TEXT, m mood
+    \"Mixed\" TEXT, m mood, n NUMERIC
 );";
 
 fn parse(sql: &str) -> Expr {
@@ -78,6 +78,26 @@ fn declared_checks_read_as_postgresql_deparses_them() {
             "((s = ANY (ARRAY['a'::text, 'b'::text])) OR (s = \"Mixed\"))",
         ),
         ("s IN ('a', 'b') AND i > 0", "(((s = ANY (ARRAY['a'::text, 'b'::text])) AND (i > 0)))"),
+        // A minus sign over a number is the one constant the grammar folds.
+        ("i > -1", "(i > '-1'::integer)"),
+        ("b > -1", "(b > '-1'::integer)"),
+        ("h > -1", "(h > '-1'::integer)"),
+        ("i > - (1)", "(i > '-1'::integer)"),
+        ("i > -(-(1))", "(i > 1)"),
+        ("i > -0", "(i > 0)"),
+        ("i > -(-2147483648)", "(i > '2147483648'::bigint)"),
+        ("b = -9223372036854775808", "(b = '-9223372036854775808'::bigint)"),
+        ("b > -9223372036854775809", "((b)::numeric > '-9223372036854775809'::numeric)"),
+        ("i IN (-1, -2)", "(i = ANY (ARRAY['-1'::integer, '-2'::integer]))"),
+        ("h IN (-1, 2)", "(h = ANY (ARRAY['-1'::integer, 2]))"),
+        ("n > -1.5", "(n > '-1.5'::numeric)"),
+        ("n > -.5", "(n > '-0.5'::numeric)"),
+        ("n > -00.50", "(n > '-0.50'::numeric)"),
+        ("n > -5.", "(n > '-5'::numeric)"),
+        ("n > -(-5.)", "(n > '5'::numeric)"),
+        ("n > -(-1.5)", "(n > 1.5)"),
+        ("n > -0.00", "(n > 0.00)"),
+        ("n > -99999999999999999999", "(n > '-99999999999999999999'::numeric)"),
         // A policy, whose subquery keeps the qualified names it writes.
         (
             "EXISTS (SELECT 1 FROM u WHERE u.x = t.s AND u.x <> '')",
@@ -94,10 +114,19 @@ fn unproved_comparisons_and_lists_keep_their_spelling() {
     let scope = ExpressionScope::Table(table(&db));
     // No `=` takes `text` and `int4`, and PostgreSQL casts `1` into the
     // `numeric` array, which no proof spells. A cast to `mood` is spelled
-    // as the deparsing session's `search_path` reaches the type.
-    for (check, comparison) in
-        [("s = 1", true), ("m = 'happy'", true), ("s IN (1)", false), ("i IN (1, 2.5)", false)]
-    {
+    // as the deparsing session's `search_path` reaches the type, a converted
+    // negative constant as a cast of its quoted cast, and a negated exponent
+    // as the digits `numeric_in` expands it into.
+    for (check, comparison) in [
+        ("s = 1", true),
+        ("m = 'happy'", true),
+        ("n = -1", true),
+        ("n > -1e3", true),
+        ("s IN (1)", false),
+        ("i IN (1, 2.5)", false),
+        ("n IN (-1, 2)", false),
+        ("n IN (-1e3, -2e3)", false),
+    ] {
         let expression = parse(check);
         let proofs =
             SemanticProofs::for_expression(&expression, &scope, &db, IdentifierCase::Folded)

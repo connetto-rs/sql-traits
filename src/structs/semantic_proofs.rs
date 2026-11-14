@@ -5,7 +5,10 @@ use alloc::{boxed::Box, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::{
-    ast::{BinaryOperator, DataType, Expr, Ident, InTarget, Query, Value, Visitor},
+    ast::{
+        BinaryOperator, DataType, Expr, Ident, InTarget, Query, UnaryOperator, Value,
+        ValueWithSpan, Visitor,
+    },
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
@@ -38,10 +41,12 @@ use crate::{
 /// deparse writes. An untyped literal read as `int2`, `int4` or `int8` is the
 /// constant it becomes, a literal read as another type of `pg_catalog` and an
 /// operand relabelled, read as its domain's base or converted by a cast
-/// function of one argument are cast to the type the operator takes. An `IN`
-/// list is the `= ANY (ARRAY[...])` and the comparisons PostgreSQL resolves
-/// it into, when every element of the array is an untyped literal or of the
-/// array's element type. Every other node is left as written.
+/// function of one argument are cast to the type the operator takes. A number
+/// under minus signs is the one constant the grammar folds it into, when the
+/// operator takes it unconverted. An `IN` list is the `= ANY (ARRAY[...])`
+/// and the comparisons PostgreSQL resolves it into, when every element of the
+/// array is an untyped literal or of the array's element type. Every other
+/// node is left as written.
 ///
 /// [`Self::view`] lends the proofs to a canonicalizer.
 ///
@@ -463,14 +468,19 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
             OperandType::UntypedLiteral => {
                 common.and_then(|common| literal(common, element)).map(Some)
             }
-            typed => {
-                common
-                    .filter(|common| {
-                        matches!(&typed, OperandType::Known { type_name, .. }
-                        if PgType::from_target(type_name) == **common)
-                    })
-                    .map(|_| None)
+            OperandType::Known { type_name, .. }
+                if common == Some(&PgType::from_target(&type_name)) =>
+            {
+                match folded(element) {
+                    Ok(Some((pg_type, constant))) => {
+                        (common == Some(&pg_type))
+                            .then(|| Some(Spelled::Constant(Box::new(constant))))
+                    }
+                    Ok(None) => Some(None),
+                    Err(Unproved) => None,
+                }
             }
+            _ => None,
         };
         Ok(converted.ok_or(Unproved))
     }
@@ -482,6 +492,12 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
         evidence: &OperandEvidence<'_, DB>,
         operand: &Expr,
     ) -> Result<Option<Spelled>, Unproved> {
+        if let Some((pg_type, constant)) = folded(operand)? {
+            // A converted constant is spelled as a cast of its own cast.
+            let typed = evidence.conversion().is_empty()
+                && PgType::from_target(evidence.target()) == pg_type;
+            return typed.then(|| Some(Spelled::Constant(Box::new(constant)))).ok_or(Unproved);
+        }
         let spelled = match evidence.conversion() {
             [] => return Ok(None),
             [CoercionStep::LiteralInput { type_name }] => {
@@ -529,26 +545,84 @@ fn literal(target: &PgType, operand: &Expr) -> Option<Spelled> {
     deparsed(target).map(Spelled::Cast)
 }
 
-/// The constant the `int2`, `int4` or `int8` named `name` reads `text` as:
-/// a bare non-negative `int4` and a quoted cast otherwise, or `None` for text
-/// other than decimal digits under an optional sign between white space, or
-/// out of range.
-fn integer_constant(name: &str, text: &str) -> Option<Expr> {
+/// The constant the `int2`, `int4` or `int8` named `name` reads `text` as,
+/// or `None` for text other than decimal digits under an optional sign
+/// between white space, or out of range.
+fn integer_constant(name: &'static str, text: &str) -> Option<Expr> {
     // `int4in` skips the white space `isspace` accepts around the digits.
     let value = text.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b').parse::<i64>();
     let value = value.ok()?;
-    let (fits, spelling) = match name {
-        "int2" => (i16::try_from(value).is_ok(), "smallint"),
-        "int4" => (i32::try_from(value).is_ok(), "integer"),
-        _ => (true, "bigint"),
+    let fits = match name {
+        "int2" => i16::try_from(value).is_ok(),
+        "int4" => i32::try_from(value).is_ok(),
+        _ => true,
     };
-    let constant = if name == "int4" && value >= 0 {
+    constant(name, &value.to_string()).filter(|_| fits)
+}
+
+/// The constant PostgreSQL's grammar folds `operand` into, a number under one
+/// or more minus signs and any parentheses, with its type, or `None` for any
+/// other operand.
+///
+/// A number written other than as decimal digits around an optional point is
+/// unproved.
+fn folded(operand: &Expr) -> Result<Option<(PgType, Expr)>, Unproved> {
+    let mut negative = None;
+    let mut node = operand;
+    let text = loop {
+        match node {
+            Expr::Nested(inner) => node = inner,
+            Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+                negative = Some(!negative.unwrap_or(false));
+                node = expr;
+            }
+            Expr::Value(ValueWithSpan { value: Value::Number(text, _), .. }) => break text,
+            _ => return Ok(None),
+        }
+    };
+    let Some(negative) = negative else { return Ok(None) };
+    let (whole, fraction) = text
+        .split_once('.')
+        .map_or((text.as_str(), None), |(whole, fraction)| (whole, Some(fraction)));
+    let decimal = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if !decimal(whole) || !fraction.is_none_or(decimal) {
+        return Err(Unproved);
+    }
+    // `numeric_in` drops the leading zeros and the sign of a zero.
+    let whole = whole.trim_start_matches('0');
+    let zero = whole.is_empty() && fraction.is_none_or(|digits| digits.bytes().all(|b| b == b'0'));
+    let sign = if negative && !zero { "-" } else { "" };
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let (name, value) = match fraction {
+        // `make_const` reads an integer as the narrowest of `int4` and
+        // `int8` that holds it.
+        None => {
+            let value = format!("{sign}{whole}");
+            let name = match value.parse::<i64>() {
+                Ok(integer) if i32::try_from(integer).is_ok() => "int4",
+                Ok(_) => "int8",
+                Err(_) => "numeric",
+            };
+            (name, value)
+        }
+        Some("") => ("numeric", format!("{sign}{whole}")),
+        Some(fraction) => ("numeric", format!("{sign}{whole}.{fraction}")),
+    };
+    constant(name, &value).map(|constant| Some((PgType::Catalog(name), constant))).ok_or(Unproved)
+}
+
+/// The constant `value` of the `pg_catalog` type `name` as `get_const_expr`
+/// writes it: bare for a non-negative `int4` and a non-negative `numeric`
+/// with a point, and quoted under a cast otherwise.
+fn constant(name: &'static str, value: &str) -> Option<Expr> {
+    let bare =
+        !value.starts_with('-') && (name == "int4" || (name == "numeric" && value.contains('.')));
+    let spelling = if bare {
         value.to_string()
     } else {
-        format!("'{value}'::{spelling}")
+        format!("'{value}'::{}", deparsed_spelling(&PgType::Catalog(name))?)
     };
-    let parsed = Parser::new(&PostgreSqlDialect {}).try_with_sql(&constant).ok()?.parse_expr();
-    parsed.ok().filter(|_| fits)
+    Parser::new(&PostgreSqlDialect {}).try_with_sql(&spelling).ok()?.parse_expr().ok()
 }
 
 /// The spelling `format_type_with_typemod` gives a `pg_catalog` type with no
