@@ -172,15 +172,9 @@ impl<F> ExpressionCalls<F> {
                 return ControlFlow::Continue(());
             }
             match call.node.and_then(&selected) {
+                // A waiting call still reaches every overload.
                 Some(CallChoice::Function(address)) => {
-                    let chosen = bound
-                        .overloads
-                        .iter()
-                        .flatten()
-                        .find(|function| Arc::as_ptr(function).addr() == address);
-                    if let Some(function) = chosen {
-                        bound.reached = alloc::vec![Arc::clone(function)];
-                    }
+                    bound.reached.retain(|function| Arc::as_ptr(function).addr() == address);
                 }
                 Some(CallChoice::Cast) => bound.reached.clear(),
                 None => {}
