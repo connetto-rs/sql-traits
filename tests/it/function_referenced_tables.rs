@@ -556,3 +556,16 @@ fn relations_report_the_same_unknowable_bodies() {
         Err(LookupError::FunctionBodyNotSql { language, .. }) if language == "plperl"
     ));
 }
+
+/// `FROM f(1)` calls `f`, so a table of the same name is not read.
+#[test]
+fn a_table_function_reads_no_table_of_its_name() {
+    let database = postgres(
+        "CREATE TABLE produced (a INT);
+         CREATE FUNCTION produced(n INT) RETURNS SETOF INT LANGUAGE sql AS 'SELECT n';
+         CREATE FUNCTION consumer() RETURNS SETOF INT LANGUAGE sql
+             AS 'SELECT * FROM produced(1)';",
+    );
+    assert_eq!(named_by(&database, "consumer").unwrap(), Vec::<String>::new());
+    assert_eq!(read_by(&database, "consumer").unwrap(), Vec::<String>::new());
+}

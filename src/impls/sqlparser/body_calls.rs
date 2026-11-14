@@ -11,30 +11,41 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{Statement, Visit};
 
-use super::data_statement::{BodyPath, BodyWalk, RunTimeBody, walk_body};
+use super::data_statement::{BodyPath, BodyWalk, RunTimeBody, add_unqualified, walk_body};
 use crate::{
     errors::LookupError,
-    structs::IdentifierCase,
+    structs::{IdentifierCase, UnqualifiedName},
     traits::DatabaseLike,
     utils::{
         call_sites::{Call, call_reaches, for_each_call},
-        object_name::{Qualifier, object_name_last_part, qualifier_of},
+        object_name::{
+            Qualifier, object_name_last_part, qualifier_of, target_name_from_object_name,
+        },
     },
 };
 
 /// Gathers the functions each call a body makes may reach, under the path in
 /// force where the call runs.
-struct CallCollector<'db, 'path, DB: DatabaseLike> {
+pub(super) struct CallCollector<'db, 'path, DB: DatabaseLike> {
     database: &'db DB,
     path: BodyPath<'path>,
     /// Every function some call may reach, deduplicated in first-reached
     /// order.
     functions: Vec<&'db DB::Function>,
+    /// The calls written without a schema, each with every function it may
+    /// reach, or [`None`] for a walk that does not gather them.
+    pub(super) unqualified: Option<Vec<UnqualifiedName<'db, DB>>>,
 }
 
 impl<'db, 'path, DB: DatabaseLike> CallCollector<'db, 'path, DB> {
     fn new(database: &'db DB, path: BodyPath<'path>) -> Self {
-        Self { database, path, functions: Vec::new() }
+        Self { database, path, functions: Vec::new(), unqualified: None }
+    }
+
+    /// A walk starting under `path` that also gathers the calls written
+    /// without a schema.
+    pub(super) fn gathering_unqualified(database: &'db DB, path: BodyPath<'path>) -> Self {
+        Self { unqualified: Some(Vec::new()), ..Self::new(database, path) }
     }
 
     /// Records every function `call` may reach under the walk's path.
@@ -42,8 +53,9 @@ impl<'db, 'path, DB: DatabaseLike> CallCollector<'db, 'path, DB> {
         let (name, arguments, case) = (call.name, call.arguments, IdentifierCase::AsWritten);
         let database = self.database;
         let path = &self.path;
+        let unqualified = qualifier_of(name) == Qualifier::Absent;
         if let BodyPath::Unknown(error) = path
-            && qualifier_of(name) == Qualifier::Absent
+            && unqualified
         {
             return Err(error.clone());
         }
@@ -65,16 +77,29 @@ impl<'db, 'path, DB: DatabaseLike> CallCollector<'db, 'path, DB> {
             }
         };
         let Some((called, _)) = object_name_last_part(name) else { return Ok(()) };
+        let names = self.unqualified.as_mut().filter(|_| unqualified);
+        let mut functions = Vec::new();
         for function in database.functions_named(called).filter(|function| reaches(function)) {
             if !self.functions.iter().any(|seen| core::ptr::eq(*seen, function)) {
                 self.functions.push(function);
             }
+            if names.is_some() {
+                functions.push(function);
+            }
+        }
+        if let Some(names) = names
+            && let Some(written) = target_name_from_object_name(name)
+        {
+            add_unqualified(
+                names,
+                UnqualifiedName::Function { name: written.into_owned(), functions },
+            );
         }
         Ok(())
     }
 
     /// Records every function the calls in `node` may reach.
-    fn collect<N: Visit + ?Sized>(&mut self, node: &N) -> Result<(), LookupError> {
+    pub(super) fn collect<N: Visit + ?Sized>(&mut self, node: &N) -> Result<(), LookupError> {
         let walk = for_each_call(node, |call| {
             match self.reach(call) {
                 Ok(()) => ControlFlow::Continue(()),
