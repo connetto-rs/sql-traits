@@ -9258,6 +9258,11 @@ impl ParserDB {
                     let (node, foreign_source) = foreign_table_node(foreign_table);
                     (Statement::CreateTable(node), Some(foreign_source))
                 }
+                // PostgreSQL runs a top-level `SELECT … INTO` as `CREATE TABLE
+                // … AS`.
+                Statement::Query(query) if matches!(dialect, SqlparserDialect::PostgreSql) => {
+                    (table_as::select_into_table(query), None)
+                }
                 statement => (statement, None),
             };
             take_builtins_named_by(&mut builder, &statement);
@@ -10709,9 +10714,17 @@ impl ParserDB {
                         });
                     }
 
+                    // PostgreSQL reads the query of a `CREATE TABLE … AS`
+                    // first, then refuses a taken name, then fits the column
+                    // list to the query's outputs and refuses a repeated one.
+                    let query_columns = table_as::query_columns(&builder, &create_table)?;
+                    if create_table.query.is_some() {
+                        validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
+                        builder.ensure_table_lookup_invariants(&create_table)?;
+                    }
                     // The query's columns are the table's own, so they are in
                     // place before anything below reads the column list.
-                    let mut creations = table_as::apply_query(&builder, &mut create_table)?;
+                    let mut creations = table_as::apply_query(&mut create_table, query_columns)?;
                     // Named before anything is created, so copied columns bring
                     // none.
                     let stored = StoredTable::of(&create_table);

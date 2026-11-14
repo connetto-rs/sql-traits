@@ -1,7 +1,10 @@
 //! Integration tests for the columns `CREATE TABLE … AS` records.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, LookupError},
+    prelude::*,
+};
 use sqlparser::{
     ast::{ColumnDef, DataType, Expr, Ident, SelectItem, SetExpr, Statement},
     dialect::PostgreSqlDialect,
@@ -119,9 +122,16 @@ fn repeated_output_names_are_refused() {
 /// list, built from the AST since the parser does not yet read the list under
 /// PostgreSQL.
 fn with_column_list(names: &[&str], query: &str) -> Result<ParserDB, Error> {
-    let mut statements =
-        Parser::parse_sql(&PostgreSqlDialect {}, &format!("{SOURCE} CREATE TABLE cn AS {query};"))
-            .expect("statements parse");
+    with_column_list_after("", names, query)
+}
+
+/// [`with_column_list`] after the statements `before`.
+fn with_column_list_after(before: &str, names: &[&str], query: &str) -> Result<ParserDB, Error> {
+    let mut statements = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        &format!("{SOURCE} {before} CREATE TABLE cn AS {query};"),
+    )
+    .expect("statements parse");
     let Some(Statement::CreateTable(create_table)) = statements.last_mut() else {
         panic!("expected CREATE TABLE")
     };
@@ -173,6 +183,21 @@ fn a_column_list_longer_than_the_outputs_is_refused() {
         with_column_list(&["a", "b", "c"], "SELECT id, iv FROM t2"),
         Err(Error::TableColumnListTooLong { table_name }) if table_name == "cn"
     ));
+}
+
+/// PostgreSQL refuses the taken name before it fits the column list to the
+/// query's outputs.
+#[test]
+fn a_taken_name_is_reported_before_a_column_list_longer_than_the_outputs() {
+    let refused =
+        with_column_list_after("CREATE TABLE cn (x INT);", &["a", "b", "c"], "SELECT id FROM t2");
+    assert!(
+        matches!(
+            refused,
+            Err(Error::IdentifierLookupError(LookupError::TableLookupConflict { .. }))
+        ),
+        "got {refused:?}"
+    );
 }
 
 fn expression(sql: &str) -> Expr {
