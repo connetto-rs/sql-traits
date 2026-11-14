@@ -1817,7 +1817,7 @@ mod tests {
         if let Err(e) = result {
             let error_msg = format!("{e}");
             assert!(error_msg.contains("is_valid"));
-            assert!(error_msg.contains("referenced"));
+            assert!(error_msg.contains("t.CHECK (is_valid(id))"), "{error_msg}");
         }
     }
 
@@ -1835,7 +1835,7 @@ mod tests {
         if let Err(e) = result {
             let error_msg = format!("{e}");
             assert!(error_msg.contains("check_access"));
-            assert!(error_msg.contains("referenced"));
+            assert!(error_msg.contains("my_policy"));
         }
     }
 
@@ -1853,7 +1853,7 @@ mod tests {
         if let Err(e) = result {
             let error_msg = format!("{e}");
             assert!(error_msg.contains("validate_insert"));
-            assert!(error_msg.contains("referenced"));
+            assert!(error_msg.contains("insert_policy"));
         }
     }
 
@@ -1871,7 +1871,7 @@ mod tests {
         if let Err(e) = result {
             let error_msg = format!("{e}");
             assert!(error_msg.contains("my_trigger_func"));
-            assert!(error_msg.contains("referenced"));
+            assert!(error_msg.contains("my_trigger"));
         }
     }
 

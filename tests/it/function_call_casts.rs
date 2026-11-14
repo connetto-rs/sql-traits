@@ -2,7 +2,10 @@
 //! takes exactly, is the cast PostgreSQL 18 reads it as.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::{Error, ObjectKind},
+    prelude::*,
+};
 use sqlparser::{
     ast::{Expr, SelectItem, SetExpr, Statement},
     dialect::PostgreSqlDialect,
@@ -154,7 +157,13 @@ fn a_cast_holds_no_function() {
          DROP FUNCTION uuid(text);"
     ));
     assert!(
-        matches!(&result, Err(Error::FunctionReferenced { function_name }) if function_name == "uuid"),
+        matches!(
+            &result,
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                if function_name == "uuid"
+                    && *dependent_kind == ObjectKind::CheckConstraint
+                    && dependent_name == "d.ck"
+        ),
         "got {result:?}"
     );
 }

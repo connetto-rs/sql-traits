@@ -232,7 +232,7 @@ fn dropping_a_function_follows_the_replaced_expression() {
     let error = parse(&format!("{CALLS_A_FUNCTION} DROP FUNCTION was_altered();"))
         .expect_err("the altered policy calls was_altered");
     assert!(
-        matches!(&error, Error::FunctionReferenced { function_name } if function_name == "was_altered"),
+        matches!(&error, Error::FunctionReferenced { function_name, .. } if function_name == "was_altered"),
         "got {error:?}"
     );
 

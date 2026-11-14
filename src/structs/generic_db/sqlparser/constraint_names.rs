@@ -15,8 +15,8 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, Expr, Ident,
-    ObjectName, TableConstraint,
+    CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, ExcludeConstraint,
+    Expr, Ident, ObjectName, TableConstraint,
 };
 
 use super::{
@@ -613,6 +613,48 @@ fn answers<'a>(
         .find(|(table, _, _)| core::ptr::eq(table.as_ref(), node))
         .map_or(&[][..], |(_, metadata, _)| metadata.generated_constraint_names());
     names(node, recorded)
+}
+
+/// The name the check `check` of `node`, a table the builder holds, answers
+/// to, the one written or else the one PostgreSQL gave it.
+pub(super) fn check_name(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    check: &CheckConstraint,
+) -> Option<String> {
+    answers(builder, node)
+        .into_iter()
+        .find(|(slot, _)| check_of(*slot) == Some(check))
+        .and_then(|(_, name)| name.map(Cow::into_owned))
+}
+
+/// The name the exclusion constraint `exclusion`, borrowed from `node`, a
+/// table the builder holds, answers to, the one written or else the one
+/// PostgreSQL gave it.
+pub(super) fn exclusion_name(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    exclusion: &ExcludeConstraint,
+) -> Option<String> {
+    answers(builder, node)
+        .into_iter()
+        .find(|(slot, _)| {
+            matches!(
+                slot,
+                Slot::Table(_, TableConstraint::Exclude(held)) if core::ptr::eq(held, exclusion)
+            )
+        })
+        .and_then(|(_, name)| name.map(Cow::into_owned))
+}
+
+/// The exclusion constraints of `node`, in the order it lists them.
+pub(super) fn exclusions(node: &CreateTable) -> impl Iterator<Item = &ExcludeConstraint> {
+    node.constraints.iter().filter_map(|constraint| {
+        match constraint {
+            TableConstraint::Exclude(exclusion) => Some(exclusion),
+            _ => None,
+        }
+    })
 }
 
 /// The check a slot holds, with the name written on its column option folded

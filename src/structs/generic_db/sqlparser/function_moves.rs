@@ -16,7 +16,10 @@ use sqlparser::ast::{
     UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption, VisitMut,
 };
 
-use super::{CarriedCalls, ParserDB, ParserDBBuilder, StoredTable, function_argument_types};
+use super::{
+    CarriedCalls, ParserDB, ParserDBBuilder, StoredTable, constraint_names,
+    function_argument_types, partition_keys,
+};
 use crate::{
     errors::Error,
     structs::{
@@ -332,6 +335,13 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
             held(TableAttribute::table(index.as_ref()));
         }
     }
+    for (table, metadata, _) in builder.tables() {
+        if moves.reached_by(metadata.partition_key_calls())
+            || metadata.exclusion_calls().iter().any(|calls| moves.reached_by(calls))
+        {
+            held(table);
+        }
+    }
 
     let case = builder.identifier_case();
     for stored in tables {
@@ -342,9 +352,9 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
                 respell(Arc::make_mut(index).attribute_mut(), metadata.calls(), moves)?;
             }
         }
-        // The table node spells the calls its columns and checks were bound
-        // from, each found by its written name and argument count, the way
-        // the rebuild finds it.
+        // The table node spells the calls its columns, checks, partition key
+        // and exclusion constraints were bound from, each found by its
+        // written name and argument count, the way the rebuild finds it.
         let mut bound = CarriedCalls::default();
         for (column, metadata, _) in builder.columns() {
             if stored.matches(TableAttribute::table(column.as_ref()), case) {
@@ -354,6 +364,19 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
         for (check, metadata) in builder.check_constraints() {
             if stored.matches(TableAttribute::table(check.as_ref()), case) {
                 bound.record(metadata.expression(), metadata.calls());
+            }
+        }
+        for (table, metadata, _) in builder.tables() {
+            if !stored.matches(table, case) {
+                continue;
+            }
+            for (exclusion, calls) in
+                constraint_names::exclusions(table).zip(metadata.exclusion_calls())
+            {
+                bound.record(exclusion, calls);
+            }
+            if let Some(entries) = partition_keys::key_entries(table) {
+                bound.record(entries, metadata.partition_key_calls());
             }
         }
         builder = ParserDB::replace_table_node_carrying(

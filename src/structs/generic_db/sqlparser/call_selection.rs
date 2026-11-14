@@ -15,11 +15,11 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{ColumnOption, Expr, Function, Query, Statement, Visit, Visitor};
 
-use super::{ParserDB, ParserDBBuilder};
+use super::{ParserDB, ParserDBBuilder, constraint_names, partition_keys};
 use crate::{
     structs::{
         CallResolution, ExpressionContext, ExpressionScope, IdentifierCase, TableAttribute,
-        metadata::CallChoice,
+        metadata::{CallChoice, ExpressionCalls},
     },
     traits::{PolicyLike, Relation, RuleLike, TriggerLike},
     utils::walk::walk,
@@ -47,6 +47,10 @@ impl ParserDBBuilder {
             || self.triggers().iter().any(|(_, calls)| calls.is_unsettled())
             || self.functions().iter().any(|(_, metadata)| metadata.body_calls().is_unsettled())
             || self.domains().iter().any(|(_, metadata)| metadata.calls().is_unsettled())
+            || self.tables().iter().any(|(_, metadata, _)| {
+                metadata.partition_key_calls().is_unsettled()
+                    || metadata.exclusion_calls().iter().any(ExpressionCalls::is_unsettled)
+            })
     }
 
     /// Settles every waiting call against `database`, the catalog this
@@ -102,6 +106,19 @@ impl ParserDBBuilder {
         for (domain, metadata) in self.domains_mut() {
             if metadata.calls().is_unsettled() {
                 metadata.calls_mut().settle(&**domain, selected);
+            }
+        }
+        for (table, metadata, _) in self.tables_mut() {
+            if let (true, Some(entries)) =
+                (metadata.partition_key_calls().is_unsettled(), partition_keys::key_entries(table))
+            {
+                metadata.partition_key_calls_mut().settle(entries, selected);
+            }
+            let exclusions = constraint_names::exclusions(table);
+            for (exclusion, calls) in exclusions.zip(metadata.exclusion_calls_mut()) {
+                if calls.is_unsettled() {
+                    calls.settle(exclusion, selected);
+                }
             }
         }
     }
@@ -181,6 +198,21 @@ impl ParserDBBuilder {
             if metadata.calls().is_unsettled() {
                 select.roots(&domain.default, &ExpressionScope::Empty);
                 select.roots(&domain.constraints, &ExpressionScope::DomainValue(&domain.data_type));
+            }
+        }
+        for (table, metadata, _) in self.tables() {
+            let scope = ExpressionScope::Table(table.as_ref());
+            if let (true, Some(entries)) =
+                (metadata.partition_key_calls().is_unsettled(), partition_keys::key_entries(table))
+            {
+                select.roots(entries, &scope);
+            }
+            for (exclusion, calls) in
+                constraint_names::exclusions(table).zip(metadata.exclusion_calls())
+            {
+                if calls.is_unsettled() {
+                    select.roots(exclusion, &scope);
+                }
             }
         }
         selections
