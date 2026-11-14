@@ -118,6 +118,8 @@ fn the_name_is_bound_where_it_reached() {
         "CREATE SEQUENCE s;
          CREATE SCHEMA app;
          CREATE SEQUENCE app.s;
+         CREATE SCHEMA other;
+         CREATE FUNCTION other.nextval(TEXT) RETURNS INT LANGUAGE sql AS 'SELECT 1';
          CREATE TABLE t (id INT DEFAULT nextval('app.s'), k INT DEFAULT other.nextval('s'));
          DROP SEQUENCE s;",
     )

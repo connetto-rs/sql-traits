@@ -163,25 +163,37 @@ fn each_call_reaches_the_overload_its_arguments_select() {
 }
 
 /// A `VARIADIC` parameter collects at least one argument unless it has a
-/// default, so a call passing none reaches only the overloads that need none.
+/// default, so a call passing none reaches only the overloads that need none,
+/// and PostgreSQL refuses one reaching none.
 #[test]
 fn a_variadic_parameter_without_a_default_needs_an_argument() {
-    let db = parse(
+    let functions =
         "CREATE FUNCTION f(VARIADIC xs INT[]) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
          CREATE FUNCTION g(VARIADIC xs INT[] DEFAULT '{}') RETURNS BOOL LANGUAGE sql AS 'SELECT true';
-         CREATE TABLE items (owner TEXT);
-         CREATE POLICY p ON items USING (
-             f() AND f(1) AND f(1, 2) AND g() AND g(1)
-             AND EXISTS (SELECT rank() OVER () FROM items)
-         );",
+         CREATE TABLE items (owner TEXT);";
+    let refused = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{functions} CREATE POLICY p ON items USING (f());"
+    ));
+    assert!(
+        matches!(
+            &refused,
+            Err(sql_traits::errors::Error::UnresolvedCall { function_name, argument_types, .. })
+                if function_name == "f" && argument_types.is_empty()
+        ),
+        "got {refused:?}"
     );
+    let db = parse(&format!(
+        "{functions} CREATE POLICY p ON items USING (
+             f(1) AND f(1, 2) AND g() AND g(1)
+             AND EXISTS (SELECT rank() OVER () FROM items)
+         );"
+    ));
     let policy = policy(&db, "p");
     let using = policy.using_expression(&db).expect("literals read").expect("USING clause");
     let calls = names_per_call(using, |call| policy.functions_reached_by(call, &db).map(names));
     assert_eq!(
         calls,
         [
-            ("f".to_owned(), vec![]),
             ("f".to_owned(), vec!["f".to_owned()]),
             ("f".to_owned(), vec!["f".to_owned()]),
             ("g".to_owned(), vec!["g".to_owned()]),

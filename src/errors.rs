@@ -118,6 +118,31 @@ impl core::fmt::Display for OperatorAttribute {
     }
 }
 
+/// Why PostgreSQL refuses an operator application or a call of a stored
+/// expression when it types the expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Unresolved {
+    /// No operator or function of the name takes the operand types,
+    /// SQLSTATE `42883`.
+    DoesNotExist,
+    /// More than one takes them and nothing tells them apart, SQLSTATE
+    /// `42725`.
+    NotUnique,
+    /// The one selected has a polymorphic parameter only untyped literals
+    /// reach, SQLSTATE `42804`.
+    PolymorphicUnknown,
+}
+
+impl core::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::DoesNotExist => "does not exist",
+            Self::NotUnique => "is not unique",
+            Self::PolymorphicUnknown => "cannot bind a polymorphic type to `unknown`",
+        })
+    }
+}
+
 /// A constraint PostgreSQL enforces against the rows a table stores, which a
 /// foreign table, storing none, cannot carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1557,6 +1582,39 @@ pub enum Error {
         operator_name: Box<str>,
         /// The attribute refused.
         attribute: OperatorAttribute,
+    },
+    #[error("Operator `{operator_name}` over ({}) {reason}.", .operand_types.join(", "))]
+    /// Error indicating that a stored expression applies an operator no
+    /// operator, or no single one, takes the operand types of.
+    ///
+    /// PostgreSQL types an expression when the statement storing it runs,
+    /// and again when `ALTER COLUMN ... TYPE` parses it over the column's
+    /// new type. A database holding an extension never raises it, since the
+    /// extension may supply the operator.
+    UnresolvedOperator {
+        /// Symbol of the operator as written.
+        operator_name: Box<str>,
+        /// Type of each operand, the left one first, `unknown` for an
+        /// untyped literal.
+        operand_types: Vec<Box<str>>,
+        /// Why PostgreSQL refuses the application.
+        reason: Unresolved,
+    },
+    #[error("Function `{function_name}({})` {reason}.", .argument_types.join(", "))]
+    /// Error indicating that a stored expression calls a function no
+    /// function, or no single one, takes the argument types of.
+    ///
+    /// PostgreSQL types an expression when the statement storing it runs,
+    /// and again when `ALTER COLUMN ... TYPE` parses it over the column's
+    /// new type. A database holding an extension never raises it, since the
+    /// extension may supply the function.
+    UnresolvedCall {
+        /// Name of the function as written.
+        function_name: String,
+        /// Type of each argument, `unknown` for an untyped literal.
+        argument_types: Vec<Box<str>>,
+        /// Why PostgreSQL refuses the call.
+        reason: Unresolved,
     },
     #[error("Invalid value `{option_value}` for collation option `{option_name}`.")]
     /// Error indicating that a `CREATE COLLATION` option is malformed.

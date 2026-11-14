@@ -1645,12 +1645,7 @@ mod tests {
 
     #[test]
     fn test_built_in_functions_in_check_constraint() {
-        let sql = r"
-            CREATE TABLE t (
-                col TEXT CHECK (length(col) > 0),
-                col2 TEXT CHECK (len(col2) > 0)
-            );
-        ";
+        let sql = "CREATE TABLE t (col TEXT CHECK (length(col) > 0));";
         let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(sql)
             .expect("Failed to parse SQL");
         let table = db
@@ -1660,19 +1655,27 @@ mod tests {
         let constraints: Vec<_> =
             table.check_constraints(&db).expect("check_constraints").collect();
 
-        assert_eq!(constraints.len(), 2);
+        assert_eq!(constraints.len(), 1);
 
-        let cc_length = &constraints[0];
-        let functions_length: Vec<_> =
-            cc_length.functions(&db).expect("functions").map(|f| f.name().to_string()).collect();
+        let functions_length: Vec<_> = constraints[0]
+            .functions(&db)
+            .expect("functions")
+            .map(|f| f.name().to_string())
+            .collect();
         assert!(
             functions_length.contains(&"length".to_string()),
             "Function 'length' not found. Found: {functions_length:?}"
         );
 
         // PostgreSQL provides no `len`.
-        let cc_len = &constraints[1];
-        assert_eq!(cc_len.functions(&db).expect("functions").count(), 0);
+        let refused = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE TABLE t (col2 TEXT CHECK (len(col2) > 0));",
+        );
+        assert!(
+            matches!(&refused, Err(crate::errors::Error::UnresolvedCall { function_name, .. })
+                if function_name == "len"),
+            "got {refused:?}"
+        );
     }
 
     #[test]

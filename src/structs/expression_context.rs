@@ -10,7 +10,7 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    errors::LookupError,
+    errors::{LookupError, Unresolved},
     impls::dql::{
         definition_graph::reference_sites::SiteRule,
         scoped_roots::{ScopedRoot, is_input},
@@ -135,6 +135,9 @@ pub struct OperatorApplication<'node, 'db, DB: DatabaseLike> {
     left: Option<&'node Expr>,
     right: Operand<'node, 'db, DB>,
     resolution: OperatorResolution<'db, DB>,
+    /// Why PostgreSQL refuses the application, with the type of each operand
+    /// the selection weighed, the left one first.
+    refused: Option<Refused>,
 }
 
 /// Where the right operand of an operator application comes from.
@@ -162,6 +165,9 @@ pub struct CallApplication<'node, 'db, DB: DatabaseLike> {
     name: TargetName<'node>,
     arguments: Vec<&'node Expr>,
     resolution: CallResolution<'db, DB>,
+    /// Why PostgreSQL refuses the call, with the type of each argument the
+    /// selection weighed.
+    refused: Option<Refused>,
 }
 
 impl<'node, 'db, DB: DatabaseLike> CallApplication<'node, 'db, DB> {
@@ -184,6 +190,12 @@ impl<'node, 'db, DB: DatabaseLike> CallApplication<'node, 'db, DB> {
     #[must_use]
     pub const fn resolution(&self) -> &CallResolution<'db, DB> {
         &self.resolution
+    }
+
+    /// The name looked up, why PostgreSQL refuses the call and the type of
+    /// each argument the selection weighed, for a call PostgreSQL refuses.
+    pub(crate) fn into_refusal(self) -> Option<(TargetName<'node>, Refused)> {
+        Some((self.name, self.refused?))
     }
 }
 
@@ -224,7 +236,18 @@ impl<'node, 'db, DB: DatabaseLike> OperatorApplication<'node, 'db, DB> {
     pub const fn resolution(&self) -> &OperatorResolution<'db, DB> {
         &self.resolution
     }
+
+    /// The name looked up, why PostgreSQL refuses the application and the
+    /// type of each operand the selection weighed, the left one first, for
+    /// an application PostgreSQL refuses.
+    pub(crate) fn into_refusal(self) -> Option<(TargetName<'node>, Refused)> {
+        Some((self.name, self.refused?))
+    }
 }
+
+/// Why PostgreSQL refuses an application or a call, and the type of each
+/// operand or argument it weighed.
+pub(crate) type Refused = (Unresolved, Vec<Box<str>>);
 
 /// How PostgreSQL evaluates a node, by the operators it applies.
 enum Form<'node> {
@@ -736,7 +759,14 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let resolution = resolve_function(self.database, reached, &types);
-        Ok(CallApplication { name, arguments, resolution })
+        let reason = match resolution {
+            CallResolution::NotFound => Some(Unresolved::DoesNotExist),
+            CallResolution::Ambiguous(_) => Some(Unresolved::NotUnique),
+            CallResolution::UnboundPolymorphic(_) => Some(Unresolved::PolymorphicUnknown),
+            CallResolution::Selected(_) | CallResolution::Undetermined => None,
+        };
+        let refused = reason.map(|reason| (reason, types.iter().map(weighed_name).collect()));
+        Ok(CallApplication { name, arguments, resolution, refused })
     }
 
     /// The call of the `pg_catalog` function `function` PostgreSQL's grammar
@@ -820,7 +850,16 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             |operator: &DB::Operator| self.pins.is_none_or(|pins| pins.admits(site, operator));
         let resolution =
             resolve_operator(self.database, lookup, left_type, right_type, self.case, &admits);
-        Ok(OperatorApplication { name, left, right, resolution })
+        let reason = match resolution {
+            OperatorResolution::NotFound => Some(Unresolved::DoesNotExist),
+            OperatorResolution::Ambiguous(_) => Some(Unresolved::NotUnique),
+            OperatorResolution::UnboundPolymorphic(_) => Some(Unresolved::PolymorphicUnknown),
+            OperatorResolution::Selected(_) | OperatorResolution::Undetermined => None,
+        };
+        let refused = reason.map(|reason| {
+            (reason, left_type.into_iter().chain([right_type]).map(weighed_name).collect())
+        });
+        Ok(OperatorApplication { name, left, right, resolution, refused })
     }
 
     /// What a node applying `applications` returns, as `returns` says.
@@ -1425,6 +1464,15 @@ fn nullif_operands(function: &Function) -> Option<(&Expr, &Expr)> {
 fn without_typmod(type_name: Option<TargetName<'_>>) -> OperandType<'_> {
     type_name
         .map_or(OperandType::Unknown, |type_name| OperandType::Known { type_name, typmod: None })
+}
+
+/// How a refusal names the type an operand or an argument was weighed as,
+/// `unknown` for an untyped literal.
+fn weighed_name(weighed: &OperandType<'_>) -> Box<str> {
+    match weighed {
+        OperandType::Known { type_name, .. } => type_name.name().into(),
+        OperandType::UntypedLiteral | OperandType::Unknown => "unknown".into(),
+    }
 }
 
 /// Whether the selected operator returns `bool`, as PostgreSQL requires of

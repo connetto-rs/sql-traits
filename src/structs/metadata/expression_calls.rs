@@ -271,6 +271,11 @@ impl<F> ExpressionCalls<F> {
         self.operators.iter().any(|node| node.state != NodeState::Settled)
     }
 
+    /// Whether some call is new or parsed again, and waits to be typed.
+    pub(crate) fn has_untyped_calls(&self) -> bool {
+        self.calls.iter().any(|call| call.state != NodeState::Settled)
+    }
+
     /// Each call's state, in the order a pre-order walk meets the calls.
     pub(crate) fn call_states(&self) -> impl Iterator<Item = NodeState> {
         self.calls.iter().map(|call| call.state)
