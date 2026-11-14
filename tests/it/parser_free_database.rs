@@ -1142,6 +1142,11 @@ impl FunctionLike for MemoryFunction {
         Ok(FunctionKind::Normal)
     }
 
+    /// No function this catalog declares is an aggregate.
+    fn aggregate_kind(&self, _database: &Self::DB) -> Result<Option<AggregateKind>, LookupError> {
+        Ok(None)
+    }
+
     fn language(&self) -> Option<&str> {
         self.language.as_deref()
     }

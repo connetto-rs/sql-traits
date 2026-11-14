@@ -11,7 +11,10 @@ use sqlparser::ast::{
 use crate::{
     errors::{HelperSetError, LookupError},
     impls::{atomic_statements, body_calls, body_expression, body_reads, helper_set},
-    structs::{Deployment, FunctionBody, FunctionKind, HelperSet, PrivilegeHolder, TargetName},
+    structs::{
+        AggregateKind, Deployment, FunctionBody, FunctionKind, HelperSet, PrivilegeHolder,
+        TargetName,
+    },
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
         call_typing::{
@@ -521,6 +524,35 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # }
     /// ```
     fn kind(&self, database: &Self::DB) -> Result<FunctionKind, LookupError>;
+
+    /// Returns how the function takes its arguments when it is an aggregate,
+    /// mirroring `pg_aggregate.aggkind`, or `None` for any other function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let mut kinds = Vec::new();
+    /// for function in db.functions().filter(|function| function.name() == "rank") {
+    ///     kinds.push(function.aggregate_kind(&db)?);
+    /// }
+    /// // The window function `rank()` is no aggregate, `rank(1) WITHIN GROUP
+    /// // (ORDER BY a)` ranks one hypothetical row.
+    /// kinds.sort();
+    /// assert_eq!(kinds, [None, Some(AggregateKind::HypotheticalSet { direct_arguments: 1 })]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn aggregate_kind(&self, database: &Self::DB) -> Result<Option<AggregateKind>, LookupError>;
 
     /// Returns the language the body is written in, as the input spells it.
     ///

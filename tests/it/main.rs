@@ -13,6 +13,7 @@ mod altered_policies;
 mod array_column_types;
 mod array_vector_interval_types;
 mod binary_send;
+mod call_kind_rules;
 mod call_resolution;
 mod call_result_types;
 mod cast_metadata;

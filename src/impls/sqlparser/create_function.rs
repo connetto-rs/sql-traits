@@ -12,7 +12,8 @@ use sqlparser::ast::{
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
-        FunctionBody, FunctionKind, FunctionMetadata, ParserDB, PrivilegeHolder, TargetName,
+        AggregateKind, FunctionBody, FunctionKind, FunctionMetadata, ParserDB, PrivilegeHolder,
+        TargetName,
     },
     traits::{DatabaseLike, FunctionLike, Metadata, role::privilege_holders},
     utils::{
@@ -172,6 +173,11 @@ impl FunctionLike for CreateFunction {
     #[inline]
     fn kind(&self, database: &Self::DB) -> Result<FunctionKind, LookupError> {
         Ok(function_metadata(self, database)?.kind())
+    }
+
+    #[inline]
+    fn aggregate_kind(&self, database: &Self::DB) -> Result<Option<AggregateKind>, LookupError> {
+        Ok(function_metadata(self, database)?.aggregate_kind())
     }
 
     fn written_body(&self) -> Option<FunctionBody<'_>> {

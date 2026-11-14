@@ -541,6 +541,10 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn aggregate_kind(&self, _database: &Self::DB) -> Result<Option<AggregateKind>, LookupError> {
+        self.unreach()
+    }
+
     fn language(&self) -> Option<&str> {
         self.unreach()
     }

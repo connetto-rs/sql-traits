@@ -19,12 +19,49 @@ use sqlparser::{
 use super::postgres_18_functions::POSTGRES_18_FUNCTIONS;
 use crate::{
     structs::{
-        FunctionKind,
+        AggregateKind, FunctionKind,
         generic_db::{Stored, builtin_functions::BuiltinTable},
         metadata::FunctionMetadata,
     },
     utils::{null_returning_positions, object_name::PG_CATALOG},
 };
+
+/// `pg_proc.prokind`, with `pg_aggregate.aggkind` and
+/// `pg_aggregate.aggnumdirectargs` for an aggregate whose arguments split
+/// between direct ones and those `WITHIN GROUP` orders by.
+#[derive(Clone, Copy)]
+pub(super) enum Kind {
+    Normal,
+    Window,
+    Aggregate,
+    OrderedSet(usize),
+    HypotheticalSet(usize),
+}
+
+impl Kind {
+    const fn function(self) -> FunctionKind {
+        match self {
+            Self::Normal => FunctionKind::Normal,
+            Self::Window => FunctionKind::Window,
+            Self::Aggregate | Self::OrderedSet(_) | Self::HypotheticalSet(_) => {
+                FunctionKind::Aggregate
+            }
+        }
+    }
+
+    const fn aggregate(self) -> Option<AggregateKind> {
+        match self {
+            Self::Normal | Self::Window => None,
+            Self::Aggregate => Some(AggregateKind::Normal),
+            Self::OrderedSet(direct_arguments) => {
+                Some(AggregateKind::OrderedSet { direct_arguments })
+            }
+            Self::HypotheticalSet(direct_arguments) => {
+                Some(AggregateKind::HypotheticalSet { direct_arguments })
+            }
+        }
+    }
+}
 
 /// `pg_proc.proisstrict`.
 #[derive(Clone, Copy)]
@@ -86,7 +123,7 @@ pub(super) struct PostgresBuiltin(
     pub(super) &'static str,
     pub(super) NullInput,
     pub(super) Volatility,
-    pub(super) FunctionKind,
+    pub(super) Kind,
     pub(super) Language,
 );
 
@@ -122,7 +159,8 @@ impl PostgresBuiltin {
         {
             metadata.set_null_returning_arguments(positions);
         }
-        metadata.set_kind(kind);
+        metadata.set_kind(kind.function());
+        metadata.set_aggregate_kind(kind.aggregate());
         metadata
     }
 }

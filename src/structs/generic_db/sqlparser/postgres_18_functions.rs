@@ -45,23 +45,32 @@
 //!     END),
 //!     CASE WHEN p.proisstrict THEN 'Strict' ELSE 'CalledOnNull' END,
 //!     CASE p.provolatile WHEN 'i' THEN 'Immutable' WHEN 's' THEN 'Stable' ELSE 'Volatile' END,
-//!     CASE p.prokind WHEN 'a' THEN 'Aggregate' WHEN 'w' THEN 'Window' ELSE 'Normal' END,
+//!     CASE p.prokind
+//!         WHEN 'w' THEN 'Window'
+//!         WHEN 'a' THEN CASE a.aggkind
+//!             WHEN 'o' THEN format('OrderedSet(%s)', a.aggnumdirectargs)
+//!             WHEN 'h' THEN format('HypotheticalSet(%s)', a.aggnumdirectargs)
+//!             ELSE 'Aggregate'
+//!         END
+//!         ELSE 'Normal'
+//!     END,
 //!     CASE l.lanname WHEN 'internal' THEN 'Internal' WHEN 'c' THEN 'C' ELSE 'Sql' END
 //! )
 //! FROM pg_proc p
 //! JOIN pg_language l ON l.oid = p.prolang
+//! LEFT JOIN pg_aggregate a ON a.aggfnoid = p.oid
 //! LEFT JOIN lists ON lists.oid = p.oid
 //! WHERE p.pronamespace = 'pg_catalog'::regnamespace
 //! ORDER BY lower(p.proname) COLLATE "C", p.proname COLLATE "C", p.oid;
 //! ```
 
 use super::postgres_builtins::{
+    Kind::{Aggregate, HypotheticalSet, Normal, OrderedSet, Window},
     Language::{C, Internal, Sql},
     NullInput::{CalledOnNull, Strict},
     PostgresBuiltin,
     Volatility::{Immutable, Stable, Volatile},
 };
-use crate::structs::FunctionKind::{Aggregate, Normal, Window};
 
 /// Every function PostgreSQL 18 creates in `pg_catalog`, sorted by the name an
 /// unquoted reference folds to.
@@ -601,7 +610,7 @@ pub(super) static POSTGRES_18_FUNCTIONS: &[PostgresBuiltin] = &[
     PostgresBuiltin("cstring_recv", "internal", "cstring", Strict, Stable, Normal, Internal),
     PostgresBuiltin("cstring_send", "cstring", "bytea", Strict, Stable, Normal, Internal),
     PostgresBuiltin("cume_dist", "", "double precision", CalledOnNull, Immutable, Window, Internal),
-    PostgresBuiltin("cume_dist", "VARIADIC \"any\"", "double precision", CalledOnNull, Immutable, Aggregate, Internal),
+    PostgresBuiltin("cume_dist", "VARIADIC \"any\"", "double precision", CalledOnNull, Immutable, HypotheticalSet(1), Internal),
     PostgresBuiltin("cume_dist_final", "internal, VARIADIC \"any\"", "double precision", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("current_database", "", "name", Strict, Stable, Normal, Internal),
     PostgresBuiltin("current_query", "", "text", CalledOnNull, Volatile, Normal, Internal),
@@ -682,7 +691,7 @@ pub(super) static POSTGRES_18_FUNCTIONS: &[PostgresBuiltin] = &[
     PostgresBuiltin("decode", "text, text", "bytea", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("degrees", "double precision", "double precision", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("dense_rank", "", "bigint", CalledOnNull, Immutable, Window, Internal),
-    PostgresBuiltin("dense_rank", "VARIADIC \"any\"", "bigint", CalledOnNull, Immutable, Aggregate, Internal),
+    PostgresBuiltin("dense_rank", "VARIADIC \"any\"", "bigint", CalledOnNull, Immutable, HypotheticalSet(1), Internal),
     PostgresBuiltin("dense_rank_final", "internal, VARIADIC \"any\"", "bigint", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("dexp", "double precision", "double precision", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("diagonal", "box", "lseg", Strict, Immutable, Normal, Internal),
@@ -1812,7 +1821,7 @@ pub(super) static POSTGRES_18_FUNCTIONS: &[PostgresBuiltin] = &[
     PostgresBuiltin("mod", "integer, integer", "integer", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("mod", "bigint, bigint", "bigint", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("mod", "numeric, numeric", "numeric", Strict, Immutable, Normal, Internal),
-    PostgresBuiltin("mode", "anyelement", "anyelement", CalledOnNull, Immutable, Aggregate, Internal),
+    PostgresBuiltin("mode", "anyelement", "anyelement", CalledOnNull, Immutable, OrderedSet(0), Internal),
     PostgresBuiltin("mode_final", "internal, anyelement", "anyelement", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("money", "integer", "money", Strict, Stable, Normal, Internal),
     PostgresBuiltin("money", "bigint", "money", Strict, Stable, Normal, Internal),
@@ -2074,18 +2083,18 @@ pub(super) static POSTGRES_18_FUNCTIONS: &[PostgresBuiltin] = &[
     PostgresBuiltin("path_sub_pt", "path, point", "path", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("pclose", "path", "path", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("percent_rank", "", "double precision", CalledOnNull, Immutable, Window, Internal),
-    PostgresBuiltin("percent_rank", "VARIADIC \"any\"", "double precision", CalledOnNull, Immutable, Aggregate, Internal),
+    PostgresBuiltin("percent_rank", "VARIADIC \"any\"", "double precision", CalledOnNull, Immutable, HypotheticalSet(1), Internal),
     PostgresBuiltin("percent_rank_final", "internal, VARIADIC \"any\"", "double precision", CalledOnNull, Immutable, Normal, Internal),
-    PostgresBuiltin("percentile_cont", "double precision, double precision", "double precision", CalledOnNull, Immutable, Aggregate, Internal),
-    PostgresBuiltin("percentile_cont", "double precision, interval", "interval", CalledOnNull, Immutable, Aggregate, Internal),
-    PostgresBuiltin("percentile_cont", "double precision[], double precision", "double precision[]", CalledOnNull, Immutable, Aggregate, Internal),
-    PostgresBuiltin("percentile_cont", "double precision[], interval", "interval[]", CalledOnNull, Immutable, Aggregate, Internal),
+    PostgresBuiltin("percentile_cont", "double precision, double precision", "double precision", CalledOnNull, Immutable, OrderedSet(1), Internal),
+    PostgresBuiltin("percentile_cont", "double precision, interval", "interval", CalledOnNull, Immutable, OrderedSet(1), Internal),
+    PostgresBuiltin("percentile_cont", "double precision[], double precision", "double precision[]", CalledOnNull, Immutable, OrderedSet(1), Internal),
+    PostgresBuiltin("percentile_cont", "double precision[], interval", "interval[]", CalledOnNull, Immutable, OrderedSet(1), Internal),
     PostgresBuiltin("percentile_cont_float8_final", "internal, double precision", "double precision", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("percentile_cont_float8_multi_final", "internal, double precision[]", "double precision[]", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("percentile_cont_interval_final", "internal, double precision", "interval", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("percentile_cont_interval_multi_final", "internal, double precision[]", "interval[]", CalledOnNull, Immutable, Normal, Internal),
-    PostgresBuiltin("percentile_disc", "double precision, anyelement", "anyelement", CalledOnNull, Immutable, Aggregate, Internal),
-    PostgresBuiltin("percentile_disc", "double precision[], anyelement", "anyarray", CalledOnNull, Immutable, Aggregate, Internal),
+    PostgresBuiltin("percentile_disc", "double precision, anyelement", "anyelement", CalledOnNull, Immutable, OrderedSet(1), Internal),
+    PostgresBuiltin("percentile_disc", "double precision[], anyelement", "anyarray", CalledOnNull, Immutable, OrderedSet(1), Internal),
     PostgresBuiltin("percentile_disc_final", "internal, double precision, anyelement", "anyelement", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("percentile_disc_multi_final", "internal, double precision[], anyelement", "anyarray", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("pg_advisory_lock", "bigint", "void", Strict, Volatile, Normal, Internal),
@@ -2675,7 +2684,7 @@ pub(super) static POSTGRES_18_FUNCTIONS: &[PostgresBuiltin] = &[
     PostgresBuiltin("range_union", "anyrange, anyrange", "anyrange", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("rangesel", "internal, oid, internal, integer", "double precision", Strict, Stable, Normal, Internal),
     PostgresBuiltin("rank", "", "bigint", CalledOnNull, Immutable, Window, Internal),
-    PostgresBuiltin("rank", "VARIADIC \"any\"", "bigint", CalledOnNull, Immutable, Aggregate, Internal),
+    PostgresBuiltin("rank", "VARIADIC \"any\"", "bigint", CalledOnNull, Immutable, HypotheticalSet(1), Internal),
     PostgresBuiltin("rank_final", "internal, VARIADIC \"any\"", "bigint", CalledOnNull, Immutable, Normal, Internal),
     PostgresBuiltin("raw_array_subscript_handler", "internal", "internal", Strict, Immutable, Normal, Internal),
     PostgresBuiltin("record_eq", "record, record", "boolean", Strict, Immutable, Normal, Internal),
