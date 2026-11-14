@@ -28,7 +28,7 @@ use crate::{
             written_argument_names, written_names,
         },
         coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
-        object_name::PG_CATALOG,
+        object_name::{PG_CATALOG, reaches_unheld_schema},
         operator_typing::resolve_operator,
         postgres_types::PgType,
         type_modifier,
@@ -743,24 +743,45 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let call = core::ptr::from_ref(function).addr();
         if let Some(target) = self.pins.and_then(|pins| pins.cast(call)) {
             let resolution = CallResolution::Cast(target.clone());
-            let refused = clauses.plain_rule().map(CallRefusal::Misapplied);
+            let refused = clauses
+                .plain_rule()
+                .filter(|_| !self.call_reaches_unheld_schema(&name, Some(call)))
+                .map(CallRefusal::Misapplied);
             return Ok(Some(CallApplication { name, arguments, resolution, refused }));
         }
-        let qualified;
-        let lookup = match self.pins.and_then(|pins| pins.call_schema(call)) {
-            Some((schema, quoted)) if name.schema().is_none() => {
-                qualified =
-                    TargetName::new(name.name(), name.name_is_quoted()).with_schema(schema, quoted);
-                &qualified
-            }
-            _ => &name,
-        };
-        let mut reached = reached_by_name(self.database, lookup, &written, self.case);
+        let qualified = self.pinned_call_name(&name, Some(call));
+        let mut reached = reached_by_name(
+            self.database,
+            qualified.as_ref().unwrap_or(&name),
+            &written,
+            self.case,
+        );
         if let Some(pins) = self.pins {
             reached.retain(|(function, _)| pins.admits_call(call, function));
         }
         let castable = matches!(written.as_slice(), [None]);
         self.applied_call(name, arguments, &reached, castable, Some(call), Some(clauses)).map(Some)
+    }
+
+    /// The name the call of `name` whose node sits at `call` looks up when
+    /// the pins qualify it, written without a schema, with the schema of
+    /// the function a deparse wrote.
+    fn pinned_call_name<'n>(
+        &'n self,
+        name: &'n TargetName<'_>,
+        call: Option<usize>,
+    ) -> Option<TargetName<'n>> {
+        let (schema, quoted) = self.pins?.call_schema(call?)?;
+        name.schema().is_none().then(|| {
+            TargetName::new(name.name(), name.name_is_quoted()).with_schema(schema, quoted)
+        })
+    }
+
+    /// Whether the call of `name` whose node sits at `call` may land in a
+    /// schema the database does not hold, which may supply the function.
+    fn call_reaches_unheld_schema(&self, name: &TargetName<'_>, call: Option<usize>) -> bool {
+        let qualified = self.pinned_call_name(name, call);
+        reaches_unheld_schema(self.database, qualified.as_ref().unwrap_or(name), self.case)
     }
 
     /// Returns the function PostgreSQL calls for `factor`, a `FROM` item
@@ -827,7 +848,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// the call passes one argument under no name, the cast it may read as,
     /// the arguments of the call whose node sits at `call` typed as the pins
     /// have them, refused for the `clauses` it writes as PostgreSQL refuses
-    /// them, which a call PostgreSQL's grammar inserts has none of.
+    /// them, which a call PostgreSQL's grammar inserts has none of. A call
+    /// whose lookup may land in a schema the database does not hold is never
+    /// refused for what the function it reaches decides.
     fn applied_call<'node>(
         &self,
         name: TargetName<'node>,
@@ -878,6 +901,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             }
             CallResolution::Undetermined => None,
         };
+        let refused = refused.filter(|_| !self.call_reaches_unheld_schema(&name, call));
         Ok(CallApplication { name, arguments, resolution, refused })
     }
 
@@ -968,9 +992,11 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             OperatorResolution::UnboundPolymorphic(_) => Some(Unresolved::PolymorphicUnknown),
             OperatorResolution::Selected(_) | OperatorResolution::Undetermined => None,
         };
-        let refused = reason.map(|reason| {
-            (reason, left_type.into_iter().chain([right_type]).map(weighed_name).collect())
-        });
+        let refused = reason
+            .filter(|_| !reaches_unheld_schema(self.database, lookup, self.case))
+            .map(|reason| {
+                (reason, left_type.into_iter().chain([right_type]).map(weighed_name).collect())
+            });
         Ok(OperatorApplication { name, left, right, resolution, refused })
     }
 

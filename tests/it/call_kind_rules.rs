@@ -182,6 +182,32 @@ fn within_group_refuses_distinct_before_binding_arguments() {
     }
 }
 
+/// A schema on the search path the model does not hold may supply an
+/// aggregate or a window function by the name a call writes, so only the
+/// clauses no function combines are refused, when written and when a type
+/// change parses the call again.
+#[test]
+fn a_call_reaching_an_unheld_schema_is_refused_only_for_clauses_no_function_takes() {
+    let path = "SET search_path = \"$user\", public, extensions;";
+    for expression in ["lower(DISTINCT b)", "lower(b) OVER ()", "text(a ORDER BY a)"] {
+        let sql = format!("{path} {}", view(expression));
+        let result = parse(&sql);
+        assert!(result.is_ok(), "{sql}\ngot {result:?}");
+    }
+    let retyped = format!(
+        "{path} CREATE TABLE t (a int4, CONSTRAINT ck CHECK (text(a ORDER BY a) <> ''));
+         ALTER TABLE t ALTER COLUMN a TYPE int8;"
+    );
+    let result = parse(&retyped);
+    assert!(result.is_ok(), "{retyped}\ngot {result:?}");
+    match parse(&format!("{path} {}", view("sum(DISTINCT a) WITHIN GROUP (ORDER BY a)"))) {
+        Err(error @ Error::MisappliedCall { .. }) => {
+            assert_eq!(error.to_string(), "cannot use DISTINCT with WITHIN GROUP");
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
 /// A function in `FROM` writes no clause, so a window function, an
 /// ordered-set aggregate and a parameterless aggregate called there are
 /// refused as without one.
