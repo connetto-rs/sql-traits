@@ -657,6 +657,15 @@ pub(super) fn exclusions(node: &CreateTable) -> impl Iterator<Item = &ExcludeCon
     })
 }
 
+/// The slot of `node` holding the check `check`, written on a column or on
+/// its own.
+pub(super) fn check_slot<'node>(
+    node: &'node CreateTable,
+    check: &CheckConstraint,
+) -> Option<Slot<'node>> {
+    slots(node).into_iter().find(|slot| check_of(*slot) == Some(check))
+}
+
 /// The check a slot holds, with the name written on its column option folded
 /// in.
 fn check_of(slot: Slot<'_>) -> Option<&CheckConstraint> {

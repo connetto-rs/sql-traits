@@ -59,9 +59,9 @@ use crate::{
     traits::ViewLike,
     utils::{
         identifier_resolution::identifiers_match,
+        last_str,
         object_name::{
-            RelationKey, qualifier_of, stored_function_key, stored_view_key, target_key,
-            target_name_from_object_name,
+            RelationKey, qualifier_of, stored_view_key, target_key, target_name_from_object_name,
         },
         output_from_wildcard,
         walk::{walk, walk_mut},
@@ -1480,9 +1480,11 @@ fn insert_target(statement: &Statement) -> Option<&ObjectName> {
 /// One object a dependency walk reaches.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Dependent {
-    /// A view, a materialized view or a function, under the key its readers
-    /// and callers name it by.
+    /// A view or a materialized view, under the key its readers name it by.
     Reader(ObjectKind, RelationKey),
+    /// A function whose bound body or signature reads a relation, which is
+    /// one overload alone.
+    Function(Arc<CreateFunction>),
     /// A rule, which nothing reads, by its name on the relation stored under
     /// the key.
     Rule(RelationKey, String),
@@ -1493,6 +1495,7 @@ impl Dependent {
     pub(super) const fn kind(&self) -> ObjectKind {
         match self {
             Self::Reader(kind, _) => *kind,
+            Self::Function(_) => ObjectKind::Function,
             Self::Rule(..) => ObjectKind::Rule,
         }
     }
@@ -1501,24 +1504,24 @@ impl Dependent {
     pub(super) fn name(&self) -> &str {
         match self {
             Self::Reader(_, key) => &key.name,
+            Self::Function(function) => last_str(&function.name),
             Self::Rule(_, name) => name,
         }
     }
 }
 
-/// Every view, function and rule reading the relation `key` names, every
-/// reader among those, and every function whose bound body calls one of those
-/// functions, transitively.
+/// Every view, function and rule reading the relation `key` names, and every
+/// reader among those, transitively.
 ///
 /// PostgreSQL refuses to drop a relation while anything reads it, and takes
 /// the whole chain with it under `CASCADE`, so the walk closes over the chain
-/// rather than stopping at the first level.
+/// rather than stopping at the first level. What calls a function the walk
+/// reaches holds that function, and goes with it as its dependent.
 pub(super) fn dependent_views(builder: &ParserDBBuilder, key: &RelationKey) -> Vec<Dependent> {
     readers_closure(builder, alloc::vec![key.clone()], Vec::new(), Some(key))
 }
 
-/// `readers` with every view, function and rule reading one of them, and
-/// every function whose bound body calls one of those functions,
+/// `readers` with every view, function and rule reading one of them,
 /// transitively.
 ///
 /// This is what a `CASCADE` takes along with the readers themselves.
@@ -1531,7 +1534,7 @@ pub(super) fn readers_and_dependents(
         .filter_map(|reader| {
             match reader {
                 Dependent::Reader(_, key) => Some(key.clone()),
-                Dependent::Rule(..) => None,
+                Dependent::Function(_) | Dependent::Rule(..) => None,
             }
         })
         .collect();
@@ -1539,9 +1542,8 @@ pub(super) fn readers_and_dependents(
 }
 
 /// `found` with every view, function and rule reading a key of `frontier` or
-/// one of the readers that walk finds, and every function calling one of the
-/// functions among them, transitively. An object whose own relation is
-/// `dropped` goes with that relation rather than reading it.
+/// one of the readers that walk finds, transitively. An object whose own
+/// relation is `dropped` goes with that relation rather than reading it.
 fn readers_closure(
     builder: &ParserDBBuilder,
     mut frontier: Vec<RelationKey>,
@@ -1571,10 +1573,7 @@ fn readers_closure(
         }))
         .chain(builder.functions().iter().map(|(function, _)| {
             (
-                Dependent::Reader(
-                    ObjectKind::Function,
-                    stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
-                ),
+                Dependent::Function(Arc::clone(function)),
                 None,
                 // A signature naming a relation's row type depends on the
                 // relation as a body reading it does.
@@ -1603,45 +1602,12 @@ fn readers_closure(
                 continue;
             }
             if !found.contains(dependent) {
-                // Nothing reads a rule, so the walk goes no further from one.
+                // Nothing reads a function or a rule as a relation, so the
+                // walk goes no further from one.
                 if let Dependent::Reader(_, key) = dependent {
                     frontier.push(key.clone());
                 }
                 found.push(dependent.clone());
-            }
-        }
-    }
-
-    // PostgreSQL records each call a bound body makes as a dependency, so a
-    // function calling one the chain holds joins it, transitively.
-    let mut calls: Vec<(RelationKey, Vec<RelationKey>)> = builder
-        .functions()
-        .iter()
-        .map(|(function, metadata)| {
-            (
-                stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
-                metadata
-                    .body_calls()
-                    .functions()
-                    .map(|callee| stored_function_key(callee, IdentifierCase::AsWritten))
-                    .collect(),
-            )
-        })
-        .collect();
-    let mut next = 0;
-    while let Some(reached) = found.get(next) {
-        next += 1;
-        let Dependent::Reader(ObjectKind::Function, callee) = reached else {
-            continue;
-        };
-        let joining: Vec<RelationKey> = calls
-            .extract_if(.., |(_, callees)| callees.contains(callee))
-            .map(|(caller, _)| caller)
-            .collect();
-        for key in joining {
-            let joined = Dependent::Reader(ObjectKind::Function, key);
-            if !found.contains(&joined) {
-                found.push(joined);
             }
         }
     }
@@ -1677,7 +1643,7 @@ pub(super) fn refuse_dependent_views(
 ///
 /// Returns the identities the row types of the views the cascade takes are
 /// held under, each with its stored array, and the functions the cascade
-/// takes, read before the removal.
+/// takes, whose own dependents are left for the caller to take.
 pub(super) fn remove_dependent_views(
     builder: &mut ParserDBBuilder,
     key: &RelationKey,
@@ -1692,8 +1658,8 @@ pub(super) fn remove_dependent_views(
 /// owned.
 ///
 /// Returns the identities the row types of the removed views hold, each with
-/// its stored array, and the functions the removal takes, read before the
-/// removal.
+/// its stored array, and the functions the removal takes, whose own
+/// dependents are left for the caller to take.
 pub(super) fn remove_readers(
     builder: &mut ParserDBBuilder,
     doomed: &[Dependent],
@@ -1736,17 +1702,14 @@ pub(super) fn remove_readers(
     for view in &granted {
         types.extend(rowtype_identities(arrays, &view.type_name()));
     }
-    let functions: Vec<Arc<CreateFunction>> = builder
-        .functions()
+    let functions: Vec<Arc<CreateFunction>> = doomed
         .iter()
-        .filter(|(function, _)| {
-            is_doomed(
-                ObjectKind::Function,
-                stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
-            )
+        .filter_map(|dependent| {
+            match dependent {
+                Dependent::Function(function) => Some(Arc::clone(function)),
+                Dependent::Reader(..) | Dependent::Rule(..) => None,
+            }
         })
-        .map(|(function, _)| function)
-        .cloned()
         .collect();
     builder.views_mut().retain(|(view, _, _)| {
         !is_doomed(ObjectKind::View, stored_view_key(view.as_ref(), IdentifierCase::AsWritten))
@@ -1761,12 +1724,9 @@ pub(super) fn remove_readers(
         view.forget_grants(builder);
         Arc::make_mut(arrays).remove(&view.type_name());
     }
-    builder.functions_mut().retain(|(function, _)| {
-        !is_doomed(
-            ObjectKind::Function,
-            stored_function_key(function.as_ref(), IdentifierCase::AsWritten),
-        )
-    });
+    builder
+        .functions_mut()
+        .retain(|(function, _)| !functions.iter().any(|doomed| Arc::ptr_eq(doomed, function)));
     builder.rules_mut().retain(|(rule, _)| !doomed.contains(&rules::dependent(rule)));
     for host in &hosts {
         rules::drop_rules_on(builder, host);

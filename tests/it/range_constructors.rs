@@ -171,14 +171,18 @@ fn calls_reach_the_constructors() {
     });
     assert_eq!(called, expected);
 
+    let checked = "CREATE TYPE span AS RANGE (subtype = int4);
+         CREATE TABLE t (x int4 CHECK (span(x, x + 1) IS NOT NULL));";
     assert!(matches!(
-        parse(
-            "CREATE TYPE span AS RANGE (subtype = int4);
-             CREATE TABLE t (x int4 CHECK (span(x, x + 1) IS NOT NULL));
-             DROP TYPE span CASCADE;",
-        ),
+        parse(&format!("{checked} DROP TYPE span;")),
         Err(Error::FunctionReferenced { function_name, .. }) if function_name == "span"
     ));
+    parse(&format!(
+        "{checked} DROP TYPE span CASCADE;
+         ALTER TABLE t ADD CONSTRAINT t_x_check CHECK (x > 0);
+         CREATE TYPE span AS RANGE (subtype = int4);"
+    ))
+    .expect("the cascade takes the constructors and the check calling one");
 }
 
 #[test]

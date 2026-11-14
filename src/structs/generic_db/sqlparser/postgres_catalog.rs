@@ -454,18 +454,6 @@ impl PostgresCatalog {
         }
     }
 
-    /// Removes operators and casts running the dropped function's exact
-    /// signature.
-    pub(super) fn drop_facts_declaring_function(
-        &mut self,
-        type_arrays: &TypeArrays,
-        name: &ObjectName,
-        args: Option<&[OperateFunctionArg]>,
-        case: IdentifierCase,
-    ) {
-        self.drop_facts_running(type_arrays, case, &core::iter::once((name, args)));
-    }
-
     /// Removes operators and casts running any of `functions`, leaving the
     /// borrowed lists alone when none does.
     pub(super) fn drop_facts_declaring_functions(
@@ -474,27 +462,14 @@ impl PostgresCatalog {
         functions: &[Arc<CreateFunction>],
         case: IdentifierCase,
     ) {
-        let signatures =
-            functions.iter().map(|function| (&function.name, function.args.as_deref()));
-        self.drop_facts_running(type_arrays, case, &signatures);
-    }
-
-    /// Removes operators and casts running any of `signatures`.
-    fn drop_facts_running<'f>(
-        &mut self,
-        type_arrays: &TypeArrays,
-        case: IdentifierCase,
-        signatures: &(impl Iterator<Item = (&'f ObjectName, Option<&'f [OperateFunctionArg]>)> + Clone),
-    ) {
+        let declares = |declared: &dyn Fn(&ObjectName, Option<&[OperateFunctionArg]>) -> bool| {
+            functions.iter().any(|function| declared(&function.name, function.args.as_deref()))
+        };
         self.remove_operators(|_, operator| {
-            signatures
-                .clone()
-                .any(|(name, args)| operator.declares_function(type_arrays, name, args, case))
+            declares(&|name, args| operator.declares_function(type_arrays, name, args, case))
         });
         let cast_runs = |cast: &PostgresCatalogCast| {
-            signatures
-                .clone()
-                .any(|(name, args)| cast.declares_function(type_arrays, name, args, case))
+            declares(&|name, args| cast.declares_function(type_arrays, name, args, case))
         };
         if self.casts.iter().any(cast_runs) {
             self.casts.to_mut().retain(|cast| !cast_runs(cast));

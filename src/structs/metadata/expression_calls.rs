@@ -156,6 +156,13 @@ impl<F> ExpressionCalls<F> {
         self.calls.iter().any(|call| !call.settled)
     }
 
+    /// Forgets the calls at the positions `calls`, counted in the order a
+    /// pre-order walk meets them, which a part removed from the node held.
+    pub(crate) fn remove_calls(&mut self, calls: core::ops::Range<usize>) {
+        self.calls.drain(calls);
+        self.collect_functions();
+    }
+
     /// Settles every call of `node`, the node this record was built from,
     /// that waits for its argument types, each looked up by its called name:
     /// one `selected` answers a function for keeps that function alone, one
