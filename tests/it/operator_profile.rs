@@ -294,8 +294,21 @@ impl<P: EmptyKinds> ColumnLike for NoneKind<P> {
         self.unreach()
     }
 
-    fn default_value(&self) -> Option<String> {
+    fn default_expression(&self) -> Option<&Expr> {
         self.unreach()
+    }
+
+    fn generation_expression(&self) -> Option<&Expr> {
+        self.unreach()
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        _call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)> {

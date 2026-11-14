@@ -784,8 +784,21 @@ impl ColumnLike for MemoryColumn {
         Ok(None)
     }
 
-    fn default_value(&self) -> Option<String> {
+    fn default_expression(&self) -> Option<&Expr> {
         None
+    }
+
+    fn generation_expression(&self) -> Option<&Expr> {
+        None
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        // The column holds no expression, so no call is one of its nodes.
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
     }
 
     fn foreign_options(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, str>, &str)> {
@@ -1310,6 +1323,23 @@ impl DomainLike for MemoryDomain {
 
     fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db MemoryDataType {
         &self.data_type
+    }
+
+    fn default_expression(&self) -> Option<&Expr> {
+        None
+    }
+
+    fn check_expressions(&self) -> impl Iterator<Item = &Expr> {
+        core::iter::empty()
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        // The domain holds no expression, so no call is one of its nodes.
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
     }
 }
 

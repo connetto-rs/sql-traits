@@ -30,7 +30,7 @@ fn column(database: &ParserDB, table: &str, column: &str) -> String {
         "{} {} {}",
         column.data_type(database),
         if nullable { "null" } else { "not null" },
-        column.default_value().unwrap_or_else(|| "no default".to_string())
+        column.default_expression().map_or_else(|| "no default".to_string(), ToString::to_string)
     )
 }
 
@@ -144,7 +144,10 @@ fn a_column_added_to_a_parent_in_a_schema_draws_from_the_sequence_there() {
         .expect("unambiguous lookup")
         .expect("app.c exists");
     let id = child.column("id", &db, IdentifierCase::AsWritten).expect("lookup").expect("id");
-    assert_eq!(id.default_value().as_deref(), Some("nextval('app.t_id_seq'::REGCLASS)"));
+    assert_eq!(
+        id.default_expression().map(ToString::to_string).as_deref(),
+        Some("nextval('app.t_id_seq'::REGCLASS)")
+    );
 }
 
 #[test]
@@ -226,7 +229,10 @@ fn a_serial_column_in_a_schema_draws_from_the_sequence_there() {
         .column("id", &db, IdentifierCase::AsWritten)
         .expect("lookup succeeds")
         .expect("column exists");
-    assert_eq!(id.default_value().as_deref(), Some("nextval('app.t_id_seq'::REGCLASS)"));
+    assert_eq!(
+        id.default_expression().map(ToString::to_string).as_deref(),
+        Some("nextval('app.t_id_seq'::REGCLASS)")
+    );
     assert!(id.is_serial(&db));
 }
 

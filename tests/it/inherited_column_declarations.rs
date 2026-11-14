@@ -97,8 +97,10 @@ fn a_redeclared_column_keeps_its_own_where_only_one_may_be_stated() {
 
     assert_eq!(checks(&database, "par"), 1);
     assert_eq!(checks(&database, "chi"), 2);
-    assert_eq!(column(&database, "par", "v").default_value().as_deref(), Some("1"));
-    assert_eq!(column(&database, "chi", "v").default_value().as_deref(), Some("9"));
+    let default =
+        |table| column(&database, table, "v").default_expression().map(ToString::to_string);
+    assert_eq!(default("par").as_deref(), Some("1"));
+    assert_eq!(default("chi").as_deref(), Some("9"));
 }
 
 #[test]
@@ -277,6 +279,7 @@ fn the_requirement_and_a_default_still_reach_every_descendant() {
          ALTER TABLE par ALTER COLUMN v SET DEFAULT 5;",
     );
     for table in ["par", "chi", "gch"] {
-        assert_eq!(column(&defaulted, table, "v").default_value().as_deref(), Some("5"), "{table}");
+        let default = column(&defaulted, table, "v").default_expression().map(ToString::to_string);
+        assert_eq!(default.as_deref(), Some("5"), "{table}");
     }
 }

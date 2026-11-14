@@ -1,5 +1,5 @@
-//! Tests that each call in a policy or check expression answers the
-//! functions it may reach, wherever it is nested.
+//! Tests that each call in a policy, check, column or domain expression
+//! answers the functions it may reach, wherever it is nested.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 #![expect(
     clippy::disallowed_methods,
@@ -370,4 +370,171 @@ fn an_expression_form_reaches_no_function() {
             ("current_user".to_owned(), vec!["current_user".to_owned()]),
         ]
     );
+}
+
+/// The default and the generation expression of a column answer per call
+/// under the path in force when the table was written, whatever path the
+/// script ends on, and a call from a copy is refused.
+#[test]
+fn column_expression_calls_resolve_under_the_statement_search_path() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x';
+         CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x';
+         CREATE FUNCTION app.d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         SET search_path TO app;
+         CREATE TABLE public.t (
+             x INT DEFAULT d(),
+             y INT GENERATED ALWAYS AS (f(x) + 1) STORED,
+             z INT
+         );
+         SET search_path TO public;",
+    );
+    let table = db.tables().next().expect("table exists");
+    let column = |name: &str| {
+        table.column(name, &db, IdentifierCase::AsWritten).expect("table is held").expect(name)
+    };
+    let (x, y, z) = (column("x"), column("y"), column("z"));
+    let default = x.default_expression().expect("x has a default");
+    let generation = y.generation_expression().expect("y is generated");
+    assert_eq!(default.to_string(), "d()");
+    assert_eq!(generation.to_string(), "f(x) + 1");
+    assert!(x.generation_expression().is_none());
+    assert!(y.default_expression().is_none());
+    assert!(z.default_expression().is_none() && z.generation_expression().is_none());
+    assert_eq!(
+        names_per_call(default, |call| x.functions_reached_by(call, &db).map(names)),
+        [("d".to_owned(), vec!["app.d".to_owned()])]
+    );
+    assert_eq!(
+        names_per_call(generation, |call| y.functions_reached_by(call, &db).map(names)),
+        [("f".to_owned(), vec!["app.f".to_owned()])]
+    );
+    let refusals =
+        refusals_per_call(generation, |call| x.functions_reached_by(call, &db).map(names));
+    assert_eq!(refusals, [("f".to_owned(), vec!["f(x)".to_owned()])]);
+    let copy = generation.clone();
+    let refusals = refusals_per_call(&copy, |call| y.functions_reached_by(call, &db).map(names));
+    assert_eq!(refusals, [("f".to_owned(), vec!["f(x)".to_owned()])]);
+}
+
+/// A default set later reaches the function the path in force at the
+/// `ALTER TABLE` selects.
+#[test]
+fn an_altered_column_default_answers_its_own_calls() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x';
+         CREATE TABLE t (x INT, y INT GENERATED ALWAYS AS (f(x)) STORED);
+         SET search_path TO app;
+         ALTER TABLE public.t ALTER COLUMN x SET DEFAULT d();
+         SET search_path TO public;",
+    );
+    let table = db.tables().next().expect("table exists");
+    let column = |name: &str| {
+        table.column(name, &db, IdentifierCase::AsWritten).expect("table is held").expect(name)
+    };
+    let (x, y) = (column("x"), column("y"));
+    let default = x.default_expression().expect("x has a default");
+    assert_eq!(
+        names_per_call(default, |call| x.functions_reached_by(call, &db).map(names)),
+        [("d".to_owned(), vec!["app.d".to_owned()])]
+    );
+    let generation = y.generation_expression().expect("y is generated");
+    assert_eq!(
+        names_per_call(generation, |call| y.functions_reached_by(call, &db).map(names)),
+        [("f".to_owned(), vec!["f".to_owned()])]
+    );
+}
+
+/// The default and every check of a domain answer per call under the path
+/// in force when the domain was created, each check counting its own calls
+/// whatever the default and the earlier checks call.
+#[test]
+fn domain_expression_calls_resolve_under_the_statement_search_path() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.ok(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE FUNCTION ok(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE FUNCTION app.d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         SET search_path TO app;
+         CREATE DOMAIN public.checked AS INT DEFAULT d()
+             CHECK (ok(VALUE)) CHECK (VALUE > 0 AND abs(VALUE) < 9 AND ok(VALUE));
+         SET search_path TO public;",
+    );
+    let domain = db.domains().next().expect("domain exists");
+    let default = domain.default_expression().expect("the domain has a default");
+    assert_eq!(
+        names_per_call(default, |call| domain.functions_reached_by(call, &db).map(names)),
+        [("d".to_owned(), vec!["app.d".to_owned()])]
+    );
+    let checks: Vec<_> = domain
+        .check_expressions()
+        .map(|check| {
+            (
+                check.to_string(),
+                names_per_call(check, |call| domain.functions_reached_by(call, &db).map(names)),
+            )
+        })
+        .collect();
+    let ok = || ("ok".to_owned(), vec!["app.ok".to_owned()]);
+    let abs = vec!["pg_catalog.abs".to_owned(); 6];
+    assert_eq!(
+        checks,
+        [
+            ("ok(VALUE)".to_owned(), vec![ok()]),
+            (
+                "VALUE > 0 AND abs(VALUE) < 9 AND ok(VALUE)".to_owned(),
+                vec![("abs".to_owned(), abs), ok()]
+            ),
+        ]
+    );
+    let copy = default.clone();
+    let refusals =
+        refusals_per_call(&copy, |call| domain.functions_reached_by(call, &db).map(names));
+    assert_eq!(refusals, [("d".to_owned(), vec!["d()".to_owned()])]);
+}
+
+/// A check `DROP FUNCTION … CASCADE` removes from a domain takes its calls
+/// along, so the checks left keep answering for their own.
+#[test]
+fn domain_checks_left_by_a_cascade_answer_their_calls() {
+    let db = parse(
+        "CREATE FUNCTION gone(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE FUNCTION ok(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE DOMAIN checked AS INT CHECK (gone(VALUE)) CHECK (ok(VALUE));
+         DROP FUNCTION gone(INT) CASCADE;",
+    );
+    let domain = db.domains().next().expect("domain exists");
+    let checks: Vec<_> = domain
+        .check_expressions()
+        .map(|check| {
+            names_per_call(check, |call| domain.functions_reached_by(call, &db).map(names))
+        })
+        .collect();
+    assert_eq!(checks, [[("ok".to_owned(), vec!["ok".to_owned()])]]);
+}
+
+/// A domain asked about its calls in a database that does not hold it is
+/// refused as absent.
+#[test]
+fn a_domain_from_another_database_is_refused() {
+    let schema = "CREATE FUNCTION ok(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+                  CREATE DOMAIN checked AS INT CHECK (ok(VALUE));";
+    let held = parse(schema);
+    let other = parse("CREATE TABLE t (x INT);");
+    let domain = held.domains().next().expect("domain exists");
+    let check = domain.check_expressions().next().expect("the domain has a check");
+    let refusals = reached_per_call(check, |call| {
+        match domain.functions_reached_by(call, &other) {
+            Err(LookupError::ObjectNotInDatabase { object, .. }) => vec![object],
+            Err(error) => panic!("unexpected error {error}"),
+            Ok(_) => panic!("a domain the database lacks was answered"),
+        }
+    });
+    assert_eq!(refusals, [("ok".to_owned(), vec!["`checked`".to_owned()])]);
 }

@@ -1,12 +1,11 @@
 //! Submodule implementing the [`ColumnLike`] trait for `sqlparser`'s
 //! [`ColumnDef`] struct.
 
-use alloc::{
-    borrow::Cow,
-    string::{String, ToString},
-};
+use alloc::{borrow::Cow, string::ToString};
 
-use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, ObjectNamePart};
+use sqlparser::ast::{
+    ColumnDef, ColumnOption, CreateTable, DataType, Expr, Function, ObjectNamePart,
+};
 
 use crate::{
     errors::{LookupError, ObjectKind},
@@ -82,6 +81,19 @@ impl Metadata for TableAttribute<CreateTable, ColumnDef> {
     type Meta = ColumnMetadata;
 }
 
+/// Resolves the metadata `database` holds for `column`.
+fn held_column_metadata<'db>(
+    column: &TableAttribute<CreateTable, ColumnDef>,
+    database: &'db ParserDB,
+) -> Result<&'db ColumnMetadata, LookupError> {
+    database.column_metadata(column).ok_or_else(|| {
+        let mut name = column.table().name.to_string();
+        name.push('.');
+        name.push_str(column.column_name());
+        ObjectKind::Column.not_in_database(&name)
+    })
+}
+
 impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     type DB = ParserDB;
 
@@ -127,12 +139,7 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
         &'db self,
         database: &'db Self::DB,
     ) -> Result<ColumnCollation<'db>, LookupError> {
-        let metadata = database.column_metadata(self).ok_or_else(|| {
-            let mut name = self.table().name.to_string();
-            name.push('.');
-            name.push_str(self.column_name());
-            ObjectKind::Column.not_in_database(&name)
-        })?;
+        let metadata = held_column_metadata(self, database)?;
         let mut unknown = false;
         for option in &self.attribute().options {
             match &option.option {
@@ -210,14 +217,37 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     }
 
     #[inline]
-    fn default_value(&self) -> Option<String> {
-        self.attribute().options.iter().find_map(|opt| {
-            if let sqlparser::ast::ColumnOption::Default(expr) = &opt.option {
-                Some(expr.to_string())
-            } else {
-                None
+    fn default_expression(&self) -> Option<&Expr> {
+        self.attribute().options.iter().find_map(|option| {
+            match &option.option {
+                ColumnOption::Default(expression) => Some(expression),
+                _ => None,
             }
         })
+    }
+
+    #[inline]
+    fn generation_expression(&self) -> Option<&Expr> {
+        self.attribute().options.iter().find_map(|option| {
+            match &option.option {
+                ColumnOption::Generated { generation_expr, .. } => generation_expr.as_ref(),
+                _ => None,
+            }
+        })
+    }
+
+    /// The calls of the whole declaration are bound in one record, so a
+    /// call is counted from the start of the column's node.
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        held_column_metadata(self, database)?
+            .calls()
+            .reached_by(self.attribute(), call)
+            .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })
     }
 
     #[inline]

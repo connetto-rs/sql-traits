@@ -1134,7 +1134,8 @@ fn a_foreign_table_is_created_as_a_partition() {
         .columns(&db)
         .expect("held")
         .map(|column| {
-            (column.column_name(), column.is_nullable(&db).expect("held"), column.default_value())
+            let default = column.default_expression().map(ToString::to_string);
+            (column.column_name(), column.is_nullable(&db).expect("held"), default)
         })
         .collect();
     assert_eq!(columns, [("id", false, None), ("note", true, Some("'x'".to_owned()))]);

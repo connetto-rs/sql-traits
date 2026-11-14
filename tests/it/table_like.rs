@@ -65,7 +65,9 @@ fn defaults(database: &ParserDB, table_name: &str) -> Vec<(String, Option<String
         .expect("table exists")
         .columns(database)
         .expect("table is in this database")
-        .map(|column| (column.column_name().to_owned(), column.default_value()))
+        .map(|column| {
+            (column.column_name().to_owned(), column.default_expression().map(ToString::to_string))
+        })
         .collect()
 }
 

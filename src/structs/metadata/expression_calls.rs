@@ -504,17 +504,17 @@ impl<F> ExpressionCalls<F> {
     }
 
     /// Returns the functions `call` reaches, or `None` when `call` is not a
-    /// node of `expression`, the expression this record was built from.
+    /// node of `node`, the node this record was built from.
     ///
-    /// `call` is matched by address, so it has to be borrowed from
-    /// `expression` itself rather than from a copy.
-    pub fn reached_by<'s>(
+    /// `call` is matched by address, so it has to be borrowed from `node`
+    /// itself rather than from a copy.
+    pub fn reached_by<'s, N: Visit + ?Sized>(
         &'s self,
-        expression: &Expr,
+        node: &N,
         call: &Function,
-    ) -> Option<impl Iterator<Item = &'s F> + use<'s, F>> {
+    ) -> Option<impl Iterator<Item = &'s F> + use<'s, F, N>> {
         let mut position = 0;
-        let found = for_each_site(expression, |site| {
+        let found = for_each_site(node, |site| {
             match site {
                 Site::Call(Call { node: Some(node), .. }) if core::ptr::eq(node, call) => {
                     ControlFlow::Break(Some(position))
