@@ -1,5 +1,5 @@
-//! The function PostgreSQL selects for a call and the type each argument
-//! takes.
+//! The function PostgreSQL selects for a call, or the cast it reads the call
+//! as, and the type each argument takes.
 
 use alloc::vec::Vec;
 
@@ -13,6 +13,11 @@ use crate::{
 pub enum CallResolution<'db, DB: DatabaseLike> {
     /// PostgreSQL runs this function.
     Selected(SelectedFunction<'db, DB>),
+    /// PostgreSQL reads the call as a cast of its one argument to this type,
+    /// which the function name names, since no function takes the argument
+    /// type exactly and the argument is an untyped literal or converts to
+    /// the type in binary or through text.
+    Cast(TargetName<'db>),
     /// No function of the name takes the argument types.
     NotFound,
     /// These functions take the argument types and nothing tells them apart.
