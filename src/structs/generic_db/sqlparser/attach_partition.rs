@@ -86,6 +86,7 @@ pub(super) fn attach_partition(
     let Some(root) = ParserDB::alter_table_target(&builder, root_name, scope)? else {
         return Ok(builder);
     };
+    super::stored_subqueries::refuse_in_bound(&builder, for_values)?;
     let root_node = ParserDB::stored_node(&builder, &root)?;
     if root_node.partition_by.is_none() {
         return Err(unsupported(ObjectKind::Table, root_name));

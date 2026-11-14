@@ -111,6 +111,7 @@ pub(super) fn create_domain(
         Arc::make_mut(catalog).rename_type_identity(&previous, current);
     }
     bind_type(&builder, &mut domain.data_type, arrays)?;
+    super::stored_subqueries::refuse_in_domain(&builder, &domain)?;
     // PostgreSQL fixes the collation when the domain is created, so a later
     // search path never rebinds it.
     let collation = domain.collation.as_ref().and_then(|collation| {

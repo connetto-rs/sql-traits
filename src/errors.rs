@@ -143,6 +143,46 @@ impl core::fmt::Display for KeyConstraint {
     }
 }
 
+/// A place PostgreSQL stores an expression it evaluates without running a
+/// query, and so refuses a subquery in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpressionPlace {
+    /// A `CHECK` constraint of a table or a domain.
+    CheckConstraint,
+    /// The `DEFAULT` of a column or a domain.
+    Default,
+    /// The expression a generated column is computed from.
+    Generation,
+    /// An expression an index or an exclusion constraint is built over.
+    IndexExpression,
+    /// The `WHERE` predicate of a partial index or exclusion constraint.
+    IndexPredicate,
+    /// An expression a table is partitioned by.
+    PartitionKey,
+    /// A value bounding a partition.
+    PartitionBound,
+    /// The `USING` expression of `ALTER COLUMN ... TYPE`.
+    Transform,
+    /// The `WHEN` condition of a trigger.
+    TriggerWhen,
+}
+
+impl core::fmt::Display for ExpressionPlace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::CheckConstraint => "check constraint",
+            Self::Default => "DEFAULT expression",
+            Self::Generation => "column generation expression",
+            Self::IndexExpression => "index expression",
+            Self::IndexPredicate => "index predicate",
+            Self::PartitionKey => "partition key expression",
+            Self::PartitionBound => "partition bound",
+            Self::Transform => "transform expression",
+            Self::TriggerWhen => "trigger WHEN condition",
+        })
+    }
+}
+
 /// A change to a table that PostgreSQL refuses to keep from the tables below.
 ///
 /// `ONLY` asks for the named table alone, and PostgreSQL grants that only when
@@ -1938,6 +1978,13 @@ pub enum Error {
         index_name: String,
         /// Reason why the index is invalid.
         reason: String,
+    },
+    #[error("cannot use subquery in {place}")]
+    /// Error indicating that an expression PostgreSQL stores and evaluates
+    /// without running a query holds a subquery.
+    SubqueryInExpression {
+        /// Where the expression is stored.
+        place: ExpressionPlace,
     },
     #[error("Function `{function_name}` not found for trigger `{trigger_name}`.")]
     /// Error indicating that a trigger references a function that does not
