@@ -94,6 +94,7 @@ mod object_kind_reporting;
 mod open_world_access;
 mod operator_alteration;
 mod operator_creation;
+mod operator_dependents;
 mod operator_lifecycle;
 mod operator_linkage;
 mod operator_metadata;

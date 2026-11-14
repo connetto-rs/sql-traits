@@ -281,7 +281,7 @@ pub(super) fn drop_views(
     dependent_holding: &impl Fn(&ObjectName) -> Option<CatalogDependent>,
 ) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let expected_kind = if materialized { ObjectKind::MaterializedView } else { ObjectKind::View };
-    let mut drop = TypeDrop { types: Vec::new(), functions: Vec::new() };
+    let mut drop = TypeDrop::default();
     for name in names {
         if object_name_last_identifier(name).is_none() {
             return Err(Error::UnnamedObject { object_kind: expected_kind });
@@ -1732,5 +1732,5 @@ pub(super) fn remove_readers(
         rules::drop_rules_on(builder, host);
     }
     super::sequences::drop_orphaned_sequences(builder);
-    TypeDrop { types, functions }
+    TypeDrop { types, functions, operators: Vec::new() }
 }

@@ -255,6 +255,13 @@ impl PostgresCatalog {
         &self.operators
     }
 
+    /// Whether the catalog holds an operator a statement or the
+    /// configuration added, the only kind a stored expression records.
+    pub(super) fn holds_added_operators(&self) -> bool {
+        self.numbered_operators > 0
+            && self.operators.iter().any(|operator| matches!(operator.row, OperatorRow::Added(_)))
+    }
+
     /// Adds or replaces the cast between the same source and target types.
     #[must_use]
     pub fn with_cast(mut self, cast: PostgresCatalogCast) -> Self {
@@ -352,12 +359,14 @@ impl PostgresCatalog {
     }
 
     /// Drops the operators of `schema` and every operator or cast a dropped
-    /// object of the schema still runs, which PostgreSQL drops with it.
-    pub(crate) fn drop_schema(&mut self, schema: &str, quoted: bool) {
-        self.remove_operators(|_, operator| operator.touches_schema(schema, quoted));
+    /// object of the schema still runs, which PostgreSQL drops with it,
+    /// returning the rows of the operators a statement added among them.
+    pub(crate) fn drop_schema(&mut self, schema: &str, quoted: bool) -> Vec<OperatorRow> {
+        let removed = self.remove_operators(|_, operator| operator.touches_schema(schema, quoted));
         if self.casts.iter().any(|cast| cast.touches_schema(schema, quoted)) {
             self.casts.to_mut().retain(|cast| !cast.touches_schema(schema, quoted));
         }
+        removed
     }
 
     /// The operator or cast that names the type `name` writes, which a drop
@@ -376,14 +385,17 @@ impl PostgresCatalog {
     }
 
     /// Drops the operators and casts naming a type of `names`, which
-    /// PostgreSQL drops with the type under `CASCADE`.
-    pub(crate) fn drop_facts_naming_types(&mut self, names: &[ObjectName]) {
-        self.remove_operators(|_, operator| names.iter().any(|name| operator.uses_type(name)));
+    /// PostgreSQL drops with the type under `CASCADE`, returning the rows of
+    /// the operators a statement added among them.
+    pub(crate) fn drop_facts_naming_types(&mut self, names: &[ObjectName]) -> Vec<OperatorRow> {
+        let removed =
+            self.remove_operators(|_, operator| names.iter().any(|name| operator.uses_type(name)));
         let cast_naming =
             |cast: &PostgresCatalogCast| names.iter().any(|name| cast.uses_type(name));
         if self.casts.iter().any(cast_naming) {
             self.casts.to_mut().retain(|cast| !cast_naming(cast));
         }
+        removed
     }
 
     /// The operator or cast running this exact function signature, which a
@@ -455,17 +467,18 @@ impl PostgresCatalog {
     }
 
     /// Removes operators and casts running any of `functions`, leaving the
-    /// borrowed lists alone when none does.
+    /// borrowed lists alone when none does, and returns the rows of the
+    /// operators a statement added among them.
     pub(super) fn drop_facts_declaring_functions(
         &mut self,
         type_arrays: &TypeArrays,
         functions: &[Arc<CreateFunction>],
         case: IdentifierCase,
-    ) {
+    ) -> Vec<OperatorRow> {
         let declares = |declared: &dyn Fn(&ObjectName, Option<&[OperateFunctionArg]>) -> bool| {
             functions.iter().any(|function| declared(&function.name, function.args.as_deref()))
         };
-        self.remove_operators(|_, operator| {
+        let removed = self.remove_operators(|_, operator| {
             declares(&|name, args| operator.declares_function(type_arrays, name, args, case))
         });
         let cast_runs = |cast: &PostgresCatalogCast| {
@@ -474,18 +487,21 @@ impl PostgresCatalog {
         if self.casts.iter().any(cast_runs) {
             self.casts.to_mut().retain(|cast| !cast_runs(cast));
         }
+        removed
     }
 
     /// Removes the operators `doomed` holds for, given each one's position,
     /// clearing the commutator and negator links the others keep to them,
-    /// and leaves the borrowed list alone when it holds for none.
+    /// and leaves the borrowed list alone when it holds for none. Returns the
+    /// rows of the operators a statement added among the removed, which the
+    /// expressions applying them recorded.
     pub(super) fn remove_operators(
         &mut self,
         doomed: impl Fn(usize, &PostgresCatalogOperator) -> bool,
-    ) {
+    ) -> Vec<OperatorRow> {
         if !self.operators.iter().enumerate().any(|(position, operator)| doomed(position, operator))
         {
-            return;
+            return Vec::new();
         }
         let operators = self.operators.to_mut();
         let mut position = 0;
@@ -504,6 +520,11 @@ impl PostgresCatalog {
                 operator.negator = None;
             }
         }
+        removed
+            .iter()
+            .map(|operator| operator.row)
+            .filter(|row| matches!(row, OperatorRow::Added(_)))
+            .collect()
     }
 
     /// Moves the operator at `position` to `schema`, the commutator and

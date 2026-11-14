@@ -1993,7 +1993,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         right: OperandType<'_>,
         case: IdentifierCase,
     ) -> OperatorResolution<'db, Self> {
-        resolve_operator(self, &operator, left.as_ref(), &right, case)
+        resolve_operator(self, &operator, left.as_ref(), &right, case, &|_| true)
     }
 
     /// Iterates over the policies defined in the schema.

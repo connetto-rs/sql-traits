@@ -89,6 +89,46 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     parameters: Vec<OperandType<'db>>,
     /// The type of `VALUE` in a domain constraint.
     value: Option<OperandType<'db>>,
+    /// What the deparsed text of a stored expression pins when PostgreSQL
+    /// parses it again.
+    pins: Option<&'query (dyn ReparsePins<DB> + 'query)>,
+}
+
+/// An application of an operator, by the address of the node applying it
+/// and its position among that node's applications.
+pub(crate) type Site = (usize, usize);
+
+/// What the text PostgreSQL deparses a stored expression into pins when
+/// `ALTER COLUMN ... TYPE` has it parsed again: the previous type of each
+/// retyped column while the old selections are read, the operator each
+/// application and the function each call selected then, the casts the
+/// deparse writes around the operands and arguments those selections
+/// converted and in place of a call read as a cast, and the schema it
+/// qualifies an operator or a function with that its name alone would not
+/// reach.
+pub(crate) trait ReparsePins<DB: DatabaseLike> {
+    /// The type a reference to the column `column` reads as, in place of
+    /// the column's own.
+    fn column_type(&self, column: &str, quoted: bool) -> Option<&DataType>;
+    /// Whether the application at `site` may select `operator`.
+    fn admits(&self, site: Site, operator: &DB::Operator) -> bool;
+    /// The type the left operand, when `left`, or the right operand of the
+    /// application at `site` is cast to.
+    fn operand(&self, site: Site, left: bool) -> Option<&OperandType<'static>>;
+    /// The schema the name of the operator the application at `site`
+    /// applies is qualified with.
+    fn schema(&self, site: Site) -> Option<(&str, bool)>;
+    /// Whether the call whose node sits at `call` may select `function`.
+    fn admits_call(&self, call: usize, function: &DB::Function) -> bool;
+    /// The type argument `index` of the call whose node sits at `call` is
+    /// cast to.
+    fn argument(&self, call: usize, index: usize) -> Option<&OperandType<'static>>;
+    /// The schema the called name of the call whose node sits at `call` is
+    /// qualified with.
+    fn call_schema(&self, call: usize) -> Option<(&str, bool)>;
+    /// The type the call whose node sits at `call` is deparsed as a cast to,
+    /// for a call read as a cast.
+    fn cast(&self, call: usize) -> Option<&TargetName<'static>>;
 }
 
 /// One operator PostgreSQL applies to evaluate an expression node, with the
@@ -408,7 +448,13 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         });
         nodes.sort_unstable();
         sites.sort_unstable_by_key(|(address, _)| *address);
-        Self { database, scope, nodes, sites, case, parameters, value }
+        Self { database, scope, nodes, sites, case, parameters, value, pins: None }
+    }
+
+    /// The context typing as `pins` has PostgreSQL's deparsed text pin it.
+    pub(crate) const fn pinned(mut self, pins: &'query (dyn ReparsePins<DB> + 'query)) -> Self {
+        self.pins = Some(pins);
+        self
     }
 
     /// Returns the definition and binding of the column `expression`
@@ -464,7 +510,13 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 match self.reference(expression)? {
                     Some((ColumnDefinition::Base { column, database, .. }, _)) => {
-                        column_type(database, column.data_type(database))
+                        let previous = self.pins.and_then(|pins| {
+                            pins.column_type(column.column_name(), column.column_name_is_quoted())
+                        });
+                        match previous {
+                            Some(data_type) => declared_type(database, data_type),
+                            None => column_type(database, column.data_type(database)),
+                        }
                     }
                     // An output a `SELECT` of this query defines takes the
                     // type of its defining expression.
@@ -649,9 +701,26 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             return Ok(None);
         }
         let Some(written) = written_argument_names(function) else { return Ok(None) };
-        let reached = reached_by_name(self.database, &name, &written, self.case);
+        let call = core::ptr::from_ref(function).addr();
+        if let Some(target) = self.pins.and_then(|pins| pins.cast(call)) {
+            let resolution = CallResolution::Cast(target.clone());
+            return Ok(Some(CallApplication { name, arguments, resolution }));
+        }
+        let qualified;
+        let lookup = match self.pins.and_then(|pins| pins.call_schema(call)) {
+            Some((schema, quoted)) if name.schema().is_none() => {
+                qualified =
+                    TargetName::new(name.name(), name.name_is_quoted()).with_schema(schema, quoted);
+                &qualified
+            }
+            _ => &name,
+        };
+        let mut reached = reached_by_name(self.database, lookup, &written, self.case);
+        if let Some(pins) = self.pins {
+            reached.retain(|(function, _)| pins.admits_call(call, function));
+        }
         let castable = matches!(written.as_slice(), [None]);
-        self.applied_call(name, arguments, &reached, castable).map(Some)
+        self.applied_call(name, arguments, &reached, castable, Some(call)).map(Some)
     }
 
     /// Returns the function PostgreSQL calls for `factor`, a `FROM` item
@@ -709,22 +778,35 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let target = called_object_name(name)?;
         let reached = reached_by_name(self.database, &target, &written, self.case);
         let castable = matches!(written.as_slice(), [None]);
-        self.applied_call(target, arguments, &reached, castable).map(Some)
+        self.applied_call(target, arguments, &reached, castable, None).map(Some)
     }
 
     /// The call of `name` passing `arguments`, one of the `reached`
     /// functions selected by the arguments' types or, when `castable` says
-    /// the call passes one argument under no name, the cast it may read as.
+    /// the call passes one argument under no name, the cast it may read as,
+    /// the arguments of the call whose node sits at `call` typed as the pins
+    /// have them.
     fn applied_call<'node>(
         &self,
         name: TargetName<'node>,
         arguments: Vec<&'node Expr>,
         reached: &[(&'db DB::Function, Matched)],
         castable: bool,
+        call: Option<usize>,
     ) -> Result<CallApplication<'node, 'db, DB>, LookupError> {
+        let pinned = |index| {
+            let pins = self.pins?;
+            pins.argument(call?, index)
+        };
         let types = arguments
             .iter()
-            .map(|argument| self.type_of(argument))
+            .enumerate()
+            .map(|(index, argument)| {
+                match pinned(index) {
+                    Some(pinned) => Ok(pinned.clone()),
+                    None => self.type_of(argument),
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let resolution =
             resolve_function(self.database, reached, &types, castable.then_some(&name));
@@ -741,7 +823,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let name = TargetName::new(function, false).with_schema(PG_CATALOG, false);
         let written = Vec::from_iter(core::iter::repeat_n(None, arguments.len()));
         let reached = reached_by_name(self.database, &name, &written, self.case);
-        self.applied_call(name, arguments, &reached, false)
+        self.applied_call(name, arguments, &reached, false, None)
     }
 
     /// The applications PostgreSQL builds for `expression` and what the node
@@ -753,13 +835,13 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let (applied, returns) = match form(expression) {
             None => return Ok(None),
             Some(Form::InList { left, elements, negated }) => {
-                let applications = self.in_list(left, elements, negated)?;
+                let applications = self.in_list(address(expression), left, elements, negated)?;
                 return Ok(applications.map(|applications| (applications, Returns::Bool)));
             }
             Some(Form::Applies(applied, returns)) => (applied, returns),
         };
         let mut applications = Vec::with_capacity(applied.len());
-        for Applied { name, left, right } in applied {
+        for (position, Applied { name, left, right }) in applied.into_iter().enumerate() {
             let (right, right_type) = match right {
                 Right::Node(node) => (Operand::Node(node), self.type_of(node)?),
                 Right::Elements(node, quantifier) => {
@@ -779,23 +861,39 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                     (Operand::Call(Box::new(call)), call_type)
                 }
             };
-            applications.push(self.resolved(name, left, right, &right_type)?);
+            let site = (address(expression), position);
+            applications.push(self.resolved(site, name, left, right, &right_type)?);
         }
         Ok(Some((applications, returns)))
     }
 
-    /// The application of `name` to `left` and `right`, whose value or
-    /// elements are of type `right_type`.
+    /// The application at `site` of `name` to `left` and `right`, whose
+    /// value or elements are of type `right_type`, as the pins have it.
     fn resolved<'node>(
         &self,
+        site: Site,
         name: TargetName<'node>,
         left: Option<&'node Expr>,
         right: Operand<'node, 'db, DB>,
         right_type: &OperandType<'_>,
     ) -> Result<OperatorApplication<'node, 'db, DB>, LookupError> {
         let left_type = left.map(|left| self.type_of(left)).transpose()?;
+        let pinned = |left| self.pins.and_then(|pins| pins.operand(site, left));
+        let left_type = left_type.as_ref().map(|actual| pinned(true).unwrap_or(actual));
+        let right_type = pinned(false).unwrap_or(right_type);
+        let qualified;
+        let lookup = match self.pins.and_then(|pins| pins.schema(site)) {
+            Some((schema, quoted)) if name.schema().is_none() => {
+                qualified =
+                    TargetName::new(name.name(), name.name_is_quoted()).with_schema(schema, quoted);
+                &qualified
+            }
+            _ => &name,
+        };
+        let admits =
+            |operator: &DB::Operator| self.pins.is_none_or(|pins| pins.admits(site, operator));
         let resolution =
-            resolve_operator(self.database, &name, left_type.as_ref(), right_type, self.case);
+            resolve_operator(self.database, lookup, left_type, right_type, self.case, &admits);
         Ok(OperatorApplication { name, left, right, resolution })
     }
 
@@ -847,10 +945,12 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         })
     }
 
-    /// The applications of `left [NOT] IN (elements)`, `None` when a type or
-    /// a reference they depend on is unknown or a row is compared.
+    /// The applications of `left [NOT] IN (elements)`, written by the node
+    /// at `node`, `None` when a type or a reference they depend on is
+    /// unknown or a row is compared.
     fn in_list<'node>(
         &self,
+        node: usize,
         left: &'node Expr,
         elements: &'node [Expr],
         negated: bool,
@@ -880,7 +980,13 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             Collapse::Into(element_type) => {
                 let built = quantifier.over(ArraySource::Built(collapsible));
                 let name = TargetName::new(name, false);
-                applications.push(self.resolved(name, Some(left), built, &element_type)?);
+                applications.push(self.resolved(
+                    (node, 0),
+                    name,
+                    Some(left),
+                    built,
+                    &element_type,
+                )?);
                 kept
             }
             Collapse::Apart => elements.iter().collect(),
@@ -888,7 +994,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         for element in separate {
             let element_type = self.type_of(element)?;
             let name = TargetName::new(name, false);
+            let site = (node, applications.len());
             applications.push(self.resolved(
+                site,
                 name,
                 Some(left),
                 Operand::Node(element),
@@ -1113,6 +1221,17 @@ fn folded(expression: &Expr) -> Option<(&str, bool)> {
         }
         inner => folded(inner).map(|(digits, negative)| (digits, !negative)),
     }
+}
+
+/// Whether `expression` itself applies operators that
+/// [`ExpressionContext::operators`] derives, read from how it is written.
+pub(crate) fn applies_operators(expression: &Expr) -> bool {
+    folded(expression).is_none()
+        && match form(expression) {
+            Some(Form::Applies(applied, _)) => !applied.is_empty(),
+            Some(Form::InList { .. }) => true,
+            None => false,
+        }
 }
 
 /// How PostgreSQL evaluates `expression`, or `None` for a form the context

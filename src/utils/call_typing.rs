@@ -1065,7 +1065,7 @@ fn nullif_result<'a, D: DatabaseLike>(
     };
     let equals = TargetName::new("=", false);
     let OperatorResolution::Selected(selected) =
-        resolve_operator(database, &equals, Some(&operand(left)), &operand(right), case)
+        resolve_operator(database, &equals, Some(&operand(left)), &operand(right), case, &|_| true)
     else {
         return None;
     };

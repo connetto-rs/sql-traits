@@ -1,5 +1,5 @@
-//! The objects of the schema holding a stored function, which PostgreSQL
-//! names when it refuses to drop the function and takes along under
+//! The objects of the schema holding a stored function or an operator, which
+//! PostgreSQL names when it refuses to drop it and takes along under
 //! `CASCADE`.
 
 use alloc::{
@@ -19,19 +19,20 @@ use super::{
 use crate::{
     errors::{Error, ObjectKind},
     structs::{
-        IdentifierCase, TableAttribute, generic_db::builtin_functions::Builtins,
-        metadata::ExpressionCalls,
+        IdentifierCase, OperatorRow, TableAttribute,
+        generic_db::builtin_functions::Builtins,
+        metadata::{ExpressionCalls, operator_node_count},
     },
     traits::{DomainLike, IndexLike, UserDefinedTypeLike},
     utils::{call_sites::for_each_call, last_str, object_name::stored_view_key},
 };
 
-/// An object holding a function, by its kind and the name a refusal gives
-/// it.
+/// An object holding a function or an operator, by its kind and the name a
+/// refusal gives it.
 pub(super) type Dependent = (ObjectKind, String);
 
-/// Where an object holding a function sits, which is what taking it along
-/// under `CASCADE` needs.
+/// Where an object holding a function or an operator sits, which is what
+/// taking it along under `CASCADE` needs.
 pub(super) enum Held {
     /// The default of the column of the table.
     ColumnDefault(StoredTable, Ident),
@@ -80,23 +81,59 @@ impl Holder {
     }
 }
 
-/// Whether `calls` holds the function `dropped`, compared by node.
-fn calls_function(calls: &ExpressionCalls<CreateFunction>, dropped: &CreateFunction) -> bool {
-    calls.functions().any(|function| core::ptr::eq(function, dropped))
+/// What a statement drops that a stored expression may hold.
+pub(super) enum Dropped<'d> {
+    /// The function `function`, the statement dropping every function of
+    /// `dropping` with it.
+    Function { function: &'d CreateFunction, dropping: &'d [Arc<CreateFunction>] },
+    /// The operators of these rows.
+    Operators(&'d [OperatorRow]),
 }
 
-/// Whether one of the next `count` sites of `sites` reaches `dropped`, every
-/// one of them taken off `sites`.
-fn sites_reach<'a>(
-    sites: &mut impl Iterator<Item = &'a [Arc<CreateFunction>]>,
-    count: usize,
-    dropped: &CreateFunction,
-) -> bool {
-    let mut held = false;
-    for reached in sites.by_ref().take(count) {
-        held |= reached.iter().any(|function| core::ptr::eq(Arc::as_ptr(function), dropped));
+/// How far a walk over the parts of a node has come, in calls and in
+/// operator nodes.
+#[derive(Default)]
+struct Cursor {
+    calls: usize,
+    operators: usize,
+}
+
+impl Dropped<'_> {
+    /// Whether `calls` holds what is dropped, a function compared by node.
+    fn is_held_by(&self, calls: &ExpressionCalls<CreateFunction>) -> bool {
+        match self {
+            Self::Function { function, .. } => {
+                calls.functions().any(|called| core::ptr::eq(called, *function))
+            }
+            Self::Operators(rows) => calls.applies(rows),
+        }
     }
-    held
+
+    /// Whether `part`, the next part of the node whose record is `calls`
+    /// past `cursor`, holds what is dropped, `cursor` moving past it.
+    fn is_held_in<N: Visit + ?Sized>(
+        &self,
+        calls: &ExpressionCalls<CreateFunction>,
+        cursor: &mut Cursor,
+        part: &N,
+    ) -> bool {
+        match self {
+            Self::Function { function, .. } => {
+                let count = call_count(part);
+                let held = calls.sites().skip(cursor.calls).take(count).any(|reached| {
+                    reached.iter().any(|called| core::ptr::eq(Arc::as_ptr(called), *function))
+                });
+                cursor.calls += count;
+                held
+            }
+            Self::Operators(rows) => {
+                let count = operator_node_count(part);
+                let held = calls.applies_in(cursor.operators..cursor.operators + count, rows);
+                cursor.operators += count;
+                held
+            }
+        }
+    }
 }
 
 impl ParserDBBuilder {
@@ -122,19 +159,36 @@ impl ParserDBBuilder {
         dropped: &CreateFunction,
         dropping: &[Arc<CreateFunction>],
     ) -> Option<Holder> {
-        self.table_holder(dropped).or_else(|| self.object_holder(dropped, dropping))
+        self.holder(&Dropped::Function { function: dropped, dropping })
     }
 
-    /// The first part of a table calling `dropped`, among its checks, its
+    /// The first object applying an operator of `rows`, with where it sits.
+    ///
+    /// An expression holds the operators its applications selected when it
+    /// was stored, which a later operator matching better leaves in place.
+    pub(super) fn operator_holder(&self, rows: &[OperatorRow]) -> Option<Holder> {
+        if rows.is_empty() {
+            return None;
+        }
+        self.holder(&Dropped::Operators(rows))
+    }
+
+    /// The first object holding what `dropped` names, with where it sits.
+    fn holder(&self, dropped: &Dropped<'_>) -> Option<Holder> {
+        self.table_holder(dropped).or_else(|| self.object_holder(dropped))
+    }
+
+    /// The first part of a table holding `dropped`, among its checks, its
     /// columns' defaults and generation expressions, its indexes, its
     /// exclusion constraints and its partition key.
     ///
     /// A check or a generated column a parent passes down goes with the
     /// parent's, so only a table's own are holders.
-    fn table_holder(&self, dropped: &CreateFunction) -> Option<Holder> {
+    fn table_holder(&self, dropped: &Dropped<'_>) -> Option<Holder> {
         for (check, metadata) in self.check_constraints() {
             let table = TableAttribute::table(check.as_ref());
-            let own = calls_function(metadata.calls(), dropped)
+            let own = dropped
+                .is_held_by(metadata.calls())
                 .then(|| constraint_names::check_slot(table, check.attribute()))
                 .flatten()
                 .filter(|slot| !constraint_names::receives_check(self, table, *slot));
@@ -154,9 +208,9 @@ impl ParserDBBuilder {
         for (column, metadata, _) in self.columns() {
             let table = TableAttribute::table(column.as_ref());
             let declared = column.attribute();
-            let mut sites = metadata.calls().sites();
+            let mut cursor = Cursor::default();
             for option in &declared.options {
-                let held = sites_reach(&mut sites, call_count(&option.option), dropped);
+                let held = dropped.is_held_in(metadata.calls(), &mut cursor, &option.option);
                 let name = || alloc::format!("{}.{}", table.name, declared.name);
                 let holder = match option.option {
                     // A column's check is a constraint of its own.
@@ -183,7 +237,7 @@ impl ParserDBBuilder {
             }
         }
         for (position, (index, metadata)) in self.indices().iter().enumerate() {
-            if calls_function(metadata.calls(), dropped) {
+            if dropped.is_held_by(metadata.calls()) {
                 let name = IndexLike::name(index.as_ref())
                     .map_or_else(|| index.attribute().to_string(), ToString::to_string);
                 return Some(Holder::new(ObjectKind::Index, name, Held::Index(position)));
@@ -201,7 +255,7 @@ impl ParserDBBuilder {
             if let Some(((exclusion, position), _)) = constraint_names::exclusions(table)
                 .zip(positions)
                 .zip(metadata.exclusion_calls())
-                .find(|(_, calls)| calls_function(calls, dropped))
+                .find(|(_, calls)| dropped.is_held_by(calls))
             {
                 // An exclusion constraint is backed by an index of its name.
                 let name = constraint_names::exclusion_name(self, table, exclusion)
@@ -213,7 +267,7 @@ impl ParserDBBuilder {
                 ));
             }
             if partition_keys::key_entries(table).is_some()
-                && calls_function(metadata.partition_key_calls(), dropped)
+                && dropped.is_held_by(metadata.partition_key_calls())
             {
                 return Some(Holder::new(
                     ObjectKind::Table,
@@ -225,15 +279,10 @@ impl ParserDBBuilder {
         None
     }
 
-    /// The first object outside a table's own parts calling or running
-    /// `dropped`, but the functions in `dropping`.
-    fn object_holder(
-        &self,
-        dropped: &CreateFunction,
-        dropping: &[Arc<CreateFunction>],
-    ) -> Option<Holder> {
-        let calls_dropped =
-            |calls: &ExpressionCalls<CreateFunction>| calls_function(calls, dropped);
+    /// The first object outside a table's own parts holding `dropped`, but
+    /// the functions a function's statement drops with it.
+    fn object_holder(&self, dropped: &Dropped<'_>) -> Option<Holder> {
+        let calls_dropped = |calls: &ExpressionCalls<CreateFunction>| dropped.is_held_by(calls);
         if let Some((view, _, _)) =
             self.views().iter().find(|(_, metadata, _)| calls_dropped(metadata.calls()))
         {
@@ -280,10 +329,15 @@ impl ParserDBBuilder {
             case: self.identifier_case(),
         };
         let runs_dropped = |trigger: &CreateTrigger| {
-            trigger.exec_body.as_ref().is_some_and(|body| {
-                trigger_scope.reaches(dropped, &body.func_desc.name, 0)
-                    && function_argument_types(dropped.args.as_deref()).is_empty()
-            })
+            match dropped {
+                Dropped::Function { function, .. } => {
+                    trigger.exec_body.as_ref().is_some_and(|body| {
+                        trigger_scope.reaches(function, &body.func_desc.name, 0)
+                            && function_argument_types(function.args.as_deref()).is_empty()
+                    })
+                }
+                Dropped::Operators(_) => false,
+            }
         };
         if let Some((trigger, _)) = self
             .triggers()
@@ -296,10 +350,18 @@ impl ParserDBBuilder {
                 Held::Trigger(Arc::clone(trigger)),
             ));
         }
+        // A body calling its own function does not hold it in place.
+        let dropping_too = |caller: &Arc<CreateFunction>| {
+            match dropped {
+                Dropped::Function { function, dropping } => {
+                    core::ptr::eq(caller.as_ref(), *function)
+                        || dropping.iter().any(|other| Arc::ptr_eq(other, caller))
+                }
+                Dropped::Operators(_) => false,
+            }
+        };
         if let Some((caller, _)) = self.functions().iter().find(|(caller, metadata)| {
-            !core::ptr::eq(caller.as_ref(), dropped)
-                && !dropping.iter().any(|other| Arc::ptr_eq(other, caller))
-                && calls_dropped(metadata.body_calls())
+            !dropping_too(caller) && calls_dropped(metadata.body_calls())
         }) {
             return Some(Holder::new(
                 ObjectKind::Function,
@@ -307,20 +369,8 @@ impl ParserDBBuilder {
                 Held::Reader(views::Dependent::Function(Arc::clone(caller))),
             ));
         }
-        for (position, (domain, metadata)) in self.domains().iter().enumerate() {
-            let mut sites = metadata.calls().sites();
-            let held = if sites_reach(&mut sites, call_count(&domain.default), dropped) {
-                Held::Domain(position)
-            } else if let Some(check) = domain
-                .constraints
-                .iter()
-                .position(|check| sites_reach(&mut sites, call_count(check), dropped))
-            {
-                Held::DomainCheck(position, check)
-            } else {
-                continue;
-            };
-            return Some(Holder::new(ObjectKind::Domain, domain.name().to_string(), held));
+        if let Some(holder) = self.domain_holder(dropped) {
+            return Some(holder);
         }
         self.user_defined_types()
             .iter()
@@ -329,6 +379,24 @@ impl ParserDBBuilder {
             .map(|(position, (type_, _))| {
                 Holder::new(ObjectKind::Type, type_.name().to_string(), Held::Type(position))
             })
+    }
+
+    /// The first domain whose default or check holds `dropped`.
+    fn domain_holder(&self, dropped: &Dropped<'_>) -> Option<Holder> {
+        self.domains().iter().enumerate().find_map(|(position, (domain, metadata))| {
+            let calls = metadata.calls();
+            let mut cursor = Cursor::default();
+            let held = if dropped.is_held_in(calls, &mut cursor, &domain.default) {
+                Held::Domain(position)
+            } else {
+                let check = domain
+                    .constraints
+                    .iter()
+                    .position(|check| dropped.is_held_in(calls, &mut cursor, check))?;
+                Held::DomainCheck(position, check)
+            };
+            Some(Holder::new(ObjectKind::Domain, domain.name().to_string(), held))
+        })
     }
 }
 

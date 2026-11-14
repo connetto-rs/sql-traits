@@ -9,8 +9,8 @@ use alloc::{
 };
 
 use sqlparser::ast::{
-    AlterOperator, AlterOperatorOperation, CreateFunction, CreateOperator, DataType, DropOperator,
-    FunctionReturnType, ObjectName, OperateFunctionArg, OperatorOption,
+    AlterOperator, AlterOperatorOperation, CreateFunction, CreateOperator, DataType, DropBehavior,
+    DropOperator, FunctionReturnType, ObjectName, OperateFunctionArg, OperatorOption,
 };
 
 use super::{
@@ -322,39 +322,52 @@ fn set(
 }
 
 /// Applies `DROP OPERATOR`, clearing the links other operators keep to the
-/// dropped ones.
+/// dropped ones, and returns the rows of the operators it removed, whose
+/// dependents a `CASCADE` takes along.
 ///
 /// # Errors
 ///
 /// Returns [`Error::OperatorNotFound`] for an absent operator without `IF
-/// EXISTS`, and [`Error::OperatorRequiredBySystem`] for a built-in one.
+/// EXISTS`, [`Error::OperatorRequiredBySystem`] for a built-in one, and
+/// [`Error::OperatorReferenced`] without `CASCADE` for one a stored
+/// expression applies.
 pub(super) fn drop(
     builder: &ParserDBBuilder,
     catalog: &mut Arc<PostgresCatalog>,
     arrays: &TypeArrays,
     session: &SessionRoles,
     drop: DropOperator,
-) -> Result<(), Error> {
+) -> Result<Vec<OperatorRow>, Error> {
+    let cascade = drop.drop_behavior == Some(DropBehavior::Cascade);
     let mut doomed = Vec::with_capacity(drop.operators.len());
     for signature in drop.operators {
         let binder = Binder::new(builder, session, arrays, symbol_of(&signature.name));
         let left = signature.left_type.map(|left| operand(builder, arrays, left)).transpose()?;
         let right = operand(builder, arrays, signature.right_type)?;
-        match binder.lookup(catalog, &signature.name, left.as_ref(), &right) {
-            Some(position) if catalog.operators_slice()[position].row == OperatorRow::BuiltIn => {
-                return Err(Error::OperatorRequiredBySystem {
-                    operator_name: binder.symbol.into(),
-                });
+        let Some(position) = binder.lookup(catalog, &signature.name, left.as_ref(), &right) else {
+            if drop.if_exists {
+                continue;
             }
-            Some(position) => doomed.push(position),
-            None if drop.if_exists => {}
-            None => return Err(Error::OperatorNotFound { operator_name: binder.symbol.into() }),
+            return Err(Error::OperatorNotFound { operator_name: binder.symbol.into() });
+        };
+        let row = catalog.operators_slice()[position].row;
+        if row == OperatorRow::BuiltIn {
+            return Err(Error::OperatorRequiredBySystem { operator_name: binder.symbol.into() });
         }
+        if let (false, Some(holder)) = (cascade, builder.operator_holder(&[row])) {
+            let (dependent_kind, dependent_name) = holder.named;
+            return Err(Error::OperatorReferenced {
+                operator_name: binder.symbol.into(),
+                dependent_kind,
+                dependent_name,
+            });
+        }
+        doomed.push(position);
     }
-    if !doomed.is_empty() {
-        Arc::make_mut(catalog).remove_operators(|position, _| doomed.contains(&position));
+    if doomed.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+    Ok(Arc::make_mut(catalog).remove_operators(|position, _| doomed.contains(&position)))
 }
 
 /// What a statement writes for an estimator attribute.

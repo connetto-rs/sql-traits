@@ -50,7 +50,9 @@ use super::{
 use crate::{
     errors::{Error, LookupError, ObjectKind},
     impls::{domain_in_schema, user_type_in_schema, user_type_named},
-    structs::{AttributeCollation, IdentifierCase, UserDefinedType, metadata::ExpressionCalls},
+    structs::{
+        AttributeCollation, IdentifierCase, OperatorRow, UserDefinedType, metadata::ExpressionCalls,
+    },
     traits::{DomainLike, UserDefinedTypeKind, UserDefinedTypeLike},
     utils::{
         identifier_resolution::stored_identifier,
@@ -90,13 +92,16 @@ fn doomed_user_type(doomed: &[Doomed], position: usize) -> bool {
     doomed.contains(&Doomed::UserType(position))
 }
 
-/// The type identities and functions removed by a dependency cascade.
+/// The type identities, functions and operators removed by a dependency
+/// cascade.
 #[derive(Default)]
 pub(super) struct TypeDrop {
     /// Removed owners and their stored arrays, captured before removal.
     pub(super) types: Vec<ObjectName>,
     /// Removed constructors, signature dependents, and reader functions.
     pub(super) functions: Vec<Arc<CreateFunction>>,
+    /// The rows of the removed operators a statement added.
+    pub(super) operators: Vec<OperatorRow>,
 }
 
 /// Whether a composite user type holds `name` in `schema`, which the relation
@@ -925,7 +930,7 @@ fn drop_positions(
     arrays: &mut Arc<TypeArrays>,
 ) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     if doomed.is_empty() {
-        return Ok((builder, TypeDrop { types: Vec::new(), functions: Vec::new() }));
+        return Ok((builder, TypeDrop::default()));
     }
     // Domains, ranges and element-holding types over a doomed type, to the end
     // of the chain.

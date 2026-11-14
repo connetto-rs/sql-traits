@@ -112,7 +112,12 @@ impl Catalog {
             in_transaction,
         )?;
         catalog.builder = super::sequences::settle_dropped_sequences(catalog.builder, cascade)?;
-        // The calls the statement stored are typed over the catalog it left.
+        // The calls and operator applications the statement stored are typed
+        // over the catalog it left, where only an operator a statement added
+        // is worth recording.
+        if catalog.builder.has_unsettled_calls() && !catalog.postgres.holds_added_operators() {
+            catalog.builder.settle_operators_on_built_ins();
+        }
         if catalog.builder.has_unsettled_calls() {
             let database = catalog.snapshot(access_resolution);
             catalog.builder.settle_calls(&database);
