@@ -232,7 +232,6 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     #[inline]
     fn is_simple(&self, database: &Self::DB) -> Result<bool, LookupError> {
         let entries = match self.expression(database)? {
-            Expr::Nested(entry) => core::slice::from_ref(entry.as_ref()),
             Expr::Tuple(entries) => entries.as_slice(),
             entry => core::slice::from_ref(entry),
         };
