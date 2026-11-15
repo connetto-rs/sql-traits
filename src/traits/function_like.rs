@@ -1892,9 +1892,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
     ///   `transaction_timestamp()` read the same statement time as `now()`. The
     ///   rest, the arguments substituted, reduce to `TRUE`, to `FALSE` or
-    ///   `NULL`, or to the literal values columns have to hold. An arm
-    ///   comparing a helper's set while returning its table's primary key is a
-    ///   parent arm, so it takes no other condition.
+    ///   `NULL`, or to the literal values columns have to hold. A column of an
+    ///   enum type compared with a label by `<`, `<=`, `>` or `>=`, either way
+    ///   round, holds the labels on the kept side of it in the order the type
+    ///   declares them, `ALTER TYPE ... ADD VALUE` applied. An arm comparing a
+    ///   helper's set while returning its table's primary key is a parent arm,
+    ///   so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it

@@ -1282,6 +1282,113 @@ fn numbers_compare_as_integers_and_refuse_what_needs_a_type() {
     }
 }
 
+/// A helper over `objects` whose grant arm filters by `condition` on its
+/// `threshold`, with `authz.role` declared in another order than its labels
+/// sort in.
+fn ranked(condition: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE TYPE authz.role AS ENUM ('reader', 'admin');
+         ALTER TYPE authz.role ADD VALUE 'writer' BEFORE 'admin';
+         ALTER TYPE authz.role ADD VALUE 'auditor' AFTER 'admin';
+         CREATE TABLE objects (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, role authz.role NOT NULL);
+         CREATE FUNCTION authz.ranked(threshold authz.role) RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           SELECT o.id FROM public.objects o
+           WHERE o.owner_id = current_setting('app.user_id', true) AND {condition}
+         $$;
+         ALTER FUNCTION authz.ranked(authz.role) OWNER TO authz_owner;
+         GRANT SELECT ON objects TO authz_owner;"
+    )
+}
+
+/// The rows of `objects` the [`ranked`] helpers read.
+const RANKED_ROWS: Rows = &[
+    ("objects", &[("id", "r"), ("owner_id", "ann"), ("role", "reader")]),
+    ("objects", &[("id", "w"), ("owner_id", "ann"), ("role", "writer")]),
+    ("objects", &[("id", "a"), ("owner_id", "ann"), ("role", "admin")]),
+    ("objects", &[("id", "d"), ("owner_id", "ann"), ("role", "auditor")]),
+    ("objects", &[("id", "x"), ("owner_id", "ben"), ("role", "admin")]),
+];
+
+/// What PostgreSQL 18.6 returns to `ann` for `(condition, threshold)`, the
+/// [`ranked`] helper called over [`RANKED_ROWS`].
+const RANKED_MEASURED: &[(&str, &str, &[&str])] = &[
+    ("o.role >= threshold", "reader", &["a", "d", "r", "w"]),
+    ("o.role >= threshold", "writer", &["a", "d", "w"]),
+    ("o.role >= threshold", "admin", &["a", "d"]),
+    ("o.role >= threshold", "auditor", &["d"]),
+    ("threshold < o.role", "reader", &["a", "d", "w"]),
+    ("threshold < o.role", "writer", &["a", "d"]),
+    ("threshold < o.role", "admin", &["d"]),
+    ("threshold < o.role", "auditor", &[]),
+    ("threshold >= o.role", "reader", &["r"]),
+    ("threshold >= o.role", "writer", &["r", "w"]),
+    ("threshold >= o.role", "admin", &["a", "r", "w"]),
+    ("threshold >= o.role", "auditor", &["a", "d", "r", "w"]),
+    ("o.role < threshold", "reader", &[]),
+    ("o.role < threshold", "writer", &["r"]),
+    ("o.role < threshold", "admin", &["r", "w"]),
+    ("o.role < threshold", "auditor", &["a", "r", "w"]),
+];
+
+#[test]
+fn an_enum_threshold_keeps_the_labels_on_its_side_in_declaration_order() {
+    let deployment = deployment();
+    for &(condition, threshold, expected) in RANKED_MEASURED {
+        let database = postgres(&ranked(condition));
+        let set = answer(&database, &deployment, "authz", "ranked", &[text(threshold)])
+            .expect("answered");
+        let returned: Vec<_> =
+            evaluate(&set, Request::of("ann"), RANKED_ROWS).into_iter().collect();
+        assert_eq!(returned, expected, "{condition} for '{threshold}'");
+        let null =
+            answer(&database, &deployment, "authz", "ranked", &[Value::Null]).expect("answered");
+        assert_eq!(render(&null), "", "{condition} keeps no row for NULL");
+    }
+    let rendered = |condition: &str| {
+        let database = postgres(&ranked(condition));
+        answer(&database, &deployment, "authz", "ranked", &[text("reader")]).map(|set| render(&set))
+    };
+    let arm = "objects.id WHERE owner_id = app.user_id AND role IN";
+    assert_eq!(
+        rendered("o.role >= threshold").expect("answered"),
+        format!("{arm} ('reader', 'writer', 'admin', 'auditor')")
+    );
+    assert_eq!(
+        rendered("o.role > 'writer'").expect("answered"),
+        format!("{arm} ('admin', 'auditor')")
+    );
+    assert_eq!(
+        rendered("(o.role >= 'admin' OR o.role = threshold)").expect("answered"),
+        format!("{arm} ('admin', 'auditor', 'reader')")
+    );
+    assert_eq!(rendered("o.role < threshold AND o.role = 'writer'").expect("answered"), "");
+    for irreducible in ["o.role >= 'owner'", "o.role::TEXT >= threshold", "o.role >= o.role"] {
+        assert!(
+            matches!(rendered(irreducible), Err(HelperSetError::Irreducible { .. })),
+            "{irreducible}"
+        );
+    }
+    let database = postgres(&ranked("o.role >= threshold"));
+    assert!(
+        matches!(
+            answer(&database, &deployment, "authz", "ranked", &[text("owner")]),
+            Err(HelperSetError::Irreducible { .. })
+        ),
+        "PostgreSQL refuses a label the type does not declare"
+    );
+    assert!(
+        matches!(
+            kept("min_role TEXT", "TEXT", "role >= min_role", &[text("read")]),
+            Err(HelperSetError::Irreducible { .. })
+        ),
+        "text compares by its collation, which declares no order of labels"
+    );
+}
+
 #[test]
 fn literals_columns_and_parameters_are_read_in_every_spelling() {
     let text_kept = |condition: &str| kept("min_role TEXT", "TEXT", condition, &[text("write")]);

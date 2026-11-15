@@ -33,8 +33,8 @@ use crate::{
         TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{
-        ColumnLike, DataTypeLike, DatabaseLike, DialectLike, ForeignKeyLike, FunctionLike,
-        Relation, RoleLike, SchemaLike, TableLike,
+        ColumnLike, DataTypeLike, DatabaseLike, DialectLike, EnumerationKind, EnumerationMember,
+        ForeignKeyLike, FunctionLike, Relation, RoleLike, SchemaLike, TableLike,
     },
     utils::{
         call_sites::{ExpressionForm, call_reaches, expression_form},
@@ -1666,6 +1666,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     _ => Ok(None),
                 }
             }
+            Expr::BinaryOp {
+                left,
+                op:
+                    op @ (BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq),
+                right,
+            } => self.threshold(scope, table, left, op, right),
             expression => {
                 Ok(match self.operand(scope, table, expression)? {
                     Operand::Passed(Passed { literal: Literal::Boolean(boolean), .. }) => {
@@ -1676,6 +1685,65 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 })
             }
         }
+    }
+
+    /// What `<left> <op> <right>` keeps where it compares a column of an
+    /// enum type with a passed label, the labels on the kept side of it in
+    /// the order the type declares them, which is the order PostgreSQL
+    /// compares them in.
+    fn threshold(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        left: &Expr,
+        op: &BinaryOperator,
+        right: &Expr,
+    ) -> Result<Option<Kept<'db, DB>>, HelperSetError> {
+        let database = self.database;
+        let sides = (self.operand(scope, table, left)?, self.operand(scope, table, right)?);
+        // `<label> < <column>` keeps what `<column> > <label>` keeps.
+        let (column, passed, column_greater) = match sides {
+            (Operand::Column(column), Operand::Passed(passed)) => {
+                (column, passed, matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq))
+            }
+            (Operand::Passed(passed), Operand::Column(column)) => {
+                (column, passed, matches!(op, BinaryOperator::Lt | BinaryOperator::LtEq))
+            }
+            _ => return Ok(None),
+        };
+        let inclusive = matches!(op, BinaryOperator::GtEq | BinaryOperator::LtEq);
+        let Some(enumeration) = column.data_type(database).enumeration(database) else {
+            return Ok(None);
+        };
+        if enumeration.kind() != EnumerationKind::Enum {
+            return Ok(None);
+        }
+        let label = match passed.literal {
+            Literal::Null => return Ok(Some(Kept::Nothing)),
+            Literal::Text(label) => label,
+            Literal::Boolean(_) | Literal::Number(_) => return Ok(None),
+        };
+        let labels: Vec<&str> = enumeration.into_members().map(EnumerationMember::label).collect();
+        // PostgreSQL refuses a label the type does not declare.
+        let Some(position) = labels.iter().position(|declared| *declared == label) else {
+            return Ok(None);
+        };
+        let kept = match (column_greater, inclusive) {
+            (true, true) => &labels[position..],
+            (true, false) => &labels[position + 1..],
+            (false, true) => &labels[..=position],
+            (false, false) => &labels[..position],
+        };
+        let values = kept
+            .iter()
+            .map(|label| {
+                Passed {
+                    literal: Literal::Text((*label).to_string()),
+                    value: Value::SingleQuotedString((*label).to_string()),
+                }
+            })
+            .collect();
+        Ok(Some(Kept::values(column, values)))
     }
 }
 
