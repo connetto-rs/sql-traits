@@ -9,9 +9,11 @@
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{Statement, Visit};
+use sqlparser::ast::Visit;
 
-use super::data_statement::{BodyPath, BodyWalk, RunTimeBody, add_unqualified, walk_body};
+use super::data_statement::{
+    BodyPath, BodyWalk, Embedded, RunTimeBody, add_unqualified, walk_body,
+};
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, UnqualifiedName},
@@ -125,8 +127,8 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for CallCollector<'_, 's, DB> {
         self.path = path;
     }
 
-    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError> {
-        self.collect(statement)
+    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
+        self.collect(&sql)
     }
 }
 
