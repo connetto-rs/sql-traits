@@ -50,18 +50,24 @@ pub(crate) fn scoped_graph<'query, 'db, DB: DatabaseLike>(
             index_nested(&mut profile, &[], deriving, outer_cursor, |walker| {
                 walker.expression(expression)
             })?;
-        }
-        ScopedRoot::Statement(Statement::Query(query)) => {
-            index_nested_query_scopes(
-                AstRef::Query(query),
-                &[],
-                deriving,
-                outer_cursor,
-                &mut profile,
-            )?;
+            profile.record_outputs(expression)?;
         }
         ScopedRoot::Statement(statement) => {
-            profile.modifying_shape(statement, &[], deriving, outer_cursor)?;
+            match statement {
+                Statement::Query(query) => {
+                    index_nested_query_scopes(
+                        AstRef::Query(query),
+                        &[],
+                        deriving,
+                        outer_cursor,
+                        &mut profile,
+                    )?;
+                }
+                _ => {
+                    profile.modifying_shape(statement, &[], deriving, outer_cursor)?;
+                }
+            }
+            profile.record_outputs(statement)?;
         }
     }
     Ok(profile.finish(outer))

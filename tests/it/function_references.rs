@@ -344,8 +344,9 @@ const OVERLOADED: &str =
 
 /// A statement writing a call `f(INT)` answers into each object PostgreSQL
 /// binds the call of at creation.
-const SELECTING: [&str; 23] = [
+const SELECTING: [&str; 24] = [
     "CREATE TABLE d (a INT DEFAULT f(1));",
+    "CREATE VIEW v AS SELECT f((SELECT 1)) AS one;",
     "CREATE TABLE d (a INT, b INT GENERATED ALWAYS AS (f(a)) STORED);",
     "CREATE TABLE d (a INT CHECK (f(a) > 0));",
     "CREATE TABLE d (a INT, CHECK (f(a) > 0));",
@@ -384,20 +385,16 @@ fn every_bound_call_holds_only_the_overload_it_selects() {
 }
 
 /// A call whose argument types the model cannot settle on one overload holds
-/// every overload of its arity, so dropping any of them is refused. A scalar
-/// subquery argument is not typed yet, and a rule on a view sees rows no
-/// typing scope describes, where PostgreSQL 18 selects `f(INT)` for both.
+/// every overload of its arity, so dropping any of them is refused. A rule
+/// on a view sees rows no typing scope describes, where PostgreSQL 18
+/// selects `f(INT)`.
 #[test]
 fn a_call_its_argument_types_do_not_settle_holds_every_overload() {
-    for unsettled in [
-        "CREATE VIEW v AS SELECT f((SELECT 1)) AS one;",
-        "CREATE VIEW tv AS SELECT a FROM t;
-         CREATE RULE rv AS ON INSERT TO tv DO INSTEAD SELECT f(new.a);",
-    ] {
-        for dropped in ["f(TEXT)", "f(INT)"] {
-            let result = parse(&format!("{OVERLOADED} {unsettled} DROP FUNCTION {dropped};"));
-            assert_in_use_by(&result, unsettled);
-        }
+    let unsettled = "CREATE VIEW tv AS SELECT a FROM t;
+         CREATE RULE rv AS ON INSERT TO tv DO INSTEAD SELECT f(new.a);";
+    for dropped in ["f(TEXT)", "f(INT)"] {
+        let result = parse(&format!("{OVERLOADED} {unsettled} DROP FUNCTION {dropped};"));
+        assert_in_use_by(&result, unsettled);
     }
 }
 
