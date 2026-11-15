@@ -62,6 +62,7 @@ pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) setting: &'db SessionSetting,
     pub(crate) raises_when_unset: bool,
     pub(crate) restriction: Option<LiteralSet<'db, DB>>,
+    pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
@@ -103,6 +104,62 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     pub fn restriction(&self) -> Option<&LiteralSet<'db, DB>> {
         self.restriction.as_ref()
     }
+
+    /// The bounds a row has to meet against the statement time, every one
+    /// of them, in the order the condition writes them.
+    #[must_use]
+    pub fn time_bounds(&self) -> &[TimeBound<'db, DB>] {
+        &self.time_bounds
+    }
+}
+
+/// `<column> <comparison> <statement time> [OR <column> IS NULL]`, a
+/// conjunct of a grant arm's condition comparing a `timestamptz` column of
+/// the arm's table with the start of the transaction, which `now()`,
+/// `CURRENT_TIMESTAMP` and `transaction_timestamp()` read.
+///
+/// The rows the arm keeps depend on when the helper runs, so a consumer
+/// answers the bound against the time of each check.
+#[derive(Debug)]
+pub struct TimeBound<'db, DB: DatabaseLike> {
+    pub(crate) column: &'db DB::Column,
+    pub(crate) comparison: TimeComparison,
+    pub(crate) keeps_null: bool,
+}
+
+impl<'db, DB: DatabaseLike> TimeBound<'db, DB> {
+    /// The column compared to the statement time.
+    #[must_use]
+    pub fn column(&self) -> &'db DB::Column {
+        self.column
+    }
+
+    /// How the column compares to the statement time, with the column on
+    /// the left whichever side the condition writes it on.
+    #[must_use]
+    pub fn comparison(&self) -> TimeComparison {
+        self.comparison
+    }
+
+    /// Whether a row holding `NULL` in the column is kept, which the
+    /// condition writes as `OR <column> IS NULL`.
+    #[must_use]
+    pub fn keeps_null(&self) -> bool {
+        self.keeps_null
+    }
+}
+
+/// How the column of a [`TimeBound`] compares to the statement time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimeComparison {
+    /// `<column> > <statement time>`.
+    Later,
+    /// `<column> >= <statement time>`.
+    LaterOrEqual,
+    /// `<column> < <statement time>`.
+    Earlier,
+    /// `<column> <= <statement time>`.
+    EarlierOrEqual,
 }
 
 /// `<column> IN (<values>)`.

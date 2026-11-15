@@ -1801,8 +1801,14 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// - A grant arm, `SELECT <column> FROM <table> WHERE <caller column> =
     ///   current_setting('<setting>'[, true]) [AND <condition>]`, where the
     ///   deployment declares the setting as the caller and the condition, the
-    ///   arguments substituted, reduces to `TRUE`, to `FALSE` or `NULL`, or to
-    ///   the literal values one column has to hold.
+    ///   arguments substituted and its time bounds set aside, reduces to
+    ///   `TRUE`, to `FALSE` or `NULL`, or to the literal values one column has
+    ///   to hold. A time bound is a conjunct `<column> <comparison> now()`, a
+    ///   `timestamptz` column of the table compared with `<`, `<=`, `>` or `>=`
+    ///   either way round, optionally `OR <column> IS NULL`, and the arm
+    ///   answers it as a [`TimeBound`](crate::structs::TimeBound).
+    ///   `CURRENT_TIMESTAMP` and `transaction_timestamp()` read the same
+    ///   statement time as `now()`.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it
