@@ -1,17 +1,20 @@
-//! Submodule defining a generic `IndexMetadata` struct.
+//! Submodule defining a generic `CheckMetadata` struct.
 
 use alloc::{sync::Arc, vec::Vec};
 
 use sqlparser::ast::Expr;
 
-use super::ExpressionCalls;
+use super::{BoundLiteral, ExpressionCalls, UnreadableLiteral, respell};
 use crate::traits::{CheckConstraintLike, DatabaseLike};
 
 #[derive(Debug, Clone)]
 /// Struct collecting metadata about a check constraint.
 pub struct CheckMetadata<U: CheckConstraintLike> {
-    /// The expression defining the constraint.
+    /// The expression defining the constraint, each literal holding the value
+    /// PostgreSQL stored for it where that value is known.
     expression: Expr,
+    /// How the literals of the expression were read.
+    literals: CheckLiterals,
     /// The table on which the constraint is defined.
     table: Arc<<U::DB as DatabaseLike>::Table>,
     /// The columns involved in the constraint.
@@ -20,8 +23,23 @@ pub struct CheckMetadata<U: CheckConstraintLike> {
     calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
 }
 
+/// How the literals of a check were read when PostgreSQL created it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckLiterals {
+    /// Not read yet, which they are once the statement creating the check
+    /// has run.
+    Pending,
+    /// No literal holds a value other than the one written.
+    AsWritten,
+    /// These literals hold the value PostgreSQL stored.
+    Stored(Vec<BoundLiteral>),
+    /// A literal holds a value not known here, so the check stays as written.
+    Unreadable(UnreadableLiteral),
+}
+
 impl<U: CheckConstraintLike> CheckMetadata<U> {
-    /// Creates a new `CheckMetadata` instance.
+    /// Creates a new `CheckMetadata` instance, whose expression reads as
+    /// written.
     #[inline]
     pub fn new(
         expression: Expr,
@@ -29,14 +47,30 @@ impl<U: CheckConstraintLike> CheckMetadata<U> {
         columns: Vec<Arc<<U::DB as DatabaseLike>::Column>>,
         calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
     ) -> Self {
-        Self { expression, table, columns, calls }
+        Self { expression, literals: CheckLiterals::AsWritten, table, columns, calls }
     }
 
-    /// Returns a reference to the expression defining the constraint.
+    /// Returns a reference to the expression defining the constraint, each
+    /// literal holding the value PostgreSQL stored for it where that value is
+    /// known.
     #[must_use]
     #[inline]
     pub fn expression(&self) -> &Expr {
         &self.expression
+    }
+
+    /// Returns how the literals of the expression were read.
+    pub(crate) fn literals(&self) -> &CheckLiterals {
+        &self.literals
+    }
+
+    /// Records how the literals of the expression, still as written, were
+    /// read, writing each stored value into it.
+    pub(crate) fn set_literals(&mut self, literals: CheckLiterals) {
+        if let CheckLiterals::Stored(bound) = &literals {
+            respell(&mut self.expression, bound);
+        }
+        self.literals = literals;
     }
 
     /// Returns a reference to the table on which the constraint is defined.

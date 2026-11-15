@@ -16,7 +16,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::{PolicyExpression, SequenceParameters, TargetName},
+    structs::{ClauseExpression, SequenceParameters, TargetName},
     traits::{
         CastContext, CastLike, CastMethod, DatabaseLike, DomainLike, ExtensionLike, Metadata,
         OperatorKind, OperatorLike, PolicyLike, Relation, RuleLike, SequenceLike, SequenceOrigin,
@@ -370,7 +370,7 @@ impl<DB: DatabaseLike<Policy = Self>> PolicyLike for Absent<DB> {
     fn using_clause<'db>(
         &'db self,
         _: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
@@ -394,7 +394,7 @@ impl<DB: DatabaseLike<Policy = Self>> PolicyLike for Absent<DB> {
     fn check_clause<'db>(
         &'db self,
         _: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db,
     {

@@ -2049,8 +2049,10 @@ pub trait TableLike:
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let check_constraints: Vec<_> =
-    ///     table.check_constraints(&db)?.map(|cc| cc.expression(&db).to_string()).collect();
+    /// let check_constraints = table
+    ///     .check_constraints(&db)?
+    ///     .map(|cc| cc.expression(&db).map(ToString::to_string))
+    ///     .collect::<Result<Vec<_>, _>>()?;
     /// assert_eq!(check_constraints, vec!["id > 0", "length(name) > 0"]);
     /// # Ok(())
     /// # }
@@ -2087,10 +2089,10 @@ pub trait TableLike:
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let non_tautological_ccs: Vec<_> = table
+    /// let non_tautological_ccs = table
     ///     .non_tautological_check_constraints(&db)?
-    ///     .map(|cc| cc.expression(&db).to_string())
-    ///     .collect();
+    ///     .map(|cc| cc.expression(&db).map(ToString::to_string))
+    ///     .collect::<Result<Vec<_>, _>>()?;
     /// assert_eq!(non_tautological_ccs, vec!["length(name) > 0"]);
     /// # Ok(())
     /// # }
@@ -4501,7 +4503,7 @@ pub trait TableLike:
     /// [`RowSecurity::InfiniteRecursion`], as PostgreSQL refuses the statement.
     /// A policy clause holding a literal whose stored value is not known here
     /// stays in its gate as
-    /// [`PolicyExpression::Written`](crate::structs::PolicyExpression::Written),
+    /// [`ClauseExpression::Written`](crate::structs::ClauseExpression::Written),
     /// so every other term is answered as usual.
     ///
     /// # Errors

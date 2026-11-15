@@ -143,7 +143,7 @@ fn a_literal_whose_value_is_unknown_hides_no_loop() {
     let gate = &security.gates().expect("the role is not exempt")[0];
     assert!(matches!(
         gate.permissive()[0].expression(),
-        PolicyExpression::Written { unreadable: LookupError::PolicyLiteralUnreadable { .. }, .. }
+        ClauseExpression::Written { unreadable: LookupError::PolicyLiteralUnreadable { .. }, .. }
     ));
 }
 

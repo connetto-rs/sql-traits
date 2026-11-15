@@ -124,7 +124,7 @@ fn calls_of_a_clause_with_an_unread_literal_reach_their_functions() {
     );
     let policy = policy(&db, "p");
     let using = policy.using_clause(&db).expect("policy is held").expect("USING clause");
-    assert!(matches!(using, PolicyExpression::Written { .. }), "the literal needs a zone");
+    assert!(matches!(using, ClauseExpression::Written { .. }), "the literal needs a zone");
     let calls = names_per_call(using.expression(), |call| {
         policy.functions_reached_by(call, &db).map(names)
     });
@@ -296,7 +296,7 @@ fn check_constraint_calls_reach_their_functions() {
     );
     let table = db.tables().next().expect("table exists");
     let check = table.check_constraints(&db).expect("table is held").next().expect("check");
-    let calls = reached_per_call(check.expression(&db), |call| {
+    let calls = reached_per_call(check.expression(&db).expect("check is held"), |call| {
         check
             .functions_reached_by(call, &db)
             .expect("call belongs to the check")
@@ -310,7 +310,7 @@ fn check_constraint_calls_reach_their_functions() {
             ("stamp".to_owned(), vec!["stamp Volatile".to_owned()]),
         ]
     );
-    let copy = check.expression(&db).clone();
+    let copy = check.expression(&db).expect("check is held").clone();
     let refusals =
         refusals_per_call(&copy, |call| check.functions_reached_by(call, &db).map(names));
     assert_eq!(
@@ -348,7 +348,7 @@ fn an_expression_form_reaches_no_function() {
 
     let table = db.tables().next().expect("table exists");
     let check = table.check_constraints(&db).expect("table is held").next().expect("check");
-    let in_check = names_per_call(check.expression(&db), |call| {
+    let in_check = names_per_call(check.expression(&db).expect("check is held"), |call| {
         check.functions_reached_by(call, &db).map(names)
     });
     assert_eq!(

@@ -14,6 +14,7 @@ mod function_metadata;
 pub use function_metadata::FunctionMetadata;
 pub(crate) use function_metadata::RangeConstructor;
 mod check_metadata;
+pub(crate) use check_metadata::CheckLiterals;
 pub use check_metadata::CheckMetadata;
 mod domain_metadata;
 pub use domain_metadata::DomainMetadata;
@@ -25,6 +26,6 @@ pub(crate) use expression_calls::{
 };
 mod policy_metadata;
 pub use policy_metadata::PolicyMetadata;
-pub(crate) use policy_metadata::{ClauseLiterals, UnreadableLiteral};
+pub(crate) use policy_metadata::{BoundLiteral, ClauseLiterals, UnreadableLiteral, respell};
 mod view_metadata;
 pub use view_metadata::ViewMetadata;

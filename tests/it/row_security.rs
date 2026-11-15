@@ -433,8 +433,8 @@ fn a_literal_whose_value_is_unknown_marks_its_own_term_alone() {
             .iter()
             .map(|term| {
                 let unreadable = match term.expression() {
-                    PolicyExpression::Stored(_) => None,
-                    PolicyExpression::Written { unreadable, .. } => Some(unreadable),
+                    ClauseExpression::Stored(_) => None,
+                    ClauseExpression::Written { unreadable, .. } => Some(unreadable),
                 };
                 (term.policy().name(), term.expression().expression().to_string(), unreadable)
             })

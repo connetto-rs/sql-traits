@@ -9,7 +9,7 @@ use sqlparser::ast::{
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
-        ParserDB, PolicyExpression, TargetName,
+        ClauseExpression, ParserDB, TargetName,
         metadata::{ClauseLiterals, ExpressionCalls, PolicyMetadata},
     },
     traits::{DatabaseLike, Metadata, PolicyLike},
@@ -39,15 +39,15 @@ fn clause<'db>(
     policy: &CreatePolicy,
     stored: &'db Expr,
     literals: &ClauseLiterals,
-) -> PolicyExpression<'db> {
+) -> ClauseExpression<'db> {
     match literals {
         ClauseLiterals::Unreadable(literal) => {
-            PolicyExpression::Written {
+            ClauseExpression::Written {
                 expression: stored,
                 unreadable: literal.error(&policy.name.value),
             }
         }
-        ClauseLiterals::AsWritten | ClauseLiterals::Stored(_) => PolicyExpression::Stored(stored),
+        ClauseLiterals::AsWritten | ClauseLiterals::Stored(_) => ClauseExpression::Stored(stored),
     }
 }
 
@@ -133,7 +133,7 @@ impl PolicyLike for CreatePolicy {
     fn using_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
@@ -162,7 +162,7 @@ impl PolicyLike for CreatePolicy {
     fn check_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db,
     {

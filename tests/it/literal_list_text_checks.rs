@@ -29,7 +29,7 @@ fn assert_facts_in<D: Dialect + Default + 'static>(
             check.is_lower_bounded_text_constraint(&db)?,
             check.is_not_empty_text_constraint(&db)?,
         );
-        assert_eq!(facts, *expected, "{}", check.expression(&db));
+        assert_eq!(facts, *expected, "{}", check.expression(&db)?);
     }
     Ok(())
 }

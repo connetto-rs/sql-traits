@@ -45,8 +45,8 @@ use crate::{
         IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
         Sequence, TableAttribute, TableMetadata, UserDefinedType, View,
         metadata::{
-            CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
-            PolicyMetadata, UniqueIndexMetadata,
+            CheckLiterals, CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls,
+            IndexMetadata, PolicyMetadata, UniqueIndexMetadata,
         },
     },
     traits::{ColumnLike, IndexLike, SequenceLike, TableLike, ViewLike},
@@ -103,7 +103,6 @@ mod parse_options;
 mod parsed_source;
 mod partition_bounds;
 mod partition_keys;
-mod policy_literals;
 mod postgres_18_collations;
 mod postgres_18_functions;
 mod postgres_builtins;
@@ -117,6 +116,7 @@ mod rules;
 mod schema_usage;
 mod sequences;
 mod signature_types;
+mod stored_literals;
 mod stored_subqueries;
 mod table_as;
 mod table_owner;
@@ -1663,7 +1663,7 @@ impl ParserDBBuilder {
             let table = TableAttribute::table(check);
             let detached = belongs_to(table);
             if detached {
-                carried.record(metadata.expression(), metadata.calls());
+                carried.record(&*check.attribute().expr, metadata.calls());
                 // A check written on a column belongs to the column.
                 let column = table.columns.iter().find(|column| {
                     column.options.iter().any(|option| {
@@ -1677,12 +1677,13 @@ impl ParserDBBuilder {
                 let declared = check.attribute();
                 let name = check_names.get_mut(position).and_then(Option::take);
                 position += 1;
-                carried.operators.record(
+                let literals = metadata.literals().clone();
+                carried.operators.record_check(
                     owner,
-                    operator_carry::Kind::Check,
                     name,
-                    &*declared.expr,
+                    &declared.expr,
                     metadata.calls_mut(),
+                    literals,
                 );
             }
             !detached
@@ -5726,16 +5727,23 @@ impl ParserDB {
             &builder,
             carried,
         )?;
-        carried.operators.take_check(&check.expr, &mut calls);
-        Ok(builder.add_check_constraint(
-            check_arc,
-            CheckMetadata::new(
-                *check.expr.clone(),
-                create_table.clone(),
-                columns_in_expression,
-                calls,
-            ),
-        ))
+        let literals = carried.operators.take_check(&check.expr, &mut calls);
+        let mut metadata = CheckMetadata::new(
+            *check.expr.clone(),
+            create_table.clone(),
+            columns_in_expression,
+            calls,
+        );
+        // A check a rebuild carries keeps the literals it was created with,
+        // and a new one is read once the statement creating it has run.
+        metadata.set_literals(literals.unwrap_or(
+            if matches!(*builder.dialect(), SqlparserDialect::PostgreSql) {
+                CheckLiterals::Pending
+            } else {
+                CheckLiterals::AsWritten
+            },
+        ));
+        Ok(builder.add_check_constraint(check_arc, metadata))
     }
 
     /// Helper function to create an index expression from columns.
@@ -9400,9 +9408,13 @@ impl ParserDB {
         } = catalog;
         let dialect = *builder.dialect();
         for statement in statements {
-            // What the previous statement created is named before this one can
-            // refer to it.
+            // What the previous statement created is named, and its checks
+            // read in the session it ran in, before this one can refer to it.
             constraint_names::name_pending(&mut builder);
+            stored_literals::bind_pending_checks(
+                &mut builder,
+                stored_literals::LiteralSession::of(&session_settings),
+            );
             if tracks_session_roles(dialect)
                 && let Some(change) =
                     SessionChange::of(&statement, dialect.hex_strings_may_be_integers())?
@@ -11196,12 +11208,12 @@ impl ParserDB {
                     }
 
                     // PostgreSQL stores each literal as this session reads it.
-                    let session = policy_literals::LiteralSession::of(&session_settings);
+                    let session = stored_literals::LiteralSession::of(&session_settings);
                     let bind = |clause: Option<&mut Expr>| {
                         clause.filter(|_| matches!(dialect, SqlparserDialect::PostgreSql)).map_or(
                             ClauseLiterals::AsWritten,
                             |clause| {
-                                policy_literals::bind(&builder, &policy.table_name, clause, session)
+                                stored_literals::bind(&builder, &policy.table_name, clause, session)
                             },
                         )
                     };
@@ -11737,12 +11749,12 @@ impl ParserDB {
                                 )?;
                             }
 
-                            let session = policy_literals::LiteralSession::of(&session_settings);
+                            let session = stored_literals::LiteralSession::of(&session_settings);
                             let bind = |clause: Option<&mut Expr>| {
                                 clause
                                     .filter(|_| matches!(dialect, SqlparserDialect::PostgreSql))
                                     .map_or(ClauseLiterals::AsWritten, |clause| {
-                                        policy_literals::bind(
+                                        stored_literals::bind(
                                             &builder,
                                             &table_name,
                                             clause,
@@ -11974,6 +11986,10 @@ impl ParserDB {
             }
         }
         constraint_names::name_pending(&mut builder);
+        stored_literals::bind_pending_checks(
+            &mut builder,
+            stored_literals::LiteralSession::of(&session_settings),
+        );
         Ok(transactions::Catalog {
             builder,
             postgres: active_postgres_catalog,

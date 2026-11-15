@@ -4,7 +4,7 @@
 
 use alloc::{string::String, vec::Vec};
 
-use super::PolicyExpression;
+use super::ClauseExpression;
 
 /// Who a statement runs as.
 #[derive(Debug)]
@@ -131,7 +131,7 @@ pub enum PolicyClause {
 pub struct GateTerm<'db, P> {
     pub(crate) policy: &'db P,
     pub(crate) clause: PolicyClause,
-    pub(crate) expression: PolicyExpression<'db>,
+    pub(crate) expression: ClauseExpression<'db>,
 }
 
 impl<'db, P> GateTerm<'db, P> {
@@ -148,10 +148,10 @@ impl<'db, P> GateTerm<'db, P> {
         self.clause
     }
 
-    /// The clause, [`PolicyExpression::Written`] where a literal of it holds
+    /// The clause, [`ClauseExpression::Written`] where a literal of it holds
     /// a value not known here.
     #[must_use]
-    pub fn expression(&self) -> &PolicyExpression<'db> {
+    pub fn expression(&self) -> &ClauseExpression<'db> {
         &self.expression
     }
 }

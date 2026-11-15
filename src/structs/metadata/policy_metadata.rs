@@ -1,14 +1,16 @@
 //! Submodule defining a generic `PolicyMetadata` struct.
 
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use core::ops::ControlFlow;
 
 use sql_values::{DateTimeError, PgType};
-use sqlparser::ast::Expr;
+use sqlparser::ast::{CastKind, DataType, Expr, Value, VisitorMut};
 
 use super::ExpressionCalls;
 use crate::{
     errors::LookupError,
     traits::{DatabaseLike, PolicyLike},
+    utils::walk::walk_mut,
 };
 
 #[derive(Debug, Clone)]
@@ -51,8 +53,9 @@ impl ClauseLiterals {
     }
 }
 
-/// A literal of a policy expression that PostgreSQL read as a date or time
-/// value when it created the policy, and whose value is not known here.
+/// A literal of a check or a policy expression that PostgreSQL read as a date
+/// or time value when it created the expression, and whose value is not
+/// known here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnreadableLiteral {
     /// The literal's text, as written.
@@ -72,6 +75,80 @@ impl UnreadableLiteral {
             data_type: self.data_type,
             reason: self.reason,
         }
+    }
+
+    /// The error answering for this literal of the check named `check` on the
+    /// table named `table`.
+    pub(crate) fn check_error(&self, table: &str, check: Option<String>) -> LookupError {
+        LookupError::CheckLiteralUnreadable {
+            table: table.into(),
+            check,
+            literal: self.literal.clone(),
+            data_type: self.data_type,
+            reason: self.reason,
+        }
+    }
+}
+
+/// A literal PostgreSQL read as a date or time value when it created the
+/// expression holding it, with the value it stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundLiteral {
+    /// The literal's place among the nodes of its expression, counted in the
+    /// order a pre-order walk meets them.
+    pub(crate) place: usize,
+    /// The type an untyped literal is cast to, or `None` for a literal a cast
+    /// or a typed string types, which takes the stored text in place.
+    pub(crate) cast: Option<DataType>,
+    /// The text PostgreSQL stored.
+    pub(crate) stored: String,
+}
+
+/// Writes the value of each of `literals` into its place in `expression`.
+pub(crate) fn respell(expression: &mut Expr, literals: &[BoundLiteral]) {
+    let walked = walk_mut(expression, &mut Respell { literals, met: 0, places: Vec::new() });
+    debug_assert!(walked.is_continue(), "the respelling never breaks");
+}
+
+/// Writes stored literals into the places it counts while it walks.
+struct Respell<'a> {
+    literals: &'a [BoundLiteral],
+    /// How many nodes the walk met.
+    met: usize,
+    /// The place of each node the walk stands in, innermost last.
+    places: Vec<usize>,
+}
+
+impl VisitorMut for Respell<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, _expr: &mut Expr) -> ControlFlow<Self::Break> {
+        self.places.push(self.met);
+        self.met += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        let place = self.places.pop();
+        let Some(literal) = self.literals.iter().find(|literal| Some(literal.place) == place)
+        else {
+            return ControlFlow::Continue(());
+        };
+        let stored = Value::SingleQuotedString(literal.stored.clone());
+        match (&literal.cast, expr) {
+            (Some(data_type), expr) => {
+                *expr = Expr::Cast {
+                    kind: CastKind::DoubleColon,
+                    expr: Box::new(Expr::Value(stored.with_empty_span())),
+                    data_type: data_type.clone(),
+                    format: None,
+                };
+            }
+            (None, Expr::TypedString(typed)) => typed.value.value = stored,
+            // The literal a cast holds.
+            (None, expr) => *expr = Expr::Value(stored.with_empty_span()),
+        }
+        ControlFlow::Continue(())
     }
 }
 

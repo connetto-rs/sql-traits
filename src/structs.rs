@@ -3,6 +3,7 @@
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod absent;
 mod call_resolution;
+mod clause_expression;
 mod column_scope;
 mod deployment;
 mod expression_context;
@@ -27,7 +28,6 @@ mod operator_resolution;
 mod partition_bound;
 pub(crate) mod plpgsql_scope;
 pub(crate) mod policy_analysis;
-mod policy_expression;
 mod privilege_holder;
 mod revoked_privilege;
 mod role_membership;
@@ -47,6 +47,7 @@ mod view;
 
 pub use absent::Absent;
 pub use call_resolution::{ArgumentEvidence, CallResolution, SelectedFunction};
+pub use clause_expression::ClauseExpression;
 pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
     ColumnScope, QueryOutput, RangeTableEntry, RelationBinding,
@@ -80,7 +81,6 @@ pub use plpgsql_scope::{
     DynamicExecution, DynamicExecutionSites, PlPgSqlScope, PlPgSqlVariable, VariableKind,
 };
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
-pub use policy_expression::PolicyExpression;
 pub use privilege_holder::PrivilegeHolder;
 pub use revoked_privilege::RevokedPrivilege;
 pub use role_membership::RoleMembership;

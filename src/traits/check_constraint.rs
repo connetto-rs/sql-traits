@@ -15,7 +15,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::IdentifierCase,
+    structs::{ClauseExpression, IdentifierCase},
     traits::{
         ColumnCollation, DataTypeLike, DatabaseLike, Metadata, MySqlCollationPadding, TableLike,
         column::ColumnLike, function_like::FunctionLike,
@@ -339,7 +339,7 @@ where
 
     for constraint in table.check_constraints(database)? {
         let cc: &C = constraint.borrow();
-        let expr = cc.expression(database);
+        let expr = cc.check_clause(database)?.expression();
         if let Some(bound) = check_text_length_bound_recursive(
             database,
             expr,
@@ -671,31 +671,123 @@ pub trait CheckConstraintLike:
     /// The type of the database that this column belongs to.
     type DB: DatabaseLike<CheckConstraint: Borrow<Self>>;
 
-    /// Returns the expression of the check constraint as an SQL AST node.
+    /// Returns the check, each literal holding the value PostgreSQL stored for
+    /// it when it created the check.
     ///
-    /// # Arguments
+    /// PostgreSQL reads a quoted literal as the type its position demands
+    /// while it parses the check, so a `timestamptz` or `timetz` literal is
+    /// the instant of the session's `TimeZone` there, and comes back as that
+    /// instant in UTC, cast to its type.
     ///
-    /// * `database` - A reference to the database instance to query the check
-    ///   constraint from.
+    /// # Errors
+    ///
+    /// Returns [`LookupError::CheckLiteralUnreadable`] for a literal whose
+    /// value needed session state the input does not settle, such as a
+    /// `TimeZone`, a `DateStyle` order or the time of creation, and
+    /// [`LookupError::ObjectNotInDatabase`] when `database` does not hold
+    /// this check constraint.
     ///
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "CREATE TABLE my_table (id INT CHECK (id > 0), name TEXT CHECK (length(name) > 0));",
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "SET TIME ZONE 'Asia/Tokyo';
+    ///      CREATE TABLE events (at TIMESTAMPTZ CHECK (at > '2026-01-01 09:00'));",
     /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let check_constraints: Vec<_> =
-    ///     table.check_constraints(&db)?.map(|cc| cc.expression(&db).to_string()).collect();
-    /// assert_eq!(check_constraints, vec!["id > 0", "length(name) > 0"]);
+    /// let table = db.tables().next().unwrap();
+    /// let check = table.check_constraints(&db)?.next().unwrap();
+    /// assert_eq!(
+    ///     check.expression(&db)?.to_string(),
+    ///     "at > '2026-01-01 00:00:00+00'::TIMESTAMP WITH TIME ZONE",
+    /// );
     /// # Ok(())
     /// # }
     /// ```
-    fn expression<'db>(&'db self, database: &'db Self::DB) -> &'db Expr;
+    fn expression<'db>(&'db self, database: &'db Self::DB) -> Result<&'db Expr, LookupError> {
+        self.check_clause(database)?.stored()
+    }
+
+    /// Returns the check, stored when every literal of it could be read and
+    /// written when one could not.
+    ///
+    /// A walk of the columns and calls the check holds reads
+    /// [`ClauseExpression::expression`], which answers either form. A caller
+    /// comparing values reads [`Self::expression`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this check constraint.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE events (at TIMESTAMPTZ CHECK (at > '2026-01-01 09:00'));",
+    /// )?;
+    /// let table = db.tables().next().unwrap();
+    /// let check = table.check_constraints(&db)?.next().unwrap();
+    /// // The script sets no `TimeZone`, so the literal's stored value is unknown.
+    /// let ClauseExpression::Written { expression, unreadable } = check.check_clause(&db)? else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(expression.to_string(), "at > '2026-01-01 09:00'");
+    /// assert!(matches!(unreadable, LookupError::CheckLiteralUnreadable { .. }));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn check_clause<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<ClauseExpression<'db>, LookupError>;
+
+    /// Returns the check as the input spells it, or `None` when this source
+    /// holds no such spelling.
+    ///
+    /// [`Self::expression`] answers each literal with the value PostgreSQL
+    /// stored for it, cast to the type it was read as. This check keeps every
+    /// literal and cast as written, and follows the same renames of the
+    /// columns it names. A catalog stores only the typed constant, so it never
+    /// knows whether a cast was written and answers `None` for a check that
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this check constraint.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE events (at TIMESTAMP CHECK (at > '2026-01-01 12:00'));",
+    /// )?;
+    /// let table = db.tables().next().unwrap();
+    /// let check = table.check_constraints(&db)?.next().unwrap();
+    /// assert_eq!(
+    ///     check.expression(&db)?.to_string(),
+    ///     "at > '2026-01-01 12:00:00'::TIMESTAMP WITHOUT TIME ZONE",
+    /// );
+    /// assert_eq!(check.written_expression(&db)?.unwrap().to_string(), "at > '2026-01-01 12:00'");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn written_expression<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError>;
 
     /// Returns whether the check was written `NO INHERIT`, staying on the
     /// table declaring it rather than passing to the tables inheriting from
@@ -1037,7 +1129,7 @@ pub trait CheckConstraintLike:
     /// )?;
     /// let table = db.tables().next().unwrap();
     /// let check = table.check_constraints(&db)?.next().unwrap();
-    /// let Expr::BinaryOp { left, .. } = check.expression(&db) else { panic!() };
+    /// let Expr::BinaryOp { left, .. } = check.expression(&db)? else { panic!() };
     /// let Expr::Function(call) = left.as_ref() else { panic!() };
     /// let reached: Vec<_> = check.functions_reached_by(call, &db)?.collect();
     /// assert_eq!(reached.len(), 1);
@@ -1246,7 +1338,7 @@ pub trait CheckConstraintLike:
     fn is_tautology(&self, database: &Self::DB) -> Result<bool, LookupError> {
         Ok(self.table(database)?.expression_truth(
             database,
-            self.expression(database),
+            self.check_clause(database)?.expression(),
             IdentifierCase::AsWritten,
         )? == Some(true))
     }
@@ -1310,9 +1402,10 @@ pub trait CheckConstraintLike:
     /// # }
     /// ```
     fn is_negation(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        let expression = self.check_clause(database)?.expression();
         if self.table(database)?.expression_truth(
             database,
-            self.expression(database),
+            expression,
             IdentifierCase::AsWritten,
         )? == Some(false)
         {
@@ -1322,7 +1415,6 @@ pub trait CheckConstraintLike:
         // A contradiction between length limits is a negation only when both
         // bounds belong to one column, since the lengths of different
         // columns are unrelated.
-        let expression = self.expression(database);
         for column in self.columns(database)? {
             let name = column.column_name();
             let mut visited_cols = Vec::new();
@@ -1363,6 +1455,11 @@ pub trait CheckConstraintLike:
     /// * `database` - A reference to the database instance to query the table
     ///   from.
     ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this check constraint.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -1388,38 +1485,40 @@ pub trait CheckConstraintLike:
     /// let [cc1, cc2, cc3, cc4, cc5, cc6] = &check_constraints.as_slice() else {
     ///     panic!("Expected six check constraints");
     /// };
-    /// assert!(cc1.is_mutual_nullability_constraint(&db));
-    /// assert!(cc2.is_mutual_nullability_constraint(&db));
-    /// assert!(!cc3.is_mutual_nullability_constraint(&db));
-    /// assert!(!cc4.is_mutual_nullability_constraint(&db));
-    /// assert!(!cc5.is_mutual_nullability_constraint(&db));
-    /// assert!(!cc6.is_mutual_nullability_constraint(&db));
+    /// assert!(cc1.is_mutual_nullability_constraint(&db)?);
+    /// assert!(cc2.is_mutual_nullability_constraint(&db)?);
+    /// assert!(!cc3.is_mutual_nullability_constraint(&db)?);
+    /// assert!(!cc4.is_mutual_nullability_constraint(&db)?);
+    /// assert!(!cc5.is_mutual_nullability_constraint(&db)?);
+    /// assert!(!cc6.is_mutual_nullability_constraint(&db)?);
     /// # Ok(())
     /// # }
     /// ```
-    fn is_mutual_nullability_constraint(&self, database: &Self::DB) -> bool {
+    fn is_mutual_nullability_constraint(&self, database: &Self::DB) -> Result<bool, LookupError> {
         use sqlparser::ast::{BinaryOperator, Expr};
 
-        let expr = self.expression(database);
+        let expr = self.check_clause(database)?.expression();
 
         // Must be an OR expression
         let Expr::BinaryOp { left, op: BinaryOperator::Or, right } = expr else {
-            return false;
+            return Ok(false);
         };
 
         // Left side should be all NULL checks, right side all NOT NULL checks
         // (or vice versa)
-        if let (Some(null_cols), Some(not_null_cols)) =
-            (extract_null_columns(left, true), extract_null_columns(right, false))
-        {
-            null_cols == not_null_cols && null_cols.len() >= 2
-        } else if let (Some(not_null_cols), Some(null_cols)) =
-            (extract_null_columns(left, false), extract_null_columns(right, true))
-        {
-            null_cols == not_null_cols && null_cols.len() >= 2
-        } else {
-            false
-        }
+        Ok(
+            if let (Some(null_cols), Some(not_null_cols)) =
+                (extract_null_columns(left, true), extract_null_columns(right, false))
+            {
+                null_cols == not_null_cols && null_cols.len() >= 2
+            } else if let (Some(not_null_cols), Some(null_cols)) =
+                (extract_null_columns(left, false), extract_null_columns(right, true))
+            {
+                null_cols == not_null_cols && null_cols.len() >= 2
+            } else {
+                false
+            },
+        )
     }
 
     /// Returns whether the check constraint checks that a textual column is not
@@ -1478,7 +1577,7 @@ pub trait CheckConstraintLike:
     /// # }
     /// ```
     fn is_not_empty_text_constraint(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        let expr = self.expression(database);
+        let expr = self.check_clause(database)?.expression();
         check_not_empty_text_recursive(database, expr, self)
     }
 
@@ -1552,7 +1651,7 @@ pub trait CheckConstraintLike:
         &self,
         database: &Self::DB,
     ) -> Result<Option<usize>, LookupError> {
-        let expr = self.expression(database);
+        let expr = self.check_clause(database)?.expression();
         let mut visited_cols = Vec::new();
         check_text_length_bound_recursive(
             database,
@@ -1624,7 +1723,7 @@ pub trait CheckConstraintLike:
         &self,
         database: &Self::DB,
     ) -> Result<Option<usize>, LookupError> {
-        let expr = self.expression(database);
+        let expr = self.check_clause(database)?.expression();
         let mut visited_cols = Vec::new();
         check_text_length_bound_recursive(
             database,

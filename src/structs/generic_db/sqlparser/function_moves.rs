@@ -366,7 +366,7 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
         }
         for (check, metadata) in builder.check_constraints() {
             if stored.matches(TableAttribute::table(check.as_ref()), case) {
-                bound.record(metadata.expression(), metadata.calls());
+                bound.record(&*check.attribute().expr, metadata.calls());
             }
         }
         for (unique_key, metadata) in builder.unique_indices() {
