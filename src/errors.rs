@@ -1924,6 +1924,16 @@ pub enum Error {
         /// Name of the host table containing the foreign key.
         host_table: String,
     },
+    #[error(
+        "Foreign key in table `{table_name}` is declared INITIALLY DEFERRED but NOT DEFERRABLE."
+    )]
+    /// Error indicating that a foreign key is declared `NOT DEFERRABLE
+    /// INITIALLY DEFERRED`, which PostgreSQL refuses with "constraint
+    /// declared INITIALLY DEFERRED must be DEFERRABLE".
+    InitiallyDeferredNotDeferrable {
+        /// Name of the table the foreign key is declared on.
+        table_name: String,
+    },
     #[error("Table `{table_name}` not found for trigger `{trigger_name}`.")]
     /// Error indicating that a trigger references a table that does not exist.
     TableNotFoundForTrigger {
