@@ -151,16 +151,18 @@ impl PostgresBuiltin {
             ObjectNamePart::Identifier(Ident::new(PG_CATALOG)),
             ObjectNamePart::Identifier(stored_ident(name)),
         ]);
-        let mut function = declaration(
+        declaration(
             name,
             arguments,
             result,
             matches!(null_input, NullInput::Strict),
             volatility,
             language,
-        )?;
-        function.leakproof = matches!(leakage, Leakage::Leakproof).then_some(true);
-        Some(function)
+        )
+        .map(|mut function| {
+            function.leakproof = matches!(leakage, Leakage::Leakproof).then_some(true);
+            function
+        })
     }
 
     fn metadata(&self) -> FunctionMetadata {
