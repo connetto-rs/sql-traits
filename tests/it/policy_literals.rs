@@ -307,11 +307,9 @@ fn every_typed_position_reads_its_literal_as_postgresql_does() -> Result<(), Loo
         using(&db, "p_derived")?,
         format!("EXISTS (SELECT 1 FROM (SELECT expires AS x FROM m) q WHERE q.x < {new_year})")
     );
-    // PostgreSQL types it by the type of `now()`, which is not inferred here,
-    // so it is never guessed.
     assert_eq!(
         using(&db, "p_computed")?,
-        "EXISTS (SELECT 1 FROM (SELECT now() AS x) q WHERE q.x < '2026-01-01')"
+        format!("EXISTS (SELECT 1 FROM (SELECT now() AS x) q WHERE q.x < {new_year})")
     );
     let row = parse(
         "SET TIME ZONE 'Europe/Rome';
@@ -508,5 +506,30 @@ fn a_dialect_without_policies_of_its_own_keeps_literals_as_written() -> Result<(
         "{TABLES} CREATE POLICY p ON t USING (tz < '2026-01-01 12:00');"
     ))?;
     assert_eq!(using(&db, "p")?, "tz < '2026-01-01 12:00'");
+    Ok(())
+}
+
+#[test]
+fn policy_literals_take_expression_result_types() -> Result<(), LookupError> {
+    let database = parse(
+        r#"SET TIME ZONE 'Europe/Rome';
+        CREATE TABLE e (ts TIMESTAMPTZ, d DATE);
+        CREATE POLICY p_case ON e USING (CASE WHEN d > '2026-01-01' THEN ts ELSE '2026-01-01 12:00' END IS NOT NULL);
+        CREATE POLICY p_array ON e USING (ts <> ALL ('{"2026-01-01 12:00",NULL}'));
+        CREATE POLICY p_function ON e USING (date_trunc('day', ts) > '2026-01-01 12:00');"#,
+    );
+    for (name, expected) in [
+        (
+            "p_case",
+            "CASE WHEN d > '2026-01-01'::DATE THEN ts ELSE '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE END IS NOT NULL",
+        ),
+        ("p_array", r#"ts <> ALL('{"2026-01-01 11:00:00+00",NULL}'::TIMESTAMP WITH TIME ZONE[])"#),
+        (
+            "p_function",
+            "date_trunc('day', ts) > '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE",
+        ),
+    ] {
+        assert_eq!(using(&database, name)?, expected, "{name}");
+    }
     Ok(())
 }
