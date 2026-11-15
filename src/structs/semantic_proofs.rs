@@ -6,7 +6,7 @@ use core::ops::ControlFlow;
 
 use sqlparser::{
     ast::{
-        BinaryOperator, DataType, Expr, Ident, InTarget, Query, UnaryOperator, Value,
+        BinaryOperator, CastKind, DataType, Expr, Ident, InTarget, Query, UnaryOperator, Value,
         ValueWithSpan, Visitor,
     },
     dialect::PostgreSqlDialect,
@@ -26,6 +26,7 @@ use crate::{
     },
     traits::{CastLike, ColumnLike, DatabaseLike, FunctionLike},
     utils::{
+        coercion::facts,
         postgres_types::{PgType, parse_data_type},
         walk::walk,
     },
@@ -41,9 +42,11 @@ use crate::{
 /// deparse writes. An untyped literal read as `int2`, `int4` or `int8` is the
 /// constant it becomes, a literal read as another type of `pg_catalog` and an
 /// operand relabelled, read as its domain's base or converted by a cast
-/// function of one argument are cast to the type the operator takes. A number
-/// under minus signs is the one constant the grammar folds it into, when the
-/// operator takes it unconverted. An `IN` list is the `= ANY (ARRAY[...])`
+/// function of one argument are cast to the type the operator takes. A
+/// literal under `COLLATE` over a type without a collation is the constant
+/// of its cast, as PostgreSQL drops the `COLLATE`. A number under minus signs
+/// is the one constant the grammar folds it into, when the operator takes it
+/// unconverted. An `IN` list is the `= ANY (ARRAY[...])`
 /// and the comparisons PostgreSQL resolves it into, when every element of the
 /// array is an untyped literal or of the array's element type. Every other
 /// node is left as written.
@@ -466,7 +469,7 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
     ) -> Result<Result<Option<Spelled>, Unproved>, LookupError> {
         let converted = match self.context.type_of(element)? {
             OperandType::UntypedLiteral => {
-                common.and_then(|common| literal(common, element)).map(Some)
+                common.and_then(|common| self.literal(common, element)).map(Some)
             }
             OperandType::Known { type_name, .. }
                 if common == Some(&PgType::from_target(&type_name)) =>
@@ -501,7 +504,7 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
         let spelled = match evidence.conversion() {
             [] => return Ok(None),
             [CoercionStep::LiteralInput { type_name }] => {
-                literal(&PgType::from_target(type_name), operand)
+                self.literal(&PgType::from_target(type_name), operand)
             }
             steps => {
                 let target = PgType::from_target(evidence.target());
@@ -525,24 +528,56 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
             if let [CoercionStep::DomainToBase { .. }, rest @ ..] = steps { rest } else { steps };
         !steps.is_empty() && rest.len() <= 1 && rest.iter().all(single)
     }
+
+    /// The untyped literal `operand` read as `target`: the constant it
+    /// becomes for an integer type, as `get_const_expr` writes it, and a cast
+    /// to `target` otherwise, or `None` for a target the deparse spells
+    /// differently.
+    ///
+    /// A `COLLATE` over the literal takes the cast under it, and a target
+    /// without a collation drops it, leaving the constant of the cast.
+    fn literal(&self, target: &PgType, operand: &Expr) -> Option<Spelled> {
+        let (written, collated) = written_literal(operand);
+        if let (
+            PgType::Catalog(name @ ("int2" | "int4" | "int8")),
+            Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(text), .. }),
+        ) = (target, written)
+            && let Some(constant) = integer_constant(name, text)
+        {
+            return Some(Spelled::Constant(Box::new(constant)));
+        }
+        let cast = deparsed(target)?;
+        if collated && facts(self.database, target)?.collation().is_none() {
+            let constant = Expr::Cast {
+                kind: CastKind::DoubleColon,
+                expr: Box::new(written.clone()),
+                data_type: cast,
+                format: None,
+            };
+            return Some(Spelled::Constant(Box::new(constant)));
+        }
+        Some(Spelled::Cast(cast))
+    }
 }
 
 /// A conversion no rewrite is proved for.
 struct Unproved;
 
-/// The untyped literal `operand` read as `target`: the constant it becomes
-/// for an integer type, as `get_const_expr` writes it, and a cast to
-/// `target` otherwise, or `None` for a target the deparse spells
-/// differently.
-fn literal(target: &PgType, operand: &Expr) -> Option<Spelled> {
-    if let (PgType::Catalog(name @ ("int2" | "int4" | "int8")), Expr::Value(value)) =
-        (target, operand)
-        && let Value::SingleQuotedString(text) = &value.value
-        && let Some(constant) = integer_constant(name, text)
-    {
-        return Some(Spelled::Constant(Box::new(constant)));
+/// The literal under the parentheses and `COLLATE` clauses of `operand`, and
+/// whether a `COLLATE` holds it.
+fn written_literal(operand: &Expr) -> (&Expr, bool) {
+    let mut collated = false;
+    let mut node = operand;
+    loop {
+        match node {
+            Expr::Nested(inner) => node = inner,
+            Expr::Collate { expr, .. } => {
+                collated = true;
+                node = expr;
+            }
+            written => return (written, collated),
+        }
     }
-    deparsed(target).map(Spelled::Cast)
 }
 
 /// The constant the `int2`, `int4` or `int8` named `name` reads `text` as,
