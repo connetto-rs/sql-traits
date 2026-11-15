@@ -551,6 +551,13 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
         self.unreach::<core::iter::Empty<ArgMode>>()
     }
 
+    fn returned_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
+        self.unreach::<core::iter::Empty<(TargetName<'db>, Cow<'db, str>)>>()
+    }
+
     fn argument_default_count(&self) -> usize {
         self.unreach()
     }

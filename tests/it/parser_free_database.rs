@@ -1159,6 +1159,13 @@ impl FunctionLike for MemoryFunction {
         self.argument_types.iter().map(|_| ArgMode::In)
     }
 
+    fn returned_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
+        core::iter::empty()
+    }
+
     fn argument_default_count(&self) -> usize {
         0
     }

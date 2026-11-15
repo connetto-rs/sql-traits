@@ -131,6 +131,25 @@ impl FunctionLike for CreateFunction {
     }
 
     #[inline]
+    fn returned_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
+        let columns = match &self.return_type {
+            Some(FunctionReturnType::DataType(DataType::Table(Some(columns)))) => {
+                columns.as_slice()
+            }
+            _ => &[],
+        };
+        columns.iter().map(|column| {
+            (
+                TargetName::new(&column.name.value, column.name.quote_style.is_some()),
+                normalize_sqlparser_type(&column.data_type),
+            )
+        })
+    }
+
+    #[inline]
     fn argument_default_count(&self) -> usize {
         self.args
             .iter()
