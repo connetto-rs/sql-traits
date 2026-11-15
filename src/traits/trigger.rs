@@ -757,7 +757,7 @@ mod tests {
             $$ LANGUAGE plpgsql;
             CREATE TRIGGER my_trigger
             BEFORE UPDATE ON users
-            FOR EACH ROW
+            FOR EACH ROW WHEN (OLD.id IS DISTINCT FROM NEW.id)
             EXECUTE FUNCTION update_timestamp();
         ";
 
@@ -782,6 +782,11 @@ mod tests {
             trigger_ref.orientation(),
             Some(sqlparser::ast::TriggerObjectKind::ForEach(sqlparser::ast::TriggerObject::Row))
         ));
+
+        assert_eq!(
+            trigger_ref.condition().map(ToString::to_string).as_deref(),
+            Some("OLD.id IS DISTINCT FROM NEW.id")
+        );
 
         let function = trigger_ref.function(&db).expect("Function should exist");
         assert_eq!(function.name(), "update_timestamp");
