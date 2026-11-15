@@ -11,8 +11,9 @@ use crate::{structs::SessionSetting, traits::DatabaseLike};
 
 /// The set a helper returns, the union of its arms.
 ///
-/// An arm whose condition keeps no row for the arguments is left out, so a
-/// helper returning nothing for them answers no arm.
+/// An arm whose condition keeps no row for the arguments is left out, and a
+/// walk with it where no other arm remains, so a helper returning nothing
+/// for them answers no arm.
 #[derive(Debug)]
 pub struct HelperSet<'db, DB: DatabaseLike> {
     pub(crate) arms: Vec<HelperArm<'db, DB>>,
@@ -47,6 +48,8 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Grant(GrantArm<'db, DB>),
     /// The rows of a table whose parent another helper returns.
     Parent(ParentArm<'db, DB>),
+    /// The rows of a table whose parent the set itself holds.
+    Walk(WalkArm<'db, DB>),
 }
 
 /// `SELECT <column> FROM <table> WHERE <caller column> =
@@ -194,5 +197,46 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
     #[must_use]
     pub fn set(&self) -> &HelperSet<'db, DB> {
         &self.set
+    }
+}
+
+/// The recursive term of `WITH RECURSIVE <walk> (<column>) AS (<arms> UNION
+/// SELECT <key> FROM <table> JOIN <walk> ON <column> = <walk>.<column>)
+/// SELECT <column> FROM <walk>`, which adds every row of the table whose
+/// parent the set holds until the set holds every row below its other arms.
+///
+/// The walk ends on a tree holding a cycle, as `UNION` keeps no row twice.
+#[derive(Debug)]
+pub struct WalkArm<'db, DB: DatabaseLike> {
+    pub(crate) table: &'db DB::Table,
+    pub(crate) key: &'db DB::Column,
+    pub(crate) column: &'db DB::Column,
+    pub(crate) foreign_key: &'db DB::ForeignKey,
+}
+
+impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
+    /// The table the walk descends.
+    #[must_use]
+    pub fn table(&self) -> &'db DB::Table {
+        self.table
+    }
+
+    /// The table's one-column primary key, which the arm returns.
+    #[must_use]
+    pub fn key(&self) -> &'db DB::Column {
+        self.key
+    }
+
+    /// The column naming each row's parent.
+    #[must_use]
+    pub fn column(&self) -> &'db DB::Column {
+        self.column
+    }
+
+    /// The single-column foreign key of [`column`](Self::column), which
+    /// references [`key`](Self::key).
+    #[must_use]
+    pub fn foreign_key(&self) -> &'db DB::ForeignKey {
+        self.foreign_key
     }
 }

@@ -113,8 +113,12 @@ ALTER TABLE project_grants FORCE ROW LEVEL SECURITY;
 ALTER TABLE connetto_installations FORCE ROW LEVEL SECURITY;
 ";
 
-/// The rows of R100's behaviour matrix, as `(table, [(column, value)])`.
-const ROWS: &[(&str, &[(&str, &str)])] = &[
+/// Fixture rows, as `(table, [(column, value)])`, a column left out holding
+/// `NULL`.
+type Rows = &'static [(&'static str, &'static [(&'static str, &'static str)])];
+
+/// The rows of R100's behaviour matrix.
+const ROWS: Rows = &[
     ("organizations", &[("id", "org"), ("created_by", "founder")]),
     ("teams", &[("id", "T"), ("organization_id", "org")]),
     ("teams", &[("id", "U"), ("organization_id", "org")]),
@@ -307,6 +311,14 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         grant.setting().name(),
                     )
                 }
+                HelperArm::Walk(walk) => {
+                    format!(
+                        "{}.{} WHERE {} IN itself",
+                        walk.table().table_name(),
+                        walk.key().column_name(),
+                        walk.column().column_name(),
+                    )
+                }
                 HelperArm::Parent(parent) => {
                     let arguments: Vec<String> =
                         parent.arguments().iter().map(ToString::to_string).collect();
@@ -329,20 +341,25 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
 }
 
 /// The fixture rows of `table`.
-fn rows(table: &str) -> impl Iterator<Item = &'static [(&'static str, &'static str)]> + '_ {
-    ROWS.iter().filter(move |(name, _)| *name == table).map(|(_, row)| *row)
+fn rows(
+    fixture: Rows,
+    table: &str,
+) -> impl Iterator<Item = &'static [(&'static str, &'static str)]> + '_ {
+    fixture.iter().filter(move |(name, _)| *name == table).map(|(_, row)| *row)
+}
+
+/// The value `row` holds in `column`, `None` for `NULL`.
+fn nullable(row: &[(&str, &'static str)], column: &str) -> Option<&'static str> {
+    row.iter().find(|(name, _)| *name == column).map(|(_, value)| *value)
 }
 
 fn cell(row: &[(&str, &'static str)], column: &str) -> &'static str {
-    row.iter()
-        .find(|(name, _)| *name == column)
-        .map(|(_, value)| *value)
-        .expect("the column has a value")
+    nullable(row, column).expect("the column has a value")
 }
 
-/// Evaluates an answer over [`ROWS`] for `caller`, the way a translator
+/// Evaluates an answer over `fixture` for `caller`, the way a translator
 /// lowering it to SQL over the backing tables would.
-fn evaluate(set: &HelperSet<'_, ParserDB>, caller: &str) -> BTreeSet<&'static str> {
+fn evaluate(set: &HelperSet<'_, ParserDB>, caller: &str, fixture: Rows) -> BTreeSet<&'static str> {
     let mut returned = BTreeSet::new();
     for arm in set.arms() {
         match arm {
@@ -353,12 +370,12 @@ fn evaluate(set: &HelperSet<'_, ParserDB>, caller: &str) -> BTreeSet<&'static st
                         .map(|value| {
                             match value {
                                 Value::SingleQuotedString(text) => text.clone(),
-                                other => panic!("R100 restricts by text, not {other}"),
+                                other => panic!("the fixtures restrict by text, not {other}"),
                             }
                         })
                         .collect()
                 });
-                for row in rows(grant.table().table_name()) {
+                for row in rows(fixture, grant.table().table_name()) {
                     let restricted = grant.restriction().is_none_or(|set| {
                         let value = cell(row, set.column().column_name());
                         allowed.as_ref().is_some_and(|allowed| allowed.iter().any(|v| v == value))
@@ -369,16 +386,34 @@ fn evaluate(set: &HelperSet<'_, ParserDB>, caller: &str) -> BTreeSet<&'static st
                 }
             }
             HelperArm::Parent(parent) => {
-                let parents = evaluate(parent.set(), caller);
-                for row in rows(parent.table().table_name()) {
+                let parents = evaluate(parent.set(), caller, fixture);
+                for row in rows(fixture, parent.table().table_name()) {
                     if parents.contains(cell(row, parent.column().column_name())) {
                         returned.insert(cell(row, parent.key().column_name()));
                     }
                 }
             }
+            HelperArm::Walk(_) => {}
         }
     }
-    returned
+    // A walk adds the rows below what the set holds until it holds them all,
+    // as PostgreSQL's `UNION` iterates its working table.
+    loop {
+        let mut grew = false;
+        for arm in set.arms() {
+            let HelperArm::Walk(walk) = arm else { continue };
+            for row in rows(fixture, walk.table().table_name()) {
+                if nullable(row, walk.column().column_name())
+                    .is_some_and(|parent| returned.contains(parent))
+                {
+                    grew |= returned.insert(cell(row, walk.key().column_name()));
+                }
+            }
+        }
+        if !grew {
+            return returned;
+        }
+    }
 }
 
 #[test]
@@ -439,7 +474,7 @@ fn every_helper_at_every_role_returns_what_postgres_returns_for_every_caller() {
     let deployment = deployment();
     for &(caller, helper, role, expected) in MEASURED {
         let set = answer(&database, &deployment, "authz", helper, &[text(role)]).expect("answered");
-        let returned: Vec<_> = evaluate(&set, caller).into_iter().collect();
+        let returned: Vec<_> = evaluate(&set, caller, ROWS).into_iter().collect();
         assert_eq!(returned, expected, "{caller} calling {helper}('{role}')");
     }
 }
@@ -543,7 +578,7 @@ fn a_column_without_a_foreign_key_is_typed_by_the_table_the_called_set_covers() 
         ]
     );
     for &(caller, expected) in INSTALLATIONS_MEASURED {
-        let returned: Vec<_> = evaluate(&set, caller).into_iter().collect();
+        let returned: Vec<_> = evaluate(&set, caller, ROWS).into_iter().collect();
         assert_eq!(returned, expected, "{caller} calling installations_administered()");
     }
 }
@@ -1390,4 +1425,227 @@ fn a_parent_argument_named_like_a_column_passes_the_column() {
             "team_id TEXT REFERENCES teams (id), min_role TEXT\n",
         );
     assert!(matches!(folders_with(&sql, text("read")), Err(HelperSetError::ArmShape { .. })));
+}
+
+/// connetto's group tree, its helper `authz.groups_with` written as `body`.
+fn groups(body: &str, after: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE TABLE groups (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES groups (id));
+         CREATE TABLE group_grants (
+           group_id TEXT NOT NULL REFERENCES groups (id),
+           principal_id TEXT NOT NULL,
+           role TEXT NOT NULL CHECK (role IN ('read', 'write')),
+           PRIMARY KEY (group_id, principal_id)
+         );
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         GRANT SELECT ON groups, group_grants TO authz_owner;
+         CREATE FUNCTION authz.groups_with(min_role TEXT) RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$ {body} $$;
+         ALTER FUNCTION authz.groups_with(TEXT) OWNER TO authz_owner;
+         {after}"
+    )
+}
+
+const GROUP_GRANT_ARM: &str = "SELECT g.group_id FROM public.group_grants g \
+     WHERE g.principal_id = current_setting('app.user_id', true) \
+     AND (g.role = 'write' OR min_role = 'read')";
+const CHILD_JOIN: &str =
+    "SELECT child.id FROM public.groups child JOIN reached ON child.parent_id = reached.id";
+
+/// A body walking from [`GROUP_GRANT_ARM`] down the tree through `term`.
+fn walking(term: &str) -> String {
+    format!(
+        "WITH RECURSIVE reached (id) AS ({GROUP_GRANT_ARM} UNION {term}) SELECT id FROM reached"
+    )
+}
+
+/// `team` under `org`, `squad` under `team`, and `other` apart.
+const TREE: Rows = &[
+    ("groups", &[("id", "org")]),
+    ("groups", &[("id", "team"), ("parent_id", "org")]),
+    ("groups", &[("id", "squad"), ("parent_id", "team")]),
+    ("groups", &[("id", "other")]),
+    ("group_grants", &[("group_id", "team"), ("principal_id", "alice"), ("role", "read")]),
+    ("group_grants", &[("group_id", "org"), ("principal_id", "bob"), ("role", "write")]),
+];
+
+/// [`TREE`] with `org` moved under `squad`, closing a cycle.
+const CYCLIC_TREE: Rows = &[
+    ("groups", &[("id", "org"), ("parent_id", "squad")]),
+    ("groups", &[("id", "team"), ("parent_id", "org")]),
+    ("groups", &[("id", "squad"), ("parent_id", "team")]),
+    ("groups", &[("id", "other")]),
+    ("group_grants", &[("group_id", "team"), ("principal_id", "alice"), ("role", "read")]),
+    ("group_grants", &[("group_id", "org"), ("principal_id", "bob"), ("role", "write")]),
+];
+
+/// What PostgreSQL 18.6 returns for `(rows, caller, minimum role)`, calling
+/// `authz.groups_with` written as `walking(CHILD_JOIN)`.
+const TREE_MEASURED: &[(Rows, &str, &str, &[&str])] = &[
+    (TREE, "alice", "read", &["squad", "team"]),
+    (TREE, "alice", "write", &[]),
+    (TREE, "bob", "read", &["org", "squad", "team"]),
+    (TREE, "bob", "write", &["org", "squad", "team"]),
+    (CYCLIC_TREE, "alice", "read", &["org", "squad", "team"]),
+];
+
+fn groups_with<'db>(
+    database: &'db ParserDB,
+    deployment: &'db Deployment,
+    role: &str,
+) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    answer(database, deployment, "authz", "groups_with", &[text(role)])
+}
+
+#[test]
+fn a_recursive_walk_answers_its_arms_and_the_walk_down_the_parent_column() {
+    let deployment = deployment();
+    for body in [
+        walking(CHILD_JOIN),
+        walking(
+            "SELECT child.id FROM reached r JOIN public.groups AS child ON r.id = child.parent_id",
+        ),
+        format!(
+            "WITH RECURSIVE reached AS ({GROUP_GRANT_ARM} UNION SELECT child.id \
+             FROM public.groups child JOIN reached ON child.parent_id = reached.group_id) \
+             SELECT reached.group_id FROM reached"
+        ),
+    ] {
+        let database = postgres(&groups(&body, ""));
+        let set = groups_with(&database, &deployment, "read").expect("answered");
+        assert_eq!(
+            render(&set),
+            "group_grants.group_id WHERE principal_id = app.user_id \
+             UNION groups.id WHERE parent_id IN itself",
+            "{body}"
+        );
+        assert_eq!(covered(&set), Some("groups"), "{body}");
+    }
+
+    let database = postgres(&groups(&walking(CHILD_JOIN), ""));
+    let set = groups_with(&database, &deployment, "read").expect("answered");
+    let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
+    let referenced = walk.foreign_key().referenced_table(&database).expect("resolves");
+    assert_eq!(referenced.table_name(), "groups");
+    for &(fixture, caller, role, expected) in TREE_MEASURED {
+        let set = groups_with(&database, &deployment, role).expect("answered");
+        let returned: Vec<_> = evaluate(&set, caller, fixture).into_iter().collect();
+        assert_eq!(returned, expected, "{caller} calling groups_with('{role}')");
+    }
+}
+
+#[test]
+fn a_walk_over_arms_keeping_no_row_answers_no_arm() {
+    let body =
+        walking(CHILD_JOIN).replace("(g.role = 'write' OR min_role = 'read')", "min_role = 'read'");
+    let database = postgres(&groups(&body, ""));
+    let deployment = deployment();
+    let set = groups_with(&database, &deployment, "write").expect("answered");
+    assert!(set.arms().is_empty(), "the walk starts from nothing");
+    assert_eq!(covered(&set), Some("groups"));
+}
+
+#[test]
+fn a_walk_with_union_all_refuses_the_answer() {
+    let body = walking(CHILD_JOIN).replace(" UNION SELECT child", " UNION ALL SELECT child");
+    let database = postgres(&groups(&body, ""));
+    let deployment = deployment();
+    assert!(matches!(
+        groups_with(&database, &deployment, "read"),
+        Err(HelperSetError::UnionAllWalk { function }) if function == "authz.groups_with"
+    ));
+}
+
+#[test]
+fn a_walk_of_any_other_shape_refuses_the_answer() {
+    let deployment = deployment();
+    let wider = "CREATE TABLE groups (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES groups (id));";
+    let shape = |sql: &str| {
+        let database = postgres(sql);
+        matches!(
+            groups_with(&database, &deployment, "read"),
+            Err(HelperSetError::ArmShape { function, .. }) if function == "authz.groups_with"
+        )
+    };
+    for body in [
+        walking(
+            "SELECT child.parent_id FROM public.groups child JOIN reached ON child.parent_id = reached.id",
+        ),
+        walking("SELECT child.id FROM public.groups child JOIN reached ON child.id = reached.id"),
+        walking(
+            "SELECT child.id FROM public.groups child JOIN reached ON child.org_id = reached.id",
+        ),
+        walking(
+            "SELECT child.id FROM public.groups child JOIN reached ON child.label = reached.id",
+        ),
+        walking(&format!("{CHILD_JOIN} JOIN public.group_grants g ON g.group_id = child.id")),
+        walking(&format!("{CHILD_JOIN} WHERE child.id <> 'x'")),
+        walking(&format!("{CHILD_JOIN} AND child.id <> 'x'")),
+        walking(&CHILD_JOIN.replace(" JOIN ", " LEFT JOIN ")),
+        walking(
+            "SELECT child.id FROM public.groups child, reached WHERE child.parent_id = reached.id",
+        ),
+        walking(
+            "SELECT child.id FROM public.groups child WHERE child.parent_id IN (SELECT id FROM reached)",
+        ),
+        walking(CHILD_JOIN).replace("WITH RECURSIVE", "WITH"),
+        walking(CHILD_JOIN)
+            .replace("SELECT id FROM reached", "SELECT id FROM reached WHERE id <> 'x'"),
+        walking(CHILD_JOIN).replace("SELECT id FROM reached", "SELECT 'x' FROM reached"),
+        walking(CHILD_JOIN).replace(
+            ") SELECT id FROM reached",
+            "), other (id) AS (SELECT 1) SELECT id FROM reached",
+        ),
+        walking(GROUP_GRANT_ARM),
+    ] {
+        let sql = groups(&body, "").replace(
+            wider,
+            "CREATE TABLE orgs (id TEXT PRIMARY KEY);
+             CREATE TABLE groups (
+               id TEXT PRIMARY KEY,
+               parent_id TEXT REFERENCES groups (id),
+               org_id TEXT REFERENCES orgs (id),
+               label TEXT
+             );",
+        );
+        assert!(shape(&sql), "{body}");
+    }
+
+    let shadowed = format!(
+        "WITH RECURSIVE reached (id) AS (SELECT id FROM reached \
+         WHERE user_id = current_setting('app.user_id', true) UNION {CHILD_JOIN}) SELECT id FROM reached"
+    );
+    let sql = groups(
+        &shadowed,
+        "CREATE TABLE reached (id TEXT REFERENCES groups (id), user_id TEXT);
+         GRANT SELECT ON reached TO authz_owner;",
+    )
+    .replace("search_path = ''", "search_path = public");
+    assert!(shape(&sql), "the walk's own name in its first arm reads the walk");
+}
+
+#[test]
+fn a_walk_needs_the_owner_to_read_the_key_and_the_parent_column() {
+    let deployment = deployment();
+    let columns = |granted: &str| {
+        groups(&walking(CHILD_JOIN), &format!("GRANT SELECT ({granted}) ON groups TO authz_owner;"))
+            .replace("GRANT SELECT ON groups, group_grants", "GRANT SELECT ON group_grants")
+    };
+    let database = postgres(&columns("id, parent_id"));
+    groups_with(&database, &deployment, "read").expect("answered");
+    let database = postgres(&columns("id"));
+    assert!(matches!(
+        groups_with(&database, &deployment, "read"),
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "groups"
+    ));
+
+    let bound = groups(&walking(CHILD_JOIN), "ALTER TABLE groups ENABLE ROW LEVEL SECURITY;")
+        .replace("NOLOGIN BYPASSRLS", "NOLOGIN");
+    let database = postgres(&bound);
+    assert!(matches!(
+        groups_with(&database, &deployment, "read"),
+        Err(HelperSetError::NotExempt { table, .. }) if table == "groups"
+    ));
 }

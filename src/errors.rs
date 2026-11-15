@@ -1214,13 +1214,23 @@ pub enum HelperSetError {
         /// The condition, as written.
         condition: String,
     },
-    /// The body is not a `UNION` of grant arms and parent arms.
-    #[error("helper `{function}` returns `{arm}`, which is neither a grant arm nor a parent arm")]
+    /// The body is not a `UNION` of grant arms and parent arms, alone or
+    /// walked down a tree by a `WITH RECURSIVE` term.
+    #[error(
+        "helper `{function}` returns `{arm}`, which is neither a grant arm, a parent arm nor a walk"
+    )]
     ArmShape {
         /// The helper.
         function: String,
         /// The query that has neither shape, as written.
         arm: String,
+    },
+    /// The body walks its tree with `UNION ALL`, which keeps every row it
+    /// reaches again and so never ends on a tree holding a cycle.
+    #[error("helper `{function}` walks its tree with UNION ALL, which never ends on a cycle")]
+    UnionAllWalk {
+        /// The helper.
+        function: String,
     },
     /// A parent arm compares a column with no single-column foreign key to a
     /// helper whose set covers no one table, so nothing names the parent

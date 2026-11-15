@@ -1680,7 +1680,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ) -> Result<bool, LookupError>;
 
     /// What this helper returns for a caller of `deployment`, called with
-    /// `arguments`, as a union of grant arms and parent arms.
+    /// `arguments`, as a union of grant arms and parent arms, walked down a
+    /// tree where the body is recursive.
     ///
     /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
     /// function returning `SETOF` one scalar type with a pinned
@@ -1688,7 +1689,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// table it reads, or on every column of it the body names, `USAGE` on
     /// the schema of every table and helper the body names, and exempt from
     /// the row-level security of the tables, and when its body is a `UNION`
-    /// of arms of two shapes.
+    /// of arms of two shapes, alone or walked down a tree.
     ///
     /// - A grant arm, `SELECT <column> FROM <table> WHERE <caller column> =
     ///   current_setting('<setting>'[, true]) [AND <condition>]`, where the
@@ -1702,11 +1703,21 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   foreign key or, where it has none, through the table the called
     ///   helper's set covers.
     ///
+    /// A body walking down a tree is `WITH RECURSIVE <walk> [(<column>)] AS
+    /// (<arms> UNION SELECT <key> FROM <table> JOIN <walk> ON <parent
+    /// column> = <walk>.<column>) SELECT <column> FROM <walk>`, the join
+    /// either way round. `<key>` is the table's one-column primary key, and
+    /// `<parent column>` has one single-column foreign key, referencing
+    /// `<key>`. The walk answers a [`WalkArm`](crate::structs::WalkArm) after
+    /// the arms. `UNION ALL` is refused, since it never ends on a tree holding
+    /// a cycle.
+    ///
     /// A grant arm whose condition reduces to `FALSE` or `NULL` keeps no row
-    /// and is left out. A column named like a parameter is the column, as
-    /// PostgreSQL resolves names in a SQL function. An unqualified name is
-    /// looked up past the schemas on the path the owner cannot use, as
-    /// PostgreSQL leaves them out of the owner's path.
+    /// and is left out, and a walk with it where no other arm remains. A
+    /// column named like a parameter is the column, as PostgreSQL resolves
+    /// names in a SQL function. An unqualified name is looked up past the
+    /// schemas on the path the owner cannot use, as PostgreSQL leaves them out
+    /// of the owner's path.
     ///
     /// # Arguments
     ///
