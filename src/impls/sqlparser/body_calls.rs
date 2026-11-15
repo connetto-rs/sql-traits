@@ -12,7 +12,7 @@ use core::ops::ControlFlow;
 use sqlparser::ast::Visit;
 
 use super::data_statement::{
-    BodyPath, BodyWalk, Embedded, RunTimeBody, add_unqualified, walk_body,
+    BodyPath, BodyWalk, Embedded, RunTimeBody, add_unqualified, calls_user_code, walk_body,
 };
 use crate::{
     errors::LookupError,
@@ -129,6 +129,10 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for CallCollector<'_, 's, DB> {
 
     fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
         self.collect(&sql)
+    }
+
+    fn runs_user_code(&self, sql: Embedded<'_>) -> bool {
+        calls_user_code(&sql, self.database)
     }
 }
 

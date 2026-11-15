@@ -176,7 +176,7 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
     }
 
     /// The first statement or expression in `nodes`, nested ones included,
-    /// that changes the path.
+    /// that changes the path, or may by calling user code.
     fn first_change(&self, nodes: &'s [Node]) -> Result<Option<Embedded<'s>>, LookupError> {
         let hex_strings_may_be_integers = self.hex_strings_may_be_integers;
         let found = each_sql(nodes, &mut |sql| {
@@ -188,7 +188,11 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 Embedded::Expression(_) => Ok(false),
             };
             match change {
-                Ok(false) if !sets_search_path_at_run_time(&sql) => ControlFlow::Continue(()),
+                Ok(false)
+                    if !sets_search_path_at_run_time(&sql) && !self.walker.runs_user_code(sql) =>
+                {
+                    ControlFlow::Continue(())
+                }
                 Ok(_) => ControlFlow::Break(Ok(sql)),
                 Err(error) => ControlFlow::Break(Err(error)),
             }

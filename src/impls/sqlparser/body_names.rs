@@ -83,4 +83,8 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for NameCollector<'_, 's, DB> {
         self.gather();
         Ok(())
     }
+
+    fn runs_user_code(&self, sql: Embedded<'_>) -> bool {
+        self.calls.runs_user_code(sql)
+    }
 }
