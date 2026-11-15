@@ -1792,6 +1792,21 @@ fn groups_with<'db>(
     answer(database, deployment, "authz", "groups_with", &[text(role)])
 }
 
+/// Checks `authz.groups_with`, written with the walk `term`, against what
+/// PostgreSQL returns for each `(rows, caller, minimum role)` of `measured`.
+fn assert_walk_measured(
+    term: &str,
+    measured: &[(Rows, &'static str, &str, &'static [&'static str])],
+) {
+    let database = postgres(&groups(&walking(term), ""));
+    let deployment = deployment();
+    for &(fixture, caller, role, expected) in measured {
+        let set = groups_with(&database, &deployment, role).expect("answered");
+        let returned: Vec<_> = evaluate(&set, Request::of(caller), fixture).into_iter().collect();
+        assert_eq!(returned, expected, "{caller} calling groups_with('{role}')");
+    }
+}
+
 #[test]
 fn a_recursive_walk_answers_its_arms_and_the_walk_down_the_parent_column() {
     let deployment = deployment();
@@ -1822,11 +1837,7 @@ fn a_recursive_walk_answers_its_arms_and_the_walk_down_the_parent_column() {
     let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
     let referenced = walk.foreign_key().referenced_table(&database).expect("resolves");
     assert_eq!(referenced.table_name(), "groups");
-    for &(fixture, caller, role, expected) in TREE_MEASURED {
-        let set = groups_with(&database, &deployment, role).expect("answered");
-        let returned: Vec<_> = evaluate(&set, Request::of(caller), fixture).into_iter().collect();
-        assert_eq!(returned, expected, "{caller} calling groups_with('{role}')");
-    }
+    assert_walk_measured(CHILD_JOIN, TREE_MEASURED);
 }
 
 #[test]
@@ -2203,12 +2214,7 @@ fn a_recursive_walk_answers_its_arms_and_the_walk_up_the_parent_column() {
         assert_eq!(walk.column().column_name(), "parent_id");
     }
 
-    let database = postgres(&groups(&walking(PARENT_JOIN), ""));
-    for &(fixture, caller, role, expected) in TREE_UP_MEASURED {
-        let set = groups_with(&database, &deployment, role).expect("answered");
-        let returned: Vec<_> = evaluate(&set, Request::of(caller), fixture).into_iter().collect();
-        assert_eq!(returned, expected, "{caller} calling groups_with('{role}')");
-    }
+    assert_walk_measured(PARENT_JOIN, TREE_UP_MEASURED);
 }
 
 /// One grantee per grant row, organizations and a team tree, the helper
