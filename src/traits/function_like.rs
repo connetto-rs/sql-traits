@@ -1800,14 +1800,19 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///
     /// - A grant arm, `SELECT <column> FROM <table> [WHERE <condition>]`, whose
     ///   condition joins with `AND` at most one comparison of a column with a
-    ///   value of the request and terms that, the arguments substituted, reduce
-    ///   to `TRUE`, to `FALSE` or `NULL`, or to the literal values columns have
-    ///   to hold. The comparison is `<column> = current_setting('<setting>'[,
-    ///   <missing_ok>])` with a setting the deployment declares as the caller,
-    ///   or `<column>` compared with each element of a setting it declares as a
-    ///   set, unpacked as declared (see
+    ///   value of the request, time bounds, and terms that, the arguments
+    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to the literal
+    ///   values columns have to hold. The comparison is `<column> =
+    ///   current_setting('<setting>'[, <missing_ok>])` with a setting the
+    ///   deployment declares as the caller, or `<column>` compared with each
+    ///   element of a setting it declares as a set, unpacked as declared (see
     ///   [`SettingComparison`](crate::structs::SettingComparison)). An arm
-    ///   without one returns the same rows for every request.
+    ///   without one returns the same rows for every request. A time bound is a
+    ///   conjunct `<column> <comparison> now()`, a `timestamptz` column of the
+    ///   table compared with `<`, `<=`, `>` or `>=` either way round,
+    ///   optionally `OR <column> IS NULL`, and the arm answers it as a
+    ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
+    ///   `transaction_timestamp()` read the same statement time as `now()`.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it

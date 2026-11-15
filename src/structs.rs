@@ -68,7 +68,8 @@ pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
 pub use function_kind::{AggregateKind, FunctionKind};
 pub use helper_set::{
-    GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm, SettingComparison, WalkArm,
+    GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm, SettingComparison, TimeBound,
+    TimeComparison, WalkArm,
 };
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
