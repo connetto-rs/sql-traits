@@ -1217,6 +1217,7 @@ fn literals_columns_and_parameters_are_read_in_every_spelling() {
         "other.role = min_role",
         "role = doc_id",
         "(role = 'a' AND role LIKE 'b') OR role = 'c'",
+        "role = 'c' OR (role = 'a' AND doc_id = 'd')",
         "role LIKE 'b' OR role = 'c'",
     ] {
         assert!(
@@ -1322,6 +1323,7 @@ fn only_postgres_own_functions_unpack_a_set_in_either_spelling() {
         "doc_id = ANY (string_to_array(current_setting('app.link_ids', true), NULL))",
         "doc_id <> ANY (string_to_array(current_setting('app.link_ids', true), ','))",
         "doc_id NOT IN (SELECT unnest(string_to_array(current_setting('app.link_ids'), ',')))",
+        "user_id = 'u' AND doc_id IN (SELECT docs_with(min_role))",
     ] {
         assert!(
             matches!(compared(condition, ""), Err(HelperSetError::Irreducible { .. })),
@@ -1332,6 +1334,7 @@ fn only_postgres_own_functions_unpack_a_set_in_either_spelling() {
     for condition in [
         "doc_id IN (SELECT jsonb_array_elements_text(current_setting('app.link_list')::json))",
         "doc_id IN (SELECT jsonb_array_elements_text(current_setting('app.link_list')))",
+        "doc_id IN (SELECT jsonb_array_elements_text(current_setting('app.link_list')::jsonb, 1))",
     ] {
         assert!(
             matches!(compared(condition, ""), Err(HelperSetError::ArmShape { .. })),
