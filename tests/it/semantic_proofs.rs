@@ -37,6 +37,91 @@ fn canonical(db: &ParserDB, check: &str) -> String {
     Canonicalizer::new(&PostgreSqlDialect {}).normalize_with_context(&proofs.view()).unwrap()
 }
 
+const USER_TYPES: &str = "CREATE SCHEMA app;
+CREATE TYPE mood AS ENUM ('happy', 'sad');
+CREATE TYPE app.tone AS ENUM ('low', 'high');
+CREATE TYPE \"Mood\" AS ENUM ('a');
+CREATE TYPE \"user\" AS ENUM ('a');
+CREATE TYPE status AS ENUM ('a');
+CREATE TYPE app.mood AS ENUM ('x');
+CREATE TABLE t (m mood, ma mood[], o app.tone, q \"Mood\", u \"user\", st status);";
+
+/// The canonical text of `check`, read as a check constraint of `t` by a
+/// session whose `search_path` is `path`.
+fn canonical_on_path(db: &ParserDB, check: &str, path: &[(&str, bool)]) -> String {
+    let expression = parse(check);
+    let scope = ExpressionScope::Table(table(db));
+    let case = IdentifierCase::Folded;
+    let proofs =
+        SemanticProofs::for_expression_deparsed_on_path(&expression, &scope, db, case, path)
+            .unwrap();
+    Canonicalizer::new(&PostgreSqlDialect {}).normalize_with_context(&proofs.view()).unwrap()
+}
+
+#[test]
+fn user_types_read_as_the_reading_session_deparses_them() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(USER_TYPES).unwrap();
+    let public: &[(&str, bool)] = &[("public", false)];
+    let app_first: &[(&str, bool)] = &[("app", false), ("public", false)];
+    let empty: &[(&str, bool)] = &[];
+    for (path, declared, deparsed) in [
+        (public, "m <> 'sad'", "(m <> 'sad'::mood)"),
+        (public, "m IN ('happy', 'sad')", "(m = ANY (ARRAY['happy'::mood, 'sad'::mood]))"),
+        (public, "o = 'low'", "(o = 'low'::app.tone)"),
+        (public, "q = 'a'", "(q = 'a'::\"Mood\")"),
+        (public, "u = 'a'", "(u = 'a'::\"user\")"),
+        (public, "st = 'a'", "(st = 'a'::status)"),
+        (public, "ma = '{happy}'", "(ma = '{happy}'::mood[])"),
+        (public, "o IN ('low', 'high')", "(o = ANY (ARRAY['low'::app.tone, 'high'::app.tone]))"),
+        (public, "m::text = 'happy'", "((m)::text = 'happy'::text)"),
+        (public, "m = 'happy'::text::mood", "(m = ('happy'::text)::mood)"),
+        (app_first, "m <> 'sad'", "(m <> 'sad'::public.mood)"),
+        (
+            app_first,
+            "m IN ('happy', 'sad')",
+            "(m = ANY (ARRAY['happy'::public.mood, 'sad'::public.mood]))",
+        ),
+        (app_first, "o = 'low'", "(o = 'low'::tone)"),
+        (app_first, "q = 'a'", "(q = 'a'::\"Mood\")"),
+        (app_first, "ma = '{happy}'", "(ma = '{happy}'::public.mood[])"),
+        (app_first, "o IN ('low', 'high')", "(o = ANY (ARRAY['low'::tone, 'high'::tone]))"),
+        (empty, "m <> 'sad'", "(m <> 'sad'::public.mood)"),
+        (empty, "o = 'low'", "(o = 'low'::app.tone)"),
+        (empty, "q = 'a'", "(q = 'a'::public.\"Mood\")"),
+        (empty, "u = 'a'", "(u = 'a'::public.\"user\")"),
+        (empty, "st = 'a'", "(st = 'a'::public.status)"),
+        (empty, "ma = '{happy}'", "(ma = '{happy}'::public.mood[])"),
+        (empty, "m::text = 'happy'", "((m)::text = 'happy'::text)"),
+    ] {
+        assert_eq!(
+            canonical_on_path(&db, declared, path),
+            canonical_on_path(&db, deparsed, path),
+            "{declared} on {path:?}"
+        );
+    }
+}
+
+#[test]
+fn a_catalog_type_an_earlier_schema_hides_keeps_its_spelling() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TYPE text AS ENUM ('a'); CREATE TABLE t (s pg_catalog.text);",
+    )
+    .unwrap();
+    let scope = ExpressionScope::Table(table(&db));
+    let expression = parse("s <> ''");
+    let case = IdentifierCase::Folded;
+    for (path, proved) in
+        [(&[("public", false)][..], true), (&[("public", false), ("pg_catalog", false)][..], false)]
+    {
+        let proofs =
+            SemanticProofs::for_expression_deparsed_on_path(&expression, &scope, &db, case, path)
+                .unwrap();
+        let view = proofs.view();
+        let proved_now = view.comparison_coercions(&expression).unwrap().is_some();
+        assert_eq!(proved_now, proved, "{path:?}");
+    }
+}
+
 #[test]
 fn declared_checks_read_as_postgresql_deparses_them() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
