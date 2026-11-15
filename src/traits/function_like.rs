@@ -10,10 +10,13 @@ use sqlparser::ast::{
 
 use crate::{
     errors::{HelperSetError, LookupError},
-    impls::{atomic_statements, body_calls, body_expression, body_reads, helper_set},
+    impls::{
+        atomic_statements, body_calls, body_expression, body_reads, body_unqualified_names,
+        helper_set,
+    },
     structs::{
         AggregateKind, Deployment, FunctionBody, FunctionKind, HelperSet, PrivilegeHolder,
-        TargetName,
+        TargetName, UnqualifiedName,
     },
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
@@ -618,7 +621,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// [`body_is_bound`](FunctionLike::body_is_bound),
     /// [`referenced_tables`](FunctionLike::referenced_tables),
     /// [`referenced_relations`](FunctionLike::referenced_relations),
-    /// [`referenced_functions`](FunctionLike::referenced_functions) and
+    /// [`referenced_functions`](FunctionLike::referenced_functions),
+    /// [`unqualified_names`](FunctionLike::unqualified_names) and
     /// [`helper_set`](FunctionLike::helper_set) all read the body from here,
     /// so an implementation handing over the body a catalog stores answers
     /// them as a parsed script does. A body bound at creation answers the
@@ -1185,6 +1189,76 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         database: &'db Self::DB,
     ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Function>, LookupError> {
         body_calls(self, database)
+    }
+
+    /// Returns every relation and function name the body writes without a
+    /// schema, so that the path in force when the function runs decides what
+    /// it reaches, each with what it reached under the path
+    /// [`referenced_relations`](FunctionLike::referenced_relations) and
+    /// [`referenced_functions`](FunctionLike::referenced_functions) resolve
+    /// it under.
+    ///
+    /// The body is read by the rules of those readers, so a `WITH` item, an
+    /// alias, a parameter, a name a PL/pgSQL body declares and an expression
+    /// written like a call, such as `COALESCE`, is no name here, and only a
+    /// name the body itself writes counts, never one in the definition of a
+    /// view it reads. A name after a straight-line `SET search_path` is still
+    /// left to a path, the one the body set, and resolves under it. A call
+    /// counts whatever schema it reached, `pg_catalog` included, since a path
+    /// placing another schema ahead of `pg_catalog` redirects it too. A name
+    /// reaching nothing the database holds counts as well, with no relation or
+    /// no function, since a caller may supply one.
+    ///
+    /// A body [bound at creation](FunctionLike::body_is_bound) answers none,
+    /// since it keeps what it reached then, whatever path is in effect.
+    /// Names are answered in the order of the statements writing them, a
+    /// statement's relations ahead of its calls, each spelling reaching the
+    /// same objects once.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`referenced_tables`](FunctionLike::referenced_tables)
+    /// for a body read each time the function runs, an unqualified name a
+    /// path change in a branch, a loop or a block with a handler may reach
+    /// among them ([`LookupError::FunctionBodyUnresolvable`]).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE items (v INT);
+    ///      CREATE TABLE fixed_items (v INT);
+    ///      CREATE FUNCTION helper(x INT) RETURNS INT LANGUAGE sql RETURN x;
+    ///      CREATE FUNCTION totals(x INT) RETURNS INT LANGUAGE sql AS $$
+    ///          WITH local_rows AS (SELECT v FROM items)
+    ///          SELECT helper(r.v) + f.v FROM local_rows r CROSS JOIN public.fixed_items f
+    ///      $$;",
+    /// )?;
+    /// let totals = db
+    ///     .function_by_target(TargetName::new("totals", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let names = totals.unqualified_names(&db)?;
+    /// // A caller's temporary `items` would shadow `public.items` here.
+    /// assert!(matches!(
+    ///     names.as_slice(),
+    ///     [
+    ///         UnqualifiedName::Relation { name: items, relation: Some(Relation::Table(_)) },
+    ///         UnqualifiedName::Function { name: helper, functions },
+    ///     ] if items.name() == "items" && helper.name() == "helper" && functions.len() == 1
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn unqualified_names<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Vec<UnqualifiedName<'db, Self::DB>>, LookupError> {
+        body_unqualified_names(self, database)
     }
 
     /// Returns the null-input behavior with PostgreSQL's default folded in.

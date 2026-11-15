@@ -7,13 +7,15 @@
 //! reads that item, so it is skipped, except as a mutation target, which
 //! always names a stored relation. The one relation source the walk does not
 //! reach is the MySQL multi-table `DELETE ... t1, t2` list, which the `Delete`
-//! implementation resolves explicitly. `referenced_relations` records what the
-//! statement names, and `referenced_tables` goes on to expand every plain view
-//! through the view's stored definition, which is bound at creation and read
-//! with no search path, and every table a `FROM` or target item without
-//! `ONLY` names into the tables below it through `INHERITS` and
-//! `PARTITION OF`. A function body read when it runs is walked the same way,
-//! one statement after another, under the path the function runs with.
+//! implementation resolves explicitly, and a `FROM` item written with an
+//! argument list names the function it calls, so it reads no relation.
+//! `referenced_relations` records what the statement names, and
+//! `referenced_tables` goes on to expand every plain view through the view's
+//! stored definition, which is bound at creation and read with no search
+//! path, and every table a `FROM` or target item without `ONLY` names into
+//! the tables below it through `INHERITS` and `PARTITION OF`. A function body
+//! read when it runs is walked the same way, one statement after another,
+//! under the path the function runs with.
 
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
@@ -28,14 +30,15 @@ use sqlparser_plpgsql::embedded::Block;
 use super::plpgsql_body::walk_block;
 use crate::{
     errors::LookupError,
-    structs::IdentifierCase,
+    structs::{IdentifierCase, UnqualifiedName},
     traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
     utils::{
         identifier_resolution::SearchPath,
         object_name::{
-            DEFAULT_SEARCH_PATH, SearchPathChange, object_name_identifiers, object_name_last_part,
-            resolve_bound_relation_object_name, resolve_relation_object_name,
-            resolve_relation_object_name_on_path, search_path_change,
+            DEFAULT_SEARCH_PATH, Qualifier, SearchPathChange, object_name_identifiers,
+            object_name_last_part, qualifier_of, resolve_bound_relation_object_name,
+            resolve_relation_object_name, resolve_relation_object_name_on_path, search_path_change,
+            target_name_from_object_name,
         },
         walk::walk,
         with_scopes::WithScopes,
@@ -78,7 +81,7 @@ pub(crate) struct Reads<'db, DB: DatabaseLike> {
 /// Walks a data statement, recording every relation it names and expanding
 /// the base tables each plain view reaches through the view's stored
 /// definition, stopping at the first resolution error.
-struct RelationCollector<'db, 'path, DB: DatabaseLike> {
+pub(super) struct RelationCollector<'db, 'path, DB: DatabaseLike> {
     database: &'db DB,
     /// The path unqualified names resolve under, or none for a body bound at
     /// creation, whose names carry the qualifier of the relation each
@@ -100,6 +103,13 @@ struct RelationCollector<'db, 'path, DB: DatabaseLike> {
     descending: Option<*const ObjectName>,
     /// The tables whose descendants are already in `tables`.
     descended: Vec<&'db DB::Table>,
+    /// The name of the last table item met with an argument list, compared
+    /// by address, which calls a function rather than naming a relation.
+    called: Option<*const ObjectName>,
+    /// The names written without a schema outside a stored view's
+    /// definition, each with the relation it reached, or [`None`] for a walk
+    /// that does not gather them.
+    pub(super) unqualified: Option<Vec<UnqualifiedName<'db, DB>>>,
 }
 
 impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
@@ -114,6 +124,26 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
             bound: false,
             descending: None,
             descended: Vec::new(),
+            called: None,
+            unqualified: None,
+        }
+    }
+
+    /// A walk of a body read when it runs, starting under `path`, that also
+    /// gathers the names the body writes without a schema.
+    pub(super) fn gathering_unqualified(database: &'db DB, path: BodyPath<'path>) -> Self {
+        Self { unqualified: Some(Vec::new()), ..Self::new(database, Some(path)) }
+    }
+
+    /// Notes `object_name` with the relation it reached when the walk gathers
+    /// unqualified names, it carries no schema, and the body itself writes it.
+    fn note_unqualified(&mut self, object_name: &ObjectName, relation: Option<Relation<'db, DB>>) {
+        let Some(names) = self.unqualified.as_mut().filter(|_| !self.bound) else { return };
+        if qualifier_of(object_name) != Qualifier::Absent {
+            return;
+        }
+        if let Some(name) = target_name_from_object_name(object_name) {
+            add_unqualified(names, UnqualifiedName::Relation { name: name.into_owned(), relation });
         }
     }
 
@@ -231,7 +261,11 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
     /// Records every relation reachable from `node`, then the MySQL
     /// multi-table `DELETE` targets `listed`, which the visitor does not
     /// reach.
-    fn collect<N: Visit>(&mut self, node: &N, listed: &[ObjectName]) -> Result<(), LookupError> {
+    pub(super) fn collect<N: Visit>(
+        &mut self,
+        node: &N,
+        listed: &[ObjectName],
+    ) -> Result<(), LookupError> {
         if let ControlFlow::Break(error) = walk(node, self) {
             return Err(error);
         }
@@ -274,6 +308,43 @@ fn same_relation<DB: DatabaseLike>(left: &Relation<'_, DB>, right: &Relation<'_,
     }
 }
 
+/// Adds `name` to `names` unless they hold the same spelling of the same
+/// kind already, reaching the same objects.
+pub(super) fn add_unqualified<'db, DB: DatabaseLike>(
+    names: &mut Vec<UnqualifiedName<'db, DB>>,
+    name: UnqualifiedName<'db, DB>,
+) {
+    let seen = names.iter().any(|seen| {
+        match (seen, &name) {
+            (
+                UnqualifiedName::Relation { name: left, relation: left_relation },
+                UnqualifiedName::Relation { name: right, relation: right_relation },
+            ) => {
+                left == right
+                    && match (left_relation, right_relation) {
+                        (Some(left), Some(right)) => same_relation(left, right),
+                        (left, right) => left.is_none() && right.is_none(),
+                    }
+            }
+            (
+                UnqualifiedName::Function { name: left, functions: left_functions },
+                UnqualifiedName::Function { name: right, functions: right_functions },
+            ) => {
+                left == right
+                    && left_functions.len() == right_functions.len()
+                    && left_functions
+                        .iter()
+                        .zip(right_functions)
+                        .all(|(left, right)| core::ptr::eq(*left, *right))
+            }
+            _ => false,
+        }
+    });
+    if !seen {
+        names.push(name);
+    }
+}
+
 impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
     type Break = LookupError;
 
@@ -293,7 +364,9 @@ impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
     }
 
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
-        if let TableFactor::Table { name, inheritance, .. } = factor
+        if let TableFactor::Table { name, args: Some(_), .. } = factor {
+            self.called = Some(&raw const *name);
+        } else if let TableFactor::Table { name, inheritance, .. } = factor
             && !matches!(inheritance, Some(TableInheritance::Only { .. }))
         {
             self.descending = Some(&raw const *name);
@@ -302,13 +375,15 @@ impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
     }
 
     fn pre_visit_relation(&mut self, object_name: &ObjectName) -> ControlFlow<Self::Break> {
-        if self.scopes.reads_item(object_name)
-            && !self.targets.iter().any(|target| core::ptr::eq(*target, object_name))
+        if self.called == Some(&raw const *object_name)
+            || (self.scopes.reads_item(object_name)
+                && !self.targets.iter().any(|target| core::ptr::eq(*target, object_name)))
         {
             return ControlFlow::Continue(());
         }
         let descending = self.descending == Some(&raw const *object_name);
         let outcome = self.resolve(object_name).and_then(|relation| {
+            self.note_unqualified(object_name, relation);
             let Some(relation) = relation else { return Ok(()) };
             self.read(relation)?;
             match relation {

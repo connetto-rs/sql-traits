@@ -40,6 +40,7 @@ mod sequence_parameters;
 mod table_privileges;
 mod target_name;
 mod type_facts;
+mod unqualified_name;
 mod user_defined_type;
 mod view;
 
@@ -90,6 +91,7 @@ pub use sequence_parameters::{SequenceParameters, SequenceType};
 pub use table_privileges::{ColumnPrivilege, TablePrivileges};
 pub use target_name::TargetName;
 pub use type_facts::{DomainFacts, TypeCategory, TypeFacts, TypeKind};
+pub use unqualified_name::UnqualifiedName;
 pub(crate) use user_defined_type::AttributeCollation;
 pub use user_defined_type::UserDefinedType;
 pub use view::{MaterializedView, View, ViewDeclaration};
