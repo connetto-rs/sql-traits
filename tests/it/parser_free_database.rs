@@ -1310,6 +1310,10 @@ impl TriggerLike for MemoryTrigger {
         None
     }
 
+    fn condition(&self) -> Option<&Expr> {
+        None
+    }
+
     fn function<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db MemoryFunction>
     where
         Self: 'db,

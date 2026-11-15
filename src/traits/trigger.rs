@@ -364,6 +364,67 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// ```
     fn orientation(&self) -> Option<sqlparser::ast::TriggerObjectKind>;
 
+    /// Returns the `WHEN` condition that decides whether the trigger fires,
+    /// or `None` for a trigger without one.
+    ///
+    /// The condition comes without the parentheses PostgreSQL requires around
+    /// it, so `WHEN (OLD.* IS DISTINCT FROM NEW.*)` reads back as
+    /// `OLD.* IS DISTINCT FROM NEW.*`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE notes (id INT PRIMARY KEY, body TEXT NOT NULL);
+    /// CREATE FUNCTION touch() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
+    /// CREATE TRIGGER filtered AFTER UPDATE ON notes FOR EACH ROW
+    ///     WHEN (OLD.* IS DISTINCT FROM NEW.*) EXECUTE FUNCTION touch();
+    /// CREATE TRIGGER unfiltered AFTER UPDATE ON notes FOR EACH ROW EXECUTE FUNCTION touch();
+    /// ",
+    /// )?;
+    /// let conditions: Vec<(&str, Option<String>)> = db
+    ///     .triggers()
+    ///     .map(|trigger| (trigger.name(), trigger.condition().map(ToString::to_string)))
+    ///     .collect();
+    /// assert_eq!(
+    ///     conditions,
+    ///     [("filtered", Some("OLD.* IS DISTINCT FROM NEW.*".to_owned())), ("unfiltered", None)]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # SQLite Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "
+    /// CREATE TABLE notes (id INT, body TEXT);
+    /// CREATE TABLE audit (id INT);
+    /// CREATE TRIGGER filtered
+    /// AFTER UPDATE ON notes
+    /// FOR EACH ROW WHEN NEW.body <> OLD.body
+    /// BEGIN
+    ///     INSERT INTO audit VALUES (NEW.id);
+    /// END;
+    /// ",
+    /// )?;
+    /// let trigger = db.triggers().next().unwrap();
+    /// assert_eq!(trigger.condition().unwrap().to_string(), "NEW.body <> OLD.body");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn condition(&self) -> Option<&sqlparser::ast::Expr>;
+
     /// Returns the function the trigger executes.
     ///
     /// # Arguments
@@ -632,6 +693,10 @@ impl<T: TriggerLike> TriggerLike for &T {
 
     fn orientation(&self) -> Option<sqlparser::ast::TriggerObjectKind> {
         (*self).orientation()
+    }
+
+    fn condition(&self) -> Option<&sqlparser::ast::Expr> {
+        (*self).condition()
     }
 
     fn function<'db>(
