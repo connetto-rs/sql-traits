@@ -499,23 +499,19 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
     ) -> Result<Vec<VariableRead<'r, 'db, DB>>, LookupError> {
         let DefinitionKind::Written { written, .. } = &self.kind else { return Ok(Vec::new()) };
         let Some(scope) = &written.scope else { return Ok(Vec::new()) };
-        let mut roots = Vec::new();
+        let mut statement = None;
+        let mut expressions: Vec<&Expr> = Vec::new();
         match &written.source {
             DefinitionSource::Value(value)
-            | DefinitionSource::ArrayElement { array: value, .. } => {
-                roots.push(ScopedRoot::Expression(value));
-            }
-            DefinitionSource::QueryOutput { statement, .. }
-            | DefinitionSource::CallOutput { call: statement, .. } => {
-                roots.push(ScopedRoot::Statement(statement));
-            }
+            | DefinitionSource::ArrayElement { array: value, .. } => expressions.push(value),
+            DefinitionSource::QueryOutput { statement: query, .. }
+            | DefinitionSource::CallOutput { call: query, .. } => statement = Some(*query),
             DefinitionSource::DynamicOutput { command, arguments, .. } => {
-                roots.push(ScopedRoot::Expression(command));
-                roots.extend(arguments.iter().map(|argument| ScopedRoot::Expression(argument)));
+                expressions.push(command);
+                expressions.extend(arguments.iter().map(|argument| &**argument));
             }
             DefinitionSource::LoopIndex { lower, upper, step } => {
-                let bounds = [lower, upper].into_iter().chain(step);
-                roots.extend(bounds.map(|bound| ScopedRoot::Expression(bound)));
+                expressions.extend([lower, upper].into_iter().chain(step).map(|bound| &**bound));
             }
             DefinitionSource::Incoming
             | DefinitionSource::Null
@@ -528,19 +524,15 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
         let database = scope.database();
         let plpgsql = ExpressionScope::PlPgSql(scope);
         let mut variables = Vec::new();
-        for root in roots {
+        if let Some(statement) = statement {
+            let root = ScopedRoot::Statement(statement);
             let context = ExpressionContext::for_root(root, &plpgsql, database, case)?;
-            match root {
-                ScopedRoot::Expression(expression) => {
-                    read_variables(&context, scope, expression, &mut variables)?;
-                }
-                ScopedRoot::Query(query) => {
-                    read_variables(&context, scope, query, &mut variables)?;
-                }
-                ScopedRoot::Statement(statement) => {
-                    read_variables(&context, scope, statement, &mut variables)?;
-                }
-            }
+            read_variables(&context, scope, statement, &mut variables)?;
+        }
+        for expression in expressions {
+            let root = ScopedRoot::Expression(expression);
+            let context = ExpressionContext::for_root(root, &plpgsql, database, case)?;
+            read_variables(&context, scope, expression, &mut variables)?;
         }
         Ok(self.flow.reaching(variables, written.inputs.as_ref()))
     }

@@ -663,9 +663,9 @@ fn a_call_may_write_a_parenthesised_cast_or_positional_argument() {
              BEGIN CALL fill((s), o::text, $1); EXECUTE s USING o, p; END"
         ),
         [vec![
-            read("s", &["'SELECT 1'", "unknown"]),
-            read("o", &["'SELECT 2'", "unknown"]),
-            read("p", &["incoming", "unknown"]),
+            read("s", &["'SELECT 1'", "argument 0 of CALL fill((s), o::TEXT, $1)"]),
+            read("o", &["'SELECT 2'", "argument 1 of CALL fill((s), o::TEXT, $1)"]),
+            read("p", &["incoming", "argument 2 of CALL fill((s), o::TEXT, $1)"]),
         ]]
     );
 }
@@ -676,7 +676,10 @@ fn a_call_may_write_a_parenthesised_cast_or_positional_argument() {
 fn a_call_writes_no_computed_argument() {
     assert_eq!(
         reaching("BEGIN CALL fill(p || p, q); CALL fill; EXECUTE p USING q; END"),
-        [vec![read("p", &["incoming"]), read("q", &["incoming", "unknown"])]]
+        [vec![
+            read("p", &["incoming"]),
+            read("q", &["incoming", "argument 1 of CALL fill(p || p, q)"]),
+        ]]
     );
 }
 
@@ -719,4 +722,110 @@ fn a_write_to_an_undeclared_name_is_unresolvable() {
             "{body}"
         );
     }
+}
+
+/// `GET DIAGNOSTICS` and `GET STACKED DIAGNOSTICS` assign each target the
+/// item it names.
+#[test]
+fn diagnostics_assign_the_items_they_name() {
+    assert_eq!(
+        reaching(
+            "DECLARE a text; b text; c text; d text; e text; f text; g text; h text; i text;
+              j text; k text; l text;
+             BEGIN
+              GET DIAGNOSTICS a = PG_ROUTINE_OID, b = PG_CONTEXT;
+              BEGIN
+               PERFORM 1 / q;
+              EXCEPTION WHEN OTHERS THEN
+               GET STACKED DIAGNOSTICS c = RETURNED_SQLSTATE, d = COLUMN_NAME,
+                e = CONSTRAINT_NAME, f = PG_DATATYPE_NAME, g = MESSAGE_TEXT, h = TABLE_NAME,
+                i = SCHEMA_NAME, j = PG_EXCEPTION_DETAIL, k = PG_EXCEPTION_HINT,
+                l = PG_EXCEPTION_CONTEXT;
+               EXECUTE a USING b, c, d, e, f, g, h, i, j, k, l;
+              END;
+             END"
+        ),
+        [vec![
+            read("a", &["RoutineOid"]),
+            read("b", &["Context"]),
+            read("c", &["ReturnedSqlstate"]),
+            read("d", &["ColumnName"]),
+            read("e", &["ConstraintName"]),
+            read("f", &["DatatypeName"]),
+            read("g", &["MessageText"]),
+            read("h", &["TableName"]),
+            read("i", &["SchemaName"]),
+            read("j", &["ExceptionDetail"]),
+            read("k", &["ExceptionHint"]),
+            read("l", &["ExceptionContext"]),
+        ]]
+    );
+}
+
+/// A lone row target takes the whole row, a row-typed parameter and a
+/// trigger's `NEW` included, while a lone scalar target takes the first
+/// output.
+#[test]
+fn a_lone_row_target_takes_the_whole_row() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{SCHEMA} CREATE FUNCTION rows(r t, p text) RETURNS void LANGUAGE plpgsql AS $$
+         BEGIN
+          FOR i IN 1..2 LOOP
+           SELECT * INTO r FROM t;
+           SELECT id INTO i FROM t;
+           EXECUTE p USING r, i;
+          END LOOP;
+         END $$;
+         CREATE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN SELECT * INTO NEW FROM t; EXECUTE 'SELECT 1' USING NEW; RETURN NEW; END $$;"
+    ))
+    .expect("schema parses");
+    let reads = |name: &str| {
+        let function = database
+            .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("function exists");
+        let body = function.dynamic_execution_sites(&database).unwrap();
+        body.sites()
+            .unwrap()
+            .iter()
+            .map(|site| spelled(&site.reads(IdentifierCase::Folded).unwrap()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        reads("rows"),
+        [vec![
+            read("p", &["incoming"]),
+            read("r", &["Row First { strict: false } of SELECT * FROM t"]),
+            read("i", &["Ordinal(0) First { strict: false } of SELECT id FROM t"]),
+        ]]
+    );
+    assert_eq!(
+        reads("stamp"),
+        [vec![read("new", &["Row First { strict: false } of SELECT * FROM t"])]]
+    );
+}
+
+/// What a command writes reads what the command and its arguments read,
+/// and a range loop index what its bounds read.
+#[test]
+fn command_and_range_definitions_read_their_inputs() {
+    let database = database(
+        "DECLARE s text;
+         BEGIN
+          EXECUTE 'SELECT ' || p INTO s USING q;
+          FOR i IN q..q + 1 BY q LOOP EXECUTE s USING i; END LOOP;
+         END",
+    );
+    let body = run(&database).dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let reads = sites[1].reads(IdentifierCase::Folded).unwrap();
+    let inputs = |index: usize| {
+        let Reaching::Definitions(definitions) = reads[index].reaching() else {
+            panic!("the variable is reached")
+        };
+        spelled(&definitions[0].reads(IdentifierCase::Folded).unwrap())
+    };
+    assert_eq!(inputs(0), [read("p", &["incoming"]), read("q", &["incoming"])]);
+    assert_eq!(inputs(1), [read("q", &["incoming"])]);
 }
