@@ -1626,11 +1626,18 @@ fn a_set_unpacked_as_any_other_type_refuses_the_answer() {
             "{condition}"
         );
     }
-    let twice = format!("l.id IN (SELECT unnest({SPLIT}::uuid[])::uuid)");
-    assert!(
-        matches!(presented_for(&twice, DataType::Uuid), Err(HelperSetError::ArmShape { .. })),
-        "a read casting its elements twice unpacks no set"
-    );
+    for condition in [
+        format!("l.id IN (SELECT unnest({SPLIT}::uuid[])::uuid)"),
+        "l.id IN (SELECT '00000000-0000-0000-0000-000000000000')".to_string(),
+    ] {
+        assert!(
+            matches!(
+                presented_for(&condition, DataType::Uuid),
+                Err(HelperSetError::ArmShape { .. })
+            ),
+            "a subquery casting its elements twice or calling nothing unpacks no set: {condition}"
+        );
+    }
 }
 
 #[test]
@@ -2964,6 +2971,8 @@ fn a_gate_on_the_caller_cast_to_any_other_type_refuses_the_answer() {
         format!("{CALLER} <> {NIL}::uuid"),
         format!("{CALLER}::uuid <> {NIL}::text"),
         format!("{CALLER}::uuid <> 0"),
+        format!("{CALLER}::text::uuid <> {NIL}"),
+        "g.id IS NOT NULL".to_string(),
     ] {
         assert!(
             matches!(
