@@ -90,6 +90,15 @@ impl Volatility {
     }
 }
 
+/// `pg_proc.proleakproof`.
+#[derive(Clone, Copy)]
+pub(super) enum Leakage {
+    /// Its errors and notices reveal nothing about its arguments.
+    Leakproof,
+    /// It may reveal its arguments.
+    NotLeakproof,
+}
+
 /// `pg_proc.prolang`, among the languages `pg_catalog` functions are written
 /// in.
 #[derive(Clone, Copy)]
@@ -111,8 +120,8 @@ impl Language {
 
 /// One `pg_proc` row: the function's name, its parameters as
 /// `pg_get_function_arguments` spells them, its result as
-/// `pg_get_function_result` does, its strictness, volatility, kind and
-/// language.
+/// `pg_get_function_result` does, its strictness, volatility, leakproof
+/// status, kind and language.
 ///
 /// A tuple struct, so a row is built by its constructor rather than by a
 /// function only const evaluation ever runs.
@@ -123,6 +132,7 @@ pub(super) struct PostgresBuiltin(
     pub(super) &'static str,
     pub(super) NullInput,
     pub(super) Volatility,
+    pub(super) Leakage,
     pub(super) Kind,
     pub(super) Language,
 );
@@ -136,23 +146,25 @@ impl PostgresBuiltin {
     /// The declaration in `pg_catalog`, so a user function may shadow it the
     /// way the server allows.
     fn function(&self) -> Option<CreateFunction> {
-        let Self(name, arguments, result, null_input, volatility, _, language) = *self;
+        let Self(name, arguments, result, null_input, volatility, leakage, _, language) = *self;
         let name = ObjectName(vec![
             ObjectNamePart::Identifier(Ident::new(PG_CATALOG)),
             ObjectNamePart::Identifier(stored_ident(name)),
         ]);
-        declaration(
+        let mut function = declaration(
             name,
             arguments,
             result,
             matches!(null_input, NullInput::Strict),
             volatility,
             language,
-        )
+        )?;
+        function.leakproof = matches!(leakage, Leakage::Leakproof).then_some(true);
+        Some(function)
     }
 
     fn metadata(&self) -> FunctionMetadata {
-        let Self(name, arguments, _, _, _, kind, _) = *self;
+        let Self(name, arguments, _, _, _, _, kind, _) = *self;
         let mut metadata = FunctionMetadata::default();
         if let Some(positions) =
             null_returning_positions(name, |types| arguments.split(", ").eq(types.iter().copied()))

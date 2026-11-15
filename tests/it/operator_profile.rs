@@ -611,6 +611,10 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn is_leakproof(&self) -> bool {
+        self.unreach()
+    }
+
     fn security_mode(&self) -> FunctionSecurity {
         self.unreach()
     }

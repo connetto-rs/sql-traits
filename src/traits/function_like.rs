@@ -1326,6 +1326,52 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         FunctionBehavior::Volatile
     }
 
+    /// Returns whether the function is marked `LEAKPROOF`, which lets
+    /// PostgreSQL evaluate it ahead of row-level security policies and
+    /// [security-barrier](crate::traits::ViewLike::is_security_barrier) view
+    /// conditions, so its errors and notices may reveal rows those conditions
+    /// would hide.
+    ///
+    /// A declared function answers `false` when its declaration writes
+    /// `NOT LEAKPROOF` or omits the attribute, which is how `pg_dump` writes a
+    /// function that is not leakproof. `ALTER FUNCTION ... LEAKPROOF` and
+    /// `ALTER FUNCTION ... NOT LEAKPROOF` apply in statement order, and
+    /// `CREATE OR REPLACE FUNCTION` takes the replacement's declaration. A
+    /// builtin [`ParserDB`](crate::structs::ParserDB) registers in
+    /// `pg_catalog` answers `pg_proc.proleakproof` from PostgreSQL 18, so
+    /// `int4eq(integer, integer)` is leakproof and `lower(text)` is not. A
+    /// function an extension or a range type creates is not leakproof, as
+    /// PostgreSQL creates them.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE FUNCTION marked(value INT) RETURNS BOOLEAN LANGUAGE sql LEAKPROOF AS 'SELECT true';
+    /// CREATE FUNCTION unmarked(value INT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';
+    /// CREATE FUNCTION altered(value INT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';
+    /// ALTER FUNCTION altered(INT) LEAKPROOF;
+    /// ",
+    /// )?;
+    /// let leakproof = |name: &str| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    ///         .is_leakproof()
+    /// };
+    /// assert!(leakproof("marked"));
+    /// assert!(!leakproof("unmarked"));
+    /// assert!(leakproof("altered"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_leakproof(&self) -> bool;
+
     /// Returns whether the function runs with the privileges of the user
     /// that defined it (`SECURITY DEFINER`) or of the user that calls it
     /// (`SECURITY INVOKER`), which decides who `current_user` names inside
