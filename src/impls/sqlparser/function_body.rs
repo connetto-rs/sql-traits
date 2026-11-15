@@ -13,7 +13,7 @@ use super::{
     body_calls::{calls_of_body, calls_on_path},
     body_names::NameCollector,
     data_statement::{BodyPath, Reads, RunTimeBody, reads_of_body, reads_on_path, walk_body},
-    dynamic_sites::BodyNames,
+    dynamic_sites::{BodyNames, SiteSource},
 };
 use crate::{
     errors::LookupError,
@@ -22,11 +22,12 @@ use crate::{
 };
 
 /// The SQL a function runs, in the shape its body is written.
+#[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
     reason = "one value lives on the stack per reader call, so boxing would only add an allocation"
 )]
-pub(super) enum SqlBody<'f> {
+pub(crate) enum SqlBody<'f> {
     /// Statements read one after another each time the function runs, parsed
     /// from the body's text or already parsed by the input.
     Statements(Cow<'f, [Statement]>),
@@ -328,8 +329,11 @@ pub(crate) fn body_dynamic_sites<'db, F: FunctionLike>(
     database: &'db F::DB,
 ) -> Result<DynamicExecutionSites<'db, F::DB>, LookupError> {
     let (body, procedural) = checked_body(function)?;
-    // Only PL/pgSQL builds SQL at run time.
-    let block = if procedural { Some(plpgsql_block(function, body)?) } else { None };
+    let body = parsed_body(function, body, procedural, database)?;
     let names = BodyNames::new(function, database)?;
-    Ok(DynamicExecutionSites::new(names, block, hex_strings_may_be_integers(database)))
+    Ok(DynamicExecutionSites::new(SiteSource::new(
+        names,
+        body,
+        hex_strings_may_be_integers(database),
+    )))
 }

@@ -160,6 +160,7 @@ mod sequence_defaults;
 mod sequence_parameters;
 mod sequences;
 mod set_returning_functions;
+mod sql_text_calls;
 mod stored_identifier_names;
 mod stored_identity_lookup;
 mod stored_subqueries;

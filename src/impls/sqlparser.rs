@@ -37,7 +37,7 @@ pub(crate) use column_def::{foreign_options_of, serial_sequence_type};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub(crate) use data_statement::BodyPath;
 pub use dialect::SqlparserDialect;
-pub(crate) use dynamic_sites::{BodyNames, dynamic_sites};
+pub(crate) use dynamic_sites::{BodyNames, SiteSource};
 pub(crate) use function_body::{
     atomic_statements, body_calls, body_dynamic_sites, body_expression, body_reads,
     body_unqualified_names,

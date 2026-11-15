@@ -1294,27 +1294,40 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
 
     /// Returns the dynamic-execution sites of the body, owning the parsed
     /// body, whose [`sites`](DynamicExecutionSites::sites) are every place
-    /// the body runs SQL it builds at run time, an `EXECUTE`,
-    /// `RETURN QUERY EXECUTE`, `OPEN ... FOR EXECUTE` or `FOR ... IN EXECUTE`,
-    /// in body order through nested blocks, branches, loops and exception
-    /// handlers. Body order says where each sits, never that a branch or a
-    /// loop runs.
+    /// the body runs SQL text, in body order through nested blocks,
+    /// branches, loops and exception handlers. Body order says where each
+    /// sits, never that a branch or a loop runs.
     ///
-    /// Each site holds the expression building its command, its `USING`
-    /// expressions, and the
-    /// [`ExpressionScope`](crate::structs::ExpressionScope) to build their
-    /// [`ExpressionContext`](crate::structs::ExpressionContext) under. There
-    /// a name binds the PL/pgSQL variable it reaches as
+    /// A site is an `EXECUTE`, `RETURN QUERY EXECUTE`, `OPEN ... FOR EXECUTE`
+    /// or `FOR ... IN EXECUTE` of a PL/pgSQL body, or a call PostgreSQL 18
+    /// resolves to one of the `pg_catalog` functions running the text an
+    /// argument gives, the first argument of `query_to_xml`,
+    /// `query_to_xmlschema`, `query_to_xml_and_xmlschema` and `ts_stat` and
+    /// the second of `ts_rewrite(tsquery, text)`. A call is read in any
+    /// statement or expression of a PL/pgSQL body, a default, a condition,
+    /// an `EXECUTE`'s command and `USING` expressions and a cursor's
+    /// arguments and query where it opens included, and in a SQL body,
+    /// quoted, `RETURN` or `BEGIN ATOMIC`, a `FROM` item included. An
+    /// `EXECUTE` follows the calls its command and `USING` expressions
+    /// write, which run first. A call resolving to a function of the same
+    /// name in another schema is no site.
+    ///
+    /// Each site holds the expression building its command, an
+    /// `EXECUTE`'s `USING` expressions, the function a call runs, and the
+    /// [`ExpressionContext`](crate::structs::ExpressionContext) of the SQL
+    /// holding the command. There a column of an enclosing query binds
+    /// first, then in a PL/pgSQL body the variable the name reaches as
     /// [`ColumnDefinition::Variable`](crate::structs::ColumnDefinition), a
     /// local hiding an argument of its name in an enclosing block, which the
     /// block's label or the function's name still reaches, and `$n` types as
-    /// argument `n`. Calls and operators resolve under the path the body runs
-    /// the site with. The SQL a command builds is never read, except that a
-    /// constant command setting `search_path` sets it for later sites. A
-    /// command built at run time, a `CALL` and any call to code that may set
-    /// its own path leave later sites under no known path.
+    /// argument `n`, and in a SQL body the input parameter of the name.
+    /// Calls and operators of a PL/pgSQL body resolve under the path the body
+    /// runs the site with. The SQL a command builds is never read, except
+    /// that a constant `EXECUTE` command setting `search_path` sets it for
+    /// later sites. A command built at run time, a `CALL` and any call to
+    /// code that may set its own path leave later sites under no known path.
     ///
-    /// A body in any language but PL/pgSQL answers no site.
+    /// A body in another language answers no site.
     ///
     /// # Errors
     ///
@@ -1333,30 +1346,44 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE FUNCTION count_of(p text) RETURNS bigint LANGUAGE plpgsql AS $$
+    ///     "CREATE TABLE t (name varchar(10));
+    ///      CREATE FUNCTION count_of(p text) RETURNS bigint LANGUAGE plpgsql AS $$
     ///      DECLARE result bigint;
     ///      BEGIN
     ///          EXECUTE 'SELECT count(*) FROM t WHERE name = ''' || p || '''' INTO result;
     ///          RETURN result;
-    ///      END $$;",
+    ///      END $$;
+    ///      CREATE FUNCTION as_xml(p text) RETURNS SETOF xml LANGUAGE sql
+    ///      RETURN (SELECT query_to_xml('SELECT ' || name, false, false, '') FROM t);",
     /// )?;
+    /// let text = TargetName::new("text", false).with_schema("pg_catalog", false);
     /// let count_of = db
     ///     .function_by_target(TargetName::new("count_of", false), IdentifierCase::AsWritten)?
     ///     .expect("Function should exist");
     /// let body = count_of.dynamic_execution_sites(&db)?;
     /// let sites = body.sites()?;
     /// let [site] = sites.as_slice() else { panic!("one site") };
-    /// let scope = site.scope();
-    /// let context =
-    ///     ExpressionContext::for_expression(site.command(), &scope, &db, IdentifierCase::Folded)?;
+    /// let context = site.context(IdentifierCase::Folded)?;
     /// let Expr::BinaryOp { left, .. } = site.command() else { panic!("a concatenation") };
     /// let Expr::BinaryOp { right: p, .. } = left.as_ref() else { panic!("a concatenation") };
     /// let Some((ColumnDefinition::Variable(parameter), _)) = context.reference(p)? else {
     ///     panic!("p binds the argument")
     /// };
     /// assert!(matches!(parameter.kind(), VariableKind::Parameter { position: 1, .. }));
-    /// let text = TargetName::new("text", false).with_schema("pg_catalog", false);
     /// assert_eq!(context.type_of(p)?, OperandType::Known { type_name: text, typmod: None });
+    ///
+    /// let as_xml = db
+    ///     .function_by_target(TargetName::new("as_xml", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = as_xml.dynamic_execution_sites(&db)?;
+    /// let sites = body.sites()?;
+    /// let [site] = sites.as_slice() else { panic!("one site") };
+    /// assert_eq!(site.function().map(|called| called.name()), Some("query_to_xml"));
+    /// let context = site.context(IdentifierCase::Folded)?;
+    /// let Expr::BinaryOp { right: name, .. } = site.command() else { panic!("a concatenation") };
+    /// // The column of `t` the enclosing query reads.
+    /// let varchar = TargetName::new("varchar", false).with_schema("pg_catalog", false);
+    /// assert_eq!(context.type_of(name)?, OperandType::Known { type_name: varchar, typmod: Some(14) });
     /// # Ok(())
     /// # }
     /// ```

@@ -160,9 +160,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             sink: &mut sink,
             modifying_bodies: true,
         };
-        match root {
+        match root.unwrapped() {
             ScopedRoot::Expression(expression) => walk.node(expression, Some(outer)),
-            ScopedRoot::Statement(Statement::Query(query)) => walk.query(query),
+            ScopedRoot::Query(query) => walk.query(query),
             ScopedRoot::Statement(statement) => walk.modifying(statement),
         }
         rules

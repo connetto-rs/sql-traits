@@ -48,6 +48,7 @@ use crate::{
     },
 };
 
+pub(crate) mod call_nodes;
 pub(crate) mod definition_graph;
 pub(crate) mod modifying;
 pub(crate) mod scoped_roots;
@@ -2207,16 +2208,45 @@ where
     }
 }
 
+/// What a [`NestedQueryWalker`] hands the queries and expressions it meets.
+pub(super) trait NestedNodes<'source> {
+    /// Takes a query nested in the walked clause, which the walker does not
+    /// enter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that stops the walk.
+    fn query(&mut self, query: &'source Query) -> Result<(), LookupError>;
+
+    /// Takes an expression the walker enters, before its parts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that stops the walk.
+    fn expression(&mut self, _expression: &'source Expr) -> Result<(), LookupError> {
+        Ok(())
+    }
+}
+
+impl<'source, F> NestedNodes<'source> for F
+where
+    F: FnMut(&'source Query) -> Result<(), LookupError>,
+{
+    fn query(&mut self, query: &'source Query) -> Result<(), LookupError> {
+        self(query)
+    }
+}
+
 struct NestedQueryWalker<F> {
     query: F,
 }
 
 impl<'source, F> NestedQueryWalker<F>
 where
-    F: FnMut(&'source Query) -> Result<(), LookupError>,
+    F: NestedNodes<'source>,
 {
     fn query(&mut self, query: &'source Query) -> Result<(), LookupError> {
-        (self.query)(query)
+        self.query.query(query)
     }
 
     fn query_expressions(&mut self, query: &'source Query) -> Result<(), LookupError> {
@@ -3129,6 +3159,7 @@ where
     }
 
     fn expression(&mut self, expression: &'source Expr) -> Result<(), LookupError> {
+        self.query.expression(expression)?;
         match expression {
             Expr::In { expr, target, .. } => {
                 self.expression(expr)?;

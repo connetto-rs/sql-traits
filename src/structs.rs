@@ -5,6 +5,7 @@ mod absent;
 mod call_resolution;
 mod column_scope;
 mod deployment;
+mod dynamic_execution;
 mod expression_context;
 mod expression_scope;
 pub(crate) mod fingerprint;
@@ -55,6 +56,8 @@ pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
     SettingContent, SettingPresence, SettingValue, TimeZoneSource,
 };
+pub(crate) use dynamic_execution::SiteScope;
+pub use dynamic_execution::{DynamicExecution, DynamicExecutionSites};
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
@@ -79,9 +82,7 @@ pub use operator_resolution::{
     CoercionStep, OperandEvidence, OperandType, OperatorResolution, SelectedOperator,
 };
 pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
-pub use plpgsql_scope::{
-    DynamicExecution, DynamicExecutionSites, PlPgSqlScope, PlPgSqlVariable, VariableKind,
-};
+pub use plpgsql_scope::{PlPgSqlScope, PlPgSqlVariable, VariableKind};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
 pub use policy_expression::PolicyExpression;
 pub use privilege_holder::PrivilegeHolder;
