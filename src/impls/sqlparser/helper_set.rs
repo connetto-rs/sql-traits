@@ -20,7 +20,10 @@ use sqlparser::{
     parser::Parser,
 };
 
-use super::function_body::{SqlBody, written_sql_body};
+use super::{
+    data_type::written_element,
+    function_body::{SqlBody, written_sql_body},
+};
 use crate::{
     errors::{HelperSetError, LookupError},
     structs::{
@@ -125,6 +128,8 @@ struct Passed {
 struct GateRead<'db> {
     setting: &'db SessionSetting,
     raises_when_unset: bool,
+    /// Whether the conjunct casts the setting to its declared type.
+    in_declared_type: bool,
     /// The value `<>` excludes, `None` for `IS NOT NULL`.
     excluded: Option<Passed>,
 }
@@ -141,12 +146,19 @@ struct Gates<'db> {
 
 impl<'db> Gates<'db> {
     /// Merges `read`, `false` where it reads another setting than the gates
-    /// merged before it.
+    /// merged before it, or reads it in another type.
     fn add(&mut self, read: GateRead<'db>) -> bool {
         let gate = self.gate.get_or_insert_with(|| {
-            CallerGate { setting: read.setting, raises_when_unset: false, excluded: Vec::new() }
+            CallerGate {
+                setting: read.setting,
+                raises_when_unset: false,
+                in_declared_type: read.in_declared_type,
+                excluded: Vec::new(),
+            }
         });
-        if !core::ptr::eq(gate.setting, read.setting) {
+        if !core::ptr::eq(gate.setting, read.setting)
+            || gate.in_declared_type != read.in_declared_type
+        {
             return false;
         }
         gate.raises_when_unset |= read.raises_when_unset;
@@ -442,12 +454,34 @@ impl<'db, DB: DatabaseLike> Kept<'db, DB> {
 enum Operand<'q, 'db, DB: DatabaseLike> {
     Column(&'db DB::Column),
     Passed(Passed),
+    /// A passed value the body casts to `cast`.
+    CastPassed {
+        passed: Passed,
+        cast: &'q DataType,
+    },
     /// `current_setting(...)`, cast to `cast` where the body casts it.
     Setting {
         read: SettingRead,
         cast: Option<&'q DataType>,
     },
     Other,
+}
+
+/// A cast the body writes on a setting it reads, as written and as the type
+/// each value it compares takes: the cast itself on the caller, and on a set
+/// the element type of an array cast or the cast on each element.
+#[derive(Clone, Copy)]
+struct ReadCast<'q> {
+    written: &'q DataType,
+    compared: &'q DataType,
+}
+
+/// A set the body unpacks: the setting it reads, how it unpacks it and the
+/// cast on its elements, where it writes one.
+struct SetRead<'q> {
+    read: SettingRead,
+    packing: SetPacking,
+    cast: Option<ReadCast<'q>>,
 }
 
 /// One arm as read, the table whose primary key it returns, where it returns
@@ -1056,29 +1090,43 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
 
     /// The gate `conjunct` writes on a caller setting,
     /// `current_setting(<caller>) <> <text>` or `current_setting(<caller>)
-    /// IS NOT NULL`, the operands either way round.
+    /// IS NOT NULL`, the operands either way round. The setting may be cast
+    /// to its declared type, and then the text too.
     fn gate(
         &self,
         scope: &Scope<'db, DB>,
         table: &ArmTable<'_, 'db, DB>,
         conjunct: &Expr,
     ) -> Result<Option<GateRead<'db>>, HelperSetError> {
-        let (read, excluded) = match unnest(conjunct) {
-            Expr::IsNotNull(read) => (self.operand(scope, table, read)?, None),
+        let (read, cast, excluded, excluded_cast) = match unnest(conjunct) {
+            Expr::IsNotNull(read) => {
+                let Operand::Setting { read, cast } = self.operand(scope, table, read)? else {
+                    return Ok(None);
+                };
+                (read, cast, None, None)
+            }
             Expr::BinaryOp { left, op: BinaryOperator::NotEq, right } => {
-                match (self.operand(scope, table, left)?, self.operand(scope, table, right)?) {
-                    (read @ Operand::Setting { cast: None, .. }, Operand::Passed(passed))
-                    | (Operand::Passed(passed), read @ Operand::Setting { cast: None, .. }) => {
-                        (read, Some(passed))
+                let ((Operand::Setting { read, cast }, excluded)
+                | (excluded, Operand::Setting { read, cast })) =
+                    (self.operand(scope, table, left)?, self.operand(scope, table, right)?)
+                else {
+                    return Ok(None);
+                };
+                let (excluded, excluded_cast) = match (excluded, cast) {
+                    (Operand::Passed(passed), _) => (passed, None),
+                    // `text` compares with no value cast to another type.
+                    (Operand::CastPassed { passed, cast: excluded_cast }, Some(_)) => {
+                        (passed, Some(excluded_cast))
                     }
                     _ => return Ok(None),
-                }
+                };
+                (read, cast, Some(excluded), excluded_cast)
             }
             _ => return Ok(None),
         };
-        let Operand::Setting { read, cast: None } = read else { return Ok(None) };
         // A setting reads as `text`, which PostgreSQL compares with no
-        // number or boolean.
+        // number or boolean. A read cast to its declared type takes the same
+        // literals, which PostgreSQL then reads in that type.
         if excluded
             .as_ref()
             .is_some_and(|passed| !matches!(passed.literal, Literal::Text(_) | Literal::Null))
@@ -1091,13 +1139,30 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 setting: read.name,
             });
         };
-        if !matches!(setting.content(), SettingContent::Value(SettingValue::Caller(_))) {
+        let SettingContent::Value(SettingValue::Caller(declared)) = setting.content() else {
             return Err(HelperSetError::SettingNotCaller {
                 function: scope.name.clone(),
                 setting: setting.name().to_string(),
             });
+        };
+        if let Some(cast) = cast
+            && !self.is_declared_type(scope, cast, declared)
+        {
+            return Err(HelperSetError::SettingCast {
+                function: scope.name.clone(),
+                setting: setting.name().to_string(),
+                cast: cast.to_string(),
+            });
         }
-        Ok(Some(GateRead { setting, raises_when_unset: read.raises_when_unset, excluded }))
+        if excluded_cast.is_some_and(|cast| !self.is_declared_type(scope, cast, declared)) {
+            return Ok(None);
+        }
+        Ok(Some(GateRead {
+            setting,
+            raises_when_unset: read.raises_when_unset,
+            in_declared_type: cast.is_some(),
+            excluded,
+        }))
     }
 
     /// The bound `condition` sets on a `timestamptz` column of the arm's
@@ -1191,23 +1256,24 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 else {
                     return Ok(None);
                 };
+                let cast = cast.map(|cast| ReadCast { written: cast, compared: cast });
                 (column, read, None, cast)
             }
             Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
-                let (Some(column), Some((read, packing))) =
+                let (Some(column), Some(set)) =
                     (table.column(left, database)?, self.set_array(scope, right))
                 else {
                     return Ok(None);
                 };
-                (column, read, Some(packing), None)
+                (column, set.read, Some(set.packing), set.cast)
             }
             Expr::In { expr, target: InTarget::Subquery(query), negated: false, .. } => {
-                let (Some(column), Some((read, packing))) =
+                let (Some(column), Some(set)) =
                     (table.column(expr, database)?, self.set_elements(scope, query))
                 else {
                     return Ok(None);
                 };
-                (column, read, Some(packing), None)
+                (column, set.read, Some(set.packing), set.cast)
             }
             _ => return Ok(None),
         };
@@ -1220,35 +1286,38 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let refuse = |reason: fn(String, String) -> HelperSetError| {
             Err(reason(scope.name.clone(), setting.name().to_string()))
         };
-        match (packing, setting.content()) {
-            (None, SettingContent::Value(SettingValue::Caller(declared))) => {
-                if let Some(cast) = cast
-                    && !self.is_declared_type(scope, cast, declared)
-                {
-                    return Err(HelperSetError::CallerCast {
-                        function: scope.name.clone(),
-                        setting: setting.name().to_string(),
-                        cast: cast.to_string(),
-                    });
-                }
-            }
+        let declared = match (packing, setting.content()) {
+            (None, SettingContent::Value(SettingValue::Caller(declared))) => declared,
             (None, _) => {
                 return refuse(|function, setting| {
                     HelperSetError::SettingNotCaller { function, setting }
                 });
             }
-            (Some(packing), SettingContent::Value(SettingValue::Set { packing: declared, .. })) => {
+            (
+                Some(packing),
+                SettingContent::Value(SettingValue::Set { element, packing: declared }),
+            ) => {
                 if packing != *declared {
                     return refuse(|function, setting| {
                         HelperSetError::MispackedSet { function, setting }
                     });
                 }
+                element
             }
             (Some(_), _) => {
                 return refuse(|function, setting| {
                     HelperSetError::SettingNotSet { function, setting }
                 });
             }
+        };
+        if let Some(cast) = cast
+            && !self.is_declared_type(scope, cast.compared, declared)
+        {
+            return Err(HelperSetError::SettingCast {
+                function: scope.name.clone(),
+                setting: setting.name().to_string(),
+                cast: cast.written.to_string(),
+            });
         }
         Ok(Some(SettingComparison { column, setting, raises_when_unset: read.raises_when_unset }))
     }
@@ -1285,21 +1354,28 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             })
     }
 
-    /// The setting `expression` builds an array of, with how it unpacks it:
-    /// `string_to_array(<setting>, <delimiter>)` or `ARRAY(SELECT
+    /// The set `expression` builds an array of: `string_to_array(<setting>,
+    /// <delimiter>)`, optionally cast to an array, or `ARRAY(SELECT
     /// <elements>)`.
-    fn set_array(
-        &self,
-        scope: &Scope<'db, DB>,
-        expression: &Expr,
-    ) -> Option<(SettingRead, SetPacking)> {
-        let Expr::Function(call) = unnest(expression) else { return None };
+    fn set_array<'q>(&self, scope: &Scope<'db, DB>, expression: &'q Expr) -> Option<SetRead<'q>> {
+        let (expression, cast) = match unnest(expression) {
+            Expr::Cast {
+                kind: CastKind::Cast | CastKind::DoubleColon,
+                expr,
+                data_type: written @ DataType::Array(definition),
+                format: None,
+            } => (unnest(expr), Some(ReadCast { written, compared: written_element(definition)? })),
+            expression => (expression, None),
+        };
+        let Expr::Function(call) = expression else { return None };
         if let FunctionArguments::Subquery(query) = &call.args {
             // `ARRAY(SELECT ...)` is a constructor, which no function shadows.
             let [ObjectNamePart::Identifier(name)] = call.name.0.as_slice() else { return None };
-            return (name.quote_style.is_none() && name.value.eq_ignore_ascii_case("array"))
-                .then(|| self.set_elements(scope, query))
-                .flatten();
+            return (cast.is_none()
+                && name.quote_style.is_none()
+                && name.value.eq_ignore_ascii_case("array"))
+            .then(|| self.set_elements(scope, query))
+            .flatten();
         }
         // A third argument names a string read as `NULL`, which changes the
         // elements.
@@ -1310,22 +1386,39 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         };
         let Expr::Value(delimiter) = unnest(delimiter) else { return None };
         let Some(Literal::Text(delimiter)) = Literal::of(&delimiter.value) else { return None };
-        Some((self.setting_argument(scope, read)?, SetPacking::Delimited(delimiter)))
+        Some(SetRead {
+            read: self.setting_argument(scope, read)?,
+            packing: SetPacking::Delimited(delimiter),
+            cast,
+        })
     }
 
-    /// The setting `query` returns the elements of, with how it unpacks it:
-    /// `SELECT unnest(<array>)` or `SELECT
+    /// The set `query` returns the elements of, each optionally cast: `SELECT
+    /// unnest(<array>)` or `SELECT
     /// jsonb_array_elements_text(<setting>::jsonb)`.
-    fn set_elements(
-        &self,
-        scope: &Scope<'db, DB>,
-        query: &Query,
-    ) -> Option<(SettingRead, SetPacking)> {
-        let call = projected_call(query)?;
+    fn set_elements<'q>(&self, scope: &Scope<'db, DB>, query: &'q Query) -> Option<SetRead<'q>> {
+        let (call, cast) = match projected(query)? {
+            Expr::Function(call) => (call, None),
+            Expr::Cast {
+                kind: CastKind::Cast | CastKind::DoubleColon,
+                expr,
+                data_type,
+                format: None,
+            } => {
+                let Expr::Function(call) = unnest(expr) else { return None };
+                (call, Some(ReadCast { written: data_type, compared: data_type }))
+            }
+            _ => return None,
+        };
         if let Some([FunctionArg::Unnamed(FunctionArgExpr::Expr(array))]) =
             self.catalog_arguments(scope, call, "unnest").map(|list| list.args.as_slice())
         {
-            return self.set_array(scope, array);
+            let set = self.set_array(scope, array)?;
+            // A read casts its elements once.
+            return match (cast, set.cast) {
+                (Some(_), Some(_)) => None,
+                (cast, array_cast) => Some(SetRead { cast: cast.or(array_cast), ..set }),
+            };
         }
         let [FunctionArg::Unnamed(FunctionArgExpr::Expr(document))] =
             self.catalog_arguments(scope, call, "jsonb_array_elements_text")?.args.as_slice()
@@ -1342,7 +1435,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return None;
         };
         let Expr::Function(read) = unnest(read) else { return None };
-        Some((self.setting_read(scope, read)?, SetPacking::JsonArray))
+        Some(SetRead {
+            read: self.setting_read(scope, read)?,
+            packing: SetPacking::JsonArray,
+            cast,
+        })
     }
 
     /// The setting an argument reads, written as `current_setting(...)`.
@@ -1369,27 +1466,32 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if let Some((passed, _)) = scope.parameter(expression) {
             return Ok(Operand::Passed(passed.clone()));
         }
-        let (call, cast) = match expression {
+        Ok(match expression {
             Expr::Value(value) => {
-                return Ok(Literal::of(&value.value).map_or(Operand::Other, |literal| {
+                Literal::of(&value.value).map_or(Operand::Other, |literal| {
                     Operand::Passed(Passed { literal, value: value.value.clone() })
-                }));
+                })
             }
-            Expr::Function(call) => (call, None),
+            Expr::Function(call) => {
+                self.setting_read(scope, call)
+                    .map_or(Operand::Other, |read| Operand::Setting { read, cast: None })
+            }
             Expr::Cast {
                 kind: CastKind::Cast | CastKind::DoubleColon,
                 expr,
                 data_type,
                 format: None,
             } => {
-                let Expr::Function(call) = unnest(expr) else { return Ok(Operand::Other) };
-                (call, Some(data_type))
+                match self.operand(scope, table, expr)? {
+                    Operand::Passed(passed) => Operand::CastPassed { passed, cast: data_type },
+                    Operand::Setting { read, cast: None } => {
+                        Operand::Setting { read, cast: Some(data_type) }
+                    }
+                    _ => Operand::Other,
+                }
             }
-            _ => return Ok(Operand::Other),
-        };
-        Ok(self
-            .setting_read(scope, call)
-            .map_or(Operand::Other, |read| Operand::Setting { read, cast }))
+            _ => Operand::Other,
+        })
     }
 
     /// `current_setting('<name>'[, <missing_ok>])`, resolved to PostgreSQL's
@@ -1742,15 +1844,21 @@ fn plain_select(select: &Select) -> bool {
 
 /// The call of `(SELECT <function>(<arguments>))`.
 fn projected_call(query: &Query) -> Option<&Function> {
+    let Expr::Function(call) = projected(query)? else { return None };
+    Some(call)
+}
+
+/// The expression `(SELECT <expression>)` returns.
+fn projected(query: &Query) -> Option<&Expr> {
     let SetExpr::Select(select) = query.body.as_ref() else { return None };
-    let [SelectItem::UnnamedExpr(Expr::Function(call))] = select.projection.as_slice() else {
+    let [SelectItem::UnnamedExpr(expression)] = select.projection.as_slice() else {
         return None;
     };
     (plain_query(query)
         && plain_select(select)
         && select.from.is_empty()
         && select.selection.is_none())
-    .then_some(call)
+    .then_some(expression)
 }
 
 /// The arguments of `call`, where it is a plain call writing nothing but its
