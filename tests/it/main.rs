@@ -91,6 +91,7 @@ mod inherited_privileges;
 mod key_ordinal_cost;
 mod keyword_grantees;
 mod leading_comment_documentation;
+mod length_check_spellings;
 mod literal_list_text_checks;
 mod names_outside_this_catalog;
 mod negated_length_checks;

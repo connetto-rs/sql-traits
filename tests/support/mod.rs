@@ -11,6 +11,7 @@ pub(crate) mod query_parsing;
 pub(crate) mod relation_labels;
 pub(crate) mod sequence_names;
 pub(crate) mod table_lookup;
+pub(crate) mod text_check_facts;
 
 /// Declared type names and the scalar family each one names, also included by
 /// the unit tests of `sql_traits::utils::scalar_family`.
