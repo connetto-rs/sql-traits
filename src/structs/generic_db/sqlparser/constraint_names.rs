@@ -25,7 +25,10 @@ use super::{
 };
 use crate::{
     errors::{Error, InheritedChange, ObjectKind},
-    structs::{TableMetadata, metadata::GeneratedConstraintName},
+    structs::{
+        TableMetadata,
+        metadata::{CheckLiterals, GeneratedConstraintName, MergedCheck, respell},
+    },
     utils::{identifier_resolution::stored_ident_name, walk::walk_expressions},
 };
 
@@ -695,7 +698,7 @@ pub(super) fn check_slot<'node>(
 
 /// The check a slot holds, with the name written on its column option folded
 /// in.
-fn check_of(slot: Slot<'_>) -> Option<&CheckConstraint> {
+pub(super) fn check_of(slot: Slot<'_>) -> Option<&CheckConstraint> {
     match slot {
         Slot::Column {
             held: ColumnOptionDef { option: ColumnOption::Check(check), .. }, ..
@@ -706,16 +709,16 @@ fn check_of(slot: Slot<'_>) -> Option<&CheckConstraint> {
 }
 
 /// Whether a parent passes `node` the check in `slot`, matched the way
-/// PostgreSQL matches an inherited check: by the name both answer to and
-/// their expression, whether either is written on a column or on its own.
+/// PostgreSQL matches an inherited check: by the name both answer to, whether
+/// either is written on a column or on its own.
 pub(super) fn receives_check(
     builder: &ParserDBBuilder,
     node: &CreateTable,
     slot: Slot<'_>,
 ) -> bool {
-    let Some(check) = check_of(slot) else {
+    if check_of(slot).is_none() {
         return false;
-    };
+    }
     let Some(name) = answers(builder, node)
         .into_iter()
         .find(|(held, _)| held.position() == slot.position())
@@ -728,10 +731,7 @@ pub(super) fn receives_check(
         .any(|parent| {
             answers(builder, parent).into_iter().any(|(passed, passed_name)| {
                 check_of(passed).is_some_and(|passed| {
-                    !passed.no_inherit
-                        && passed_name.as_deref() == Some(name.as_ref())
-                        && inheritance::stored_expr(&passed.expr)
-                            == inheritance::stored_expr(&check.expr)
+                    !passed.no_inherit && passed_name.as_deref() == Some(name.as_ref())
                 })
             })
         })
@@ -739,49 +739,70 @@ pub(super) fn receives_check(
 
 /// Removes from a table being created the unnamed copies of parent checks it
 /// declares itself under the name the parent's check answers to, since the
-/// two are one constraint, both its own and received. Answers the renderings
-/// of the copies removed from its constraint list.
-pub(super) fn merge_named_copies(builder: &ParserDBBuilder, node: &mut CreateTable) -> Vec<String> {
-    let declared: Vec<(String, Expr)> = slots(node)
+/// two are one constraint, both its own and received, and has the table's
+/// check hold the stored values of each copy once its literals are read.
+/// Answers the renderings of the copies removed from its constraint list.
+pub(super) fn merge_named_copies(
+    builder: &ParserDBBuilder,
+    node: &mut CreateTable,
+    checks: &mut Vec<(CheckConstraint, CheckLiterals)>,
+) -> Vec<String> {
+    let declared: Vec<(String, CheckConstraint)> = slots(node)
         .into_iter()
         .filter_map(|slot| {
             let name = slot.declared_name()?;
-            Some((
-                stored_ident_name(name).into_owned(),
-                inheritance::stored_expr(&check_of(slot)?.expr),
-            ))
+            Some((stored_ident_name(name).into_owned(), check_of(slot)?.clone()))
         })
         .collect();
-    let passed: Vec<Expr> = inheritance::parent_names(node)
+    let passed: Vec<(Expr, &str, &CheckConstraint)> = inheritance::parent_names(node)
         .filter_map(|parent| builder.resolve_bound_table_name(parent).ok().flatten())
         .flat_map(|parent| {
             answers(builder, parent).into_iter().filter_map(|(slot, name)| {
                 let check = check_of(slot)?;
-                let expr = inheritance::stored_expr(&check.expr);
-                (slot.declared_name().is_none()
-                    && !check.no_inherit
-                    && declared.iter().any(|(held, held_expr)| {
-                        Some(held.as_str()) == name.as_deref() && *held_expr == expr
-                    }))
-                .then_some(expr)
+                let (held_name, local) =
+                    declared.iter().find(|(held, _)| Some(held.as_str()) == name.as_deref())?;
+                (slot.declared_name().is_none() && !check.no_inherit)
+                    .then(|| (inheritance::stored_expr(&check.expr), held_name.as_str(), local))
             })
         })
         .collect();
     if passed.is_empty() {
         return Vec::new();
     }
-    let is_merged_copy = |check: &CheckConstraint| {
-        check.name.is_none() && passed.contains(&inheritance::stored_expr(&check.expr))
+    let table_name = node.name.to_string();
+    let mut merge = |copy: &CheckConstraint| {
+        if copy.name.is_some() {
+            return false;
+        }
+        let stored = inheritance::stored_expr(&copy.expr);
+        let Some((_, name, local)) = passed.iter().find(|(expr, ..)| *expr == stored) else {
+            return false;
+        };
+        if let Some(position) = checks.iter().position(|(held, _)| held == copy) {
+            let (_, literals) = checks.remove(position);
+            let mut expression = *copy.expr.clone();
+            if let CheckLiterals::Stored(bound) = &literals {
+                respell(&mut expression, bound);
+            }
+            let merged = MergedCheck {
+                expression,
+                literals,
+                table_name: table_name.clone(),
+                constraint_name: (*name).to_string(),
+            };
+            inheritance::merge_into_local(checks, local, merged);
+        }
+        true
     };
     for column in &mut node.columns {
         column.options.retain(|held| {
             !(held.name.is_none()
-                && matches!(&held.option, ColumnOption::Check(check) if is_merged_copy(check)))
+                && matches!(&held.option, ColumnOption::Check(check) if merge(check)))
         });
     }
     let mut removed = Vec::new();
     node.constraints.retain(|constraint| {
-        let copy = matches!(constraint, TableConstraint::Check(check) if is_merged_copy(check));
+        let copy = matches!(constraint, TableConstraint::Check(check) if merge(check));
         if copy {
             removed.push(constraint.to_string());
         }

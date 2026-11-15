@@ -44,14 +44,14 @@ impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
         let metadata = check_constraint_metadata(self, database)?;
         let expression = metadata.expression();
         Ok(match metadata.literals() {
-            CheckLiterals::Unreadable(literal) => {
+            CheckLiterals::Unreadable(literal, _) => {
                 let check = self.constraint_name(database)?.map(Cow::into_owned);
                 ClauseExpression::Written {
                     expression,
                     unreadable: literal.check_error(self.table().table_name(), check),
                 }
             }
-            CheckLiterals::Pending | CheckLiterals::AsWritten | CheckLiterals::Stored(_) => {
+            CheckLiterals::Pending(_) | CheckLiterals::AsWritten | CheckLiterals::Stored(_) => {
                 ClauseExpression::Stored(expression)
             }
         })

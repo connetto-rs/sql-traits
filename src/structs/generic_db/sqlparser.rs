@@ -5746,13 +5746,7 @@ impl ParserDB {
         // A check a rebuild carries keeps the literals it was created with,
         // a copy of a parent's check holds the values the parent stored, and
         // a new one is read once the statement creating it has run.
-        metadata.set_literals(literals.unwrap_or(
-            if matches!(*builder.dialect(), SqlparserDialect::PostgreSql) {
-                CheckLiterals::Pending
-            } else {
-                CheckLiterals::AsWritten
-            },
-        ));
+        metadata.set_literals(literals.unwrap_or(CheckLiterals::Pending(Vec::new())));
         Ok(builder.add_check_constraint(check_arc, metadata))
     }
 
@@ -7185,6 +7179,8 @@ impl ParserDB {
             );
         }
 
+        let added: *const CreateTable = Self::stored_node(&builder, &stored)?;
+        let added = (added, constraint.clone());
         let mut frontier = alloc::vec![(stored, constraint)];
         let mut reached: Vec<StoredTable> = Vec::new();
 
@@ -7207,10 +7203,7 @@ impl ParserDB {
                     node.constraints.iter().find(|held| inheritance::is_copy_of(held, &passed))
                 {
                     let held = held.clone();
-                    let merged = constraint_validity::merged_copy_validated(
-                        &builder, &child, &held, validated,
-                    )?;
-                    constraint_validity::record(&mut builder, &child, &held, merged);
+                    Self::merge_into_held(&mut builder, &added, &child, &held, validated)?;
                     frontier.push((child, held));
                     continue;
                 }
@@ -7248,6 +7241,32 @@ impl ParserDB {
         }
 
         Ok(builder)
+    }
+
+    /// Merges `added`, the constraint the statement adds with the node of
+    /// the table it adds it to, into `held`, the constraint of its kind
+    /// `child` already holds, recording whether the merged one is validated.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `stored_literals::merge_added_check` does for two checks
+    /// and what `constraint_validity::merged_copy_validated` does.
+    fn merge_into_held(
+        builder: &mut ParserDBBuilder,
+        (added_on, added): &(*const CreateTable, TableConstraint),
+        child: &StoredTable,
+        held: &TableConstraint,
+        validated: bool,
+    ) -> Result<(), crate::errors::Error> {
+        let held_on: *const CreateTable = Self::stored_node(builder, child)?;
+        stored_literals::merge_added_check(
+            builder,
+            (*added_on, added),
+            (held_on, child.name.as_str(), held),
+        )?;
+        let merged = constraint_validity::merged_copy_validated(builder, child, held, validated)?;
+        constraint_validity::record(builder, child, held, merged);
+        Ok(())
     }
 
     /// Refuses a primary key or unique constraint that `ALTER TABLE ... ADD`
@@ -9422,7 +9441,7 @@ impl ParserDB {
             stored_literals::bind_pending_checks(
                 &mut builder,
                 stored_literals::LiteralSession::of(&session_settings),
-            );
+            )?;
             if tracks_session_roles(dialect)
                 && let Some(change) =
                     SessionChange::of(&statement, dialect.hex_strings_may_be_integers())?
@@ -10977,7 +10996,11 @@ impl ParserDB {
                         &collation_metadata,
                         &active_postgres_catalog,
                     )?;
-                    let merged = constraint_names::merge_named_copies(&builder, &mut create_table);
+                    let merged = constraint_names::merge_named_copies(
+                        &builder,
+                        &mut create_table,
+                        &mut inherited.checks,
+                    );
                     inherited.constraints.retain(|rendering| !merged.contains(rendering));
                     // The bound is checked against the partitions the root
                     // already has, which the parents just resolved.
@@ -11997,7 +12020,7 @@ impl ParserDB {
         stored_literals::bind_pending_checks(
             &mut builder,
             stored_literals::LiteralSession::of(&session_settings),
-        );
+        )?;
         Ok(transactions::Catalog {
             builder,
             postgres: active_postgres_catalog,

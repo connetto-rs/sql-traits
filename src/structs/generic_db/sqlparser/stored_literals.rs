@@ -20,29 +20,40 @@ use sql_values::{
     PgTimestampTz, PgType,
 };
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, InTarget, ObjectName, ObjectNamePart, Query, Select, TableFactor,
-    TableWithJoins, TimezoneInfo, TypedString, Value, ValueWithSpan, Visitor, VisitorMut,
+    BinaryOperator, CastKind, CheckConstraint, CreateTable, DataType, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, InTarget, ObjectName, ObjectNamePart, Query, Select,
+    TableConstraint, TableFactor, TableWithJoins, TimezoneInfo, TypedString, Value, ValueWithSpan,
+    Visitor, VisitorMut,
 };
 
 use super::{
     ParserDBBuilder, SessionSettings,
     function_bodies::{wrapping_query, wrapping_select},
+    inheritance::stored_expr,
     view_rewrites,
 };
 use crate::{
+    errors::Error,
+    impls::SqlparserDialect,
     structs::{
         ColumnDefinition, ColumnDefinitionScope, ColumnScope, IdentifierCase, ParserDB,
         TableAttribute,
-        metadata::{BoundLiteral, CheckLiterals, ClauseLiterals, UnreadableLiteral, respell},
+        metadata::{
+            BoundLiteral, CheckLiterals, ClauseLiterals, MergedCheck, ReadSession,
+            UnreadableLiteral, respell,
+        },
     },
     traits::ColumnLike,
-    utils::walk::{walk, walk_expressions, walk_mut},
+    utils::{
+        identifier_resolution::stored_ident_name,
+        walk::{walk, walk_expressions, walk_mut},
+    },
 };
 
 /// The session state an expression's literals are read under.
 #[derive(Clone, Copy)]
 pub(super) struct LiteralSession<'a> {
+    settings: &'a SessionSettings,
     time_zone: Option<&'a PgTimeZone>,
     date_order: Option<DateOrder>,
 }
@@ -52,8 +63,17 @@ impl<'a> LiteralSession<'a> {
     /// runs.
     pub(super) fn of(settings: &'a SessionSettings) -> Self {
         Self {
+            settings,
             time_zone: settings.time_zone(),
             date_order: settings.date_style().and_then(date_order),
+        }
+    }
+
+    /// Which value each setting bearing on the stored values holds.
+    fn reading(self) -> ReadSession {
+        ReadSession {
+            time_zone: self.settings.reading("timezone"),
+            date_style: self.settings.reading("datestyle"),
         }
     }
 
@@ -331,7 +351,17 @@ struct Coercions<'scope, 'query, 'db, 'session> {
     wants_columns: bool,
     found: Vec<Coercion>,
     unreadable: Option<UnreadableLiteral>,
+    /// Whether every value read so far follows from its text and the
+    /// session's settings, which a literal needing the time of creation keeps
+    /// from holding, and a `timetz` read in a zone not known here too, since
+    /// the zone's offset on the day of creation decides its value.
+    settled: bool,
 }
+
+/// The first literal whose value is not known here, with the session state
+/// settling every value of the expression, `None` when one also depends on
+/// the time the expression was created at.
+type Unread = (UnreadableLiteral, Option<ReadSession>);
 
 impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
     fn new(
@@ -345,28 +375,36 @@ impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
             wants_columns: false,
             found: Vec::new(),
             unreadable: None,
+            settled: true,
         }
     }
 
-    fn finish(self) -> Result<Vec<Coercion>, UnreadableLiteral> {
+    fn finish(self) -> Result<Vec<Coercion>, Unread> {
         match self.unreadable {
-            Some(unreadable) => Err(unreadable),
+            Some(unreadable) => Err((unreadable, self.settled.then(|| self.session.reading()))),
             None => Ok(self.found),
         }
     }
 
     /// Reads `text`, held by `node`, as `temporal`.
+    ///
+    /// Every literal is read, those after one whose value is not known too,
+    /// so that whether the values follow from the session alone is known.
     fn coerce(&mut self, node: &Expr, text: &str, temporal: Temporal, form: Form) {
-        if self.unreadable.is_some() {
-            return;
-        }
         match temporal.read(text, self.session.context()) {
             Ok(stored) => self.found.push(Coercion { address: address(node), form, stored }),
             Err(reason) => {
-                self.unreadable = Some(UnreadableLiteral {
-                    literal: text.to_string(),
-                    data_type: temporal.pg_type(),
-                    reason,
+                if reason == DateTimeError::NeedsCurrentTime
+                    || (temporal == Temporal::TimeTz && reason == DateTimeError::NeedsTimeZone)
+                {
+                    self.settled = false;
+                }
+                self.unreadable.get_or_insert_with(|| {
+                    UnreadableLiteral {
+                        literal: text.to_string(),
+                        data_type: temporal.pg_type(),
+                        reason,
+                    }
                 });
             }
         }
@@ -576,7 +614,7 @@ fn coercions(
     builder: &ParserDBBuilder,
     query: &Query,
     session: LiteralSession<'_>,
-) -> Result<Vec<Coercion>, UnreadableLiteral> {
+) -> Result<Vec<Coercion>, Unread> {
     let mut unscoped = Coercions::new(None, session);
     let walked = walk(query, &mut unscoped);
     debug_assert!(walked.is_continue(), "the walk never breaks");
@@ -600,7 +638,7 @@ fn read(
     table: &ObjectName,
     expression: &mut Expr,
     session: LiteralSession<'_>,
-) -> Result<Vec<BoundLiteral>, UnreadableLiteral> {
+) -> Result<Vec<BoundLiteral>, Unread> {
     if !holds_quoted_literal(expression) {
         return Ok(Vec::new());
     }
@@ -673,20 +711,32 @@ pub(super) fn bind(
                 ClauseLiterals::Stored(Box::new(written))
             }
         }
-        Err(unreadable) => ClauseLiterals::Unreadable(unreadable),
+        Err((unreadable, _)) => ClauseLiterals::Unreadable(unreadable),
     }
 }
 
 /// Reads the literals of every check created since the last call under
-/// `session`, the session of the statement creating them.
-pub(super) fn bind_pending_checks(builder: &mut ParserDBBuilder, session: LiteralSession<'_>) {
+/// `session`, the session of the statement creating them, and holds each to
+/// the checks it merged with.
+///
+/// # Errors
+///
+/// Returns [`Error::InheritedConstraintConflict`] for a check holding other
+/// stored values than one it merged with, and
+/// [`Error::InheritedCheckUndecidable`] when a value deciding that is not
+/// known here.
+pub(super) fn bind_pending_checks(
+    builder: &mut ParserDBBuilder,
+    session: LiteralSession<'_>,
+) -> Result<(), Error> {
+    let reads_literals = matches!(*builder.dialect(), SqlparserDialect::PostgreSql);
     let read_checks: Vec<(usize, CheckLiterals)> = builder
         .check_constraints()
         .iter()
         .enumerate()
-        .filter(|(_, (_, metadata))| *metadata.literals() == CheckLiterals::Pending)
+        .filter(|(_, (_, metadata))| matches!(metadata.literals(), CheckLiterals::Pending(_)))
         .map(|(index, (check, metadata))| {
-            if !holds_quoted_literal(metadata.expression()) {
+            if !reads_literals || !holds_quoted_literal(metadata.expression()) {
                 return (index, CheckLiterals::AsWritten);
             }
             let mut expression = metadata.expression().clone();
@@ -694,15 +744,123 @@ pub(super) fn bind_pending_checks(builder: &mut ParserDBBuilder, session: Litera
             let literals = match read(builder, table, &mut expression, session) {
                 Ok(bound) if bound.is_empty() => CheckLiterals::AsWritten,
                 Ok(bound) => CheckLiterals::Stored(bound),
-                Err(unreadable) => CheckLiterals::Unreadable(unreadable),
+                Err((unreadable, settled)) => CheckLiterals::Unreadable(unreadable, settled),
             };
             (index, literals)
         })
         .collect();
     let checks = builder.check_constraints_mut();
     for (index, literals) in read_checks {
-        checks[index].1.set_literals(literals);
+        let metadata = &mut checks[index].1;
+        let merged = metadata.take_merges();
+        metadata.set_literals(literals);
+        for other in merged {
+            hold_merge((metadata.expression(), metadata.literals()), other)?;
+        }
     }
+    Ok(())
+}
+
+/// Whether two checks hold the same stored values, as PostgreSQL compares a
+/// check with the one of the same name it merges with, or the literal whose
+/// value keeps that from being known.
+///
+/// The same text read under one session holds the same values when nothing
+/// else, such as the time of creation, decides them.
+pub(super) fn same_stored(
+    (expression, literals): (&Expr, &CheckLiterals),
+    (other_expression, other_literals): (&Expr, &CheckLiterals),
+) -> Result<bool, UnreadableLiteral> {
+    let same_text = || stored_expr(expression) == stored_expr(other_expression);
+    match (literals, other_literals) {
+        (
+            CheckLiterals::Unreadable(_, Some(session)),
+            CheckLiterals::Unreadable(_, Some(other_session)),
+        ) if session.same_values(other_session) && same_text() => Ok(true),
+        (CheckLiterals::Unreadable(literal, _), _) | (_, CheckLiterals::Unreadable(literal, _)) => {
+            Err(literal.clone())
+        }
+        _ => Ok(same_text()),
+    }
+}
+
+/// Refuses `check`, an expression with how its literals were read, merging
+/// with `other` unless the two hold the same stored values.
+///
+/// # Errors
+///
+/// Returns [`Error::InheritedConstraintConflict`] when the values differ and
+/// [`Error::InheritedCheckUndecidable`] when one is not known here.
+pub(super) fn hold_merge(check: (&Expr, &CheckLiterals), other: MergedCheck) -> Result<(), Error> {
+    let MergedCheck { expression, literals, table_name, constraint_name } = other;
+    match same_stored(check, (&expression, &literals)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Error::InheritedConstraintConflict { table_name, constraint_name }),
+        Err(literal) => {
+            Err(Error::InheritedCheckUndecidable {
+                table_name,
+                constraint_name,
+                literal: literal.literal,
+                reason: literal.reason,
+            })
+        }
+    }
+}
+
+/// Whether `check` is the check written as `written` on the table `table`.
+fn is_check_on(
+    check: &TableAttribute<CreateTable, CheckConstraint>,
+    table: *const CreateTable,
+    written: &CheckConstraint,
+) -> bool {
+    core::ptr::eq(TableAttribute::table(check), table) && check.attribute() == written
+}
+
+/// Has `added`, a constraint the statement adds to the table `parent`, hold
+/// the same stored values as `held`, the constraint of its name the
+/// descendant `child` named `child_name` already holds, once the added
+/// check's literals are read, when both are checks.
+///
+/// # Errors
+///
+/// Returns what [`hold_merge`] does when the added check was read already.
+pub(super) fn merge_added_check(
+    builder: &mut ParserDBBuilder,
+    (parent, added): (*const CreateTable, &TableConstraint),
+    (child, child_name, held): (*const CreateTable, &str, &TableConstraint),
+) -> Result<(), Error> {
+    let (TableConstraint::Check(added), TableConstraint::Check(held)) = (added, held) else {
+        return Ok(());
+    };
+    let Some((expression, literals)) = builder
+        .check_constraints()
+        .iter()
+        .find(|(check, _)| is_check_on(check, child, held))
+        .map(|(_, metadata)| (metadata.expression().clone(), metadata.literals().clone()))
+    else {
+        return Ok(());
+    };
+    let other = MergedCheck {
+        expression,
+        literals,
+        table_name: child_name.to_string(),
+        constraint_name: held
+            .name
+            .as_ref()
+            .map_or_else(|| held.to_string(), |name| stored_ident_name(name).into_owned()),
+    };
+    let Some((_, metadata)) = builder
+        .check_constraints_mut()
+        .iter_mut()
+        .find(|(check, _)| is_check_on(check, parent, added))
+    else {
+        return Ok(());
+    };
+    if let Some(pending) = metadata.pending_merges() {
+        pending.push(other);
+        return Ok(());
+    }
+    hold_merge((metadata.expression(), metadata.literals()), other)
 }
 
 /// Swaps `target` with the first expression a walk of the wrapper query meets,

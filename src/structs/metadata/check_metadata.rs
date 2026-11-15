@@ -1,6 +1,6 @@
 //! Submodule defining a generic `CheckMetadata` struct.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use sqlparser::ast::Expr;
 
@@ -27,14 +27,73 @@ pub struct CheckMetadata<U: CheckConstraintLike> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckLiterals {
     /// Not read yet, which they are once the statement creating the check
-    /// has run.
-    Pending,
+    /// has run, with the checks of a parent or a child it merged with, which
+    /// it has to hold the same stored values as.
+    Pending(Vec<MergedCheck>),
     /// No literal holds a value other than the one written.
     AsWritten,
     /// These literals hold the value PostgreSQL stored.
     Stored(Vec<BoundLiteral>),
-    /// A literal holds a value not known here, so the check stays as written.
-    Unreadable(UnreadableLiteral),
+    /// A literal holds a value not known here, so the check stays as written,
+    /// with the session state settling every value of the check, `None` when
+    /// a value also depends on the time the check was created at.
+    Unreadable(UnreadableLiteral, Option<ReadSession>),
+}
+
+/// A check a pending one merged with, which PostgreSQL allows only when the
+/// two hold the same stored values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergedCheck {
+    /// The other check's expression, each literal holding the value
+    /// PostgreSQL stored for it where that value is known.
+    pub(crate) expression: Expr,
+    /// How the other check's literals were read, never pending.
+    pub(crate) literals: CheckLiterals,
+    /// The table holding the child's check of the two, which a refusal names.
+    pub(crate) table_name: String,
+    /// The name the two checks share.
+    pub(crate) constraint_name: String,
+}
+
+/// The session settings a check's literals were read under, as far as they
+/// bear on the values PostgreSQL stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadSession {
+    /// The `TimeZone` setting.
+    pub(crate) time_zone: SettingReading,
+    /// The `DateStyle` setting.
+    pub(crate) date_style: SettingReading,
+}
+
+impl ReadSession {
+    /// Whether both reads saw every setting hold one value.
+    pub(crate) fn same_values(&self, other: &Self) -> bool {
+        self.time_zone.same_value(&other.time_zone) && self.date_style.same_value(&other.date_style)
+    }
+}
+
+/// Which value a setting held when a check's literals were read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SettingReading {
+    /// The value the session started with, which the input never gives and
+    /// which stays the same for every statement.
+    Started,
+    /// A value the input sets, as written.
+    Known(String),
+    /// A value a `SET` gave that the input leaves unknown.
+    Unknown,
+}
+
+impl SettingReading {
+    /// Whether two reads saw the setting hold one value, which a value the
+    /// input leaves unknown never counts as.
+    fn same_value(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Started, Self::Started) => true,
+            (Self::Known(left), Self::Known(right)) => left == right,
+            _ => false,
+        }
+    }
 }
 
 impl<U: CheckConstraintLike> CheckMetadata<U> {
@@ -71,6 +130,24 @@ impl<U: CheckConstraintLike> CheckMetadata<U> {
             respell(&mut self.expression, bound);
         }
         self.literals = literals;
+    }
+
+    /// The checks the check, still pending, has to hold the same stored
+    /// values as once its literals are read, `None` once they were read.
+    pub(crate) fn pending_merges(&mut self) -> Option<&mut Vec<MergedCheck>> {
+        match &mut self.literals {
+            CheckLiterals::Pending(pending) => Some(pending),
+            _ => None,
+        }
+    }
+
+    /// Takes the checks a pending check merged with, none once its literals
+    /// were read.
+    pub(crate) fn take_merges(&mut self) -> Vec<MergedCheck> {
+        match &mut self.literals {
+            CheckLiterals::Pending(merges) => core::mem::take(merges),
+            _ => Vec::new(),
+        }
     }
 
     /// Returns a reference to the table on which the constraint is defined.

@@ -67,7 +67,8 @@ fn mismatch(sql: &str) -> ChildMismatch {
                 ChildMismatch::MissingConstraint { constraint_name }
                 | ChildMismatch::ConstraintDiffers { constraint_name }
                 | ChildMismatch::ConstraintNotInherited { constraint_name }
-                | ChildMismatch::ConstraintNotValid { constraint_name } => constraint_name,
+                | ChildMismatch::ConstraintNotValid { constraint_name }
+                | ChildMismatch::ConstraintUndecidable { constraint_name, .. } => constraint_name,
             };
             assert!(
                 message.contains("`c`")

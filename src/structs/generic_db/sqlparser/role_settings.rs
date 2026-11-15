@@ -21,18 +21,19 @@ use sqlparser::ast::{
 use super::{ParserDBBuilder, SessionRoles, parse_options::WrittenTimeZone, stored_role_name};
 use crate::{
     errors::Error,
-    structs::{RoleSetting, role_setting::setting_zone},
+    structs::{RoleSetting, metadata::SettingReading, role_setting::setting_zone},
     utils::{
         identifier_resolution::{SessionPrincipal, session_principal, stored_identifier},
         object_name::{require_static_object_name, setting_value},
     },
 };
 
-/// One setting's value as the session holds it.
+/// One setting's value as the session holds it, `None` once a `SET` gave it
+/// a value the input leaves unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Held {
     name: String,
-    value: Value,
+    value: Option<Value>,
 }
 
 /// A setting's value, with the zone PostgreSQL reads from a `TimeZone` one.
@@ -45,11 +46,12 @@ struct Value {
 /// The values a session's own `SET` statements leave, as `SET ... FROM
 /// CURRENT` reads them.
 ///
-/// A setting is absent while its value is not known, because neither the
-/// input nor the session's start set it. A `SET LOCAL` holds until its
-/// transaction ends, a plain `SET` lasts past it, a `RESET` returns to the
-/// value the session started with, and a rollback restores the catalog copy
-/// carrying this state.
+/// A setting is absent while it holds the value the session started with and
+/// the input never gave, and held without a value once a `SET` gives it one
+/// the input leaves unknown, so two reads can tell whether they saw one
+/// value. A `SET LOCAL` holds until its transaction ends, a plain `SET` lasts
+/// past it, a `RESET` returns to the value the session started with, and a
+/// rollback restores the catalog copy carrying this state.
 #[derive(Debug, Clone, Default)]
 pub(super) struct SessionSettings {
     started: Vec<Held>,
@@ -77,21 +79,35 @@ impl SessionSettings {
             .map(|WrittenTimeZone { written, zone }| {
                 Held {
                     name: "timezone".to_string(),
-                    value: Value { text: written, zone: Some(zone) },
+                    value: Some(Value { text: written, zone: Some(zone) }),
                 }
             })
             .collect();
         Self { committed: started.clone(), started, local: None }
     }
 
-    /// The value `name` holds now, compared without case.
-    fn current(&self, name: &str) -> Option<&Value> {
+    /// What the session holds for `name` now, compared without case.
+    fn held(&self, name: &str) -> Option<&Held> {
         self.local
             .as_ref()
             .unwrap_or(&self.committed)
             .iter()
             .find(|held| held.name.eq_ignore_ascii_case(name))
-            .map(|held| &held.value)
+    }
+
+    /// The value `name` holds now, when known.
+    fn current(&self, name: &str) -> Option<&Value> {
+        self.held(name).and_then(|held| held.value.as_ref())
+    }
+
+    /// Which value `name` holds now: the one the session started with, a
+    /// known one, or one the input leaves unknown.
+    pub(super) fn reading(&self, name: &str) -> SettingReading {
+        match self.held(name) {
+            None => SettingReading::Started,
+            Some(Held { value: Some(value), .. }) => SettingReading::Known(value.text.clone()),
+            Some(Held { value: None, .. }) => SettingReading::Unknown,
+        }
     }
 
     /// The `TimeZone` the session runs in now, when known.
@@ -194,13 +210,15 @@ fn change_of(
 
 impl Change {
     fn apply_to(self, held: &mut Vec<Held>, started: &[Held]) {
+        // `None` returns the setting to the session's start, which holds no
+        // value for it.
         let (name, value) = match self {
             Self::ResetAll => {
                 held.clear();
                 held.extend_from_slice(started);
                 return;
             }
-            Self::Set { name, value } => (name, value),
+            Self::Set { name, value } => (name, Some(value)),
             Self::Reset { name } => {
                 let value = started
                     .iter()

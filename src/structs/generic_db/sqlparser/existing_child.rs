@@ -8,14 +8,19 @@ use alloc::{
     vec::Vec,
 };
 
-use sqlparser::ast::{CheckConstraint, ColumnDef, ColumnOption, CreateTable, TableConstraint};
+use sqlparser::ast::{
+    CheckConstraint, ColumnDef, ColumnOption, CreateTable, Expr, TableConstraint,
+};
 
 use super::{
     ParserDBBuilder, StoredTable,
     constraint_names::{self, Slot},
-    constraint_validity, inheritance, states_not_null,
+    constraint_validity, inheritance, states_not_null, stored_literals,
 };
-use crate::errors::ChildMismatch;
+use crate::{
+    errors::ChildMismatch,
+    structs::{TableAttribute, metadata::CheckLiterals},
+};
 
 /// Refuses a child lacking the parent's shape, its columns first and then the
 /// checks it passes down, and answers the child's own table checks that now
@@ -86,6 +91,25 @@ struct HeldCheck {
     name: Option<String>,
     /// Whether it sits in the table's constraint list.
     in_constraint_list: bool,
+    /// Its expression holding each stored value, with how its literals were
+    /// read.
+    stored: Option<(Expr, CheckLiterals)>,
+}
+
+/// The expression of `node`'s check written as `check`, holding each stored
+/// value, with how its literals were read.
+fn stored_check(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    check: &CheckConstraint,
+) -> Option<(Expr, CheckLiterals)> {
+    builder
+        .check_constraints()
+        .iter()
+        .find(|(held, _)| {
+            core::ptr::eq(TableAttribute::table(held.as_ref()), node) && held.attribute() == check
+        })
+        .map(|(_, metadata)| (metadata.expression().clone(), metadata.literals().clone()))
 }
 
 /// Every check the table holds.
@@ -96,12 +120,19 @@ fn checks_of(builder: &ParserDBBuilder, table: &StoredTable, node: &CreateTable)
             let name = name.map(Cow::into_owned);
             match slot {
                 Slot::Column { held, .. } => {
-                    let ColumnOption::Check(check) = &held.option else {
+                    let ColumnOption::Check(written) = &held.option else {
                         return None;
                     };
-                    let mut check = check.clone();
+                    let stored = stored_check(builder, node, written);
+                    let mut check = written.clone();
                     check.name = check.name.or_else(|| held.name.clone());
-                    Some(HeldCheck { check, validated: true, name, in_constraint_list: false })
+                    Some(HeldCheck {
+                        check,
+                        validated: true,
+                        name,
+                        in_constraint_list: false,
+                        stored,
+                    })
                 }
                 Slot::Table(_, constraint) => {
                     let TableConstraint::Check(check) = constraint else {
@@ -112,6 +143,7 @@ fn checks_of(builder: &ParserDBBuilder, table: &StoredTable, node: &CreateTable)
                         validated: constraint_validity::is_validated(builder, table, constraint),
                         name,
                         in_constraint_list: true,
+                        stored: stored_check(builder, node, check),
                     })
                 }
             }
@@ -152,7 +184,22 @@ fn merged_checks(
             });
         };
         let constraint_name = || own.name.clone().unwrap_or_else(|| own.check.to_string());
-        if !same_expr(&own.check) {
+        let same = match (&own.stored, &passed.stored) {
+            (Some((own_expr, own_literals)), Some((passed_expr, passed_literals))) => {
+                stored_literals::same_stored(
+                    (own_expr, own_literals),
+                    (passed_expr, passed_literals),
+                )
+                .map_err(|unreadable| {
+                    ChildMismatch::ConstraintUndecidable {
+                        constraint_name: constraint_name(),
+                        literal: unreadable.literal,
+                    }
+                })?
+            }
+            _ => same_expr(&own.check),
+        };
+        if !same {
             return Err(ChildMismatch::ConstraintDiffers { constraint_name: constraint_name() });
         }
         if own.check.no_inherit {
