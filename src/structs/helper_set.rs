@@ -44,25 +44,24 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
 /// One `SELECT` of a helper's `UNION`.
 #[derive(Debug)]
 pub enum HelperArm<'db, DB: DatabaseLike> {
-    /// The rows of a table its condition keeps, compared with a value of the
-    /// request or not.
+    /// The rows of a table its condition keeps, for the grantee it names or
+    /// for anyone.
     Grant(GrantArm<'db, DB>),
     /// The rows of a table whose parent another helper returns.
     Parent(ParentArm<'db, DB>),
-    /// The rows of a table whose parent the set itself holds.
+    /// The rows next to the ones the set itself holds, along a tree.
     Walk(WalkArm<'db, DB>),
 }
 
-/// `SELECT <column> FROM <table> [WHERE [<setting comparison>] [AND
-/// <condition>]]`.
-///
-/// An arm comparing no column with a setting returns the same rows for
-/// every request.
+/// `SELECT <column> FROM <table> [WHERE <conditions>]`, the rows the
+/// conditions keep for the grantee they name, the caller gate they write and
+/// the restrictions the rest of them reduce to.
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
     pub(crate) column: &'db DB::Column,
-    pub(crate) request: Option<SettingComparison<'db, DB>>,
+    pub(crate) granted_to: GrantedTo<'db, DB>,
+    pub(crate) gate: Option<CallerGate<'db>>,
     pub(crate) restrictions: Vec<LiteralSet<'db, DB>>,
 }
 
@@ -79,11 +78,17 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
         self.column
     }
 
-    /// The comparison of a column with a value of the request, or `None`
-    /// where the arm keeps the same rows for every request.
+    /// Whose rows the arm keeps.
     #[must_use]
-    pub fn request(&self) -> Option<&SettingComparison<'db, DB>> {
-        self.request.as_ref()
+    pub fn granted_to(&self) -> &GrantedTo<'db, DB> {
+        &self.granted_to
+    }
+
+    /// The condition on a caller setting itself, or `None` where the arm
+    /// keeps its rows whatever the setting reads.
+    #[must_use]
+    pub fn gate(&self) -> Option<&CallerGate<'db>> {
+        self.gate.as_ref()
     }
 
     /// The values columns have to hold, each set over its own column, all of
@@ -92,6 +97,102 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     #[must_use]
     pub fn restrictions(&self) -> &[LiteralSet<'db, DB>] {
         &self.restrictions
+    }
+}
+
+/// Whose rows a [`GrantArm`] keeps.
+#[derive(Debug)]
+pub enum GrantedTo<'db, DB: DatabaseLike> {
+    /// The rows whose column holds the caller, or an element of a declared
+    /// set, the request carries.
+    Request(SettingComparison<'db, DB>),
+    /// `<column> IN (SELECT <function>(<arguments>))`, the rows naming one of
+    /// the grantees another helper returns, such as every grantee the caller
+    /// is.
+    Set(GranteeSet<'db, DB>),
+    /// Every row the other conditions keep, whoever the request names, the
+    /// conditions naming no grantee.
+    Anyone,
+}
+
+/// The column a grant arm compares with the set another helper returns.
+#[derive(Debug)]
+pub struct GranteeSet<'db, DB: DatabaseLike> {
+    pub(crate) column: &'db DB::Column,
+    pub(crate) foreign_key: Option<&'db DB::ForeignKey>,
+    pub(crate) function: &'db DB::Function,
+    pub(crate) arguments: Vec<Value>,
+    pub(crate) set: Box<HelperSet<'db, DB>>,
+}
+
+impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
+    /// The column holding the grantee.
+    #[must_use]
+    pub fn column(&self) -> &'db DB::Column {
+        self.column
+    }
+
+    /// The single-column foreign key of [`column`](Self::column), or `None`
+    /// where the column has none.
+    #[must_use]
+    pub fn foreign_key(&self) -> Option<&'db DB::ForeignKey> {
+        self.foreign_key
+    }
+
+    /// The helper returning the grantees.
+    #[must_use]
+    pub fn function(&self) -> &'db DB::Function {
+        self.function
+    }
+
+    /// The arguments the arm passes to [`function`](Self::function), the
+    /// helper's own arguments substituted.
+    #[must_use]
+    pub fn arguments(&self) -> &[Value] {
+        &self.arguments
+    }
+
+    /// What [`function`](Self::function) returns for
+    /// [`arguments`](Self::arguments).
+    #[must_use]
+    pub fn set(&self) -> &HelperSet<'db, DB> {
+        &self.set
+    }
+}
+
+/// `current_setting(<caller setting>) <> <value>` for each excluded value,
+/// or `current_setting(<caller setting>) IS NOT NULL`, which keep the arm's
+/// rows only for a setting reading neither `NULL` nor an excluded value.
+///
+/// A custom setting set for one transaction reads `''` once the transaction
+/// ends, so `IS NOT NULL` holds on a pooled connection that once carried a
+/// caller. `<> ''` holds only where a caller was sent.
+#[derive(Debug)]
+pub struct CallerGate<'db> {
+    pub(crate) setting: &'db SessionSetting,
+    pub(crate) raises_when_unset: bool,
+    pub(crate) excluded: Vec<Value>,
+}
+
+impl<'db> CallerGate<'db> {
+    /// The caller setting the gate reads, as the deployment declares it.
+    #[must_use]
+    pub fn setting(&self) -> &'db SessionSetting {
+        self.setting
+    }
+
+    /// Whether the body reads the setting with `current_setting(name)`, which
+    /// raises `42704` where the setting was never set.
+    #[must_use]
+    pub fn raises_when_unset(&self) -> bool {
+        self.raises_when_unset
+    }
+
+    /// The values the setting must differ from, each once, in the order the
+    /// body first names them, empty for `IS NOT NULL` alone.
+    #[must_use]
+    pub fn excluded(&self) -> &[Value] {
+        &self.excluded
     }
 }
 
@@ -232,9 +333,8 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
 }
 
 /// The recursive term of `WITH RECURSIVE <walk> (<column>) AS (<arms> UNION
-/// SELECT <key> FROM <table> JOIN <walk> ON <column> = <walk>.<column>)
-/// SELECT <column> FROM <walk>`, which adds every row of the table whose
-/// parent the set holds until the set holds every row below its other arms.
+/// <term>) SELECT <column> FROM <walk>`, walking the tree the table's parent
+/// column draws until the set stops growing.
 ///
 /// The walk ends on a tree holding a cycle, as `UNION` keeps no row twice.
 #[derive(Debug)]
@@ -243,16 +343,17 @@ pub struct WalkArm<'db, DB: DatabaseLike> {
     pub(crate) key: &'db DB::Column,
     pub(crate) column: &'db DB::Column,
     pub(crate) foreign_key: &'db DB::ForeignKey,
+    pub(crate) direction: WalkDirection,
 }
 
 impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
-    /// The table the walk descends.
+    /// The table the walk follows.
     #[must_use]
     pub fn table(&self) -> &'db DB::Table {
         self.table
     }
 
-    /// The table's one-column primary key, which the arm returns.
+    /// The table's one-column primary key.
     #[must_use]
     pub fn key(&self) -> &'db DB::Column {
         self.key
@@ -270,4 +371,24 @@ impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
     pub fn foreign_key(&self) -> &'db DB::ForeignKey {
         self.foreign_key
     }
+
+    /// Which way the walk follows the tree.
+    #[must_use]
+    pub fn direction(&self) -> WalkDirection {
+        self.direction
+    }
+}
+
+/// Which way a [`WalkArm`] follows its tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkDirection {
+    /// `SELECT <key> FROM <table> JOIN <walk> ON <column> = <walk>.<column>`,
+    /// which adds the key of every row whose parent the set holds, so the
+    /// set ends holding every row below its other arms.
+    Down,
+    /// `SELECT <column> FROM <table> JOIN <walk> ON <key> = <walk>.<column>`,
+    /// which adds the parent of every row the set holds, so the set ends
+    /// holding every row above its other arms. A root adds its parent
+    /// column's `NULL`, which no `IN` matches.
+    Up,
 }

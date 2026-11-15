@@ -24,9 +24,10 @@ use super::function_body::{SqlBody, written_sql_body};
 use crate::{
     errors::{HelperSetError, LookupError},
     structs::{
-        Deployment, FunctionBody, GrantArm, HelperArm, HelperSet, IdentifierCase, LiteralSet,
-        ParentArm, RowSecurity, RowStatement, SetPacking, SettingComparison, SettingContent,
-        SettingValue, TargetName, WalkArm,
+        CallerGate, Deployment, FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm,
+        HelperSet, IdentifierCase, LiteralSet, ParentArm, RowSecurity, RowStatement,
+        SessionSetting, SetPacking, SettingComparison, SettingContent, SettingValue, TargetName,
+        WalkArm, WalkDirection,
     },
     traits::{
         ColumnLike, DatabaseLike, DialectLike, ForeignKeyLike, FunctionLike, Relation, RoleLike,
@@ -115,6 +116,55 @@ struct SettingRead {
 struct Passed {
     literal: Literal,
     value: Value,
+}
+
+/// One conjunct gating a grant arm on a caller setting itself.
+struct GateRead<'db> {
+    setting: &'db SessionSetting,
+    raises_when_unset: bool,
+    /// The value `<>` excludes, `None` for `IS NOT NULL`.
+    excluded: Option<Passed>,
+}
+
+/// The gates a grant arm's conjuncts write, merged into one.
+#[derive(Default)]
+struct Gates<'db> {
+    gate: Option<CallerGate<'db>>,
+    /// The literals the gate excludes, beside the values it hands over.
+    excluded: Vec<Literal>,
+    /// Whether one excludes `NULL`, which keeps no row.
+    keeps_nothing: bool,
+}
+
+impl<'db> Gates<'db> {
+    /// Merges `read`, `false` where it reads another setting than the gates
+    /// merged before it.
+    fn add(&mut self, read: GateRead<'db>) -> bool {
+        let gate = self.gate.get_or_insert_with(|| {
+            CallerGate { setting: read.setting, raises_when_unset: false, excluded: Vec::new() }
+        });
+        if !core::ptr::eq(gate.setting, read.setting) {
+            return false;
+        }
+        gate.raises_when_unset |= read.raises_when_unset;
+        match read.excluded {
+            Some(Passed { literal: Literal::Null, .. }) => self.keeps_nothing = true,
+            Some(Passed { literal, value }) if !self.excluded.contains(&literal) => {
+                self.excluded.push(literal);
+                gate.excluded.push(value);
+            }
+            Some(_) | None => {}
+        }
+        true
+    }
+}
+
+/// The helper an arm's `(SELECT <helper>(<arguments>))` calls, with what it
+/// answers.
+struct Called<'db, DB: DatabaseLike> {
+    function: &'db DB::Function,
+    arguments: Vec<Value>,
+    set: HelperSet<'db, DB>,
 }
 
 /// One input parameter of the helper being read, bound to its argument.
@@ -532,21 +582,27 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let database = self.database;
         self.require_select(scope, table.table, || table.columns_read(select, database))?;
         let keyed = self.keyed_table(table.table, column)?;
-        let selection = select.selection.as_ref();
-        if let Some(Expr::In { expr, target: InTarget::Subquery(called), negated: false, .. }) =
-            selection.map(unnest)
+        let returns_key = table
+            .table
+            .primary_key_column(database)?
+            .is_some_and(|primary| core::ptr::eq(primary, column));
+        if returns_key
+            && let Some(Expr::In {
+                expr, target: InTarget::Subquery(called), negated: false, ..
+            }) = select.selection.as_ref().map(unnest)
             && self.set_elements(scope, called).is_none()
         {
             let arm = self.parent_arm(scope, select, &table, column, expr, called)?;
             return Ok((keyed, Some(arm)));
         }
-        Ok((keyed, self.grant_arm(scope, select, &table, column, selection)?))
+        Ok((keyed, self.grant_arm(scope, select, &table, column, returns_key)?))
     }
 
     /// Reads the recursive term of a walk, `SELECT <key> FROM <table> JOIN
-    /// <walk> ON <column> = <walk>.<column>`, the join either way round.
-    /// PostgreSQL refuses the walk's name in a subquery of the term, so the
-    /// join is its one spelling.
+    /// <walk> ON <parent column> = <walk>.<column>` walking down and `SELECT
+    /// <parent column> FROM <table> JOIN <walk> ON <key> = <walk>.<column>`
+    /// walking up, the join either way round. PostgreSQL refuses the walk's
+    /// name in a subquery of the term, so the join is its one spelling.
     fn walk_arm(
         &self,
         scope: &Scope<'db, DB>,
@@ -595,16 +651,19 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(shape());
         }
         let table = self.arm_table(scope, term, relation, true)?;
-        let (Some(key), Some(returned), Some(column)) = (
+        let (Some(key), Some(returned), Some(compared)) = (
             table.table.primary_key_column(database)?,
             table.column(returned, database)?,
             table.column(compared, database)?,
         ) else {
             return Err(shape());
         };
-        if !core::ptr::eq(returned, key) || core::ptr::eq(column, key) {
-            return Err(shape());
-        }
+        let (column, direction) = match (core::ptr::eq(returned, key), core::ptr::eq(compared, key))
+        {
+            (true, false) => (compared, WalkDirection::Down),
+            (false, true) => (returned, WalkDirection::Up),
+            _ => return Err(shape()),
+        };
         let [foreign_key] = single_column_foreign_keys(table.table, column, database)?[..] else {
             return Err(shape());
         };
@@ -617,7 +676,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(shape());
         }
         self.require_select(scope, table.table, || Ok(vec![key, column]))?;
-        Ok(WalkArm { table: table.table, key, column, foreign_key })
+        Ok(WalkArm { table: table.table, key, column, foreign_key, direction })
     }
 
     /// The table whose primary key `column` of `table` holds, `table` itself
@@ -700,6 +759,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(ArmTable { table, qualifier })
     }
 
+    /// Reads `<column> IN (SELECT <helper>(<arguments>))` in an arm returning
+    /// `key`, its table's primary key.
     fn parent_arm(
         &mut self,
         scope: &Scope<'db, DB>,
@@ -711,13 +772,6 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ) -> Result<HelperArm<'db, DB>, HelperSetError> {
         let database = self.database;
         let shape = || scope.arm_shape(select);
-        if table
-            .table
-            .primary_key_column(database)?
-            .is_none_or(|primary| !core::ptr::eq(primary, key))
-        {
-            return Err(shape());
-        }
         let Some(column) = table.column(compared, database)? else {
             return Err(shape());
         };
@@ -728,6 +782,69 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             [] if !core::ptr::eq(column, key) => None,
             _ => return Err(shape()),
         };
+        let Called { function: callee, arguments, set } =
+            self.called_set(scope, select, table, subquery)?;
+        let parent_table = match foreign_key {
+            Some(foreign_key) => foreign_key.referenced_table(database)?,
+            None => {
+                set.covered_table().ok_or_else(|| {
+                    HelperSetError::UncoveredParent {
+                        function: scope.name.clone(),
+                        column: column.column_name().to_string(),
+                        called: callee.target_name().to_string(),
+                    }
+                })?
+            }
+        };
+        Ok(HelperArm::Parent(ParentArm {
+            table: table.table,
+            key,
+            column,
+            foreign_key,
+            parent_table,
+            function: callee,
+            arguments,
+            set: Box::new(set),
+        }))
+    }
+
+    /// Reads `<column> IN (SELECT <helper>(<arguments>))` in a grant arm,
+    /// the column holding a grantee of the helper's set.
+    fn grantee_set(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        table: &ArmTable<'_, 'db, DB>,
+        compared: &Expr,
+        subquery: &Query,
+    ) -> Result<GranteeSet<'db, DB>, HelperSetError> {
+        let database = self.database;
+        let shape = || scope.arm_shape(select);
+        let Some(column) = table.column(compared, database)? else {
+            return Err(shape());
+        };
+        let foreign_key = match single_column_foreign_keys(table.table, column, database)?[..] {
+            [] => None,
+            [foreign_key] => Some(foreign_key),
+            _ => return Err(shape()),
+        };
+        let Called { function, arguments, set } =
+            self.called_set(scope, select, table, subquery)?;
+        Ok(GranteeSet { column, foreign_key, function, arguments, set: Box::new(set) })
+    }
+
+    /// The helper `(SELECT <helper>(<arguments>))` calls, the arguments it
+    /// passes, each a parameter substituted or a literal, and what the helper
+    /// answers for them.
+    fn called_set(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        table: &ArmTable<'_, 'db, DB>,
+        subquery: &Query,
+    ) -> Result<Called<'db, DB>, HelperSetError> {
+        let database = self.database;
+        let shape = || scope.arm_shape(select);
         let call = projected_call(subquery).ok_or_else(shape)?;
         let list = plain_arguments(call).ok_or_else(shape)?;
         let mut arguments = Vec::new();
@@ -756,28 +873,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             });
         }
         let set = self.answer(callee, &arguments)?;
-        let parent_table = match foreign_key {
-            Some(foreign_key) => foreign_key.referenced_table(database)?,
-            None => {
-                set.covered_table().ok_or_else(|| {
-                    HelperSetError::UncoveredParent {
-                        function: scope.name.clone(),
-                        column: column.column_name().to_string(),
-                        called: callee.target_name().to_string(),
-                    }
-                })?
-            }
-        };
-        Ok(HelperArm::Parent(ParentArm {
-            table: table.table,
-            key,
-            column,
-            foreign_key,
-            parent_table,
-            function: callee,
-            arguments,
-            set: Box::new(set),
-        }))
+        Ok(Called { function: callee, arguments, set })
     }
 
     /// The one helper a parent arm's call reaches under the path its body
@@ -861,24 +957,49 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         })
     }
 
+    /// Reads a grant arm, `None` where its conditions keep no row. An arm
+    /// returning its table's key from a helper's set is a parent arm, which
+    /// takes no other condition, so `returns_key` refuses a set beside one.
     fn grant_arm(
-        &self,
+        &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         table: &ArmTable<'_, 'db, DB>,
         column: &'db DB::Column,
-        selection: Option<&Expr>,
+        returns_key: bool,
     ) -> Result<Option<HelperArm<'db, DB>>, HelperSetError> {
+        let shape = || scope.arm_shape(select);
         let mut conjuncts = Vec::new();
-        if let Some(selection) = selection {
+        if let Some(selection) = &select.selection {
             conjunction(selection, &mut conjuncts);
         }
-        let mut request = None;
+        let mut granted_to = None;
+        let mut gates = Gates::default();
         let mut conditions = Vec::new();
         for conjunct in conjuncts {
-            if let Some(found) = self.setting_comparison(scope, table, conjunct)? {
-                if request.replace(found).is_some() {
-                    return Err(scope.arm_shape(select));
+            let grantee = if let Some(request) = self.setting_comparison(scope, table, conjunct)? {
+                Some(GrantedTo::Request(request))
+            } else if let Expr::In {
+                expr,
+                target: InTarget::Subquery(called),
+                negated: false,
+                ..
+            } = unnest(conjunct)
+            {
+                if returns_key {
+                    return Err(shape());
+                }
+                Some(GrantedTo::Set(self.grantee_set(scope, select, table, expr, called)?))
+            } else {
+                None
+            };
+            if let Some(grantee) = grantee {
+                if granted_to.replace(grantee).is_some() {
+                    return Err(shape());
+                }
+            } else if let Some(read) = self.gate(scope, table, conjunct)? {
+                if !gates.add(read) {
+                    return Err(shape());
                 }
             } else {
                 conditions.push(conjunct);
@@ -908,7 +1029,60 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     .collect()
             }
         };
-        Ok(Some(HelperArm::Grant(GrantArm { table: table.table, column, request, restrictions })))
+        if gates.keeps_nothing {
+            return Ok(None);
+        }
+        Ok(Some(HelperArm::Grant(GrantArm {
+            table: table.table,
+            column,
+            granted_to: granted_to.unwrap_or(GrantedTo::Anyone),
+            gate: gates.gate,
+            restrictions,
+        })))
+    }
+
+    /// The gate `conjunct` writes on a caller setting,
+    /// `current_setting(<caller>) <> <text>` or `current_setting(<caller>)
+    /// IS NOT NULL`, the operands either way round.
+    fn gate(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        conjunct: &Expr,
+    ) -> Result<Option<GateRead<'db>>, HelperSetError> {
+        let (read, excluded) = match unnest(conjunct) {
+            Expr::IsNotNull(read) => (self.operand(scope, table, read)?, None),
+            Expr::BinaryOp { left, op: BinaryOperator::NotEq, right } => {
+                match (self.operand(scope, table, left)?, self.operand(scope, table, right)?) {
+                    (read @ Operand::Setting(_), Operand::Passed(passed))
+                    | (Operand::Passed(passed), read @ Operand::Setting(_)) => (read, Some(passed)),
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        let Operand::Setting(read) = read else { return Ok(None) };
+        // A setting reads as `text`, which PostgreSQL compares with no
+        // number or boolean.
+        if excluded
+            .as_ref()
+            .is_some_and(|passed| !matches!(passed.literal, Literal::Text(_) | Literal::Null))
+        {
+            return Ok(None);
+        }
+        let Some(setting) = self.deployment.setting(&read.name) else {
+            return Err(HelperSetError::UndeclaredSetting {
+                function: scope.name.clone(),
+                setting: read.name,
+            });
+        };
+        if !matches!(setting.content(), SettingContent::Value(SettingValue::Caller(_))) {
+            return Err(HelperSetError::SettingNotCaller {
+                function: scope.name.clone(),
+                setting: setting.name().to_string(),
+            });
+        }
+        Ok(Some(GateRead { setting, raises_when_unset: read.raises_when_unset, excluded }))
     }
 
     /// The comparison of a column with a value of the request `conjunct`

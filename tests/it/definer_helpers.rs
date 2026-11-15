@@ -298,23 +298,47 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
         .map(|arm| {
             match arm {
                 HelperArm::Grant(grant) => {
-                    let request = grant.request().map(|request| {
-                        let compared = match request.setting().content() {
-                            SettingContent::Value(SettingValue::Set { .. }) => "IN",
-                            _ => "=",
-                        };
-                        format!(
-                            "{} {compared} {}",
-                            request.column().column_name(),
-                            request.setting().name()
-                        )
+                    let granted_to = match grant.granted_to() {
+                        GrantedTo::Request(request) => {
+                            let compared = match request.setting().content() {
+                                SettingContent::Value(SettingValue::Set { .. }) => "IN",
+                                _ => "=",
+                            };
+                            Some(format!(
+                                "{} {compared} {}",
+                                request.column().column_name(),
+                                request.setting().name()
+                            ))
+                        }
+                        GrantedTo::Set(grantees) => {
+                            let arguments: Vec<String> =
+                                grantees.arguments().iter().map(ToString::to_string).collect();
+                            Some(format!(
+                                "{} IN {}({}) {{{}}}",
+                                grantees.column().column_name(),
+                                grantees.function().target_name(),
+                                arguments.join(", "),
+                                render(grantees.set()),
+                            ))
+                        }
+                        GrantedTo::Anyone => None,
+                    };
+                    let gate = grant.gate().map(|gate| {
+                        let excluded: Vec<String> =
+                            gate.excluded().iter().map(ToString::to_string).collect();
+                        if excluded.is_empty() {
+                            format!("{} IS NOT NULL", gate.setting().name())
+                        } else {
+                            format!("{} NOT IN ({})", gate.setting().name(), excluded.join(", "))
+                        }
                     });
                     let restrictions = grant.restrictions().iter().map(|set| {
                         let values: Vec<String> =
                             set.values().iter().map(ToString::to_string).collect();
                         format!("{} IN ({})", set.column().column_name(), values.join(", "))
                     });
-                    let conditions: Vec<String> = request.into_iter().chain(restrictions).collect();
+                    let conditions: Vec<String> =
+                        granted_to.into_iter().chain(gate).chain(restrictions).collect();
                     let filter = if conditions.is_empty() {
                         String::new()
                     } else {
@@ -327,11 +351,15 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                     )
                 }
                 HelperArm::Walk(walk) => {
+                    let (returned, compared) = match walk.direction() {
+                        WalkDirection::Down => (walk.key(), walk.column()),
+                        WalkDirection::Up => (walk.column(), walk.key()),
+                    };
                     format!(
                         "{}.{} WHERE {} IN itself",
                         walk.table().table_name(),
-                        walk.key().column_name(),
-                        walk.column().column_name(),
+                        returned.column_name(),
+                        compared.column_name(),
                     )
                 }
                 HelperArm::Parent(parent) => {
@@ -372,24 +400,25 @@ fn cell(row: &[(&str, &'static str)], column: &str) -> &'static str {
     nullable(row, column).expect("the column has a value")
 }
 
-/// What a request carries: its caller, and the elements of each set setting
-/// it sets, a setting it leaves unset holding none.
+/// What a request carries: its caller, `None` where the caller setting reads
+/// `NULL`, and the elements of each set setting it sets, a setting it leaves
+/// unset holding none.
 #[derive(Clone, Copy)]
 struct Request {
-    caller: &'static str,
+    caller: Option<&'static str>,
     sets: &'static [(&'static str, &'static [&'static str])],
 }
 
 impl Request {
     /// A request carrying `caller` and no set.
     const fn of(caller: &'static str) -> Self {
-        Self { caller, sets: &[] }
+        Self { caller: Some(caller), sets: &[] }
     }
 
     /// Whether `value` is what the request carries in `setting`.
     fn carries(self, setting: &SessionSetting, value: &str) -> bool {
         match setting.content() {
-            SettingContent::Value(SettingValue::Caller(_)) => value == self.caller,
+            SettingContent::Value(SettingValue::Caller(_)) => self.caller == Some(value),
             SettingContent::Value(SettingValue::Set { .. }) => {
                 self.sets
                     .iter()
@@ -410,7 +439,8 @@ fn holds(value: &Value, cell: &str) -> bool {
 }
 
 /// Evaluates an answer over `fixture` for `request`, the way a translator
-/// lowering it to SQL over the backing tables would.
+/// lowering it to SQL over the backing tables would. A walk up the tree
+/// leaves out the `NULL` a root adds.
 fn evaluate(
     set: &HelperSet<'_, ParserDB>,
     request: Request,
@@ -420,16 +450,38 @@ fn evaluate(
     for arm in set.arms() {
         match arm {
             HelperArm::Grant(grant) => {
+                let gated = grant.gate().is_none_or(|gate| {
+                    request.caller.is_some_and(|caller| {
+                        gate.excluded().iter().all(|value| !holds(value, caller))
+                    })
+                });
+                if !gated {
+                    continue;
+                }
+                let grantees = match grant.granted_to() {
+                    GrantedTo::Set(grantees) => Some(evaluate(grantees.set(), request, fixture)),
+                    GrantedTo::Request(_) | GrantedTo::Anyone => None,
+                };
                 for row in rows(fixture, grant.table().table_name()) {
                     let restricted = grant.restrictions().iter().all(|set| {
                         let value = cell(row, set.column().column_name());
                         set.values().iter().any(|allowed| holds(allowed, value))
                     });
-                    let requested = grant.request().is_none_or(|compared| {
-                        request
-                            .carries(compared.setting(), cell(row, compared.column().column_name()))
-                    });
-                    if requested && restricted {
+                    let granted = match grant.granted_to() {
+                        GrantedTo::Request(compared) => {
+                            request.carries(
+                                compared.setting(),
+                                cell(row, compared.column().column_name()),
+                            )
+                        }
+                        GrantedTo::Set(compared) => {
+                            grantees.as_ref().is_some_and(|grantees| {
+                                grantees.contains(cell(row, compared.column().column_name()))
+                            })
+                        }
+                        GrantedTo::Anyone => true,
+                    };
+                    if granted && restricted {
                         returned.insert(cell(row, grant.column().column_name()));
                     }
                 }
@@ -445,17 +497,21 @@ fn evaluate(
             HelperArm::Walk(_) => {}
         }
     }
-    // A walk adds the rows below what the set holds until it holds them all,
-    // as PostgreSQL's `UNION` iterates its working table.
+    // A walk adds the rows next to what the set holds until it holds them
+    // all, as PostgreSQL's `UNION` iterates its working table.
     loop {
         let mut grew = false;
         for arm in set.arms() {
             let HelperArm::Walk(walk) = arm else { continue };
+            let (reached, added) = match walk.direction() {
+                WalkDirection::Down => (walk.column(), walk.key()),
+                WalkDirection::Up => (walk.key(), walk.column()),
+            };
             for row in rows(fixture, walk.table().table_name()) {
-                if nullable(row, walk.column().column_name())
-                    .is_some_and(|parent| returned.contains(parent))
+                if nullable(row, reached.column_name()).is_some_and(|held| returned.contains(held))
+                    && let Some(added) = nullable(row, added.column_name())
                 {
-                    grew |= returned.insert(cell(row, walk.key().column_name()));
+                    grew |= returned.insert(added);
                 }
             }
         }
@@ -729,7 +785,7 @@ fn a_role_less_membership_table_answers_every_grant_row_of_the_caller() {
     assert_eq!(render(&set), "members.doc_id WHERE user_id = app.user_id");
     let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
     assert!(
-        grant.request().is_some_and(SettingComparison::raises_when_unset),
+        matches!(grant.granted_to(), GrantedTo::Request(request) if request.raises_when_unset()),
         "current_setting without missing_ok raises on an unset setting"
     );
 
@@ -737,7 +793,9 @@ fn a_role_less_membership_table_answers_every_grant_row_of_the_caller() {
         .expect("answered");
     assert_eq!(render(&set), "members.doc_id WHERE user_id = app.user_id AND kind IN ('note')");
     let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
-    assert!(grant.request().is_some_and(|request| !request.raises_when_unset()));
+    assert!(
+        matches!(grant.granted_to(), GrantedTo::Request(request) if !request.raises_when_unset())
+    );
 }
 
 #[test]
@@ -1023,7 +1081,7 @@ fn an_arm_of_any_other_shape_refuses_the_answer() {
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) AND role = 'a' AND user_id = current_setting('app.user_id')",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) GROUP BY doc_id",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) INTERSECT SELECT id FROM docs",
-        "SELECT parent_id FROM docs WHERE id IN (SELECT docs_with(min_role))",
+        "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(min_role)) AND id = 'x'",
     ] {
         assert!(
             matches!(refusal(&helper(DEFINER, body, "")), HelperSetError::ArmShape { .. }),
@@ -1323,14 +1381,20 @@ fn only_postgres_own_functions_unpack_a_set_in_either_spelling() {
         "doc_id = ANY (string_to_array(current_setting('app.link_ids', true), NULL))",
         "doc_id <> ANY (string_to_array(current_setting('app.link_ids', true), ','))",
         "doc_id NOT IN (SELECT unnest(string_to_array(current_setting('app.link_ids'), ',')))",
-        "user_id = 'u' AND doc_id IN (SELECT docs_with(min_role))",
     ] {
         assert!(
             matches!(compared(condition, ""), Err(HelperSetError::Irreducible { .. })),
             "{condition}"
         );
     }
-    // A subquery unpacking no set is read as a parent arm's call.
+    assert!(
+        matches!(
+            compared("user_id = 'u' AND doc_id IN (SELECT docs_with(min_role))", ""),
+            Err(HelperSetError::CallCycle { function }) if function == "docs_with"
+        ),
+        "a subquery unpacking no set calls a helper returning grantees, here the helper itself"
+    );
+    // A subquery unpacking no set is read as a helper's call.
     for condition in [
         "doc_id IN (SELECT jsonb_array_elements_text(current_setting('app.link_list')::json))",
         "doc_id IN (SELECT jsonb_array_elements_text(current_setting('app.link_list')))",
@@ -1786,6 +1850,12 @@ fn a_walk_of_any_other_shape_refuses_the_answer() {
         walking(
             "SELECT child.id FROM public.groups child JOIN reached ON child.label = reached.id",
         ),
+        walking(
+            "SELECT child.org_id FROM public.groups child JOIN reached ON child.id = reached.id",
+        ),
+        walking(
+            "SELECT child.label FROM public.groups child JOIN reached ON child.id = reached.id",
+        ),
         walking(&format!("{CHILD_JOIN} JOIN public.group_grants g ON g.group_id = child.id")),
         walking(&format!("{CHILD_JOIN} WHERE child.id <> 'x'")),
         walking(&format!("{CHILD_JOIN} AND child.id <> 'x'")),
@@ -1934,44 +2004,48 @@ const REQUEST_VALUE_ROWS: Rows = &[
 /// setting set to `''` or `'[]'`, and a request setting neither leaves it
 /// unset, which `current_setting(name, true)` reads as `NULL`.
 const SET_MEASURED: &[(&str, Request, &[&str])] = &[
-    ("presented_links", Request { caller: "", sets: &[("app.link_ids", &[])] }, &[]),
-    ("presented_links", Request { caller: "", sets: &[("app.link_ids", &["l1"])] }, &["l1"]),
-    ("presented_links", Request { caller: "", sets: &[("app.link_ids", &["l1", "l2"])] }, &["l1"]),
+    ("presented_links", Request { caller: None, sets: &[("app.link_ids", &[])] }, &[]),
+    ("presented_links", Request { caller: None, sets: &[("app.link_ids", &["l1"])] }, &["l1"]),
     (
         "presented_links",
-        Request { caller: "", sets: &[("app.link_ids", &["l2", "l3", "lx"])] },
+        Request { caller: None, sets: &[("app.link_ids", &["l1", "l2"])] },
+        &["l1"],
+    ),
+    (
+        "presented_links",
+        Request { caller: None, sets: &[("app.link_ids", &["l2", "l3", "lx"])] },
         &["l3"],
     ),
     (
         "presented_links",
-        Request { caller: "", sets: &[("app.link_ids", &["l3", "l1"])] },
+        Request { caller: None, sets: &[("app.link_ids", &["l3", "l1"])] },
         &["l1", "l3"],
     ),
     ("presented_links", Request::of(""), &[]),
-    ("listed_links", Request { caller: "", sets: &[("app.link_ids", &["l1", "l2"])] }, &["l1"]),
+    ("listed_links", Request { caller: None, sets: &[("app.link_ids", &["l1", "l2"])] }, &["l1"]),
     (
         "listed_links",
-        Request { caller: "", sets: &[("app.link_ids", &["l3", "l1"])] },
+        Request { caller: None, sets: &[("app.link_ids", &["l3", "l1"])] },
         &["l1", "l3"],
     ),
     ("listed_links", Request::of(""), &[]),
-    ("json_links", Request { caller: "", sets: &[("app.link_list", &[])] }, &[]),
-    ("json_links", Request { caller: "", sets: &[("app.link_list", &["l1", "l2"])] }, &["l1"]),
+    ("json_links", Request { caller: None, sets: &[("app.link_list", &[])] }, &[]),
+    ("json_links", Request { caller: None, sets: &[("app.link_list", &["l1", "l2"])] }, &["l1"]),
     (
         "json_links",
-        Request { caller: "", sets: &[("app.link_list", &["l3", "lx", "l1"])] },
+        Request { caller: None, sets: &[("app.link_list", &["l3", "lx", "l1"])] },
         &["l1", "l3"],
     ),
     ("json_links", Request::of(""), &[]),
-    ("json_array_links", Request { caller: "", sets: &[("app.link_list", &[])] }, &[]),
+    ("json_array_links", Request { caller: None, sets: &[("app.link_list", &[])] }, &[]),
     (
         "json_array_links",
-        Request { caller: "", sets: &[("app.link_list", &["l1", "l2"])] },
+        Request { caller: None, sets: &[("app.link_list", &["l1", "l2"])] },
         &["l1"],
     ),
     (
         "json_array_links",
-        Request { caller: "", sets: &[("app.link_list", &["l3", "lx", "l1"])] },
+        Request { caller: None, sets: &[("app.link_list", &["l3", "lx", "l1"])] },
         &["l1", "l3"],
     ),
     ("json_array_links", Request::of(""), &[]),
@@ -2027,7 +2101,9 @@ fn a_set_arm_returns_what_postgres_returns_for_every_presented_set() {
         );
         assert_eq!(covered(&set), Some("share_links"), "{helper}");
         let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
-        assert!(grant.request().is_some_and(|request| !request.raises_when_unset()));
+        assert!(
+            matches!(grant.granted_to(), GrantedTo::Request(request) if !request.raises_when_unset())
+        );
     }
     for &(helper, request, expected) in SET_MEASURED {
         let set = answer(&database, &deployment, "authz", helper, &[]).expect("answered");
@@ -2056,9 +2132,336 @@ fn a_caller_free_arm_returns_what_postgres_returns_for_every_argument() {
             )
         );
         let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
-        assert!(grant.request().is_none(), "no column is compared with the request");
+        assert!(
+            matches!(grant.granted_to(), GrantedTo::Anyone),
+            "no column is compared with the request"
+        );
         let returned: Vec<_> =
             evaluate(&set, Request::of(""), REQUEST_VALUE_ROWS).into_iter().collect();
         assert_eq!(returned, expected, "installations_allowing('{table}', '{command}')");
     }
+}
+
+const PARENT_JOIN: &str =
+    "SELECT parent.parent_id FROM public.groups parent JOIN reached ON parent.id = reached.id";
+
+/// What PostgreSQL 18.6 returns for `(rows, caller, minimum role)`, calling
+/// `authz.groups_with` written as `walking(PARENT_JOIN)`, the `NULL` a root
+/// adds left out.
+const TREE_UP_MEASURED: &[(Rows, &str, &str, &[&str])] = &[
+    (TREE, "alice", "read", &["org", "team"]),
+    (TREE, "alice", "write", &[]),
+    (TREE, "bob", "read", &["org"]),
+    (TREE, "bob", "write", &["org"]),
+    (CYCLIC_TREE, "alice", "read", &["org", "squad", "team"]),
+    (CYCLIC_TREE, "bob", "write", &["org", "squad", "team"]),
+];
+
+#[test]
+fn a_recursive_walk_answers_its_arms_and_the_walk_up_the_parent_column() {
+    let deployment = deployment();
+    for body in [
+        walking(PARENT_JOIN),
+        walking(
+            "SELECT parent.parent_id FROM reached r JOIN public.groups AS parent ON r.id = parent.id",
+        ),
+    ] {
+        let database = postgres(&groups(&body, ""));
+        let set = groups_with(&database, &deployment, "read").expect("answered");
+        assert_eq!(
+            render(&set),
+            "group_grants.group_id WHERE principal_id = app.user_id \
+             UNION groups.parent_id WHERE id IN itself",
+            "{body}"
+        );
+        assert_eq!(covered(&set), Some("groups"), "{body}");
+        let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
+        assert_eq!(walk.direction(), WalkDirection::Up);
+        assert_eq!(walk.column().column_name(), "parent_id");
+    }
+
+    let database = postgres(&groups(&walking(PARENT_JOIN), ""));
+    for &(fixture, caller, role, expected) in TREE_UP_MEASURED {
+        let set = groups_with(&database, &deployment, role).expect("answered");
+        let returned: Vec<_> = evaluate(&set, Request::of(caller), fixture).into_iter().collect();
+        assert_eq!(returned, expected, "{caller} calling groups_with('{role}')");
+    }
+}
+
+/// One grantee per grant row, organizations and a team tree, the helper
+/// `authz.caller_grantees()` returning every grantee the caller is and
+/// `authz.projects_granted(min_role)` the projects granted to any of them.
+const GRANTEES: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+CREATE TABLE grantees (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('user', 'team', 'organization', 'everyone', 'signed_in'))
+);
+CREATE TABLE organizations (id TEXT PRIMARY KEY REFERENCES grantees (id));
+CREATE TABLE memberships (
+  organization_id TEXT NOT NULL REFERENCES organizations (id),
+  user_id TEXT NOT NULL REFERENCES grantees (id),
+  state TEXT NOT NULL CHECK (state IN ('active', 'deactivated')),
+  PRIMARY KEY (organization_id, user_id)
+);
+CREATE TABLE teams (id TEXT PRIMARY KEY REFERENCES grantees (id), parent_id TEXT REFERENCES teams (id));
+CREATE TABLE team_members (
+  team_id TEXT NOT NULL REFERENCES teams (id),
+  user_id TEXT NOT NULL REFERENCES grantees (id),
+  PRIMARY KEY (team_id, user_id)
+);
+CREATE TABLE projects (id TEXT PRIMARY KEY);
+CREATE TABLE project_grants (
+  project_id TEXT NOT NULL REFERENCES projects (id),
+  grantee_id TEXT NOT NULL REFERENCES grantees (id),
+  role TEXT NOT NULL CHECK (role IN ('read', 'admin')),
+  PRIMARY KEY (project_id, grantee_id)
+);
+GRANT SELECT ON grantees, memberships, teams, team_members, project_grants TO authz_owner;
+CREATE FUNCTION authz.caller_grantees() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  WITH RECURSIVE reached (id) AS (
+    SELECT g.id FROM public.grantees g WHERE g.id = current_setting('app.user_id', true)
+    UNION
+    SELECT g.id FROM public.grantees g WHERE g.kind = 'everyone'
+    UNION
+    SELECT g.id FROM public.grantees g
+    WHERE g.kind = 'signed_in' AND current_setting('app.user_id', true) <> ''
+    UNION
+    SELECT m.organization_id FROM public.memberships m
+    WHERE m.user_id = current_setting('app.user_id', true) AND m.state = 'active'
+    UNION
+    SELECT tm.team_id FROM public.team_members tm
+    WHERE tm.user_id = current_setting('app.user_id', true)
+    UNION
+    SELECT t.parent_id FROM public.teams t JOIN reached ON t.id = reached.id
+  ) SELECT id FROM reached
+$$;
+CREATE FUNCTION authz.projects_granted(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT pg.project_id FROM public.project_grants pg
+  WHERE pg.grantee_id IN (SELECT authz.caller_grantees())
+    AND (pg.role = 'admin' OR min_role = 'read')
+$$;
+ALTER FUNCTION authz.caller_grantees() OWNER TO authz_owner;
+ALTER FUNCTION authz.projects_granted(TEXT) OWNER TO authz_owner;
+";
+
+/// `alice` an active member of `org`, `bob` a deactivated one on team
+/// `platform` under `eng`, `carol` on `core` under `platform`, and `dave`
+/// on no team.
+const GRANTEE_ROWS: Rows = &[
+    ("grantees", &[("id", "alice"), ("kind", "user")]),
+    ("grantees", &[("id", "bob"), ("kind", "user")]),
+    ("grantees", &[("id", "carol"), ("kind", "user")]),
+    ("grantees", &[("id", "dave"), ("kind", "user")]),
+    ("grantees", &[("id", "everyone"), ("kind", "everyone")]),
+    ("grantees", &[("id", "signed_in"), ("kind", "signed_in")]),
+    ("grantees", &[("id", "org"), ("kind", "organization")]),
+    ("grantees", &[("id", "eng"), ("kind", "team")]),
+    ("grantees", &[("id", "platform"), ("kind", "team")]),
+    ("grantees", &[("id", "core"), ("kind", "team")]),
+    ("grantees", &[("id", "other"), ("kind", "team")]),
+    ("organizations", &[("id", "org")]),
+    ("memberships", &[("organization_id", "org"), ("user_id", "alice"), ("state", "active")]),
+    ("memberships", &[("organization_id", "org"), ("user_id", "bob"), ("state", "deactivated")]),
+    ("teams", &[("id", "eng")]),
+    ("teams", &[("id", "platform"), ("parent_id", "eng")]),
+    ("teams", &[("id", "core"), ("parent_id", "platform")]),
+    ("teams", &[("id", "other")]),
+    ("team_members", &[("team_id", "core"), ("user_id", "carol")]),
+    ("team_members", &[("team_id", "platform"), ("user_id", "bob")]),
+    ("project_grants", &[("project_id", "p_alice"), ("grantee_id", "alice"), ("role", "admin")]),
+    (
+        "project_grants",
+        &[("project_id", "p_everyone"), ("grantee_id", "everyone"), ("role", "read")],
+    ),
+    (
+        "project_grants",
+        &[("project_id", "p_signed_in"), ("grantee_id", "signed_in"), ("role", "read")],
+    ),
+    ("project_grants", &[("project_id", "p_org"), ("grantee_id", "org"), ("role", "admin")]),
+    ("project_grants", &[("project_id", "p_eng"), ("grantee_id", "eng"), ("role", "read")]),
+    (
+        "project_grants",
+        &[("project_id", "p_platform"), ("grantee_id", "platform"), ("role", "admin")],
+    ),
+    ("project_grants", &[("project_id", "p_core"), ("grantee_id", "core"), ("role", "read")]),
+    ("project_grants", &[("project_id", "p_other"), ("grantee_id", "other"), ("role", "admin")]),
+];
+
+/// A caller setting reading the caller, `None` for one never set, and the
+/// sets three helper calls return for it.
+type GranteesMeasured = (
+    Option<&'static str>,
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+/// What PostgreSQL 18.6 returns over [`GRANTEE_ROWS`] for
+/// `authz.caller_grantees()`, the `NULL` a root team adds left out, then for
+/// `authz.projects_granted('read')` and `authz.projects_granted('admin')`.
+const GRANTEES_MEASURED: &[GranteesMeasured] = &[
+    (
+        Some("alice"),
+        &["alice", "everyone", "org", "signed_in"],
+        &["p_alice", "p_everyone", "p_org", "p_signed_in"],
+        &["p_alice", "p_org"],
+    ),
+    (
+        Some("bob"),
+        &["bob", "eng", "everyone", "platform", "signed_in"],
+        &["p_eng", "p_everyone", "p_platform", "p_signed_in"],
+        &["p_platform"],
+    ),
+    (
+        Some("carol"),
+        &["carol", "core", "eng", "everyone", "platform", "signed_in"],
+        &["p_core", "p_eng", "p_everyone", "p_platform", "p_signed_in"],
+        &["p_platform"],
+    ),
+    (Some("dave"), &["dave", "everyone", "signed_in"], &["p_everyone", "p_signed_in"], &[]),
+    (Some("zed"), &["everyone", "signed_in"], &["p_everyone", "p_signed_in"], &[]),
+    (Some(""), &["everyone"], &["p_everyone"], &[]),
+    (None, &["everyone"], &["p_everyone"], &[]),
+];
+
+const CALLER_GRANTEES: &str = "grantees.id WHERE id = app.user_id \
+     UNION grantees.id WHERE kind IN ('everyone') \
+     UNION grantees.id WHERE app.user_id NOT IN ('') AND kind IN ('signed_in') \
+     UNION memberships.organization_id WHERE user_id = app.user_id AND state IN ('active') \
+     UNION team_members.team_id WHERE user_id = app.user_id \
+     UNION teams.parent_id WHERE id IN itself";
+
+#[test]
+fn a_grant_arm_compares_its_grantee_with_every_grantee_the_caller_is() {
+    let database = postgres(GRANTEES);
+    let deployment = deployment();
+    let grantees =
+        answer(&database, &deployment, "authz", "caller_grantees", &[]).expect("answered");
+    assert_eq!(render(&grantees), CALLER_GRANTEES);
+    assert_eq!(covered(&grantees), None, "the arms return keys of four tables");
+    let HelperArm::Grant(everyone) = &grantees.arms()[1] else { panic!("a grant arm") };
+    assert!(matches!(everyone.granted_to(), GrantedTo::Anyone));
+
+    let admin = answer(&database, &deployment, "authz", "projects_granted", &[text("admin")])
+        .expect("answered");
+    assert_eq!(
+        render(&admin),
+        format!(
+            "project_grants.project_id WHERE grantee_id IN authz.caller_grantees() \
+             {{{CALLER_GRANTEES}}} AND role IN ('admin')"
+        )
+    );
+    let HelperArm::Grant(grant) = &admin.arms()[0] else { panic!("a grant arm") };
+    let GrantedTo::Set(set) = grant.granted_to() else { panic!("granted to a set") };
+    let referenced = set.foreign_key().expect("typed").referenced_table(&database).expect("found");
+    assert_eq!(referenced.table_name(), "grantees");
+    assert_eq!(covered(&admin), Some("projects"));
+
+    let read = answer(&database, &deployment, "authz", "projects_granted", &[text("read")])
+        .expect("answered");
+    for &(caller, expected_grantees, expected_read, expected_admin) in GRANTEES_MEASURED {
+        let request = Request { caller, sets: &[] };
+        for (set, expected, called) in [
+            (&grantees, expected_grantees, "caller_grantees()"),
+            (&read, expected_read, "projects_granted('read')"),
+            (&admin, expected_admin, "projects_granted('admin')"),
+        ] {
+            let returned: Vec<_> = evaluate(set, request, GRANTEE_ROWS).into_iter().collect();
+            assert_eq!(returned, expected, "{caller:?} calling {called}");
+        }
+    }
+
+    let twice = GRANTEES.replace(
+        "AND (pg.role = 'admin' OR min_role = 'read')",
+        "AND pg.grantee_id = current_setting('app.user_id', true)",
+    );
+    assert_ne!(twice, GRANTEES, "the condition is replaced");
+    assert!(
+        matches!(
+            answer(&postgres(&twice), &deployment, "authz", "projects_granted", &[text("read")]),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "an arm names one grantee"
+    );
+}
+
+#[test]
+fn a_gate_on_the_caller_setting_excludes_the_values_it_compares_with() {
+    let deployment = deployment();
+    let gated = |gate: &str| {
+        let sql = GRANTEES.replace("current_setting('app.user_id', true) <> ''", gate);
+        assert_ne!(sql, GRANTEES, "the gate is replaced");
+        let database = postgres(&sql);
+        let set = answer(&database, &deployment, "authz", "caller_grantees", &[])?;
+        let HelperArm::Grant(grant) = &set.arms()[2] else { panic!("a grant arm") };
+        Ok::<_, HelperSetError>(grant.gate().map(|gate| {
+            let excluded: Vec<String> = gate.excluded().iter().map(ToString::to_string).collect();
+            (gate.setting().name().to_string(), gate.raises_when_unset(), excluded)
+        }))
+    };
+    let nil = "'00000000-0000-0000-0000-000000000000'";
+    for (gate, raises, excluded) in [
+        ("current_setting('app.user_id', true) IS NOT NULL".to_string(), false, vec![]),
+        (format!("current_setting('app.user_id', true) <> {nil}"), false, vec![nil]),
+        (format!("{nil} != current_setting('app.user_id')"), true, vec![nil]),
+        (
+            format!(
+                "current_setting('app.user_id', true) <> '' AND current_setting('app.user_id') <> {nil} \
+                 AND current_setting('app.user_id', true) IS NOT NULL AND '' <> current_setting('app.user_id', true)"
+            ),
+            true,
+            vec!["''", nil],
+        ),
+    ] {
+        let excluded = excluded.into_iter().map(str::to_string).collect();
+        let expected = ("app.user_id".to_string(), raises, excluded);
+        assert_eq!(gated(&gate), Ok(Some(expected)), "{gate}");
+    }
+
+    let database = postgres(&GRANTEES.replace(
+        "current_setting('app.user_id', true) <> ''",
+        "current_setting('app.user_id', true) <> NULL",
+    ));
+    let set = answer(&database, &deployment, "authz", "caller_grantees", &[]).expect("answered");
+    assert!(
+        !render(&set).contains("signed_in"),
+        "a gate excluding NULL keeps no row: {}",
+        render(&set)
+    );
+
+    assert!(matches!(
+        gated("current_setting('app.user_id', true) <> 0"),
+        Err(HelperSetError::Irreducible { .. })
+    ));
+    assert!(matches!(
+        gated("current_setting('app.tenant', true) <> ''"),
+        Err(HelperSetError::UndeclaredSetting { setting, .. }) if setting == "app.tenant"
+    ));
+    let two_callers = Deployment::new(
+        "app",
+        ["app"],
+        ["app.user_id", "app.agent_id"].map(|name| {
+            SessionSetting::value(name, SettingValue::Caller(DataType::Text))
+                .expect("a custom setting name")
+                .may_be_unset()
+        }),
+    )
+    .expect("a valid deployment");
+    let sql = GRANTEES.replace(
+        "current_setting('app.user_id', true) <> ''",
+        "current_setting('app.user_id', true) <> '' AND current_setting('app.agent_id', true) <> ''",
+    );
+    let database = postgres(&sql);
+    assert!(
+        matches!(
+            answer(&database, &two_callers, "authz", "caller_grantees", &[]),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "a gate reads one setting"
+    );
 }
