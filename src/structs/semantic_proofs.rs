@@ -1,7 +1,11 @@
 //! The casts and constants PostgreSQL derives for an expression, as
 //! sqlparser-canonicalize's [`SemanticContext`] reads them.
 
-use alloc::{boxed::Box, string::ToString, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::ops::ControlFlow;
 
 use sqlparser::{
@@ -21,12 +25,14 @@ use crate::{
     errors::LookupError,
     structs::{
         ArraySource, CoercionStep, ColumnDefinition, ExpressionContext, ExpressionScope,
-        IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution,
+        IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution, TargetName,
         expression_context::Collapse,
     },
     traits::{CastLike, ColumnLike, DatabaseLike, FunctionLike},
     utils::{
-        coercion::facts,
+        coercion::{canonical, facts},
+        identifier_resolution::identifiers_match,
+        object_name::PG_CATALOG,
         postgres_types::{PgType, parse_data_type},
         walk::walk,
     },
@@ -40,9 +46,10 @@ use crate::{
 /// A comparison `=`, `<>`, `<`, `>`, `<=` or `>=` whose operator PostgreSQL
 /// selects spells each converted operand as the cast or the constant the
 /// deparse writes. An untyped literal read as `int2`, `int4` or `int8` is the
-/// constant it becomes, a literal read as another type of `pg_catalog` and an
-/// operand relabelled, read as its domain's base or converted by a cast
-/// function of one argument are cast to the type the operator takes. A
+/// constant it becomes, and a literal read as another type and an operand
+/// relabelled, read as its domain's base or converted by a cast function of
+/// one argument are cast to the type the operator takes, a type outside
+/// `pg_catalog` only when the reading session's `search_path` is known. A
 /// literal under `COLLATE` over a type without a collation is the constant
 /// of its cast, as PostgreSQL drops the `COLLATE`. A number under minus signs
 /// is the one constant the grammar folds it into, when the operator takes it
@@ -147,6 +154,10 @@ impl<'root> SemanticProofs<'root> {
     /// `database`, its column references reaching what `scope` names,
     /// comparing identifiers under `case`.
     ///
+    /// A conversion into a type outside `pg_catalog` stays unproved, since
+    /// the deparse spells that type as the reading session's `search_path`
+    /// reaches it. [`Self::for_expression_deparsed_on_path`] states the path.
+    ///
     /// # Errors
     ///
     /// Returns the errors [`ExpressionContext::for_expression`] returns and
@@ -158,10 +169,74 @@ impl<'root> SemanticProofs<'root> {
         database: &'db DB,
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
+        Self::prove(expression, scope, database, case, None)
+    }
+
+    /// Builds the proofs of [`Self::for_expression`] for a deparse a session
+    /// whose `search_path` names the schemas of `search_path` reads, with
+    /// `$user` replaced by the schema it stands for.
+    ///
+    /// A type is spelled by its name alone when it is the first type of that
+    /// name on the path, `pg_catalog` searched first unless the path names
+    /// it, and qualified with its schema otherwise, as `format_type` writes
+    /// it. A type of `pg_catalog` that an earlier schema hides stays
+    /// unproved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`Self::for_expression`] returns.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+    /// use sqlparser_canonicalize::Canonicalizer;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TYPE mood AS ENUM ('happy', 'sad'); CREATE TABLE t (m mood);",
+    /// )?;
+    /// let table = db.table_by_target(TargetName::new("t", false), IdentifierCase::Folded)?;
+    /// let scope = ExpressionScope::Table(table.expect("t exists"));
+    /// let canonical = |check: &str, path: &[(&str, bool)]| {
+    ///     let check = Parser::new(&PostgreSqlDialect {}).try_with_sql(check)?.parse_expr()?;
+    ///     let case = IdentifierCase::Folded;
+    ///     let proofs =
+    ///         SemanticProofs::for_expression_deparsed_on_path(&check, &scope, &db, case, path)?;
+    ///     let canonicalizer = Canonicalizer::new(&PostgreSqlDialect {});
+    ///     Ok::<_, Box<dyn std::error::Error>>(canonicalizer.normalize_with_context(&proofs.view())?)
+    /// };
+    /// let public = [("public", false)];
+    /// assert_eq!(canonical("m <> 'sad'", &public)?, canonical("(m <> 'sad'::mood)", &public)?);
+    /// assert_eq!(canonical("m <> 'sad'", &[])?, canonical("(m <> 'sad'::public.mood)", &[])?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn for_expression_deparsed_on_path<'db, DB: DatabaseLike, S: AsRef<str>>(
+        expression: &'root Expr,
+        scope: &ExpressionScope<'_, 'db, DB>,
+        database: &'db DB,
+        case: IdentifierCase,
+        search_path: &[(S, bool)],
+    ) -> Result<Self, LookupError> {
+        let path: Vec<(&str, bool)> =
+            search_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted)).collect();
+        Self::prove(expression, scope, database, case, Some(&path))
+    }
+
+    /// Builds the proofs for a deparse read on `reader_path`, `None` when
+    /// unknown.
+    fn prove<'db, DB: DatabaseLike>(
+        expression: &'root Expr,
+        scope: &ExpressionScope<'_, 'db, DB>,
+        database: &'db DB,
+        case: IdentifierCase,
+        reader_path: Option<&[(&str, bool)]>,
+    ) -> Result<Self, LookupError> {
         let context = ExpressionContext::for_expression(expression, scope, database, case)?;
         let mut prover = Prover {
             context: &context,
             database,
+            reader_path,
             spells_columns: matches!(scope, ExpressionScope::Table(_)),
             depth: 0,
             proofs: Self {
@@ -286,6 +361,9 @@ fn address(expression: &Expr) -> usize {
 struct Prover<'c, 'query, 'db, 'root, DB: DatabaseLike> {
     context: &'c ExpressionContext<'query, 'db, DB>,
     database: &'db DB,
+    /// The `search_path` of the session reading the deparse, `None` when
+    /// unknown.
+    reader_path: Option<&'c [(&'c str, bool)]>,
     /// Whether the scope is one table, whose columns a bare name reaches
     /// outside any subquery.
     spells_columns: bool,
@@ -446,7 +524,7 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
             [] => None,
             steps => {
                 let target = PgType::from_target(elements.target()).array();
-                Some(self.converts(steps).then(|| deparsed(&target)).flatten()?)
+                Some(self.converts(steps).then(|| self.deparsed(&target)).flatten()?)
             }
         };
         Some((converted, cast))
@@ -508,7 +586,7 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
             }
             steps => {
                 let target = PgType::from_target(evidence.target());
-                self.converts(steps).then(|| deparsed(&target)).flatten().map(Spelled::Cast)
+                self.converts(steps).then(|| self.deparsed(&target)).flatten().map(Spelled::Cast)
             }
         };
         spelled.map(Some).ok_or(Unproved)
@@ -546,7 +624,7 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
         {
             return Some(Spelled::Constant(Box::new(constant)));
         }
-        let cast = deparsed(target)?;
+        let cast = self.deparsed(target)?;
         if collated && facts(self.database, target)?.collation().is_none() {
             let constant = Expr::Cast {
                 kind: CastKind::DoubleColon,
@@ -557,6 +635,57 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
             return Some(Spelled::Constant(Box::new(constant)));
         }
         Some(Spelled::Cast(cast))
+    }
+
+    /// The type `pg_type` is, spelled as `format_type_with_typemod` spells it
+    /// with no modifier in the reading session, or `None` when that spelling
+    /// is unknown.
+    fn deparsed(&self, pg_type: &PgType) -> Option<DataType> {
+        parse_data_type(&self.spelling(&canonical(self.database, pg_type))?)
+    }
+
+    /// The text of [`Self::deparsed`] for a canonical type.
+    fn spelling(&self, pg_type: &PgType) -> Option<String> {
+        match pg_type {
+            PgType::Array(element) => Some(format!("{}[]", self.spelling(element)?)),
+            PgType::Catalog(name) => {
+                let hidden = self.reader_path.is_some_and(|path| {
+                    self.first_holder(path, name).is_some_and(|(schema, quoted)| {
+                        !identifiers_match(schema, quoted, PG_CATALOG, false)
+                    })
+                });
+                if hidden { None } else { catalog_spelling(name) }
+            }
+            named => {
+                let (PgType::Named(name), Some(path)) = (named, self.reader_path) else {
+                    return None;
+                };
+                let schema = name.schema()?;
+                let typname = quote_identifier(name.name());
+                let visible = self
+                    .first_holder(path, name.name())
+                    .is_some_and(|(first, quoted)| identifiers_match(first, quoted, schema, true));
+                Some(if visible {
+                    typname
+                } else {
+                    format!("{}.{typname}", quote_identifier(schema))
+                })
+            }
+        }
+    }
+
+    /// The first schema on the type search path of `path` holding a type
+    /// stored as `name`, `pg_catalog` searched first unless `path` names it.
+    fn first_holder<'p>(&self, path: &'p [(&'p str, bool)], name: &str) -> Option<(&'p str, bool)> {
+        let catalog = path
+            .iter()
+            .any(|&(schema, quoted)| identifiers_match(schema, quoted, PG_CATALOG, false));
+        (!catalog).then_some((PG_CATALOG, false)).into_iter().chain(path.iter().copied()).find(
+            |&(schema, quoted)| {
+                let qualified = TargetName::new(name, true).with_schema(schema, quoted);
+                self.database.type_facts(qualified).is_some()
+            },
+        )
     }
 }
 
@@ -652,11 +781,8 @@ fn folded(operand: &Expr) -> Result<Option<(PgType, Expr)>, Unproved> {
 fn constant(name: &'static str, value: &str) -> Option<Expr> {
     let bare =
         !value.starts_with('-') && (name == "int4" || (name == "numeric" && value.contains('.')));
-    let spelling = if bare {
-        value.to_string()
-    } else {
-        format!("'{value}'::{}", deparsed_spelling(&PgType::Catalog(name))?)
-    };
+    let spelling =
+        if bare { value.to_string() } else { format!("'{value}'::{}", catalog_spelling(name)?) };
     Parser::new(&PostgreSqlDialect {}).try_with_sql(&spelling).ok()?.parse_expr().ok()
 }
 
@@ -679,25 +805,193 @@ const DEPARSED_NAMES: [(&str, &str); 14] = [
     ("varchar", "character varying"),
 ];
 
-/// The type `pg_type` is, spelled as `format_type_with_typemod` spells it
-/// with no modifier, or `None` for a type outside `pg_catalog`, whose
-/// qualification depends on the deparsing session's `search_path`.
-fn deparsed(pg_type: &PgType) -> Option<DataType> {
-    parse_data_type(&deparsed_spelling(pg_type)?)
+/// The keywords PostgreSQL 18's `quote_identifier` quotes, every keyword but
+/// the unreserved ones, as `pg_get_keywords` lists them in byte order.
+const QUOTED_KEYWORDS: [&str; 164] = [
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// The spelling `format_type_with_typemod` gives the `pg_catalog` type stored
+/// as `name` with no modifier, when `pg_catalog` comes first on the type
+/// search path.
+fn catalog_spelling(name: &str) -> Option<String> {
+    let renamed = DEPARSED_NAMES.binary_search_by_key(&name, |(stored, _)| stored);
+    // `quote_identifier` leaves a lowercase name bare.
+    let bare = name.starts_with(|first: char| first.is_ascii_lowercase())
+        && name.bytes().all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'));
+    let spelling = renamed.map(|index| DEPARSED_NAMES[index].1).ok();
+    spelling.or_else(|| bare.then_some(name)).map(ToString::to_string)
 }
 
-/// The text of [`deparsed`].
-fn deparsed_spelling(pg_type: &PgType) -> Option<alloc::string::String> {
-    match pg_type {
-        PgType::Array(element) => Some(format!("{}[]", deparsed_spelling(element)?)),
-        PgType::Catalog(name) => {
-            let renamed = DEPARSED_NAMES.binary_search_by_key(name, |(stored, _)| stored);
-            // `quote_identifier` leaves a lowercase name bare.
-            let bare = name.starts_with(|first: char| first.is_ascii_lowercase())
-                && name.bytes().all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'));
-            let spelling = renamed.map(|index| DEPARSED_NAMES[index].1).ok();
-            spelling.or_else(|| bare.then_some(*name)).map(ToString::to_string)
-        }
-        _ => None,
-    }
+/// `name` as `quote_identifier` writes it: bare when it is lowercase letters,
+/// digits and underscores not led by a digit and no keyword
+/// [`QUOTED_KEYWORDS`] holds, and quoted otherwise.
+fn quote_identifier(name: &str) -> String {
+    let bare = name.starts_with(|first: char| first.is_ascii_lowercase() || first == '_')
+        && name.bytes().all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+        && QUOTED_KEYWORDS.binary_search(&name).is_err();
+    if bare { name.to_string() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
 }
