@@ -19,7 +19,8 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_plpgsql::embedded::{
-    Block, BoundCursor, Branch, DeclarationKind, Dynamic, Loop, LoopControl, Node,
+    Assignment, Block, BoundCursor, Branch, DeclarationKind, Dynamic, Indirection, Loop,
+    LoopControl, Node, Open,
 };
 
 use super::data_statement::{
@@ -67,8 +68,17 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
 
     fn node(&mut self, node: &'s Node) -> Result<(), LookupError> {
         match node {
-            Node::Statement(statement) => self.statement(statement),
-            Node::Dynamic(dynamic) => self.walker.dynamic(self.function, dynamic),
+            Node::Statement { statement, .. } => self.statement(statement),
+            Node::Assignment(assignment) => {
+                subscripts(assignment).try_for_each(|subscript| self.expression(subscript))?;
+                self.expression(&assignment.value)
+            }
+            Node::Dynamic { dynamic, .. } | Node::Open(Open::Dynamic { dynamic, .. }) => {
+                self.walker.dynamic(self.function, dynamic)
+            }
+            Node::Open(Open::Bound(cursor)) => self.opened(cursor),
+            Node::Open(Open::Query { query, .. }) => self.statement(query),
+            Node::Fetch(_) | Node::Diagnostics(_) => Ok(()),
             Node::Block(block) => self.block(block),
             Node::If(choice) => self.branches(&choice.branches, &choice.otherwise),
             Node::Case(choice) => {
@@ -78,7 +88,6 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 self.branches(&choice.branches, &choice.otherwise)
             }
             Node::Loop(repeated) => self.repeated(repeated),
-            Node::Open(cursor) => self.opened(cursor),
         }
     }
 
@@ -165,10 +174,10 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                     self.expression(step)?;
                 }
             }
-            LoopControl::Query(query) => self.statement(query)?,
-            LoopControl::Array(array) => self.expression(array)?,
+            LoopControl::Query { query, .. } => self.statement(query)?,
+            LoopControl::Array { array, .. } => self.expression(array)?,
             LoopControl::Cursor { cursor, .. } => self.opened(cursor)?,
-            LoopControl::Dynamic(dynamic) => self.walker.dynamic(self.function, dynamic)?,
+            LoopControl::Dynamic { dynamic, .. } => self.walker.dynamic(self.function, dynamic)?,
         }
         if let Some(found) = change {
             self.forget(found);
@@ -239,9 +248,18 @@ fn each_sql<'s, B>(
 ) -> ControlFlow<B> {
     for node in nodes {
         match node {
-            Node::Statement(statement) => visit(Embedded::Statement(statement), None)?,
-            Node::Dynamic(dynamic) => each_dynamic_sql(dynamic, visit)?,
-            Node::Open(cursor) => each_cursor_sql(cursor, visit)?,
+            Node::Statement { statement, .. } => visit(Embedded::Statement(statement), None)?,
+            Node::Assignment(assignment) => {
+                subscripts(assignment)
+                    .try_for_each(|subscript| visit(Embedded::Expression(subscript), None))?;
+                visit(Embedded::Expression(&assignment.value), None)?;
+            }
+            Node::Dynamic { dynamic, .. } | Node::Open(Open::Dynamic { dynamic, .. }) => {
+                each_dynamic_sql(dynamic, visit)?;
+            }
+            Node::Open(Open::Bound(cursor)) => each_cursor_sql(cursor, visit)?,
+            Node::Open(Open::Query { query, .. }) => visit(Embedded::Statement(query), None)?,
+            Node::Fetch(_) | Node::Diagnostics(_) => {}
             Node::Block(block) => {
                 defaults(block)
                     .try_for_each(|default| visit(Embedded::Expression(default), None))?;
@@ -260,10 +278,12 @@ fn each_sql<'s, B>(
             Node::Loop(repeated) => {
                 match &repeated.control {
                     LoopControl::Unconditional => {}
-                    LoopControl::While(query) | LoopControl::Array(query) => {
+                    LoopControl::While(query) | LoopControl::Array { array: query, .. } => {
                         visit(Embedded::Expression(query), None)?;
                     }
-                    LoopControl::Query(statement) => visit(Embedded::Statement(statement), None)?,
+                    LoopControl::Query { query, .. } => {
+                        visit(Embedded::Statement(query), None)?;
+                    }
                     LoopControl::Range { lower, upper, step, .. } => {
                         visit(Embedded::Expression(lower), None)?;
                         visit(Embedded::Expression(upper), None)?;
@@ -272,7 +292,7 @@ fn each_sql<'s, B>(
                         }
                     }
                     LoopControl::Cursor { cursor, .. } => each_cursor_sql(cursor, visit)?,
-                    LoopControl::Dynamic(dynamic) => each_dynamic_sql(dynamic, visit)?,
+                    LoopControl::Dynamic { dynamic, .. } => each_dynamic_sql(dynamic, visit)?,
                 }
                 each_sql(&repeated.statements, visit)?;
             }
@@ -289,6 +309,20 @@ fn defaults(block: &Block) -> impl Iterator<Item = &Query> {
             DeclarationKind::Variable(variable) => variable.default.as_deref(),
             DeclarationKind::Alias(_) | DeclarationKind::Cursor(_) => None,
         }
+    })
+}
+
+/// The `SELECT` evaluating each subscript and slice bound the target of
+/// `assignment` writes, in the order written.
+fn subscripts(assignment: &Assignment) -> impl Iterator<Item = &Query> {
+    assignment.target.indirection.iter().flat_map(|step| {
+        match step {
+            Indirection::Field(_) => [None, None],
+            Indirection::Index(index) => [Some(&**index), None],
+            Indirection::Slice { lower, upper } => [lower.as_deref(), upper.as_deref()],
+        }
+        .into_iter()
+        .flatten()
     })
 }
 
