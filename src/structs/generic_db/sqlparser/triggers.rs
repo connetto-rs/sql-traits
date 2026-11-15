@@ -7,21 +7,25 @@
 //! table that becomes a partition receives copies of the row triggers its
 //! parent holds then. A copy goes with the trigger it copies or with the
 //! detaching of its partition, and is never dropped or replaced on its own.
+//!
+//! Each trigger, copies included, carries its own enablement. An `ALTER
+//! TABLE` without `ONLY` that changes a row trigger's enablement changes
+//! every copy below it as well.
 
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 
 use sqlparser::ast::{
-    CreateTable, CreateTrigger, DropTrigger, ObjectName, TriggerObject, TriggerObjectKind,
+    CreateTable, CreateTrigger, DropTrigger, Ident, ObjectName, TriggerObject, TriggerObjectKind,
 };
 
 use super::{
-    ParserDB, ParserDBBuilder, StoredTable, bind_reference,
+    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference,
     inheritance::{self, ParentKind},
     object_names_match, require_named, stored_qualifier, stored_subqueries, views,
 };
 use crate::{
     errors::{Error, ObjectKind},
-    structs::metadata::TriggerMetadata,
+    structs::{TriggerEnablement, metadata::TriggerMetadata},
     traits::TableLike,
     utils::last_str,
 };
@@ -203,6 +207,76 @@ pub(super) fn drop_clones_on_detached(builder: &mut ParserDBBuilder, partition: 
         .collect();
     for name in &names {
         drop_with_clones(builder, name, partition);
+    }
+}
+
+/// Applies `ALTER TABLE ... { ENABLE | DISABLE } [ REPLICA | ALWAYS ] TRIGGER
+/// name`, where an unquoted `ALL` or `USER` names every trigger of the table.
+///
+/// `USER` leaves out PostgreSQL's internal triggers, which the model does not
+/// hold, so both reach the same triggers here.
+///
+/// # Errors
+///
+/// Returns [`Error::AlterTableNotFound`] for an absent table without `IF
+/// EXISTS`, and [`Error::AlterTableTriggerNotFound`] when the table carries
+/// no trigger of the name.
+pub(super) fn alter_enablement(
+    mut builder: ParserDBBuilder,
+    table_name: &ObjectName,
+    scope: AlterTableScope,
+    trigger_name: &Ident,
+    enablement: TriggerEnablement,
+) -> Result<ParserDBBuilder, Error> {
+    let Some(table) = ParserDB::alter_table_target(&builder, table_name, scope)? else {
+        return Ok(builder);
+    };
+    let every = trigger_name.quote_style.is_none()
+        && ["ALL", "USER"].iter().any(|keyword| trigger_name.value.eq_ignore_ascii_case(keyword));
+    let wanted = ObjectName::from(alloc::vec![trigger_name.clone()]);
+    let case = builder.identifier_case();
+    let named: Vec<(ObjectName, bool)> = builder
+        .triggers()
+        .iter()
+        .filter(|(trigger, _)| {
+            table.named_by(&trigger.table_name)
+                && (every || object_names_match(&trigger.name, &wanted, case))
+        })
+        .map(|(trigger, _)| (trigger.name.clone(), fires_per_row(trigger)))
+        .collect();
+    if named.is_empty() && !every {
+        return Err(Error::AlterTableTriggerNotFound {
+            trigger_name: trigger_name.value.clone(),
+            table_name: table.name,
+        });
+    }
+    for (name, per_row) in &named {
+        set_enablement(&mut builder, name, &table, enablement, *per_row && !scope.only);
+    }
+    Ok(builder)
+}
+
+/// Sets the enablement of the trigger named `name` on `table`, and of its
+/// copies below `table` when `down` is set.
+fn set_enablement(
+    builder: &mut ParserDBBuilder,
+    name: &ObjectName,
+    table: &StoredTable,
+    enablement: TriggerEnablement,
+    down: bool,
+) {
+    if let Some(position) = position_on(builder, name, table) {
+        builder.triggers_mut()[position].1.set_enablement(enablement);
+    }
+    if !down {
+        return;
+    }
+    for partition in partitions(builder, table) {
+        let copied = position_on(builder, name, &partition)
+            .is_some_and(|position| builder.triggers()[position].1.is_clone());
+        if copied {
+            set_enablement(builder, name, &partition, enablement, true);
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use core::fmt::Debug;
 
 use crate::{
     errors::LookupError,
-    structs::TargetName,
+    structs::{TargetName, TriggerEnablement},
     traits::{DatabaseLike, FunctionLike, Metadata},
     utils::maintenance_trigger_parser::{MaintenanceBodyError, parse_maintenance_body},
 };
@@ -476,6 +476,51 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     where
         Self: 'db;
 
+    /// Returns which sessions the trigger fires in, as `pg_trigger.tgenabled`
+    /// records it.
+    ///
+    /// A trigger is created [`TriggerEnablement::Origin`]. `ALTER TABLE`
+    /// changes it with `DISABLE TRIGGER`, `ENABLE TRIGGER`, `ENABLE REPLICA
+    /// TRIGGER` and `ENABLE ALWAYS TRIGGER`, naming one trigger or all of the
+    /// table's with `ALL` or `USER`. Without `ONLY` the change reaches the
+    /// copies of a row trigger on the partitions below, each of which keeps
+    /// its own state otherwise.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance holding the trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this trigger.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE t (id INT);
+    /// CREATE FUNCTION f() RETURNS TRIGGER AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
+    /// CREATE TRIGGER audit AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+    /// CREATE TRIGGER other AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+    /// ALTER TABLE t DISABLE TRIGGER ALL;
+    /// ALTER TABLE t ENABLE ALWAYS TRIGGER audit;
+    /// ",
+    /// )?;
+    /// let t = db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let enablement = |name| db.trigger(name, t).unwrap().enablement(&db);
+    /// assert_eq!(enablement("audit")?, TriggerEnablement::Always);
+    /// assert_eq!(enablement("other")?, TriggerEnablement::Disabled);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn enablement(&self, database: &Self::DB) -> Result<TriggerEnablement, LookupError>;
+
     /// Returns the function the trigger executes.
     ///
     /// # Arguments
@@ -758,6 +803,10 @@ impl<T: TriggerLike> TriggerLike for &T {
         Self: 'db,
     {
         (*self).parent_trigger(database)
+    }
+
+    fn enablement(&self, database: &Self::DB) -> Result<TriggerEnablement, LookupError> {
+        (*self).enablement(database)
     }
 
     fn function<'db>(

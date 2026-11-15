@@ -135,9 +135,6 @@ fn operations_over_things_the_model_does_not_describe_change_nothing() {
         // Rewrite rules, whose enablement has nothing to attach to.
         "ALTER TABLE t DISABLE RULE r",
         "ALTER TABLE t ENABLE ALWAYS RULE r",
-        // A trigger is modelled, but whether it is armed is not.
-        "ALTER TABLE t DISABLE TRIGGER g",
-        "ALTER TABLE t ENABLE REPLICA TRIGGER g",
         // Replication identity.
         "ALTER TABLE t REPLICA IDENTITY FULL",
     ];

@@ -186,6 +186,7 @@ mod target_names;
 mod temporary_namespace;
 mod thread_safety;
 mod transactional_ingestion;
+mod trigger_enablement;
 mod type_array_binding;
 mod type_array_builder;
 mod type_array_identities;

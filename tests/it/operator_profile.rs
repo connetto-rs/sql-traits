@@ -755,6 +755,10 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn enablement(&self, _database: &Self::DB) -> Result<TriggerEnablement, LookupError> {
+        self.unreach()
+    }
+
     fn function<'db>(
         &'db self,
         _database: &'db Self::DB,

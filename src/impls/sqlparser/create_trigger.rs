@@ -7,7 +7,7 @@ use sqlparser::ast::{ArgMode, CreateTrigger};
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ParserDB, TargetName, metadata::TriggerMetadata},
+    structs::{ParserDB, TargetName, TriggerEnablement, metadata::TriggerMetadata},
     traits::{DatabaseLike, FunctionLike, Metadata, TableLike, TriggerLike},
     utils::{
         identifier_resolution::stored_identifier,
@@ -22,6 +22,16 @@ use crate::{
 /// The schema a stored or bound name lives in, `public` when it writes none.
 fn in_schema(schema: Option<(&str, bool)>) -> Cow<'_, str> {
     schema.map_or(Cow::Borrowed("public"), |(schema, quoted)| stored_identifier(schema, quoted))
+}
+
+/// Resolves the metadata `database` holds for `trigger`.
+fn trigger_metadata<'db>(
+    trigger: &CreateTrigger,
+    database: &'db ParserDB,
+) -> Result<&'db TriggerMetadata, LookupError> {
+    database
+        .trigger_metadata(trigger)
+        .ok_or_else(|| ObjectKind::Trigger.not_in_database(trigger.name()))
 }
 
 impl Metadata for CreateTrigger {
@@ -89,16 +99,17 @@ impl TriggerLike for CreateTrigger {
     where
         Self: 'db,
     {
-        let metadata = database
-            .trigger_metadata(self)
-            .ok_or_else(|| ObjectKind::Trigger.not_in_database(self.name()))?;
-        if !metadata.is_clone() {
+        if !trigger_metadata(self, database)?.is_clone() {
             return Ok(None);
         }
         let Some(parent_table) = self.table(database)?.partition_root(database)? else {
             return Ok(None);
         };
         Ok(database.trigger(self.name(), parent_table))
+    }
+
+    fn enablement(&self, database: &Self::DB) -> Result<TriggerEnablement, LookupError> {
+        Ok(trigger_metadata(self, database)?.enablement())
     }
 
     /// The function ingestion bound the trigger to, which takes no arguments

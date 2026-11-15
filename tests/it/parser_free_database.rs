@@ -1335,6 +1335,10 @@ impl TriggerLike for MemoryTrigger {
         Ok(None)
     }
 
+    fn enablement(&self, _database: &Self::DB) -> Result<TriggerEnablement, LookupError> {
+        Ok(TriggerEnablement::Origin)
+    }
+
     fn function<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db MemoryFunction>
     where
         Self: 'db,

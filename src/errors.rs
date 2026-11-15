@@ -3663,6 +3663,15 @@ pub enum Error {
         /// Name of the foreign table.
         table_name: String,
     },
+    #[error("Trigger `{trigger_name}` for table `{table_name}` does not exist.")]
+    /// Error indicating that an `ALTER TABLE` enabling or disabling a trigger
+    /// names one the table does not carry.
+    AlterTableTriggerNotFound {
+        /// Name of the trigger that was not found.
+        trigger_name: String,
+        /// Name of the table the statement alters.
+        table_name: String,
+    },
     #[error("Rule `{rule_name}` already exists on relation `{relation_name}`.")]
     /// Error indicating that a `CREATE RULE` statement names a rule the table
     /// or view already carries without `OR REPLACE`. A rule name is unique per

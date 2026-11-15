@@ -43,7 +43,7 @@ use crate::{
     structs::{
         ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
         IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
-        Sequence, TableAttribute, TableMetadata, UserDefinedType, View,
+        Sequence, TableAttribute, TableMetadata, TriggerEnablement, UserDefinedType, View,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -10647,6 +10647,43 @@ impl ParserDB {
                                 )?;
                             }
 
+                            AlterTableOperation::EnableTrigger { name } => {
+                                builder = triggers::alter_enablement(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
+                                    TriggerEnablement::Origin,
+                                )?;
+                            }
+                            AlterTableOperation::DisableTrigger { name } => {
+                                builder = triggers::alter_enablement(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
+                                    TriggerEnablement::Disabled,
+                                )?;
+                            }
+                            AlterTableOperation::EnableReplicaTrigger { name } => {
+                                builder = triggers::alter_enablement(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
+                                    TriggerEnablement::Replica,
+                                )?;
+                            }
+                            AlterTableOperation::EnableAlwaysTrigger { name } => {
+                                builder = triggers::alter_enablement(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
+                                    TriggerEnablement::Always,
+                                )?;
+                            }
+
                             // Ignored: each of these changes something the
                             // model carries no representation of, so nothing it
                             // answers can change.
@@ -10682,12 +10719,6 @@ impl ParserDB {
                             | AlterTableOperation::EnableAlwaysRule { .. }
                             | AlterTableOperation::EnableReplicaRule { .. }
                             | AlterTableOperation::DisableRule { .. }
-                            // A trigger is modelled, but whether it is armed is
-                            // not, so enablement changes nothing answerable.
-                            | AlterTableOperation::EnableTrigger { .. }
-                            | AlterTableOperation::EnableAlwaysTrigger { .. }
-                            | AlterTableOperation::EnableReplicaTrigger { .. }
-                            | AlterTableOperation::DisableTrigger { .. }
                             // Replication identity selects which columns
                             // identify a row downstream, which the model does
                             // not track.
