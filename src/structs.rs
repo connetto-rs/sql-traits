@@ -69,7 +69,7 @@ pub use function_body::FunctionBody;
 pub use function_kind::{AggregateKind, FunctionKind};
 pub use helper_set::{
     CallerGate, GrantArm, GrantedTo, GranteeSet, HelperArm, HelperSet, LiteralSet, ParentArm,
-    SettingComparison, WalkArm, WalkDirection,
+    SettingComparison, TimeBound, TimeComparison, WalkArm, WalkDirection,
 };
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;

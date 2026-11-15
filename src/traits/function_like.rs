@@ -1811,11 +1811,16 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   lets through. Conditions `current_setting('<setting>') <> <text>` and
     ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
     ///   the arm on what the setting reads (see
-    ///   [`CallerGate`](crate::structs::CallerGate)). The rest, the arguments
-    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to the literal
-    ///   values columns have to hold. An arm comparing a helper's set while
-    ///   returning its table's primary key is a parent arm, so it takes no
-    ///   other condition.
+    ///   [`CallerGate`](crate::structs::CallerGate)). A time bound is a
+    ///   conjunct `<column> <comparison> now()`, a `timestamptz` column of the
+    ///   table compared with `<`, `<=`, `>` or `>=` either way round,
+    ///   optionally `OR <column> IS NULL`, and the arm answers it as a
+    ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
+    ///   `transaction_timestamp()` read the same statement time as `now()`. The
+    ///   rest, the arguments substituted, reduce to `TRUE`, to `FALSE` or
+    ///   `NULL`, or to the literal values columns have to hold. An arm
+    ///   comparing a helper's set while returning its table's primary key is a
+    ///   parent arm, so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it

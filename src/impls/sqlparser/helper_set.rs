@@ -27,19 +27,20 @@ use crate::{
         CallerGate, Deployment, FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm,
         HelperSet, IdentifierCase, LiteralSet, ParentArm, RowSecurity, RowStatement,
         SessionSetting, SetPacking, SettingComparison, SettingContent, SettingValue, TargetName,
-        WalkArm, WalkDirection,
+        TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{
-        ColumnLike, DatabaseLike, DialectLike, ForeignKeyLike, FunctionLike, Relation, RoleLike,
-        SchemaLike, TableLike,
+        ColumnLike, DataTypeLike, DatabaseLike, DialectLike, ForeignKeyLike, FunctionLike,
+        Relation, RoleLike, SchemaLike, TableLike,
     },
     utils::{
-        call_sites::call_reaches,
+        call_sites::{ExpressionForm, call_reaches, expression_form},
         identifier_resolution::{SearchPath, identifiers_match},
         object_name::{
             Qualifier, object_name_last_part, qualifier_of, resolve_relation_object_name_on_path,
             target_name_of_table,
         },
+        scalar_family::ScalarFamily,
         walk::walk_expressions,
     },
 };
@@ -1006,7 +1007,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
         }
         let mut kept = Kept::All;
+        let mut time_bounds = Vec::new();
         for condition in conditions {
+            if let Some(bound) = self.time_bound(scope, table, condition)? {
+                time_bounds.push(bound);
+                continue;
+            }
             let reduced = self.reduce(scope, table, condition)?.ok_or_else(|| {
                 HelperSetError::Irreducible {
                     function: scope.name.clone(),
@@ -1038,6 +1044,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             granted_to: granted_to.unwrap_or(GrantedTo::Anyone),
             gate: gates.gate,
             restrictions,
+            time_bounds,
         })))
     }
 
@@ -1083,6 +1090,79 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             });
         }
         Ok(Some(GateRead { setting, raises_when_unset: read.raises_when_unset, excluded }))
+    }
+
+    /// The bound `condition` sets on a `timestamptz` column of the arm's
+    /// table against the statement time, where it sets one.
+    fn time_bound(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        condition: &Expr,
+    ) -> Result<Option<TimeBound<'db, DB>>, HelperSetError> {
+        let database = self.database;
+        let (comparison, null) = match unnest(condition) {
+            Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+                match (unnest(left), unnest(right)) {
+                    (Expr::IsNull(null), comparison) | (comparison, Expr::IsNull(null)) => {
+                        (comparison, Some(null))
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            comparison => (comparison, None),
+        };
+        let Expr::BinaryOp { left, op, right } = comparison else { return Ok(None) };
+        let (compared, comparison) = if self.statement_time(scope, right) {
+            let comparison = match op {
+                BinaryOperator::Gt => TimeComparison::Later,
+                BinaryOperator::GtEq => TimeComparison::LaterOrEqual,
+                BinaryOperator::Lt => TimeComparison::Earlier,
+                BinaryOperator::LtEq => TimeComparison::EarlierOrEqual,
+                _ => return Ok(None),
+            };
+            (left, comparison)
+        } else if self.statement_time(scope, left) {
+            let comparison = match op {
+                BinaryOperator::Lt => TimeComparison::Later,
+                BinaryOperator::LtEq => TimeComparison::LaterOrEqual,
+                BinaryOperator::Gt => TimeComparison::Earlier,
+                BinaryOperator::GtEq => TimeComparison::EarlierOrEqual,
+                _ => return Ok(None),
+            };
+            (right, comparison)
+        } else {
+            return Ok(None);
+        };
+        let Some(column) = table.column(compared, database)? else { return Ok(None) };
+        if column.data_type(database).scalar_family(database) != Some(ScalarFamily::TimestampTz) {
+            return Ok(None);
+        }
+        if let Some(null) = null
+            && table.column(null, database)?.is_none_or(|nulled| !core::ptr::eq(nulled, column))
+        {
+            return Ok(None);
+        }
+        Ok(Some(TimeBound { column, comparison, keeps_null: null.is_some() }))
+    }
+
+    /// Whether `expression` reads the statement time, the start of the
+    /// transaction, as `now()`, `CURRENT_TIMESTAMP` and
+    /// `transaction_timestamp()` read it.
+    fn statement_time(&self, scope: &Scope<'db, DB>, expression: &Expr) -> bool {
+        let Expr::Function(call) = unnest(expression) else { return false };
+        if let Some(form) = expression_form(&call.name) {
+            // `CURRENT_TIMESTAMP(<precision>)` rounds the time it reads.
+            return form == ExpressionForm::Value("TIMESTAMP WITH TIME ZONE")
+                && matches!(call.args, FunctionArguments::None)
+                && call.filter.is_none()
+                && call.over.is_none()
+                && call.null_treatment.is_none()
+                && call.within_group.is_empty();
+        }
+        ["now", "transaction_timestamp"].into_iter().any(|name| {
+            self.catalog_arguments(scope, call, name).is_some_and(|list| list.args.is_empty())
+        })
     }
 
     /// The comparison of a column with a value of the request `conjunct`
@@ -1174,7 +1254,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         // A third argument names a string read as `NULL`, which changes the
         // elements.
         let [read, FunctionArg::Unnamed(FunctionArgExpr::Expr(delimiter))] =
-            self.catalog_call(scope, call, "string_to_array")?.args.as_slice()
+            self.catalog_arguments(scope, call, "string_to_array")?.args.as_slice()
         else {
             return None;
         };
@@ -1193,12 +1273,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ) -> Option<(SettingRead, SetPacking)> {
         let call = projected_call(query)?;
         if let Some([FunctionArg::Unnamed(FunctionArgExpr::Expr(array))]) =
-            self.catalog_call(scope, call, "unnest").map(|list| list.args.as_slice())
+            self.catalog_arguments(scope, call, "unnest").map(|list| list.args.as_slice())
         {
             return self.set_array(scope, array);
         }
         let [FunctionArg::Unnamed(FunctionArgExpr::Expr(document))] =
-            self.catalog_call(scope, call, "jsonb_array_elements_text")?.args.as_slice()
+            self.catalog_arguments(scope, call, "jsonb_array_elements_text")?.args.as_slice()
         else {
             return None;
         };
@@ -1255,33 +1335,32 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// `current_setting('<name>'[, <missing_ok>])`, resolved to PostgreSQL's
     /// own function.
     fn setting_read(&self, scope: &Scope<'db, DB>, call: &Function) -> Option<SettingRead> {
+        let list = self.catalog_arguments(scope, call, "current_setting")?;
         let literal = |argument: &FunctionArg| {
             let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) = argument else {
                 return None;
             };
             Literal::of(&value.value)
         };
-        let (name, raises_when_unset) =
-            match self.catalog_call(scope, call, "current_setting")?.args.as_slice() {
-                [name] => (literal(name)?, true),
-                [name, missing_ok] => {
-                    let Literal::Boolean(missing_ok) = literal(missing_ok)? else { return None };
-                    (literal(name)?, !missing_ok)
-                }
-                _ => return None,
-            };
+        let (name, raises_when_unset) = match list.args.as_slice() {
+            [name] => (literal(name)?, true),
+            [name, missing_ok] => {
+                let Literal::Boolean(missing_ok) = literal(missing_ok)? else { return None };
+                (literal(name)?, !missing_ok)
+            }
+            _ => return None,
+        };
         let Literal::Text(name) = name else { return None };
         Some(SettingRead { name, raises_when_unset })
     }
 
-    /// The arguments of `call` where it calls PostgreSQL's own `function`,
-    /// writing nothing but its argument list, unqualified or qualified by
-    /// `pg_catalog`.
-    fn catalog_call<'c>(
+    /// The arguments of `call` where it calls PostgreSQL's own `name`, in
+    /// `pg_catalog`, and nothing else it could reach.
+    fn catalog_arguments<'c>(
         &self,
         scope: &Scope<'db, DB>,
         call: &'c Function,
-        function: &str,
+        name: &str,
     ) -> Option<&'c FunctionArgumentList> {
         // A qualifier built when the statement runs names no schema.
         let catalog = match qualifier_of(&call.name) {
@@ -1290,20 +1369,21 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             qualifier => qualifier == Qualifier::Absent,
         };
-        let (name, quoted) = object_name_last_part(&call.name)?;
-        if !catalog || !identifiers_match(name, quoted, function, false) {
+        let (called, quoted) = object_name_last_part(&call.name)?;
+        if !catalog || !identifiers_match(called, quoted, name, false) {
             return None;
         }
         let list = plain_arguments(call)?;
-        // PostgreSQL's own function is in `pg_catalog`, and an overload
-        // declared in a schema the owner can use, which the call may reach,
-        // is refused.
+        // An overload declared in a schema the owner can use, which the call
+        // may reach, is refused.
         let path = || scope.usable_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
-        let shadowed = self.database.functions_named(name).any(|declared| {
-            call_reaches(declared, &call.name, list.args.len(), path, IdentifierCase::AsWritten)
-                && declared.target_name().schema() != Some("pg_catalog")
-        });
-        (!shadowed).then_some(list)
+        if self.database.functions_named(called).any(|function| {
+            call_reaches(function, &call.name, list.args.len(), path, IdentifierCase::AsWritten)
+                && function.target_name().schema() != Some("pg_catalog")
+        }) {
+            return None;
+        }
+        Some(list)
     }
 
     /// What `condition` keeps, `None` where it reduces to no literal set.
