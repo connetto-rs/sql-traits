@@ -1193,6 +1193,20 @@ pub enum HelperSetError {
         /// The setting.
         setting: String,
     },
+    /// A grant arm casts its read of the caller to a type other than the one
+    /// the deployment declares the caller in, a cast that may change the
+    /// caller it compares.
+    #[error(
+        "helper `{function}` casts caller setting `{setting}` to `{cast}`, not its declared type"
+    )]
+    CallerCast {
+        /// The helper.
+        function: String,
+        /// The setting.
+        setting: String,
+        /// The type it is cast to, as written.
+        cast: String,
+    },
     /// The body compares a column with the elements of a setting the
     /// deployment declares as something other than a set.
     #[error(

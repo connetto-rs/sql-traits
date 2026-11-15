@@ -1437,6 +1437,92 @@ fn only_postgres_own_functions_unpack_a_set_in_either_spelling() {
     );
 }
 
+/// A helper over `UUID` keys reading the caller as `read`, under `path`.
+fn blocking(path: &str, read: &str, after: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE TABLE organization_blocks (
+           organization_id UUID NOT NULL, principal_id UUID NOT NULL,
+           PRIMARY KEY (organization_id, principal_id));
+         GRANT SELECT ON organization_blocks TO authz_owner;
+         {after}
+         CREATE FUNCTION authz.blocking_organizations() RETURNS SETOF UUID
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = {path} AS $$
+           SELECT b.organization_id FROM public.organization_blocks b
+           WHERE b.principal_id = {read}
+         $$;
+         ALTER FUNCTION authz.blocking_organizations() OWNER TO authz_owner;"
+    )
+}
+
+/// What `read` makes of `authz.blocking_organizations` in `sql`, the caller
+/// declared as `caller`.
+fn blocked_by<T>(
+    sql: &str,
+    caller: DataType,
+    read: impl FnOnce(&HelperSet<'_, ParserDB>) -> T,
+) -> Result<T, HelperSetError> {
+    let database = postgres(sql);
+    let setting = SessionSetting::value("app.user_id", SettingValue::Caller(caller))
+        .expect("a custom setting name");
+    let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
+    answer(&database, &deployment, "authz", "blocking_organizations", &[]).map(|set| read(&set))
+}
+
+const BLOCKING_ARM: &str = "organization_blocks.organization_id WHERE principal_id = app.user_id";
+
+#[test]
+fn a_caller_read_cast_to_its_declared_type_reads_the_caller() {
+    for read in [
+        "current_setting('app.user_id', true)::uuid",
+        "(current_setting('app.user_id', true))::UUID",
+        "CAST(current_setting('app.user_id', true) AS uuid)",
+        "pg_catalog.current_setting('app.user_id', true)::pg_catalog.uuid",
+    ] {
+        let answered = blocked_by(&blocking("''", read, ""), DataType::Uuid, render);
+        assert_eq!(answered.as_deref(), Ok(BLOCKING_ARM), "{read}");
+    }
+    let raises = |read: &str| {
+        blocked_by(&blocking("''", read, ""), DataType::Uuid, |set| {
+            let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
+            request.raises_when_unset()
+        })
+    };
+    assert_eq!(raises("current_setting('app.user_id')::uuid"), Ok(true));
+    assert_eq!(raises("current_setting('app.user_id', true)::uuid"), Ok(false));
+}
+
+#[test]
+fn a_caller_read_cast_to_any_other_type_refuses_the_answer() {
+    let cast = |sql: &str, caller: DataType| {
+        matches!(
+            blocked_by(sql, caller, render),
+            Err(HelperSetError::CallerCast { setting, .. }) if setting == "app.user_id"
+        )
+    };
+    let read = "current_setting('app.user_id', true)::uuid";
+    assert!(cast(&blocking("''", read, ""), DataType::Text), "a text caller cast to uuid");
+    for read in [
+        "current_setting('app.user_id', true)::varchar(8)",
+        "current_setting('app.user_id', true)::text",
+    ] {
+        assert!(cast(&blocking("''", read, ""), DataType::Varchar(None)), "{read}");
+    }
+    let shadow = "CREATE DOMAIN public.uuid AS pg_catalog.uuid CHECK (VALUE IS NOT NULL);";
+    assert!(
+        cast(&blocking("public, pg_catalog", read, shadow), DataType::Uuid),
+        "a uuid the path finds before pg_catalog's is not the declared type"
+    );
+    let catalog = "current_setting('app.user_id', true)::pg_catalog.uuid";
+    for (path, read) in [("public", read), ("public, pg_catalog", catalog)] {
+        let answered = blocked_by(&blocking(path, read, shadow), DataType::Uuid, render);
+        assert_eq!(answered.as_deref(), Ok(BLOCKING_ARM), "{path}: {read}");
+    }
+}
+
 #[test]
 fn a_body_or_arm_outside_the_two_shapes_refuses_the_answer() {
     let shape = |sql: &str| matches!(refusal(sql), HelperSetError::ArmShape { .. });
