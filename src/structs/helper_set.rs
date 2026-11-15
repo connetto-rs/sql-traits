@@ -172,16 +172,19 @@ impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
 /// or `current_setting(<caller setting>) IS NOT NULL`, which keep the arm's
 /// rows only for a setting reading neither `NULL` nor an excluded value. The
 /// body may cast every read of the setting to its declared type, and then
-/// each value plain or cast to that type.
+/// each value plain or cast to that type. It may read the setting through
+/// `NULLIF(<read>, '')` in every conjunct, which reads `''` as `NULL`.
 ///
 /// A custom setting set for one transaction reads `''` once the transaction
 /// ends, so `IS NOT NULL` holds on a pooled connection that once carried a
-/// caller. `<> ''` holds only where a caller was sent.
+/// caller. `<> ''` and a read through `NULLIF` hold only where a caller was
+/// sent (see [`excludes_unset`](Self::excludes_unset)).
 #[derive(Debug)]
 pub struct CallerGate<'db> {
     pub(crate) setting: &'db SessionSetting,
     pub(crate) raises_when_unset: bool,
     pub(crate) in_declared_type: bool,
+    pub(crate) excludes_unset: bool,
     pub(crate) excluded: Vec<Value>,
 }
 
@@ -208,8 +211,20 @@ impl<'db> CallerGate<'db> {
         self.in_declared_type
     }
 
+    /// Whether the gate keeps no row for a request that sent no caller, the
+    /// setting reading `''` or `NULL`. The body writes `<> ''` or reads the
+    /// setting through `NULLIF(<read>, '')`. A read cast to a type `''` is
+    /// not a value of, such as `uuid`, raises `22P02` on `''` unless it goes
+    /// through `NULLIF`, so a gate of such reads answers `false`.
+    #[must_use]
+    pub fn excludes_unset(&self) -> bool {
+        self.excludes_unset
+    }
+
     /// The values the setting must differ from, each once, in the order the
-    /// body first names them, empty for `IS NOT NULL` alone.
+    /// body first names them, `''` left to
+    /// [`excludes_unset`](Self::excludes_unset). Empty for `IS NOT NULL` or
+    /// `<> ''` alone.
     #[must_use]
     pub fn excluded(&self) -> &[Value] {
         &self.excluded
@@ -228,12 +243,15 @@ impl<'db> CallerGate<'db> {
 /// `jsonb_array_elements_text(current_setting(<set>)::jsonb)[::<element
 /// type>]`, the set packed as
 /// [`SetPacking::JsonArray`](crate::structs::SetPacking). The element type is
-/// the one the deployment declares, written at most once in a read.
+/// the one the deployment declares, written at most once in a read. Every
+/// `current_setting(...)` may be read through `NULLIF(current_setting(...),
+/// '')`, which reads `''` as `NULL`.
 #[derive(Debug)]
 pub struct SettingComparison<'db, DB: DatabaseLike> {
     pub(crate) column: &'db DB::Column,
     pub(crate) setting: &'db SessionSetting,
     pub(crate) raises_when_unset: bool,
+    pub(crate) excludes_unset: bool,
 }
 
 impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
@@ -257,6 +275,18 @@ impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
     #[must_use]
     pub fn raises_when_unset(&self) -> bool {
         self.raises_when_unset
+    }
+
+    /// Whether the comparison keeps no row for a request that left the
+    /// setting unset, the setting reading `''` or `NULL`.
+    ///
+    /// A read through `NULLIF(<read>, '')` reads both as `NULL`, and a
+    /// delimited set unpacks `''` to no element. A caller read otherwise
+    /// matches a column holding `''`, or raises `22P02` where it is cast to
+    /// a type `''` is not a value of, and a JSON set raises `22P02` on `''`.
+    #[must_use]
+    pub fn excludes_unset(&self) -> bool {
+        self.excludes_unset
     }
 }
 

@@ -329,13 +329,19 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                 HelperArm::Grant(grant) => {
                     let granted_to = render_granted_to(grant.granted_to());
                     let gate = grant.gate().map(|gate| {
+                        let name = gate.setting().name();
                         let excluded: Vec<String> =
                             gate.excluded().iter().map(ToString::to_string).collect();
-                        if excluded.is_empty() {
-                            format!("{} IS NOT NULL", gate.setting().name())
-                        } else {
-                            format!("{} NOT IN ({})", gate.setting().name(), excluded.join(", "))
+                        let mut gated = Vec::new();
+                        if gate.excludes_unset() {
+                            gated.push(format!("{name} IS SET"));
                         }
+                        if !excluded.is_empty() {
+                            gated.push(format!("{name} NOT IN ({})", excluded.join(", ")));
+                        } else if !gate.excludes_unset() {
+                            gated.push(format!("{name} IS NOT NULL"));
+                        }
+                        gated.join(" AND ")
                     });
                     let restrictions = grant.restrictions().iter().map(|set| {
                         let values: Vec<String> =
@@ -475,7 +481,8 @@ fn evaluate(
             HelperArm::Grant(grant) => {
                 let gated = grant.gate().is_none_or(|gate| {
                     request.caller.is_some_and(|caller| {
-                        gate.excluded().iter().all(|value| !holds(value, caller))
+                        !(gate.excludes_unset() && caller.is_empty())
+                            && gate.excluded().iter().all(|value| !holds(value, caller))
                     })
                 });
                 if !gated {
@@ -2563,7 +2570,7 @@ const GRANTEES_MEASURED: &[GranteesMeasured] = &[
 
 const CALLER_GRANTEES: &str = "grantees.id WHERE id = app.user_id \
      UNION grantees.id WHERE kind IN ('everyone') \
-     UNION grantees.id WHERE app.user_id NOT IN ('') AND kind IN ('signed_in') \
+     UNION grantees.id WHERE app.user_id IS SET AND kind IN ('signed_in') \
      UNION memberships.organization_id WHERE user_id = app.user_id AND state IN ('active') \
      UNION team_members.team_id WHERE user_id = app.user_id \
      UNION teams.parent_id WHERE id IN itself";
@@ -2795,25 +2802,32 @@ fn a_gate_on_the_caller_setting_excludes_the_values_it_compares_with() {
         let HelperArm::Grant(grant) = &set.arms()[2] else { panic!("a grant arm") };
         Ok::<_, HelperSetError>(grant.gate().map(|gate| {
             let excluded: Vec<String> = gate.excluded().iter().map(ToString::to_string).collect();
-            (gate.setting().name().to_string(), gate.raises_when_unset(), excluded)
+            (
+                gate.setting().name().to_string(),
+                gate.raises_when_unset(),
+                gate.excludes_unset(),
+                excluded,
+            )
         }))
     };
     let nil = "'00000000-0000-0000-0000-000000000000'";
-    for (gate, raises, excluded) in [
-        ("current_setting('app.user_id', true) IS NOT NULL".to_string(), false, vec![]),
-        (format!("current_setting('app.user_id', true) <> {nil}"), false, vec![nil]),
-        (format!("{nil} != current_setting('app.user_id')"), true, vec![nil]),
+    for (gate, raises, excludes_unset, excluded) in [
+        ("current_setting('app.user_id', true) IS NOT NULL".to_string(), false, false, vec![]),
+        ("'' <> current_setting('app.user_id', true)".to_string(), false, true, vec![]),
+        (format!("current_setting('app.user_id', true) <> {nil}"), false, false, vec![nil]),
+        (format!("{nil} != current_setting('app.user_id')"), true, false, vec![nil]),
         (
             format!(
                 "current_setting('app.user_id', true) <> '' AND current_setting('app.user_id') <> {nil} \
                  AND current_setting('app.user_id', true) IS NOT NULL AND '' <> current_setting('app.user_id', true)"
             ),
             true,
-            vec!["''", nil],
+            true,
+            vec![nil],
         ),
     ] {
         let excluded = excluded.into_iter().map(str::to_string).collect();
-        let expected = ("app.user_id".to_string(), raises, excluded);
+        let expected = ("app.user_id".to_string(), raises, excludes_unset, excluded);
         assert_eq!(gated(&gate), Ok(Some(expected)), "{gate}");
     }
 
@@ -2902,21 +2916,27 @@ fn signing(path: &str, gate: &str, after: &str) -> String {
 }
 
 /// Whether a gate raises when unset, whether it compares in the declared
-/// type, and the values it excludes.
-type SignedInGate = Option<(bool, bool, Vec<String>)>;
+/// type, whether it excludes the unset caller, and the values it excludes.
+type SignedInGate = Option<(bool, bool, bool, Vec<String>)>;
 
 /// The gate `authz.signed_in` in `sql` reads, the caller declared as a
 /// `uuid`.
 fn signed_in_gate(sql: &str) -> Result<SignedInGate, HelperSetError> {
     let database = postgres(sql);
     let setting = SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Uuid))
-        .expect("a custom setting name");
+        .expect("a custom setting name")
+        .may_be_unset();
     let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
     let set = answer(&database, &deployment, "authz", "signed_in", &[])?;
     let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
     Ok(grant.gate().map(|gate| {
         let excluded = gate.excluded().iter().map(ToString::to_string).collect();
-        (gate.raises_when_unset(), gate.compares_in_declared_type(), excluded)
+        (
+            gate.raises_when_unset(),
+            gate.compares_in_declared_type(),
+            gate.excludes_unset(),
+            excluded,
+        )
     }))
 }
 
@@ -2947,7 +2967,7 @@ fn a_gate_on_the_caller_cast_to_its_declared_type_compares_in_that_type() {
         let excluded = excluded.into_iter().map(str::to_string).collect();
         assert_eq!(
             signed_in_gate(&signing("''", &gate, "")),
-            Ok(Some((raises, in_declared_type, excluded))),
+            Ok(Some((raises, in_declared_type, false, excluded))),
             "{gate}"
         );
     }
@@ -2987,6 +3007,143 @@ fn a_gate_on_the_caller_cast_to_any_other_type_refuses_the_answer() {
         matches!(signed_in_gate(&signing("''", &mixed, "")), Err(HelperSetError::ArmShape { .. })),
         "a gate reads the caller in one type"
     );
+}
+
+/// `CALLER` read through `NULLIF`, `NULL` both before the setting was ever
+/// set and once the transaction that set it ended.
+const ABSENT: &str = "NULLIF(current_setting('app.user_id', true), '')";
+
+#[test]
+fn a_gate_on_the_caller_read_through_nullif_excludes_the_unset_caller() {
+    for (gate, raises, in_declared_type, excluded) in [
+        (format!("{ABSENT}::uuid IS NOT NULL"), false, true, vec![]),
+        (format!("{ABSENT} IS NOT NULL"), false, false, vec![]),
+        (format!("(NULLIF(({CALLER}), ''))::pg_catalog.uuid IS NOT NULL"), false, true, vec![]),
+        (format!("nullif(pg_catalog.{CALLER}, '')::uuid IS NOT NULL"), false, true, vec![]),
+        (
+            format!("{NIL} <> NULLIF(current_setting('app.user_id'), '')::uuid"),
+            true,
+            true,
+            vec![NIL],
+        ),
+        (
+            format!("{ABSENT}::uuid IS NOT NULL AND {ABSENT}::uuid <> {NIL}::uuid"),
+            false,
+            true,
+            vec![NIL],
+        ),
+        (format!("{ABSENT} <> ''"), false, false, vec![]),
+    ] {
+        let excluded = excluded.into_iter().map(str::to_string).collect();
+        assert_eq!(
+            signed_in_gate(&signing("''", &gate, "")),
+            Ok(Some((raises, in_declared_type, true, excluded))),
+            "{gate}"
+        );
+    }
+}
+
+#[test]
+fn a_nullif_over_anything_but_a_setting_read_and_the_empty_string_refuses_the_answer() {
+    for gate in [
+        format!("NULLIF({CALLER}, ' ')::uuid IS NOT NULL"),
+        format!("NULLIF({CALLER}, NULL)::uuid IS NOT NULL"),
+        format!("NULLIF({CALLER}, ''::text)::uuid IS NOT NULL"),
+        format!("NULLIF('', {CALLER})::uuid IS NOT NULL"),
+        format!("NULLIF({CALLER}::uuid, NULL) IS NOT NULL"),
+        format!("NULLIF({ABSENT}, '')::uuid IS NOT NULL"),
+        format!("\"nullif\"({CALLER}, '')::uuid IS NOT NULL"),
+        format!("public.nullif({CALLER}, '')::uuid IS NOT NULL"),
+        format!("COALESCE({CALLER}, '')::uuid IS NOT NULL"),
+    ] {
+        assert!(
+            matches!(
+                signed_in_gate(&signing("''", &gate, "")),
+                Err(HelperSetError::Irreducible { .. })
+            ),
+            "{gate}"
+        );
+    }
+    assert!(
+        matches!(
+            signed_in_gate(&signing("''", &format!("{ABSENT}::text IS NOT NULL"), "")),
+            Err(HelperSetError::SettingCast { setting, .. }) if setting == "app.user_id"
+        ),
+        "a read through NULLIF casts to the declared type alone"
+    );
+    assert!(
+        matches!(
+            signed_in_gate(&signing(
+                "''",
+                "NULLIF(current_setting('app.tenant', true), '') IS NOT NULL",
+                ""
+            )),
+            Err(HelperSetError::UndeclaredSetting { setting, .. }) if setting == "app.tenant"
+        ),
+        "a read through NULLIF reads the setting it names"
+    );
+    let mixed = format!("{ABSENT}::uuid IS NOT NULL AND {CALLER}::uuid <> {NIL}");
+    assert!(
+        matches!(signed_in_gate(&signing("''", &mixed, "")), Err(HelperSetError::ArmShape { .. })),
+        "a gate reads the caller through NULLIF in every conjunct or in none"
+    );
+}
+
+#[test]
+fn a_comparison_with_the_caller_read_through_nullif_excludes_the_unset_caller() {
+    let read = |read: &str| {
+        blocked_by(&blocking("''", read, ""), DataType::Uuid, |set| {
+            let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
+            (render(set), request.raises_when_unset(), request.excludes_unset())
+        })
+    };
+    for (written, raises, excludes_unset) in [
+        (format!("{ABSENT}::uuid"), false, true),
+        ("CAST(NULLIF(current_setting('app.user_id'), '') AS uuid)".to_string(), true, true),
+        ("current_setting('app.user_id', true)::uuid".to_string(), false, false),
+    ] {
+        let expected = (BLOCKING_ARM.to_string(), raises, excludes_unset);
+        assert_eq!(read(&written), Ok(expected), "{written}");
+    }
+    assert!(
+        matches!(
+            read(&format!("NULLIF({CALLER}, 'none')::uuid")),
+            Err(HelperSetError::Irreducible { .. })
+        ),
+        "a NULLIF against another string reads no caller"
+    );
+}
+
+#[test]
+fn a_set_read_excludes_the_unset_request_unless_it_raises_on_the_empty_string() {
+    let excludes_unset = |condition: &str, packing: SetPacking| {
+        let database = postgres(&presenting("''", condition, ""));
+        let setting = SessionSetting::value(
+            "app.link_ids",
+            SettingValue::Set { element: DataType::Uuid, packing },
+        )
+        .expect("a custom setting name");
+        let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
+        answer(&database, &deployment, "authz", "presented_links", &[]).map(|set| {
+            let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the set") };
+            request.excludes_unset()
+        })
+    };
+    let absent_split = "string_to_array(NULLIF(current_setting('app.link_ids', true), ''), ',')";
+    let absent_elements =
+        "jsonb_array_elements_text(NULLIF(current_setting('app.link_ids', true), '')::jsonb)";
+    let comma = || SetPacking::Delimited(",".into());
+    for (condition, packing, expected) in [
+        (format!("l.id = ANY ({SPLIT}::uuid[])"), comma(), true),
+        (format!("l.id = ANY ({absent_split}::uuid[])"), comma(), true),
+        (format!("l.id IN (SELECT unnest({absent_split})::uuid)"), comma(), true),
+        (format!("l.id IN (SELECT {ELEMENTS}::uuid)"), SetPacking::JsonArray, false),
+        (format!("l.id IN (SELECT {absent_elements}::uuid)"), SetPacking::JsonArray, true),
+    ] {
+        assert_eq!(excludes_unset(&condition, packing), Ok(expected), "{condition}");
+    }
 }
 
 #[test]
