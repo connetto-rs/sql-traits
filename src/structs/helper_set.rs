@@ -1,5 +1,5 @@
-//! What a declared `STABLE SECURITY DEFINER` SQL helper returns for one caller
-//! and one argument list, as
+//! What a declared `STABLE SECURITY DEFINER` SQL helper returns for one
+//! request and one argument list, as
 //! [`FunctionLike::helper_set`](crate::traits::FunctionLike::helper_set)
 //! answers it.
 
@@ -44,7 +44,8 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
 /// One `SELECT` of a helper's `UNION`.
 #[derive(Debug)]
 pub enum HelperArm<'db, DB: DatabaseLike> {
-    /// The rows of a grant table naming the caller.
+    /// The rows of a table its condition keeps, compared with a value of the
+    /// request or not.
     Grant(GrantArm<'db, DB>),
     /// The rows of a table whose parent another helper returns.
     Parent(ParentArm<'db, DB>),
@@ -52,16 +53,17 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Walk(WalkArm<'db, DB>),
 }
 
-/// `SELECT <column> FROM <table> WHERE <caller column> =
-/// current_setting(<caller setting>) [AND <condition>]`.
+/// `SELECT <column> FROM <table> [WHERE [<setting comparison>] [AND
+/// <condition>]]`.
+///
+/// An arm comparing no column with a setting returns the same rows for
+/// every request.
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
     pub(crate) column: &'db DB::Column,
-    pub(crate) caller_column: &'db DB::Column,
-    pub(crate) setting: &'db SessionSetting,
-    pub(crate) raises_when_unset: bool,
-    pub(crate) restriction: Option<LiteralSet<'db, DB>>,
+    pub(crate) request: Option<SettingComparison<'db, DB>>,
+    pub(crate) restrictions: Vec<LiteralSet<'db, DB>>,
     pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
 }
 
@@ -78,13 +80,56 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
         self.column
     }
 
-    /// The column holding the caller.
+    /// The comparison of a column with a value of the request, or `None`
+    /// where the arm keeps the same rows for every request.
     #[must_use]
-    pub fn caller_column(&self) -> &'db DB::Column {
-        self.caller_column
+    pub fn request(&self) -> Option<&SettingComparison<'db, DB>> {
+        self.request.as_ref()
     }
 
-    /// The setting holding the caller, as the deployment declares it.
+    /// The values columns have to hold, each set over its own column, all of
+    /// them holding at once. Empty where the condition is absent or holds
+    /// for every row.
+    #[must_use]
+    pub fn restrictions(&self) -> &[LiteralSet<'db, DB>] {
+        &self.restrictions
+    }
+
+    /// The bounds a row has to meet against the statement time, every one
+    /// of them, in the order the condition writes them.
+    #[must_use]
+    pub fn time_bounds(&self) -> &[TimeBound<'db, DB>] {
+        &self.time_bounds
+    }
+}
+
+/// `<column> = current_setting(<caller>)`, or `<column>` compared with each
+/// element of a declared set, `<column> = ANY (<array>)` or `<column> IN
+/// (SELECT <elements>)`.
+///
+/// `<array>` is `string_to_array(current_setting(<set>), <delimiter>)`, the
+/// set packed as [`SetPacking::Delimited`](crate::structs::SetPacking) by
+/// that delimiter, or `ARRAY(SELECT <elements>)`. `<elements>` is
+/// `unnest(<array>)`, or
+/// `jsonb_array_elements_text(current_setting(<set>)::jsonb)`, the set packed
+/// as [`SetPacking::JsonArray`](crate::structs::SetPacking).
+#[derive(Debug)]
+pub struct SettingComparison<'db, DB: DatabaseLike> {
+    pub(crate) column: &'db DB::Column,
+    pub(crate) setting: &'db SessionSetting,
+    pub(crate) raises_when_unset: bool,
+}
+
+impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
+    /// The column compared.
+    #[must_use]
+    pub fn column(&self) -> &'db DB::Column {
+        self.column
+    }
+
+    /// The setting compared with, as the deployment declares it, either
+    /// [`SettingValue::Caller`](crate::structs::SettingValue::Caller) or
+    /// [`SettingValue::Set`](crate::structs::SettingValue::Set).
     #[must_use]
     pub fn setting(&self) -> &'db SessionSetting {
         self.setting
@@ -96,20 +141,6 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     #[must_use]
     pub fn raises_when_unset(&self) -> bool {
         self.raises_when_unset
-    }
-
-    /// The values one column has to hold, or `None` where the condition is
-    /// absent or holds for every row.
-    #[must_use]
-    pub fn restriction(&self) -> Option<&LiteralSet<'db, DB>> {
-        self.restriction.as_ref()
-    }
-
-    /// The bounds a row has to meet against the statement time, every one
-    /// of them, in the order the condition writes them.
-    #[must_use]
-    pub fn time_bounds(&self) -> &[TimeBound<'db, DB>] {
-        &self.time_bounds
     }
 }
 
