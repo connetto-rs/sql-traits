@@ -418,7 +418,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         database: &'db DB,
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
-        Self::scoped(ScopedRoot::Expression(expression), expression, scope, database, case)
+        Self::for_root(ScopedRoot::Expression(expression), scope, database, case)
     }
 
     /// Builds the context of `statement`, a query or an `INSERT`, `UPDATE`,
@@ -447,7 +447,30 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         database: &'db DB,
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
-        Self::scoped(ScopedRoot::Statement(statement), statement, scope, database, case)
+        Self::for_root(ScopedRoot::Statement(statement), scope, database, case)
+    }
+
+    /// Builds the context of `root` over `database` under `scope`, comparing
+    /// identifiers under `case`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the relation-name lookup errors resolving `root` runs into.
+    pub(crate) fn for_root(
+        root: ScopedRoot<'query>,
+        scope: &ExpressionScope<'query, 'db, DB>,
+        database: &'db DB,
+        case: IdentifierCase,
+    ) -> Result<Self, LookupError> {
+        match root {
+            ScopedRoot::Expression(expression) => {
+                Self::scoped(root, expression, scope, database, case)
+            }
+            ScopedRoot::Query(query) => Self::scoped(root, query, scope, database, case),
+            ScopedRoot::Statement(statement) => {
+                Self::scoped(root, statement, scope, database, case)
+            }
+        }
     }
 
     /// Builds the context of `root`, which `node` is, under `scope`.

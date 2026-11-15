@@ -3,7 +3,7 @@
 
 use alloc::{borrow::ToOwned, vec::Vec};
 
-use sqlparser::ast::{CreateRuleEvent, Expr, Statement};
+use sqlparser::ast::{CreateRuleEvent, Expr, Query, Statement};
 
 use super::{
     AstRef, DerivationProfile, DerivedColumn, DerivedRelationRef, DerivedShape, Deriving,
@@ -19,13 +19,25 @@ use crate::{
 };
 
 /// An expression or a statement a context is built over.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ScopedRoot<'query> {
     /// An expression of an object, as a check constraint's.
     Expression(&'query Expr),
+    /// The `SELECT` evaluating an expression of a PL/pgSQL body.
+    Query(&'query Query),
     /// A query or a data-modifying statement, as a rule action or a
     /// statement of a `BEGIN ATOMIC` body.
     Statement(&'query Statement),
+}
+
+impl ScopedRoot<'_> {
+    /// The root, a query written as a statement read as the query.
+    pub(crate) fn unwrapped(self) -> Self {
+        match self {
+            Self::Statement(Statement::Query(query)) => Self::Query(query),
+            root => root,
+        }
+    }
 }
 
 /// Builds the scopes of `root` under the names `scope` reaches, and answers
@@ -45,28 +57,25 @@ pub(crate) fn scoped_graph<'query, 'db, DB: DatabaseLike>(
     let outer = profile.begin_unowned_scope(None);
     reach(&mut profile, outer, scope, database);
     let outer_cursor = profile.cursor(&outer);
-    match root {
+    match root.unwrapped() {
         ScopedRoot::Expression(expression) => {
             index_nested(&mut profile, &[], deriving, outer_cursor, |walker| {
                 walker.expression(expression)
             })?;
             profile.record_outputs(expression)?;
         }
+        ScopedRoot::Query(query) => {
+            index_nested_query_scopes(
+                AstRef::Query(query),
+                &[],
+                deriving,
+                outer_cursor,
+                &mut profile,
+            )?;
+            profile.record_outputs(query)?;
+        }
         ScopedRoot::Statement(statement) => {
-            match statement {
-                Statement::Query(query) => {
-                    index_nested_query_scopes(
-                        AstRef::Query(query),
-                        &[],
-                        deriving,
-                        outer_cursor,
-                        &mut profile,
-                    )?;
-                }
-                _ => {
-                    profile.modifying_shape(statement, &[], deriving, outer_cursor)?;
-                }
-            }
+            profile.modifying_shape(statement, &[], deriving, outer_cursor)?;
             profile.record_outputs(statement)?;
         }
     }

@@ -1,18 +1,14 @@
-//! The names a PL/pgSQL body reaches where it evaluates an expression, and the
-//! places it runs SQL it builds at run time.
+//! The names a PL/pgSQL body reaches where it evaluates an expression.
 
-use alloc::{borrow::Cow, format, string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 
-use sqlparser::ast::{ArgMode, Expr, Ident, Statement};
-use sqlparser_plpgsql::{
-    embedded::Block,
-    namespace::{NameKind, Namespace},
-};
+use sqlparser::ast::{ArgMode, Ident, Statement};
+use sqlparser_plpgsql::namespace::{NameKind, Namespace};
 
 use crate::{
     errors::LookupError,
-    impls::{BodyNames, BodyPath, dynamic_sites},
-    structs::{ExpressionScope, OperandType},
+    impls::{BodyNames, BodyPath},
+    structs::OperandType,
     traits::DatabaseLike,
     utils::identifier_resolution::stored_identifier,
 };
@@ -128,9 +124,9 @@ pub(crate) fn stored_parts<'a>(idents: impl IntoIterator<Item = &'a Ident>) -> V
 /// The names a PL/pgSQL expression reaches at the point of the body it sits
 /// in, and the `search_path` the body runs it under.
 ///
-/// [`ExpressionScope::PlPgSql`] hands it to
-/// [`ExpressionContext`](crate::structs::ExpressionContext), which binds a
-/// name no relation of the expression's own queries holds to the innermost
+/// [`ExpressionScope::PlPgSql`](crate::structs::ExpressionScope::PlPgSql) hands
+/// it to [`ExpressionContext`](crate::structs::ExpressionContext), which binds
+/// a name no relation of the expression's own queries holds to the innermost
 /// variable of that name, a name qualified by a block label or by the
 /// function's name to that level's variable, and `$n` to argument `n`.
 #[derive(Debug)]
@@ -191,88 +187,5 @@ impl<'b, 'db, DB: DatabaseLike> PlPgSqlScope<'b, 'db, DB> {
     /// The path the body runs the expression under.
     pub(crate) const fn path(&self) -> &BodyPath<'b> {
         &self.path
-    }
-}
-
-/// The dynamic-execution sites of a function body, owning the body they
-/// borrow from.
-///
-/// [`FunctionLike::dynamic_execution_sites`](crate::traits::FunctionLike::dynamic_execution_sites)
-/// parses the body into it, and [`Self::sites`] reads the sites.
-#[derive(Debug)]
-pub struct DynamicExecutionSites<'db, DB: DatabaseLike> {
-    names: BodyNames<'db, DB>,
-    /// The parsed PL/pgSQL body, `None` for a body in another language.
-    block: Option<Block>,
-    hex_strings_may_be_integers: bool,
-}
-
-impl<'db, DB: DatabaseLike> DynamicExecutionSites<'db, DB> {
-    pub(crate) const fn new(
-        names: BodyNames<'db, DB>,
-        block: Option<Block>,
-        hex_strings_may_be_integers: bool,
-    ) -> Self {
-        Self { names, block, hex_strings_may_be_integers }
-    }
-
-    /// Returns every place the body runs SQL it builds at run time, in body
-    /// order, as
-    /// [`FunctionLike::dynamic_execution_sites`](crate::traits::FunctionLike::dynamic_execution_sites)
-    /// describes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::FunctionBodyUnresolvable`] for an `ALIAS FOR`
-    /// naming no variable and for an `OPEN` naming no cursor declared with a
-    /// query, and the errors reading the path a statement of the body sets.
-    pub fn sites(&self) -> Result<Vec<DynamicExecution<'_, 'db, DB>>, LookupError> {
-        let Some(block) = &self.block else { return Ok(Vec::new()) };
-        dynamic_sites(&self.names, block, self.hex_strings_may_be_integers)
-    }
-}
-
-/// A place a PL/pgSQL body runs SQL it builds at run time, an `EXECUTE`,
-/// `RETURN QUERY EXECUTE`, `OPEN ... FOR EXECUTE` or `FOR ... IN EXECUTE`.
-#[derive(Debug, Clone)]
-pub struct DynamicExecution<'b, 'db, DB: DatabaseLike> {
-    command: Cow<'b, Expr>,
-    arguments: Vec<Cow<'b, Expr>>,
-    scope: PlPgSqlScope<'b, 'db, DB>,
-}
-
-impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
-    pub(crate) const fn new(
-        command: Cow<'b, Expr>,
-        arguments: Vec<Cow<'b, Expr>>,
-        scope: PlPgSqlScope<'b, 'db, DB>,
-    ) -> Self {
-        Self { command, arguments, scope }
-    }
-
-    /// Returns the expression whose value is the SQL text the site runs.
-    #[must_use]
-    pub fn command(&self) -> &Expr {
-        &self.command
-    }
-
-    /// Returns the `USING` expressions, in the order the site writes them,
-    /// whose values the SQL text reads as `$1`, `$2` and so on.
-    pub fn arguments(&self) -> impl ExactSizeIterator<Item = &Expr> {
-        self.arguments.iter().map(|argument| &**argument)
-    }
-
-    /// Returns the names the command and arguments reach, as the scope to
-    /// build their [`ExpressionContext`](crate::structs::ExpressionContext)
-    /// under.
-    #[must_use]
-    pub const fn scope(&self) -> ExpressionScope<'_, 'db, DB> {
-        ExpressionScope::PlPgSql(&self.scope)
-    }
-
-    /// Returns the names the command and arguments reach.
-    #[must_use]
-    pub const fn plpgsql_scope(&self) -> &PlPgSqlScope<'b, 'db, DB> {
-        &self.scope
     }
 }

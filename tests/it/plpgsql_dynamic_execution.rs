@@ -60,14 +60,7 @@ fn names(database: &ParserDB, name: &str) -> Vec<Vec<(String, String)>> {
         .unwrap()
         .iter()
         .map(|site| {
-            let scope = site.scope();
-            let context = ExpressionContext::for_expression(
-                site.command(),
-                &scope,
-                database,
-                IdentifierCase::Folded,
-            )
-            .unwrap();
+            let context = site.context(IdentifierCase::Folded).unwrap();
             let mut typed = Vec::new();
             let _ = visit_expressions(site.command(), |expression| {
                 if matches!(
@@ -99,10 +92,7 @@ fn variable(database: &ParserDB, name: &str, written: &str) -> Option<(VariableK
     let body = function(database, name).dynamic_execution_sites(database).unwrap();
     let sites = body.sites().unwrap();
     let [site] = sites.as_slice() else { panic!("{name} has one site") };
-    let scope = site.scope();
-    let context =
-        ExpressionContext::for_expression(site.command(), &scope, database, IdentifierCase::Folded)
-            .unwrap();
+    let context = site.context(IdentifierCase::Folded).unwrap();
     let mut found = None;
     let _ = visit_expressions(site.command(), |expression| {
         if expression.to_string() == written {
@@ -180,14 +170,7 @@ fn a_command_types_and_its_calls_resolve_under_the_function_path() {
     for (name, schema) in [("trusting", "pg_catalog"), ("hijacked", "evil")] {
         let body = function(&database, name).dynamic_execution_sites(&database).unwrap();
         let sites = body.sites().unwrap();
-        let scope = sites[0].scope();
-        let context = ExpressionContext::for_expression(
-            sites[0].command(),
-            &scope,
-            &database,
-            IdentifierCase::Folded,
-        )
-        .unwrap();
+        let context = sites[0].context(IdentifierCase::Folded).unwrap();
         assert_eq!(
             rendered(&context.type_of(sites[0].command()).unwrap()),
             "pg_catalog.text",
@@ -210,14 +193,7 @@ fn called_schemas(database: &ParserDB, name: &str) -> Vec<Vec<String>> {
         .unwrap()
         .iter()
         .map(|site| {
-            let scope = site.scope();
-            let context = ExpressionContext::for_expression(
-                site.command(),
-                &scope,
-                database,
-                IdentifierCase::Folded,
-            )
-            .unwrap();
+            let context = site.context(IdentifierCase::Folded).unwrap();
             let mut schemas = Vec::new();
             let _ = visit_expressions(site.command(), |expression| {
                 if let Some(call) = context.call(expression).unwrap() {
@@ -543,14 +519,7 @@ fn an_unresolvable_copied_type_keeps_its_error() {
     );
     let body = function(&database, "missing").dynamic_execution_sites(&database).unwrap();
     let sites = body.sites().unwrap();
-    let scope = sites[0].scope();
-    let context = ExpressionContext::for_expression(
-        sites[0].command(),
-        &scope,
-        &database,
-        IdentifierCase::Folded,
-    )
-    .unwrap();
+    let context = sites[0].context(IdentifierCase::Folded).unwrap();
     let Expr::BinaryOp { right, .. } = sites[0].command() else { panic!("a concatenation") };
     let Some((ColumnDefinition::Variable(local), _)) = context.reference(right).unwrap() else {
         panic!("a binds a local")
@@ -732,7 +701,7 @@ fn aliases_and_unnamed_arguments_reach_their_parameters() {
     assert_eq!(variable(&database, "aliased", "a"), unnamed);
     let body = function(&database, "aliased").dynamic_execution_sites(&database).unwrap();
     let found = body.sites().unwrap();
-    let scope = found[0].plpgsql_scope();
+    let scope = found[0].plpgsql_scope().expect("a PL/pgSQL site");
     assert_eq!(scope.function().name(), "aliased");
     assert_eq!(scope.parameter(1).as_ref().map(PlPgSqlVariable::name), Some("p"));
     assert_eq!(
@@ -941,10 +910,7 @@ fn declared_type_errors(database: &ParserDB, name: &str) -> Vec<(String, Option<
     let body = function(database, name).dynamic_execution_sites(database).unwrap();
     let sites = body.sites().unwrap();
     let [site] = sites.as_slice() else { panic!("{name} has one site") };
-    let scope = site.scope();
-    let context =
-        ExpressionContext::for_expression(site.command(), &scope, database, IdentifierCase::Folded)
-            .unwrap();
+    let context = site.context(IdentifierCase::Folded).unwrap();
     let mut found = Vec::new();
     let _ = visit_expressions(site.command(), |expression| {
         if let Some((
@@ -1068,27 +1034,13 @@ fn operators_and_from_calls_another_schema_defines_stay_undetermined_under_an_un
     let from_call = |site: &DynamicExecution<'_, '_, ParserDB>| {
         let Expr::Subquery(query) = site.command() else { panic!("a scalar subquery") };
         let SetExpr::Select(select) = query.body.as_ref() else { panic!("a SELECT") };
-        let scope = site.scope();
-        let context = ExpressionContext::for_expression(
-            site.command(),
-            &scope,
-            &database,
-            IdentifierCase::Folded,
-        )
-        .unwrap();
+        let context = site.context(IdentifierCase::Folded).unwrap();
         let call = context.relation_call(&select.from[0].relation).unwrap().expect("a call");
         matches!(call.resolution(), CallResolution::Selected(_))
     };
     assert!(from_call(before));
     assert!(!from_call(after));
-    let scope = concatenated.scope();
-    let context = ExpressionContext::for_expression(
-        concatenated.command(),
-        &scope,
-        &database,
-        IdentifierCase::Folded,
-    )
-    .unwrap();
+    let context = concatenated.context(IdentifierCase::Folded).unwrap();
     let mut resolved = Vec::new();
     let _ = visit_expressions(concatenated.command(), |expression| {
         if let Expr::BinaryOp { .. } = expression {
