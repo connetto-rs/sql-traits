@@ -19,7 +19,7 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_plpgsql::embedded::{
-    Block, Branch, DeclarationKind, Dynamic, Loop, LoopControl, Node,
+    Block, BoundCursor, Branch, DeclarationKind, Dynamic, Loop, LoopControl, Node,
 };
 
 use super::data_statement::{
@@ -78,7 +78,15 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 self.branches(&choice.branches, &choice.otherwise)
             }
             Node::Loop(repeated) => self.repeated(repeated),
+            Node::Open(cursor) => self.opened(cursor),
         }
+    }
+
+    /// Walks the arguments of `cursor`, then the query it opens, which
+    /// PostgreSQL plans when the cursor opens.
+    fn opened(&mut self, cursor: &'s BoundCursor) -> Result<(), LookupError> {
+        cursor.arguments.iter().try_for_each(|argument| self.expression(argument))?;
+        self.statement(&cursor.query)
     }
 
     /// Walks a block, starting each handler under the path the block's
@@ -159,10 +167,7 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
             }
             LoopControl::Query(query) => self.statement(query)?,
             LoopControl::Array(array) => self.expression(array)?,
-            LoopControl::Cursor { arguments, query, .. } => {
-                arguments.iter().try_for_each(|argument| self.expression(argument))?;
-                self.statement(query)?;
-            }
+            LoopControl::Cursor { cursor, .. } => self.opened(cursor)?,
             LoopControl::Dynamic(dynamic) => self.walker.dynamic(self.function, dynamic)?,
         }
         if let Some(found) = change {
@@ -236,6 +241,7 @@ fn each_sql<'s, B>(
         match node {
             Node::Statement(statement) => visit(Embedded::Statement(statement), None)?,
             Node::Dynamic(dynamic) => each_dynamic_sql(dynamic, visit)?,
+            Node::Open(cursor) => each_cursor_sql(cursor, visit)?,
             Node::Block(block) => {
                 defaults(block)
                     .try_for_each(|default| visit(Embedded::Expression(default), None))?;
@@ -265,12 +271,7 @@ fn each_sql<'s, B>(
                             visit(Embedded::Expression(step), None)?;
                         }
                     }
-                    LoopControl::Cursor { arguments, query, .. } => {
-                        arguments
-                            .iter()
-                            .try_for_each(|argument| visit(Embedded::Expression(argument), None))?;
-                        visit(Embedded::Statement(query), None)?;
-                    }
+                    LoopControl::Cursor { cursor, .. } => each_cursor_sql(cursor, visit)?,
                     LoopControl::Dynamic(dynamic) => each_dynamic_sql(dynamic, visit)?,
                 }
                 each_sql(&repeated.statements, visit)?;
@@ -309,4 +310,12 @@ fn each_dynamic_sql<'s, B>(
 ) -> ControlFlow<B> {
     visit(Embedded::Expression(&dynamic.command), Some(dynamic))?;
     dynamic.arguments.iter().try_for_each(|argument| visit(Embedded::Expression(argument), None))
+}
+
+fn each_cursor_sql<'s, B>(
+    cursor: &'s BoundCursor,
+    visit: &mut impl FnMut(Embedded<'s>, Option<&'s Dynamic>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    cursor.arguments.iter().try_for_each(|argument| visit(Embedded::Expression(argument), None))?;
+    visit(Embedded::Statement(&cursor.query), None)
 }
