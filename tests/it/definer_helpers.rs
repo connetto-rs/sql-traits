@@ -303,8 +303,26 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                             set.values().iter().map(ToString::to_string).collect();
                         format!(" AND {} IN ({})", set.column().column_name(), values.join(", "))
                     });
+                    let bounds: String = grant
+                        .time_bounds()
+                        .iter()
+                        .map(|bound| {
+                            let column = bound.column().column_name();
+                            let operator = match bound.comparison() {
+                                TimeComparison::Later => ">",
+                                TimeComparison::LaterOrEqual => ">=",
+                                TimeComparison::Earlier => "<",
+                                TimeComparison::EarlierOrEqual => "<=",
+                            };
+                            if bound.keeps_null() {
+                                format!(" AND ({column} IS NULL OR {column} {operator} now)")
+                            } else {
+                                format!(" AND {column} {operator} now")
+                            }
+                        })
+                        .collect();
                     format!(
-                        "{}.{} WHERE {} = {}{restriction}",
+                        "{}.{} WHERE {} = {}{restriction}{bounds}",
                         grant.table().table_name(),
                         grant.column().column_name(),
                         grant.caller_column().column_name(),
@@ -1648,4 +1666,199 @@ fn a_walk_needs_the_owner_to_read_the_key_and_the_parent_column() {
         groups_with(&database, &deployment, "read"),
         Err(HelperSetError::NotExempt { table, .. }) if table == "groups"
     ));
+}
+
+/// A grant table holding a start and an expiry, each `NULL` for a grant
+/// open at that end.
+const EXPIRING: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE TABLE docs (id TEXT PRIMARY KEY);
+CREATE TABLE doc_grants (
+  doc_id TEXT NOT NULL REFERENCES docs (id),
+  user_id TEXT NOT NULL,
+  starts_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ
+);
+GRANT SELECT ON doc_grants TO authz_owner;
+CREATE FUNCTION docs_live() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT g.doc_id FROM public.doc_grants g
+  WHERE g.user_id = current_setting('app.user_id', true)
+    AND g.starts_at <= now() AND (g.expires_at IS NULL OR g.expires_at > now())
+$$;
+CREATE FUNCTION docs_flipped() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT g.doc_id FROM public.doc_grants g
+  WHERE g.user_id = current_setting('app.user_id', true)
+    AND (current_timestamp >= g.starts_at OR g.starts_at IS NULL)
+    AND transaction_timestamp() <= g.expires_at
+$$;
+ALTER FUNCTION docs_live() OWNER TO authz_owner;
+ALTER FUNCTION docs_flipped() OWNER TO authz_owner;
+";
+
+/// Where a fixture time lies against the statement time, `NULL` for none.
+const INSTANTS: [Option<&str>; 4] = [None, Some("past"), Some("now"), Some("future")];
+
+/// The rank of a fixture time, the statement time being `now`.
+fn instant(name: &str) -> core::cmp::Ordering {
+    match name {
+        "past" => core::cmp::Ordering::Less,
+        "now" => core::cmp::Ordering::Equal,
+        "future" => core::cmp::Ordering::Greater,
+        other => panic!("no fixture time {other}"),
+    }
+}
+
+/// What a grant arm of [`EXPIRING`] returns to `caller` over one grant row
+/// to `alice` per start and expiry in [`INSTANTS`], each document named
+/// `<start>-<expiry>`, the way a translator checking at the statement time
+/// would answer it.
+fn evaluate_expiring(set: &HelperSet<'_, ParserDB>, caller: &str) -> Vec<String> {
+    let mut returned = Vec::new();
+    for start in INSTANTS {
+        for expiry in INSTANTS {
+            let row = [("starts_at", start), ("expires_at", expiry)];
+            let kept = set.arms().iter().any(|arm| {
+                let HelperArm::Grant(grant) = arm else { panic!("only grant arms") };
+                assert!(grant.restriction().is_none());
+                caller == "alice"
+                    && grant.time_bounds().iter().all(|bound| {
+                        let (_, time) = row
+                            .iter()
+                            .find(|(column, _)| *column == bound.column().column_name())
+                            .expect("a fixture column");
+                        time.map_or(bound.keeps_null(), |time| {
+                            let ordering = instant(time);
+                            match bound.comparison() {
+                                TimeComparison::Later => ordering.is_gt(),
+                                TimeComparison::LaterOrEqual => ordering.is_ge(),
+                                TimeComparison::Earlier => ordering.is_lt(),
+                                TimeComparison::EarlierOrEqual => ordering.is_le(),
+                            }
+                        })
+                    })
+            });
+            if kept {
+                returned.push(format!("{}-{}", start.unwrap_or("null"), expiry.unwrap_or("null")));
+            }
+        }
+    }
+    returned.sort();
+    returned
+}
+
+#[test]
+fn a_grant_arm_keeps_each_bound_against_the_statement_time() {
+    let database = postgres(EXPIRING);
+    let deployment = deployment();
+    // Measured on PostgreSQL 16.15 in one transaction, which holds the
+    // statement time, the `now` rows written at it.
+    let cases = [
+        (
+            "docs_live",
+            "doc_grants.doc_id WHERE user_id = app.user_id \
+             AND starts_at <= now AND (expires_at IS NULL OR expires_at > now)",
+            &["now-future", "now-null", "past-future", "past-null"][..],
+        ),
+        (
+            "docs_flipped",
+            "doc_grants.doc_id WHERE user_id = app.user_id \
+             AND (starts_at IS NULL OR starts_at <= now) AND expires_at >= now",
+            &["now-future", "now-now", "null-future", "null-now", "past-future", "past-now"][..],
+        ),
+    ];
+    for (helper, rendered, measured) in cases {
+        let set = answer(&database, &deployment, "public", helper, &[]).expect("answered");
+        assert_eq!(render(&set), rendered, "{helper}");
+        assert_eq!(evaluate_expiring(&set, "alice"), measured, "{helper}");
+        assert!(evaluate_expiring(&set, "bob").is_empty(), "{helper}");
+    }
+}
+
+/// What `docs_with('read')` answers, rendered, with `condition` filtering
+/// its grant arm after the caller, over members holding times of every
+/// type, `after` following the helper.
+fn bounded(condition: &str, after: &str) -> Result<String, HelperSetError> {
+    let body = format!(
+        "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) AND ({condition})"
+    );
+    let sql = helper(DEFINER, &body, after).replace(
+        "user_id TEXT, role TEXT)",
+        "user_id TEXT, role TEXT, starts_at TIMESTAMPTZ, expires_at TIMESTAMPTZ, local_end TIMESTAMP, end_day DATE)",
+    );
+    let database = postgres(&sql);
+    let deployment = deployment();
+    answer(&database, &deployment, "public", "docs_with", &[text("read")]).map(|set| render(&set))
+}
+
+#[test]
+fn the_statement_time_is_read_in_every_spelling_postgres_takes_for_it() {
+    for (condition, expected) in [
+        ("expires_at > now()", "expires_at > now"),
+        ("expires_at > NOW()", "expires_at > now"),
+        ("expires_at > pg_catalog.now()", "expires_at > now"),
+        ("expires_at > \"pg_catalog\".now()", "expires_at > now"),
+        ("members.expires_at > CURRENT_TIMESTAMP", "expires_at > now"),
+        ("(expires_at) > (current_timestamp)", "expires_at > now"),
+        ("expires_at > transaction_timestamp()", "expires_at > now"),
+        ("expires_at >= now()", "expires_at >= now"),
+        ("now() < expires_at", "expires_at > now"),
+        ("now() <= expires_at", "expires_at >= now"),
+        ("now() > expires_at", "expires_at < now"),
+        ("now() >= expires_at", "expires_at <= now"),
+        ("expires_at IS NULL OR now() < expires_at", "(expires_at IS NULL OR expires_at > now)"),
+        (
+            "(expires_at > now()) OR (expires_at IS NULL)",
+            "(expires_at IS NULL OR expires_at > now)",
+        ),
+        (
+            "role IN ('admin', min_role) AND starts_at < now() AND expires_at > now()",
+            "role IN ('admin', 'read') AND starts_at < now AND expires_at > now",
+        ),
+    ] {
+        assert_eq!(
+            bounded(condition, "").expect("answered"),
+            format!("{ROLES} AND {expected}"),
+            "{condition}"
+        );
+    }
+    assert_eq!(
+        bounded("role = 'admin' AND role = 'write' AND expires_at > now()", "").expect("answered"),
+        "",
+        "an arm whose literals keep no row is left out whatever its bounds"
+    );
+}
+
+#[test]
+fn a_time_condition_no_bound_represents_is_irreducible() {
+    for condition in [
+        "expires_at > statement_timestamp()",
+        "expires_at > clock_timestamp()",
+        "expires_at > localtimestamp",
+        "expires_at > current_timestamp(3)",
+        "expires_at > now() + interval '1 day'",
+        "expires_at > app.now()",
+        "expires_at = now()",
+        "expires_at <> now()",
+        "now() = expires_at",
+        "local_end > now()",
+        "end_day > now()",
+        "starts_at < expires_at",
+        "expires_at IS NULL",
+        "expires_at IS NULL OR starts_at > now()",
+        "expires_at > now() OR expires_at > now()",
+        "role = 'admin' OR expires_at > now()",
+        "NOT expires_at <= now()",
+    ] {
+        assert!(
+            matches!(bounded(condition, ""), Err(HelperSetError::Irreducible { .. })),
+            "{condition}"
+        );
+    }
+    let shadow = "CREATE FUNCTION now() RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS 'SELECT NULL';";
+    assert!(
+        matches!(bounded("expires_at > now()", shadow), Err(HelperSetError::Irreducible { .. })),
+        "a declared now the call may reach is not PostgreSQL's"
+    );
 }

@@ -1205,9 +1205,12 @@ pub enum HelperSetError {
         /// The parameter.
         parameter: String,
     },
-    /// A grant arm's condition, its arguments substituted, reduces to
-    /// neither `TRUE` nor a set of literal values of one column.
-    #[error("helper `{function}` filters by `{condition}`, which reduces to no literal set")]
+    /// A grant arm's condition, its arguments substituted and its bounds on
+    /// the statement time set aside, reduces to neither `TRUE` nor a set of
+    /// literal values of one column.
+    #[error(
+        "helper `{function}` filters by `{condition}`, which reduces to neither a literal set nor a time bound"
+    )]
     Irreducible {
         /// The helper.
         function: String,
