@@ -191,6 +191,45 @@ fn derived_outputs_and_domains_take_their_definition_types() {
     );
 }
 
+/// A scalar subquery takes the type and modifier of its one output column,
+/// a wildcard's included, and an untyped literal output takes `text`, as a
+/// view over it reports with `format_type`. A subquery of several columns,
+/// which PostgreSQL refuses as an expression, and one over a wildcard it
+/// cannot enumerate take no type.
+#[test]
+fn scalar_subqueries_take_their_output_columns_type() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE docs (title VARCHAR(5)); CREATE TABLE pair (a INT, b INT);",
+    )
+    .unwrap();
+    let query = query(
+        "SELECT (SELECT title FROM docs), (SELECT * FROM docs), (SELECT title AS t FROM docs),
+                (SELECT 'x'), (SELECT NULL),
+                (SELECT a, b FROM pair), (SELECT * FROM generate_series(1, 2))",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let varchar = OperandType::Known {
+        type_name: TargetName::new("varchar", false).with_schema("pg_catalog", false),
+        typmod: Some(9),
+    };
+    let types = projected(&query)
+        .into_iter()
+        .map(|subquery| context.type_of(subquery).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        types,
+        [
+            varchar.clone(),
+            varchar.clone(),
+            varchar,
+            pg("text"),
+            pg("text"),
+            OperandType::Unknown,
+            OperandType::Unknown
+        ]
+    );
+}
+
 /// A column whose modifier the model cannot encode leaves its type unknown.
 #[test]
 fn an_unencodable_modifier_leaves_the_type_unknown() {
@@ -587,13 +626,13 @@ fn in_lists_collapse_the_elements_free_of_their_own_columns() {
             some(&["= ANY [1, 2]", "= (SELECT j)::INT4"]),
             some(&["= ANY [1, (SELECT u.k FROM u)::INT4, 2]"]),
             some(&["= 1", "= 2", "= 'a'::TEXT"]),
-            None,
+            some(&["= ANY [1, (SELECT u.k FROM u), 2]"]),
         ]
     );
     let types: Vec<_> = nodes.iter().map(|node| context.type_of(node).unwrap()).collect();
-    assert!(types[..10].iter().all(|operand| *operand == pg("bool")));
+    assert!(types[..10].iter().chain(&types[11..]).all(|operand| *operand == pg("bool")));
     // No `=` takes `int4` and `text`.
-    assert_eq!(types[10..], [OperandType::Unknown, OperandType::Unknown]);
+    assert_eq!(types[10], OperandType::Unknown);
 
     // `i IN (1, 2.5)` compares `numeric` with `numeric`, converting `i`.
     let applications = context.operators(nodes[5]).unwrap().unwrap();
