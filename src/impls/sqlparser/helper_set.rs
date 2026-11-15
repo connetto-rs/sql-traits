@@ -109,11 +109,14 @@ enum Equality {
 }
 
 /// `current_setting('<name>'[, <missing_ok>])`, resolved to PostgreSQL's own
-/// function.
+/// function, or that read through `NULLIF(<read>, '')`.
 struct SettingRead {
     name: String,
     /// Whether the body reads the setting without `missing_ok`.
     raises_when_unset: bool,
+    /// Whether the body reads it through `NULLIF(<read>, '')`, which reads
+    /// `''` as `NULL`.
+    empty_as_null: bool,
 }
 
 /// A value the body passes: the literal it compares as and the value a
@@ -130,6 +133,8 @@ struct GateRead<'db> {
     raises_when_unset: bool,
     /// Whether the conjunct casts the setting to its declared type.
     in_declared_type: bool,
+    /// Whether the conjunct reads the setting through `NULLIF(<read>, '')`.
+    empty_as_null: bool,
     /// The value `<>` excludes, `None` for `IS NOT NULL`.
     excluded: Option<Passed>,
 }
@@ -138,6 +143,8 @@ struct GateRead<'db> {
 #[derive(Default)]
 struct Gates<'db> {
     gate: Option<CallerGate<'db>>,
+    /// Whether the gates read the setting through `NULLIF(<read>, '')`.
+    empty_as_null: bool,
     /// The literals the gate excludes, beside the values it hands over.
     excluded: Vec<Literal>,
     /// Whether one excludes `NULL`, which keeps no row.
@@ -146,24 +153,32 @@ struct Gates<'db> {
 
 impl<'db> Gates<'db> {
     /// Merges `read`, `false` where it reads another setting than the gates
-    /// merged before it, or reads it in another type.
+    /// merged before it, or reads it in another type or another spelling.
     fn add(&mut self, read: GateRead<'db>) -> bool {
+        if self.gate.is_none() {
+            self.empty_as_null = read.empty_as_null;
+        }
         let gate = self.gate.get_or_insert_with(|| {
             CallerGate {
                 setting: read.setting,
                 raises_when_unset: false,
                 in_declared_type: read.in_declared_type,
+                excludes_unset: read.empty_as_null,
                 excluded: Vec::new(),
             }
         });
         if !core::ptr::eq(gate.setting, read.setting)
             || gate.in_declared_type != read.in_declared_type
+            || self.empty_as_null != read.empty_as_null
         {
             return false;
         }
         gate.raises_when_unset |= read.raises_when_unset;
         match read.excluded {
             Some(Passed { literal: Literal::Null, .. }) => self.keeps_nothing = true,
+            Some(Passed { literal: Literal::Text(text), .. }) if text.is_empty() => {
+                gate.excludes_unset = true;
+            }
             Some(Passed { literal, value }) if !self.excluded.contains(&literal) => {
                 self.excluded.push(literal);
                 gate.excluded.push(value);
@@ -1161,6 +1176,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             setting,
             raises_when_unset: read.raises_when_unset,
             in_declared_type: cast.is_some(),
+            empty_as_null: read.empty_as_null,
             excluded,
         }))
     }
@@ -1283,6 +1299,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 setting: read.name,
             });
         };
+        // `string_to_array('', <delimiter>)` is an empty array.
+        let excludes_unset =
+            read.empty_as_null || matches!(packing, Some(SetPacking::Delimited(_)));
         let refuse = |reason: fn(String, String) -> HelperSetError| {
             Err(reason(scope.name.clone(), setting.name().to_string()))
         };
@@ -1319,7 +1338,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 cast: cast.written.to_string(),
             });
         }
-        Ok(Some(SettingComparison { column, setting, raises_when_unset: read.raises_when_unset }))
+        Ok(Some(SettingComparison {
+            column,
+            setting,
+            raises_when_unset: read.raises_when_unset,
+            excludes_unset,
+        }))
     }
 
     /// Whether `cast`, as the helper's path resolves it, is `declared`, the
@@ -1434,23 +1458,43 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         else {
             return None;
         };
-        let Expr::Function(read) = unnest(read) else { return None };
         Some(SetRead {
-            read: self.setting_read(scope, read)?,
+            read: self.setting_expression(scope, read)?,
             packing: SetPacking::JsonArray,
             cast,
         })
     }
 
-    /// The setting an argument reads, written as `current_setting(...)`.
+    /// The setting an argument reads, written as `current_setting(...)`,
+    /// optionally through `NULLIF(<read>, '')`.
     fn setting_argument(
         &self,
         scope: &Scope<'db, DB>,
         argument: &FunctionArg,
     ) -> Option<SettingRead> {
         let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else { return None };
-        let Expr::Function(call) = unnest(argument) else { return None };
-        self.setting_read(scope, call)
+        self.setting_expression(scope, argument)
+    }
+
+    /// The setting `expression` reads, `current_setting(...)` or
+    /// `NULLIF(current_setting(...), '')`.
+    fn setting_expression(&self, scope: &Scope<'db, DB>, expression: &Expr) -> Option<SettingRead> {
+        let Expr::Function(call) = unnest(expression) else { return None };
+        if expression_form(&call.name) != Some(ExpressionForm::NullIf) {
+            return self.setting_read(scope, call);
+        }
+        let [
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(read)),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(empty))),
+        ] = plain_arguments(call)?.args.as_slice()
+        else {
+            return None;
+        };
+        let Expr::Function(read) = unnest(read) else { return None };
+        if Literal::of(&empty.value) != Some(Literal::Text(String::new())) {
+            return None;
+        }
+        Some(SettingRead { empty_as_null: true, ..self.setting_read(scope, read)? })
     }
 
     fn operand<'q>(
@@ -1472,8 +1516,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     Operand::Passed(Passed { literal, value: value.value.clone() })
                 })
             }
-            Expr::Function(call) => {
-                self.setting_read(scope, call)
+            Expr::Function(_) => {
+                self.setting_expression(scope, expression)
                     .map_or(Operand::Other, |read| Operand::Setting { read, cast: None })
             }
             Expr::Cast {
@@ -1513,7 +1557,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             _ => return None,
         };
         let Literal::Text(name) = name else { return None };
-        Some(SettingRead { name, raises_when_unset })
+        Some(SettingRead { name, raises_when_unset, empty_as_null: false })
     }
 
     /// The arguments of `call` where it calls PostgreSQL's own `name`, in
