@@ -372,7 +372,7 @@ impl ParserDBBuilder {
         if let Some((trigger, _)) = self
             .triggers()
             .iter()
-            .find(|(trigger, calls)| calls_dropped(calls) || runs_dropped(trigger))
+            .find(|(trigger, metadata)| calls_dropped(metadata.calls()) || runs_dropped(trigger))
         {
             return Some(Holder::new(
                 ObjectKind::Trigger,

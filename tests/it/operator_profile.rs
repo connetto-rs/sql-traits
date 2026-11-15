@@ -745,6 +745,16 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn parent_trigger<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Trigger>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.unreach()
+    }
+
     fn function<'db>(
         &'db self,
         _database: &'db Self::DB,

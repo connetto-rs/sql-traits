@@ -278,9 +278,9 @@ pub(super) fn move_functions(
         }
     }
     let case = builder.identifier_case();
-    for (trigger, calls) in builder.triggers_mut() {
-        if moves.reached_by(calls) {
-            respell(&mut Arc::make_mut(trigger).condition, calls, moves)?;
+    for (trigger, metadata) in builder.triggers_mut() {
+        if moves.reached_by(metadata.calls()) {
+            respell(&mut Arc::make_mut(trigger).condition, metadata.calls(), moves)?;
         }
         // A trigger holds the name of the function it runs, bound at creation
         // and left bare for one in the default schema.

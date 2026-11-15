@@ -160,6 +160,7 @@ fn a_trigger_name_on_two_tables_names_each_tables_own_trigger() {
             let calls: Vec<&str> = db
                 .trigger_metadata(trigger)
                 .expect("the trigger is held")
+                .calls()
                 .functions()
                 .map(FunctionLike::name)
                 .collect();

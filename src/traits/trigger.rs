@@ -425,6 +425,57 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// ```
     fn condition(&self) -> Option<&sqlparser::ast::Expr>;
 
+    /// Returns the trigger this one is the partition's copy of.
+    ///
+    /// PostgreSQL copies a `FOR EACH ROW` trigger on a partitioned table onto
+    /// each of its partitions, under the same name, and the copies on a
+    /// partitioned partition onto its own partitions in turn. The copy is
+    /// answered with the trigger on the partitioned table directly above it,
+    /// and any other trigger with [`None`].
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance holding the trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this trigger, and the errors of [`Self::table`] when the table
+    /// holding a copy cannot be found.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE events (id INT) PARTITION BY RANGE (id);
+    /// CREATE TABLE events_low PARTITION OF events FOR VALUES FROM (0) TO (10);
+    /// CREATE FUNCTION audit() RETURNS TRIGGER AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
+    /// CREATE TRIGGER audit AFTER INSERT ON events FOR EACH ROW EXECUTE FUNCTION audit();
+    /// ",
+    /// )?;
+    /// let low = db
+    ///     .table_by_target(TargetName::new("events_low", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// let copy = low.triggers(&db)?.next().unwrap();
+    /// let parent = copy.parent_trigger(&db)?.unwrap();
+    /// assert_eq!(parent.name(), "audit");
+    /// assert_eq!(parent.table(&db)?.table_name(), "events");
+    /// assert!(parent.parent_trigger(&db)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn parent_trigger<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Trigger>, LookupError>
+    where
+        Self: 'db;
+
     /// Returns the function the trigger executes.
     ///
     /// # Arguments
@@ -697,6 +748,16 @@ impl<T: TriggerLike> TriggerLike for &T {
 
     fn condition(&self) -> Option<&sqlparser::ast::Expr> {
         (*self).condition()
+    }
+
+    fn parent_trigger<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Trigger>, LookupError>
+    where
+        Self: 'db,
+    {
+        (*self).parent_trigger(database)
     }
 
     fn function<'db>(

@@ -160,7 +160,7 @@ impl ParserDBBuilder {
             .iter()
             .flat_map(|(_, metadata)| [metadata.using_calls(), metadata.check_calls()]);
         let rules = self.rules().iter().map(|(_, calls)| calls);
-        let triggers = self.triggers().iter().map(|(_, calls)| calls);
+        let triggers = self.triggers().iter().map(|(_, metadata)| metadata.calls());
         let functions = self.functions().iter().map(|(_, metadata)| metadata.body_calls());
         let domains = self.domains().iter().map(|(_, metadata)| metadata.calls());
         let tables = self.tables().iter().flat_map(|(_, metadata, _)| {
@@ -216,8 +216,8 @@ impl ParserDBBuilder {
         for (_, calls) in self.rules_mut() {
             calls.settle_on_built_ins();
         }
-        for (_, calls) in self.triggers_mut() {
-            calls.settle_on_built_ins();
+        for (_, metadata) in self.triggers_mut() {
+            metadata.calls_mut().settle_on_built_ins();
         }
         for (_, metadata) in self.functions_mut() {
             metadata.body_calls_mut().settle_on_built_ins();
@@ -272,8 +272,8 @@ impl ParserDBBuilder {
         for (rule, calls) in self.rules_mut() {
             settle(calls, &**rule, selections, refuse)?;
         }
-        for (trigger, calls) in self.triggers_mut() {
-            settle(calls, &trigger.condition, selections, refuse)?;
+        for (trigger, metadata) in self.triggers_mut() {
+            settle(metadata.calls_mut(), &trigger.condition, selections, refuse)?;
         }
         for (function, metadata) in self.functions_mut() {
             settle(metadata.body_calls_mut(), &function.function_body, selections, false)?;
@@ -361,8 +361,8 @@ impl ParserDBBuilder {
                 select.roots(&**rule, &ExpressionScope::Rule { table, event: rule.event });
             }
         }
-        for (trigger, calls) in self.triggers() {
-            if let (true, Ok(table)) = (is_waiting(calls), trigger.table(database)) {
+        for (trigger, metadata) in self.triggers() {
+            if let (true, Ok(table)) = (is_waiting(metadata.calls()), trigger.table(database)) {
                 select.roots(&trigger.condition, &ExpressionScope::Trigger(table));
             }
         }

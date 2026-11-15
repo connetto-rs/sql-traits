@@ -3623,6 +3623,46 @@ pub enum Error {
         /// Name of the table carrying it.
         table_name: String,
     },
+    #[error(
+        "Trigger `{trigger_name}` on table `{table_name}` is the partition's copy of the trigger \
+         on table `{parent_table_name}`, so only dropping that one drops it."
+    )]
+    /// Error indicating that a `DROP TRIGGER` statement names the copy
+    /// PostgreSQL keeps on a partition of a row trigger on the partitioned
+    /// table above it, which only goes with the trigger it copies.
+    ClonedTriggerDropped {
+        /// Name of the trigger.
+        trigger_name: String,
+        /// Name of the partition carrying the copy.
+        table_name: String,
+        /// Name of the partitioned table carrying the trigger it copies.
+        parent_table_name: String,
+    },
+    #[error(
+        "Trigger `{trigger_name}` on table `{table_name}` is the partition's copy of a trigger \
+         on a partitioned table and cannot be replaced."
+    )]
+    /// Error indicating that a `CREATE OR REPLACE TRIGGER` statement names the
+    /// copy PostgreSQL keeps on a partition of a row trigger on the
+    /// partitioned table above it.
+    ClonedTriggerReplaced {
+        /// Name of the trigger.
+        trigger_name: String,
+        /// Name of the partition carrying the copy.
+        table_name: String,
+    },
+    #[error(
+        "Constraint trigger `{trigger_name}` cannot be created on foreign table `{table_name}`."
+    )]
+    /// Error indicating that a constraint trigger would land on a foreign
+    /// table, whether written on it or copied onto it as a partition, which
+    /// PostgreSQL refuses.
+    ConstraintTriggerOnForeignTable {
+        /// Name of the trigger.
+        trigger_name: String,
+        /// Name of the foreign table.
+        table_name: String,
+    },
     #[error("Rule `{rule_name}` already exists on relation `{relation_name}`.")]
     /// Error indicating that a `CREATE RULE` statement names a rule the table
     /// or view already carries without `OR REPLACE`. A rule name is unique per

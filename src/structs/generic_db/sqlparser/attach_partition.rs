@@ -20,7 +20,7 @@ use super::{
     AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference, constraint_validity,
     existing_child, idents_match,
     inheritance::{self, ParentKind},
-    partition_bounds, stored_qualifier, views,
+    partition_bounds, stored_qualifier, triggers, views,
 };
 use crate::{
     errors::{Error, ObjectKind, UnattachablePartition},
@@ -135,6 +135,7 @@ pub(super) fn attach_partition(
     for column in &column_names {
         inheritance::mark_inherited(&mut builder, &partition, column);
     }
+    triggers::clone_onto_partition(&mut builder, &root, &partition)?;
 
     let mut frontier = vec![(partition, received)];
     while let Some((table, mut received)) = frontier.pop() {

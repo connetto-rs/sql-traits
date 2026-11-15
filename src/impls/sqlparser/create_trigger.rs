@@ -6,9 +6,9 @@ use alloc::borrow::Cow;
 use sqlparser::ast::{ArgMode, CreateTrigger};
 
 use crate::{
-    errors::LookupError,
-    structs::{ParserDB, TargetName},
-    traits::{DatabaseLike, FunctionLike, Metadata, TriggerLike},
+    errors::{LookupError, ObjectKind},
+    structs::{ParserDB, TargetName, metadata::TriggerMetadata},
+    traits::{DatabaseLike, FunctionLike, Metadata, TableLike, TriggerLike},
     utils::{
         identifier_resolution::stored_identifier,
         last_str,
@@ -25,9 +25,7 @@ fn in_schema(schema: Option<(&str, bool)>) -> Cow<'_, str> {
 }
 
 impl Metadata for CreateTrigger {
-    /// The calls of the trigger's `WHEN` condition, bound when it was
-    /// written.
-    type Meta = crate::structs::metadata::ExpressionCalls<sqlparser::ast::CreateFunction>;
+    type Meta = TriggerMetadata;
 }
 
 impl TriggerLike for CreateTrigger {
@@ -80,6 +78,27 @@ impl TriggerLike for CreateTrigger {
                 condition => condition,
             }
         })
+    }
+
+    /// The trigger of the same name on the table directly above the
+    /// partition, for a trigger ingestion recorded as its copy.
+    fn parent_trigger<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Trigger>, LookupError>
+    where
+        Self: 'db,
+    {
+        let metadata = database
+            .trigger_metadata(self)
+            .ok_or_else(|| ObjectKind::Trigger.not_in_database(self.name()))?;
+        if !metadata.is_clone() {
+            return Ok(None);
+        }
+        let Some(parent_table) = self.table(database)?.partition_root(database)? else {
+            return Ok(None);
+        };
+        Ok(database.trigger(self.name(), parent_table))
     }
 
     /// The function ingestion bound the trigger to, which takes no arguments

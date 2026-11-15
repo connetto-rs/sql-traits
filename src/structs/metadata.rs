@@ -26,5 +26,7 @@ pub(crate) use expression_calls::{
 mod policy_metadata;
 pub use policy_metadata::PolicyMetadata;
 pub(crate) use policy_metadata::{ClauseLiterals, UnreadableLiteral};
+mod trigger_metadata;
+pub use trigger_metadata::TriggerMetadata;
 mod view_metadata;
 pub use view_metadata::ViewMetadata;
