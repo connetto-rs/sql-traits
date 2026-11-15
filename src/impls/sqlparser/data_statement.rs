@@ -1311,9 +1311,9 @@ mod tests {
             let mut statement = parse_one("SELECT pg_catalog.lower('a')");
             let Statement::Query(query) = &mut statement else { panic!("expected a query") };
             let SetExpr::Select(select) = query.body.as_mut() else { panic!("expected a select") };
-            if let SelectItem::UnnamedExpr(Expr::Function(function)) = &mut select.projection[0] {
-                function.name = ObjectName(name);
-            }
+            let item = &mut select.projection[0];
+            let SelectItem::UnnamedExpr(Expr::Function(call)) = item else { panic!("a call") };
+            call.name = ObjectName(name);
             assert!(super::calls_user_code(&statement, &db), "{statement}");
         }
     }

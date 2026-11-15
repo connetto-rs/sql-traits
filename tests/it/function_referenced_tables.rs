@@ -539,12 +539,17 @@ fn a_call_to_a_user_function_hides_later_unqualified_names() {
                PERFORM helper();
               END LOOP;
              END
+         $$;
+         CREATE FUNCTION after_assigned() RETURNS INT LANGUAGE plpgsql AS $$
+             DECLARE x INT;
+             BEGIN x := helper(); RETURN (SELECT count(*) FROM docs); END
          $$;",
     );
     for (function, statement) in [
         ("after_helper", "SELECT helper()"),
         ("after_pinned", "SELECT pinned()"),
         ("helper_in_loop", "SELECT helper()"),
+        ("after_assigned", "SELECT helper()"),
     ] {
         assert!(
             matches!(
