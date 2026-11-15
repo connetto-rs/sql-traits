@@ -292,6 +292,11 @@ impl FunctionLike for CreateFunction {
     }
 
     #[inline]
+    fn is_leakproof(&self) -> bool {
+        self.leakproof == Some(true)
+    }
+
+    #[inline]
     fn security_mode(&self) -> FunctionSecurity {
         self.security.clone().unwrap_or(FunctionSecurity::Invoker)
     }

@@ -1231,6 +1231,10 @@ impl FunctionLike for MemoryFunction {
         false
     }
 
+    fn is_leakproof(&self) -> bool {
+        false
+    }
+
     fn security_mode(&self) -> FunctionSecurity {
         FunctionSecurity::Invoker
     }

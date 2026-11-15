@@ -11590,6 +11590,7 @@ impl ParserDB {
                                     action,
                                     AlterFunctionAction::Behavior(_)
                                         | AlterFunctionAction::CalledOnNull(_)
+                                        | AlterFunctionAction::Leakproof(_)
                                         | AlterFunctionAction::Security { .. }
                                         | AlterFunctionAction::Set(_)
                                         | AlterFunctionAction::Reset(_)
@@ -11617,6 +11618,9 @@ impl ParserDB {
                                     }
                                     AlterFunctionAction::CalledOnNull(called_on_null) => {
                                         function.called_on_null = Some(called_on_null);
+                                    }
+                                    AlterFunctionAction::Leakproof(leakproof) => {
+                                        function.leakproof = Some(leakproof);
                                     }
                                     AlterFunctionAction::Security { security, .. } => {
                                         function.security = Some(security);
