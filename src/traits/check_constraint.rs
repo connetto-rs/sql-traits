@@ -528,7 +528,7 @@ where
                 return Ok(Some(bound));
             }
 
-            if matches!(op, BinaryOperator::And) {
+            if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                 let l = check_text_length_bound_recursive(
                     database,
                     left,
@@ -545,37 +545,19 @@ where
                     visited_cols,
                     direction,
                 )?;
-                return Ok(match (l, r, direction) {
+                return Ok(match (op, l, r, direction) {
                     // AND + Upper: Minimize (most restrictive limit)
-                    (Some(a), Some(b), BoundDirection::Upper) => Some(core::cmp::min(a, b)),
-                    // AND + Lower: Maximize (most restrictive minimum)
-                    (Some(a), Some(b), BoundDirection::Lower) => Some(core::cmp::max(a, b)),
-                    (Some(a), None, _) => Some(a),
-                    (None, Some(b), _) => Some(b),
-                    _ => None,
-                });
-            }
-
-            if matches!(op, BinaryOperator::Or) {
-                let l = check_text_length_bound_recursive(
-                    database,
-                    left,
-                    check_constraint,
-                    target_col,
-                    visited_cols,
-                    direction,
-                )?;
-                let r = check_text_length_bound_recursive(
-                    database,
-                    right,
-                    check_constraint,
-                    target_col,
-                    visited_cols,
-                    direction,
-                )?;
-                return Ok(match (l, r, direction) {
                     // OR + Lower: Minimize (least restrictive minimum)
-                    (Some(a), Some(b), BoundDirection::Lower) => Some(core::cmp::min(a, b)),
+                    (BinaryOperator::And, Some(a), Some(b), BoundDirection::Upper)
+                    | (BinaryOperator::Or, Some(a), Some(b), BoundDirection::Lower) => {
+                        Some(core::cmp::min(a, b))
+                    }
+                    // AND + Lower: Maximize (most restrictive minimum)
+                    (BinaryOperator::And, Some(a), Some(b), BoundDirection::Lower) => {
+                        Some(core::cmp::max(a, b))
+                    }
+                    (BinaryOperator::And, Some(a), None, _) => Some(a),
+                    (BinaryOperator::And, None, Some(b), _) => Some(b),
                     _ => None,
                 });
             }
@@ -591,8 +573,52 @@ where
                 direction,
             )
         }
+        Expr::Between { expr, negated: false, low, high } => {
+            let (op, limit) = match direction {
+                BoundDirection::Upper => (BinaryOperator::LtEq, high),
+                BoundDirection::Lower => (BinaryOperator::GtEq, low),
+            };
+            get_length_bound(
+                database,
+                expr,
+                &op,
+                limit,
+                check_constraint,
+                target_col,
+                visited_cols,
+                direction,
+            )
+        }
         _ => Ok(None),
     }
+}
+
+/// Whether `length <op> limit` holds a textual column of `check_constraint`
+/// to a length of at least one, `limit` being a number literal.
+fn requires_nonzero_length<C>(
+    database: &C::DB,
+    length: &Expr,
+    op: &BinaryOperator,
+    limit: &Expr,
+    check_constraint: &C,
+) -> Result<bool, LookupError>
+where
+    C: CheckConstraintLike,
+{
+    if !matches!(limit, Expr::Value(_)) {
+        return Ok(false);
+    }
+    Ok(get_length_bound(
+        database,
+        length,
+        op,
+        limit,
+        check_constraint,
+        None,
+        &mut Vec::new(),
+        BoundDirection::Lower,
+    )?
+    .is_some_and(|bound| bound >= 1))
 }
 
 /// Helper function to recursively determine if an expression checks for a
@@ -629,6 +655,18 @@ where
                 }
             }
 
+            if requires_nonzero_length(database, left, op, right, check_constraint)?
+                || requires_nonzero_length(
+                    database,
+                    right,
+                    &swap_cmp_op(op),
+                    left,
+                    check_constraint,
+                )?
+            {
+                return Ok(true);
+            }
+
             if matches!(op, BinaryOperator::And) {
                 return Ok(check_not_empty_text_recursive(database, left, check_constraint)?
                     || check_not_empty_text_recursive(database, right, check_constraint)?);
@@ -637,6 +675,9 @@ where
             Ok(false)
         }
         Expr::Nested(inner) => check_not_empty_text_recursive(database, inner, check_constraint),
+        Expr::Between { expr, negated: false, low, .. } => {
+            requires_nonzero_length(database, expr, &BinaryOperator::GtEq, low, check_constraint)
+        }
         _ => Ok(false),
     }
 }
@@ -1423,8 +1464,10 @@ pub trait CheckConstraintLike:
     }
 
     /// Returns whether the check constraint checks that a textual column is not
-    /// empty (i.e., `col <> ''` or `col != ''`), or holds it to listed string
-    /// literals none of which is `''`.
+    /// empty (i.e., `col <> ''` or `col != ''`), holds its length to at least
+    /// one by a number literal (`length(col) >= 1`, `length(col) > 0` or
+    /// `length(col) BETWEEN 1 AND n`), or holds it to listed string literals
+    /// none of which is `''`.
     ///
     /// The listed forms are `col IN ('x', ...)`, `col = ANY (ARRAY['x', ...])`
     /// and an `OR` of `col = 'x'` equalities, read through casts to `TEXT` or
@@ -1458,14 +1501,15 @@ pub trait CheckConstraintLike:
     ///         chained TEXT CHECK (chained <> '' AND chained IS NOT NULL),
     ///         chained_or TEXT CHECK (chained_or <> '' OR chained_or = 'default'),
     ///         listed TEXT CHECK (listed IN ('read', 'write')),
-    ///         listed_empty TEXT CHECK (listed_empty IN ('read', ''))
+    ///         listed_empty TEXT CHECK (listed_empty IN ('read', '')),
+    ///         sized TEXT CHECK (length(sized) BETWEEN 1 AND 200)
     ///     );",
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
     /// let check_constraints: Vec<_> = table.check_constraints(&db)?.collect();
-    /// let [cc1, cc2, cc3, cc4, cc5, cc6, cc7] = &check_constraints.as_slice() else {
-    ///     panic!("Expected seven check constraints");
+    /// let [cc1, cc2, cc3, cc4, cc5, cc6, cc7, cc8] = &check_constraints.as_slice() else {
+    ///     panic!("Expected eight check constraints");
     /// };
     /// assert!(cc1.is_not_empty_text_constraint(&db)?);
     /// assert!(!cc2.is_not_empty_text_constraint(&db)?);
@@ -1474,6 +1518,7 @@ pub trait CheckConstraintLike:
     /// assert!(!cc5.is_not_empty_text_constraint(&db)?);
     /// assert!(cc6.is_not_empty_text_constraint(&db)?);
     /// assert!(!cc7.is_not_empty_text_constraint(&db)?);
+    /// assert!(cc8.is_not_empty_text_constraint(&db)?);
     /// # Ok(())
     /// # }
     /// ```
@@ -1489,6 +1534,7 @@ pub trait CheckConstraintLike:
     /// upper bound).
     /// - `length(col) < N` returns `Some(N)`
     /// - `length(col) <= N` returns `Some(N + 1)`
+    /// - `length(col) BETWEEN M AND N` returns `Some(N + 1)`
     /// - `col IN ('ab', 'abc')` returns `Some(4)`, one past the longest listed
     ///   literal in characters, under the forms and collations
     ///   [`Self::is_not_empty_text_constraint`] reads
@@ -1571,6 +1617,7 @@ pub trait CheckConstraintLike:
     /// accepted length).
     /// - `length(col) > N` returns `Some(N + 1)`
     /// - `length(col) >= N` returns `Some(N)`
+    /// - `length(col) BETWEEN N AND M` returns `Some(N)`
     /// - `col IN ('ab', 'abc')` returns `Some(2)`, the shortest listed literal
     ///   in characters, under the forms and collations
     ///   [`Self::is_not_empty_text_constraint`] reads
