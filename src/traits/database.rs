@@ -2425,6 +2425,65 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         self.column_grants().next().is_some()
     }
 
+    /// Returns whether `PUBLIC` would hold `EXECUTE` on a function `owner`
+    /// created now in `schema`, or `None` when the database does not know the
+    /// defaults it would start with.
+    ///
+    /// PostgreSQL gives `PUBLIC` `EXECUTE` on every new function unless the
+    /// creating role's `ALTER DEFAULT PRIVILEGES` say otherwise. The role's
+    /// default without `IN SCHEMA` replaces that built-in grant, and a default
+    /// limited to the schema can only add to it, so `ALTER DEFAULT PRIVILEGES
+    /// IN SCHEMA s REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` leaves `PUBLIC`
+    /// holding `EXECUTE` on the next function in `s`. The next function
+    /// `owner` creates in `schema` answers
+    /// [`FunctionLike::is_executable_by_public`] the same until a `GRANT` or
+    /// `REVOKE` reaches it.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner` - The role creating the function, named as
+    ///   [`FunctionLike::owner`] names it, `None` for the role an input runs as
+    ///   without naming it.
+    /// * `schema` - The name PostgreSQL stores for the schema the function
+    ///   would be created in.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let builtin = ParserDB::parse::<PostgreSqlDialect>("CREATE SCHEMA api;")?;
+    /// assert_eq!(builtin.new_function_executable_by_public(None, "api"), Some(true));
+    ///
+    /// let revoked = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE SCHEMA api;
+    /// ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+    /// ",
+    /// )?;
+    /// assert_eq!(revoked.new_function_executable_by_public(None, "api"), Some(false));
+    ///
+    /// let schema_only = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE SCHEMA api;
+    /// ALTER DEFAULT PRIVILEGES IN SCHEMA api REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+    /// ",
+    /// )?;
+    /// assert_eq!(schema_only.new_function_executable_by_public(None, "api"), Some(true));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn new_function_executable_by_public(
+        &self,
+        _owner: Option<&str>,
+        _schema: &str,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Iterates over the schemas the database holds, `public` among them while
     /// it exists.
     ///
