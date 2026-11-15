@@ -204,9 +204,9 @@ impl<'db> CallerGate<'db> {
     }
 }
 
-/// `<column> = current_setting(<caller>)`, or `<column>` compared with each
-/// element of a declared set, `<column> = ANY (<array>)` or `<column> IN
-/// (SELECT <elements>)`.
+/// `<column> = current_setting(<caller>)[::<declared type>]`, or `<column>`
+/// compared with each element of a declared set, `<column> = ANY (<array>)` or
+/// `<column> IN (SELECT <elements>)`.
 ///
 /// `<array>` is `string_to_array(current_setting(<set>), <delimiter>)`, the
 /// set packed as [`SetPacking::Delimited`](crate::structs::SetPacking) by

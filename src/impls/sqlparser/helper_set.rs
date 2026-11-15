@@ -37,10 +37,12 @@ use crate::{
         call_sites::{ExpressionForm, call_reaches, expression_form},
         identifier_resolution::{SearchPath, identifiers_match},
         object_name::{
-            Qualifier, object_name_last_part, qualifier_of, resolve_relation_object_name_on_path,
-            target_name_of_table,
+            PG_CATALOG, Qualifier, object_name_last_part, qualifier_of,
+            resolve_relation_object_name_on_path, target_name_of_table, type_search_path,
         },
+        postgres_types::PgType,
         scalar_family::ScalarFamily,
+        type_modifier,
         walk::walk_expressions,
     },
 };
@@ -437,10 +439,14 @@ impl<'db, DB: DatabaseLike> Kept<'db, DB> {
 }
 
 /// One side of a comparison in a grant arm.
-enum Operand<'db, DB: DatabaseLike> {
+enum Operand<'q, 'db, DB: DatabaseLike> {
     Column(&'db DB::Column),
     Passed(Passed),
-    Setting(SettingRead),
+    /// `current_setting(...)`, cast to `cast` where the body casts it.
+    Setting {
+        read: SettingRead,
+        cast: Option<&'q DataType>,
+    },
     Other,
 }
 
@@ -1061,14 +1067,16 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             Expr::IsNotNull(read) => (self.operand(scope, table, read)?, None),
             Expr::BinaryOp { left, op: BinaryOperator::NotEq, right } => {
                 match (self.operand(scope, table, left)?, self.operand(scope, table, right)?) {
-                    (read @ Operand::Setting(_), Operand::Passed(passed))
-                    | (Operand::Passed(passed), read @ Operand::Setting(_)) => (read, Some(passed)),
+                    (read @ Operand::Setting { cast: None, .. }, Operand::Passed(passed))
+                    | (Operand::Passed(passed), read @ Operand::Setting { cast: None, .. }) => {
+                        (read, Some(passed))
+                    }
                     _ => return Ok(None),
                 }
             }
             _ => return Ok(None),
         };
-        let Operand::Setting(read) = read else { return Ok(None) };
+        let Operand::Setting { read, cast: None } = read else { return Ok(None) };
         // A setting reads as `text`, which PostgreSQL compares with no
         // number or boolean.
         if excluded
@@ -1175,15 +1183,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         conjunct: &Expr,
     ) -> Result<Option<SettingComparison<'db, DB>>, HelperSetError> {
         let database = self.database;
-        let (column, read, packing) = match unnest(conjunct) {
+        let (column, read, packing, cast) = match unnest(conjunct) {
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
                 let sides = (self.operand(scope, table, left)?, self.operand(scope, table, right)?);
-                let ((Operand::Column(column), Operand::Setting(read))
-                | (Operand::Setting(read), Operand::Column(column))) = sides
+                let ((Operand::Column(column), Operand::Setting { read, cast })
+                | (Operand::Setting { read, cast }, Operand::Column(column))) = sides
                 else {
                     return Ok(None);
                 };
-                (column, read, None)
+                (column, read, None, cast)
             }
             Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
                 let (Some(column), Some((read, packing))) =
@@ -1191,7 +1199,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 else {
                     return Ok(None);
                 };
-                (column, read, Some(packing))
+                (column, read, Some(packing), None)
             }
             Expr::In { expr, target: InTarget::Subquery(query), negated: false, .. } => {
                 let (Some(column), Some((read, packing))) =
@@ -1199,7 +1207,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 else {
                     return Ok(None);
                 };
-                (column, read, Some(packing))
+                (column, read, Some(packing), None)
             }
             _ => return Ok(None),
         };
@@ -1213,7 +1221,17 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             Err(reason(scope.name.clone(), setting.name().to_string()))
         };
         match (packing, setting.content()) {
-            (None, SettingContent::Value(SettingValue::Caller(_))) => {}
+            (None, SettingContent::Value(SettingValue::Caller(declared))) => {
+                if let Some(cast) = cast
+                    && !self.is_declared_type(scope, cast, declared)
+                {
+                    return Err(HelperSetError::CallerCast {
+                        function: scope.name.clone(),
+                        setting: setting.name().to_string(),
+                        cast: cast.to_string(),
+                    });
+                }
+            }
             (None, _) => {
                 return refuse(|function, setting| {
                     HelperSetError::SettingNotCaller { function, setting }
@@ -1233,6 +1251,38 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
         }
         Ok(Some(SettingComparison { column, setting, raises_when_unset: read.raises_when_unset }))
+    }
+
+    /// Whether `cast`, as the helper's path resolves it, is `declared`, the
+    /// type a setting is declared in, whose canonical text the cast keeps.
+    fn is_declared_type(
+        &self,
+        scope: &Scope<'db, DB>,
+        cast: &DataType,
+        declared: &DataType,
+    ) -> bool {
+        let modifier = type_modifier::declared(cast);
+        let written = PgType::of(cast);
+        if modifier.is_none()
+            || modifier != type_modifier::declared(declared)
+            || written != PgType::of(declared)
+        {
+            return false;
+        }
+        // An unqualified name is looked up on the path, where a type of that
+        // name in a schema before `pg_catalog` is the one the cast reaches.
+        let qualified = matches!(cast, DataType::Custom(name, _) if name.0.len() > 1);
+        let (PgType::Catalog(name), false) = (written, qualified) else {
+            return true;
+        };
+        let path = || scope.usable_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
+        !type_search_path(path)
+            .take_while(|(schema, quoted)| !identifiers_match(schema, *quoted, PG_CATALOG, false))
+            .any(|(schema, quoted)| {
+                self.database
+                    .type_facts(TargetName::new(name, false).with_schema(schema, quoted))
+                    .is_some()
+            })
     }
 
     /// The setting `expression` builds an array of, with how it unpacks it:
@@ -1306,12 +1356,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         self.setting_read(scope, call)
     }
 
-    fn operand(
+    fn operand<'q>(
         &self,
         scope: &Scope<'db, DB>,
         table: &ArmTable<'_, 'db, DB>,
-        expression: &Expr,
-    ) -> Result<Operand<'db, DB>, HelperSetError> {
+        expression: &'q Expr,
+    ) -> Result<Operand<'q, 'db, DB>, HelperSetError> {
         let expression = unnest(expression);
         if let Some(column) = table.column(expression, self.database)? {
             return Ok(Operand::Column(column));
@@ -1319,17 +1369,27 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if let Some((passed, _)) = scope.parameter(expression) {
             return Ok(Operand::Passed(passed.clone()));
         }
-        match expression {
+        let (call, cast) = match expression {
             Expr::Value(value) => {
-                Ok(Literal::of(&value.value).map_or(Operand::Other, |literal| {
+                return Ok(Literal::of(&value.value).map_or(Operand::Other, |literal| {
                     Operand::Passed(Passed { literal, value: value.value.clone() })
-                }))
+                }));
             }
-            Expr::Function(call) => {
-                Ok(self.setting_read(scope, call).map_or(Operand::Other, Operand::Setting))
+            Expr::Function(call) => (call, None),
+            Expr::Cast {
+                kind: CastKind::Cast | CastKind::DoubleColon,
+                expr,
+                data_type,
+                format: None,
+            } => {
+                let Expr::Function(call) = unnest(expr) else { return Ok(Operand::Other) };
+                (call, Some(data_type))
             }
-            _ => Ok(Operand::Other),
-        }
+            _ => return Ok(Operand::Other),
+        };
+        Ok(self
+            .setting_read(scope, call)
+            .map_or(Operand::Other, |read| Operand::Setting { read, cast }))
     }
 
     /// `current_setting('<name>'[, <missing_ok>])`, resolved to PostgreSQL's

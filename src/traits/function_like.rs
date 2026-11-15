@@ -1803,9 +1803,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   either a comparison of a column with a value of the request or
     ///   `<column> IN (SELECT <helper>(<arguments>))`, the helper answered in
     ///   turn as a parent arm's is. The comparison is `<column> =
-    ///   current_setting('<setting>'[, <missing_ok>])` with a setting the
-    ///   deployment declares as the caller, or `<column>` compared with each
-    ///   element of a setting it declares as a set, unpacked as declared (see
+    ///   current_setting('<setting>'[, <missing_ok>])[::<type>]` with a setting
+    ///   the deployment declares as the caller, in `<type>` where the read is
+    ///   cast, or `<column>` compared with each element of a setting it
+    ///   declares as a set, unpacked as declared (see
     ///   [`SettingComparison`](crate::structs::SettingComparison)). An arm
     ///   naming no grantee returns the same rows for every request its gate
     ///   lets through. Conditions `current_setting('<setting>') <> <text>` and
