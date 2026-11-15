@@ -125,6 +125,23 @@ fn explaining_select_into_creates_nothing() {
     assert!(db.tables().all(|table| table.table_name() != "t"));
 }
 
+/// A query that writes no relation leaves the schema as it was, whether its
+/// leftmost `SELECT` has no `INTO`, the query is no `SELECT` at all, or the
+/// `INTO` names targets PostgreSQL's grammar does not take.
+#[test]
+fn a_query_without_a_relation_target_creates_nothing() {
+    for sql in [
+        "SELECT id FROM src;",
+        "SELECT id FROM src UNION SELECT 1;",
+        "VALUES (1);",
+        "SELECT 1, 2 INTO a, b;",
+    ] {
+        let db = parse(sql).unwrap_or_else(|error| panic!("{sql} got {error:?}"));
+        let names: Vec<&str> = db.tables().map(TableLike::table_name).collect();
+        assert_eq!(names, ["src"], "{sql}");
+    }
+}
+
 /// MySQL's `SELECT ... INTO` assigns variables and creates no table.
 #[test]
 fn select_into_creates_a_table_only_under_postgresql() {
