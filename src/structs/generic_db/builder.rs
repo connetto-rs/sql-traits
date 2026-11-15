@@ -622,7 +622,16 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self
     }
 
-    fn ensure_table_lookup_invariants(&self, table: &P::Table) -> Result<(), LookupError> {
+    /// Checks that adding `table` leaves every table lookup unambiguous.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::TableLookupConflict`] when `table` shares its
+    /// identity with a stored table, or would make a bare name reach two.
+    pub(crate) fn ensure_table_lookup_invariants(
+        &self,
+        table: &P::Table,
+    ) -> Result<(), LookupError> {
         let case = self.identifier_case;
         for (existing, _, _) in self.tables() {
             let existing = existing.as_ref();

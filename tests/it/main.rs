@@ -153,6 +153,7 @@ mod schema_usage;
 mod scope_identifier_context;
 mod search_path;
 mod search_path_creation;
+mod select_into_tables;
 #[cfg(feature = "canonicalize")]
 mod semantic_proofs;
 mod sequence_defaults;

@@ -12,10 +12,16 @@
 //! crate derives no type for an expression, so any other output leaves the
 //! column untyped and keeps the output it was created from, with the catalog
 //! the query read frozen, since PostgreSQL keeps no link from the table to it.
+//!
+//! PostgreSQL runs a top-level `SELECT … INTO t` as `CREATE TABLE t AS` over
+//! the same query, so that statement takes this path as well.
 
-use alloc::{borrow::ToOwned, string::ToString, sync::Arc, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
 
-use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, Ident};
+use sqlparser::ast::{
+    ColumnDef, ColumnOption, CreateTable, DataType, Expr, Ident, ObjectName, Query, Select,
+    SelectInto, SetExpr, Statement, helpers::stmt_create_table::CreateTableBuilder,
+};
 
 use super::{ParserDBBuilder, view_rewrites, views};
 use crate::{
@@ -59,28 +65,34 @@ fn copied_column(name: Ident, column: &ColumnDef) -> ColumnDef {
     ColumnDef { name, data_type, options }
 }
 
-/// Gives the node of a `CREATE TABLE … AS` statement the columns its query
-/// produces, answering the output each column without a declared type was
-/// created from, by the column's name.
+/// The columns the query of a `CREATE TABLE … AS` statement produces, before
+/// the statement's column list renames them.
+pub(super) struct QueryColumns {
+    columns: Vec<ColumnDef>,
+    /// The ordinals of the outputs reading no stored column.
+    computed: Vec<usize>,
+    creating: CreatingQuery,
+}
+
+/// Reads the columns the query of a `CREATE TABLE … AS` statement produces.
 ///
-/// A query whose outputs cannot all be counted and named, such as a wildcard
-/// over a set-returning function, leaves the node with the names its column
-/// list declares.
+/// Answers [`None`] for a statement that takes no columns from a query, and
+/// for a query whose outputs cannot all be counted and named, such as a
+/// wildcard over a set-returning function, which leaves the node with the
+/// names its column list declares.
 ///
 /// # Errors
 ///
-/// Returns [`Error::TableColumnListTooLong`] when the column list names more
-/// columns than the query produces, and the lookup errors reading the query
-/// raises.
-pub(super) fn apply_query(
+/// Returns the lookup errors reading the query raises.
+pub(super) fn query_columns(
     builder: &ParserDBBuilder,
-    create_table: &mut CreateTable,
-) -> Result<Vec<(Ident, ColumnCreation)>, Error> {
+    create_table: &CreateTable,
+) -> Result<Option<QueryColumns>, Error> {
     let Some(query) = create_table.query.as_deref() else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if !takes_query_columns(create_table) {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let mut bound = query.clone();
@@ -92,11 +104,11 @@ pub(super) fn apply_query(
     {
         let scope = ColumnScope::from_query(&bound, &read, IdentifierCase::AsWritten)?;
         let Some(outputs) = scope.scope_for_query(&bound) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         for (ordinal, output) in outputs.outputs().enumerate() {
             let QueryOutput::Column { name: Some((name, quoted)), definition } = output else {
-                return Ok(Vec::new());
+                return Ok(None);
             };
             output_names.push((name.to_owned(), quoted));
             let name =
@@ -113,14 +125,35 @@ pub(super) fn apply_query(
             }
         }
     }
+    Ok(Some(QueryColumns {
+        columns,
+        computed,
+        creating: CreatingQuery::new(bound, output_names, read),
+    }))
+}
 
+/// Gives the node of a `CREATE TABLE … AS` statement the columns
+/// [`query_columns`] read, renamed by its column list, and answers the output
+/// each column without a declared type was created from, by the column's name.
+///
+/// # Errors
+///
+/// Returns [`Error::TableColumnListTooLong`] when the column list names more
+/// columns than the query produces.
+pub(super) fn apply_query(
+    create_table: &mut CreateTable,
+    query: Option<QueryColumns>,
+) -> Result<Vec<(Ident, ColumnCreation)>, Error> {
+    let Some(QueryColumns { mut columns, computed, creating }) = query else {
+        return Ok(Vec::new());
+    };
     if create_table.columns.len() > columns.len() {
         return Err(Error::TableColumnListTooLong { table_name: create_table.name.to_string() });
     }
     for (column, declared) in columns.iter_mut().zip(core::mem::take(&mut create_table.columns)) {
         column.name = declared.name;
     }
-    let creating = Arc::new(CreatingQuery::new(bound, output_names, read));
+    let creating = Arc::new(creating);
     let creations = computed
         .into_iter()
         .map(|ordinal| {
@@ -129,4 +162,43 @@ pub(super) fn apply_query(
         .collect();
     create_table.columns = columns;
     Ok(creations)
+}
+
+/// The `CREATE TABLE … AS` statement PostgreSQL runs a `SELECT … INTO` as,
+/// with the `INTO` clause of the leftmost `SELECT` turned into the table it
+/// names, or the query unchanged when that `SELECT` writes no table.
+///
+/// MySQL's `SELECT … INTO` assigns variables and creates nothing, so the
+/// caller applies this to PostgreSQL alone.
+pub(super) fn select_into_table(mut query: Box<Query>) -> Statement {
+    let Some(select) = leftmost_select(&mut query.body) else {
+        return Statement::Query(query);
+    };
+    let Some(SelectInto { temporary, unlogged, targets, .. }) = select.into.take() else {
+        return Statement::Query(query);
+    };
+    // PostgreSQL's grammar takes exactly one relation name after `INTO`.
+    let name = match <[Expr; 1]>::try_from(targets) {
+        Ok([Expr::Identifier(ident)]) => ObjectName::from(vec![ident]),
+        Ok([Expr::CompoundIdentifier(parts)]) => ObjectName::from(parts),
+        _ => return Statement::Query(query),
+    };
+    Statement::CreateTable(
+        CreateTableBuilder::new(name)
+            .temporary(temporary)
+            .unlogged(unlogged)
+            .query(Some(query))
+            .build(),
+    )
+}
+
+/// The `SELECT` an `INTO` clause may sit on, the first one a set operation
+/// or a parenthesized query reaches.
+fn leftmost_select(body: &mut SetExpr) -> Option<&mut Select> {
+    match body {
+        SetExpr::Select(select) => Some(select),
+        SetExpr::Query(query) => leftmost_select(&mut query.body),
+        SetExpr::SetOperation { left, .. } => leftmost_select(left),
+        _ => None,
+    }
 }
