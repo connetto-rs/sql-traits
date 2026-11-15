@@ -9,11 +9,11 @@ use alloc::{
 };
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{ArgMode, Expr, Value, Visit};
+use sqlparser::ast::{ArgMode, Expr, Statement, Value, Visit};
 
 use crate::{
     errors::LookupError,
-    impls::SiteKey,
+    impls::{SiteKey, dql::scoped_roots::ScopedRoot},
     structs::{
         ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope,
         PlPgSqlVariable, VariableKind,
@@ -21,6 +21,34 @@ use crate::{
     traits::DatabaseLike,
     utils::walk::walk_expressions,
 };
+
+/// Which part of what a query or a dynamic command returns a definition
+/// assigns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Output {
+    /// The output column at this position, from 0, as each of several
+    /// targets and a lone scalar target take one.
+    Ordinal(usize),
+    /// The whole row, as a lone row or record target takes it.
+    Row,
+}
+
+/// Which rows of a query or a dynamic command a definition assigns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Rows {
+    /// The first row, as `INTO` assigns it. Without `STRICT`, a command
+    /// returning no row assigns a null instead, which this definition stands
+    /// for too. With `STRICT`, any row count but one raises an error and
+    /// assigns nothing.
+    First {
+        /// Whether `INTO STRICT` is written.
+        strict: bool,
+    },
+    /// Every row in turn, as a `FOR` loop assigns them to its targets. A
+    /// loop over no row assigns a null, which a [`DefinitionSource::Null`]
+    /// definition of the same targets stands for.
+    Each,
+}
 
 /// One step from a variable into the part of it a definition assigns.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +72,37 @@ pub enum TargetStep<'r> {
     },
 }
 
+/// What `GET DIAGNOSTICS` assigns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiagnosticsItem {
+    /// `ROW_COUNT`.
+    RowCount,
+    /// `PG_ROUTINE_OID`.
+    RoutineOid,
+    /// `PG_CONTEXT`.
+    Context,
+    /// `RETURNED_SQLSTATE`.
+    ReturnedSqlstate,
+    /// `COLUMN_NAME`.
+    ColumnName,
+    /// `CONSTRAINT_NAME`.
+    ConstraintName,
+    /// `PG_DATATYPE_NAME`.
+    DatatypeName,
+    /// `MESSAGE_TEXT`.
+    MessageText,
+    /// `TABLE_NAME`.
+    TableName,
+    /// `SCHEMA_NAME`.
+    SchemaName,
+    /// `PG_EXCEPTION_DETAIL`.
+    ExceptionDetail,
+    /// `PG_EXCEPTION_HINT`.
+    ExceptionHint,
+    /// `PG_EXCEPTION_CONTEXT`.
+    ExceptionContext,
+}
+
 /// Where the value a definition assigns comes from.
 #[derive(Debug, Clone, PartialEq)]
 #[expect(
@@ -51,23 +110,87 @@ pub enum TargetStep<'r> {
     reason = "a source is built once per write the walk meets and read in place, so boxing an \
               expression would add an allocation without saving one"
 )]
-pub enum DefinitionSource<'r> {
+pub enum DefinitionSource<'r, 'db> {
     /// The value an input argument, a trigger function's variable,
     /// `SQLSTATE` or `SQLERRM` holds when the function starts or its handler
     /// runs.
     Incoming,
-    /// The null a declaration without a default, an output argument and
-    /// `$0` hold.
+    /// The null a declaration without a default, an output argument, `$0`
+    /// and the targets of a `FOR` loop over no row hold.
     Null,
     /// The value of an expression, as an assignment or a declaration's
     /// default gives it.
     Value(Cow<'r, Expr>),
+    /// An output of a query PostgreSQL plans with the body, as `SELECT ...
+    /// INTO`, `INSERT ... RETURNING ... INTO`, a `FOR` loop over a query and
+    /// a `FOR` loop over a cursor declared with its query assign it.
+    QueryOutput {
+        /// The query, its `INTO` clause dropped.
+        statement: &'r Statement,
+        /// The part of each row assigned.
+        output: Output,
+        /// The rows assigned.
+        rows: Rows,
+    },
+    /// An output of SQL the body builds at run time, as `EXECUTE ... INTO`
+    /// and `FOR ... IN EXECUTE` assign it, which only running the command
+    /// tells.
+    DynamicOutput {
+        /// The expression whose value is the command.
+        command: Cow<'r, Expr>,
+        /// The `USING` expressions.
+        arguments: Vec<Cow<'r, Expr>>,
+        /// The part of each row assigned.
+        output: Output,
+        /// The rows assigned.
+        rows: Rows,
+    },
+    /// A row `FETCH` reads from a cursor, or a null when none is left, from
+    /// whichever query the cursor was opened with.
+    CursorOutput {
+        /// The cursor variable.
+        cursor: PlPgSqlVariable<'db>,
+        /// The part of the row assigned.
+        output: Output,
+    },
+    /// Every element or slice of an array in turn, as `FOREACH` assigns it.
+    ArrayElement {
+        /// The expression whose value is the array.
+        array: Cow<'r, Expr>,
+        /// The `SLICE` dimension, 0 for single elements.
+        slice: u32,
+        /// The part of each element assigned.
+        output: Output,
+    },
+    /// Every integer of a `FOR` loop's range in turn.
+    LoopIndex {
+        /// The first bound written.
+        lower: Cow<'r, Expr>,
+        /// The second bound written.
+        upper: Cow<'r, Expr>,
+        /// The `BY` step.
+        step: Option<Cow<'r, Expr>>,
+    },
     /// The cursor's own name, which a cursor declared with its query holds
     /// on entering its block.
     CursorName,
-    /// A value the walk does not trace, such as `FOUND`, a cursor parameter
-    /// and what `INTO`, `FETCH`, `GET DIAGNOSTICS`, `OPEN`, `CALL` and the
-    /// targets of a `FOR` or `FOREACH` loop assign.
+    /// A portal name PostgreSQL generates, which `OPEN` and a `FOR` loop
+    /// over a cursor give a cursor variable holding null.
+    PortalName,
+    /// What `GET DIAGNOSTICS` reads.
+    Diagnostics(DiagnosticsItem),
+    /// The value a procedure's `INOUT` or `OUT` parameter may return to the
+    /// variable `CALL` passes there. Every variable passed has one, listed
+    /// beside its earlier definitions, since the model holds no procedure
+    /// whose signature tells which parameters return a value.
+    CallOutput {
+        /// The `CALL`.
+        call: &'r Statement,
+        /// The argument's position among those written, from 0.
+        argument: usize,
+    },
+    /// A value nothing in the body tells, such as `FOUND` and a cursor
+    /// parameter.
     Unknown,
 }
 
@@ -89,7 +212,7 @@ pub(crate) enum Slot {
 pub(crate) struct Written<'r, 'db, DB: DatabaseLike> {
     pub(crate) variable: PlPgSqlVariable<'db>,
     pub(crate) part: Vec<TargetStep<'r>>,
-    pub(crate) source: DefinitionSource<'r>,
+    pub(crate) source: DefinitionSource<'r, 'db>,
     /// The names and path the SQL of the source is evaluated under, `None`
     /// for a source without SQL.
     pub(crate) scope: Option<PlPgSqlScope<'r, 'db, DB>>,
@@ -163,7 +286,7 @@ impl<'r, 'db, DB: DatabaseLike> ValueFlow<'r, 'db, DB> {
 }
 
 /// Where the value a variable holds before the body writes it comes from.
-fn entry_source(kind: &VariableKind) -> &'static DefinitionSource<'static> {
+fn entry_source(kind: &VariableKind) -> &'static DefinitionSource<'static, 'static> {
     match kind {
         VariableKind::Parameter { mode: ArgMode::Out, .. } | VariableKind::ReturnValue => {
             &DefinitionSource::Null
@@ -293,7 +416,7 @@ pub struct Definition<'r, 'db, DB: DatabaseLike> {
 
 #[derive(Debug, Clone)]
 enum DefinitionKind<'r, 'db, DB: DatabaseLike> {
-    Entry { variable: PlPgSqlVariable<'db>, source: &'static DefinitionSource<'static> },
+    Entry { variable: PlPgSqlVariable<'db>, source: &'static DefinitionSource<'static, 'static> },
     Written { index: usize, written: &'r Written<'r, 'db, DB> },
 }
 
@@ -334,7 +457,7 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
 
     /// Returns where the value the definition assigns comes from.
     #[must_use]
-    pub const fn source(&self) -> &DefinitionSource<'r> {
+    pub const fn source(&self) -> &DefinitionSource<'r, 'db> {
         match &self.kind {
             DefinitionKind::Entry { source, .. } => source,
             DefinitionKind::Written { written, .. } => &written.source,
@@ -358,29 +481,67 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
         }
     }
 
-    /// Returns the variables the expression of [`Self::source`] reads, each
-    /// once in the order first read, with the definitions that may reach
-    /// the point the body evaluates it. Identifiers compare under `case`. A
-    /// source without an expression reads nothing.
+    /// Returns the variables the SQL of [`Self::source`] reads, each once in
+    /// the order first read, with the definitions that may reach the point
+    /// the body evaluates it. Identifiers compare under `case`.
+    ///
+    /// A source without SQL reads nothing. A `FETCH` reads the query its
+    /// cursor was opened with, which the definition does not hold, and a
+    /// `CALL` reads the arguments it passes.
     ///
     /// # Errors
     ///
-    /// Returns the relation-name lookup errors building the context of the
-    /// expression runs into.
+    /// Returns the relation-name lookup errors building the contexts of the
+    /// source's SQL runs into.
     pub fn reads(
         &self,
         case: IdentifierCase,
     ) -> Result<Vec<VariableRead<'r, 'db, DB>>, LookupError> {
         let DefinitionKind::Written { written, .. } = &self.kind else { return Ok(Vec::new()) };
-        let (Some(scope), DefinitionSource::Value(value)) = (&written.scope, &written.source)
-        else {
-            return Ok(Vec::new());
-        };
+        let Some(scope) = &written.scope else { return Ok(Vec::new()) };
+        let mut roots = Vec::new();
+        match &written.source {
+            DefinitionSource::Value(value)
+            | DefinitionSource::ArrayElement { array: value, .. } => {
+                roots.push(ScopedRoot::Expression(value));
+            }
+            DefinitionSource::QueryOutput { statement, .. }
+            | DefinitionSource::CallOutput { call: statement, .. } => {
+                roots.push(ScopedRoot::Statement(statement));
+            }
+            DefinitionSource::DynamicOutput { command, arguments, .. } => {
+                roots.push(ScopedRoot::Expression(command));
+                roots.extend(arguments.iter().map(|argument| ScopedRoot::Expression(argument)));
+            }
+            DefinitionSource::LoopIndex { lower, upper, step } => {
+                let bounds = [lower, upper].into_iter().chain(step);
+                roots.extend(bounds.map(|bound| ScopedRoot::Expression(bound)));
+            }
+            DefinitionSource::Incoming
+            | DefinitionSource::Null
+            | DefinitionSource::CursorOutput { .. }
+            | DefinitionSource::CursorName
+            | DefinitionSource::PortalName
+            | DefinitionSource::Diagnostics(_)
+            | DefinitionSource::Unknown => {}
+        }
         let database = scope.database();
         let plpgsql = ExpressionScope::PlPgSql(scope);
-        let context = ExpressionContext::for_expression(value, &plpgsql, database, case)?;
         let mut variables = Vec::new();
-        read_variables(&context, scope, &**value, &mut variables)?;
+        for root in roots {
+            let context = ExpressionContext::for_root(root, &plpgsql, database, case)?;
+            match root {
+                ScopedRoot::Expression(expression) => {
+                    read_variables(&context, scope, expression, &mut variables)?;
+                }
+                ScopedRoot::Query(query) => {
+                    read_variables(&context, scope, query, &mut variables)?;
+                }
+                ScopedRoot::Statement(statement) => {
+                    read_variables(&context, scope, statement, &mut variables)?;
+                }
+            }
+        }
         Ok(self.flow.reaching(variables, written.inputs.as_ref()))
     }
 }

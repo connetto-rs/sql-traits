@@ -21,10 +21,11 @@ use sqlparser::ast::{
 };
 use sqlparser_plpgsql::{
     embedded::{
-        Assignment, Block, BoundCursor, Branch, Declaration, DeclarationKind, Diagnostics, Exit,
-        ExitKind, Indirection, Loop, LoopControl, Node, Open, RaiseLevel, Target, expression,
+        Assignment, Block, BoundCursor, Branch, Declaration, DeclarationKind, Diagnostics,
+        DiagnosticsKind, Dynamic, Exit, ExitKind, Indirection, Loop, LoopControl, Node, Open,
+        RaiseLevel, Target, expression,
     },
-    namespace::{Namespace, Site, Sql, Write, WriteSite},
+    namespace::{Name, NameKind, Namespace, Site, Sql, TriggerVariable, Write, WriteSite},
 };
 
 use super::{
@@ -35,7 +36,7 @@ use super::{
 use crate::{
     errors::LookupError,
     structs::{
-        DefinitionSource, PlPgSqlScope, PlPgSqlVariable, TargetStep,
+        DefinitionSource, DiagnosticsItem, Output, PlPgSqlScope, PlPgSqlVariable, Rows, TargetStep,
         plpgsql_flow::{Slot, State, ValueFlow, Written},
         plpgsql_scope::stored_parts,
     },
@@ -125,15 +126,19 @@ fn is_entry(slots: &BTreeSet<Slot>) -> bool {
 struct Resolved<'b, 'db> {
     variable: PlPgSqlVariable<'db>,
     part: Vec<TargetStep<'b>>,
+    /// Whether the target is a whole variable holding a row, which a lone
+    /// target of a query takes a whole row into.
+    row: bool,
 }
 
 /// A definition a write makes each time the walk passes it.
 struct Pending<'b, 'db, DB: DatabaseLike> {
-    /// The write's address and the target's position.
-    key: (usize, usize),
+    /// The write's address, the target's position and whether this is the
+    /// null a loop over no row assigns.
+    key: (usize, usize, bool),
     variable: PlPgSqlVariable<'db>,
     part: Vec<TargetStep<'b>>,
-    source: DefinitionSource<'b>,
+    source: DefinitionSource<'b, 'db>,
     scope: Option<PlPgSqlScope<'b, 'db, DB>>,
     /// Whether the definition replaces every earlier one of the variable,
     /// which only a write of the whole variable that surely assigns does.
@@ -173,7 +178,7 @@ struct Flow<'b, 'db, DB: DatabaseLike> {
     definitions: Vec<Written<'b, 'db, DB>>,
     /// The index of each definition among `definitions`, by its
     /// [`Pending::key`].
-    keys: BTreeMap<(usize, usize), usize>,
+    keys: BTreeMap<(usize, usize, bool), usize>,
     /// The definitions reaching each statement, expression and dynamic SQL
     /// where the body evaluates it.
     points: BTreeMap<SiteKey, State>,
@@ -214,7 +219,8 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     fn lookup(&self, namespace: &Namespace, parts: Vec<String>) -> Option<Resolved<'b, 'db>> {
         let (name, consumed) = namespace.lookup(&parts, |name| self.names.holds_row(name))?;
         let part: Vec<_> = parts.into_iter().skip(consumed).map(TargetStep::Field).collect();
-        Some(Resolved { variable: self.names.variable(name), part })
+        let row = part.is_empty() && holds_row(self.names, name);
+        Some(Resolved { variable: self.names.variable(name), part, row })
     }
 
     /// The variable `target` assigns in `namespace`, and the part of it.
@@ -226,6 +232,9 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         let parts = stored_parts(target.name.0.iter().filter_map(ObjectNamePart::as_ident));
         let mut resolved =
             self.lookup(namespace, parts).ok_or_else(|| self.unresolvable(&target.name))?;
+        if !target.indirection.is_empty() {
+            resolved.row = false;
+        }
         resolved.part.extend(target.indirection.iter().map(|step| {
             match step {
                 Indirection::Field(field) => {
@@ -245,30 +254,53 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         Ok(resolved)
     }
 
-    /// The value the write at `address` gives `targets`, which only running
-    /// the query, command or cursor `sql` it reads tells.
+    /// The definitions the write at `address` gives `targets`, each the
+    /// output `source` builds, evaluated under `scope`, or the null a loop
+    /// over no row assigns with `null`.
+    ///
+    /// A lone target holding a row takes the whole row, any other the
+    /// column at its position. With `whole`, a lone target takes the whole
+    /// value, as `FOREACH` assigns an element.
+    #[expect(clippy::too_many_arguments, reason = "each describes one side of the write")]
     fn targets(
         &self,
         address: usize,
         targets: &'b [Target],
+        whole: bool,
+        null: bool,
+        scope: Option<&PlPgSqlScope<'b, 'db, DB>>,
+        source: impl Fn(Output) -> DefinitionSource<'b, 'db>,
         sql: &dyn Display,
     ) -> Result<Vec<Pending<'b, 'db, DB>>, LookupError> {
         let namespace = &self.targets_namespace(address, sql)?.namespace;
-        targets
+        let resolved: Vec<_> = targets
             .iter()
+            .map(|target| self.target(namespace, target))
+            .collect::<Result<_, _>>()?;
+        let lone = match resolved.as_slice() {
+            [target] => whole || target.row,
+            _ => false,
+        };
+        Ok(resolved
+            .into_iter()
             .enumerate()
-            .map(|(position, target)| {
-                let Resolved { variable, part } = self.target(namespace, target)?;
-                Ok(Pending {
-                    key: (address, position),
+            .map(|(position, Resolved { variable, part, .. })| {
+                let (source, scope) = if null {
+                    (DefinitionSource::Null, None)
+                } else {
+                    let output = if lone { Output::Row } else { Output::Ordinal(position) };
+                    (source(output), scope.cloned())
+                };
+                Pending {
+                    key: (address, position, null),
                     variable,
                     part,
-                    source: DefinitionSource::Unknown,
-                    scope: None,
+                    source,
+                    scope,
                     kills: true,
-                })
+                }
             })
-            .collect()
+            .collect())
     }
 
     /// Makes the definition `pending`, whose source is evaluated where
@@ -369,7 +401,18 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 let key = SiteKey::of(Sql::Statement(statement));
                 self.evaluated(key, &state);
                 if let Some(into) = into {
-                    let writes = self.targets(address, &into.targets, statement)?;
+                    let scope = self.scope(key, statement)?;
+                    let rows = Rows::First { strict: into.strict };
+                    let source = |output| DefinitionSource::QueryOutput { statement, output, rows };
+                    let writes = self.targets(
+                        address,
+                        &into.targets,
+                        false,
+                        false,
+                        Some(&scope),
+                        source,
+                        statement,
+                    )?;
                     self.write_all(&writes, &mut state);
                 } else if let Statement::Call(_) = &**statement {
                     let writes = self.call(address, statement)?;
@@ -382,12 +425,34 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 self.evaluated(key, &state);
                 if let Some(into) = into {
                     let command = expression(&dynamic.command);
-                    let writes = self.targets(address, &into.targets, &command)?;
+                    let scope = self.scope(key, &command)?;
+                    let rows = Rows::First { strict: into.strict };
+                    let source = |output| dynamic_output(dynamic, output, rows);
+                    let writes = self.targets(
+                        address,
+                        &into.targets,
+                        false,
+                        false,
+                        Some(&scope),
+                        source,
+                        &command,
+                    )?;
                     self.write_all(&writes, &mut state);
                 }
             }
             Node::Fetch(fetch) => {
-                let writes = self.targets(address, &fetch.targets, &fetch.cursor)?;
+                let cursor = self.cursor(address, &fetch.cursor)?;
+                let source =
+                    |output| DefinitionSource::CursorOutput { cursor: cursor.clone(), output };
+                let writes = self.targets(
+                    address,
+                    &fetch.targets,
+                    false,
+                    false,
+                    None,
+                    source,
+                    &fetch.cursor,
+                )?;
                 self.write_all(&writes, &mut state);
             }
             Node::Diagnostics(diagnostics) => {
@@ -449,7 +514,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         let namespace = &self.targets_namespace(address, &target.name)?.namespace;
         let Resolved { variable, part, .. } = self.target(namespace, target)?;
         let pending = Pending {
-            key: (address, 0),
+            key: (address, 0, false),
             variable,
             part,
             source: DefinitionSource::Value(expression(value)),
@@ -460,8 +525,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         Ok(())
     }
 
-    /// Writes what `diagnostics` at `address` reads into its targets, which
-    /// only running the body tells.
+    /// Writes what `diagnostics` at `address` reads into its targets.
     fn diagnostics(
         &mut self,
         address: usize,
@@ -471,12 +535,12 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         let mut writes = Vec::new();
         for (position, item) in diagnostics.items.iter().enumerate() {
             let namespace = &self.targets_namespace(address, &item.target.name)?.namespace;
-            let Resolved { variable, part } = self.target(namespace, &item.target)?;
+            let Resolved { variable, part, .. } = self.target(namespace, &item.target)?;
             writes.push(Pending {
-                key: (address, position),
+                key: (address, position, false),
                 variable,
                 part,
-                source: DefinitionSource::Unknown,
+                source: DefinitionSource::Diagnostics(diagnostics_item(item.kind)),
                 scope: None,
                 kills: true,
             });
@@ -485,8 +549,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         Ok(())
     }
 
-    /// Writes the portal name `open` at `address` may give its cursor,
-    /// which only running the body tells.
+    /// Writes the portal name `open` at `address` may give its cursor.
     fn open(
         &mut self,
         address: usize,
@@ -504,10 +567,10 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         }
         // A cursor variable already naming a portal keeps its name.
         let pending = Pending {
-            key: (address, 0),
+            key: (address, 0, false),
             variable: self.cursor(address, open.cursor())?,
             part: Vec::new(),
-            source: DefinitionSource::Unknown,
+            source: DefinitionSource::PortalName,
             scope: None,
             kills: false,
         };
@@ -524,7 +587,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         let namespace = &self.targets_namespace(address, cursor)?.namespace;
         let parts = stored_parts(cursor.0.iter().filter_map(ObjectNamePart::as_ident));
         match self.lookup(namespace, parts) {
-            Some(Resolved { variable, part }) if part.is_empty() => Ok(variable),
+            Some(Resolved { variable, part, .. }) if part.is_empty() => Ok(variable),
             _ => Err(self.unresolvable(cursor)),
         }
     }
@@ -538,6 +601,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         address: usize,
         call: &'b Statement,
     ) -> Result<Vec<Pending<'b, 'db, DB>>, LookupError> {
+        let scope = self.scope(SiteKey::of(Sql::Statement(call)), call)?;
         let namespace = &self.targets_namespace(address, call)?.namespace;
         let mut writes = Vec::new();
         for (argument, mut passed) in call_arguments(call) {
@@ -557,15 +621,15 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 }
                 _ => continue,
             };
-            let Some(Resolved { variable, part }) = self.lookup(namespace, parts) else {
+            let Some(Resolved { variable, part, .. }) = self.lookup(namespace, parts) else {
                 continue;
             };
             writes.push(Pending {
-                key: (address, argument),
+                key: (address, argument, false),
                 variable,
                 part,
-                source: DefinitionSource::Unknown,
-                scope: None,
+                source: DefinitionSource::CallOutput { call, argument },
+                scope: Some(scope.clone()),
                 kills: false,
             });
         }
@@ -622,8 +686,14 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             return Err(self.unresolvable(&declaration.name));
         };
         let variable = self.names.variable(name);
-        let pending =
-            Pending { key: (address, 0), variable, part: Vec::new(), source, scope, kills: true };
+        let pending = Pending {
+            key: (address, 0, false),
+            variable,
+            part: Vec::new(),
+            source,
+            scope,
+            kills: true,
+        };
         self.write_all(core::slice::from_ref(&pending), state);
         Ok(())
     }
@@ -760,43 +830,93 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             let name = self.targets_namespace(address, &variable)?.declared.as_ref();
             name.map(|name| self.names.variable(name)).ok_or_else(|| self.unresolvable(&variable))
         };
-        let unknown = |position, variable, kills| {
-            Pending {
-                key: (address, position),
-                variable,
-                part: Vec::new(),
-                source: DefinitionSource::Unknown,
-                scope: None,
-                kills,
-            }
-        };
         Ok(match control {
             LoopControl::Unconditional | LoopControl::While(_) => (Vec::new(), Vec::new()),
-            LoopControl::Range { variable, .. } => {
-                (Vec::from([unknown(0, declared(variable)?, true)]), Vec::new())
+            LoopControl::Range { variable, lower, upper, step } => {
+                let pending = Pending {
+                    key: (address, 0, false),
+                    variable: declared(variable)?,
+                    part: Vec::new(),
+                    source: DefinitionSource::LoopIndex {
+                        lower: expression(lower),
+                        upper: expression(upper),
+                        step: step.as_deref().map(expression),
+                    },
+                    scope: Some(self.scope(query_key(lower), lower)?),
+                    kills: true,
+                };
+                (Vec::from([pending]), Vec::new())
             }
-            // A loop over no row assigns its targets a null, which the
-            // unknown value of a row stands for too.
             LoopControl::Query { targets, query } => {
-                (self.targets(address, targets, query)?, self.targets(address, targets, query)?)
+                let scope = self.scope(SiteKey::of(Sql::Statement(query)), query)?;
+                let source = |output| {
+                    DefinitionSource::QueryOutput { statement: query, output, rows: Rows::Each }
+                };
+                (
+                    self.targets(address, targets, false, false, Some(&scope), source, query)?,
+                    self.targets(address, targets, false, true, None, source, query)?,
+                )
             }
             LoopControl::Cursor { variable, cursor } => {
+                let query = &*cursor.query;
+                let row = Pending {
+                    key: (address, 0, false),
+                    variable: declared(variable)?,
+                    part: Vec::new(),
+                    source: DefinitionSource::QueryOutput {
+                        statement: query,
+                        output: Output::Row,
+                        rows: Rows::Each,
+                    },
+                    scope: Some(self.scope(SiteKey::of(Sql::Statement(query)), query)?),
+                    kills: true,
+                };
                 // A cursor variable holding null names the portal the loop
                 // opens until the loop ends, and keeps any other name.
-                let portal = unknown(1, self.cursor(address, &cursor.name)?, false);
-                (Vec::from([unknown(0, declared(variable)?, true), portal]), Vec::new())
+                let portal = Pending {
+                    key: (address, 1, false),
+                    variable: self.cursor(address, &cursor.name)?,
+                    part: Vec::new(),
+                    source: DefinitionSource::PortalName,
+                    scope: None,
+                    kills: false,
+                };
+                (Vec::from([row, portal]), Vec::new())
             }
             LoopControl::Dynamic { targets, dynamic } => {
                 let command = expression(&dynamic.command);
+                let scope = self.scope(SiteKey::of(Sql::Dynamic(dynamic)), &command)?;
+                let source = |output| dynamic_output(dynamic, output, Rows::Each);
                 (
-                    self.targets(address, targets, &command)?,
-                    self.targets(address, targets, &command)?,
+                    self.targets(address, targets, false, false, Some(&scope), source, &command)?,
+                    self.targets(address, targets, false, true, None, source, &command)?,
                 )
             }
-            LoopControl::Array { targets, array, .. } => {
-                (self.targets(address, targets, array)?, Vec::new())
+            LoopControl::Array { targets, slice, array } => {
+                let scope = self.scope(query_key(array), array)?;
+                let source = |output| {
+                    DefinitionSource::ArrayElement {
+                        array: expression(array),
+                        slice: *slice,
+                        output,
+                    }
+                };
+                (
+                    self.targets(address, targets, true, false, Some(&scope), source, array)?,
+                    Vec::new(),
+                )
             }
         })
+    }
+}
+
+/// What `dynamic` returns, the part `output` of the rows `rows`.
+fn dynamic_output(dynamic: &Dynamic, output: Output, rows: Rows) -> DefinitionSource<'_, 'static> {
+    DefinitionSource::DynamicOutput {
+        command: expression(&dynamic.command),
+        arguments: dynamic.arguments.iter().map(expression).collect(),
+        output,
+        rows,
     }
 }
 
@@ -821,4 +941,42 @@ fn call_arguments(call: &Statement) -> impl Iterator<Item = (usize, &Expr)> {
             }
         }
     })
+}
+
+/// Whether the variable `name` reaches holds a row, asking `names` for the
+/// variables whose declared type decides.
+fn holds_row<DB: DatabaseLike>(names: &BodyNames<'_, DB>, name: &Name) -> bool {
+    match name.kind() {
+        NameKind::LoopRecord { .. }
+        | NameKind::Trigger(TriggerVariable::New | TriggerVariable::Old) => true,
+        NameKind::Parameter { .. } | NameKind::CursorParameter { .. } => names.holds_row(name),
+        NameKind::Declared { declaration, .. } => {
+            matches!(declaration.kind, DeclarationKind::Variable(_)) && names.holds_row(name)
+        }
+        NameKind::ReturnValue
+        | NameKind::Trigger(_)
+        | NameKind::Found
+        | NameKind::LoopIndex { .. }
+        | NameKind::SqlState
+        | NameKind::SqlErrm => false,
+    }
+}
+
+/// The item `GET DIAGNOSTICS` reads as `kind`.
+const fn diagnostics_item(kind: DiagnosticsKind) -> DiagnosticsItem {
+    match kind {
+        DiagnosticsKind::RowCount => DiagnosticsItem::RowCount,
+        DiagnosticsKind::RoutineOid => DiagnosticsItem::RoutineOid,
+        DiagnosticsKind::Context => DiagnosticsItem::Context,
+        DiagnosticsKind::ReturnedSqlstate => DiagnosticsItem::ReturnedSqlstate,
+        DiagnosticsKind::ColumnName => DiagnosticsItem::ColumnName,
+        DiagnosticsKind::ConstraintName => DiagnosticsItem::ConstraintName,
+        DiagnosticsKind::DatatypeName => DiagnosticsItem::DatatypeName,
+        DiagnosticsKind::MessageText => DiagnosticsItem::MessageText,
+        DiagnosticsKind::TableName => DiagnosticsItem::TableName,
+        DiagnosticsKind::SchemaName => DiagnosticsItem::SchemaName,
+        DiagnosticsKind::ExceptionDetail => DiagnosticsItem::ExceptionDetail,
+        DiagnosticsKind::ExceptionHint => DiagnosticsItem::ExceptionHint,
+        DiagnosticsKind::ExceptionContext => DiagnosticsItem::ExceptionContext,
+    }
 }

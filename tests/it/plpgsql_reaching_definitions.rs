@@ -35,7 +35,23 @@ fn rendered(definition: &Definition<'_, '_, ParserDB>) -> String {
         DefinitionSource::Incoming => "incoming".to_owned(),
         DefinitionSource::Null => "null".to_owned(),
         DefinitionSource::Value(value) => value.to_string(),
+        DefinitionSource::QueryOutput { statement, output, rows } => {
+            format!("{output:?} {rows:?} of {statement}")
+        }
+        DefinitionSource::DynamicOutput { command, output, rows, .. } => {
+            format!("{output:?} {rows:?} of EXECUTE {command}")
+        }
+        DefinitionSource::CursorOutput { cursor, output } => {
+            format!("{output:?} of FETCH {}", cursor.name())
+        }
+        DefinitionSource::ArrayElement { array, slice, output } => {
+            format!("{output:?} slice {slice} of {array}")
+        }
+        DefinitionSource::LoopIndex { lower, upper, .. } => format!("{lower} .. {upper}"),
         DefinitionSource::CursorName => "cursor name".to_owned(),
+        DefinitionSource::PortalName => "portal name".to_owned(),
+        DefinitionSource::Diagnostics(item) => format!("{item:?}"),
+        DefinitionSource::CallOutput { call, argument } => format!("argument {argument} of {call}"),
         DefinitionSource::Unknown => "unknown".to_owned(),
     };
     let part: String = definition
@@ -228,7 +244,7 @@ fn a_field_write_keeps_the_rest_of_the_variable() {
               EXECUTE r.name;
              END"
         ),
-        [vec![read("r", &["unknown", ".name p"])]]
+        [vec![read("r", &["Row First { strict: false } of SELECT name FROM t", ".name p"])]]
     );
 }
 
@@ -255,47 +271,142 @@ fn control_transfers_skip_what_they_leave() {
     );
 }
 
-/// The writes the walk does not trace assign an unknown value, which
-/// replaces what a whole variable held unless the write may leave it.
+/// `SELECT ... INTO` assigns a query output, with its `STRICT` and the
+/// output position, and an `EXECUTE ... INTO` the command's result. The
+/// definition of a query output reads what the query reads.
 #[test]
-fn untraced_writes_assign_an_unknown_value() {
+fn into_assigns_query_and_command_outputs() {
     assert_eq!(
         reaching(
-            "DECLARE c CURSOR FOR SELECT name FROM t; k refcursor; s text := 'SELECT 1'; f text;
-              n integer; o text := 'SELECT 2'; e text := 'SELECT 3'; l text := 'SELECT 4';
-              g text; h text;
+            "DECLARE s text; n integer;
              BEGIN
-              SELECT name INTO s FROM t;
+              SELECT name, id INTO STRICT s, n FROM t WHERE name = p;
+              EXECUTE s USING n;
+              EXECUTE 'SELECT ' || p INTO s;
+              EXECUTE s;
+             END"
+        ),
+        [
+            vec![
+                read(
+                    "s",
+                    &["Ordinal(0) First { strict: true } of SELECT name, id FROM t WHERE name = p"]
+                ),
+                read(
+                    "n",
+                    &["Ordinal(1) First { strict: true } of SELECT name, id FROM t WHERE name = p"]
+                ),
+            ],
+            vec![read("p", &["incoming"])],
+            vec![read("s", &["Ordinal(0) First { strict: false } of EXECUTE 'SELECT ' || p"])],
+        ]
+    );
+    let database = database(
+        "DECLARE s text;
+         BEGIN SELECT name INTO s FROM t WHERE name = p; EXECUTE s; END",
+    );
+    let body = run(&database).dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let reads = sites[0].reads(IdentifierCase::Folded).unwrap();
+    let Reaching::Definitions(definitions) = reads[0].reaching() else { panic!("s is reached") };
+    assert_eq!(
+        spelled(&definitions[0].reads(IdentifierCase::Folded).unwrap()),
+        [read("p", &["incoming"])]
+    );
+}
+
+/// A `STRICT` query that raises assigns nothing, so its handler sees the
+/// earlier value beside the query output.
+#[test]
+fn a_strict_query_that_raises_leaves_the_earlier_value() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN
+              BEGIN
+               SELECT name INTO STRICT s FROM t;
+               PERFORM 1 / q;
+              EXCEPTION WHEN OTHERS THEN
+               EXECUTE s;
+              END;
+             END"
+        ),
+        [vec![read(
+            "s",
+            &["'SELECT 1'", "Ordinal(0) First { strict: true } of SELECT name FROM t"]
+        )]]
+    );
+}
+
+/// A loop over a query assigns its target each row, and a null when the
+/// query returns none. An empty `FOREACH` keeps what the target held.
+#[test]
+fn loops_over_rows_and_arrays_assign_their_targets() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1'; e text := 'SELECT 2';
+             BEGIN
+              FOR s IN SELECT name FROM t LOOP END LOOP;
+              FOREACH e IN ARRAY ARRAY[p] LOOP END LOOP;
+              EXECUTE s USING e;
+             END"
+        ),
+        [vec![
+            read("s", &["null", "Ordinal(0) Each of SELECT name FROM t"]),
+            read("e", &["'SELECT 2'", "Row slice 0 of ARRAY[p]"]),
+        ]]
+    );
+}
+
+/// A loop over a command's rows assigns each row, and a null when the
+/// command returns none.
+#[test]
+fn a_loop_over_a_command_assigns_each_row_or_a_null() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN
+              FOR s IN EXECUTE 'SELECT ' || p LOOP EXECUTE s; END LOOP;
+              EXECUTE s;
+             END"
+        ),
+        [
+            vec![read("p", &["incoming"])],
+            vec![read("s", &["Ordinal(0) Each of EXECUTE 'SELECT ' || p"])],
+            vec![read("s", &["null", "Ordinal(0) Each of EXECUTE 'SELECT ' || p"])],
+        ]
+    );
+}
+
+/// `FETCH`, `OPEN`, `GET DIAGNOSTICS` and `CALL` assign what they read,
+/// and a `CALL` adds what the procedure may return beside the earlier
+/// value.
+#[test]
+fn every_other_write_assigns_its_targets() {
+    assert_eq!(
+        reaching(
+            "DECLARE c CURSOR FOR SELECT name FROM t; k refcursor; s text; n integer;
+              o text := 'SELECT 1';
+             BEGIN
               OPEN c;
-              FETCH c INTO f;
+              FETCH c INTO s;
               GET DIAGNOSTICS n = ROW_COUNT;
               CALL fill(o, 'x', run.p, missing);
-              FOREACH e IN ARRAY ARRAY[p] LOOP END LOOP;
-              FOR l IN SELECT name FROM t LOOP END LOOP;
-              EXECUTE 'SELECT 5' INTO g;
-              FOR h IN EXECUTE 'SELECT 6' LOOP END LOOP;
               OPEN k FOR SELECT name FROM t;
-              OPEN k FOR EXECUTE 'SELECT 7';
-              ASSERT p IS NOT NULL;
-              EXECUTE s USING f, n, c, o, e, l, g, h, k, p;
+              OPEN k FOR EXECUTE 'SELECT 2';
+              FOR i IN 1..q LOOP EXECUTE s USING n, c, o, i, k, p; END LOOP;
              END"
         ),
         [
             vec![],
-            vec![],
-            vec![],
             vec![
-                read("s", &["unknown"]),
-                read("f", &["unknown"]),
-                read("n", &["unknown"]),
-                read("c", &["cursor name", "unknown"]),
-                read("o", &["'SELECT 2'", "unknown"]),
-                read("e", &["'SELECT 3'", "unknown"]),
-                read("l", &["unknown"]),
-                read("g", &["unknown"]),
-                read("h", &["unknown"]),
-                read("k", &["null", "unknown", "unknown"]),
-                read("p", &["incoming", "unknown"]),
+                read("s", &["Ordinal(0) of FETCH c"]),
+                read("n", &["RowCount"]),
+                read("c", &["cursor name", "portal name"]),
+                read("o", &["'SELECT 1'", "argument 0 of CALL fill(o, 'x', run.p, missing)"]),
+                read("i", &["1 .. q"]),
+                read("k", &["null", "portal name", "portal name"]),
+                read("p", &["incoming", "argument 2 of CALL fill(o, 'x', run.p, missing)"]),
             ],
         ]
     );
@@ -438,7 +549,7 @@ fn a_cursor_loop_names_its_portal_while_it_runs() {
               EXECUTE 'CLOSE ' || quote_ident(c);
              END"
         ),
-        [vec![read("c", &["NULL", "unknown"])], vec![read("c", &["NULL"])]]
+        [vec![read("c", &["NULL", "portal name"])], vec![read("c", &["NULL"])]]
     );
 }
 
