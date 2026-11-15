@@ -226,10 +226,9 @@ fn a_name_is_answered_once_for_each_object_it_reaches() {
         "CREATE SCHEMA app;
          CREATE TABLE app.items (v INT);
          CREATE TABLE public.items (v INT);
-         CREATE FUNCTION helper() RETURNS INT LANGUAGE sql RETURN 1;
          CREATE FUNCTION repeated() RETURNS VOID LANGUAGE sql AS $$
-             SELECT helper() FROM items, gone;
-             SELECT helper() FROM items, gone;
+             SELECT now() FROM items, gone;
+             SELECT now() FROM items, gone;
              SET search_path = app;
              DELETE FROM items;
          $$;",
@@ -252,7 +251,7 @@ fn a_name_is_answered_once_for_each_object_it_reaches() {
         .collect();
     assert_eq!(
         reached,
-        ["items: public.items", "gone: None", "helper(): 1 reached", "items: app.items"]
+        ["items: public.items", "gone: None", "now(): 1 reached", "items: app.items"]
     );
 }
 

@@ -461,7 +461,7 @@ fn calls_in_embedded_statements_are_resolved() {
          END $$;
          CREATE FUNCTION looped() RETURNS VOID LANGUAGE plpgsql AS $$
          BEGIN
-           LOOP PERFORM helper(); SET LOCAL search_path = app; END LOOP;
+           LOOP PERFORM now(); SET LOCAL search_path = app; END LOOP;
          END $$;",
     );
     assert_eq!(declared_called_by(&database, "caller").unwrap(), ["app.helper"]);

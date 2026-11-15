@@ -31,11 +31,12 @@ use super::plpgsql_body::walk_block;
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, UnqualifiedName},
-    traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
+    traits::{DataStatementLike, DatabaseLike, FunctionLike, Relation, TableLike, ViewLike},
     utils::{
-        identifier_resolution::SearchPath,
+        call_sites::for_each_call,
+        identifier_resolution::{SearchPath, identifiers_match},
         object_name::{
-            DEFAULT_SEARCH_PATH, Qualifier, SearchPathChange, object_name_identifiers,
+            DEFAULT_SEARCH_PATH, PG_CATALOG, Qualifier, SearchPathChange, object_name_identifiers,
             object_name_last_part, qualifier_of, resolve_bound_relation_object_name,
             resolve_relation_object_name, resolve_relation_object_name_on_path, search_path_change,
             target_name_from_object_name,
@@ -475,6 +476,11 @@ pub(crate) trait BodyWalk<'s> {
     ///
     /// Returns any error resolving a name the statement holds.
     fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError>;
+
+    /// Whether `sql` calls code that may set `search_path` for the
+    /// statements after it, as [`calls_user_code`] decides over the
+    /// walker's database.
+    fn runs_user_code(&self, sql: Embedded<'_>) -> bool;
 }
 
 /// The statements of a function body read when it runs.
@@ -541,7 +547,7 @@ pub(crate) fn walk_statement<'s>(
     walker: &mut impl BodyWalk<'s>,
     hex_strings_may_be_integers: bool,
 ) -> Result<(), LookupError> {
-    if matches!(statement, Statement::Call(_) | Statement::Execute { .. }) {
+    if runs_code_outside(statement) {
         return Err(unresolvable(function, statement));
     }
     match search_path_change(statement, hex_strings_may_be_integers)? {
@@ -549,7 +555,8 @@ pub(crate) fn walk_statement<'s>(
         Some(SearchPathChange::Reset) => walker.set_path(BodyPath::default_path()),
         None => {
             walker.walk(Embedded::Statement(statement))?;
-            if sets_search_path_at_run_time(statement) {
+            let embedded = Embedded::Statement(statement);
+            if sets_search_path_at_run_time(statement) || walker.runs_user_code(embedded) {
                 walker.set_path(BodyPath::Unknown(unresolvable(function, statement)));
             }
         }
@@ -558,8 +565,8 @@ pub(crate) fn walk_statement<'s>(
 }
 
 /// Hands the `SELECT` evaluating an expression of the PL/pgSQL body of
-/// `function` to `walker`, after which a call setting `search_path` leaves
-/// the path unknown.
+/// `function` to `walker`, after which a call setting `search_path` or user
+/// code leaves the path unknown.
 ///
 /// # Errors
 ///
@@ -570,10 +577,16 @@ pub(crate) fn walk_expression<'s>(
     walker: &mut impl BodyWalk<'s>,
 ) -> Result<(), LookupError> {
     walker.walk(Embedded::Expression(query))?;
-    if sets_search_path_at_run_time(query) {
+    if sets_search_path_at_run_time(query) || walker.runs_user_code(Embedded::Expression(query)) {
         walker.set_path(BodyPath::Unknown(unresolvable(function, query)));
     }
     Ok(())
+}
+
+/// Whether `statement` runs code the body does not hold, a `CALL`, an
+/// `EXECUTE` of a prepared statement or a `DO` block.
+pub(crate) const fn runs_code_outside(statement: &Statement) -> bool {
+    matches!(statement, Statement::Call(_) | Statement::Execute { .. } | Statement::Do(_))
 }
 
 impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
@@ -597,6 +610,10 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
             _ => &[],
         };
         self.collect(&sql, listed)
+    }
+
+    fn runs_user_code(&self, sql: Embedded<'_>) -> bool {
+        calls_user_code(&sql, self.database)
     }
 }
 
@@ -650,6 +667,49 @@ pub(crate) fn sets_search_path_at_run_time<N: Visit + ?Sized>(node: &N) -> bool 
         }
     }
     walk(node, &mut SetConfigCalls).is_break()
+}
+
+/// Whether a call in `node` may run a function outside `pg_catalog`, which
+/// may set `search_path` for the statements after it.
+///
+/// PostgreSQL keeps a plain `SET` or `set_config(..., false)` past the end of
+/// the function running it, even one with its own `SET search_path` clause,
+/// so any such function counts. So does a call no function the database
+/// holds answers, or one whose name or schema only run time knows.
+pub(crate) fn calls_user_code<N: Visit + ?Sized, DB: DatabaseLike>(
+    node: &N,
+    database: &DB,
+) -> bool {
+    let in_catalog =
+        |schema: &str, quoted: bool| identifiers_match(schema, quoted, PG_CATALOG, false);
+    for_each_call(node, |call| {
+        let user = match (qualifier_of(call.name), object_name_last_part(call.name)) {
+            (Qualifier::Named(schema, quoted), _) => !in_catalog(schema, quoted),
+            // A name built at run time may name any function.
+            (Qualifier::RunTime, _) | (Qualifier::Absent, None) => true,
+            (Qualifier::Absent, Some((called, called_quoted))) => {
+                let mut reached = database.functions_named(called).filter(|function| {
+                    identifiers_match(
+                        function.name(),
+                        function.name_is_quoted(),
+                        called,
+                        called_quoted,
+                    ) && function.accepts_argument_count(call.arguments)
+                });
+                let mut known = false;
+                let outside = reached.any(|function| {
+                    known = true;
+                    let declared = function.target_name();
+                    declared
+                        .schema()
+                        .is_none_or(|schema| !in_catalog(schema, declared.schema_is_quoted()))
+                });
+                outside || !known
+            }
+        };
+        if user { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+    })
+    .is_break()
 }
 
 impl<DB: DatabaseLike> DataStatementLike<DB> for Query {
@@ -1232,5 +1292,29 @@ mod tests {
         let statement = parse_one("SELECT * FROM users");
         let collected = super::collect(&statement, &db, |_| {}, &[]).expect("resolves");
         assert_eq!(collected.tables.len(), 1);
+    }
+
+    /// A call whose name or schema a part built at run time writes may run
+    /// any function, so it counts as user code.
+    #[test]
+    fn a_call_named_at_run_time_runs_user_code() {
+        use sqlparser::ast::{
+            Expr, Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction, SelectItem, SetExpr,
+        };
+        let db = schema_db();
+        let run_time = ObjectNamePart::Function(ObjectNamePartFunction {
+            name: Ident::new("IDENTIFIER"),
+            args: Vec::new(),
+        });
+        let called = ObjectNamePart::Identifier(Ident::new("lower"));
+        for name in [vec![run_time.clone()], vec![run_time, called]] {
+            let mut statement = parse_one("SELECT pg_catalog.lower('a')");
+            let Statement::Query(query) = &mut statement else { panic!("expected a query") };
+            let SetExpr::Select(select) = query.body.as_mut() else { panic!("expected a select") };
+            let item = &mut select.projection[0];
+            let SelectItem::UnnamedExpr(Expr::Function(call)) = item else { panic!("a call") };
+            call.name = ObjectName(name);
+            assert!(super::calls_user_code(&statement, &db), "{statement}");
+        }
     }
 }

@@ -185,7 +185,7 @@ fn each_function_is_reported_once_in_the_order_first_reached() {
          CREATE FUNCTION g(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
          CREATE FUNCTION repeated() RETURNS INT LANGUAGE sql AS $$
              SELECT g(1) + f(1);
-             SELECT g(2);
+             SELECT public.g(2);
          $$;",
     );
     assert_eq!(called_by(&database, "repeated").unwrap(), ["public.g(INT)", "public.f(INT)"]);
