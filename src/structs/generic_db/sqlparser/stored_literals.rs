@@ -3,10 +3,11 @@
 //! expression, under the session's `TimeZone` and `DateStyle` and at a time
 //! of creation never known here.
 //!
-//! An untyped literal takes its type from the other side of a comparison, the
-//! subject of `BETWEEN` or `IN`, or the common type of the arguments of
-//! `coalesce`, `nullif`, `greatest` and `least`, where that side is a table's
-//! column or a cast, and stays as written anywhere else.
+//! Literals take their types from comparisons, row fields, `BETWEEN`, `IN`,
+//! `CASE` results and common-type calls, including domain, function and
+//! operator results. Arrays and ranges read their elements and bounds under
+//! those types. An operand whose type cannot be resolved leaves its literals as
+//! written.
 
 use alloc::{
     boxed::Box,
@@ -20,9 +21,10 @@ use sql_values::{
     PgTimestampTz, PgType,
 };
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, InTarget, ObjectName, ObjectNamePart, Query, Select, TableFactor,
-    TableWithJoins, TimezoneInfo, TypedString, Value, ValueWithSpan, Visitor, VisitorMut,
+    ArrayElemTypeDef, BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, Ident, InTarget, ObjectName, ObjectNamePart, Query,
+    TableFactor, TableWithJoins, TimezoneInfo, TypedString, Value, ValueWithSpan, Visitor,
+    VisitorMut,
 };
 
 use super::{
@@ -32,13 +34,19 @@ use super::{
 };
 use crate::{
     structs::{
-        ColumnDefinition, ColumnDefinitionScope, ColumnScope, IdentifierCase, ParserDB,
-        TableAttribute,
+        ExpressionContext, IdentifierCase, OperandType, ParserDB, TableAttribute,
         metadata::{BoundLiteral, CheckLiterals, ClauseLiterals, UnreadableLiteral, respell},
     },
-    traits::ColumnLike,
-    utils::walk::{walk, walk_expressions, walk_mut},
+    utils::{
+        coercion::{base, canonical_owned},
+        postgres_types::PgType as CatalogType,
+        walk::{walk, walk_expressions, walk_mut},
+    },
 };
+
+mod containers;
+
+use containers::{read_array, read_range};
 
 /// The session state an expression's literals are read under.
 #[derive(Clone, Copy)]
@@ -182,21 +190,109 @@ impl Temporal {
     }
 }
 
+/// A temporal input function, optionally applied to container members.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputType {
+    Scalar(Temporal),
+    Array(Temporal),
+    Range(Temporal),
+}
+
+impl InputType {
+    fn of(data_type: &DataType) -> Option<Self> {
+        Temporal::of(data_type)
+            .map(Self::Scalar)
+            .or_else(|| Self::catalog(&CatalogType::of(data_type)))
+    }
+
+    fn catalog(data_type: &CatalogType) -> Option<Self> {
+        match data_type {
+            CatalogType::Catalog(name) => {
+                Some(match *name {
+                    "date" => Self::Scalar(Temporal::Date),
+                    "timestamp" => Self::Scalar(Temporal::Timestamp),
+                    "timestamptz" => Self::Scalar(Temporal::TimestampTz),
+                    "time" => Self::Scalar(Temporal::Time),
+                    "timetz" => Self::Scalar(Temporal::TimeTz),
+                    "daterange" => Self::Range(Temporal::Date),
+                    "tsrange" => Self::Range(Temporal::Timestamp),
+                    "tstzrange" => Self::Range(Temporal::TimestampTz),
+                    _ => return None,
+                })
+            }
+            CatalogType::Array(element) => {
+                match Self::catalog(element)? {
+                    Self::Scalar(temporal) => Some(Self::Array(temporal)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn data_type(self) -> DataType {
+        match self {
+            Self::Scalar(temporal) => temporal.data_type(),
+            Self::Array(temporal) => {
+                DataType::Array(ArrayElemTypeDef::SquareBracket(
+                    Box::new(temporal.data_type()),
+                    None,
+                ))
+            }
+            Self::Range(temporal) => {
+                let name = match temporal {
+                    Temporal::Date => "daterange",
+                    Temporal::Timestamp => "tsrange",
+                    _ => "tstzrange",
+                };
+                DataType::Custom(ObjectName::from(alloc::vec![Ident::new(name)]), Vec::new())
+            }
+        }
+    }
+
+    fn pg_type(self) -> PgType {
+        match self {
+            Self::Scalar(temporal) | Self::Array(temporal) | Self::Range(temporal) => {
+                temporal.pg_type()
+            }
+        }
+    }
+
+    fn common(self, other: Self) -> Option<Self> {
+        if self == other {
+            return Some(self);
+        }
+        match (self, other) {
+            (Self::Scalar(left), Self::Scalar(right)) => left.common(right).map(Self::Scalar),
+            (Self::Array(left), Self::Array(right)) => left.common(right).map(Self::Array),
+            _ => None,
+        }
+    }
+
+    fn read(self, text: &str, context: InputContext<'_>) -> Result<String, DateTimeError> {
+        match self {
+            Self::Scalar(temporal) => temporal.read(text, context),
+            Self::Array(temporal) => read_array(text, temporal, context),
+            Self::Range(temporal) => read_range(text, temporal, context),
+        }
+    }
+}
+
 /// What an operand gives a literal beside it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operand {
     /// An untyped quoted literal, which takes its type from the other side.
     Untyped,
     /// A value of a date or time type.
-    Typed(Temporal),
+    Typed(InputType),
     /// A value of another type, or of one not known here.
     Opaque,
 }
 
 /// The common type of `operands`, ignoring untyped literals, or [`None`] when
 /// one is opaque, two do not meet or none is typed.
-fn common(operands: impl IntoIterator<Item = Operand>) -> Option<Temporal> {
-    let mut found: Option<Temporal> = None;
+fn common(operands: impl IntoIterator<Item = Operand>) -> Option<InputType> {
+    let mut found: Option<InputType> = None;
     for operand in operands {
         match operand {
             Operand::Untyped => {}
@@ -307,7 +403,7 @@ fn address(expr: &Expr) -> usize {
 #[derive(Clone, Copy)]
 enum Form {
     /// An untyped literal, cast to the type it was read as.
-    Untyped(Temporal),
+    Untyped(InputType),
     /// A literal an explicit cast or a typed literal types, respelled in
     /// place.
     Typed,
@@ -323,9 +419,7 @@ struct Coercion {
 /// Finds every literal of an expression read as a date or time value, with
 /// the value PostgreSQL stores for it.
 struct Coercions<'scope, 'query, 'db, 'session> {
-    scope: Option<(&'scope ColumnScope<'query, 'db, ParserDB>, &'db ParserDB)>,
-    /// The scope of each select the walk stands in, innermost last.
-    selects: Vec<Option<ColumnDefinitionScope<'scope, 'query, 'db, ParserDB>>>,
+    scope: Option<(&'scope ExpressionContext<'query, 'db, ParserDB>, &'db ParserDB)>,
     session: LiteralSession<'session>,
     /// Whether a literal stood beside a column, whose type only a scope gives.
     wants_columns: bool,
@@ -335,17 +429,10 @@ struct Coercions<'scope, 'query, 'db, 'session> {
 
 impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
     fn new(
-        scope: Option<(&'scope ColumnScope<'query, 'db, ParserDB>, &'db ParserDB)>,
+        scope: Option<(&'scope ExpressionContext<'query, 'db, ParserDB>, &'db ParserDB)>,
         session: LiteralSession<'session>,
     ) -> Self {
-        Self {
-            scope,
-            selects: Vec::new(),
-            session,
-            wants_columns: false,
-            found: Vec::new(),
-            unreadable: None,
-        }
+        Self { scope, session, wants_columns: false, found: Vec::new(), unreadable: None }
     }
 
     fn finish(self) -> Result<Vec<Coercion>, UnreadableLiteral> {
@@ -356,7 +443,7 @@ impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
     }
 
     /// Reads `text`, held by `node`, as `temporal`.
-    fn coerce(&mut self, node: &Expr, text: &str, temporal: Temporal, form: Form) {
+    fn coerce(&mut self, node: &Expr, text: &str, temporal: InputType, form: Form) {
         if self.unreadable.is_some() {
             return;
         }
@@ -373,7 +460,7 @@ impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
     }
 
     /// Reads `expr` as `temporal` when it is an untyped literal.
-    fn coerce_untyped(&mut self, expr: &Expr, temporal: Temporal) {
+    fn coerce_untyped(&mut self, expr: &Expr, temporal: InputType) {
         if let Some((node, text)) = untyped_literal(expr) {
             self.coerce(node, text, temporal, Form::Untyped(temporal));
         }
@@ -381,6 +468,14 @@ impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
 
     /// Types an untyped literal on one side of a comparison by the other.
     fn compared(&mut self, left: &Expr, right: &Expr) {
+        if let (Expr::Tuple(left), Expr::Tuple(right)) = (left, right) {
+            if left.len() == right.len() {
+                for (left, right) in left.iter().zip(right) {
+                    self.compared(left, right);
+                }
+            }
+            return;
+        }
         for (literal, other) in [(left, right), (right, left)] {
             if untyped_literal(literal).is_some()
                 && let Operand::Typed(temporal) = self.operand(other)
@@ -405,13 +500,12 @@ impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
 
     fn operand(&mut self, expr: &Expr) -> Operand {
         let declared =
-            |data_type: &DataType| Temporal::of(data_type).map_or(Operand::Opaque, Operand::Typed);
+            |data_type: &DataType| InputType::of(data_type).map_or(Operand::Opaque, Operand::Typed);
         match expr {
             Expr::Nested(inner) => self.operand(inner),
             Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(_), .. }) => {
                 Operand::Untyped
             }
-            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => self.column(expr),
             Expr::Cast {
                 kind: CastKind::Cast | CastKind::DoubleColon,
                 data_type,
@@ -434,43 +528,61 @@ impl<'scope, 'query, 'db, 'session> Coercions<'scope, 'query, 'db, 'session> {
                             .find(|operand| *operand != Operand::Untyped)
                             .unwrap_or(Operand::Opaque)
                     }
-                    None => Operand::Opaque,
+                    None => self.resolved(expr),
                 }
             }
-            _ => Operand::Opaque,
+            Expr::Case { conditions, else_result, .. } => {
+                let types: Vec<_> = else_result
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .chain(conditions.iter().map(|condition| &condition.result))
+                    .map(|result| self.operand(result))
+                    .collect();
+                common(types).map_or(Operand::Opaque, Operand::Typed)
+            }
+            Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Operand::Untyped,
+            _ => self.resolved(expr),
         }
     }
 
-    /// The type of the column `reference` names in the innermost select.
-    fn column(&mut self, reference: &Expr) -> Operand {
+    /// Resolves columns, domains and selected call or operator results.
+    fn resolved(&mut self, expression: &Expr) -> Operand {
         self.wants_columns = true;
-        let Some((_, database)) = self.scope else { return Operand::Opaque };
-        let Some(Some(select)) = self.selects.last() else { return Operand::Opaque };
-        match select.resolve_column_definition(reference) {
-            Ok(Some(ColumnDefinition::Base { column, .. })) => {
-                Temporal::of(column.data_type(database)).map_or(Operand::Opaque, Operand::Typed)
-            }
-            _ => Operand::Opaque,
-        }
+        let Some((context, database)) = self.scope else { return Operand::Opaque };
+        let Ok(OperandType::Known { type_name, .. }) = context.type_of(expression) else {
+            return Operand::Opaque;
+        };
+        let declared = canonical_owned(database, CatalogType::from_target(&type_name));
+        let Ok(declared) = base(database, &declared) else { return Operand::Opaque };
+        InputType::catalog(&declared).map_or(Operand::Opaque, Operand::Typed)
     }
 }
 
 impl Visitor for Coercions<'_, '_, '_, '_> {
     type Break = ();
 
-    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
-        let scope = self.scope.and_then(|(scope, _)| scope.scope_for_select(select));
-        self.selects.push(scope);
-        ControlFlow::Continue(())
-    }
-
-    fn post_visit_select(&mut self, _select: &Select) -> ControlFlow<Self::Break> {
-        self.selects.pop();
-        ControlFlow::Continue(())
-    }
-
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
         match expr {
+            Expr::Case { operand, conditions, else_result, .. } => {
+                if let Some(operand) = operand {
+                    for condition in conditions {
+                        self.compared(operand, &condition.condition);
+                    }
+                }
+                let results: Vec<_> = else_result
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .chain(conditions.iter().map(|condition| &condition.result))
+                    .collect();
+                self.by_common_type(&results);
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                if untyped_literal(right).is_some()
+                    && let Operand::Typed(InputType::Scalar(temporal)) = self.operand(left)
+                {
+                    self.coerce_untyped(right, InputType::Array(temporal));
+                }
+            }
             Expr::BinaryOp {
                 left,
                 op:
@@ -537,7 +649,7 @@ impl Visitor for Coercions<'_, '_, '_, '_> {
                 data_type,
                 format: None,
             } => {
-                if let Some(temporal) = Temporal::of(data_type)
+                if let Some(temporal) = InputType::of(data_type)
                     && let Some((node, text)) = untyped_literal(inner)
                 {
                     self.coerce(node, text, temporal, Form::Typed);
@@ -548,7 +660,7 @@ impl Visitor for Coercions<'_, '_, '_, '_> {
                 value: ValueWithSpan { value: Value::SingleQuotedString(text), .. },
                 ..
             }) => {
-                if let Some(temporal) = Temporal::of(data_type) {
+                if let Some(temporal) = InputType::of(data_type) {
                     self.coerce(expr, text, temporal, Form::Typed);
                 }
             }
@@ -570,10 +682,24 @@ fn holds_quoted_literal(expr: &Expr) -> bool {
     .is_break()
 }
 
+/// Builds the relation, function and type catalog used to read `queries`.
+fn catalog<'query>(
+    builder: &ParserDBBuilder,
+    queries: impl IntoIterator<Item = &'query Query>,
+) -> ParserDB {
+    let mut database = view_rewrites::catalog(builder, queries);
+    database.functions = builder.functions().to_vec();
+    database.builtins = builder.builtins().clone();
+    database.domains = builder.domains().to_vec();
+    database.user_defined_types = builder.user_defined_types().to_vec();
+    database.extensions = builder.extensions().to_vec();
+    database
+}
+
 /// Every literal of `query` read as a date or time value, with the value
 /// stored, or the first one whose value is not known here.
 fn coercions(
-    builder: &ParserDBBuilder,
+    database: &ParserDB,
     query: &Query,
     session: LiteralSession<'_>,
 ) -> Result<Vec<Coercion>, UnreadableLiteral> {
@@ -583,28 +709,24 @@ fn coercions(
     if !unscoped.wants_columns {
         return unscoped.finish();
     }
-    let read = view_rewrites::catalog(builder, core::iter::once(query));
-    // A query whose scopes cannot be derived types only its casts.
-    let scope = ColumnScope::from_query(query, &read, IdentifierCase::AsWritten).ok();
-    let mut scoped = Coercions::new(scope.as_ref().map(|scope| (scope, &read)), session);
+    let scope = ExpressionContext::new(query, database, IdentifierCase::AsWritten).ok();
+    let mut scoped = Coercions::new(scope.as_ref().map(|scope| (scope, database)), session);
     let walked = walk(query, &mut scoped);
     debug_assert!(walked.is_continue(), "the walk never breaks");
     scoped.finish()
 }
 
-/// Every date and time literal of `expression`, a clause on `table`, with the
-/// value PostgreSQL stores for it under `session`, by its place among the
-/// nodes of `expression`, or the first one whose value is not known here.
+/// Reads the stored literals of the clause wrapped in `query`.
 fn read(
-    builder: &ParserDBBuilder,
-    table: &ObjectName,
-    expression: &mut Expr,
+    database: &ParserDB,
+    query: &Query,
     session: LiteralSession<'_>,
 ) -> Result<Vec<BoundLiteral>, UnreadableLiteral> {
-    if !holds_quoted_literal(expression) {
-        return Ok(Vec::new());
-    }
-    let clause = core::mem::replace(expression, Expr::Value(Value::Null.with_empty_span()));
+    coercions(database, query, session).map(|coercions| placed(query, coercions))
+}
+
+/// Wraps a clause on `table` in the query supplying its column scope.
+fn clause_query(table: &ObjectName, clause: Expr) -> Query {
     let from = TableWithJoins {
         relation: TableFactor::Table {
             name: table.clone(),
@@ -621,11 +743,7 @@ fn read(
         },
         joins: Vec::new(),
     };
-    let mut query = wrapping_query(wrapping_select(Vec::new(), alloc::vec![from], Some(clause)));
-    let literals = coercions(builder, &query, session).map(|coercions| placed(&query, coercions));
-    let walked = walk_mut(&mut query, &mut Restore { target: expression });
-    debug_assert!(walked.is_break(), "the clause is the first expression of the wrapper query");
-    literals
+    wrapping_query(wrapping_select(Vec::new(), alloc::vec![from], Some(clause)))
 }
 
 /// The literals `coercions` reads in the clause of the wrapper `query`, each
@@ -661,7 +779,16 @@ pub(super) fn bind(
     expression: &mut Expr,
     session: LiteralSession<'_>,
 ) -> ClauseLiterals {
-    match read(builder, table, expression, session) {
+    if !holds_quoted_literal(expression) {
+        return ClauseLiterals::AsWritten;
+    }
+    let clause = core::mem::replace(expression, Expr::Value(Value::Null.with_empty_span()));
+    let mut query = clause_query(table, clause);
+    let database = catalog(builder, core::iter::once(&query));
+    let literals = read(&database, &query, session);
+    let walked = walk_mut(&mut query, &mut Restore { target: expression });
+    debug_assert!(walked.is_break(), "the clause is the first expression of the wrapper query");
+    match literals {
         Ok(bound) if bound.is_empty() => ClauseLiterals::AsWritten,
         Ok(bound) => {
             let written = expression.clone();
@@ -680,27 +807,37 @@ pub(super) fn bind(
 /// Reads the literals of every check created since the last call under
 /// `session`, the session of the statement creating them.
 pub(super) fn bind_pending_checks(builder: &mut ParserDBBuilder, session: LiteralSession<'_>) {
-    let read_checks: Vec<(usize, CheckLiterals)> = builder
+    let pending: Vec<_> = builder
         .check_constraints()
         .iter()
         .enumerate()
         .filter(|(_, (_, metadata))| *metadata.literals() == CheckLiterals::Pending)
         .map(|(index, (check, metadata))| {
-            if !holds_quoted_literal(metadata.expression()) {
-                return (index, CheckLiterals::AsWritten);
-            }
-            let mut expression = metadata.expression().clone();
-            let table = &TableAttribute::table(check.as_ref()).name;
-            let literals = match read(builder, table, &mut expression, session) {
-                Ok(bound) if bound.is_empty() => CheckLiterals::AsWritten,
-                Ok(bound) => CheckLiterals::Stored(bound),
-                Err(unreadable) => CheckLiterals::Unreadable(unreadable),
-            };
-            (index, literals)
+            let query = holds_quoted_literal(metadata.expression()).then(|| {
+                clause_query(
+                    &TableAttribute::table(check.as_ref()).name,
+                    metadata.expression().clone(),
+                )
+            });
+            (index, query)
         })
         .collect();
+    let database = pending
+        .iter()
+        .any(|(_, query)| query.is_some())
+        .then(|| catalog(builder, pending.iter().filter_map(|(_, query)| query.as_ref())));
     let checks = builder.check_constraints_mut();
-    for (index, literals) in read_checks {
+    for (index, query) in pending {
+        let literals = match (database.as_ref(), query.as_ref()) {
+            (Some(database), Some(query)) => {
+                match read(database, query, session) {
+                    Ok(bound) if bound.is_empty() => CheckLiterals::AsWritten,
+                    Ok(bound) => CheckLiterals::Stored(bound),
+                    Err(unreadable) => CheckLiterals::Unreadable(unreadable),
+                }
+            }
+            _ => CheckLiterals::AsWritten,
+        };
         checks[index].1.set_literals(literals);
     }
 }

@@ -260,3 +260,129 @@ fn a_dialect_without_these_types_keeps_check_literals_as_written() -> Result<(),
     assert_eq!(check.expression(&db)?.to_string(), "tz > '2026-01-01 12:00'");
     Ok(())
 }
+
+#[test]
+fn temporal_literals_take_expression_result_types() -> Result<(), LookupError> {
+    let database = parse(
+        r#"SET TIME ZONE 'Europe/Rome';
+        CREATE DOMAIN stamp AS TIMESTAMPTZ;
+        CREATE TABLE e (ts TIMESTAMPTZ, d DATE, st stamp, tr TSTZRANGE,
+        CONSTRAINT c_case CHECK (CASE WHEN d > '2026-01-01' THEN ts ELSE '2026-01-01 12:00' END IS NOT NULL),
+        CONSTRAINT c_array CHECK (ts = ANY ('{"2026-01-01 12:00",NULL,"2026-06-01 12:00"}')),
+        CONSTRAINT c_domain CHECK (st > '2026-01-01 12:00'),
+        CONSTRAINT c_function CHECK (date_trunc('day', ts) > '2026-01-01 12:00'),
+        CONSTRAINT c_range CHECK (tr <> '[2026-01-01 12:00, 2026-06-01 12:00)'),
+        CONSTRAINT c_operator CHECK (d + 1 > '2026-01-01'),
+        CONSTRAINT c_row CHECK ((ts, d) > ('2026-01-01 12:00', '2026-01-01')));"#,
+    );
+    for (name, expected) in [
+        (
+            "c_case",
+            "CASE WHEN d > '2026-01-01'::DATE THEN ts ELSE '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE END IS NOT NULL",
+        ),
+        (
+            "c_array",
+            r#"ts = ANY('{"2026-01-01 11:00:00+00",NULL,"2026-06-01 10:00:00+00"}'::TIMESTAMP WITH TIME ZONE[])"#,
+        ),
+        ("c_domain", "st > '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE"),
+        (
+            "c_function",
+            "date_trunc('day', ts) > '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE",
+        ),
+        ("c_range", r#"tr <> '["2026-01-01 11:00:00+00","2026-06-01 10:00:00+00")'::tstzrange"#),
+        ("c_operator", "d + 1 > '2026-01-01'::DATE"),
+        (
+            "c_row",
+            "(ts, d) > ('2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE, '2026-01-01'::DATE)",
+        ),
+    ] {
+        assert_eq!(stored(&database, name)?, expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_case_result_requires_the_creating_time_zone() {
+    let database = parse(
+        "CREATE TABLE e (ts TIMESTAMPTZ, CONSTRAINT c_case CHECK (
+         CASE WHEN true THEN ts ELSE '2026-01-01 12:00' END IS NOT NULL));",
+    );
+    assert!(matches!(stored(&database, "c_case"), Err(LookupError::CheckLiteralUnreadable { .. })));
+}
+
+#[test]
+fn temporal_containers_preserve_bounds_dimensions_and_nulls() -> Result<(), LookupError> {
+    let database = parse(
+        r#"SET TIME ZONE 'Europe/Rome';
+        CREATE DOMAIN stamp AS TIMESTAMPTZ;
+        CREATE DOMAIN nested_stamp AS stamp;
+        CREATE TABLE e (ts TIMESTAMPTZ, st nested_stamp, dr DATERANGE, nr TSRANGE,
+        CONSTRAINT c_nested CHECK(st > '2026-01-01 12:00'),
+        CONSTRAINT c_dates CHECK(dr <> '(2026-01-01,2026-01-03]'),
+        CONSTRAINT c_empty CHECK(dr <> '(2026-01-01,2026-01-02)'),
+        CONSTRAINT c_unbounded CHECK(nr <> '(,2026-01-01 12:00]'),
+        CONSTRAINT c_infinite CHECK(dr <> '(infinity,infinity]'),
+        CONSTRAINT c_matrix CHECK(ts = ANY ('[0:1][2:3]={{"2026-01-01 12:00",NULL},{infinity,-infinity}}')));"#,
+    );
+    for (name, expected) in [
+        ("c_nested", "st > '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE"),
+        ("c_dates", "dr <> '[2026-01-02,2026-01-04)'::daterange"),
+        ("c_empty", "dr <> 'empty'::daterange"),
+        ("c_infinite", "dr <> 'empty'::daterange"),
+        ("c_unbounded", r#"nr <> '(,"2026-01-01 12:00:00"]'::tsrange"#),
+        (
+            "c_matrix",
+            r#"ts = ANY('[0:1][2:3]={{"2026-01-01 11:00:00+00",NULL},{infinity,-infinity}}'::TIMESTAMP WITH TIME ZONE[])"#,
+        ),
+    ] {
+        assert_eq!(stored(&database, name)?, expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn temporal_container_output_quotes_only_required_members() -> Result<(), LookupError> {
+    let database = parse(
+        r#"SET TIME ZONE 'Europe/Rome';
+        CREATE TABLE e (ts TIMESTAMPTZ, dr DATERANGE,
+        CONSTRAINT c_infinite_point CHECK(dr <> '[infinity,infinity]'),
+        CONSTRAINT c_negative_infinity CHECK(dr <> '[-infinity,-infinity]'),
+        CONSTRAINT c_quote CHECK(ts = ANY ('{"2026-01-01 12:00",2026-06-01\ 12:00,nUlL}')),
+        CONSTRAINT c_dimensions CHECK(ts = ANY ('[1:1]={"2026-01-01 12:00"}')),
+        CONSTRAINT c_null CHECK(ts = ANY ('{NULL}')),
+        CONSTRAINT c_zero CHECK(ts = ANY ('{}')));"#,
+    );
+    for (name, expected) in [
+        ("c_infinite_point", "dr <> '[infinity,infinity]'::daterange"),
+        ("c_negative_infinity", "dr <> '[-infinity,-infinity]'::daterange"),
+        (
+            "c_quote",
+            r#"ts = ANY('{"2026-01-01 11:00:00+00","2026-06-01 10:00:00+00",NULL}'::TIMESTAMP WITH TIME ZONE[])"#,
+        ),
+        ("c_dimensions", r#"ts = ANY('{"2026-01-01 11:00:00+00"}'::TIMESTAMP WITH TIME ZONE[])"#),
+        ("c_null", "ts = ANY('{NULL}'::TIMESTAMP WITH TIME ZONE[])"),
+        ("c_zero", "ts = ANY('{}'::TIMESTAMP WITH TIME ZONE[])"),
+    ] {
+        assert_eq!(stored(&database, name)?, expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn case_subjects_and_nullable_results_type_literals() -> Result<(), LookupError> {
+    let database = parse(
+        "SET TIME ZONE 'Europe/Rome';
+        CREATE TABLE e (ts TIMESTAMPTZ, d DATE,
+        CONSTRAINT c_simple CHECK(CASE d WHEN '2026-01-01' THEN ts ELSE '2026-06-01 12:00' END IS NOT NULL),
+        CONSTRAINT c_result CHECK((CASE WHEN d IS NULL THEN NULL ELSE ts END) > '2026-01-01 12:00'));",
+    );
+    assert_eq!(
+        stored(&database, "c_simple")?,
+        "CASE d WHEN '2026-01-01'::DATE THEN ts ELSE '2026-06-01 10:00:00+00'::TIMESTAMP WITH TIME ZONE END IS NOT NULL"
+    );
+    assert_eq!(
+        stored(&database, "c_result")?,
+        "(CASE WHEN d IS NULL THEN NULL ELSE ts END) > '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE"
+    );
+    Ok(())
+}
