@@ -117,7 +117,7 @@ fn a_catalog_type_an_earlier_schema_hides_keeps_its_spelling() {
             SemanticProofs::for_expression_deparsed_on_path(&expression, &scope, &db, case, path)
                 .unwrap();
         let view = proofs.view();
-        let proved_now = view.comparison_coercions(&expression).unwrap().is_some();
+        let proved_now = view.operator_coercions(&expression).unwrap().is_some();
         assert_eq!(proved_now, proved, "{path:?}");
     }
 }
@@ -212,35 +212,86 @@ fn declared_checks_read_as_postgresql_deparses_them() {
     }
 }
 
+/// Every other binary operator, `LIKE`, `ILIKE` and `SIMILAR TO` read as the
+/// operators and escape functions they become, and `BETWEEN` as its
+/// comparisons with each bound.
 #[test]
-fn unproved_comparisons_and_lists_keep_their_spelling() {
+fn operators_matches_and_ranges_read_as_postgresql_deparses_them() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    for (declared, deparsed) in [
+        ("s || 'x' <> ''", "(((s || 'x'::text) <> ''::text))"),
+        ("v || 'x' <> ''", "((((v)::text || 'x'::text) <> ''::text))"),
+        ("i + '1' > 0", "(((i + 1) > 0))"),
+        ("n / 2 > 1", "(((n / (2)::numeric) > (1)::numeric))"),
+        (
+            "2 ^ i > 1",
+            "((((2)::double precision ^ (i)::double precision) > (1)::double precision))",
+        ),
+        ("i % 2 = 0", "(((i % 2) = 0))"),
+        ("s ~ '^a'", "((s ~ '^a'::text))"),
+        ("s !~* '^a'", "((s !~* '^a'::text))"),
+        ("s LIKE 'a%'", "((s ~~ 'a%'::text))"),
+        ("s NOT LIKE 'a%'", "((s !~~ 'a%'::text))"),
+        ("s ILIKE 'a%'", "((s ~~* 'a%'::text))"),
+        ("s NOT ILIKE 'a%'", "((s !~~* 'a%'::text))"),
+        ("s LIKE 'a!%' ESCAPE '!'", "((s ~~ like_escape('a!%'::text, '!'::text)))"),
+        ("s SIMILAR TO 'a%'", "((s ~ similar_to_escape('a%'::text)))"),
+        ("s NOT SIMILAR TO 'a%' ESCAPE '!'", "((s !~ similar_to_escape('a%'::text, '!'::text)))"),
+        ("v LIKE 'a%'", "(((v)::text ~~ 'a%'::text))"),
+        ("c LIKE 'a%'", "((c ~~ 'a%'::text))"),
+        ("v SIMILAR TO 'a%'", "(((v)::text ~ similar_to_escape('a%'::text)))"),
+        ("s LIKE s || '%'", "((s ~~ (s || '%'::text)))"),
+        ("i BETWEEN 1 AND 10", "(((i >= 1) AND (i <= 10)))"),
+        ("s BETWEEN 'a' AND 'z'", "(((s >= 'a'::text) AND (s <= 'z'::text)))"),
+        ("i NOT BETWEEN '1' AND '10'", "(((i < 1) OR (i > 10)))"),
+        ("v BETWEEN 'a' AND 'z'", "((((v)::text >= 'a'::text) AND ((v)::text <= 'z'::text)))"),
+        ("n BETWEEN 1 AND 2.5", "(((n >= (1)::numeric) AND (n <= 2.5)))"),
+        ("i BETWEEN -1 AND 1", "(((i >= '-1'::integer) AND (i <= 1)))"),
+    ] {
+        assert_eq!(canonical(&db, declared), canonical(&db, deparsed), "{declared}");
+    }
+}
+
+#[test]
+fn unproved_operations_and_lists_keep_their_spelling() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
     let scope = ExpressionScope::Table(table(&db));
-    // No `=` takes `text` and `int4`, and PostgreSQL casts `1` into the
-    // `numeric` array, which no proof spells. A cast to `mood` is spelled
-    // as the deparsing session's `search_path` reaches the type, a converted
-    // negative constant as a cast of its quoted cast, and a negated exponent
-    // as the digits `numeric_in` expands it into.
-    for (check, comparison) in [
-        ("s = 1", true),
-        ("m = 'happy'", true),
-        ("n = -1", true),
-        ("n > -1e3", true),
-        ("s IN (1)", false),
-        ("i IN (1, 2.5)", false),
-        ("n IN (-1, 2)", false),
-        ("n IN (-1e3, -2e3)", false),
-    ] {
+    let proved = |check: &str| {
         let expression = parse(check);
         let proofs =
             SemanticProofs::for_expression(&expression, &scope, &db, IdentifierCase::Folded)
                 .unwrap();
         let view = proofs.view();
-        if comparison {
-            assert!(view.comparison_coercions(&expression).unwrap().is_none(), "{check}");
-        } else {
-            assert!(view.membership_coercions(&expression).unwrap().is_none(), "{check}");
-        }
+        (
+            view.operator_coercions(&expression).unwrap().is_some(),
+            view.pattern_coercions(&expression).unwrap().is_some(),
+            view.range_coercions(&expression).unwrap().is_some(),
+            view.membership_coercions(&expression).unwrap().is_some(),
+        )
+    };
+    // No `=` takes `text` and `int4`, and PostgreSQL casts `1` into the
+    // `numeric` array, which no proof spells. A cast to `mood` is spelled
+    // as the deparsing session's `search_path` reaches the type, a converted
+    // negative constant as a cast of its quoted cast, and a negated exponent
+    // as the digits `numeric_in` expands it into. No `~~` takes `int4`, and
+    // no `<=` takes `text` and `int4`.
+    for check in [
+        "s = 1",
+        "m = 'happy'",
+        "n = -1",
+        "n > -1e3",
+        "s IN (1)",
+        "i IN (1, 2.5)",
+        "n IN (-1, 2)",
+        "n IN (-1e3, -2e3)",
+        "i LIKE 'a%'",
+        "s SIMILAR TO 1",
+        "s LIKE 'a' ESCAPE 1",
+        "s BETWEEN 'a' AND 1",
+        "s LIKE ANY (ARRAY['a%'])",
+        "m BETWEEN 'happy' AND 'sad'",
+    ] {
+        assert_eq!(proved(check), (false, false, false, false), "{check}");
     }
 }
 
@@ -254,7 +305,7 @@ fn a_trigger_condition_keeps_its_row_qualifications() {
     let view = proofs.view();
     let Expr::BinaryOp { left, .. } = &expression else { unreachable!() };
     assert!(view.column_reference(left).unwrap().is_none());
-    assert!(view.comparison_coercions(&expression).unwrap().is_some());
+    assert!(view.operator_coercions(&expression).unwrap().is_some());
 }
 
 #[test]
@@ -267,7 +318,7 @@ fn a_missing_column_keeps_its_spelling() {
     let view = proofs.view();
     let Expr::BinaryOp { left, .. } = &expression else { unreachable!() };
     assert!(view.column_reference(left).unwrap().is_none());
-    assert!(view.comparison_coercions(&expression).unwrap().is_none());
+    assert!(view.operator_coercions(&expression).unwrap().is_none());
 }
 
 #[test]
@@ -288,7 +339,9 @@ fn a_node_of_another_expression_is_refused() {
         SemanticProofs::for_expression(&expression, &scope, &db, IdentifierCase::Folded).unwrap();
     let view = proofs.view();
     let copy = expression.clone();
-    assert!(view.comparison_coercions(&copy).is_err());
+    assert!(view.operator_coercions(&copy).is_err());
+    assert!(view.pattern_coercions(&copy).is_err());
+    assert!(view.range_coercions(&copy).is_err());
     assert!(view.column_reference(&copy).is_err());
     assert!(view.membership_coercions(&copy).is_err());
 }

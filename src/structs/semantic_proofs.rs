@@ -17,16 +17,16 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_canonicalize::{
-    ArrayCoercions, CanonicalizeError, ComparisonCoercions, Conversion, MembershipCoercions,
-    MembershipElement, SemanticContext,
+    ArrayCoercions, CanonicalizeError, Conversion, MembershipCoercions, MembershipElement,
+    OperatorCoercions, PatternCoercions, RangeCoercions, SemanticContext,
 };
 
 use crate::{
     errors::LookupError,
     structs::{
-        ArraySource, CoercionStep, ColumnDefinition, ExpressionContext, ExpressionScope,
-        IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution, TargetName,
-        expression_context::Collapse,
+        ArraySource, CallResolution, CoercionStep, ColumnDefinition, ExpressionContext,
+        ExpressionScope, IdentifierCase, Operand, OperandEvidence, OperandType,
+        OperatorApplication, OperatorResolution, TargetName, expression_context::Collapse,
     },
     traits::{CastLike, ColumnLike, DatabaseLike, FunctionLike},
     utils::{
@@ -43,7 +43,7 @@ use crate::{
 ///
 /// A column reference outside any subquery of an expression a table scopes
 /// is spelled by its stored name alone, as `pg_get_constraintdef` writes it.
-/// A comparison `=`, `<>`, `<`, `>`, `<=` or `>=` whose operator PostgreSQL
+/// A binary operation other than `AND` and `OR` whose operator PostgreSQL
 /// selects spells each converted operand as the cast or the constant the
 /// deparse writes. An untyped literal read as `int2`, `int4` or `int8` is the
 /// constant it becomes, and a literal read as another type and an operand
@@ -53,7 +53,10 @@ use crate::{
 /// literal under `COLLATE` over a type without a collation is the constant
 /// of its cast, as PostgreSQL drops the `COLLATE`. A number under minus signs
 /// is the one constant the grammar folds it into, when the operator takes it
-/// unconverted. An `IN` list is the `= ANY (ARRAY[...])`
+/// unconverted. A `LIKE`, `ILIKE` or `SIMILAR TO` match is the operator
+/// PostgreSQL stores, its pattern under the escape function the grammar
+/// inserts, and a `BETWEEN` range the comparisons with its bounds, when every
+/// operand they convert is proved. An `IN` list is the `= ANY (ARRAY[...])`
 /// and the comparisons PostgreSQL resolves it into, when every element of the
 /// array is an untyped literal or of the array's element type. Every other
 /// node is left as written.
@@ -90,8 +93,14 @@ pub struct SemanticProofs<'root> {
     nodes: Vec<usize>,
     /// The spelling of each proved column reference, by address.
     columns: Vec<(usize, Ident)>,
-    /// The conversions of each proved comparison, by address.
-    comparisons: Vec<(usize, Coercions)>,
+    /// The conversions of each proved binary operation, by address.
+    operators: Vec<(usize, Coercions)>,
+    /// The conversions of each proved `LIKE`, `ILIKE` or `SIMILAR TO` match,
+    /// by address.
+    patterns: Vec<(usize, Match)>,
+    /// The conversions of the comparisons with the low and the high bound of
+    /// each proved `BETWEEN` range, by address.
+    ranges: Vec<(usize, (Coercions, Coercions))>,
     /// The resolution of each proved `IN` list, by address.
     memberships: Vec<(usize, Membership)>,
 }
@@ -114,7 +123,7 @@ impl Spelled {
     }
 }
 
-/// The conversions of both operands of a comparison.
+/// The conversions of both operands of a binary operator.
 #[derive(Debug, Clone)]
 struct Coercions {
     left: Option<Spelled>,
@@ -122,12 +131,22 @@ struct Coercions {
 }
 
 impl Coercions {
-    fn borrowed(&self) -> ComparisonCoercions<'_> {
-        ComparisonCoercions {
+    fn borrowed(&self) -> OperatorCoercions<'_> {
+        OperatorCoercions {
             left: self.left.as_ref().map(Spelled::conversion),
             right: self.right.as_ref().map(Spelled::conversion),
         }
     }
+}
+
+/// The conversions of a `LIKE`, `ILIKE` or `SIMILAR TO` match, the pattern
+/// and the escape those of the escape function's arguments when PostgreSQL
+/// calls one.
+#[derive(Debug, Clone)]
+struct Match {
+    subject: Option<Spelled>,
+    pattern: Option<Spelled>,
+    escape: Option<Spelled>,
 }
 
 /// The resolution of an `IN` list.
@@ -243,7 +262,9 @@ impl<'root> SemanticProofs<'root> {
                 root: expression,
                 nodes: Vec::new(),
                 columns: Vec::new(),
-                comparisons: Vec::new(),
+                operators: Vec::new(),
+                patterns: Vec::new(),
+                ranges: Vec::new(),
                 memberships: Vec::new(),
             },
         };
@@ -253,7 +274,9 @@ impl<'root> SemanticProofs<'root> {
         let mut proofs = prover.proofs;
         proofs.nodes.sort_unstable();
         proofs.columns.sort_unstable_by_key(|(address, _)| *address);
-        proofs.comparisons.sort_unstable_by_key(|(address, _)| *address);
+        proofs.operators.sort_unstable_by_key(|(address, _)| *address);
+        proofs.patterns.sort_unstable_by_key(|(address, _)| *address);
+        proofs.ranges.sort_unstable_by_key(|(address, _)| *address);
         proofs.memberships.sort_unstable_by_key(|(address, _)| *address);
         Ok(proofs)
     }
@@ -326,12 +349,35 @@ impl SemanticContext for SemanticProofView<'_> {
         Ok(found(&self.proofs.columns, address).map(core::slice::from_ref))
     }
 
-    fn comparison_coercions(
+    fn operator_coercions(
         &self,
         occurrence: &Expr,
-    ) -> Result<Option<ComparisonCoercions<'_>>, CanonicalizeError> {
+    ) -> Result<Option<OperatorCoercions<'_>>, CanonicalizeError> {
         let address = self.proofs.check(occurrence)?;
-        Ok(found(&self.proofs.comparisons, address).map(Coercions::borrowed))
+        Ok(found(&self.proofs.operators, address).map(Coercions::borrowed))
+    }
+
+    fn pattern_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<PatternCoercions<'_>>, CanonicalizeError> {
+        let address = self.proofs.check(occurrence)?;
+        Ok(found(&self.proofs.patterns, address).map(|pattern| {
+            PatternCoercions {
+                subject: pattern.subject.as_ref().map(Spelled::conversion),
+                pattern: pattern.pattern.as_ref().map(Spelled::conversion),
+                escape: pattern.escape.as_ref().map(Spelled::conversion),
+            }
+        }))
+    }
+
+    fn range_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<RangeCoercions<'_>>, CanonicalizeError> {
+        let address = self.proofs.check(occurrence)?;
+        Ok(found(&self.proofs.ranges, address)
+            .map(|(low, high)| RangeCoercions { low: low.borrowed(), high: high.borrowed() }))
     }
 
     fn membership_coercions(
@@ -409,18 +455,19 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
                     self.proofs.columns.push((address, Ident::with_quote('"', stored)));
                 }
             }
-            Expr::BinaryOp {
-                op:
-                    BinaryOperator::Eq
-                    | BinaryOperator::NotEq
-                    | BinaryOperator::Lt
-                    | BinaryOperator::Gt
-                    | BinaryOperator::LtEq
-                    | BinaryOperator::GtEq,
-                ..
-            } => {
-                let proved = self.comparison(expression)?;
-                self.proofs.comparisons.extend(proved.map(|coercions| (address, coercions)));
+            Expr::BinaryOp { op, .. }
+                if !matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+            {
+                let proved = self.operator(expression)?;
+                self.proofs.operators.extend(proved.map(|coercions| (address, coercions)));
+            }
+            Expr::Like { .. } | Expr::ILike { .. } | Expr::SimilarTo { .. } => {
+                let proved = self.pattern(expression)?;
+                self.proofs.patterns.extend(proved.map(|pattern| (address, pattern)));
+            }
+            Expr::Between { .. } => {
+                let proved = self.range(expression)?;
+                self.proofs.ranges.extend(proved.map(|bounds| (address, bounds)));
             }
             Expr::In { expr: left, target: InTarget::List(list), global: false, .. } => {
                 let proved = self.membership(expression, left, list)?;
@@ -431,17 +478,63 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
         Ok(())
     }
 
-    /// The conversions of the comparison `expression`, `None` when one is
-    /// unproved.
-    fn comparison(&self, expression: &Expr) -> Result<Option<Coercions>, LookupError> {
+    /// The conversions of the binary operation `expression`, `None` when one
+    /// is unproved.
+    fn operator(&self, expression: &Expr) -> Result<Option<Coercions>, LookupError> {
         let applications = self.context.operators(expression)?.unwrap_or_default();
         let [application] = applications.as_slice() else { return Ok(None) };
+        Ok(self.applied(application))
+    }
+
+    /// The conversions of `application` to two operand nodes, `None` when
+    /// one is unproved.
+    fn applied(&self, application: &OperatorApplication<'_, '_, DB>) -> Option<Coercions> {
         let (Some(left), Operand::Node(right), OperatorResolution::Selected(selected)) =
             (application.left(), application.right(), application.resolution())
         else {
+            return None;
+        };
+        self.coercions(selected.left(), left, selected.right(), right)
+    }
+
+    /// The conversions of the `LIKE`, `ILIKE` or `SIMILAR TO` match
+    /// `expression`, `None` when one is unproved.
+    fn pattern(&self, expression: &Expr) -> Result<Option<Match>, LookupError> {
+        let applications = self.context.operators(expression)?.unwrap_or_default();
+        let [application] = applications.as_slice() else { return Ok(None) };
+        let (Some(subject), OperatorResolution::Selected(selected)) =
+            (application.left(), application.resolution())
+        else {
             return Ok(None);
         };
-        Ok(self.coercions(selected.left(), left, selected.right(), right))
+        let subject = selected.left().map(|evidence| self.spelled(evidence, subject));
+        let (pattern, escape) = match application.right() {
+            Operand::Node(pattern) => (self.spelled(selected.right(), pattern), Ok(None)),
+            // The escape function's result is the operator's operand as it
+            // is, its arguments converted to its parameters.
+            Operand::Call(call) if selected.right().conversion().is_empty() => {
+                let CallResolution::Selected(function) = call.resolution() else { return Ok(None) };
+                let mut arguments = function
+                    .arguments()
+                    .iter()
+                    .zip(call.arguments())
+                    .map(|(argument, written)| self.spelled(argument.evidence(), written));
+                (arguments.next().unwrap_or(Ok(None)), arguments.next().unwrap_or(Ok(None)))
+            }
+            _ => return Ok(None),
+        };
+        let (Some(Ok(subject)), Ok(pattern), Ok(escape)) = (subject, pattern, escape) else {
+            return Ok(None);
+        };
+        Ok(Some(Match { subject, pattern, escape }))
+    }
+
+    /// The conversions of the comparisons with the low and the high bound of
+    /// the `BETWEEN` range `expression`, `None` when one is unproved.
+    fn range(&self, expression: &Expr) -> Result<Option<(Coercions, Coercions)>, LookupError> {
+        let applications = self.context.operators(expression)?.unwrap_or_default();
+        let [low, high] = applications.as_slice() else { return Ok(None) };
+        Ok(self.applied(low).zip(self.applied(high)))
     }
 
     /// The conversions of `left` and `right` as `left_evidence` and
