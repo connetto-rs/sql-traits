@@ -1053,11 +1053,37 @@ pub enum SequenceParameterError {
     },
 }
 
+/// Why a helper's call of an accessor, a zero-argument `sql` function whose
+/// body returns a setting read, does not read as that read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccessorRefusal {
+    /// The accessor is `IMMUTABLE`, so PostgreSQL may run it once while it
+    /// plans a statement and keep that value in a cached plan.
+    Immutable,
+    /// The accessor returns a type other than its body's read, or a set,
+    /// so PostgreSQL converts the read or refuses the call where a helper
+    /// compares it.
+    ReturnType,
+    /// The accessor sets the setting it reads for its own run, so it reads
+    /// that value rather than the caller's.
+    SetsSetting,
+}
+
+impl core::fmt::Display for AccessorRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Immutable => "is IMMUTABLE",
+            Self::ReturnType => "returns another type than its body reads",
+            Self::SetsSetting => "sets the setting it reads",
+        })
+    }
+}
+
 /// Why [`FunctionLike::helper_set`](crate::traits::FunctionLike::helper_set)
 /// refuses to answer what a helper returns.
 ///
 /// Each refusal names the helper it is met in, a helper a parent arm calls
-/// where it is met there.
+/// where it is met there, and an accessor where it is met in its body.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum HelperSetError {
     /// A table, function or column of the body cannot be looked up.
@@ -1278,12 +1304,26 @@ pub enum HelperSetError {
         /// The call, as written.
         call: String,
     },
-    /// The parent arms reach a helper already being answered, which PostgreSQL
-    /// calls until the stack runs out (`54001`).
-    #[error("helper `{function}` reaches itself through its parent arms")]
+    /// The parent arms reach a helper already being answered, or an
+    /// accessor's body reaches the accessor again, which PostgreSQL calls
+    /// until the stack runs out (`54001`).
+    #[error("`{function}` reaches itself through the calls of its body")]
     CallCycle {
-        /// The helper reached again.
+        /// The helper or accessor reached again.
         function: String,
+    },
+    /// The body reads a setting through an accessor PostgreSQL does not run
+    /// as the read its body returns.
+    #[error("helper `{function}` reads setting `{setting}` through `{accessor}`, which {reason}")]
+    Accessor {
+        /// The helper, or the accessor whose body calls it.
+        function: String,
+        /// The accessor.
+        accessor: String,
+        /// The setting its body reads.
+        setting: String,
+        /// Why its call does not read as its body.
+        reason: AccessorRefusal,
     },
 }
 
