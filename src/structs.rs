@@ -67,7 +67,9 @@ pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonica
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
 pub use function_kind::{AggregateKind, FunctionKind};
-pub use helper_set::{GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm, WalkArm};
+pub use helper_set::{
+    GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm, SettingComparison, WalkArm,
+};
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};

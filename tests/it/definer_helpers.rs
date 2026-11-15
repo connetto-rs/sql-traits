@@ -298,17 +298,32 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
         .map(|arm| {
             match arm {
                 HelperArm::Grant(grant) => {
-                    let restriction = grant.restriction().map_or(String::new(), |set| {
+                    let request = grant.request().map(|request| {
+                        let compared = match request.setting().content() {
+                            SettingContent::Value(SettingValue::Set { .. }) => "IN",
+                            _ => "=",
+                        };
+                        format!(
+                            "{} {compared} {}",
+                            request.column().column_name(),
+                            request.setting().name()
+                        )
+                    });
+                    let restrictions = grant.restrictions().iter().map(|set| {
                         let values: Vec<String> =
                             set.values().iter().map(ToString::to_string).collect();
-                        format!(" AND {} IN ({})", set.column().column_name(), values.join(", "))
+                        format!("{} IN ({})", set.column().column_name(), values.join(", "))
                     });
+                    let conditions: Vec<String> = request.into_iter().chain(restrictions).collect();
+                    let filter = if conditions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" WHERE {}", conditions.join(" AND "))
+                    };
                     format!(
-                        "{}.{} WHERE {} = {}{restriction}",
+                        "{}.{}{filter}",
                         grant.table().table_name(),
-                        grant.column().column_name(),
-                        grant.caller_column().column_name(),
-                        grant.setting().name(),
+                        grant.column().column_name()
                     )
                 }
                 HelperArm::Walk(walk) => {
@@ -357,36 +372,70 @@ fn cell(row: &[(&str, &'static str)], column: &str) -> &'static str {
     nullable(row, column).expect("the column has a value")
 }
 
-/// Evaluates an answer over `fixture` for `caller`, the way a translator
+/// What a request carries: its caller, and the elements of each set setting
+/// it sets, a setting it leaves unset holding none.
+#[derive(Clone, Copy)]
+struct Request {
+    caller: &'static str,
+    sets: &'static [(&'static str, &'static [&'static str])],
+}
+
+impl Request {
+    /// A request carrying `caller` and no set.
+    const fn of(caller: &'static str) -> Self {
+        Self { caller, sets: &[] }
+    }
+
+    /// Whether `value` is what the request carries in `setting`.
+    fn carries(self, setting: &SessionSetting, value: &str) -> bool {
+        match setting.content() {
+            SettingContent::Value(SettingValue::Caller(_)) => value == self.caller,
+            SettingContent::Value(SettingValue::Set { .. }) => {
+                self.sets
+                    .iter()
+                    .any(|(name, elements)| *name == setting.name() && elements.contains(&value))
+            }
+            other => panic!("the fixtures compare with no {other:?}"),
+        }
+    }
+}
+
+/// Whether a fixture cell holding `cell` holds a restriction's `value`.
+fn holds(value: &Value, cell: &str) -> bool {
+    match value {
+        Value::SingleQuotedString(text) => text == cell,
+        Value::Boolean(boolean) => cell == if *boolean { "true" } else { "false" },
+        other => panic!("the fixtures restrict by text or boolean, not {other}"),
+    }
+}
+
+/// Evaluates an answer over `fixture` for `request`, the way a translator
 /// lowering it to SQL over the backing tables would.
-fn evaluate(set: &HelperSet<'_, ParserDB>, caller: &str, fixture: Rows) -> BTreeSet<&'static str> {
+fn evaluate(
+    set: &HelperSet<'_, ParserDB>,
+    request: Request,
+    fixture: Rows,
+) -> BTreeSet<&'static str> {
     let mut returned = BTreeSet::new();
     for arm in set.arms() {
         match arm {
             HelperArm::Grant(grant) => {
-                let allowed: Option<Vec<String>> = grant.restriction().map(|set| {
-                    set.values()
-                        .iter()
-                        .map(|value| {
-                            match value {
-                                Value::SingleQuotedString(text) => text.clone(),
-                                other => panic!("the fixtures restrict by text, not {other}"),
-                            }
-                        })
-                        .collect()
-                });
                 for row in rows(fixture, grant.table().table_name()) {
-                    let restricted = grant.restriction().is_none_or(|set| {
+                    let restricted = grant.restrictions().iter().all(|set| {
                         let value = cell(row, set.column().column_name());
-                        allowed.as_ref().is_some_and(|allowed| allowed.iter().any(|v| v == value))
+                        set.values().iter().any(|allowed| holds(allowed, value))
                     });
-                    if cell(row, grant.caller_column().column_name()) == caller && restricted {
+                    let requested = grant.request().is_none_or(|compared| {
+                        request
+                            .carries(compared.setting(), cell(row, compared.column().column_name()))
+                    });
+                    if requested && restricted {
                         returned.insert(cell(row, grant.column().column_name()));
                     }
                 }
             }
             HelperArm::Parent(parent) => {
-                let parents = evaluate(parent.set(), caller, fixture);
+                let parents = evaluate(parent.set(), request, fixture);
                 for row in rows(fixture, parent.table().table_name()) {
                     if parents.contains(cell(row, parent.column().column_name())) {
                         returned.insert(cell(row, parent.key().column_name()));
@@ -474,7 +523,7 @@ fn every_helper_at_every_role_returns_what_postgres_returns_for_every_caller() {
     let deployment = deployment();
     for &(caller, helper, role, expected) in MEASURED {
         let set = answer(&database, &deployment, "authz", helper, &[text(role)]).expect("answered");
-        let returned: Vec<_> = evaluate(&set, caller, ROWS).into_iter().collect();
+        let returned: Vec<_> = evaluate(&set, Request::of(caller), ROWS).into_iter().collect();
         assert_eq!(returned, expected, "{caller} calling {helper}('{role}')");
     }
 }
@@ -578,7 +627,7 @@ fn a_column_without_a_foreign_key_is_typed_by_the_table_the_called_set_covers() 
         ]
     );
     for &(caller, expected) in INSTALLATIONS_MEASURED {
-        let returned: Vec<_> = evaluate(&set, caller, ROWS).into_iter().collect();
+        let returned: Vec<_> = evaluate(&set, Request::of(caller), ROWS).into_iter().collect();
         assert_eq!(returned, expected, "{caller} calling installations_administered()");
     }
 }
@@ -680,7 +729,7 @@ fn a_role_less_membership_table_answers_every_grant_row_of_the_caller() {
     assert_eq!(render(&set), "members.doc_id WHERE user_id = app.user_id");
     let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
     assert!(
-        grant.raises_when_unset(),
+        grant.request().is_some_and(SettingComparison::raises_when_unset),
         "current_setting without missing_ok raises on an unset setting"
     );
 
@@ -688,7 +737,7 @@ fn a_role_less_membership_table_answers_every_grant_row_of_the_caller() {
         .expect("answered");
     assert_eq!(render(&set), "members.doc_id WHERE user_id = app.user_id AND kind IN ('note')");
     let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
-    assert!(!grant.raises_when_unset());
+    assert!(grant.request().is_some_and(|request| !request.raises_when_unset()));
 }
 
 #[test]
@@ -858,29 +907,89 @@ fn an_owner_lacking_a_privilege_the_body_needs_refuses_the_answer() {
     ));
 }
 
+/// A deployment declaring `app.user_id` as `value`.
+fn declaring(value: SettingValue) -> Deployment {
+    let setting = SessionSetting::value("app.user_id", value).expect("a custom setting name");
+    Deployment::new("app", ["app"], [setting]).expect("a valid deployment")
+}
+
+fn delimited(delimiter: &str) -> SettingValue {
+    SettingValue::Set { element: DataType::Text, packing: SetPacking::Delimited(delimiter.into()) }
+}
+
 #[test]
-fn a_caller_must_come_from_a_declared_caller_setting() {
-    let parameter = helper(DEFINER, "SELECT doc_id FROM members WHERE user_id = min_role", "");
-    assert!(matches!(
-        refusal(&parameter),
-        HelperSetError::CallerFromParameter { parameter, .. } if parameter == "min_role"
-    ));
+fn a_compared_setting_must_be_declared_as_what_the_comparison_reads() {
     let undeclared = helper(DEFINER, &GRANT_ARM.replace("app.user_id", "app.tenant"), "");
     assert!(matches!(
         refusal(&undeclared),
         HelperSetError::UndeclaredSetting { setting, .. } if setting == "app.tenant"
     ));
-    let scalar = Deployment::new(
-        "app",
-        ["app"],
-        [SessionSetting::value("app.user_id", SettingValue::Scalar(DataType::Text))
-            .expect("valid")],
-    )
-    .expect("valid");
+    let equal = helper(DEFINER, GRANT_ARM, "");
+    for value in [SettingValue::Scalar(DataType::Text), delimited(",")] {
+        assert!(
+            matches!(
+                refusal_with(&equal, &declaring(value.clone())),
+                HelperSetError::SettingNotCaller { setting, .. } if setting == "app.user_id"
+            ),
+            "{value:?}"
+        );
+    }
+    let split = helper(
+        DEFINER,
+        "SELECT doc_id FROM members WHERE user_id = ANY (string_to_array(current_setting('app.user_id', true), ','))",
+        "",
+    );
     assert!(matches!(
-        refusal_with(&helper(DEFINER, GRANT_ARM, ""), &scalar),
-        HelperSetError::SettingNotCaller { setting, .. } if setting == "app.user_id"
+        refusal(&split),
+        HelperSetError::SettingNotSet { setting, .. } if setting == "app.user_id"
     ));
+    let json = helper(
+        DEFINER,
+        "SELECT doc_id FROM members WHERE user_id IN (SELECT jsonb_array_elements_text(current_setting('app.user_id', true)::jsonb))",
+        "",
+    );
+    let json_array = SettingValue::Set { element: DataType::Text, packing: SetPacking::JsonArray };
+    for (sql, value) in
+        [(&split, delimited(";")), (&split, json_array.clone()), (&json, delimited(","))]
+    {
+        assert!(
+            matches!(
+                refusal_with(sql, &declaring(value.clone())),
+                HelperSetError::MispackedSet { setting, .. } if setting == "app.user_id"
+            ),
+            "{value:?}"
+        );
+    }
+    for (sql, value) in [(&split, delimited(",")), (&json, json_array)] {
+        let database = postgres(sql);
+        let deployment = declaring(value);
+        let set = answer(&database, &deployment, "public", "docs_with", &[text("read")])
+            .expect("answered");
+        assert_eq!(render(&set), "members.doc_id WHERE user_id IN app.user_id");
+    }
+}
+
+#[test]
+fn an_arm_comparing_no_setting_keeps_the_rows_its_literals_and_arguments_select() {
+    let answered = |body: &str| {
+        let database = postgres(&helper(DEFINER, body, ""));
+        let deployment = deployment();
+        answer(&database, &deployment, "public", "docs_with", &[text("u1")])
+            .map(|set| render(&set))
+            .expect("answered")
+    };
+    assert_eq!(
+        answered("SELECT doc_id FROM members WHERE user_id = min_role"),
+        "members.doc_id WHERE user_id IN ('u1')",
+        "the argument chooses the rows of one call, as PostgreSQL substitutes it"
+    );
+    assert_eq!(
+        answered("SELECT doc_id FROM members WHERE role = 'admin' AND user_id = min_role"),
+        "members.doc_id WHERE role IN ('admin') AND user_id IN ('u1')"
+    );
+    assert_eq!(answered("SELECT doc_id FROM members"), "members.doc_id");
+    assert_eq!(answered("SELECT doc_id FROM members WHERE TRUE"), "members.doc_id");
+    assert_eq!(answered("SELECT doc_id FROM members WHERE min_role = 'u2'"), "");
 }
 
 #[test]
@@ -911,7 +1020,7 @@ fn an_arm_of_any_other_shape_refuses_the_answer() {
     ));
     for body in [
         "SELECT doc_id FROM members JOIN docs ON docs.id = members.doc_id WHERE user_id = current_setting('app.user_id', true)",
-        "SELECT doc_id FROM members WHERE role = 'admin'",
+        "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) AND role = 'a' AND user_id = current_setting('app.user_id')",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) GROUP BY doc_id",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) INTERSECT SELECT id FROM docs",
         "SELECT parent_id FROM docs WHERE id IN (SELECT docs_with(min_role))",
@@ -1011,7 +1120,7 @@ fn an_in_list_keeps_the_literals_it_lists_and_decides_one_over_parameters() {
 }
 
 #[test]
-fn two_conditions_on_one_column_keep_the_values_both_allow() {
+fn conditions_intersect_per_column_and_hold_together_across_columns() {
     let both = |argument: &str| {
         kept(
             "min_role TEXT",
@@ -1022,10 +1131,29 @@ fn two_conditions_on_one_column_keep_the_values_both_allow() {
     };
     assert_eq!(both("write").expect("answered"), format!("{ROLES} AND role IN ('write')"));
     assert_eq!(both("read").expect("answered"), "", "no value is allowed by both");
-    assert!(matches!(
-        kept("min_role TEXT", "TEXT", "role = min_role AND doc_id = 'd'", &[text("read")]),
-        Err(HelperSetError::Irreducible { .. })
-    ));
+    let across = |argument: &str| {
+        kept(
+            "min_role TEXT",
+            "TEXT",
+            "doc_id = 'd' AND role IN ('admin', min_role) AND doc_id IN ('d', 'e')",
+            &[text(argument)],
+        )
+    };
+    assert_eq!(
+        across("write").expect("answered"),
+        format!("{ROLES} AND doc_id IN ('d') AND role IN ('admin', 'write')")
+    );
+    assert_eq!(
+        kept(
+            "min_role TEXT",
+            "TEXT",
+            "doc_id = 'd' AND role = min_role AND role = 'admin'",
+            &[text("read")]
+        )
+        .expect("answered"),
+        "",
+        "one column allowing no value keeps no row whatever the others allow"
+    );
 }
 
 #[test]
@@ -1114,6 +1242,10 @@ fn only_postgres_own_current_setting_with_a_literal_name_reads_the_caller() {
     assert_eq!(caller("current_setting($s$app.user_id$s$)", "").expect("answered"), ROLES);
     let shadow = "CREATE FUNCTION current_setting(name TEXT, missing BOOLEAN) RETURNS TEXT
                   LANGUAGE sql AS $$ SELECT 'x' $$;";
+    // A read that is not the caller leaves a comparison no literal decides.
+    let irreducible = |read: &str, after: &str| {
+        matches!(caller(read, after), Err(HelperSetError::Irreducible { .. }))
+    };
     for read in [
         "other.current_setting('app.user_id', true)",
         "current_setting('app.user_id', 'yes')",
@@ -1122,13 +1254,10 @@ fn only_postgres_own_current_setting_with_a_literal_name_reads_the_caller() {
         "current_setting('app.user_id', true, true)",
         "current_setting(DISTINCT 'app.user_id')",
     ] {
-        assert!(matches!(caller(read, ""), Err(HelperSetError::ArmShape { .. })), "{read}");
+        assert!(irreducible(read, ""), "{read}");
     }
     assert!(
-        matches!(
-            caller("current_setting('app.user_id', true)", shadow),
-            Err(HelperSetError::ArmShape { .. })
-        ),
+        irreducible("current_setting('app.user_id', true)", shadow),
         "a declared current_setting the call may reach is not PostgreSQL's"
     );
     assert!(matches!(
@@ -1138,10 +1267,84 @@ fn only_postgres_own_current_setting_with_a_literal_name_reads_the_caller() {
         ),
         Err(HelperSetError::ArmShape { .. })
     ));
-    assert!(matches!(
-        caller("doc_id AND role = 'admin'", ""),
-        Err(HelperSetError::ArmShape { .. })
-    ));
+    assert!(irreducible("doc_id AND role = 'admin'", ""));
+}
+
+#[test]
+fn only_postgres_own_functions_unpack_a_set_in_either_spelling() {
+    let link_ids = SessionSetting::value("app.link_ids", delimited(",")).expect("valid");
+    let link_list = SessionSetting::value(
+        "app.link_list",
+        SettingValue::Set { element: DataType::Text, packing: SetPacking::JsonArray },
+    )
+    .expect("valid");
+    let deployment = Deployment::new("app", ["app"], [link_ids, link_list]).expect("valid");
+    let compared = |condition: &str, after: &str| {
+        let body = format!("SELECT doc_id FROM members WHERE {condition}");
+        let database = postgres(&helper(DEFINER, &body, after));
+        answer(&database, &deployment, "public", "docs_with", &[text("read")])
+            .map(|set| render(&set))
+    };
+    let split = "string_to_array(current_setting('app.link_ids', true), ',')";
+    let elements = "jsonb_array_elements_text(current_setting('app.link_list')::jsonb)";
+    for (condition, setting) in [
+        (format!("doc_id = ANY ({split})"), "app.link_ids"),
+        (format!("doc_id = SOME (pg_catalog.{split})"), "app.link_ids"),
+        (format!("doc_id = ANY (({split}))"), "app.link_ids"),
+        (format!("doc_id IN (SELECT unnest({split}))"), "app.link_ids"),
+        (format!("doc_id IN (SELECT pg_catalog.unnest({split}))"), "app.link_ids"),
+        (format!("doc_id = ANY (ARRAY(SELECT unnest({split})))"), "app.link_ids"),
+        (format!("doc_id IN (SELECT {elements})"), "app.link_list"),
+        (format!("doc_id = ANY (ARRAY(SELECT {elements}))"), "app.link_list"),
+        (
+            "doc_id IN (SELECT jsonb_array_elements_text(CAST(current_setting('app.link_list') AS jsonb)))"
+                .into(),
+            "app.link_list",
+        ),
+    ] {
+        assert_eq!(
+            compared(&condition, "").expect("answered"),
+            format!("members.doc_id WHERE doc_id IN {setting}"),
+            "{condition}"
+        );
+    }
+    let shadow = "CREATE FUNCTION string_to_array(value TEXT, delimiter TEXT) RETURNS TEXT[]
+                  LANGUAGE sql AS $$ SELECT ARRAY['x'] $$;";
+    assert!(
+        matches!(
+            compared(&format!("doc_id = ANY ({split})"), shadow),
+            Err(HelperSetError::Irreducible { .. })
+        ),
+        "a declared string_to_array the call may reach is not PostgreSQL's"
+    );
+    for condition in [
+        "doc_id = ANY (string_to_array(current_setting('app.link_ids', true), ',', ''))",
+        "doc_id = ANY (string_to_array(current_setting('app.link_ids', true), NULL))",
+        "doc_id <> ANY (string_to_array(current_setting('app.link_ids', true), ','))",
+        "doc_id NOT IN (SELECT unnest(string_to_array(current_setting('app.link_ids'), ',')))",
+    ] {
+        assert!(
+            matches!(compared(condition, ""), Err(HelperSetError::Irreducible { .. })),
+            "{condition}"
+        );
+    }
+    // A subquery unpacking no set is read as a parent arm's call.
+    for condition in [
+        "doc_id IN (SELECT jsonb_array_elements_text(current_setting('app.link_list')::json))",
+        "doc_id IN (SELECT jsonb_array_elements_text(current_setting('app.link_list')))",
+    ] {
+        assert!(
+            matches!(compared(condition, ""), Err(HelperSetError::ArmShape { .. })),
+            "{condition}"
+        );
+    }
+    assert!(
+        matches!(
+            compared(&format!("doc_id = ANY ({split}) AND user_id = ANY ({split})"), ""),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "an arm compares one column with the request"
+    );
 }
 
 #[test]
@@ -1160,7 +1363,7 @@ fn a_body_or_arm_outside_the_two_shapes_refuses_the_answer() {
         format!("WITH g AS (SELECT 1) {GRANT_ARM}"),
         GRANT_ARM.replace("SELECT doc_id", "SELECT *"),
         GRANT_ARM.replace("SELECT doc_id", "SELECT 'd'"),
-        "SELECT doc_id FROM members WHERE role IN ('admin')".into(),
+        "SELECT doc_id FROM members WHERE role IN ('admin') GROUP BY doc_id".into(),
         GRANT_ARM.replace("FROM members", "FROM ONLY members"),
         GRANT_ARM.replace("FROM members", "FROM members AS m (a, b, c)"),
         GRANT_ARM.replace("FROM members", "FROM member_view"),
@@ -1531,7 +1734,7 @@ fn a_recursive_walk_answers_its_arms_and_the_walk_down_the_parent_column() {
     assert_eq!(referenced.table_name(), "groups");
     for &(fixture, caller, role, expected) in TREE_MEASURED {
         let set = groups_with(&database, &deployment, role).expect("answered");
-        let returned: Vec<_> = evaluate(&set, caller, fixture).into_iter().collect();
+        let returned: Vec<_> = evaluate(&set, Request::of(caller), fixture).into_iter().collect();
         assert_eq!(returned, expected, "{caller} calling groups_with('{role}')");
     }
 }
@@ -1648,4 +1851,211 @@ fn a_walk_needs_the_owner_to_read_the_key_and_the_parent_column() {
         groups_with(&database, &deployment, "read"),
         Err(HelperSetError::NotExempt { table, .. }) if table == "groups"
     ));
+}
+
+/// Share links a request presents and app installations capped per table and
+/// command, each read by a helper comparing with no caller.
+const REQUEST_VALUES: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+CREATE TABLE share_links (id TEXT PRIMARY KEY, revoked BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE installation_permissions (
+  installation_id TEXT NOT NULL,
+  table_name TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('select', 'insert', 'update', 'delete')),
+  PRIMARY KEY (installation_id, table_name, action)
+);
+GRANT SELECT ON share_links, installation_permissions TO authz_owner;
+CREATE FUNCTION authz.presented_links() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT l.id FROM public.share_links l
+  WHERE l.id = ANY (string_to_array(current_setting('app.link_ids', true), ',')) AND l.revoked = FALSE
+$$;
+CREATE FUNCTION authz.listed_links() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT l.id FROM public.share_links l
+  WHERE l.id IN (SELECT unnest(string_to_array(current_setting('app.link_ids', true), ','))) AND l.revoked = FALSE
+$$;
+CREATE FUNCTION authz.json_links() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT l.id FROM public.share_links l
+  WHERE l.id IN (SELECT jsonb_array_elements_text(current_setting('app.link_list', true)::jsonb)) AND l.revoked = FALSE
+$$;
+CREATE FUNCTION authz.json_array_links() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT l.id FROM public.share_links l
+  WHERE l.id = ANY (ARRAY(SELECT jsonb_array_elements_text(CAST(current_setting('app.link_list', true) AS jsonb)))) AND l.revoked = FALSE
+$$;
+CREATE FUNCTION authz.installations_allowing(target TEXT, command TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT ip.installation_id FROM public.installation_permissions ip WHERE ip.table_name = target AND ip.action = command
+$$;
+ALTER FUNCTION authz.presented_links() OWNER TO authz_owner;
+ALTER FUNCTION authz.listed_links() OWNER TO authz_owner;
+ALTER FUNCTION authz.json_links() OWNER TO authz_owner;
+ALTER FUNCTION authz.json_array_links() OWNER TO authz_owner;
+ALTER FUNCTION authz.installations_allowing(TEXT, TEXT) OWNER TO authz_owner;
+";
+
+/// The rows [`REQUEST_VALUES`] was measured over.
+const REQUEST_VALUE_ROWS: Rows = &[
+    ("share_links", &[("id", "l1"), ("revoked", "false")]),
+    ("share_links", &[("id", "l2"), ("revoked", "true")]),
+    ("share_links", &[("id", "l3"), ("revoked", "false")]),
+    (
+        "installation_permissions",
+        &[("installation_id", "i1"), ("table_name", "docs"), ("action", "select")],
+    ),
+    (
+        "installation_permissions",
+        &[("installation_id", "i1"), ("table_name", "docs"), ("action", "insert")],
+    ),
+    (
+        "installation_permissions",
+        &[("installation_id", "i2"), ("table_name", "docs"), ("action", "select")],
+    ),
+    (
+        "installation_permissions",
+        &[("installation_id", "i2"), ("table_name", "notes"), ("action", "select")],
+    ),
+    (
+        "installation_permissions",
+        &[("installation_id", "i3"), ("table_name", "notes"), ("action", "delete")],
+    ),
+];
+
+/// What PostgreSQL 18.6 returns for `(helper, the elements the request sets,
+/// returned)`, as `app` over [`REQUEST_VALUE_ROWS`]. No elements is the
+/// setting set to `''` or `'[]'`, and a request setting neither leaves it
+/// unset, which `current_setting(name, true)` reads as `NULL`.
+const SET_MEASURED: &[(&str, Request, &[&str])] = &[
+    ("presented_links", Request { caller: "", sets: &[("app.link_ids", &[])] }, &[]),
+    ("presented_links", Request { caller: "", sets: &[("app.link_ids", &["l1"])] }, &["l1"]),
+    ("presented_links", Request { caller: "", sets: &[("app.link_ids", &["l1", "l2"])] }, &["l1"]),
+    (
+        "presented_links",
+        Request { caller: "", sets: &[("app.link_ids", &["l2", "l3", "lx"])] },
+        &["l3"],
+    ),
+    (
+        "presented_links",
+        Request { caller: "", sets: &[("app.link_ids", &["l3", "l1"])] },
+        &["l1", "l3"],
+    ),
+    ("presented_links", Request::of(""), &[]),
+    ("listed_links", Request { caller: "", sets: &[("app.link_ids", &["l1", "l2"])] }, &["l1"]),
+    (
+        "listed_links",
+        Request { caller: "", sets: &[("app.link_ids", &["l3", "l1"])] },
+        &["l1", "l3"],
+    ),
+    ("listed_links", Request::of(""), &[]),
+    ("json_links", Request { caller: "", sets: &[("app.link_list", &[])] }, &[]),
+    ("json_links", Request { caller: "", sets: &[("app.link_list", &["l1", "l2"])] }, &["l1"]),
+    (
+        "json_links",
+        Request { caller: "", sets: &[("app.link_list", &["l3", "lx", "l1"])] },
+        &["l1", "l3"],
+    ),
+    ("json_links", Request::of(""), &[]),
+    ("json_array_links", Request { caller: "", sets: &[("app.link_list", &[])] }, &[]),
+    (
+        "json_array_links",
+        Request { caller: "", sets: &[("app.link_list", &["l1", "l2"])] },
+        &["l1"],
+    ),
+    (
+        "json_array_links",
+        Request { caller: "", sets: &[("app.link_list", &["l3", "lx", "l1"])] },
+        &["l1", "l3"],
+    ),
+    ("json_array_links", Request::of(""), &[]),
+];
+
+/// What PostgreSQL 18.6 returns for `installations_allowing(table, command)`
+/// over [`REQUEST_VALUE_ROWS`].
+const INSTALLATIONS_ALLOWING_MEASURED: &[(&str, &str, &[&str])] = &[
+    ("docs", "select", &["i1", "i2"]),
+    ("docs", "insert", &["i1"]),
+    ("notes", "delete", &["i3"]),
+    ("notes", "update", &[]),
+    ("notes", "select", &["i2"]),
+];
+
+/// A deployment declaring the caller, a scalar installation and the presented
+/// links packed both ways.
+fn request_deployment() -> Deployment {
+    let setting = |name: &str, value: SettingValue| {
+        SessionSetting::value(name, value).expect("a custom setting name").may_be_unset()
+    };
+    Deployment::new(
+        "app",
+        ["app"],
+        [
+            setting("app.user_id", SettingValue::Caller(DataType::Text)),
+            setting("app.installation_id", SettingValue::Scalar(DataType::Text)),
+            setting("app.link_ids", delimited(",")),
+            setting(
+                "app.link_list",
+                SettingValue::Set { element: DataType::Text, packing: SetPacking::JsonArray },
+            ),
+        ],
+    )
+    .expect("a valid deployment")
+}
+
+#[test]
+fn a_set_arm_returns_what_postgres_returns_for_every_presented_set() {
+    let database = postgres(REQUEST_VALUES);
+    let deployment = request_deployment();
+    for (helper, setting) in [
+        ("presented_links", "app.link_ids"),
+        ("listed_links", "app.link_ids"),
+        ("json_links", "app.link_list"),
+        ("json_array_links", "app.link_list"),
+    ] {
+        let set = answer(&database, &deployment, "authz", helper, &[]).expect("answered");
+        assert_eq!(
+            render(&set),
+            format!("share_links.id WHERE id IN {setting} AND revoked IN (false)"),
+            "{helper}"
+        );
+        assert_eq!(covered(&set), Some("share_links"), "{helper}");
+        let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
+        assert!(grant.request().is_some_and(|request| !request.raises_when_unset()));
+    }
+    for &(helper, request, expected) in SET_MEASURED {
+        let set = answer(&database, &deployment, "authz", helper, &[]).expect("answered");
+        let returned: Vec<_> = evaluate(&set, request, REQUEST_VALUE_ROWS).into_iter().collect();
+        assert_eq!(returned, expected, "{helper} for {:?}", request.sets);
+    }
+}
+
+#[test]
+fn a_caller_free_arm_returns_what_postgres_returns_for_every_argument() {
+    let database = postgres(REQUEST_VALUES);
+    let deployment = request_deployment();
+    for &(table, command, expected) in INSTALLATIONS_ALLOWING_MEASURED {
+        let set = answer(
+            &database,
+            &deployment,
+            "authz",
+            "installations_allowing",
+            &[text(table), text(command)],
+        )
+        .expect("answered");
+        assert_eq!(
+            render(&set),
+            format!(
+                "installation_permissions.installation_id WHERE table_name IN ('{table}') AND action IN ('{command}')"
+            )
+        );
+        let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
+        assert!(grant.request().is_none(), "no column is compared with the request");
+        let returned: Vec<_> =
+            evaluate(&set, Request::of(""), REQUEST_VALUE_ROWS).into_iter().collect();
+        assert_eq!(returned, expected, "installations_allowing('{table}', '{command}')");
+    }
 }

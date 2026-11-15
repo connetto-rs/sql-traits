@@ -1195,18 +1195,29 @@ pub enum HelperSetError {
         /// The setting.
         setting: String,
     },
-    /// A grant arm compares a column to a parameter where it would compare it
-    /// to the caller, so whoever calls the helper chooses whose grants it
-    /// returns.
-    #[error("helper `{function}` takes its caller from parameter `{parameter}`")]
-    CallerFromParameter {
+    /// The body compares a column with the elements of a setting the
+    /// deployment declares as something other than a set.
+    #[error(
+        "helper `{function}` compares a column with the elements of setting `{setting}`, which is not a set"
+    )]
+    SettingNotSet {
         /// The helper.
         function: String,
-        /// The parameter.
-        parameter: String,
+        /// The setting.
+        setting: String,
     },
-    /// A grant arm's condition, its arguments substituted, reduces to
-    /// neither `TRUE` nor a set of literal values of one column.
+    /// The body unpacks a set setting other than the deployment packs it,
+    /// splitting it on another delimiter or reading it as the other packing.
+    #[error("helper `{function}` unpacks setting `{setting}` other than the deployment packs it")]
+    MispackedSet {
+        /// The helper.
+        function: String,
+        /// The setting.
+        setting: String,
+    },
+    /// A grant arm's condition, its arguments substituted, reduces neither to
+    /// `TRUE`, `FALSE` or `NULL` nor to literal values columns have to hold,
+    /// all at once.
     #[error("helper `{function}` filters by `{condition}`, which reduces to no literal set")]
     Irreducible {
         /// The helper.

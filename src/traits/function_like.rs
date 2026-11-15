@@ -1786,7 +1786,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         database: &Self::DB,
     ) -> Result<bool, LookupError>;
 
-    /// What this helper returns for a caller of `deployment`, called with
+    /// What this helper returns for a request of `deployment`, called with
     /// `arguments`, as a union of grant arms and parent arms, walked down a
     /// tree where the body is recursive.
     ///
@@ -1798,11 +1798,16 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// the row-level security of the tables, and when its body is a `UNION`
     /// of arms of two shapes, alone or walked down a tree.
     ///
-    /// - A grant arm, `SELECT <column> FROM <table> WHERE <caller column> =
-    ///   current_setting('<setting>'[, true]) [AND <condition>]`, where the
-    ///   deployment declares the setting as the caller and the condition, the
-    ///   arguments substituted, reduces to `TRUE`, to `FALSE` or `NULL`, or to
-    ///   the literal values one column has to hold.
+    /// - A grant arm, `SELECT <column> FROM <table> [WHERE <condition>]`, whose
+    ///   condition joins with `AND` at most one comparison of a column with a
+    ///   value of the request and terms that, the arguments substituted, reduce
+    ///   to `TRUE`, to `FALSE` or `NULL`, or to the literal values columns have
+    ///   to hold. The comparison is `<column> = current_setting('<setting>'[,
+    ///   <missing_ok>])` with a setting the deployment declares as the caller,
+    ///   or `<column>` compared with each element of a setting it declares as a
+    ///   set, unpacked as declared (see
+    ///   [`SettingComparison`](crate::structs::SettingComparison)). An arm
+    ///   without one returns the same rows for every request.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it
@@ -1829,7 +1834,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Arguments
     ///
     /// * `arguments` - One literal per input parameter.
-    /// * `deployment` - The deployment declaring the caller setting.
+    /// * `deployment` - The deployment declaring the settings the arms compare
+    ///   with.
     /// * `database` - The database the helper belongs to.
     ///
     /// # Errors
@@ -1871,8 +1877,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     docs_with.helper_set(&[Value::SingleQuotedString("write".into())], &deployment, &db)?;
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
     /// assert_eq!(grant.column().column_name(), "doc_id");
-    /// assert_eq!(grant.caller_column().column_name(), "principal_id");
-    /// let roles = grant.restriction().expect("the condition keeps two roles");
+    /// let request = grant.request().expect("the arm compares with the caller");
+    /// assert_eq!(request.column().column_name(), "principal_id");
+    /// let [roles] = grant.restrictions() else { panic!("the condition restricts one column") };
+    /// assert_eq!(roles.column().column_name(), "role");
     /// let admin = Value::SingleQuotedString("admin".into());
     /// let write = Value::SingleQuotedString("write".into());
     /// assert_eq!(roles.values(), [admin, write]);
