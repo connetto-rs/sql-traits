@@ -188,4 +188,9 @@ impl<'b, 'db, DB: DatabaseLike> PlPgSqlScope<'b, 'db, DB> {
     pub(crate) const fn path(&self) -> &BodyPath<'b> {
         &self.path
     }
+
+    /// The database the function belongs to.
+    pub(crate) const fn database(&self) -> &'db DB {
+        self.names.database()
+    }
 }
