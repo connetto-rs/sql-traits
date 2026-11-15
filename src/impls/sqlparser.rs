@@ -2,6 +2,7 @@
 //! module for the `sqlparser` crate.
 
 mod body_calls;
+mod body_names;
 mod check_constraint;
 mod column_def;
 mod create_domain;
@@ -18,6 +19,7 @@ mod data_type;
 mod dialect;
 mod dml;
 pub(crate) mod dql;
+mod dynamic_sites;
 mod foreign_key_constraint;
 mod function_body;
 mod grant;
@@ -33,8 +35,13 @@ mod view;
 
 pub(crate) use column_def::{foreign_options_of, serial_sequence_type};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
+pub(crate) use data_statement::BodyPath;
 pub use dialect::SqlparserDialect;
-pub(crate) use function_body::{atomic_statements, body_calls, body_expression, body_reads};
+pub(crate) use dynamic_sites::{BodyNames, dynamic_sites};
+pub(crate) use function_body::{
+    atomic_statements, body_calls, body_dynamic_sites, body_expression, body_reads,
+    body_unqualified_names,
+};
 pub use grant::apply_revoke_to_grant;
 pub(crate) use grant::{
     PrivilegeKind, grant_objects_match, grantee_is_public, grantee_is_session_principal,

@@ -11,11 +11,13 @@ use sqlparser_plpgsql::{embedded::Block, embedded_sql};
 
 use super::{
     body_calls::{calls_of_body, calls_on_path},
-    data_statement::{BodyPath, Reads, RunTimeBody, reads_of_body, reads_on_path},
+    body_names::NameCollector,
+    data_statement::{BodyPath, Reads, RunTimeBody, reads_of_body, reads_on_path, walk_body},
+    dynamic_sites::BodyNames,
 };
 use crate::{
     errors::LookupError,
-    structs::FunctionBody,
+    structs::{DynamicExecutionSites, FunctionBody, UnqualifiedName},
     traits::{DatabaseLike, DialectLike, FunctionLike},
 };
 
@@ -90,11 +92,7 @@ fn parsed_body<'f, F: FunctionLike>(
     database: &F::DB,
 ) -> Result<SqlBody<'f>, LookupError> {
     if procedural {
-        let FunctionBody::Text(text) = body else {
-            return Err(unparsable(function, &"a PL/pgSQL body is written as a string"));
-        };
-        let block = embedded_sql(text).map_err(|error| unparsable(function, &error))?;
-        return Ok(SqlBody::PlPgSql(block));
+        return plpgsql_block(function, body).map(SqlBody::PlPgSql);
     }
     Ok(match body {
         FunctionBody::Text(text) => {
@@ -112,6 +110,17 @@ fn parsed_body<'f, F: FunctionLike>(
             bound_definition_body(function, definition, database)?
         }
     })
+}
+
+/// The block a PL/pgSQL `body` of `function` parses into.
+fn plpgsql_block<F: FunctionLike>(
+    function: &F,
+    body: FunctionBody<'_>,
+) -> Result<Block, LookupError> {
+    let FunctionBody::Text(text) = body else {
+        return Err(unparsable(function, &"a PL/pgSQL body is written as a string"));
+    };
+    embedded_sql(text).map_err(|error| unparsable(function, &error))
 }
 
 /// The body bound at creation that the `CREATE FUNCTION` statement
@@ -186,7 +195,7 @@ pub(crate) fn atomic_statements<'f, F: FunctionLike>(
 }
 
 /// The path a body read each time `function` runs starts under.
-fn run_time_path<'f, F: FunctionLike>(
+pub(super) fn run_time_path<'f, F: FunctionLike>(
     function: &'f F,
     database: &'f F::DB,
 ) -> Result<BodyPath<'f>, LookupError> {
@@ -265,4 +274,62 @@ pub(crate) fn body_calls<'db, F: FunctionLike>(
             Ok(function.bound_body_functions(database)?.collect())
         }
     }
+}
+
+/// Every relation and function name the body of `function` writes without a
+/// schema, with what each reached, as [`FunctionLike::unqualified_names`]
+/// describes.
+pub(crate) fn body_unqualified_names<'db, F: FunctionLike>(
+    function: &F,
+    database: &'db F::DB,
+) -> Result<Vec<UnqualifiedName<'db, F::DB>>, LookupError> {
+    let (body, procedural) = checked_body(function)?;
+    // A bound body is never parsed here, since the path decides none of its
+    // names.
+    let sql = if body.is_bound() && !procedural {
+        None
+    } else {
+        Some(parsed_body(function, body, procedural, database)?)
+    };
+    let hex_strings_may_be_integers = hex_strings_may_be_integers(database);
+    let start = || run_time_path(function, database).map(|path| NameCollector::new(database, path));
+    Ok(match sql {
+        Some(SqlBody::Statements(statements)) => {
+            let mut names = start()?;
+            let body = RunTimeBody::Sql(&statements);
+            walk_body(function.name(), body, &mut names, hex_strings_may_be_integers)?;
+            names.into_names()
+        }
+        Some(SqlBody::PlPgSql(block)) => {
+            let mut names = start()?;
+            let body = RunTimeBody::PlPgSql(&block);
+            walk_body(function.name(), body, &mut names, hex_strings_may_be_integers)?;
+            names.into_names()
+        }
+        Some(SqlBody::Expression(expression)) => {
+            let mut names = start()?;
+            names.collect(expression)?;
+            names.into_names()
+        }
+        Some(SqlBody::Select(select)) => {
+            let mut names = start()?;
+            names.collect(select)?;
+            names.into_names()
+        }
+        // Bound at creation, keeping what it reached then.
+        None | Some(SqlBody::Return(_) | SqlBody::Atomic(_)) => Vec::new(),
+    })
+}
+
+/// The dynamic-execution sites of the body of `function`, as
+/// [`FunctionLike::dynamic_execution_sites`] describes.
+pub(crate) fn body_dynamic_sites<'db, F: FunctionLike>(
+    function: &'db F,
+    database: &'db F::DB,
+) -> Result<DynamicExecutionSites<'db, F::DB>, LookupError> {
+    let (body, procedural) = checked_body(function)?;
+    // Only PL/pgSQL builds SQL at run time.
+    let block = if procedural { Some(plpgsql_block(function, body)?) } else { None };
+    let names = BodyNames::new(function, database)?;
+    Ok(DynamicExecutionSites::new(names, block, hex_strings_may_be_integers(database)))
 }

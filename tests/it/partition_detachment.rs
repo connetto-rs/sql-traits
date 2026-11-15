@@ -75,7 +75,7 @@ fn a_detached_partition_is_a_table_of_its_own() {
         assert_eq!(p0.check_constraints(&db).expect("held").count(), 2);
         let note =
             p0.column("note", &db, IdentifierCase::AsWritten).expect("lookup").expect("kept");
-        assert_eq!(note.default_value().as_deref(), Some("'x'"));
+        assert_eq!(note.default_expression().map(ToString::to_string).as_deref(), Some("'x'"));
         // The identity the root gave stays with the root.
         assert_eq!(identity_columns(&db, "p0"), Vec::<String>::new());
         let v = p0.column("v", &db, IdentifierCase::AsWritten).expect("lookup").expect("kept");

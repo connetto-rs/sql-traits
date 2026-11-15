@@ -1,6 +1,6 @@
 //! Error enumeration used in the `sql_traits` crate.
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 
 use sqlparser::{ast::FunctionBehavior, parser::ParserError};
 
@@ -115,6 +115,140 @@ impl core::fmt::Display for OperatorAttribute {
             Self::Restrict => "restrict",
             Self::Join => "join",
         })
+    }
+}
+
+/// Why PostgreSQL refuses an operator application or a call of a stored
+/// expression when it types the expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Unresolved {
+    /// No operator or function of the name takes the operand types,
+    /// SQLSTATE `42883`.
+    DoesNotExist,
+    /// More than one takes them and nothing tells them apart, SQLSTATE
+    /// `42725`.
+    NotUnique,
+    /// The one selected has a polymorphic parameter only untyped literals
+    /// reach, SQLSTATE `42804`.
+    PolymorphicUnknown,
+}
+
+impl core::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::DoesNotExist => "does not exist",
+            Self::NotUnique => "is not unique",
+            Self::PolymorphicUnknown => "cannot bind a polymorphic type to `unknown`",
+        })
+    }
+}
+
+/// A call PostgreSQL refuses for the clauses it writes, given the kind of
+/// function it selects, or for clauses no call may combine.
+///
+/// Each variant names the rule `ParseFuncOrColumn` or the grammar enforces,
+/// and [`Misapplied::message`] gives PostgreSQL's wording for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Misapplied {
+    /// `f(*)` selecting no aggregate or window function.
+    StarOnPlainFunction,
+    /// `DISTINCT` among the arguments of no aggregate or window function.
+    DistinctOnPlainFunction,
+    /// `WITHIN GROUP` on no aggregate or window function.
+    WithinGroupOnPlainFunction,
+    /// An argument `ORDER BY` on no aggregate or window function.
+    OrderByOnPlainFunction,
+    /// `FILTER` on no aggregate or window function.
+    FilterOnPlainFunction,
+    /// `OVER` on no aggregate or window function.
+    OverOnPlainFunction,
+    /// An ordered-set aggregate called without `WITHIN GROUP`.
+    WithinGroupRequired,
+    /// An ordered-set aggregate called over a window.
+    OverOnOrderedSetAggregate,
+    /// `WITHIN GROUP` on an aggregate that is no ordered-set one.
+    WithinGroupOnNormalAggregate,
+    /// A window function called without `OVER`.
+    OverRequired,
+    /// `WITHIN GROUP` on a window function.
+    WithinGroupOnWindowFunction,
+    /// An aggregate called with no arguments and no `*`.
+    StarRequired,
+    /// An aggregate called without `OVER` and with an argument by name.
+    NamedArgumentOnAggregate,
+    /// `DISTINCT` among the arguments of a call over a window.
+    DistinctOverWindow,
+    /// An argument `ORDER BY` in a call over a window.
+    OrderByOverWindow,
+    /// `FILTER` on a window function.
+    FilterOnWindowFunction,
+    /// An argument `ORDER BY` beside `WITHIN GROUP`.
+    OrderByWithinGroup,
+    /// `DISTINCT` beside `WITHIN GROUP`.
+    DistinctWithinGroup,
+}
+
+impl Misapplied {
+    /// Returns the message PostgreSQL 18 refuses a call of `function`
+    /// with, the function named as the call writes it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::errors::Misapplied;
+    ///
+    /// assert_eq!(
+    ///     Misapplied::OverRequired.message("row_number"),
+    ///     "window function row_number requires an OVER clause",
+    /// );
+    /// ```
+    #[must_use]
+    pub fn message(self, function: &str) -> String {
+        let not_aggregate = |clause: &str| {
+            format!("{clause} specified, but {function} is not an aggregate function")
+        };
+        match self {
+            Self::StarOnPlainFunction => not_aggregate(&format!("{function}(*)")),
+            Self::DistinctOnPlainFunction => not_aggregate("DISTINCT"),
+            Self::WithinGroupOnPlainFunction => not_aggregate("WITHIN GROUP"),
+            Self::OrderByOnPlainFunction => not_aggregate("ORDER BY"),
+            Self::FilterOnPlainFunction => not_aggregate("FILTER"),
+            Self::OverOnPlainFunction => {
+                format!(
+                    "OVER specified, but {function} is not a window function nor an aggregate function"
+                )
+            }
+            Self::WithinGroupRequired => {
+                format!("WITHIN GROUP is required for ordered-set aggregate {function}")
+            }
+            Self::OverOnOrderedSetAggregate => {
+                format!("OVER is not supported for ordered-set aggregate {function}")
+            }
+            Self::WithinGroupOnNormalAggregate => {
+                format!(
+                    "{function} is not an ordered-set aggregate, so it cannot have WITHIN GROUP"
+                )
+            }
+            Self::OverRequired => format!("window function {function} requires an OVER clause"),
+            Self::WithinGroupOnWindowFunction => {
+                format!("window function {function} cannot have WITHIN GROUP")
+            }
+            Self::StarRequired => {
+                format!("{function}(*) must be used to call a parameterless aggregate function")
+            }
+            Self::NamedArgumentOnAggregate => "aggregates cannot use named arguments".into(),
+            Self::DistinctOverWindow => "DISTINCT is not implemented for window functions".into(),
+            Self::OrderByOverWindow => {
+                "aggregate ORDER BY is not implemented for window functions".into()
+            }
+            Self::FilterOnWindowFunction => {
+                "FILTER is not implemented for non-aggregate window functions".into()
+            }
+            Self::OrderByWithinGroup => {
+                "cannot use multiple ORDER BY clauses with WITHIN GROUP".into()
+            }
+            Self::DistinctWithinGroup => "cannot use DISTINCT with WITHIN GROUP".into(),
+        }
     }
 }
 
@@ -687,8 +821,8 @@ pub enum LookupError {
 /// [`TargetName::parse`](crate::structs::TargetName::parse).
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum TargetNameParseError {
-    /// The text was empty, so it names nothing.
-    #[error("cannot parse a target name from empty text")]
+    /// The text was empty or only whitespace, so it names nothing.
+    #[error("cannot parse a target name from empty or blank text")]
     Empty,
     /// A part of the name was empty, as in `app.`, `.docs` or `""`.
     #[error("target name `{text}` has an empty identifier part")]
@@ -703,7 +837,7 @@ pub enum TargetNameParseError {
         text: String,
     },
     /// Text followed an identifier where a separating dot or the end of the
-    /// name was required, as in `a"b` or `"a"x`.
+    /// name was required, as in `a"b`, `"a"x` or `ord ers`.
     #[error("target name `{text}` has unexpected text `{found}` after an identifier")]
     UnexpectedText {
         /// The full text that was being parsed.
@@ -1080,13 +1214,23 @@ pub enum HelperSetError {
         /// The condition, as written.
         condition: String,
     },
-    /// The body is not a `UNION` of grant arms and parent arms.
-    #[error("helper `{function}` returns `{arm}`, which is neither a grant arm nor a parent arm")]
+    /// The body is not a `UNION` of grant arms and parent arms, alone or
+    /// walked down a tree by a `WITH RECURSIVE` term.
+    #[error(
+        "helper `{function}` returns `{arm}`, which is neither a grant arm, a parent arm nor a walk"
+    )]
     ArmShape {
         /// The helper.
         function: String,
         /// The query that has neither shape, as written.
         arm: String,
+    },
+    /// The body walks its tree with `UNION ALL`, which keeps every row it
+    /// reaches again and so never ends on a tree holding a cycle.
+    #[error("helper `{function}` walks its tree with UNION ALL, which never ends on a cycle")]
+    UnionAllWalk {
+        /// The helper.
+        function: String,
     },
     /// A parent arm compares a column with no single-column foreign key to a
     /// helper whose set covers no one table, so nothing names the parent
@@ -1597,6 +1741,59 @@ pub enum Error {
         operator_name: Box<str>,
         /// The attribute refused.
         attribute: OperatorAttribute,
+    },
+    #[error("Operator `{operator_name}` over ({}) {reason}.", .operand_types.join(", "))]
+    /// Error indicating that a stored expression applies an operator no
+    /// operator, or no single one, takes the operand types of.
+    ///
+    /// PostgreSQL types an expression when the statement storing it runs,
+    /// and again when `ALTER COLUMN ... TYPE` parses it over the column's
+    /// new type. A database holding an extension never raises it, and
+    /// neither does an operator whose lookup may land in a schema the
+    /// database does not hold, qualified with it or on the search path,
+    /// since the extension or the schema may supply the operator.
+    UnresolvedOperator {
+        /// Symbol of the operator as written.
+        operator_name: Box<str>,
+        /// Type of each operand, the left one first, `unknown` for an
+        /// untyped literal.
+        operand_types: Vec<Box<str>>,
+        /// Why PostgreSQL refuses the application.
+        reason: Unresolved,
+    },
+    #[error("Function `{function_name}({})` {reason}.", .argument_types.join(", "))]
+    /// Error indicating that a stored expression calls a function no
+    /// function, or no single one, takes the argument types of.
+    ///
+    /// PostgreSQL types an expression when the statement storing it runs,
+    /// and again when `ALTER COLUMN ... TYPE` parses it over the column's
+    /// new type. A database holding an extension never raises it, and
+    /// neither does a call whose lookup may land in a schema the database
+    /// does not hold, qualified with it or on the search path, since the
+    /// extension or the schema may supply the function.
+    UnresolvedCall {
+        /// Name of the function as written.
+        function_name: String,
+        /// Type of each argument, `unknown` for an untyped literal.
+        argument_types: Vec<Box<str>>,
+        /// Why PostgreSQL refuses the call.
+        reason: Unresolved,
+    },
+    #[error("{}", .rule.message(.function_name))]
+    /// Error indicating that a stored expression calls a function with
+    /// clauses PostgreSQL refuses for the kind of function the call selects,
+    /// or with clauses no call may combine.
+    ///
+    /// PostgreSQL checks a call's clauses when the statement storing the
+    /// expression runs, and again when `ALTER COLUMN ... TYPE` parses it
+    /// over the column's new type. A call whose lookup may land in a schema
+    /// the database does not hold is refused only for clauses no function
+    /// combines, since that schema may supply a function of another kind.
+    MisappliedCall {
+        /// Name of the function as written, each part unquoted.
+        function_name: String,
+        /// The rule the call breaks.
+        rule: Misapplied,
     },
     #[error("Invalid value `{option_value}` for collation option `{option_name}`.")]
     /// Error indicating that a `CREATE COLLATION` option is malformed.
@@ -3058,6 +3255,28 @@ pub enum Error {
         table_name: String,
         /// The kind of constraint refused.
         constraint: KeyConstraint,
+    },
+    #[error("{constraint} constraint of table `{table_name}` names column `{column_name}` twice.")]
+    /// Error indicating that a primary key or unique constraint names one
+    /// column twice in its key, column names compared as they are stored,
+    /// which PostgreSQL and MySQL refuse.
+    RepeatedKeyColumn {
+        /// Name of the table the constraint is declared on.
+        table_name: String,
+        /// The repeating entry of the key, as written.
+        column_name: String,
+        /// Whether the constraint is a primary key or a unique constraint.
+        constraint: KeyConstraint,
+    },
+    #[error("Index on table `{table_name}` names column `{column_name}` twice.")]
+    /// Error indicating that an index names one column twice in its key,
+    /// column names compared as they are stored, which MySQL refuses while
+    /// PostgreSQL stores the column twice.
+    RepeatedIndexColumn {
+        /// Name of the table the index is declared on.
+        table_name: String,
+        /// The repeating entry of the key, as written.
+        column_name: String,
     },
     #[error(
         "Column `{column_name}` of table `{table_name}` cannot take foreign-data wrapper options, because `{table_name}` is not a foreign table."

@@ -2,9 +2,10 @@
 //!
 //! PostgreSQL folds unquoted identifiers to lowercase and treats quoted
 //! identifiers as exact/case-sensitive. [`stored_identifier`] answers the
-//! name the catalog holds. [`normalize_identifier`] answers the form two
-//! names are compared under, which is additionally Unicode-NFC-normalized and
-//! whitespace-trimmed per FINGERPRINT_SPEC §7.1.
+//! name the catalog holds, which is also the form two names are compared
+//! under. [`normalize_identifier`] answers the form a fingerprint encodes,
+//! which is additionally Unicode-NFC-normalized and whitespace-trimmed per
+//! FINGERPRINT_SPEC §7.1.
 
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
@@ -57,6 +58,9 @@ pub fn parse_lookup_identifier(name: &str) -> LookupIdentifier<'_> {
 /// PostgreSQL rules:
 /// - quoted identifiers: exact/case-sensitive
 /// - unquoted identifiers: case-insensitive via lowercase folding
+///
+/// Both sides are compared as [`stored_identifier`] answers, so surrounding
+/// spaces and Unicode composition tell two names apart.
 #[must_use]
 pub fn identifiers_match(
     left_value: &str,
@@ -64,9 +68,7 @@ pub fn identifiers_match(
     right_value: &str,
     right_quoted: bool,
 ) -> bool {
-    let left = normalize_identifier(left_value, left_quoted);
-    let right = normalize_identifier(right_value, right_quoted);
-    left == right
+    stored_identifier(left_value, left_quoted) == stored_identifier(right_value, right_quoted)
 }
 
 /// Returns whether a stored identifier matches a textual lookup identifier.
@@ -163,7 +165,7 @@ pub fn session_principal(value: &str, quoted: bool) -> Option<SessionPrincipal> 
     None
 }
 
-/// Normalizes an identifier for comparison and fingerprint encoding.
+/// Normalizes an identifier for fingerprint encoding.
 ///
 /// Applies the FINGERPRINT_SPEC §7.1 / audit §5 rules:
 /// 1. Trim surrounding ASCII whitespace.
@@ -173,8 +175,8 @@ pub fn session_principal(value: &str, quoted: bool) -> Option<SessionPrincipal> 
 /// 3. ASCII-lowercase unquoted identifiers (matching PostgreSQL folding);
 ///    quoted identifiers retain their case post-NFC.
 ///
-/// The result is not a name PostgreSQL stores, which [`stored_identifier`]
-/// answers.
+/// The result is not a name PostgreSQL stores or compares, which
+/// [`stored_identifier`] answers.
 #[must_use]
 pub fn normalize_identifier(value: &str, quoted: bool) -> Cow<'_, str> {
     let trimmed = value.trim();
@@ -462,8 +464,8 @@ mod tests {
     // unquoted identifiers (quoted preserve case after NFC).
     // ---------------------------------------------------------------
 
-    /// INV-001: surrounding whitespace must be stripped before any
-    /// downstream comparison or fingerprint encoding.
+    /// INV-001: surrounding whitespace must be stripped before fingerprint
+    /// encoding.
     #[test]
     fn test_inv_001_normalize_trims_whitespace() {
         assert_eq!(normalize_identifier("  users  ", false), normalize_identifier("users", false));

@@ -1,5 +1,5 @@
-//! Tests that each call in a policy or check expression answers the
-//! functions it may reach, wherever it is nested.
+//! Tests that each call in a policy, check, column, domain or index
+//! expression answers the functions it may reach, wherever it is nested.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 #![expect(
     clippy::disallowed_methods,
@@ -163,25 +163,37 @@ fn each_call_reaches_the_overload_its_arguments_select() {
 }
 
 /// A `VARIADIC` parameter collects at least one argument unless it has a
-/// default, so a call passing none reaches only the overloads that need none.
+/// default, so a call passing none reaches only the overloads that need none,
+/// and PostgreSQL refuses one reaching none.
 #[test]
 fn a_variadic_parameter_without_a_default_needs_an_argument() {
-    let db = parse(
+    let functions =
         "CREATE FUNCTION f(VARIADIC xs INT[]) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
          CREATE FUNCTION g(VARIADIC xs INT[] DEFAULT '{}') RETURNS BOOL LANGUAGE sql AS 'SELECT true';
-         CREATE TABLE items (owner TEXT);
-         CREATE POLICY p ON items USING (
-             f() AND f(1) AND f(1, 2) AND g() AND g(1)
-             AND EXISTS (SELECT rank() OVER () FROM items)
-         );",
+         CREATE TABLE items (owner TEXT);";
+    let refused = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{functions} CREATE POLICY p ON items USING (f());"
+    ));
+    assert!(
+        matches!(
+            &refused,
+            Err(sql_traits::errors::Error::UnresolvedCall { function_name, argument_types, .. })
+                if function_name == "f" && argument_types.is_empty()
+        ),
+        "got {refused:?}"
     );
+    let db = parse(&format!(
+        "{functions} CREATE POLICY p ON items USING (
+             f(1) AND f(1, 2) AND g() AND g(1)
+             AND EXISTS (SELECT rank() OVER () FROM items)
+         );"
+    ));
     let policy = policy(&db, "p");
     let using = policy.using_expression(&db).expect("literals read").expect("USING clause");
     let calls = names_per_call(using, |call| policy.functions_reached_by(call, &db).map(names));
     assert_eq!(
         calls,
         [
-            ("f".to_owned(), vec![]),
             ("f".to_owned(), vec!["f".to_owned()]),
             ("f".to_owned(), vec!["f".to_owned()]),
             ("g".to_owned(), vec!["g".to_owned()]),
@@ -358,4 +370,248 @@ fn an_expression_form_reaches_no_function() {
             ("current_user".to_owned(), vec!["current_user".to_owned()]),
         ]
     );
+}
+
+/// The default and the generation expression of a column answer per call
+/// under the path in force when the table was written, whatever path the
+/// script ends on, and a call from a copy is refused.
+#[test]
+fn column_expression_calls_resolve_under_the_statement_search_path() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x';
+         CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x';
+         CREATE FUNCTION app.d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         SET search_path TO app;
+         CREATE TABLE public.t (
+             x INT DEFAULT d(),
+             y INT GENERATED ALWAYS AS (f(x) + 1) STORED,
+             z INT
+         );
+         SET search_path TO public;",
+    );
+    let table = db.tables().next().expect("table exists");
+    let column = |name: &str| {
+        table.column(name, &db, IdentifierCase::AsWritten).expect("table is held").expect(name)
+    };
+    let (x, y, z) = (column("x"), column("y"), column("z"));
+    let default = x.default_expression().expect("x has a default");
+    let generation = y.generation_expression().expect("y is generated");
+    assert_eq!(default.to_string(), "d()");
+    assert_eq!(generation.to_string(), "f(x) + 1");
+    assert!(x.generation_expression().is_none());
+    assert!(y.default_expression().is_none());
+    assert!(z.default_expression().is_none() && z.generation_expression().is_none());
+    assert_eq!(
+        names_per_call(default, |call| x.functions_reached_by(call, &db).map(names)),
+        [("d".to_owned(), vec!["app.d".to_owned()])]
+    );
+    assert_eq!(
+        names_per_call(generation, |call| y.functions_reached_by(call, &db).map(names)),
+        [("f".to_owned(), vec!["app.f".to_owned()])]
+    );
+    let refusals =
+        refusals_per_call(generation, |call| x.functions_reached_by(call, &db).map(names));
+    assert_eq!(refusals, [("f".to_owned(), vec!["f(x)".to_owned()])]);
+    let copy = generation.clone();
+    let refusals = refusals_per_call(&copy, |call| y.functions_reached_by(call, &db).map(names));
+    assert_eq!(refusals, [("f".to_owned(), vec!["f(x)".to_owned()])]);
+}
+
+/// A default set later reaches the function the path in force at the
+/// `ALTER TABLE` selects.
+#[test]
+fn an_altered_column_default_answers_its_own_calls() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x';
+         CREATE TABLE t (x INT, y INT GENERATED ALWAYS AS (f(x)) STORED);
+         SET search_path TO app;
+         ALTER TABLE public.t ALTER COLUMN x SET DEFAULT d();
+         SET search_path TO public;",
+    );
+    let table = db.tables().next().expect("table exists");
+    let column = |name: &str| {
+        table.column(name, &db, IdentifierCase::AsWritten).expect("table is held").expect(name)
+    };
+    let (x, y) = (column("x"), column("y"));
+    let default = x.default_expression().expect("x has a default");
+    assert_eq!(
+        names_per_call(default, |call| x.functions_reached_by(call, &db).map(names)),
+        [("d".to_owned(), vec!["app.d".to_owned()])]
+    );
+    let generation = y.generation_expression().expect("y is generated");
+    assert_eq!(
+        names_per_call(generation, |call| y.functions_reached_by(call, &db).map(names)),
+        [("f".to_owned(), vec!["f".to_owned()])]
+    );
+}
+
+/// The default and every check of a domain answer per call under the path
+/// in force when the domain was created, each check counting its own calls
+/// whatever the default and the earlier checks call.
+#[test]
+fn domain_expression_calls_resolve_under_the_statement_search_path() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.ok(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE FUNCTION ok(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE FUNCTION app.d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION d() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         SET search_path TO app;
+         CREATE DOMAIN public.checked AS INT DEFAULT d()
+             CHECK (ok(VALUE)) CHECK (VALUE > 0 AND abs(VALUE) < 9 AND ok(VALUE));
+         SET search_path TO public;",
+    );
+    let domain = db.domains().next().expect("domain exists");
+    let default = domain.default_expression().expect("the domain has a default");
+    assert_eq!(
+        names_per_call(default, |call| domain.functions_reached_by(call, &db).map(names)),
+        [("d".to_owned(), vec!["app.d".to_owned()])]
+    );
+    let checks: Vec<_> = domain
+        .check_expressions()
+        .map(|check| {
+            (
+                check.to_string(),
+                names_per_call(check, |call| domain.functions_reached_by(call, &db).map(names)),
+            )
+        })
+        .collect();
+    let ok = || ("ok".to_owned(), vec!["app.ok".to_owned()]);
+    let abs = vec!["pg_catalog.abs".to_owned(); 6];
+    assert_eq!(
+        checks,
+        [
+            ("ok(VALUE)".to_owned(), vec![ok()]),
+            (
+                "VALUE > 0 AND abs(VALUE) < 9 AND ok(VALUE)".to_owned(),
+                vec![("abs".to_owned(), abs), ok()]
+            ),
+        ]
+    );
+    let copy = default.clone();
+    let refusals =
+        refusals_per_call(&copy, |call| domain.functions_reached_by(call, &db).map(names));
+    assert_eq!(refusals, [("d".to_owned(), vec!["d()".to_owned()])]);
+}
+
+/// A check `DROP FUNCTION … CASCADE` removes from a domain takes its calls
+/// along, so the checks left keep answering for their own.
+#[test]
+fn domain_checks_left_by_a_cascade_answer_their_calls() {
+    let db = parse(
+        "CREATE FUNCTION gone(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE FUNCTION ok(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+         CREATE DOMAIN checked AS INT CHECK (gone(VALUE)) CHECK (ok(VALUE));
+         DROP FUNCTION gone(INT) CASCADE;",
+    );
+    let domain = db.domains().next().expect("domain exists");
+    let checks: Vec<_> = domain
+        .check_expressions()
+        .map(|check| {
+            names_per_call(check, |call| domain.functions_reached_by(call, &db).map(names))
+        })
+        .collect();
+    assert_eq!(checks, [[("ok".to_owned(), vec!["ok".to_owned()])]]);
+}
+
+/// A domain asked about its calls in a database that does not hold it is
+/// refused as absent.
+#[test]
+fn a_domain_from_another_database_is_refused() {
+    let schema = "CREATE FUNCTION ok(x INT) RETURNS BOOL LANGUAGE sql AS 'SELECT true';
+                  CREATE DOMAIN checked AS INT CHECK (ok(VALUE));";
+    let held = parse(schema);
+    let other = parse("CREATE TABLE t (x INT);");
+    let domain = held.domains().next().expect("domain exists");
+    let check = domain.check_expressions().next().expect("the domain has a check");
+    let refusals = reached_per_call(check, |call| {
+        match domain.functions_reached_by(call, &other) {
+            Err(LookupError::ObjectNotInDatabase { object, .. }) => vec![object],
+            Err(error) => panic!("unexpected error {error}"),
+            Ok(_) => panic!("a domain the database lacks was answered"),
+        }
+    });
+    assert_eq!(refusals, [("ok".to_owned(), vec!["`checked`".to_owned()])]);
+}
+
+/// The schema of the index tests, whose index binds its calls under a path
+/// the script then leaves.
+const MOVED_PATH_INDEX: &str = "CREATE SCHEMA earlier;
+     CREATE SCHEMA later;
+     CREATE FUNCTION earlier.norm(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x';
+     CREATE FUNCTION later.norm(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT -x';
+     CREATE FUNCTION earlier.keep(x INT) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT true';
+     CREATE FUNCTION later.keep(x INT) RETURNS BOOL LANGUAGE sql IMMUTABLE AS 'SELECT true';
+     CREATE TABLE public.t (x INT, y INT);
+     SET search_path = earlier, public;
+     CREATE INDEX keyed ON public.t (norm(x), y, (norm(y) + 1)) WHERE keep(x) AND norm(y) > 0;
+     CREATE INDEX plain ON public.t (norm(x));
+     SET search_path = later, public;";
+
+/// Each call of an expression, in walk order, with the qualified names of
+/// the functions it reaches.
+type CallsReached = Vec<(String, Vec<String>)>;
+
+/// The calls of `index`'s key and predicate, each with the functions it
+/// reaches in `db`.
+fn index_calls(
+    db: &ParserDB,
+    index: &<ParserDB as DatabaseLike>::Index,
+) -> (CallsReached, CallsReached) {
+    let expression = index.expression(db).expect("the index is held");
+    let predicate = index.predicate().expect("the index is partial");
+    let lookup = |call: &sqlparser::ast::Function| index.functions_reached_by(call, db).map(names);
+    (names_per_call(expression, lookup), names_per_call(predicate, lookup))
+}
+
+/// The key and the predicate of an index answer per call under the path in
+/// force at `CREATE INDEX`, whatever path the script ends on, the predicate
+/// counting its calls after every call of the key.
+#[test]
+fn index_calls_resolve_under_the_statement_search_path() {
+    let db = parse(MOVED_PATH_INDEX);
+    let index = db.indexes().find(|index| index.name() == Some("keyed")).expect("index exists");
+    let norm = || ("norm".to_owned(), vec!["earlier.norm".to_owned()]);
+    let keep = ("keep".to_owned(), vec!["earlier.keep".to_owned()]);
+    assert_eq!(index_calls(&db, index), (vec![norm(), norm()], vec![keep, norm()]));
+}
+
+/// A column rename rewrites the key of an index over it, whose calls keep
+/// the functions they were bound to whatever path the rename runs under.
+#[test]
+fn index_calls_survive_a_rename_under_another_path() {
+    let db = parse(&format!("{MOVED_PATH_INDEX} ALTER TABLE public.t RENAME COLUMN y TO z;"));
+    let index = db.indexes().find(|index| index.name() == Some("keyed")).expect("index exists");
+    let norm = || ("norm".to_owned(), vec!["earlier.norm".to_owned()]);
+    let keep = ("keep".to_owned(), vec!["earlier.keep".to_owned()]);
+    assert_eq!(index_calls(&db, index), (vec![norm(), norm()], vec![keep, norm()]));
+}
+
+/// A call copied out of an index, or borrowed from another index, is refused
+/// as no node of the index asked.
+#[test]
+fn an_index_refuses_calls_it_does_not_hold() {
+    let db = parse(MOVED_PATH_INDEX);
+    let index =
+        |name: &str| db.indexes().find(|index| index.name() == Some(name)).expect("index exists");
+    let (keyed, plain) = (index("keyed"), index("plain"));
+    let copy = keyed.predicate().expect("the index is partial").clone();
+    let refusals =
+        refusals_per_call(&copy, |call| keyed.functions_reached_by(call, &db).map(names));
+    assert_eq!(
+        refusals,
+        [
+            ("keep".to_owned(), vec!["keep(x)".to_owned()]),
+            ("norm".to_owned(), vec!["norm(y)".to_owned()])
+        ]
+    );
+    let other = plain.expression(&db).expect("the index is held");
+    let refusals =
+        refusals_per_call(other, |call| keyed.functions_reached_by(call, &db).map(names));
+    assert_eq!(refusals, [("norm".to_owned(), vec!["norm(x)".to_owned()])]);
 }

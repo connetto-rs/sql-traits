@@ -1,11 +1,14 @@
 //! Implementation of the `DomainLike` trait for sqlparser's `CreateDomain`
 //! type.
 
-use sqlparser::ast::{CreateDomain, DataType, ObjectName};
+use alloc::string::ToString;
+
+use sqlparser::ast::{CreateDomain, DataType, Expr, Function, ObjectName, TableConstraint};
 
 use crate::{
+    errors::{LookupError, ObjectKind},
     structs::{IdentifierCase, ParserDB},
-    traits::{DomainLike, Metadata},
+    traits::{DatabaseLike, DomainLike, Metadata},
     utils::{
         identifier_resolution::stored_identifier,
         object_name::{object_name_identifiers, object_name_last_part, qualifier_of},
@@ -50,6 +53,37 @@ impl DomainLike for CreateDomain {
     #[inline]
     fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db DataType {
         &self.data_type
+    }
+
+    #[inline]
+    fn default_expression(&self) -> Option<&Expr> {
+        self.default.as_ref()
+    }
+
+    #[inline]
+    fn check_expressions(&self) -> impl Iterator<Item = &Expr> {
+        self.constraints.iter().filter_map(|constraint| {
+            match constraint {
+                TableConstraint::Check(check) => Some(check.expr.as_ref()),
+                _ => None,
+            }
+        })
+    }
+
+    /// The calls of the default and every check are bound in one record, so
+    /// a call is counted from the start of the domain's node.
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        database
+            .domain_metadata(self)
+            .ok_or_else(|| ObjectKind::Domain.not_in_database(self.name()))?
+            .calls()
+            .reached_by(self, call)
+            .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })
     }
 }
 

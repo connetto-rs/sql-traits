@@ -38,7 +38,7 @@ pub(super) enum Owner {
     /// The column of this identity: its default, its generation expression
     /// and its inline checks.
     Column(ColumnIdentity),
-    /// The table itself: its own checks and its exclusions.
+    /// The table itself: its own checks, its exclusions and its unique keys.
     Table,
 }
 
@@ -55,6 +55,8 @@ pub(super) enum Kind {
     Check,
     /// An exclusion constraint's record.
     Exclusion,
+    /// A unique constraint's record, whose key may hold expressions.
+    UniqueKey,
     /// The partition key's record.
     PartitionKey,
 }

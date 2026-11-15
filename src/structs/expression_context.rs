@@ -4,30 +4,36 @@ use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArguments, Ident, InTarget, ObjectNamePart, Query, Statement,
-    TableFactor, UnaryOperator, Value, Visit, Visitor,
+    ArgMode, BinaryOperator, CastKind, DataType, DuplicateTreatment, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Ident, InTarget, ObjectNamePart,
+    Query, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
 };
 
 use crate::{
-    errors::LookupError,
-    impls::dql::{
-        definition_graph::reference_sites::SiteRule,
-        scoped_roots::{ScopedRoot, is_input},
+    errors::{LookupError, Misapplied, Unresolved},
+    impls::{
+        BodyPath,
+        dql::{
+            ColumnOrigin,
+            definition_graph::reference_sites::SiteRule,
+            scoped_roots::{ScopedRoot, is_input},
+        },
     },
     structs::{
-        CallResolution, ColumnBinding, ColumnDefinition, ColumnScope, ExpressionScope,
-        IdentifierCase, OperandType, OperatorResolution, SelectedOperator, TargetName,
+        AggregateKind, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope,
+        ExpressionScope, FunctionKind, IdentifierCase, OperandType, OperatorResolution,
+        PlPgSqlScope, PlPgSqlVariable, SelectedOperator, TargetName, plpgsql_scope::stored_parts,
     },
-    traits::{ColumnLike, DataTypeLike, DatabaseLike, FunctionLike},
+    traits::{ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, OperatorLike, TableLike},
     utils::{
         call_sites::expression_form,
         call_typing::{
-            Matched, called_name, called_object_name, reached_by_name, resolve_function,
-            written_argument_names, written_names,
+            Matched, WrittenName, called_name, called_object_name, reached_by_name,
+            resolve_function, written_argument_names, written_names,
         },
         coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
-        object_name::PG_CATALOG,
+        identifier_resolution::identifiers_match,
+        object_name::{PG_CATALOG, RoutinePath, reaches_unheld_schema},
         operator_typing::resolve_operator,
         postgres_types::PgType,
         type_modifier,
@@ -92,6 +98,9 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     /// What the deparsed text of a stored expression pins when PostgreSQL
     /// parses it again.
     pins: Option<&'query (dyn ReparsePins<DB> + 'query)>,
+    /// The PL/pgSQL variables the expression reaches, and the path its body
+    /// runs it under.
+    variables: Option<&'query PlPgSqlScope<'query, 'db, DB>>,
 }
 
 /// An application of an operator, by the address of the node applying it
@@ -139,6 +148,9 @@ pub struct OperatorApplication<'node, 'db, DB: DatabaseLike> {
     left: Option<&'node Expr>,
     right: Operand<'node, 'db, DB>,
     resolution: OperatorResolution<'db, DB>,
+    /// Why PostgreSQL refuses the application, with the type of each operand
+    /// the selection weighed, the left one first.
+    refused: Option<Refused>,
 }
 
 /// Where the right operand of an operator application comes from.
@@ -166,6 +178,8 @@ pub struct CallApplication<'node, 'db, DB: DatabaseLike> {
     name: TargetName<'node>,
     arguments: Vec<&'node Expr>,
     resolution: CallResolution<'db, DB>,
+    /// Why PostgreSQL refuses the call.
+    refused: Option<CallRefusal>,
 }
 
 impl<'node, 'db, DB: DatabaseLike> CallApplication<'node, 'db, DB> {
@@ -188,6 +202,12 @@ impl<'node, 'db, DB: DatabaseLike> CallApplication<'node, 'db, DB> {
     #[must_use]
     pub const fn resolution(&self) -> &CallResolution<'db, DB> {
         &self.resolution
+    }
+
+    /// The name looked up and why PostgreSQL refuses the call, for a call
+    /// PostgreSQL refuses.
+    pub(crate) fn into_refusal(self) -> Option<(TargetName<'node>, CallRefusal)> {
+        Some((self.name, self.refused?))
     }
 }
 
@@ -228,6 +248,28 @@ impl<'node, 'db, DB: DatabaseLike> OperatorApplication<'node, 'db, DB> {
     pub const fn resolution(&self) -> &OperatorResolution<'db, DB> {
         &self.resolution
     }
+
+    /// The name looked up, why PostgreSQL refuses the application and the
+    /// type of each operand the selection weighed, the left one first, for
+    /// an application PostgreSQL refuses.
+    pub(crate) fn into_refusal(self) -> Option<(TargetName<'node>, Refused)> {
+        Some((self.name, self.refused?))
+    }
+}
+
+/// Why PostgreSQL refuses an application or a call, and the type of each
+/// operand or argument it weighed.
+pub(crate) type Refused = (Unresolved, Vec<Box<str>>);
+
+/// Why PostgreSQL refuses a call.
+#[derive(Debug, Clone)]
+pub(crate) enum CallRefusal {
+    /// No function, or no single one, takes the arguments, typed as the
+    /// selection weighed them.
+    Unresolved(Refused),
+    /// The call writes clauses the function it selects refuses, or clauses
+    /// no call may combine.
+    Misapplied(Misapplied),
 }
 
 /// How PostgreSQL evaluates a node, by the operators it applies.
@@ -267,7 +309,7 @@ type Applications<'node, 'db, DB> = (Vec<OperatorApplication<'node, 'db, DB>>, R
 
 /// What PostgreSQL does with the elements of an `IN` list it may build into
 /// one array.
-enum Collapse<'a> {
+pub(crate) enum Collapse<'a> {
     /// It builds them into one array of elements of this type.
     Into(OperandType<'a>),
     /// It compares with each of them apart.
@@ -364,7 +406,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// ```
     pub fn for_expression(
         expression: &'query Expr,
-        scope: &ExpressionScope<'_, 'db, DB>,
+        scope: &ExpressionScope<'query, 'db, DB>,
         database: &'db DB,
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
@@ -393,7 +435,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// into.
     pub fn for_statement(
         statement: &'query Statement,
-        scope: &ExpressionScope<'_, 'db, DB>,
+        scope: &ExpressionScope<'query, 'db, DB>,
         database: &'db DB,
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
@@ -404,7 +446,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     fn scoped<N: Visit + ?Sized>(
         root: ScopedRoot<'query>,
         node: &'query N,
-        scope: &ExpressionScope<'_, 'db, DB>,
+        scope: &ExpressionScope<'query, 'db, DB>,
         database: &'db DB,
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
@@ -415,10 +457,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                     .argument_modes()
                     .zip(function.argument_type_names(database))
                     .filter(|(mode, _)| is_input(mode))
-                    .map(|(_, name)| {
-                        PgType::parse(&name)
-                            .map_or(OperandType::Unknown, |pg_type| known(database, pg_type, None))
-                    })
+                    .map(|(_, name)| declared_type_named(database, &name))
                     .collect()
             }
             _ => Vec::new(),
@@ -427,7 +466,12 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             ExpressionScope::DomainValue(data_type) => Some(declared_type(database, data_type)),
             _ => None,
         };
-        Ok(Self::assemble(node, column_scope, sites, database, case, parameters, value))
+        let mut context =
+            Self::assemble(node, column_scope, sites, database, case, parameters, value);
+        if let ExpressionScope::PlPgSql(variables) = scope {
+            context.variables = Some(variables);
+        }
+        Ok(context)
     }
 
     /// The context of the nodes of `root`, resolved in `scope` by the rules
@@ -448,7 +492,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         });
         nodes.sort_unstable();
         sites.sort_unstable_by_key(|(address, _)| *address);
-        Self { database, scope, nodes, sites, case, parameters, value, pins: None }
+        Self { database, scope, nodes, sites, case, parameters, value, pins: None, variables: None }
     }
 
     /// The context typing as `pins` has PostgreSQL's deparsed text pin it.
@@ -461,6 +505,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// references, resolved as the clause holding it resolves it, or `None`
     /// for a node that is no column reference or binds nothing.
     ///
+    /// Under [`ExpressionScope::PlPgSql`] a name no relation in reach holds
+    /// binds the variable it reaches, or that variable's field when parts
+    /// follow its name, with no `FROM` item or column in the binding.
+    ///
     /// # Errors
     ///
     /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
@@ -471,12 +519,61 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
     {
         self.check(expression)?;
-        match (expression, self.rule(expression)) {
-            (Expr::Identifier(_) | Expr::CompoundIdentifier(_), Some(rule)) => {
-                self.scope.resolve_site(rule, expression)
-            }
-            _ => Ok(None),
+        let parts = match expression {
+            Expr::Identifier(ident) => core::slice::from_ref(ident),
+            Expr::CompoundIdentifier(parts) => parts.as_slice(),
+            _ => return Ok(None),
+        };
+        let Some(rule) = self.rule(expression) else { return Ok(None) };
+        match self.scope.resolve_site(rule, expression)? {
+            Some(bound) => Ok(Some(bound)),
+            None => Ok(self.variable_reference(parts)),
         }
+    }
+
+    /// The PL/pgSQL variable the name `parts` writes, or whose field it names.
+    fn variable_reference(
+        &self,
+        parts: &[Ident],
+    ) -> Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)> {
+        let (variable, consumed) = self.variables?.variable(&stored_parts(parts))?;
+        let definition = if consumed < parts.len() {
+            ColumnDefinition::VariableField(variable)
+        } else {
+            ColumnDefinition::Variable(variable)
+        };
+        Some((definition, ColumnBinding::new(None, None, ColumnOrigin::Unknown, None)))
+    }
+
+    /// The type of the field of `variable` that `expression` names. A field
+    /// of a table's row takes its column's type. A field of a record, whose
+    /// fields only the row it holds at run time decides, and a field of a
+    /// field stay unknown.
+    fn field_type(
+        &self,
+        variable: &PlPgSqlVariable<'db>,
+        expression: &Expr,
+    ) -> Result<OperandType<'db>, LookupError> {
+        let (
+            Expr::CompoundIdentifier(parts),
+            Ok(OperandType::Known { type_name, .. }),
+            Some(variables),
+        ) = (expression, variable.data_type(), self.variables)
+        else {
+            return Ok(OperandType::Unknown);
+        };
+        let consumed = variables.variable(&stored_parts(parts)).map(|(_, consumed)| consumed);
+        let (Some(consumed), [.., field]) = (consumed, parts.as_slice()) else {
+            return Ok(OperandType::Unknown);
+        };
+        let table = self.database.table_by_target(type_name.clone(), IdentifierCase::AsWritten)?;
+        let (Some(table), true) = (table, consumed + 1 == parts.len()) else {
+            return Ok(OperandType::Unknown);
+        };
+        let column = table.column(&field.to_string(), self.database, IdentifierCase::AsWritten)?;
+        Ok(column.map_or(OperandType::Unknown, |column| {
+            column_type(self.database, column.data_type(self.database))
+        }))
     }
 
     /// The rule the clause holding the column reference `expression` resolves
@@ -527,6 +624,14 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                     }
                     Some((ColumnDefinition::Parameter { ordinal, .. }, _)) => {
                         self.parameters.get(ordinal).cloned().unwrap_or(OperandType::Unknown)
+                    }
+                    // A variable whose declared type failed to resolve types
+                    // as unknown, the error kept on the variable.
+                    Some((ColumnDefinition::Variable(variable), _)) => {
+                        variable.data_type().cloned().unwrap_or(OperandType::Unknown)
+                    }
+                    Some((ColumnDefinition::VariableField(variable), _)) => {
+                        self.field_type(&variable, expression)?
                     }
                     None => self.domain_value(expression).unwrap_or(OperandType::Unknown),
                     _ => OperandType::Unknown,
@@ -695,32 +800,117 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             Expr::Function(function) => function,
             _ => return Ok(None),
         };
-        let Some(arguments) = call_arguments(function) else { return Ok(None) };
+        let Some((arguments, clauses)) = call_arguments(function) else { return Ok(None) };
         let name = called_name(function)?;
         if expression_form(&function.name).is_some() || is_row(expression) {
             return Ok(None);
+        }
+        if let Some(rule) = clauses.written_rule() {
+            let refused = Some(CallRefusal::Misapplied(rule));
+            let resolution = CallResolution::Undetermined;
+            return Ok(Some(CallApplication { name, arguments, resolution, refused }));
         }
         let Some(written) = written_argument_names(function) else { return Ok(None) };
         let call = core::ptr::from_ref(function).addr();
         if let Some(target) = self.pins.and_then(|pins| pins.cast(call)) {
             let resolution = CallResolution::Cast(target.clone());
-            return Ok(Some(CallApplication { name, arguments, resolution }));
+            let refused = clauses
+                .plain_rule()
+                .filter(|_| !self.call_reaches_unheld_schema(&name, Some(call)))
+                .map(CallRefusal::Misapplied);
+            return Ok(Some(CallApplication { name, arguments, resolution, refused }));
         }
-        let qualified;
-        let lookup = match self.pins.and_then(|pins| pins.call_schema(call)) {
-            Some((schema, quoted)) if name.schema().is_none() => {
-                qualified =
-                    TargetName::new(name.name(), name.name_is_quoted()).with_schema(schema, quoted);
-                &qualified
-            }
-            _ => &name,
+        let qualified = self.pinned_call_name(&name, Some(call));
+        let Some(mut reached) = self.reached(qualified.as_ref().unwrap_or(&name), &written) else {
+            return Ok(Some(undetermined_call(name, arguments)));
         };
-        let mut reached = reached_by_name(self.database, lookup, &written, self.case);
         if let Some(pins) = self.pins {
             reached.retain(|(function, _)| pins.admits_call(call, function));
         }
         let castable = matches!(written.as_slice(), [None]);
-        self.applied_call(name, arguments, &reached, castable, Some(call)).map(Some)
+        self.applied_call(name, arguments, &reached, castable, Some(call), Some(clauses)).map(Some)
+    }
+
+    /// The functions a call of `name` passing arguments under the names
+    /// `written` may run, or `None` where the body runs the call under a
+    /// path nothing tells and a schema besides `pg_catalog` defines a
+    /// function of the name.
+    fn reached(
+        &self,
+        name: &TargetName<'_>,
+        written: &[WrittenName<'_>],
+    ) -> Option<Vec<(&'db DB::Function, Matched)>> {
+        let path = self.function_path(name)?;
+        Some(reached_by_name(self.database, name, written, path, self.case))
+    }
+
+    /// The path an unqualified call of `name` looks its functions up on, as
+    /// [`Self::routine_path`] answers it.
+    fn function_path(&self, name: &TargetName<'_>) -> Option<RoutinePath<'_>> {
+        self.routine_path(name, || {
+            self.database
+                .functions_named(name.name())
+                .any(|function| outside_catalog(&function.target_name()))
+        })
+    }
+
+    /// The path an unqualified application of the operator `name` looks its
+    /// operators up on, as [`Self::routine_path`] answers it.
+    fn operator_path(&self, name: &TargetName<'_>) -> Option<RoutinePath<'_>> {
+        self.routine_path(name, || {
+            self.database.operators().is_some_and(|mut operators| {
+                operators.any(|operator| {
+                    let declared = operator.target_name();
+                    declared.name() == name.name() && outside_catalog(&declared)
+                })
+            })
+        })
+    }
+
+    /// The path an unqualified function or operator `name` is looked up on:
+    /// the one a PL/pgSQL body runs the expression under, and the database's
+    /// own path elsewhere. Under a path nothing tells, a name only
+    /// `pg_catalog` defines reaches it, which PostgreSQL searches first
+    /// unless the path places it later, and `None` answers that any other
+    /// name may reach a function or operator the path places first, as
+    /// `defined_elsewhere` says one exists.
+    fn routine_path(
+        &self,
+        name: &TargetName<'_>,
+        defined_elsewhere: impl FnOnce() -> bool,
+    ) -> Option<RoutinePath<'_>> {
+        let Some(variables) = &self.variables else { return Some(RoutinePath::Database) };
+        match variables.path() {
+            BodyPath::Database => Some(RoutinePath::Database),
+            BodyPath::Set(path) => Some(RoutinePath::Set(path)),
+            BodyPath::Unknown(_) if name.schema().is_some() || !defined_elsewhere() => {
+                Some(RoutinePath::Catalog)
+            }
+            BodyPath::Unknown(_) => None,
+        }
+    }
+
+    /// The name the call of `name` whose node sits at `call` looks up when
+    /// the pins qualify it, written without a schema, with the schema of
+    /// the function a deparse wrote.
+    fn pinned_call_name<'n>(
+        &'n self,
+        name: &'n TargetName<'_>,
+        call: Option<usize>,
+    ) -> Option<TargetName<'n>> {
+        let (schema, quoted) = self.pins?.call_schema(call?)?;
+        name.schema().is_none().then(|| {
+            TargetName::new(name.name(), name.name_is_quoted()).with_schema(schema, quoted)
+        })
+    }
+
+    /// Whether the call of `name` whose node sits at `call` may land in a
+    /// schema the database does not hold, which may supply the function.
+    fn call_reaches_unheld_schema(&self, name: &TargetName<'_>, call: Option<usize>) -> bool {
+        let qualified = self.pinned_call_name(name, call);
+        let lookup = qualified.as_ref().unwrap_or(name);
+        self.function_path(lookup)
+            .is_none_or(|path| reaches_unheld_schema(self.database, lookup, path, self.case))
     }
 
     /// Returns the function PostgreSQL calls for `factor`, a `FROM` item
@@ -776,16 +966,22 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             return Ok(None);
         };
         let target = called_object_name(name)?;
-        let reached = reached_by_name(self.database, &target, &written, self.case);
+        let Some(reached) = self.reached(&target, &written) else {
+            return Ok(Some(undetermined_call(target, arguments)));
+        };
         let castable = matches!(written.as_slice(), [None]);
-        self.applied_call(target, arguments, &reached, castable, None).map(Some)
+        let clauses = CallClauses::listed(listed);
+        self.applied_call(target, arguments, &reached, castable, None, Some(clauses)).map(Some)
     }
 
     /// The call of `name` passing `arguments`, one of the `reached`
     /// functions selected by the arguments' types or, when `castable` says
     /// the call passes one argument under no name, the cast it may read as,
     /// the arguments of the call whose node sits at `call` typed as the pins
-    /// have them.
+    /// have them, refused for the `clauses` it writes as PostgreSQL refuses
+    /// them, which a call PostgreSQL's grammar inserts has none of. A call
+    /// whose lookup may land in a schema the database does not hold is never
+    /// refused for what the function it reaches decides.
     fn applied_call<'node>(
         &self,
         name: TargetName<'node>,
@@ -793,6 +989,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         reached: &[(&'db DB::Function, Matched)],
         castable: bool,
         call: Option<usize>,
+        clauses: Option<CallClauses>,
     ) -> Result<CallApplication<'node, 'db, DB>, LookupError> {
         let pinned = |index| {
             let pins = self.pins?;
@@ -810,7 +1007,33 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             .collect::<Result<Vec<_>, _>>()?;
         let resolution =
             resolve_function(self.database, reached, &types, castable.then_some(&name));
-        Ok(CallApplication { name, arguments, resolution })
+        let unresolved =
+            |reason| CallRefusal::Unresolved((reason, types.iter().map(weighed_name).collect()));
+        let of_kind = |called: &DB::Function| -> Result<Option<CallRefusal>, LookupError> {
+            let Some(clauses) = clauses else { return Ok(None) };
+            let aggregate = called.aggregate_kind(self.database)?;
+            if let Some(rule) =
+                clauses.kind_rule(called.kind(self.database)?, aggregate, types.len())
+            {
+                return Ok(Some(CallRefusal::Misapplied(rule)));
+            }
+            let divided = divides(called, aggregate, types.len(), clauses.within_group);
+            Ok((!divided).then(|| unresolved(Unresolved::DoesNotExist)))
+        };
+        let refused = match &resolution {
+            CallResolution::NotFound => Some(unresolved(Unresolved::DoesNotExist)),
+            CallResolution::Ambiguous(_) => Some(unresolved(Unresolved::NotUnique)),
+            CallResolution::Selected(selected) => of_kind(selected.function())?,
+            CallResolution::UnboundPolymorphic(function) => {
+                of_kind(function)?.or_else(|| Some(unresolved(Unresolved::PolymorphicUnknown)))
+            }
+            CallResolution::Cast(_) => {
+                clauses.and_then(CallClauses::plain_rule).map(CallRefusal::Misapplied)
+            }
+            CallResolution::Undetermined => None,
+        };
+        let refused = refused.filter(|_| !self.call_reaches_unheld_schema(&name, call));
+        Ok(CallApplication { name, arguments, resolution, refused })
     }
 
     /// The call of the `pg_catalog` function `function` PostgreSQL's grammar
@@ -822,8 +1045,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     ) -> Result<CallApplication<'node, 'db, DB>, LookupError> {
         let name = TargetName::new(function, false).with_schema(PG_CATALOG, false);
         let written = Vec::from_iter(core::iter::repeat_n(None, arguments.len()));
-        let reached = reached_by_name(self.database, &name, &written, self.case);
-        self.applied_call(name, arguments, &reached, false, None)
+        let reached =
+            reached_by_name(self.database, &name, &written, RoutinePath::Database, self.case);
+        self.applied_call(name, arguments, &reached, false, None, None)
     }
 
     /// The applications PostgreSQL builds for `expression` and what the node
@@ -892,9 +1116,37 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         };
         let admits =
             |operator: &DB::Operator| self.pins.is_none_or(|pins| pins.admits(site, operator));
-        let resolution =
-            resolve_operator(self.database, lookup, left_type, right_type, self.case, &admits);
-        Ok(OperatorApplication { name, left, right, resolution })
+        let path = self.operator_path(lookup);
+        let resolution = match path {
+            Some(path) => {
+                resolve_operator(
+                    self.database,
+                    lookup,
+                    left_type,
+                    right_type,
+                    path,
+                    self.case,
+                    &admits,
+                )
+            }
+            None => OperatorResolution::Undetermined,
+        };
+        let reason = match resolution {
+            OperatorResolution::NotFound => Some(Unresolved::DoesNotExist),
+            OperatorResolution::Ambiguous(_) => Some(Unresolved::NotUnique),
+            OperatorResolution::UnboundPolymorphic(_) => Some(Unresolved::PolymorphicUnknown),
+            OperatorResolution::Selected(_) | OperatorResolution::Undetermined => None,
+        };
+        let refused = reason
+            .filter(|_| {
+                path.is_some_and(|path| {
+                    !reaches_unheld_schema(self.database, lookup, path, self.case)
+                })
+            })
+            .map(|reason| {
+                (reason, left_type.into_iter().chain([right_type]).map(weighed_name).collect())
+            });
+        Ok(OperatorApplication { name, left, right, resolution, refused })
     }
 
     /// What a node applying `applications` returns, as `returns` says.
@@ -1009,7 +1261,11 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// What PostgreSQL does with the `IN` list elements `elements` it may
     /// build into one array, deciding by the common type of `left` and the
     /// elements.
-    fn collapse(&self, left: &Expr, elements: &[&Expr]) -> Result<Collapse<'_>, LookupError> {
+    pub(crate) fn collapse(
+        &self,
+        left: &Expr,
+        elements: &[&Expr],
+    ) -> Result<Collapse<'_>, LookupError> {
         let mut types = Vec::with_capacity(elements.len() + 1);
         for node in core::iter::once(left).chain(elements.iter().copied()) {
             types.push(match self.type_of(node)? {
@@ -1080,8 +1336,15 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     }
 
     /// The type of the parameter `$n` names in a function body's context,
-    /// and [`OperandType::Unknown`] outside one.
+    /// the variable PL/pgSQL declares under `$n` in a PL/pgSQL body's, `$0`
+    /// included, and [`OperandType::Unknown`] outside either.
     fn positional(&self, placeholder: &str) -> OperandType<'db> {
+        if let Some(variables) = self.variables {
+            return variables
+                .variable(&[placeholder.into()])
+                .and_then(|(variable, _)| variable.data_type().ok().cloned())
+                .unwrap_or(OperandType::Unknown);
+        }
         placeholder
             .strip_prefix('$')
             .and_then(|position| position.parse::<usize>().ok())
@@ -1111,6 +1374,22 @@ fn address(expression: &Expr) -> usize {
     core::ptr::from_ref(expression).addr()
 }
 
+/// A call of `name` passing `arguments` whose function nothing tells, since
+/// the path it is looked up on is unknown.
+fn undetermined_call<'node, 'db, DB: DatabaseLike>(
+    name: TargetName<'node>,
+    arguments: Vec<&'node Expr>,
+) -> CallApplication<'node, 'db, DB> {
+    CallApplication { name, arguments, resolution: CallResolution::Undetermined, refused: None }
+}
+
+/// Whether the function or operator declared as `name` lives outside
+/// `pg_catalog`.
+fn outside_catalog(name: &TargetName<'_>) -> bool {
+    name.schema()
+        .is_none_or(|schema| !identifiers_match(schema, name.schema_is_quoted(), PG_CATALOG, false))
+}
+
 /// The type of a `pg_catalog` type with no modifier.
 fn catalog(name: &'static str) -> OperandType<'static> {
     OperandType::Known {
@@ -1120,7 +1399,7 @@ fn catalog(name: &'static str) -> OperandType<'static> {
 }
 
 /// The type of a value of the column type `data_type`.
-fn column_type<'a, D: DatabaseLike>(
+pub(crate) fn column_type<'a, D: DatabaseLike>(
     database: &'a D,
     data_type: &'a D::DataType,
 ) -> OperandType<'a> {
@@ -1133,7 +1412,10 @@ fn column_type<'a, D: DatabaseLike>(
 }
 
 /// The type a cast or a typed string names, with the modifier it declares.
-fn declared_type<'a, D: DatabaseLike>(database: &'a D, data_type: &DataType) -> OperandType<'a> {
+pub(crate) fn declared_type<'a, D: DatabaseLike>(
+    database: &'a D,
+    data_type: &DataType,
+) -> OperandType<'a> {
     let Some(typmod) = type_modifier::declared(data_type) else {
         return OperandType::Unknown;
     };
@@ -1145,6 +1427,29 @@ fn known<D: DatabaseLike>(database: &D, pg_type: PgType, typmod: Option<i32>) ->
     match type_name(database, &canonical_owned(database, pg_type)) {
         Some(type_name) => OperandType::Known { type_name, typmod },
         None => OperandType::Unknown,
+    }
+}
+
+/// The type a declaration names by `type_name`, as a function argument or a
+/// PL/pgSQL variable declares it, without a modifier.
+pub(crate) fn declared_type_named<'db, D: DatabaseLike>(
+    database: &'db D,
+    type_name: &str,
+) -> OperandType<'db> {
+    PgType::parse(type_name).map_or(OperandType::Unknown, |pg_type| known(database, pg_type, None))
+}
+
+/// The type of an array of `element`, carrying the element's modifier as
+/// PL/pgSQL's `%TYPE[]` does.
+pub(crate) fn array_of<'db, D: DatabaseLike>(
+    database: &'db D,
+    element: &OperandType<'_>,
+) -> OperandType<'db> {
+    match element {
+        OperandType::Known { type_name, typmod } => {
+            known(database, PgType::from_target(type_name).array(), *typmod)
+        }
+        OperandType::UntypedLiteral | OperandType::Unknown => OperandType::Unknown,
     }
 }
 
@@ -1466,17 +1771,177 @@ fn plain_arguments(function: &Function) -> Option<Vec<&Expr>> {
     }
 }
 
+/// The clauses a call writes that PostgreSQL checks against the kind of
+/// function the call selects.
+#[derive(Debug, Clone, Copy)]
+struct CallClauses {
+    /// The call passes `*`.
+    star: bool,
+    /// An argument is passed by name.
+    named: bool,
+    /// `DISTINCT` precedes the arguments.
+    distinct: bool,
+    /// The arguments end in `ORDER BY`.
+    ordered: bool,
+    /// How many values `WITHIN GROUP` orders by.
+    within_group: usize,
+    /// The call writes `FILTER`.
+    filter: bool,
+    /// The call writes `OVER`.
+    over: bool,
+}
+
+impl CallClauses {
+    /// The clauses of a call passing `arguments` and writing nothing else,
+    /// as a function in `FROM` does.
+    fn listed(arguments: &[FunctionArg]) -> Self {
+        Self {
+            star: matches!(arguments, [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]),
+            named: arguments.iter().any(|argument| !matches!(argument, FunctionArg::Unnamed(_))),
+            distinct: false,
+            ordered: false,
+            within_group: 0,
+            filter: false,
+            over: false,
+        }
+    }
+
+    /// The rule PostgreSQL's grammar refuses the clauses by, whatever
+    /// function the call names.
+    const fn written_rule(self) -> Option<Misapplied> {
+        if self.within_group == 0 {
+            None
+        } else if self.ordered {
+            Some(Misapplied::OrderByWithinGroup)
+        } else if self.distinct {
+            Some(Misapplied::DistinctWithinGroup)
+        } else {
+            None
+        }
+    }
+
+    /// The rule the clauses break on a call of a function that is neither
+    /// an aggregate nor a window function, or a call read as a cast.
+    const fn plain_rule(self) -> Option<Misapplied> {
+        if self.star {
+            Some(Misapplied::StarOnPlainFunction)
+        } else if self.distinct {
+            Some(Misapplied::DistinctOnPlainFunction)
+        } else if self.within_group > 0 {
+            Some(Misapplied::WithinGroupOnPlainFunction)
+        } else if self.ordered {
+            Some(Misapplied::OrderByOnPlainFunction)
+        } else if self.filter {
+            Some(Misapplied::FilterOnPlainFunction)
+        } else if self.over {
+            Some(Misapplied::OverOnPlainFunction)
+        } else {
+            None
+        }
+    }
+
+    /// The rule the clauses break on a call passing `arguments` arguments
+    /// to a function of `kind`, an aggregate of `aggregate`, in the order
+    /// `ParseFuncOrColumn` checks them.
+    const fn kind_rule(
+        self,
+        kind: FunctionKind,
+        aggregate: Option<AggregateKind>,
+        arguments: usize,
+    ) -> Option<Misapplied> {
+        let ordered_set = matches!(
+            aggregate,
+            Some(AggregateKind::OrderedSet { .. } | AggregateKind::HypotheticalSet { .. })
+        );
+        let rule = match kind {
+            FunctionKind::Normal => return self.plain_rule(),
+            FunctionKind::Aggregate if ordered_set => {
+                if self.within_group == 0 {
+                    Some(Misapplied::WithinGroupRequired)
+                } else if self.over {
+                    Some(Misapplied::OverOnOrderedSetAggregate)
+                } else {
+                    None
+                }
+            }
+            FunctionKind::Aggregate if self.within_group > 0 => {
+                Some(Misapplied::WithinGroupOnNormalAggregate)
+            }
+            FunctionKind::Window if !self.over => Some(Misapplied::OverRequired),
+            FunctionKind::Window if self.within_group > 0 => {
+                Some(Misapplied::WithinGroupOnWindowFunction)
+            }
+            FunctionKind::Aggregate | FunctionKind::Window => None,
+        };
+        if rule.is_some() {
+            return rule;
+        }
+        let aggregate = matches!(kind, FunctionKind::Aggregate);
+        let starless = aggregate && arguments == 0 && !self.star;
+        if !self.over {
+            if starless {
+                Some(Misapplied::StarRequired)
+            } else if self.named {
+                Some(Misapplied::NamedArgumentOnAggregate)
+            } else {
+                None
+            }
+        } else if self.distinct {
+            Some(Misapplied::DistinctOverWindow)
+        } else if starless {
+            Some(Misapplied::StarRequired)
+        } else if self.ordered {
+            Some(Misapplied::OrderByOverWindow)
+        } else if !aggregate && self.filter {
+            Some(Misapplied::FilterOnWindowFunction)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether `arguments` arguments, the last `ordered` of them those `WITHIN
+/// GROUP` orders by, split into direct and ordered ones as `called`, an
+/// aggregate of `aggregate`, declares, which holds for any call of a
+/// function no ordered-set aggregate.
+///
+/// A hypothetical-set aggregate whose direct and ordered arguments are all
+/// variadic takes as many direct ones as ordered ones, and an ordered-set
+/// one of that shape at least one direct one more than ordered ones.
+fn divides<F: FunctionLike>(
+    called: &F,
+    aggregate: Option<AggregateKind>,
+    arguments: usize,
+    ordered: usize,
+) -> bool {
+    let (direct, hypothetical) = match aggregate {
+        Some(AggregateKind::OrderedSet { direct_arguments }) => (direct_arguments, false),
+        Some(AggregateKind::HypotheticalSet { direct_arguments }) => (direct_arguments, true),
+        Some(AggregateKind::Normal) | None => return true,
+    };
+    let (inputs, variadic) = called
+        .argument_modes()
+        .filter(|mode| !matches!(mode, ArgMode::Out))
+        .fold((0, false), |(inputs, _), mode| (inputs + 1, matches!(mode, ArgMode::Variadic)));
+    if !variadic || direct < inputs {
+        return arguments - ordered == direct;
+    }
+    let collected = (arguments + 1).saturating_sub(inputs);
+    if hypothetical { collected == 2 * ordered } else { collected > ordered }
+}
+
 /// The nodes the arguments of a call come from, those it writes followed by
-/// the ordering arguments of `WITHIN GROUP`, or `None` for a call written
-/// with a subquery, a `*` but `count(*)`'s, or a clause PostgreSQL has no
-/// grammar for. `DISTINCT`, `ORDER BY`, `FILTER` and `OVER` pass nothing.
-fn call_arguments(function: &Function) -> Option<Vec<&Expr>> {
+/// the ordering arguments of `WITHIN GROUP`, with the clauses the call
+/// writes, or `None` for a call written with a subquery, a `*` but
+/// `count(*)`'s, or a clause PostgreSQL has no grammar for. `DISTINCT`,
+/// `ORDER BY`, `FILTER` and `OVER` pass nothing.
+fn call_arguments(function: &Function) -> Option<(Vec<&Expr>, CallClauses)> {
     if !matches!(function.parameters, FunctionArguments::None) || function.null_treatment.is_some()
     {
         return None;
     }
-    let mut arguments = match &function.args {
-        FunctionArguments::None => Vec::new(),
+    let (mut arguments, mut clauses) = match &function.args {
+        FunctionArguments::None => (Vec::new(), CallClauses::listed(&[])),
         FunctionArguments::Subquery(_) => return None,
         FunctionArguments::List(list) => {
             let ordered = |clause: &FunctionArgumentClause| {
@@ -1485,11 +1950,17 @@ fn call_arguments(function: &Function) -> Option<Vec<&Expr>> {
             if !list.clauses.iter().all(ordered) {
                 return None;
             }
-            listed_arguments(&list.args)?
+            let mut clauses = CallClauses::listed(&list.args);
+            clauses.distinct = list.duplicate_treatment == Some(DuplicateTreatment::Distinct);
+            clauses.ordered = !list.clauses.is_empty();
+            (listed_arguments(&list.args)?, clauses)
         }
     };
     arguments.extend(function.within_group.iter().map(|ordering| &ordering.expr));
-    Some(arguments)
+    clauses.within_group = function.within_group.len();
+    clauses.filter = function.filter.is_some();
+    clauses.over = function.over.is_some();
+    Some((arguments, clauses))
 }
 
 /// The nodes `arguments` pass, none for the lone `*` of `count(*)`, or
@@ -1532,6 +2003,15 @@ fn nullif_operands(function: &Function) -> Option<(&Expr, &Expr)> {
 fn without_typmod(type_name: Option<TargetName<'_>>) -> OperandType<'_> {
     type_name
         .map_or(OperandType::Unknown, |type_name| OperandType::Known { type_name, typmod: None })
+}
+
+/// How a refusal names the type an operand or an argument was weighed as,
+/// `unknown` for an untyped literal.
+fn weighed_name(weighed: &OperandType<'_>) -> Box<str> {
+    match weighed {
+        OperandType::Known { type_name, .. } => type_name.name().into(),
+        OperandType::UntypedLiteral | OperandType::Unknown => "unknown".into(),
+    }
 }
 
 /// Whether the selected operator returns `bool`, as PostgreSQL requires of

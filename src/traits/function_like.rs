@@ -10,8 +10,14 @@ use sqlparser::ast::{
 
 use crate::{
     errors::{HelperSetError, LookupError},
-    impls::{atomic_statements, body_calls, body_expression, body_reads, helper_set},
-    structs::{Deployment, FunctionBody, FunctionKind, HelperSet, PrivilegeHolder, TargetName},
+    impls::{
+        atomic_statements, body_calls, body_dynamic_sites, body_expression, body_reads,
+        body_unqualified_names, helper_set,
+    },
+    structs::{
+        AggregateKind, Deployment, DynamicExecutionSites, FunctionBody, FunctionKind, HelperSet,
+        PrivilegeHolder, TargetName, UnqualifiedName,
+    },
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
         call_typing::{
@@ -323,6 +329,37 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn argument_modes(&self) -> impl Iterator<Item = ArgMode>;
 
+    /// Returns the name and normalized type name of each column a
+    /// `RETURNS TABLE` clause declares, in declaration order, and nothing
+    /// for any other result.
+    ///
+    /// PostgreSQL stores these columns after the arguments in
+    /// `pg_proc.proargnames` with mode `t`, so a PL/pgSQL body reaches each
+    /// as an output parameter.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION f(a INT) RETURNS TABLE (\"Total\" BIGINT) LANGUAGE sql AS 'SELECT 1';",
+    /// )?;
+    /// let f = db
+    ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let columns: Vec<_> = f.returned_columns(&db).collect();
+    /// assert_eq!(columns, [(TargetName::new("Total", true), "BIGINT".into())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn returned_columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)>;
+
     /// Returns how many of the trailing input arguments carry a default,
     /// mirroring `pg_proc.pronargdefaults`. A call may leave those out.
     ///
@@ -522,6 +559,35 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn kind(&self, database: &Self::DB) -> Result<FunctionKind, LookupError>;
 
+    /// Returns how the function takes its arguments when it is an aggregate,
+    /// mirroring `pg_aggregate.aggkind`, or `None` for any other function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let mut kinds = Vec::new();
+    /// for function in db.functions().filter(|function| function.name() == "rank") {
+    ///     kinds.push(function.aggregate_kind(&db)?);
+    /// }
+    /// // The window function `rank()` is no aggregate, `rank(1) WITHIN GROUP
+    /// // (ORDER BY a)` ranks one hypothetical row.
+    /// kinds.sort();
+    /// assert_eq!(kinds, [None, Some(AggregateKind::HypotheticalSet { direct_arguments: 1 })]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn aggregate_kind(&self, database: &Self::DB) -> Result<Option<AggregateKind>, LookupError>;
+
     /// Returns the language the body is written in, as the input spells it.
     ///
     /// The body only means anything under its language, so a caller reading
@@ -586,7 +652,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// [`body_is_bound`](FunctionLike::body_is_bound),
     /// [`referenced_tables`](FunctionLike::referenced_tables),
     /// [`referenced_relations`](FunctionLike::referenced_relations),
-    /// [`referenced_functions`](FunctionLike::referenced_functions) and
+    /// [`referenced_functions`](FunctionLike::referenced_functions),
+    /// [`unqualified_names`](FunctionLike::unqualified_names) and
     /// [`helper_set`](FunctionLike::helper_set) all read the body from here,
     /// so an implementation handing over the body a catalog stores answers
     /// them as a parsed script does. A body bound at creation answers the
@@ -1155,6 +1222,152 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         body_calls(self, database)
     }
 
+    /// Returns every relation and function name the body writes without a
+    /// schema, so that the path in force when the function runs decides what
+    /// it reaches, each with what it reached under the path
+    /// [`referenced_relations`](FunctionLike::referenced_relations) and
+    /// [`referenced_functions`](FunctionLike::referenced_functions) resolve
+    /// it under.
+    ///
+    /// The body is read by the rules of those readers, so a `WITH` item, an
+    /// alias, a parameter, a name a PL/pgSQL body declares and an expression
+    /// written like a call, such as `COALESCE`, is no name here, and only a
+    /// name the body itself writes counts, never one in the definition of a
+    /// view it reads. A name after a straight-line `SET search_path` is still
+    /// left to a path, the one the body set, and resolves under it. A call
+    /// counts whatever schema it reached, `pg_catalog` included, since a path
+    /// placing another schema ahead of `pg_catalog` redirects it too. A name
+    /// reaching nothing the database holds counts as well, with no relation or
+    /// no function, since a caller may supply one.
+    ///
+    /// A body [bound at creation](FunctionLike::body_is_bound) answers none,
+    /// since it keeps what it reached then, whatever path is in effect.
+    /// Names are answered in the order of the statements writing them, a
+    /// statement's relations ahead of its calls, each spelling reaching the
+    /// same objects once.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`referenced_tables`](FunctionLike::referenced_tables)
+    /// for a body read each time the function runs, an unqualified name a
+    /// path change in a branch, a loop or a block with a handler may reach
+    /// among them ([`LookupError::FunctionBodyUnresolvable`]).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE items (v INT);
+    ///      CREATE TABLE fixed_items (v INT);
+    ///      CREATE FUNCTION helper(x INT) RETURNS INT LANGUAGE sql RETURN x;
+    ///      CREATE FUNCTION totals(x INT) RETURNS INT LANGUAGE sql AS $$
+    ///          WITH local_rows AS (SELECT v FROM items)
+    ///          SELECT helper(r.v) + f.v FROM local_rows r CROSS JOIN public.fixed_items f
+    ///      $$;",
+    /// )?;
+    /// let totals = db
+    ///     .function_by_target(TargetName::new("totals", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let names = totals.unqualified_names(&db)?;
+    /// // A caller's temporary `items` would shadow `public.items` here.
+    /// assert!(matches!(
+    ///     names.as_slice(),
+    ///     [
+    ///         UnqualifiedName::Relation { name: items, relation: Some(Relation::Table(_)) },
+    ///         UnqualifiedName::Function { name: helper, functions },
+    ///     ] if items.name() == "items" && helper.name() == "helper" && functions.len() == 1
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn unqualified_names<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Vec<UnqualifiedName<'db, Self::DB>>, LookupError> {
+        body_unqualified_names(self, database)
+    }
+
+    /// Returns the dynamic-execution sites of the body, owning the parsed
+    /// body, whose [`sites`](DynamicExecutionSites::sites) are every place
+    /// the body runs SQL it builds at run time, an `EXECUTE`,
+    /// `RETURN QUERY EXECUTE`, `OPEN ... FOR EXECUTE` or `FOR ... IN EXECUTE`,
+    /// in body order through nested blocks, branches, loops and exception
+    /// handlers. Body order says where each sits, never that a branch or a
+    /// loop runs.
+    ///
+    /// Each site holds the expression building its command, its `USING`
+    /// expressions, and the
+    /// [`ExpressionScope`](crate::structs::ExpressionScope) to build their
+    /// [`ExpressionContext`](crate::structs::ExpressionContext) under. There
+    /// a name binds the PL/pgSQL variable it reaches as
+    /// [`ColumnDefinition::Variable`](crate::structs::ColumnDefinition), a
+    /// local hiding an argument of its name in an enclosing block, which the
+    /// block's label or the function's name still reaches, and `$n` types as
+    /// argument `n`. Calls and operators resolve under the path the body runs
+    /// the site with. The SQL a command builds is never read, except that a
+    /// constant command setting `search_path` sets it for later sites. A
+    /// command built at run time, a `CALL` and any call to code that may set
+    /// its own path leave later sites under no known path.
+    ///
+    /// A body in any language but PL/pgSQL answers no site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyNotSql`] for a body in a language
+    /// sql-traits does not read, [`LookupError::FunctionBodyUnavailable`] when
+    /// the source is unavailable, [`LookupError::FunctionBodyUnparsable`] for
+    /// a body that does not parse, a PL/pgSQL block declaring a name twice
+    /// included, and the errors reading the function's own `search_path`
+    /// setting.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION count_of(p text) RETURNS bigint LANGUAGE plpgsql AS $$
+    ///      DECLARE result bigint;
+    ///      BEGIN
+    ///          EXECUTE 'SELECT count(*) FROM t WHERE name = ''' || p || '''' INTO result;
+    ///          RETURN result;
+    ///      END $$;",
+    /// )?;
+    /// let count_of = db
+    ///     .function_by_target(TargetName::new("count_of", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = count_of.dynamic_execution_sites(&db)?;
+    /// let sites = body.sites()?;
+    /// let [site] = sites.as_slice() else { panic!("one site") };
+    /// let scope = site.scope();
+    /// let context =
+    ///     ExpressionContext::for_expression(site.command(), &scope, &db, IdentifierCase::Folded)?;
+    /// let Expr::BinaryOp { left, .. } = site.command() else { panic!("a concatenation") };
+    /// let Expr::BinaryOp { right: p, .. } = left.as_ref() else { panic!("a concatenation") };
+    /// let Some((ColumnDefinition::Variable(parameter), _)) = context.reference(p)? else {
+    ///     panic!("p binds the argument")
+    /// };
+    /// assert!(matches!(parameter.kind(), VariableKind::Parameter { position: 1, .. }));
+    /// let text = TargetName::new("text", false).with_schema("pg_catalog", false);
+    /// assert_eq!(context.type_of(p)?, OperandType::Known { type_name: text, typmod: None });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn dynamic_execution_sites<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<DynamicExecutionSites<'db, Self::DB>, LookupError> {
+        body_dynamic_sites(self, database)
+    }
+
     /// Returns the null-input behavior with PostgreSQL's default folded in.
     fn null_input_behavior(&self) -> FunctionCalledOnNull;
 
@@ -1219,6 +1432,52 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     fn volatility(&self) -> FunctionBehavior {
         FunctionBehavior::Volatile
     }
+
+    /// Returns whether the function is marked `LEAKPROOF`, which lets
+    /// PostgreSQL evaluate it ahead of row-level security policies and
+    /// [security-barrier](crate::traits::ViewLike::is_security_barrier) view
+    /// conditions, so its errors and notices may reveal rows those conditions
+    /// would hide.
+    ///
+    /// A declared function answers `false` when its declaration writes
+    /// `NOT LEAKPROOF` or omits the attribute, which is how `pg_dump` writes a
+    /// function that is not leakproof. `ALTER FUNCTION ... LEAKPROOF` and
+    /// `ALTER FUNCTION ... NOT LEAKPROOF` apply in statement order, and
+    /// `CREATE OR REPLACE FUNCTION` takes the replacement's declaration. A
+    /// builtin [`ParserDB`](crate::structs::ParserDB) registers in
+    /// `pg_catalog` answers `pg_proc.proleakproof` from PostgreSQL 18, so
+    /// `int4eq(integer, integer)` is leakproof and `lower(text)` is not. A
+    /// function an extension or a range type creates is not leakproof, as
+    /// PostgreSQL creates them.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE FUNCTION marked(value INT) RETURNS BOOLEAN LANGUAGE sql LEAKPROOF AS 'SELECT true';
+    /// CREATE FUNCTION unmarked(value INT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';
+    /// CREATE FUNCTION altered(value INT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';
+    /// ALTER FUNCTION altered(INT) LEAKPROOF;
+    /// ",
+    /// )?;
+    /// let leakproof = |name: &str| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    ///         .is_leakproof()
+    /// };
+    /// assert!(leakproof("marked"));
+    /// assert!(!leakproof("unmarked"));
+    /// assert!(leakproof("altered"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_leakproof(&self) -> bool;
 
     /// Returns whether the function runs with the privileges of the user
     /// that defined it (`SECURITY DEFINER`) or of the user that calls it
@@ -1528,7 +1787,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ) -> Result<bool, LookupError>;
 
     /// What this helper returns for a caller of `deployment`, called with
-    /// `arguments`, as a union of grant arms and parent arms.
+    /// `arguments`, as a union of grant arms and parent arms, walked down a
+    /// tree where the body is recursive.
     ///
     /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
     /// function returning `SETOF` one scalar type with a pinned
@@ -1536,7 +1796,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// table it reads, or on every column of it the body names, `USAGE` on
     /// the schema of every table and helper the body names, and exempt from
     /// the row-level security of the tables, and when its body is a `UNION`
-    /// of arms of two shapes.
+    /// of arms of two shapes, alone or walked down a tree.
     ///
     /// - A grant arm, `SELECT <column> FROM <table> WHERE <caller column> =
     ///   current_setting('<setting>'[, true]) [AND <condition>]`, where the
@@ -1550,11 +1810,21 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   foreign key or, where it has none, through the table the called
     ///   helper's set covers.
     ///
+    /// A body walking down a tree is `WITH RECURSIVE <walk> [(<column>)] AS
+    /// (<arms> UNION SELECT <key> FROM <table> JOIN <walk> ON <parent
+    /// column> = <walk>.<column>) SELECT <column> FROM <walk>`, the join
+    /// either way round. `<key>` is the table's one-column primary key, and
+    /// `<parent column>` has one single-column foreign key, referencing
+    /// `<key>`. The walk answers a [`WalkArm`](crate::structs::WalkArm) after
+    /// the arms. `UNION ALL` is refused, since it never ends on a tree holding
+    /// a cycle.
+    ///
     /// A grant arm whose condition reduces to `FALSE` or `NULL` keeps no row
-    /// and is left out. A column named like a parameter is the column, as
-    /// PostgreSQL resolves names in a SQL function. An unqualified name is
-    /// looked up past the schemas on the path the owner cannot use, as
-    /// PostgreSQL leaves them out of the owner's path.
+    /// and is left out, and a walk with it where no other arm remains. A
+    /// column named like a parameter is the column, as PostgreSQL resolves
+    /// names in a SQL function. An unqualified name is looked up past the
+    /// schemas on the path the owner cannot use, as PostgreSQL leaves them out
+    /// of the owner's path.
     ///
     /// # Arguments
     ///

@@ -47,6 +47,9 @@ pub(super) enum Held {
     /// The exclusion constraint at the position of the table's constraint
     /// list.
     Exclusion(StoredTable, usize),
+    /// The unique constraint at the position of the table's constraint list,
+    /// whose key calls the function.
+    UniqueKey(StoredTable, usize),
     /// The table whose partition key calls the function.
     PartitionedTable(StoredTable),
     /// A view, a materialized view, a rule or a calling function, which goes
@@ -179,8 +182,8 @@ impl ParserDBBuilder {
     }
 
     /// The first part of a table holding `dropped`, among its checks, its
-    /// columns' defaults and generation expressions, its indexes, its
-    /// exclusion constraints and its partition key.
+    /// columns' defaults and generation expressions, its indexes, its unique
+    /// and exclusion constraints and its partition key.
     ///
     /// A check or a generated column a parent passes down goes with the
     /// parent's, so only a table's own are holders.
@@ -243,6 +246,9 @@ impl ParserDBBuilder {
                 return Some(Holder::new(ObjectKind::Index, name, Held::Index(position)));
             }
         }
+        if let Some(holder) = self.unique_key_holder(dropped) {
+            return Some(holder);
+        }
         for (table, metadata, _) in self.tables() {
             let positions = table
                 .constraints
@@ -277,6 +283,30 @@ impl ParserDBBuilder {
             }
         }
         None
+    }
+
+    /// The first unique key written among a table's constraints that holds
+    /// `dropped`.
+    fn unique_key_holder(&self, dropped: &Dropped<'_>) -> Option<Holder> {
+        self.unique_indices().iter().find_map(|(unique_key, metadata)| {
+            if !dropped.is_held_by(metadata.calls()) {
+                return None;
+            }
+            let table = TableAttribute::table(unique_key.as_ref());
+            let position = table.constraints.iter().position(|constraint| {
+                matches!(
+                    constraint,
+                    sqlparser::ast::TableConstraint::Unique(held) if held == unique_key.attribute()
+                )
+            })?;
+            let name = IndexLike::name(unique_key.as_ref())
+                .map_or_else(|| unique_key.attribute().to_string(), ToString::to_string);
+            Some(Holder::new(
+                ObjectKind::UniqueIndex,
+                name,
+                Held::UniqueKey(StoredTable::of(table), position),
+            ))
+        })
     }
 
     /// The first object outside a table's own parts holding `dropped`, but

@@ -13,7 +13,7 @@ use crate::{
     impls::{
         grantee_is_public, grantee_is_session_principal, grantee_matches_role, grantees_match,
     },
-    structs::{FunctionKind, PrivilegeHolder, metadata::ExpressionCalls},
+    structs::{AggregateKind, FunctionKind, PrivilegeHolder, metadata::ExpressionCalls},
     utils::{identifier_resolution::stored_identifier, object_name::object_name_last_part},
 };
 
@@ -32,6 +32,9 @@ pub struct FunctionMetadata {
     null_returning_arguments: &'static [usize],
     /// The function's `pg_proc.prokind`.
     kind: FunctionKind,
+    /// The aggregate's `pg_aggregate.aggkind`, `None` for a function that is
+    /// no aggregate.
+    aggregate_kind: Option<AggregateKind>,
     /// The name of the extension the function belongs to, which creates and
     /// drops it.
     extension: Option<Ident>,
@@ -110,6 +113,20 @@ impl FunctionMetadata {
     #[inline]
     pub(crate) fn set_kind(&mut self, kind: FunctionKind) {
         self.kind = kind;
+    }
+
+    /// Returns the aggregate's `pg_aggregate.aggkind`, or `None` for a
+    /// function that is no aggregate.
+    #[must_use]
+    #[inline]
+    pub(crate) fn aggregate_kind(&self) -> Option<AggregateKind> {
+        self.aggregate_kind
+    }
+
+    /// Sets the aggregate's `pg_aggregate.aggkind`.
+    #[inline]
+    pub(crate) fn set_aggregate_kind(&mut self, kind: Option<AggregateKind>) {
+        self.aggregate_kind = kind;
     }
 
     /// Returns the name of the extension the function belongs to.

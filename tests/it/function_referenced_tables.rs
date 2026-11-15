@@ -450,9 +450,16 @@ fn a_body_running_code_outside_it_cannot_be_read() {
          $$;
          CREATE FUNCTION executes() RETURNS INT LANGUAGE sql AS $$
              EXECUTE prepared; SELECT 1
+         $$;
+         CREATE FUNCTION runs_block() RETURNS BIGINT LANGUAGE sql AS $$
+             DO 'BEGIN END'; SELECT count(*) FROM docs
          $$;",
     );
-    for (function, statement) in [("calls", "CALL elsewhere()"), ("executes", "EXECUTE prepared")] {
+    for (function, statement) in [
+        ("calls", "CALL elsewhere()"),
+        ("executes", "EXECUTE prepared"),
+        ("runs_block", "DO 'BEGIN END'"),
+    ] {
         assert_eq!(
             read_by(&database, function),
             Err(LookupError::FunctionBodyUnresolvable {
@@ -499,6 +506,64 @@ fn a_path_set_at_run_time_hides_later_unqualified_names() {
         Err(LookupError::FunctionBodyUnresolvable { statement, .. })
             if statement == "SELECT set_config(name, 'other', true)"
     ));
+}
+
+/// A function outside `pg_catalog` may set `search_path` for its caller, its
+/// own `SET search_path` clause included, since PostgreSQL 18 keeps a plain
+/// `SET` past the function's end. A `pg_catalog` function keeps the path.
+#[test]
+fn a_call_to_a_user_function_hides_later_unqualified_names() {
+    let database = postgres(
+        "CREATE TABLE docs (id INT);
+         CREATE FUNCTION helper() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION pinned() RETURNS INT LANGUAGE sql SET search_path = public AS 'SELECT 1';
+         CREATE FUNCTION after_helper() RETURNS INT LANGUAGE sql AS $$
+             SELECT helper(); SELECT count(*)::int FROM docs
+         $$;
+         CREATE FUNCTION after_pinned() RETURNS INT LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pinned(); RETURN (SELECT count(*) FROM docs); END
+         $$;
+         CREATE FUNCTION qualified_after() RETURNS INT LANGUAGE sql AS $$
+             SELECT helper(); SELECT count(*)::int FROM public.docs
+         $$;
+         CREATE FUNCTION before_helper() RETURNS INT LANGUAGE sql AS $$
+             SELECT count(*)::int FROM docs; SELECT helper()
+         $$;
+         CREATE FUNCTION catalog_only() RETURNS INT LANGUAGE sql AS $$
+             SELECT length(lower('A')); SELECT count(*)::int FROM docs
+         $$;
+         CREATE FUNCTION helper_in_loop() RETURNS INT LANGUAGE plpgsql AS $$
+             BEGIN
+              FOR i IN 1..2 LOOP
+               RETURN (SELECT count(*) FROM docs);
+               PERFORM helper();
+              END LOOP;
+             END
+         $$;
+         CREATE FUNCTION after_assigned() RETURNS INT LANGUAGE plpgsql AS $$
+             DECLARE x INT;
+             BEGIN x := helper(); RETURN (SELECT count(*) FROM docs); END
+         $$;",
+    );
+    for (function, statement) in [
+        ("after_helper", "SELECT helper()"),
+        ("after_pinned", "SELECT pinned()"),
+        ("helper_in_loop", "SELECT helper()"),
+        ("after_assigned", "SELECT helper()"),
+    ] {
+        assert!(
+            matches!(
+                read_by(&database, function),
+                Err(LookupError::FunctionBodyUnresolvable { statement: written, .. })
+                    if written == statement
+            ),
+            "{function}: {:?}",
+            read_by(&database, function)
+        );
+    }
+    assert_eq!(read_by(&database, "qualified_after").unwrap(), ["public.docs"]);
+    assert_eq!(read_by(&database, "before_helper").unwrap(), ["public.docs"]);
+    assert_eq!(read_by(&database, "catalog_only").unwrap(), ["public.docs"]);
 }
 
 fn named_by(database: &ParserDB, function: &str) -> Result<Vec<String>, LookupError> {
@@ -555,4 +620,17 @@ fn relations_report_the_same_unknowable_bodies() {
         named_by(&database, "procedural"),
         Err(LookupError::FunctionBodyNotSql { language, .. }) if language == "plperl"
     ));
+}
+
+/// `FROM f(1)` calls `f`, so a table of the same name is not read.
+#[test]
+fn a_table_function_reads_no_table_of_its_name() {
+    let database = postgres(
+        "CREATE TABLE produced (a INT);
+         CREATE FUNCTION produced(n INT) RETURNS SETOF INT LANGUAGE sql AS 'SELECT n';
+         CREATE FUNCTION consumer() RETURNS SETOF INT LANGUAGE sql
+             AS 'SELECT * FROM produced(1)';",
+    );
+    assert_eq!(named_by(&database, "consumer").unwrap(), Vec::<String>::new());
+    assert_eq!(read_by(&database, "consumer").unwrap(), Vec::<String>::new());
 }

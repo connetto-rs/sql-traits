@@ -78,6 +78,8 @@ fn snapshots_preserve_each_incremental_schema_state() {
             ColumnDefinition::SetOperation { .. } => "set operation".to_owned(),
             ColumnDefinition::RecursiveUnion { .. } => "recursive union".to_owned(),
             ColumnDefinition::Parameter { .. } => "parameter".to_owned(),
+            ColumnDefinition::Variable(_) => "variable".to_owned(),
+            ColumnDefinition::VariableField(_) => "variable field".to_owned(),
             ColumnDefinition::Opaque => "opaque".to_owned(),
         }
     });

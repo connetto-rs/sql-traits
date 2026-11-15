@@ -96,7 +96,7 @@ impl ParserDB {
             Held::Check(table, position) => {
                 builder = Self::drop_cascaded_constraint(builder, &table, position, &name)?;
             }
-            Held::Exclusion(table, position) => {
+            Held::Exclusion(table, position) | Held::UniqueKey(table, position) => {
                 builder = Self::drop_cascaded_constraint(
                     builder,
                     &table,

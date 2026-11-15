@@ -50,7 +50,7 @@ fn renaming_public_moves_what_it_holds() {
         .columns(&db)
         .expect("t is held")
         .find(|column| column.column_name() == "n")
-        .and_then(ColumnLike::default_value)
+        .and_then(|column| column.default_expression().map(ToString::to_string))
         .expect("the default survives");
     assert!(default.contains("main.q"), "{default}");
     let sequence = db.sequences().next().expect("q is held");

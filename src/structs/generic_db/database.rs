@@ -477,18 +477,19 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
 /// lookup then accepts.
 ///
 /// The index is keyed by PostgreSQL's rule, so a folding lookup probes the
-/// folded key and follows the aliases a quoted stored spelling registered
-/// under. An exact lookup gathers the same candidates, since byte equality
-/// implies folded equality, and then keeps only those whose stored key
-/// matches byte for byte.
+/// folded key and follows the aliases each stored object registered under its
+/// own folded key. PostgreSQL's rule cuts a name to 63 bytes, so a bucket can
+/// hold relations whose full names differ, and a folding or exact lookup
+/// keeps only the candidates whose stored key it compares equal to.
 struct IndexProbe {
     /// Key whose bucket, with `aliases` when they are consulted, holds every
     /// candidate.
     key: RelationKey,
     /// Whether the folded aliases of `key` are consulted.
     aliases: bool,
-    /// Stored key a candidate must equal, when the bucket alone does not
-    /// decide it.
+    /// Comparison the lookup states.
+    case: IdentifierCase,
+    /// Stored key a candidate of an exact lookup must equal.
     exact: Option<RelationKey>,
 }
 
@@ -524,6 +525,7 @@ impl IndexProbe {
         Self {
             key: RelationKey { schema: schema(probing), name: name(probing) },
             aliases: case != IdentifierCase::AsWritten,
+            case,
             exact: (case == IdentifierCase::Exact).then(|| {
                 RelationKey {
                     schema: schema(IdentifierCase::Exact),
@@ -533,10 +535,16 @@ impl IndexProbe {
         }
     }
 
-    /// Whether a relation whose stored key is `stored` is one this probe
-    /// accepts.
-    fn accepts(&self, stored: impl FnOnce() -> RelationKey) -> bool {
-        self.exact.as_ref().is_none_or(|exact| stored() == *exact)
+    /// Whether a relation whose stored key under a case is `stored` is one
+    /// this probe accepts.
+    fn accepts(&self, stored: impl FnOnce(IdentifierCase) -> RelationKey) -> bool {
+        match self.case {
+            IdentifierCase::AsWritten => true,
+            IdentifierCase::Folded => stored(IdentifierCase::Folded) == self.key,
+            IdentifierCase::Exact => {
+                self.exact.as_ref().is_some_and(|exact| stored(IdentifierCase::Exact) == *exact)
+            }
+        }
     }
 }
 
@@ -598,7 +606,7 @@ impl<P: SchemaProfile> GenericDB<P> {
         self.probed_relation_slots(probe)
             .filter_map(|slot| stored(*slot))
             .map(|(table, _, _)| table.as_ref())
-            .filter(|table| probe.accepts(|| stored_table_key(*table, IdentifierCase::Exact)))
+            .filter(|table| probe.accepts(|case| stored_table_key(*table, case)))
             .collect()
     }
 
@@ -615,7 +623,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                 }
             })
             .map(|(view, _, _)| view.as_ref())
-            .filter(|view| probe.accepts(|| stored_view_key(*view, IdentifierCase::Exact)))
+            .filter(|view| probe.accepts(|case| stored_view_key(*view, case)))
             .collect()
     }
 
@@ -637,7 +645,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                 }
             })
             .map(|(view, _, _)| view.as_ref())
-            .filter(|view| probe.accepts(|| stored_view_key(*view, IdentifierCase::Exact)))
+            .filter(|view| probe.accepts(|case| stored_view_key(*view, case)))
             .collect()
     }
 
@@ -654,9 +662,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                 }
             })
             .map(|(sequence, _)| sequence.as_ref())
-            .filter(|sequence| {
-                probe.accepts(|| stored_sequence_key(*sequence, IdentifierCase::Exact))
-            })
+            .filter(|sequence| probe.accepts(|case| stored_sequence_key(*sequence, case)))
             .collect()
     }
 
@@ -670,29 +676,27 @@ impl<P: SchemaProfile> GenericDB<P> {
             match slot {
                 RelationSlot::Table(position) => {
                     self.tables.get(*position).is_some_and(|(table, _, _)| {
-                        probe.accepts(|| stored_table_key(table.as_ref(), IdentifierCase::Exact))
+                        probe.accepts(|case| stored_table_key(table.as_ref(), case))
                     })
                 }
                 RelationSlot::ForeignTable(position) => {
                     self.foreign_tables.get(*position).is_some_and(|(table, _, _)| {
-                        probe.accepts(|| stored_table_key(table.as_ref(), IdentifierCase::Exact))
+                        probe.accepts(|case| stored_table_key(table.as_ref(), case))
                     })
                 }
                 RelationSlot::View(position) => {
                     self.views.get(*position).is_some_and(|(view, _, _)| {
-                        probe.accepts(|| stored_view_key(view.as_ref(), IdentifierCase::Exact))
+                        probe.accepts(|case| stored_view_key(view.as_ref(), case))
                     })
                 }
                 RelationSlot::MaterializedView(position) => {
                     self.materialized_views.get(*position).is_some_and(|(view, _, _)| {
-                        probe.accepts(|| stored_view_key(view.as_ref(), IdentifierCase::Exact))
+                        probe.accepts(|case| stored_view_key(view.as_ref(), case))
                     })
                 }
                 RelationSlot::Sequence(position) => {
                     self.sequences.get(*position).is_some_and(|(sequence, _)| {
-                        probe.accepts(|| {
-                            stored_sequence_key(sequence.as_ref(), IdentifierCase::Exact)
-                        })
+                        probe.accepts(|case| stored_sequence_key(sequence.as_ref(), case))
                     })
                 }
             }
@@ -733,9 +737,7 @@ impl<P: SchemaProfile> GenericDB<P> {
             .chain(aliases.iter().flat_map(own))
             .chain(self.builtins.keyed(&probe.key, probe.aliases))
             .map(|(function, _)| function.as_ref())
-            .filter(|function| {
-                probe.accepts(|| stored_function_key(*function, IdentifierCase::Exact))
-            })
+            .filter(|function| probe.accepts(|case| stored_function_key(*function, case)))
             .collect()
     }
 

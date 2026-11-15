@@ -12,7 +12,8 @@ use sqlparser::ast::{
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
-        FunctionBody, FunctionKind, FunctionMetadata, ParserDB, PrivilegeHolder, TargetName,
+        AggregateKind, FunctionBody, FunctionKind, FunctionMetadata, ParserDB, PrivilegeHolder,
+        TargetName,
     },
     traits::{DatabaseLike, FunctionLike, Metadata, role::privilege_holders},
     utils::{
@@ -130,6 +131,25 @@ impl FunctionLike for CreateFunction {
     }
 
     #[inline]
+    fn returned_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
+        let columns = match &self.return_type {
+            Some(FunctionReturnType::DataType(DataType::Table(Some(columns)))) => {
+                columns.as_slice()
+            }
+            _ => &[],
+        };
+        columns.iter().map(|column| {
+            (
+                TargetName::new(&column.name.value, column.name.quote_style.is_some()),
+                normalize_sqlparser_type(&column.data_type),
+            )
+        })
+    }
+
+    #[inline]
     fn argument_default_count(&self) -> usize {
         self.args
             .iter()
@@ -172,6 +192,11 @@ impl FunctionLike for CreateFunction {
     #[inline]
     fn kind(&self, database: &Self::DB) -> Result<FunctionKind, LookupError> {
         Ok(function_metadata(self, database)?.kind())
+    }
+
+    #[inline]
+    fn aggregate_kind(&self, database: &Self::DB) -> Result<Option<AggregateKind>, LookupError> {
+        Ok(function_metadata(self, database)?.aggregate_kind())
     }
 
     fn written_body(&self) -> Option<FunctionBody<'_>> {
@@ -283,6 +308,11 @@ impl FunctionLike for CreateFunction {
     #[inline]
     fn volatility(&self) -> FunctionBehavior {
         self.behavior.clone().unwrap_or(FunctionBehavior::Volatile)
+    }
+
+    #[inline]
+    fn is_leakproof(&self) -> bool {
+        self.leakproof == Some(true)
     }
 
     #[inline]

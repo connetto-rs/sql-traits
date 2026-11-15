@@ -25,7 +25,8 @@ pub enum CallResolution<'db, DB: DatabaseLike> {
     /// PostgreSQL selects this function, then refuses the call, since only
     /// untyped literals reach a polymorphic parameter.
     UnboundPolymorphic(&'db DB::Function),
-    /// An argument type or a fact selection needs is missing.
+    /// An argument type or a fact selection needs is missing, or the call
+    /// writes clauses PostgreSQL's grammar refuses before any selection.
     Undetermined,
 }
 

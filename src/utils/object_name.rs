@@ -23,7 +23,7 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
-    traits::{DatabaseLike, FunctionLike, Relation, SequenceLike, TableLike, ViewLike},
+    traits::{DatabaseLike, FunctionLike, Relation, SchemaLike, SequenceLike, TableLike, ViewLike},
     utils::identifier_resolution::{
         SearchPath, identifiers_match, is_temporary_schema, stored_identifier,
     },
@@ -68,6 +68,60 @@ where
         .then_some((PG_CATALOG, false))
         .into_iter()
         .chain(search_path().filter(|&(schema, quoted)| !is_temporary_schema(schema, quoted)))
+}
+
+/// The path an unqualified function or operator name is looked up on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RoutinePath<'path> {
+    /// The database's own search path.
+    Database,
+    /// A path a function's setting or a statement of its body chose.
+    Set(&'path [(Cow<'path, str>, bool)]),
+    /// `pg_catalog` alone, the one schema a path nothing tells still
+    /// searches first, for a name no other schema defines.
+    Catalog,
+}
+
+impl<'path> RoutinePath<'path> {
+    /// The schemas an unqualified function or operator lookup walks, in
+    /// order.
+    pub(crate) fn schemas<D: DatabaseLike>(self, database: &'path D) -> Vec<(&'path str, bool)> {
+        match self {
+            Self::Database => function_search_path(|| database.search_path()).collect(),
+            Self::Set(path) => {
+                function_search_path(|| path.iter().map(|(schema, quoted)| (&**schema, *quoted)))
+                    .collect()
+            }
+            Self::Catalog => Vec::from([(PG_CATALOG, false)]),
+        }
+    }
+}
+
+/// Whether a function or operator lookup of `name` may land in a schema
+/// `database` does not hold, whose functions and operators the database
+/// cannot know. `pg_catalog` and the temporary schema are always held, and
+/// neither `"$user"` nor an empty entry on the search path names a schema.
+pub(crate) fn reaches_unheld_schema<D: DatabaseLike>(
+    database: &D,
+    name: &TargetName<'_>,
+    path: RoutinePath<'_>,
+    case: IdentifierCase,
+) -> bool {
+    let held = |schema: &str, quoted: bool| {
+        identifiers_match(schema, quoted, PG_CATALOG, false)
+            || is_temporary_schema(schema, quoted)
+            || database.schemas().any(|declared| {
+                case.identifiers_match(declared.name(), declared.name_is_quoted(), schema, quoted)
+            })
+    };
+    match name.schema() {
+        Some(schema) => !held(schema, name.schema_is_quoted()),
+        None => {
+            path.schemas(database).into_iter().any(|(schema, quoted)| {
+                !schema.is_empty() && schema != "$user" && !held(schema, quoted)
+            })
+        }
+    }
 }
 
 /// The schemas a type lookup walks for an unqualified name.
@@ -505,16 +559,6 @@ pub(crate) struct RelationKey {
     pub schema: String,
     /// Normalized relation name.
     pub name: String,
-}
-
-impl RelationKey {
-    /// The key a folded lookup reaches this one by.
-    pub(crate) fn folded(&self) -> Self {
-        Self {
-            schema: IdentifierCase::Folded.compared_form(&self.schema, false).into_owned(),
-            name: IdentifierCase::Folded.compared_form(&self.name, false).into_owned(),
-        }
-    }
 }
 
 /// Normalizes a stored schema under `case`, folding a schema-less table into

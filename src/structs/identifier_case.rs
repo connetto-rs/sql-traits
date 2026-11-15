@@ -3,7 +3,7 @@
 use alloc::borrow::Cow;
 use core::fmt::{Display, Formatter, Result as FmtResult};
 
-use crate::utils::identifier_resolution::{normalize_identifier, parse_lookup_identifier};
+use crate::utils::identifier_resolution::{parse_lookup_identifier, stored_identifier};
 
 /// How a lookup compares a written identifier against a stored one.
 ///
@@ -17,9 +17,10 @@ use crate::utils::identifier_resolution::{normalize_identifier, parse_lookup_ide
 /// therefore an argument to every lookup rather than a property of the
 /// database.
 ///
-/// All three cases trim the identifier and apply Unicode NFC normalization
-/// first, as [`normalize_identifier`] does, so a precomposed name and a
-/// decomposed one are one identifier under each of them.
+/// No rule trims an identifier or normalizes its Unicode composition, so
+/// `"amount "` and `"amount"`, or a precomposed `é` and an `e` followed by a
+/// combining accent, are two names under each of them, as they are on
+/// PostgreSQL and SQLite.
 ///
 /// # Example
 ///
@@ -70,8 +71,12 @@ impl IdentifierCase {
         }
     }
 
-    /// The form an identifier is compared under, trimmed and NFC-normalized,
-    /// folded when the rule folds it.
+    /// The form an identifier is compared under.
+    ///
+    /// Under [`AsWritten`](Self::AsWritten) this is the name PostgreSQL
+    /// stores, as [`stored_identifier`] answers. [`Folded`](Self::Folded)
+    /// lowers the ASCII letters of every name and [`Exact`](Self::Exact) keeps
+    /// every name as written.
     ///
     /// # Example
     ///
@@ -82,11 +87,18 @@ impl IdentifierCase {
     /// assert_eq!(IdentifierCase::AsWritten.compared_form("Docs", false), "docs");
     /// assert_eq!(IdentifierCase::Folded.compared_form("Docs", true), "docs");
     /// assert_eq!(IdentifierCase::Exact.compared_form("Docs", false), "Docs");
+    /// assert_eq!(IdentifierCase::Folded.compared_form(" Docs ", true), " docs ");
     /// ```
     #[must_use]
     #[inline]
     pub fn compared_form(self, value: &str, quoted: bool) -> Cow<'_, str> {
-        normalize_identifier(value, !self.folds(quoted))
+        match self {
+            Self::AsWritten => stored_identifier(value, quoted),
+            Self::Folded if value.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+                Cow::Owned(value.to_ascii_lowercase())
+            }
+            Self::Folded | Self::Exact => Cow::Borrowed(value),
+        }
     }
 
     /// Whether two identifiers are one name under the rule.

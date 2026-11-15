@@ -784,8 +784,21 @@ impl ColumnLike for MemoryColumn {
         Ok(None)
     }
 
-    fn default_value(&self) -> Option<String> {
+    fn default_expression(&self) -> Option<&Expr> {
         None
+    }
+
+    fn generation_expression(&self) -> Option<&Expr> {
+        None
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        // The column holds no expression, so no call is one of its nodes.
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
     }
 
     fn foreign_options(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, str>, &str)> {
@@ -930,6 +943,15 @@ impl IndexLike for MemoryIndex {
     fn is_unique(&self) -> bool {
         false
     }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        // The key names a column alone, so no call is one of its nodes.
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
+    }
 }
 
 impl IndexLike for MemoryUniqueIndex {
@@ -966,6 +988,14 @@ impl IndexLike for MemoryUniqueIndex {
 
     fn is_unique(&self) -> bool {
         true
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        self.0.functions_reached_by(call, database)
     }
 }
 
@@ -1129,6 +1159,13 @@ impl FunctionLike for MemoryFunction {
         self.argument_types.iter().map(|_| ArgMode::In)
     }
 
+    fn returned_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
+        core::iter::empty()
+    }
+
     fn argument_default_count(&self) -> usize {
         0
     }
@@ -1140,6 +1177,11 @@ impl FunctionLike for MemoryFunction {
     /// This catalog holds only functions it declares, which are normal.
     fn kind(&self, _database: &Self::DB) -> Result<FunctionKind, LookupError> {
         Ok(FunctionKind::Normal)
+    }
+
+    /// No function this catalog declares is an aggregate.
+    fn aggregate_kind(&self, _database: &Self::DB) -> Result<Option<AggregateKind>, LookupError> {
+        Ok(None)
     }
 
     fn language(&self) -> Option<&str> {
@@ -1193,6 +1235,10 @@ impl FunctionLike for MemoryFunction {
     }
 
     fn returns_null_on_null_argument(&self, _database: &Self::DB, _index: usize) -> bool {
+        false
+    }
+
+    fn is_leakproof(&self) -> bool {
         false
     }
 
@@ -1305,6 +1351,23 @@ impl DomainLike for MemoryDomain {
 
     fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db MemoryDataType {
         &self.data_type
+    }
+
+    fn default_expression(&self) -> Option<&Expr> {
+        None
+    }
+
+    fn check_expressions(&self) -> impl Iterator<Item = &Expr> {
+        core::iter::empty()
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
+        // The domain holds no expression, so no call is one of its nodes.
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
     }
 }
 

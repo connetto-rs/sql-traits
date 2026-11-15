@@ -112,15 +112,18 @@ impl Catalog {
             in_transaction,
         )?;
         catalog.builder = super::sequences::settle_dropped_sequences(catalog.builder, cascade)?;
-        // The calls and operator applications the statement stored are typed
-        // over the catalog it left, where only an operator a statement added
-        // is worth recording.
-        if catalog.builder.has_unsettled_calls() && !catalog.postgres.holds_added_operators() {
+        // An extension may supply an operator or a function the catalog lacks.
+        let refuse = matches!(catalog.builder.dialect(), SqlparserDialect::PostgreSql)
+            && super::extensions::holds_only_plpgsql(&catalog.builder);
+        if catalog.builder.has_unsettled_calls()
+            && !refuse
+            && !catalog.postgres.holds_added_operators()
+        {
             catalog.builder.settle_operators_on_built_ins();
         }
         if catalog.builder.has_unsettled_calls() {
             let database = catalog.snapshot(access_resolution);
-            catalog.builder.settle_calls(&database);
+            catalog.builder.settle_calls(&database, refuse)?;
         }
         Ok(catalog)
     }

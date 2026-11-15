@@ -127,6 +127,8 @@ fn describe(definition: Option<&ColumnDefinition<'_, '_, '_, ParserDB>>) -> Stri
         }
         Some(ColumnDefinition::RecursiveUnion { .. }) => "recursive".to_owned(),
         Some(ColumnDefinition::Parameter { ordinal, .. }) => format!("parameter {ordinal}"),
+        Some(ColumnDefinition::Variable(variable)) => format!("variable {}", variable.name()),
+        Some(ColumnDefinition::VariableField(variable)) => format!("field of {}", variable.name()),
         Some(ColumnDefinition::Opaque) => "opaque".to_owned(),
     }
 }
@@ -220,6 +222,19 @@ fn duplicate_output_names_are_ambiguous_only_for_different_values() {
             object_name: "id".to_owned(),
             candidates: vec!["id".to_owned(), "id + 1".to_owned()],
         })
+    );
+    for sql in [
+        "SELECT x.* FROM (VALUES (1, 2)) x(a, a) ORDER BY a",
+        "SELECT * FROM (VALUES (1, 2)) x(a, a) ORDER BY a",
+    ] {
+        assert!(
+            matches!(order_by(sql), Err(LookupError::AmbiguousTableLookup { .. })),
+            "two `VALUES` columns are two values in {sql}"
+        );
+    }
+    assert_eq!(
+        order_by("SELECT x.a, x.a FROM (VALUES (1, 2)) x(a, b) ORDER BY a").unwrap(),
+        "opaque"
     );
 }
 

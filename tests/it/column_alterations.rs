@@ -649,7 +649,7 @@ fn altering_a_column_changes_what_it_declares() {
         .column("a", &defaulted, IdentifierCase::AsWritten)
         .expect("t is in this database")
         .expect("a is declared");
-    assert_eq!(column.default_value().as_deref(), Some("7"));
+    assert_eq!(column.default_expression().map(ToString::to_string).as_deref(), Some("7"));
 
     let undefaulted = parse(
         "CREATE TABLE t (id INT PRIMARY KEY, a INT DEFAULT 7);
@@ -664,7 +664,7 @@ fn altering_a_column_changes_what_it_declares() {
         .column("a", &undefaulted, IdentifierCase::AsWritten)
         .expect("t is in this database")
         .expect("a is declared");
-    assert_eq!(column.default_value(), None);
+    assert_eq!(column.default_expression(), None);
 
     let retyped = parse(
         "CREATE TABLE t (id INT PRIMARY KEY, a INT);

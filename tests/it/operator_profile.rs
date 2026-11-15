@@ -294,8 +294,21 @@ impl<P: EmptyKinds> ColumnLike for NoneKind<P> {
         self.unreach()
     }
 
-    fn default_value(&self) -> Option<String> {
+    fn default_expression(&self) -> Option<&Expr> {
         self.unreach()
+    }
+
+    fn generation_expression(&self) -> Option<&Expr> {
+        self.unreach()
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        _call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
     fn foreign_options(&self) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
@@ -422,6 +435,15 @@ impl<P: EmptyKinds> IndexLike for NoneKind<P> {
     fn is_unique(&self) -> bool {
         self.unreach()
     }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        _call: &Function,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
+    }
 }
 
 impl<P: EmptyKinds> ForeignKeyLike for NoneKind<P> {
@@ -529,6 +551,13 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
         self.unreach::<core::iter::Empty<ArgMode>>()
     }
 
+    fn returned_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
+        self.unreach::<core::iter::Empty<(TargetName<'db>, Cow<'db, str>)>>()
+    }
+
     fn argument_default_count(&self) -> usize {
         self.unreach()
     }
@@ -538,6 +567,10 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
     }
 
     fn kind(&self, _database: &Self::DB) -> Result<FunctionKind, LookupError> {
+        self.unreach()
+    }
+
+    fn aggregate_kind(&self, _database: &Self::DB) -> Result<Option<AggregateKind>, LookupError> {
         self.unreach()
     }
 
@@ -582,6 +615,10 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
     }
 
     fn returns_null_on_null_argument(&self, _database: &Self::DB, _index: usize) -> bool {
+        self.unreach()
+    }
+
+    fn is_leakproof(&self) -> bool {
         self.unreach()
     }
 

@@ -25,6 +25,7 @@ mod identity;
 pub mod metadata;
 mod operator_resolution;
 mod partition_bound;
+pub(crate) mod plpgsql_scope;
 pub(crate) mod policy_analysis;
 mod policy_expression;
 mod privilege_holder;
@@ -33,11 +34,14 @@ mod role_membership;
 mod role_setting;
 mod row_security;
 mod schema;
+#[cfg(feature = "canonicalize")]
+mod semantic_proofs;
 mod sequence;
 mod sequence_parameters;
 mod table_privileges;
 mod target_name;
 mod type_facts;
+mod unqualified_name;
 mod user_defined_type;
 mod view;
 
@@ -54,13 +58,16 @@ pub use deployment::{
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
-pub(crate) use expression_context::{ReparsePins, Site, applies_operators};
+pub(crate) use expression_context::{
+    CallRefusal, ReparsePins, Site, applies_operators, array_of, column_type, declared_type,
+    declared_type_named,
+};
 pub use expression_scope::ExpressionScope;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
-pub use function_kind::FunctionKind;
-pub use helper_set::{GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm};
+pub use function_kind::{AggregateKind, FunctionKind};
+pub use helper_set::{GrantArm, HelperArm, HelperSet, LiteralSet, ParentArm, WalkArm};
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
@@ -69,6 +76,9 @@ pub use operator_resolution::{
     CoercionStep, OperandEvidence, OperandType, OperatorResolution, SelectedOperator,
 };
 pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
+pub use plpgsql_scope::{
+    DynamicExecution, DynamicExecutionSites, PlPgSqlScope, PlPgSqlVariable, VariableKind,
+};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
 pub use policy_expression::PolicyExpression;
 pub use privilege_holder::PrivilegeHolder;
@@ -80,12 +90,15 @@ pub use row_security::{
     RowSecurityExemption, RowStatement, RowVersion,
 };
 pub use schema::Schema;
+#[cfg(feature = "canonicalize")]
+pub use semantic_proofs::{SemanticProofView, SemanticProofs};
 pub use sequence::Sequence;
 pub(crate) use sequence::StoredSequenceOwner;
 pub use sequence_parameters::{SequenceParameters, SequenceType};
 pub use table_privileges::{ColumnPrivilege, TablePrivileges};
 pub use target_name::TargetName;
 pub use type_facts::{DomainFacts, TypeCategory, TypeFacts, TypeKind};
+pub use unqualified_name::UnqualifiedName;
 pub(crate) use user_defined_type::AttributeCollation;
 pub use user_defined_type::UserDefinedType;
 pub use view::{MaterializedView, View, ViewDeclaration};

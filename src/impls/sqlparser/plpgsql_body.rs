@@ -10,13 +10,21 @@
 //! starts under the path the block started with, and a statement after the
 //! block cannot know whether the block finished or a handler ran.
 
+use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{SelectItem, SetExpr, Statement};
-use sqlparser_plpgsql::embedded::{Block, Branch, Dynamic, Loop, LoopControl, Node};
+use sqlparser::{
+    ast::{Query, Statement},
+    dialect::PostgreSqlDialect,
+    parser::Parser,
+};
+use sqlparser_plpgsql::embedded::{
+    Block, Branch, DeclarationKind, Dynamic, Loop, LoopControl, Node,
+};
 
 use super::data_statement::{
-    BodyPath, BodyWalk, sets_search_path_at_run_time, unresolvable, walk_statement,
+    BodyPath, BodyWalk, Embedded, runs_code_outside, sets_search_path_at_run_time, unresolvable,
+    walk_expression, walk_statement,
 };
 use crate::{errors::LookupError, utils::object_name::search_path_change};
 
@@ -25,8 +33,8 @@ use crate::{errors::LookupError, utils::object_name::search_path_change};
 ///
 /// # Errors
 ///
-/// Returns [`LookupError::FunctionBodyUnresolvable`] for SQL the body builds
-/// at run time, and the errors of [`walk_statement`].
+/// Returns the errors `walker` answers for SQL the body builds at run time,
+/// and the errors of [`walk_statement`].
 pub(crate) fn walk_block<'s>(
     function: &str,
     block: &'s Block,
@@ -49,6 +57,10 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
         walk_statement(self.function, statement, self.walker, self.hex_strings_may_be_integers)
     }
 
+    fn expression(&mut self, query: &'s Query) -> Result<(), LookupError> {
+        walk_expression(self.function, query, self.walker)
+    }
+
     fn nodes(&mut self, nodes: &'s [Node]) -> Result<(), LookupError> {
         nodes.iter().try_for_each(|node| self.node(node))
     }
@@ -56,12 +68,12 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
     fn node(&mut self, node: &'s Node) -> Result<(), LookupError> {
         match node {
             Node::Statement(statement) => self.statement(statement),
-            Node::Dynamic(dynamic) => Err(self.dynamic(dynamic)),
+            Node::Dynamic(dynamic) => self.walker.dynamic(self.function, dynamic),
             Node::Block(block) => self.block(block),
             Node::If(choice) => self.branches(&choice.branches, &choice.otherwise),
             Node::Case(choice) => {
                 if let Some(subject) = &choice.subject {
-                    self.statement(subject)?;
+                    self.expression(subject)?;
                 }
                 self.branches(&choice.branches, &choice.otherwise)
             }
@@ -73,7 +85,7 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
     /// statements started with.
     fn block(&mut self, block: &'s Block) -> Result<(), LookupError> {
         // Run on entry, before the block's handlers take effect.
-        block.declarations.iter().try_for_each(|declaration| self.statement(declaration))?;
+        defaults(block).try_for_each(|default| self.expression(default))?;
         let mut change = None;
         if !block.handlers.is_empty() {
             change = self.first_change(&block.statements)?;
@@ -108,7 +120,7 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
     ) -> Result<(), LookupError> {
         let mut change = None;
         for branch in branches {
-            self.statement(&branch.condition)?;
+            self.expression(&branch.condition)?;
             let Some(found) = self.first_change(&branch.statements)? else {
                 self.nodes(&branch.statements)?;
                 continue;
@@ -136,21 +148,22 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 if let Some(found) = change {
                     self.forget(found);
                 }
-                self.statement(condition)?;
+                self.expression(condition)?;
             }
-            LoopControl::Range { lower, upper, step } => {
-                self.statement(lower)?;
-                self.statement(upper)?;
+            LoopControl::Range { lower, upper, step, .. } => {
+                self.expression(lower)?;
+                self.expression(upper)?;
                 if let Some(step) = step {
-                    self.statement(step)?;
+                    self.expression(step)?;
                 }
             }
-            LoopControl::Query(query) | LoopControl::Array(query) => self.statement(query)?,
-            LoopControl::Cursor { arguments, query } => {
-                arguments.iter().try_for_each(|argument| self.statement(argument))?;
+            LoopControl::Query(query) => self.statement(query)?,
+            LoopControl::Array(array) => self.expression(array)?,
+            LoopControl::Cursor { arguments, query, .. } => {
+                arguments.iter().try_for_each(|argument| self.expression(argument))?;
                 self.statement(query)?;
             }
-            LoopControl::Dynamic(dynamic) => return Err(self.dynamic(dynamic)),
+            LoopControl::Dynamic(dynamic) => self.walker.dynamic(self.function, dynamic)?,
         }
         if let Some(found) = change {
             self.forget(found);
@@ -162,106 +175,138 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
         self.nodes(&repeated.statements)
     }
 
-    /// Makes every later unqualified name answer that `statement` hides it.
-    fn forget(&mut self, statement: &Statement) {
-        self.walker.set_path(BodyPath::Unknown(unresolvable(self.function, statement)));
+    /// Makes every later unqualified name answer that `sql` hides it.
+    fn forget(&mut self, sql: Embedded<'_>) {
+        self.walker.set_path(BodyPath::Unknown(unresolvable(self.function, &sql)));
     }
 
-    /// The first statement in `nodes`, nested ones included, that changes
-    /// the path.
-    fn first_change(&self, nodes: &'s [Node]) -> Result<Option<&'s Statement>, LookupError> {
-        let hex_strings_may_be_integers = self.hex_strings_may_be_integers;
-        let found = each_statement(nodes, &mut |statement| {
-            match search_path_change(statement, hex_strings_may_be_integers) {
-                Ok(None) if !sets_search_path_at_run_time(statement) => ControlFlow::Continue(()),
-                Ok(_) => ControlFlow::Break(Ok(statement)),
+    /// The first statement or expression in `nodes`, nested ones included,
+    /// that changes the path or may. Such SQL sets the path, runs code
+    /// outside the body, calls user code, or builds SQL at run time. Constant
+    /// SQL text counts only when a statement it parses into would, or when
+    /// PostgreSQL would refuse it once it runs, as the straight line reads
+    /// it.
+    fn first_change(&self, nodes: &'s [Node]) -> Result<Option<Embedded<'s>>, LookupError> {
+        let may_change = |sql: Embedded<'_>| -> Result<bool, LookupError> {
+            let changes = match sql {
+                Embedded::Statement(statement) => {
+                    runs_code_outside(statement)
+                        || search_path_change(statement, self.hex_strings_may_be_integers)?
+                            .is_some()
+                }
+                Embedded::Expression(_) => false,
+            };
+            Ok(changes || sets_search_path_at_run_time(&sql) || self.walker.runs_user_code(sql))
+        };
+        let found = each_sql(nodes, &mut |sql, command| {
+            let changed = match command {
+                Some(dynamic) => {
+                    Ok(constant_command(dynamic).is_none_or(|statements| {
+                        statements
+                            .iter()
+                            .any(|run| may_change(Embedded::Statement(run)).unwrap_or(true))
+                    }))
+                }
+                None => may_change(sql),
+            };
+            match changed {
+                Ok(false) => ControlFlow::Continue(()),
+                Ok(true) => ControlFlow::Break(Ok(sql)),
                 Err(error) => ControlFlow::Break(Err(error)),
             }
         });
         found.break_value().transpose()
     }
-
-    /// The error SQL built at run time answers, naming the `EXECUTE` by the
-    /// expression that builds its command.
-    fn dynamic(&self, dynamic: &Dynamic) -> LookupError {
-        let command = &*dynamic.command;
-        if let Statement::Query(query) = command
-            && let SetExpr::Select(select) = &*query.body
-            && select.from.is_empty()
-            && let [SelectItem::UnnamedExpr(expression)] = select.projection.as_slice()
-        {
-            return unresolvable(self.function, &format_args!("EXECUTE {expression}"));
-        }
-        unresolvable(self.function, &format_args!("EXECUTE ({command})"))
-    }
 }
 
-/// Hands `visit` every statement `nodes` run, nested ones included, in body
-/// order, until it breaks.
-fn each_statement<'s, B>(
+/// The statements the command of `dynamic` runs when it is constant text
+/// that parses, or `None` when only run time knows them.
+pub(crate) fn constant_command(dynamic: &Dynamic) -> Option<Vec<Statement>> {
+    Parser::parse_sql(&PostgreSqlDialect {}, dynamic.constant_command()?).ok()
+}
+
+/// Hands `visit` every statement and expression `nodes` run, nested ones
+/// included, in body order, until it breaks, with the dynamic site whose
+/// command an expression evaluates.
+fn each_sql<'s, B>(
     nodes: &'s [Node],
-    visit: &mut impl FnMut(&'s Statement) -> ControlFlow<B>,
+    visit: &mut impl FnMut(Embedded<'s>, Option<&'s Dynamic>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
     for node in nodes {
         match node {
-            Node::Statement(statement) => visit(statement)?,
-            Node::Dynamic(dynamic) => each_dynamic_statement(dynamic, visit)?,
+            Node::Statement(statement) => visit(Embedded::Statement(statement), None)?,
+            Node::Dynamic(dynamic) => each_dynamic_sql(dynamic, visit)?,
             Node::Block(block) => {
-                block.declarations.iter().try_for_each(&mut *visit)?;
-                each_statement(&block.statements, visit)?;
+                defaults(block)
+                    .try_for_each(|default| visit(Embedded::Expression(default), None))?;
+                each_sql(&block.statements, visit)?;
                 for handler in &block.handlers {
-                    each_statement(handler, visit)?;
+                    each_sql(handler, visit)?;
                 }
             }
-            Node::If(choice) => each_branch_statement(&choice.branches, &choice.otherwise, visit)?,
+            Node::If(choice) => each_branch_sql(&choice.branches, &choice.otherwise, visit)?,
             Node::Case(choice) => {
                 if let Some(subject) = &choice.subject {
-                    visit(subject)?;
+                    visit(Embedded::Expression(subject), None)?;
                 }
-                each_branch_statement(&choice.branches, &choice.otherwise, visit)?;
+                each_branch_sql(&choice.branches, &choice.otherwise, visit)?;
             }
             Node::Loop(repeated) => {
                 match &repeated.control {
                     LoopControl::Unconditional => {}
-                    LoopControl::While(statement)
-                    | LoopControl::Query(statement)
-                    | LoopControl::Array(statement) => visit(statement)?,
-                    LoopControl::Range { lower, upper, step } => {
-                        visit(lower)?;
-                        visit(upper)?;
+                    LoopControl::While(query) | LoopControl::Array(query) => {
+                        visit(Embedded::Expression(query), None)?;
+                    }
+                    LoopControl::Query(statement) => visit(Embedded::Statement(statement), None)?,
+                    LoopControl::Range { lower, upper, step, .. } => {
+                        visit(Embedded::Expression(lower), None)?;
+                        visit(Embedded::Expression(upper), None)?;
                         if let Some(step) = step {
-                            visit(step)?;
+                            visit(Embedded::Expression(step), None)?;
                         }
                     }
-                    LoopControl::Cursor { arguments, query } => {
-                        arguments.iter().try_for_each(&mut *visit)?;
-                        visit(query)?;
+                    LoopControl::Cursor { arguments, query, .. } => {
+                        arguments
+                            .iter()
+                            .try_for_each(|argument| visit(Embedded::Expression(argument), None))?;
+                        visit(Embedded::Statement(query), None)?;
                     }
-                    LoopControl::Dynamic(dynamic) => each_dynamic_statement(dynamic, visit)?,
+                    LoopControl::Dynamic(dynamic) => each_dynamic_sql(dynamic, visit)?,
                 }
-                each_statement(&repeated.statements, visit)?;
+                each_sql(&repeated.statements, visit)?;
             }
         }
     }
     ControlFlow::Continue(())
 }
 
-fn each_branch_statement<'s, B>(
-    branches: &'s [Branch],
-    otherwise: &'s [Node],
-    visit: &mut impl FnMut(&'s Statement) -> ControlFlow<B>,
-) -> ControlFlow<B> {
-    for branch in branches {
-        visit(&branch.condition)?;
-        each_statement(&branch.statements, visit)?;
-    }
-    each_statement(otherwise, visit)
+/// The `SELECT` evaluating each default the `DECLARE` section of `block`
+/// writes, in order.
+fn defaults(block: &Block) -> impl Iterator<Item = &Query> {
+    block.declarations.iter().filter_map(|declaration| {
+        match &declaration.kind {
+            DeclarationKind::Variable(variable) => variable.default.as_deref(),
+            DeclarationKind::Alias(_) | DeclarationKind::Cursor(_) => None,
+        }
+    })
 }
 
-fn each_dynamic_statement<'s, B>(
-    dynamic: &'s Dynamic,
-    visit: &mut impl FnMut(&'s Statement) -> ControlFlow<B>,
+fn each_branch_sql<'s, B>(
+    branches: &'s [Branch],
+    otherwise: &'s [Node],
+    visit: &mut impl FnMut(Embedded<'s>, Option<&'s Dynamic>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
-    visit(&dynamic.command)?;
-    dynamic.arguments.iter().try_for_each(visit)
+    for branch in branches {
+        visit(Embedded::Expression(&branch.condition), None)?;
+        each_sql(&branch.statements, visit)?;
+    }
+    each_sql(otherwise, visit)
+}
+
+fn each_dynamic_sql<'s, B>(
+    dynamic: &'s Dynamic,
+    visit: &mut impl FnMut(Embedded<'s>, Option<&'s Dynamic>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    visit(Embedded::Expression(&dynamic.command), Some(dynamic))?;
+    dynamic.arguments.iter().try_for_each(|argument| visit(Embedded::Expression(argument), None))
 }

@@ -1,10 +1,10 @@
 //! Implement the [`UniqueConstraint`] trait for the `sqlparser` crate's
 //! [`TableAttribute`] wrapper.
 
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    ColumnDef, CreateTable, Expr, IndexType, NullsDistinctOption, UniqueConstraint,
+    ColumnDef, CreateTable, Expr, Function, IndexType, NullsDistinctOption, UniqueConstraint,
 };
 
 use super::index_clauses::{included_columns, written_access_method};
@@ -121,6 +121,17 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     {
         self.metadata(database)?;
         included_columns(&self.attribute().include, self.table(), database)
+    }
+
+    fn functions_reached_by<'db>(
+        &'db self,
+        call: &Function,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
+    {
+        self.metadata(database)?
+            .reached_by(self.attribute(), call)
+            .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })
     }
 
     #[inline]

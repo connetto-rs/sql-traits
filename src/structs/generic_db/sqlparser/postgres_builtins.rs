@@ -19,12 +19,49 @@ use sqlparser::{
 use super::postgres_18_functions::POSTGRES_18_FUNCTIONS;
 use crate::{
     structs::{
-        FunctionKind,
+        AggregateKind, FunctionKind,
         generic_db::{Stored, builtin_functions::BuiltinTable},
         metadata::FunctionMetadata,
     },
     utils::{null_returning_positions, object_name::PG_CATALOG},
 };
+
+/// `pg_proc.prokind`, with `pg_aggregate.aggkind` and
+/// `pg_aggregate.aggnumdirectargs` for an aggregate whose arguments split
+/// between direct ones and those `WITHIN GROUP` orders by.
+#[derive(Clone, Copy)]
+pub(super) enum Kind {
+    Normal,
+    Window,
+    Aggregate,
+    OrderedSet(usize),
+    HypotheticalSet(usize),
+}
+
+impl Kind {
+    const fn function(self) -> FunctionKind {
+        match self {
+            Self::Normal => FunctionKind::Normal,
+            Self::Window => FunctionKind::Window,
+            Self::Aggregate | Self::OrderedSet(_) | Self::HypotheticalSet(_) => {
+                FunctionKind::Aggregate
+            }
+        }
+    }
+
+    const fn aggregate(self) -> Option<AggregateKind> {
+        match self {
+            Self::Normal | Self::Window => None,
+            Self::Aggregate => Some(AggregateKind::Normal),
+            Self::OrderedSet(direct_arguments) => {
+                Some(AggregateKind::OrderedSet { direct_arguments })
+            }
+            Self::HypotheticalSet(direct_arguments) => {
+                Some(AggregateKind::HypotheticalSet { direct_arguments })
+            }
+        }
+    }
+}
 
 /// `pg_proc.proisstrict`.
 #[derive(Clone, Copy)]
@@ -53,6 +90,15 @@ impl Volatility {
     }
 }
 
+/// `pg_proc.proleakproof`.
+#[derive(Clone, Copy)]
+pub(super) enum Leakage {
+    /// Its errors and notices reveal nothing about its arguments.
+    Leakproof,
+    /// It may reveal its arguments.
+    NotLeakproof,
+}
+
 /// `pg_proc.prolang`, among the languages `pg_catalog` functions are written
 /// in.
 #[derive(Clone, Copy)]
@@ -74,8 +120,8 @@ impl Language {
 
 /// One `pg_proc` row: the function's name, its parameters as
 /// `pg_get_function_arguments` spells them, its result as
-/// `pg_get_function_result` does, its strictness, volatility, kind and
-/// language.
+/// `pg_get_function_result` does, its strictness, volatility, leakproof
+/// status, kind and language.
 ///
 /// A tuple struct, so a row is built by its constructor rather than by a
 /// function only const evaluation ever runs.
@@ -86,7 +132,8 @@ pub(super) struct PostgresBuiltin(
     pub(super) &'static str,
     pub(super) NullInput,
     pub(super) Volatility,
-    pub(super) FunctionKind,
+    pub(super) Leakage,
+    pub(super) Kind,
     pub(super) Language,
 );
 
@@ -99,7 +146,7 @@ impl PostgresBuiltin {
     /// The declaration in `pg_catalog`, so a user function may shadow it the
     /// way the server allows.
     fn function(&self) -> Option<CreateFunction> {
-        let Self(name, arguments, result, null_input, volatility, _, language) = *self;
+        let Self(name, arguments, result, null_input, volatility, leakage, _, language) = *self;
         let name = ObjectName(vec![
             ObjectNamePart::Identifier(Ident::new(PG_CATALOG)),
             ObjectNamePart::Identifier(stored_ident(name)),
@@ -112,17 +159,22 @@ impl PostgresBuiltin {
             volatility,
             language,
         )
+        .map(|mut function| {
+            function.leakproof = matches!(leakage, Leakage::Leakproof).then_some(true);
+            function
+        })
     }
 
     fn metadata(&self) -> FunctionMetadata {
-        let Self(name, arguments, _, _, _, kind, _) = *self;
+        let Self(name, arguments, _, _, _, _, kind, _) = *self;
         let mut metadata = FunctionMetadata::default();
         if let Some(positions) =
             null_returning_positions(name, |types| arguments.split(", ").eq(types.iter().copied()))
         {
             metadata.set_null_returning_arguments(positions);
         }
-        metadata.set_kind(kind);
+        metadata.set_kind(kind.function());
+        metadata.set_aggregate_kind(kind.aggregate());
         metadata
     }
 }

@@ -327,6 +327,11 @@ impl<F> ExpressionCalls<F> {
         self.operators.iter().any(|node| node.state != NodeState::Settled)
     }
 
+    /// Whether some call is new or parsed again, and waits to be typed.
+    pub(crate) fn has_untyped_calls(&self) -> bool {
+        self.calls.iter().any(|call| call.state != NodeState::Settled)
+    }
+
     /// Each call's state, in the order a pre-order walk meets the calls.
     pub(crate) fn call_states(&self) -> impl Iterator<Item = NodeState> {
         self.calls.iter().map(|call| call.state)
@@ -499,35 +504,27 @@ impl<F> ExpressionCalls<F> {
     }
 
     /// Returns the functions `call` reaches, or `None` when `call` is not a
-    /// node of `expression`, the expression this record was built from.
+    /// node of `node`, the node this record was built from.
     ///
-    /// `call` is matched by address, so it has to be borrowed from
-    /// `expression` itself rather than from a copy.
-    pub fn reached_by<'s>(
+    /// `call` is matched by address, so it has to be borrowed from `node`
+    /// itself rather than from a copy.
+    pub fn reached_by<'s, N: Visit + ?Sized>(
         &'s self,
-        expression: &Expr,
+        node: &N,
         call: &Function,
-    ) -> Option<impl Iterator<Item = &'s F> + use<'s, F>> {
-        let mut position = 0;
-        let found = for_each_site(expression, |site| {
-            match site {
-                Site::Call(Call { node: Some(node), .. }) if core::ptr::eq(node, call) => {
-                    ControlFlow::Break(Some(position))
-                }
-                Site::ExpressionForm(node) if core::ptr::eq(node, call) => ControlFlow::Break(None),
-                Site::Call(_) => {
-                    position += 1;
-                    ControlFlow::Continue(())
-                }
-                Site::ExpressionForm(_) => ControlFlow::Continue(()),
-            }
-        });
-        let ControlFlow::Break(position) = found else {
-            return None;
-        };
-        let reached: &[Arc<F>] = match position {
-            Some(position) => self.calls.get(position)?.reached(),
-            None => &[],
+    ) -> Option<impl Iterator<Item = &'s F> + use<'s, F, N>> {
+        self.reached_at(call_site(node, call)?)
+    }
+
+    /// Returns the functions the call at `site` reaches, or `None` when the
+    /// record holds no call at its position.
+    pub(crate) fn reached_at(
+        &self,
+        site: CallSite,
+    ) -> Option<impl Iterator<Item = &F> + use<'_, F>> {
+        let reached: &[Arc<F>] = match site {
+            CallSite::Call(position) => self.calls.get(position)?.reached(),
+            CallSite::ExpressionForm => &[],
         };
         Some(reached.iter().map(AsRef::as_ref))
     }
@@ -545,6 +542,41 @@ impl<F> ExpressionCalls<F> {
                 *slot = Arc::clone(fresh);
             }
         }
+    }
+}
+
+/// Where a node written with the syntax of a call sits among the calls of
+/// the node holding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallSite {
+    /// A call, at its position in the order a pre-order walk meets them.
+    Call(usize),
+    /// An expression form, which runs no function.
+    ExpressionForm,
+}
+
+/// Returns where `call` sits among the calls of `node`, or `None` when
+/// `call` is not a node of `node`, which is matched by address.
+pub(crate) fn call_site<N: Visit + ?Sized>(node: &N, call: &Function) -> Option<CallSite> {
+    let mut position = 0;
+    let found = for_each_site(node, |site| {
+        match site {
+            Site::Call(Call { node: Some(node), .. }) if core::ptr::eq(node, call) => {
+                ControlFlow::Break(CallSite::Call(position))
+            }
+            Site::ExpressionForm(node) if core::ptr::eq(node, call) => {
+                ControlFlow::Break(CallSite::ExpressionForm)
+            }
+            Site::Call(_) => {
+                position += 1;
+                ControlFlow::Continue(())
+            }
+            Site::ExpressionForm(_) => ControlFlow::Continue(()),
+        }
+    });
+    match found {
+        ControlFlow::Break(site) => Some(site),
+        ControlFlow::Continue(()) => None,
     }
 }
 

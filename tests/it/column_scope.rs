@@ -198,6 +198,24 @@ fn table_function_stays_opaque() {
     assert_eq!(qualified.as_deref(), Some("b"));
 }
 
+// A `VALUES` list in `FROM` exposes `column1`, `column2`, …, renamed by its
+// alias column list, so its columns are known and a bare reference past it
+// resolves, while a name it shares with a table is ambiguous.
+#[test]
+fn values_list_exposes_its_columns() {
+    let db = schema_db();
+    let bare = resolve_projection("SELECT payload FROM (VALUES (1, 2)) v JOIN b ON true", &db)
+        .expect("resolves");
+    assert_eq!(bare.as_deref(), Some("b"));
+    let computed =
+        resolve_projection("SELECT v.column2 FROM (VALUES (1, 2)) v JOIN b ON true", &db)
+            .expect("resolves");
+    assert_eq!(computed, None);
+    let shared =
+        resolve_projection("SELECT payload FROM (VALUES (1)) v(payload) JOIN b ON true", &db);
+    assert!(matches!(shared, Err(LookupError::AmbiguousTableLookup { .. })), "got {shared:?}");
+}
+
 #[test]
 fn unresolvable_relation_name_still_poisons_a_bare_reference() {
     let db = schema_db();
@@ -1270,13 +1288,15 @@ fn set_operation_arms_that_cannot_pair_answer_nothing() {
     for body in [
         "SELECT id FROM a UNION ALL SELECT id, payload FROM a",
         "SELECT count(*) FROM a UNION ALL SELECT id FROM a",
-        "SELECT id FROM a UNION ALL VALUES (1)",
-        "VALUES (1) UNION ALL SELECT id FROM a",
+        "SELECT id FROM a UNION ALL VALUES (1, 2)",
+        "VALUES (1, 2) UNION ALL SELECT id FROM a",
     ] {
         let sql = format!("WITH v AS ({body}) SELECT v.id FROM v");
         assert_eq!(resolve_projection(&sql, &db).expect("resolves"), None, "{body}");
     }
-    for body in ["SELECT id FROM a UNION ALL VALUES (1)", "VALUES (1) UNION ALL SELECT id FROM a"] {
+    for body in
+        ["SELECT id FROM a UNION ALL VALUES (1, 2)", "VALUES (1, 2) UNION ALL SELECT id FROM a"]
+    {
         let sql = format!("WITH RECURSIVE v(id) AS ({body}) SELECT v.id FROM v");
         assert_eq!(resolve_projection(&sql, &db).expect("resolves"), None, "{body}");
     }

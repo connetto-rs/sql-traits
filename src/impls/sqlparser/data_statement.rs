@@ -7,13 +7,15 @@
 //! reads that item, so it is skipped, except as a mutation target, which
 //! always names a stored relation. The one relation source the walk does not
 //! reach is the MySQL multi-table `DELETE ... t1, t2` list, which the `Delete`
-//! implementation resolves explicitly. `referenced_relations` records what the
-//! statement names, and `referenced_tables` goes on to expand every plain view
-//! through the view's stored definition, which is bound at creation and read
-//! with no search path, and every table a `FROM` or target item without
-//! `ONLY` names into the tables below it through `INHERITS` and
-//! `PARTITION OF`. A function body read when it runs is walked the same way,
-//! one statement after another, under the path the function runs with.
+//! implementation resolves explicitly, and a `FROM` item written with an
+//! argument list names the function it calls, so it reads no relation.
+//! `referenced_relations` records what the statement names, and
+//! `referenced_tables` goes on to expand every plain view through the view's
+//! stored definition, which is bound at creation and read with no search
+//! path, and every table a `FROM` or target item without `ONLY` names into
+//! the tables below it through `INHERITS` and `PARTITION OF`. A function body
+//! read when it runs is walked the same way, one statement after another,
+//! under the path the function runs with.
 
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use core::ops::ControlFlow;
@@ -23,19 +25,21 @@ use sqlparser::ast::{
     Query, Statement, TableFactor, TableInheritance, TableObject, Update, Value, ValueWithSpan,
     Visit, Visitor,
 };
-use sqlparser_plpgsql::embedded::Block;
+use sqlparser_plpgsql::embedded::{Block, Dynamic, expression};
 
 use super::plpgsql_body::walk_block;
 use crate::{
     errors::LookupError,
-    structs::IdentifierCase,
-    traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
+    structs::{IdentifierCase, UnqualifiedName},
+    traits::{DataStatementLike, DatabaseLike, FunctionLike, Relation, TableLike, ViewLike},
     utils::{
-        identifier_resolution::SearchPath,
+        call_sites::for_each_call,
+        identifier_resolution::{SearchPath, identifiers_match},
         object_name::{
-            DEFAULT_SEARCH_PATH, SearchPathChange, object_name_identifiers, object_name_last_part,
-            resolve_bound_relation_object_name, resolve_relation_object_name,
-            resolve_relation_object_name_on_path, search_path_change,
+            DEFAULT_SEARCH_PATH, PG_CATALOG, Qualifier, SearchPathChange, object_name_identifiers,
+            object_name_last_part, qualifier_of, resolve_bound_relation_object_name,
+            resolve_relation_object_name, resolve_relation_object_name_on_path, search_path_change,
+            target_name_from_object_name,
         },
         walk::walk,
         with_scopes::WithScopes,
@@ -43,7 +47,7 @@ use crate::{
 };
 
 /// The path unqualified names resolve under in a body read when it runs.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum BodyPath<'path> {
     /// The database's own path.
     Database,
@@ -75,10 +79,37 @@ pub(crate) struct Reads<'db, DB: DatabaseLike> {
     pub(crate) tables: Vec<&'db DB::Table>,
 }
 
+/// Resolves the relation `object_name` names in a body read when it runs, an
+/// unqualified name under `path`.
+///
+/// # Errors
+///
+/// Returns the error of an unknown path for an unqualified name, and the
+/// errors resolving the name.
+pub(super) fn resolve_on_body_path<'db, DB: DatabaseLike>(
+    object_name: &ObjectName,
+    database: &'db DB,
+    path: &BodyPath<'_>,
+) -> Result<Option<Relation<'db, DB>>, LookupError> {
+    let case = IdentifierCase::AsWritten;
+    match path {
+        BodyPath::Set(path) => {
+            resolve_relation_object_name_on_path(object_name, database, path, case)
+        }
+        BodyPath::Unknown(error) if object_name_identifiers(object_name)?.0.is_none() => {
+            Err(error.clone())
+        }
+        // A qualified name reaches its schema whatever the path holds.
+        BodyPath::Database | BodyPath::Unknown(_) => {
+            resolve_relation_object_name(object_name, database, case)
+        }
+    }
+}
+
 /// Walks a data statement, recording every relation it names and expanding
 /// the base tables each plain view reaches through the view's stored
 /// definition, stopping at the first resolution error.
-struct RelationCollector<'db, 'path, DB: DatabaseLike> {
+pub(super) struct RelationCollector<'db, 'path, DB: DatabaseLike> {
     database: &'db DB,
     /// The path unqualified names resolve under, or none for a body bound at
     /// creation, whose names carry the qualifier of the relation each
@@ -100,6 +131,13 @@ struct RelationCollector<'db, 'path, DB: DatabaseLike> {
     descending: Option<*const ObjectName>,
     /// The tables whose descendants are already in `tables`.
     descended: Vec<&'db DB::Table>,
+    /// The name of the last table item met with an argument list, compared
+    /// by address, which calls a function rather than naming a relation.
+    called: Option<*const ObjectName>,
+    /// The names written without a schema outside a stored view's
+    /// definition, each with the relation it reached, or [`None`] for a walk
+    /// that does not gather them.
+    pub(super) unqualified: Option<Vec<UnqualifiedName<'db, DB>>>,
 }
 
 impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
@@ -114,27 +152,35 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
             bound: false,
             descending: None,
             descended: Vec::new(),
+            called: None,
+            unqualified: None,
+        }
+    }
+
+    /// A walk of a body read when it runs, starting under `path`, that also
+    /// gathers the names the body writes without a schema.
+    pub(super) fn gathering_unqualified(database: &'db DB, path: BodyPath<'path>) -> Self {
+        Self { unqualified: Some(Vec::new()), ..Self::new(database, Some(path)) }
+    }
+
+    /// Notes `object_name` with the relation it reached when the walk gathers
+    /// unqualified names, it carries no schema, and the body itself writes it.
+    fn note_unqualified(&mut self, object_name: &ObjectName, relation: Option<Relation<'db, DB>>) {
+        let Some(names) = self.unqualified.as_mut().filter(|_| !self.bound) else { return };
+        if qualifier_of(object_name) != Qualifier::Absent {
+            return;
+        }
+        if let Some(name) = target_name_from_object_name(object_name) {
+            add_unqualified(names, UnqualifiedName::Relation { name: name.into_owned(), relation });
         }
     }
 
     /// Resolves a name the walk meets, as bound inside a view definition or a
     /// body bound at creation, and under the walk's path otherwise.
     fn resolve(&self, object_name: &ObjectName) -> Result<Option<Relation<'db, DB>>, LookupError> {
-        let case = IdentifierCase::AsWritten;
-        let Some(path) = self.path.as_ref().filter(|_| !self.bound) else {
-            return resolve_bound_relation_object_name(object_name, self.database);
-        };
-        match path {
-            BodyPath::Set(path) => {
-                resolve_relation_object_name_on_path(object_name, self.database, path, case)
-            }
-            BodyPath::Unknown(error) if object_name_identifiers(object_name)?.0.is_none() => {
-                Err(error.clone())
-            }
-            // A qualified name reaches its schema whatever the path holds.
-            BodyPath::Database | BodyPath::Unknown(_) => {
-                resolve_relation_object_name(object_name, self.database, case)
-            }
+        match self.path.as_ref().filter(|_| !self.bound) {
+            Some(path) => resolve_on_body_path(object_name, self.database, path),
+            None => resolve_bound_relation_object_name(object_name, self.database),
         }
     }
 
@@ -231,7 +277,11 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
     /// Records every relation reachable from `node`, then the MySQL
     /// multi-table `DELETE` targets `listed`, which the visitor does not
     /// reach.
-    fn collect<N: Visit>(&mut self, node: &N, listed: &[ObjectName]) -> Result<(), LookupError> {
+    pub(super) fn collect<N: Visit>(
+        &mut self,
+        node: &N,
+        listed: &[ObjectName],
+    ) -> Result<(), LookupError> {
         if let ControlFlow::Break(error) = walk(node, self) {
             return Err(error);
         }
@@ -274,6 +324,43 @@ fn same_relation<DB: DatabaseLike>(left: &Relation<'_, DB>, right: &Relation<'_,
     }
 }
 
+/// Adds `name` to `names` unless they hold the same spelling of the same
+/// kind already, reaching the same objects.
+pub(super) fn add_unqualified<'db, DB: DatabaseLike>(
+    names: &mut Vec<UnqualifiedName<'db, DB>>,
+    name: UnqualifiedName<'db, DB>,
+) {
+    let seen = names.iter().any(|seen| {
+        match (seen, &name) {
+            (
+                UnqualifiedName::Relation { name: left, relation: left_relation },
+                UnqualifiedName::Relation { name: right, relation: right_relation },
+            ) => {
+                left == right
+                    && match (left_relation, right_relation) {
+                        (Some(left), Some(right)) => same_relation(left, right),
+                        (left, right) => left.is_none() && right.is_none(),
+                    }
+            }
+            (
+                UnqualifiedName::Function { name: left, functions: left_functions },
+                UnqualifiedName::Function { name: right, functions: right_functions },
+            ) => {
+                left == right
+                    && left_functions.len() == right_functions.len()
+                    && left_functions
+                        .iter()
+                        .zip(right_functions)
+                        .all(|(left, right)| core::ptr::eq(*left, *right))
+            }
+            _ => false,
+        }
+    });
+    if !seen {
+        names.push(name);
+    }
+}
+
 impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
     type Break = LookupError;
 
@@ -293,7 +380,9 @@ impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
     }
 
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
-        if let TableFactor::Table { name, inheritance, .. } = factor
+        if let TableFactor::Table { name, args: Some(_), .. } = factor {
+            self.called = Some(&raw const *name);
+        } else if let TableFactor::Table { name, inheritance, .. } = factor
             && !matches!(inheritance, Some(TableInheritance::Only { .. }))
         {
             self.descending = Some(&raw const *name);
@@ -302,13 +391,15 @@ impl<DB: DatabaseLike> Visitor for RelationCollector<'_, '_, DB> {
     }
 
     fn pre_visit_relation(&mut self, object_name: &ObjectName) -> ControlFlow<Self::Break> {
-        if self.scopes.reads_item(object_name)
-            && !self.targets.iter().any(|target| core::ptr::eq(*target, object_name))
+        if self.called == Some(&raw const *object_name)
+            || (self.scopes.reads_item(object_name)
+                && !self.targets.iter().any(|target| core::ptr::eq(*target, object_name)))
         {
             return ControlFlow::Continue(());
         }
         let descending = self.descending == Some(&raw const *object_name);
         let outcome = self.resolve(object_name).and_then(|relation| {
+            self.note_unqualified(object_name, relation);
             let Some(relation) = relation else { return Ok(()) };
             self.read(relation)?;
             match relation {
@@ -350,6 +441,34 @@ pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
     Ok(collector.reads)
 }
 
+/// One piece of SQL a function body runs, a statement or the `SELECT` a
+/// PL/pgSQL body evaluates an expression with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Embedded<'s> {
+    /// A statement.
+    Statement(&'s Statement),
+    /// The `SELECT` evaluating an expression.
+    Expression(&'s Query),
+}
+
+impl Visit for Embedded<'_> {
+    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
+        match self {
+            Self::Statement(statement) => walk(*statement, visitor),
+            Self::Expression(query) => walk(*query, visitor),
+        }
+    }
+}
+
+impl core::fmt::Display for Embedded<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Statement(statement) => statement.fmt(formatter),
+            Self::Expression(query) => query.fmt(formatter),
+        }
+    }
+}
+
 /// What a walk over the statements of a function body read when it runs
 /// gathers, one statement after another, under the path in force for each.
 pub(crate) trait BodyWalk<'s> {
@@ -371,7 +490,40 @@ pub(crate) trait BodyWalk<'s> {
     /// # Errors
     ///
     /// Returns any error resolving a name the statement holds.
-    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError>;
+    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError>;
+
+    /// Whether `sql` calls code that may set `search_path` for the
+    /// statements after it, as [`calls_user_code`] decides over the
+    /// walker's database.
+    fn runs_user_code(&self, sql: Embedded<'_>) -> bool;
+
+    /// Takes a statement that runs code outside the body, as
+    /// [`runs_code_outside`] picks it, which hides what the body reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyUnresolvable`] unless the walker
+    /// reads past such code.
+    fn opaque(&mut self, function: &str, statement: &'s Statement) -> Result<(), LookupError> {
+        Err(unresolvable(function, statement))
+    }
+
+    /// Takes SQL a PL/pgSQL body builds at run time, run under the path in
+    /// force where it sits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyUnresolvable`] unless the walker
+    /// reads past such SQL.
+    fn dynamic(&mut self, function: &str, dynamic: &'s Dynamic) -> Result<(), LookupError> {
+        Err(dynamic_unresolvable(function, dynamic))
+    }
+}
+
+/// The error SQL built at run time answers, naming the `EXECUTE` by the
+/// expression that builds its command.
+pub(crate) fn dynamic_unresolvable(function: &str, dynamic: &Dynamic) -> LookupError {
+    unresolvable(function, &format_args!("EXECUTE {}", expression(&dynamic.command)))
 }
 
 /// The statements of a function body read when it runs.
@@ -430,28 +582,54 @@ pub(crate) fn unresolvable(function: &str, statement: &impl ToString) -> LookupE
 ///
 /// # Errors
 ///
-/// Returns [`LookupError::FunctionBodyUnresolvable`] for a statement that
-/// runs code outside the body, and any error `walker` returns.
+/// Returns any error `walker` returns, a statement that runs code outside
+/// the body among them as [`BodyWalk::opaque`] answers it.
 pub(crate) fn walk_statement<'s>(
     function: &str,
     statement: &'s Statement,
     walker: &mut impl BodyWalk<'s>,
     hex_strings_may_be_integers: bool,
 ) -> Result<(), LookupError> {
-    if matches!(statement, Statement::Call(_) | Statement::Execute { .. }) {
-        return Err(unresolvable(function, statement));
+    if runs_code_outside(statement) {
+        return walker.opaque(function, statement);
     }
     match search_path_change(statement, hex_strings_may_be_integers)? {
         Some(SearchPathChange::Set(path)) => walker.set_path(BodyPath::Set(path)),
         Some(SearchPathChange::Reset) => walker.set_path(BodyPath::default_path()),
         None => {
-            walker.walk(statement)?;
-            if sets_search_path_at_run_time(statement) {
+            walker.walk(Embedded::Statement(statement))?;
+            let embedded = Embedded::Statement(statement);
+            if sets_search_path_at_run_time(statement) || walker.runs_user_code(embedded) {
                 walker.set_path(BodyPath::Unknown(unresolvable(function, statement)));
             }
         }
     }
     Ok(())
+}
+
+/// Hands the `SELECT` evaluating an expression of the PL/pgSQL body of
+/// `function` to `walker`, after which a call setting `search_path` or user
+/// code leaves the path unknown.
+///
+/// # Errors
+///
+/// Returns any error `walker` returns.
+pub(crate) fn walk_expression<'s>(
+    function: &str,
+    query: &Query,
+    walker: &mut impl BodyWalk<'s>,
+) -> Result<(), LookupError> {
+    walker.walk(Embedded::Expression(query))?;
+    if sets_search_path_at_run_time(query) || walker.runs_user_code(Embedded::Expression(query)) {
+        walker.set_path(BodyPath::Unknown(unresolvable(function, query)));
+    }
+    Ok(())
+}
+
+/// Whether `statement` runs code the body does not hold, a `CALL`, an
+/// `EXECUTE` of a prepared statement or a `DO` block.
+pub(crate) const fn runs_code_outside(statement: &Statement) -> bool {
+    matches!(statement, Statement::Call(_) | Statement::Execute { .. } | Statement::Do(_))
 }
 
 impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
@@ -469,12 +647,16 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
         self.path = Some(path);
     }
 
-    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError> {
-        let listed = match statement {
-            Statement::Delete(delete) => delete.tables.as_slice(),
+    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
+        let listed = match sql {
+            Embedded::Statement(Statement::Delete(delete)) => delete.tables.as_slice(),
             _ => &[],
         };
-        self.collect(statement, listed)
+        self.collect(&sql, listed)
+    }
+
+    fn runs_user_code(&self, sql: Embedded<'_>) -> bool {
+        calls_user_code(&sql, self.database)
     }
 }
 
@@ -498,9 +680,9 @@ pub(crate) fn reads_of_body<'db, DB: DatabaseLike>(
     Ok(collector.reads)
 }
 
-/// Whether `statement` calls `set_config` on `search_path`, or on a setting
-/// named only when it runs.
-pub(crate) fn sets_search_path_at_run_time(statement: &Statement) -> bool {
+/// Whether `node` calls `set_config` on `search_path`, or on a setting named
+/// only when it runs.
+pub(crate) fn sets_search_path_at_run_time<N: Visit + ?Sized>(node: &N) -> bool {
     struct SetConfigCalls;
     impl Visitor for SetConfigCalls {
         type Break = ();
@@ -527,7 +709,50 @@ pub(crate) fn sets_search_path_at_run_time(statement: &Statement) -> bool {
             ControlFlow::Continue(())
         }
     }
-    walk(statement, &mut SetConfigCalls).is_break()
+    walk(node, &mut SetConfigCalls).is_break()
+}
+
+/// Whether a call in `node` may run a function outside `pg_catalog`, which
+/// may set `search_path` for the statements after it.
+///
+/// PostgreSQL keeps a plain `SET` or `set_config(..., false)` past the end of
+/// the function running it, even one with its own `SET search_path` clause,
+/// so any such function counts. So does a call no function the database
+/// holds answers, or one whose name or schema only run time knows.
+pub(crate) fn calls_user_code<N: Visit + ?Sized, DB: DatabaseLike>(
+    node: &N,
+    database: &DB,
+) -> bool {
+    let in_catalog =
+        |schema: &str, quoted: bool| identifiers_match(schema, quoted, PG_CATALOG, false);
+    for_each_call(node, |call| {
+        let user = match (qualifier_of(call.name), object_name_last_part(call.name)) {
+            (Qualifier::Named(schema, quoted), _) => !in_catalog(schema, quoted),
+            // A name built at run time may name any function.
+            (Qualifier::RunTime, _) | (Qualifier::Absent, None) => true,
+            (Qualifier::Absent, Some((called, called_quoted))) => {
+                let mut reached = database.functions_named(called).filter(|function| {
+                    identifiers_match(
+                        function.name(),
+                        function.name_is_quoted(),
+                        called,
+                        called_quoted,
+                    ) && function.accepts_argument_count(call.arguments)
+                });
+                let mut known = false;
+                let outside = reached.any(|function| {
+                    known = true;
+                    let declared = function.target_name();
+                    declared
+                        .schema()
+                        .is_none_or(|schema| !in_catalog(schema, declared.schema_is_quoted()))
+                });
+                outside || !known
+            }
+        };
+        if user { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+    })
+    .is_break()
 }
 
 impl<DB: DatabaseLike> DataStatementLike<DB> for Query {
@@ -1110,5 +1335,29 @@ mod tests {
         let statement = parse_one("SELECT * FROM users");
         let collected = super::collect(&statement, &db, |_| {}, &[]).expect("resolves");
         assert_eq!(collected.tables.len(), 1);
+    }
+
+    /// A call whose name or schema a part built at run time writes may run
+    /// any function, so it counts as user code.
+    #[test]
+    fn a_call_named_at_run_time_runs_user_code() {
+        use sqlparser::ast::{
+            Expr, Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction, SelectItem, SetExpr,
+        };
+        let db = schema_db();
+        let run_time = ObjectNamePart::Function(ObjectNamePartFunction {
+            name: Ident::new("IDENTIFIER"),
+            args: Vec::new(),
+        });
+        let called = ObjectNamePart::Identifier(Ident::new("lower"));
+        for name in [vec![run_time.clone()], vec![run_time, called]] {
+            let mut statement = parse_one("SELECT pg_catalog.lower('a')");
+            let Statement::Query(query) = &mut statement else { panic!("expected a query") };
+            let SetExpr::Select(select) = query.body.as_mut() else { panic!("expected a select") };
+            let item = &mut select.projection[0];
+            let SelectItem::UnnamedExpr(Expr::Function(call)) = item else { panic!("a call") };
+            call.name = ObjectName(name);
+            assert!(super::calls_user_code(&statement, &db), "{statement}");
+        }
     }
 }
