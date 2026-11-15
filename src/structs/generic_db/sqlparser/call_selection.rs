@@ -50,7 +50,7 @@ use crate::{
         call_sites::for_each_call,
         call_typing::{reached_by_name, written_argument_names},
         identifier_resolution::stored_identifier,
-        object_name::qualifier_of,
+        object_name::{RoutinePath, qualifier_of},
         walk::walk,
     },
 };
@@ -985,7 +985,7 @@ impl Deparsed {
         let Some(written) = written_argument_names(function) else { return };
         let bare = TargetName::new(call.name().name(), call.name().name_is_quoted());
         let selected = selected.function();
-        let reached = reached_by_name(database, &bare, &written, case)
+        let reached = reached_by_name(database, &bare, &written, RoutinePath::Database, case)
             .iter()
             .any(|(held, _)| core::ptr::eq(*held, selected));
         if !reached {

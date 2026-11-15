@@ -431,7 +431,7 @@ fn returned(items: &[SelectItem]) -> Vec<&Expr> {
 
 fn context_of<'q, 'db>(
     root: &'q Statement,
-    scope: &ExpressionScope<'_, 'db, ParserDB>,
+    scope: &ExpressionScope<'q, 'db, ParserDB>,
     db: &'db ParserDB,
 ) -> ExpressionContext<'q, 'db, ParserDB> {
     ExpressionContext::for_statement(root, scope, db, IdentifierCase::AsWritten).unwrap()

@@ -25,6 +25,7 @@ mod identity;
 pub mod metadata;
 mod operator_resolution;
 mod partition_bound;
+pub(crate) mod plpgsql_scope;
 pub(crate) mod policy_analysis;
 mod policy_expression;
 mod privilege_holder;
@@ -57,7 +58,10 @@ pub use deployment::{
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
-pub(crate) use expression_context::{CallRefusal, ReparsePins, Site, applies_operators};
+pub(crate) use expression_context::{
+    CallRefusal, ReparsePins, Site, applies_operators, array_of, column_type, declared_type,
+    declared_type_named,
+};
 pub use expression_scope::ExpressionScope;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
@@ -72,6 +76,9 @@ pub use operator_resolution::{
     CoercionStep, OperandEvidence, OperandType, OperatorResolution, SelectedOperator,
 };
 pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
+pub use plpgsql_scope::{
+    DynamicExecution, DynamicExecutionSites, PlPgSqlScope, PlPgSqlVariable, VariableKind,
+};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
 pub use policy_expression::PolicyExpression;
 pub use privilege_holder::PrivilegeHolder;

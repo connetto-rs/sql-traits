@@ -70,6 +70,33 @@ where
         .chain(search_path().filter(|&(schema, quoted)| !is_temporary_schema(schema, quoted)))
 }
 
+/// The path an unqualified function or operator name is looked up on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RoutinePath<'path> {
+    /// The database's own search path.
+    Database,
+    /// A path a function's setting or a statement of its body chose.
+    Set(&'path [(Cow<'path, str>, bool)]),
+    /// `pg_catalog` alone, the one schema a path nothing tells still
+    /// searches first, for a name no other schema defines.
+    Catalog,
+}
+
+impl<'path> RoutinePath<'path> {
+    /// The schemas an unqualified function or operator lookup walks, in
+    /// order.
+    pub(crate) fn schemas<D: DatabaseLike>(self, database: &'path D) -> Vec<(&'path str, bool)> {
+        match self {
+            Self::Database => function_search_path(|| database.search_path()).collect(),
+            Self::Set(path) => {
+                function_search_path(|| path.iter().map(|(schema, quoted)| (&**schema, *quoted)))
+                    .collect()
+            }
+            Self::Catalog => Vec::from([(PG_CATALOG, false)]),
+        }
+    }
+}
+
 /// Whether a function or operator lookup of `name` may land in a schema
 /// `database` does not hold, whose functions and operators the database
 /// cannot know. `pg_catalog` and the temporary schema are always held, and
@@ -77,6 +104,7 @@ where
 pub(crate) fn reaches_unheld_schema<D: DatabaseLike>(
     database: &D,
     name: &TargetName<'_>,
+    path: RoutinePath<'_>,
     case: IdentifierCase,
 ) -> bool {
     let held = |schema: &str, quoted: bool| {
@@ -89,7 +117,7 @@ pub(crate) fn reaches_unheld_schema<D: DatabaseLike>(
     match name.schema() {
         Some(schema) => !held(schema, name.schema_is_quoted()),
         None => {
-            function_search_path(|| database.search_path()).any(|(schema, quoted)| {
+            path.schemas(database).into_iter().any(|(schema, quoted)| {
                 !schema.is_empty() && schema != "$user" && !held(schema, quoted)
             })
         }

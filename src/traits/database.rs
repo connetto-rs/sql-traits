@@ -27,7 +27,7 @@ use crate::{
         coercion::common_type_name,
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
-            RelationKey, function_has_stored_identity, function_search_path,
+            RelationKey, RoutinePath, function_has_stored_identity, function_search_path,
             relation_name_is_claimed, resolve_function_in_iter,
             resolve_function_on_search_path_in_iter, resolve_one_function,
             resolve_sequence_in_iter, resolve_sequence_on_search_path_in_iter,
@@ -1993,7 +1993,15 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         right: OperandType<'_>,
         case: IdentifierCase,
     ) -> OperatorResolution<'db, Self> {
-        resolve_operator(self, &operator, left.as_ref(), &right, case, &|_| true)
+        resolve_operator(
+            self,
+            &operator,
+            left.as_ref(),
+            &right,
+            RoutinePath::Database,
+            case,
+            &|_| true,
+        )
     }
 
     /// Iterates over the policies defined in the schema.

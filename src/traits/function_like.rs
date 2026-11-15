@@ -11,12 +11,12 @@ use sqlparser::ast::{
 use crate::{
     errors::{HelperSetError, LookupError},
     impls::{
-        atomic_statements, body_calls, body_expression, body_reads, body_unqualified_names,
-        helper_set,
+        atomic_statements, body_calls, body_dynamic_sites, body_expression, body_reads,
+        body_unqualified_names, helper_set,
     },
     structs::{
-        AggregateKind, Deployment, FunctionBody, FunctionKind, HelperSet, PrivilegeHolder,
-        TargetName, UnqualifiedName,
+        AggregateKind, Deployment, DynamicExecutionSites, FunctionBody, FunctionKind, HelperSet,
+        PrivilegeHolder, TargetName, UnqualifiedName,
     },
     traits::{DatabaseLike, Metadata, Relation},
     utils::{
@@ -1290,6 +1290,82 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         database: &'db Self::DB,
     ) -> Result<Vec<UnqualifiedName<'db, Self::DB>>, LookupError> {
         body_unqualified_names(self, database)
+    }
+
+    /// Returns the dynamic-execution sites of the body, owning the parsed
+    /// body, whose [`sites`](DynamicExecutionSites::sites) are every place
+    /// the body runs SQL it builds at run time, an `EXECUTE`,
+    /// `RETURN QUERY EXECUTE`, `OPEN ... FOR EXECUTE` or `FOR ... IN EXECUTE`,
+    /// in body order through nested blocks, branches, loops and exception
+    /// handlers. Body order says where each sits, never that a branch or a
+    /// loop runs.
+    ///
+    /// Each site holds the expression building its command, its `USING`
+    /// expressions, and the
+    /// [`ExpressionScope`](crate::structs::ExpressionScope) to build their
+    /// [`ExpressionContext`](crate::structs::ExpressionContext) under. There
+    /// a name binds the PL/pgSQL variable it reaches as
+    /// [`ColumnDefinition::Variable`](crate::structs::ColumnDefinition), a
+    /// local hiding an argument of its name in an enclosing block, which the
+    /// block's label or the function's name still reaches, and `$n` types as
+    /// argument `n`. Calls and operators resolve under the path the body runs
+    /// the site with. The SQL a command builds is never read, except that a
+    /// constant command setting `search_path` sets it for later sites. A
+    /// command built at run time, a `CALL` and any call to code that may set
+    /// its own path leave later sites under no known path.
+    ///
+    /// A body in any language but PL/pgSQL answers no site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyNotSql`] for a body in a language
+    /// sql-traits does not read, [`LookupError::FunctionBodyUnavailable`] when
+    /// the source is unavailable, [`LookupError::FunctionBodyUnparsable`] for
+    /// a body that does not parse, a PL/pgSQL block declaring a name twice
+    /// included, and the errors reading the function's own `search_path`
+    /// setting.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION count_of(p text) RETURNS bigint LANGUAGE plpgsql AS $$
+    ///      DECLARE result bigint;
+    ///      BEGIN
+    ///          EXECUTE 'SELECT count(*) FROM t WHERE name = ''' || p || '''' INTO result;
+    ///          RETURN result;
+    ///      END $$;",
+    /// )?;
+    /// let count_of = db
+    ///     .function_by_target(TargetName::new("count_of", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = count_of.dynamic_execution_sites(&db)?;
+    /// let sites = body.sites()?;
+    /// let [site] = sites.as_slice() else { panic!("one site") };
+    /// let scope = site.scope();
+    /// let context =
+    ///     ExpressionContext::for_expression(site.command(), &scope, &db, IdentifierCase::Folded)?;
+    /// let Expr::BinaryOp { left, .. } = site.command() else { panic!("a concatenation") };
+    /// let Expr::BinaryOp { right: p, .. } = left.as_ref() else { panic!("a concatenation") };
+    /// let Some((ColumnDefinition::Variable(parameter), _)) = context.reference(p)? else {
+    ///     panic!("p binds the argument")
+    /// };
+    /// assert!(matches!(parameter.kind(), VariableKind::Parameter { position: 1, .. }));
+    /// let text = TargetName::new("text", false).with_schema("pg_catalog", false);
+    /// assert_eq!(context.type_of(p)?, OperandType::Known { type_name: text, typmod: None });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn dynamic_execution_sites<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<DynamicExecutionSites<'db, Self::DB>, LookupError> {
+        body_dynamic_sites(self, database)
     }
 
     /// Returns the null-input behavior with PostgreSQL's default folded in.
