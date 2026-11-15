@@ -15,7 +15,8 @@ use sqlparser::ast::{
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior, FunctionSecurity,
     GroupByExpr, Ident, InTarget, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query,
     Select, SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    TableAliasColumnDef, TableFactor, TableFunctionArgs, Value, WildcardAdditionalOptions,
+    TableAliasColumnDef, TableFactor, TableFunctionArgs, UnaryOperator, Value,
+    WildcardAdditionalOptions,
 };
 
 use super::{
@@ -25,14 +26,14 @@ use super::{
 use crate::{
     errors::{AccessorRefusal, HelperSetError, LookupError},
     structs::{
-        CallerGate, CapLift, CapOperand, Deployment, FunctionBody, GrantArm, GrantedTo, GranteeSet,
-        HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm, RowCap, RowSecurity,
-        RowStatement, SessionSetting, SetPacking, SettingComparison, SettingContent, SettingValue,
-        TargetName, TimeBound, TimeComparison, WalkArm, WalkDirection,
+        AntiJoin, CallerGate, CapLift, CapOperand, Correlation, Deployment, FunctionBody, GrantArm,
+        GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm, RowCap,
+        RowSecurity, RowStatement, SessionSetting, SetPacking, SettingComparison, SettingContent,
+        SettingValue, TargetName, TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{
-        ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, FunctionLike, Relation, RoleLike,
-        SchemaLike, TableLike,
+        ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, FunctionLike, IndexLike, Relation,
+        RoleLike, SchemaLike, TableLike,
     },
     utils::{
         call_sites::{ExpressionForm, call_reaches, expression_form},
@@ -390,16 +391,7 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
         let columns: Vec<&'db DB::Column> = self.table.columns(database)?.collect();
         let mut read: Vec<&'db DB::Column> = Vec::new();
         let _: ControlFlow<()> = walk_expressions(select, |expression| {
-            let named = self.column_name(expression).and_then(|name| {
-                let name = name.to_string();
-                columns.iter().copied().find(|column| {
-                    IdentifierCase::AsWritten.names_stored(
-                        column.column_name(),
-                        column.column_name_is_quoted(),
-                        &name,
-                    )
-                })
-            });
+            let named = self.column_among(expression, &columns);
             if let Some(column) = named
                 && !read.iter().any(|seen| core::ptr::eq(*seen, column))
             {
@@ -408,6 +400,22 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
             ControlFlow::Continue(())
         });
         Ok(read)
+    }
+
+    /// The one of `columns`, the table's own, `expression` names.
+    fn column_among(
+        &self,
+        expression: &Expr,
+        columns: &[&'db DB::Column],
+    ) -> Option<&'db DB::Column> {
+        let name = self.column_name(expression)?.to_string();
+        columns.iter().copied().find(|column| {
+            IdentifierCase::AsWritten.names_stored(
+                column.column_name(),
+                column.column_name_is_quoted(),
+                &name,
+            )
+        })
     }
 }
 
@@ -453,6 +461,26 @@ impl<'db, DB: DatabaseLike> Kept<'db, DB> {
             }
         }
         Self::values(column, kept)
+    }
+
+    /// The literal sets the rows kept hold, `None` where no row is kept.
+    fn literal_sets(self) -> Option<Vec<LiteralSet<'db, DB>>> {
+        match self {
+            Self::Nothing => None,
+            Self::All => Some(Vec::new()),
+            Self::In(sets) => {
+                Some(
+                    sets.into_iter()
+                        .map(|(column, values)| {
+                            LiteralSet {
+                                column,
+                                values: values.into_iter().map(|passed| passed.value).collect(),
+                            }
+                        })
+                        .collect(),
+                )
+            }
+        }
     }
 
     fn and(self, other: Self) -> Self {
@@ -668,7 +696,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let [from] = select.from.as_slice() else {
             return Err(scope.arm_shape(select));
         };
-        let table = self.arm_table(scope, select, &from.relation, from.joins.is_empty())?;
+        let table = self
+            .arm_table(scope, &from.relation, from.joins.is_empty(), || scope.arm_shape(select))?;
         let database = self.database;
         let mut columns = Vec::with_capacity(arity);
         for item in &select.projection {
@@ -756,7 +785,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if !plain_select(term) || join.global || ambiguous(compared) || ambiguous(returned) {
             return Err(shape());
         }
-        let table = self.arm_table(scope, term, relation, true)?;
+        let table = self.arm_table(scope, relation, true, shape)?;
         let (Some(key), Some(returned), Some(compared)) = (
             table.table.primary_key_column(database)?,
             table.column(returned, database)?,
@@ -813,31 +842,31 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// Resolves the one table an arm reads, and checks the owner reads all
-    /// of it.
+    /// of it, `shape` naming the refusal of anything else.
     fn arm_table<'q>(
         &self,
         scope: &Scope<'db, DB>,
-        select: &Select,
         relation: &'q TableFactor,
         unjoined: bool,
+        shape: impl Fn() -> HelperSetError,
     ) -> Result<ArmTable<'q, 'db, DB>, HelperSetError> {
         let database = self.database;
         let Some((name, alias)) = plain_table(relation).filter(|_| unjoined) else {
-            return Err(scope.arm_shape(select));
+            return Err(shape());
         };
         let resolve = |path: &SearchPath<'db>| {
             resolve_relation_object_name_on_path(name, database, path, IdentifierCase::AsWritten)
         };
         let table = match resolve(&scope.usable_path)? {
             Some(Relation::Table(table)) => table,
-            Some(_) => return Err(scope.arm_shape(select)),
+            Some(_) => return Err(shape()),
             None => {
                 // A table only a schema the owner cannot use holds is not
                 // found.
                 if let Some(Relation::Table(hidden)) = resolve(&scope.path)? {
                     self.require_usage(scope, table_schema(hidden))?;
                 }
-                return Err(scope.arm_shape(select));
+                return Err(shape());
             }
         };
         self.require_usage(scope, table_schema(table))?;
@@ -1156,6 +1185,57 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 conditions.push(conjunct);
             }
         }
+        let mut anti_joins = Vec::new();
+        let mut filters = Vec::new();
+        for condition in conditions {
+            match not_exists(condition) {
+                Some(blocking) => {
+                    anti_joins.extend(self.anti_join(scope, table, condition, blocking)?);
+                }
+                None => filters.push(condition),
+            }
+        }
+        let (kept, time_bounds) = self.filter(scope, table, filters)?;
+        if gates.keeps_nothing {
+            return Ok(Vec::new());
+        }
+        let mut grantees = grantees.unwrap_or_else(|| vec![(GrantedTo::Anyone, Kept::All)]);
+        let caps: Arc<[RowCap<'db, DB>]> = caps.into();
+        let anti_joins: Arc<[AntiJoin<'db, DB>]> = anti_joins.into();
+        let grant = |(granted_to, own): Grantee<'db, DB>,
+                     kept: Kept<'db, DB>,
+                     gate: Option<CallerGate<'db>>,
+                     time_bounds: Vec<TimeBound<'db, DB>>| {
+            let restrictions = kept.and(own).literal_sets()?;
+            Some(HelperArm::Grant(GrantArm {
+                table: table.table,
+                columns: columns.to_vec(),
+                granted_to,
+                gate,
+                restrictions,
+                time_bounds,
+                caps: Arc::clone(&caps),
+                anti_joins: Arc::clone(&anti_joins),
+            }))
+        };
+        // Every grantee but the last takes its own copy of the conditions.
+        let last = grantees.pop();
+        let mut arms = Vec::with_capacity(grantees.len() + 1);
+        for grantee in grantees {
+            arms.extend(grant(grantee, kept.clone(), gates.gate.clone(), time_bounds.clone()));
+        }
+        arms.extend(last.and_then(|last| grant(last, kept, gates.gate, time_bounds)));
+        Ok(arms)
+    }
+
+    /// What `conditions` keep of `table`, beside the bounds they set against
+    /// the statement time.
+    fn filter<'c>(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        conditions: impl IntoIterator<Item = &'c Expr>,
+    ) -> Result<(Kept<'db, DB>, Vec<TimeBound<'db, DB>>), HelperSetError> {
         let mut kept = Kept::All;
         let mut time_bounds = Vec::new();
         for condition in conditions {
@@ -1171,47 +1251,86 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             })?;
             kept = kept.and(reduced);
         }
-        if gates.keeps_nothing {
-            return Ok(Vec::new());
-        }
-        let mut grantees = grantees.unwrap_or_else(|| vec![(GrantedTo::Anyone, Kept::All)]);
-        let caps: Arc<[RowCap<'db, DB>]> = caps.into();
-        let grant = |(granted_to, own): Grantee<'db, DB>,
-                     kept: Kept<'db, DB>,
-                     gate: Option<CallerGate<'db>>,
-                     time_bounds: Vec<TimeBound<'db, DB>>| {
-            let restrictions = match kept.and(own) {
-                Kept::Nothing => return None,
-                Kept::All => Vec::new(),
-                Kept::In(sets) => {
-                    sets.into_iter()
-                        .map(|(column, values)| {
-                            LiteralSet {
-                                column,
-                                values: values.into_iter().map(|passed| passed.value).collect(),
-                            }
-                        })
-                        .collect()
-                }
-            };
-            Some(HelperArm::Grant(GrantArm {
-                table: table.table,
-                columns: columns.to_vec(),
-                granted_to,
-                gate,
-                restrictions,
-                time_bounds,
-                caps: Arc::clone(&caps),
-            }))
+        Ok((kept, time_bounds))
+    }
+
+    /// Reads `condition`, `NOT EXISTS (<blocking>)` in a grant arm reading
+    /// `table`, `None` where its conditions keep no blocking row.
+    fn anti_join(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        condition: &Expr,
+        blocking: &Query,
+    ) -> Result<Option<AntiJoin<'db, DB>>, HelperSetError> {
+        let database = self.database;
+        let shape = || {
+            HelperSetError::Irreducible {
+                function: scope.name.clone(),
+                condition: condition.to_string(),
+            }
         };
-        // Every grantee but the last takes its own copy of the conditions.
-        let last = grantees.pop();
-        let mut arms = Vec::with_capacity(grantees.len() + 1);
-        for grantee in grantees {
-            arms.extend(grant(grantee, kept.clone(), gates.gate.clone(), time_bounds.clone()));
+        let SetExpr::Select(select) = blocking.body.as_ref() else { return Err(shape()) };
+        let ([item], [from], Some(selection)) =
+            (select.projection.as_slice(), select.from.as_slice(), &select.selection)
+        else {
+            return Err(shape());
+        };
+        // `EXISTS` reads no value of a row, but `*` still needs every column.
+        let reads_every_column = match item {
+            SelectItem::UnnamedExpr(Expr::Value(value)) if Literal::of(&value.value).is_some() => {
+                false
+            }
+            SelectItem::Wildcard(options) if *options == WildcardAdditionalOptions::default() => {
+                true
+            }
+            _ => return Err(shape()),
+        };
+        if !plain_query(blocking) || !plain_select(select) {
+            return Err(shape());
         }
-        arms.extend(last.and_then(|last| grant(last, kept, gates.gate, time_bounds)));
-        Ok(arms)
+        let blocker = self.arm_table(scope, &from.relation, from.joins.is_empty(), shape)?;
+        // The blocking table's name hides the arm's, so no column correlates.
+        if same_ident(&blocker.qualifier, &table.qualifier) {
+            return Err(shape());
+        }
+        let mut conjuncts = Vec::new();
+        conjunction(selection, &mut conjuncts);
+        let mut correlations = Vec::new();
+        let mut filters = Vec::new();
+        for conjunct in conjuncts {
+            if let Some(correlation) = correlation(table, &blocker, conjunct, database)? {
+                correlations.push(correlation);
+            } else if reads_arm(table, &blocker, conjunct, database)? {
+                return Err(HelperSetError::Irreducible {
+                    function: scope.name.clone(),
+                    condition: conjunct.to_string(),
+                });
+            } else {
+                filters.push(conjunct);
+            }
+        }
+        if correlations.is_empty() {
+            return Err(shape());
+        }
+        self.require_select(scope, blocker.table, || {
+            if reads_every_column {
+                Ok(blocker.table.columns(database)?.collect())
+            } else {
+                blocker.columns_read(select, database)
+            }
+        })?;
+        let (kept, time_bounds) = self.filter(scope, &blocker, filters)?;
+        let Some(restrictions) = kept.literal_sets() else { return Ok(None) };
+        let correlated: Vec<_> =
+            correlations.iter().map(|correlation| correlation.blocking_column).collect();
+        Ok(Some(AntiJoin {
+            table: blocker.table,
+            keyed: holds_key(blocker.table, &correlated, database)?,
+            correlations,
+            restrictions,
+            time_bounds,
+        }))
     }
 
     /// `<column> IN (<values>)` listing at least one read of a setting
@@ -2095,6 +2214,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                         Some(Kept::of(if boolean { Equality::Holds } else { Equality::Fails }))
                     }
                     Operand::Passed(Passed { literal: Literal::Null, .. }) => Some(Kept::Nothing),
+                    // A boolean column alone keeps the rows holding `TRUE`.
+                    Operand::Column(column)
+                        if column.data_type(self.database).scalar_family(self.database)
+                            == Some(ScalarFamily::Bool) =>
+                    {
+                        let passed =
+                            Passed { literal: Literal::Boolean(true), value: Value::Boolean(true) };
+                        Some(Kept::values(column, vec![passed]))
+                    }
                     _ => None,
                 })
             }
@@ -2451,4 +2579,95 @@ fn single_column_foreign_keys<'db, DB: DatabaseLike>(
         }
     }
     Ok(foreign_keys)
+}
+
+/// The subquery of `NOT EXISTS (<query>)`, also written `NOT (EXISTS
+/// (<query>))`.
+fn not_exists(condition: &Expr) -> Option<&Query> {
+    match unnest(condition) {
+        Expr::Exists { subquery, negated: true } => Some(subquery),
+        Expr::UnaryOp { op: UnaryOperator::Not, expr } => {
+            let Expr::Exists { subquery, negated: false } = unnest(expr) else { return None };
+            Some(subquery)
+        }
+        _ => None,
+    }
+}
+
+/// The equality `conjunct` writes between a column of the blocking table
+/// and a column of the arm's, if it writes one. A name both tables hold
+/// names the blocking table's, as PostgreSQL resolves it in the subquery.
+fn correlation<'db, DB: DatabaseLike>(
+    table: &ArmTable<'_, 'db, DB>,
+    blocker: &ArmTable<'_, 'db, DB>,
+    conjunct: &Expr,
+    database: &'db DB,
+) -> Result<Option<Correlation<'db, DB>>, LookupError> {
+    let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = unnest(conjunct) else {
+        return Ok(None);
+    };
+    for (blocking, arm) in [(left, right), (right, left)] {
+        if let Some(blocking_column) = blocker.column(blocking, database)?
+            && blocker.column(arm, database)?.is_none()
+            && let Some(arm_column) = table.column(arm, database)?
+        {
+            return Ok(Some(Correlation { blocking_column, arm_column }));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `condition` names a column of the arm's table anywhere, a name
+/// the blocking table holds naming the blocking table's.
+fn reads_arm<'db, DB: DatabaseLike>(
+    table: &ArmTable<'_, 'db, DB>,
+    blocker: &ArmTable<'_, 'db, DB>,
+    condition: &Expr,
+    database: &'db DB,
+) -> Result<bool, LookupError> {
+    let blocking: Vec<&'db DB::Column> = blocker.table.columns(database)?.collect();
+    let arm: Vec<&'db DB::Column> = table.table.columns(database)?.collect();
+    let read = walk_expressions(condition, |expression| {
+        if blocker.column_among(expression, &blocking).is_none()
+            && table.column_among(expression, &arm).is_some()
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    Ok(read.is_break())
+}
+
+/// Whether `columns` hold every column of the primary key of `table`, or of
+/// a unique key of it over plain columns with no predicate.
+fn holds_key<'db, DB: DatabaseLike>(
+    table: &'db DB::Table,
+    columns: &[&'db DB::Column],
+    database: &'db DB,
+) -> Result<bool, LookupError> {
+    let held = |key: &mut dyn Iterator<Item = &'db DB::Column>| {
+        let mut key = key.peekable();
+        key.peek().is_some()
+            && key.all(|column| columns.iter().any(|held| core::ptr::eq(*held, column)))
+    };
+    if held(&mut table.primary_key_columns(database)?) {
+        return Ok(true);
+    }
+    for index in table.unique_indices(database)? {
+        if plain_key(index, database)? && held(&mut index.columns(database)?) {
+            return Ok(true);
+        }
+    }
+    for index in table.indices(database)?.filter(|index| index.is_unique()) {
+        if plain_key(index, database)? && held(&mut index.columns(database)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `index` is over plain columns with no predicate.
+fn plain_key<I: IndexLike>(index: &I, database: &I::DB) -> Result<bool, LookupError> {
+    Ok(index.predicate().is_none() && index.is_simple(database)?)
 }

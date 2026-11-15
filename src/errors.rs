@@ -1270,8 +1270,12 @@ pub enum HelperSetError {
         setting: String,
     },
     /// A grant arm's condition, its arguments substituted and its bounds on
-    /// the statement time set aside, reduces neither to `TRUE`, `FALSE` or
-    /// `NULL` nor to literal values columns have to hold, all at once.
+    /// the statement time and anti-joins set aside, reduces neither to
+    /// `TRUE`, `FALSE` or `NULL` nor to literal values columns have to hold,
+    /// all at once. The same holds of the conditions of an anti-join beside
+    /// its correlations. A `NOT EXISTS` reading anything but one table, or
+    /// correlating no column, or reading the arm's table other than in a
+    /// correlation, is irreducible too.
     #[error(
         "helper `{function}` filters by `{condition}`, which reduces to neither a literal set nor a time bound"
     )]

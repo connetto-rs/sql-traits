@@ -56,7 +56,8 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
 
 /// `SELECT <columns> FROM <table> [WHERE <conditions>]`, the rows the
 /// conditions keep for the grantee they name, the caller gate they write,
-/// the restrictions the rest of them reduce to and the caps they write.
+/// the restrictions and bounds the rest of them reduce to, the caps they
+/// write, and the rows of other tables whose existence takes a row away.
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
@@ -68,6 +69,8 @@ pub struct GrantArm<'db, DB: DatabaseLike> {
     /// Shared by the arms an `IN` list of request values splits one
     /// condition into.
     pub(crate) caps: Arc<[RowCap<'db, DB>]>,
+    /// Shared as [`caps`](Self::caps) is.
+    pub(crate) anti_joins: Arc<[AntiJoin<'db, DB>]>,
 }
 
 impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
@@ -118,6 +121,14 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     #[must_use]
     pub fn caps(&self) -> &[RowCap<'db, DB>] {
         &self.caps
+    }
+
+    /// The anti-joins a row has to pass, every one of them, in the order the
+    /// condition writes them. An anti-join whose own conditions keep no
+    /// blocking row takes no row away and is left out.
+    #[must_use]
+    pub fn anti_joins(&self) -> &[AntiJoin<'db, DB>] {
+        &self.anti_joins
     }
 }
 
@@ -491,6 +502,86 @@ impl<'db, DB: DatabaseLike> LiteralSet<'db, DB> {
     #[must_use]
     pub fn values(&self) -> &[Value] {
         &self.values
+    }
+}
+
+/// `NOT EXISTS (SELECT 1 FROM <table> WHERE <correlations> [AND
+/// <conditions>])`, a conjunct of a grant arm's condition keeping a row of
+/// the arm only where no row of `<table>` matches it. The subquery may
+/// return any literal or `*` in place of `1`, as `EXISTS` reads none of it.
+///
+/// Each correlation is `<table>.<column> = <arm table>.<column>`, either way
+/// round. A row of the arm holding `NULL` in a correlated column matches no
+/// blocking row, so it is kept. The other conditions read only the blocking
+/// table, the helper's arguments and the statement time, and reduce to
+/// [`restrictions`](Self::restrictions) and
+/// [`time_bounds`](Self::time_bounds) the way a grant arm's do.
+#[derive(Debug)]
+pub struct AntiJoin<'db, DB: DatabaseLike> {
+    pub(crate) table: &'db DB::Table,
+    pub(crate) correlations: Vec<Correlation<'db, DB>>,
+    pub(crate) keyed: bool,
+    pub(crate) restrictions: Vec<LiteralSet<'db, DB>>,
+    pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
+}
+
+impl<'db, DB: DatabaseLike> AntiJoin<'db, DB> {
+    /// The table whose rows block a row of the arm.
+    #[must_use]
+    pub fn table(&self) -> &'db DB::Table {
+        self.table
+    }
+
+    /// The equalities a blocking row has to meet with the row of the arm,
+    /// all of them, in the order the condition writes them.
+    #[must_use]
+    pub fn correlations(&self) -> &[Correlation<'db, DB>] {
+        &self.correlations
+    }
+
+    /// Whether the correlated columns of [`table`](Self::table) hold every
+    /// column of its primary key or of one of its unique keys over plain
+    /// columns with no predicate, so at most one blocking row matches each
+    /// row of the arm.
+    #[must_use]
+    pub fn is_keyed(&self) -> bool {
+        self.keyed
+    }
+
+    /// The values columns of a blocking row have to hold, as
+    /// [`GrantArm::restrictions`] reads them. Empty where the conditions
+    /// beside the correlations are absent or hold for every row.
+    #[must_use]
+    pub fn restrictions(&self) -> &[LiteralSet<'db, DB>] {
+        &self.restrictions
+    }
+
+    /// The bounds a blocking row has to meet against the statement time,
+    /// every one of them, in the order the condition writes them.
+    #[must_use]
+    pub fn time_bounds(&self) -> &[TimeBound<'db, DB>] {
+        &self.time_bounds
+    }
+}
+
+/// `<blocking column> = <arm column>`, one equality of an [`AntiJoin`].
+#[derive(Debug)]
+pub struct Correlation<'db, DB: DatabaseLike> {
+    pub(crate) blocking_column: &'db DB::Column,
+    pub(crate) arm_column: &'db DB::Column,
+}
+
+impl<'db, DB: DatabaseLike> Correlation<'db, DB> {
+    /// The column of the blocking table.
+    #[must_use]
+    pub fn blocking_column(&self) -> &'db DB::Column {
+        self.blocking_column
+    }
+
+    /// The column of the arm's table it equals.
+    #[must_use]
+    pub fn arm_column(&self) -> &'db DB::Column {
+        self.arm_column
     }
 }
 
