@@ -425,6 +425,34 @@ pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
     Ok(collector.reads)
 }
 
+/// One piece of SQL a function body runs, a statement or the `SELECT` a
+/// PL/pgSQL body evaluates an expression with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Embedded<'s> {
+    /// A statement.
+    Statement(&'s Statement),
+    /// The `SELECT` evaluating an expression.
+    Expression(&'s Query),
+}
+
+impl Visit for Embedded<'_> {
+    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
+        match self {
+            Self::Statement(statement) => walk(*statement, visitor),
+            Self::Expression(query) => walk(*query, visitor),
+        }
+    }
+}
+
+impl core::fmt::Display for Embedded<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Statement(statement) => statement.fmt(formatter),
+            Self::Expression(query) => query.fmt(formatter),
+        }
+    }
+}
+
 /// What a walk over the statements of a function body read when it runs
 /// gathers, one statement after another, under the path in force for each.
 pub(crate) trait BodyWalk<'s> {
@@ -441,12 +469,12 @@ pub(crate) trait BodyWalk<'s> {
     /// Takes up `path` for the statements after the one setting it.
     fn set_path(&mut self, path: BodyPath<'s>);
 
-    /// Walks one statement that leaves the path alone.
+    /// Walks one statement or expression that leaves the path alone.
     ///
     /// # Errors
     ///
     /// Returns any error resolving a name the statement holds.
-    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError>;
+    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError>;
 }
 
 /// The statements of a function body read when it runs.
@@ -520,11 +548,30 @@ pub(crate) fn walk_statement<'s>(
         Some(SearchPathChange::Set(path)) => walker.set_path(BodyPath::Set(path)),
         Some(SearchPathChange::Reset) => walker.set_path(BodyPath::default_path()),
         None => {
-            walker.walk(statement)?;
+            walker.walk(Embedded::Statement(statement))?;
             if sets_search_path_at_run_time(statement) {
                 walker.set_path(BodyPath::Unknown(unresolvable(function, statement)));
             }
         }
+    }
+    Ok(())
+}
+
+/// Hands the `SELECT` evaluating an expression of the PL/pgSQL body of
+/// `function` to `walker`, after which a call setting `search_path` leaves
+/// the path unknown.
+///
+/// # Errors
+///
+/// Returns any error `walker` returns.
+pub(crate) fn walk_expression<'s>(
+    function: &str,
+    query: &Query,
+    walker: &mut impl BodyWalk<'s>,
+) -> Result<(), LookupError> {
+    walker.walk(Embedded::Expression(query))?;
+    if sets_search_path_at_run_time(query) {
+        walker.set_path(BodyPath::Unknown(unresolvable(function, query)));
     }
     Ok(())
 }
@@ -544,12 +591,12 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
         self.path = Some(path);
     }
 
-    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError> {
-        let listed = match statement {
-            Statement::Delete(delete) => delete.tables.as_slice(),
+    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
+        let listed = match sql {
+            Embedded::Statement(Statement::Delete(delete)) => delete.tables.as_slice(),
             _ => &[],
         };
-        self.collect(statement, listed)
+        self.collect(&sql, listed)
     }
 }
 
@@ -573,9 +620,9 @@ pub(crate) fn reads_of_body<'db, DB: DatabaseLike>(
     Ok(collector.reads)
 }
 
-/// Whether `statement` calls `set_config` on `search_path`, or on a setting
-/// named only when it runs.
-pub(crate) fn sets_search_path_at_run_time(statement: &Statement) -> bool {
+/// Whether `node` calls `set_config` on `search_path`, or on a setting named
+/// only when it runs.
+pub(crate) fn sets_search_path_at_run_time<N: Visit + ?Sized>(node: &N) -> bool {
     struct SetConfigCalls;
     impl Visitor for SetConfigCalls {
         type Break = ();
@@ -602,7 +649,7 @@ pub(crate) fn sets_search_path_at_run_time(statement: &Statement) -> bool {
             ControlFlow::Continue(())
         }
     }
-    walk(statement, &mut SetConfigCalls).is_break()
+    walk(node, &mut SetConfigCalls).is_break()
 }
 
 impl<DB: DatabaseLike> DataStatementLike<DB> for Query {

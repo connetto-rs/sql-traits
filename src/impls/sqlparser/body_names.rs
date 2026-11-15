@@ -8,11 +8,11 @@
 
 use alloc::vec::Vec;
 
-use sqlparser::ast::{Statement, Visit};
+use sqlparser::ast::Visit;
 
 use super::{
     body_calls::CallCollector,
-    data_statement::{BodyPath, BodyWalk, RelationCollector, add_unqualified},
+    data_statement::{BodyPath, BodyWalk, Embedded, RelationCollector, add_unqualified},
 };
 use crate::{errors::LookupError, structs::UnqualifiedName, traits::DatabaseLike};
 
@@ -77,9 +77,9 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for NameCollector<'_, 's, DB> {
         self.calls.set_path(path);
     }
 
-    fn walk(&mut self, statement: &Statement) -> Result<(), LookupError> {
-        self.relations.walk(statement)?;
-        self.calls.walk(statement)?;
+    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
+        self.relations.walk(sql)?;
+        self.calls.walk(sql)?;
         self.gather();
         Ok(())
     }
