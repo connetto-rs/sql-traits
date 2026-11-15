@@ -12,7 +12,7 @@ use crate::{
             parameter_evidence, select, typed_input,
         },
         coercion::{base, canonical_owned},
-        object_name::function_search_path,
+        object_name::RoutinePath,
         postgres_types::PgType,
     },
 };
@@ -45,21 +45,22 @@ impl<'db, O: OperatorLike> Candidate<'db, O> {
     }
 }
 
-/// The operators of the invoked name and arity on the operator's search
-/// path that `admits` keeps, the earliest of identical signatures kept, as
-/// `OpernameGetCandidates` gathers them, or [`None`] when an operator's
-/// operand types are unknown.
+/// The operators of the invoked name and arity that `admits` keeps, an
+/// unqualified name looked up on `path`, the earliest of identical
+/// signatures kept, as `OpernameGetCandidates` gathers them, or [`None`]
+/// when an operator's operand types are unknown.
 fn candidates<'db, D: DatabaseLike>(
     database: &'db D,
     operators: impl Iterator<Item = &'db D::Operator>,
     name: &TargetName<'_>,
     kind: OperatorKind,
+    path: RoutinePath<'_>,
     case: IdentifierCase,
     admits: &dyn Fn(&D::Operator) -> bool,
 ) -> Option<Vec<Candidate<'db, D::Operator>>> {
     let path: Vec<(&str, bool)> = match name.schema() {
         Some(schema) => Vec::from([(schema, name.schema_is_quoted())]),
-        None => function_search_path(|| database.search_path()).collect(),
+        None => path.schemas(database),
     };
     let mut reached: Vec<(usize, &'db D::Operator)> = operators
         .filter(|operator| operator.kind() == kind && admits(operator))
@@ -87,12 +88,14 @@ fn candidates<'db, D: DatabaseLike>(
 }
 
 /// The operator PostgreSQL runs for `operator` applied to `right`, and to
-/// `left` for a binary operator, among the operators `admits` keeps.
+/// `left` for a binary operator, among the operators `admits` keeps, an
+/// unqualified name looked up on `path`.
 pub(crate) fn resolve_operator<'db, D: DatabaseLike>(
     database: &'db D,
     operator: &TargetName<'_>,
     left: Option<&OperandType<'_>>,
     right: &OperandType<'_>,
+    path: RoutinePath<'_>,
     case: IdentifierCase,
     admits: &dyn Fn(&D::Operator) -> bool,
 ) -> OperatorResolution<'db, D> {
@@ -106,7 +109,8 @@ pub(crate) fn resolve_operator<'db, D: DatabaseLike>(
     else {
         return OperatorResolution::Undetermined;
     };
-    let Some(candidates) = candidates(database, operators, operator, kind, case, admits) else {
+    let Some(candidates) = candidates(database, operators, operator, kind, path, case, admits)
+    else {
         return OperatorResolution::Undetermined;
     };
     match exact(database, &candidates, &inputs) {

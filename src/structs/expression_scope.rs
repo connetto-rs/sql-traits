@@ -5,7 +5,7 @@
 
 use sqlparser::ast::{CreateRuleEvent, DataType};
 
-use crate::traits::DatabaseLike;
+use crate::{structs::PlPgSqlScope, traits::DatabaseLike};
 
 /// The names an expression outside a query reaches besides the relations of
 /// the queries and statements it holds, as PostgreSQL 18 resolves them for
@@ -43,4 +43,16 @@ pub enum ExpressionScope<'s, 'db, DB: DatabaseLike> {
     /// Every relation of the body comes first, so a column of the same name
     /// wins over a parameter.
     FunctionBody(&'db DB::Function),
+    /// The variables a PL/pgSQL body reaches where it evaluates the
+    /// expression, by name, innermost block first, qualified by a block's
+    /// label or the function's name, and `$n` for any argument, output ones
+    /// included. A field of a row variable takes its column's type.
+    ///
+    /// A name a relation of the expression's own queries holds binds that
+    /// column, even where it also names a variable. PostgreSQL 18 refuses
+    /// such a name as ambiguous under its default
+    /// `plpgsql.variable_conflict = error`. Calls and operators resolve
+    /// under the path the body runs the expression with. Relations in the
+    /// expression's queries resolve under the database's own path.
+    PlPgSql(&'s PlPgSqlScope<'s, 'db, DB>),
 }

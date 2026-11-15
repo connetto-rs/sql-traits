@@ -25,7 +25,7 @@ use sqlparser::ast::{
     Query, Statement, TableFactor, TableInheritance, TableObject, Update, Value, ValueWithSpan,
     Visit, Visitor,
 };
-use sqlparser_plpgsql::embedded::Block;
+use sqlparser_plpgsql::embedded::{Block, Dynamic, expression};
 
 use super::plpgsql_body::walk_block;
 use crate::{
@@ -47,7 +47,7 @@ use crate::{
 };
 
 /// The path unqualified names resolve under in a body read when it runs.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum BodyPath<'path> {
     /// The database's own path.
     Database,
@@ -77,6 +77,33 @@ pub(crate) struct Reads<'db, DB: DatabaseLike> {
     /// Every base table named or reached through a plain view, deduplicated
     /// in first-seen order.
     pub(crate) tables: Vec<&'db DB::Table>,
+}
+
+/// Resolves the relation `object_name` names in a body read when it runs, an
+/// unqualified name under `path`.
+///
+/// # Errors
+///
+/// Returns the error of an unknown path for an unqualified name, and the
+/// errors resolving the name.
+pub(super) fn resolve_on_body_path<'db, DB: DatabaseLike>(
+    object_name: &ObjectName,
+    database: &'db DB,
+    path: &BodyPath<'_>,
+) -> Result<Option<Relation<'db, DB>>, LookupError> {
+    let case = IdentifierCase::AsWritten;
+    match path {
+        BodyPath::Set(path) => {
+            resolve_relation_object_name_on_path(object_name, database, path, case)
+        }
+        BodyPath::Unknown(error) if object_name_identifiers(object_name)?.0.is_none() => {
+            Err(error.clone())
+        }
+        // A qualified name reaches its schema whatever the path holds.
+        BodyPath::Database | BodyPath::Unknown(_) => {
+            resolve_relation_object_name(object_name, database, case)
+        }
+    }
 }
 
 /// Walks a data statement, recording every relation it names and expanding
@@ -151,21 +178,9 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
     /// Resolves a name the walk meets, as bound inside a view definition or a
     /// body bound at creation, and under the walk's path otherwise.
     fn resolve(&self, object_name: &ObjectName) -> Result<Option<Relation<'db, DB>>, LookupError> {
-        let case = IdentifierCase::AsWritten;
-        let Some(path) = self.path.as_ref().filter(|_| !self.bound) else {
-            return resolve_bound_relation_object_name(object_name, self.database);
-        };
-        match path {
-            BodyPath::Set(path) => {
-                resolve_relation_object_name_on_path(object_name, self.database, path, case)
-            }
-            BodyPath::Unknown(error) if object_name_identifiers(object_name)?.0.is_none() => {
-                Err(error.clone())
-            }
-            // A qualified name reaches its schema whatever the path holds.
-            BodyPath::Database | BodyPath::Unknown(_) => {
-                resolve_relation_object_name(object_name, self.database, case)
-            }
+        match self.path.as_ref().filter(|_| !self.bound) {
+            Some(path) => resolve_on_body_path(object_name, self.database, path),
+            None => resolve_bound_relation_object_name(object_name, self.database),
         }
     }
 
@@ -470,7 +485,7 @@ pub(crate) trait BodyWalk<'s> {
     /// Takes up `path` for the statements after the one setting it.
     fn set_path(&mut self, path: BodyPath<'s>);
 
-    /// Walks one statement or expression that leaves the path alone.
+    /// Walks one statement that leaves the path alone.
     ///
     /// # Errors
     ///
@@ -481,6 +496,34 @@ pub(crate) trait BodyWalk<'s> {
     /// statements after it, as [`calls_user_code`] decides over the
     /// walker's database.
     fn runs_user_code(&self, sql: Embedded<'_>) -> bool;
+
+    /// Takes a statement that runs code outside the body, as
+    /// [`runs_code_outside`] picks it, which hides what the body reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyUnresolvable`] unless the walker
+    /// reads past such code.
+    fn opaque(&mut self, function: &str, statement: &'s Statement) -> Result<(), LookupError> {
+        Err(unresolvable(function, statement))
+    }
+
+    /// Takes SQL a PL/pgSQL body builds at run time, run under the path in
+    /// force where it sits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyUnresolvable`] unless the walker
+    /// reads past such SQL.
+    fn dynamic(&mut self, function: &str, dynamic: &'s Dynamic) -> Result<(), LookupError> {
+        Err(dynamic_unresolvable(function, dynamic))
+    }
+}
+
+/// The error SQL built at run time answers, naming the `EXECUTE` by the
+/// expression that builds its command.
+pub(crate) fn dynamic_unresolvable(function: &str, dynamic: &Dynamic) -> LookupError {
+    unresolvable(function, &format_args!("EXECUTE {}", expression(&dynamic.command)))
 }
 
 /// The statements of a function body read when it runs.
@@ -539,8 +582,8 @@ pub(crate) fn unresolvable(function: &str, statement: &impl ToString) -> LookupE
 ///
 /// # Errors
 ///
-/// Returns [`LookupError::FunctionBodyUnresolvable`] for a statement that
-/// runs code outside the body, and any error `walker` returns.
+/// Returns any error `walker` returns, a statement that runs code outside
+/// the body among them as [`BodyWalk::opaque`] answers it.
 pub(crate) fn walk_statement<'s>(
     function: &str,
     statement: &'s Statement,
@@ -548,7 +591,7 @@ pub(crate) fn walk_statement<'s>(
     hex_strings_may_be_integers: bool,
 ) -> Result<(), LookupError> {
     if runs_code_outside(statement) {
-        return Err(unresolvable(function, statement));
+        return walker.opaque(function, statement);
     }
     match search_path_change(statement, hex_strings_may_be_integers)? {
         Some(SearchPathChange::Set(path)) => walker.set_path(BodyPath::Set(path)),

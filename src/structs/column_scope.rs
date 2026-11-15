@@ -15,7 +15,7 @@ use crate::{
         },
         scoped_roots::{ScopedRoot, scoped_graph},
     },
-    structs::{ExpressionScope, IdentifierCase},
+    structs::{ExpressionScope, IdentifierCase, PlPgSqlVariable},
     traits::DatabaseLike,
 };
 
@@ -64,6 +64,12 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
         /// from 0, the one `$1` names first.
         ordinal: usize,
     },
+    /// A PL/pgSQL variable the function body holding the reference reaches,
+    /// read by name where no column of the same name is in reach.
+    Variable(PlPgSqlVariable<'db>),
+    /// A field of a PL/pgSQL row or record variable, written after the
+    /// variable's name.
+    VariableField(PlPgSqlVariable<'db>),
     /// A relation exposes the name without an inspectable definition.
     Opaque,
 }

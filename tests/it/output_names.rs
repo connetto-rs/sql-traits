@@ -127,6 +127,8 @@ fn describe(definition: Option<&ColumnDefinition<'_, '_, '_, ParserDB>>) -> Stri
         }
         Some(ColumnDefinition::RecursiveUnion { .. }) => "recursive".to_owned(),
         Some(ColumnDefinition::Parameter { ordinal, .. }) => format!("parameter {ordinal}"),
+        Some(ColumnDefinition::Variable(variable)) => format!("variable {}", variable.name()),
+        Some(ColumnDefinition::VariableField(variable)) => format!("field of {}", variable.name()),
         Some(ColumnDefinition::Opaque) => "opaque".to_owned(),
     }
 }

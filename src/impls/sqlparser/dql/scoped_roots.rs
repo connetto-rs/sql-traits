@@ -67,7 +67,8 @@ pub(crate) fn scoped_graph<'query, 'db, DB: DatabaseLike>(
     Ok(profile.finish(outer))
 }
 
-/// Fills `outer` with the relations `scope` reaches.
+/// Fills `outer` with the relations `scope` reaches. A PL/pgSQL scope
+/// reaches none, since its variables bind only names no relation holds.
 fn reach<'db, DB: DatabaseLike>(
     profile: &mut DefinitionDerivation<'_, 'db, DB>,
     outer: ScopeId,
@@ -75,7 +76,7 @@ fn reach<'db, DB: DatabaseLike>(
     database: &'db DB,
 ) {
     match scope {
-        ExpressionScope::Empty | ExpressionScope::DomainValue(_) => {}
+        ExpressionScope::Empty | ExpressionScope::DomainValue(_) | ExpressionScope::PlPgSql(_) => {}
         ExpressionScope::Table(table) => profile.push_table_entry(outer, table, database, None),
         ExpressionScope::Trigger(table) => {
             profile.push_table_entry(outer, table, database, Some(("new", false)));

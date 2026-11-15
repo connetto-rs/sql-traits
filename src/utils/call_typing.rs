@@ -24,7 +24,7 @@ use crate::{
         },
         identifier_resolution::identifiers_match,
         object_name::{
-            PG_CATALOG, function_search_path, overqualified_object_name, run_time_object_name,
+            PG_CATALOG, RoutinePath, overqualified_object_name, run_time_object_name,
             target_name_from_object_name,
         },
         operator_typing::resolve_operator,
@@ -949,7 +949,7 @@ pub(crate) fn reached_functions<'db, D: DatabaseLike>(
         return Ok(Vec::new());
     }
     let Some(written) = written_argument_names(call) else { return Ok(Vec::new()) };
-    Ok(reached_by_name(database, &target, &written, case))
+    Ok(reached_by_name(database, &target, &written, RoutinePath::Database, case))
 }
 
 /// The name `call` calls.
@@ -976,16 +976,18 @@ pub(crate) fn called_object_name(name: &ObjectName) -> Result<TargetName<'_>, Lo
 }
 
 /// The functions a call of `target` passing arguments under the names
-/// `written` may run, gathered and hidden as `FuncnameGetCandidates` does.
+/// `written` may run, an unqualified name looked up on `path`, gathered and
+/// hidden as `FuncnameGetCandidates` does.
 pub(crate) fn reached_by_name<'db, D: DatabaseLike>(
     database: &'db D,
     target: &TargetName<'_>,
     written: &[WrittenName<'_>],
+    path: RoutinePath<'_>,
     case: IdentifierCase,
 ) -> Vec<(&'db D::Function, Matched)> {
     let path: Vec<(&str, bool)> = match target.schema() {
         Some(schema) => vec![(schema, target.schema_is_quoted())],
-        None => function_search_path(|| database.search_path()).collect(),
+        None => path.schemas(database),
     };
 
     let mut reached: Vec<(usize, &'db D::Function, Matched)> = database
@@ -1064,9 +1066,15 @@ fn nullif_result<'a, D: DatabaseLike>(
         }
     };
     let equals = TargetName::new("=", false);
-    let OperatorResolution::Selected(selected) =
-        resolve_operator(database, &equals, Some(&operand(left)), &operand(right), case, &|_| true)
-    else {
+    let OperatorResolution::Selected(selected) = resolve_operator(
+        database,
+        &equals,
+        Some(&operand(left)),
+        &operand(right),
+        RoutinePath::Database,
+        case,
+        &|_| true,
+    ) else {
         return None;
     };
     let returns_bool = selected
