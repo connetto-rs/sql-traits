@@ -13,8 +13,9 @@ use sqlparser::{
     ast::{
         ArgMode, BinaryOperator, DataType, Distinct, Expr, Function, FunctionArg, FunctionArgExpr,
         FunctionArgumentList, FunctionArguments, FunctionBehavior, FunctionSecurity, GroupByExpr,
-        Ident, InTarget, Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator, Statement,
-        TableFactor, Value,
+        Ident, InTarget, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query, Select,
+        SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+        TableAliasColumnDef, TableFactor, Value,
     },
     parser::Parser,
 };
@@ -25,7 +26,7 @@ use crate::{
     structs::{
         Deployment, FunctionBody, GrantArm, HelperArm, HelperSet, IdentifierCase, LiteralSet,
         ParentArm, RowSecurity, RowStatement, SessionSetting, SettingContent, SettingValue,
-        TargetName,
+        TargetName, WalkArm,
     },
     traits::{
         ColumnLike, DatabaseLike, DialectLike, ForeignKeyLike, FunctionLike, Relation, RoleLike,
@@ -137,6 +138,74 @@ struct Scope<'db, DB: DatabaseLike> {
 impl<DB: DatabaseLike> Scope<'_, DB> {
     fn arm_shape(&self, arm: &impl ToString) -> HelperSetError {
         HelperSetError::ArmShape { function: self.name.clone(), arm: arm.to_string() }
+    }
+
+    /// Splits the body into its arms and, where it writes `WITH RECURSIVE`,
+    /// the term walking down a tree under them.
+    fn body<'q>(&self, query: &'q Query) -> Result<Body<'q>, HelperSetError> {
+        let mut arms = Vec::new();
+        let Some(with) = &query.with else {
+            union_arms(query, &mut arms).map_err(|arm| self.arm_shape(&arm))?;
+            return Ok(Body { arms, walk: None });
+        };
+        let shape = || self.arm_shape(query);
+        let ([cte], true) = (with.cte_tables.as_slice(), with.recursive) else {
+            return Err(shape());
+        };
+        if !unadorned(query)
+            || cte.materialized.is_some()
+            || cte.from.is_some()
+            || cte.alias.at.is_some()
+            || !plain_query(&cte.query)
+        {
+            return Err(shape());
+        }
+        let SetExpr::SetOperation { op: SetOperator::Union, set_quantifier, left, right } =
+            cte.query.body.as_ref()
+        else {
+            return Err(shape());
+        };
+        match set_quantifier {
+            SetQuantifier::None | SetQuantifier::Distinct => {}
+            SetQuantifier::All | SetQuantifier::AllByName => {
+                return Err(HelperSetError::UnionAllWalk { function: self.name.clone() });
+            }
+            SetQuantifier::ByName | SetQuantifier::DistinctByName => return Err(shape()),
+        }
+        let SetExpr::Select(term) = right.as_ref() else { return Err(shape()) };
+        set_arms(left, &mut arms).map_err(|arm| self.arm_shape(&arm))?;
+        let name = &cte.alias.name;
+        // PostgreSQL refuses the walk's name in the arms before its recursive
+        // term, so a table of that name is not what they read.
+        if arms
+            .iter()
+            .any(|arm| arm.from.iter().any(|from| walk_qualifier(&from.relation, name).is_some()))
+        {
+            return Err(shape());
+        }
+        let column = match cte.alias.columns.as_slice() {
+            [] => arms.first().and_then(|first| output_name(first)).ok_or_else(shape)?,
+            [TableAliasColumnDef { name, data_type: None }] => name,
+            _ => return Err(shape()),
+        };
+        let SetExpr::Select(last) = query.body.as_ref() else { return Err(shape()) };
+        let ([from], [item], None) =
+            (last.from.as_slice(), last.projection.as_slice(), &last.selection)
+        else {
+            return Err(shape());
+        };
+        let (SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }) =
+            item
+        else {
+            return Err(shape());
+        };
+        let selects_column = from.joins.is_empty()
+            && walk_qualifier(&from.relation, name)
+                .is_some_and(|qualifier| names_column(returned, qualifier, column, true));
+        if !plain_select(last) || !selects_column {
+            return Err(shape());
+        }
+        Ok(Body { arms, walk: Some(Walk { name, column, term }) })
     }
 
     /// The parameter `expression` names, if it names one.
@@ -311,6 +380,21 @@ enum Operand<'db, DB: DatabaseLike> {
 /// one, beside the arm, `None` where its condition keeps no row.
 type ReadArm<'db, DB> = (Option<&'db <DB as DatabaseLike>::Table>, Option<HelperArm<'db, DB>>);
 
+/// A helper body's arms, with the term walking down a tree under them where
+/// the body writes `WITH RECURSIVE`.
+struct Body<'q> {
+    arms: Vec<&'q Select>,
+    walk: Option<Walk<'q>>,
+}
+
+/// The recursive term of a body, with the name and the one column it reads
+/// the set by.
+struct Walk<'q> {
+    name: &'q Ident,
+    column: &'q Ident,
+    term: &'q Select,
+}
+
 /// Answers helpers, following parent arms into the helpers they call.
 struct Reader<'db, DB: DatabaseLike> {
     deployment: &'db Deployment,
@@ -379,21 +463,29 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let [Statement::Query(query)] = statements.as_ref() else {
             return Err(scope.arm_shape(&written(written_body)));
         };
-        let mut selects = Vec::new();
-        union_arms(query, &mut selects).map_err(|arm| scope.arm_shape(&arm))?;
+        let body = scope.body(query)?;
 
         self.answering.push(function);
-        let read = selects
+        let read = body
+            .arms
             .into_iter()
             .map(|select| self.arm(&scope, select))
             .collect::<Result<Vec<_>, _>>();
         self.answering.pop();
-        let read = read?;
+        let mut read = read?;
+        if let Some(walk) = &body.walk {
+            let walk = self.walk_arm(&scope, walk)?;
+            read.push((Some(walk.table), Some(HelperArm::Walk(walk))));
+        }
         let mut keyed = read.iter().map(|(keyed, _)| *keyed);
         let covered_table = keyed.next().flatten().filter(|first| {
             keyed.all(|other| other.is_some_and(|other| core::ptr::eq(other, *first)))
         });
-        let arms = read.into_iter().filter_map(|(_, arm)| arm).collect();
+        let mut arms: Vec<_> = read.into_iter().filter_map(|(_, arm)| arm).collect();
+        // A walk under arms keeping no row starts from nothing.
+        if arms.iter().all(|arm| matches!(arm, HelperArm::Walk(_))) {
+            arms.clear();
+        }
         Ok(HelperSet { arms, covered_table })
     }
 
@@ -422,7 +514,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let Some(column) = table.column(returned, self.database)? else {
             return Err(scope.arm_shape(select));
         };
-        self.require_select(scope, select, &table)?;
+        let database = self.database;
+        self.require_select(scope, table.table, || table.columns_read(select, database))?;
         let keyed = self.keyed_table(table.table, column)?;
         if let Expr::In { expr, target: InTarget::Subquery(called), negated: false, .. } =
             unnest(selection)
@@ -431,6 +524,83 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Ok((keyed, Some(arm)));
         }
         Ok((keyed, self.grant_arm(scope, select, &table, column, selection)?))
+    }
+
+    /// Reads the recursive term of a walk, `SELECT <key> FROM <table> JOIN
+    /// <walk> ON <column> = <walk>.<column>`, the join either way round.
+    /// PostgreSQL refuses the walk's name in a subquery of the term, so the
+    /// join is its one spelling.
+    fn walk_arm(
+        &self,
+        scope: &Scope<'db, DB>,
+        walk: &Walk<'_>,
+    ) -> Result<WalkArm<'db, DB>, HelperSetError> {
+        let database = self.database;
+        let term = walk.term;
+        let shape = || scope.arm_shape(term);
+        let ([item], [from]) = (term.projection.as_slice(), term.from.as_slice()) else {
+            return Err(shape());
+        };
+        let (SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }) =
+            item
+        else {
+            return Err(shape());
+        };
+        let ([join], None) = (from.joins.as_slice(), &term.selection) else {
+            return Err(shape());
+        };
+        let (JoinOperator::Join(JoinConstraint::On(on))
+        | JoinOperator::Inner(JoinConstraint::On(on))) = &join.join_operator
+        else {
+            return Err(shape());
+        };
+        let (relation, qualifier) = match (
+            walk_qualifier(&from.relation, walk.name),
+            walk_qualifier(&join.relation, walk.name),
+        ) {
+            (None, Some(qualifier)) => (&from.relation, qualifier),
+            (Some(qualifier), None) => (&join.relation, qualifier),
+            _ => return Err(shape()),
+        };
+        let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = unnest(on) else {
+            return Err(shape());
+        };
+        let compared = if names_column(right, qualifier, walk.column, false) {
+            left
+        } else if names_column(left, qualifier, walk.column, false) {
+            right
+        } else {
+            return Err(shape());
+        };
+        // A bare name the walk's column shares is ambiguous in the join.
+        let ambiguous = |expression: &Expr| matches!(unnest(expression), Expr::Identifier(ident) if same_ident(ident, walk.column));
+        if !plain_select(term) || join.global || ambiguous(compared) || ambiguous(returned) {
+            return Err(shape());
+        }
+        let table = self.arm_table(scope, term, relation, true)?;
+        let (Some(key), Some(returned), Some(column)) = (
+            table.table.primary_key_column(database)?,
+            table.column(returned, database)?,
+            table.column(compared, database)?,
+        ) else {
+            return Err(shape());
+        };
+        if !core::ptr::eq(returned, key) || core::ptr::eq(column, key) {
+            return Err(shape());
+        }
+        let [foreign_key] = single_column_foreign_keys(table.table, column, database)?[..] else {
+            return Err(shape());
+        };
+        let references_key = core::ptr::eq(foreign_key.referenced_table(database)?, table.table)
+            && foreign_key
+                .referenced_columns(database)?
+                .next()
+                .is_some_and(|referenced| core::ptr::eq(referenced, key));
+        if !references_key {
+            return Err(shape());
+        }
+        self.require_select(scope, table.table, || Ok(vec![key, column]))?;
+        Ok(WalkArm { table: table.table, key, column, foreign_key })
     }
 
     /// The table whose primary key `column` of `table` holds, `table` itself
@@ -470,30 +640,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         unjoined: bool,
     ) -> Result<ArmTable<'q, 'db, DB>, HelperSetError> {
         let database = self.database;
-        let TableFactor::Table {
-            name,
-            alias,
-            args: None,
-            with_hints,
-            version: None,
-            with_ordinality: false,
-            partitions,
-            json_path: None,
-            sample: None,
-            index_directives,
-            inheritance: None,
-        } = relation
-        else {
+        let Some((name, alias)) = plain_table(relation).filter(|_| unjoined) else {
             return Err(scope.arm_shape(select));
         };
-        if !unjoined
-            || !with_hints.is_empty()
-            || !partitions.is_empty()
-            || !index_directives.is_empty()
-            || alias.as_ref().is_some_and(|alias| !alias.columns.is_empty())
-        {
-            return Err(scope.arm_shape(select));
-        }
         let resolve = |path: &SearchPath<'db>| {
             resolve_relation_object_name_on_path(name, database, path, IdentifierCase::AsWritten)
         };
@@ -528,7 +677,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }));
         }
         let qualifier = match alias {
-            Some(alias) => Cow::Borrowed(&alias.name),
+            Some(alias) => Cow::Borrowed(alias),
             None => Cow::Owned(Ident::new(table.table_name())),
         };
         Ok(ArmTable { table, qualifier })
@@ -676,27 +825,22 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
     }
 
-    /// Refuses the answer where the owner holds `SELECT` neither on the
-    /// arm's table nor on every column of it the arm reads.
+    /// Refuses the answer where the owner holds `SELECT` neither on `table`
+    /// nor on every column of it `read` answers the arm reads.
     fn require_select(
         &self,
         scope: &Scope<'db, DB>,
-        select: &Select,
-        table: &ArmTable<'_, 'db, DB>,
+        table: &'db DB::Table,
+        read: impl FnOnce() -> Result<Vec<&'db DB::Column>, LookupError>,
     ) -> Result<(), HelperSetError> {
-        let held = table.table.privileges(scope.owner, self.database)?.select;
-        if held.on_table()
-            || table
-                .columns_read(select, self.database)?
-                .iter()
-                .all(|column| held.on_column(column))
-        {
+        let held = table.privileges(scope.owner, self.database)?.select;
+        if held.on_table() || read()?.iter().all(|column| held.on_column(column)) {
             return Ok(());
         }
         Err(HelperSetError::MissingSelect {
             function: scope.name.clone(),
             owner: scope.owner.name().to_string(),
-            table: target_name_of_table(table.table).to_string(),
+            table: target_name_of_table(table).to_string(),
         })
     }
 
@@ -1052,8 +1196,12 @@ fn set_arms<'q>(body: &'q SetExpr, arms: &mut Vec<&'q Select>) -> Result<(), Str
 
 /// Whether `query` is its body alone.
 fn plain_query(query: &Query) -> bool {
-    query.with.is_none()
-        && query.order_by.is_none()
+    query.with.is_none() && unadorned(query)
+}
+
+/// Whether `query` writes nothing beside its `WITH` and its body.
+fn unadorned(query: &Query) -> bool {
+    query.order_by.is_none()
         && query.limit_clause.is_none()
         && query.fetch.is_none()
         && query.locks.is_empty()
@@ -1061,6 +1209,78 @@ fn plain_query(query: &Query) -> bool {
         && query.settings.is_none()
         && query.format_clause.is_none()
         && query.pipe_operators.is_empty()
+}
+
+/// The name and the alias of the table `relation` names with nothing else
+/// written.
+fn plain_table(relation: &TableFactor) -> Option<(&ObjectName, Option<&Ident>)> {
+    let TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        with_hints,
+        version: None,
+        with_ordinality: false,
+        partitions,
+        json_path: None,
+        sample: None,
+        index_directives,
+        inheritance: None,
+    } = relation
+    else {
+        return None;
+    };
+    let plain = with_hints.is_empty()
+        && partitions.is_empty()
+        && index_directives.is_empty()
+        && alias.as_ref().is_none_or(|alias| alias.columns.is_empty() && alias.at.is_none());
+    plain.then(|| (name, alias.as_ref().map(|alias| &alias.name)))
+}
+
+/// The name `relation`'s columns are qualified by where it reads the walk
+/// named `walk`, its alias or the walk's own name.
+fn walk_qualifier<'q>(relation: &'q TableFactor, walk: &Ident) -> Option<&'q Ident> {
+    let (name, alias) = plain_table(relation)?;
+    let [ObjectNamePart::Identifier(part)] = name.0.as_slice() else { return None };
+    same_ident(part, walk).then_some(alias.unwrap_or(part))
+}
+
+/// Whether `expression` names `column` qualified by `qualifier`, or bare
+/// where `bare` allows it.
+fn names_column(expression: &Expr, qualifier: &Ident, column: &Ident, bare: bool) -> bool {
+    match unnest(expression) {
+        Expr::Identifier(ident) => bare && same_ident(ident, column),
+        Expr::CompoundIdentifier(parts) => {
+            matches!(parts.as_slice(), [named, ident] if same_ident(named, qualifier) && same_ident(ident, column))
+        }
+        _ => false,
+    }
+}
+
+/// Whether two identifiers name the same object, as PostgreSQL folds them.
+fn same_ident(left: &Ident, right: &Ident) -> bool {
+    identifiers_match(
+        &left.value,
+        left.quote_style.is_some(),
+        &right.value,
+        right.quote_style.is_some(),
+    )
+}
+
+/// The name of the column `select` returns, which names the column of a
+/// `WITH` item declaring none.
+fn output_name(select: &Select) -> Option<&Ident> {
+    match select.projection.as_slice() {
+        [SelectItem::ExprWithAlias { alias, .. }] => Some(alias),
+        [SelectItem::UnnamedExpr(expression)] => {
+            match unnest(expression) {
+                Expr::Identifier(ident) => Some(ident),
+                Expr::CompoundIdentifier(parts) => parts.last(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Whether `select` filters rows with nothing but `FROM` and `WHERE`.
