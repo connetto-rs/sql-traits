@@ -422,8 +422,8 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                 }
                 HelperArm::Walk(walk) => {
                     let (returned, compared) = match walk.direction() {
-                        WalkDirection::Down => (walk.key(), walk.column()),
-                        WalkDirection::Up => (walk.column(), walk.key()),
+                        WalkDirection::Down => (walk.child(), walk.column()),
+                        WalkDirection::Up => (walk.column(), walk.child()),
                     };
                     format!(
                         "{}.{} WHERE {} IN itself",
@@ -601,8 +601,8 @@ fn evaluate(
         for arm in set.arms() {
             let HelperArm::Walk(walk) = arm else { continue };
             let (reached, added) = match walk.direction() {
-                WalkDirection::Down => (walk.column(), walk.key()),
-                WalkDirection::Up => (walk.key(), walk.column()),
+                WalkDirection::Down => (walk.column(), walk.child()),
+                WalkDirection::Up => (walk.child(), walk.column()),
             };
             for row in rows(fixture, walk.table().table_name()) {
                 if nullable(row, reached.column_name()).is_some_and(|held| returned.contains(held))
@@ -4830,5 +4830,333 @@ fn a_revocation_stamp_keeps_a_link_while_it_holds_no_value() {
             let returned: Vec<_> = evaluate(set, request, REVOCABLE_ROWS).into_iter().collect();
             assert_eq!(returned, expected, "{caller:?} calling {called}");
         }
+    }
+}
+
+/// A folder tree kept in the edge table `folder_parents`, one row per folder
+/// that has a parent, and projects filed in folders through
+/// `project_folders`. `authz.folders_reached()` walks from the folders granted
+/// to the caller along `term`, and `authz.projects_reached()` returns the
+/// projects filed in them.
+fn edges(term: &str, after: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE TABLE organizations (id TEXT PRIMARY KEY);
+         CREATE TABLE folders (
+           id TEXT PRIMARY KEY,
+           organization_id TEXT NOT NULL REFERENCES organizations (id),
+           UNIQUE (organization_id, id)
+         );
+         CREATE TABLE folder_parents (
+           organization_id TEXT NOT NULL REFERENCES organizations (id),
+           folder_id TEXT NOT NULL REFERENCES folders (id),
+           parent_id TEXT NOT NULL REFERENCES folders (id),
+           PRIMARY KEY (organization_id, folder_id),
+           FOREIGN KEY (organization_id, folder_id) REFERENCES folders (organization_id, id),
+           FOREIGN KEY (organization_id, parent_id) REFERENCES folders (organization_id, id)
+         );
+         CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id);
+         CREATE TABLE projects (
+           id TEXT PRIMARY KEY,
+           organization_id TEXT NOT NULL REFERENCES organizations (id),
+           UNIQUE (organization_id, id)
+         );
+         CREATE TABLE project_folders (
+           organization_id TEXT NOT NULL REFERENCES organizations (id),
+           project_id TEXT NOT NULL REFERENCES projects (id),
+           folder_id TEXT NOT NULL REFERENCES folders (id),
+           PRIMARY KEY (organization_id, project_id),
+           FOREIGN KEY (organization_id, project_id) REFERENCES projects (organization_id, id),
+           FOREIGN KEY (organization_id, folder_id) REFERENCES folders (organization_id, id)
+         );
+         CREATE UNIQUE INDEX project_folders_project ON project_folders (project_id);
+         CREATE TABLE folder_grants (
+           folder_id TEXT NOT NULL REFERENCES folders (id),
+           user_id TEXT NOT NULL,
+           PRIMARY KEY (folder_id, user_id)
+         );
+         GRANT SELECT ON folders, folder_parents, project_folders, folder_grants TO authz_owner;
+         CREATE FUNCTION authz.folders_reached() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           WITH RECURSIVE reached (id) AS (
+             SELECT fg.folder_id FROM public.folder_grants fg
+             WHERE fg.user_id = current_setting('app.user_id', true)
+             UNION {term}
+           ) SELECT id FROM reached
+         $$;
+         CREATE FUNCTION authz.projects_reached() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           SELECT pf.project_id FROM public.project_folders pf
+           WHERE pf.folder_id IN (SELECT authz.folders_reached())
+         $$;
+         ALTER FUNCTION authz.folders_reached() OWNER TO authz_owner;
+         ALTER FUNCTION authz.projects_reached() OWNER TO authz_owner;
+         {after}"
+    )
+}
+
+const EDGE_DOWN: &str =
+    "SELECT fp.folder_id FROM public.folder_parents fp JOIN reached ON fp.parent_id = reached.id";
+const EDGE_UP: &str =
+    "SELECT fp.parent_id FROM public.folder_parents fp JOIN reached ON fp.folder_id = reached.id";
+
+/// `team` under `org`, `squad` under `team`, `other` apart, and a project
+/// filed in each but `p_loose`.
+const EDGE_TREE: Rows = &[
+    ("folder_parents", &[("folder_id", "team"), ("parent_id", "org")]),
+    ("folder_parents", &[("folder_id", "squad"), ("parent_id", "team")]),
+    ("folder_grants", &[("folder_id", "team"), ("user_id", "alice")]),
+    ("folder_grants", &[("folder_id", "org"), ("user_id", "bob")]),
+    ("project_folders", &[("project_id", "p_org"), ("folder_id", "org")]),
+    ("project_folders", &[("project_id", "p_team"), ("folder_id", "team")]),
+    ("project_folders", &[("project_id", "p_squad"), ("folder_id", "squad")]),
+    ("project_folders", &[("project_id", "p_other"), ("folder_id", "other")]),
+];
+
+/// [`EDGE_TREE`] with `org` moved under `squad`, closing a cycle.
+const CYCLIC_EDGE_TREE: Rows = &[
+    ("folder_parents", &[("folder_id", "team"), ("parent_id", "org")]),
+    ("folder_parents", &[("folder_id", "squad"), ("parent_id", "team")]),
+    ("folder_parents", &[("folder_id", "org"), ("parent_id", "squad")]),
+    ("folder_grants", &[("folder_id", "team"), ("user_id", "alice")]),
+    ("folder_grants", &[("folder_id", "org"), ("user_id", "bob")]),
+    ("project_folders", &[("project_id", "p_org"), ("folder_id", "org")]),
+    ("project_folders", &[("project_id", "p_team"), ("folder_id", "team")]),
+    ("project_folders", &[("project_id", "p_squad"), ("folder_id", "squad")]),
+    ("project_folders", &[("project_id", "p_other"), ("folder_id", "other")]),
+];
+
+/// What PostgreSQL 18.6 returns for `(rows, caller)` from
+/// `authz.folders_reached()` written with [`EDGE_DOWN`], then with
+/// [`EDGE_UP`], then from `authz.projects_reached()` over the walk down.
+type EdgesMeasured =
+    (Rows, &'static str, &'static [&'static str], &'static [&'static str], &'static [&'static str]);
+
+const EDGES_MEASURED: &[EdgesMeasured] = &[
+    (EDGE_TREE, "alice", &["squad", "team"], &["org", "team"], &["p_squad", "p_team"]),
+    (EDGE_TREE, "bob", &["org", "squad", "team"], &["org"], &["p_org", "p_squad", "p_team"]),
+    (EDGE_TREE, "zed", &[], &[], &[]),
+    (
+        CYCLIC_EDGE_TREE,
+        "alice",
+        &["org", "squad", "team"],
+        &["org", "squad", "team"],
+        &["p_org", "p_squad", "p_team"],
+    ),
+    (
+        CYCLIC_EDGE_TREE,
+        "bob",
+        &["org", "squad", "team"],
+        &["org", "squad", "team"],
+        &["p_org", "p_squad", "p_team"],
+    ),
+];
+
+const FOLDER_GRANT_ARM: &str = "folder_grants.folder_id WHERE user_id = app.user_id";
+
+#[test]
+fn a_walk_reads_an_edge_table_down_and_up_its_unique_column() {
+    let deployment = deployment();
+    for (term, rendered, direction) in [
+        (EDGE_DOWN, "folder_parents.folder_id WHERE parent_id IN itself", WalkDirection::Down),
+        (
+            "SELECT fp.folder_id FROM reached r JOIN public.folder_parents AS fp ON r.id = fp.parent_id",
+            "folder_parents.folder_id WHERE parent_id IN itself",
+            WalkDirection::Down,
+        ),
+        (EDGE_UP, "folder_parents.parent_id WHERE folder_id IN itself", WalkDirection::Up),
+        (
+            "SELECT fp.parent_id FROM reached r JOIN public.folder_parents AS fp ON r.id = fp.folder_id",
+            "folder_parents.parent_id WHERE folder_id IN itself",
+            WalkDirection::Up,
+        ),
+    ] {
+        let database = postgres(&edges(term, ""));
+        let set =
+            answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+        assert_eq!(render(&set), format!("{FOLDER_GRANT_ARM} UNION {rendered}"), "{term}");
+        assert_eq!(covered(&set), Some("folders"), "{term}");
+        let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
+        assert_eq!(walk.direction(), direction, "{term}");
+        assert_eq!(walk.tree().table_name(), "folders", "{term}");
+        assert_eq!(walk.key().column_name(), "id", "{term}");
+        assert_eq!(walk.child().column_name(), "folder_id", "{term}");
+        let referenced = walk.foreign_key().referenced_table(&database).expect("resolves");
+        assert_eq!(referenced.table_name(), "folders", "{term}");
+    }
+
+    for (term, direction) in [(EDGE_DOWN, WalkDirection::Down), (EDGE_UP, WalkDirection::Up)] {
+        let database = postgres(&edges(term, ""));
+        let set =
+            answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+        for (fixture, caller, down, up, _) in EDGES_MEASURED {
+            let expected = match direction {
+                WalkDirection::Down => down,
+                WalkDirection::Up => up,
+            };
+            let returned: Vec<_> =
+                evaluate(&set, Request::of(caller), fixture).into_iter().collect();
+            assert_eq!(returned, *expected, "{caller} walking {term}");
+        }
+    }
+
+    let keyed_by_child = edges(EDGE_DOWN, "")
+        .replace("PRIMARY KEY (organization_id, folder_id),", "PRIMARY KEY (folder_id),")
+        .replace("CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id);", "");
+    let database = postgres(&keyed_by_child);
+    let set = answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+    assert_eq!(
+        render(&set),
+        format!("{FOLDER_GRANT_ARM} UNION folder_parents.folder_id WHERE parent_id IN itself"),
+        "an edge table keyed by its child"
+    );
+}
+
+#[test]
+fn a_self_referencing_walk_reads_its_key_as_the_child() {
+    let database = postgres(&groups(&walking(CHILD_JOIN), ""));
+    let deployment = deployment();
+    let set = groups_with(&database, &deployment, "read").expect("answered");
+    let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
+    assert_eq!(walk.tree().table_name(), "groups");
+    assert_eq!(walk.table().table_name(), "groups");
+    assert!(core::ptr::eq(walk.child(), walk.key()));
+}
+
+#[test]
+fn an_edge_table_of_any_other_shape_refuses_the_walk() {
+    let deployment = deployment();
+    let unique = "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id);";
+    let parent = "parent_id TEXT NOT NULL REFERENCES folders (id),";
+    let both = format!(
+        "{unique} CREATE UNIQUE INDEX folder_parents_parent ON folder_parents (parent_id);"
+    );
+    for (term, from, to) in [
+        (EDGE_DOWN, unique, ""),
+        (EDGE_UP, unique, ""),
+        (
+            EDGE_DOWN,
+            unique,
+            "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id) WHERE parent_id <> 'x';",
+        ),
+        (
+            EDGE_DOWN,
+            unique,
+            "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (lower(folder_id));",
+        ),
+        (
+            EDGE_DOWN,
+            unique,
+            "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id, parent_id);",
+        ),
+        (EDGE_DOWN, unique, "CREATE INDEX folder_parents_folder ON folder_parents (folder_id);"),
+        (EDGE_DOWN, unique, &both),
+        (EDGE_DOWN, parent, "parent_id TEXT NOT NULL REFERENCES organizations (id),"),
+        (EDGE_DOWN, parent, "parent_id TEXT NOT NULL,"),
+        (
+            EDGE_DOWN,
+            parent,
+            "parent_id TEXT NOT NULL REFERENCES folders (id) REFERENCES folders (id),",
+        ),
+        (EDGE_DOWN, "folder_id TEXT NOT NULL REFERENCES folders (id),", "folder_id TEXT NOT NULL,"),
+        (
+            "SELECT fp.parent_id FROM public.folder_parents fp JOIN reached ON fp.parent_id = reached.id",
+            "",
+            "",
+        ),
+        (
+            "SELECT fp.folder_id FROM public.folder_parents fp JOIN reached ON fp.folder_id = reached.id",
+            "",
+            "",
+        ),
+        (
+            "SELECT fp.organization_id FROM public.folder_parents fp JOIN reached ON fp.folder_id = reached.id",
+            "",
+            "",
+        ),
+    ] {
+        let sql = edges(term, "").replace(from, to);
+        let database = postgres(&sql);
+        assert!(
+            matches!(
+                answer(&database, &deployment, "authz", "folders_reached", &[]),
+                Err(HelperSetError::ArmShape { function, .. }) if function == "authz.folders_reached"
+            ),
+            "{term} with {to}"
+        );
+    }
+}
+
+#[test]
+fn an_edge_walk_needs_the_owner_to_read_both_edge_columns() {
+    let deployment = deployment();
+    let columns = |granted: &str| {
+        edges(EDGE_DOWN, &format!("GRANT SELECT ({granted}) ON folder_parents TO authz_owner;"))
+            .replace("GRANT SELECT ON folders, folder_parents,", "GRANT SELECT ON folders,")
+    };
+    let database = postgres(&columns("folder_id, parent_id"));
+    answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+    let database = postgres(&columns("folder_id"));
+    assert!(matches!(
+        answer(&database, &deployment, "authz", "folders_reached", &[]),
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "folder_parents"
+    ));
+}
+
+#[test]
+fn an_arm_returning_a_unique_column_keyed_by_another_table_is_a_parent_arm() {
+    let database = postgres(&edges(EDGE_DOWN, ""));
+    let deployment = deployment();
+    let set = answer(&database, &deployment, "authz", "projects_reached", &[]).expect("answered");
+    assert_eq!(
+        render(&set),
+        format!(
+            "project_folders.project_id WHERE folder_id -> folders IN authz.folders_reached() \
+             {{{FOLDER_GRANT_ARM} UNION folder_parents.folder_id WHERE parent_id IN itself}}"
+        )
+    );
+    assert_eq!(covered(&set), Some("projects"));
+    let HelperArm::Parent(parent) = &set.arms()[0] else { panic!("a parent arm") };
+    assert_eq!(parent.table().table_name(), "project_folders");
+    assert_eq!(parent.child_table().table_name(), "projects");
+    assert_eq!(parent.parent_table().table_name(), "folders");
+    for (fixture, caller, _, _, projects) in EDGES_MEASURED {
+        let returned: Vec<_> = evaluate(&set, Request::of(caller), fixture).into_iter().collect();
+        assert_eq!(returned, *projects, "{caller} calling projects_reached()");
+    }
+
+    let set = answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+    let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the walk") };
+    assert_eq!(walk.table().table_name(), "folder_parents");
+}
+
+#[test]
+fn an_arm_returning_a_column_no_unique_key_covers_alone_stays_a_grant_arm() {
+    let deployment = deployment();
+    let unique = "CREATE UNIQUE INDEX project_folders_project ON project_folders (project_id);";
+    let folder = "folder_id TEXT NOT NULL REFERENCES folders (id),\n           PRIMARY KEY (organization_id, project_id)";
+    for (from, to) in [
+        (unique, ""),
+        (
+            unique,
+            "CREATE UNIQUE INDEX project_folders_project ON project_folders (project_id) WHERE folder_id <> 'x';",
+        ),
+        (
+            unique,
+            "CREATE UNIQUE INDEX project_folders_project ON project_folders (project_id, folder_id);",
+        ),
+        (folder, "folder_id TEXT NOT NULL,\n           PRIMARY KEY (organization_id, project_id)"),
+    ] {
+        let sql = edges(EDGE_DOWN, "").replace(from, to);
+        assert_ne!(sql, edges(EDGE_DOWN, ""), "{from} is replaced");
+        let database = postgres(&sql);
+        let set =
+            answer(&database, &deployment, "authz", "projects_reached", &[]).expect("answered");
+        assert!(
+            matches!(&set.arms()[0], HelperArm::Grant(grant) if matches!(grant.granted_to(), GrantedTo::Set(_))),
+            "{to}"
+        );
     }
 }

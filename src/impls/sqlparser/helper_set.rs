@@ -635,6 +635,14 @@ enum Listed<'q> {
     Literal(Passed),
 }
 
+/// A table, its primary key and the foreign key a column references them
+/// through.
+type ReferencedKey<'db, DB> = (
+    &'db <DB as DatabaseLike>::Table,
+    &'db <DB as DatabaseLike>::Column,
+    &'db <DB as DatabaseLike>::ForeignKey,
+);
+
 /// A helper body's arms, with the term walking down a tree under them where
 /// the body writes `WITH RECURSIVE`.
 struct Body<'q> {
@@ -722,7 +730,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut read = read?;
         if let Some(walk) = &body.walk {
             let walk = self.walk_arm(&scope, walk)?;
-            read.push((Some(walk.table), vec![HelperArm::Walk(walk)]));
+            read.push((Some(walk.tree), vec![HelperArm::Walk(walk)]));
         }
         let mut keyed = read.iter().map(|(keyed, _)| *keyed);
         let covered_table = keyed.next().flatten().filter(|first| {
@@ -768,29 +776,27 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         self.require_select(scope, table.table, || table.columns_read(select, database))?;
         let [column] = columns[..] else {
-            return Ok((None, self.grant_arm(scope, select, &table, &columns, false)?));
+            return Ok((None, self.grant_arm(scope, select, &table, &columns, None)?));
         };
         let keyed = self.keyed_table(table.table, column)?;
-        let returns_key = table
-            .table
-            .primary_key_column(database)?
-            .is_some_and(|primary| core::ptr::eq(primary, column));
-        if returns_key
+        let child = self.child_table(table.table, column)?;
+        if let Some(child) = child
             && let Some(Expr::In {
                 expr, target: InTarget::Subquery(called), negated: false, ..
             }) = select.selection.as_ref().map(unnest)
             && !matches!(unnest(expr), Expr::Tuple(_))
             && self.set_elements(scope, called)?.is_none()
+            && self.parent_comparison(&table, column, child, expr)?
         {
-            let arm = self.parent_arm(scope, select, &table, column, expr, called)?;
+            let arm = self.parent_arm(scope, select, &table, (column, child), expr, called)?;
             return Ok((keyed, vec![arm]));
         }
-        Ok((keyed, self.grant_arm(scope, select, &table, &columns, returns_key)?))
+        Ok((keyed, self.grant_arm(scope, select, &table, &columns, child)?))
     }
 
-    /// Reads the recursive term of a walk, `SELECT <key> FROM <table> JOIN
+    /// Reads the recursive term of a walk, `SELECT <child> FROM <table> JOIN
     /// <walk> ON <parent column> = <walk>.<column>` walking down and `SELECT
-    /// <parent column> FROM <table> JOIN <walk> ON <key> = <walk>.<column>`
+    /// <parent column> FROM <table> JOIN <walk> ON <child> = <walk>.<column>`
     /// walking up, the join either way round. PostgreSQL refuses the walk's
     /// name in a subquery of the term, so the join is its one spelling.
     fn walk_arm(
@@ -841,32 +847,64 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(shape());
         }
         let table = self.arm_table(scope, relation, true, shape)?;
-        let (Some(key), Some(returned), Some(compared)) = (
-            table.table.primary_key_column(database)?,
-            table.column(returned, database)?,
-            table.column(compared, database)?,
-        ) else {
+        let (Some(returned), Some(compared)) =
+            (table.column(returned, database)?, table.column(compared, database)?)
+        else {
             return Err(shape());
         };
-        let (column, direction) = match (core::ptr::eq(returned, key), core::ptr::eq(compared, key))
-        {
-            (true, false) => (compared, WalkDirection::Down),
-            (false, true) => (returned, WalkDirection::Up),
-            _ => return Err(shape()),
-        };
-        let [foreign_key] = single_column_foreign_keys(table.table, column, database)?[..] else {
+        let Some(walk) = self.edge(table.table, returned, compared)? else {
             return Err(shape());
         };
-        let references_key = core::ptr::eq(foreign_key.referenced_table(database)?, table.table)
-            && foreign_key
-                .referenced_columns(database)?
-                .next()
-                .is_some_and(|referenced| core::ptr::eq(referenced, key));
-        if !references_key {
-            return Err(shape());
-        }
-        self.require_select(scope, table.table, || Ok(vec![key, column]))?;
-        Ok(WalkArm { table: table.table, key, column, foreign_key, direction })
+        self.require_select(scope, table.table, || Ok(vec![walk.child, walk.column]))?;
+        Ok(walk)
+    }
+
+    /// The walk adding `returned` of each row of `table` whose `compared` the
+    /// set holds, `None` where the two columns draw no edge of a tree.
+    ///
+    /// The child is the table's primary key where one of the two is, else the
+    /// one a unique key covers alone. The parent column references the tree's
+    /// one-column primary key through its one single-column foreign key. The
+    /// child is that key where the table is the tree, and otherwise references
+    /// the same key the same way from an edge table.
+    fn edge(
+        &self,
+        table: &'db DB::Table,
+        returned: &'db DB::Column,
+        compared: &'db DB::Column,
+    ) -> Result<Option<WalkArm<'db, DB>>, LookupError> {
+        let database = self.database;
+        let primary = table.primary_key_column(database)?;
+        let is_primary = |column| primary.is_some_and(|primary| core::ptr::eq(primary, column));
+        let direction = match (is_primary(returned), is_primary(compared)) {
+            (true, false) => WalkDirection::Down,
+            (false, true) => WalkDirection::Up,
+            (true, true) => return Ok(None),
+            (false, false) => {
+                match (
+                    holds_key(table, &[returned], database)?,
+                    holds_key(table, &[compared], database)?,
+                ) {
+                    (true, false) => WalkDirection::Down,
+                    (false, true) => WalkDirection::Up,
+                    _ => return Ok(None),
+                }
+            }
+        };
+        let (child, column) = match direction {
+            WalkDirection::Down => (returned, compared),
+            WalkDirection::Up => (compared, returned),
+        };
+        let Some((tree, key, foreign_key)) = self.referenced_key(table, column)? else {
+            return Ok(None);
+        };
+        let drawn = if core::ptr::eq(tree, table) {
+            core::ptr::eq(child, key)
+        } else {
+            self.referenced_key(table, child)?
+                .is_some_and(|(referenced, _, _)| core::ptr::eq(referenced, tree))
+        };
+        Ok(drawn.then_some(WalkArm { table, tree, key, child, column, foreign_key, direction }))
     }
 
     /// The table whose primary key `column` of `table` holds, `table` itself
@@ -878,11 +916,69 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         table: &'db DB::Table,
         column: &'db DB::Column,
     ) -> Result<Option<&'db DB::Table>, LookupError> {
+        if table
+            .primary_key_column(self.database)?
+            .is_some_and(|primary| core::ptr::eq(primary, column))
+        {
+            return Ok(Some(table));
+        }
+        Ok(self.referenced_key(table, column)?.map(|(referenced, _, _)| referenced))
+    }
+
+    /// The table whose row `column` of `table` names in an arm a parent arm
+    /// may return it from, `table` itself where `column` is its primary key,
+    /// else the other table whose primary key the column references through
+    /// its one single-column foreign key, where a unique key of `table`
+    /// covers the column alone.
+    fn child_table(
+        &self,
+        table: &'db DB::Table,
+        column: &'db DB::Column,
+    ) -> Result<Option<&'db DB::Table>, LookupError> {
         let database = self.database;
         if table.primary_key_column(database)?.is_some_and(|primary| core::ptr::eq(primary, column))
         {
             return Ok(Some(table));
         }
+        let Some((referenced, _, _)) = self.referenced_key(table, column)? else {
+            return Ok(None);
+        };
+        let names_child =
+            !core::ptr::eq(referenced, table) && holds_key(table, &[column], database)?;
+        Ok(names_child.then_some(referenced))
+    }
+
+    /// Whether comparing `compared` with a helper's set, in an arm returning
+    /// `key`, a row of `child`, reads as a parent arm. It always does for the
+    /// arm's own primary key, and for a row of another table where `compared`
+    /// is another column with one single-column foreign key.
+    fn parent_comparison(
+        &self,
+        table: &ArmTable<'_, 'db, DB>,
+        key: &'db DB::Column,
+        child: &'db DB::Table,
+        compared: &Expr,
+    ) -> Result<bool, LookupError> {
+        let database = self.database;
+        if core::ptr::eq(child, table.table) {
+            return Ok(true);
+        }
+        let Some(column) = table.column(compared, database)? else {
+            return Ok(false);
+        };
+        Ok(!core::ptr::eq(column, key)
+            && single_column_foreign_keys(table.table, column, database)?.len() == 1)
+    }
+
+    /// The table, its primary key and the foreign key `column` of `table`
+    /// references it through, where the column's one single-column foreign
+    /// key references that table's one-column primary key.
+    fn referenced_key(
+        &self,
+        table: &'db DB::Table,
+        column: &'db DB::Column,
+    ) -> Result<Option<ReferencedKey<'db, DB>>, LookupError> {
+        let database = self.database;
         let [foreign_key] = single_column_foreign_keys(table, column, database)?[..] else {
             return Ok(None);
         };
@@ -893,7 +989,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         ) else {
             return Ok(None);
         };
-        Ok(core::ptr::eq(primary, referenced_column).then_some(referenced))
+        Ok(core::ptr::eq(primary, referenced_column).then_some((referenced, primary, foreign_key)))
     }
 
     /// Resolves the one table an arm reads, and checks the owner reads all
@@ -950,13 +1046,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// Reads `<column> IN (SELECT <helper>(<arguments>))` in an arm returning
-    /// `key`, its table's primary key.
+    /// `key`, which names a row of `child_table`.
     fn parent_arm(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         table: &ArmTable<'_, 'db, DB>,
-        key: &'db DB::Column,
+        (key, child_table): (&'db DB::Column, &'db DB::Table),
         compared: &Expr,
         subquery: &Query,
     ) -> Result<HelperArm<'db, DB>, HelperSetError> {
@@ -990,6 +1086,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(HelperArm::Parent(ParentArm {
             table: table.table,
             key,
+            child_table,
             column,
             foreign_key,
             parent_table,
@@ -1184,16 +1281,17 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
 
     /// Reads a grant arm returning `columns`, answering one arm per grantee
     /// an `IN` list naming the request lists and none where its conditions
-    /// keep no row. An arm returning its table's key from a helper's set is
-    /// a parent arm, which takes no other condition, so `returns_key`
-    /// refuses a set beside one.
+    /// keep no row. An arm returning a row of `child` from a helper's set is
+    /// a parent arm where [`parent_comparison`](Self::parent_comparison)
+    /// reads it as one, which takes no other condition, so such a set beside
+    /// one is refused.
     fn grant_arm(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         table: &ArmTable<'_, 'db, DB>,
         columns: &[&'db DB::Column],
-        returns_key: bool,
+        child: Option<&'db DB::Table>,
     ) -> Result<Vec<HelperArm<'db, DB>>, HelperSetError> {
         let shape = || scope.arm_shape(select);
         let mut conjuncts = Vec::new();
@@ -1220,7 +1318,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 ..
             } = unnest(conjunct)
             {
-                if returns_key {
+                if let (Some(child), [column]) = (child, columns)
+                    && self.parent_comparison(table, column, child, expr)?
+                {
                     return Err(shape());
                 }
                 let grantees = self.grantee_set(scope, select, table, expr, called)?;
