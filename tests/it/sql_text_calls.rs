@@ -8,7 +8,10 @@
 )]
 
 use sql_traits::prelude::*;
-use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
+use sqlparser::{
+    ast::Expr,
+    dialect::{MsSqlDialect, PostgreSqlDialect},
+};
 
 fn postgres(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses")
@@ -152,6 +155,11 @@ fn every_clause_of_a_statement_runs_the_text_its_calls_pass() {
            WHEN NOT MATCHED
             THEN INSERT VALUES (query_to_xml('SELECT 19 WHERE ' || p, false, false, '')::text)
            RETURNING query_to_xml('SELECT 20 WHERE ' || p, false, false, '');
+          MERGE INTO items USING items AS o
+           ON query_to_xml('SELECT 21 WHERE ' || p, false, false, '') IS NULL
+           WHEN MATCHED THEN DELETE;
+          INSERT INTO items DEFAULT VALUES
+           RETURNING query_to_xml('SELECT 22 WHERE ' || p, false, false, '');
          END;",
     );
     let called = |function: &str, number: u8| {
@@ -167,7 +175,7 @@ fn every_clause_of_a_statement_runs_the_text_its_calls_pass() {
     expected.push(called("ts_stat", 11));
     expected.extend([12, 13].map(|number| called("query_to_xml", number)));
     expected.push(called("ts_stat", 14));
-    expected.extend((15..=20).map(|number| called("query_to_xml", number)));
+    expected.extend((15..=22).map(|number| called("query_to_xml", number)));
     assert_eq!(calls(&database, "clauses"), expected);
 }
 
@@ -362,4 +370,16 @@ fn plpgsql_call_arguments_run_the_text_their_calls_pass() {
         sites(&database, "called"),
         [(Some("pg_catalog.query_to_xml".to_owned()), "'SELECT 1 WHERE ' || p".to_owned())]
     );
+}
+
+/// A body written in another dialect calls no `pg_catalog` function, so a
+/// call spelled as one runs no text.
+#[test]
+fn other_dialect_bodies_run_no_text() {
+    let database = ParserDB::parse::<MsSqlDialect>(
+        "CREATE FUNCTION listed() RETURNS TABLE
+          AS RETURN SELECT query_to_xml('SELECT 1', 0, 0, '') AS x;",
+    )
+    .unwrap();
+    assert_eq!(calls(&database, "listed"), Vec::<(String, String)>::new());
 }
