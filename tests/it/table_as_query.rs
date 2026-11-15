@@ -115,6 +115,45 @@ fn repeated_output_names_are_refused() {
     );
 }
 
+fn names(db: &ParserDB, table: &str) -> Vec<String> {
+    columns(db, table).into_iter().map(|(name, _)| name).collect()
+}
+
+#[test]
+fn a_values_list_names_its_outputs_by_position() {
+    for (query, expected) in [
+        ("SELECT * FROM (VALUES (1, 'x'), (2, 'y')) x", ["column1", "column2"]),
+        ("SELECT * FROM (VALUES (1, 'x')) x(a)", ["a", "column2"]),
+        ("SELECT x.* FROM (VALUES (1, 'x')) x(a, b)", ["a", "b"]),
+        ("SELECT x.column2, x.column1 FROM (VALUES (1, 'x')) x", ["column2", "column1"]),
+    ] {
+        let db = parse(&format!("CREATE TABLE ct AS {query};"));
+        assert_eq!(names(&db, "ct"), expected, "{query}");
+        assert_eq!(*column(&db, "ct", expected[0]).data_type(&db), DataType::Unspecified);
+    }
+}
+
+#[test]
+fn outputs_read_through_a_view_over_a_values_list_are_named() {
+    for kind in ["VIEW", "MATERIALIZED VIEW"] {
+        let db = parse(&format!(
+            "CREATE {kind} v AS SELECT * FROM (VALUES (1, 2)) x(a); CREATE TABLE ct AS SELECT * FROM v;"
+        ));
+        assert_eq!(names(&db, "ct"), ["a", "column2"], "{kind}");
+    }
+}
+
+#[test]
+fn repeated_values_alias_columns_are_refused() {
+    let result = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE ct AS SELECT * FROM (VALUES (1, 2)) x(a, a);",
+    );
+    assert!(
+        matches!(result, Err(Error::ColumnAlreadyExists { column_name, .. }) if column_name == "a"),
+        "PostgreSQL refuses a column specified more than once"
+    );
+}
+
 /// A `CREATE TABLE … AS query` statement with `names` written as its column
 /// list, built from the AST since the parser does not yet read the list under
 /// PostgreSQL.
