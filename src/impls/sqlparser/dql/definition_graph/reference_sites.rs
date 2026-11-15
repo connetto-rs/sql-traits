@@ -163,6 +163,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         match root.unwrapped() {
             ScopedRoot::Expression(expression) => walk.node(expression, Some(outer)),
             ScopedRoot::Query(query) => walk.query(query),
+            ScopedRoot::Statement(Statement::Call(function)) => walk.node(function, Some(outer)),
             ScopedRoot::Statement(statement) => walk.modifying(statement),
         }
         rules

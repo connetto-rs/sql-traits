@@ -113,7 +113,62 @@ fn sql_bodies_run_the_text_their_catalog_calls_pass() {
         for typed in concatenated_types(&database, name) {
             assert_eq!(typed, "pg_catalog.text", "{name}");
         }
+        let body = function(&database, name).dynamic_execution_sites(&database).unwrap();
+        assert!(body.sites().unwrap().iter().all(|site| site.plpgsql_scope().is_none()), "{name}");
     }
+}
+
+/// Every clause of a query or a data-modifying statement runs the text its
+/// calls pass, in common table expressions, set operations, joins, nested
+/// joins, `ON CONFLICT`, `FROM`, `USING`, `MERGE` actions and `RETURNING`.
+#[test]
+fn every_clause_of_a_statement_runs_the_text_its_calls_pass() {
+    let database = postgres(
+        "CREATE TABLE items (name text PRIMARY KEY);
+         CREATE FUNCTION clauses(p text) RETURNS void LANGUAGE sql BEGIN ATOMIC
+          WITH made AS (SELECT query_to_xml('SELECT 1 WHERE ' || p, false, false, '') AS x),
+           added AS (INSERT INTO items
+            SELECT query_to_xml('SELECT 2 WHERE ' || p, false, false, '')::text RETURNING name),
+           listed AS (TABLE items)
+          SELECT x FROM made;
+          SELECT 1 FROM items JOIN ts_stat('SELECT 3 WHERE ' || p) AS s ON true
+           UNION (SELECT 1 FROM (items JOIN ts_stat('SELECT 4 WHERE ' || p) AS t ON true));
+          INSERT INTO items VALUES ('a') ON CONFLICT (name) DO UPDATE
+           SET name = query_to_xml('SELECT 5 WHERE ' || p, false, false, '')::text
+           WHERE query_to_xml('SELECT 6 WHERE ' || p, false, false, '') IS NULL
+           RETURNING query_to_xml('SELECT 7 WHERE ' || p, false, false, '');
+          UPDATE items SET name = query_to_xml('SELECT 8 WHERE ' || p, false, false, '')::text
+           WHERE query_to_xml('SELECT 9 WHERE ' || p, false, false, '') IS NULL
+           RETURNING query_to_xml('SELECT 10 WHERE ' || p, false, false, '');
+          UPDATE items SET name = 'b' FROM ts_stat('SELECT 11 WHERE ' || p) AS u;
+          DELETE FROM items WHERE query_to_xml('SELECT 12 WHERE ' || p, false, false, '') IS NULL
+           RETURNING query_to_xml('SELECT 13 WHERE ' || p, false, false, '');
+          DELETE FROM items USING ts_stat('SELECT 14 WHERE ' || p) AS v;
+          MERGE INTO items
+           USING (SELECT query_to_xml('SELECT 15 WHERE ' || p, false, false, '') AS x) AS m
+           ON query_to_xml('SELECT 16 WHERE ' || p, false, false, '') IS NULL
+           WHEN MATCHED AND query_to_xml('SELECT 17 WHERE ' || p, false, false, '') IS NULL
+            THEN UPDATE SET name = query_to_xml('SELECT 18 WHERE ' || p, false, false, '')::text
+           WHEN NOT MATCHED
+            THEN INSERT VALUES (query_to_xml('SELECT 19 WHERE ' || p, false, false, '')::text)
+           RETURNING query_to_xml('SELECT 20 WHERE ' || p, false, false, '');
+         END;",
+    );
+    let called = |function: &str, number: u8| {
+        (format!("pg_catalog.{function}"), format!("'SELECT {number} WHERE ' || p"))
+    };
+    let mut expected = Vec::from([
+        called("query_to_xml", 1),
+        called("query_to_xml", 2),
+        called("ts_stat", 3),
+        called("ts_stat", 4),
+    ]);
+    expected.extend((5..=10).map(|number| called("query_to_xml", number)));
+    expected.push(called("ts_stat", 11));
+    expected.extend([12, 13].map(|number| called("query_to_xml", number)));
+    expected.push(called("ts_stat", 14));
+    expected.extend((15..=20).map(|number| called("query_to_xml", number)));
+    assert_eq!(calls(&database, "clauses"), expected);
 }
 
 /// A call PostgreSQL resolves to another function of the name runs no text:
@@ -287,5 +342,24 @@ fn plpgsql_calls_read_the_variables_in_reach() {
     assert_eq!(
         concatenated_types(&database, "scoped"),
         ["pg_catalog.int4", "pg_catalog.name", "pg_catalog.varchar"]
+    );
+}
+
+/// The arguments of a `CALL` in a PL/pgSQL body run the text their calls
+/// pass, and a statement writing no call holds no site.
+#[test]
+fn plpgsql_call_arguments_run_the_text_their_calls_pass() {
+    let database = postgres(
+        "CREATE TABLE items (name text);
+         CREATE PROCEDURE note(t xml) LANGUAGE sql BEGIN ATOMIC SELECT 1; END;
+         CREATE FUNCTION called(p text) RETURNS void LANGUAGE plpgsql AS $$
+         BEGIN
+          TRUNCATE items;
+          CALL note(query_to_xml('SELECT 1 WHERE ' || p, false, false, ''));
+         END $$;",
+    );
+    assert_eq!(
+        sites(&database, "called"),
+        [(Some("pg_catalog.query_to_xml".to_owned()), "'SELECT 1 WHERE ' || p".to_owned())]
     );
 }

@@ -5,21 +5,30 @@ use alloc::vec::Vec;
 
 use sqlparser::ast::{
     Delete, DoUpdate, Expr, FromTable, Insert, Merge, MergeAction, MergeClause, MergeInsertExpr,
-    MergeInsertKind, MergeUpdateExpr, MergeUpdateKind, OnConflict, OnConflictAction, OnInsert,
-    OutputClause, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Update,
-    UpdateTableFromKind,
+    MergeInsertKind, MergeUpdateExpr, MergeUpdateKind, ObjectName, OnConflict, OnConflictAction,
+    OnInsert, OutputClause, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    Update, UpdateTableFromKind,
 };
 
 use super::{NestedNodes, NestedQueryWalker, scoped_roots::ScopedRoot};
 use crate::errors::LookupError;
 
-/// A node written as a function call.
+/// A node written as a function call, with the name it calls.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CallNode<'node> {
     /// A function expression, `Expr::Function`.
-    Expression(&'node Expr),
+    Expression { call: &'node Expr, name: &'node ObjectName },
     /// A `FROM` item carrying an argument list.
-    Relation(&'node TableFactor),
+    Relation { factor: &'node TableFactor, name: &'node ObjectName },
+}
+
+impl<'node> CallNode<'node> {
+    /// Returns the name the node calls, as written.
+    pub(crate) const fn name(&self) -> &'node ObjectName {
+        match self {
+            Self::Expression { name, .. } | Self::Relation { name, .. } => name,
+        }
+    }
 }
 
 /// Every node `root` writes as a function call, nested queries and the
@@ -48,8 +57,8 @@ impl<'node> NestedNodes<'node> for &mut CallFinder<'node> {
     }
 
     fn expression(&mut self, expression: &'node Expr) -> Result<(), LookupError> {
-        if let Expr::Function(_) = expression {
-            self.calls.push(CallNode::Expression(expression));
+        if let Expr::Function(function) = expression {
+            self.calls.push(CallNode::Expression { call: expression, name: &function.name });
         }
         Ok(())
     }
@@ -131,8 +140,8 @@ impl<'node> CallFinder<'node> {
     /// [`Self::factor`] leaves to this walk.
     fn nested_factors(&mut self, factor: &'node TableFactor) -> Result<(), LookupError> {
         match factor {
-            TableFactor::Function { .. } | TableFactor::Table { args: Some(_), .. } => {
-                self.calls.push(CallNode::Relation(factor));
+            TableFactor::Function { name, .. } | TableFactor::Table { name, args: Some(_), .. } => {
+                self.calls.push(CallNode::Relation { factor, name });
                 Ok(())
             }
             TableFactor::Derived { subquery, .. } => self.query(subquery),
@@ -143,9 +152,6 @@ impl<'node> CallFinder<'node> {
                     .iter()
                     .try_for_each(|join| self.nested_factors(&join.relation))
             }
-            TableFactor::Pivot { table, .. }
-            | TableFactor::Unpivot { table, .. }
-            | TableFactor::MatchRecognize { table, .. } => self.nested_factors(table),
             _ => Ok(()),
         }
     }

@@ -10,7 +10,7 @@ use alloc::{
 };
 use core::iter;
 
-use sqlparser::ast::{ArgMode, Expr, ObjectName, Query, Statement, TableFactor};
+use sqlparser::ast::{ArgMode, Expr, ObjectName, Query, Statement};
 use sqlparser_plpgsql::{
     embedded::{Block, DeclarationKind, DeclaredType, Dynamic, expression},
     namespace::{self, FunctionKind, Name, NameKind, Signature, Sql, TriggerVariable},
@@ -440,15 +440,12 @@ impl<'db, DB: DatabaseLike> SiteSource<'db, DB> {
             SqlBody::Statements(statements) | SqlBody::Atomic(statements) => {
                 self.sql_sites(statements.iter().map(ScopedRoot::Statement))
             }
-            SqlBody::Expression(expression) => {
-                self.sql_sites(iter::once(ScopedRoot::Expression(expression)))
-            }
             SqlBody::Return(expression) => {
                 self.sql_sites(iter::once(ScopedRoot::Expression(expression)))
             }
-            // SQL Server's `AS RETURN SELECT`, which calls no PostgreSQL
-            // function.
-            SqlBody::Select(_) => Ok(Vec::new()),
+            // Another dialect's `AS (expression)` or `AS RETURN SELECT`,
+            // where no `pg_catalog` function resolves.
+            SqlBody::Expression(_) | SqlBody::Select(_) => Ok(Vec::new()),
         }
     }
 
@@ -489,7 +486,8 @@ fn text_sink_calls<'b, 'db, DB: DatabaseLike>(
     scope: &ExpressionScope<'_, 'db, DB>,
     database: &'db DB,
 ) -> Result<Vec<(&'b Expr, &'db DB::Function)>, LookupError> {
-    let candidates: Vec<_> = call_nodes(root).into_iter().filter(names_text_sink).collect();
+    let candidates: Vec<_> =
+        call_nodes(root).into_iter().filter(|node| names_text_sink(node.name())).collect();
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -497,32 +495,26 @@ fn text_sink_calls<'b, 'db, DB: DatabaseLike>(
     let mut calls = Vec::new();
     for node in candidates {
         let call = match node {
-            CallNode::Expression(call) => context.call(call)?,
-            CallNode::Relation(factor) => context.relation_call(factor)?,
+            CallNode::Expression { call, .. } => context.call(call)?,
+            CallNode::Relation { factor, .. } => context.relation_call(factor)?,
         };
         let Some(call) = call else { continue };
         let CallResolution::Selected(selected) = call.resolution() else { continue };
         let called = selected.function();
         let Some(text) = text_parameter(called) else { continue };
-        let argument =
-            selected.arguments().iter().position(|argument| argument.parameter() == text);
-        if let Some(&command) = argument.and_then(|index| call.arguments().get(index)) {
-            calls.push((command, called));
-        }
+        let command = selected
+            .arguments()
+            .iter()
+            .zip(call.arguments())
+            .find(|(argument, _)| argument.parameter() == text)
+            .map(|(_, &command)| (command, called));
+        calls.extend(command);
     }
     Ok(calls)
 }
 
-/// Whether `node` calls a function written with the name of one of
-/// [`TEXT_SINKS`].
-fn names_text_sink(node: &CallNode<'_>) -> bool {
-    let name = match node {
-        CallNode::Expression(Expr::Function(function)) => &function.name,
-        CallNode::Relation(
-            TableFactor::Function { name, .. } | TableFactor::Table { name, .. },
-        ) => name,
-        CallNode::Expression(_) | CallNode::Relation(_) => return false,
-    };
+/// Whether `name` is written as the name of one of [`TEXT_SINKS`].
+fn names_text_sink(name: &ObjectName) -> bool {
     object_name_last_part(name).is_some_and(|(called, quoted)| {
         TEXT_SINKS.iter().any(|sink| identifiers_match(sink.name, false, called, quoted))
     })
