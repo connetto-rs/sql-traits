@@ -85,6 +85,26 @@ fn a_signature_names_the_types_as_written_when_qualified() {
     assert_eq!(signatures(&database), expected(NAMES));
 }
 
+/// Only a `RETURNS TABLE` clause declares returned columns. A set result and
+/// output arguments declare none.
+#[test]
+fn only_a_returns_table_clause_declares_returned_columns() {
+    let database = parse(SCHEMA).expect("the schema applies");
+    let columns = |name: &str| -> Vec<String> {
+        let function = database
+            .functions()
+            .find(|function| function.name() == name)
+            .expect("the function exists");
+        function
+            .returned_columns(&database)
+            .map(|(column, type_name)| format!("{} {type_name}", column.name()))
+            .collect()
+    };
+    assert_eq!(columns("columns"), ["c app.d"]);
+    assert_eq!(columns("rows"), Vec::<String>::new());
+    assert_eq!(columns("args"), Vec::<String>::new());
+}
+
 /// A bare name is bound to the schema of the type the path reaches, so a
 /// later path does not change what it names.
 #[test]
