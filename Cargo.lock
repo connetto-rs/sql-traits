@@ -1028,7 +1028,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#189906ac24ccdf0df0eaaef3b3608a292a54df93"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#1fde5fd1d49cd1188fe92047fef6d67a6e3b12bd"
 dependencies = [
  "seahash",
  "sqlparser",
