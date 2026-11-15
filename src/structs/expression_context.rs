@@ -22,9 +22,12 @@ use crate::{
     structs::{
         AggregateKind, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope,
         ExpressionScope, FunctionKind, IdentifierCase, OperandType, OperatorResolution,
-        PlPgSqlScope, PlPgSqlVariable, SelectedOperator, TargetName, plpgsql_scope::stored_parts,
+        PlPgSqlScope, PlPgSqlVariable, SelectedOperator, TargetName, VariableKind,
+        plpgsql_scope::stored_parts,
     },
-    traits::{ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, OperatorLike, TableLike},
+    traits::{
+        ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, OperatorLike, TableLike, TriggerLike,
+    },
     utils::{
         call_sites::expression_form,
         call_typing::{
@@ -106,6 +109,11 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
 /// An application of an operator, by the address of the node applying it
 /// and its position among that node's applications.
 pub(crate) type Site = (usize, usize);
+
+/// Whether `variable` is a trigger function's `NEW` or `OLD`.
+fn is_trigger_row(variable: &PlPgSqlVariable<'_>) -> bool {
+    *variable.kind() == VariableKind::Trigger && matches!(variable.name(), "new" | "old")
+}
 
 /// What the text PostgreSQL deparses a stored expression into pins when
 /// `ALTER COLUMN ... TYPE` has it parsed again: the previous type of each
@@ -546,34 +554,157 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     }
 
     /// The type of the field of `variable` that `expression` names. A field
-    /// of a table's row takes its column's type. A field of a record, whose
-    /// fields only the row it holds at run time decides, and a field of a
-    /// field stay unknown.
+    /// of a table's row takes its column's type, and a field of a trigger
+    /// function's `NEW` or `OLD` the type every table of
+    /// [`Self::row_field_types`] agrees on. A field of any other record,
+    /// whose fields only the row it holds at run time decides, and a field
+    /// of a field stay unknown.
     fn field_type(
         &self,
         variable: &PlPgSqlVariable<'db>,
         expression: &Expr,
     ) -> Result<OperandType<'db>, LookupError> {
-        let (
-            Expr::CompoundIdentifier(parts),
-            Ok(OperandType::Known { type_name, .. }),
-            Some(variables),
-        ) = (expression, variable.data_type(), self.variables)
+        if is_trigger_row(variable) {
+            let Some(field) = self.field(expression) else { return Ok(OperandType::Unknown) };
+            let mut types =
+                self.trigger_field_types(field)?.into_iter().map(|(_, data_type)| data_type);
+            let first = types.next().unwrap_or(OperandType::Unknown);
+            return Ok(if types.all(|data_type| data_type == first) {
+                first
+            } else {
+                OperandType::Unknown
+            });
+        }
+        let (Ok(OperandType::Known { type_name, .. }), Some(field)) =
+            (variable.data_type(), self.field(expression))
         else {
             return Ok(OperandType::Unknown);
         };
-        let consumed = variables.variable(&stored_parts(parts)).map(|(_, consumed)| consumed);
-        let (Some(consumed), [.., field]) = (consumed, parts.as_slice()) else {
-            return Ok(OperandType::Unknown);
+        match self.database.table_by_target(type_name.clone(), IdentifierCase::AsWritten)? {
+            Some(table) => self.column_of(table, field),
+            None => Ok(OperandType::Unknown),
+        }
+    }
+
+    /// The field `expression` names of the variable it reaches, `None` for a
+    /// node naming no field or naming a field of a field.
+    fn field<'e>(&self, expression: &'e Expr) -> Option<&'e Ident> {
+        let (Expr::CompoundIdentifier(parts), Some(variables)) = (expression, self.variables)
+        else {
+            return None;
         };
-        let table = self.database.table_by_target(type_name.clone(), IdentifierCase::AsWritten)?;
-        let (Some(table), true) = (table, consumed + 1 == parts.len()) else {
-            return Ok(OperandType::Unknown);
-        };
+        let (_, consumed) = variables.variable(&stored_parts(parts))?;
+        match parts.as_slice() {
+            [.., field] if consumed + 1 == parts.len() => Some(field),
+            _ => None,
+        }
+    }
+
+    /// The type of the column `field` names in `table`, unknown when the
+    /// table has no such column.
+    fn column_of(
+        &self,
+        table: &'db DB::Table,
+        field: &Ident,
+    ) -> Result<OperandType<'db>, LookupError> {
         let column = table.column(&field.to_string(), self.database, IdentifierCase::AsWritten)?;
         Ok(column.map_or(OperandType::Unknown, |column| {
             column_type(self.database, column.data_type(self.database))
         }))
+    }
+
+    /// Returns, for a field of a trigger function's `NEW` or `OLD` that
+    /// `expression` names, each table a trigger executing the function is
+    /// defined on, once, in the order the database holds the triggers, with
+    /// the type the field takes when that table's trigger fires. That is the
+    /// column's type, or [`OperandType::Unknown`] where the table has no such
+    /// column. PostgreSQL 18 types the field from the table on a
+    /// statement-level trigger too, where the row itself is null.
+    ///
+    /// [`Self::type_of`] answers the type every table agrees on, and
+    /// [`OperandType::Unknown`] when they disagree. Any other node, a field
+    /// of a field, and a function no trigger executes answer no table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
+    /// query, the lookup errors resolving the reference returns, and the
+    /// error [`TriggerLike::table`] returns for a trigger whose table does
+    /// not resolve.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE counted (name integer);
+    ///      CREATE TABLE items (name text);
+    ///      CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    ///      BEGIN EXECUTE 'SELECT ' || NEW.name; RETURN NEW; END $$;
+    ///      CREATE TRIGGER on_counted BEFORE INSERT ON counted
+    ///          FOR EACH ROW EXECUTE FUNCTION audit_row();
+    ///      CREATE TRIGGER on_items BEFORE INSERT ON items
+    ///          FOR EACH ROW EXECUTE FUNCTION audit_row();",
+    /// )?;
+    /// let audit_row = db
+    ///     .function_by_target(TargetName::new("audit_row", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = audit_row.dynamic_execution_sites(&db)?;
+    /// let sites = body.sites()?;
+    /// let scope = sites[0].scope();
+    /// let context =
+    ///     ExpressionContext::for_expression(sites[0].command(), &scope, &db, IdentifierCase::Folded)?;
+    /// let Expr::BinaryOp { right: name, .. } = sites[0].command() else { panic!("a concatenation") };
+    /// assert_eq!(context.type_of(name)?, OperandType::Unknown);
+    /// let types: Vec<_> = context
+    ///     .row_field_types(name)?
+    ///     .into_iter()
+    ///     .map(|(table, field)| (table.table_name(), field))
+    ///     .collect();
+    /// let int4 = TargetName::new("int4", false).with_schema("pg_catalog", false);
+    /// let text = TargetName::new("text", false).with_schema("pg_catalog", false);
+    /// assert_eq!(
+    ///     types,
+    ///     [
+    ///         ("counted", OperandType::Known { type_name: int4, typmod: None }),
+    ///         ("items", OperandType::Known { type_name: text, typmod: None }),
+    ///     ]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn row_field_types(
+        &self,
+        expression: &Expr,
+    ) -> Result<Vec<(&'db DB::Table, OperandType<'db>)>, LookupError> {
+        let Some((ColumnDefinition::VariableField(variable), _)) = self.reference(expression)?
+        else {
+            return Ok(Vec::new());
+        };
+        match self.field(expression).filter(|_| is_trigger_row(&variable)) {
+            Some(field) => self.trigger_field_types(field),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Each table a trigger executing the function of the PL/pgSQL scope is
+    /// defined on, once, with the type of its column `field`.
+    fn trigger_field_types(
+        &self,
+        field: &Ident,
+    ) -> Result<Vec<(&'db DB::Table, OperandType<'db>)>, LookupError> {
+        let Some(variables) = self.variables else { return Ok(Vec::new()) };
+        let mut tables: Vec<&'db DB::Table> = Vec::new();
+        for trigger in variables.function().triggers(self.database) {
+            let table = trigger.table(self.database)?;
+            if !tables.iter().any(|seen| core::ptr::eq(*seen, table)) {
+                tables.push(table);
+            }
+        }
+        tables.into_iter().map(|table| Ok((table, self.column_of(table, field)?))).collect()
     }
 
     /// The rule the clause holding the column reference `expression` resolves

@@ -688,6 +688,139 @@ fn trigger_functions_hold_their_trigger_variables() {
     );
 }
 
+/// Each table a trigger executing `name` is defined on, with the type the
+/// field `written` in the command of the only site of `name` takes on it.
+fn row_field_types(database: &ParserDB, name: &str, written: &str) -> Vec<(String, String)> {
+    let body = function(database, name).dynamic_execution_sites(database).unwrap();
+    let sites = body.sites().unwrap();
+    let [site] = sites.as_slice() else { panic!("{name} has one site") };
+    let scope = site.scope();
+    let context =
+        ExpressionContext::for_expression(site.command(), &scope, database, IdentifierCase::Folded)
+            .unwrap();
+    let mut found = None;
+    let _ = visit_expressions(site.command(), |expression| {
+        if expression.to_string() == written {
+            found = Some(context.row_field_types(expression).unwrap());
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+        .expect("the command writes the name")
+        .iter()
+        .map(|(table, data_type)| (table.table_name().to_owned(), rendered(data_type)))
+        .collect()
+}
+
+/// A field of `NEW` or `OLD`, written bare, through an alias or qualified by
+/// the function's name, takes its column's type from the table whose trigger
+/// executes the function, as PostgreSQL 18 types it per firing.
+#[test]
+fn trigger_row_fields_take_the_firing_tables_column_types() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, size varchar(5));
+         CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE fresh ALIAS FOR new;
+         BEGIN
+          EXECUTE 'SELECT ' || NEW.name || old.size || fresh.name || audit_row.new.name
+           || new.missing || new.name.part || new;
+          RETURN NEW;
+         END $$;
+         CREATE TRIGGER audit_insert BEFORE INSERT ON audit FOR EACH ROW EXECUTE FUNCTION audit_row();
+         CREATE TRIGGER audit_update BEFORE UPDATE ON audit FOR EACH ROW EXECUTE FUNCTION audit_row();",
+    );
+    assert_eq!(
+        names(&database, "audit_row"),
+        [[
+            ("NEW.name".to_owned(), "pg_catalog.text".to_owned()),
+            ("old.size".to_owned(), "pg_catalog.varchar(9)".to_owned()),
+            ("fresh.name".to_owned(), "pg_catalog.text".to_owned()),
+            ("audit_row.new.name".to_owned(), "pg_catalog.text".to_owned()),
+            ("new.missing".to_owned(), "?".to_owned()),
+            ("new.name.part".to_owned(), "?".to_owned()),
+            ("new".to_owned(), "pg_catalog.record".to_owned()),
+        ]]
+    );
+    assert_eq!(
+        row_field_types(&database, "audit_row", "NEW.name"),
+        [("audit".to_owned(), "pg_catalog.text".to_owned())]
+    );
+    assert_eq!(
+        row_field_types(&database, "audit_row", "new.missing"),
+        [("audit".to_owned(), "?".to_owned())]
+    );
+    assert_eq!(row_field_types(&database, "audit_row", "new.name.part"), []);
+    assert_eq!(row_field_types(&database, "audit_row", "new"), []);
+}
+
+/// One function behind triggers on tables that disagree on a field types it
+/// as unknown, each table's own answer kept, a statement-level trigger's
+/// table included.
+#[test]
+fn trigger_row_fields_disagreeing_across_tables_stay_unknown() {
+    let database = postgres(
+        "CREATE TABLE counted (id integer, name integer);
+         CREATE TABLE nameless (id integer);
+         CREATE TABLE items (id integer, name text);
+         CREATE FUNCTION show_name() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN EXECUTE 'SELECT ' || new.name || new.id; RETURN NEW; END $$;
+         CREATE TRIGGER show_counted BEFORE INSERT ON counted FOR EACH ROW EXECUTE FUNCTION show_name();
+         CREATE TRIGGER show_nameless BEFORE INSERT ON nameless FOR EACH ROW EXECUTE FUNCTION show_name();
+         CREATE TRIGGER show_statement BEFORE INSERT ON items FOR EACH STATEMENT EXECUTE FUNCTION show_name();",
+    );
+    assert_eq!(
+        names(&database, "show_name"),
+        [[
+            ("new.name".to_owned(), "?".to_owned()),
+            ("new.id".to_owned(), "pg_catalog.int4".to_owned()),
+        ]]
+    );
+    assert_eq!(
+        row_field_types(&database, "show_name", "new.name"),
+        [
+            ("counted".to_owned(), "pg_catalog.int4".to_owned()),
+            ("nameless".to_owned(), "?".to_owned()),
+            ("items".to_owned(), "pg_catalog.text".to_owned()),
+        ]
+    );
+}
+
+/// The triggers and columns the schema ends with type a trigger function's
+/// row fields, whatever order created them.
+#[test]
+fn trigger_row_fields_follow_later_triggers_and_column_changes() {
+    let database = postgres(
+        "CREATE FUNCTION first() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN EXECUTE 'SELECT ' || new.name; RETURN NEW; END $$;
+         CREATE FUNCTION second() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN EXECUTE 'SELECT ' || new.name; RETURN NEW; END $$;
+         CREATE TABLE a (name integer);
+         CREATE TABLE b (name integer);
+         CREATE TRIGGER on_a BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION first();
+         CREATE TRIGGER on_b BEFORE INSERT ON b FOR EACH ROW EXECUTE FUNCTION second();
+         ALTER TABLE a ALTER COLUMN name TYPE text;
+         CREATE OR REPLACE TRIGGER on_a BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION second();",
+    );
+    assert_eq!(names(&database, "first"), [[("new.name".to_owned(), "?".to_owned())]]);
+    assert_eq!(row_field_types(&database, "first", "new.name"), []);
+    assert_eq!(
+        row_field_types(&database, "second", "new.name"),
+        [
+            ("a".to_owned(), "pg_catalog.text".to_owned()),
+            ("b".to_owned(), "pg_catalog.int4".to_owned()),
+        ]
+    );
+    let dropped = postgres(
+        "CREATE TABLE a (name text);
+         CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN EXECUTE 'SELECT ' || new.name; RETURN NEW; END $$;
+         CREATE TRIGGER on_a BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION f();
+         DROP TRIGGER on_a ON a;",
+    );
+    assert_eq!(names(&dropped, "f"), [[("new.name".to_owned(), "?".to_owned())]]);
+}
+
 /// `%TYPE[]` and `%ROWTYPE[]` declare the array over the copied type with
 /// its modifier, an array's array being the array itself, as PostgreSQL 18
 /// declares them, and a type copied from a view stays unknown.

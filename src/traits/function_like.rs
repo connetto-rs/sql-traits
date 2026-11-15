@@ -18,7 +18,7 @@ use crate::{
         AggregateKind, Deployment, DynamicExecutionSites, FunctionBody, FunctionKind, HelperSet,
         PrivilegeHolder, TargetName, UnqualifiedName,
     },
-    traits::{DatabaseLike, Metadata, Relation},
+    traits::{DatabaseLike, Metadata, Relation, TriggerLike},
     utils::{
         call_typing::{
             accepts_positional, actuals, bind, check_argument_count, declared_at_call, input_modes,
@@ -1366,6 +1366,48 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         database: &'db Self::DB,
     ) -> Result<DynamicExecutionSites<'db, Self::DB>, LookupError> {
         body_dynamic_sites(self, database)
+    }
+
+    /// Returns the triggers that execute the function, row-level and
+    /// statement-level alike, in the order `database` holds them. The reverse
+    /// of [`TriggerLike::function`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE a (id INT);
+    ///      CREATE TABLE b (id INT);
+    ///      CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+    ///      CREATE FUNCTION idle() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+    ///      CREATE TRIGGER on_a BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION touch();
+    ///      CREATE TRIGGER on_b AFTER UPDATE ON b FOR EACH STATEMENT EXECUTE FUNCTION touch();",
+    /// )?;
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .map(|found| found.expect("Function should exist"))
+    /// };
+    /// let names: Vec<&str> = function("touch")?.triggers(&db).map(TriggerLike::name).collect();
+    /// assert_eq!(names, ["on_a", "on_b"]);
+    /// assert_eq!(function("idle")?.triggers(&db).count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn triggers<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Trigger>
+    where
+        Self: 'db,
+    {
+        database.triggers().filter(move |trigger| {
+            trigger.function(database).is_some_and(|function| core::ptr::eq(function, self))
+        })
     }
 
     /// Returns the null-input behavior with PostgreSQL's default folded in.
