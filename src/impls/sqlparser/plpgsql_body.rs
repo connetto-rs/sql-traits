@@ -88,6 +88,9 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 self.branches(&choice.branches, &choice.otherwise)
             }
             Node::Loop(repeated) => self.repeated(repeated),
+            Node::Exit(_) | Node::Return { .. } | Node::Raise(_) | Node::Assert(_) => {
+                transfer_expressions(node).try_for_each(|query| self.expression(query))
+            }
         }
     }
 
@@ -260,6 +263,10 @@ fn each_sql<'s, B>(
             Node::Open(Open::Bound(cursor)) => each_cursor_sql(cursor, visit)?,
             Node::Open(Open::Query { query, .. }) => visit(Embedded::Statement(query), None)?,
             Node::Fetch(_) | Node::Diagnostics(_) => {}
+            Node::Exit(_) | Node::Return { .. } | Node::Raise(_) | Node::Assert(_) => {
+                transfer_expressions(node)
+                    .try_for_each(|query| visit(Embedded::Expression(query), None))?;
+            }
             Node::Block(block) => {
                 defaults(block)
                     .try_for_each(|default| visit(Embedded::Expression(default), None))?;
@@ -324,6 +331,20 @@ fn subscripts(assignment: &Assignment) -> impl Iterator<Item = &Query> {
         .into_iter()
         .flatten()
     })
+}
+
+/// The `SELECT` evaluating each expression an `EXIT`, `CONTINUE`, `RETURN`,
+/// `RAISE` or `ASSERT` evaluates, in the order written, and none for any
+/// other node.
+fn transfer_expressions(node: &Node) -> impl Iterator<Item = &Query> {
+    let (first, arguments, options, last): (_, &[Query], &[Query], _) = match node {
+        Node::Exit(exit) => (exit.condition.as_deref(), &[], &[], None),
+        Node::Return { value } => (value.as_deref(), &[], &[], None),
+        Node::Raise(raise) => (None, &raise.arguments, &raise.options, None),
+        Node::Assert(assert) => (Some(&*assert.condition), &[], &[], assert.message.as_deref()),
+        _ => (None, &[], &[], None),
+    };
+    first.into_iter().chain(arguments).chain(options).chain(last)
 }
 
 fn each_branch_sql<'s, B>(
