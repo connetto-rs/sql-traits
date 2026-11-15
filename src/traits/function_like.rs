@@ -1787,7 +1787,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ) -> Result<bool, LookupError>;
 
     /// What this helper returns for a request of `deployment`, called with
-    /// `arguments`, as a union of grant arms and parent arms, walked down a
+    /// `arguments`, as a union of grant arms and parent arms, walked along a
     /// tree where the body is recursive.
     ///
     /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
@@ -1796,23 +1796,31 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// table it reads, or on every column of it the body names, `USAGE` on
     /// the schema of every table and helper the body names, and exempt from
     /// the row-level security of the tables, and when its body is a `UNION`
-    /// of arms of two shapes, alone or walked down a tree.
+    /// of arms of two shapes, alone or walked along a tree.
     ///
-    /// - A grant arm, `SELECT <column> FROM <table> [WHERE <condition>]`, whose
-    ///   condition joins with `AND` at most one comparison of a column with a
-    ///   value of the request, time bounds, and terms that, the arguments
-    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to the literal
-    ///   values columns have to hold. The comparison is `<column> =
+    /// - A grant arm, `SELECT <column> FROM <table> [WHERE <conditions>]`, the
+    ///   conditions joined by `AND`. At most one of them names the grantee,
+    ///   either a comparison of a column with a value of the request or
+    ///   `<column> IN (SELECT <helper>(<arguments>))`, the helper answered in
+    ///   turn as a parent arm's is. The comparison is `<column> =
     ///   current_setting('<setting>'[, <missing_ok>])` with a setting the
     ///   deployment declares as the caller, or `<column>` compared with each
     ///   element of a setting it declares as a set, unpacked as declared (see
     ///   [`SettingComparison`](crate::structs::SettingComparison)). An arm
-    ///   without one returns the same rows for every request. A time bound is a
+    ///   naming no grantee returns the same rows for every request its gate
+    ///   lets through. Conditions `current_setting('<setting>') <> <text>` and
+    ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
+    ///   the arm on what the setting reads (see
+    ///   [`CallerGate`](crate::structs::CallerGate)). A time bound is a
     ///   conjunct `<column> <comparison> now()`, a `timestamptz` column of the
     ///   table compared with `<`, `<=`, `>` or `>=` either way round,
     ///   optionally `OR <column> IS NULL`, and the arm answers it as a
     ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
-    ///   `transaction_timestamp()` read the same statement time as `now()`.
+    ///   `transaction_timestamp()` read the same statement time as `now()`. The
+    ///   rest, the arguments substituted, reduce to `TRUE`, to `FALSE` or
+    ///   `NULL`, or to the literal values columns have to hold. An arm
+    ///   comparing a helper's set while returning its table's primary key is a
+    ///   parent arm, so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it
@@ -1820,16 +1828,17 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   foreign key or, where it has none, through the table the called
     ///   helper's set covers.
     ///
-    /// A body walking down a tree is `WITH RECURSIVE <walk> [(<column>)] AS
-    /// (<arms> UNION SELECT <key> FROM <table> JOIN <walk> ON <parent
-    /// column> = <walk>.<column>) SELECT <column> FROM <walk>`, the join
-    /// either way round. `<key>` is the table's one-column primary key, and
-    /// `<parent column>` has one single-column foreign key, referencing
-    /// `<key>`. The walk answers a [`WalkArm`](crate::structs::WalkArm) after
-    /// the arms. `UNION ALL` is refused, since it never ends on a tree holding
-    /// a cycle.
+    /// A body walking a tree is `WITH RECURSIVE <walk> [(<column>)] AS
+    /// (<arms> UNION <term>) SELECT <column> FROM <walk>`. The term walks
+    /// down as `SELECT <key> FROM <table> JOIN <walk> ON <parent column> =
+    /// <walk>.<column>` and up as `SELECT <parent column> FROM <table> JOIN
+    /// <walk> ON <key> = <walk>.<column>`, the join either way round. `<key>`
+    /// is the table's one-column primary key, and `<parent column>` has one
+    /// single-column foreign key, referencing `<key>`. The walk answers a
+    /// [`WalkArm`](crate::structs::WalkArm) after the arms. `UNION ALL` is
+    /// refused, since it never ends on a tree holding a cycle.
     ///
-    /// A grant arm whose condition reduces to `FALSE` or `NULL` keeps no row
+    /// A grant arm whose conditions reduce to `FALSE` or `NULL` keeps no row
     /// and is left out, and a walk with it where no other arm remains. A
     /// column named like a parameter is the column, as PostgreSQL resolves
     /// names in a SQL function. An unqualified name is looked up past the
@@ -1882,7 +1891,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     docs_with.helper_set(&[Value::SingleQuotedString("write".into())], &deployment, &db)?;
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
     /// assert_eq!(grant.column().column_name(), "doc_id");
-    /// let request = grant.request().expect("the arm compares with the caller");
+    /// let GrantedTo::Request(request) = grant.granted_to() else { unreachable!() };
     /// assert_eq!(request.column().column_name(), "principal_id");
     /// let [roles] = grant.restrictions() else { panic!("the condition restricts one column") };
     /// assert_eq!(roles.column().column_name(), "role");

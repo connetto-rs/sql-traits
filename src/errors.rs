@@ -1184,11 +1184,9 @@ pub enum HelperSetError {
         /// The setting, as written.
         setting: String,
     },
-    /// The body compares a column to a setting the deployment declares as
-    /// something other than the caller.
-    #[error(
-        "helper `{function}` compares a column to setting `{setting}`, which is not the caller"
-    )]
+    /// A grant arm compares a column with, or gates on, a setting the
+    /// deployment declares as something other than the caller.
+    #[error("helper `{function}` reads setting `{setting}` as the caller, which it is not")]
     SettingNotCaller {
         /// The helper.
         function: String,
@@ -1228,7 +1226,7 @@ pub enum HelperSetError {
         condition: String,
     },
     /// The body is not a `UNION` of grant arms and parent arms, alone or
-    /// walked down a tree by a `WITH RECURSIVE` term.
+    /// walked along a tree by a `WITH RECURSIVE` term.
     #[error(
         "helper `{function}` returns `{arm}`, which is neither a grant arm, a parent arm nor a walk"
     )]
