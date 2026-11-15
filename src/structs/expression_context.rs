@@ -22,7 +22,7 @@ use crate::{
     structs::{
         AggregateKind, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope,
         ExpressionScope, FunctionKind, IdentifierCase, OperandType, OperatorResolution,
-        PlPgSqlScope, PlPgSqlVariable, SelectedOperator, TargetName, VariableKind,
+        PlPgSqlScope, PlPgSqlVariable, QueryOutput, SelectedOperator, TargetName, VariableKind,
         plpgsql_scope::stored_parts,
     },
     traits::{
@@ -35,7 +35,7 @@ use crate::{
             resolve_function, written_argument_names, written_names,
         },
         coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
-        identifier_resolution::identifiers_match,
+        identifier_resolution::{identifiers_match, stored_identifier},
         object_name::{PG_CATALOG, RoutinePath, reaches_unheld_schema},
         operator_typing::resolve_operator,
         postgres_types::PgType,
@@ -577,18 +577,19 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     }
 
     /// The type of the field of `variable` that `expression` names. A field
-    /// of a table's row takes its column's type, and a field of a trigger
+    /// of a table's row takes its column's type, a field of a trigger
     /// function's `NEW` or `OLD` the type every table of
-    /// [`Self::row_field_types`] agrees on. A field of any other record,
-    /// whose fields only the row it holds at run time decides, and a field
-    /// of a field stay unknown.
+    /// [`Self::row_field_types`] agrees on, and a field of a cursor loop's
+    /// record the type of the cursor query's output of that name. A field of
+    /// any other record, whose fields only the row it holds at run time
+    /// decides, and a field of a field stay unknown.
     fn field_type(
         &self,
         variable: &PlPgSqlVariable<'db>,
         expression: &Expr,
     ) -> Result<OperandType<'db>, LookupError> {
+        let Some(field) = self.field(expression) else { return Ok(OperandType::Unknown) };
         if is_trigger_row(variable) {
-            let Some(field) = self.field(expression) else { return Ok(OperandType::Unknown) };
             let mut types =
                 self.trigger_field_types(field)?.into_iter().map(|(_, data_type)| data_type);
             let first = types.next().unwrap_or(OperandType::Unknown);
@@ -598,9 +599,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                 OperandType::Unknown
             });
         }
-        let (Ok(OperandType::Known { type_name, .. }), Some(field)) =
-            (variable.data_type(), self.field(expression))
-        else {
+        if let Some(query) = self.loop_query(variable, expression) {
+            return self.cursor_output_type(query, field);
+        }
+        let Ok(OperandType::Known { type_name, .. }) = variable.data_type() else {
             return Ok(OperandType::Unknown);
         };
         match self.database.table_by_target(type_name.clone(), IdentifierCase::AsWritten)? {
@@ -621,6 +623,20 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             [.., field] if consumed + 1 == parts.len() => Some(field),
             _ => None,
         }
+    }
+
+    /// The query whose rows `variable`, which `expression` reads a field of,
+    /// holds in turn when it is the record a cursor `FOR` loop declares.
+    fn loop_query(
+        &self,
+        variable: &PlPgSqlVariable<'db>,
+        expression: &Expr,
+    ) -> Option<&'query Statement> {
+        if *variable.kind() != VariableKind::LoopRecord {
+            return None;
+        }
+        let Expr::CompoundIdentifier(parts) = expression else { return None };
+        self.variables?.loop_query(&stored_parts(parts))
     }
 
     /// The type of the column `field` names in `table`, unknown when the
@@ -730,6 +746,106 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         tables.into_iter().map(|table| Ok((table, self.column_of(table, field)?))).collect()
     }
 
+    /// The type of the output `field` names of `query`, a cursor's query,
+    /// the first output of that name as a record field reads it. The query
+    /// is read with no variable in reach, since the names it reaches are
+    /// those where the cursor is declared with its parameters, so an output
+    /// reading a variable stays unknown, and so does every output once one
+    /// whose name is not modeled or an unexpanded wildcard comes first.
+    fn cursor_output_type(
+        &self,
+        query: &Statement,
+        field: &Ident,
+    ) -> Result<OperandType<'db>, LookupError> {
+        let Statement::Query(query) = query else { return Ok(OperandType::Unknown) };
+        let context = ExpressionContext::new(query, self.database, self.case)?;
+        let wanted = stored_identifier(&field.value, field.quote_style.is_some());
+        for output in context.query_outputs(query) {
+            match output {
+                QueryOutput::Column { name: Some((name, quoted)), definition } => {
+                    if stored_identifier(name, quoted) == wanted {
+                        // The type borrows from the cursor's context, which
+                        // ends here, so its name is copied out.
+                        return Ok(match context.output_type(definition)? {
+                            OperandType::Known { type_name, typmod } => {
+                                OperandType::Known { type_name: type_name.into_owned(), typmod }
+                            }
+                            _ => OperandType::Unknown,
+                        });
+                    }
+                }
+                QueryOutput::Column { name: None, .. } | QueryOutput::Unexpanded => break,
+            }
+        }
+        Ok(OperandType::Unknown)
+    }
+
+    /// The type of the one column `query` outputs, as a scalar subquery
+    /// takes it, unknown for a query of several columns or of a wildcard
+    /// whose columns are not enumerated.
+    fn subquery_type(&self, query: &Query) -> Result<OperandType<'_>, LookupError> {
+        let mut outputs = self.query_outputs(query);
+        match (outputs.next(), outputs.next()) {
+            (Some(QueryOutput::Column { definition, .. }), None) => self.output_type(definition),
+            _ => Ok(OperandType::Unknown),
+        }
+    }
+
+    /// The outputs of `query`, a query of this context, none for one whose
+    /// outputs the context does not record.
+    fn query_outputs(
+        &self,
+        query: &Query,
+    ) -> impl Iterator<Item = QueryOutput<'_, 'query, 'db, DB>> {
+        self.scope.scope_for_query(query).into_iter().flat_map(|scope| scope.outputs())
+    }
+
+    /// The type of an output column `definition` defines, an untyped literal
+    /// taking `text` as PostgreSQL resolves the unknown outputs of a query.
+    fn output_type<'s>(
+        &'s self,
+        definition: ColumnDefinition<'s, 'query, 'db, DB>,
+    ) -> Result<OperandType<'s>, LookupError> {
+        Ok(match self.definition_type(definition)? {
+            OperandType::UntypedLiteral => catalog("text"),
+            resolved => resolved,
+        })
+    }
+
+    /// The type of the values `definition` defines, unknown for a field of a
+    /// variable, which only the name reading it tells, and for a definition
+    /// this context does not type.
+    fn definition_type<'s>(
+        &'s self,
+        definition: ColumnDefinition<'s, 'query, 'db, DB>,
+    ) -> Result<OperandType<'s>, LookupError> {
+        Ok(match definition {
+            ColumnDefinition::Base { column, database, .. } => {
+                let previous = self.pins.and_then(|pins| {
+                    pins.column_type(column.column_name(), column.column_name_is_quoted())
+                });
+                match previous {
+                    Some(data_type) => declared_type(database, data_type),
+                    None => column_type(database, column.data_type(database)),
+                }
+            }
+            // An output a `SELECT` of this query defines takes the type of its
+            // defining expression.
+            ColumnDefinition::Expression { expression, .. } if self.holds(expression) => {
+                self.type_of(expression)?
+            }
+            ColumnDefinition::Parameter { ordinal, .. } => {
+                self.parameters.get(ordinal).cloned().unwrap_or(OperandType::Unknown)
+            }
+            // A variable whose declared type failed to resolve types as
+            // unknown, the error kept on the variable.
+            ColumnDefinition::Variable(variable) => {
+                variable.data_type().cloned().unwrap_or(OperandType::Unknown)
+            }
+            _ => OperandType::Unknown,
+        })
+    }
+
     /// The rule the clause holding the column reference `expression` resolves
     /// it by, `None` for a node that is no column reference or sits where no
     /// scope was derived.
@@ -750,47 +866,33 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// operand's type as `=` converts it. A call [`Self::call`] answers takes
     /// the result of the function PostgreSQL selects. A `-` over a numeric
     /// literal is the negative constant PostgreSQL's grammar folds it into.
+    /// A scalar subquery takes the type of its one output column. One of
+    /// several columns stays unknown, and so does a set operation, whose
+    /// column takes the common type of its operands.
+    ///
+    /// Under [`ExpressionScope::PlPgSql`] a field of the record a cursor
+    /// `FOR` loop declares takes the type of the cursor query's output of
+    /// that name, an output reading a cursor parameter or any other variable
+    /// staying unknown.
     ///
     /// # Errors
     ///
     /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
-    /// query, and the lookup errors resolving a column reference returns.
+    /// query, and the lookup errors resolving a column reference or a cursor
+    /// query returns.
     pub fn type_of(&self, expression: &Expr) -> Result<OperandType<'_>, LookupError> {
         self.check(expression)?;
         Ok(match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 match self.reference(expression)? {
-                    Some((ColumnDefinition::Base { column, database, .. }, _)) => {
-                        let previous = self.pins.and_then(|pins| {
-                            pins.column_type(column.column_name(), column.column_name_is_quoted())
-                        });
-                        match previous {
-                            Some(data_type) => declared_type(database, data_type),
-                            None => column_type(database, column.data_type(database)),
-                        }
-                    }
-                    // An output a `SELECT` of this query defines takes the
-                    // type of its defining expression.
-                    Some((ColumnDefinition::Expression { expression, .. }, _))
-                        if self.holds(expression) =>
-                    {
-                        self.type_of(expression)?
-                    }
-                    Some((ColumnDefinition::Parameter { ordinal, .. }, _)) => {
-                        self.parameters.get(ordinal).cloned().unwrap_or(OperandType::Unknown)
-                    }
-                    // A variable whose declared type failed to resolve types
-                    // as unknown, the error kept on the variable.
-                    Some((ColumnDefinition::Variable(variable), _)) => {
-                        variable.data_type().cloned().unwrap_or(OperandType::Unknown)
-                    }
                     Some((ColumnDefinition::VariableField(variable), _)) => {
                         self.field_type(&variable, expression)?
                     }
+                    Some((definition, _)) => self.definition_type(definition)?,
                     None => self.domain_value(expression).unwrap_or(OperandType::Unknown),
-                    _ => OperandType::Unknown,
                 }
             }
+            Expr::Subquery(query) => self.subquery_type(query)?,
             Expr::Value(value) => {
                 match &value.value {
                     Value::Placeholder(placeholder) => self.positional(placeholder),

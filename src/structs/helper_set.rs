@@ -170,7 +170,9 @@ impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
 
 /// `current_setting(<caller setting>) <> <value>` for each excluded value,
 /// or `current_setting(<caller setting>) IS NOT NULL`, which keep the arm's
-/// rows only for a setting reading neither `NULL` nor an excluded value.
+/// rows only for a setting reading neither `NULL` nor an excluded value. The
+/// body may cast every read of the setting to its declared type, and then
+/// each value plain or cast to that type.
 ///
 /// A custom setting set for one transaction reads `''` once the transaction
 /// ends, so `IS NOT NULL` holds on a pooled connection that once carried a
@@ -179,6 +181,7 @@ impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
 pub struct CallerGate<'db> {
     pub(crate) setting: &'db SessionSetting,
     pub(crate) raises_when_unset: bool,
+    pub(crate) in_declared_type: bool,
     pub(crate) excluded: Vec<Value>,
 }
 
@@ -196,6 +199,15 @@ impl<'db> CallerGate<'db> {
         self.raises_when_unset
     }
 
+    /// Whether the body casts the setting to its declared type, so each
+    /// excluded value compares with the caller as that type rather than as
+    /// text. As a `uuid`, `'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'` and its
+    /// lower-case spelling exclude the same caller.
+    #[must_use]
+    pub fn compares_in_declared_type(&self) -> bool {
+        self.in_declared_type
+    }
+
     /// The values the setting must differ from, each once, in the order the
     /// body first names them, empty for `IS NOT NULL` alone.
     #[must_use]
@@ -208,12 +220,15 @@ impl<'db> CallerGate<'db> {
 /// compared with each element of a declared set, `<column> = ANY (<array>)` or
 /// `<column> IN (SELECT <elements>)`.
 ///
-/// `<array>` is `string_to_array(current_setting(<set>), <delimiter>)`, the
-/// set packed as [`SetPacking::Delimited`](crate::structs::SetPacking) by
-/// that delimiter, or `ARRAY(SELECT <elements>)`. `<elements>` is
-/// `unnest(<array>)`, or
-/// `jsonb_array_elements_text(current_setting(<set>)::jsonb)`, the set packed
-/// as [`SetPacking::JsonArray`](crate::structs::SetPacking).
+/// `<array>` is `string_to_array(current_setting(<set>),
+/// <delimiter>)[::<element type>[]]`, the set packed as
+/// [`SetPacking::Delimited`](crate::structs::SetPacking) by that delimiter,
+/// or `ARRAY(SELECT <elements>)`. `<elements>` is
+/// `unnest(<array>)[::<element type>]`, or
+/// `jsonb_array_elements_text(current_setting(<set>)::jsonb)[::<element
+/// type>]`, the set packed as
+/// [`SetPacking::JsonArray`](crate::structs::SetPacking). The element type is
+/// the one the deployment declares, written at most once in a read.
 #[derive(Debug)]
 pub struct SettingComparison<'db, DB: DatabaseLike> {
     pub(crate) column: &'db DB::Column,

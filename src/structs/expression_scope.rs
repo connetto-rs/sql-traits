@@ -48,7 +48,9 @@ pub enum ExpressionScope<'s, 'db, DB: DatabaseLike> {
     /// label or the function's name, and `$n` for any argument, output ones
     /// included. A field of a row variable takes its column's type, and a
     /// field of a trigger function's `NEW` or `OLD` the type it has in every
-    /// table a trigger executing the function is defined on.
+    /// table a trigger executing the function is defined on, and a field of a
+    /// cursor loop's record the type of the cursor query's output of that
+    /// name.
     ///
     /// A name a relation of the expression's own queries holds binds that
     /// column, even where it also names a variable. PostgreSQL 18 refuses

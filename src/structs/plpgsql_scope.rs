@@ -2,8 +2,8 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use sqlparser::ast::{ArgMode, Ident};
-use sqlparser_plpgsql::namespace::Namespace;
+use sqlparser::ast::{ArgMode, Ident, Statement};
+use sqlparser_plpgsql::namespace::{NameKind, Namespace};
 
 use crate::{
     errors::LookupError,
@@ -171,6 +171,17 @@ impl<'b, 'db, DB: DatabaseLike> PlPgSqlScope<'b, 'db, DB> {
     pub(crate) fn variable(&self, parts: &[String]) -> Option<(PlPgSqlVariable<'db>, usize)> {
         let (name, consumed) = self.namespace.lookup(parts, |name| self.names.holds_row(name))?;
         Some((self.names.variable(name), consumed))
+    }
+
+    /// Returns the query whose rows the variable the name `parts` writes
+    /// holds in turn, when that variable is the record a cursor `FOR` loop
+    /// declares.
+    pub(crate) fn loop_query(&self, parts: &[String]) -> Option<&Statement> {
+        let (name, _) = self.namespace.lookup(parts, |name| self.names.holds_row(name))?;
+        match name.kind() {
+            NameKind::LoopRecord { query, .. } => Some(query),
+            _ => None,
+        }
     }
 
     /// The path the body runs the expression under.

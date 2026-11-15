@@ -3,7 +3,7 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     Expr, Ident, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
-    Values, Visitor,
+    Values, Visit, Visitor,
 };
 
 use super::{
@@ -175,7 +175,12 @@ fn values_entries<'query, 'db>(values: &Values) -> Vec<OutputEntry<'query, 'db>>
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
-    pub(crate) fn record_outputs(&mut self, query: &Query) -> Result<(), LookupError> {
+    /// Records the outputs of every `SELECT` scope derived so far and of
+    /// every query `root` holds, itself included when it is one.
+    pub(crate) fn record_outputs<N: Visit + ?Sized>(
+        &mut self,
+        root: &N,
+    ) -> Result<(), LookupError> {
         for scope in (0..self.graph.scopes.len()).map(ScopeId) {
             if let Some(select) = self.graph.scopes[scope.0].select {
                 self.graph.scopes[scope.0].outputs = self.select_outputs(scope, select)?;
@@ -183,7 +188,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
         }
         self.graph.select_index.sort_by_key(|entry| entry.address);
         let mut collector = QueryCollector { derivation: self, queries: BTreeMap::new() };
-        let _: ControlFlow<()> = walk(query, &mut collector);
+        let _: ControlFlow<()> = walk(root, &mut collector);
         let queries = collector.queries;
         self.graph.queries =
             queries.into_iter().map(|(address, outputs)| QueryNode { address, outputs }).collect();

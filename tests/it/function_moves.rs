@@ -211,7 +211,10 @@ fn a_call_reaching_a_moved_and_a_staying_function_is_refused() {
     let overloads = "CREATE SCHEMA s;
          CREATE FUNCTION s.f(x INT) RETURNS INT AS 'SELECT x';
          CREATE FUNCTION s.f(x TEXT) RETURNS INT AS 'SELECT 1';";
-    let unsettled = format!("{overloads} CREATE VIEW v AS SELECT s.f((SELECT 1)) AS one;");
+    let unsettled = format!(
+        "{overloads} CREATE VIEW tv AS SELECT 1 AS a;
+         CREATE RULE rv AS ON INSERT TO tv DO INSTEAD SELECT s.f(new.a);"
+    );
     let result = parse(&format!("{unsettled} ALTER FUNCTION s.f(INT) RENAME TO g;"));
     assert!(
         matches!(&result, Err(Error::MovedFunctionCallAmbiguous { function_name, .. }) if function_name == "f"),

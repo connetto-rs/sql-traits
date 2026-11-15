@@ -52,8 +52,8 @@ fn rendered(operand: &OperandType<'_>) -> String {
     }
 }
 
-/// Every name and `$n` the command of each site of `name` writes, with the
-/// type it takes there.
+/// Every name, `$n` and scalar subquery the command of each site of `name`
+/// writes, with the type it takes there.
 fn names(database: &ParserDB, name: &str) -> Vec<Vec<(String, String)>> {
     let body = function(database, name).dynamic_execution_sites(database).unwrap();
     body.sites()
@@ -67,6 +67,7 @@ fn names(database: &ParserDB, name: &str) -> Vec<Vec<(String, String)>> {
                     expression,
                     Expr::Identifier(_)
                         | Expr::CompoundIdentifier(_)
+                        | Expr::Subquery(_)
                         | Expr::Value(sqlparser::ast::ValueWithSpan {
                             value: Value::Placeholder(_),
                             ..
@@ -429,6 +430,52 @@ fn an_alias_of_a_loop_variable_answers_the_loop_name() {
     assert_eq!(
         variable(&database, "recorded", "b"),
         Some((VariableKind::LoopRecord, "r".to_owned()))
+    );
+}
+
+/// A field of a cursor loop's record takes the type of the cursor query's
+/// output of that name, an untyped literal's being `text`, and a scalar
+/// subquery the type of its one output, as PostgreSQL 18 reports with
+/// `pg_typeof`. The cursor query reaches no variable, so an output reading
+/// the cursor's parameter stays unknown rather than taking the type of a
+/// body variable of the same name, and so does a field the query does not
+/// output. A wildcard whose columns are unknown may output the field before
+/// the column of that name, so every field after it stays unknown too.
+#[test]
+fn cursor_loop_fields_and_scalar_subqueries_take_their_output_types() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE FUNCTION looped() RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE
+          k integer;
+          source CURSOR (k text) FOR SELECT name, seen, k AS shadow, 'x' AS lit FROM audit;
+          spread CURSOR FOR SELECT g.*, name FROM generate_series(1, 2) AS g, audit;
+         BEGIN
+          FOR rec IN source('x') LOOP
+           EXECUTE 'SELECT ' || rec.name || rec.seen || rec.shadow || rec.lit || rec.missing;
+          END LOOP;
+          EXECUTE 'SELECT ' || (SELECT name FROM audit) || (SELECT k);
+          FOR rec IN spread LOOP EXECUTE 'SELECT ' || rec.name; END LOOP;
+         END $$;",
+    );
+    assert_eq!(
+        names(&database, "looped"),
+        [
+            vec![
+                ("rec.name".to_owned(), "pg_catalog.text".to_owned()),
+                ("rec.seen".to_owned(), "pg_catalog.int4".to_owned()),
+                ("rec.shadow".to_owned(), "?".to_owned()),
+                ("rec.lit".to_owned(), "pg_catalog.text".to_owned()),
+                ("rec.missing".to_owned(), "?".to_owned()),
+            ],
+            vec![
+                ("(SELECT name FROM audit)".to_owned(), "pg_catalog.text".to_owned()),
+                ("name".to_owned(), "pg_catalog.text".to_owned()),
+                ("(SELECT k)".to_owned(), "pg_catalog.int4".to_owned()),
+                ("k".to_owned(), "pg_catalog.int4".to_owned()),
+            ],
+            vec![("rec.name".to_owned(), "?".to_owned())],
+        ]
     );
 }
 
