@@ -1500,7 +1500,7 @@ fn a_caller_read_cast_to_any_other_type_refuses_the_answer() {
     let cast = |sql: &str, caller: DataType| {
         matches!(
             blocked_by(sql, caller, render),
-            Err(HelperSetError::CallerCast { setting, .. }) if setting == "app.user_id"
+            Err(HelperSetError::SettingCast { setting, .. }) if setting == "app.user_id"
         )
     };
     let read = "current_setting('app.user_id', true)::uuid";
@@ -1521,6 +1521,116 @@ fn a_caller_read_cast_to_any_other_type_refuses_the_answer() {
         let answered = blocked_by(&blocking(path, read, shadow), DataType::Uuid, render);
         assert_eq!(answered.as_deref(), Ok(BLOCKING_ARM), "{path}: {read}");
     }
+}
+
+/// A helper over `UUID` share links keeping those `condition` keeps, under
+/// `path`.
+fn presenting(path: &str, condition: &str, after: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE TABLE share_links (id UUID PRIMARY KEY);
+         GRANT SELECT ON share_links TO authz_owner;
+         {after}
+         CREATE FUNCTION authz.presented_links() RETURNS SETOF UUID
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = {path} AS $$
+           SELECT l.id FROM public.share_links l WHERE {condition}
+         $$;
+         ALTER FUNCTION authz.presented_links() OWNER TO authz_owner;"
+    )
+}
+
+/// What `authz.presented_links` in `sql` answers, `app.link_ids` declared
+/// as a set of `element` packed as `packing`.
+fn presented(sql: &str, element: DataType, packing: SetPacking) -> Result<String, HelperSetError> {
+    let database = postgres(sql);
+    let setting = SessionSetting::value("app.link_ids", SettingValue::Set { element, packing })
+        .expect("a custom setting name");
+    let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
+    answer(&database, &deployment, "authz", "presented_links", &[]).map(|set| render(&set))
+}
+
+const PRESENTED_ARM: &str = "share_links.id WHERE id IN app.link_ids";
+
+const SPLIT: &str = "string_to_array(current_setting('app.link_ids', true), ',')";
+const ELEMENTS: &str = "jsonb_array_elements_text(current_setting('app.link_ids', true)::jsonb)";
+
+/// What `presented_links` answers for `condition`, `app.link_ids` declared
+/// as a set of `element`, packed as a JSON array where `condition` reads it
+/// through `ELEMENTS` and delimited by commas elsewhere.
+fn presented_for(condition: &str, element: DataType) -> Result<String, HelperSetError> {
+    let packing = if condition.contains(ELEMENTS) {
+        SetPacking::JsonArray
+    } else {
+        SetPacking::Delimited(",".into())
+    };
+    presented(&presenting("''", condition, ""), element, packing)
+}
+
+#[test]
+fn a_set_unpacked_as_its_declared_element_type_reads_the_set() {
+    for condition in [
+        format!("l.id = ANY ({SPLIT}::uuid[])"),
+        format!("l.id = ANY (CAST({SPLIT} AS UUID[]))"),
+        format!("l.id = ANY (({SPLIT})::uuid[])"),
+        format!("l.id = ANY (pg_catalog.{SPLIT}::pg_catalog.uuid[])"),
+        format!("l.id IN (SELECT unnest({SPLIT}::uuid[]))"),
+        format!("l.id = ANY (ARRAY(SELECT unnest({SPLIT}::uuid[])))"),
+        format!("l.id IN (SELECT unnest({SPLIT})::uuid)"),
+        format!("l.id = ANY (ARRAY(SELECT CAST(unnest({SPLIT}) AS uuid)))"),
+        format!("l.id IN (SELECT {ELEMENTS}::uuid)"),
+        format!("l.id = ANY (ARRAY(SELECT {ELEMENTS}::uuid))"),
+    ] {
+        assert_eq!(
+            presented_for(&condition, DataType::Uuid).as_deref(),
+            Ok(PRESENTED_ARM),
+            "{condition}"
+        );
+    }
+}
+
+#[test]
+fn a_set_unpacked_as_any_other_type_refuses_the_answer() {
+    let cast = |result: Result<String, HelperSetError>| {
+        matches!(
+            result,
+            Err(HelperSetError::SettingCast { setting, .. }) if setting == "app.link_ids"
+        )
+    };
+    let uuids = format!("l.id = ANY ({SPLIT}::uuid[])");
+    assert!(cast(presented_for(&uuids, DataType::Text)), "a text set cast to uuid[]");
+    for condition in [
+        format!("l.id = ANY ({SPLIT}::text[])"),
+        format!("l.id IN (SELECT unnest({SPLIT}::varchar(36)[]))"),
+        format!("l.id IN (SELECT unnest({SPLIT})::uuid[])"),
+        format!("l.id IN (SELECT {ELEMENTS}::text)"),
+    ] {
+        assert!(cast(presented_for(&condition, DataType::Uuid)), "{condition}");
+    }
+    let shadow = "CREATE DOMAIN public.uuid AS pg_catalog.uuid CHECK (VALUE IS NOT NULL);";
+    let comma = SetPacking::Delimited(",".into());
+    assert!(
+        cast(presented(&presenting("public, pg_catalog", &uuids, shadow), DataType::Uuid, comma)),
+        "a uuid the path finds before pg_catalog's is not the declared element type"
+    );
+    for condition in [
+        format!("l.id = ANY ({SPLIT}::uuid)"),
+        format!("l.id = ANY (ARRAY(SELECT unnest({SPLIT}))::uuid[])"),
+    ] {
+        assert!(
+            matches!(
+                presented_for(&condition, DataType::Uuid),
+                Err(HelperSetError::Irreducible { .. })
+            ),
+            "{condition}"
+        );
+    }
+    let twice = format!("l.id IN (SELECT unnest({SPLIT}::uuid[])::uuid)");
+    assert!(
+        matches!(presented_for(&twice, DataType::Uuid), Err(HelperSetError::ArmShape { .. })),
+        "a read casting its elements twice unpacks no set"
+    );
 }
 
 #[test]
@@ -2763,6 +2873,110 @@ fn a_gate_on_the_caller_setting_excludes_the_values_it_compares_with() {
             Err(HelperSetError::SettingNotCaller { setting, .. }) if setting == "app.team_ids"
         ),
         "a gate reads a caller setting"
+    );
+}
+
+/// A helper over `UUID` grantees returning the signed-in grantee behind
+/// `gate`, under `path`.
+fn signing(path: &str, gate: &str, after: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE TABLE grantees (id UUID PRIMARY KEY, kind TEXT NOT NULL);
+         GRANT SELECT ON grantees TO authz_owner;
+         {after}
+         CREATE FUNCTION authz.signed_in() RETURNS SETOF UUID
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = {path} AS $$
+           SELECT g.id FROM public.grantees g WHERE g.kind = 'signed_in' AND {gate}
+         $$;
+         ALTER FUNCTION authz.signed_in() OWNER TO authz_owner;"
+    )
+}
+
+/// Whether a gate raises when unset, whether it compares in the declared
+/// type, and the values it excludes.
+type SignedInGate = Option<(bool, bool, Vec<String>)>;
+
+/// The gate `authz.signed_in` in `sql` reads, the caller declared as a
+/// `uuid`.
+fn signed_in_gate(sql: &str) -> Result<SignedInGate, HelperSetError> {
+    let database = postgres(sql);
+    let setting = SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Uuid))
+        .expect("a custom setting name");
+    let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
+    let set = answer(&database, &deployment, "authz", "signed_in", &[])?;
+    let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+    Ok(grant.gate().map(|gate| {
+        let excluded = gate.excluded().iter().map(ToString::to_string).collect();
+        (gate.raises_when_unset(), gate.compares_in_declared_type(), excluded)
+    }))
+}
+
+const NIL: &str = "'00000000-0000-0000-0000-000000000000'";
+const CALLER: &str = "current_setting('app.user_id', true)";
+
+#[test]
+fn a_gate_on_the_caller_cast_to_its_declared_type_compares_in_that_type() {
+    for (gate, raises, in_declared_type, excluded) in [
+        (format!("{CALLER}::uuid <> {NIL}"), false, true, vec![NIL]),
+        (format!("{CALLER}::uuid <> {NIL}::uuid"), false, true, vec![NIL]),
+        (
+            format!("CAST({NIL} AS UUID) <> current_setting('app.user_id')::uuid"),
+            true,
+            true,
+            vec![NIL],
+        ),
+        (
+            format!("pg_catalog.{CALLER}::pg_catalog.uuid <> {NIL}::pg_catalog.uuid"),
+            false,
+            true,
+            vec![NIL],
+        ),
+        (format!("{CALLER}::uuid IS NOT NULL"), false, true, vec![]),
+        (format!("{CALLER}::uuid IS NOT NULL AND {CALLER}::uuid <> {NIL}"), false, true, vec![NIL]),
+        (format!("{CALLER} <> {NIL}"), false, false, vec![NIL]),
+    ] {
+        let excluded = excluded.into_iter().map(str::to_string).collect();
+        assert_eq!(
+            signed_in_gate(&signing("''", &gate, "")),
+            Ok(Some((raises, in_declared_type, excluded))),
+            "{gate}"
+        );
+    }
+}
+
+#[test]
+fn a_gate_on_the_caller_cast_to_any_other_type_refuses_the_answer() {
+    let cast = |sql: &str| {
+        matches!(
+            signed_in_gate(sql),
+            Err(HelperSetError::SettingCast { setting, .. }) if setting == "app.user_id"
+        )
+    };
+    assert!(cast(&signing("''", &format!("{CALLER}::text <> {NIL}"), "")));
+    let shadow = "CREATE DOMAIN public.uuid AS pg_catalog.uuid CHECK (VALUE IS NOT NULL);";
+    assert!(
+        cast(&signing("public, pg_catalog", &format!("{CALLER}::uuid <> {NIL}"), shadow)),
+        "a uuid the path finds before pg_catalog's is not the declared type"
+    );
+    for gate in [
+        format!("{CALLER} <> {NIL}::uuid"),
+        format!("{CALLER}::uuid <> {NIL}::text"),
+        format!("{CALLER}::uuid <> 0"),
+    ] {
+        assert!(
+            matches!(
+                signed_in_gate(&signing("''", &gate, "")),
+                Err(HelperSetError::Irreducible { .. })
+            ),
+            "{gate}"
+        );
+    }
+    let mixed = format!("{CALLER}::uuid <> {NIL} AND {CALLER} IS NOT NULL");
+    assert!(
+        matches!(signed_in_gate(&signing("''", &mixed, "")), Err(HelperSetError::ArmShape { .. })),
+        "a gate reads the caller in one type"
     );
 }
 
