@@ -329,6 +329,37 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn argument_modes(&self) -> impl Iterator<Item = ArgMode>;
 
+    /// Returns the name and normalized type name of each column a
+    /// `RETURNS TABLE` clause declares, in declaration order, and nothing
+    /// for any other result.
+    ///
+    /// PostgreSQL stores these columns after the arguments in
+    /// `pg_proc.proargnames` with mode `t`, so a PL/pgSQL body reaches each
+    /// as an output parameter.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION f(a INT) RETURNS TABLE (\"Total\" BIGINT) LANGUAGE sql AS 'SELECT 1';",
+    /// )?;
+    /// let f = db
+    ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let columns: Vec<_> = f.returned_columns(&db).collect();
+    /// assert_eq!(columns, [(TargetName::new("Total", true), "BIGINT".into())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn returned_columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)>;
+
     /// Returns how many of the trailing input arguments carry a default,
     /// mirroring `pg_proc.pronargdefaults`. A call may leave those out.
     ///
