@@ -43,6 +43,9 @@ pub enum VariableKind {
     },
     /// A cursor a `DECLARE` section binds to a query, a `refcursor`.
     Cursor,
+    /// A parameter of a cursor declared with its query, which only that
+    /// query reads.
+    CursorParameter,
     /// The integer index a `FOR index IN lower .. upper` loop declares for its
     /// body.
     LoopIndex,
@@ -221,8 +224,8 @@ impl<'db, DB: DatabaseLike> DynamicExecutionSites<'db, DB> {
     /// # Errors
     ///
     /// Returns [`LookupError::FunctionBodyUnresolvable`] for an `ALIAS FOR`
-    /// naming no variable, and the errors reading the path a statement of
-    /// the body sets.
+    /// naming no variable and for an `OPEN` naming no cursor declared with a
+    /// query, and the errors reading the path a statement of the body sets.
     pub fn sites(&self) -> Result<Vec<DynamicExecution<'_, 'db, DB>>, LookupError> {
         let Some(block) = &self.block else { return Ok(Vec::new()) };
         dynamic_sites(&self.names, block, self.hex_strings_may_be_integers)

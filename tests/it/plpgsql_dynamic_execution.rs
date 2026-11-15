@@ -649,6 +649,48 @@ fn a_constant_do_block_hides_the_path_from_later_sites() {
     assert_eq!(last, ["?", "pg_catalog"]);
 }
 
+/// A cursor opened in a branch runs its query there, so a query calling
+/// code that may set the path leaves later sites under no known path.
+#[test]
+fn a_cursor_opened_in_a_branch_hides_the_path_from_later_sites() {
+    let database = postgres(
+        "CREATE SCHEMA evil;
+         CREATE FUNCTION evil.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1';
+         CREATE FUNCTION side() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION via_open(flag boolean, p text) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE c CURSOR FOR SELECT side();
+         BEGIN
+          IF flag THEN OPEN c; END IF;
+          EXECUTE 'SELECT ' || quote_ident(p) || quote_literal(p);
+         END $$;",
+    );
+    let last = called_schemas(&database, "via_open").pop().unwrap();
+    assert_eq!(last, ["?", "pg_catalog"]);
+}
+
+/// `OPEN outer.c` under a record named `outer` reads a field of the record,
+/// which is no cursor, so the body is refused, as PostgreSQL 18 refuses to
+/// compile it.
+#[test]
+fn opening_a_field_of_a_record_hiding_a_label_refuses_the_body() {
+    let database = postgres(
+        "CREATE FUNCTION hidden() RETURNS void LANGUAGE plpgsql AS $$
+         <<outer>> DECLARE c CURSOR FOR SELECT 1;
+         BEGIN
+          DECLARE outer record; BEGIN OPEN outer.c; END;
+         END $$;",
+    );
+    let refused = sites(&database, "hidden");
+    assert!(
+        matches!(
+            &refused,
+            Err(LookupError::FunctionBodyUnresolvable { function, statement })
+                if function == "hidden" && statement == "OPEN outer.c"
+        ),
+        "{refused:?}"
+    );
+}
+
 /// A constant command PostgreSQL 18 only refuses when it runs leaves the
 /// path unknown after the branch holding it, and the function keeps its
 /// sites.

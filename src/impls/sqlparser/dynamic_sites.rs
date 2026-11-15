@@ -11,7 +11,7 @@ use alloc::{
 use sqlparser::ast::{ArgMode, ObjectName, Statement};
 use sqlparser_plpgsql::{
     embedded::{Block, DeclarationKind, DeclaredType, Dynamic, expression},
-    namespace::{self, FunctionKind, Name, NameKind, Signature, TriggerVariable},
+    namespace::{self, FunctionKind, Name, NameKind, Signature, Sql, TriggerVariable},
 };
 
 use super::{
@@ -157,6 +157,9 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
                 };
                 (declaration.name.clone(), kind)
             }
+            NameKind::CursorParameter { parameter, .. } => {
+                (parameter.name.clone(), VariableKind::CursorParameter)
+            }
             NameKind::LoopIndex { variable } => (variable.clone(), VariableKind::LoopIndex),
             NameKind::LoopRecord { variable, .. } => (variable.clone(), VariableKind::LoopRecord),
             NameKind::SqlState => ("sqlstate".into(), VariableKind::Handler),
@@ -198,6 +201,9 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
                     }
                     DeclarationKind::Cursor(_) | DeclarationKind::Alias(_) => named("refcursor"),
                 }
+            }
+            NameKind::CursorParameter { parameter, type_of } => {
+                self.declared_type(&parameter.data_type, type_of.as_deref())?
             }
             NameKind::LoopIndex { .. } => named("integer"),
             NameKind::LoopRecord { .. } => named("record"),
@@ -307,22 +313,24 @@ const fn trigger_type(variable: TriggerVariable) -> &'static str {
 /// # Errors
 ///
 /// Returns [`LookupError::FunctionBodyUnresolvable`] for an `ALIAS FOR`
-/// naming no variable, and the errors reading the path a statement of the
-/// body sets.
+/// naming no variable and for an `OPEN` naming no cursor declared with a
+/// query, and the errors reading the path a statement of the body sets.
 pub(crate) fn dynamic_sites<'b, 'db, DB: DatabaseLike>(
     names: &'b BodyNames<'db, DB>,
     block: &'b Block,
     hex_strings_may_be_integers: bool,
 ) -> Result<Vec<DynamicExecution<'b, 'db, DB>>, LookupError> {
     let function = names.function.name();
-    let sites =
-        block.dynamic_sites(&names.signature(), |name| names.holds_row(name)).map_err(|error| {
-            match error {
-                namespace::Error::UnknownAliasTarget { alias, target } => {
-                    unresolvable(function, &format_args!("{alias} ALIAS FOR {target}"))
-                }
+    let sites = block.sites(&names.signature(), |name| names.holds_row(name)).map_err(|error| {
+        match error {
+            namespace::Error::UnknownAliasTarget { alias, target } => {
+                unresolvable(function, &format_args!("{alias} ALIAS FOR {target}"))
             }
-        })?;
+            namespace::Error::UnboundCursor { name } => {
+                unresolvable(function, &format_args!("OPEN {name}"))
+            }
+        }
+    })?;
     let mut collector = PathCollector {
         function,
         database: names.database,
@@ -331,14 +339,17 @@ pub(crate) fn dynamic_sites<'b, 'db, DB: DatabaseLike>(
         paths: Vec::new(),
     };
     walk_body(function, RunTimeBody::PlPgSql(block), &mut collector, hex_strings_may_be_integers)?;
-    Ok(sites
-        .into_iter()
+    let dynamic_sites = sites.into_iter().filter_map(|site| {
+        let Sql::Dynamic(dynamic) = site.sql else { return None };
+        Some((dynamic, site.namespace))
+    });
+    Ok(dynamic_sites
         .zip(collector.paths)
-        .map(|(site, (dynamic, path))| {
-            debug_assert!(core::ptr::eq(site.dynamic, dynamic), "sites pair in body order");
-            let arguments = site.dynamic.arguments.iter().map(expression).collect();
-            let scope = PlPgSqlScope::new(names, site.namespace, path);
-            DynamicExecution::new(expression(&site.dynamic.command), arguments, scope)
+        .map(|((dynamic, namespace), (walked, path))| {
+            debug_assert!(core::ptr::eq(dynamic, walked), "sites pair in body order");
+            let arguments = dynamic.arguments.iter().map(expression).collect();
+            let scope = PlPgSqlScope::new(names, namespace, path);
+            DynamicExecution::new(expression(&dynamic.command), arguments, scope)
         })
         .collect())
 }
