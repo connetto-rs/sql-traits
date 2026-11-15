@@ -367,10 +367,10 @@ fn alter_policy_reads_the_clauses_it_writes_in_the_zone_it_runs_in() -> Result<(
 }
 
 /// A clause's text, with the error it carries when it is written.
-fn clause(expression: Option<PolicyExpression<'_>>) -> (String, Option<LookupError>) {
+fn clause(expression: Option<ClauseExpression<'_>>) -> (String, Option<LookupError>) {
     match expression.expect("the clause exists") {
-        PolicyExpression::Stored(expression) => (expression.to_string(), None),
-        PolicyExpression::Written { expression, unreadable } => {
+        ClauseExpression::Stored(expression) => (expression.to_string(), None),
+        ClauseExpression::Written { expression, unreadable } => {
             (expression.to_string(), Some(unreadable))
         }
     }

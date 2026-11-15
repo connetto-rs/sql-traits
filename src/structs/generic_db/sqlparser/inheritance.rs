@@ -29,6 +29,7 @@ use super::{
 };
 use crate::{
     errors::Error,
+    structs::{TableAttribute, metadata::CheckLiterals},
     traits::TableLike,
     utils::{identifier_resolution::stored_ident_name, is_identity, walk::walk_expressions_mut},
 };
@@ -1122,6 +1123,32 @@ pub(super) struct Inherited {
     pub(super) unvalidated_constraints: Vec<String>,
     /// Metadata copied with inherited columns.
     pub(super) column_metadata: Vec<super::PreservedColumnMetadata>,
+    /// Each check received, with how the parent's check had its literals
+    /// read, since the copy holds the values the parent stored.
+    pub(super) checks: Vec<(CheckConstraint, CheckLiterals)>,
+}
+
+/// Records `copy`, the child's copy of a check `parent` holds, with how the
+/// parent's check had its literals read.
+///
+/// The parent may hold the same check twice, read in different sessions, so
+/// each of its checks answers one copy, in the order they were created.
+fn receive_check(
+    builder: &ParserDBBuilder,
+    parent: &CreateTable,
+    copy: &CheckConstraint,
+    answered: &mut Vec<usize>,
+    checks: &mut Vec<(CheckConstraint, CheckLiterals)>,
+) {
+    let found = builder.check_constraints().iter().enumerate().find(|(index, (held, _))| {
+        core::ptr::eq(TableAttribute::table(held.as_ref()), parent)
+            && held.attribute() == copy
+            && !answered.contains(index)
+    });
+    if let Some((index, (_, metadata))) = found {
+        answered.push(index);
+        checks.push((copy.clone(), metadata.literals().clone()));
+    }
 }
 
 /// Copies one constraint from a parent into the child's list.
@@ -1256,6 +1283,8 @@ pub(super) fn apply_parents(
     let mut columns: Vec<ColumnDef> = Vec::new();
     let mut column_metadata: Vec<super::PreservedColumnMetadata> = Vec::new();
     let mut constraints: Vec<TableConstraint> = Vec::new();
+    let mut checks: Vec<(CheckConstraint, CheckLiterals)> = Vec::new();
+    let mut answered: Vec<usize> = Vec::new();
 
     let context =
         ParentApplication::new(builder, &parents, &child_name, collations, catalog, &search_path);
@@ -1268,6 +1297,11 @@ pub(super) fn apply_parents(
             // already taken, keeping the position the first parent gave it.
             if !columns.iter().any(|held| same_column(&held.name, &column.name)) {
                 let inherited = inherited_column(builder, *kind, create_table, column, &mut taken);
+                for option in &inherited.options {
+                    if let ColumnOption::Check(check) = &option.option {
+                        receive_check(builder, parent, check, &mut answered, &mut checks);
+                    }
+                }
                 if let Some(metadata) =
                     inherited_column_metadata(builder, parent, column, &inherited)
                 {
@@ -1290,6 +1324,7 @@ pub(super) fn apply_parents(
         }
 
         for constraint in &parent.constraints {
+            let held = constraints.len();
             copy_parent_constraint(
                 builder,
                 *kind,
@@ -1299,6 +1334,9 @@ pub(super) fn apply_parents(
                 &mut constraints,
                 &child_name,
             )?;
+            if let Some(TableConstraint::Check(copy)) = constraints.get(held) {
+                receive_check(builder, parent, copy, &mut answered, &mut checks);
+            }
         }
     }
 
@@ -1329,6 +1367,7 @@ pub(super) fn apply_parents(
         constraints: constraints.iter().map(TableConstraint::to_string).collect(),
         unvalidated_constraints: unvalidated_copies(builder, &parents, &constraints),
         column_metadata,
+        checks,
     };
 
     create_table.columns = columns;

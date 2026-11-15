@@ -7,7 +7,10 @@ use sqlparser::ast::{CheckConstraint, CreateTable, Expr, Function};
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ConstraintObject, ParserDB, TableAttribute, metadata::CheckMetadata},
+    structs::{
+        ClauseExpression, ConstraintObject, ParserDB, TableAttribute,
+        metadata::{CheckLiterals, CheckMetadata},
+    },
     traits::{CheckConstraintLike, DatabaseLike, Metadata, TableLike},
 };
 
@@ -34,9 +37,32 @@ fn check_constraint_metadata<'db>(
 impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
     type DB = ParserDB;
 
+    fn check_clause<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<ClauseExpression<'db>, LookupError> {
+        let metadata = check_constraint_metadata(self, database)?;
+        let expression = metadata.expression();
+        Ok(match metadata.literals() {
+            CheckLiterals::Unreadable(literal) => {
+                let check = self.constraint_name(database)?.map(Cow::into_owned);
+                ClauseExpression::Written {
+                    expression,
+                    unreadable: literal.check_error(self.table().table_name(), check),
+                }
+            }
+            CheckLiterals::Pending | CheckLiterals::AsWritten | CheckLiterals::Stored(_) => {
+                ClauseExpression::Stored(expression)
+            }
+        })
+    }
+
     #[inline]
-    fn expression<'db>(&'db self, _database: &'db Self::DB) -> &'db Expr {
-        self.attribute().expr.as_ref()
+    fn written_expression<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError> {
+        Ok(Some(self.attribute().expr.as_ref()))
     }
 
     #[inline]
@@ -90,9 +116,13 @@ impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
-        check_constraint_metadata(self, database)?
-            .calls()
-            .reached_by(self.expression(database), call)
+        // A call stands at the same place among the calls of the written
+        // check as in the stored one.
+        let metadata = check_constraint_metadata(self, database)?;
+        let calls = metadata.calls();
+        calls
+            .reached_by(self.attribute().expr.as_ref(), call)
+            .or_else(|| calls.reached_by(metadata.expression(), call))
             .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })
     }
 }

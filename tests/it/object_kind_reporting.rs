@@ -79,7 +79,7 @@ fn check_constraint_over<'db>(
     table
         .check_constraints(database)
         .expect("table is in this database")
-        .find(|check| check.expression(database).to_string() == expression)
+        .find(|check| check.expression(database).expect("check is held").to_string() == expression)
         .expect("table declares a check constraint enforcing that expression")
 }
 
@@ -156,6 +156,10 @@ fn a_named_check_constraint_reports_itself_by_name() {
     );
     assert_eq!(
         check.functions(&other).err(),
+        Some(ObjectKind::CheckConstraint.not_in_database("ck_named"))
+    );
+    assert_eq!(
+        check.expression(&other).err(),
         Some(ObjectKind::CheckConstraint.not_in_database("ck_named"))
     );
 }

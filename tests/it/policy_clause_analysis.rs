@@ -90,7 +90,7 @@ fn unreadable_stored_check_blocks_using_fallback() {
     );
     assert!(matches!(
         analysis.clause(PolicyClause::WithCheck),
-        Some(PolicyExpression::Written { .. })
+        Some(ClauseExpression::Written { .. })
     ));
     let docs = policy.table(&db).expect("docs");
     let runtime = docs

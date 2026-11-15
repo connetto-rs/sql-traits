@@ -358,7 +358,7 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
                             expressions.extend(
                                 analysis
                                     .clause(source)
-                                    .map(crate::structs::PolicyExpression::expression),
+                                    .map(crate::structs::ClauseExpression::expression),
                             );
                         }
                     }

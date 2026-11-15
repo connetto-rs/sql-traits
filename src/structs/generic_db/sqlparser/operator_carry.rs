@@ -16,8 +16,8 @@ use alloc::{
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateFunction, DataType, Expr, Ident, ObjectName, ObjectNamePart,
-    Visit, VisitMut, VisitorMut,
+    CheckConstraint, ColumnDef, ColumnOption, CreateFunction, DataType, Expr, Ident, ObjectName,
+    ObjectNamePart, Visit, VisitMut, VisitorMut,
 };
 
 use super::function_dependents::call_count;
@@ -25,7 +25,7 @@ use crate::{
     structs::{
         ColumnIdentity, IdentifierCase,
         metadata::{
-            CarriedNodes, ExpressionCalls, NodeState, OperatorNode, WrittenPins,
+            CarriedNodes, CheckLiterals, ExpressionCalls, NodeState, OperatorNode, WrittenPins,
             operator_node_count,
         },
     },
@@ -79,6 +79,8 @@ struct Entry {
     /// every other name blanked.
     shape: String,
     selections: Selections,
+    /// How the literals of a check were read, for a check's entry.
+    literals: Option<CheckLiterals>,
 }
 
 /// The selections a rebuild carries, and what the rebuilding statement
@@ -102,6 +104,9 @@ pub(super) struct CarriedOperators {
     /// The column whose default or generation expression the statement
     /// writes anew.
     written: Option<(Ident, Kind)>,
+    /// The checks a table being created receives from its parents, each with
+    /// how the parent's check had its literals read.
+    received: Vec<(CheckConstraint, CheckLiterals)>,
     case: IdentifierCase,
 }
 
@@ -124,6 +129,7 @@ impl CarriedOperators {
             check_names: (Vec::new(), 0),
             retyped: None,
             written: None,
+            received: Vec::new(),
             case,
         }
     }
@@ -133,6 +139,19 @@ impl CarriedOperators {
     pub(super) fn rebuild(&mut self, columns: Columns, check_names: Vec<Option<String>>) {
         self.rebuilt_columns = columns;
         self.check_names = (check_names, 0);
+    }
+
+    /// Has the table being created receive `checks` from its parents, each
+    /// with how the parent's check had its literals read.
+    pub(super) fn receive_checks(&mut self, checks: Vec<(CheckConstraint, CheckLiterals)>) {
+        self.received = checks;
+    }
+
+    /// How the parent's check that `check` is a copy of had its literals read,
+    /// `None` for a check no parent passed down.
+    pub(super) fn take_received(&mut self, check: &CheckConstraint) -> Option<CheckLiterals> {
+        let position = self.received.iter().position(|(received, _)| received == check)?;
+        Some(self.received.remove(position).1)
     }
 
     /// Records the selections of `calls`, the record of the column `column`
@@ -161,6 +180,7 @@ impl CarriedOperators {
                     calls: Vec::new(),
                     written: WrittenPins::default(),
                 },
+                literals: None,
             });
         }
     }
@@ -177,7 +197,23 @@ impl CarriedOperators {
     ) {
         let shape = self.shape(node, &self.recorded_columns);
         let selections = calls.take_operator_nodes();
-        self.entries.push(Entry { owner, kind, name, shape, selections });
+        self.entries.push(Entry { owner, kind, name, shape, selections, literals: None });
+    }
+
+    /// Records the selections of `calls`, the record of the check over `node`
+    /// of `owner` answering to `name`, with how its `literals` were read.
+    pub(super) fn record_check(
+        &mut self,
+        owner: Owner,
+        name: Option<String>,
+        node: &Expr,
+        calls: &mut ExpressionCalls<CreateFunction>,
+        literals: CheckLiterals,
+    ) {
+        let shape = self.shape(node, &self.recorded_columns);
+        let selections = calls.take_operator_nodes();
+        let literals = Some(literals);
+        self.entries.push(Entry { owner, kind: Kind::Check, name, shape, selections, literals });
     }
 
     /// Records the selections of `calls`, the partition key's record.
@@ -188,6 +224,7 @@ impl CarriedOperators {
             name: None,
             shape: String::new(),
             selections: calls.take_operator_nodes(),
+            literals: None,
         });
     }
 
@@ -249,7 +286,8 @@ impl CarriedOperators {
                     let name = option.name.as_ref().map(|name| name.value.as_str());
                     self.take_entry(owner, kind, name, |entry| entry.shape == shape)
                 }
-            };
+            }
+            .map(|entry| entry.selections);
             let count = operator_node_count(&option.option);
             let carried = match taken {
                 Some(taken) if taken.nodes.len() == count => {
@@ -275,13 +313,23 @@ impl CarriedOperators {
 
     /// Gives `calls`, the record of the check over `node` the rebuild builds
     /// next, what the check it continues selected, of the column whose
-    /// checks are being built or else of the table.
-    pub(super) fn take_check(&mut self, node: &Expr, calls: &mut ExpressionCalls<CreateFunction>) {
+    /// checks are being built or else of the table, and answers how that
+    /// check's literals were read, `None` for a check the statement adds.
+    pub(super) fn take_check(
+        &mut self,
+        node: &Expr,
+        calls: &mut ExpressionCalls<CreateFunction>,
+    ) -> Option<CheckLiterals> {
         let owner = self.building.map_or(Owner::Table, Owner::Column);
         let (names, built) = &mut self.check_names;
         let name = names.get_mut(*built).and_then(Option::take);
         *built += 1;
-        self.take(owner, Kind::Check, name.as_deref(), node, calls);
+        let shape = self.shape(node, &self.rebuilt_columns);
+        let entry =
+            self.take_entry(owner, Kind::Check, name.as_deref(), |entry| entry.shape == shape);
+        let (selections, literals) = entry.map(|entry| (entry.selections, entry.literals)).unzip();
+        self.settle(node, calls, selections);
+        literals.flatten()
     }
 
     /// Gives `calls`, the record of `node`, a `kind` expression of `owner`
@@ -297,7 +345,21 @@ impl CarriedOperators {
         calls: &mut ExpressionCalls<CreateFunction>,
     ) {
         let shape = self.shape(node, &self.rebuilt_columns);
-        let carried = self.take_entry(owner, kind, name, |entry| entry.shape == shape);
+        let carried = self
+            .take_entry(owner, kind, name, |entry| entry.shape == shape)
+            .map(|entry| entry.selections);
+        self.settle(node, calls, carried);
+    }
+
+    /// Gives `calls`, the record of `node`, the `carried` selections of the
+    /// expression it continues, rewritten when it reads the column the
+    /// statement retypes.
+    fn settle<N: Visit + ?Sized>(
+        &self,
+        node: &N,
+        calls: &mut ExpressionCalls<CreateFunction>,
+        carried: Option<Selections>,
+    ) {
         let state = if carried.is_some() { NodeState::Settled } else { NodeState::Pending };
         calls.set_call_states(0..usize::MAX, state);
         if let Some(carried) = carried {
@@ -310,7 +372,9 @@ impl CarriedOperators {
     /// PostgreSQL refuses to retype a column the key reads, so the key is
     /// never parsed again.
     pub(super) fn take_partition_key(&mut self, calls: &mut ExpressionCalls<CreateFunction>) {
-        let carried = self.take_entry(Owner::Table, Kind::PartitionKey, None, |_| true);
+        let carried = self
+            .take_entry(Owner::Table, Kind::PartitionKey, None, |_| true)
+            .map(|entry| entry.selections);
         let state = if carried.is_some() { NodeState::Settled } else { NodeState::Pending };
         calls.set_call_states(0..usize::MAX, state);
         if let Some(carried) = carried {
@@ -347,16 +411,16 @@ impl CarriedOperators {
         calls.keep_previous_calls_for_rewritten();
     }
 
-    /// Takes the selections of the entry of `owner` and `kind` that
-    /// `matches` keeps, one answering to `name` first, and else the first
-    /// one recorded. The others keep their order.
+    /// Takes the entry of `owner` and `kind` that `matches` keeps, one
+    /// answering to `name` first, and else the first one recorded. The others
+    /// keep their order.
     fn take_entry(
         &mut self,
         owner: Owner,
         kind: Kind,
         name: Option<&str>,
         matches: impl Fn(&Entry) -> bool,
-    ) -> Option<Selections> {
+    ) -> Option<Entry> {
         let candidate =
             |entry: &Entry| entry.owner == owner && entry.kind == kind && matches(entry);
         let named = name.and_then(|name| {
@@ -365,7 +429,7 @@ impl CarriedOperators {
                 .position(|entry| candidate(entry) && entry.name.as_deref() == Some(name))
         });
         let position = named.or_else(|| self.entries.iter().position(candidate))?;
-        Some(self.entries.remove(position).selections)
+        Some(self.entries.remove(position))
     }
 
     /// The spelling of `node` with each column of `columns` it reads written

@@ -2,7 +2,7 @@
 
 use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType};
 
-use super::{GatedCommand, PolicyClause, PolicyExpression};
+use super::{ClauseExpression, GatedCommand, PolicyClause};
 use crate::errors::PolicyClauseError;
 
 /// A command's visibility or new-row check context.
@@ -99,8 +99,8 @@ impl MissingPolicyClause {
 pub struct PolicyAnalysis<'db> {
     command: CreatePolicyCommand,
     mode: CreatePolicyType,
-    using: Option<PolicyExpression<'db>>,
-    check: Option<PolicyExpression<'db>>,
+    using: Option<ClauseExpression<'db>>,
+    check: Option<ClauseExpression<'db>>,
     invalid: Option<PolicyClauseError>,
 }
 
@@ -109,8 +109,8 @@ impl<'db> PolicyAnalysis<'db> {
     pub(crate) fn new(
         command: CreatePolicyCommand,
         mode: CreatePolicyType,
-        using: Option<PolicyExpression<'db>>,
-        check: Option<PolicyExpression<'db>>,
+        using: Option<ClauseExpression<'db>>,
+        check: Option<ClauseExpression<'db>>,
     ) -> Self {
         let invalid = match command {
             CreatePolicyCommand::Insert if using.is_some() => {
@@ -139,7 +139,7 @@ impl<'db> PolicyAnalysis<'db> {
     /// A stored clause, including unreadable expressions and illegal
     /// combinations.
     #[must_use]
-    pub fn clause(&self, clause: PolicyClause) -> Option<&PolicyExpression<'db>> {
+    pub fn clause(&self, clause: PolicyClause) -> Option<&ClauseExpression<'db>> {
         match clause {
             PolicyClause::Using => self.using.as_ref(),
             PolicyClause::WithCheck => self.check.as_ref(),
@@ -195,7 +195,7 @@ impl<'db> PolicyAnalysis<'db> {
     /// Consumes the analysis without copying its stored expressions.
     pub(crate) fn into_clauses(
         self,
-    ) -> (Option<PolicyExpression<'db>>, Option<PolicyExpression<'db>>) {
+    ) -> (Option<ClauseExpression<'db>>, Option<ClauseExpression<'db>>) {
         (self.using, self.check)
     }
 }

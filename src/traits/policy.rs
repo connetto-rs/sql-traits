@@ -7,7 +7,7 @@ use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Function, Owne
 
 use crate::{
     errors::LookupError,
-    structs::{PolicyAnalysis, PolicyExpression, TargetName},
+    structs::{ClauseExpression, PolicyAnalysis, TargetName},
     traits::{DatabaseLike, Metadata, RoleLike, role::privilege_holders},
     utils::identifier_resolution::stored_identifier,
 };
@@ -467,14 +467,14 @@ pub trait PolicyLike:
     where
         Self: 'db,
     {
-        self.using_clause(database)?.map(PolicyExpression::stored).transpose()
+        self.using_clause(database)?.map(ClauseExpression::stored).transpose()
     }
 
     /// Returns the `USING` clause of the policy, if any, stored when every
     /// literal of it could be read and written when one could not.
     ///
     /// A walk of the relations, subqueries and calls the clause holds reads
-    /// [`PolicyExpression::expression`], which answers either form. A caller
+    /// [`ClauseExpression::expression`], which answers either form. A caller
     /// comparing values reads [`Self::using_expression`].
     ///
     /// # Errors
@@ -499,7 +499,7 @@ pub trait PolicyLike:
     /// )?;
     /// let policy = db.policies().next().unwrap();
     /// // The script sets no `TimeZone`, so the literal's stored value is unknown.
-    /// let Some(PolicyExpression::Written { expression, unreadable }) = policy.using_clause(&db)?
+    /// let Some(ClauseExpression::Written { expression, unreadable }) = policy.using_clause(&db)?
     /// else {
     ///     unreachable!()
     /// };
@@ -514,7 +514,7 @@ pub trait PolicyLike:
     fn using_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db;
 
@@ -631,7 +631,7 @@ pub trait PolicyLike:
     where
         Self: 'db,
     {
-        self.check_clause(database)?.map(PolicyExpression::stored).transpose()
+        self.check_clause(database)?.map(ClauseExpression::stored).transpose()
     }
 
     /// Returns explicit `WITH CHECK`, or `None` without a `USING` fallback,
@@ -657,7 +657,7 @@ pub trait PolicyLike:
     /// ",
     /// )?;
     /// let policy = db.policies().next().unwrap();
-    /// let Some(PolicyExpression::Stored(check)) = policy.check_clause(&db)? else { unreachable!() };
+    /// let Some(ClauseExpression::Stored(check)) = policy.check_clause(&db)? else { unreachable!() };
     /// assert_eq!(check.to_string(), "expires > '2026-01-01 09:00:00+00'::TIMESTAMP WITH TIME ZONE");
     /// assert_eq!(policy.using_clause(&db)?, None);
     /// # Ok(())
@@ -666,7 +666,7 @@ pub trait PolicyLike:
     fn check_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db;
 
@@ -843,7 +843,7 @@ where
     fn using_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
@@ -870,7 +870,7 @@ where
     fn check_clause<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db,
     {

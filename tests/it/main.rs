@@ -19,6 +19,7 @@ mod call_result_types;
 mod cast_metadata;
 mod catalog_navigation;
 mod check_constraint_columns;
+mod check_literals;
 mod clause_bindings;
 mod coercion;
 mod collation_name_cost;

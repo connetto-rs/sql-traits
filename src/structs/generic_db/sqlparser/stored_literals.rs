@@ -1,6 +1,7 @@
-//! The date and time literals of a policy expression, read as PostgreSQL reads
-//! them while it parses `CREATE POLICY` and `ALTER POLICY`, under the session's
-//! `TimeZone` and `DateStyle` and at a time of creation never known here.
+//! The date and time literals of a check or a policy expression, read as
+//! PostgreSQL reads them while it parses the statement creating the
+//! expression, under the session's `TimeZone` and `DateStyle` and at a time
+//! of creation never known here.
 //!
 //! An untyped literal takes its type from the other side of a comparison, the
 //! subject of `BETWEEN` or `IN`, or the common type of the arguments of
@@ -32,13 +33,14 @@ use super::{
 use crate::{
     structs::{
         ColumnDefinition, ColumnDefinitionScope, ColumnScope, IdentifierCase, ParserDB,
-        metadata::{ClauseLiterals, UnreadableLiteral},
+        TableAttribute,
+        metadata::{BoundLiteral, CheckLiterals, ClauseLiterals, UnreadableLiteral, respell},
     },
     traits::ColumnLike,
     utils::walk::{walk, walk_expressions, walk_mut},
 };
 
-/// The session state a policy's literals are read under.
+/// The session state an expression's literals are read under.
 #[derive(Clone, Copy)]
 pub(super) struct LiteralSession<'a> {
     time_zone: Option<&'a PgTimeZone>,
@@ -46,7 +48,8 @@ pub(super) struct LiteralSession<'a> {
 }
 
 impl<'a> LiteralSession<'a> {
-    /// The state `settings` hold where the policy statement runs.
+    /// The state `settings` hold where the statement creating the expression
+    /// runs.
     pub(super) fn of(settings: &'a SessionSettings) -> Self {
         Self {
             time_zone: settings.time_zone(),
@@ -55,7 +58,7 @@ impl<'a> LiteralSession<'a> {
     }
 
     /// The context PostgreSQL's input functions read, which never knows the
-    /// time the policy was created at.
+    /// time the expression was created at.
     fn context(self) -> InputContext<'a> {
         let context = InputContext::new();
         let context = match self.time_zone {
@@ -317,8 +320,8 @@ struct Coercion {
     stored: String,
 }
 
-/// Finds every literal of a policy expression read as a date or time value,
-/// with the value PostgreSQL stores for it.
+/// Finds every literal of an expression read as a date or time value, with
+/// the value PostgreSQL stores for it.
 struct Coercions<'scope, 'query, 'db, 'session> {
     scope: Option<(&'scope ColumnScope<'query, 'db, ParserDB>, &'db ParserDB)>,
     /// The scope of each select the walk stands in, innermost last.
@@ -555,43 +558,6 @@ impl Visitor for Coercions<'_, '_, '_, '_> {
     }
 }
 
-/// Writes the value of every literal `coercions` reads back into its node.
-struct Respell {
-    coercions: Vec<Coercion>,
-}
-
-impl VisitorMut for Respell {
-    type Break = ();
-
-    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-        let at = address(expr);
-        let Some(index) = self.coercions.iter().position(|coercion| coercion.address == at) else {
-            return ControlFlow::Continue(());
-        };
-        let Coercion { form, stored, .. } = self.coercions.swap_remove(index);
-        match (form, expr) {
-            (Form::Untyped(temporal), expr) => {
-                *expr = Expr::Cast {
-                    kind: CastKind::DoubleColon,
-                    expr: Box::new(Expr::Value(
-                        Value::SingleQuotedString(stored).with_empty_span(),
-                    )),
-                    data_type: temporal.data_type(),
-                    format: None,
-                };
-            }
-            (Form::Typed, Expr::TypedString(typed)) => {
-                typed.value.value = Value::SingleQuotedString(stored);
-            }
-            // The literal a cast holds.
-            (Form::Typed, expr) => {
-                *expr = Expr::Value(Value::SingleQuotedString(stored).with_empty_span());
-            }
-        }
-        ControlFlow::Continue(())
-    }
-}
-
 /// Whether `expr` holds a quoted literal anywhere.
 fn holds_quoted_literal(expr: &Expr) -> bool {
     walk_expressions(expr, |node| {
@@ -626,18 +592,17 @@ fn coercions(
     scoped.finish()
 }
 
-/// Rewrites every date and time literal of `expression`, a clause of a policy
-/// on `table`, as the value PostgreSQL stores for it under `session`, keeping
-/// the clause as written beside it, or answers the first literal whose value
-/// is not known here and leaves the clause as written.
-pub(super) fn bind(
+/// Every date and time literal of `expression`, a clause on `table`, with the
+/// value PostgreSQL stores for it under `session`, by its place among the
+/// nodes of `expression`, or the first one whose value is not known here.
+fn read(
     builder: &ParserDBBuilder,
     table: &ObjectName,
     expression: &mut Expr,
     session: LiteralSession<'_>,
-) -> ClauseLiterals {
+) -> Result<Vec<BoundLiteral>, UnreadableLiteral> {
     if !holds_quoted_literal(expression) {
-        return ClauseLiterals::AsWritten;
+        return Ok(Vec::new());
     }
     let clause = core::mem::replace(expression, Expr::Value(Value::Null.with_empty_span()));
     let from = TableWithJoins {
@@ -657,25 +622,86 @@ pub(super) fn bind(
         joins: Vec::new(),
     };
     let mut query = wrapping_query(wrapping_select(Vec::new(), alloc::vec![from], Some(clause)));
-    let literals = match coercions(builder, &query, session) {
-        Ok(coercions) if coercions.is_empty() => ClauseLiterals::AsWritten,
-        Ok(coercions) => {
-            // The clause is the first expression of the wrapper query.
-            let written =
-                walk_expressions(&query, |clause| ControlFlow::Break(Box::new(clause.clone())))
-                    .break_value();
-            let walked = walk_mut(&mut query, &mut Respell { coercions });
-            debug_assert!(walked.is_continue(), "the respelling never breaks");
-            written.map_or(ClauseLiterals::AsWritten, ClauseLiterals::Stored)
-        }
-        Err(unreadable) => ClauseLiterals::Unreadable(unreadable),
-    };
+    let literals = coercions(builder, &query, session).map(|coercions| placed(&query, coercions));
     let walked = walk_mut(&mut query, &mut Restore { target: expression });
     debug_assert!(walked.is_break(), "the clause is the first expression of the wrapper query");
-    match literals {
-        // A typed literal can store the very text it was written with.
-        ClauseLiterals::Stored(written) if *written == *expression => ClauseLiterals::AsWritten,
-        literals => literals,
+    literals
+}
+
+/// The literals `coercions` reads in the clause of the wrapper `query`, each
+/// by its place among the clause's nodes.
+fn placed(query: &Query, mut coercions: Vec<Coercion>) -> Vec<BoundLiteral> {
+    let mut bound = Vec::with_capacity(coercions.len());
+    // The clause is the first expression of the wrapper query, so its nodes
+    // are counted from the first one met.
+    let mut place = 0;
+    let _ = walk_expressions(query, |node| {
+        let at = address(node);
+        if let Some(index) = coercions.iter().position(|coercion| coercion.address == at) {
+            let Coercion { form, stored, .. } = coercions.swap_remove(index);
+            let cast = match form {
+                Form::Untyped(temporal) => Some(temporal.data_type()),
+                Form::Typed => None,
+            };
+            bound.push(BoundLiteral { place, cast, stored });
+        }
+        place += 1;
+        if coercions.is_empty() { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+    });
+    bound
+}
+
+/// Rewrites every date and time literal of `expression`, a clause of a policy
+/// on `table`, as the value PostgreSQL stores for it under `session`, keeping
+/// the clause as written beside it, or answers the first literal whose value
+/// is not known here and leaves the clause as written.
+pub(super) fn bind(
+    builder: &ParserDBBuilder,
+    table: &ObjectName,
+    expression: &mut Expr,
+    session: LiteralSession<'_>,
+) -> ClauseLiterals {
+    match read(builder, table, expression, session) {
+        Ok(bound) if bound.is_empty() => ClauseLiterals::AsWritten,
+        Ok(bound) => {
+            let written = expression.clone();
+            respell(expression, &bound);
+            // A typed literal can store the very text it was written with.
+            if *expression == written {
+                ClauseLiterals::AsWritten
+            } else {
+                ClauseLiterals::Stored(Box::new(written))
+            }
+        }
+        Err(unreadable) => ClauseLiterals::Unreadable(unreadable),
+    }
+}
+
+/// Reads the literals of every check created since the last call under
+/// `session`, the session of the statement creating them.
+pub(super) fn bind_pending_checks(builder: &mut ParserDBBuilder, session: LiteralSession<'_>) {
+    let read_checks: Vec<(usize, CheckLiterals)> = builder
+        .check_constraints()
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, metadata))| *metadata.literals() == CheckLiterals::Pending)
+        .map(|(index, (check, metadata))| {
+            if !holds_quoted_literal(metadata.expression()) {
+                return (index, CheckLiterals::AsWritten);
+            }
+            let mut expression = metadata.expression().clone();
+            let table = &TableAttribute::table(check.as_ref()).name;
+            let literals = match read(builder, table, &mut expression, session) {
+                Ok(bound) if bound.is_empty() => CheckLiterals::AsWritten,
+                Ok(bound) => CheckLiterals::Stored(bound),
+                Err(unreadable) => CheckLiterals::Unreadable(unreadable),
+            };
+            (index, literals)
+        })
+        .collect();
+    let checks = builder.check_constraints_mut();
+    for (index, literals) in read_checks {
+        checks[index].1.set_literals(literals);
     }
 }
 

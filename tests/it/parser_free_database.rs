@@ -1083,8 +1083,19 @@ impl CheckConstraintLike for MemoryCheckConstraint {
         Ok(None)
     }
 
-    fn expression<'db>(&'db self, _database: &'db Self::DB) -> &'db Expr {
-        &self.expression
+    fn check_clause<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<ClauseExpression<'db>, LookupError> {
+        Ok(ClauseExpression::Stored(&self.expression))
+    }
+
+    /// A catalog stores only the typed constant, never the check as written.
+    fn written_expression<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError> {
+        Ok(None)
     }
 
     fn table<'db>(&'db self, database: &'db Self::DB) -> Result<&'db MemoryTable, LookupError> {
@@ -1482,11 +1493,11 @@ impl PolicyLike for MemoryPolicy {
     fn using_clause<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
-        Ok(self.using.as_ref().map(PolicyExpression::Stored))
+        Ok(self.using.as_ref().map(ClauseExpression::Stored))
     }
 
     fn written_using<'db>(
@@ -1509,11 +1520,11 @@ impl PolicyLike for MemoryPolicy {
     fn check_clause<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> Result<Option<PolicyExpression<'db>>, LookupError>
+    ) -> Result<Option<ClauseExpression<'db>>, LookupError>
     where
         Self: 'db,
     {
-        Ok(self.check.as_ref().map(PolicyExpression::Stored))
+        Ok(self.check.as_ref().map(ClauseExpression::Stored))
     }
 
     fn written_check<'db>(

@@ -815,6 +815,26 @@ pub enum LookupError {
         /// What reading the literal needed or refused.
         reason: sql_values::DateTimeError,
     },
+    /// A quoted literal of a check is read as a date or time value when the
+    /// check is created, under session state the input does not settle, such
+    /// as the `TimeZone`, the `DateStyle` order or the current time, or in a
+    /// spelling PostgreSQL refuses.
+    #[error(
+        "A check of table `{table}` reads the literal '{literal}' as {data_type} when it is created, and that value is not known here: {reason}"
+    )]
+    CheckLiteralUnreadable {
+        /// Name of the table holding the check, as written.
+        table: String,
+        /// Name of the check, written or the one PostgreSQL generates, when it
+        /// has one.
+        check: Option<String>,
+        /// The literal's text, as written.
+        literal: String,
+        /// The type PostgreSQL reads the literal as.
+        data_type: sql_values::PgType,
+        /// What reading the literal needed or refused.
+        reason: sql_values::DateTimeError,
+    },
 }
 
 /// Why a text could not be read back as a target name by

@@ -661,7 +661,17 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
 impl<P: EmptyKinds> CheckConstraintLike for NoneKind<P> {
     type DB = GenericDB<P>;
 
-    fn expression<'db>(&'db self, _database: &'db Self::DB) -> &'db Expr {
+    fn check_clause<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<sql_traits::structs::ClauseExpression<'db>, LookupError> {
+        self.unreach()
+    }
+
+    fn written_expression<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError> {
         self.unreach()
     }
 

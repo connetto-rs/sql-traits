@@ -345,3 +345,38 @@ fn a_node_of_another_expression_is_refused() {
     assert!(view.column_reference(&copy).is_err());
     assert!(view.membership_coercions(&copy).is_err());
 }
+
+/// A check's date and time literals read as the values the creating session
+/// stored, which is what PostgreSQL deparses.
+#[test]
+fn a_check_reads_its_date_and_time_literals_as_postgresql_stored_them() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "SET TIME ZONE 'UTC';
+         CREATE TABLE w (
+             ts TIMESTAMPTZ CHECK (ts > '2020-01-01'),
+             d DATE CHECK (d BETWEEN '2020-01-01' AND '2020-12-31'),
+             tm TIME CHECK (tm <> '12:00')
+         );",
+    )
+    .unwrap();
+    let table =
+        db.table_by_target(TargetName::new("w", false), IdentifierCase::Folded).unwrap().unwrap();
+    let scope = ExpressionScope::Table(table);
+    let canonical = |expression: &Expr| {
+        let proofs =
+            SemanticProofs::for_expression(expression, &scope, &db, IdentifierCase::Folded)
+                .unwrap();
+        Canonicalizer::new(&PostgreSqlDialect {}).normalize_with_context(&proofs.view()).unwrap()
+    };
+    let deparsed = [
+        "(ts > '2020-01-01 00:00:00+00'::timestamp with time zone)",
+        "((d >= '2020-01-01'::date) AND (d <= '2020-12-31'::date))",
+        "(tm <> '12:00:00'::time without time zone)",
+    ];
+    let checks: Vec<_> = table.check_constraints(&db).unwrap().collect();
+    assert_eq!(checks.len(), deparsed.len());
+    for (check, deparsed) in checks.into_iter().zip(deparsed) {
+        let stored = check.expression(&db).unwrap();
+        assert_eq!(canonical(stored), canonical(&parse(deparsed)), "{stored}");
+    }
+}
