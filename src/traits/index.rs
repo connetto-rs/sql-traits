@@ -200,8 +200,8 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// ```
     fn is_unique(&self) -> bool;
 
-    /// Returns whether the index is defined using simply columns
-    /// and no other expressions.
+    /// Returns whether every entry of the index is a plain column, written
+    /// with or without parentheses, and none is an expression.
     ///
     /// # Errors
     ///
@@ -221,17 +221,28 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
     /// let index = table.indices(&db)?.next().unwrap();
     /// assert!(index.is_simple(&db)?);
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "CREATE TABLE users (id int, name text); CREATE INDEX ON users ((lower(name)), id);",
+    /// )?;
+    /// assert!(!db.indexes().next().unwrap().is_simple(&db)?);
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
     fn is_simple(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        let expr = self.expression(database)?;
-        let inner_expr = match expr {
-            Expr::Nested(inner) => inner,
-            _ => expr,
+        let entries = match self.expression(database)? {
+            Expr::Nested(entry) => core::slice::from_ref(entry.as_ref()),
+            Expr::Tuple(entries) => entries.as_slice(),
+            entry => core::slice::from_ref(entry),
         };
-        Ok(matches!(inner_expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Tuple(_)))
+        Ok(entries.iter().all(|entry| {
+            let mut column = entry;
+            while let Expr::Nested(inner) = column {
+                column = inner;
+            }
+            matches!(column, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        }))
     }
 
     /// Returns the columns which appear in the index.
