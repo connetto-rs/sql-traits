@@ -501,6 +501,41 @@ fn replacing_a_view_may_only_add_columns_on_the_end() {
     assert_eq!(db.views().count(), 1, "the replacement takes the recorded view's place");
 }
 
+/// The definition's own names count as much as a column list's, so a view that
+/// wrote no list keeps the same two rules.
+#[test]
+fn replacing_a_view_reads_the_names_its_definition_gives() {
+    // Measured on PostgreSQL 18.6.
+    let refused = parse(
+        "CREATE VIEW v AS SELECT 1 AS a, 2 AS b;
+         CREATE OR REPLACE VIEW v AS SELECT 1 AS a, 2 AS c;",
+    )
+    .expect_err("a rename is refused");
+    assert!(
+        matches!(&refused, Error::ViewColumnRenamedByReplace { existing_column, new_column, .. }
+            if existing_column == "b" && new_column == "c"),
+        "got {refused:?}"
+    );
+
+    let refused = parse(
+        "CREATE VIEW v AS SELECT 1 AS a, 2 AS b;
+         CREATE OR REPLACE VIEW v AS SELECT 1 AS a;",
+    )
+    .expect_err("a drop is refused");
+    assert!(matches!(&refused, Error::ViewColumnsDroppedByReplace { .. }), "got {refused:?}");
+
+    parse(
+        "CREATE VIEW v AS SELECT 1 AS a;
+         CREATE OR REPLACE VIEW v (a, b) AS SELECT 1, 2;",
+    )
+    .expect("a list repeating the definition's name and appending one is accepted");
+    parse(
+        "CREATE VIEW v AS SELECT * FROM json_each('{}');
+         CREATE OR REPLACE VIEW v AS SELECT * FROM json_each('{}');",
+    )
+    .expect("a definition the model cannot name is compared on nothing");
+}
+
 #[test]
 fn a_replacement_keeps_the_recorded_owner() {
     let db = parse(

@@ -6,11 +6,13 @@
 //! A view shares one pool of names with tables, materialized views and
 //! indexes, so creating one under a taken name is refused whichever kind holds
 //! it, and the two drop spellings refuse each other's kind with the server's
-//! own wording. `CREATE OR REPLACE VIEW` may only add output columns on the
-//! end: renaming one and dropping one are both refused, checked whenever the
-//! recorded and the replacing shapes can both be read. A materialized view has
-//! no replace form at all, and a plain view has no `IF NOT EXISTS` form, both
-//! of which the parser accepts and the server rejects outright.
+//! own wording. A view may not expose one column name twice, whether its column
+//! list or its definition names the two. `CREATE OR REPLACE VIEW` may only add
+//! output columns on the end: renaming one and dropping one are both refused,
+//! checked whenever the recorded and the replacing shapes can both be read. A
+//! materialized view has no replace form at all, and a plain view has no `IF
+//! NOT EXISTS` form, both of which the parser accepts and the server rejects
+//! outright.
 //!
 //! A view whose definition reads a temporary relation is temporary whatever
 //! the statement wrote, and lands in `pg_temp`. A materialized view may not
@@ -38,7 +40,7 @@ use sqlparser::ast::{
 
 use super::{
     AlterTableScope, Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier,
-    bind_reference, domains, function_bodies, object_name_last_identifier,
+    bind_reference, domains, first_repeated_column, function_bodies, object_name_last_identifier,
     object_name_matches_resolved_identity, place_relation,
     postgres_catalog::{CatalogDependent, PostgresCatalog},
     relation_name_holder, require_named_in_catalog,
@@ -139,11 +141,20 @@ pub(super) fn create_view(
         && let Some(position) = stored_view_position(&builder, &node.name)
     {
         let (existing, mut metadata, identity) = builder.views_mut().remove(position);
-        check_replacement_columns(existing.as_ref(), &node)?;
+        let exposed = exposed_by(&builder, &node)?;
+        check_replacement_columns(&builder, existing.as_ref(), &exposed)?;
+        refuse_repeated_columns(&exposed.0, &name_ident.value, builder.identifier_case())?;
         metadata.set_calls(builder.calls_in(&node.query));
         let mut view = View::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
+    }
+
+    // PostgreSQL reports a repeated column of a plain view before a taken
+    // name, and a taken name of a materialized view before a repeated column.
+    if !node.materialized {
+        let (names, _) = exposed_by(&builder, &node)?;
+        refuse_repeated_columns(&names, &name_ident.value, builder.identifier_case())?;
     }
 
     // A view takes a shell of its name over, filling the type name.
@@ -165,6 +176,10 @@ pub(super) fn create_view(
             object_name: name_ident.value.clone(),
         });
     }
+    if node.materialized {
+        let (names, _) = exposed_by(&builder, &node)?;
+        refuse_repeated_columns(&names, &name_ident.value, builder.identifier_case())?;
+    }
 
     if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &node.name) {
         Arc::make_mut(catalog).rename_type_identity(&previous, current);
@@ -185,28 +200,34 @@ pub(super) fn create_view(
     Ok(creator.grant(builder, DefaultKind::Relations, &GrantObjects::Tables(vec![node.name])))
 }
 
-/// Checks the two rules a replacement has to keep: it may not rename an output
-/// column and it may not drop one.
+/// Checks the two rules a replacement has to keep: it may not drop an output
+/// column and it may not rename one.
 ///
-/// Only the names are checkable here. A view carries no declared types, so the
-/// server's third rule, that a column's type may not change, needs a type for
-/// an arbitrary expression, which this crate does not derive. When either
-/// shape's names cannot be read the replacement is recorded without complaint,
-/// which never refuses input the server accepts.
-fn check_replacement_columns(existing: &View, node: &CreateView) -> Result<(), Error> {
-    let (Some(before), Some(after)) = (existing.declared_output_names(), declared_names_of(node))
-    else {
-        return Ok(());
-    };
-
-    if after.len() < before.len() {
+/// Both shapes are read as far as [`output_names`] can name them, from a column
+/// list or from the definition. A position either shape leaves unnamed is not
+/// compared, and a drop is concluded only when every column of the replacing
+/// shape is named, which never refuses input the server accepts. A view
+/// carries no declared types, so the server's third rule, that a column's type
+/// may not change, needs a type for an arbitrary expression, which this crate
+/// does not derive.
+///
+/// # Errors
+///
+/// Returns [`Error::ViewColumnsDroppedByReplace`],
+/// [`Error::ViewColumnRenamedByReplace`], and the [`LookupError`] reading the
+/// recorded definition raises.
+fn check_replacement_columns(
+    builder: &ParserDBBuilder,
+    existing: &View,
+    (after, after_enumerable): &(Vec<(String, bool)>, bool),
+) -> Result<(), Error> {
+    let (before, _) = output_names(builder, existing.declaration())?;
+    if *after_enumerable && after.len() < before.len() {
         return Err(Error::ViewColumnsDroppedByReplace {
             view_name: existing.view_name().to_string(),
         });
     }
-    for ((existing_name, existing_quoted), (new_name, new_quoted)) in
-        before.iter().zip(after.iter())
-    {
+    for ((existing_name, existing_quoted), (new_name, new_quoted)) in before.iter().zip(after) {
         if !identifiers_match(existing_name, *existing_quoted, new_name, *new_quoted) {
             return Err(Error::ViewColumnRenamedByReplace {
                 view_name: existing.view_name().to_string(),
@@ -218,15 +239,45 @@ fn check_replacement_columns(existing: &View, node: &CreateView) -> Result<(), E
     Ok(())
 }
 
-/// The output names a `CREATE VIEW` node writes explicitly, or [`None`] when it
-/// writes none and the definition would have to be read.
-fn declared_names_of(node: &CreateView) -> Option<Vec<(String, bool)>> {
-    (!node.columns.is_empty()).then(|| {
-        node.columns
-            .iter()
-            .map(|column| (column.name.value.clone(), column.name.quote_style.is_some()))
-            .collect()
-    })
+/// Refuses a view exposing one column name twice among `names`, whether the
+/// column list, the definition's aliases and stored columns, or the names
+/// PostgreSQL derives for unaliased outputs give the two.
+///
+/// # Errors
+///
+/// Returns [`Error::ColumnAlreadyExists`] naming the later of the two.
+fn refuse_repeated_columns(
+    names: &[(String, bool)],
+    view_name: &str,
+    case: IdentifierCase,
+) -> Result<(), Error> {
+    let names = names.iter().map(|(name, quoted)| (name.as_str(), *quoted));
+    match first_repeated_column(names, case) {
+        Some(column_name) => {
+            Err(Error::ColumnAlreadyExists {
+                table_name: view_name.to_string(),
+                column_name: column_name.to_string(),
+            })
+        }
+        None => Ok(()),
+    }
+}
+
+/// The names a `CREATE VIEW` node exposes, as [`output_names`] answers them for
+/// a recorded view.
+///
+/// # Errors
+///
+/// Returns the [`LookupError`] reading the definition raises.
+fn exposed_by(
+    builder: &ParserDBBuilder,
+    node: &CreateView,
+) -> Result<(Vec<(String, bool)>, bool), Error> {
+    let declared = node
+        .columns
+        .iter()
+        .map(|column| (column.name.value.as_str(), column.name.quote_style.is_some()));
+    exposed_names(builder, &node.query, declared)
 }
 
 /// The position of the plain view a written `name` resolves to.
@@ -1106,16 +1157,30 @@ pub(super) fn output_names(
     builder: &ParserDBBuilder,
     declaration: &ViewDeclaration,
 ) -> Result<(Vec<(String, bool)>, bool), Error> {
-    let read = view_rewrites::catalog(builder, core::iter::once(declaration.query()));
-    let derived = query_output_names(declaration.query(), &read, IdentifierCase::AsWritten)?;
+    let declared = declaration.columns().iter().map(|(name, quoted)| (name.as_str(), *quoted));
+    exposed_names(builder, declaration.query(), declared)
+}
+
+/// The names a view defined by `query` with the column list `declared`
+/// exposes, as [`output_names`] answers them.
+fn exposed_names<'a>(
+    builder: &ParserDBBuilder,
+    query: &Query,
+    declared: impl Iterator<Item = (&'a str, bool)>,
+) -> Result<(Vec<(String, bool)>, bool), Error> {
+    let read = view_rewrites::catalog(builder, core::iter::once(query));
+    let derived = query_output_names(query, &read, IdentifierCase::AsWritten)?;
     let enumerable = derived.is_some();
     let mut names = derived.unwrap_or_default();
-    let declared = declaration.columns();
-    if names.len() < declared.len() {
-        names.resize(declared.len(), (String::new(), false));
-    }
-    for (name, written) in names.iter_mut().zip(declared) {
-        name.clone_from(written);
+    for (ordinal, (name, quoted)) in declared.enumerate() {
+        match names.get_mut(ordinal) {
+            Some((derived_name, derived_quoted)) => {
+                derived_name.clear();
+                derived_name.push_str(name);
+                *derived_quoted = quoted;
+            }
+            None => names.push((name.to_string(), quoted)),
+        }
     }
     Ok((names, enumerable))
 }

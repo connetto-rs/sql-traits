@@ -325,7 +325,8 @@ fn a_resolved_aggregate_window_or_from_call_stays() {
     for sql in [
         "CREATE VIEW v AS SELECT x FROM generate_series(1, 3) AS x;",
         "CREATE VIEW v AS SELECT x FROM unnest(ARRAY[1, 2]) AS x;",
-        "CREATE VIEW v AS SELECT count(*), count(DISTINCT a), sum(a) FILTER (WHERE a > 0) FROM t;",
+        "CREATE VIEW v AS SELECT count(*), count(DISTINCT a) AS distinct_a,
+             sum(a) FILTER (WHERE a > 0) FROM t;",
         "CREATE VIEW v AS SELECT string_agg(b, ',' ORDER BY b) FROM t;",
         "CREATE VIEW v AS SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a),
              mode() WITHIN GROUP (ORDER BY b) FROM t;",
