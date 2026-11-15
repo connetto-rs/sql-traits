@@ -343,30 +343,22 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         }
                         gated.join(" AND ")
                     });
-                    let restrictions = grant.restrictions().iter().map(|set| {
-                        let values: Vec<String> =
-                            set.values().iter().map(ToString::to_string).collect();
-                        format!("{} IN ({})", set.column().column_name(), values.join(", "))
-                    });
-                    let bounds = grant.time_bounds().iter().map(|bound| {
-                        let column = bound.column().column_name();
-                        let operator = match bound.comparison() {
-                            TimeComparison::Later => ">",
-                            TimeComparison::LaterOrEqual => ">=",
-                            TimeComparison::Earlier => "<",
-                            TimeComparison::EarlierOrEqual => "<=",
-                        };
-                        if bound.keeps_null() {
-                            format!("({column} IS NULL OR {column} {operator} now)")
-                        } else {
-                            format!("{column} {operator} now")
-                        }
+                    let joins = grant.joined_rows().iter().map(|joined| {
+                        let host: Vec<&str> =
+                            joined.columns().iter().map(|(host, _)| host.column_name()).collect();
+                        format!(
+                            "({}) -> {} {{{}}}",
+                            host.join(", "),
+                            joined.table().table_name(),
+                            render_conditions(joined.restrictions(), joined.time_bounds())
+                                .join(" AND ")
+                        )
                     });
                     let conditions: Vec<String> = granted_to
                         .into_iter()
                         .chain(gate)
-                        .chain(restrictions)
-                        .chain(bounds)
+                        .chain(render_conditions(grant.restrictions(), grant.time_bounds()))
+                        .chain(joins)
                         .collect();
                     let filter = if conditions.is_empty() {
                         String::new()
@@ -410,6 +402,51 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
         })
         .collect();
     arms.join(" UNION ")
+}
+
+/// The restrictions and the time bounds a grant arm or a row it joins sets.
+fn render_conditions(
+    restrictions: &[LiteralSet<'_, ParserDB>],
+    bounds: &[TimeBound<'_, ParserDB>],
+) -> Vec<String> {
+    let restrictions = restrictions.iter().map(|set| {
+        let values: Vec<String> = set.values().iter().map(ToString::to_string).collect();
+        format!("{} IN ({})", set.column().column_name(), values.join(", "))
+    });
+    let bounds = bounds.iter().map(|bound| {
+        let column = bound.column().column_name();
+        let operator = match bound.comparison() {
+            TimeComparison::Later => ">",
+            TimeComparison::LaterOrEqual => ">=",
+            TimeComparison::Earlier => "<",
+            TimeComparison::EarlierOrEqual => "<=",
+        };
+        if bound.keeps_null() {
+            format!("({column} IS NULL OR {column} {operator} now)")
+        } else {
+            format!("{column} {operator} now")
+        }
+    });
+    restrictions.chain(bounds).collect()
+}
+
+/// Whether `row` meets every restriction of `restrictions`.
+fn restricted(row: &[(&str, &'static str)], restrictions: &[LiteralSet<'_, ParserDB>]) -> bool {
+    restrictions.iter().all(|set| {
+        let value = cell(row, set.column().column_name());
+        set.values().iter().any(|allowed| holds(allowed, value))
+    })
+}
+
+/// Whether `row` names a row of the joined table meeting its restrictions,
+/// a `NULL` in its foreign key naming none.
+fn joins(row: &[(&str, &'static str)], joined: &JoinedRow<'_, ParserDB>, fixture: Rows) -> bool {
+    rows(fixture, joined.table().table_name()).any(|other| {
+        joined.columns().iter().all(|(host, referenced)| {
+            nullable(row, host.column_name()).is_some()
+                && nullable(row, host.column_name()) == nullable(other, referenced.column_name())
+        }) && restricted(other, joined.restrictions())
+    })
 }
 
 /// The fixture rows of `table`.
@@ -493,10 +530,8 @@ fn evaluate(
                     GrantedTo::Request(_) | GrantedTo::Anyone => None,
                 };
                 for row in rows(fixture, grant.table().table_name()) {
-                    let restricted = grant.restrictions().iter().all(|set| {
-                        let value = cell(row, set.column().column_name());
-                        set.values().iter().any(|allowed| holds(allowed, value))
-                    });
+                    let restricted = restricted(row, grant.restrictions())
+                        && grant.joined_rows().iter().all(|joined| joins(row, joined, fixture));
                     let granted = match grant.granted_to() {
                         GrantedTo::Request(compared) => {
                             request.carries(
@@ -1107,7 +1142,6 @@ fn an_arm_of_any_other_shape_refuses_the_answer() {
         Err(HelperSetError::ArmShape { function, .. }) if function == "authz.owners_with"
     ));
     for body in [
-        "SELECT doc_id FROM members JOIN docs ON docs.id = members.doc_id WHERE user_id = current_setting('app.user_id', true)",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) AND role = 'a' AND user_id = current_setting('app.user_id')",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) GROUP BY doc_id",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) INTERSECT SELECT id FROM docs",
@@ -2144,6 +2178,21 @@ fn a_walk_of_any_other_shape_refuses_the_answer() {
     )
     .replace("search_path = ''", "search_path = public");
     assert!(shape(&sql), "the walk's own name in its first arm reads the walk");
+
+    let joined = format!(
+        "WITH RECURSIVE reached (id) AS (SELECT s.reached_id FROM seeds s \
+         JOIN reached ON reached.id = s.reached_id \
+         WHERE s.user_id = current_setting('app.user_id', true) UNION {CHILD_JOIN}) \
+         SELECT id FROM reached"
+    );
+    let sql = groups(
+        &joined,
+        "CREATE TABLE reached (id TEXT PRIMARY KEY REFERENCES groups (id));
+         CREATE TABLE seeds (reached_id TEXT REFERENCES reached (id), user_id TEXT);
+         GRANT SELECT ON reached, seeds TO authz_owner;",
+    )
+    .replace("search_path = ''", "search_path = public");
+    assert!(shape(&sql), "the walk's own name joined in its first arm reads the walk");
 }
 
 #[test]
@@ -3211,4 +3260,348 @@ fn a_time_condition_no_bound_represents_is_irreducible() {
         matches!(bounded("expires_at > now()", shadow), Err(HelperSetError::Irreducible { .. })),
         "a declared now the call may reach is not PostgreSQL's"
     );
+}
+
+/// connetto's team membership, which keeps a team member only while their
+/// organization membership is active, and a tree of objects owned by users.
+const JOINED: &str = "
+CREATE ROLE owner NOLOGIN BYPASSRLS;
+CREATE TABLE memberships (
+  organization_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  expires_at TIMESTAMPTZ,
+  PRIMARY KEY (organization_id, user_id)
+);
+CREATE TABLE team_members (
+  team_id TEXT NOT NULL,
+  organization_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  team_role TEXT NOT NULL,
+  PRIMARY KEY (team_id, user_id),
+  FOREIGN KEY (organization_id, user_id) REFERENCES memberships (organization_id, user_id)
+);
+CREATE TABLE objects (
+  id TEXT PRIMARY KEY,
+  parent_id TEXT REFERENCES objects (id),
+  owner_id TEXT NOT NULL,
+  archived BOOLEAN NOT NULL DEFAULT false
+);
+CREATE FUNCTION member_teams(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT member.team_id FROM public.team_members member
+  JOIN public.memberships membership
+    ON membership.organization_id = member.organization_id AND membership.user_id = member.user_id
+  WHERE member.user_id = current_setting('app.user_id', true)
+    AND (member.team_role = 'admin' OR min_role = 'member')
+    AND membership.state = 'active'
+$$;
+CREATE FUNCTION child_objects() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT object.id FROM public.objects object
+  JOIN public.objects parent ON parent.id = object.parent_id
+  WHERE object.owner_id = NULLIF(current_setting('app.user_id', true), '') AND parent.archived = false
+$$;
+ALTER FUNCTION member_teams(TEXT) OWNER TO owner;
+ALTER FUNCTION child_objects() OWNER TO owner;
+GRANT SELECT ON memberships, team_members, objects TO owner;
+";
+
+/// Alice is an active member of `o1` and a suspended one of `o2`, Bob a
+/// suspended member of `o1`. `c2` sits under the archived `r2`.
+const JOINED_ROWS: Rows = &[
+    ("memberships", &[("organization_id", "o1"), ("user_id", "alice"), ("state", "active")]),
+    ("memberships", &[("organization_id", "o1"), ("user_id", "bob"), ("state", "suspended")]),
+    ("memberships", &[("organization_id", "o1"), ("user_id", "carol"), ("state", "active")]),
+    ("memberships", &[("organization_id", "o2"), ("user_id", "alice"), ("state", "suspended")]),
+    (
+        "team_members",
+        &[
+            ("team_id", "T"),
+            ("organization_id", "o1"),
+            ("user_id", "alice"),
+            ("team_role", "admin"),
+        ],
+    ),
+    (
+        "team_members",
+        &[("team_id", "T"), ("organization_id", "o1"), ("user_id", "bob"), ("team_role", "admin")],
+    ),
+    (
+        "team_members",
+        &[
+            ("team_id", "U"),
+            ("organization_id", "o1"),
+            ("user_id", "carol"),
+            ("team_role", "member"),
+        ],
+    ),
+    (
+        "team_members",
+        &[
+            ("team_id", "V"),
+            ("organization_id", "o2"),
+            ("user_id", "alice"),
+            ("team_role", "admin"),
+        ],
+    ),
+    (
+        "team_members",
+        &[
+            ("team_id", "W"),
+            ("organization_id", "o1"),
+            ("user_id", "alice"),
+            ("team_role", "member"),
+        ],
+    ),
+    ("objects", &[("id", "r1"), ("owner_id", "alice"), ("archived", "false")]),
+    ("objects", &[("id", "c1"), ("parent_id", "r1"), ("owner_id", "alice"), ("archived", "false")]),
+    ("objects", &[("id", "r2"), ("owner_id", "bob"), ("archived", "true")]),
+    ("objects", &[("id", "c2"), ("parent_id", "r2"), ("owner_id", "alice"), ("archived", "false")]),
+    ("objects", &[("id", "c3"), ("parent_id", "r1"), ("owner_id", "bob"), ("archived", "false")]),
+];
+
+/// What PostgreSQL 17.11 returns for `(caller, helper, argument)`, the
+/// helpers of [`JOINED`] called over [`JOINED_ROWS`].
+const JOINED_MEASURED: &[(&str, &str, Option<&str>, &[&str])] = &[
+    ("alice", "member_teams", Some("admin"), &["T"]),
+    ("alice", "member_teams", Some("member"), &["T", "W"]),
+    ("alice", "child_objects", None, &["c1"]),
+    ("bob", "member_teams", Some("admin"), &[]),
+    ("bob", "member_teams", Some("member"), &[]),
+    ("bob", "child_objects", None, &["c3"]),
+    ("carol", "member_teams", Some("admin"), &[]),
+    ("carol", "member_teams", Some("member"), &["U"]),
+    ("carol", "child_objects", None, &[]),
+    ("", "member_teams", Some("admin"), &[]),
+    ("", "member_teams", Some("member"), &[]),
+    ("", "child_objects", None, &[]),
+];
+
+#[test]
+fn a_joined_row_keeps_the_rows_whose_foreign_key_names_a_row_meeting_its_conditions() {
+    let database = postgres(JOINED);
+    let deployment = deployment();
+    let set = answer(&database, &deployment, "public", "member_teams", &[text("admin")])
+        .expect("answered");
+    assert_eq!(
+        render(&set),
+        "team_members.team_id WHERE user_id = app.user_id AND team_role IN ('admin') \
+         AND (organization_id, user_id) -> memberships {state IN ('active')}"
+    );
+    let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
+    let [joined] = grant.joined_rows() else { panic!("one joined row") };
+    let referenced: Vec<&str> =
+        joined.columns().iter().map(|(_, referenced)| referenced.column_name()).collect();
+    assert_eq!(referenced, ["organization_id", "user_id"]);
+    assert_eq!(
+        joined.foreign_key().referenced_table(&database).expect("resolves").table_name(),
+        "memberships"
+    );
+
+    let set = answer(&database, &deployment, "public", "child_objects", &[]).expect("answered");
+    assert_eq!(
+        render(&set),
+        "objects.id WHERE owner_id = app.user_id AND (parent_id) -> objects {archived IN (false)}"
+    );
+
+    for &(caller, helper, argument, expected) in JOINED_MEASURED {
+        let arguments: Vec<Value> = argument.into_iter().map(text).collect();
+        let set = answer(&database, &deployment, "public", helper, &arguments).expect("answered");
+        let returned: Vec<_> =
+            evaluate(&set, Request::of(caller), JOINED_ROWS).into_iter().collect();
+        assert_eq!(returned, expected, "{caller} calling {helper}({argument:?})");
+    }
+}
+
+/// `member_teams('admin')` with `body` as its body, rendered.
+fn joined(body: &str) -> Result<String, HelperSetError> {
+    let sql = JOINED.replace(
+        "SELECT member.team_id FROM public.team_members member
+  JOIN public.memberships membership
+    ON membership.organization_id = member.organization_id AND membership.user_id = member.user_id
+  WHERE member.user_id = current_setting('app.user_id', true)
+    AND (member.team_role = 'admin' OR min_role = 'member')
+    AND membership.state = 'active'",
+        body,
+    );
+    assert_ne!(sql, JOINED, "the body is replaced");
+    let database = postgres(&sql);
+    let deployment = deployment();
+    answer(&database, &deployment, "public", "member_teams", &[text("admin")])
+        .map(|set| render(&set))
+}
+
+const MEMBER_TEAMS: &str = "team_members.team_id WHERE user_id = app.user_id \
+     AND (organization_id, user_id) -> memberships {state IN ('active')}";
+
+#[test]
+fn a_joined_row_is_read_from_on_and_where_in_every_spelling_of_the_join() {
+    for body in [
+        "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+         ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
+         WHERE m.user_id = current_setting('app.user_id', true) AND o.state = 'active'",
+        "SELECT m.team_id FROM public.team_members m INNER JOIN public.memberships o \
+         ON m.user_id = o.user_id AND (m.organization_id = o.organization_id AND o.state = 'active') \
+         WHERE m.user_id = current_setting('app.user_id', true)",
+        "SELECT team_members.team_id FROM public.team_members JOIN public.memberships \
+         ON memberships.organization_id = team_members.organization_id \
+         WHERE memberships.user_id = team_members.user_id AND state = 'active' \
+         AND team_members.user_id = current_setting('app.user_id', true)",
+        "SELECT team_id FROM public.team_members m JOIN public.memberships o \
+         ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
+         AND m.user_id = current_setting('app.user_id', true) \
+         WHERE state IN ('active', 'invited') AND o.state = min_role OR o.state = 'active'",
+    ] {
+        assert_eq!(joined(body).as_deref(), Ok(MEMBER_TEAMS), "{body}");
+    }
+    assert_eq!(
+        joined(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+             ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
+             WHERE m.user_id = current_setting('app.user_id', true) AND o.state = 'active' \
+             AND (o.expires_at IS NULL OR o.expires_at > now())"
+        )
+        .as_deref(),
+        Ok("team_members.team_id WHERE user_id = app.user_id \
+            AND (organization_id, user_id) -> memberships \
+            {state IN ('active') AND (expires_at IS NULL OR expires_at > now)}")
+    );
+    assert_eq!(
+        joined(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+             ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
+             WHERE m.user_id = current_setting('app.user_id', true) \
+             AND o.state = 'active' AND o.state = min_role"
+        )
+        .as_deref(),
+        Ok(""),
+        "a joined row no row meets keeps no row of the arm"
+    );
+    let database = postgres(&helper(
+        DEFINER,
+        "SELECT doc_id FROM members JOIN docs ON docs.id = members.doc_id \
+         WHERE user_id = current_setting('app.user_id', true) AND parent_id = 'root'",
+        "",
+    ));
+    let deployment = deployment();
+    assert_eq!(
+        answer(&database, &deployment, "public", "docs_with", &[text("read")])
+            .map(|set| render(&set))
+            .as_deref(),
+        Ok(
+            "members.doc_id WHERE user_id = app.user_id AND (doc_id) -> docs {parent_id IN ('root')}"
+        ),
+        "a bare name is the column of the one row holding it"
+    );
+}
+
+#[test]
+fn a_join_other_than_a_whole_foreign_key_to_the_row_it_names_refuses_the_answer() {
+    let caller = "m.user_id = current_setting('app.user_id', true)";
+    for body in [
+        format!(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+             ON o.user_id = m.user_id WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+             ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
+             AND o.state = m.team_role WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+             ON o.organization_id = m.organization_id AND o.user_id = m.team_id WHERE {caller}"
+        ),
+        format!(
+            "SELECT o.organization_id FROM public.memberships o JOIN public.team_members m \
+             ON o.organization_id = m.organization_id AND o.user_id = m.user_id WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m LEFT JOIN public.memberships o \
+             ON o.organization_id = m.organization_id AND o.user_id = m.user_id WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+             USING (organization_id, user_id) WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m NATURAL JOIN public.memberships o \
+             WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m CROSS JOIN public.memberships o \
+             WHERE o.organization_id = m.organization_id AND o.user_id = m.user_id AND {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships o ON TRUE \
+             WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m JOIN (SELECT * FROM public.memberships) o \
+             ON o.organization_id = m.organization_id AND o.user_id = m.user_id WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships m \
+             ON m.organization_id = m.organization_id AND m.user_id = m.user_id WHERE {caller}"
+        ),
+        "SELECT team_id FROM public.team_members m JOIN public.memberships o \
+         ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
+         WHERE user_id = current_setting('app.user_id', true)"
+            .to_string(),
+    ] {
+        assert!(matches!(joined(&body), Err(HelperSetError::ArmShape { .. })), "{body}");
+    }
+
+    let on_joined = "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+         ON o.organization_id = m.organization_id AND o.user_id = m.user_id WHERE ";
+    for condition in [
+        "o.user_id = current_setting('app.user_id', true)",
+        "o.organization_id IN (SELECT member_teams(min_role))",
+        "o.state <> m.team_role",
+        "o.state = 'active' OR m.team_role = 'admin'",
+    ] {
+        assert!(
+            matches!(
+                joined(&format!("{on_joined}{caller} AND {condition}")),
+                Err(HelperSetError::Irreducible { .. })
+            ),
+            "{condition}"
+        );
+    }
+
+    let parent = helper(
+        DEFINER,
+        "SELECT d.id FROM docs d JOIN docs p ON p.id = d.parent_id \
+         WHERE d.parent_id IN (SELECT docs_with(min_role))",
+        "",
+    );
+    assert!(
+        matches!(refusal(&parent), HelperSetError::ArmShape { .. }),
+        "a parent arm takes no joined row"
+    );
+}
+
+#[test]
+fn the_owner_has_to_read_a_joined_table_past_its_policies() {
+    let body = "SELECT doc_id FROM members JOIN docs d ON d.id = members.doc_id \
+         WHERE user_id = current_setting('app.user_id', true) AND d.parent_id = 'root'";
+    let ungranted = helper(DEFINER, body, "")
+        .replace("GRANT SELECT ON docs, members TO owner;", "GRANT SELECT ON members TO owner;");
+    assert!(matches!(
+        refusal(&ungranted),
+        HelperSetError::MissingSelect { table, .. } if table == "docs"
+    ));
+    let columns = helper(DEFINER, body, "GRANT SELECT (id, parent_id) ON docs TO owner;")
+        .replace("GRANT SELECT ON docs, members TO owner;", "GRANT SELECT ON members TO owner;");
+    let database = postgres(&columns);
+    let deployment = deployment();
+    answer(&database, &deployment, "public", "docs_with", &[text("read")])
+        .expect("SELECT on the joined columns the arm reads is enough");
+    let bound = helper(DEFINER, body, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;")
+        .replace("CREATE ROLE owner NOLOGIN BYPASSRLS;", "CREATE ROLE owner NOLOGIN;");
+    assert!(matches!(
+        refusal(&bound),
+        HelperSetError::NotExempt { table, .. } if table == "docs"
+    ));
 }

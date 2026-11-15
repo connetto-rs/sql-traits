@@ -1892,9 +1892,15 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
     ///   `transaction_timestamp()` read the same statement time as `now()`. The
     ///   rest, the arguments substituted, reduce to `TRUE`, to `FALSE` or
-    ///   `NULL`, or to the literal values columns have to hold. An arm
-    ///   comparing a helper's set while returning its table's primary key is a
-    ///   parent arm, so it takes no other condition.
+    ///   `NULL`, or to the literal values columns have to hold. The table may
+    ///   be followed by `[INNER] JOIN <table> ON <condition>` for each row it
+    ///   names through a foreign key, the conditions in `ON` read as those in
+    ///   `WHERE`. Each column of the key equated with the column it references
+    ///   joins the row, and the conditions on that row alone reduce to a
+    ///   [`JoinedRow`](crate::structs::JoinedRow), the grantee and the returned
+    ///   column staying on the arm's own table. An arm comparing a helper's set
+    ///   while returning its table's primary key is a parent arm, so it takes
+    ///   no other condition and joins no row.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it

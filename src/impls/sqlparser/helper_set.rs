@@ -13,9 +13,9 @@ use sqlparser::{
     ast::{
         ArgMode, BinaryOperator, CastKind, DataType, Distinct, Expr, Function, FunctionArg,
         FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior,
-        FunctionSecurity, GroupByExpr, Ident, InTarget, JoinConstraint, JoinOperator, ObjectName,
-        ObjectNamePart, Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator,
-        SetQuantifier, Statement, TableAliasColumnDef, TableFactor, Value,
+        FunctionSecurity, GroupByExpr, Ident, InTarget, Join, JoinConstraint, JoinOperator,
+        ObjectName, ObjectNamePart, Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator,
+        SetQuantifier, Statement, TableAliasColumnDef, TableFactor, Value, Visit,
     },
     parser::Parser,
 };
@@ -28,7 +28,7 @@ use crate::{
     errors::{HelperSetError, LookupError},
     structs::{
         CallerGate, Deployment, FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm,
-        HelperSet, IdentifierCase, LiteralSet, ParentArm, RowSecurity, RowStatement,
+        HelperSet, IdentifierCase, JoinedRow, LiteralSet, ParentArm, RowSecurity, RowStatement,
         SessionSetting, SetPacking, SettingComparison, SettingContent, SettingValue, TargetName,
         TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
@@ -220,6 +220,13 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
         HelperSetError::ArmShape { function: self.name.clone(), arm: arm.to_string() }
     }
 
+    fn irreducible(&self, condition: &Expr) -> HelperSetError {
+        HelperSetError::Irreducible {
+            function: self.name.clone(),
+            condition: condition.to_string(),
+        }
+    }
+
     /// Splits the body into its arms and, where it writes `WITH RECURSIVE`,
     /// the term walking down a tree under them.
     fn body<'q>(&self, query: &'q Query) -> Result<Body<'q>, HelperSetError> {
@@ -257,10 +264,11 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
         let name = &cte.alias.name;
         // PostgreSQL refuses the walk's name in the arms before its recursive
         // term, so a table of that name is not what they read.
-        if arms
-            .iter()
-            .any(|arm| arm.from.iter().any(|from| walk_qualifier(&from.relation, name).is_some()))
-        {
+        if arms.iter().flat_map(|arm| &arm.from).any(|from| {
+            core::iter::once(&from.relation)
+                .chain(from.joins.iter().map(|join| &join.relation))
+                .any(|relation| walk_qualifier(relation, name).is_some())
+        }) {
             return Err(shape());
         }
         let column = match cte.alias.columns.as_slice() {
@@ -503,6 +511,27 @@ struct SetRead<'q> {
 /// one, beside the arm, `None` where its condition keeps no row.
 type ReadArm<'db, DB> = (Option<&'db <DB as DatabaseLike>::Table>, Option<HelperArm<'db, DB>>);
 
+/// A column of an arm's own table beside the column of a joined table it
+/// equals.
+type JoinedColumns<'db, DB> =
+    (&'db <DB as DatabaseLike>::Column, &'db <DB as DatabaseLike>::Column);
+
+/// The foreign key joining a row to an arm, with its columns.
+type JoiningKey<'db, DB> = (&'db <DB as DatabaseLike>::ForeignKey, Vec<JoinedColumns<'db, DB>>);
+
+/// The conjuncts of an arm on one row it joins, beside the columns joining
+/// it.
+struct Joining<'q, 'db, DB: DatabaseLike> {
+    conditions: Vec<&'q Expr>,
+    key: Vec<JoinedColumns<'db, DB>>,
+}
+
+/// What the conditions on one row of an arm reduce to.
+struct RowConditions<'db, DB: DatabaseLike> {
+    restrictions: Vec<LiteralSet<'db, DB>>,
+    time_bounds: Vec<TimeBound<'db, DB>>,
+}
+
 /// A helper body's arms, with the term walking down a tree under them where
 /// the body writes `WITH RECURSIVE`.
 struct Body<'q> {
@@ -626,32 +655,50 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let ([item], [from]) = (select.projection.as_slice(), select.from.as_slice()) else {
             return Err(scope.arm_shape(select));
         };
-        let table = self.arm_table(scope, select, &from.relation, from.joins.is_empty())?;
+        let database = self.database;
+        let mut rows = vec![self.arm_table(scope, select, &from.relation)?];
+        for join in &from.joins {
+            if join.global || join_condition(join).is_none() {
+                return Err(scope.arm_shape(select));
+            }
+            rows.push(self.arm_table(scope, select, &join.relation)?);
+        }
+        // PostgreSQL refuses two rows of one name, and a bare name two rows
+        // hold.
+        let named_twice = rows.iter().enumerate().any(|(index, row)| {
+            rows[..index].iter().any(|other| same_ident(&row.qualifier, &other.qualifier))
+        });
+        if named_twice || rows_named(&rows, select, database)?.is_none() {
+            return Err(scope.arm_shape(select));
+        }
+        let table = &rows[0];
         let (SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }) =
             item
         else {
             return Err(scope.arm_shape(select));
         };
-        let Some(column) = table.column(returned, self.database)? else {
+        let Some(column) = table.column(returned, database)? else {
             return Err(scope.arm_shape(select));
         };
-        let database = self.database;
-        self.require_select(scope, table.table, || table.columns_read(select, database))?;
+        for row in &rows {
+            self.require_select(scope, row.table, || row.columns_read(select, database))?;
+        }
         let keyed = self.keyed_table(table.table, column)?;
         let returns_key = table
             .table
             .primary_key_column(database)?
             .is_some_and(|primary| core::ptr::eq(primary, column));
         if returns_key
+            && from.joins.is_empty()
             && let Some(Expr::In {
                 expr, target: InTarget::Subquery(called), negated: false, ..
             }) = select.selection.as_ref().map(unnest)
             && self.set_elements(scope, called).is_none()
         {
-            let arm = self.parent_arm(scope, select, &table, column, expr, called)?;
+            let arm = self.parent_arm(scope, select, table, column, expr, called)?;
             return Ok((keyed, Some(arm)));
         }
-        Ok((keyed, self.grant_arm(scope, select, &table, column, returns_key)?))
+        Ok((keyed, self.grant_arm(scope, select, &rows, column, returns_key)?))
     }
 
     /// Reads the recursive term of a walk, `SELECT <key> FROM <table> JOIN
@@ -678,11 +725,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let ([join], None) = (from.joins.as_slice(), &term.selection) else {
             return Err(shape());
         };
-        let (JoinOperator::Join(JoinConstraint::On(on))
-        | JoinOperator::Inner(JoinConstraint::On(on))) = &join.join_operator
-        else {
-            return Err(shape());
-        };
+        let Some(on) = join_condition(join) else { return Err(shape()) };
         let (relation, qualifier) = match (
             walk_qualifier(&from.relation, walk.name),
             walk_qualifier(&join.relation, walk.name),
@@ -706,7 +749,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if !plain_select(term) || join.global || ambiguous(compared) || ambiguous(returned) {
             return Err(shape());
         }
-        let table = self.arm_table(scope, term, relation, true)?;
+        let table = self.arm_table(scope, term, relation)?;
         let (Some(key), Some(returned), Some(compared)) = (
             table.table.primary_key_column(database)?,
             table.column(returned, database)?,
@@ -762,17 +805,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(core::ptr::eq(primary, referenced_column).then_some(referenced))
     }
 
-    /// Resolves the one table an arm reads, and checks the owner reads all
-    /// of it.
+    /// Resolves a table an arm reads, and checks the owner reads all of it.
     fn arm_table<'q>(
         &self,
         scope: &Scope<'db, DB>,
         select: &Select,
         relation: &'q TableFactor,
-        unjoined: bool,
     ) -> Result<ArmTable<'q, 'db, DB>, HelperSetError> {
         let database = self.database;
-        let Some((name, alias)) = plain_table(relation).filter(|_| unjoined) else {
+        let Some((name, alias)) = plain_table(relation) else {
             return Err(scope.arm_shape(select));
         };
         let resolve = |path: &SearchPath<'db>| {
@@ -1016,23 +1057,56 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// Reads a grant arm, `None` where its conditions keep no row. An arm
     /// returning its table's key from a helper's set is a parent arm, which
     /// takes no other condition, so `returns_key` refuses a set beside one.
+    /// `rows` holds the arm's table and then each table it joins.
     fn grant_arm(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
-        table: &ArmTable<'_, 'db, DB>,
+        rows: &[ArmTable<'_, 'db, DB>],
         column: &'db DB::Column,
         returns_key: bool,
     ) -> Result<Option<HelperArm<'db, DB>>, HelperSetError> {
+        let database = self.database;
         let shape = || scope.arm_shape(select);
+        let (table, joined) = rows.split_first().ok_or_else(shape)?;
+        // An inner join keeps the rows its condition and `WHERE` keep alike.
         let mut conjuncts = Vec::new();
+        for join in select.from.iter().flat_map(|from| &from.joins) {
+            conjunction(join_condition(join).ok_or_else(shape)?, &mut conjuncts);
+        }
         if let Some(selection) = &select.selection {
             conjunction(selection, &mut conjuncts);
         }
+        let mut own = Vec::new();
+        let mut joining: Vec<Joining<'_, 'db, DB>> =
+            joined.iter().map(|_| Joining { conditions: Vec::new(), key: Vec::new() }).collect();
+        for conjunct in conjuncts {
+            match rows_named(rows, conjunct, database)?.ok_or_else(shape)?.as_slice() {
+                [] | [0] => own.push(conjunct),
+                [row] => joining[row - 1].conditions.push(conjunct),
+                _ => {
+                    let (row, (host, referenced)) = self
+                        .key_equality(table, joined, conjunct)?
+                        .ok_or_else(|| scope.irreducible(conjunct))?;
+                    let key = &mut joining[row].key;
+                    if !key.iter().any(|(seen_host, seen_referenced)| {
+                        core::ptr::eq(*seen_host, host)
+                            && core::ptr::eq(*seen_referenced, referenced)
+                    }) {
+                        key.push((host, referenced));
+                    }
+                }
+            }
+        }
+        let mut keys = Vec::new();
+        for (row, joining) in joined.iter().zip(&joining) {
+            keys.push(self.joining_key(table.table, row.table, &joining.key)?.ok_or_else(shape)?);
+        }
+
         let mut granted_to = None;
         let mut gates = Gates::default();
         let mut conditions = Vec::new();
-        for conjunct in conjuncts {
+        for conjunct in own {
             let grantee = if let Some(request) = self.setting_comparison(scope, table, conjunct)? {
                 Some(GrantedTo::Request(request))
             } else if let Expr::In {
@@ -1061,19 +1135,52 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 conditions.push(conjunct);
             }
         }
+        let own = self.row_conditions(scope, table, &conditions)?;
+        let mut joined_rows = Vec::new();
+        let mut keeps_nothing = own.is_none() || gates.keeps_nothing;
+        for ((row, joining), (foreign_key, columns)) in joined.iter().zip(&joining).zip(keys) {
+            let Some(kept) = self.row_conditions(scope, row, &joining.conditions)? else {
+                keeps_nothing = true;
+                continue;
+            };
+            joined_rows.push(JoinedRow {
+                table: row.table,
+                foreign_key,
+                columns,
+                restrictions: kept.restrictions,
+                time_bounds: kept.time_bounds,
+            });
+        }
+        let Some(own) = own.filter(|_| !keeps_nothing) else { return Ok(None) };
+        Ok(Some(HelperArm::Grant(GrantArm {
+            table: table.table,
+            column,
+            granted_to: granted_to.unwrap_or(GrantedTo::Anyone),
+            gate: gates.gate,
+            restrictions: own.restrictions,
+            time_bounds: own.time_bounds,
+            joined_rows,
+        })))
+    }
+
+    /// What `conditions` keep of the rows of `table`, `None` where they keep
+    /// none.
+    fn row_conditions(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        conditions: &[&Expr],
+    ) -> Result<Option<RowConditions<'db, DB>>, HelperSetError> {
         let mut kept = Kept::All;
         let mut time_bounds = Vec::new();
-        for condition in conditions {
+        for &condition in conditions {
             if let Some(bound) = self.time_bound(scope, table, condition)? {
                 time_bounds.push(bound);
                 continue;
             }
-            let reduced = self.reduce(scope, table, condition)?.ok_or_else(|| {
-                HelperSetError::Irreducible {
-                    function: scope.name.clone(),
-                    condition: condition.to_string(),
-                }
-            })?;
+            let reduced = self
+                .reduce(scope, table, condition)?
+                .ok_or_else(|| scope.irreducible(condition))?;
             kept = kept.and(reduced);
         }
         let restrictions = match kept {
@@ -1090,17 +1197,65 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     .collect()
             }
         };
-        if gates.keeps_nothing {
+        Ok(Some(RowConditions { restrictions, time_bounds }))
+    }
+
+    /// `<joined column> = <column>`, either way round, a column of the arm's
+    /// own `table` equated with one of a row it joins, answered as the index
+    /// of that row in `joined` beside the two columns.
+    fn key_equality(
+        &self,
+        table: &ArmTable<'_, 'db, DB>,
+        joined: &[ArmTable<'_, 'db, DB>],
+        conjunct: &Expr,
+    ) -> Result<Option<(usize, JoinedColumns<'db, DB>)>, LookupError> {
+        let database = self.database;
+        let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = unnest(conjunct) else {
             return Ok(None);
+        };
+        for (index, row) in joined.iter().enumerate() {
+            for (host, referenced) in [(left, right), (right, left)] {
+                if let (Some(host), Some(referenced)) =
+                    (table.column(host, database)?, row.column(referenced, database)?)
+                {
+                    return Ok(Some((index, (host, referenced))));
+                }
+            }
         }
-        Ok(Some(HelperArm::Grant(GrantArm {
-            table: table.table,
-            column,
-            granted_to: granted_to.unwrap_or(GrantedTo::Anyone),
-            gate: gates.gate,
-            restrictions,
-            time_bounds,
-        })))
+        Ok(None)
+    }
+
+    /// The one foreign key of `host` referencing `joined` whose every column
+    /// `key` equates with the column it references, and nothing else, with
+    /// its columns in the order it declares them.
+    fn joining_key(
+        &self,
+        host: &'db DB::Table,
+        joined: &'db DB::Table,
+        key: &[JoinedColumns<'db, DB>],
+    ) -> Result<Option<JoiningKey<'db, DB>>, LookupError> {
+        let database = self.database;
+        let mut found = None;
+        for foreign_key in host.foreign_keys(database)? {
+            if !core::ptr::eq(foreign_key.referenced_table(database)?, joined) {
+                continue;
+            }
+            let columns: Vec<_> = foreign_key
+                .host_columns(database)?
+                .zip(foreign_key.referenced_columns(database)?)
+                .collect();
+            let equated = columns.len() == key.len()
+                && columns.iter().all(|(host, referenced)| {
+                    key.iter().any(|(equated_host, equated_referenced)| {
+                        core::ptr::eq(*equated_host, *host)
+                            && core::ptr::eq(*equated_referenced, *referenced)
+                    })
+                });
+            if equated && found.replace((foreign_key, columns)).is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(found)
     }
 
     /// The gate `conjunct` writes on a caller setting,
@@ -1790,6 +1945,53 @@ fn unadorned(query: &Query) -> bool {
         && query.settings.is_none()
         && query.format_clause.is_none()
         && query.pipe_operators.is_empty()
+}
+
+/// The `ON` condition of an inner `join`, the one spelling of a join an arm
+/// reads.
+fn join_condition(join: &Join) -> Option<&Expr> {
+    let (JoinOperator::Join(JoinConstraint::On(on)) | JoinOperator::Inner(JoinConstraint::On(on))) =
+        &join.join_operator
+    else {
+        return None;
+    };
+    Some(on)
+}
+
+/// The indexes in `rows` of the rows whose columns `node` names, each once,
+/// `None` where it names bare a column two of them hold, which PostgreSQL
+/// refuses as ambiguous.
+fn rows_named<'db, DB: DatabaseLike, N: Visit + ?Sized>(
+    rows: &[ArmTable<'_, 'db, DB>],
+    node: &N,
+    database: &'db DB,
+) -> Result<Option<Vec<usize>>, LookupError> {
+    let mut named = Vec::new();
+    let walked = walk_expressions(node, |expression| {
+        if !matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            return ControlFlow::Continue(());
+        }
+        let mut holding = None;
+        for (index, row) in rows.iter().enumerate() {
+            match row.column(expression, database) {
+                Err(error) => return ControlFlow::Break(Some(error)),
+                Ok(Some(_)) if holding.is_some() => return ControlFlow::Break(None),
+                Ok(Some(_)) => holding = Some(index),
+                Ok(None) => {}
+            }
+        }
+        if let Some(index) = holding
+            && !named.contains(&index)
+        {
+            named.push(index);
+        }
+        ControlFlow::Continue(())
+    });
+    match walked {
+        ControlFlow::Continue(()) => Ok(Some(named)),
+        ControlFlow::Break(None) => Ok(None),
+        ControlFlow::Break(Some(error)) => Err(error),
+    }
 }
 
 /// The name and the alias of the table `relation` names with nothing else
