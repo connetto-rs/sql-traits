@@ -17,7 +17,7 @@ CREATE DOMAIN dv AS VARCHAR(5);
 CREATE TABLE u (x TEXT);
 CREATE TABLE t (
     id INT PRIMARY KEY, s TEXT, i INT4, v VARCHAR(5), c CHAR(3), b INT8, h INT2, d dt, e dv,
-    \"Mixed\" TEXT, m mood, n NUMERIC
+    \"Mixed\" TEXT, m mood, n NUMERIC, day DATE
 );";
 
 fn parse(sql: &str) -> Expr {
@@ -98,6 +98,25 @@ fn declared_checks_read_as_postgresql_deparses_them() {
         ("n > -(-1.5)", "(n > 1.5)"),
         ("n > -0.00", "(n > 0.00)"),
         ("n > -99999999999999999999", "(n > '-99999999999999999999'::numeric)"),
+        // A conversion goes under a `COLLATE`, which a type without a
+        // collation drops.
+        ("s = 'a' COLLATE \"C\"", "(s = ('a'::text COLLATE \"C\"))"),
+        ("v = 'a' COLLATE \"C\"", "((v)::text = ('a'::text COLLATE \"C\"))"),
+        ("v COLLATE \"C\" = 'a'", "(((v)::text COLLATE \"C\") = 'a'::text)"),
+        ("c = 'a' COLLATE \"C\"", "(c = ('a'::bpchar COLLATE \"C\"))"),
+        ("d = 'x' COLLATE \"C\"", "((d)::text = ('x'::text COLLATE \"C\"))"),
+        ("d COLLATE \"C\" = 'x'", "(((d)::text COLLATE \"C\") = 'x'::text)"),
+        ("i = '1' COLLATE \"C\"", "(i = 1)"),
+        ("i = '-1' COLLATE \"C\"", "(i = '-1'::integer)"),
+        ("b = '7' COLLATE \"C\"", "(b = '7'::bigint)"),
+        ("day = '2020-01-01' COLLATE \"C\"", "(day = '2020-01-01'::date)"),
+        ("i = ('7')", "(i = 7)"),
+        ("i IN ('1' COLLATE \"C\", '2')", "(i = ANY (ARRAY[1, 2]))"),
+        (
+            "v IN ('a' COLLATE \"C\", 'b')",
+            "((v)::text = ANY ((ARRAY[('a'::character varying COLLATE \"C\"), \
+             'b'::character varying])::text[]))",
+        ),
         // A policy, whose subquery keeps the qualified names it writes.
         (
             "EXISTS (SELECT 1 FROM u WHERE u.x = t.s AND u.x <> '')",
