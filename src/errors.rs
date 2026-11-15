@@ -447,6 +447,15 @@ pub enum ChildMismatch {
         /// The check's name.
         constraint_name: String,
     },
+    /// The table holds a check of the parent's name whose stored values
+    /// cannot be compared with the parent's, since a literal of one of them
+    /// holds a value not known here.
+    ConstraintUndecidable {
+        /// The check's name.
+        constraint_name: String,
+        /// The literal whose value is not known, as written.
+        literal: String,
+    },
     /// The table's check of the parent's name is marked `NO INHERIT`.
     ConstraintNotInherited {
         /// The check's name.
@@ -483,6 +492,12 @@ impl core::fmt::Display for ChildMismatch {
             }
             Self::ConstraintDiffers { constraint_name } => {
                 write!(f, "its check `{constraint_name}` differs from the parent's")
+            }
+            Self::ConstraintUndecidable { constraint_name, literal } => {
+                write!(
+                    f,
+                    "its check `{constraint_name}` cannot be compared with the parent's, the value of '{literal}' not being known here"
+                )
             }
             Self::ConstraintNotInherited { constraint_name } => {
                 write!(f, "its check `{constraint_name}` is marked `NO INHERIT`")
@@ -1461,6 +1476,23 @@ pub enum Error {
         table_name: String,
         /// Name the two constraints share.
         constraint_name: String,
+    },
+    #[error(
+        "Constraint `{constraint_name}` of table `{table_name}` cannot be compared with the constraint of the same name a parent passes down, because the value PostgreSQL stored for '{literal}' is not known here: {reason}"
+    )]
+    /// Error indicating that a table's check would merge with the check of the
+    /// same name a parent passes down, which PostgreSQL does when the two hold
+    /// the same stored values, and a literal of one of them holds a value
+    /// read under session state the input does not settle.
+    InheritedCheckUndecidable {
+        /// Name of the table holding the check that would merge.
+        table_name: String,
+        /// Name the two checks share.
+        constraint_name: String,
+        /// The literal whose value is not known, as written.
+        literal: String,
+        /// What reading the literal needed or refused.
+        reason: sql_values::DateTimeError,
     },
     #[error("Cannot add a `NO INHERIT` check to partitioned table `{table_name}`.")]
     /// Error indicating that a `NO INHERIT` check was written on a partitioned

@@ -29,7 +29,10 @@ use super::{
 };
 use crate::{
     errors::Error,
-    structs::{TableAttribute, metadata::CheckLiterals},
+    structs::{
+        TableAttribute,
+        metadata::{CheckLiterals, MergedCheck, respell},
+    },
     traits::TableLike,
     utils::{identifier_resolution::stored_ident_name, is_identity, walk::walk_expressions_mut},
 };
@@ -388,8 +391,8 @@ fn without_generated_option_name(option: &ColumnOptionDef) -> ColumnOptionDef {
     match &mut bare.option {
         ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_) => bare.name = None,
         ColumnOption::Check(check) => {
-            stored_check(check);
             bare.name = bare.name.as_ref().map(stored_name);
+            check_identity(check, bare.name.is_some());
         }
         _ => {}
     }
@@ -402,11 +405,19 @@ fn stored_name(name: &Ident) -> Ident {
     Ident::with_quote('"', stored_ident_name(name).into_owned())
 }
 
-/// Rewrites a check into the form PostgreSQL compares: its name as stored and
-/// its expression as [`stored_expr`] gives it.
-fn stored_check(check: &mut CheckConstraint) {
+/// Rewrites a check into what tells it apart from other checks, its name as
+/// stored for a named one, `named` when the name is written outside it, and
+/// its expression as [`stored_expr`] gives it for an unnamed one.
+///
+/// PostgreSQL knows a named check by its name whatever the expression, and a
+/// merge of two checks compares their stored values instead.
+fn check_identity(check: &mut CheckConstraint, named: bool) {
     check.name = check.name.as_ref().map(stored_name);
-    *check.expr = stored_expr(&check.expr);
+    *check.expr = if named || check.name.is_some() {
+        Expr::Value(Value::Null.into())
+    } else {
+        stored_expr(&check.expr)
+    };
 }
 
 /// The expression as PostgreSQL stores it, which keeps no parentheses the tree
@@ -739,8 +750,8 @@ pub(super) fn partition_copy(
 /// The constraint with the name a copy would have been given stripped away.
 ///
 /// A partition's copy of a key differs from the root's only in that name, so
-/// recognising the copy has to look past it. A check is compared in the form
-/// PostgreSQL stores it, and every other kind is compared whole.
+/// recognising the copy has to look past it. A check is known as
+/// [`check_identity`] gives it, and every other kind is compared whole.
 fn without_generated_name(constraint: &TableConstraint) -> TableConstraint {
     let mut bare = constraint.clone();
     match &mut bare {
@@ -752,7 +763,7 @@ fn without_generated_name(constraint: &TableConstraint) -> TableConstraint {
             unique.name = None;
             unique.index_name = None;
         }
-        TableConstraint::Check(check) => stored_check(check),
+        TableConstraint::Check(check) => check_identity(check, false),
         TableConstraint::NotNull(not_null) => not_null.name = None,
         _ => {}
     }
@@ -1128,26 +1139,179 @@ pub(super) struct Inherited {
     pub(super) checks: Vec<(CheckConstraint, CheckLiterals)>,
 }
 
-/// Records `copy`, the child's copy of a check `parent` holds, with how the
-/// parent's check had its literals read.
-///
-/// The parent may hold the same check twice, read in different sessions, so
-/// each of its checks answers one copy, in the order they were created.
-fn receive_check(
-    builder: &ParserDBBuilder,
-    parent: &CreateTable,
-    copy: &CheckConstraint,
-    answered: &mut Vec<usize>,
+/// The checks a table being created receives from its parents, each with how
+/// the parent's check had its literals read, and its own checks a parent's
+/// merged with.
+#[derive(Default)]
+struct ReceivedChecks {
+    /// The positions in the builder's checks of the parents' checks already
+    /// answering a copy.
+    answered: Vec<usize>,
+    checks: Vec<(CheckConstraint, CheckLiterals)>,
+}
+
+impl ReceivedChecks {
+    /// The parent's check written as `check`, with how its literals were
+    /// read and its expression holding each stored value.
+    ///
+    /// The parent may hold the same check twice, read in different sessions,
+    /// so each of its checks answers one copy, in the order they were
+    /// created.
+    fn parent_check(
+        &mut self,
+        builder: &ParserDBBuilder,
+        parent: &CreateTable,
+        check: &CheckConstraint,
+    ) -> Option<(Expr, CheckLiterals)> {
+        let (index, (_, metadata)) =
+            builder.check_constraints().iter().enumerate().find(|(index, (held, _))| {
+                core::ptr::eq(TableAttribute::table(held.as_ref()), parent)
+                    && held.attribute() == check
+                    && !self.answered.contains(index)
+            })?;
+        self.answered.push(index);
+        Some((metadata.expression().clone(), metadata.literals().clone()))
+    }
+
+    /// Records `copy`, the child's copy of a check `parent` holds.
+    fn receive(&mut self, builder: &ParserDBBuilder, parent: &CreateTable, copy: &CheckConstraint) {
+        if let Some((_, literals)) = self.parent_check(builder, parent, copy) {
+            self.checks.push((copy.clone(), literals));
+        }
+    }
+
+    /// Records the checks `inherited`, the child's copy of a column of
+    /// `parent`, carries, taking off it each one merging with a check of
+    /// its name.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::merge_named`] does.
+    fn column(
+        &mut self,
+        builder: &ParserDBBuilder,
+        (parent, create_table): (&CreateTable, &CreateTable),
+        inherited: &mut ColumnDef,
+        constraints: &[TableConstraint],
+    ) -> Result<(), Error> {
+        let mut kept = Vec::with_capacity(inherited.options.len());
+        for option in core::mem::take(&mut inherited.options) {
+            if let ColumnOption::Check(check) = &option.option {
+                if let Some(name) = option.name.as_ref().or(check.name.as_ref())
+                    && self.merge_named(
+                        builder,
+                        (parent, create_table),
+                        (name, check),
+                        constraints,
+                    )?
+                {
+                    continue;
+                }
+                self.receive(builder, parent, check);
+            }
+            kept.push(option);
+        }
+        inherited.options = kept;
+        Ok(())
+    }
+
+    /// Merges `passed`, a constraint `parent` passes down, when it is a
+    /// named check meeting a check of its name, answering whether it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::merge_named`] does.
+    fn constraint(
+        &mut self,
+        builder: &ParserDBBuilder,
+        tables: (&CreateTable, &CreateTable),
+        passed: &TableConstraint,
+        constraints: &[TableConstraint],
+    ) -> Result<bool, Error> {
+        match passed {
+            TableConstraint::Check(check) => {
+                let Some(name) = &check.name else { return Ok(false) };
+                self.merge_named(builder, tables, (name, check), constraints)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Merges `written`, a check `parent` passes down under `name`, with the
+    /// check of that name the table being created declares itself or
+    /// received from an earlier parent, answering whether one was there.
+    ///
+    /// The table's own check is compared once its literals are read, an
+    /// earlier parent's at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InheritedConstraintConflict`] when an earlier
+    /// parent's check holds other stored values and
+    /// [`Error::InheritedCheckUndecidable`] when a value deciding that is not
+    /// known here.
+    fn merge_named(
+        &mut self,
+        builder: &ParserDBBuilder,
+        (parent, create_table): (&CreateTable, &CreateTable),
+        (name, written): (&Ident, &CheckConstraint),
+        constraints: &[TableConstraint],
+    ) -> Result<bool, Error> {
+        let named = |check: &CheckConstraint, name: &Ident| {
+            let mut named = check.clone();
+            named.name = Some(name.clone());
+            TableConstraint::Check(named)
+        };
+        let passed = named(written, name);
+        let local = super::constraint_names::slots(create_table).into_iter().find_map(|slot| {
+            let held = super::constraint_names::check_of(slot)?;
+            is_copy_of(&named(held, slot.declared_name()?), &passed).then(|| held.clone())
+        });
+        let earlier = constraints.iter().find_map(|held| {
+            match held {
+                TableConstraint::Check(held_check) if is_copy_of(held, &passed) => {
+                    Some(held_check.clone())
+                }
+                _ => None,
+            }
+        });
+        if local.is_none() && earlier.is_none() {
+            return Ok(false);
+        }
+        let Some((expression, literals)) = self.parent_check(builder, parent, written) else {
+            return Ok(true);
+        };
+        let other = MergedCheck {
+            expression,
+            literals,
+            table_name: create_table.name.to_string(),
+            constraint_name: stored_ident_name(name).into_owned(),
+        };
+        if let Some(local) = local {
+            merge_into_local(&mut self.checks, &local, other);
+        } else if let Some(earlier) = earlier
+            && let Some((_, literals)) = self.checks.iter().find(|(held, _)| *held == earlier)
+        {
+            let mut expression = *earlier.expr.clone();
+            if let CheckLiterals::Stored(bound) = literals {
+                respell(&mut expression, bound);
+            }
+            super::stored_literals::hold_merge((&expression, literals), other)?;
+        }
+        Ok(true)
+    }
+}
+
+/// Has `local`, a check the table being created declares itself, hold the
+/// same stored values as `other` once its literals are read.
+pub(super) fn merge_into_local(
     checks: &mut Vec<(CheckConstraint, CheckLiterals)>,
+    local: &CheckConstraint,
+    other: MergedCheck,
 ) {
-    let found = builder.check_constraints().iter().enumerate().find(|(index, (held, _))| {
-        core::ptr::eq(TableAttribute::table(held.as_ref()), parent)
-            && held.attribute() == copy
-            && !answered.contains(index)
-    });
-    if let Some((index, (_, metadata))) = found {
-        answered.push(index);
-        checks.push((copy.clone(), metadata.literals().clone()));
+    match checks.iter_mut().find(|(held, _)| held == local) {
+        Some((_, CheckLiterals::Pending(pending))) => pending.push(other),
+        _ => checks.push((local.clone(), CheckLiterals::Pending(alloc::vec![other]))),
     }
 }
 
@@ -1283,8 +1447,7 @@ pub(super) fn apply_parents(
     let mut columns: Vec<ColumnDef> = Vec::new();
     let mut column_metadata: Vec<super::PreservedColumnMetadata> = Vec::new();
     let mut constraints: Vec<TableConstraint> = Vec::new();
-    let mut checks: Vec<(CheckConstraint, CheckLiterals)> = Vec::new();
-    let mut answered: Vec<usize> = Vec::new();
+    let mut received = ReceivedChecks::default();
 
     let context =
         ParentApplication::new(builder, &parents, &child_name, collations, catalog, &search_path);
@@ -1296,12 +1459,9 @@ pub(super) fn apply_parents(
             // A second parent declaring the same column merges into the one
             // already taken, keeping the position the first parent gave it.
             if !columns.iter().any(|held| same_column(&held.name, &column.name)) {
-                let inherited = inherited_column(builder, *kind, create_table, column, &mut taken);
-                for option in &inherited.options {
-                    if let ColumnOption::Check(check) = &option.option {
-                        receive_check(builder, parent, check, &mut answered, &mut checks);
-                    }
-                }
+                let mut inherited =
+                    inherited_column(builder, *kind, create_table, column, &mut taken);
+                received.column(builder, (parent, create_table), &mut inherited, &constraints)?;
                 if let Some(metadata) =
                     inherited_column_metadata(builder, parent, column, &inherited)
                 {
@@ -1324,6 +1484,11 @@ pub(super) fn apply_parents(
         }
 
         for constraint in &parent.constraints {
+            if passes_down(*kind, constraint)
+                && received.constraint(builder, (parent, create_table), constraint, &constraints)?
+            {
+                continue;
+            }
             let held = constraints.len();
             copy_parent_constraint(
                 builder,
@@ -1335,7 +1500,7 @@ pub(super) fn apply_parents(
                 &child_name,
             )?;
             if let Some(TableConstraint::Check(copy)) = constraints.get(held) {
-                receive_check(builder, parent, copy, &mut answered, &mut checks);
+                received.receive(builder, parent, copy);
             }
         }
     }
@@ -1367,7 +1532,7 @@ pub(super) fn apply_parents(
         constraints: constraints.iter().map(TableConstraint::to_string).collect(),
         unvalidated_constraints: unvalidated_copies(builder, &parents, &constraints),
         column_metadata,
-        checks,
+        checks: received.checks,
     };
 
     create_table.columns = columns;
