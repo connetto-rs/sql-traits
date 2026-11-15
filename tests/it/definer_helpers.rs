@@ -2649,6 +2649,63 @@ fn a_gate_on_the_caller_setting_excludes_the_values_it_compares_with() {
         ),
         "a gate reads one setting"
     );
+
+    let with_set = Deployment::new(
+        "app",
+        ["app"],
+        [
+            SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))
+                .expect("a custom setting name")
+                .may_be_unset(),
+            SessionSetting::value("app.team_ids", delimited(",")).expect("a custom setting name"),
+        ],
+    )
+    .expect("a valid deployment");
+    let database = postgres(&GRANTEES.replace(
+        "current_setting('app.user_id', true) <> ''",
+        "current_setting('app.team_ids', true) <> ''",
+    ));
+    assert!(
+        matches!(
+            answer(&database, &with_set, "authz", "caller_grantees", &[]),
+            Err(HelperSetError::SettingNotCaller { setting, .. }) if setting == "app.team_ids"
+        ),
+        "a gate reads a caller setting"
+    );
+}
+
+#[test]
+fn a_grantee_column_is_typed_by_its_one_foreign_key_or_by_none() {
+    let deployment = deployment();
+    let typed = |from: &str, to: &str| {
+        let sql = GRANTEES.replace(from, to);
+        assert_ne!(sql, GRANTEES, "{from} is replaced");
+        let database = postgres(&sql);
+        answer(&database, &deployment, "authz", "projects_granted", &[text("admin")]).map(|set| {
+            let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
+            let GrantedTo::Set(grantees) = grant.granted_to() else { panic!("granted to a set") };
+            grantees.foreign_key().is_some()
+        })
+    };
+    let column = "grantee_id TEXT NOT NULL REFERENCES grantees (id),";
+    assert_eq!(typed(column, "grantee_id TEXT NOT NULL,"), Ok(false), "a column without one");
+    assert!(
+        matches!(
+            typed(
+                column,
+                "grantee_id TEXT NOT NULL REFERENCES grantees (id) REFERENCES teams (id),"
+            ),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "a column with two names no one grantee table"
+    );
+    assert!(
+        matches!(
+            typed("WHERE pg.grantee_id IN", "WHERE lower(pg.grantee_id) IN"),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "a set compared with no column"
+    );
 }
 
 #[test]
