@@ -587,10 +587,7 @@ fn enumeration_of<'db>(
         }
         stored @ DataType::Custom(..) => {
             let (user_type, _) = user_type_of(stored, database)?;
-            let Some(UserDefinedTypeRepresentation::Enum { labels }) = user_type.representation()
-            else {
-                return None;
-            };
+            let labels = user_type.enum_labels()?;
             Some(Enumeration::new(EnumerationKind::Enum, None, Members::Labels(labels.iter())))
         }
         _ => None,

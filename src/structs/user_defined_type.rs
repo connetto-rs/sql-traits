@@ -106,6 +106,15 @@ impl UserDefinedType {
         self.representation.as_ref()
     }
 
+    /// The labels an enum type holds in their sort order, or `None` for a type
+    /// that is no enum.
+    pub(crate) fn enum_labels(&self) -> Option<&[Ident]> {
+        match &self.representation {
+            Some(UserDefinedTypeRepresentation::Enum { labels }) => Some(labels),
+            _ => None,
+        }
+    }
+
     /// The multirange a range type brings, named and bound as the type itself,
     /// or `None` for a type that is no range.
     #[must_use]

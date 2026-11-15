@@ -210,3 +210,43 @@ fn a_postgres_enum_type_answers_its_labels_through_the_catalog() {
     let element = column("a").array_element(&db).expect("a is an array");
     assert_eq!(collect(element.enumeration(&db)), labels);
 }
+
+/// A PostgreSQL enum type answers its labels from the type itself, as `ALTER
+/// TYPE ... ADD VALUE` leaves them, so an enum that only function parameters
+/// name is reachable from the name a parameter carries. Every other kind of
+/// user-defined type answers none.
+#[test]
+fn a_postgres_enum_type_answers_its_labels_from_its_definition() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TYPE access_level AS ENUM ('read', 'admin');
+         ALTER TYPE access_level ADD VALUE 'write' AFTER 'read';
+         CREATE FUNCTION sufficient(actual access_level, required access_level) RETURNS boolean
+           LANGUAGE sql IMMUTABLE AS $$ SELECT actual >= required $$;
+         CREATE TYPE pair AS (left_side INT, right_side TEXT);
+         CREATE TYPE span AS RANGE (subtype = int);
+         CREATE TYPE moodless;",
+    )
+    .expect("schema builds");
+
+    let function = db
+        .function_by_target(TargetName::new("sufficient", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("sufficient is declared");
+    let parameter_type =
+        function.argument_type_names(&db).next().expect("sufficient has arguments");
+    let access_level = db
+        .user_defined_types()
+        .find(|type_| type_.name() == parameter_type)
+        .expect("the parameter names a user-defined type");
+    assert_eq!(
+        collect(access_level.enumeration()),
+        Some((EnumerationKind::Enum, None, members(&["read", "write", "admin"])))
+    );
+    for other in ["pair", "span", "moodless"] {
+        let type_ = db
+            .user_defined_types()
+            .find(|type_| type_.name() == other)
+            .expect("the type is declared");
+        assert_eq!(collect(type_.enumeration()), None, "{other}");
+    }
+}
