@@ -495,3 +495,32 @@ fn elements_unknowns_and_raises() {
         ]
     );
 }
+
+/// A notice raises nothing, a definition reads each variable once however
+/// often its value names it, and a write after `RETURN` reaches no read.
+#[test]
+fn notices_continue_and_returns_end_the_path() {
+    let database = database(
+        "DECLARE s text := 'SELECT 1';
+         BEGIN
+          RAISE NOTICE 'running %', p;
+          CALL fill(t.*);
+          s := p || p;
+          EXECUTE s;
+          RETURN;
+          s := q;
+          EXECUTE s;
+         END",
+    );
+    let body = run(&database).dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let reads: Vec<_> =
+        sites.iter().map(|site| spelled(&site.reads(IdentifierCase::Folded).unwrap())).collect();
+    assert_eq!(reads, [vec![read("s", &["p || p"])], vec![read("s", &["unreachable"])]]);
+    let reached = sites[0].reads(IdentifierCase::Folded).unwrap();
+    let Reaching::Definitions(definitions) = reached[0].reaching() else { panic!("s is reached") };
+    assert_eq!(
+        spelled(&definitions[0].reads(IdentifierCase::Folded).unwrap()),
+        [read("p", &["incoming"])]
+    );
+}

@@ -594,9 +594,8 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             let handled = self.nodes(handler, raised.clone())?;
             join(&mut end, handled.as_ref());
         }
-        if let Some(frame) = self.frames.pop() {
-            join(&mut end, frame.exited.as_ref());
-        }
+        let exited = self.frames.pop().and_then(|frame| frame.exited);
+        join(&mut end, exited.as_ref());
         Ok(end)
     }
 
@@ -710,9 +709,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 self.write(pending, entry, &mut state);
             }
             let mut back = self.nodes(&repeated.statements, state)?;
-            if let Some(frame) = self.frames.last() {
-                join(&mut back, frame.continued.as_ref());
-            }
+            join(&mut back, self.frames.last().and_then(|frame| frame.continued.as_ref()));
             let mut next = entry.cloned();
             join(&mut next, back.as_ref());
             if next == head {
@@ -743,13 +740,10 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         {
             // Leaving the loop, `EXIT` included, gives a cursor variable the
             // loop named back its null.
-            let named = self.keys.get(&portal.key).copied();
-            if let (Some(index), Some(slots)) = (named, state.get_mut(&portal.variable.id())) {
-                slots.remove(&Slot::Written(index));
-                if is_entry(slots) {
-                    state.remove(&portal.variable.id());
-                }
-            }
+            let named = self.keys.get(&portal.key).map(|&index| Slot::Written(index));
+            state.entry(portal.variable.id()).and_modify(|slots| {
+                slots.retain(|slot| Some(slot) != named.as_ref());
+            });
         }
         Ok(exit)
     }
