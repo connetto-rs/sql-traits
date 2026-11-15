@@ -261,29 +261,93 @@ fn control_transfers_skip_what_they_leave() {
 fn untraced_writes_assign_an_unknown_value() {
     assert_eq!(
         reaching(
-            "DECLARE c CURSOR FOR SELECT name FROM t; s text := 'SELECT 1'; f text; n integer;
-              o text := 'SELECT 2'; e text := 'SELECT 3'; l text := 'SELECT 4';
+            "DECLARE c CURSOR FOR SELECT name FROM t; k refcursor; s text := 'SELECT 1'; f text;
+              n integer; o text := 'SELECT 2'; e text := 'SELECT 3'; l text := 'SELECT 4';
+              g text; h text;
              BEGIN
               SELECT name INTO s FROM t;
               OPEN c;
               FETCH c INTO f;
               GET DIAGNOSTICS n = ROW_COUNT;
-              CALL fill(o);
+              CALL fill(o, 'x', run.p, missing);
               FOREACH e IN ARRAY ARRAY[p] LOOP END LOOP;
               FOR l IN SELECT name FROM t LOOP END LOOP;
-              EXECUTE s USING f, n, c, o, e, l;
+              EXECUTE 'SELECT 5' INTO g;
+              FOR h IN EXECUTE 'SELECT 6' LOOP END LOOP;
+              OPEN k FOR SELECT name FROM t;
+              OPEN k FOR EXECUTE 'SELECT 7';
+              ASSERT p IS NOT NULL;
+              EXECUTE s USING f, n, c, o, e, l, g, h, k, p;
              END"
         ),
-        [vec![
-            read("s", &["unknown"]),
-            read("f", &["unknown"]),
-            read("n", &["unknown"]),
-            read("c", &["cursor name", "unknown"]),
-            read("o", &["'SELECT 2'", "unknown"]),
-            read("e", &["'SELECT 3'", "unknown"]),
-            read("l", &["unknown"]),
-        ]]
+        [
+            vec![],
+            vec![],
+            vec![],
+            vec![
+                read("s", &["unknown"]),
+                read("f", &["unknown"]),
+                read("n", &["unknown"]),
+                read("c", &["cursor name", "unknown"]),
+                read("o", &["'SELECT 2'", "unknown"]),
+                read("e", &["'SELECT 3'", "unknown"]),
+                read("l", &["unknown"]),
+                read("g", &["unknown"]),
+                read("h", &["unknown"]),
+                read("k", &["null", "unknown", "unknown"]),
+                read("p", &["incoming", "unknown"]),
+            ],
+        ]
     );
+}
+
+/// An output parameter starts as a null and an input parameter as the
+/// argument, which a branch assigning it joins.
+#[test]
+fn parameters_start_as_their_arguments_or_nulls() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{SCHEMA} CREATE FUNCTION outputs(p text, OUT r text) LANGUAGE plpgsql AS $$
+         BEGIN IF p IS NULL THEN p := 'SELECT 1'; END IF; EXECUTE r USING p; END $$;"
+    ))
+    .expect("schema parses");
+    let outputs = database
+        .function_by_target(TargetName::new("outputs", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("function exists");
+    let body = outputs.dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    assert_eq!(
+        spelled(&sites[0].reads(IdentifierCase::Folded).unwrap()),
+        [read("r", &["null"]), read("p", &["incoming", "'SELECT 1'"])]
+    );
+}
+
+/// A definition is the same handle at every read it reaches, through a
+/// copy of the site too, and a definition the body did not write has no
+/// scope and reads nothing.
+#[test]
+fn a_definition_is_one_handle_for_every_read() {
+    let database = database(
+        "DECLARE s text := 'SELECT 1'; n text;
+         BEGIN EXECUTE s; EXECUTE s USING p, n; END",
+    );
+    let body = run(&database).dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let copy = sites[1].clone();
+    let first = sites[0].reads(IdentifierCase::Folded).unwrap();
+    let second = copy.reads(IdentifierCase::Folded).unwrap();
+    let Reaching::Definitions(at_first) = first[0].reaching() else { panic!("s is reached") };
+    let Reaching::Definitions(at_second) = second[0].reaching() else { panic!("s is reached") };
+    assert_eq!(at_first, at_second);
+    assert_eq!(at_first[0].variable().name(), "s");
+    let Reaching::Definitions(incoming) = second[1].reaching() else { panic!("p is reached") };
+    assert_ne!(incoming[0].id(), at_first[0].id());
+    assert_eq!(incoming[0].variable().name(), "p");
+    assert!(incoming[0].scope().is_none());
+    assert!(incoming[0].reads(IdentifierCase::Folded).unwrap().is_empty());
+    let Reaching::Definitions(null) = second[2].reaching() else { panic!("n is reached") };
+    assert!(null[0].scope().is_none());
+    assert!(null[0].reads(IdentifierCase::Folded).unwrap().is_empty());
 }
 
 /// A catalog call running SQL text reads the variables its text argument
@@ -415,13 +479,18 @@ fn elements_unknowns_and_raises() {
             "DECLARE a text[] := ARRAY['SELECT 1'];
              BEGIN
               a[q] := p;
+              a[1:q] := ARRAY[p];
+              a[1].f := p;
               EXECUTE a[1] USING FOUND;
               RAISE EXCEPTION 'stop';
               EXECUTE p;
              END"
         ),
         [
-            vec![read("a", &["ARRAY['SELECT 1']", "[q] p"]), read("found", &["unknown"])],
+            vec![
+                read("a", &["ARRAY['SELECT 1']", "[q] p", "[:] ARRAY[p]", "[1].f p"]),
+                read("found", &["unknown"]),
+            ],
             vec![read("p", &["unreachable"])],
         ]
     );

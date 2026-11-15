@@ -607,15 +607,6 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         declaration: &'b Declaration,
         state: &mut Option<State>,
     ) -> Result<(), LookupError> {
-        if let DeclarationKind::Alias(_) = declaration.kind {
-            // An alias declares no variable of its own, nor a write.
-            return Ok(());
-        }
-        let address = core::ptr::from_ref(declaration).addr();
-        let Some(name) = &self.targets_namespace(address, &declaration.name)?.declared else {
-            return Err(self.unresolvable(&declaration.name));
-        };
-        let variable = self.names.variable(name);
         let (source, scope) = match &declaration.kind {
             DeclarationKind::Variable(declared) => {
                 match declared.default.as_deref() {
@@ -628,8 +619,14 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 }
             }
             DeclarationKind::Cursor(_) => (DefinitionSource::CursorName, None),
+            // An alias declares no variable of its own, nor a write.
             DeclarationKind::Alias(_) => return Ok(()),
         };
+        let address = core::ptr::from_ref(declaration).addr();
+        let Some(name) = &self.targets_namespace(address, &declaration.name)?.declared else {
+            return Err(self.unresolvable(&declaration.name));
+        };
+        let variable = self.names.variable(name);
         let pending =
             Pending { key: (address, 0), variable, part: Vec::new(), source, scope, kills: true };
         self.write_all(core::slice::from_ref(&pending), state);
