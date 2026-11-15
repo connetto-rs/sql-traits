@@ -1912,6 +1912,14 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// [`WalkArm`](crate::structs::WalkArm) after the arms. `UNION ALL` is
     /// refused, since it never ends on a tree holding a cycle.
     ///
+    /// The final query may instead reselect what the walk reached, `SELECT
+    /// <key> FROM <table> WHERE <key> IN (SELECT <column> FROM <walk>) [AND
+    /// <conditions>]`, where `<table>` is the one the set covers (see
+    /// [`HelperSet::covered_table`]), so the walk reaches keys of it alone.
+    /// The conditions are read as a grant arm's and answered as the
+    /// [`selection`](HelperSet::selection), left out where they keep every
+    /// row.
+    ///
     /// A grant arm whose conditions reduce to `FALSE` or `NULL` keeps no row
     /// and is left out, and a walk with it where no other arm remains. A
     /// column named like a parameter is the column, as PostgreSQL resolves

@@ -9,7 +9,8 @@ use sqlparser::ast::Value;
 
 use crate::{structs::SessionSetting, traits::DatabaseLike};
 
-/// The set a helper returns, the union of its arms.
+/// The set a helper returns, the union of its arms kept to the rows its
+/// [`selection`](Self::selection) keeps.
 ///
 /// An arm whose condition keeps no row for the arguments is left out, and a
 /// walk with it where no other arm remains, so a helper returning nothing
@@ -18,6 +19,7 @@ use crate::{structs::SessionSetting, traits::DatabaseLike};
 pub struct HelperSet<'db, DB: DatabaseLike> {
     pub(crate) arms: Vec<HelperArm<'db, DB>>,
     pub(crate) covered_table: Option<&'db DB::Table>,
+    pub(crate) selection: Option<GrantArm<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
@@ -28,9 +30,13 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
     }
 
     /// The one table whose primary key every arm the body writes returns,
-    /// as its own primary key or through a single-column foreign key
-    /// referencing it, so that every value of the set is a key of that
-    /// table.
+    /// as its own primary key or through a foreign key referencing it, so
+    /// that every value of the set is a key of that table.
+    ///
+    /// A foreign key counts where the column stands at the position of the
+    /// table's one-column primary key among the columns it references, and
+    /// where it checks every value the column holds, being `MATCH FULL` or
+    /// its other columns `NOT NULL`.
     ///
     /// `None` where two arms return keys of different tables, or an arm
     /// returns a column that is neither. Arms left out for the arguments
@@ -38,6 +44,23 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
     #[must_use]
     pub fn covered_table(&self) -> Option<&'db DB::Table> {
         self.covered_table
+    }
+
+    /// The rows of the [covered table](Self::covered_table) the final query
+    /// of a walk keeps, which every value of the set is the key of.
+    ///
+    /// A walk's final query `SELECT <key> FROM <table> WHERE <key> IN (SELECT
+    /// <column> FROM <walk>) AND <conditions>` keeps the keys it reached of
+    /// the rows its conditions keep. Its conditions are read as those of a
+    /// grant arm returning the key, so a consumer applies the selection as
+    /// it applies a [`GrantArm`] and keeps the values of the arms the
+    /// selection also returns. A consumer leaving it out returns more than
+    /// the helper does.
+    ///
+    /// `None` where the final query keeps every key the walk reached.
+    #[must_use]
+    pub fn selection(&self) -> Option<&GrantArm<'db, DB>> {
+        self.selection.as_ref()
     }
 }
 

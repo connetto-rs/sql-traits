@@ -15,7 +15,7 @@ use sqlparser::{
         FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior,
         FunctionSecurity, GroupByExpr, Ident, InTarget, JoinConstraint, JoinOperator, ObjectName,
         ObjectNamePart, Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator,
-        SetQuantifier, Statement, TableAliasColumnDef, TableFactor, Value,
+        SetQuantifier, Statement, TableAliasColumnDef, TableFactor, Value, Visit,
     },
     parser::Parser,
 };
@@ -221,7 +221,8 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
     }
 
     /// Splits the body into its arms and, where it writes `WITH RECURSIVE`,
-    /// the term walking down a tree under them.
+    /// the term walking down a tree under them, with the final query where
+    /// it reselects what the walk reached.
     fn body<'q>(&self, query: &'q Query) -> Result<Body<'q>, HelperSetError> {
         let mut arms = Vec::new();
         let Some(with) = &query.with else {
@@ -269,23 +270,28 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
             _ => return Err(shape()),
         };
         let SetExpr::Select(last) = query.body.as_ref() else { return Err(shape()) };
-        let ([from], [item], None) =
-            (last.from.as_slice(), last.projection.as_slice(), &last.selection)
-        else {
-            return Err(shape());
+        let [from] = last.from.as_slice() else { return Err(shape()) };
+        let reselection = match walk_qualifier(&from.relation, name) {
+            Some(qualifier) => {
+                let ([item], None) = (last.projection.as_slice(), &last.selection) else {
+                    return Err(shape());
+                };
+                let (SelectItem::UnnamedExpr(returned)
+                | SelectItem::ExprWithAlias { expr: returned, .. }) = item
+                else {
+                    return Err(shape());
+                };
+                if !plain_select(last)
+                    || !from.joins.is_empty()
+                    || !names_column(returned, qualifier, column, true)
+                {
+                    return Err(shape());
+                }
+                None
+            }
+            None => Some(last.as_ref()),
         };
-        let (SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }) =
-            item
-        else {
-            return Err(shape());
-        };
-        let selects_column = from.joins.is_empty()
-            && walk_qualifier(&from.relation, name)
-                .is_some_and(|qualifier| names_column(returned, qualifier, column, true));
-        if !plain_select(last) || !selects_column {
-            return Err(shape());
-        }
-        Ok(Body { arms, walk: Some(Walk { name, column, term }) })
+        Ok(Body { arms, walk: Some(Walk { name, column, term, reselection }) })
     }
 
     /// The parameter `expression` names, if it names one.
@@ -366,33 +372,35 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
         }
     }
 
-    /// Every column of the table `select` names, each once, which the owner
+    /// Every column of the table `nodes` name, each once, which the owner
     /// needs `SELECT` on wherever the name stands.
-    fn columns_read(
+    fn columns_read<'n, N: Visit + 'n>(
         &self,
-        select: &Select,
+        nodes: impl IntoIterator<Item = &'n N>,
         database: &'db DB,
     ) -> Result<Vec<&'db DB::Column>, LookupError> {
         let columns: Vec<&'db DB::Column> = self.table.columns(database)?.collect();
         let mut read: Vec<&'db DB::Column> = Vec::new();
-        let _: ControlFlow<()> = walk_expressions(select, |expression| {
-            let named = self.column_name(expression).and_then(|name| {
-                let name = name.to_string();
-                columns.iter().copied().find(|column| {
-                    IdentifierCase::AsWritten.names_stored(
-                        column.column_name(),
-                        column.column_name_is_quoted(),
-                        &name,
-                    )
-                })
+        for node in nodes {
+            let _: ControlFlow<()> = walk_expressions(node, |expression| {
+                let named = self.column_name(expression).and_then(|name| {
+                    let name = name.to_string();
+                    columns.iter().copied().find(|column| {
+                        IdentifierCase::AsWritten.names_stored(
+                            column.column_name(),
+                            column.column_name_is_quoted(),
+                            &name,
+                        )
+                    })
+                });
+                if let Some(column) = named
+                    && !read.iter().any(|seen| core::ptr::eq(*seen, column))
+                {
+                    read.push(column);
+                }
+                ControlFlow::Continue(())
             });
-            if let Some(column) = named
-                && !read.iter().any(|seen| core::ptr::eq(*seen, column))
-            {
-                read.push(column);
-            }
-            ControlFlow::Continue(())
-        });
+        }
         Ok(read)
     }
 }
@@ -511,11 +519,13 @@ struct Body<'q> {
 }
 
 /// The recursive term of a body, with the name and the one column it reads
-/// the set by.
+/// the set by, and the final query where it reselects what the walk reached
+/// rather than return it as `SELECT <column> FROM <walk>`.
 struct Walk<'q> {
     name: &'q Ident,
     column: &'q Ident,
     term: &'q Select,
+    reselection: Option<&'q Select>,
 }
 
 /// Answers helpers, following parent arms into the helpers they call.
@@ -605,11 +615,20 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             keyed.all(|other| other.is_some_and(|other| core::ptr::eq(other, *first)))
         });
         let mut arms: Vec<_> = read.into_iter().filter_map(|(_, arm)| arm).collect();
+        let mut selection = None;
+        if let Some(walk @ Walk { reselection: Some(last), .. }) = &body.walk {
+            match self.reselection(&scope, walk, last, covered_table)? {
+                Some(kept) if keeps_every_row(&kept) => {}
+                Some(kept) => selection = Some(kept),
+                None => arms.clear(),
+            }
+        }
         // A walk under arms keeping no row starts from nothing.
         if arms.iter().all(|arm| matches!(arm, HelperArm::Walk(_))) {
             arms.clear();
+            selection = None;
         }
-        Ok(HelperSet { arms, covered_table })
+        Ok(HelperSet { arms, covered_table, selection })
     }
 
     /// Reads one arm, answering the table whose primary key it returns,
@@ -636,7 +655,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(scope.arm_shape(select));
         };
         let database = self.database;
-        self.require_select(scope, table.table, || table.columns_read(select, database))?;
+        self.require_select(scope, table.table, || {
+            table.columns_read(core::iter::once(select), database)
+        })?;
         let keyed = self.keyed_table(table.table, column)?;
         let returns_key = table
             .table
@@ -651,7 +672,80 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             let arm = self.parent_arm(scope, select, &table, column, expr, called)?;
             return Ok((keyed, Some(arm)));
         }
-        Ok((keyed, self.grant_arm(scope, select, &table, column, returns_key)?))
+        let mut conjuncts = Vec::new();
+        if let Some(selection) = &select.selection {
+            conjunction(selection, &mut conjuncts);
+        }
+        let arm = self.grant_arm(scope, select, &table, column, returns_key, conjuncts)?;
+        Ok((keyed, arm.map(HelperArm::Grant)))
+    }
+
+    /// Reads the final query of a walk reselecting the keys it reached,
+    /// `SELECT <key> FROM <table> WHERE <key> IN (SELECT <column> FROM
+    /// <walk>) [AND <conditions>]`, its conditions read as those of a grant
+    /// arm returning the key, `None` where they keep no row. The walk has
+    /// to reach keys of the table alone, which it does where every arm and
+    /// the walk return them, so the reselection keeps every one of them the
+    /// conditions keep.
+    fn reselection(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        walk: &Walk<'_>,
+        select: &Select,
+        covered_table: Option<&'db DB::Table>,
+    ) -> Result<Option<GrantArm<'db, DB>>, HelperSetError> {
+        let database = self.database;
+        let shape = || scope.arm_shape(select);
+        let ([item], [from], Some(selection)) =
+            (select.projection.as_slice(), select.from.as_slice(), &select.selection)
+        else {
+            return Err(shape());
+        };
+        if !plain_select(select) {
+            return Err(shape());
+        }
+        let table = self.arm_table(scope, select, &from.relation, from.joins.is_empty())?;
+        let (SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }) =
+            item
+        else {
+            return Err(shape());
+        };
+        let Some(key) = table.table.primary_key_column(database)? else { return Err(shape()) };
+        let is_key = |expression: &Expr| -> Result<bool, LookupError> {
+            Ok(table.column(expression, database)?.is_some_and(|column| core::ptr::eq(column, key)))
+        };
+        if !is_key(returned)? {
+            return Err(shape());
+        }
+        let mut conjuncts = Vec::new();
+        conjunction(selection, &mut conjuncts);
+        let mut compared = None;
+        let mut conditions = Vec::new();
+        for conjunct in conjuncts {
+            if compared.is_none()
+                && let Expr::In {
+                    expr, target: InTarget::Subquery(subquery), negated: false, ..
+                } = conjunct
+                && reads_walk(subquery, walk)
+                && is_key(expr)?
+            {
+                compared = Some(expr.as_ref());
+            } else {
+                conditions.push(conjunct);
+            }
+        }
+        let Some(compared) = compared else { return Err(shape()) };
+        if !covered_table.is_some_and(|covered| core::ptr::eq(covered, table.table)) {
+            return Err(HelperSetError::UncoveredReselection {
+                function: scope.name.clone(),
+                table: target_name_of_table(table.table).to_string(),
+            });
+        }
+        self.require_select(scope, table.table, || {
+            let read = [returned, compared].into_iter().chain(conditions.iter().copied());
+            table.columns_read(read, database)
+        })?;
+        self.grant_arm(scope, select, &table, key, true, conditions)
     }
 
     /// Reads the recursive term of a walk, `SELECT <key> FROM <table> JOIN
@@ -736,9 +830,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// The table whose primary key `column` of `table` holds, `table` itself
-    /// where `column` is its primary key, else the table its one
-    /// single-column foreign key references, where that key references the
-    /// primary key.
+    /// where `column` is its primary key, else the one table its foreign keys
+    /// name. A foreign key names the table it references where `column`
+    /// stands at the position of that table's one-column primary key among
+    /// the referenced columns, and where it checks every value `column`
+    /// holds, being `MATCH FULL` or its other columns `NOT NULL`.
     fn keyed_table(
         &self,
         table: &'db DB::Table,
@@ -749,17 +845,38 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         {
             return Ok(Some(table));
         }
-        let [foreign_key] = single_column_foreign_keys(table, column, database)?[..] else {
-            return Ok(None);
-        };
-        let referenced = foreign_key.referenced_table(database)?;
-        let (Some(primary), Some(referenced_column)) = (
-            referenced.primary_key_column(database)?,
-            foreign_key.referenced_columns(database)?.next(),
-        ) else {
-            return Ok(None);
-        };
-        Ok(core::ptr::eq(primary, referenced_column).then_some(referenced))
+        let mut keyed = None;
+        for foreign_key in table.foreign_keys(database)? {
+            let mut position = None;
+            let mut unchecked = false;
+            for (index, host) in foreign_key.host_columns(database)?.enumerate() {
+                if core::ptr::eq(host, column) {
+                    position = Some(index);
+                } else {
+                    unchecked |= host.is_nullable(database)?;
+                }
+            }
+            let Some(position) = position else { continue };
+            if unchecked && !foreign_key.match_full(database) {
+                continue;
+            }
+            let referenced = foreign_key.referenced_table(database)?;
+            let (Some(primary), Some(referenced_column)) = (
+                referenced.primary_key_column(database)?,
+                foreign_key.referenced_columns(database)?.nth(position),
+            ) else {
+                continue;
+            };
+            if !core::ptr::eq(primary, referenced_column) {
+                continue;
+            }
+            match keyed {
+                None => keyed = Some(referenced),
+                Some(seen) if core::ptr::eq(seen, referenced) => {}
+                Some(_) => return Ok(None),
+            }
+        }
+        Ok(keyed)
     }
 
     /// Resolves the one table an arm reads, and checks the owner reads all
@@ -1013,9 +1130,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         })
     }
 
-    /// Reads a grant arm, `None` where its conditions keep no row. An arm
-    /// returning its table's key from a helper's set is a parent arm, which
-    /// takes no other condition, so `returns_key` refuses a set beside one.
+    /// Reads a grant arm whose condition joins `conjuncts` by `AND`, `None`
+    /// where they keep no row. An arm returning its table's key from a
+    /// helper's set is a parent arm, which takes no other condition, so
+    /// `returns_key` refuses a set beside one.
     fn grant_arm(
         &mut self,
         scope: &Scope<'db, DB>,
@@ -1023,12 +1141,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         table: &ArmTable<'_, 'db, DB>,
         column: &'db DB::Column,
         returns_key: bool,
-    ) -> Result<Option<HelperArm<'db, DB>>, HelperSetError> {
+        conjuncts: Vec<&Expr>,
+    ) -> Result<Option<GrantArm<'db, DB>>, HelperSetError> {
         let shape = || scope.arm_shape(select);
-        let mut conjuncts = Vec::new();
-        if let Some(selection) = &select.selection {
-            conjunction(selection, &mut conjuncts);
-        }
         let mut granted_to = None;
         let mut gates = Gates::default();
         let mut conditions = Vec::new();
@@ -1093,14 +1208,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if gates.keeps_nothing {
             return Ok(None);
         }
-        Ok(Some(HelperArm::Grant(GrantArm {
+        Ok(Some(GrantArm {
             table: table.table,
             column,
             granted_to: granted_to.unwrap_or(GrantedTo::Anyone),
             gate: gates.gate,
             restrictions,
             time_bounds,
-        })))
+        }))
     }
 
     /// The gate `conjunct` writes on a caller setting,
@@ -1824,6 +1939,30 @@ fn walk_qualifier<'q>(relation: &'q TableFactor, walk: &Ident) -> Option<&'q Ide
     let (name, alias) = plain_table(relation)?;
     let [ObjectNamePart::Identifier(part)] = name.0.as_slice() else { return None };
     same_ident(part, walk).then_some(alias.unwrap_or(part))
+}
+
+/// Whether `query` is `SELECT <column> FROM <walk>`, returning every value
+/// the walk reached.
+fn reads_walk(query: &Query, walk: &Walk<'_>) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else { return false };
+    let ([SelectItem::UnnamedExpr(returned)], [from], None) =
+        (select.projection.as_slice(), select.from.as_slice(), &select.selection)
+    else {
+        return false;
+    };
+    plain_query(query)
+        && plain_select(select)
+        && from.joins.is_empty()
+        && walk_qualifier(&from.relation, walk.name)
+            .is_some_and(|qualifier| names_column(returned, qualifier, walk.column, true))
+}
+
+/// Whether `arm` keeps every row of its table, for every request.
+fn keeps_every_row<DB: DatabaseLike>(arm: &GrantArm<'_, DB>) -> bool {
+    matches!(arm.granted_to, GrantedTo::Anyone)
+        && arm.gate.is_none()
+        && arm.restrictions.is_empty()
+        && arm.time_bounds.is_empty()
 }
 
 /// Whether `expression` names `column` qualified by `qualifier`, or bare
