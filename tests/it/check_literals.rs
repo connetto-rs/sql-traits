@@ -100,6 +100,79 @@ fn a_check_added_later_reads_its_literals_in_the_session_adding_it() -> Result<(
     Ok(())
 }
 
+fn stored_on(db: &ParserDB, table: &str, name: &str) -> Result<String, LookupError> {
+    let table = db.tables().find(|held| held.table_name() == table).expect("table exists");
+    let check = table
+        .check_constraints(db)?
+        .find(|check| check.constraint_name(db).expect("held").as_deref() == Some(name))
+        .expect("check exists");
+    Ok(check.expression(db)?.to_string())
+}
+
+#[test]
+fn a_check_passed_down_keeps_the_values_the_parent_stored() -> Result<(), LookupError> {
+    let db = parse(
+        "SET TIME ZONE 'Europe/Rome';
+         CREATE TABLE parent (
+             ts TIMESTAMPTZ CONSTRAINT p_col CHECK (ts < '2027-01-01 12:00'),
+             CONSTRAINT p_ts CHECK (ts > '2026-01-01 12:00')
+         );
+         CREATE TABLE ranged (
+             ts TIMESTAMPTZ CONSTRAINT r_col CHECK (ts < '2027-01-01 12:00'),
+             CONSTRAINT r_ts CHECK (ts > '2026-01-01 12:00')
+         ) PARTITION BY RANGE (ts);
+         SET TIME ZONE 'Asia/Tokyo';
+         CREATE TABLE child () INHERITS (parent);
+         CREATE TABLE mid PARTITION OF ranged FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')
+             PARTITION BY RANGE (ts);
+         SET TIME ZONE 'America/New_York';
+         CREATE TABLE grandchild () INHERITS (child);
+         CREATE TABLE leaf PARTITION OF mid FOR VALUES FROM ('2026-01-01') TO ('2026-06-01');",
+    );
+    for table in ["parent", "child", "grandchild"] {
+        assert_eq!(
+            stored_on(&db, table, "p_ts")?,
+            "ts > '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE"
+        );
+        assert_eq!(
+            stored_on(&db, table, "p_col")?,
+            "ts < '2027-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE"
+        );
+    }
+    for table in ["ranged", "mid", "leaf"] {
+        assert_eq!(
+            stored_on(&db, table, "r_ts")?,
+            "ts > '2026-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE"
+        );
+        assert_eq!(
+            stored_on(&db, table, "r_col")?,
+            "ts < '2027-01-01 11:00:00+00'::TIMESTAMP WITH TIME ZONE"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_check_unreadable_in_the_parent_stays_unreadable_in_a_child() {
+    let db = parse(
+        "CREATE TABLE parent (ts TIMESTAMPTZ, CONSTRAINT p_ts CHECK (ts > '2026-01-01 12:00'));
+         SET TIME ZONE 'Asia/Tokyo';
+         CREATE TABLE child () INHERITS (parent);",
+    );
+    for table in ["parent", "child"] {
+        assert_eq!(
+            stored_on(&db, table, "p_ts"),
+            Err(unreadable(
+                table,
+                "p_ts",
+                "2026-01-01 12:00",
+                PgType::TimestampTz,
+                DateTimeError::NeedsTimeZone
+            ))
+        );
+    }
+}
+
 #[test]
 fn a_rebuilt_check_keeps_its_literals_through_renames_and_retyping() -> Result<(), LookupError> {
     let db = parse(&format!(

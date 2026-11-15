@@ -16,8 +16,8 @@ use alloc::{
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateFunction, DataType, Expr, Ident, ObjectName, ObjectNamePart,
-    Visit, VisitMut, VisitorMut,
+    CheckConstraint, ColumnDef, ColumnOption, CreateFunction, DataType, Expr, Ident, ObjectName,
+    ObjectNamePart, Visit, VisitMut, VisitorMut,
 };
 
 use super::function_dependents::call_count;
@@ -104,6 +104,9 @@ pub(super) struct CarriedOperators {
     /// The column whose default or generation expression the statement
     /// writes anew.
     written: Option<(Ident, Kind)>,
+    /// The checks a table being created receives from its parents, each with
+    /// how the parent's check had its literals read.
+    received: Vec<(CheckConstraint, CheckLiterals)>,
     case: IdentifierCase,
 }
 
@@ -126,6 +129,7 @@ impl CarriedOperators {
             check_names: (Vec::new(), 0),
             retyped: None,
             written: None,
+            received: Vec::new(),
             case,
         }
     }
@@ -135,6 +139,19 @@ impl CarriedOperators {
     pub(super) fn rebuild(&mut self, columns: Columns, check_names: Vec<Option<String>>) {
         self.rebuilt_columns = columns;
         self.check_names = (check_names, 0);
+    }
+
+    /// Has the table being created receive `checks` from its parents, each
+    /// with how the parent's check had its literals read.
+    pub(super) fn receive_checks(&mut self, checks: Vec<(CheckConstraint, CheckLiterals)>) {
+        self.received = checks;
+    }
+
+    /// How the parent's check that `check` is a copy of had its literals read,
+    /// `None` for a check no parent passed down.
+    pub(super) fn take_received(&mut self, check: &CheckConstraint) -> Option<CheckLiterals> {
+        let position = self.received.iter().position(|(received, _)| received == check)?;
+        Some(self.received.remove(position).1)
     }
 
     /// Records the selections of `calls`, the record of the column `column`
