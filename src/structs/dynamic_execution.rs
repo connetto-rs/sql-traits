@@ -43,7 +43,7 @@ impl<'db, DB: DatabaseLike> DynamicExecutionSites<'db, DB> {
     /// the lookup errors resolving a call of one of the functions running
     /// SQL text.
     pub fn sites(&self) -> Result<Vec<DynamicExecution<'_, 'db, DB>>, LookupError> {
-        self.source.sites()
+        self.source.dynamic_sites()
     }
 }
 

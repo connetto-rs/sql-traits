@@ -608,12 +608,77 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         }
     }
 
+    /// Returns the PL/pgSQL variable the name of the column reference
+    /// `expression` reaches, whether or not a relation in reach binds the
+    /// name first, as [`PlPgSqlScope::variable`] reaches it. A node that is
+    /// no column reference, and any node outside [`ExpressionScope::PlPgSql`],
+    /// reaches none.
+    ///
+    /// A reference that [`Self::reference`] binds to a column and that also
+    /// reaches a variable is one PostgreSQL 18 refuses as ambiguous under
+    /// its default `plpgsql.variable_conflict = error`, and binds to one or
+    /// the other under `use_column` or `use_variable`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
+    /// query.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use core::ops::ControlFlow;
+    ///
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::visit_expressions, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE notes (id integer PRIMARY KEY);
+    ///      CREATE FUNCTION find_note(id integer) RETURNS integer LANGUAGE plpgsql AS $$
+    ///      DECLARE result integer;
+    ///      BEGIN
+    ///          SELECT notes.id INTO result FROM notes WHERE notes.id = find_note.id;
+    ///          RETURN result;
+    ///      END $$;",
+    /// )?;
+    /// let find_note = db
+    ///     .function_by_target(TargetName::new("find_note", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = find_note.plpgsql_sites(&db)?;
+    /// let sites = body.sites()?;
+    /// let context = sites[0].context(IdentifierCase::Folded)?;
+    /// let mut reached = Vec::new();
+    /// let _ = visit_expressions(&sites[0].sql(), |expression| {
+    ///     let variable = context.variable(expression).expect("a node of the site");
+    ///     reached.push((expression.to_string(), variable.map(|found| found.name().to_owned())));
+    ///     ControlFlow::<()>::Continue(())
+    /// });
+    /// // Each qualified name reaches one of the column and the argument.
+    /// assert!(reached.contains(&("notes.id".to_owned(), None)));
+    /// assert!(reached.contains(&("find_note.id".to_owned(), Some("id".to_owned()))));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn variable(&self, expression: &Expr) -> Result<Option<PlPgSqlVariable<'db>>, LookupError> {
+        self.check(expression)?;
+        let parts = match expression {
+            Expr::Identifier(ident) => core::slice::from_ref(ident),
+            Expr::CompoundIdentifier(parts) => parts.as_slice(),
+            _ => return Ok(None),
+        };
+        if self.rule(expression).is_none() {
+            return Ok(None);
+        }
+        Ok(self.variables.and_then(|variables| variables.variable(parts)))
+    }
+
     /// The PL/pgSQL variable the name `parts` writes, or whose field it names.
     fn variable_reference(
         &self,
         parts: &[Ident],
     ) -> Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)> {
-        let (variable, consumed) = self.variables?.variable(&stored_parts(parts))?;
+        let (variable, consumed) = self.variables?.lookup(&stored_parts(parts))?;
         let definition = if consumed < parts.len() {
             ColumnDefinition::VariableField(variable)
         } else {
@@ -627,8 +692,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// function's `NEW` or `OLD` the type every table of
     /// [`Self::row_field_types`] agrees on, and a field of a record the type
     /// every definition of [`Self::record_field_types`] agrees on. A field
-    /// of a field and of a variable of any other composite type stays
-    /// unknown.
+    /// of a variable of any other composite type stays unknown.
     fn field_type(
         &self,
         variable: &PlPgSqlVariable<'db>,
@@ -678,13 +742,13 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     }
 
     /// The field `expression` names of the variable it reaches, `None` for a
-    /// node naming no field or naming a field of a field.
+    /// node naming no field.
     fn field<'e>(&self, expression: &'e Expr) -> Option<&'e Ident> {
         let (Expr::CompoundIdentifier(parts), Some(variables)) = (expression, self.variables)
         else {
             return None;
         };
-        let (_, consumed) = variables.variable(&stored_parts(parts))?;
+        let (_, consumed) = variables.lookup(&stored_parts(parts))?;
         match parts.as_slice() {
             [.., field] if consumed + 1 == parts.len() => Some(field),
             _ => None,
@@ -1747,7 +1811,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     fn positional(&self, placeholder: &str) -> OperandType<'db> {
         if let Some(variables) = self.variables {
             return variables
-                .variable(&[placeholder.into()])
+                .lookup(&[placeholder.into()])
                 .and_then(|(variable, _)| variable.data_type().ok().cloned())
                 .unwrap_or(OperandType::Unknown);
         }

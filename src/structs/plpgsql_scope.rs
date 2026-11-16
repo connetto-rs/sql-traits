@@ -186,13 +186,40 @@ impl<'b, 'db, DB: DatabaseLike> PlPgSqlScope<'b, 'db, DB> {
         Some(self.names.variable(name))
     }
 
-    /// Returns the variable the name `parts` writes reaches, innermost level
-    /// first, with the number of parts it consumed, one for a bare name and
-    /// two for a name qualified by a label. PostgreSQL compares the parts as
-    /// [`stored`](crate::utils::identifier_resolution) identifiers.
-    pub(crate) fn variable(&self, parts: &[String]) -> Option<(PlPgSqlVariable<'db>, usize)> {
+    /// Returns the variable PostgreSQL 18 binds the column reference `parts`
+    /// writes to, whether or not a column of the same name binds it first,
+    /// innermost level first. A bare name reaches a variable of that name,
+    /// two parts a variable qualified by a block label or by the function's
+    /// name or a field of a row variable, and three parts a field of a row
+    /// variable qualified by a label. A scalar variable never reaches a field.
+    ///
+    /// Under the default `plpgsql.variable_conflict = error`, PostgreSQL 18
+    /// refuses as ambiguous a reference that both a column and a variable
+    /// reach. [`ExpressionContext::variable`](crate::structs::ExpressionContext::variable)
+    /// answers the same for a column reference of a site's context.
+    #[must_use]
+    pub fn variable(&self, parts: &[Ident]) -> Option<PlPgSqlVariable<'db>> {
+        self.lookup(&stored_parts(parts)).map(|(variable, _)| variable)
+    }
+
+    /// Returns the row variable PostgreSQL 18 expands the qualified wildcard
+    /// `qualifier.*` to, as [`Self::variable`] reaches a name, such as the
+    /// `r` of `SELECT r.* FROM notes r` with `r` a record variable.
+    #[must_use]
+    pub fn wildcard_variable(&self, qualifier: &[Ident]) -> Option<PlPgSqlVariable<'db>> {
+        let mut parts = stored_parts(qualifier);
+        parts.push(String::from("*"));
+        self.lookup(&parts).map(|(variable, _)| variable)
+    }
+
+    /// Returns the variable the name `parts` writes reaches, with the number
+    /// of parts naming it, one for a bare name or a field of a row variable
+    /// and two for a name qualified by a label. PostgreSQL compares the parts
+    /// as [`stored`](crate::utils::identifier_resolution) identifiers, and
+    /// reads no variable in a name whose parts go past one field.
+    pub(crate) fn lookup(&self, parts: &[String]) -> Option<(PlPgSqlVariable<'db>, usize)> {
         let (name, consumed) = self.namespace.lookup(parts, |name| self.names.holds_row(name))?;
-        Some((self.names.variable(name), consumed))
+        (consumed + 1 >= parts.len()).then(|| (self.names.variable(name), consumed))
     }
 
     /// The path the body runs the expression under.

@@ -12,9 +12,13 @@ use sqlparser::ast::Visit;
 
 use super::{
     body_calls::CallCollector,
-    data_statement::{BodyPath, BodyWalk, Embedded, RelationCollector, add_unqualified},
+    data_statement::{BodyPath, BodyWalk, RelationCollector, add_unqualified},
 };
-use crate::{errors::LookupError, structs::UnqualifiedName, traits::DatabaseLike};
+use crate::{
+    errors::LookupError,
+    structs::{EmbeddedSql, UnqualifiedName},
+    traits::DatabaseLike,
+};
 
 /// Walks a body for its relations and its calls together, gathering the
 /// names each writes without a schema in the order of the statements naming
@@ -77,14 +81,14 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for NameCollector<'_, 's, DB> {
         self.calls.set_path(path);
     }
 
-    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
+    fn walk(&mut self, sql: EmbeddedSql<'_>) -> Result<(), LookupError> {
         self.relations.walk(sql)?;
         self.calls.walk(sql)?;
         self.gather();
         Ok(())
     }
 
-    fn runs_user_code(&self, sql: Embedded<'_>) -> bool {
+    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool {
         self.calls.runs_user_code(sql)
     }
 }

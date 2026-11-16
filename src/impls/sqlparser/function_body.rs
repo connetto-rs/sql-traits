@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     errors::LookupError,
-    structs::{DynamicExecutionSites, FunctionBody, UnqualifiedName},
+    structs::{FunctionBody, UnqualifiedName},
     traits::{DatabaseLike, DialectLike, FunctionLike},
 };
 
@@ -322,18 +322,15 @@ pub(crate) fn body_unqualified_names<'db, F: FunctionLike>(
     })
 }
 
-/// The dynamic-execution sites of the body of `function`, as
-/// [`FunctionLike::dynamic_execution_sites`] describes.
-pub(crate) fn body_dynamic_sites<'db, F: FunctionLike>(
+/// The parsed body of `function`, from which
+/// [`FunctionLike::dynamic_execution_sites`] and
+/// [`FunctionLike::plpgsql_sites`] read their sites.
+pub(crate) fn body_site_source<'db, F: FunctionLike>(
     function: &'db F,
     database: &'db F::DB,
-) -> Result<DynamicExecutionSites<'db, F::DB>, LookupError> {
+) -> Result<SiteSource<'db, F::DB>, LookupError> {
     let (body, procedural) = checked_body(function)?;
     let body = parsed_body(function, body, procedural, database)?;
     let names = BodyNames::new(function, database)?;
-    Ok(DynamicExecutionSites::new(SiteSource::new(
-        names,
-        body,
-        hex_strings_may_be_integers(database),
-    )))
+    Ok(SiteSource::new(names, body, hex_strings_may_be_integers(database)))
 }
