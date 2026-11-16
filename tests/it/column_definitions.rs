@@ -499,6 +499,9 @@ fn a_view_over_a_values_list_enumerates_its_cells() {
         .expect("definition resolves")
         .expect("the column resolves");
     assert_eq!(outline(&definition), "values(= 1)");
+    let ColumnDefinition::Values { rows } = definition else { panic!("expected a values column") };
+    assert_copy(rows);
+    assert_eq!(format!("{rows:?}"), format!("{:?}", Clone::clone(&rows)));
     assert!(scope.resolve_column_definition(&reference("v.y")).expect("lookup runs").is_none());
 }
 
