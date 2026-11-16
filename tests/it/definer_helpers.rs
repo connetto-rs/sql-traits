@@ -1366,7 +1366,9 @@ fn an_enum_threshold_keeps_the_labels_on_its_side_in_declaration_order() {
         format!("{arm} ('admin', 'auditor', 'reader')")
     );
     assert_eq!(rendered("o.role < threshold AND o.role = 'writer'").expect("answered"), "");
-    for irreducible in ["o.role >= 'owner'", "o.role::TEXT >= threshold", "o.role >= o.role"] {
+    for irreducible in
+        ["o.role >= 'owner'", "o.role::TEXT >= threshold", "o.role >= o.role", "o.role >= 1"]
+    {
         assert!(
             matches!(rendered(irreducible), Err(HelperSetError::Irreducible { .. })),
             "{irreducible}"
@@ -1386,6 +1388,16 @@ fn an_enum_threshold_keeps_the_labels_on_its_side_in_declaration_order() {
             Err(HelperSetError::Irreducible { .. })
         ),
         "text compares by its collation, which declares no order of labels"
+    );
+    let set = ranked("o.role >= threshold")
+        .replace("role authz.role NOT NULL", "role SET('reader', 'admin') NOT NULL");
+    let database = postgres(&set);
+    assert!(
+        matches!(
+            answer(&database, &deployment, "authz", "ranked", &[text("reader")]),
+            Err(HelperSetError::Irreducible { .. })
+        ),
+        "a SET holds a subset of its labels, which declaration order does not rank"
     );
 }
 
