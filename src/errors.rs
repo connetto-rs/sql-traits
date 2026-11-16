@@ -1086,8 +1086,8 @@ pub enum HelperSetError {
         /// The helper.
         function: String,
     },
-    /// The helper does not return `SETOF` one scalar type.
-    #[error("helper `{function}` does not return SETOF a scalar type")]
+    /// The helper returns neither `SETOF` one scalar type nor `TABLE (...)`.
+    #[error("helper `{function}` returns neither SETOF a scalar type nor TABLE")]
     ReturnType {
         /// The helper.
         function: String,
@@ -1184,10 +1184,21 @@ pub enum HelperSetError {
         /// The setting, as written.
         setting: String,
     },
-    /// A grant arm compares a column with, or gates on, a setting the
-    /// deployment declares as something other than the caller.
+    /// A grant arm gates on a setting the deployment declares as something
+    /// other than the caller.
     #[error("helper `{function}` reads setting `{setting}` as the caller, which it is not")]
     SettingNotCaller {
+        /// The helper.
+        function: String,
+        /// The setting.
+        setting: String,
+    },
+    /// A grant arm compares a column with a setting the deployment declares
+    /// as neither the caller nor a scalar.
+    #[error(
+        "helper `{function}` compares a column with setting `{setting}`, which holds no single value"
+    )]
+    SettingNotScalar {
         /// The helper.
         function: String,
         /// The setting.

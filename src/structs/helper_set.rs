@@ -33,8 +33,8 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
     /// table.
     ///
     /// `None` where two arms return keys of different tables, or an arm
-    /// returns a column that is neither. Arms left out for the arguments
-    /// count, so the answer does not depend on them.
+    /// returns a column that is neither or several columns. Arms left out
+    /// for the arguments count, so the answer does not depend on them.
     #[must_use]
     pub fn covered_table(&self) -> Option<&'db DB::Table> {
         self.covered_table
@@ -53,17 +53,18 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Walk(WalkArm<'db, DB>),
 }
 
-/// `SELECT <column> FROM <table> [WHERE <conditions>]`, the rows the
-/// conditions keep for the grantee they name, the caller gate they write and
-/// the restrictions the rest of them reduce to.
+/// `SELECT <columns> FROM <table> [WHERE <conditions>]`, the rows the
+/// conditions keep for the grantee they name, the caller gate they write,
+/// the restrictions the rest of them reduce to and the caps they write.
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
-    pub(crate) column: &'db DB::Column,
+    pub(crate) columns: Vec<&'db DB::Column>,
     pub(crate) granted_to: GrantedTo<'db, DB>,
     pub(crate) gate: Option<CallerGate<'db>>,
     pub(crate) restrictions: Vec<LiteralSet<'db, DB>>,
     pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
+    pub(crate) caps: Vec<RowCap<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
@@ -73,10 +74,12 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
         self.table
     }
 
-    /// The column the arm returns.
+    /// The columns the arm returns, in the order the helper returns them,
+    /// one for a helper returning `SETOF` a scalar type and one per column
+    /// of a helper returning `TABLE (...)`.
     #[must_use]
-    pub fn column(&self) -> &'db DB::Column {
-        self.column
+    pub fn columns(&self) -> &[&'db DB::Column] {
+        &self.columns
     }
 
     /// Whose rows the arm keeps.
@@ -106,13 +109,20 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     pub fn time_bounds(&self) -> &[TimeBound<'db, DB>] {
         &self.time_bounds
     }
+
+    /// The caps a row has to meet, every one of them, in the order the
+    /// condition writes them.
+    #[must_use]
+    pub fn caps(&self) -> &[RowCap<'db, DB>] {
+        &self.caps
+    }
 }
 
 /// Whose rows a [`GrantArm`] keeps.
 #[derive(Debug)]
 pub enum GrantedTo<'db, DB: DatabaseLike> {
-    /// The rows whose column holds the caller, or an element of a declared
-    /// set, the request carries.
+    /// The rows whose column holds the caller, a scalar or an element of a
+    /// declared set the request carries.
     Request(SettingComparison<'db, DB>),
     /// `<column> IN (SELECT <function>(<arguments>))`, the rows naming one of
     /// the grantees another helper returns, such as every grantee the caller
@@ -165,6 +175,113 @@ impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
     #[must_use]
     pub fn set(&self) -> &HelperSet<'db, DB> {
         &self.set
+    }
+}
+
+/// `<operands> IN (SELECT * FROM <function>(<arguments>))`, a conjunct of a
+/// grant arm's condition keeping a row only where some row the helper
+/// returns holds, column by column, what the operands hold, optionally
+/// behind `<setting> IS NULL OR`, which lifts the cap for a request leaving
+/// the setting unset.
+///
+/// The operands are written as a row, `(<operand>, ...)`, one per column
+/// the helper returns. A single operand is a cap only behind `IS NULL OR`,
+/// and may then compare with `(SELECT <function>(<arguments>))` as well,
+/// since without it the conjunct names the arm's grantee (see
+/// [`GrantedTo::Set`]). Each operand is a column of the arm's table, or a
+/// literal or an argument, plain or cast to the type the helper declares
+/// the column it pairs with in. An operand holding `NULL` matches no row,
+/// as PostgreSQL's row comparison answers `NULL` for it.
+#[derive(Debug)]
+pub struct RowCap<'db, DB: DatabaseLike> {
+    pub(crate) operands: Vec<CapOperand<'db, DB>>,
+    pub(crate) function: &'db DB::Function,
+    pub(crate) arguments: Vec<Value>,
+    pub(crate) set: Box<HelperSet<'db, DB>>,
+    pub(crate) lift: Option<CapLift<'db>>,
+}
+
+impl<'db, DB: DatabaseLike> RowCap<'db, DB> {
+    /// The operands, one per column [`set`](Self::set) returns, in its
+    /// order.
+    #[must_use]
+    pub fn operands(&self) -> &[CapOperand<'db, DB>] {
+        &self.operands
+    }
+
+    /// The helper returning the rows the operands are compared with.
+    #[must_use]
+    pub fn function(&self) -> &'db DB::Function {
+        self.function
+    }
+
+    /// The arguments the cap passes to [`function`](Self::function), the
+    /// helper's own arguments substituted.
+    #[must_use]
+    pub fn arguments(&self) -> &[Value] {
+        &self.arguments
+    }
+
+    /// What [`function`](Self::function) returns for
+    /// [`arguments`](Self::arguments).
+    #[must_use]
+    pub fn set(&self) -> &HelperSet<'db, DB> {
+        &self.set
+    }
+
+    /// The `<setting> IS NULL` lifting the cap, or `None` where the cap
+    /// holds for every request.
+    #[must_use]
+    pub fn lift(&self) -> Option<&CapLift<'db>> {
+        self.lift.as_ref()
+    }
+}
+
+/// One operand of a [`RowCap`].
+#[derive(Debug)]
+pub enum CapOperand<'db, DB: DatabaseLike> {
+    /// A column of the arm's table, compared row by row.
+    Column(&'db DB::Column),
+    /// A literal or an argument, the same for every row.
+    Value(Value),
+}
+
+/// `current_setting(<setting>) IS NULL`, lifting a [`RowCap`] for a request
+/// leaving the setting unset. The body may cast the read to the type the
+/// deployment declares the setting in, and may read it through
+/// `NULLIF(<read>, '')`, which reads `''` as `NULL`.
+///
+/// A custom setting set for one transaction reads `''` once the
+/// transaction ends, so a read without `NULLIF` keeps the cap on a pooled
+/// connection that once carried the setting (see
+/// [`lifts_on_empty`](Self::lifts_on_empty)).
+#[derive(Debug)]
+pub struct CapLift<'db> {
+    pub(crate) setting: &'db SessionSetting,
+    pub(crate) raises_when_unset: bool,
+    pub(crate) lifts_on_empty: bool,
+}
+
+impl<'db> CapLift<'db> {
+    /// The setting read, as the deployment declares it.
+    #[must_use]
+    pub fn setting(&self) -> &'db SessionSetting {
+        self.setting
+    }
+
+    /// Whether the body reads the setting with `current_setting(name)`, which
+    /// raises `42704` where the setting was never set.
+    #[must_use]
+    pub fn raises_when_unset(&self) -> bool {
+        self.raises_when_unset
+    }
+
+    /// Whether the setting reading `''` lifts the cap, the body reading it
+    /// through `NULLIF(<read>, '')`. A read cast to a type `''` is not a
+    /// value of, such as `uuid`, raises `22P02` on `''` otherwise.
+    #[must_use]
+    pub fn lifts_on_empty(&self) -> bool {
+        self.lifts_on_empty
     }
 }
 
@@ -231,9 +348,9 @@ impl<'db> CallerGate<'db> {
     }
 }
 
-/// `<column> = current_setting(<caller>)[::<declared type>]`, or `<column>`
-/// compared with each element of a declared set, `<column> = ANY (<array>)` or
-/// `<column> IN (SELECT <elements>)`.
+/// `<column> = current_setting(<caller or scalar>)[::<declared type>]`, or
+/// `<column>` compared with each element of a declared set, `<column> = ANY
+/// (<array>)` or `<column> IN (SELECT <elements>)`.
 ///
 /// `<array>` is `string_to_array(current_setting(<set>),
 /// <delimiter>)[::<element type>[]]`, the set packed as
@@ -262,7 +379,8 @@ impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
     }
 
     /// The setting compared with, as the deployment declares it, either
-    /// [`SettingValue::Caller`](crate::structs::SettingValue::Caller) or
+    /// [`SettingValue::Caller`](crate::structs::SettingValue::Caller),
+    /// [`SettingValue::Scalar`](crate::structs::SettingValue::Scalar) or
     /// [`SettingValue::Set`](crate::structs::SettingValue::Set).
     #[must_use]
     pub fn setting(&self) -> &'db SessionSetting {

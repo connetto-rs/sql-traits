@@ -318,6 +318,37 @@ fn render_granted_to(granted_to: &GrantedTo<'_, ParserDB>) -> Option<String> {
     }
 }
 
+/// A cap as `(<operands>) IN <helper>(<arguments>) {<its set>}`, behind
+/// `<setting> IS UNSET OR` where `''` lifts it too and `<setting> IS NULL
+/// OR` where only `NULL` does.
+fn render_cap(cap: &RowCap<'_, ParserDB>) -> String {
+    let operands: Vec<String> = cap
+        .operands()
+        .iter()
+        .map(|operand| {
+            match operand {
+                CapOperand::Column(column) => column.column_name().to_string(),
+                CapOperand::Value(value) => value.to_string(),
+            }
+        })
+        .collect();
+    let arguments: Vec<String> = cap.arguments().iter().map(ToString::to_string).collect();
+    let membership = format!(
+        "({}) IN {}({}) {{{}}}",
+        operands.join(", "),
+        cap.function().target_name(),
+        arguments.join(", "),
+        render(cap.set()),
+    );
+    match cap.lift() {
+        Some(lift) => {
+            let unset = if lift.lifts_on_empty() { "UNSET" } else { "NULL" };
+            format!("({} IS {unset} OR {membership})", lift.setting().name())
+        }
+        None => membership,
+    }
+}
+
 /// An answer as one line, each arm as its table and column followed by what
 /// filters it.
 fn render(set: &HelperSet<'_, ParserDB>) -> String {
@@ -367,17 +398,20 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         .chain(gate)
                         .chain(restrictions)
                         .chain(bounds)
+                        .chain(grant.caps().iter().map(render_cap))
                         .collect();
                     let filter = if conditions.is_empty() {
                         String::new()
                     } else {
                         format!(" WHERE {}", conditions.join(" AND "))
                     };
-                    format!(
-                        "{}.{}{filter}",
-                        grant.table().table_name(),
-                        grant.column().column_name()
-                    )
+                    let columns: Vec<&str> =
+                        grant.columns().iter().copied().map(ColumnLike::column_name).collect();
+                    let returned = match columns.as_slice() {
+                        [column] => (*column).to_string(),
+                        columns => format!("({})", columns.join(", ")),
+                    };
+                    format!("{}.{returned}{filter}", grant.table().table_name())
                 }
                 HelperArm::Walk(walk) => {
                     let (returned, compared) = match walk.direction() {
@@ -430,28 +464,32 @@ fn cell(row: &[(&str, &'static str)], column: &str) -> &'static str {
 }
 
 /// What a request carries: its caller, `None` where the caller setting reads
-/// `NULL`, and the elements of each set setting it sets, a setting it leaves
-/// unset holding none.
+/// `NULL`, and the values of each other setting it sets, the elements of a
+/// set or the one value of a scalar, a setting it leaves unset holding none.
 #[derive(Clone, Copy)]
 struct Request {
     caller: Option<&'static str>,
-    sets: &'static [(&'static str, &'static [&'static str])],
+    values: &'static [(&'static str, &'static [&'static str])],
 }
 
 impl Request {
-    /// A request carrying `caller` and no set.
+    /// A request carrying `caller` and no other setting.
     const fn of(caller: &'static str) -> Self {
-        Self { caller: Some(caller), sets: &[] }
+        Self { caller: Some(caller), values: &[] }
+    }
+
+    /// The values the request carries in the setting named `name`, `None`
+    /// where it leaves the setting unset.
+    fn values(self, name: &str) -> Option<&'static [&'static str]> {
+        self.values.iter().find(|(set, _)| *set == name).map(|(_, values)| *values)
     }
 
     /// Whether `value` is what the request carries in `setting`.
     fn carries(self, setting: &SessionSetting, value: &str) -> bool {
         match setting.content() {
             SettingContent::Value(SettingValue::Caller(_)) => self.caller == Some(value),
-            SettingContent::Value(SettingValue::Set { .. }) => {
-                self.sets
-                    .iter()
-                    .any(|(name, elements)| *name == setting.name() && elements.contains(&value))
+            SettingContent::Value(SettingValue::Set { .. } | SettingValue::Scalar(_)) => {
+                self.values(setting.name()).is_some_and(|values| values.contains(&value))
             }
             other => panic!("the fixtures compare with no {other:?}"),
         }
@@ -467,66 +505,46 @@ fn holds(value: &Value, cell: &str) -> bool {
     }
 }
 
-/// Evaluates an answer over `fixture` for `request`, the way a translator
-/// lowering it to SQL over the backing tables would. A walk up the tree
-/// leaves out the `NULL` a root adds.
+/// Whether `lift` lifts its cap for `request`, which carries the setting it
+/// reads as a scalar.
+fn lifted(lift: &CapLift<'_>, request: Request) -> bool {
+    match request.values(lift.setting().name()) {
+        None => true,
+        Some(&[value]) => value.is_empty() && lift.lifts_on_empty(),
+        Some(values) => panic!("a scalar holds one value, not {values:?}"),
+    }
+}
+
+/// The rows `cap` compares its operands with for `request` over `fixture`.
+fn cap_rows(
+    cap: &RowCap<'_, ParserDB>,
+    request: Request,
+    fixture: Rows,
+) -> BTreeSet<Vec<&'static str>> {
+    if let [_] = cap.operands() {
+        return evaluate(cap.set(), request, fixture)
+            .into_iter()
+            .map(|value| vec![value])
+            .collect();
+    }
+    arm_rows(cap.set(), request, fixture)
+}
+
+/// Evaluates an answer of one column over `fixture` for `request`, the way a
+/// translator lowering it to SQL over the backing tables would. A walk up
+/// the tree leaves out the `NULL` a root adds.
 fn evaluate(
     set: &HelperSet<'_, ParserDB>,
     request: Request,
     fixture: Rows,
 ) -> BTreeSet<&'static str> {
-    let mut returned = BTreeSet::new();
-    for arm in set.arms() {
-        match arm {
-            HelperArm::Grant(grant) => {
-                let gated = grant.gate().is_none_or(|gate| {
-                    request.caller.is_some_and(|caller| {
-                        !(gate.excludes_unset() && caller.is_empty())
-                            && gate.excluded().iter().all(|value| !holds(value, caller))
-                    })
-                });
-                if !gated {
-                    continue;
-                }
-                let grantees = match grant.granted_to() {
-                    GrantedTo::Set(grantees) => Some(evaluate(grantees.set(), request, fixture)),
-                    GrantedTo::Request(_) | GrantedTo::Anyone => None,
-                };
-                for row in rows(fixture, grant.table().table_name()) {
-                    let restricted = grant.restrictions().iter().all(|set| {
-                        let value = cell(row, set.column().column_name());
-                        set.values().iter().any(|allowed| holds(allowed, value))
-                    });
-                    let granted = match grant.granted_to() {
-                        GrantedTo::Request(compared) => {
-                            request.carries(
-                                compared.setting(),
-                                cell(row, compared.column().column_name()),
-                            )
-                        }
-                        GrantedTo::Set(compared) => {
-                            grantees.as_ref().is_some_and(|grantees| {
-                                grantees.contains(cell(row, compared.column().column_name()))
-                            })
-                        }
-                        GrantedTo::Anyone => true,
-                    };
-                    if granted && restricted {
-                        returned.insert(cell(row, grant.column().column_name()));
-                    }
-                }
-            }
-            HelperArm::Parent(parent) => {
-                let parents = evaluate(parent.set(), request, fixture);
-                for row in rows(fixture, parent.table().table_name()) {
-                    if parents.contains(cell(row, parent.column().column_name())) {
-                        returned.insert(cell(row, parent.key().column_name()));
-                    }
-                }
-            }
-            HelperArm::Walk(_) => {}
-        }
-    }
+    let mut returned: BTreeSet<&'static str> = arm_rows(set, request, fixture)
+        .into_iter()
+        .map(|row| {
+            let [value] = row[..] else { panic!("the helper returns one column") };
+            value
+        })
+        .collect();
     // A walk adds the rows next to what the set holds until it holds them
     // all, as PostgreSQL's `UNION` iterates its working table.
     loop {
@@ -549,6 +567,110 @@ fn evaluate(
             return returned;
         }
     }
+}
+
+/// The rows the grant and parent arms of `set` return over `fixture` for
+/// `request`, each as the values of its columns, leaving out what a walk
+/// adds.
+fn arm_rows(
+    set: &HelperSet<'_, ParserDB>,
+    request: Request,
+    fixture: Rows,
+) -> BTreeSet<Vec<&'static str>> {
+    let mut returned = BTreeSet::new();
+    for arm in set.arms() {
+        match arm {
+            HelperArm::Grant(grant) => {
+                let gated = grant.gate().is_none_or(|gate| {
+                    request.caller.is_some_and(|caller| {
+                        !(gate.excludes_unset() && caller.is_empty())
+                            && gate.excluded().iter().all(|value| !holds(value, caller))
+                    })
+                });
+                if !gated {
+                    continue;
+                }
+                let grantees = match grant.granted_to() {
+                    GrantedTo::Set(grantees) => Some(evaluate(grantees.set(), request, fixture)),
+                    GrantedTo::Request(_) | GrantedTo::Anyone => None,
+                };
+                // A lifted cap keeps every row, so its rows are `None`.
+                let caps: Vec<_> = grant
+                    .caps()
+                    .iter()
+                    .map(|cap| {
+                        (!cap.lift().is_some_and(|lift| lifted(lift, request)))
+                            .then(|| cap_rows(cap, request, fixture))
+                    })
+                    .collect();
+                for row in rows(fixture, grant.table().table_name()) {
+                    let restricted = grant.restrictions().iter().all(|set| {
+                        let value = cell(row, set.column().column_name());
+                        set.values().iter().any(|allowed| holds(allowed, value))
+                    });
+                    let granted = match grant.granted_to() {
+                        GrantedTo::Request(compared) => {
+                            request.carries(
+                                compared.setting(),
+                                cell(row, compared.column().column_name()),
+                            )
+                        }
+                        GrantedTo::Set(compared) => {
+                            grantees.as_ref().is_some_and(|grantees| {
+                                grantees.contains(cell(row, compared.column().column_name()))
+                            })
+                        }
+                        GrantedTo::Anyone => true,
+                    };
+                    if granted && restricted && capped(grant.caps(), &caps, row) {
+                        returned.insert(
+                            grant
+                                .columns()
+                                .iter()
+                                .map(|column| cell(row, column.column_name()))
+                                .collect(),
+                        );
+                    }
+                }
+            }
+            HelperArm::Parent(parent) => {
+                let parents = evaluate(parent.set(), request, fixture);
+                for row in rows(fixture, parent.table().table_name()) {
+                    if parents.contains(cell(row, parent.column().column_name())) {
+                        returned.insert(vec![cell(row, parent.key().column_name())]);
+                    }
+                }
+            }
+            HelperArm::Walk(_) => {}
+        }
+    }
+    returned
+}
+
+/// Whether `row` meets every cap, each beside the rows it compares with,
+/// `None` where it is lifted.
+fn capped(
+    caps: &[RowCap<'_, ParserDB>],
+    compared: &[Option<BTreeSet<Vec<&'static str>>>],
+    row: &[(&str, &'static str)],
+) -> bool {
+    caps.iter().zip(compared).all(|(cap, allowed)| {
+        let Some(allowed) = allowed else { return true };
+        // A `NULL` operand matches no row.
+        let operands: Option<Vec<&str>> = cap
+            .operands()
+            .iter()
+            .map(|operand| {
+                match operand {
+                    CapOperand::Column(column) => nullable(row, column.column_name()),
+                    CapOperand::Value(Value::SingleQuotedString(text)) => Some(text.as_str()),
+                    CapOperand::Value(Value::Null) => None,
+                    CapOperand::Value(other) => panic!("the fixtures cap by text, not {other}"),
+                }
+            })
+            .collect();
+        operands.is_some_and(|operands| allowed.contains(&operands))
+    })
 }
 
 #[test]
@@ -1013,15 +1135,14 @@ fn a_compared_setting_must_be_declared_as_what_the_comparison_reads() {
         HelperSetError::UndeclaredSetting { setting, .. } if setting == "app.tenant"
     ));
     let equal = helper(DEFINER, GRANT_ARM, "");
-    for value in [SettingValue::Scalar(DataType::Text), delimited(",")] {
-        assert!(
-            matches!(
-                refusal_with(&equal, &declaring(value.clone())),
-                HelperSetError::SettingNotCaller { setting, .. } if setting == "app.user_id"
-            ),
-            "{value:?}"
-        );
-    }
+    assert!(matches!(
+        refusal_with(&equal, &declaring(delimited(","))),
+        HelperSetError::SettingNotScalar { setting, .. } if setting == "app.user_id"
+    ));
+    let database = postgres(&equal);
+    let scalar = declaring(SettingValue::Scalar(DataType::Text));
+    let set = answer(&database, &scalar, "public", "docs_with", &[text("read")]).expect("answered");
+    assert_eq!(render(&set), "members.doc_id WHERE user_id = app.user_id AND role IN ('read')");
     let split = helper(
         DEFINER,
         "SELECT doc_id FROM members WHERE user_id = ANY (string_to_array(current_setting('app.user_id', true), ','))",
@@ -2248,48 +2369,48 @@ const REQUEST_VALUE_ROWS: Rows = &[
 /// setting set to `''` or `'[]'`, and a request setting neither leaves it
 /// unset, which `current_setting(name, true)` reads as `NULL`.
 const SET_MEASURED: &[(&str, Request, &[&str])] = &[
-    ("presented_links", Request { caller: None, sets: &[("app.link_ids", &[])] }, &[]),
-    ("presented_links", Request { caller: None, sets: &[("app.link_ids", &["l1"])] }, &["l1"]),
+    ("presented_links", Request { caller: None, values: &[("app.link_ids", &[])] }, &[]),
+    ("presented_links", Request { caller: None, values: &[("app.link_ids", &["l1"])] }, &["l1"]),
     (
         "presented_links",
-        Request { caller: None, sets: &[("app.link_ids", &["l1", "l2"])] },
+        Request { caller: None, values: &[("app.link_ids", &["l1", "l2"])] },
         &["l1"],
     ),
     (
         "presented_links",
-        Request { caller: None, sets: &[("app.link_ids", &["l2", "l3", "lx"])] },
+        Request { caller: None, values: &[("app.link_ids", &["l2", "l3", "lx"])] },
         &["l3"],
     ),
     (
         "presented_links",
-        Request { caller: None, sets: &[("app.link_ids", &["l3", "l1"])] },
+        Request { caller: None, values: &[("app.link_ids", &["l3", "l1"])] },
         &["l1", "l3"],
     ),
     ("presented_links", Request::of(""), &[]),
-    ("listed_links", Request { caller: None, sets: &[("app.link_ids", &["l1", "l2"])] }, &["l1"]),
+    ("listed_links", Request { caller: None, values: &[("app.link_ids", &["l1", "l2"])] }, &["l1"]),
     (
         "listed_links",
-        Request { caller: None, sets: &[("app.link_ids", &["l3", "l1"])] },
+        Request { caller: None, values: &[("app.link_ids", &["l3", "l1"])] },
         &["l1", "l3"],
     ),
     ("listed_links", Request::of(""), &[]),
-    ("json_links", Request { caller: None, sets: &[("app.link_list", &[])] }, &[]),
-    ("json_links", Request { caller: None, sets: &[("app.link_list", &["l1", "l2"])] }, &["l1"]),
+    ("json_links", Request { caller: None, values: &[("app.link_list", &[])] }, &[]),
+    ("json_links", Request { caller: None, values: &[("app.link_list", &["l1", "l2"])] }, &["l1"]),
     (
         "json_links",
-        Request { caller: None, sets: &[("app.link_list", &["l3", "lx", "l1"])] },
+        Request { caller: None, values: &[("app.link_list", &["l3", "lx", "l1"])] },
         &["l1", "l3"],
     ),
     ("json_links", Request::of(""), &[]),
-    ("json_array_links", Request { caller: None, sets: &[("app.link_list", &[])] }, &[]),
+    ("json_array_links", Request { caller: None, values: &[("app.link_list", &[])] }, &[]),
     (
         "json_array_links",
-        Request { caller: None, sets: &[("app.link_list", &["l1", "l2"])] },
+        Request { caller: None, values: &[("app.link_list", &["l1", "l2"])] },
         &["l1"],
     ),
     (
         "json_array_links",
-        Request { caller: None, sets: &[("app.link_list", &["l3", "lx", "l1"])] },
+        Request { caller: None, values: &[("app.link_list", &["l3", "lx", "l1"])] },
         &["l1", "l3"],
     ),
     ("json_array_links", Request::of(""), &[]),
@@ -2352,7 +2473,7 @@ fn a_set_arm_returns_what_postgres_returns_for_every_presented_set() {
     for &(helper, request, expected) in SET_MEASURED {
         let set = answer(&database, &deployment, "authz", helper, &[]).expect("answered");
         let returned: Vec<_> = evaluate(&set, request, REQUEST_VALUE_ROWS).into_iter().collect();
-        assert_eq!(returned, expected, "{helper} for {:?}", request.sets);
+        assert_eq!(returned, expected, "{helper} for {:?}", request.values);
     }
 }
 
@@ -2604,7 +2725,7 @@ fn a_grant_arm_compares_its_grantee_with_every_grantee_the_caller_is() {
     let read = answer(&database, &deployment, "authz", "projects_granted", &[text("read")])
         .expect("answered");
     for &(caller, expected_grantees, expected_read, expected_admin) in GRANTEES_MEASURED {
-        let request = Request { caller, sets: &[] };
+        let request = Request { caller, values: &[] };
         for (set, expected, called) in [
             (&grantees, expected_grantees, "caller_grantees()"),
             (&read, expected_read, "projects_granted('read')"),
@@ -3211,4 +3332,287 @@ fn a_time_condition_no_bound_represents_is_irreducible() {
         matches!(bounded("expires_at > now()", shadow), Err(HelperSetError::Irreducible { .. })),
         "a declared now the call may reach is not PostgreSQL's"
     );
+}
+
+/// App installations capped to organization and kind pairs, as connetto's
+/// core schema writes them.
+const CAPS: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+CREATE TYPE authz.resource_kind AS ENUM ('organization', 'folder', 'project');
+CREATE TABLE memberships (
+  organization_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (organization_id, user_id));
+CREATE TABLE resources (
+  id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, kind authz.resource_kind NOT NULL,
+  owner_id TEXT NOT NULL);
+CREATE TABLE installation_permissions (
+  installation_id TEXT NOT NULL, organization_id TEXT NOT NULL,
+  kind authz.resource_kind NOT NULL, max_role TEXT NOT NULL CHECK (max_role IN ('reader', 'admin')),
+  PRIMARY KEY (installation_id, organization_id, kind));
+GRANT SELECT ON memberships, resources, installation_permissions TO authz_owner;
+CREATE FUNCTION authz.capped_kinds(min_role TEXT)
+RETURNS TABLE (organization_id TEXT, kind authz.resource_kind)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT permission.organization_id, permission.kind FROM public.installation_permissions permission
+  WHERE permission.installation_id = NULLIF(current_setting('app.installation_id', true), '')
+    AND (permission.max_role = 'admin' OR permission.max_role = min_role)
+$$;
+CREATE FUNCTION authz.member_organizations() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT membership.organization_id FROM public.memberships membership
+  WHERE membership.user_id = NULLIF(current_setting('app.user_id', true), '')
+    AND (NULLIF(current_setting('app.installation_id', true), '') IS NULL
+      OR (membership.organization_id, 'organization'::authz.resource_kind)
+        IN (SELECT * FROM authz.capped_kinds('reader')))
+$$;
+CREATE FUNCTION authz.owned_resources(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT resource.id FROM public.resources resource
+  WHERE resource.owner_id = NULLIF(current_setting('app.user_id', true), '')
+    AND (current_setting('app.installation_id', true) IS NULL
+      OR (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role)))
+$$;
+CREATE FUNCTION authz.capped_resources(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT resource.id FROM public.resources resource
+  WHERE (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))
+$$;
+ALTER FUNCTION authz.capped_kinds(TEXT) OWNER TO authz_owner;
+ALTER FUNCTION authz.member_organizations() OWNER TO authz_owner;
+ALTER FUNCTION authz.owned_resources(TEXT) OWNER TO authz_owner;
+ALTER FUNCTION authz.capped_resources(TEXT) OWNER TO authz_owner;
+";
+
+/// The rows [`CAPS`] was measured over. Installation `i1` holds organization
+/// `o1` and kind `folder` and organization `o2` and kind `project`, but not
+/// `o2` with `folder`.
+const CAP_ROWS: Rows = &[
+    ("memberships", &[("organization_id", "o1"), ("user_id", "alice")]),
+    ("memberships", &[("organization_id", "o2"), ("user_id", "alice")]),
+    ("memberships", &[("organization_id", "o1"), ("user_id", "bob")]),
+    (
+        "resources",
+        &[("id", "r1"), ("organization_id", "o1"), ("kind", "organization"), ("owner_id", "alice")],
+    ),
+    (
+        "resources",
+        &[("id", "r2"), ("organization_id", "o1"), ("kind", "project"), ("owner_id", "alice")],
+    ),
+    (
+        "resources",
+        &[("id", "r3"), ("organization_id", "o2"), ("kind", "project"), ("owner_id", "alice")],
+    ),
+    (
+        "resources",
+        &[("id", "r4"), ("organization_id", "o2"), ("kind", "folder"), ("owner_id", "alice")],
+    ),
+    (
+        "resources",
+        &[("id", "r5"), ("organization_id", "o1"), ("kind", "folder"), ("owner_id", "bob")],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i1"),
+            ("organization_id", "o1"),
+            ("kind", "organization"),
+            ("max_role", "reader"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i1"),
+            ("organization_id", "o1"),
+            ("kind", "folder"),
+            ("max_role", "reader"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i1"),
+            ("organization_id", "o2"),
+            ("kind", "project"),
+            ("max_role", "admin"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i2"),
+            ("organization_id", "o2"),
+            ("kind", "organization"),
+            ("max_role", "admin"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i2"),
+            ("organization_id", "o2"),
+            ("kind", "folder"),
+            ("max_role", "reader"),
+        ],
+    ),
+];
+
+/// A deployment declaring the caller and the acting installation, a scalar,
+/// both of which a request may leave unset.
+fn installation_deployment() -> Deployment {
+    let setting = |name: &str, value: SettingValue| {
+        SessionSetting::value(name, value).expect("a custom setting name").may_be_unset()
+    };
+    Deployment::new(
+        "app",
+        ["app"],
+        [
+            setting("app.user_id", SettingValue::Caller(DataType::Text)),
+            setting("app.installation_id", SettingValue::Scalar(DataType::Text)),
+        ],
+    )
+    .expect("a valid deployment")
+}
+
+/// Requests of `alice`, leaving the installation unset, setting it to `''`
+/// and acting through `i1`, `i2` and an installation holding no row.
+const ALICE: Request = Request::of("alice");
+const ALICE_EMPTY: Request =
+    Request { caller: Some("alice"), values: &[("app.installation_id", &[""])] };
+const ALICE_I1: Request =
+    Request { caller: Some("alice"), values: &[("app.installation_id", &["i1"])] };
+const ALICE_I2: Request =
+    Request { caller: Some("alice"), values: &[("app.installation_id", &["i2"])] };
+const ALICE_IX: Request =
+    Request { caller: Some("alice"), values: &[("app.installation_id", &["ix"])] };
+const BOB_I1: Request =
+    Request { caller: Some("bob"), values: &[("app.installation_id", &["i1"])] };
+const BOB_I2: Request =
+    Request { caller: Some("bob"), values: &[("app.installation_id", &["i2"])] };
+
+/// What PostgreSQL 18.6 returns for `(helper, arguments, request, returned)`
+/// over [`CAP_ROWS`], each returned row its columns joined by `,`. An unset
+/// installation was never set in the session, which `current_setting(name,
+/// true)` reads as `NULL`.
+const CAPS_MEASURED: &[(&str, &[&str], Request, &[&str])] = &[
+    ("capped_kinds", &["reader"], ALICE, &[]),
+    ("capped_kinds", &["reader"], ALICE_EMPTY, &[]),
+    ("capped_kinds", &["reader"], ALICE_I1, &["o1,folder", "o1,organization", "o2,project"]),
+    ("capped_kinds", &["admin"], ALICE_I1, &["o2,project"]),
+    ("capped_kinds", &["reader"], ALICE_I2, &["o2,folder", "o2,organization"]),
+    ("capped_kinds", &["admin"], ALICE_I2, &["o2,organization"]),
+    ("capped_kinds", &["reader"], ALICE_IX, &[]),
+    ("member_organizations", &[], ALICE, &["o1", "o2"]),
+    ("member_organizations", &[], ALICE_EMPTY, &["o1", "o2"]),
+    ("member_organizations", &[], ALICE_I1, &["o1"]),
+    ("member_organizations", &[], ALICE_I2, &["o2"]),
+    ("member_organizations", &[], ALICE_IX, &[]),
+    ("member_organizations", &[], BOB_I1, &["o1"]),
+    ("member_organizations", &[], BOB_I2, &[]),
+    ("owned_resources", &["reader"], ALICE, &["r1", "r2", "r3", "r4"]),
+    ("owned_resources", &["reader"], ALICE_EMPTY, &[]),
+    ("owned_resources", &["reader"], ALICE_I1, &["r1", "r3"]),
+    ("owned_resources", &["admin"], ALICE_I1, &["r3"]),
+    ("owned_resources", &["reader"], ALICE_I2, &["r4"]),
+    ("owned_resources", &["admin"], ALICE_I2, &[]),
+    ("owned_resources", &["reader"], ALICE_IX, &[]),
+    ("owned_resources", &["reader"], BOB_I1, &["r5"]),
+    ("capped_resources", &["reader"], ALICE, &[]),
+    ("capped_resources", &["reader"], ALICE_I1, &["r1", "r3", "r5"]),
+    ("capped_resources", &["admin"], ALICE_I1, &["r3"]),
+    ("capped_resources", &["reader"], ALICE_I2, &["r4"]),
+];
+
+#[test]
+fn a_cap_keeps_the_rows_whose_pair_the_capping_helper_returns() {
+    let database = postgres(CAPS);
+    let deployment = installation_deployment();
+    let capped_kinds = |role: &str| {
+        format!(
+            "authz.capped_kinds('{role}') {{installation_permissions.(organization_id, kind) WHERE installation_id = app.installation_id AND max_role IN ('admin', '{role}')}}"
+        )
+    };
+    let cases = [
+        (
+            "capped_kinds",
+            "installation_permissions.(organization_id, kind) WHERE installation_id = app.installation_id AND max_role IN ('admin', 'reader')"
+                .to_string(),
+        ),
+        (
+            "member_organizations",
+            format!(
+                "memberships.organization_id WHERE user_id = app.user_id AND (app.installation_id IS UNSET OR (organization_id, 'organization') IN {})",
+                capped_kinds("reader")
+            ),
+        ),
+        (
+            "owned_resources",
+            format!(
+                "resources.id WHERE owner_id = app.user_id AND (app.installation_id IS NULL OR (organization_id, kind) IN {})",
+                capped_kinds("reader")
+            ),
+        ),
+        (
+            "capped_resources",
+            format!("resources.id WHERE (organization_id, kind) IN {}", capped_kinds("reader")),
+        ),
+    ];
+    for (helper, expected) in cases {
+        let arguments: &[Value] =
+            if helper == "member_organizations" { &[] } else { &[text("reader")] };
+        let set = answer(&database, &deployment, "authz", helper, arguments).expect("answered");
+        assert_eq!(render(&set), expected, "{helper}");
+    }
+    for &(helper, arguments, request, expected) in CAPS_MEASURED {
+        let arguments: Vec<Value> = arguments.iter().map(|argument| text(argument)).collect();
+        let set = answer(&database, &deployment, "authz", helper, &arguments).expect("answered");
+        let returned: Vec<String> =
+            arm_rows(&set, request, CAP_ROWS).into_iter().map(|row| row.join(",")).collect();
+        assert_eq!(returned, expected, "{helper}({arguments:?}) for {:?}", request.values);
+    }
+}
+
+/// `authz.capped_resources` with `condition` as its condition.
+fn capping(condition: &str) -> Result<String, HelperSetError> {
+    let sql = CAPS.replace(
+        "WHERE (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))",
+        &format!("WHERE {condition}"),
+    );
+    let database = postgres(&sql);
+    let deployment = installation_deployment();
+    answer(&database, &deployment, "authz", "capped_resources", &[text("reader")])
+        .map(|set| render(&set))
+}
+
+#[test]
+fn a_cap_compares_one_operand_per_column_the_capping_helper_returns() {
+    for condition in [
+        "(resource.organization_id) IN (SELECT * FROM authz.capped_kinds(min_role))",
+        "(resource.organization_id, resource.kind, resource.id) IN (SELECT * FROM authz.capped_kinds(min_role))",
+        "(resource.organization_id, resource.kind) IN (SELECT authz.capped_kinds(min_role))",
+        "(resource.organization_id, 'project'::TEXT) IN (SELECT * FROM authz.capped_kinds(min_role))",
+        "(resource.organization_id, current_setting('app.user_id', true)) IN (SELECT * FROM authz.capped_kinds(min_role))",
+        "(resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role) WHERE true)",
+        "current_setting('app.installation_id', true) IS NULL OR resource.id IN (SELECT * FROM authz.capped_kinds(min_role))",
+    ] {
+        let answer = capping(condition);
+        assert!(matches!(answer, Err(HelperSetError::ArmShape { .. })), "{condition}: {answer:?}");
+    }
+    assert_eq!(
+        capping("(resource.organization_id, 'project'::authz.resource_kind) IN (SELECT * FROM authz.capped_kinds(min_role) AS capped)")
+            .expect("answered")
+            .split(" {")
+            .next(),
+        Some("resources.id WHERE (organization_id, 'project') IN authz.capped_kinds('reader')")
+    );
+    assert_eq!(
+        capping("current_setting('app.installation_id', true) IS NULL OR resource.organization_id IN (SELECT authz.member_organizations())")
+            .expect("answered"),
+        "resources.id WHERE (app.installation_id IS NULL OR (organization_id) IN authz.member_organizations() {memberships.organization_id WHERE user_id = app.user_id AND (app.installation_id IS UNSET OR (organization_id, 'organization') IN authz.capped_kinds('reader') {installation_permissions.(organization_id, kind) WHERE installation_id = app.installation_id AND max_role IN ('admin', 'reader')})})"
+    );
+    assert!(matches!(
+        capping("current_setting('app.installation_id', true)::INT IS NULL OR (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))"),
+        Err(HelperSetError::SettingCast { setting, .. }) if setting == "app.installation_id"
+    ));
 }

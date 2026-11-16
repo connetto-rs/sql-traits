@@ -15,9 +15,10 @@ use sqlparser::{
         FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior,
         FunctionSecurity, GroupByExpr, Ident, InTarget, JoinConstraint, JoinOperator, ObjectName,
         ObjectNamePart, Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator,
-        SetQuantifier, Statement, TableAliasColumnDef, TableFactor, Value,
+        SetQuantifier, Statement, TableAliasColumnDef, TableFactor, TableFunctionArgs, Value,
+        WildcardAdditionalOptions,
     },
-    parser::Parser,
+    parser::{Parser, ParserError},
 };
 
 use super::{
@@ -27,10 +28,10 @@ use super::{
 use crate::{
     errors::{HelperSetError, LookupError},
     structs::{
-        CallerGate, Deployment, FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm,
-        HelperSet, IdentifierCase, LiteralSet, ParentArm, RowSecurity, RowStatement,
-        SessionSetting, SetPacking, SettingComparison, SettingContent, SettingValue, TargetName,
-        TimeBound, TimeComparison, WalkArm, WalkDirection,
+        CallerGate, CapLift, CapOperand, Deployment, FunctionBody, GrantArm, GrantedTo, GranteeSet,
+        HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm, RowCap, RowSecurity,
+        RowStatement, SessionSetting, SetPacking, SettingComparison, SettingContent, SettingValue,
+        TargetName, TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, DialectLike, ForeignKeyLike, FunctionLike,
@@ -195,6 +196,13 @@ struct Called<'db, DB: DatabaseLike> {
     function: &'db DB::Function,
     arguments: Vec<Value>,
     set: HelperSet<'db, DB>,
+}
+
+/// A helper call an arm's subquery writes, the name it calls and the
+/// arguments it passes.
+struct Call<'q> {
+    name: &'q ObjectName,
+    arguments: &'q [FunctionArg],
 }
 
 /// One input parameter of the helper being read, bound to its argument.
@@ -551,9 +559,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if function.security_mode() != FunctionSecurity::Definer {
             return Err(HelperSetError::SecurityInvoker { function: name });
         }
-        if !returns_scalar_set(function, database) {
+        let Some(arity) = returned_arity(function, database) else {
             return Err(HelperSetError::ReturnType { function: name });
-        }
+        };
         let Some(path) = function.search_path(database)? else {
             return Err(HelperSetError::UnpinnedSearchPath { function: name });
         };
@@ -592,11 +600,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let read = body
             .arms
             .into_iter()
-            .map(|select| self.arm(&scope, select))
+            .map(|select| self.arm(&scope, select, arity))
             .collect::<Result<Vec<_>, _>>();
         self.answering.pop();
         let mut read = read?;
         if let Some(walk) = &body.walk {
+            // A walk adds one column, so its arms return one too.
+            if arity != 1 {
+                return Err(scope.arm_shape(walk.term));
+            }
             let walk = self.walk_arm(&scope, walk)?;
             read.push((Some(walk.table), Some(HelperArm::Walk(walk))));
         }
@@ -612,31 +624,39 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(HelperSet { arms, covered_table })
     }
 
-    /// Reads one arm, answering the table whose primary key it returns,
-    /// where it returns one, and the arm, `None` where its condition keeps
-    /// no row.
+    /// Reads one arm returning `arity` columns, answering the table whose
+    /// primary key it returns, where it returns one column holding one, and
+    /// the arm, `None` where its condition keeps no row.
     fn arm(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
+        arity: usize,
     ) -> Result<ReadArm<'db, DB>, HelperSetError> {
-        if !plain_select(select) {
+        if !plain_select(select) || select.projection.len() != arity {
             return Err(scope.arm_shape(select));
         }
-        let ([item], [from]) = (select.projection.as_slice(), select.from.as_slice()) else {
+        let [from] = select.from.as_slice() else {
             return Err(scope.arm_shape(select));
         };
         let table = self.arm_table(scope, select, &from.relation, from.joins.is_empty())?;
-        let (SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }) =
-            item
-        else {
-            return Err(scope.arm_shape(select));
-        };
-        let Some(column) = table.column(returned, self.database)? else {
-            return Err(scope.arm_shape(select));
-        };
         let database = self.database;
+        let mut columns = Vec::with_capacity(arity);
+        for item in &select.projection {
+            let (SelectItem::UnnamedExpr(returned)
+            | SelectItem::ExprWithAlias { expr: returned, .. }) = item
+            else {
+                return Err(scope.arm_shape(select));
+            };
+            let Some(column) = table.column(returned, database)? else {
+                return Err(scope.arm_shape(select));
+            };
+            columns.push(column);
+        }
         self.require_select(scope, table.table, || table.columns_read(select, database))?;
+        let [column] = columns[..] else {
+            return Ok((None, self.grant_arm(scope, select, &table, columns, false)?));
+        };
         let keyed = self.keyed_table(table.table, column)?;
         let returns_key = table
             .table
@@ -646,12 +666,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             && let Some(Expr::In {
                 expr, target: InTarget::Subquery(called), negated: false, ..
             }) = select.selection.as_ref().map(unnest)
+            && !matches!(unnest(expr), Expr::Tuple(_))
             && self.set_elements(scope, called).is_none()
         {
             let arm = self.parent_arm(scope, select, &table, column, expr, called)?;
             return Ok((keyed, Some(arm)));
         }
-        Ok((keyed, self.grant_arm(scope, select, &table, column, returns_key)?))
+        Ok((keyed, self.grant_arm(scope, select, &table, columns, returns_key)?))
     }
 
     /// Reads the recursive term of a walk, `SELECT <key> FROM <table> JOIN
@@ -838,8 +859,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             [] if !core::ptr::eq(column, key) => None,
             _ => return Err(shape()),
         };
+        let call = projected_call(subquery).ok_or_else(shape)?;
         let Called { function: callee, arguments, set } =
-            self.called_set(scope, select, table, subquery)?;
+            self.called_set(scope, select, table, &call, 1)?;
         let parent_table = match foreign_key {
             Some(foreign_key) => foreign_key.referenced_table(database)?,
             None => {
@@ -884,27 +906,27 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             [foreign_key] => Some(foreign_key),
             _ => return Err(shape()),
         };
+        let call = projected_call(subquery).ok_or_else(shape)?;
         let Called { function, arguments, set } =
-            self.called_set(scope, select, table, subquery)?;
+            self.called_set(scope, select, table, &call, 1)?;
         Ok(GranteeSet { column, foreign_key, function, arguments, set: Box::new(set) })
     }
 
-    /// The helper `(SELECT <helper>(<arguments>))` calls, the arguments it
-    /// passes, each a parameter substituted or a literal, and what the helper
-    /// answers for them.
+    /// The helper `call` reaches, the arguments it passes, each a parameter
+    /// substituted or a literal, and what the helper answers for them, the
+    /// helper returning `arity` columns.
     fn called_set(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         table: &ArmTable<'_, 'db, DB>,
-        subquery: &Query,
+        call: &Call<'_>,
+        arity: usize,
     ) -> Result<Called<'db, DB>, HelperSetError> {
         let database = self.database;
         let shape = || scope.arm_shape(select);
-        let call = projected_call(subquery).ok_or_else(shape)?;
-        let list = plain_arguments(call).ok_or_else(shape)?;
         let mut arguments = Vec::new();
-        for argument in &list.args {
+        for argument in call.arguments {
             let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else {
                 return Err(shape());
             };
@@ -920,7 +942,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             };
             arguments.push(passed.or_else(literal).ok_or_else(shape)?);
         }
-        let callee = self.called(scope, call, arguments.len())?;
+        let callee = self.called(scope, call.name, arguments.len())?;
         if !scope.owner.is_superuser() && !callee.can_execute(scope.owner, database)? {
             return Err(HelperSetError::MissingExecute {
                 function: scope.name.clone(),
@@ -928,23 +950,28 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 called: callee.target_name().to_string(),
             });
         }
+        // A helper returning neither `SETOF` nor `TABLE` is refused as it is
+        // answered below.
+        if returned_arity(callee, database).is_some_and(|returned| returned != arity) {
+            return Err(shape());
+        }
         let set = self.answer(callee, &arguments)?;
         Ok(Called { function: callee, arguments, set })
     }
 
-    /// The one helper a parent arm's call reaches under the path its body
-    /// runs with.
+    /// The one helper a call written as `written` reaches under the path the
+    /// body runs with.
     fn called(
         &self,
         scope: &Scope<'db, DB>,
-        call: &Function,
+        written: &ObjectName,
         arguments: usize,
     ) -> Result<&'db DB::Function, HelperSetError> {
-        let name = object_name_last_part(&call.name).map_or("", |(name, _)| name);
+        let name = object_name_last_part(written).map_or("", |(name, _)| name);
         let reached = |path: &SearchPath<'db>| {
             let path = || path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
             let mut reached = self.database.functions_named(name).filter(move |function| {
-                call_reaches(*function, &call.name, arguments, path, IdentifierCase::AsWritten)
+                call_reaches(*function, written, arguments, path, IdentifierCase::AsWritten)
             });
             match (reached.next(), reached.next()) {
                 (Some(callee), None) => Some(callee),
@@ -954,7 +981,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let unresolved = || {
             HelperSetError::UnresolvedCall {
                 function: scope.name.clone(),
-                call: call.name.to_string(),
+                call: written.to_string(),
             }
         };
         let Some(callee) = reached(&scope.usable_path) else {
@@ -1013,15 +1040,16 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         })
     }
 
-    /// Reads a grant arm, `None` where its conditions keep no row. An arm
-    /// returning its table's key from a helper's set is a parent arm, which
-    /// takes no other condition, so `returns_key` refuses a set beside one.
+    /// Reads a grant arm returning `columns`, `None` where its conditions
+    /// keep no row. An arm returning its table's key from a helper's set is
+    /// a parent arm, which takes no other condition, so `returns_key`
+    /// refuses a set beside one.
     fn grant_arm(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         table: &ArmTable<'_, 'db, DB>,
-        column: &'db DB::Column,
+        columns: Vec<&'db DB::Column>,
         returns_key: bool,
     ) -> Result<Option<HelperArm<'db, DB>>, HelperSetError> {
         let shape = || scope.arm_shape(select);
@@ -1031,8 +1059,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         let mut granted_to = None;
         let mut gates = Gates::default();
+        let mut caps = Vec::new();
         let mut conditions = Vec::new();
         for conjunct in conjuncts {
+            if let Some(cap) = self.cap(scope, select, table, conjunct)? {
+                caps.push(cap);
+                continue;
+            }
             let grantee = if let Some(request) = self.setting_comparison(scope, table, conjunct)? {
                 Some(GrantedTo::Request(request))
             } else if let Expr::In {
@@ -1095,12 +1128,111 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         Ok(Some(HelperArm::Grant(GrantArm {
             table: table.table,
-            column,
+            columns,
             granted_to: granted_to.unwrap_or(GrantedTo::Anyone),
             gate: gates.gate,
             restrictions,
             time_bounds,
+            caps,
         })))
+    }
+
+    /// The cap `conjunct` writes, if it writes one: `<operands> IN (SELECT *
+    /// FROM <helper>(<arguments>))` with two operands or more, or `<lift> OR
+    /// <operands> IN (...)` either way round, with one operand or more, one
+    /// operand also compared with `(SELECT <helper>(<arguments>))`.
+    fn cap(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        table: &ArmTable<'_, 'db, DB>,
+        conjunct: &Expr,
+    ) -> Result<Option<RowCap<'db, DB>>, HelperSetError> {
+        let (lift, membership) = match unnest(conjunct) {
+            Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+                match (self.lift(scope, table, left)?, self.lift(scope, table, right)?) {
+                    (Some(lift), None) => (Some(lift), unnest(right)),
+                    (None, Some(lift)) => (Some(lift), unnest(left)),
+                    _ => return Ok(None),
+                }
+            }
+            membership @ Expr::In { expr, .. } if matches!(unnest(expr), Expr::Tuple(_)) => {
+                (None, membership)
+            }
+            _ => return Ok(None),
+        };
+        let Expr::In { expr, target: InTarget::Subquery(subquery), negated: false, .. } =
+            membership
+        else {
+            return Ok(None);
+        };
+        let shape = || scope.arm_shape(select);
+        let items = match unnest(expr) {
+            Expr::Tuple(items) => items.as_slice(),
+            item => core::slice::from_ref(item),
+        };
+        let call = selected_call(subquery)
+            .or_else(|| projected_call(subquery).filter(|_| items.len() == 1))
+            .ok_or_else(shape)?;
+        let Called { function, arguments, set } =
+            self.called_set(scope, select, table, &call, items.len())?;
+        let database = self.database;
+        let mut operands = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            operands.push(match self.operand(scope, table, item)? {
+                Operand::Column(column) => CapOperand::Column(column),
+                Operand::Passed(passed) => CapOperand::Value(passed.value),
+                Operand::CastPassed { passed, cast }
+                    if returned_type(function, database, index)
+                        .is_some_and(|declared| self.is_declared_type(scope, cast, &declared)) =>
+                {
+                    CapOperand::Value(passed.value)
+                }
+                _ => return Err(shape()),
+            });
+        }
+        Ok(Some(RowCap { operands, function, arguments, set: Box::new(set), lift }))
+    }
+
+    /// The lift `expression` writes on a cap, if it writes one,
+    /// `current_setting(<setting>) IS NULL`, the read optionally cast to the
+    /// type the setting is declared in.
+    fn lift(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        expression: &Expr,
+    ) -> Result<Option<CapLift<'db>>, HelperSetError> {
+        let Expr::IsNull(read) = unnest(expression) else { return Ok(None) };
+        let Operand::Setting { read, cast } = self.operand(scope, table, read)? else {
+            return Ok(None);
+        };
+        let Some(setting) = self.deployment.setting(&read.name) else {
+            return Err(HelperSetError::UndeclaredSetting {
+                function: scope.name.clone(),
+                setting: read.name,
+            });
+        };
+        if let Some(cast) = cast {
+            let declared = match setting.content() {
+                SettingContent::Value(
+                    SettingValue::Caller(declared) | SettingValue::Scalar(declared),
+                ) => Some(declared),
+                _ => None,
+            };
+            if !declared.is_some_and(|declared| self.is_declared_type(scope, cast, declared)) {
+                return Err(HelperSetError::SettingCast {
+                    function: scope.name.clone(),
+                    setting: setting.name().to_string(),
+                    cast: cast.to_string(),
+                });
+            }
+        }
+        Ok(Some(CapLift {
+            setting,
+            raises_when_unset: read.raises_when_unset,
+            lifts_on_empty: read.empty_as_null,
+        }))
     }
 
     /// The gate `conjunct` writes on a caller setting,
@@ -1306,10 +1438,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             Err(reason(scope.name.clone(), setting.name().to_string()))
         };
         let declared = match (packing, setting.content()) {
-            (None, SettingContent::Value(SettingValue::Caller(declared))) => declared,
+            (
+                None,
+                SettingContent::Value(
+                    SettingValue::Caller(declared) | SettingValue::Scalar(declared),
+                ),
+            ) => declared,
             (None, _) => {
                 return refuse(|function, setting| {
-                    HelperSetError::SettingNotCaller { function, setting }
+                    HelperSetError::SettingNotScalar { function, setting }
                 });
             }
             (
@@ -1715,6 +1852,31 @@ fn parameters<'db, F: FunctionLike>(
         .collect()
 }
 
+/// How many columns `function` returns, one where it is declared `RETURNS
+/// SETOF` one scalar type and one per column of `RETURNS TABLE (...)`, or
+/// `None` for any other result.
+fn returned_arity<F: FunctionLike>(function: &F, database: &F::DB) -> Option<usize> {
+    match function.returned_columns(database).count() {
+        0 => returns_scalar_set(function, database).then_some(1),
+        columns => Some(columns),
+    }
+}
+
+/// The type `function` declares its returned column at `index` in, where
+/// the dialect reads it back.
+fn returned_type<F: FunctionLike>(
+    function: &F,
+    database: &F::DB,
+    index: usize,
+) -> Option<DataType> {
+    let declared = match function.returned_columns(database).nth(index) {
+        Some((_, declared)) => declared,
+        None if index == 0 => function.result_type_name(database)?,
+        None => return None,
+    };
+    parsed_type(&declared, database).ok()
+}
+
 /// Whether `function` is declared `RETURNS SETOF` one scalar type, which a
 /// `record` is not.
 fn returns_scalar_set<F: FunctionLike>(function: &F, database: &F::DB) -> bool {
@@ -1724,10 +1886,14 @@ fn returns_scalar_set<F: FunctionLike>(function: &F, database: &F::DB) -> bool {
     let Some(element) = function.result_type_name(database) else { return false };
     // The element is read back as written, so a quoted `"RECORD"` names a
     // type of its own rather than `record`.
-    let element = Parser::new(database.dialect().sqlparser_dialect())
-        .try_with_sql(&element)
-        .and_then(|mut parser| parser.parse_data_type());
-    !element.is_ok_and(|element| is_row(&element))
+    !parsed_type(&element, database).is_ok_and(|element| is_row(&element))
+}
+
+/// `name` read back as a type in the dialect of `database`.
+fn parsed_type<DB: DatabaseLike>(name: &str, database: &DB) -> Result<DataType, ParserError> {
+    Parser::new(database.dialect().sqlparser_dialect())
+        .try_with_sql(name)
+        .and_then(|mut parser| parser.parse_data_type())
 }
 
 /// Whether a `SETOF` type is a row rather than one scalar.
@@ -1795,10 +1961,19 @@ fn unadorned(query: &Query) -> bool {
 /// The name and the alias of the table `relation` names with nothing else
 /// written.
 fn plain_table(relation: &TableFactor) -> Option<(&ObjectName, Option<&Ident>)> {
+    let (name, alias, None) = plain_relation(relation)? else { return None };
+    Some((name, alias))
+}
+
+/// The name, the alias and the arguments, where it calls a function, of the
+/// relation `relation` names with nothing else written.
+fn plain_relation(
+    relation: &TableFactor,
+) -> Option<(&ObjectName, Option<&Ident>, Option<&TableFunctionArgs>)> {
     let TableFactor::Table {
         name,
         alias,
-        args: None,
+        args,
         with_hints,
         version: None,
         with_ordinality: false,
@@ -1814,8 +1989,9 @@ fn plain_table(relation: &TableFactor) -> Option<(&ObjectName, Option<&Ident>)> 
     let plain = with_hints.is_empty()
         && partitions.is_empty()
         && index_directives.is_empty()
+        && args.as_ref().is_none_or(|args| args.settings.is_none())
         && alias.as_ref().is_none_or(|alias| alias.columns.is_empty() && alias.at.is_none());
-    plain.then(|| (name, alias.as_ref().map(|alias| &alias.name)))
+    plain.then(|| (name, alias.as_ref().map(|alias| &alias.name), args.as_ref()))
 }
 
 /// The name `relation`'s columns are qualified by where it reads the walk
@@ -1887,9 +2063,28 @@ fn plain_select(select: &Select) -> bool {
 }
 
 /// The call of `(SELECT <function>(<arguments>))`.
-fn projected_call(query: &Query) -> Option<&Function> {
+fn projected_call(query: &Query) -> Option<Call<'_>> {
     let Expr::Function(call) = projected(query)? else { return None };
-    Some(call)
+    Some(Call { name: &call.name, arguments: &plain_arguments(call)?.args })
+}
+
+/// The call of `(SELECT * FROM <function>(<arguments>) [<alias>])`.
+fn selected_call(query: &Query) -> Option<Call<'_>> {
+    let SetExpr::Select(select) = query.body.as_ref() else { return None };
+    let ([SelectItem::Wildcard(options)], [from]) =
+        (select.projection.as_slice(), select.from.as_slice())
+    else {
+        return None;
+    };
+    let (name, _, Some(TableFunctionArgs { args, .. })) = plain_relation(&from.relation)? else {
+        return None;
+    };
+    (plain_query(query)
+        && plain_select(select)
+        && select.selection.is_none()
+        && from.joins.is_empty()
+        && *options == WildcardAdditionalOptions::default())
+    .then_some(Call { name, arguments: args })
 }
 
 /// The expression `(SELECT <expression>)` returns.
