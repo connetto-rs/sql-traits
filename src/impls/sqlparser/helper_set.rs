@@ -13,9 +13,9 @@ use core::ops::ControlFlow;
 use sqlparser::ast::{
     ArgMode, BinaryOperator, CastKind, DataType, Distinct, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior, FunctionSecurity,
-    GroupByExpr, Ident, InTarget, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query,
-    Select, SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    TableAliasColumnDef, TableFactor, TableFunctionArgs, UnaryOperator, Value,
+    GroupByExpr, Ident, InTarget, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart,
+    Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+    TableAliasColumnDef, TableFactor, TableFunctionArgs, UnaryOperator, Value, Visit,
     WildcardAdditionalOptions,
 };
 
@@ -27,8 +27,8 @@ use crate::{
     errors::{AccessorRefusal, HelperSetError, LookupError},
     structs::{
         AntiJoin, CallerGate, CapLift, CapOperand, Correlation, Deployment, FunctionBody, GrantArm,
-        GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm,
-        Restriction, RowCap, RowSecurity, RowStatement, SessionSetting, SetPacking,
+        GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase, JoinedRow, LiteralSet,
+        ParentArm, Restriction, RowCap, RowSecurity, RowStatement, SessionSetting, SetPacking,
         SettingComparison, SettingContent, SettingValue, TargetName, TimeBound, TimeComparison,
         WalkArm, WalkDirection,
     },
@@ -236,6 +236,13 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
         HelperSetError::ArmShape { function: self.name.clone(), arm: arm.to_string() }
     }
 
+    fn irreducible(&self, condition: &Expr) -> HelperSetError {
+        HelperSetError::Irreducible {
+            function: self.name.clone(),
+            condition: condition.to_string(),
+        }
+    }
+
     /// Splits the body into its arms and, where it writes `WITH RECURSIVE`,
     /// the term walking down a tree under them.
     fn body<'q>(&self, query: &'q Query) -> Result<Body<'q>, HelperSetError> {
@@ -273,10 +280,11 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
         let name = &cte.alias.name;
         // PostgreSQL refuses the walk's name in the arms before its recursive
         // term, so a table of that name is not what they read.
-        if arms
-            .iter()
-            .any(|arm| arm.from.iter().any(|from| walk_qualifier(&from.relation, name).is_some()))
-        {
+        if arms.iter().flat_map(|arm| &arm.from).any(|from| {
+            core::iter::once(&from.relation)
+                .chain(from.joins.iter().map(|join| &join.relation))
+                .any(|relation| walk_qualifier(relation, name).is_some())
+        }) {
             return Err(shape());
         }
         let column = match cte.alias.columns.as_slice() {
@@ -346,21 +354,25 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
     }
 }
 
-/// The table an arm reads, with the name its columns are qualified by.
+/// The table an arm reads, with the name its columns are qualified by and
+/// the columns it declares.
 struct ArmTable<'q, 'db, DB: DatabaseLike> {
     table: &'db DB::Table,
     qualifier: Cow<'q, Ident>,
+    columns: Vec<&'db DB::Column>,
 }
 
 impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
-    /// The column `expression` names, if it names one of the table's.
-    fn column(
-        &self,
-        expression: &Expr,
-        database: &'db DB,
-    ) -> Result<Option<&'db DB::Column>, LookupError> {
-        let Some(name) = self.column_name(expression) else { return Ok(None) };
-        self.table.column(&name.to_string(), database, IdentifierCase::AsWritten)
+    /// The column of the table `expression` names, if it names one.
+    fn column(&self, expression: &Expr) -> Option<&'db DB::Column> {
+        let name = self.column_name(expression)?.to_string();
+        self.columns.iter().copied().find(|column| {
+            IdentifierCase::AsWritten.names_stored(
+                column.column_name(),
+                column.column_name_is_quoted(),
+                &name,
+            )
+        })
     }
 
     /// The name `expression` gives a column of this table, bare or qualified
@@ -384,39 +396,17 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
 
     /// Every column of the table `select` names, each once, which the owner
     /// needs `SELECT` on wherever the name stands.
-    fn columns_read(
-        &self,
-        select: &Select,
-        database: &'db DB,
-    ) -> Result<Vec<&'db DB::Column>, LookupError> {
-        let columns: Vec<&'db DB::Column> = self.table.columns(database)?.collect();
+    fn columns_read(&self, select: &Select) -> Vec<&'db DB::Column> {
         let mut read: Vec<&'db DB::Column> = Vec::new();
         let _: ControlFlow<()> = walk_expressions(select, |expression| {
-            let named = self.column_among(expression, &columns);
-            if let Some(column) = named
+            if let Some(column) = self.column(expression)
                 && !read.iter().any(|seen| core::ptr::eq(*seen, column))
             {
                 read.push(column);
             }
             ControlFlow::Continue(())
         });
-        Ok(read)
-    }
-
-    /// The one of `columns`, the table's own, `expression` names.
-    fn column_among(
-        &self,
-        expression: &Expr,
-        columns: &[&'db DB::Column],
-    ) -> Option<&'db DB::Column> {
-        let name = self.column_name(expression)?.to_string();
-        columns.iter().copied().find(|column| {
-            IdentifierCase::AsWritten.names_stored(
-                column.column_name(),
-                column.column_name_is_quoted(),
-                &name,
-            )
-        })
+        read
     }
 }
 
@@ -643,6 +633,25 @@ type ReferencedKey<'db, DB> = (
     &'db <DB as DatabaseLike>::ForeignKey,
 );
 
+/// A column of an arm's own table beside the column of a joined table it
+/// equals.
+type JoinedColumns<'db, DB> =
+    (&'db <DB as DatabaseLike>::Column, &'db <DB as DatabaseLike>::Column);
+
+/// The foreign key joining a row to an arm, with its columns.
+type JoiningKey<'db, DB> = (&'db <DB as DatabaseLike>::ForeignKey, Vec<JoinedColumns<'db, DB>>);
+
+/// The conjuncts of an arm on one row it joins, beside the columns joining
+/// it.
+struct Joining<'q, 'db, DB: DatabaseLike> {
+    conditions: Vec<&'q Expr>,
+    key: Vec<JoinedColumns<'db, DB>>,
+}
+
+/// The conjuncts of an arm on its own table, beside the rows it joins,
+/// `None` where one of them keeps no row.
+type JoinedConditions<'q, 'db, DB> = (Vec<&'q Expr>, Option<Vec<JoinedRow<'db, DB>>>);
+
 /// A helper body's arms, with the term walking down a tree under them where
 /// the body writes `WITH RECURSIVE`.
 struct Body<'q> {
@@ -760,39 +769,56 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let [from] = select.from.as_slice() else {
             return Err(scope.arm_shape(select));
         };
-        let table = self
-            .arm_table(scope, &from.relation, from.joins.is_empty(), || scope.arm_shape(select))?;
-        let database = self.database;
+        let shape = || scope.arm_shape(select);
+        let mut rows = vec![self.arm_table(scope, &from.relation, true, shape)?];
+        for join in &from.joins {
+            if join.global || join_condition(join).is_none() {
+                return Err(shape());
+            }
+            rows.push(self.arm_table(scope, &join.relation, true, shape)?);
+        }
+        // PostgreSQL refuses two rows of one name, and a bare name two rows
+        // hold.
+        let named_twice = rows.iter().enumerate().any(|(index, row)| {
+            rows[..index].iter().any(|other| same_ident(&row.qualifier, &other.qualifier))
+        });
+        if named_twice || rows_named(&rows, select).is_none() {
+            return Err(shape());
+        }
+        let table = &rows[0];
         let mut columns = Vec::with_capacity(arity);
         for item in &select.projection {
             let (SelectItem::UnnamedExpr(returned)
             | SelectItem::ExprWithAlias { expr: returned, .. }) = item
             else {
-                return Err(scope.arm_shape(select));
+                return Err(shape());
             };
-            let Some(column) = table.column(returned, database)? else {
-                return Err(scope.arm_shape(select));
+            let Some(column) = table.column(returned) else {
+                return Err(shape());
             };
             columns.push(column);
         }
-        self.require_select(scope, table.table, || table.columns_read(select, database))?;
+        for row in &rows {
+            self.require_select(scope, row.table, || row.columns_read(select))?;
+        }
         let [column] = columns[..] else {
-            return Ok((None, self.grant_arm(scope, select, &table, &columns, None)?));
+            return Ok((None, self.grant_arm(scope, select, &rows, &columns, None)?));
         };
         let keyed = self.keyed_table(table.table, column)?;
         let child = self.child_table(table.table, column)?;
         if let Some(child) = child
+            && from.joins.is_empty()
             && let Some(Expr::In {
                 expr, target: InTarget::Subquery(called), negated: false, ..
             }) = select.selection.as_ref().map(unnest)
             && !matches!(unnest(expr), Expr::Tuple(_))
             && self.set_elements(scope, called)?.is_none()
-            && self.parent_comparison(&table, column, child, expr)?
+            && self.parent_comparison(table, column, child, expr)?
         {
-            let arm = self.parent_arm(scope, select, &table, (column, child), expr, called)?;
+            let arm = self.parent_arm(scope, select, table, (column, child), expr, called)?;
             return Ok((keyed, vec![arm]));
         }
-        Ok((keyed, self.grant_arm(scope, select, &table, &columns, child)?))
+        Ok((keyed, self.grant_arm(scope, select, &rows, &columns, child)?))
     }
 
     /// Reads the recursive term of a walk, one arm per edge it follows.
@@ -969,17 +995,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         returned: &Expr,
         compared: &Expr,
     ) -> Result<WalkArm<'db, DB>, HelperSetError> {
-        let database = self.database;
         let shape = || scope.arm_shape(select);
-        let (Some(returned), Some(compared)) =
-            (table.column(returned, database)?, table.column(compared, database)?)
+        let (Some(returned), Some(compared)) = (table.column(returned), table.column(compared))
         else {
             return Err(shape());
         };
         let Some(walk) = self.edge(table.table, returned, compared)? else {
             return Err(shape());
         };
-        self.require_select(scope, table.table, || Ok(vec![walk.child, walk.column]))?;
+        self.require_select(scope, table.table, || vec![walk.child, walk.column])?;
         Ok(walk)
     }
 
@@ -1126,7 +1150,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if core::ptr::eq(child, table.table) {
             return Ok(true);
         }
-        let Some(column) = table.column(compared, database)? else {
+        let Some(column) = table.column(compared) else {
             return Ok(false);
         };
         Ok(!core::ptr::eq(column, key)
@@ -1205,7 +1229,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             Some(alias) => Cow::Borrowed(alias),
             None => Cow::Owned(Ident::new(table.table_name())),
         };
-        Ok(ArmTable { table, qualifier })
+        let columns = table.columns(database)?.collect();
+        Ok(ArmTable { table, qualifier, columns })
     }
 
     /// Reads `<column> IN (SELECT <helper>(<arguments>))` in an arm returning
@@ -1221,7 +1246,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ) -> Result<HelperArm<'db, DB>, HelperSetError> {
         let database = self.database;
         let shape = || scope.arm_shape(select);
-        let Some(column) = table.column(compared, database)? else {
+        let Some(column) = table.column(compared) else {
             return Err(shape());
         };
         let foreign_key = match single_column_foreign_keys(table.table, column, database)?[..] {
@@ -1271,7 +1296,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ) -> Result<GranteeSet<'db, DB>, HelperSetError> {
         let database = self.database;
         let shape = || scope.arm_shape(select);
-        let Some(column) = table.column(compared, database)? else {
+        let Some(column) = table.column(compared) else {
             return Err(shape());
         };
         let foreign_key = match single_column_foreign_keys(table.table, column, database)?[..] {
@@ -1305,7 +1330,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             };
             // A column of the table takes the name before a parameter does,
             // and passes a value of each row.
-            if table.column(argument, database)?.is_some() {
+            if table.column(argument).is_some() {
                 return Err(shape());
             }
             let passed = scope.parameter(argument).map(|(passed, _)| passed.value.clone());
@@ -1429,10 +1454,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         &self,
         scope: &Scope<'db, DB>,
         table: &'db DB::Table,
-        read: impl FnOnce() -> Result<Vec<&'db DB::Column>, LookupError>,
+        read: impl FnOnce() -> Vec<&'db DB::Column>,
     ) -> Result<(), HelperSetError> {
         let held = table.privileges(scope.owner, self.database)?.select;
-        if held.on_table() || read()?.iter().all(|column| held.on_column(column)) {
+        if held.on_table() || read().iter().all(|column| held.on_column(column)) {
             return Ok(());
         }
         Err(HelperSetError::MissingSelect {
@@ -1447,25 +1472,24 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// keep no row. An arm returning a row of `child` from a helper's set is
     /// a parent arm where [`parent_comparison`](Self::parent_comparison)
     /// reads it as one, which takes no other condition, so such a set beside
-    /// one is refused.
+    /// one is refused. `rows` holds the arm's table and then each table it
+    /// joins.
     fn grant_arm(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
-        table: &ArmTable<'_, 'db, DB>,
+        rows: &[ArmTable<'_, 'db, DB>],
         columns: &[&'db DB::Column],
         child: Option<&'db DB::Table>,
     ) -> Result<Vec<HelperArm<'db, DB>>, HelperSetError> {
         let shape = || scope.arm_shape(select);
-        let mut conjuncts = Vec::new();
-        if let Some(selection) = &select.selection {
-            conjunction(selection, &mut conjuncts);
-        }
+        let table = rows.first().ok_or_else(shape)?;
+        let (own, joined_rows) = self.joined_rows(scope, select, rows)?;
         let mut grantees = None;
         let mut gates = Gates::default();
         let mut caps = Vec::new();
         let mut conditions = Vec::new();
-        for conjunct in conjuncts {
+        for conjunct in own {
             if let Some(cap) = self.cap(scope, select, table, conjunct)? {
                 caps.push(cap);
                 continue;
@@ -1514,12 +1538,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
         }
         let (kept, time_bounds) = self.filter(scope, table, filters)?;
-        if gates.keeps_nothing {
+        let Some(joined_rows) = joined_rows.filter(|_| !gates.keeps_nothing) else {
             return Ok(Vec::new());
-        }
+        };
         let mut grantees = grantees.unwrap_or_else(|| vec![(GrantedTo::Anyone, Kept::All)]);
         let caps: Arc<[RowCap<'db, DB>]> = caps.into();
         let anti_joins: Arc<[AntiJoin<'db, DB>]> = anti_joins.into();
+        let joined_rows: Arc<[JoinedRow<'db, DB>]> = joined_rows.into();
         let grant = |(granted_to, own): Grantee<'db, DB>,
                      kept: Kept<'db, DB>,
                      gate: Option<CallerGate<'db>>,
@@ -1534,6 +1559,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 time_bounds,
                 caps: Arc::clone(&caps),
                 anti_joins: Arc::clone(&anti_joins),
+                joined_rows: Arc::clone(&joined_rows),
             }))
         };
         // Every grantee but the last takes its own copy of the conditions.
@@ -1544,6 +1570,67 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         arms.extend(last.and_then(|last| grant(last, kept, gates.gate, time_bounds)));
         Ok(arms)
+    }
+
+    /// Splits the conditions of an arm reading `rows`, its table and then
+    /// each table it joins, into the conjuncts on the arm's own table and the
+    /// rows it joins, `None` in place of the rows where one of them keeps no
+    /// row.
+    fn joined_rows<'q>(
+        &self,
+        scope: &Scope<'db, DB>,
+        select: &'q Select,
+        rows: &[ArmTable<'_, 'db, DB>],
+    ) -> Result<JoinedConditions<'q, 'db, DB>, HelperSetError> {
+        let shape = || scope.arm_shape(select);
+        let (table, joined) = rows.split_first().ok_or_else(shape)?;
+        // An inner join keeps the rows its condition and `WHERE` keep alike.
+        let mut conjuncts = Vec::new();
+        for join in select.from.iter().flat_map(|from| &from.joins) {
+            conjunction(join_condition(join).ok_or_else(shape)?, &mut conjuncts);
+        }
+        if let Some(selection) = &select.selection {
+            conjunction(selection, &mut conjuncts);
+        }
+        let mut own = Vec::new();
+        let mut joining: Vec<Joining<'_, 'db, DB>> =
+            joined.iter().map(|_| Joining { conditions: Vec::new(), key: Vec::new() }).collect();
+        for conjunct in conjuncts {
+            // The subquery of an anti-join resolves names on its own table
+            // first, so it is read against the arm's table alone.
+            if not_exists(conjunct).is_some() {
+                own.push(conjunct);
+                continue;
+            }
+            match rows_named(rows, conjunct).ok_or_else(shape)?.as_slice() {
+                [] | [0] => own.push(conjunct),
+                [row] => joining[row - 1].conditions.push(conjunct),
+                _ => {
+                    let (row, (host, referenced)) = Self::key_equality(table, joined, conjunct)
+                        .ok_or_else(|| scope.irreducible(conjunct))?;
+                    let key = &mut joining[row].key;
+                    if !key.iter().any(|(seen_host, seen_referenced)| {
+                        core::ptr::eq(*seen_host, host)
+                            && core::ptr::eq(*seen_referenced, referenced)
+                    }) {
+                        key.push((host, referenced));
+                    }
+                }
+            }
+        }
+        let mut keys = Vec::with_capacity(joined.len());
+        for (row, joining) in joined.iter().zip(&joining) {
+            keys.push(self.joining_key(table.table, row.table, &joining.key)?.ok_or_else(shape)?);
+        }
+        let mut joined_rows = Vec::with_capacity(joined.len());
+        for ((row, joining), (foreign_key, columns)) in joined.iter().zip(&joining).zip(keys) {
+            let (kept, time_bounds) =
+                self.filter(scope, row, joining.conditions.iter().copied())?;
+            joined_rows.push(kept.restrictions().map(|restrictions| {
+                JoinedRow { table: row.table, foreign_key, columns, restrictions, time_bounds }
+            }));
+        }
+        Ok((own, joined_rows.into_iter().collect()))
     }
 
     /// What `conditions` keep of `table`, beside the bounds they set against
@@ -1557,19 +1644,67 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut kept = Kept::All;
         let mut time_bounds = Vec::new();
         for condition in conditions {
-            if let Some(bound) = self.time_bound(scope, table, condition)? {
+            if let Some(bound) = self.time_bound(scope, table, condition) {
                 time_bounds.push(bound);
                 continue;
             }
-            let reduced = self.reduce(scope, table, condition)?.ok_or_else(|| {
-                HelperSetError::Irreducible {
-                    function: scope.name.clone(),
-                    condition: condition.to_string(),
-                }
-            })?;
+            let reduced = self
+                .reduce(scope, table, condition)?
+                .ok_or_else(|| scope.irreducible(condition))?;
             kept = kept.and(reduced);
         }
         Ok((kept, time_bounds))
+    }
+
+    /// `<joined column> = <column>`, either way round, a column of the arm's
+    /// own `table` equated with one of a row it joins, answered as the index
+    /// of that row in `joined` beside the two columns.
+    fn key_equality(
+        table: &ArmTable<'_, 'db, DB>,
+        joined: &[ArmTable<'_, 'db, DB>],
+        conjunct: &Expr,
+    ) -> Option<(usize, JoinedColumns<'db, DB>)> {
+        let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = unnest(conjunct) else {
+            return None;
+        };
+        joined.iter().enumerate().find_map(|(index, row)| {
+            [(left, right), (right, left)].into_iter().find_map(|(host, referenced)| {
+                Some((index, (table.column(host)?, row.column(referenced)?)))
+            })
+        })
+    }
+
+    /// The one foreign key of `host` referencing `joined` whose every column
+    /// `key` equates with the column it references, and nothing else, with
+    /// its columns in the order it declares them.
+    fn joining_key(
+        &self,
+        host: &'db DB::Table,
+        joined: &'db DB::Table,
+        key: &[JoinedColumns<'db, DB>],
+    ) -> Result<Option<JoiningKey<'db, DB>>, LookupError> {
+        let database = self.database;
+        let mut found = None;
+        for foreign_key in host.foreign_keys(database)? {
+            if !core::ptr::eq(foreign_key.referenced_table(database)?, joined) {
+                continue;
+            }
+            let columns: Vec<_> = foreign_key
+                .host_columns(database)?
+                .zip(foreign_key.referenced_columns(database)?)
+                .collect();
+            let equated = columns.len() == key.len()
+                && columns.iter().all(|(host, referenced)| {
+                    key.iter().any(|(equated_host, equated_referenced)| {
+                        core::ptr::eq(*equated_host, *host)
+                            && core::ptr::eq(*equated_referenced, *referenced)
+                    })
+                });
+            if equated && found.replace((foreign_key, columns)).is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(found)
     }
 
     /// Reads `condition`, `NOT EXISTS (<blocking>)` in a grant arm reading
@@ -1582,12 +1717,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         blocking: &Query,
     ) -> Result<Option<AntiJoin<'db, DB>>, HelperSetError> {
         let database = self.database;
-        let shape = || {
-            HelperSetError::Irreducible {
-                function: scope.name.clone(),
-                condition: condition.to_string(),
-            }
-        };
+        let shape = || scope.irreducible(condition);
         let SetExpr::Select(select) = blocking.body.as_ref() else { return Err(shape()) };
         let ([item], [from], Some(selection)) =
             (select.projection.as_slice(), select.from.as_slice(), &select.selection)
@@ -1617,13 +1747,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut correlations = Vec::new();
         let mut filters = Vec::new();
         for conjunct in conjuncts {
-            if let Some(correlation) = correlation(table, &blocker, conjunct, database)? {
+            if let Some(correlation) = correlation(table, &blocker, conjunct) {
                 correlations.push(correlation);
-            } else if reads_arm(table, &blocker, conjunct, database)? {
-                return Err(HelperSetError::Irreducible {
-                    function: scope.name.clone(),
-                    condition: conjunct.to_string(),
-                });
+            } else if reads_arm(table, &blocker, conjunct) {
+                return Err(scope.irreducible(conjunct));
             } else {
                 filters.push(conjunct);
             }
@@ -1632,11 +1759,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(shape());
         }
         self.require_select(scope, blocker.table, || {
-            if reads_every_column {
-                Ok(blocker.table.columns(database)?.collect())
-            } else {
-                blocker.columns_read(select, database)
-            }
+            if reads_every_column { blocker.columns.clone() } else { blocker.columns_read(select) }
         })?;
         let (kept, time_bounds) = self.filter(scope, &blocker, filters)?;
         let Some(restrictions) = kept.restrictions() else { return Ok(None) };
@@ -1666,7 +1789,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         else {
             return Ok(None);
         };
-        let Some(column) = table.column(expr, self.database)? else { return Ok(None) };
+        let Some(column) = table.column(expr) else { return Ok(None) };
         let mut elements = Vec::with_capacity(list.len());
         for element in list {
             elements.push(match self.operand(scope, table, element)? {
@@ -1865,7 +1988,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         scope: &Scope<'db, DB>,
         table: &ArmTable<'_, 'db, DB>,
         condition: &Expr,
-    ) -> Result<Option<TimeBound<'db, DB>>, HelperSetError> {
+    ) -> Option<TimeBound<'db, DB>> {
         let database = self.database;
         let (comparison, null) = match unnest(condition) {
             Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
@@ -1873,19 +1996,19 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     (Expr::IsNull(null), comparison) | (comparison, Expr::IsNull(null)) => {
                         (comparison, Some(null))
                     }
-                    _ => return Ok(None),
+                    _ => return None,
                 }
             }
             comparison => (comparison, None),
         };
-        let Expr::BinaryOp { left, op, right } = comparison else { return Ok(None) };
+        let Expr::BinaryOp { left, op, right } = comparison else { return None };
         let (compared, comparison) = if self.statement_time(scope, right) {
             let comparison = match op {
                 BinaryOperator::Gt => TimeComparison::Later,
                 BinaryOperator::GtEq => TimeComparison::LaterOrEqual,
                 BinaryOperator::Lt => TimeComparison::Earlier,
                 BinaryOperator::LtEq => TimeComparison::EarlierOrEqual,
-                _ => return Ok(None),
+                _ => return None,
             };
             (left, comparison)
         } else if self.statement_time(scope, left) {
@@ -1894,22 +2017,22 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 BinaryOperator::LtEq => TimeComparison::LaterOrEqual,
                 BinaryOperator::Gt => TimeComparison::Earlier,
                 BinaryOperator::GtEq => TimeComparison::EarlierOrEqual,
-                _ => return Ok(None),
+                _ => return None,
             };
             (right, comparison)
         } else {
-            return Ok(None);
+            return None;
         };
-        let Some(column) = table.column(compared, database)? else { return Ok(None) };
+        let column = table.column(compared)?;
         if column.data_type(database).scalar_family(database) != Some(ScalarFamily::TimestampTz) {
-            return Ok(None);
+            return None;
         }
         if let Some(null) = null
-            && table.column(null, database)?.is_none_or(|nulled| !core::ptr::eq(nulled, column))
+            && table.column(null).is_none_or(|nulled| !core::ptr::eq(nulled, column))
         {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(TimeBound { column, comparison, keeps_null: null.is_some() }))
+        Some(TimeBound { column, comparison, keeps_null: null.is_some() })
     }
 
     /// Whether `expression` reads the statement time, the start of the
@@ -1940,7 +2063,6 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         table: &ArmTable<'_, 'db, DB>,
         conjunct: &Expr,
     ) -> Result<Option<SettingComparison<'db, DB>>, HelperSetError> {
-        let database = self.database;
         let (column, read, packing, cast) = match unnest(conjunct) {
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
                 let sides = (self.operand(scope, table, left)?, self.operand(scope, table, right)?);
@@ -1953,8 +2075,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 (column, read, None, cast)
             }
             Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
-                let (Some(column), Some(set)) =
-                    (table.column(left, database)?, self.set_array(scope, right)?)
+                let (Some(column), Some(set)) = (table.column(left), self.set_array(scope, right)?)
                 else {
                     return Ok(None);
                 };
@@ -1962,7 +2083,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             Expr::In { expr, target: InTarget::Subquery(query), negated: false, .. } => {
                 let (Some(column), Some(set)) =
-                    (table.column(expr, database)?, self.set_elements(scope, query)?)
+                    (table.column(expr), self.set_elements(scope, query)?)
                 else {
                     return Ok(None);
                 };
@@ -2378,7 +2499,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         expression: &'q Expr,
     ) -> Result<Operand<'q, 'db, DB>, HelperSetError> {
         let expression = unnest(expression);
-        if let Some(column) = table.column(expression, self.database)? {
+        if let Some(column) = table.column(expression) {
             return Ok(Operand::Column(column));
         }
         if let Some((passed, _)) = scope.parameter(expression) {
@@ -3039,42 +3160,70 @@ fn correlation<'db, DB: DatabaseLike>(
     table: &ArmTable<'_, 'db, DB>,
     blocker: &ArmTable<'_, 'db, DB>,
     conjunct: &Expr,
-    database: &'db DB,
-) -> Result<Option<Correlation<'db, DB>>, LookupError> {
+) -> Option<Correlation<'db, DB>> {
     let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = unnest(conjunct) else {
-        return Ok(None);
+        return None;
     };
-    for (blocking, arm) in [(left, right), (right, left)] {
-        if let Some(blocking_column) = blocker.column(blocking, database)?
-            && blocker.column(arm, database)?.is_none()
-            && let Some(arm_column) = table.column(arm, database)?
-        {
-            return Ok(Some(Correlation { blocking_column, arm_column }));
-        }
-    }
-    Ok(None)
+    [(left, right), (right, left)].into_iter().find_map(|(blocking, arm)| {
+        let blocking_column = blocker.column(blocking)?;
+        let arm_column = table.column(arm).filter(|_| blocker.column(arm).is_none())?;
+        Some(Correlation { blocking_column, arm_column })
+    })
 }
 
 /// Whether `condition` names a column of the arm's table anywhere, a name
 /// the blocking table holds naming the blocking table's.
-fn reads_arm<'db, DB: DatabaseLike>(
-    table: &ArmTable<'_, 'db, DB>,
-    blocker: &ArmTable<'_, 'db, DB>,
+fn reads_arm<DB: DatabaseLike>(
+    table: &ArmTable<'_, '_, DB>,
+    blocker: &ArmTable<'_, '_, DB>,
     condition: &Expr,
-    database: &'db DB,
-) -> Result<bool, LookupError> {
-    let blocking: Vec<&'db DB::Column> = blocker.table.columns(database)?.collect();
-    let arm: Vec<&'db DB::Column> = table.table.columns(database)?.collect();
-    let read = walk_expressions(condition, |expression| {
-        if blocker.column_among(expression, &blocking).is_none()
-            && table.column_among(expression, &arm).is_some()
-        {
+) -> bool {
+    walk_expressions(condition, |expression| {
+        if blocker.column(expression).is_none() && table.column(expression).is_some() {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
         }
+    })
+    .is_break()
+}
+
+/// The `ON` condition of an inner `join`, the one spelling of a join an arm
+/// reads.
+fn join_condition(join: &Join) -> Option<&Expr> {
+    let (JoinOperator::Join(JoinConstraint::On(on)) | JoinOperator::Inner(JoinConstraint::On(on))) =
+        &join.join_operator
+    else {
+        return None;
+    };
+    Some(on)
+}
+
+/// The indexes in `rows` of the rows whose columns `node` names, each once,
+/// `None` where it names bare a column two of them hold, which PostgreSQL
+/// refuses as ambiguous.
+fn rows_named<DB: DatabaseLike, N: Visit + ?Sized>(
+    rows: &[ArmTable<'_, '_, DB>],
+    node: &N,
+) -> Option<Vec<usize>> {
+    let mut named = Vec::new();
+    let walked = walk_expressions(node, |expression| {
+        if !matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            return ControlFlow::Continue(());
+        }
+        let mut holding = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.column(expression).is_some())
+            .map(|(index, _)| index);
+        match (holding.next(), holding.next()) {
+            (_, Some(_)) => return ControlFlow::Break(()),
+            (Some(index), None) if !named.contains(&index) => named.push(index),
+            _ => {}
+        }
+        ControlFlow::Continue(())
     });
-    Ok(read.is_break())
+    walked.is_continue().then_some(named)
 }
 
 /// Whether `columns` hold every column of the primary key of `table`, or of

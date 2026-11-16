@@ -1917,9 +1917,15 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   [`Restriction`](crate::structs::Restriction)). A column of an enum
     ///   type compared with a label by `<`, `<=`, `>` or `>=`, either way
     ///   round, holds the labels on the kept side of it in the order the type
-    ///   declares them, `ALTER TYPE ... ADD VALUE` applied. An arm comparing a
-    ///   helper's set while returning a key it would return as a parent arm is
-    ///   one, so it takes no other condition.
+    ///   declares them, `ALTER TYPE ... ADD VALUE` applied. The table may be
+    ///   followed by `[INNER] JOIN <table> ON <condition>` for each row it
+    ///   names through a foreign key, the conditions in `ON` read as those in
+    ///   `WHERE`. Each column of the key equated with the column it references
+    ///   joins the row, and the conditions on that row alone reduce to a
+    ///   [`JoinedRow`](crate::structs::JoinedRow), the grantee and the returned
+    ///   columns staying on the arm's own table. An arm comparing a helper's
+    ///   set while returning a key it would return as a parent arm is one, so
+    ///   it takes no other condition and joins no row.
     /// - A parent arm, `SELECT <key> FROM <table> WHERE <column> IN (SELECT
     ///   <helper>(<arguments>))`, each argument a parameter or a literal, the
     ///   helper called answered in turn for the arguments it receives. `<key>`

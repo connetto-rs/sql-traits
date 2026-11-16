@@ -55,10 +55,11 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Walk(WalkArm<'db, DB>),
 }
 
-/// `SELECT <columns> FROM <table> [WHERE <conditions>]`, the rows the
-/// conditions keep for the grantee they name, the caller gate they write,
-/// the restrictions and bounds the rest of them reduce to, the caps they
-/// write, and the rows of other tables whose existence takes a row away.
+/// `SELECT <columns> FROM <table> [JOIN <joined table> ON <key>]... [WHERE
+/// <conditions>]`, the rows the conditions keep for the grantee they name,
+/// the caller gate they write, the restrictions and bounds the rest of them
+/// reduce to, the caps they write, the rows of other tables each row has to
+/// name, and the rows of other tables whose existence takes a row away.
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
@@ -72,6 +73,8 @@ pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) caps: Arc<[RowCap<'db, DB>]>,
     /// Shared as [`caps`](Self::caps) is.
     pub(crate) anti_joins: Arc<[AntiJoin<'db, DB>]>,
+    /// Shared as [`caps`](Self::caps) is.
+    pub(crate) joined_rows: Arc<[JoinedRow<'db, DB>]>,
 }
 
 impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
@@ -130,6 +133,67 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     #[must_use]
     pub fn anti_joins(&self) -> &[AntiJoin<'db, DB>] {
         &self.anti_joins
+    }
+
+    /// The rows the arm joins, in the order the body joins them, each of
+    /// which a row of the arm's table has to name for the arm to keep it.
+    #[must_use]
+    pub fn joined_rows(&self) -> &[JoinedRow<'db, DB>] {
+        &self.joined_rows
+    }
+}
+
+/// `JOIN <table> ON <referenced column> = <host column> [AND ...]`, the row
+/// a grant arm's row names through one foreign key of the arm's table, every
+/// column of the key equated with the column it references, either way round
+/// and in any order, with the conditions the arm sets on that row.
+///
+/// A foreign key references a unique key, so a row of the arm names at most
+/// one joined row, and the arm keeps its row only where that joined row
+/// exists and meets the conditions. A row holding `NULL` in a column of the
+/// key names none.
+#[derive(Debug)]
+pub struct JoinedRow<'db, DB: DatabaseLike> {
+    pub(crate) table: &'db DB::Table,
+    pub(crate) foreign_key: &'db DB::ForeignKey,
+    pub(crate) columns: Vec<(&'db DB::Column, &'db DB::Column)>,
+    pub(crate) restrictions: Vec<Restriction<'db, DB>>,
+    pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
+}
+
+impl<'db, DB: DatabaseLike> JoinedRow<'db, DB> {
+    /// The table joined, the one [`foreign_key`](Self::foreign_key)
+    /// references.
+    #[must_use]
+    pub fn table(&self) -> &'db DB::Table {
+        self.table
+    }
+
+    /// The foreign key of the arm's table naming the joined row.
+    #[must_use]
+    pub fn foreign_key(&self) -> &'db DB::ForeignKey {
+        self.foreign_key
+    }
+
+    /// Each column of [`foreign_key`](Self::foreign_key) beside the column of
+    /// the joined table it references, in the order the key declares them.
+    #[must_use]
+    pub fn columns(&self) -> &[(&'db DB::Column, &'db DB::Column)] {
+        &self.columns
+    }
+
+    /// What columns of the joined row have to hold, as
+    /// [`GrantArm::restrictions`] sets it on the arm's own row.
+    #[must_use]
+    pub fn restrictions(&self) -> &[Restriction<'db, DB>] {
+        &self.restrictions
+    }
+
+    /// The bounds the joined row has to meet against the statement time, as
+    /// [`GrantArm::time_bounds`] sets them on the arm's own row.
+    #[must_use]
+    pub fn time_bounds(&self) -> &[TimeBound<'db, DB>] {
+        &self.time_bounds
     }
 }
 
@@ -432,8 +496,8 @@ impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
 
 /// `<column> <comparison> <statement time> [OR <column> IS NULL]`, a
 /// conjunct of a grant arm's condition comparing a `timestamptz` column of
-/// the arm's table with the start of the transaction, which `now()`,
-/// `CURRENT_TIMESTAMP` and `transaction_timestamp()` read.
+/// the arm's table, or of a row it joins, with the start of the transaction,
+/// which `now()`, `CURRENT_TIMESTAMP` and `transaction_timestamp()` read.
 ///
 /// The rows the arm keeps depend on when the helper runs, so a consumer
 /// answers the bound against the time of each check.

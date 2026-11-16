@@ -75,8 +75,8 @@ pub use function_body::FunctionBody;
 pub use function_kind::{AggregateKind, FunctionKind};
 pub use helper_set::{
     AntiJoin, CallerGate, CapLift, CapOperand, Correlation, GrantArm, GrantedTo, GranteeSet,
-    HelperArm, HelperSet, LiteralSet, ParentArm, Restriction, RowCap, SettingComparison, TimeBound,
-    TimeComparison, WalkArm, WalkDirection,
+    HelperArm, HelperSet, JoinedRow, LiteralSet, ParentArm, Restriction, RowCap, SettingComparison,
+    TimeBound, TimeComparison, WalkArm, WalkDirection,
 };
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
