@@ -6762,6 +6762,22 @@ fn a_read_normalized_otherwise_or_of_anything_but_a_scalar_refuses_the_answer() 
         normalized("app.link_ids"),
         "a lowered set"
     );
+    assert_eq!(
+        inviting("invitation.email = lower(current_setting('app.user_id', true))", "")
+            .map_err(|refusal| refusal.to_string()),
+        Err("helper `authz.invited` compares a column with `lower` of setting `app.user_id`, \
+             which is not a scalar"
+            .to_string()),
+        "the refusal names the normalization"
+    );
+    let lowered_lift = capping(
+        "lower(current_setting('app.installation_id', true)) IS NULL \
+         OR (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))",
+    );
+    assert!(
+        matches!(lowered_lift, Err(HelperSetError::Irreducible { .. })),
+        "a lowered read lifts no cap: {lowered_lift:?}"
+    );
     let shadow =
         "CREATE FUNCTION authz.lower(TEXT) RETURNS TEXT LANGUAGE sql STABLE AS $$ SELECT $1 $$;";
     for (condition, after) in [
