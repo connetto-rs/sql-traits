@@ -123,6 +123,19 @@ fn an_assignment_replaces_what_the_variable_held() {
     );
 }
 
+/// A statement without `INTO` that is no `CALL` assigns no variable, so
+/// what a variable held before it reaches the statements after it.
+#[test]
+fn a_statement_without_into_keeps_what_variables_hold() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN UPDATE t SET name = s WHERE id = q; EXECUTE s; END"
+        ),
+        [vec![read("s", &["'SELECT 1'"])]]
+    );
+}
+
 /// A branch that does not assign keeps what the variable held before the
 /// branch, beside what every assigning branch leaves.
 #[test]
