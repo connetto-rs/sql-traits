@@ -9,7 +9,7 @@
 //! statements until the state at its head stops growing.
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     string::String,
     vec::Vec,
 };
@@ -75,7 +75,7 @@ pub(crate) fn value_flow<'b, 'db, DB: DatabaseLike>(
         points: BTreeMap::new(),
         frames: Vec::new(),
     };
-    flow.block(block, Some(State::new()))?;
+    flow.block(block, State::new())?;
     Ok(ValueFlow { definitions: flow.definitions, points: flow.points })
 }
 
@@ -95,10 +95,14 @@ fn query_key(query: &Query) -> SiteKey {
 /// Adds the definitions `from` may hold to `into`.
 fn join(into: &mut Option<State>, from: Option<&State>) {
     let Some(from) = from else { return };
-    let Some(state) = into else {
-        *into = Some(from.clone());
-        return;
-    };
+    match into {
+        Some(state) => merge(state, from),
+        None => *into = Some(from.clone()),
+    }
+}
+
+/// Adds the definitions `from` holds to `state`.
+fn merge(state: &mut State, from: &State) {
     // A variable missing from either side holds its entry definition there.
     for (variable, slots) in state.iter_mut() {
         if !from.contains_key(variable) {
@@ -269,35 +273,28 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
 
     /// Makes the definition `pending`, whose source is evaluated where
     /// `inputs` reach, and leaves it in `state`.
-    fn write(
-        &mut self,
-        pending: &Pending<'b, 'db, DB>,
-        inputs: Option<&State>,
-        state: &mut Option<State>,
-    ) {
+    fn write(&mut self, pending: &Pending<'b, 'db, DB>, inputs: &State, state: &mut State) {
         let index = self.define(pending, inputs);
-        if let Some(state) = state {
-            let slots =
-                state.entry(pending.variable.id()).or_insert_with(|| BTreeSet::from([Slot::Entry]));
-            if pending.kills && pending.part.is_empty() {
-                slots.clear();
-            }
-            slots.insert(Slot::Written(index));
+        let slots =
+            state.entry(pending.variable.id()).or_insert_with(|| BTreeSet::from([Slot::Entry]));
+        if pending.kills && pending.part.is_empty() {
+            slots.clear();
         }
-        self.raised(state.as_ref());
+        slots.insert(Slot::Written(index));
+        self.raised(state);
     }
 
     /// Every write in `writes`, each source evaluated where `state` reaches.
-    fn write_all(&mut self, writes: &[Pending<'b, 'db, DB>], state: &mut Option<State>) {
+    fn write_all(&mut self, writes: &[Pending<'b, 'db, DB>], state: &mut State) {
         let inputs = state.clone();
         for pending in writes {
-            self.write(pending, inputs.as_ref(), state);
+            self.write(pending, &inputs, state);
         }
     }
 
     /// The index of the definition `pending`, made on the walk's first pass
     /// over its write, so definitions follow the body's order.
-    fn define(&mut self, pending: &Pending<'b, 'db, DB>, inputs: Option<&State>) -> usize {
+    fn define(&mut self, pending: &Pending<'b, 'db, DB>, inputs: &State) -> usize {
         let index = *self.keys.entry(pending.key).or_insert_with(|| {
             self.definitions.push(Written {
                 variable: pending.variable.clone(),
@@ -308,28 +305,26 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             });
             self.definitions.len() - 1
         });
-        join(&mut self.definitions[index].inputs, inputs);
+        join(&mut self.definitions[index].inputs, Some(inputs));
         index
     }
 
     /// Hands what a raise at a point holding `state` leaves to every
     /// enclosing block whose handlers may catch it.
-    fn raised(&mut self, state: Option<&State>) {
-        if state.is_none() {
-            return;
-        }
+    fn raised(&mut self, state: &State) {
         for frame in self.frames.iter_mut().filter(|frame| frame.catching) {
-            join(&mut frame.raised, state);
+            join(&mut frame.raised, Some(state));
         }
     }
 
     /// Records `state` as reaching the SQL `key` names where the body
     /// evaluates it.
-    fn evaluated(&mut self, key: SiteKey, state: Option<&State>) {
-        let mut reaching = self.points.remove(&key);
-        join(&mut reaching, state);
-        if let Some(reaching) = reaching {
-            self.points.insert(key, reaching);
+    fn evaluated(&mut self, key: SiteKey, state: &State) {
+        match self.points.entry(key) {
+            Entry::Occupied(mut reaching) => merge(reaching.get_mut(), state),
+            Entry::Vacant(reaching) => {
+                reaching.insert(state.clone());
+            }
         }
     }
 
@@ -337,7 +332,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     fn evaluated_queries<'q>(
         &mut self,
         queries: impl IntoIterator<Item = &'q Query>,
-        state: Option<&State>,
+        state: &State,
     ) {
         for query in queries {
             self.evaluated(query_key(query), state);
@@ -346,36 +341,33 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
 
     /// Records `state` as reaching the arguments and the query of `cursor`
     /// as it opens.
-    fn opened(&mut self, cursor: &BoundCursor, state: Option<&State>) {
+    fn opened(&mut self, cursor: &BoundCursor, state: &State) {
         self.evaluated_queries(&cursor.arguments, state);
         self.evaluated(SiteKey::of(Sql::Statement(&cursor.query)), state);
     }
 
+    /// Walks `nodes` from `state`, `None` where no path reaches them.
     fn nodes(
         &mut self,
         nodes: &'b [Node],
         mut state: Option<State>,
     ) -> Result<Option<State>, LookupError> {
         for node in nodes {
-            state = self.node(node, state)?;
+            let Some(reached) = state else { return Ok(None) };
+            state = self.node(node, reached)?;
         }
         Ok(state)
     }
 
-    fn node(
-        &mut self,
-        node: &'b Node,
-        mut state: Option<State>,
-    ) -> Result<Option<State>, LookupError> {
-        if state.is_none() {
-            return Ok(None);
-        }
-        self.raised(state.as_ref());
+    /// Walks `node` from `state`, giving what it leaves, `None` where it
+    /// leaves on no path.
+    fn node(&mut self, node: &'b Node, mut state: State) -> Result<Option<State>, LookupError> {
+        self.raised(&state);
         let address = core::ptr::from_ref(node).addr();
         match node {
             Node::Statement { statement, into } => {
                 let key = SiteKey::of(Sql::Statement(statement));
-                self.evaluated(key, state.as_ref());
+                self.evaluated(key, &state);
                 if let Some(into) = into {
                     let writes = self.targets(address, &into.targets, statement)?;
                     self.write_all(&writes, &mut state);
@@ -387,7 +379,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             Node::Assignment(assignment) => self.assignment(address, assignment, &mut state)?,
             Node::Dynamic { dynamic, into } => {
                 let key = SiteKey::of(Sql::Dynamic(dynamic));
-                self.evaluated(key, state.as_ref());
+                self.evaluated(key, &state);
                 if let Some(into) = into {
                     let command = expression(&dynamic.command);
                     let writes = self.targets(address, &into.targets, &command)?;
@@ -402,38 +394,36 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 self.diagnostics(address, diagnostics, &mut state)?;
             }
             Node::Open(open) => self.open(address, open, &mut state)?,
-            Node::Block(block) => state = self.block(block, state)?,
-            Node::If(choice) => {
-                state = self.branches(&choice.branches, &choice.otherwise, state)?;
-            }
+            Node::Block(block) => return self.block(block, state),
+            Node::If(choice) => return self.branches(&choice.branches, &choice.otherwise, state),
             // The parser does not tell a missing `ELSE` from an empty one, so
             // a value no branch matches also falls through, beside the
             // `case_not_found` the raise at the statement stands for.
             Node::Case(choice) => {
-                self.evaluated_queries(choice.subject.as_deref(), state.as_ref());
-                state = self.branches(&choice.branches, &choice.otherwise, state)?;
+                self.evaluated_queries(choice.subject.as_deref(), &state);
+                return self.branches(&choice.branches, &choice.otherwise, state);
             }
-            Node::Loop(repeated) => state = self.repeated(address, repeated, state.as_ref())?,
+            Node::Loop(repeated) => return self.repeated(address, repeated, &state),
             Node::Exit(exit) => {
-                self.evaluated_queries(transfer_expressions(node), state.as_ref());
-                self.exit(exit, state.as_ref());
+                self.evaluated_queries(transfer_expressions(node), &state);
+                self.exit(exit, &state);
                 if exit.condition.is_none() {
-                    state = None;
+                    return Ok(None);
                 }
             }
             Node::Return { .. } => {
-                self.evaluated_queries(transfer_expressions(node), state.as_ref());
-                state = None;
+                self.evaluated_queries(transfer_expressions(node), &state);
+                return Ok(None);
             }
             Node::Raise(raise) => {
-                self.evaluated_queries(transfer_expressions(node), state.as_ref());
+                self.evaluated_queries(transfer_expressions(node), &state);
                 if raise.level == RaiseLevel::Exception {
-                    state = None;
+                    return Ok(None);
                 }
             }
-            Node::Assert(_) => self.evaluated_queries(transfer_expressions(node), state.as_ref()),
+            Node::Assert(_) => self.evaluated_queries(transfer_expressions(node), &state),
         }
-        Ok(state)
+        Ok(Some(state))
     }
 
     /// Writes the value `assignment` at `address` gives its target.
@@ -441,7 +431,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         &mut self,
         address: usize,
         assignment: &'b Assignment,
-        state: &mut Option<State>,
+        state: &mut State,
     ) -> Result<(), LookupError> {
         let subscripts = assignment.target.indirection.iter().flat_map(|step| {
             match step {
@@ -452,9 +442,9 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             .into_iter()
             .flatten()
         });
-        self.evaluated_queries(subscripts, state.as_ref());
+        self.evaluated_queries(subscripts, state);
         let value = &*assignment.value;
-        self.evaluated(query_key(value), state.as_ref());
+        self.evaluated(query_key(value), state);
         let target = &assignment.target;
         let namespace = &self.targets_namespace(address, &target.name)?.namespace;
         let Resolved { variable, part, .. } = self.target(namespace, target)?;
@@ -476,7 +466,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         &mut self,
         address: usize,
         diagnostics: &'b Diagnostics,
-        state: &mut Option<State>,
+        state: &mut State,
     ) -> Result<(), LookupError> {
         let mut writes = Vec::new();
         for (position, item) in diagnostics.items.iter().enumerate() {
@@ -501,15 +491,15 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         &mut self,
         address: usize,
         open: &'b Open,
-        state: &mut Option<State>,
+        state: &mut State,
     ) -> Result<(), LookupError> {
         match open {
-            Open::Bound(cursor) => self.opened(cursor, state.as_ref()),
+            Open::Bound(cursor) => self.opened(cursor, state),
             Open::Query { query, .. } => {
-                self.evaluated(SiteKey::of(Sql::Statement(query)), state.as_ref());
+                self.evaluated(SiteKey::of(Sql::Statement(query)), state);
             }
             Open::Dynamic { dynamic, .. } => {
-                self.evaluated(SiteKey::of(Sql::Dynamic(dynamic)), state.as_ref());
+                self.evaluated(SiteKey::of(Sql::Dynamic(dynamic)), state);
             }
         }
         // A cursor variable already naming a portal keeps its name.
@@ -585,19 +575,15 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     /// Walks a block, its declarations evaluated before its handlers take
     /// effect, and each handler from what any raise among its statements
     /// leaves.
-    fn block(
-        &mut self,
-        block: &'b Block,
-        mut state: Option<State>,
-    ) -> Result<Option<State>, LookupError> {
+    fn block(&mut self, block: &'b Block, mut state: State) -> Result<Option<State>, LookupError> {
         self.frames.push(Frame::new(block.label.as_deref(), false));
         for declaration in &block.declarations {
-            self.raised(state.as_ref());
+            self.raised(&state);
             self.declaration(declaration, &mut state)?;
         }
         let index = self.frames.len() - 1;
         self.frames[index].catching = !block.handlers.is_empty();
-        let mut end = self.nodes(&block.statements, state)?;
+        let mut end = self.nodes(&block.statements, Some(state))?;
         self.frames[index].catching = false;
         let raised = self.frames[index].raised.take();
         for handler in &block.handlers {
@@ -614,13 +600,13 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     fn declaration(
         &mut self,
         declaration: &'b Declaration,
-        state: &mut Option<State>,
+        state: &mut State,
     ) -> Result<(), LookupError> {
         let (source, scope) = match &declaration.kind {
             DeclarationKind::Variable(declared) => {
                 match declared.default.as_deref() {
                     Some(default) => {
-                        self.evaluated(query_key(default), state.as_ref());
+                        self.evaluated(query_key(default), state);
                         let scope = self.scope(query_key(default), default)?;
                         (DefinitionSource::Value(expression(default)), Some(scope))
                     }
@@ -648,15 +634,15 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         &mut self,
         branches: &'b [Branch],
         otherwise: &'b [Node],
-        state: Option<State>,
+        state: State,
     ) -> Result<Option<State>, LookupError> {
         let mut end = None;
         for branch in branches {
-            self.evaluated(query_key(&branch.condition), state.as_ref());
-            let taken = self.nodes(&branch.statements, state.clone())?;
+            self.evaluated(query_key(&branch.condition), &state);
+            let taken = self.nodes(&branch.statements, Some(state.clone()))?;
             join(&mut end, taken.as_ref());
         }
-        let fallen = self.nodes(otherwise, state)?;
+        let fallen = self.nodes(otherwise, Some(state))?;
         join(&mut end, fallen.as_ref());
         Ok(end)
     }
@@ -664,7 +650,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     /// Hands `state` to the block or loop `exit` leaves or continues, the
     /// innermost carrying its label, or the innermost loop without one. A
     /// label nothing carries is the function's, which leaves the body.
-    fn exit(&mut self, exit: &Exit, state: Option<&State>) {
+    fn exit(&mut self, exit: &Exit, state: &State) {
         let frame = match &exit.label {
             Some(label) => {
                 self.frames.iter_mut().rev().find(|frame| frame.label == Some(label.as_str()))
@@ -673,8 +659,8 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         };
         let Some(frame) = frame else { return };
         match exit.kind {
-            ExitKind::Exit => join(&mut frame.exited, state),
-            ExitKind::Continue => join(&mut frame.continued, state),
+            ExitKind::Exit => join(&mut frame.exited, Some(state)),
+            ExitKind::Continue => join(&mut frame.continued, Some(state)),
         }
     }
 
@@ -684,7 +670,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         &mut self,
         address: usize,
         repeated: &'b Loop,
-        entry: Option<&State>,
+        entry: &State,
     ) -> Result<Option<State>, LookupError> {
         match &repeated.control {
             LoopControl::Unconditional | LoopControl::While(_) => {}
@@ -708,20 +694,22 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             self.define(pending, entry);
         }
         self.frames.push(Frame::new(repeated.label.as_deref(), true));
-        let mut head = entry.cloned();
+        let mut head = entry.clone();
         let back = loop {
             if let LoopControl::While(condition) = &repeated.control {
-                self.evaluated(query_key(condition), head.as_ref());
+                self.evaluated(query_key(condition), &head);
             }
-            self.raised(head.as_ref());
+            self.raised(&head);
             let mut state = head.clone();
             for pending in &each {
                 self.write(pending, entry, &mut state);
             }
-            let mut back = self.nodes(&repeated.statements, state)?;
+            let mut back = self.nodes(&repeated.statements, Some(state))?;
             join(&mut back, self.frames.last().and_then(|frame| frame.continued.as_ref()));
-            let mut next = entry.cloned();
-            join(&mut next, back.as_ref());
+            let mut next = entry.clone();
+            if let Some(back) = &back {
+                merge(&mut next, back);
+            }
             if next == head {
                 break back;
             }
@@ -732,17 +720,19 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             LoopControl::Unconditional => None,
             // A loop over no row assigns its targets a null.
             LoopControl::Query { .. } | LoopControl::Dynamic { .. } => {
-                let mut empty = entry.cloned();
+                let mut empty = entry.clone();
                 for pending in &none {
                     self.write(pending, entry, &mut empty);
                 }
-                join(&mut empty, back.as_ref());
-                empty
+                if let Some(back) = &back {
+                    merge(&mut empty, back);
+                }
+                Some(empty)
             }
             LoopControl::While(_)
             | LoopControl::Range { .. }
             | LoopControl::Cursor { .. }
-            | LoopControl::Array { .. } => head,
+            | LoopControl::Array { .. } => Some(head),
         };
         join(&mut exit, exited.as_ref());
         if let (LoopControl::Cursor { .. }, [_, portal], Some(state)) =
