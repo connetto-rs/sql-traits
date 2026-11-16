@@ -526,6 +526,26 @@ fn calls_in_embedded_statements_are_resolved() {
     ));
 }
 
+/// `RETURN NEXT` reads and calls what its value names, and `RETURN QUERY`
+/// what its query names.
+#[test]
+fn set_returning_statements_read_and_call_what_they_name() {
+    let database = postgres(
+        "CREATE TABLE counted (id INT);
+         CREATE TABLE listed (id INT);
+         CREATE FUNCTION next_helper() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION query_helper() RETURNS INT LANGUAGE sql AS 'SELECT 2';
+         CREATE FUNCTION next_row() RETURNS SETOF BIGINT LANGUAGE plpgsql
+             AS $$ BEGIN RETURN NEXT (SELECT count(*) FROM counted) + next_helper(); END $$;
+         CREATE FUNCTION query_rows() RETURNS SETOF BIGINT LANGUAGE plpgsql
+             AS $$ BEGIN RETURN QUERY SELECT id + query_helper() FROM listed; END $$;",
+    );
+    assert_eq!(read_by(&database, "next_row").unwrap(), ["public.counted"]);
+    assert_eq!(declared_called_by(&database, "next_row").unwrap(), ["public.next_helper"]);
+    assert_eq!(read_by(&database, "query_rows").unwrap(), ["public.listed"]);
+    assert_eq!(declared_called_by(&database, "query_rows").unwrap(), ["public.query_helper"]);
+}
+
 #[test]
 fn a_body_in_another_procedural_language_cannot_be_read() {
     let database =

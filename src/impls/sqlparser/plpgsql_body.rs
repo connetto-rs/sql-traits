@@ -20,7 +20,7 @@ use sqlparser::{
 };
 use sqlparser_plpgsql::embedded::{
     Assignment, Block, BoundCursor, Branch, DeclarationKind, Dynamic, Fetch, Indirection, Loop,
-    LoopControl, Node, Open, RaiseOption,
+    LoopControl, Node, Open, RaiseOption, ReturnQuery,
 };
 
 use super::data_statement::{
@@ -68,12 +68,16 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
 
     fn node(&mut self, node: &'s Node) -> Result<(), LookupError> {
         match node {
-            Node::Statement { statement, .. } => self.statement(statement),
+            Node::Statement { statement, .. }
+            | Node::Perform { query: statement }
+            | Node::ReturnQuery(ReturnQuery::Query(statement)) => self.statement(statement),
             Node::Assignment(assignment) => {
                 subscripts(assignment).try_for_each(|subscript| self.expression(subscript))?;
                 self.expression(&assignment.value)
             }
-            Node::Dynamic { dynamic, .. } | Node::Open(Open::Dynamic { dynamic, .. }) => {
+            Node::Dynamic { dynamic, .. }
+            | Node::Open(Open::Dynamic { dynamic, .. })
+            | Node::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
                 self.walker.dynamic(self.function, dynamic)
             }
             Node::Open(Open::Bound(cursor)) => self.opened(cursor),
@@ -94,7 +98,11 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 self.branches(&choice.branches, &choice.otherwise)
             }
             Node::Loop(repeated) => self.repeated(repeated),
-            Node::Exit(_) | Node::Return { .. } | Node::Raise(_) | Node::Assert(_) => {
+            Node::Exit(_)
+            | Node::Return { .. }
+            | Node::ReturnNext { .. }
+            | Node::Raise(_)
+            | Node::Assert(_) => {
                 transfer_expressions(node).try_for_each(|query| self.expression(query))
             }
         }
@@ -257,13 +265,19 @@ fn each_sql<'s, B>(
 ) -> ControlFlow<B> {
     for node in nodes {
         match node {
-            Node::Statement { statement, .. } => visit(Embedded::Statement(statement), None)?,
+            Node::Statement { statement, .. }
+            | Node::Perform { query: statement }
+            | Node::ReturnQuery(ReturnQuery::Query(statement)) => {
+                visit(Embedded::Statement(statement), None)?;
+            }
             Node::Assignment(assignment) => {
                 subscripts(assignment)
                     .try_for_each(|subscript| visit(Embedded::Expression(subscript), None))?;
                 visit(Embedded::Expression(&assignment.value), None)?;
             }
-            Node::Dynamic { dynamic, .. } | Node::Open(Open::Dynamic { dynamic, .. }) => {
+            Node::Dynamic { dynamic, .. }
+            | Node::Open(Open::Dynamic { dynamic, .. })
+            | Node::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
                 each_dynamic_sql(dynamic, visit)?;
             }
             Node::Open(Open::Bound(cursor)) => each_cursor_sql(cursor, visit)?,
@@ -277,7 +291,11 @@ fn each_sql<'s, B>(
             | Node::Commit { .. }
             | Node::Rollback { .. }
             | Node::Diagnostics(_) => {}
-            Node::Exit(_) | Node::Return { .. } | Node::Raise(_) | Node::Assert(_) => {
+            Node::Exit(_)
+            | Node::Return { .. }
+            | Node::ReturnNext { .. }
+            | Node::Raise(_)
+            | Node::Assert(_) => {
                 transfer_expressions(node)
                     .try_for_each(|query| visit(Embedded::Expression(query), None))?;
             }
@@ -348,12 +366,12 @@ fn subscripts(assignment: &Assignment) -> impl Iterator<Item = &Query> {
 }
 
 /// The `SELECT` evaluating each expression an `EXIT`, `CONTINUE`, `RETURN`,
-/// `RAISE` or `ASSERT` evaluates, in the order written, and none for any
-/// other node.
+/// `RETURN NEXT`, `RAISE` or `ASSERT` evaluates, in the order written, and
+/// none for any other node.
 pub(crate) fn transfer_expressions(node: &Node) -> impl Iterator<Item = &Query> {
     let (first, arguments, options, last): (_, &[Query], &[RaiseOption], _) = match node {
         Node::Exit(exit) => (exit.condition.as_deref(), &[], &[], None),
-        Node::Return { value } => (value.as_deref(), &[], &[], None),
+        Node::Return { value } | Node::ReturnNext { value } => (value.as_deref(), &[], &[], None),
         Node::Raise(raise) => (None, &raise.arguments, &raise.options, None),
         Node::Assert(assert) => (Some(&*assert.condition), &[], &[], assert.message.as_deref()),
         _ => (None, &[], &[], None),
