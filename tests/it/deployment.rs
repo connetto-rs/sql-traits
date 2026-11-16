@@ -123,6 +123,22 @@ fn an_empty_separator_cannot_split_a_set() {
 }
 
 #[test]
+fn a_principal_is_declared_with_a_type() {
+    let principal =
+        |kind: &str| SettingValue::Principal { kind: kind.into(), identity: DataType::Uuid };
+    assert!(SessionSetting::value("app.installation_id", principal("installation")).is_ok());
+    assert_eq!(
+        SessionSetting::value("app.installation_id", principal("")).map(|_| ()),
+        Err(DeploymentError::EmptyPrincipalKind { setting: "app.installation_id".into() })
+    );
+    let field = JsonField::new(["azp"], principal("")).expect("a path");
+    assert_eq!(
+        SessionSetting::json("request.jwt.claims", [field]).map(|_| ()),
+        Err(DeploymentError::EmptyPrincipalKind { setting: "request.jwt.claims".into() })
+    );
+}
+
+#[test]
 fn a_json_setting_names_distinct_non_empty_fields() {
     let sub = || JsonField::new(["sub"], SettingValue::Caller(DataType::Uuid)).expect("a path");
     let roles = JsonField::new(
