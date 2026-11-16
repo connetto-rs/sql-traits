@@ -1873,15 +1873,19 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   `<column> IN (SELECT <helper>(<arguments>))`, the helper answered in
     ///   turn as a parent arm's is. The comparison is `<column> =
     ///   current_setting('<setting>'[, <missing_ok>])` with a setting the
-    ///   deployment declares as the caller, or `<column>` compared with each
-    ///   element of a setting it declares as a set, unpacked as declared (see
-    ///   [`SettingComparison`](crate::structs::SettingComparison)). An arm
-    ///   naming no grantee returns the same rows for every request its gate
-    ///   lets through. Conditions `current_setting('<setting>') <> <text>` and
+    ///   deployment declares as the caller or as another principal, or
+    ///   `<column>` compared with each element of a setting it declares as a
+    ///   set, unpacked as declared (see
+    ///   [`SettingComparison`](crate::structs::SettingComparison)). `<column>
+    ///   IN (<values>)` listing principals beside literals and parameters
+    ///   answers one grant arm per principal and one granted to anyone for the
+    ///   literals together, each keeping the other conditions. An arm naming no
+    ///   grantee returns the same rows for every request its gate lets through.
+    ///   Conditions `current_setting('<setting>') <> <text>` and
     ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
     ///   the arm on what the setting reads (see
     ///   [`CallerGate`](crate::structs::CallerGate)). The body may cast a read
-    ///   of the caller to its declared type, and a set to an array of its
+    ///   of one value to its declared type, and a set to an array of its
     ///   declared element type or each element to that type, and any other cast
     ///   refuses the answer. It may read any setting through
     ///   `NULLIF(current_setting(...), '')`, which reads `''` as `NULL` and so

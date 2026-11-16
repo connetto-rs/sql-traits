@@ -417,6 +417,16 @@ enum Kept<'db, DB: DatabaseLike> {
     In(Vec<(&'db DB::Column, Vec<Passed>)>),
 }
 
+impl<DB: DatabaseLike> Clone for Kept<'_, DB> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::All => Self::All,
+            Self::Nothing => Self::Nothing,
+            Self::In(sets) => Self::In(sets.clone()),
+        }
+    }
+}
+
 impl<'db, DB: DatabaseLike> Kept<'db, DB> {
     fn of(equality: Equality) -> Self {
         if equality == Equality::Holds { Self::All } else { Self::Nothing }
@@ -424,6 +434,20 @@ impl<'db, DB: DatabaseLike> Kept<'db, DB> {
 
     fn values(column: &'db DB::Column, values: Vec<Passed>) -> Self {
         if values.is_empty() { Self::Nothing } else { Self::In(vec![(column, values)]) }
+    }
+
+    /// `<column> IN (<listed>)`, each value kept once and `NULL` matching
+    /// no row.
+    fn listed(column: &'db DB::Column, listed: Vec<Passed>) -> Self {
+        let mut kept: Vec<Passed> = Vec::new();
+        for passed in listed {
+            if passed.literal != Literal::Null
+                && !kept.iter().any(|seen| seen.literal == passed.literal)
+            {
+                kept.push(passed);
+            }
+        }
+        Self::values(column, kept)
     }
 
     fn and(self, other: Self) -> Self {
@@ -509,8 +533,19 @@ struct SetRead<'q> {
 }
 
 /// One arm as read, the table whose primary key it returns, where it returns
-/// one, beside the arm, `None` where its condition keeps no row.
-type ReadArm<'db, DB> = (Option<&'db <DB as DatabaseLike>::Table>, Option<HelperArm<'db, DB>>);
+/// one, beside the arms it answers, none where its condition keeps no row.
+type ReadArm<'db, DB> = (Option<&'db <DB as DatabaseLike>::Table>, Vec<HelperArm<'db, DB>>);
+
+/// Whose rows one arm a grant arm answers keeps, with what keeping them
+/// adds to the arm's other conditions.
+type Grantee<'db, DB> = (GrantedTo<'db, DB>, Kept<'db, DB>);
+
+/// An element of an `IN` list naming the request.
+enum Listed<'q> {
+    /// A read of a setting, with the cast the body writes on it.
+    Read(SettingRead, Option<&'q DataType>),
+    Literal(Passed),
+}
 
 /// A helper body's arms, with the term walking down a tree under them where
 /// the body writes `WITH RECURSIVE`.
@@ -593,13 +628,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut read = read?;
         if let Some(walk) = &body.walk {
             let walk = self.walk_arm(&scope, walk)?;
-            read.push((Some(walk.table), Some(HelperArm::Walk(walk))));
+            read.push((Some(walk.table), vec![HelperArm::Walk(walk)]));
         }
         let mut keyed = read.iter().map(|(keyed, _)| *keyed);
         let covered_table = keyed.next().flatten().filter(|first| {
             keyed.all(|other| other.is_some_and(|other| core::ptr::eq(other, *first)))
         });
-        let mut arms: Vec<_> = read.into_iter().filter_map(|(_, arm)| arm).collect();
+        let mut arms: Vec<_> = read.into_iter().flat_map(|(_, arms)| arms).collect();
         // A walk under arms keeping no row starts from nothing.
         if arms.iter().all(|arm| matches!(arm, HelperArm::Walk(_))) {
             arms.clear();
@@ -608,8 +643,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// Reads one arm, answering the table whose primary key it returns,
-    /// where it returns one, and the arm, `None` where its condition keeps
-    /// no row.
+    /// where it returns one, and the arms it answers, none where its
+    /// condition keeps no row.
     fn arm(
         &mut self,
         scope: &Scope<'db, DB>,
@@ -644,7 +679,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             && self.set_elements(scope, called)?.is_none()
         {
             let arm = self.parent_arm(scope, select, &table, column, expr, called)?;
-            return Ok((keyed, Some(arm)));
+            return Ok((keyed, vec![arm]));
         }
         Ok((keyed, self.grant_arm(scope, select, &table, column, returns_key)?))
     }
@@ -1035,7 +1070,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         })
     }
 
-    /// Reads a grant arm, `None` where its conditions keep no row. An arm
+    /// Reads a grant arm, answering one arm per grantee an `IN` list naming
+    /// the request lists and none where its conditions keep no row. An arm
     /// returning its table's key from a helper's set is a parent arm, which
     /// takes no other condition, so `returns_key` refuses a set beside one.
     fn grant_arm(
@@ -1045,18 +1081,20 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         table: &ArmTable<'_, 'db, DB>,
         column: &'db DB::Column,
         returns_key: bool,
-    ) -> Result<Option<HelperArm<'db, DB>>, HelperSetError> {
+    ) -> Result<Vec<HelperArm<'db, DB>>, HelperSetError> {
         let shape = || scope.arm_shape(select);
         let mut conjuncts = Vec::new();
         if let Some(selection) = &select.selection {
             conjunction(selection, &mut conjuncts);
         }
-        let mut granted_to = None;
+        let mut grantees = None;
         let mut gates = Gates::default();
         let mut conditions = Vec::new();
         for conjunct in conjuncts {
-            let grantee = if let Some(request) = self.setting_comparison(scope, table, conjunct)? {
-                Some(GrantedTo::Request(request))
+            let named = if let Some(request) = self.setting_comparison(scope, table, conjunct)? {
+                Some(vec![(GrantedTo::Request(request), Kept::All)])
+            } else if let Some(listed) = self.request_list(scope, table, conjunct)? {
+                Some(listed)
             } else if let Expr::In {
                 expr,
                 target: InTarget::Subquery(called),
@@ -1067,12 +1105,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 if returns_key {
                     return Err(shape());
                 }
-                Some(GrantedTo::Set(self.grantee_set(scope, select, table, expr, called)?))
+                let grantees = self.grantee_set(scope, select, table, expr, called)?;
+                Some(vec![(GrantedTo::Set(grantees), Kept::All)])
             } else {
                 None
             };
-            if let Some(grantee) = grantee {
-                if granted_to.replace(grantee).is_some() {
+            if let Some(named) = named {
+                if grantees.replace(named).is_some() {
                     return Err(shape());
                 }
             } else if let Some(read) = self.gate(scope, table, conjunct)? {
@@ -1098,31 +1137,97 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             })?;
             kept = kept.and(reduced);
         }
-        let restrictions = match kept {
-            Kept::Nothing => return Ok(None),
-            Kept::All => Vec::new(),
-            Kept::In(sets) => {
-                sets.into_iter()
-                    .map(|(column, values)| {
-                        LiteralSet {
-                            column,
-                            values: values.into_iter().map(|passed| passed.value).collect(),
-                        }
-                    })
-                    .collect()
-            }
-        };
         if gates.keeps_nothing {
+            return Ok(Vec::new());
+        }
+        let mut grantees = grantees.unwrap_or_else(|| vec![(GrantedTo::Anyone, Kept::All)]);
+        let grant = |(granted_to, own): Grantee<'db, DB>,
+                     kept: Kept<'db, DB>,
+                     gate: Option<CallerGate<'db>>,
+                     time_bounds: Vec<TimeBound<'db, DB>>| {
+            let restrictions = match kept.and(own) {
+                Kept::Nothing => return None,
+                Kept::All => Vec::new(),
+                Kept::In(sets) => {
+                    sets.into_iter()
+                        .map(|(column, values)| {
+                            LiteralSet {
+                                column,
+                                values: values.into_iter().map(|passed| passed.value).collect(),
+                            }
+                        })
+                        .collect()
+                }
+            };
+            Some(HelperArm::Grant(GrantArm {
+                table: table.table,
+                column,
+                granted_to,
+                gate,
+                restrictions,
+                time_bounds,
+            }))
+        };
+        // Every grantee but the last takes its own copy of the conditions.
+        let last = grantees.pop();
+        let mut arms = Vec::with_capacity(grantees.len() + 1);
+        for grantee in grantees {
+            arms.extend(grant(grantee, kept.clone(), gates.gate.clone(), time_bounds.clone()));
+        }
+        arms.extend(last.and_then(|last| grant(last, kept, gates.gate, time_bounds)));
+        Ok(arms)
+    }
+
+    /// `<column> IN (<values>)` listing at least one read of a setting
+    /// beside literals and parameters: one grantee per read, each compared
+    /// as `<column> = <read>` is, and the literals together as one grantee
+    /// of anyone restricted to them, in the place of the first. `None`
+    /// where the list names no read or anything else.
+    fn request_list(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        conjunct: &Expr,
+    ) -> Result<Option<Vec<Grantee<'db, DB>>>, HelperSetError> {
+        let Expr::In { expr, target: InTarget::List(list), negated: false, .. } = unnest(conjunct)
+        else {
+            return Ok(None);
+        };
+        let Some(column) = table.column(expr, self.database)? else { return Ok(None) };
+        let mut elements = Vec::with_capacity(list.len());
+        for element in list {
+            elements.push(match self.operand(scope, table, element)? {
+                Operand::Setting { read, cast } => Listed::Read(read, cast),
+                Operand::Passed(passed) => Listed::Literal(passed),
+                _ => return Ok(None),
+            });
+        }
+        if !elements.iter().any(|element| matches!(element, Listed::Read(..))) {
             return Ok(None);
         }
-        Ok(Some(HelperArm::Grant(GrantArm {
-            table: table.table,
-            column,
-            granted_to: granted_to.unwrap_or(GrantedTo::Anyone),
-            gate: gates.gate,
-            restrictions,
-            time_bounds,
-        })))
+        let mut grantees = Vec::with_capacity(elements.len());
+        let mut literals = None;
+        let mut values = Vec::new();
+        for element in elements {
+            match element {
+                Listed::Read(read, cast) => {
+                    let cast = cast.map(|cast| ReadCast { written: cast, compared: cast });
+                    let request = self.compared(scope, column, &read, None, cast)?;
+                    grantees.push((GrantedTo::Request(request), Kept::All));
+                }
+                Listed::Literal(passed) => {
+                    if literals.is_none() {
+                        literals = Some(grantees.len());
+                        grantees.push((GrantedTo::Anyone, Kept::Nothing));
+                    }
+                    values.push(passed);
+                }
+            }
+        }
+        if let Some(index) = literals {
+            grantees[index].1 = Kept::listed(column, values);
+        }
+        Ok(Some(grantees))
     }
 
     /// The gate `conjunct` writes on a caller setting,
@@ -1267,7 +1372,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// The comparison of a column with a value of the request `conjunct`
-    /// writes, if it writes one: `<column> = <caller>`, `<column> = ANY
+    /// writes, if it writes one: `<column> = <principal>`, `<column> = ANY
     /// (<array>)` or `<column> IN (SELECT <elements>)`.
     fn setting_comparison(
         &self,
@@ -1305,12 +1410,21 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             _ => return Ok(None),
         };
-        let Some(setting) = self.deployment.setting(&read.name) else {
-            return Err(HelperSetError::UndeclaredSetting {
-                function: scope.name.clone(),
-                setting: read.name,
-            });
-        };
+        self.compared(scope, column, &read, packing.as_ref(), cast).map(Some)
+    }
+
+    /// `column` compared with `read`, the identity of a principal where
+    /// `packing` is `None`, else each element of a set unpacked as
+    /// `packing`, and either cast as `cast`.
+    fn compared(
+        &self,
+        scope: &Scope<'db, DB>,
+        column: &'db DB::Column,
+        read: &SettingRead,
+        packing: Option<&SetPacking>,
+        cast: Option<ReadCast<'_>>,
+    ) -> Result<SettingComparison<'db, DB>, HelperSetError> {
+        let (setting, _) = self.declared_setting(scope, &read.name)?;
         // `string_to_array('', <delimiter>)` is an empty array.
         let excludes_unset =
             read.empty_as_null || matches!(packing, Some(SetPacking::Delimited(_)));
@@ -1318,17 +1432,23 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             Err(reason(scope.name.clone(), setting.name().to_string()))
         };
         let declared = match (packing, setting.content()) {
-            (None, SettingContent::Value(SettingValue::Caller(declared))) => declared,
+            (
+                None,
+                SettingContent::Value(
+                    SettingValue::Caller(declared)
+                    | SettingValue::Principal { identity: declared, .. },
+                ),
+            ) => declared,
             (None, _) => {
                 return refuse(|function, setting| {
-                    HelperSetError::SettingNotCaller { function, setting }
+                    HelperSetError::SettingNotPrincipal { function, setting }
                 });
             }
             (
                 Some(packing),
                 SettingContent::Value(SettingValue::Set { element, packing: declared }),
             ) => {
-                if packing != *declared {
+                if packing != declared {
                     return refuse(|function, setting| {
                         HelperSetError::MispackedSet { function, setting }
                     });
@@ -1350,12 +1470,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 cast: cast.written.to_string(),
             });
         }
-        Ok(Some(SettingComparison {
+        Ok(SettingComparison {
             column,
             setting,
             raises_when_unset: read.raises_when_unset,
             excludes_unset,
-        }))
+        })
     }
 
     /// Whether `cast`, as the helper's path resolves it, is `declared`, the
@@ -1604,9 +1724,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let Some((read, cast)) = self.typed_setting(&body, returned)? else { return Ok(None) };
         let in_declared_type = cast.is_some() || read.in_declared_type;
         let declared = if in_declared_type {
-            let (setting, declared) = self.caller_setting(&body, &read.name)?;
+            let (setting, declared) = self.declared_setting(&body, &read.name)?;
             if let Some(cast) = cast
-                && !self.is_declared_type(&body, cast, declared)
+                && declared.is_none_or(|declared| !self.is_declared_type(&body, cast, declared))
             {
                 return Err(HelperSetError::SettingCast {
                     function: body.name,
@@ -1614,7 +1734,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     cast: cast.to_string(),
                 });
             }
-            Some(declared)
+            declared
         } else {
             None
         };
@@ -1642,17 +1762,32 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         scope: &Scope<'db, DB>,
         name: &str,
     ) -> Result<(&'db SessionSetting, &'db DataType), HelperSetError> {
+        let (setting, _) = self.declared_setting(scope, name)?;
+        let SettingContent::Value(SettingValue::Caller(declared)) = setting.content() else {
+            return Err(HelperSetError::SettingNotCaller {
+                function: scope.name.clone(),
+                setting: setting.name().to_string(),
+            });
+        };
+        Ok((setting, declared))
+    }
+
+    /// The setting `name` names, with the type of the one value it holds,
+    /// `None` for a set or a JSON document.
+    fn declared_setting(
+        &self,
+        scope: &Scope<'db, DB>,
+        name: &str,
+    ) -> Result<(&'db SessionSetting, Option<&'db DataType>), HelperSetError> {
         let Some(setting) = self.deployment.setting(name) else {
             return Err(HelperSetError::UndeclaredSetting {
                 function: scope.name.clone(),
                 setting: name.to_string(),
             });
         };
-        let SettingContent::Value(SettingValue::Caller(declared)) = setting.content() else {
-            return Err(HelperSetError::SettingNotCaller {
-                function: scope.name.clone(),
-                setting: setting.name().to_string(),
-            });
+        let declared = match setting.content() {
+            SettingContent::Value(value) => value.single_type(),
+            SettingContent::Json(_) => None,
         };
         Ok((setting, declared))
     }
@@ -1815,17 +1950,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     values.push(passed);
                 }
                 match self.operand(scope, table, expr)? {
-                    Operand::Column(column) => {
-                        let mut kept: Vec<Passed> = Vec::new();
-                        for passed in values {
-                            if passed.literal != Literal::Null
-                                && !kept.iter().any(|seen| seen.literal == passed.literal)
-                            {
-                                kept.push(passed);
-                            }
-                        }
-                        Ok(Some(Kept::values(column, kept)))
-                    }
+                    Operand::Column(column) => Ok(Some(Kept::listed(column, values))),
                     Operand::Passed(passed) => {
                         let mut found = Equality::Fails;
                         for value in &values {

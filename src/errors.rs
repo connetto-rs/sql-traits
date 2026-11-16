@@ -886,6 +886,12 @@ pub enum DeploymentError {
         /// The setting holding the set.
         setting: String,
     },
+    /// A principal is declared with no type.
+    #[error("setting `{setting}` declares a principal of no type")]
+    EmptyPrincipalKind {
+        /// The setting holding the principal.
+        setting: String,
+    },
     /// A JSON field was declared with no key.
     #[error("a JSON field needs at least one key")]
     EmptyFieldPath,
@@ -1210,10 +1216,21 @@ pub enum HelperSetError {
         /// The setting, as written.
         setting: String,
     },
-    /// A grant arm compares a column with, or gates on, a setting the
-    /// deployment declares as something other than the caller.
-    #[error("helper `{function}` reads setting `{setting}` as the caller, which it is not")]
+    /// A grant arm gates on a setting the deployment declares as something
+    /// other than the caller.
+    #[error("helper `{function}` gates on setting `{setting}` as the caller, which it is not")]
     SettingNotCaller {
+        /// The helper.
+        function: String,
+        /// The setting.
+        setting: String,
+    },
+    /// A grant arm compares a column with a setting the deployment declares
+    /// as neither the caller nor another principal.
+    #[error(
+        "helper `{function}` compares a column with setting `{setting}` as the identity of a principal, which it is not"
+    )]
+    SettingNotPrincipal {
         /// The helper.
         function: String,
         /// The setting.
