@@ -377,24 +377,27 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         }
                         gated.join(" AND ")
                     });
-                    let restrictions = grant.restrictions().iter().map(|set| {
-                        let values: Vec<String> =
-                            set.values().iter().map(ToString::to_string).collect();
-                        format!("{} IN ({})", set.column().column_name(), values.join(", "))
-                    });
-                    let bounds = grant.time_bounds().iter().map(|bound| {
-                        let column = bound.column().column_name();
-                        let operator = match bound.comparison() {
-                            TimeComparison::Later => ">",
-                            TimeComparison::LaterOrEqual => ">=",
-                            TimeComparison::Earlier => "<",
-                            TimeComparison::EarlierOrEqual => "<=",
-                        };
-                        if bound.keeps_null() {
-                            format!("({column} IS NULL OR {column} {operator} now)")
-                        } else {
-                            format!("{column} {operator} now")
-                        }
+                    let restrictions = grant.restrictions().iter().map(render_restriction);
+                    let bounds = grant.time_bounds().iter().map(render_bound);
+                    let anti_joins = grant.anti_joins().iter().map(|anti_join| {
+                        let correlations = anti_join.correlations().iter().map(|correlation| {
+                            format!(
+                                "{} = {}.{}",
+                                correlation.blocking_column().column_name(),
+                                grant.table().table_name(),
+                                correlation.arm_column().column_name()
+                            )
+                        });
+                        let conditions: Vec<String> = correlations
+                            .chain(anti_join.restrictions().iter().map(render_restriction))
+                            .chain(anti_join.time_bounds().iter().map(render_bound))
+                            .collect();
+                        let keyed = if anti_join.is_keyed() { "keyed " } else { "" };
+                        format!(
+                            "NOT EXISTS ({keyed}{} WHERE {})",
+                            anti_join.table().table_name(),
+                            conditions.join(" AND ")
+                        )
                     });
                     let conditions: Vec<String> = granted_to
                         .into_iter()
@@ -402,6 +405,7 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         .chain(restrictions)
                         .chain(bounds)
                         .chain(grant.caps().iter().map(render_cap))
+                        .chain(anti_joins)
                         .collect();
                     let filter = if conditions.is_empty() {
                         String::new()
@@ -447,6 +451,28 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
         })
         .collect();
     arms.join(" UNION ")
+}
+
+/// `<column> IN (<values>)`.
+fn render_restriction(set: &LiteralSet<'_, ParserDB>) -> String {
+    let values: Vec<String> = set.values().iter().map(ToString::to_string).collect();
+    format!("{} IN ({})", set.column().column_name(), values.join(", "))
+}
+
+/// `<column> <comparison> now`, or `NULL` kept beside it.
+fn render_bound(bound: &TimeBound<'_, ParserDB>) -> String {
+    let column = bound.column().column_name();
+    let operator = match bound.comparison() {
+        TimeComparison::Later => ">",
+        TimeComparison::LaterOrEqual => ">=",
+        TimeComparison::Earlier => "<",
+        TimeComparison::EarlierOrEqual => "<=",
+    };
+    if bound.keeps_null() {
+        format!("({column} IS NULL OR {column} {operator} now)")
+    } else {
+        format!("{column} {operator} now")
+    }
 }
 
 /// The fixture rows of `table`.
@@ -625,7 +651,9 @@ fn arm_rows(
                         }
                         GrantedTo::Anyone => true,
                     };
-                    if granted && restricted && capped(grant.caps(), &caps, row) {
+                    let unblocked =
+                        grant.anti_joins().iter().all(|anti_join| !blocks(anti_join, row, fixture));
+                    if granted && restricted && unblocked && capped(grant.caps(), &caps, row) {
                         returned.insert(
                             grant
                                 .columns()
@@ -673,6 +701,22 @@ fn capped(
             })
             .collect();
         operands.is_some_and(|operands| allowed.contains(&operands))
+    })
+}
+
+/// Whether a row of `fixture` blocks `row` of a grant arm through
+/// `anti_join`, a `NULL` in a correlated column of `row` matching nothing.
+fn blocks(anti_join: &AntiJoin<'_, ParserDB>, row: &[(&str, &'static str)], fixture: Rows) -> bool {
+    assert!(anti_join.time_bounds().is_empty(), "the fixtures bound no blocking row in time");
+    rows(fixture, anti_join.table().table_name()).any(|blocking| {
+        anti_join.correlations().iter().all(|correlation| {
+            nullable(row, correlation.arm_column().column_name()).is_some_and(|value| {
+                nullable(blocking, correlation.blocking_column().column_name()) == Some(value)
+            })
+        }) && anti_join.restrictions().iter().all(|set| {
+            let value = cell(blocking, set.column().column_name());
+            set.values().iter().any(|allowed| holds(allowed, value))
+        })
     })
 }
 
@@ -4264,4 +4308,261 @@ fn every_arm_an_in_list_of_principals_answers_keeps_the_caps() {
     assert!(arms[0].starts_with("resources.id WHERE owner_id = app.user_id AND "), "{answer}");
     assert!(arms[1].starts_with("resources.id WHERE owner_id IN ('nobody') AND "), "{answer}");
     assert!(arms.iter().all(|arm| arm.contains(cap)), "{answer}");
+}
+
+/// Grants a membership takes away once deactivated, and objects whose
+/// archived parent hides them.
+const ANTI_JOINS: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE TYPE membership_state AS ENUM ('active', 'deactivated');
+CREATE TABLE organizations (id TEXT PRIMARY KEY);
+CREATE TABLE memberships (
+  organization_id TEXT NOT NULL REFERENCES organizations (id),
+  user_id TEXT NOT NULL,
+  state membership_state NOT NULL,
+  PRIMARY KEY (organization_id, user_id)
+);
+CREATE TABLE grants (
+  resource_id TEXT NOT NULL,
+  organization_id TEXT REFERENCES organizations (id),
+  grantee_id TEXT NOT NULL
+);
+CREATE TABLE objects (
+  id TEXT PRIMARY KEY,
+  parent_id TEXT REFERENCES objects (id),
+  owner_id TEXT NOT NULL,
+  archived BOOLEAN NOT NULL DEFAULT false
+);
+CREATE FUNCTION resources_with() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT permission.resource_id FROM public.grants permission
+  WHERE permission.grantee_id = current_setting('app.user_id', true)
+    AND NOT EXISTS (
+      SELECT 1 FROM public.memberships membership
+      WHERE membership.organization_id = permission.organization_id
+        AND membership.user_id = permission.grantee_id
+        AND membership.state = 'deactivated'
+    )
+$$;
+CREATE FUNCTION objects_unblocked() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT object.id FROM public.objects object
+  WHERE object.owner_id = current_setting('app.user_id', true)
+    AND NOT (EXISTS (
+      SELECT * FROM public.objects blocked WHERE object.parent_id = blocked.id AND blocked.archived
+    ))
+$$;
+ALTER FUNCTION resources_with() OWNER TO authz_owner;
+ALTER FUNCTION objects_unblocked() OWNER TO authz_owner;
+GRANT SELECT ON organizations, memberships, grants, objects TO authz_owner;
+";
+
+/// The rows the helpers of [`ANTI_JOINS`] were called over.
+const ANTI_JOIN_ROWS: Rows = &[
+    ("memberships", &[("organization_id", "o1"), ("user_id", "alice"), ("state", "active")]),
+    ("memberships", &[("organization_id", "o2"), ("user_id", "alice"), ("state", "deactivated")]),
+    ("memberships", &[("organization_id", "o2"), ("user_id", "bob"), ("state", "active")]),
+    ("memberships", &[("organization_id", "o3"), ("user_id", "carol"), ("state", "deactivated")]),
+    ("grants", &[("resource_id", "r1"), ("organization_id", "o1"), ("grantee_id", "alice")]),
+    ("grants", &[("resource_id", "r2"), ("organization_id", "o2"), ("grantee_id", "alice")]),
+    ("grants", &[("resource_id", "r3"), ("grantee_id", "alice")]),
+    ("grants", &[("resource_id", "r4"), ("organization_id", "o3"), ("grantee_id", "alice")]),
+    ("grants", &[("resource_id", "r5"), ("organization_id", "o2"), ("grantee_id", "bob")]),
+    ("grants", &[("resource_id", "r6"), ("organization_id", "o3"), ("grantee_id", "carol")]),
+    ("objects", &[("id", "a"), ("owner_id", "alice"), ("archived", "false")]),
+    ("objects", &[("id", "x"), ("owner_id", "bob"), ("archived", "true")]),
+    ("objects", &[("id", "b"), ("parent_id", "a"), ("owner_id", "alice"), ("archived", "false")]),
+    ("objects", &[("id", "c"), ("parent_id", "x"), ("owner_id", "alice"), ("archived", "false")]),
+    ("objects", &[("id", "d"), ("parent_id", "x"), ("owner_id", "bob"), ("archived", "false")]),
+    ("objects", &[("id", "y"), ("parent_id", "b"), ("owner_id", "alice"), ("archived", "true")]),
+];
+
+/// What PostgreSQL 16.15 returns for `(caller, helper)`, the helpers of
+/// [`ANTI_JOINS`] called over [`ANTI_JOIN_ROWS`].
+const ANTI_JOINS_MEASURED: &[(&str, &str, &[&str])] = &[
+    ("alice", "resources_with", &["r1", "r3", "r4"]),
+    ("alice", "objects_unblocked", &["a", "b", "y"]),
+    ("bob", "resources_with", &["r5"]),
+    ("bob", "objects_unblocked", &["x"]),
+    ("carol", "resources_with", &[]),
+    ("carol", "objects_unblocked", &[]),
+    ("zed", "resources_with", &[]),
+    ("zed", "objects_unblocked", &[]),
+];
+
+#[test]
+fn an_anti_join_keeps_a_grant_only_where_no_blocking_row_matches_it() {
+    let database = postgres(ANTI_JOINS);
+    let deployment = deployment();
+    let resources =
+        answer(&database, &deployment, "public", "resources_with", &[]).expect("answered");
+    assert_eq!(
+        render(&resources),
+        "grants.resource_id WHERE grantee_id = app.user_id AND NOT EXISTS (keyed memberships \
+         WHERE organization_id = grants.organization_id AND user_id = grants.grantee_id \
+         AND state IN ('deactivated'))"
+    );
+    let objects =
+        answer(&database, &deployment, "public", "objects_unblocked", &[]).expect("answered");
+    assert_eq!(
+        render(&objects),
+        "objects.id WHERE owner_id = app.user_id AND NOT EXISTS (keyed objects \
+         WHERE id = objects.parent_id AND archived IN (true))"
+    );
+    for &(caller, helper, measured) in ANTI_JOINS_MEASURED {
+        let set = if helper == "resources_with" { &resources } else { &objects };
+        let returned: Vec<_> =
+            evaluate(set, Request::of(caller), ANTI_JOIN_ROWS).into_iter().collect();
+        assert_eq!(returned, measured, "{caller:?} calling {helper}()");
+    }
+}
+
+/// What `resources_with()` of [`ANTI_JOINS`] answers, rendered, with
+/// `blocking` in place of its `NOT EXISTS` subquery, `after` following the
+/// helper.
+fn excluded_by(blocking: &str, after: &str) -> Result<String, HelperSetError> {
+    let written = "SELECT 1 FROM public.memberships membership
+      WHERE membership.organization_id = permission.organization_id
+        AND membership.user_id = permission.grantee_id
+        AND membership.state = 'deactivated'";
+    let sql = format!("{}{after}", ANTI_JOINS.replace(written, blocking));
+    assert!(sql.contains(blocking), "the subquery is replaced");
+    let database = postgres(&sql);
+    let deployment = deployment();
+    answer(&database, &deployment, "public", "resources_with", &[]).map(|set| render(&set))
+}
+
+#[test]
+fn an_anti_join_reads_its_correlations_by_postgres_name_resolution() {
+    let arm = "grants.resource_id WHERE grantee_id = app.user_id";
+    for (blocking, expected) in [
+        (
+            "SELECT 1 FROM public.memberships WHERE grantee_id = user_id AND organization_id = permission.organization_id",
+            "NOT EXISTS (keyed memberships WHERE user_id = grants.grantee_id \
+             AND organization_id = grants.organization_id)",
+        ),
+        (
+            "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id",
+            "NOT EXISTS (memberships WHERE user_id = grants.grantee_id)",
+        ),
+        (
+            "SELECT NULL FROM public.memberships m WHERE m.user_id = permission.grantee_id \
+             AND m.state IN ('deactivated', 'active') AND m.state = 'deactivated'",
+            "NOT EXISTS (memberships WHERE user_id = grants.grantee_id AND state IN ('deactivated'))",
+        ),
+        (
+            "SELECT 1 FROM public.organizations o WHERE o.id = permission.organization_id",
+            "NOT EXISTS (keyed organizations WHERE id = grants.organization_id)",
+        ),
+    ] {
+        assert_eq!(
+            excluded_by(blocking, "").expect("answered"),
+            format!("{arm} AND {expected}"),
+            "{blocking}"
+        );
+    }
+    assert_eq!(
+        excluded_by(
+            "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id AND m.state = 'deactivated' AND false",
+            ""
+        )
+        .expect("answered"),
+        arm,
+        "an anti-join keeping no blocking row takes no row away"
+    );
+    assert_eq!(
+        excluded_by(
+            "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id",
+            "CREATE UNIQUE INDEX one_membership ON memberships (user_id);"
+        )
+        .expect("answered"),
+        format!("{arm} AND NOT EXISTS (keyed memberships WHERE user_id = grants.grantee_id)"),
+        "a unique index keys the blocking rows"
+    );
+    assert_eq!(
+        excluded_by(
+            "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id",
+            "ALTER TABLE memberships ADD CONSTRAINT one_membership UNIQUE (user_id);"
+        )
+        .expect("answered"),
+        format!("{arm} AND NOT EXISTS (keyed memberships WHERE user_id = grants.grantee_id)"),
+        "a unique constraint keys the blocking rows"
+    );
+    assert_eq!(
+        excluded_by(
+            "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id",
+            "CREATE UNIQUE INDEX one_active ON memberships (user_id) WHERE state = 'active';"
+        )
+        .expect("answered"),
+        format!("{arm} AND NOT EXISTS (memberships WHERE user_id = grants.grantee_id)"),
+        "a partial unique index keys only the rows its predicate holds for"
+    );
+}
+
+#[test]
+fn an_anti_join_of_any_other_shape_refuses_the_answer() {
+    for blocking in [
+        "SELECT 1 FROM public.memberships m WHERE m.state = 'deactivated'",
+        "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id \
+         AND m.organization_id <> permission.organization_id",
+        "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id \
+         AND resource_id = 'r1'",
+        "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id \
+         AND m.user_id = current_setting('app.user_id', true)",
+        "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id \
+         AND m.organization_id = lower(permission.organization_id)",
+        "SELECT m.user_id FROM public.memberships m WHERE m.user_id = permission.grantee_id",
+        "SELECT 1 FROM public.memberships m JOIN public.organizations o \
+         ON o.id = m.organization_id WHERE m.user_id = permission.grantee_id",
+        "SELECT 1 FROM public.memberships permission WHERE permission.user_id = permission.user_id",
+        "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id LIMIT 1",
+        "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id GROUP BY m.state",
+        "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id \
+         UNION SELECT 1 FROM public.organizations o WHERE o.id = permission.organization_id",
+        "SELECT 1 FROM public.memberships m",
+        "SELECT 1, 2 FROM public.memberships m WHERE m.user_id = permission.grantee_id",
+    ] {
+        assert!(
+            matches!(excluded_by(blocking, ""), Err(HelperSetError::Irreducible { .. })),
+            "{blocking}"
+        );
+    }
+    let positive = ANTI_JOINS.replace("AND NOT EXISTS (", "AND EXISTS (");
+    assert_ne!(positive, ANTI_JOINS, "the anti-join is replaced");
+    assert!(
+        matches!(
+            answer(&postgres(&positive), &deployment(), "public", "resources_with", &[]),
+            Err(HelperSetError::Irreducible { .. })
+        ),
+        "a semi-join keeps no grant an anti-join reads"
+    );
+    let unreadable = ANTI_JOINS.replace(
+        "GRANT SELECT ON organizations, memberships, grants, objects",
+        "GRANT SELECT ON organizations, grants, objects",
+    );
+    assert!(
+        matches!(
+            answer(&postgres(&unreadable), &deployment(), "public", "resources_with", &[]),
+            Err(HelperSetError::MissingSelect { table, .. }) if table == "memberships"
+        ),
+        "the owner reads the blocking rows"
+    );
+    let some_columns = "ALTER TABLE memberships ADD COLUMN note TEXT;
+        REVOKE SELECT ON memberships FROM authz_owner;
+        GRANT SELECT (organization_id, user_id, state) ON memberships TO authz_owner;";
+    assert!(
+        excluded_by(
+            "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id",
+            some_columns
+        )
+        .is_ok(),
+        "the owner reads every column the subquery names"
+    );
+    assert!(
+        matches!(
+            excluded_by("SELECT * FROM public.memberships m WHERE m.user_id = permission.grantee_id", some_columns),
+            Err(HelperSetError::MissingSelect { table, .. }) if table == "memberships"
+        ),
+        "`*` reads every column, as PostgreSQL 16.15 refuses it"
+    );
 }

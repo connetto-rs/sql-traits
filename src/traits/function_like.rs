@@ -1906,10 +1906,15 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   `>` or `>=` either way round, optionally `OR <column> IS NULL`, and
     ///   the arm answers it as a [`TimeBound`](crate::structs::TimeBound).
     ///   `CURRENT_TIMESTAMP` and `transaction_timestamp()` read the same
-    ///   statement time as `now()`. The rest, the arguments substituted, reduce
-    ///   to `TRUE`, to `FALSE` or `NULL`, or to the literal values columns have
-    ///   to hold. An arm comparing a helper's set while returning its table's
-    ///   primary key is a parent arm, so it takes no other condition.
+    ///   statement time as `now()`. An anti-join is a conjunct `NOT EXISTS
+    ///   (SELECT 1 FROM <table> WHERE <conditions>)` whose conditions equal
+    ///   columns of `<table>` with columns of the arm's table and otherwise
+    ///   read `<table>` alone, and the arm answers it as an
+    ///   [`AntiJoin`](crate::structs::AntiJoin). The rest, the arguments
+    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to the literal
+    ///   values columns have to hold, a `boolean` column alone holding `TRUE`.
+    ///   An arm comparing a helper's set while returning its table's primary
+    ///   key is a parent arm, so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it
