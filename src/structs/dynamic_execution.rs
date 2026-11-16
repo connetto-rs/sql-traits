@@ -1,13 +1,18 @@
 //! The places a function body runs SQL text it builds at run time.
 
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
 
+use once_cell::race::OnceBox;
 use sqlparser::ast::Expr;
+use sqlparser_plpgsql::embedded::Block;
 
 use crate::{
     errors::LookupError,
-    impls::{SiteSource, dql::scoped_roots::ScopedRoot},
-    structs::{ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope},
+    impls::{BodyNames, SiteKey, SiteSource, dql::scoped_roots::ScopedRoot, value_flow},
+    structs::{
+        ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope,
+        plpgsql_flow::{ValueFlow, VariableRead, read_variables},
+    },
     traits::DatabaseLike,
 };
 
@@ -56,7 +61,15 @@ enum SiteRoot<'b> {
 #[derive(Debug)]
 pub(crate) enum SiteScope<'b, 'db, DB: DatabaseLike> {
     /// The variables in reach where a PL/pgSQL body evaluates it.
-    PlPgSql(PlPgSqlScope<'b, 'db, DB>),
+    PlPgSql {
+        /// The variables in reach.
+        scope: PlPgSqlScope<'b, 'db, DB>,
+        /// The statement, expression or dynamic SQL of the body holding
+        /// the site.
+        key: SiteKey,
+        /// The value flow of the body.
+        flow: Arc<SiteFlow<'b, 'db, DB>>,
+    },
     /// The input parameters of the function whose SQL body holds it.
     FunctionBody(&'db DB::Function),
 }
@@ -64,9 +77,42 @@ pub(crate) enum SiteScope<'b, 'db, DB: DatabaseLike> {
 impl<DB: DatabaseLike> Clone for SiteScope<'_, '_, DB> {
     fn clone(&self) -> Self {
         match self {
-            Self::PlPgSql(scope) => Self::PlPgSql(scope.clone()),
+            Self::PlPgSql { scope, key, flow } => {
+                Self::PlPgSql { scope: scope.clone(), key: *key, flow: Arc::clone(flow) }
+            }
             Self::FunctionBody(function) => Self::FunctionBody(function),
         }
+    }
+}
+
+/// The value flow of one PL/pgSQL body, which the sites of one
+/// [`DynamicExecutionSites::sites`] call share and the first
+/// [`DynamicExecution::reads`] computes.
+#[derive(Debug)]
+pub(crate) struct SiteFlow<'b, 'db, DB: DatabaseLike> {
+    names: &'b BodyNames<'db, DB>,
+    block: &'b Block,
+    hex_strings_may_be_integers: bool,
+    flow: OnceBox<Result<ValueFlow<'b, 'db, DB>, LookupError>>,
+}
+
+impl<'b, 'db, DB: DatabaseLike> SiteFlow<'b, 'db, DB> {
+    pub(crate) const fn new(
+        names: &'b BodyNames<'db, DB>,
+        block: &'b Block,
+        hex_strings_may_be_integers: bool,
+    ) -> Self {
+        Self { names, block, hex_strings_may_be_integers, flow: OnceBox::new() }
+    }
+
+    /// The value flow of the body, computed on the first call.
+    fn get(&self) -> Result<&ValueFlow<'b, 'db, DB>, LookupError> {
+        self.flow
+            .get_or_init(|| {
+                Box::new(value_flow(self.names, self.block, self.hex_strings_may_be_integers))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 }
 
@@ -90,17 +136,10 @@ impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
     pub(crate) const fn execute(
         command: Cow<'b, Expr>,
         arguments: Vec<Cow<'b, Expr>>,
-        scope: PlPgSqlScope<'b, 'db, DB>,
+        scope: SiteScope<'b, 'db, DB>,
         database: &'db DB,
     ) -> Self {
-        Self {
-            root: SiteRoot::Command,
-            command,
-            arguments,
-            scope: SiteScope::PlPgSql(scope),
-            function: None,
-            database,
-        }
+        Self { root: SiteRoot::Command, command, arguments, scope, function: None, database }
     }
 
     /// The call of `function`, written in `root`, running the text its
@@ -171,7 +210,7 @@ impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
     #[must_use]
     pub const fn scope(&self) -> ExpressionScope<'_, 'db, DB> {
         match &self.scope {
-            SiteScope::PlPgSql(scope) => ExpressionScope::PlPgSql(scope),
+            SiteScope::PlPgSql { scope, .. } => ExpressionScope::PlPgSql(scope),
             SiteScope::FunctionBody(function) => ExpressionScope::FunctionBody(*function),
         }
     }
@@ -181,8 +220,87 @@ impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
     #[must_use]
     pub const fn plpgsql_scope(&self) -> Option<&PlPgSqlScope<'b, 'db, DB>> {
         match &self.scope {
-            SiteScope::PlPgSql(scope) => Some(scope),
+            SiteScope::PlPgSql { scope, .. } => Some(scope),
             SiteScope::FunctionBody(_) => None,
         }
+    }
+
+    /// Returns the PL/pgSQL variables the [`command`](Self::command) and
+    /// [`arguments`](Self::arguments) read, each once in the order first
+    /// read, with the definitions that may reach the site. Identifiers
+    /// compare under `case`. A site of a SQL body reads no variable.
+    ///
+    /// A variable is read whole or through a field, by any name reaching
+    /// it, an alias or a label-qualified name included. Its definitions are
+    /// what each path from the start of the body to the site may have left
+    /// in it, through branches, loops, `EXIT`, `CONTINUE`, `RETURN` and the
+    /// errors a handler catches. The value flow of the body is computed once
+    /// for every site of one [`DynamicExecutionSites::sites`] call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the relation-name lookup errors building the contexts of the
+    /// command and arguments runs into,
+    /// [`LookupError::FunctionBodyUnresolvable`] for a write whose target
+    /// names no variable, and the errors [`DynamicExecutionSites::sites`]
+    /// returns.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION run(p text) RETURNS void LANGUAGE plpgsql AS $$
+    ///      DECLARE s text := 'SELECT 1';
+    ///      BEGIN
+    ///          IF p IS NOT NULL THEN
+    ///              s := 'SELECT ' || p;
+    ///          END IF;
+    ///          EXECUTE s;
+    ///      END $$;",
+    /// )?;
+    /// let run = db
+    ///     .function_by_target(TargetName::new("run", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = run.dynamic_execution_sites(&db)?;
+    /// let sites = body.sites()?;
+    /// let reads = sites[0].reads(IdentifierCase::Folded)?;
+    /// let [command] = reads.as_slice() else { panic!("s is read") };
+    /// assert_eq!(command.variable().name(), "s");
+    /// let Reaching::Definitions(definitions) = command.reaching() else { panic!("s is reached") };
+    /// let values: Vec<String> = definitions
+    ///     .iter()
+    ///     .map(|definition| {
+    ///         let DefinitionSource::Value(value) = definition.source() else { panic!("assigned") };
+    ///         value.to_string()
+    ///     })
+    ///     .collect();
+    /// assert_eq!(values, ["'SELECT 1'", "'SELECT ' || p"]);
+    /// let inputs = definitions[1].reads(IdentifierCase::Folded)?;
+    /// let [input] = inputs.as_slice() else { panic!("p is read") };
+    /// assert!(matches!(input.variable().kind(), VariableKind::Parameter { position: 1, .. }));
+    /// let Reaching::Definitions(incoming) = input.reaching() else { panic!("p is reached") };
+    /// assert_eq!(incoming[0].source(), &DefinitionSource::Incoming);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn reads(
+        &self,
+        case: IdentifierCase,
+    ) -> Result<Vec<VariableRead<'_, 'db, DB>>, LookupError> {
+        let SiteScope::PlPgSql { scope, key, flow } = &self.scope else { return Ok(Vec::new()) };
+        let flow = flow.get()?;
+        let mut variables = Vec::new();
+        read_variables(&self.context(case)?, scope, self.command(), &mut variables)?;
+        let plpgsql = ExpressionScope::PlPgSql(scope);
+        for argument in self.arguments() {
+            let context =
+                ExpressionContext::for_expression(argument, &plpgsql, self.database, case)?;
+            read_variables(&context, scope, argument, &mut variables)?;
+        }
+        Ok(flow.reaching(variables, flow.points.get(key)))
     }
 }

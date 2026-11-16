@@ -120,6 +120,7 @@ mod partition_keys;
 mod per_object_grants;
 mod persisted_names_and_collations;
 mod plpgsql_dynamic_execution;
+mod plpgsql_reaching_definitions;
 mod policy_applies_to_role;
 mod policy_clause_analysis;
 mod policy_literals;

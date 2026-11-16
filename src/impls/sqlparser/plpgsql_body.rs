@@ -336,7 +336,7 @@ fn subscripts(assignment: &Assignment) -> impl Iterator<Item = &Query> {
 /// The `SELECT` evaluating each expression an `EXIT`, `CONTINUE`, `RETURN`,
 /// `RAISE` or `ASSERT` evaluates, in the order written, and none for any
 /// other node.
-fn transfer_expressions(node: &Node) -> impl Iterator<Item = &Query> {
+pub(crate) fn transfer_expressions(node: &Node) -> impl Iterator<Item = &Query> {
     let (first, arguments, options, last): (_, &[Query], &[Query], _) = match node {
         Node::Exit(exit) => (exit.condition.as_deref(), &[], &[], None),
         Node::Return { value } => (value.as_deref(), &[], &[], None),
