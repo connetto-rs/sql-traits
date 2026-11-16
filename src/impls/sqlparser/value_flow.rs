@@ -456,6 +456,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 }
             }
             Node::Fetch(fetch) => {
+                self.evaluated_queries(fetch.direction.expression(), &state);
                 let cursor = self.cursor(address, &fetch.cursor)?;
                 let source =
                     |output| DefinitionSource::CursorOutput { cursor: cursor.clone(), output };
@@ -473,6 +474,11 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             Node::Diagnostics(diagnostics) => {
                 self.diagnostics(address, diagnostics, &mut state)?;
             }
+            Node::Move { direction, .. } => self.evaluated_queries(direction.expression(), &state),
+            Node::Close { .. } => {}
+            // A function runs inside its caller's transaction, which it may
+            // not end, so these raise `invalid_transaction_termination`.
+            Node::Commit { .. } | Node::Rollback { .. } => return Ok(None),
             Node::Open(open) => self.open(address, open, &mut state)?,
             Node::Block(block) => return self.block(block, state),
             Node::If(choice) => return self.branches(&choice.branches, &choice.otherwise, state),
@@ -667,7 +673,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         self.frames[index].catching = false;
         let raised = self.frames[index].raised.take();
         for handler in &block.handlers {
-            let handled = self.nodes(handler, raised.clone())?;
+            let handled = self.nodes(&handler.statements, raised.clone())?;
             join(&mut end, handled.as_ref());
         }
         let exited = self.frames.pop().and_then(|frame| frame.exited);
@@ -851,12 +857,13 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         };
         Ok(match control {
             LoopControl::Unconditional | LoopControl::While(_) => (Vec::new(), Vec::new()),
-            LoopControl::Range { variable, lower, upper, step } => {
+            LoopControl::Range { variable, reverse, lower, upper, step } => {
                 let pending = Pending {
                     key: (address, 0, false),
                     variable: declared(variable)?,
                     part: Vec::new(),
                     source: DefinitionSource::LoopIndex {
+                        reverse: *reverse,
                         lower: expression(lower),
                         upper: expression(upper),
                         step: step.as_deref().map(expression),

@@ -178,11 +178,14 @@ pub enum DefinitionSource<'r, 'db> {
         /// The part of each element assigned.
         output: Output,
     },
-    /// Every integer of a `FOR` loop's range in turn.
+    /// Every integer of a `FOR` loop's range in turn, from the first bound
+    /// written to the second.
     LoopIndex {
-        /// The first bound written.
+        /// Whether `REVERSE` counts down from `lower` to `upper`.
+        reverse: bool,
+        /// The first bound written, where the count starts.
         lower: Cow<'r, Expr>,
-        /// The second bound written.
+        /// The second bound written, past which the count stops.
         upper: Cow<'r, Expr>,
         /// The `BY` step.
         step: Option<Cow<'r, Expr>>,
@@ -786,7 +789,7 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
                 expressions.push(command);
                 expressions.extend(arguments.iter().map(|argument| &**argument));
             }
-            DefinitionSource::LoopIndex { lower, upper, step } => {
+            DefinitionSource::LoopIndex { lower, upper, step, .. } => {
                 expressions.extend([lower, upper].into_iter().chain(step).map(|bound| &**bound));
             }
             DefinitionSource::Incoming

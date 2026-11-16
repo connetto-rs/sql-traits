@@ -19,8 +19,8 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_plpgsql::embedded::{
-    Assignment, Block, BoundCursor, Branch, DeclarationKind, Dynamic, Indirection, Loop,
-    LoopControl, Node, Open,
+    Assignment, Block, BoundCursor, Branch, DeclarationKind, Dynamic, Fetch, Indirection, Loop,
+    LoopControl, Node, Open, RaiseOption,
 };
 
 use super::data_statement::{
@@ -78,7 +78,13 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
             }
             Node::Open(Open::Bound(cursor)) => self.opened(cursor),
             Node::Open(Open::Query { query, .. }) => self.statement(query),
-            Node::Fetch(_) | Node::Diagnostics(_) => Ok(()),
+            Node::Fetch(Fetch { direction, .. }) | Node::Move { direction, .. } => {
+                direction.expression().map_or(Ok(()), |count| self.expression(count))
+            }
+            Node::Close { .. }
+            | Node::Commit { .. }
+            | Node::Rollback { .. }
+            | Node::Diagnostics(_) => Ok(()),
             Node::Block(block) => self.block(block),
             Node::If(choice) => self.branches(&choice.branches, &choice.otherwise),
             Node::Case(choice) => {
@@ -111,7 +117,7 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
             change = self.first_change(&block.statements)?;
             for handler in &block.handlers {
                 if change.is_none() {
-                    change = self.first_change(handler)?;
+                    change = self.first_change(&handler.statements)?;
                 }
             }
         }
@@ -122,7 +128,7 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
             if let Some(entry) = &entry {
                 self.walker.restore_path(entry.clone());
             }
-            self.nodes(handler)?;
+            self.nodes(&handler.statements)?;
         }
         if let Some(change) = change {
             self.forget(change);
@@ -262,7 +268,15 @@ fn each_sql<'s, B>(
             }
             Node::Open(Open::Bound(cursor)) => each_cursor_sql(cursor, visit)?,
             Node::Open(Open::Query { query, .. }) => visit(Embedded::Statement(query), None)?,
-            Node::Fetch(_) | Node::Diagnostics(_) => {}
+            Node::Fetch(Fetch { direction, .. }) | Node::Move { direction, .. } => {
+                if let Some(count) = direction.expression() {
+                    visit(Embedded::Expression(count), None)?;
+                }
+            }
+            Node::Close { .. }
+            | Node::Commit { .. }
+            | Node::Rollback { .. }
+            | Node::Diagnostics(_) => {}
             Node::Exit(_) | Node::Return { .. } | Node::Raise(_) | Node::Assert(_) => {
                 transfer_expressions(node)
                     .try_for_each(|query| visit(Embedded::Expression(query), None))?;
@@ -272,7 +286,7 @@ fn each_sql<'s, B>(
                     .try_for_each(|default| visit(Embedded::Expression(default), None))?;
                 each_sql(&block.statements, visit)?;
                 for handler in &block.handlers {
-                    each_sql(handler, visit)?;
+                    each_sql(&handler.statements, visit)?;
                 }
             }
             Node::If(choice) => each_branch_sql(&choice.branches, &choice.otherwise, visit)?,
@@ -337,14 +351,14 @@ fn subscripts(assignment: &Assignment) -> impl Iterator<Item = &Query> {
 /// `RAISE` or `ASSERT` evaluates, in the order written, and none for any
 /// other node.
 pub(crate) fn transfer_expressions(node: &Node) -> impl Iterator<Item = &Query> {
-    let (first, arguments, options, last): (_, &[Query], &[Query], _) = match node {
+    let (first, arguments, options, last): (_, &[Query], &[RaiseOption], _) = match node {
         Node::Exit(exit) => (exit.condition.as_deref(), &[], &[], None),
         Node::Return { value } => (value.as_deref(), &[], &[], None),
         Node::Raise(raise) => (None, &raise.arguments, &raise.options, None),
         Node::Assert(assert) => (Some(&*assert.condition), &[], &[], assert.message.as_deref()),
         _ => (None, &[], &[], None),
     };
-    first.into_iter().chain(arguments).chain(options).chain(last)
+    first.into_iter().chain(arguments).chain(options.iter().map(|option| &option.value)).chain(last)
 }
 
 fn each_branch_sql<'s, B>(

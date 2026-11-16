@@ -104,6 +104,31 @@ fn expressions_holding_sublinks_are_read() {
     );
 }
 
+/// The count of a `FETCH` or `MOVE` and the value of a `RAISE` option are
+/// queries PostgreSQL runs where the statement stands.
+#[test]
+fn cursor_counts_and_raise_options_are_read() {
+    let database = postgres(
+        "CREATE TABLE docs (id INT);
+         CREATE TABLE fetched (id INT);
+         CREATE TABLE moved (id INT);
+         CREATE TABLE hinted (id INT);
+         CREATE FUNCTION counted() RETURNS VOID LANGUAGE plpgsql AS $$
+         DECLARE c SCROLL CURSOR FOR SELECT id FROM docs; n INT;
+         BEGIN
+           OPEN c;
+           FETCH ABSOLUTE (SELECT count(*) FROM fetched) FROM c INTO n;
+           MOVE BACKWARD (SELECT count(*) FROM moved) IN c;
+           CLOSE c;
+           RAISE NOTICE 'counted' USING HINT = (SELECT max(id)::text FROM hinted);
+         END $$;",
+    );
+    assert_eq!(
+        read_by(&database, "counted").unwrap(),
+        ["public.docs", "public.fetched", "public.moved", "public.hinted"]
+    );
+}
+
 /// `CASE` with and without a subject, every kind of loop and a block with a
 /// handler each run their SQL where the body reaches them, nested here inside
 /// an outer loop.
@@ -277,6 +302,33 @@ fn a_nested_or_repeated_path_change_hides_later_names() {
             "{name}"
         );
     }
+}
+
+/// A path the count of a `MOVE` in a loop sets reaches the loop's earlier
+/// statements on the next iteration.
+#[test]
+fn a_path_set_by_a_cursor_count_in_a_loop_hides_earlier_names() {
+    let database = postgres(
+        "CREATE TABLE docs (id INT);
+         CREATE FUNCTION moving() RETURNS VOID LANGUAGE plpgsql AS $$
+         DECLARE c CURSOR FOR SELECT 1;
+         BEGIN
+           OPEN c;
+           FOR i IN 1..2 LOOP
+             PERFORM 1 FROM docs;
+             MOVE RELATIVE length(set_config('search_path', 'app', true)) FROM c;
+           END LOOP;
+         END $$;",
+    );
+    assert!(
+        matches!(
+            read_by(&database, "moving"),
+            Err(LookupError::FunctionBodyUnresolvable { statement, .. })
+                if statement.contains("set_config")
+        ),
+        "{:?}",
+        read_by(&database, "moving")
+    );
 }
 
 /// A `SET` PostgreSQL refuses is reported wherever it sits.
