@@ -3975,6 +3975,132 @@ fn a_set_read_through_an_accessor_returning_its_text_reads_the_set() {
     }
 }
 
+/// `authz.link_ids()` returning `body` as `returns`, declared as an accessor.
+fn link_ids(returns: &str, body: &str) -> String {
+    accessor("link_ids", returns, ACCESSOR, body)
+}
+
+/// What `presented_links` answers once `after` declares its accessors,
+/// `app.link_ids` a set of `uuid` packed as `packing`: the arm, and whether
+/// the comparison raises where the set is unset and excludes the unset set.
+fn presented_through(
+    after: &str,
+    condition: &str,
+    packing: SetPacking,
+) -> Result<(String, bool, bool), HelperSetError> {
+    let database = postgres(&presenting("''", condition, after));
+    let setting = SessionSetting::value(
+        "app.link_ids",
+        SettingValue::Set { element: DataType::Uuid, packing },
+    )
+    .expect("a custom setting name");
+    let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
+    answer(&database, &deployment, "authz", "presented_links", &[]).map(|set| {
+        let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+        let GrantedTo::Request(request) = grant.granted_to() else { panic!("the set") };
+        (render(&set), request.raises_when_unset(), request.excludes_unset())
+    })
+}
+
+#[test]
+fn a_set_read_through_an_accessor_reads_as_the_set_it_returns() {
+    let comma = || SetPacking::Delimited(",".into());
+    let absent_split = "string_to_array(NULLIF(current_setting('app.link_ids', true), ''), ',')";
+    let uuids = link_ids("UUID[]", &format!("{absent_split}::uuid[]"));
+    let texts = link_ids("text[]", "string_to_array(current_setting('app.link_ids'), ',')");
+    let elements = link_ids("uuid[]", &format!("ARRAY(SELECT {ELEMENTS}::uuid)"));
+    let unnested = link_ids("uuid[]", &format!("ARRAY(SELECT unnest({SPLIT})::uuid)"));
+    for (after, condition, packing, raises, excludes_unset) in [
+        (&uuids, "l.id = ANY (authz.link_ids())", comma(), false, true),
+        (&uuids, "l.id = ANY ((authz.link_ids()))", comma(), false, true),
+        (&uuids, "l.id IN (SELECT unnest(authz.link_ids()))", comma(), false, true),
+        (&uuids, "l.id = ANY (ARRAY(SELECT unnest(authz.link_ids())))", comma(), false, true),
+        (&texts, "l.id = ANY (authz.link_ids()::uuid[])", comma(), true, true),
+        (&texts, "l.id IN (SELECT unnest(authz.link_ids())::uuid)", comma(), true, true),
+        (&elements, "l.id = ANY (authz.link_ids())", SetPacking::JsonArray, false, false),
+        (&unnested, "l.id = ANY (authz.link_ids())", comma(), false, true),
+    ] {
+        let expected = (PRESENTED_ARM.to_string(), raises, excludes_unset);
+        assert_eq!(
+            presented_through(after, condition, packing),
+            Ok(expected),
+            "{condition} after {after}"
+        );
+    }
+    assert_eq!(
+        presented_through(&uuids, "l.id = ANY (authz.link_ids())", comma()),
+        presented_through("", &format!("l.id = ANY ({absent_split}::uuid[])"), comma()),
+        "an accessor reads as the set read inlined"
+    );
+}
+
+#[test]
+fn a_set_accessor_postgres_does_not_run_as_its_read_refuses_the_answer() {
+    let comma = || SetPacking::Delimited(",".into());
+    let body = format!("{SPLIT}::uuid[]");
+    let refused = |after: &str| {
+        match presented_through(after, "l.id = ANY (authz.link_ids())", comma()) {
+            Err(HelperSetError::Accessor { function, accessor, setting, reason })
+                if function == "authz.presented_links"
+                    && accessor == "authz.link_ids"
+                    && setting == "app.link_ids" =>
+            {
+                Some(reason)
+            }
+            _ => None,
+        }
+    };
+    let immutable = accessor(
+        "link_ids",
+        "uuid[]",
+        "LANGUAGE sql IMMUTABLE SECURITY DEFINER SET search_path = ''",
+        &body,
+    );
+    assert_eq!(refused(&immutable), Some(AccessorRefusal::Immutable));
+    let sets = accessor("link_ids", "uuid[]", &format!("{ACCESSOR} SET app.link_ids = ''"), &body);
+    assert_eq!(refused(&sets), Some(AccessorRefusal::SetsSetting));
+    for (returns, body) in [
+        ("uuid", body.as_str()),
+        ("SETOF uuid[]", body.as_str()),
+        ("text[]", body.as_str()),
+        ("uuid[]", SPLIT),
+    ] {
+        assert_eq!(
+            refused(&link_ids(returns, body)),
+            Some(AccessorRefusal::ReturnType),
+            "{returns}: {body}"
+        );
+    }
+    assert!(
+        matches!(
+            presented_through(&link_ids("text[]", &format!("{SPLIT}::text[]")), "l.id = ANY (authz.link_ids())", comma()),
+            Err(HelperSetError::SettingCast { function, .. }) if function == "authz.link_ids"
+        ),
+        "the accessor casts to the declared element type"
+    );
+    assert!(
+        matches!(
+            presented_through(
+                &link_ids("uuid[]", &body),
+                "l.id = ANY (authz.link_ids())",
+                SetPacking::JsonArray
+            ),
+            Err(HelperSetError::MispackedSet { .. })
+        ),
+        "the accessor unpacks the set as the deployment packs it"
+    );
+    for condition in ["l.id = ANY (authz.link_ids()::uuid[])", "l.id = ANY (authz.link_ids(NULL))"]
+    {
+        assert!(
+            matches!(
+                presented_through(&link_ids("uuid[]", &body), condition, comma()),
+                Err(HelperSetError::Irreducible { .. })
+            ),
+            "{condition}"
+        );
+    }
+}
+
 #[test]
 fn an_accessor_resolves_its_body_on_its_own_path_or_on_the_helpers() {
     let shadow = "CREATE FUNCTION public.current_setting(text, boolean) RETURNS text
