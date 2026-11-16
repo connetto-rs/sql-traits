@@ -499,7 +499,6 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
         case: IdentifierCase,
     ) -> Result<Vec<VariableRead<'r, 'db, DB>>, LookupError> {
         let DefinitionKind::Written { written, .. } = &self.kind else { return Ok(Vec::new()) };
-        let Some(scope) = &written.scope else { return Ok(Vec::new()) };
         let mut statement = None;
         let mut expressions: Vec<&Expr> = Vec::new();
         match &written.source {
@@ -520,8 +519,9 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
             | DefinitionSource::CursorName
             | DefinitionSource::PortalName
             | DefinitionSource::Diagnostics(_)
-            | DefinitionSource::Unknown => {}
+            | DefinitionSource::Unknown => return Ok(Vec::new()),
         }
+        let Some(scope) = &written.scope else { return Ok(Vec::new()) };
         let database = scope.database();
         let plpgsql = ExpressionScope::PlPgSql(scope);
         let mut variables = Vec::new();

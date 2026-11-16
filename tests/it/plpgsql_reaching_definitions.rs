@@ -762,6 +762,29 @@ fn diagnostics_assign_the_items_they_name() {
     );
 }
 
+/// A definition whose value comes from no SQL of the body, a diagnostics
+/// item, a declaration without a default or a `FETCH`, reads nothing.
+#[test]
+fn a_definition_without_sql_reads_nothing() {
+    let database = database(
+        "DECLARE a text; b text; c CURSOR FOR SELECT name FROM t;
+         BEGIN
+          GET DIAGNOSTICS a = PG_CONTEXT;
+          IF q > 0 THEN OPEN c; FETCH c INTO b; END IF;
+          EXECUTE a USING b;
+         END",
+    );
+    let body = run(&database).dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    for read in sites[0].reads(IdentifierCase::Folded).unwrap() {
+        let Reaching::Definitions(definitions) = read.reaching() else { panic!("reached") };
+        for definition in definitions {
+            let reads = definition.reads(IdentifierCase::Folded).unwrap();
+            assert!(reads.is_empty(), "{}", rendered(definition));
+        }
+    }
+}
+
 /// A lone row target takes the whole row, a row-typed parameter and a
 /// trigger's `NEW` included, while a lone scalar target takes the first
 /// output.
