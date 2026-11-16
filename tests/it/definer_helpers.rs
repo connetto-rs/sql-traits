@@ -323,14 +323,18 @@ fn render_granted_to(granted_to: &GrantedTo<'_, ParserDB>) -> Option<String> {
 
 /// A cap as `(<operands>) IN <helper>(<arguments>) {<its set>}`, behind
 /// `<setting> IS UNSET OR` where `''` lifts it too and `<setting> IS NULL
-/// OR` where only `NULL` does.
-fn render_cap(cap: &RowCap<'_, ParserDB>) -> String {
+/// OR` where only `NULL` does, an operand on a row of `joined` qualified by
+/// its table.
+fn render_cap(cap: &RowCap<'_, ParserDB>, joined: &[JoinedRow<'_, ParserDB>]) -> String {
     let operands: Vec<String> = cap
         .operands()
         .iter()
         .map(|operand| {
             match operand {
                 CapOperand::Column(column) => column.column_name().to_string(),
+                CapOperand::Joined { row, column } => {
+                    format!("{}.{}", joined[*row].table().table_name(), column.column_name())
+                }
                 CapOperand::Value(value) => value.to_string(),
             }
         })
@@ -398,7 +402,7 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
         .chain(restrictions)
         .chain(bounds)
         .chain(joins)
-        .chain(grant.caps().iter().map(render_cap))
+        .chain(grant.caps().iter().map(|cap| render_cap(cap, grant.joined_rows())))
         .chain(anti_joins)
         .collect();
     let filter = if conditions.is_empty() {
@@ -700,7 +704,7 @@ fn grant_rows(
             GrantedTo::Anyone => true,
         };
         let unblocked = grant.anti_joins().iter().all(|anti_join| !blocks(anti_join, row, fixture));
-        if granted && restricted && unblocked && capped(grant.caps(), &caps, row) {
+        if granted && restricted && unblocked && capped(grant, &caps, row, fixture) {
             returned.insert(
                 grant.columns().iter().map(|column| cell(row, column.column_name())).collect(),
             );
@@ -734,14 +738,15 @@ fn arm_rows(
     returned
 }
 
-/// Whether `row` meets every cap, each beside the rows it compares with,
-/// `None` where it is lifted.
+/// Whether `row` of `grant` meets every cap, each beside the rows it
+/// compares with, `None` where it is lifted.
 fn capped(
-    caps: &[RowCap<'_, ParserDB>],
+    grant: &GrantArm<'_, ParserDB>,
     compared: &[Option<BTreeSet<Vec<&'static str>>>],
     row: &[(&str, &'static str)],
+    fixture: Rows,
 ) -> bool {
-    caps.iter().zip(compared).all(|(cap, allowed)| {
+    grant.caps().iter().zip(compared).all(|(cap, allowed)| {
         let Some(allowed) = allowed else { return true };
         // A `NULL` operand matches no row.
         let operands: Option<Vec<&str>> = cap
@@ -750,6 +755,11 @@ fn capped(
             .map(|operand| {
                 match operand {
                     CapOperand::Column(column) => nullable(row, column.column_name()),
+                    CapOperand::Joined { row: joined, column } => {
+                        let named = named_row(row, &grant.joined_rows()[*joined], fixture)
+                            .expect("the arm keeps only rows naming their joined rows");
+                        nullable(named, column.column_name())
+                    }
                     CapOperand::Value(Value::SingleQuotedString(text)) => Some(text.as_str()),
                     CapOperand::Value(Value::Null) => None,
                     CapOperand::Value(other) => panic!("the fixtures cap by text, not {other}"),
@@ -773,14 +783,25 @@ fn blocks(anti_join: &AntiJoin<'_, ParserDB>, row: &[(&str, &'static str)], fixt
     })
 }
 
-/// Whether `row` names a row of the joined table meeting its restrictions,
-/// a `NULL` in its foreign key naming none.
-fn joins(row: &[(&str, &'static str)], joined: &JoinedRow<'_, ParserDB>, fixture: Rows) -> bool {
-    rows(fixture, joined.table().table_name()).any(|other| {
+/// The row of the joined table `row` names through the foreign key of
+/// `joined`, `None` where a `NULL` in the key names none.
+fn named_row(
+    row: &[(&str, &'static str)],
+    joined: &JoinedRow<'_, ParserDB>,
+    fixture: Rows,
+) -> Option<&'static [(&'static str, &'static str)]> {
+    rows(fixture, joined.table().table_name()).find(|other| {
         joined.columns().iter().all(|(host, referenced)| {
             nullable(row, host.column_name()).is_some()
                 && nullable(row, host.column_name()) == nullable(other, referenced.column_name())
-        }) && joined.restrictions().iter().all(|restriction| restricts(restriction, other))
+        })
+    })
+}
+
+/// Whether `row` names a row of the joined table meeting its restrictions.
+fn joins(row: &[(&str, &'static str)], joined: &JoinedRow<'_, ParserDB>, fixture: Rows) -> bool {
+    named_row(row, joined, fixture).is_some_and(|other| {
+        joined.restrictions().iter().all(|restriction| restricts(restriction, other))
     })
 }
 
@@ -6287,4 +6308,224 @@ fn the_owner_has_to_read_a_joined_table_past_its_policies() {
         refusal(&bound),
         HelperSetError::NotExempt { table, .. } if table == "docs"
     ));
+}
+
+/// connetto's team administration as connetto-schema `f276257` writes it,
+/// an app installation acting for a team admin capped by the organization of
+/// the admin's membership, which the arm reads off the joined row.
+const ADMINISTERED: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+CREATE TYPE authz.role AS ENUM ('reader', 'writer', 'admin');
+CREATE TYPE authz.resource_kind AS ENUM ('organization', 'folder', 'project', 'ownable');
+CREATE TYPE authz.membership_state AS ENUM ('active', 'deactivated');
+CREATE TYPE authz.team_role AS ENUM ('member', 'admin');
+CREATE TABLE memberships (
+  organization_id UUID NOT NULL,
+  user_id UUID NOT NULL,
+  state authz.membership_state NOT NULL,
+  PRIMARY KEY (organization_id, user_id)
+);
+CREATE TABLE team_members (
+  team_id UUID NOT NULL,
+  organization_id UUID NOT NULL,
+  user_id UUID NOT NULL,
+  team_role authz.team_role NOT NULL,
+  PRIMARY KEY (team_id, user_id),
+  FOREIGN KEY (organization_id, user_id) REFERENCES memberships (organization_id, user_id) ON DELETE CASCADE
+);
+CREATE TABLE installation_permissions (
+  installation_id UUID NOT NULL,
+  organization_id UUID NOT NULL,
+  kind authz.resource_kind NOT NULL,
+  max_role authz.role NOT NULL,
+  PRIMARY KEY (installation_id, kind)
+);
+GRANT SELECT ON memberships, team_members, installation_permissions TO authz_owner;
+CREATE FUNCTION authz.caller_id() RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT NULLIF(current_setting('app.user_id', true), '')::uuid
+$$;
+CREATE FUNCTION authz.acting_installation_id() RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT NULLIF(current_setting('app.installation_id', true), '')::uuid
+$$;
+CREATE FUNCTION authz.capped_kinds(min_role authz.role)
+RETURNS TABLE (organization_id UUID, kind authz.resource_kind)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT permission.organization_id, permission.kind FROM public.installation_permissions permission
+  WHERE permission.installation_id = authz.acting_installation_id()
+    AND permission.max_role >= min_role
+$$;
+CREATE FUNCTION authz.administered_teams() RETURNS SETOF UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT member.team_id FROM public.team_members member
+  JOIN public.memberships membership ON membership.organization_id = member.organization_id AND membership.user_id = member.user_id
+  WHERE member.user_id = authz.caller_id()
+    AND member.team_role = 'admin' AND membership.state = 'active'
+    AND (authz.acting_installation_id() IS NULL
+      OR (membership.organization_id, 'organization'::authz.resource_kind)
+        IN (SELECT * FROM authz.capped_kinds('admin')))
+$$;
+ALTER FUNCTION authz.caller_id() OWNER TO authz_owner;
+ALTER FUNCTION authz.acting_installation_id() OWNER TO authz_owner;
+ALTER FUNCTION authz.capped_kinds(authz.role) OWNER TO authz_owner;
+ALTER FUNCTION authz.administered_teams() OWNER TO authz_owner;
+";
+
+/// Alice is an active member of `o1` and `o2` and Bob a deactivated one of
+/// `o1`. Alice administers `T1` in `o1` and `T2` in `o2` and is a plain
+/// member of `T3`, and Bob administers `T4`. Installation `i1` holds `o1` as
+/// an organization and `o2` only as a folder, and `i2` holds `o2` as an
+/// organization below `admin`. Each name stands for one `uuid`.
+const ADMINISTERED_ROWS: Rows = &[
+    ("memberships", &[("organization_id", "o1"), ("user_id", "alice"), ("state", "active")]),
+    ("memberships", &[("organization_id", "o2"), ("user_id", "alice"), ("state", "active")]),
+    ("memberships", &[("organization_id", "o1"), ("user_id", "bob"), ("state", "deactivated")]),
+    (
+        "team_members",
+        &[
+            ("team_id", "T1"),
+            ("organization_id", "o1"),
+            ("user_id", "alice"),
+            ("team_role", "admin"),
+        ],
+    ),
+    (
+        "team_members",
+        &[
+            ("team_id", "T2"),
+            ("organization_id", "o2"),
+            ("user_id", "alice"),
+            ("team_role", "admin"),
+        ],
+    ),
+    (
+        "team_members",
+        &[
+            ("team_id", "T3"),
+            ("organization_id", "o1"),
+            ("user_id", "alice"),
+            ("team_role", "member"),
+        ],
+    ),
+    (
+        "team_members",
+        &[("team_id", "T4"), ("organization_id", "o1"), ("user_id", "bob"), ("team_role", "admin")],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i1"),
+            ("organization_id", "o1"),
+            ("kind", "organization"),
+            ("max_role", "admin"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i1"),
+            ("organization_id", "o2"),
+            ("kind", "folder"),
+            ("max_role", "admin"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i2"),
+            ("organization_id", "o2"),
+            ("kind", "organization"),
+            ("max_role", "reader"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_id", "i2"),
+            ("organization_id", "o1"),
+            ("kind", "project"),
+            ("max_role", "admin"),
+        ],
+    ),
+];
+
+/// What PostgreSQL 16.15 returns for `authz.administered_teams()` over
+/// [`ADMINISTERED_ROWS`] for each request.
+const ADMINISTERED_MEASURED: &[(Request, &[&str])] = &[
+    (ALICE, &["T1", "T2"]),
+    (ALICE_EMPTY, &["T1", "T2"]),
+    (ALICE_I1, &["T1"]),
+    (ALICE_I2, &[]),
+    (ALICE_IX, &[]),
+    (Request::of("bob"), &[]),
+    (BOB_I1, &[]),
+];
+
+#[test]
+fn a_cap_reads_its_operands_off_the_row_the_arm_joins() {
+    let database = postgres(ADMINISTERED);
+    let deployment = principals(&DataType::Uuid);
+    let set = answer(&database, &deployment, "authz", "administered_teams", &[]).expect("answered");
+    assert_eq!(
+        render(&set),
+        "team_members.team_id WHERE user_id = app.user_id AND team_role IN ('admin') \
+         AND (organization_id, user_id) -> memberships {state IN ('active')} \
+         AND (app.installation_id IS UNSET OR (memberships.organization_id, 'organization') \
+         IN authz.capped_kinds('admin') {installation_permissions.(organization_id, kind) \
+         WHERE installation_id = app.installation_id AND max_role IN ('admin')})"
+    );
+    let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+    let ([joined], [cap]) = (grant.joined_rows(), grant.caps()) else {
+        panic!("one joined row and one cap")
+    };
+    let [CapOperand::Joined { row: 0, column }, CapOperand::Value(_)] = cap.operands() else {
+        panic!("the organization of the joined row beside a label")
+    };
+    assert!(core::ptr::eq(column.table(&database), joined.table()));
+    for &(request, expected) in ADMINISTERED_MEASURED {
+        let returned: Vec<_> = evaluate(&set, request, ADMINISTERED_ROWS).into_iter().collect();
+        assert_eq!(returned, expected, "{:?} for {:?}", request.caller, request.values);
+    }
+}
+
+#[test]
+fn a_bare_name_in_a_joined_cap_is_the_joined_column_before_a_parameter() {
+    let administering = |condition: &str| {
+        let sql = ADMINISTERED
+            .replace(
+                "authz.administered_teams() RETURNS",
+                "authz.administered_teams(state authz.role) RETURNS",
+            )
+            .replace(
+                "authz.administered_teams() OWNER",
+                "authz.administered_teams(authz.role) OWNER",
+            )
+            .replace(
+                "(authz.acting_installation_id() IS NULL
+      OR (membership.organization_id, 'organization'::authz.resource_kind)
+        IN (SELECT * FROM authz.capped_kinds('admin')))",
+                condition,
+            );
+        let database = postgres(&sql);
+        let deployment = principals(&DataType::Uuid);
+        answer(&database, &deployment, "authz", "administered_teams", &[text("admin")])
+            .map(|set| render(&set))
+    };
+    assert!(
+        administering("true").is_ok_and(|rendered| !rendered.contains("IN authz.capped_kinds")),
+        "the cap is replaced"
+    );
+    let argument = administering(
+        "(authz.acting_installation_id() IS NULL OR (membership.organization_id, \
+         'organization'::authz.resource_kind) IN (SELECT * FROM authz.capped_kinds(state)))",
+    );
+    assert!(matches!(argument, Err(HelperSetError::ArmShape { .. })), "{argument:?}");
+    let lift = administering(
+        "(state IS NULL OR (membership.organization_id, 'organization'::authz.resource_kind) \
+         IN (SELECT * FROM authz.capped_kinds('admin')))",
+    );
+    assert!(matches!(lift, Err(HelperSetError::Irreducible { .. })), "{lift:?}");
 }

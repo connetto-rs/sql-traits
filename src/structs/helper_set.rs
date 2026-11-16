@@ -296,10 +296,11 @@ impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
 /// the helper returns. A single operand is a cap only behind `IS NULL OR`,
 /// and may then compare with `(SELECT <function>(<arguments>))` as well,
 /// since without it the conjunct names the arm's grantee (see
-/// [`GrantedTo::Set`]). Each operand is a column of the arm's table, or a
-/// literal or an argument, plain or cast to the type the helper declares
-/// the column it pairs with in. An operand holding `NULL` matches no row,
-/// as PostgreSQL's row comparison answers `NULL` for it.
+/// [`GrantedTo::Set`]). Each operand is a column of the arm's table or of a
+/// row it joins (see [`GrantArm::joined_rows`]), or a literal or an
+/// argument, plain or cast to the type the helper declares the column it
+/// pairs with in. An operand holding `NULL` matches no row, as PostgreSQL's
+/// row comparison answers `NULL` for it.
 #[derive(Debug)]
 pub struct RowCap<'db, DB: DatabaseLike> {
     pub(crate) operands: Vec<CapOperand<'db, DB>>,
@@ -350,6 +351,14 @@ impl<'db, DB: DatabaseLike> RowCap<'db, DB> {
 pub enum CapOperand<'db, DB: DatabaseLike> {
     /// A column of the arm's table, compared row by row.
     Column(&'db DB::Column),
+    /// A column of the row the arm joins at `row` in
+    /// [`GrantArm::joined_rows`], read off the row each row of the arm names.
+    Joined {
+        /// The index of the joined row in [`GrantArm::joined_rows`].
+        row: usize,
+        /// The column of that row's table.
+        column: &'db DB::Column,
+    },
     /// A literal or an argument, the same for every row.
     Value(Value),
 }
