@@ -10,7 +10,10 @@ extern crate alloc;
 
 use alloc::collections::BTreeSet;
 
-use sql_traits::{errors::HelperSetError, prelude::*};
+use sql_traits::{
+    errors::{AccessorRefusal, HelperSetError},
+    prelude::*,
+};
 use sqlparser::{
     ast::{DataType, Value},
     dialect::PostgreSqlDialect,
@@ -3091,13 +3094,7 @@ fn a_nullif_over_anything_but_a_setting_read_and_the_empty_string_refuses_the_an
 
 #[test]
 fn a_comparison_with_the_caller_read_through_nullif_excludes_the_unset_caller() {
-    let read = |read: &str| {
-        blocked_by(&blocking("''", read, ""), DataType::Uuid, |set| {
-            let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
-            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
-            (render(set), request.raises_when_unset(), request.excludes_unset())
-        })
-    };
+    let read = |read: &str| blocked_through("", read);
     for (written, raises, excludes_unset) in [
         (format!("{ABSENT}::uuid"), false, true),
         ("CAST(NULLIF(current_setting('app.user_id'), '') AS uuid)".to_string(), true, true),
@@ -3211,4 +3208,282 @@ fn a_time_condition_no_bound_represents_is_irreducible() {
         matches!(bounded("expires_at > now()", shadow), Err(HelperSetError::Irreducible { .. })),
         "a declared now the call may reach is not PostgreSQL's"
     );
+}
+
+/// The attributes of an accessor running as its owner on its own path.
+const ACCESSOR: &str = "LANGUAGE sql STABLE SECURITY DEFINER SET search_path = ''";
+
+/// The accessor `authz.<name>()` returning `body` as `returns`, declared
+/// with `attributes` and owned by `authz_owner`.
+fn accessor(name: &str, returns: &str, attributes: &str, body: &str) -> String {
+    format!(
+        "CREATE FUNCTION authz.{name}() RETURNS {returns} {attributes} AS $$ SELECT {body} $$;
+         ALTER FUNCTION authz.{name}() OWNER TO authz_owner;"
+    )
+}
+
+/// `authz.caller_id()` returning the caller read through `NULLIF` as its
+/// declared `uuid`.
+fn caller_id(attributes: &str) -> String {
+    accessor("caller_id", "UUID", attributes, &format!("{ABSENT}::uuid"))
+}
+
+/// `authz.raw_caller()` returning the caller as the text it is set to,
+/// raising where it is unset.
+fn raw_caller() -> String {
+    accessor("raw_caller", "text", "LANGUAGE sql STABLE", "current_setting('app.user_id')")
+}
+
+/// What `authz.blocking_organizations` reading the caller as `read` answers
+/// once `after` declares its accessors: the arm, and whether the comparison
+/// raises where the caller is unset and excludes the unset caller.
+fn blocked_through(after: &str, read: &str) -> Result<(String, bool, bool), HelperSetError> {
+    blocked_by(&blocking("''", read, after), DataType::Uuid, |set| {
+        let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+        let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
+        (render(set), request.raises_when_unset(), request.excludes_unset())
+    })
+}
+
+#[test]
+fn a_caller_read_through_an_accessor_reads_as_the_read_it_returns() {
+    let nested = format!(
+        "{}{}",
+        raw_caller(),
+        accessor("caller_id", "uuid", "LANGUAGE sql STABLE", "authz.raw_caller()::uuid")
+    );
+    let volatile = accessor(
+        "caller_id",
+        "uuid",
+        "LANGUAGE sql VOLATILE SECURITY INVOKER",
+        "CAST(current_setting('app.user_id') AS uuid)",
+    );
+    for (after, read, raises, excludes_unset) in [
+        (caller_id(ACCESSOR), "authz.caller_id()", false, true),
+        (caller_id(ACCESSOR), "(authz.caller_id())", false, true),
+        (volatile, "authz.caller_id()", true, false),
+        (raw_caller(), "authz.raw_caller()::uuid", true, false),
+        (raw_caller(), "NULLIF(authz.raw_caller(), '')::uuid", true, true),
+        (nested, "authz.caller_id()", true, false),
+    ] {
+        let expected = (BLOCKING_ARM.to_string(), raises, excludes_unset);
+        assert_eq!(blocked_through(&after, read), Ok(expected), "{read} after {after}");
+    }
+    assert_eq!(
+        blocked_through(&caller_id(ACCESSOR), &format!("{ABSENT}::uuid")),
+        blocked_through("", &format!("{ABSENT}::uuid")),
+        "an accessor reads as the read inlined"
+    );
+}
+
+#[test]
+fn a_gate_reads_the_caller_through_an_accessor() {
+    let gate = |after: &str, gate: &str| signed_in_gate(&signing("''", gate, after));
+    assert_eq!(
+        gate(&caller_id(ACCESSOR), "authz.caller_id() IS NOT NULL"),
+        Ok(Some((false, true, true, vec![])))
+    );
+    assert_eq!(
+        gate(&caller_id(ACCESSOR), &format!("authz.caller_id() <> {NIL}::uuid")),
+        Ok(Some((false, true, true, vec![NIL.to_string()])))
+    );
+    assert_eq!(
+        gate(&raw_caller(), "authz.raw_caller() <> ''"),
+        Ok(Some((true, false, true, vec![])))
+    );
+}
+
+#[test]
+fn a_set_read_through_an_accessor_returning_its_text_reads_the_set() {
+    let link_ids =
+        accessor("link_ids", "text", ACCESSOR, "NULLIF(current_setting('app.link_ids', true), '')");
+    let comma = || SetPacking::Delimited(",".into());
+    for (condition, packing) in [
+        ("l.id = ANY (string_to_array(authz.link_ids(), ',')::uuid[])", comma()),
+        ("l.id IN (SELECT unnest(string_to_array(authz.link_ids(), ','))::uuid)", comma()),
+        (
+            "l.id IN (SELECT jsonb_array_elements_text(authz.link_ids()::jsonb)::uuid)",
+            SetPacking::JsonArray,
+        ),
+    ] {
+        let sql = presenting("''", condition, &link_ids);
+        assert_eq!(
+            presented(&sql, DataType::Uuid, packing).as_deref(),
+            Ok(PRESENTED_ARM),
+            "{condition}"
+        );
+    }
+}
+
+#[test]
+fn an_accessor_resolves_its_body_on_its_own_path_or_on_the_helpers() {
+    let shadow = "CREATE FUNCTION public.current_setting(text, boolean) RETURNS text
+                  LANGUAGE sql STABLE AS $$ SELECT 'someone' $$;";
+    let read = |attributes: &str| {
+        let after = format!("{shadow}{}", caller_id(attributes));
+        blocked_by(
+            &blocking("public, pg_catalog", "authz.caller_id()", &after),
+            DataType::Uuid,
+            render,
+        )
+    };
+    assert_eq!(read(ACCESSOR).as_deref(), Ok(BLOCKING_ARM), "its own path skips the shadow");
+    assert!(
+        matches!(read("LANGUAGE sql STABLE"), Err(HelperSetError::Irreducible { .. })),
+        "the helper's path reaches the shadow"
+    );
+}
+
+#[test]
+fn an_accessor_postgres_does_not_run_as_its_read_refuses_the_answer() {
+    let refused = |after: &str| {
+        let Err(error) = blocked_through(after, "authz.caller_id()") else { return None };
+        let HelperSetError::Accessor { function, accessor, setting, reason } = &error else {
+            return None;
+        };
+        assert_eq!(
+            (function.as_str(), accessor.as_str(), setting.as_str()),
+            ("authz.blocking_organizations", "authz.caller_id", "app.user_id"),
+            "{after}"
+        );
+        Some((*reason, error.to_string()))
+    };
+    let refusal = |reason, which: &str| {
+        Some((
+            reason,
+            format!(
+                "helper `authz.blocking_organizations` reads setting `app.user_id` through \
+                 `authz.caller_id`, which {which}"
+            ),
+        ))
+    };
+    let immutable = "LANGUAGE sql IMMUTABLE SECURITY DEFINER SET search_path = ''";
+    assert_eq!(refused(&caller_id(immutable)), refusal(AccessorRefusal::Immutable, "is IMMUTABLE"));
+    for setting in ["app.user_id", "App.User_Id"] {
+        let sets = format!("{ACCESSOR} SET {setting} = '{}'", NIL.trim_matches('\''));
+        assert_eq!(
+            refused(&caller_id(&sets)),
+            refusal(AccessorRefusal::SetsSetting, "sets the setting it reads"),
+            "{setting}"
+        );
+    }
+    let other = format!("{ACCESSOR} SET app.tenant = 'x'");
+    assert_eq!(
+        blocked_through(&caller_id(&other), "authz.caller_id()").map(|read| read.0).as_deref(),
+        Ok(BLOCKING_ARM),
+        "an accessor setting another setting"
+    );
+    let returns_nothing = format!(
+        "CREATE FUNCTION authz.caller_id() {ACCESSOR} AS $$ SELECT {ABSENT}::uuid $$;
+         ALTER FUNCTION authz.caller_id() OWNER TO authz_owner;"
+    );
+    let wrong_type =
+        refusal(AccessorRefusal::ReturnType, "returns another type than its body reads");
+    assert_eq!(refused(&returns_nothing), wrong_type, "an accessor declaring no result");
+    for (returns, body) in [
+        ("text", format!("{ABSENT}::uuid")),
+        ("varchar", "current_setting('app.user_id')".to_string()),
+        ("SETOF uuid", format!("{ABSENT}::uuid")),
+    ] {
+        let after = accessor("caller_id", returns, ACCESSOR, &body);
+        assert_eq!(refused(&after), wrong_type, "{returns}: {body}");
+    }
+}
+
+#[test]
+fn an_accessor_is_checked_as_a_call_and_its_read_as_a_read() {
+    let read = |after: &str| blocked_through(after, "authz.caller_id()");
+    let revoked = format!(
+        "CREATE ROLE accessor_owner NOLOGIN;
+         {}ALTER FUNCTION authz.caller_id() OWNER TO accessor_owner;
+         REVOKE EXECUTE ON FUNCTION authz.caller_id() FROM PUBLIC;",
+        caller_id(ACCESSOR)
+    );
+    assert!(
+        matches!(
+            read(&revoked),
+            Err(HelperSetError::MissingExecute { function, called, .. })
+                if function == "authz.blocking_organizations" && called == "authz.caller_id"
+        ),
+        "the helper's owner executes the accessor"
+    );
+    let hidden = format!(
+        "CREATE SCHEMA keys;
+         {}",
+        caller_id(ACCESSOR).replace("authz.", "keys.")
+    );
+    assert!(
+        matches!(
+            blocked_through(&hidden, "keys.caller_id()"),
+            Err(HelperSetError::MissingUsage { schema, .. }) if schema == "keys"
+        ),
+        "the helper's owner uses the accessor's schema"
+    );
+    let text =
+        accessor("caller_id", "text", ACCESSOR, "current_setting('app.user_id', true)::text");
+    assert!(
+        matches!(
+            read(&text),
+            Err(HelperSetError::SettingCast { function, .. }) if function == "authz.caller_id"
+        ),
+        "the accessor casts to the declared type"
+    );
+    let tenant =
+        accessor("caller_id", "uuid", ACCESSOR, "current_setting('app.tenant', true)::uuid");
+    assert!(
+        matches!(
+            read(&tenant),
+            Err(HelperSetError::UndeclaredSetting { function, setting })
+                if function == "authz.caller_id" && setting == "app.tenant"
+        ),
+        "the accessor reads a declared setting"
+    );
+    let cycle = format!(
+        "{}{}CREATE OR REPLACE FUNCTION authz.raw_caller() RETURNS text LANGUAGE sql STABLE
+         AS $$ SELECT authz.echo() $$;",
+        raw_caller(),
+        accessor("echo", "text", "LANGUAGE sql STABLE", "authz.raw_caller()")
+    );
+    assert!(
+        matches!(
+            blocked_through(&cycle, "authz.raw_caller()::uuid"),
+            Err(HelperSetError::CallCycle { function }) if function == "authz.raw_caller"
+        ),
+        "an accessor reaching itself"
+    );
+}
+
+#[test]
+fn a_call_returning_anything_but_a_setting_read_is_irreducible() {
+    let after = |body: &str| accessor("caller_id", "uuid", ACCESSOR, body);
+    for (after, read) in [
+        (after(&format!("lower({ABSENT})::uuid")), "authz.caller_id()"),
+        (after("o.principal_id FROM public.organization_blocks o"), "authz.caller_id()"),
+        (after(&format!("{ABSENT}::uuid WHERE true")), "authz.caller_id()"),
+        (caller_id(ACCESSOR), "authz.caller_id()::uuid"),
+        (
+            "CREATE FUNCTION authz.caller_id() RETURNS uuid LANGUAGE sql STABLE
+             RETURN NULLIF(current_setting('app.user_id', true), '')::uuid;"
+                .to_string(),
+            "authz.caller_id()",
+        ),
+        (
+            "CREATE FUNCTION authz.caller_id() RETURNS uuid LANGUAGE plpgsql STABLE
+             AS $$ BEGIN RETURN current_setting('app.user_id')::uuid; END $$;"
+                .to_string(),
+            "authz.caller_id()",
+        ),
+        (
+            "CREATE FUNCTION authz.caller_id(fallback uuid) RETURNS uuid LANGUAGE sql STABLE
+             AS $$ SELECT coalesce(current_setting('app.user_id', true)::uuid, fallback) $$;"
+                .to_string(),
+            "authz.caller_id(NULL)",
+        ),
+        (String::new(), "authz.caller_id()"),
+    ] {
+        assert!(
+            matches!(blocked_through(&after, read), Err(HelperSetError::Irreducible { .. })),
+            "{read} after {after}"
+        );
+    }
 }
