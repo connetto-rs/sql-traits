@@ -4,12 +4,13 @@
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    ConstraintReferenceMatchKind, CreateTable, ForeignKeyConstraint, ReferentialAction,
+    ConstraintReferenceMatchKind, CreateTable, DeferrableInitial, ForeignKeyConstraint,
+    ReferentialAction,
 };
 
 use crate::{
     errors::LookupError,
-    structs::{ConstraintObject, ParserDB, TableAttribute, TargetName},
+    structs::{ConstraintDeferral, ConstraintObject, ParserDB, TableAttribute, TargetName},
     traits::{ForeignKeyLike, Metadata, database::DatabaseLike, table::TableLike},
     utils::object_name::{resolve_required_bound_table, target_name_of_object_name},
 };
@@ -80,6 +81,18 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
 
     fn is_validated(&self, database: &Self::DB) -> Result<bool, LookupError> {
         super::create_table::holds_validated(self.table(), self.attribute(), database)
+    }
+
+    /// `INITIALLY DEFERRED` implies `DEFERRABLE`, as in PostgreSQL, and
+    /// ingestion refuses the one combination contradicting it.
+    #[inline]
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        let characteristics = self.attribute().characteristics.unwrap_or_default();
+        match (characteristics.deferrable, characteristics.initially) {
+            (_, Some(DeferrableInitial::Deferred)) => ConstraintDeferral::InitiallyDeferred,
+            (Some(true), _) => ConstraintDeferral::InitiallyImmediate,
+            (Some(false) | None, _) => ConstraintDeferral::NotDeferrable,
+        }
     }
 
     fn host_columns<'db>(

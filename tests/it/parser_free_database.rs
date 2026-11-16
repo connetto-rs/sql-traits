@@ -1061,6 +1061,10 @@ impl ForeignKeyLike for MemoryForeignKey {
         ConstraintReferenceMatchKind::Simple
     }
 
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        ConstraintDeferral::NotDeferrable
+    }
+
     fn referenced_columns<'db>(
         &'db self,
         _database: &'db Self::DB,
