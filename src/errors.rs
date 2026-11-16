@@ -5,7 +5,7 @@ use alloc::{boxed::Box, format, string::String, vec::Vec};
 use sqlparser::{ast::FunctionBehavior, parser::ParserError};
 
 use crate::{
-    structs::{FunctionKind, IdentifierCase, SequenceType},
+    structs::{FunctionKind, IdentifierCase, RequestNormalization, SequenceType},
     traits::PartitionStrategy,
 };
 
@@ -1226,15 +1226,29 @@ pub enum HelperSetError {
         setting: String,
     },
     /// A grant arm compares a column with a setting the deployment declares
-    /// as neither the caller nor another principal.
+    /// as a set or a JSON document, as though it held one value.
     #[error(
-        "helper `{function}` compares a column with setting `{setting}` as the identity of a principal, which it is not"
+        "helper `{function}` compares a column with setting `{setting}` as one value, which it is not"
     )]
-    SettingNotPrincipal {
+    SettingNotSingle {
         /// The helper.
         function: String,
         /// The setting.
         setting: String,
+    },
+    /// A grant arm compares a column with a normalization of a setting the
+    /// deployment declares as the caller, another principal or a set, whose
+    /// identities or elements the normalization would change.
+    #[error(
+        "helper `{function}` compares a column with `{normalization}` of setting `{setting}`, which is not a scalar"
+    )]
+    SettingNormalized {
+        /// The helper.
+        function: String,
+        /// The setting.
+        setting: String,
+        /// The normalization the body writes on the read.
+        normalization: RequestNormalization,
     },
     /// A grant arm casts its read of a setting to a type other than the one
     /// the deployment declares it in, or the elements of a set to a type

@@ -1875,18 +1875,19 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   with a value of the request or `<column> IN (SELECT
     ///   <helper>(<arguments>))`, the helper answered in turn as a parent arm's
     ///   is. The comparison is `<column> = current_setting('<setting>'[,
-    ///   <missing_ok>])` with a setting the deployment declares as the caller
-    ///   or as another principal, or `<column>` compared with each element of a
-    ///   setting it declares as a set, unpacked as declared (see
+    ///   <missing_ok>])` with a setting the deployment declares as the caller,
+    ///   as another principal or as a scalar, a scalar read optionally through
+    ///   `lower(...)`, or `<column>` compared with each element of a setting it
+    ///   declares as a set, unpacked as declared (see
     ///   [`SettingComparison`](crate::structs::SettingComparison)). `<column>
-    ///   IN (<values>)` listing principals beside literals and parameters
-    ///   answers one grant arm per principal and one granted to anyone for the
-    ///   literals together, each keeping the other conditions. An arm naming no
-    ///   grantee returns the same rows for every request its gate lets through.
-    ///   A cap, `(<operands>) IN (SELECT * FROM <helper>(<arguments>))`,
-    ///   optionally behind `<setting> IS NULL OR`, keeps the rows whose
-    ///   operands are a row the helper returns, the helper answered in turn
-    ///   (see [`RowCap`](crate::structs::RowCap)). Conditions
+    ///   IN (<values>)` listing principals or scalars beside literals and
+    ///   parameters answers one grant arm per read and one granted to anyone
+    ///   for the literals together, each keeping the other conditions. An arm
+    ///   naming no grantee returns the same rows for every request its gate
+    ///   lets through. A cap, `(<operands>) IN (SELECT * FROM
+    ///   <helper>(<arguments>))`, optionally behind `<setting> IS NULL OR`,
+    ///   keeps the rows whose operands are a row the helper returns, the helper
+    ///   answered in turn (see [`RowCap`](crate::structs::RowCap)). Conditions
     ///   `current_setting('<setting>') <> <text>` and
     ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
     ///   the arm on what the setting reads (see
