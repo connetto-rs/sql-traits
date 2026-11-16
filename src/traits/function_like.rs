@@ -1918,27 +1918,42 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   type compared with a label by `<`, `<=`, `>` or `>=`, either way
     ///   round, holds the labels on the kept side of it in the order the type
     ///   declares them, `ALTER TYPE ... ADD VALUE` applied. An arm comparing a
-    ///   helper's set while returning its table's primary key is a parent arm,
-    ///   so it takes no other condition.
-    /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
-    ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
-    ///   literal, the helper called answered in turn for the arguments it
-    ///   receives. The column names its parent through its one single-column
-    ///   foreign key or, where it has none, through the table the called
-    ///   helper's set covers.
+    ///   helper's set while returning a key it would return as a parent arm is
+    ///   one, so it takes no other condition.
+    /// - A parent arm, `SELECT <key> FROM <table> WHERE <column> IN (SELECT
+    ///   <helper>(<arguments>))`, each argument a parameter or a literal, the
+    ///   helper called answered in turn for the arguments it receives. `<key>`
+    ///   is the table's primary key, and the column names its parent through
+    ///   its one single-column foreign key or, where it has none, through the
+    ///   table the called helper's set covers. `<key>` is otherwise a column a
+    ///   unique key covers alone, referencing another table's primary key
+    ///   through its one single-column foreign key, as in an edge table holding
+    ///   the parent of each child, and the column, one other than `<key>`, has
+    ///   one single-column foreign key.
     ///
     /// A body walking a tree is `WITH RECURSIVE <walk> [(<column>)] AS
     /// (<arms> UNION <term>) SELECT <column> FROM <walk>`. The term walks
-    /// down as `SELECT <key> FROM <table> JOIN <walk> ON <parent column> =
+    /// down as `SELECT <child> FROM <table> JOIN <walk> ON <parent column> =
     /// <walk>.<column>` and up as `SELECT <parent column> FROM <table> JOIN
-    /// <walk> ON <key> = <walk>.<column>`, the join either way round. `<key>`
-    /// is the table's one-column primary key, and `<parent column>` has one
-    /// single-column foreign key, referencing `<key>`. The walk answers a
-    /// [`WalkArm`](crate::structs::WalkArm) after the arms. `UNION ALL` is
-    /// refused, since it never ends on a tree holding a cycle.
+    /// <walk> ON <child> = <walk>.<column>`, the join either way round. A term
+    /// walking several edges at once is `SELECT <step>.<column> FROM <walk>
+    /// CROSS JOIN LATERAL (<edges>) <step>`, or `FROM <walk>, LATERAL`, the
+    /// edges a `UNION` or `UNION ALL` of `SELECT <child> FROM <table> WHERE
+    /// <parent column> = <walk>.<column>` walking down and `SELECT <parent
+    /// column> FROM <table> WHERE <child> = <walk>.<column>` walking up.
+    /// `<parent column>` names a row of the tree through foreign keys holding
+    /// it at the position of the tree's one-column primary key, alone or among
+    /// other columns, all of them referencing the same table and one checking
+    /// every row naming one, its match `FULL` or its other columns `NOT NULL`.
+    /// The table is the tree itself, with `<child>` its primary key, or an
+    /// edge table, with `<child>` its primary key or a column a unique key
+    /// covers alone, naming a row of the tree the same way. The walk answers a
+    /// [`WalkArm`](crate::structs::WalkArm) per edge after the arms. `UNION
+    /// ALL` between the arms and the term is refused, since it never ends on a
+    /// tree holding a cycle.
     ///
     /// A grant arm whose conditions reduce to `FALSE` or `NULL` keeps no row
-    /// and is left out, and a walk with it where no other arm remains. A
+    /// and is left out, and the walks with it where no other arm remains. A
     /// column named like a parameter is the column, as PostgreSQL resolves
     /// names in a SQL function. An unqualified name is looked up past the
     /// schemas on the path the owner cannot use, as PostgreSQL leaves them out

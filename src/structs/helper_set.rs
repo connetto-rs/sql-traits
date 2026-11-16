@@ -11,9 +11,9 @@ use crate::{structs::SessionSetting, traits::DatabaseLike};
 
 /// The set a helper returns, the union of its arms.
 ///
-/// An arm whose condition keeps no row for the arguments is left out, and a
-/// walk with it where no other arm remains, so a helper returning nothing
-/// for them answers no arm.
+/// An arm whose condition keeps no row for the arguments is left out, and
+/// the walks with it where no other arm remains, so a helper returning
+/// nothing for them answers no arm.
 #[derive(Debug)]
 pub struct HelperSet<'db, DB: DatabaseLike> {
     pub(crate) arms: Vec<HelperArm<'db, DB>>,
@@ -50,7 +50,8 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Grant(GrantArm<'db, DB>),
     /// The rows of a table whose parent another helper returns.
     Parent(ParentArm<'db, DB>),
-    /// The rows next to the ones the set itself holds, along a tree.
+    /// The rows next to the ones the set itself holds, along one edge of a
+    /// tree, the set growing along every walk at once.
     Walk(WalkArm<'db, DB>),
 }
 
@@ -613,16 +614,23 @@ impl<'db, DB: DatabaseLike> Correlation<'db, DB> {
 }
 
 /// `SELECT <key> FROM <table> WHERE <column> IN (SELECT
-/// <function>(<arguments>))`, the column naming a row of the parent table.
+/// <function>(<arguments>))`, the key naming a row of the child table and
+/// the column naming a row of the parent table.
 ///
-/// The column names the parent through its single-column foreign key, or,
-/// where it has none, through the set it is compared to, which then covers
-/// the parent table (see [`HelperSet::covered_table`]). A column whose
+/// The key is the table's primary key, the table then being the child table,
+/// or a column a unique key covers alone whose one single-column foreign key
+/// references another table's primary key, that table then being the child
+/// table, as in an edge table holding the parent of each child that has one.
+/// The column names the parent
+/// through its single-column foreign key, or, where it has none and the key is
+/// the table's primary key, through the set it is compared to, which then
+/// covers the parent table (see [`HelperSet::covered_table`]). A column whose
 /// parent may be one of several tables is read by one arm per table.
 #[derive(Debug)]
 pub struct ParentArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
     pub(crate) key: &'db DB::Column,
+    pub(crate) child_table: &'db DB::Table,
     pub(crate) column: &'db DB::Column,
     pub(crate) foreign_key: Option<&'db DB::ForeignKey>,
     pub(crate) parent_table: &'db DB::Table,
@@ -638,10 +646,19 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
         self.table
     }
 
-    /// The table's primary key, which the arm returns.
+    /// The column the arm returns, the table's primary key or a column
+    /// naming a row of [`child_table`](Self::child_table).
     #[must_use]
     pub fn key(&self) -> &'db DB::Column {
         self.key
+    }
+
+    /// The table whose primary key [`key`](Self::key) holds, the arm's own
+    /// [`table`](Self::table) where the key is its primary key, else the table
+    /// the key's one single-column foreign key references.
+    #[must_use]
+    pub fn child_table(&self) -> &'db DB::Table {
+        self.child_table
     }
 
     /// The column naming the parent.
@@ -686,41 +703,65 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
     }
 }
 
-/// The recursive term of `WITH RECURSIVE <walk> (<column>) AS (<arms> UNION
-/// <term>) SELECT <column> FROM <walk>`, walking the tree the table's parent
-/// column draws until the set stops growing.
+/// One edge the recursive term of `WITH RECURSIVE <walk> (<column>) AS
+/// (<arms> UNION <term>) SELECT <column> FROM <walk>` follows, walking the
+/// tree whose edges the table holds until the set stops growing.
 ///
-/// The walk ends on a tree holding a cycle, as `UNION` keeps no row twice.
+/// Each row of the table is an edge from the tree's row its child column
+/// names to the one its parent column names. The table is the tree itself,
+/// its child column the primary key, where each row names its own parent,
+/// or an edge table, its child column its primary key or a column a unique
+/// key covers alone, holding one row per child that has a parent. A term
+/// reading a `LATERAL` union of edges answers one walk per edge, each
+/// adding to the one set every other one reads. The walk ends on a tree
+/// holding a cycle, as `UNION` keeps no row twice.
 #[derive(Debug)]
 pub struct WalkArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
+    pub(crate) tree: &'db DB::Table,
     pub(crate) key: &'db DB::Column,
+    pub(crate) child: &'db DB::Column,
     pub(crate) column: &'db DB::Column,
     pub(crate) foreign_key: &'db DB::ForeignKey,
     pub(crate) direction: WalkDirection,
 }
 
 impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
-    /// The table the walk follows.
+    /// The table holding the edges, the one the term reads.
     #[must_use]
     pub fn table(&self) -> &'db DB::Table {
         self.table
     }
 
-    /// The table's one-column primary key.
+    /// The table whose rows the walk adds, [`table`](Self::table) itself
+    /// where each row names its own parent.
+    #[must_use]
+    pub fn tree(&self) -> &'db DB::Table {
+        self.tree
+    }
+
+    /// The tree's one-column primary key.
     #[must_use]
     pub fn key(&self) -> &'db DB::Column {
         self.key
     }
 
-    /// The column naming each row's parent.
+    /// The column naming the child of each edge, [`key`](Self::key) where
+    /// the tree holds its own edges.
+    #[must_use]
+    pub fn child(&self) -> &'db DB::Column {
+        self.child
+    }
+
+    /// The column naming the parent of each edge.
     #[must_use]
     pub fn column(&self) -> &'db DB::Column {
         self.column
     }
 
-    /// The single-column foreign key of [`column`](Self::column), which
-    /// references [`key`](Self::key).
+    /// The first foreign key the table declares through which
+    /// [`column`](Self::column) names a row of the tree, holding the column
+    /// alone or at the position of [`key`](Self::key) among others.
     #[must_use]
     pub fn foreign_key(&self) -> &'db DB::ForeignKey {
         self.foreign_key
@@ -736,13 +777,18 @@ impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
 /// Which way a [`WalkArm`] follows its tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkDirection {
-    /// `SELECT <key> FROM <table> JOIN <walk> ON <column> = <walk>.<column>`,
-    /// which adds the key of every row whose parent the set holds, so the
-    /// set ends holding every row below its other arms.
+    /// `SELECT <child> FROM <table> JOIN <walk> ON <column> =
+    /// <walk>.<column>`, or a `LATERAL` edge `SELECT <child> FROM <table>
+    /// WHERE <column> = <walk>.<column>`, which adds the child of every edge
+    /// whose parent the set holds, so the set ends holding every row below its
+    /// other arms.
     Down,
-    /// `SELECT <column> FROM <table> JOIN <walk> ON <key> = <walk>.<column>`,
-    /// which adds the parent of every row the set holds, so the set ends
-    /// holding every row above its other arms. A root adds its parent
-    /// column's `NULL`, which no `IN` matches.
+    /// `SELECT <column> FROM <table> JOIN <walk> ON <child> =
+    /// <walk>.<column>`, or a `LATERAL` edge `SELECT <column> FROM <table>
+    /// WHERE <child> = <walk>.<column>`, which adds the parent of every edge
+    /// whose child the set holds, so the set ends holding every row above its
+    /// other arms. A root of a tree holding its own edges adds its parent
+    /// column's `NULL`, which no `IN` matches, and a root of an edge table has
+    /// no edge.
     Up,
 }
