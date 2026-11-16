@@ -1038,7 +1038,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#932cff2dfc9455caf0f862ae0b26d8640ed29ec5"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#19a1b3aea6c7866cf2fe7a7168699f5ce65b69d0"
 dependencies = [
  "sqlparser",
  "thiserror",

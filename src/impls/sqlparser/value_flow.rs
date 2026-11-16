@@ -22,8 +22,8 @@ use sqlparser::ast::{
 use sqlparser_plpgsql::{
     embedded::{
         Assignment, Block, BoundCursor, Branch, Declaration, DeclarationKind, Diagnostics,
-        DiagnosticsKind, Dynamic, Exit, ExitKind, Indirection, Loop, LoopControl, Node, Open,
-        RaiseLevel, Target, expression,
+        DiagnosticsKind, Dynamic, Exit, ExitKind, Indirection, IntoTargets, Loop, LoopControl,
+        Node, Open, RaiseLevel, ReturnQuery, Target, expression,
     },
     namespace::{Name, NameKind, Namespace, Site, Sql, TriggerVariable, Write, WriteSite},
 };
@@ -413,26 +413,10 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         let address = core::ptr::from_ref(node).addr();
         match node {
             Node::Statement { statement, into } => {
-                let key = SiteKey::of(Sql::Statement(statement));
-                self.evaluated(key, &state);
-                if let Some(into) = into {
-                    let scope = self.scope(key, statement)?;
-                    let rows = Rows::First { strict: into.strict };
-                    let source = |output| DefinitionSource::QueryOutput { statement, output, rows };
-                    let writes = self.targets(
-                        address,
-                        &into.targets,
-                        false,
-                        false,
-                        Some(&scope),
-                        source,
-                        statement,
-                    )?;
-                    self.write_all(&writes, &mut state);
-                } else if let Statement::Call(_) = &**statement {
-                    let writes = self.call(address, statement)?;
-                    self.write_all(&writes, &mut state);
-                }
+                self.statement(address, statement, into.as_ref(), &mut state)?;
+            }
+            Node::Perform { query } | Node::ReturnQuery(ReturnQuery::Query(query)) => {
+                self.evaluated(SiteKey::of(Sql::Statement(query)), &state);
             }
             Node::Assignment(assignment) => self.assignment(address, assignment, &mut state)?,
             Node::Dynamic { dynamic, into } => {
@@ -454,6 +438,9 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                     )?;
                     self.write_all(&writes, &mut state);
                 }
+            }
+            Node::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
+                self.evaluated(SiteKey::of(Sql::Dynamic(dynamic)), &state);
             }
             Node::Fetch(fetch) => {
                 self.evaluated_queries(fetch.direction.expression(), &state);
@@ -507,9 +494,44 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                     return Ok(None);
                 }
             }
-            Node::Assert(_) => self.evaluated_queries(transfer_expressions(node), &state),
+            Node::ReturnNext { .. } | Node::Assert(_) => {
+                self.evaluated_queries(transfer_expressions(node), &state);
+            }
         }
         Ok(Some(state))
+    }
+
+    /// Records `state` as reaching `statement` at `address`, then writes its
+    /// first row into the targets of `into`, or what a `CALL` passes back
+    /// into its arguments.
+    fn statement(
+        &mut self,
+        address: usize,
+        statement: &'b Statement,
+        into: Option<&'b IntoTargets>,
+        state: &mut State,
+    ) -> Result<(), LookupError> {
+        let key = SiteKey::of(Sql::Statement(statement));
+        self.evaluated(key, state);
+        if let Some(into) = into {
+            let scope = self.scope(key, statement)?;
+            let rows = Rows::First { strict: into.strict };
+            let source = |output| DefinitionSource::QueryOutput { statement, output, rows };
+            let writes = self.targets(
+                address,
+                &into.targets,
+                false,
+                false,
+                Some(&scope),
+                source,
+                statement,
+            )?;
+            self.write_all(&writes, state);
+        } else if let Statement::Call(_) = statement {
+            let writes = self.call(address, statement)?;
+            self.write_all(&writes, state);
+        }
+        Ok(())
     }
 
     /// Writes the value `assignment` at `address` gives its target.

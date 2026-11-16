@@ -84,17 +84,26 @@ fn spelled(reads: &[VariableRead<'_, '_, ParserDB>]) -> Vec<(String, Vec<String>
         .collect()
 }
 
-/// The variables each site of `run` running `body` reads, with their
+/// The variables each site of the function `name` reads, with their
 /// definitions spelled.
-fn reaching(body: &str) -> Vec<Vec<(String, Vec<String>)>> {
-    let database = database(body);
-    let sites = run(&database).dynamic_execution_sites(&database).unwrap();
+fn reaching_in(database: &ParserDB, name: &str) -> Vec<Vec<(String, Vec<String>)>> {
+    let function = database
+        .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("function exists");
+    let sites = function.dynamic_execution_sites(database).unwrap();
     sites
         .sites()
         .unwrap()
         .iter()
         .map(|site| spelled(&site.reads(IdentifierCase::Folded).unwrap()))
         .collect()
+}
+
+/// The variables each site of `run` running `body` reads, with their
+/// definitions spelled.
+fn reaching(body: &str) -> Vec<Vec<(String, Vec<String>)>> {
+    reaching_in(&database(body), "run")
 }
 
 fn read(variable: &str, definitions: &[&str]) -> (String, Vec<String>) {
@@ -111,6 +120,19 @@ fn an_assignment_replaces_what_the_variable_held() {
              BEGIN s := 'SELECT ' || p; EXECUTE s USING q; END"
         ),
         [vec![read("s", &["'SELECT ' || p"]), read("q", &["incoming"])]]
+    );
+}
+
+/// A statement without `INTO` that is no `CALL` assigns no variable, so
+/// what a variable held before it reaches the statements after it.
+#[test]
+fn a_statement_without_into_keeps_what_variables_hold() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN UPDATE t SET name = s WHERE id = q; EXECUTE s; END"
+        ),
+        [vec![read("s", &["'SELECT 1'"])]]
     );
 }
 
@@ -896,18 +918,7 @@ fn a_lone_row_target_takes_the_whole_row() {
          BEGIN SELECT * INTO NEW FROM t; EXECUTE 'SELECT 1' USING NEW; RETURN NEW; END $$;"
     ))
     .expect("schema parses");
-    let reads = |name: &str| {
-        let function = database
-            .function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
-            .expect("unambiguous lookup")
-            .expect("function exists");
-        let body = function.dynamic_execution_sites(&database).unwrap();
-        body.sites()
-            .unwrap()
-            .iter()
-            .map(|site| spelled(&site.reads(IdentifierCase::Folded).unwrap()))
-            .collect::<Vec<_>>()
-    };
+    let reads = |name: &str| reaching_in(&database, name);
     assert_eq!(
         reads("rows"),
         [vec![
@@ -944,4 +955,34 @@ fn command_and_range_definitions_read_their_inputs() {
     };
     assert_eq!(inputs(0), [read("p", &["incoming"]), read("q", &["incoming"])]);
     assert_eq!(inputs(1), [read("q", &["incoming"])]);
+}
+
+/// `RETURN NEXT` and `RETURN QUERY` read what reaches them and carry on, a
+/// bare `RETURN NEXT` included, and `RETURN QUERY EXECUTE` is a site of its
+/// own.
+#[test]
+fn set_returning_statements_read_what_reaches_them_and_carry_on() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION listed(p text, q integer) RETURNS SETOF xml LANGUAGE plpgsql AS $$
+         DECLARE s text := 'SELECT ' || p;
+         BEGIN
+          RETURN NEXT query_to_xml(s, true, false, '');
+          s := 'SELECT ' || q;
+          RETURN QUERY SELECT query_to_xml(s, true, false, '');
+          s := 'SELECT 1';
+          RETURN QUERY EXECUTE s USING q;
+         END $$;
+         CREATE FUNCTION filled(p text, OUT x text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+         BEGIN x := p; RETURN NEXT; EXECUTE x; END $$;",
+    )
+    .expect("schema parses");
+    assert_eq!(
+        reaching_in(&database, "listed"),
+        [
+            vec![read("s", &["'SELECT ' || p"])],
+            vec![read("s", &["'SELECT ' || q"])],
+            vec![read("s", &["'SELECT 1'"]), read("q", &["incoming"])],
+        ]
+    );
+    assert_eq!(reaching_in(&database, "filled"), [vec![read("x", &["p"])]]);
 }
