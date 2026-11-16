@@ -1911,10 +1911,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   columns of `<table>` with columns of the arm's table and otherwise
     ///   read `<table>` alone, and the arm answers it as an
     ///   [`AntiJoin`](crate::structs::AntiJoin). The rest, the arguments
-    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to the literal
-    ///   values columns have to hold, a `boolean` column alone holding `TRUE`.
-    ///   An arm comparing a helper's set while returning its table's primary
-    ///   key is a parent arm, so it takes no other condition.
+    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to what
+    ///   columns have to hold, literal values, a `boolean` column alone holding
+    ///   `TRUE`, `<column> IS NULL` or `<column> IS NOT NULL` (see
+    ///   [`Restriction`](crate::structs::Restriction)). An arm comparing a
+    ///   helper's set while returning its table's primary key is a parent arm,
+    ///   so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it
@@ -1988,7 +1990,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// assert_eq!(doc.column_name(), "doc_id");
     /// let GrantedTo::Request(request) = grant.granted_to() else { unreachable!() };
     /// assert_eq!(request.column().column_name(), "principal_id");
-    /// let [roles] = grant.restrictions() else { panic!("the condition restricts one column") };
+    /// let [Restriction::In(roles)] = grant.restrictions() else {
+    ///     panic!("the condition restricts one column to literals")
+    /// };
     /// assert_eq!(roles.column().column_name(), "role");
     /// let admin = Value::SingleQuotedString("admin".into());
     /// let write = Value::SingleQuotedString("write".into());
