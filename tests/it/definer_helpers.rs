@@ -4089,6 +4089,19 @@ fn a_set_accessor_postgres_does_not_run_as_its_read_refuses_the_answer() {
         ),
         "the accessor unpacks the set as the deployment packs it"
     );
+    let database =
+        postgres(&presenting("''", "l.id = ANY (authz.link_ids())", &link_ids("uuid[]", &body)));
+    let caller = SessionSetting::value("app.link_ids", SettingValue::Caller(DataType::Uuid))
+        .expect("a custom setting name");
+    let deployment = Deployment::new("app", ["app"], [caller]).expect("a valid deployment");
+    assert!(
+        matches!(
+            answer(&database, &deployment, "authz", "presented_links", &[]),
+            Err(HelperSetError::SettingNotSet { function, setting })
+                if function == "authz.link_ids" && setting == "app.link_ids"
+        ),
+        "the accessor casts the elements of a setting declared as a set"
+    );
     for condition in ["l.id = ANY (authz.link_ids()::uuid[])", "l.id = ANY (authz.link_ids(NULL))"]
     {
         assert!(
