@@ -1275,3 +1275,43 @@ fn a_polymorphic_result_declares_dollar_zero() {
     );
     assert_eq!(names(&database, "with_out"), [[("$0".to_owned(), "?".to_owned())]]);
 }
+
+/// The rows a record's queries give are typed under each identifier case
+/// apart, so a query whose relation only the folded comparison finds twice
+/// keeps that lookup error for every field read of its row under that case
+/// alone. A record whose only row comes from its own field never takes a
+/// type, and a read no path reaches lists no definition.
+#[test]
+fn record_rows_follow_the_identifier_case_and_stay_unknown_without_a_row() {
+    let database = postgres(
+        "CREATE TABLE audit (name text);
+         CREATE TABLE \"AUDIT\" (name integer);
+         CREATE FUNCTION cased(p boolean) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE r record; s record;
+         BEGIN
+          SELECT name INTO r FROM audit;
+          EXECUTE 'SELECT ' || r.name;
+          LOOP SELECT s.name AS name INTO s; EXIT WHEN p; END LOOP;
+          EXECUTE 'SELECT ' || s.name;
+          RETURN;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    let body = function(&database, "cased").dynamic_execution_sites(&database).unwrap();
+    let read = |site: &DynamicExecution<'_, '_, ParserDB>, case: IdentifierCase| {
+        let context = site.context(case).unwrap();
+        let Expr::BinaryOp { right: field, .. } = site.command() else { panic!("a concatenation") };
+        match (context.type_of(field), context.record_field_types(field)) {
+            (Ok(data_type), Ok(listed)) => (rendered(&data_type), listed.len()),
+            (Err(LookupError::AmbiguousTableLookup { .. }), Err(_)) => ("ambiguous".to_owned(), 0),
+            unexpected => panic!("{unexpected:?}"),
+        }
+    };
+    let sites = body.sites().unwrap();
+    let text = || "pg_catalog.text".to_owned();
+    assert_eq!(read(&sites[0], IdentifierCase::AsWritten), (text(), 1));
+    assert_eq!(read(&sites[0], IdentifierCase::Folded), ("ambiguous".to_owned(), 0));
+    assert_eq!(read(&sites[0], IdentifierCase::Exact), (text(), 1));
+    assert_eq!(read(&sites[1], IdentifierCase::Folded), ("?".to_owned(), 1));
+    assert_eq!(read(&sites[2], IdentifierCase::Folded), ("?".to_owned(), 0));
+}
