@@ -1898,13 +1898,15 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   maps both states of an unset setting to `NULL`. Wherever it reads a
     ///   setting it may call an accessor instead, a zero-argument `sql`
     ///   function written as a string whose body selects one such read, cast or
-    ///   not, and returns its type. The accessor's body resolves on its own
-    ///   path or, where it pins none, on the caller's, as the role it runs as,
-    ///   and an accessor that is `IMMUTABLE` or sets the setting it reads
-    ///   refuses the answer. A time bound is a conjunct `<column> <comparison>
-    ///   now()`, a `timestamptz` column of the table compared with `<`, `<=`,
-    ///   `>` or `>=` either way round, optionally `OR <column> IS NULL`, and
-    ///   the arm answers it as a [`TimeBound`](crate::structs::TimeBound).
+    ///   not, and returns its type, and wherever it builds the array of a set
+    ///   it may call an accessor whose body selects that array and returns its
+    ///   array type. The accessor's body resolves on its own path or, where it
+    ///   pins none, on the caller's, as the role it runs as, and an accessor
+    ///   that is `IMMUTABLE` or sets the setting it reads refuses the answer. A
+    ///   time bound is a conjunct `<column> <comparison> now()`, a
+    ///   `timestamptz` column of the table compared with `<`, `<=`, `>` or `>=`
+    ///   either way round, optionally `OR <column> IS NULL`, and the arm
+    ///   answers it as a [`TimeBound`](crate::structs::TimeBound).
     ///   `CURRENT_TIMESTAMP` and `transaction_timestamp()` read the same
     ///   statement time as `now()`. An anti-join is a conjunct `NOT EXISTS
     ///   (SELECT 1 FROM <table> WHERE <conditions>)` whose conditions equal

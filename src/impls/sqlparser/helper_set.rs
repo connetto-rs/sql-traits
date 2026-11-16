@@ -119,7 +119,7 @@ struct SettingRead {
     /// `''` as `NULL`.
     empty_as_null: bool,
     /// Whether an accessor returns it cast to the type the deployment
-    /// declares it in.
+    /// declares it in, or a set cast to the type it declares its elements in.
     in_declared_type: bool,
 }
 
@@ -614,6 +614,13 @@ struct SetRead<'q> {
     read: SettingRead,
     packing: SetPacking,
     cast: Option<ReadCast<'q>>,
+}
+
+impl SetRead<'_> {
+    /// Whether the body casts the elements, itself or through an accessor.
+    fn is_cast(&self) -> bool {
+        self.cast.is_some() || self.read.in_declared_type
+    }
 }
 
 /// One arm as read, the table whose primary key it returns, where it returns
@@ -2280,8 +2287,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// The set `expression` builds an array of: `string_to_array(<setting>,
-    /// <delimiter>)`, optionally cast to an array, or `ARRAY(SELECT
-    /// <elements>)`.
+    /// <delimiter>)`, optionally cast to an array, `ARRAY(SELECT
+    /// <elements>)`, or an accessor returning either.
     fn set_array<'q>(
         &self,
         scope: &Scope<'db, DB>,
@@ -2322,7 +2329,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             ],
         ) = self.catalog_arguments(scope, call, "string_to_array").map(|list| list.args.as_slice())
         else {
-            return Ok(None);
+            // A read casts its elements once.
+            return Ok(self.accessor_set(scope, call)?.and_then(|(read, packing)| {
+                (cast.is_none() || !read.in_declared_type).then_some(SetRead {
+                    read,
+                    packing,
+                    cast,
+                })
+            }));
         };
         let Expr::Value(delimiter) = unnest(delimiter) else { return Ok(None) };
         let Some(Literal::Text(delimiter)) = Literal::of(&delimiter.value) else { return Ok(None) };
@@ -2357,9 +2371,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         {
             let Some(set) = self.set_array(scope, array)? else { return Ok(None) };
             // A read casts its elements once.
-            return Ok(match (cast, set.cast) {
-                (Some(_), Some(_)) => None,
-                (cast, array_cast) => Some(SetRead { cast: cast.or(array_cast), ..set }),
+            return Ok(match (cast, set.is_cast()) {
+                (Some(_), true) => None,
+                (cast, _) => Some(SetRead { cast: cast.or(set.cast), ..set }),
             });
         }
         let Some([FunctionArg::Unnamed(FunctionArgExpr::Expr(document))]) = self
@@ -2450,6 +2464,89 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         scope: &Scope<'db, DB>,
         call: &Function,
     ) -> Result<Option<SettingRead>, HelperSetError> {
+        let read = self.accessed(scope, call, |body, returned| {
+            let Some((read, cast)) = self.typed_setting(body, returned)? else { return Ok(None) };
+            let in_declared_type = cast.is_some() || read.in_declared_type;
+            let declared = if in_declared_type {
+                let (setting, declared) = self.declared_setting(body, &read.name)?;
+                if let Some(cast) = cast
+                    && declared.is_none_or(|declared| !self.is_declared_type(body, cast, declared))
+                {
+                    return Err(HelperSetError::SettingCast {
+                        function: body.name.clone(),
+                        setting: setting.name().to_string(),
+                        cast: cast.to_string(),
+                    });
+                }
+                declared
+            } else {
+                None
+            };
+            let returns_read = self
+                .accessor_returns(body)
+                .is_some_and(|returned| self.is_read_type(body, &returned, declared));
+            Ok(Some((SettingRead { in_declared_type, ..read }, (), returns_read)))
+        })?;
+        Ok(read.map(|(read, ())| read))
+    }
+
+    /// The set the accessor `call` reaches returns, a zero-argument `sql`
+    /// function whose body selects an array of its elements, optionally cast,
+    /// as it reads under the path and the role the accessor runs with, with
+    /// how the body unpacks it.
+    fn accessor_set(
+        &self,
+        scope: &Scope<'db, DB>,
+        call: &Function,
+    ) -> Result<Option<(SettingRead, SetPacking)>, HelperSetError> {
+        self.accessed(scope, call, |body, returned| {
+            let Some(set) = self.set_array(body, returned)? else { return Ok(None) };
+            let in_declared_type = set.is_cast();
+            let element = if in_declared_type {
+                let (setting, _) = self.declared_setting(body, &set.read.name)?;
+                let element = match setting.content() {
+                    SettingContent::Value(SettingValue::Set { element, .. }) => Some(element),
+                    _ => None,
+                };
+                if let Some(cast) = set.cast
+                    && element
+                        .is_none_or(|element| !self.is_declared_type(body, cast.compared, element))
+                {
+                    return Err(HelperSetError::SettingCast {
+                        function: body.name.clone(),
+                        setting: setting.name().to_string(),
+                        cast: cast.written.to_string(),
+                    });
+                }
+                element
+            } else {
+                None
+            };
+            let returns_read = self.accessor_returns(body).is_some_and(|returned| {
+                matches!(&returned, DataType::Array(definition)
+                    if written_element(definition)
+                        .is_some_and(|returned| self.is_read_type(body, returned, element)))
+            });
+            Ok(Some((SettingRead { in_declared_type, ..set.read }, set.packing, returns_read)))
+        })
+    }
+
+    /// What `read` reads from the expression the body of the accessor `call`
+    /// reaches selects, read under the path and the role the accessor runs
+    /// with, the setting read beside what else it reads and whether the
+    /// accessor returns the read's own type. An accessor is a zero-argument
+    /// `sql` function whose body is one query selecting one expression, and
+    /// it reads as that read only where PostgreSQL runs it on each call and
+    /// returns the read unchanged.
+    fn accessed<T>(
+        &self,
+        scope: &Scope<'db, DB>,
+        call: &Function,
+        read: impl FnOnce(
+            &Scope<'db, DB>,
+            &Expr,
+        ) -> Result<Option<(SettingRead, T, bool)>, HelperSetError>,
+    ) -> Result<Option<(SettingRead, T)>, HelperSetError> {
         let database = self.database;
         if !plain_arguments(call).is_some_and(|list| list.args.is_empty()) {
             return Ok(None);
@@ -2490,36 +2587,22 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             owner,
             accessing,
         };
-        let Some((read, cast)) = self.typed_setting(&body, returned)? else { return Ok(None) };
-        let in_declared_type = cast.is_some() || read.in_declared_type;
-        let declared = if in_declared_type {
-            let (setting, declared) = self.declared_setting(&body, &read.name)?;
-            if let Some(cast) = cast
-                && declared.is_none_or(|declared| !self.is_declared_type(&body, cast, declared))
-            {
-                return Err(HelperSetError::SettingCast {
-                    function: body.name,
-                    setting: setting.name().to_string(),
-                    cast: cast.to_string(),
-                });
-            }
-            declared
-        } else {
-            None
+        let Some((setting_read, accessed, returns_read)) = read(&body, returned)? else {
+            return Ok(None);
         };
         let reason = if accessor.volatility() == FunctionBehavior::Immutable {
             AccessorRefusal::Immutable
-        } else if sets_setting(accessor, &read.name) {
+        } else if sets_setting(accessor, &setting_read.name) {
             AccessorRefusal::SetsSetting
-        } else if !self.returns_read(&body, declared) {
+        } else if !returns_read {
             AccessorRefusal::ReturnType
         } else {
-            return Ok(Some(SettingRead { in_declared_type, ..read }));
+            return Ok(Some((setting_read, accessed)));
         };
         Err(HelperSetError::Accessor {
             function: scope.name.clone(),
             accessor: body.name,
-            setting: read.name,
+            setting: setting_read.name,
             reason,
         })
     }
@@ -2561,22 +2644,27 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok((setting, declared))
     }
 
-    /// Whether the accessor `scope` reads returns one value of the type its
-    /// body's read takes, `declared` where the read is cast to it and `text`
-    /// where it is not.
-    fn returns_read(&self, scope: &Scope<'db, DB>, declared: Option<&DataType>) -> bool {
+    /// The type of the one value the accessor `scope` reads returns, `None`
+    /// where it returns a set of rows or declares no type the reader parses.
+    fn accessor_returns(&self, scope: &Scope<'db, DB>) -> Option<DataType> {
         let accessor = scope.function;
         if accessor.returns_set() {
-            return false;
+            return None;
         }
-        let Some(returned) =
-            accessor.result_type_name(self.database).and_then(|name| parse_data_type(&name))
-        else {
-            return false;
-        };
+        accessor.result_type_name(self.database).and_then(|name| parse_data_type(&name))
+    }
+
+    /// Whether `returned` is the type a read takes, `declared` where the read
+    /// is cast to it and `text` where it is not.
+    fn is_read_type(
+        &self,
+        scope: &Scope<'db, DB>,
+        returned: &DataType,
+        declared: Option<&DataType>,
+    ) -> bool {
         match declared {
-            Some(declared) => self.is_declared_type(scope, &returned, declared),
-            None => PgType::of(&returned) == PgType::of(&DataType::Text),
+            Some(declared) => self.is_declared_type(scope, returned, declared),
+            None => PgType::of(returned) == PgType::of(&DataType::Text),
         }
     }
 
