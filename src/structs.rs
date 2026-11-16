@@ -4,6 +4,7 @@
 mod absent;
 mod call_resolution;
 mod column_scope;
+mod constraint_deferral;
 mod deployment;
 mod dynamic_execution;
 mod expression_context;
@@ -52,6 +53,7 @@ pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
     ColumnScope, QueryOutput, RangeTableEntry, RelationBinding,
 };
+pub use constraint_deferral::ConstraintDeferral;
 pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
     SettingContent, SettingPresence, SettingValue, TimeZoneSource,

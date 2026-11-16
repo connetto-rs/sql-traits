@@ -25,13 +25,13 @@ use sqlparser::{
         ColumnOption, ColumnOptionDef, CreateCollation, CreateCollationDefinition, CreateDomain,
         CreateExtension, CreateForeignTable, CreateFunction, CreateFunctionBody, CreateIndex,
         CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
-        DataType, DropBehavior, DropDomain, Expr, ForeignKeyConstraint, FunctionDefinitionSetParam,
-        FunctionDesc, FunctionSetValue, GeneratedAs, Grant, GrantObjects, Grantee, GranteeName,
-        GranteesType, Ident, IndexColumn, MySQLColumnPosition, NotNullConstraint, ObjectName,
-        ObjectNamePart, OperateFunctionArg, OrderByExpr, OrderByOptions, Owner,
-        PrimaryKeyConstraint, Privileges, Query, RenameTableNameKind, ResetConfig, RoleOption,
-        SchemaName, SqlOption, Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value,
-        ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
+        DataType, DeferrableInitial, DropBehavior, DropDomain, Expr, ForeignKeyConstraint,
+        FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue, GeneratedAs, Grant,
+        GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition,
+        NotNullConstraint, ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr,
+        OrderByOptions, Owner, PrimaryKeyConstraint, Privileges, Query, RenameTableNameKind,
+        ResetConfig, RoleOption, SchemaName, SqlOption, Statement, TableConstraint, TriggerEvent,
+        UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
         helpers::stmt_create_table::CreateTableBuilder,
     },
     dialect::Dialect,
@@ -6397,6 +6397,15 @@ impl ParserDB {
         table_metadata: &mut TableMetadata<CreateTable>,
         builder: ParserDBBuilder,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        if let Some(characteristics) = fk.characteristics
+            && characteristics.deferrable == Some(false)
+            && characteristics.initially == Some(DeferrableInitial::Deferred)
+        {
+            return Err(crate::errors::Error::InitiallyDeferredNotDeferrable {
+                table_name: create_table.name.to_string(),
+            });
+        }
+
         for col_ident in &fk.columns {
             let column_exists = table_metadata.column_arcs().any(|col| {
                 identifiers_match(

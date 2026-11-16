@@ -4,12 +4,13 @@
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    ConstraintReferenceMatchKind, CreateTable, ForeignKeyConstraint, ReferentialAction,
+    ConstraintCharacteristics, ConstraintReferenceMatchKind, CreateTable, DeferrableInitial,
+    ForeignKeyConstraint, Ident, ObjectName, ReferentialAction,
 };
 
 use crate::{
     errors::LookupError,
-    structs::{ConstraintObject, ParserDB, TableAttribute, TargetName},
+    structs::{ConstraintDeferral, ConstraintObject, ParserDB, TableAttribute, TargetName},
     traits::{ForeignKeyLike, Metadata, database::DatabaseLike, table::TableLike},
     utils::object_name::{resolve_required_bound_table, target_name_of_object_name},
 };
@@ -82,6 +83,11 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
         super::create_table::holds_validated(self.table(), self.attribute(), database)
     }
 
+    #[inline]
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        deferral_of(self.attribute().characteristics)
+    }
+
     fn host_columns<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -103,6 +109,66 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
         let referenced_table = self.referenced_table(database)?;
         resolve_columns(referenced_table, database, &self.attribute().referred_columns)
     }
+}
+
+/// `INITIALLY DEFERRED` implies `DEFERRABLE`, as in PostgreSQL, and ingestion
+/// refuses the one combination contradicting it.
+fn deferral_of(characteristics: Option<ConstraintCharacteristics>) -> ConstraintDeferral {
+    let characteristics = characteristics.unwrap_or_default();
+    match (characteristics.deferrable, characteristics.initially) {
+        (_, Some(DeferrableInitial::Deferred)) => ConstraintDeferral::InitiallyDeferred,
+        (Some(true), _) => ConstraintDeferral::InitiallyImmediate,
+        (Some(false) | None, _) => ConstraintDeferral::NotDeferrable,
+    }
+}
+
+/// A foreign key as `pg_constraint` stores it, unnamed and with every omitted
+/// clause read as its default.
+#[derive(PartialEq)]
+struct StoredForeignKey<'key> {
+    columns: &'key [Ident],
+    foreign_table: &'key ObjectName,
+    referred_columns: &'key [Ident],
+    on_delete: ReferentialAction,
+    on_update: ReferentialAction,
+    match_kind: ConstraintReferenceMatchKind,
+    deferral: ConstraintDeferral,
+    enforced: bool,
+}
+
+impl<'key> From<&'key ForeignKeyConstraint> for StoredForeignKey<'key> {
+    fn from(key: &'key ForeignKeyConstraint) -> Self {
+        let ForeignKeyConstraint {
+            name: _,
+            index_name: _,
+            columns,
+            foreign_table,
+            referred_columns,
+            on_delete,
+            on_update,
+            match_kind,
+            characteristics,
+        } = key;
+        Self {
+            columns,
+            foreign_table,
+            referred_columns,
+            on_delete: on_delete.unwrap_or(ReferentialAction::NoAction),
+            on_update: on_update.unwrap_or(ReferentialAction::NoAction),
+            match_kind: match_kind.unwrap_or(ConstraintReferenceMatchKind::Simple),
+            deferral: deferral_of(*characteristics),
+            enforced: characteristics.and_then(|written| written.enforced).unwrap_or(true),
+        }
+    }
+}
+
+/// Whether `left` and `right` are one foreign key as PostgreSQL stores it,
+/// whatever each is named and whichever defaults each spells out.
+pub(crate) fn foreign_keys_stored_alike(
+    left: &ForeignKeyConstraint,
+    right: &ForeignKeyConstraint,
+) -> bool {
+    StoredForeignKey::from(left) == StoredForeignKey::from(right)
 }
 
 /// Resolves `column_names` against the columns `table` declares.

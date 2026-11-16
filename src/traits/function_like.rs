@@ -1885,19 +1885,24 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   declared element type or each element to that type, and any other cast
     ///   refuses the answer. It may read any setting through
     ///   `NULLIF(current_setting(...), '')`, which reads `''` as `NULL` and so
-    ///   maps both states of an unset setting to `NULL`. A time bound is a
-    ///   conjunct `<column> <comparison> now()`, a `timestamptz` column of the
-    ///   table compared with `<`, `<=`, `>` or `>=` either way round,
-    ///   optionally `OR <column> IS NULL`, and the arm answers it as a
-    ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
-    ///   `transaction_timestamp()` read the same statement time as `now()`. The
-    ///   rest, the arguments substituted, reduce to `TRUE`, to `FALSE` or
-    ///   `NULL`, or to the literal values columns have to hold. A column of an
-    ///   enum type compared with a label by `<`, `<=`, `>` or `>=`, either way
-    ///   round, holds the labels on the kept side of it in the order the type
-    ///   declares them, `ALTER TYPE ... ADD VALUE` applied. An arm comparing a
-    ///   helper's set while returning its table's primary key is a parent arm,
-    ///   so it takes no other condition.
+    ///   maps both states of an unset setting to `NULL`. Wherever it reads a
+    ///   setting it may call an accessor instead, a zero-argument `sql`
+    ///   function written as a string whose body selects one such read, cast or
+    ///   not, and returns its type. The accessor's body resolves on its own
+    ///   path or, where it pins none, on the caller's, as the role it runs as,
+    ///   and an accessor that is `IMMUTABLE` or sets the setting it reads
+    ///   refuses the answer. A time bound is a conjunct `<column> <comparison>
+    ///   now()`, a `timestamptz` column of the table compared with `<`, `<=`,
+    ///   `>` or `>=` either way round, optionally `OR <column> IS NULL`, and
+    ///   the arm answers it as a [`TimeBound`](crate::structs::TimeBound).
+    ///   `CURRENT_TIMESTAMP` and `transaction_timestamp()` read the same
+    ///   statement time as `now()`. The rest, the arguments substituted, reduce
+    ///   to `TRUE`, to `FALSE` or `NULL`, or to the literal values columns have
+    ///   to hold. A column of an enum type compared with a label by `<`, `<=`,
+    ///   `>` or `>=`, either way round, holds the labels on the kept side of it
+    ///   in the order the type declares them, `ALTER TYPE ... ADD VALUE`
+    ///   applied. An arm comparing a helper's set while returning its table's
+    ///   primary key is a parent arm, so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it

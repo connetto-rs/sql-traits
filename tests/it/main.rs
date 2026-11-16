@@ -51,6 +51,7 @@ mod expression_context;
 mod expression_scopes;
 mod expression_truth;
 mod extensions;
+mod foreign_key_deferral;
 mod foreign_tables;
 mod function_body_binding;
 mod function_call_casts;
