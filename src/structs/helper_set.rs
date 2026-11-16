@@ -11,9 +11,9 @@ use crate::{structs::SessionSetting, traits::DatabaseLike};
 
 /// The set a helper returns, the union of its arms.
 ///
-/// An arm whose condition keeps no row for the arguments is left out, and a
-/// walk with it where no other arm remains, so a helper returning nothing
-/// for them answers no arm.
+/// An arm whose condition keeps no row for the arguments is left out, and
+/// the walks with it where no other arm remains, so a helper returning
+/// nothing for them answers no arm.
 #[derive(Debug)]
 pub struct HelperSet<'db, DB: DatabaseLike> {
     pub(crate) arms: Vec<HelperArm<'db, DB>>,
@@ -50,7 +50,8 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Grant(GrantArm<'db, DB>),
     /// The rows of a table whose parent another helper returns.
     Parent(ParentArm<'db, DB>),
-    /// The rows next to the ones the set itself holds, along a tree.
+    /// The rows next to the ones the set itself holds, along one edge of a
+    /// tree, the set growing along every walk at once.
     Walk(WalkArm<'db, DB>),
 }
 
@@ -702,16 +703,18 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
     }
 }
 
-/// The recursive term of `WITH RECURSIVE <walk> (<column>) AS (<arms> UNION
-/// <term>) SELECT <column> FROM <walk>`, walking the tree whose edges the
-/// table holds until the set stops growing.
+/// One edge the recursive term of `WITH RECURSIVE <walk> (<column>) AS
+/// (<arms> UNION <term>) SELECT <column> FROM <walk>` follows, walking the
+/// tree whose edges the table holds until the set stops growing.
 ///
 /// Each row of the table is an edge from the tree's row its child column
 /// names to the one its parent column names. The table is the tree itself,
 /// its child column the primary key, where each row names its own parent,
 /// or an edge table, its child column its primary key or a column a unique
-/// key covers alone, holding one row per child that has a parent. The walk
-/// ends on a tree holding a cycle, as `UNION` keeps no row twice.
+/// key covers alone, holding one row per child that has a parent. A term
+/// reading a `LATERAL` union of edges answers one walk per edge, each
+/// adding to the one set every other one reads. The walk ends on a tree
+/// holding a cycle, as `UNION` keeps no row twice.
 #[derive(Debug)]
 pub struct WalkArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
@@ -756,8 +759,9 @@ impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
         self.column
     }
 
-    /// The single-column foreign key of [`column`](Self::column), which
-    /// references [`key`](Self::key).
+    /// The first foreign key the table declares through which
+    /// [`column`](Self::column) names a row of the tree, holding the column
+    /// alone or at the position of [`key`](Self::key) among others.
     #[must_use]
     pub fn foreign_key(&self) -> &'db DB::ForeignKey {
         self.foreign_key
@@ -774,13 +778,17 @@ impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkDirection {
     /// `SELECT <child> FROM <table> JOIN <walk> ON <column> =
-    /// <walk>.<column>`, which adds the child of every edge whose parent the
-    /// set holds, so the set ends holding every row below its other arms.
+    /// <walk>.<column>`, or a `LATERAL` edge `SELECT <child> FROM <table>
+    /// WHERE <column> = <walk>.<column>`, which adds the child of every edge
+    /// whose parent the set holds, so the set ends holding every row below its
+    /// other arms.
     Down,
     /// `SELECT <column> FROM <table> JOIN <walk> ON <child> =
-    /// <walk>.<column>`, which adds the parent of every edge whose child the
-    /// set holds, so the set ends holding every row above its other arms. A
-    /// root of a tree holding its own edges adds its parent column's `NULL`,
-    /// which no `IN` matches, and a root of an edge table has no edge.
+    /// <walk>.<column>`, or a `LATERAL` edge `SELECT <column> FROM <table>
+    /// WHERE <child> = <walk>.<column>`, which adds the parent of every edge
+    /// whose child the set holds, so the set ends holding every row above its
+    /// other arms. A root of a tree holding its own edges adds its parent
+    /// column's `NULL`, which no `IN` matches, and a root of an edge table has
+    /// no edge.
     Up,
 }

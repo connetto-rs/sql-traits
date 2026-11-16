@@ -2469,6 +2469,16 @@ fn a_walk_of_any_other_shape_refuses_the_answer() {
         walking(&format!("{CHILD_JOIN} WHERE child.id <> 'x'")),
         walking(&format!("{CHILD_JOIN} AND child.id <> 'x'")),
         walking(&CHILD_JOIN.replace(" JOIN ", " LEFT JOIN ")),
+        walking(&CHILD_JOIN.replace(" JOIN ", " GLOBAL JOIN ")),
+        walking(&format!("{CHILD_JOIN} GROUP BY child.id")),
+        walking(
+            &CHILD_JOIN.replace("child.parent_id = reached.id", "child.parent_id <> reached.id"),
+        ),
+        walking(&CHILD_JOIN.replace("SELECT child.id", "SELECT id")),
+        walking(
+            "SELECT child.id FROM public.groups child JOIN public.groups other ON child.parent_id = other.id",
+        ),
+        walking("SELECT child.id FROM reached, public.groups child, public.groups other"),
         walking(
             "SELECT child.id FROM public.groups child, reached WHERE child.parent_id = reached.id",
         ),
@@ -4991,27 +5001,34 @@ fn a_walk_reads_an_edge_table_down_and_up_its_unique_column() {
         let database = postgres(&edges(term, ""));
         let set =
             answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
-        for (fixture, caller, down, up, _) in EDGES_MEASURED {
-            let expected = match direction {
-                WalkDirection::Down => down,
-                WalkDirection::Up => up,
-            };
-            let returned: Vec<_> =
-                evaluate(&set, Request::of(caller), fixture).into_iter().collect();
-            assert_eq!(returned, *expected, "{caller} walking {term}");
-        }
+        let measured =
+            EDGES_MEASURED.iter().map(|&(rows, caller, down, up, _)| (rows, caller, down, up));
+        assert_walked(&set, direction, term, measured);
     }
 
-    let keyed_by_child = edges(EDGE_DOWN, "")
-        .replace("PRIMARY KEY (organization_id, folder_id),", "PRIMARY KEY (folder_id),")
-        .replace("CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id);", "");
-    let database = postgres(&keyed_by_child);
-    let set = answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
-    assert_eq!(
-        render(&set),
-        format!("{FOLDER_GRANT_ARM} UNION folder_parents.folder_id WHERE parent_id IN itself"),
-        "an edge table keyed by its child"
-    );
+    let index = "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id);";
+    for (description, keyed) in [
+        (
+            "an edge table keyed by its child",
+            edges(EDGE_DOWN, "")
+                .replace("PRIMARY KEY (organization_id, folder_id),", "PRIMARY KEY (folder_id),")
+                .replace(index, ""),
+        ),
+        (
+            "an edge table with its child unique by constraint",
+            edges(EDGE_DOWN, "")
+                .replace(index, "ALTER TABLE folder_parents ADD UNIQUE (folder_id);"),
+        ),
+    ] {
+        let database = postgres(&keyed);
+        let set =
+            answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+        assert_eq!(
+            render(&set),
+            format!("{FOLDER_GRANT_ARM} UNION folder_parents.folder_id WHERE parent_id IN itself"),
+            "{description}"
+        );
+    }
 }
 
 #[test]
@@ -5054,13 +5071,6 @@ fn an_edge_table_of_any_other_shape_refuses_the_walk() {
         (EDGE_DOWN, unique, "CREATE INDEX folder_parents_folder ON folder_parents (folder_id);"),
         (EDGE_DOWN, unique, &both),
         (EDGE_DOWN, parent, "parent_id TEXT NOT NULL REFERENCES organizations (id),"),
-        (EDGE_DOWN, parent, "parent_id TEXT NOT NULL,"),
-        (
-            EDGE_DOWN,
-            parent,
-            "parent_id TEXT NOT NULL REFERENCES folders (id) REFERENCES folders (id),",
-        ),
-        (EDGE_DOWN, "folder_id TEXT NOT NULL REFERENCES folders (id),", "folder_id TEXT NOT NULL,"),
         (
             "SELECT fp.parent_id FROM public.folder_parents fp JOIN reached ON fp.parent_id = reached.id",
             "",
@@ -5130,6 +5140,16 @@ fn an_arm_returning_a_unique_column_keyed_by_another_table_is_a_parent_arm() {
     let set = answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
     let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the walk") };
     assert_eq!(walk.table().table_name(), "folder_parents");
+
+    let computed = edges(EDGE_DOWN, "").replace(
+        "WHERE pf.folder_id IN (SELECT authz.folders_reached())",
+        "WHERE lower(pf.folder_id) IN (SELECT authz.folders_reached())",
+    );
+    let database = postgres(&computed);
+    assert!(matches!(
+        answer(&database, &deployment, "authz", "projects_reached", &[]),
+        Err(HelperSetError::ArmShape { .. })
+    ));
 }
 
 #[test]
@@ -5159,4 +5179,305 @@ fn an_arm_returning_a_column_no_unique_key_covers_alone_stays_a_grant_arm() {
             "{to}"
         );
     }
+}
+
+#[test]
+fn an_edge_column_reaches_the_tree_through_any_foreign_key_naming_its_key() {
+    let deployment = deployment();
+    let parent = "parent_id TEXT NOT NULL REFERENCES folders (id),";
+    let child = "folder_id TEXT NOT NULL REFERENCES folders (id),";
+    for (from, to) in [
+        (parent, "parent_id TEXT NOT NULL,"),
+        (child, "folder_id TEXT NOT NULL,"),
+        (parent, "parent_id TEXT NOT NULL REFERENCES folders (id) REFERENCES folders (id),"),
+    ] {
+        let sql = edges(EDGE_DOWN, "").replace(from, to);
+        let database = postgres(&sql);
+        let set =
+            answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+        assert_eq!(
+            render(&set),
+            format!("{FOLDER_GRANT_ARM} UNION folder_parents.folder_id WHERE parent_id IN itself"),
+            "{to}"
+        );
+        let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
+        assert_eq!(walk.tree().table_name(), "folders", "{to}");
+        let referenced = walk.foreign_key().referenced_table(&database).expect("resolves");
+        assert_eq!(referenced.table_name(), "folders", "{to}");
+    }
+}
+
+/// Resources of every kind kept in `resources`, folders and projects filed
+/// under a folder through `resource_parents` and ownables filed in a project
+/// through `ownables`. Each edge column references `resources` only through a
+/// composite foreign key pinning the kind it names. `authz.reached()` walks
+/// from the resources granted to the caller along `term`.
+fn hierarchy(term: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE TABLE organizations (id TEXT PRIMARY KEY);
+         CREATE TABLE resources (
+           id TEXT PRIMARY KEY,
+           kind TEXT NOT NULL,
+           organization_id TEXT NOT NULL REFERENCES organizations (id),
+           UNIQUE (id, kind)
+         );
+         CREATE TABLE resource_parents (
+           id TEXT PRIMARY KEY,
+           kind TEXT NOT NULL CHECK (kind IN ('folder', 'project')),
+           parent_id TEXT NOT NULL,
+           parent_kind TEXT GENERATED ALWAYS AS ('folder') STORED NOT NULL,
+           FOREIGN KEY (id, kind) REFERENCES resources (id, kind),
+           FOREIGN KEY (parent_id, parent_kind) REFERENCES resources (id, kind)
+         );
+         CREATE TABLE ownables (
+           id TEXT PRIMARY KEY,
+           kind TEXT GENERATED ALWAYS AS ('ownable') STORED NOT NULL,
+           project_id TEXT NOT NULL,
+           project_kind TEXT GENERATED ALWAYS AS ('project') STORED NOT NULL,
+           FOREIGN KEY (id, kind) REFERENCES resources (id, kind),
+           FOREIGN KEY (project_id, project_kind) REFERENCES resources (id, kind)
+         );
+         CREATE TABLE resource_grants (
+           resource_id TEXT NOT NULL REFERENCES resources (id),
+           user_id TEXT NOT NULL,
+           PRIMARY KEY (resource_id, user_id)
+         );
+         GRANT SELECT ON resources, resource_parents, ownables, resource_grants TO authz_owner;
+         CREATE FUNCTION authz.reached() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           WITH RECURSIVE reached (id) AS (
+             SELECT g.resource_id FROM public.resource_grants g
+             WHERE g.user_id = current_setting('app.user_id', true)
+             UNION {term}
+           ) SELECT id FROM reached
+         $$;
+         ALTER FUNCTION authz.reached() OWNER TO authz_owner;"
+    )
+}
+
+const LATERAL_DOWN: &str = "SELECT child.id FROM reached CROSS JOIN LATERAL (
+       SELECT p.id FROM public.resource_parents p WHERE p.parent_id = reached.id
+       UNION ALL
+       SELECT o.id FROM public.ownables o WHERE o.project_id = reached.id
+     ) child";
+const LATERAL_UP: &str = "SELECT parent.id FROM reached, LATERAL (
+       SELECT p.parent_id FROM public.resource_parents p WHERE p.id = reached.id
+       UNION
+       SELECT o.project_id FROM public.ownables o WHERE reached.id = o.id
+     ) parent (id)";
+
+/// `f_team` under `f_root`, the project `p1` under `f_team`, the project
+/// `p_other` filed under no folder, and the ownables `o1` in `p1` and `o2` in
+/// `p_other`.
+const HIERARCHY: Rows = &[
+    ("resource_parents", &[("id", "f_team"), ("parent_id", "f_root")]),
+    ("resource_parents", &[("id", "p1"), ("parent_id", "f_team")]),
+    ("ownables", &[("id", "o1"), ("project_id", "p1")]),
+    ("ownables", &[("id", "o2"), ("project_id", "p_other")]),
+    ("resource_grants", &[("resource_id", "f_team"), ("user_id", "alice")]),
+    ("resource_grants", &[("resource_id", "f_root"), ("user_id", "bob")]),
+    ("resource_grants", &[("resource_id", "p_other"), ("user_id", "carol")]),
+    ("resource_grants", &[("resource_id", "o1"), ("user_id", "dave")]),
+];
+
+/// [`HIERARCHY`] with `f_root` moved under `f_team`, closing a cycle.
+const CYCLIC_HIERARCHY: Rows = &[
+    ("resource_parents", &[("id", "f_team"), ("parent_id", "f_root")]),
+    ("resource_parents", &[("id", "p1"), ("parent_id", "f_team")]),
+    ("resource_parents", &[("id", "f_root"), ("parent_id", "f_team")]),
+    ("ownables", &[("id", "o1"), ("project_id", "p1")]),
+    ("ownables", &[("id", "o2"), ("project_id", "p_other")]),
+    ("resource_grants", &[("resource_id", "f_team"), ("user_id", "alice")]),
+    ("resource_grants", &[("resource_id", "f_root"), ("user_id", "bob")]),
+    ("resource_grants", &[("resource_id", "p_other"), ("user_id", "carol")]),
+    ("resource_grants", &[("resource_id", "o1"), ("user_id", "dave")]),
+];
+
+/// What PostgreSQL 18.6 returns for `(rows, caller)` from `authz.reached()`
+/// written with [`LATERAL_DOWN`], then with [`LATERAL_UP`].
+type HierarchyMeasured = (Rows, &'static str, &'static [&'static str], &'static [&'static str]);
+
+const HIERARCHY_MEASURED: &[HierarchyMeasured] = &[
+    (HIERARCHY, "alice", &["f_team", "o1", "p1"], &["f_root", "f_team"]),
+    (HIERARCHY, "bob", &["f_root", "f_team", "o1", "p1"], &["f_root"]),
+    (HIERARCHY, "carol", &["o2", "p_other"], &["p_other"]),
+    (HIERARCHY, "dave", &["o1"], &["f_root", "f_team", "o1", "p1"]),
+    (HIERARCHY, "zed", &[], &[]),
+    (CYCLIC_HIERARCHY, "alice", &["f_root", "f_team", "o1", "p1"], &["f_root", "f_team"]),
+    (CYCLIC_HIERARCHY, "bob", &["f_root", "f_team", "o1", "p1"], &["f_root", "f_team"]),
+    (CYCLIC_HIERARCHY, "dave", &["o1"], &["f_root", "f_team", "o1", "p1"]),
+];
+
+const RESOURCE_GRANT_ARM: &str = "resource_grants.resource_id WHERE user_id = app.user_id";
+
+#[test]
+fn a_lateral_step_walks_every_edge_its_union_reads() {
+    let deployment = deployment();
+    for (term, rendered, direction) in [
+        (
+            LATERAL_DOWN,
+            "resource_parents.id WHERE parent_id IN itself UNION ownables.id WHERE project_id IN itself",
+            WalkDirection::Down,
+        ),
+        (
+            LATERAL_UP,
+            "resource_parents.parent_id WHERE id IN itself UNION ownables.project_id WHERE id IN itself",
+            WalkDirection::Up,
+        ),
+    ] {
+        let database = postgres(&hierarchy(term));
+        let set = answer(&database, &deployment, "authz", "reached", &[]).expect("answered");
+        assert_eq!(render(&set), format!("{RESOURCE_GRANT_ARM} UNION {rendered}"), "{term}");
+        assert_eq!(covered(&set), Some("resources"), "{term}");
+        for arm in &set.arms()[1..] {
+            let HelperArm::Walk(walk) = arm else { panic!("every arm after the first walks") };
+            assert_eq!(walk.direction(), direction, "{term}");
+            assert_eq!(walk.tree().table_name(), "resources", "{term}");
+            assert_eq!(walk.key().column_name(), "id", "{term}");
+            assert_eq!(walk.child().column_name(), "id", "{term}");
+        }
+        assert_walked(&set, direction, term, HIERARCHY_MEASURED.iter().copied());
+    }
+}
+
+/// Checks `set`, written with `term` walking in `direction`, against what
+/// PostgreSQL returns for each `(rows, caller, walked down, walked up)`.
+fn assert_walked(
+    set: &HelperSet<'_, ParserDB>,
+    direction: WalkDirection,
+    term: &str,
+    measured: impl IntoIterator<Item = HierarchyMeasured>,
+) {
+    for (fixture, caller, down, up) in measured {
+        let expected = match direction {
+            WalkDirection::Down => down,
+            WalkDirection::Up => up,
+        };
+        let returned: Vec<_> = evaluate(set, Request::of(caller), fixture).into_iter().collect();
+        assert_eq!(returned, expected, "{caller} walking {term}");
+    }
+}
+
+#[test]
+fn a_lateral_step_over_one_edge_walks_as_the_join_does() {
+    let deployment = deployment();
+    for term in [
+        "SELECT child.id FROM reached CROSS JOIN LATERAL \
+         (SELECT g.id FROM public.groups g WHERE g.parent_id = reached.id) child",
+        "SELECT c.node FROM reached r, LATERAL \
+         (SELECT id FROM public.groups WHERE parent_id = r.id) AS c (node)",
+        "SELECT node FROM reached CROSS JOIN LATERAL \
+         (SELECT g.id AS node FROM public.groups g WHERE reached.id = g.parent_id) child",
+    ] {
+        let database = postgres(&groups(&walking(term), ""));
+        let set = groups_with(&database, &deployment, "read").expect("answered");
+        assert_eq!(
+            render(&set),
+            "group_grants.group_id WHERE principal_id = app.user_id \
+             UNION groups.id WHERE parent_id IN itself",
+            "{term}"
+        );
+        assert_walk_measured(term, TREE_MEASURED);
+    }
+}
+
+#[test]
+fn a_lateral_step_of_any_other_shape_refuses_the_answer() {
+    let deployment = deployment();
+    let edge = "SELECT g.id FROM public.groups g WHERE g.parent_id = reached.id";
+    for term in [
+        format!("SELECT child.id FROM reached CROSS JOIN ({edge}) child"),
+        format!("SELECT child.id FROM LATERAL ({edge}) child CROSS JOIN reached"),
+        format!("SELECT reached.id FROM reached CROSS JOIN LATERAL ({edge}) child"),
+        format!("SELECT id FROM reached CROSS JOIN LATERAL ({edge}) child"),
+        format!(
+            "SELECT child.id FROM reached CROSS JOIN LATERAL ({edge}) child WHERE child.id <> 'x'"
+        ),
+        format!("SELECT child.id FROM reached LEFT JOIN LATERAL ({edge}) child ON TRUE"),
+        format!("SELECT reached.id FROM reached CROSS JOIN LATERAL ({edge}) reached"),
+        format!("SELECT child.a FROM reached CROSS JOIN LATERAL ({edge}) child (a, b)"),
+        format!("SELECT child.id FROM reached CROSS JOIN LATERAL ({edge} LIMIT 1) child"),
+        format!(
+            "SELECT child.id FROM reached CROSS JOIN LATERAL \
+             ({edge} EXCEPT SELECT g.id FROM public.groups g WHERE g.parent_id = reached.id) child"
+        ),
+        format!(
+            "SELECT child.id FROM reached CROSS JOIN LATERAL ({edge} AND g.id <> reached.id) child"
+        ),
+        "SELECT child.id FROM reached CROSS JOIN LATERAL \
+         (SELECT reached.id FROM public.groups reached WHERE reached.parent_id = reached.id) child"
+            .to_string(),
+        "SELECT child.id FROM reached CROSS JOIN LATERAL \
+         (SELECT g.id FROM public.groups g WHERE g.parent_id = id) child"
+            .to_string(),
+        "SELECT child.parent_id FROM reached CROSS JOIN LATERAL \
+         (SELECT g.parent_id FROM public.groups g WHERE g.parent_id = reached.id) child"
+            .to_string(),
+        "SELECT child.id FROM reached CROSS JOIN LATERAL \
+         (SELECT g.id FROM public.groups g JOIN public.group_grants gg ON gg.group_id = g.id \
+          WHERE g.parent_id = reached.id) child"
+            .to_string(),
+    ] {
+        let database = postgres(&groups(&walking(&term), ""));
+        assert!(
+            matches!(
+                groups_with(&database, &deployment, "read"),
+                Err(HelperSetError::ArmShape { function, .. }) if function == "authz.groups_with"
+            ),
+            "{term}"
+        );
+    }
+}
+
+#[test]
+fn an_edge_not_naming_the_tree_key_through_a_checked_foreign_key_refuses_the_walk() {
+    let deployment = deployment();
+    let checked = "project_kind TEXT GENERATED ALWAYS AS ('project') STORED NOT NULL,";
+    let unchecked = "project_kind TEXT CHECK (project_kind = 'project'),";
+    let shape = |sql: &str| {
+        let database = postgres(sql);
+        matches!(
+            answer(&database, &deployment, "authz", "reached", &[]),
+            Err(HelperSetError::ArmShape { function, .. }) if function == "authz.reached"
+        )
+    };
+    let organization_children = "SELECT child.id FROM reached CROSS JOIN LATERAL (
+       SELECT r.id FROM public.resources r WHERE r.organization_id = reached.id
+     ) child";
+    assert!(shape(&hierarchy(organization_children)), "a child of another tree");
+    assert!(
+        shape(&hierarchy(
+            &organization_children.replace("= reached.id", "= reached.id AND r.id <> reached.id")
+        )),
+        "a child of another tree but the reached row"
+    );
+    assert!(
+        shape(&hierarchy(LATERAL_DOWN).replace(checked, unchecked)),
+        "a foreign key checking nothing where its other column is NULL"
+    );
+    let full = hierarchy(LATERAL_DOWN).replace(checked, unchecked).replace(
+        "FOREIGN KEY (project_id, project_kind) REFERENCES resources (id, kind)",
+        "FOREIGN KEY (project_id, project_kind) REFERENCES resources (id, kind) MATCH FULL",
+    );
+    let database = postgres(&full);
+    let set = answer(&database, &deployment, "authz", "reached", &[]).expect("answered");
+    assert_eq!(set.arms().len(), 3, "MATCH FULL refuses a key holding NULL in part");
+}
+
+#[test]
+fn a_lateral_step_needs_the_owner_to_read_every_edge_it_walks() {
+    let deployment = deployment();
+    let sql = hierarchy(LATERAL_DOWN).replace(
+        "GRANT SELECT ON resources, resource_parents, ownables, resource_grants",
+        "GRANT SELECT (id) ON ownables TO authz_owner;
+         GRANT SELECT ON resources, resource_parents, resource_grants",
+    );
+    let database = postgres(&sql);
+    assert!(matches!(
+        answer(&database, &deployment, "authz", "reached", &[]),
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "ownables"
+    ));
 }

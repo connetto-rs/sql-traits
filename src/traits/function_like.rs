@@ -1935,17 +1935,25 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// (<arms> UNION <term>) SELECT <column> FROM <walk>`. The term walks
     /// down as `SELECT <child> FROM <table> JOIN <walk> ON <parent column> =
     /// <walk>.<column>` and up as `SELECT <parent column> FROM <table> JOIN
-    /// <walk> ON <child> = <walk>.<column>`, the join either way round.
-    /// `<parent column>` references the tree's one-column primary key through
-    /// its one single-column foreign key. The table is the tree itself, with
-    /// `<child>` its primary key, or an edge table, with `<child>` its
-    /// primary key or a column a unique key covers alone, referencing the
-    /// tree's primary key the same way. The walk answers a
-    /// [`WalkArm`](crate::structs::WalkArm) after the arms. `UNION ALL` is
-    /// refused, since it never ends on a tree holding a cycle.
+    /// <walk> ON <child> = <walk>.<column>`, the join either way round. A term
+    /// walking several edges at once is `SELECT <step>.<column> FROM <walk>
+    /// CROSS JOIN LATERAL (<edges>) <step>`, or `FROM <walk>, LATERAL`, the
+    /// edges a `UNION` or `UNION ALL` of `SELECT <child> FROM <table> WHERE
+    /// <parent column> = <walk>.<column>` walking down and `SELECT <parent
+    /// column> FROM <table> WHERE <child> = <walk>.<column>` walking up.
+    /// `<parent column>` names a row of the tree through foreign keys holding
+    /// it at the position of the tree's one-column primary key, alone or among
+    /// other columns, all of them referencing the same table and one checking
+    /// every row naming one, its match `FULL` or its other columns `NOT NULL`.
+    /// The table is the tree itself, with `<child>` its primary key, or an
+    /// edge table, with `<child>` its primary key or a column a unique key
+    /// covers alone, naming a row of the tree the same way. The walk answers a
+    /// [`WalkArm`](crate::structs::WalkArm) per edge after the arms. `UNION
+    /// ALL` between the arms and the term is refused, since it never ends on a
+    /// tree holding a cycle.
     ///
     /// A grant arm whose conditions reduce to `FALSE` or `NULL` keeps no row
-    /// and is left out, and a walk with it where no other arm remains. A
+    /// and is left out, and the walks with it where no other arm remains. A
     /// column named like a parameter is the column, as PostgreSQL resolves
     /// names in a SQL function. An unqualified name is looked up past the
     /// schemas on the path the owner cannot use, as PostgreSQL leaves them out
