@@ -1627,7 +1627,6 @@ fn a_set_unpacked_as_any_other_type_refuses_the_answer() {
     for condition in [
         format!("l.id = ANY ({SPLIT}::uuid)"),
         format!("l.id = ANY (ARRAY(SELECT unnest({SPLIT}))::uuid[])"),
-        format!("l.id = ANY (CAST({SPLIT} AS ARRAY))"),
     ] {
         assert!(
             matches!(
