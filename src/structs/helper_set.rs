@@ -78,6 +78,12 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Walk(WalkArm<'db, DB>),
 }
 
+impl<'db, DB: DatabaseLike> From<GrantArm<'db, DB>> for HelperArm<'db, DB> {
+    fn from(arm: GrantArm<'db, DB>) -> Self {
+        Self::Grant(arm)
+    }
+}
+
 /// `SELECT <columns> FROM <table> [JOIN <joined table> ON <key>]... [WHERE
 /// <conditions>]`, the rows the conditions keep for the grantee they name,
 /// the caller gate they write, the restrictions and bounds the rest of them

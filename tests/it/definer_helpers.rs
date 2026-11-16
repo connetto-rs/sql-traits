@@ -2620,6 +2620,15 @@ fn a_walk_reselecting_under_conditions_answers_the_rows_they_keep() {
     assert!(set.arms().is_empty(), "the final query keeps no row");
     assert!(set.selection().is_none());
     assert_eq!(covered(&set), Some("groups"));
+
+    let keyed = reselecting(
+        "SELECT g.id FROM public.groups g \
+         WHERE g.id IN (SELECT id FROM reached) AND g.id IN ('org', 'squad')",
+    );
+    let database = postgres(&kinded(&keyed, ""));
+    let set = groups_with(&database, &deployment, "read").expect("answered");
+    let returned: Vec<_> = evaluate(&set, Request::of("bob"), KINDED_TREE).into_iter().collect();
+    assert_eq!(returned, ["org", "squad"], "the key is a condition beside the walk");
 }
 
 #[test]

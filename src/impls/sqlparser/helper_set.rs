@@ -895,26 +895,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             let mut read = vec![key];
             for conjunct in conjuncts.iter().filter(|conjunct| !core::ptr::eq(**conjunct, reached))
             {
-                for column in table.columns_read(*conjunct) {
-                    if !read.iter().any(|seen| core::ptr::eq(*seen, column)) {
-                        read.push(column);
-                    }
-                }
+                read.extend(table.columns_read(*conjunct));
             }
             read
         })?;
         let rows = [table];
-        let arms =
-            self.grant_arm(scope, select, &rows, &[key], Some(rows[0].table), Some(reached))?;
-        Ok(arms
-            .into_iter()
-            .filter_map(|arm| {
-                match arm {
-                    HelperArm::Grant(grant) => Some(grant),
-                    HelperArm::Parent(_) | HelperArm::Walk(_) => None,
-                }
-            })
-            .collect())
+        self.grant_arm(scope, select, &rows, &[key], None, Some(reached))
     }
 
     /// Reads the recursive term of a walk, one arm per edge it follows.
@@ -1565,13 +1551,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
 
     /// Reads a grant arm returning `columns`, answering one arm per grantee
     /// an `IN` list naming the request lists and none where its conditions
-    /// keep no row. An arm returning a row of `child` from a helper's set is
-    /// a parent arm where [`parent_comparison`](Self::parent_comparison)
-    /// reads it as one, which takes no other condition, so such a set beside
-    /// one is refused. `rows` holds the arm's table and then each table it
-    /// joins. `reached` is the conjunct of a walk's final query keeping the
-    /// keys the walk reached, which is no condition of the arm.
-    fn grant_arm(
+    /// keep no row, each as an `A`. An arm returning a row of `child` from a
+    /// helper's set is a parent arm where
+    /// [`parent_comparison`](Self::parent_comparison) reads it as one, which
+    /// takes no other condition, so such a set beside one is refused. `rows`
+    /// holds the arm's table and then each table it joins. `reached` is the
+    /// conjunct of a walk's final query keeping the keys the walk reached,
+    /// which is no condition of the arm.
+    fn grant_arm<A: From<GrantArm<'db, DB>>>(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
@@ -1579,7 +1566,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         columns: &[&'db DB::Column],
         child: Option<&'db DB::Table>,
         reached: Option<&Expr>,
-    ) -> Result<Vec<HelperArm<'db, DB>>, HelperSetError> {
+    ) -> Result<Vec<A>, HelperSetError> {
         let shape = || scope.arm_shape(select);
         let table = rows.first().ok_or_else(shape)?;
         let (own, joined_rows) = self.joined_rows(scope, select, rows, reached)?;
@@ -1648,7 +1635,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                      gate: Option<CallerGate<'db>>,
                      time_bounds: Vec<TimeBound<'db, DB>>| {
             let restrictions = kept.and(own).restrictions()?;
-            Some(HelperArm::Grant(GrantArm {
+            Some(A::from(GrantArm {
                 table: table.table,
                 columns: columns.to_vec(),
                 granted_to,
