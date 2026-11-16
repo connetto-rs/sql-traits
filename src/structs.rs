@@ -86,7 +86,8 @@ pub use operator_resolution::{
 };
 pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
 pub use plpgsql_flow::{
-    Definition, DefinitionId, DefinitionSource, Reaching, TargetStep, VariableRead,
+    Definition, DefinitionId, DefinitionSource, DiagnosticsItem, Output, Reaching, Rows,
+    TargetStep, VariableRead,
 };
 pub use plpgsql_scope::{PlPgSqlScope, PlPgSqlVariable, VariableKind};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
