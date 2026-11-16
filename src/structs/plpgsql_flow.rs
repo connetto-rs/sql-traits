@@ -3,25 +3,38 @@
 
 use alloc::{
     borrow::Cow,
+    boxed::Box,
     collections::{BTreeMap, BTreeSet},
     string::String,
     sync::Arc,
     vec::Vec,
 };
-use core::{fmt, ops::ControlFlow};
+use core::{fmt, ops::ControlFlow, sync::atomic::AtomicBool};
 
+use once_cell::race::OnceBox;
 use sqlparser::ast::{ArgMode, Expr, Statement, Value, Visit};
 
 use crate::{
     errors::LookupError,
     impls::{SiteKey, dql::scoped_roots::ScopedRoot},
     structs::{
-        ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope,
-        PlPgSqlVariable, VariableKind,
+        ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase, OperandType,
+        PlPgSqlScope, PlPgSqlVariable, VariableKind, row_of,
     },
     traits::DatabaseLike,
-    utils::walk::walk_expressions,
+    utils::{object_name::PG_CATALOG, walk::walk_expressions},
 };
+
+/// Whether `variable` is declared `record` or is a loop's record, whose
+/// fields the row it holds decides, where a composite type converts the row
+/// to its own fields.
+pub(crate) fn is_record(variable: &PlPgSqlVariable<'_>) -> bool {
+    matches!(
+        variable.data_type(),
+        Ok(OperandType::Known { type_name, .. })
+            if type_name.name() == "record" && type_name.schema() == Some(PG_CATALOG)
+    )
+}
 
 /// Which part of what a query or a dynamic command returns a definition
 /// assigns.
@@ -235,6 +248,85 @@ pub(crate) struct ValueFlow<'r, 'db, DB: DatabaseLike> {
     /// The query each cursor declared with one opens, by the cursor
     /// variable's id.
     pub(crate) cursors: BTreeMap<usize, CursorQuery<'r, 'db, DB>>,
+    /// The rows each row source gives a record, by identifier case, solved
+    /// on the first record field typed under that case.
+    pub(crate) rows: [OnceBox<RowTypes>; 3],
+}
+
+/// Where a record's row comes from, as [`RowTypes`] keys it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RowSource {
+    /// The query of the written definition at this index.
+    Written(usize),
+    /// The query of the cursor variable of this id.
+    Cursor(usize),
+}
+
+/// The outputs of a row source's query up to the first one without a
+/// modeled name, each by stored name with its type, `None` while no round
+/// has typed it.
+pub(crate) type Row = Vec<(String, Option<OperandType<'static>>)>;
+
+/// The row of every row source of a body.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct RowTypes {
+    rows: BTreeMap<RowSource, Result<Row, LookupError>>,
+}
+
+impl RowTypes {
+    /// The type the row of `source` gives the field stored as `field`,
+    /// `None` while untyped and unknown for a field the row does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lookup error typing the source's query ran into.
+    pub(crate) fn field(
+        &self,
+        source: RowSource,
+        field: &str,
+    ) -> Result<Option<OperandType<'static>>, LookupError> {
+        match self.rows.get(&source) {
+            None => Ok(None),
+            Some(Err(error)) => Err(error.clone()),
+            Some(Ok(row)) => {
+                Ok(row
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map_or(Some(OperandType::Unknown), |(_, data_type)| data_type.clone()))
+            }
+        }
+    }
+}
+
+/// The join of two field types, `None` below every type and unknown above
+/// them.
+pub(crate) fn join<'t>(
+    left: Option<OperandType<'t>>,
+    right: Option<OperandType<'t>>,
+) -> Option<OperandType<'t>> {
+    match (left, right) {
+        (None, data_type) | (data_type, None) => data_type,
+        (Some(left), Some(right)) => Some(if left == right { left } else { OperandType::Unknown }),
+    }
+}
+
+/// One round of solving [`RowTypes`]: the rows the previous round left, and
+/// whether typing the current output read a field they leave untyped.
+#[derive(Debug)]
+pub(crate) struct Round<'r> {
+    /// The rows of the previous round.
+    pub(crate) rows: &'r RowTypes,
+    /// Whether a field read since the last reset joined to `None`.
+    pub(crate) untyped: AtomicBool,
+}
+
+/// The slot of [`ValueFlow::rows`] for `case`.
+const fn case_slot(case: IdentifierCase) -> usize {
+    match case {
+        IdentifierCase::AsWritten => 0,
+        IdentifierCase::Folded => 1,
+        IdentifierCase::Exact => 2,
+    }
 }
 
 /// The query a cursor declared with one opens.
@@ -274,10 +366,8 @@ pub(crate) enum FlowPoint<'r, 'db, DB: DatabaseLike> {
         flow: &'r ValueFlow<'r, 'db, DB>,
         /// The definition's index.
         index: usize,
-        /// The definitions whose sources are being typed on the way here,
-        /// this one included, which a field read here takes as unknown
-        /// rather than typing again.
-        visiting: Vec<usize>,
+        /// The round solving the rows, `None` once they are solved.
+        round: Option<&'r Round<'r>>,
     },
     /// Where the query of a cursor is evaluated, which every opening of the
     /// cursor reaches.
@@ -286,8 +376,8 @@ pub(crate) enum FlowPoint<'r, 'db, DB: DatabaseLike> {
         flow: &'r ValueFlow<'r, 'db, DB>,
         /// The query.
         key: SiteKey,
-        /// The definitions whose sources are being typed on the way here.
-        visiting: Vec<usize>,
+        /// The round solving the rows.
+        round: &'r Round<'r>,
     },
 }
 
@@ -297,8 +387,8 @@ pub(crate) struct Reached<'f, DB: DatabaseLike> {
     pub(crate) flow: &'f ValueFlow<'f, 'f, DB>,
     /// The definitions reaching the point, `None` where no path reaches it.
     pub(crate) state: Option<&'f State>,
-    /// The definitions being typed on the way here.
-    pub(crate) visiting: &'f [usize],
+    /// The round solving the rows, `None` once they are solved.
+    pub(crate) round: Option<&'f Round<'f>>,
 }
 
 impl<DB: DatabaseLike> FlowPoint<'_, '_, DB> {
@@ -307,15 +397,108 @@ impl<DB: DatabaseLike> FlowPoint<'_, '_, DB> {
         Ok(match self {
             Self::Site { flow, key } => {
                 let flow = flow.flow()?;
-                Reached { flow, state: flow.points.get(key), visiting: &[] }
+                Reached { flow, state: flow.points.get(key), round: None }
             }
-            Self::Definition { flow, index, visiting } => {
-                Reached { flow, state: flow.definitions[*index].inputs.as_ref(), visiting }
+            Self::Definition { flow, index, round } => {
+                Reached { flow, state: flow.definitions[*index].inputs.as_ref(), round: *round }
             }
-            Self::Cursor { flow, key, visiting } => {
-                Reached { flow, state: flow.points.get(key), visiting }
+            Self::Cursor { flow, key, round } => {
+                Reached { flow, state: flow.points.get(key), round: Some(round) }
             }
         })
+    }
+}
+
+impl<DB: DatabaseLike> ValueFlow<'_, '_, DB> {
+    /// The rows every row source gives a record under `case`, solved on the
+    /// first call.
+    pub(crate) fn row_types(&self, case: IdentifierCase) -> &RowTypes {
+        self.rows[case_slot(case)].get_or_init(|| Box::new(self.solve_rows(case)))
+    }
+
+    /// The row source the written definition at `index` gives a record its
+    /// row from: a query it assigns the whole of a record from, or the
+    /// declared query of a cursor it fetches from while the cursor variable
+    /// holds its own name on every path to it. `None` for any other
+    /// definition.
+    pub(crate) fn row_source(&self, index: usize) -> Option<RowSource> {
+        let written = &self.definitions[index];
+        if !written.part.is_empty() || !is_record(&written.variable) {
+            return None;
+        }
+        match &written.source {
+            DefinitionSource::QueryOutput {
+                statement: Statement::Query(_),
+                output: Output::Row,
+                ..
+            } if written.scope.is_some() => Some(RowSource::Written(index)),
+            DefinitionSource::CursorOutput { cursor, output: Output::Row } => {
+                let inputs = written.inputs.as_ref()?;
+                let own = inputs.get(&cursor.id()).is_some_and(|slots| {
+                    slots.iter().all(|slot| {
+                        matches!(slot, Slot::Written(name) if matches!(
+                            self.definitions[*name].source,
+                            DefinitionSource::CursorName | DefinitionSource::PortalName
+                        ))
+                    })
+                });
+                (own && self.cursors.contains_key(&cursor.id()))
+                    .then_some(RowSource::Cursor(cursor.id()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The least fixed point of the rows, each round typing every source's
+    /// query from the rows the previous one left and joining the result with
+    /// them, until no row changes.
+    fn solve_rows(&self, case: IdentifierCase) -> RowTypes {
+        let mut sources = Vec::new();
+        for (index, written) in self.definitions.iter().enumerate() {
+            if let Some(RowSource::Written(_)) = self.row_source(index)
+                && let (Some(scope), DefinitionSource::QueryOutput { statement, .. }) =
+                    (&written.scope, &written.source)
+            {
+                sources.push((RowSource::Written(index), *statement, scope));
+            }
+        }
+        for (id, cursor) in &self.cursors {
+            sources.push((RowSource::Cursor(*id), cursor.statement, &cursor.scope));
+        }
+        let mut rows = RowTypes::default();
+        loop {
+            let round = Round { rows: &rows, untyped: AtomicBool::new(false) };
+            let mut next = BTreeMap::new();
+            for (source, statement, scope) in &sources {
+                let point = match source {
+                    RowSource::Written(index) => {
+                        FlowPoint::Definition { flow: self, index: *index, round: Some(&round) }
+                    }
+                    RowSource::Cursor(id) => {
+                        FlowPoint::Cursor { flow: self, key: self.cursors[id].key, round: &round }
+                    }
+                };
+                let typed = row_of(statement, &(*scope).clone().at(point), case, &round);
+                let joined = match (rows.rows.get(source), typed) {
+                    (Some(Ok(earlier)), Ok(typed)) => {
+                        Ok(earlier
+                            .iter()
+                            .zip(typed)
+                            .map(|((name, earlier), (_, typed))| {
+                                (name.clone(), join(earlier.clone(), typed))
+                            })
+                            .collect())
+                    }
+                    (_, typed) => typed,
+                };
+                next.insert(*source, joined);
+            }
+            let next = RowTypes { rows: next };
+            if next == rows {
+                return rows;
+            }
+            rows = next;
+        }
     }
 }
 
@@ -563,39 +746,16 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
     /// read there takes its type from the definitions reaching that point.
     #[must_use]
     pub fn scope(&self) -> Option<PlPgSqlScope<'r, 'db, DB>> {
-        self.scope_within(&[])
+        let DefinitionKind::Written { index, written } = &self.kind else { return None };
+        let point = FlowPoint::Definition { flow: self.flow, index: *index, round: None };
+        Some(written.scope.as_ref()?.clone().at(point))
     }
 
-    /// [`Self::scope`] for typing the source on the way from typing the
-    /// definitions `visiting`, `None` as well when this is one of them.
-    pub(crate) fn scope_within(&self, visiting: &[usize]) -> Option<PlPgSqlScope<'r, 'db, DB>> {
-        let DefinitionKind::Written { index, written } = &self.kind else { return None };
-        let scope = written.scope.as_ref().filter(|_| !visiting.contains(index))?;
-        let mut visiting = visiting.to_vec();
-        visiting.push(*index);
-        Some(scope.clone().at(FlowPoint::Definition { flow: self.flow, index: *index, visiting }))
-    }
-
-    /// The query of the cursor a [`DefinitionSource::CursorOutput`] reads,
-    /// with the names and path it is evaluated under, standing where every
-    /// opening of the cursor evaluates it, for typing the source on the way
-    /// from typing the definitions `visiting`. `None` for any other source,
-    /// a `refcursor`, a cursor the body never opens, and a definition that
-    /// is one of `visiting`.
-    pub(crate) fn cursor_query_within(
-        &self,
-        visiting: &[usize],
-    ) -> Option<(&'r Statement, PlPgSqlScope<'r, 'db, DB>)> {
-        let DefinitionKind::Written { index, written } = &self.kind else { return None };
-        let DefinitionSource::CursorOutput { cursor, .. } = &written.source else { return None };
-        if visiting.contains(index) {
-            return None;
-        }
-        let query = self.flow.cursors.get(&cursor.id())?;
-        let mut visiting = visiting.to_vec();
-        visiting.push(*index);
-        let point = FlowPoint::Cursor { flow: self.flow, key: query.key, visiting };
-        Some((query.statement, query.scope.clone().at(point)))
+    /// The row source this definition gives a record its row from, `None`
+    /// for any definition [`ValueFlow::row_source`] gives none.
+    pub(crate) fn row_source(&self) -> Option<RowSource> {
+        let DefinitionKind::Written { index, .. } = &self.kind else { return None };
+        self.flow.row_source(*index)
     }
 
     /// Returns the variables the SQL of [`Self::source`] reads, each once in

@@ -484,8 +484,9 @@ fn cursor_loop_fields_and_scalar_subqueries_take_their_output_types() {
 /// loop over a query, the empty row a loop over no row leaves, and a
 /// `FETCH` from a cursor declared with its query, as PostgreSQL 18 reports
 /// with `pg_typeof`. The query is typed where the body runs it, so an
-/// output reading a variable takes the variable's type. A record typed
-/// through a loop from its own earlier rows stays unknown.
+/// output reading a variable takes the variable's type, and an output
+/// reading the record's own field through a loop takes the type of the row
+/// that entered the loop.
 #[test]
 fn record_fields_take_the_output_types_of_the_rows_reaching_them() {
     let database = postgres(
@@ -520,7 +521,7 @@ fn record_fields_take_the_output_types_of_the_rows_reaching_them() {
             typed("r.name", "pg_catalog.int4"),
             typed("r.name", "pg_catalog.text"),
             typed("r.name", "pg_catalog.int4"),
-            typed("r.name", "?"),
+            typed("r.name", "pg_catalog.int4"),
         ]
     );
 }
@@ -530,9 +531,9 @@ fn record_fields_take_the_output_types_of_the_rows_reaching_them() {
 /// reading a record's field types it from the rows reaching every opening
 /// of the cursor. A row from a dynamic command or a `refcursor` stays
 /// unknown, and so does a row a cursor gives from the record's own field
-/// through a loop. `record_field_types` lists the first two with their
-/// unknown types, but nothing for a row variable's field, which takes its
-/// column's type.
+/// while such a row reaches its opening. `record_field_types` lists the
+/// first two with their unknown types, but nothing for a row variable's
+/// field, which takes its column's type.
 #[test]
 fn record_fields_skip_field_writes_and_follow_cursor_openings() {
     let database = postgres(
@@ -612,6 +613,71 @@ fn record_fields_skip_field_writes_and_follow_cursor_openings() {
     assert!(listed[0].0.starts_with("DynamicOutput"), "{listed:?}");
     assert!(listed[1].0.starts_with("CursorOutput"), "{listed:?}");
     assert!(listed.iter().all(|(_, field)| field == "?"));
+}
+
+/// Rows feeding one another around a loop are typed together, so a record
+/// eight branches of a loop each refill from its own field takes the type
+/// of the row entering the loop, `text` as PostgreSQL 18 reports with
+/// `pg_typeof`, without typing the branches once per path between them.
+#[test]
+fn records_refilled_around_a_loop_by_many_branches_keep_their_type() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE FUNCTION grown(p integer) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE r record;
+         BEGIN
+          SELECT name INTO r FROM audit;
+          FOR i IN 1..p LOOP
+           CASE i
+            WHEN 1 THEN SELECT r.name AS name INTO r;
+            WHEN 2 THEN SELECT r.name AS name INTO r;
+            WHEN 3 THEN SELECT r.name AS name INTO r;
+            WHEN 4 THEN SELECT r.name AS name INTO r;
+            WHEN 5 THEN SELECT r.name AS name INTO r;
+            WHEN 6 THEN SELECT r.name AS name INTO r;
+            WHEN 7 THEN SELECT r.name AS name INTO r;
+            WHEN 8 THEN SELECT r.name AS name INTO r;
+           END CASE;
+          END LOOP;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    assert_eq!(names(&database, "grown"), [[("r.name".to_owned(), "pg_catalog.text".to_owned())]]);
+}
+
+/// A variable of a composite type other than a table's row keeps its
+/// declared fields, which PostgreSQL 18 fills by position and converts, so
+/// a field of a type or a view's row stays unknown whatever query fills it.
+/// A `FETCH` through a cursor variable that may name another portal reads
+/// that portal's row, so its fields stay unknown too.
+#[test]
+fn composite_fields_and_rows_of_renamed_cursors_stay_unknown() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE TYPE pair AS (name text, seen integer);
+         CREATE VIEW shown AS SELECT name, seen FROM audit;
+         CREATE FUNCTION filled(p boolean) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE
+          v pair;
+          w shown;
+          r record;
+          c CURSOR FOR SELECT name FROM audit;
+          d CURSOR FOR SELECT seen AS name FROM audit;
+         BEGIN
+          SELECT seen AS name, seen INTO v FROM audit;
+          SELECT seen AS name, seen INTO w FROM audit;
+          EXECUTE 'SELECT ' || v.name || w.name;
+          OPEN d;
+          IF p THEN c := d; ELSE OPEN c; END IF;
+          FETCH c INTO r;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    let unknown = |name: &str| (name.to_owned(), "?".to_owned());
+    assert_eq!(
+        names(&database, "filled"),
+        [vec![unknown("v.name"), unknown("w.name")], vec![unknown("r.name")]]
+    );
 }
 
 /// `%TYPE` and `%ROWTYPE` resolve through the schema under the function's

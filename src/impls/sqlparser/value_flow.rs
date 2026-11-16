@@ -78,7 +78,12 @@ pub(crate) fn value_flow<'b, 'db, DB: DatabaseLike>(
         cursors: BTreeMap::new(),
     };
     flow.block(block, State::new())?;
-    Ok(ValueFlow { definitions: flow.definitions, points: flow.points, cursors: flow.cursors })
+    Ok(ValueFlow {
+        definitions: flow.definitions,
+        points: flow.points,
+        cursors: flow.cursors,
+        rows: Default::default(),
+    })
 }
 
 /// Where `write` sits in the body.

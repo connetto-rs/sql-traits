@@ -1,7 +1,7 @@
 //! The facts each expression node of one query takes.
 
 use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
-use core::ops::ControlFlow;
+use core::{ops::ControlFlow, sync::atomic::Ordering};
 
 use sqlparser::ast::{
     ArgMode, BinaryOperator, CastKind, DataType, DuplicateTreatment, Expr, Function, FunctionArg,
@@ -22,9 +22,9 @@ use crate::{
     structs::{
         AggregateKind, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope, Definition,
         DefinitionSource, ExpressionScope, FunctionKind, IdentifierCase, OperandType,
-        OperatorResolution, Output, PlPgSqlScope, PlPgSqlVariable, QueryOutput, SelectedOperator,
+        OperatorResolution, PlPgSqlScope, PlPgSqlVariable, QueryOutput, SelectedOperator,
         TargetName, VariableKind,
-        plpgsql_flow::{FlowPoint, Reached},
+        plpgsql_flow::{FlowPoint, Reached, Round, Row, is_record, join},
         plpgsql_scope::stored_parts,
     },
     traits::{
@@ -112,57 +112,53 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
 /// and its position among that node's applications.
 pub(crate) type Site = (usize, usize);
 
+/// The definitions of a record reaching a field read, each with the type it
+/// gives the field, and the round solving the rows the read stands in.
+type RecordCandidates<'r, 'db, DB> =
+    (Vec<(Definition<'r, 'r, DB>, Option<OperandType<'db>>)>, Option<&'r Round<'r>>);
+
 /// Whether `variable` is a trigger function's `NEW` or `OLD`.
 fn is_trigger_row(variable: &PlPgSqlVariable<'_>) -> bool {
     *variable.kind() == VariableKind::Trigger && matches!(variable.name(), "new" | "old")
 }
 
-/// The type every one of `types` is, unknown when they differ or there is
-/// none.
-fn agreed<'db>(mut types: impl Iterator<Item = OperandType<'db>>) -> OperandType<'db> {
-    let first = types.next().unwrap_or(OperandType::Unknown);
-    if types.all(|data_type| data_type == first) { first } else { OperandType::Unknown }
-}
-
-/// The type of the output `field` names of `statement`, a query whose rows a
-/// record takes, typed under `scope`. The first output of that name counts,
-/// as a record field reads it, and every output stays unknown once one whose
-/// name is not modeled or an unexpanded wildcard comes first. A statement
-/// other than a query, whose outputs the model does not record, gives an
-/// unknown type.
+/// The outputs of `statement`, the query a record's row comes from, typed
+/// under `scope` in `round`: each up to the first output whose name is not
+/// modeled or an unexpanded wildcard, by stored name, with `None` for one
+/// whose type read a record field `round` leaves untyped. A statement other
+/// than a query, whose outputs the model does not record, outputs nothing.
 ///
 /// # Errors
 ///
 /// Returns the relation-name lookup errors building the query's context.
-fn record_output_type<DB: DatabaseLike>(
+pub(crate) fn row_of<DB: DatabaseLike>(
     statement: &Statement,
-    field: &Ident,
     scope: &PlPgSqlScope<'_, '_, DB>,
     case: IdentifierCase,
-) -> Result<OperandType<'static>, LookupError> {
-    let Statement::Query(query) = statement else { return Ok(OperandType::Unknown) };
+    round: &Round<'_>,
+) -> Result<Row, LookupError> {
+    let Statement::Query(query) = statement else { return Ok(Vec::new()) };
     let database = scope.database();
     let scope = ExpressionScope::PlPgSql(scope);
     let context = ExpressionContext::for_root(ScopedRoot::Query(query), &scope, database, case)?;
-    let wanted = stored_identifier(&field.value, field.quote_style.is_some());
+    let mut row = Vec::new();
     for output in context.query_outputs(query) {
-        match output {
-            QueryOutput::Column { name: Some((name, quoted)), definition } => {
-                if stored_identifier(name, quoted) == wanted {
-                    // The type borrows from the query's context, which ends
-                    // here, so its name is copied out.
-                    return Ok(match context.output_type(definition)? {
-                        OperandType::Known { type_name, typmod } => {
-                            OperandType::Known { type_name: type_name.into_owned(), typmod }
-                        }
-                        _ => OperandType::Unknown,
-                    });
-                }
+        let QueryOutput::Column { name: Some((name, quoted)), definition } = output else {
+            break;
+        };
+        round.untyped.store(false, Ordering::Relaxed);
+        // The type borrows from the query's context, which ends here, so its
+        // name is copied out.
+        let data_type = match context.output_type(definition)? {
+            OperandType::Known { type_name, typmod } => {
+                OperandType::Known { type_name: type_name.into_owned(), typmod }
             }
-            QueryOutput::Column { name: None, .. } | QueryOutput::Unexpanded => break,
-        }
+            _ => OperandType::Unknown,
+        };
+        let typed = !round.untyped.load(Ordering::Relaxed);
+        row.push((stored_identifier(name, quoted).into_owned(), typed.then_some(data_type)));
     }
-    Ok(OperandType::Unknown)
+    Ok(row)
 }
 
 /// What the text PostgreSQL deparses a stored expression into pins when
@@ -629,9 +625,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// The type of the field of `variable` that `expression` names. A field
     /// of a table's row takes its column's type, a field of a trigger
     /// function's `NEW` or `OLD` the type every table of
-    /// [`Self::row_field_types`] agrees on, and a field of any other record
-    /// the type every definition of [`Self::record_field_types`] agrees on.
-    /// A field of a field stays unknown.
+    /// [`Self::row_field_types`] agrees on, and a field of a record the type
+    /// every definition of [`Self::record_field_types`] agrees on. A field
+    /// of a field and of a variable of any other composite type stays
+    /// unknown.
     fn field_type(
         &self,
         variable: &PlPgSqlVariable<'db>,
@@ -640,13 +637,32 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let Some(field) = self.field(expression) else { return Ok(OperandType::Unknown) };
         if is_trigger_row(variable) {
             let types = self.trigger_field_types(field)?;
-            return Ok(agreed(types.into_iter().map(|(_, data_type)| data_type)));
+            let joined = types
+                .into_iter()
+                .fold(None, |joined, (_, data_type)| join(joined, Some(data_type)));
+            return Ok(joined.unwrap_or(OperandType::Unknown));
         }
         if let Some(table) = self.row_table(variable)? {
             return self.column_of(table, field);
         }
-        let candidates = self.record_candidates(variable, field)?;
-        Ok(agreed(candidates.into_iter().map(|(_, data_type)| data_type)))
+        if !is_record(variable) {
+            return Ok(OperandType::Unknown);
+        }
+        let (candidates, round) = self.record_candidates(variable, field)?;
+        if candidates.is_empty() {
+            return Ok(OperandType::Unknown);
+        }
+        let joined =
+            candidates.into_iter().fold(None, |joined, (_, data_type)| join(joined, data_type));
+        Ok(joined.unwrap_or_else(|| {
+            // Every definition gives a row the round solving the rows has
+            // not typed yet, so the output reading the field waits for one
+            // that has.
+            if let Some(round) = round {
+                round.untyped.store(true, Ordering::Relaxed);
+            }
+            OperandType::Unknown
+        }))
     }
 
     /// The table whose row `variable` is declared as, `None` for a record and
@@ -773,23 +789,26 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     ///
     /// A row a query gives the record, through `SELECT ... INTO`, a `FOR`
     /// loop over the query or over a cursor and a `FETCH` from a cursor
-    /// declared with its query, takes the type of the query's first output
-    /// of that name. The query is typed under the names it reaches where the
-    /// body evaluates it, a cursor's parameters included. A field the query
-    /// does not output stays unknown, and so does every field once an
-    /// output whose name is not modeled or an unexpanded wildcard comes
-    /// first. Any other value the record is given, a dynamic command's row
-    /// and a statement other than a query included, gives an unknown type.
-    /// A definition of one field is left out, since PostgreSQL converts the
-    /// value to the type the field already has, and so is the null of a
-    /// record never assigned, whose fields PostgreSQL refuses to read.
+    /// declared with its query while the cursor variable holds its own name,
+    /// takes the type of the query's first output of that name. The query is
+    /// typed under the names it reaches where the body evaluates it, a
+    /// cursor's parameters included, and a field of the record it reads
+    /// takes the type every row reaching it agrees on, through any loop the
+    /// record's own rows go around. A field the query does not output stays
+    /// unknown, and so does every field once an output whose name is not
+    /// modeled or an unexpanded wildcard comes first. Any other value the
+    /// record is given, a dynamic command's row and a statement other than a
+    /// query included, gives an unknown type. A definition of one field is
+    /// left out, since PostgreSQL converts the value to the type the field
+    /// already has, and so is the null of a record never assigned, whose
+    /// fields PostgreSQL refuses to read.
     ///
     /// [`Self::type_of`] answers the type every definition listed agrees on,
     /// and [`OperandType::Unknown`] when they disagree or none is listed. A
-    /// field of a variable a table's row types, of a trigger function's
-    /// `NEW` or `OLD`, which [`Self::row_field_types`] answers, and of a
-    /// field, any other node and an expression outside a PL/pgSQL body
-    /// list none.
+    /// field of a variable a table's row or any other composite type types,
+    /// of a trigger function's `NEW` or `OLD`, which
+    /// [`Self::row_field_types`] answers, and of a field, any other node and
+    /// an expression outside a PL/pgSQL body list none.
     ///
     /// # Errors
     ///
@@ -847,66 +866,51 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             return Ok(Vec::new());
         };
         let Some(field) = self.field(expression) else { return Ok(Vec::new()) };
-        if is_trigger_row(&variable) || self.row_table(&variable)?.is_some() {
+        if is_trigger_row(&variable) || !is_record(&variable) {
             return Ok(Vec::new());
         }
-        self.record_candidates(&variable, field)
+        let (candidates, _) = self.record_candidates(&variable, field)?;
+        Ok(candidates
+            .into_iter()
+            .map(|(definition, data_type)| (definition, data_type.unwrap_or(OperandType::Unknown)))
+            .collect())
     }
 
     /// The definitions of [`Self::record_field_types`] with the types they
-    /// give the field `field` of the record `variable`.
+    /// give the field `field` of the record `variable`, `None` for a row the
+    /// round solving the rows has not typed yet, and that round when the
+    /// scope stands in one.
     fn record_candidates(
         &self,
         variable: &PlPgSqlVariable<'db>,
         field: &Ident,
-    ) -> Result<Vec<(Definition<'query, 'query, DB>, OperandType<'db>)>, LookupError> {
+    ) -> Result<RecordCandidates<'query, 'db, DB>, LookupError> {
         // A scope standing at no point of the flow, or at one no path
         // reaches, lists no definition.
         let reached = self.variables.and_then(PlPgSqlScope::point).map(FlowPoint::reaching);
-        let Some(Reached { flow, state: Some(state), visiting }) = reached.transpose()? else {
-            return Ok(Vec::new());
+        let Some(Reached { flow, state: Some(state), round }) = reached.transpose()? else {
+            return Ok((Vec::new(), None));
         };
+        let wanted = stored_identifier(&field.value, field.quote_style.is_some());
         let mut candidates = Vec::new();
         for definition in flow.definitions_of(state, variable) {
-            if !definition.part().is_empty() {
+            if !definition.part().is_empty()
+                || matches!(definition.source(), DefinitionSource::Null)
+            {
                 continue;
             }
-            let field_type = match definition.source() {
-                DefinitionSource::Null => continue,
-                DefinitionSource::QueryOutput { statement, output: Output::Row, .. } => {
-                    match definition.scope_within(visiting) {
-                        Some(scope) => record_output_type(statement, field, &scope, self.case)?,
-                        // The record is being typed from this definition
-                        // already, on the way here.
-                        None => OperandType::Unknown,
-                    }
+            let field_type = match (definition.row_source(), round) {
+                (None, _) => Some(OperandType::Unknown),
+                // A lookup error typing the query surfaces once the rows are
+                // solved, where every field of the row reads it.
+                (Some(source), Some(round)) => {
+                    round.rows.field(source, &wanted).unwrap_or(Some(OperandType::Unknown))
                 }
-                DefinitionSource::CursorOutput { output: Output::Row, .. } => {
-                    match definition.cursor_query_within(visiting) {
-                        Some((statement, scope)) => {
-                            record_output_type(statement, field, &scope, self.case)?
-                        }
-                        // A `refcursor`, a cursor never opened, or one the
-                        // record is being typed from on the way here.
-                        None => OperandType::Unknown,
-                    }
-                }
-                DefinitionSource::Incoming
-                | DefinitionSource::Value(_)
-                | DefinitionSource::QueryOutput { output: Output::Ordinal(_), .. }
-                | DefinitionSource::DynamicOutput { .. }
-                | DefinitionSource::CursorOutput { output: Output::Ordinal(_), .. }
-                | DefinitionSource::ArrayElement { .. }
-                | DefinitionSource::LoopIndex { .. }
-                | DefinitionSource::CursorName
-                | DefinitionSource::PortalName
-                | DefinitionSource::Diagnostics(_)
-                | DefinitionSource::CallOutput { .. }
-                | DefinitionSource::Unknown => OperandType::Unknown,
+                (Some(source), None) => flow.row_types(self.case).field(source, &wanted)?,
             };
             candidates.push((definition, field_type));
         }
-        Ok(candidates)
+        Ok((candidates, round))
     }
 
     /// Each table a trigger executing the function of the PL/pgSQL scope is
