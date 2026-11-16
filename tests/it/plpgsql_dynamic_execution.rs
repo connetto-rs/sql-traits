@@ -436,11 +436,11 @@ fn an_alias_of_a_loop_variable_answers_the_loop_name() {
 /// A field of a cursor loop's record takes the type of the cursor query's
 /// output of that name, an untyped literal's being `text`, and a scalar
 /// subquery the type of its one output, as PostgreSQL 18 reports with
-/// `pg_typeof`. The cursor query reaches no variable, so an output reading
-/// the cursor's parameter stays unknown rather than taking the type of a
-/// body variable of the same name, and so does a field the query does not
-/// output. A wildcard whose columns are unknown may output the field before
-/// the column of that name, so every field after it stays unknown too.
+/// `pg_typeof`. An output reading the cursor's parameter takes the
+/// parameter's type over a body variable of the same name, and a field the
+/// query does not output stays unknown. A wildcard whose columns are unknown
+/// may output the field before the column of that name, so every field
+/// after it stays unknown too.
 #[test]
 fn cursor_loop_fields_and_scalar_subqueries_take_their_output_types() {
     let database = postgres(
@@ -464,7 +464,7 @@ fn cursor_loop_fields_and_scalar_subqueries_take_their_output_types() {
             vec![
                 ("rec.name".to_owned(), "pg_catalog.text".to_owned()),
                 ("rec.seen".to_owned(), "pg_catalog.int4".to_owned()),
-                ("rec.shadow".to_owned(), "?".to_owned()),
+                ("rec.shadow".to_owned(), "pg_catalog.text".to_owned()),
                 ("rec.lit".to_owned(), "pg_catalog.text".to_owned()),
                 ("rec.missing".to_owned(), "?".to_owned()),
             ],
@@ -476,6 +476,207 @@ fn cursor_loop_fields_and_scalar_subqueries_take_their_output_types() {
             ],
             vec![("rec.name".to_owned(), "?".to_owned())],
         ]
+    );
+}
+
+/// A field of a record takes the type of the output of that name of the
+/// query whose row reaches the read, through `SELECT ... INTO`, a `FOR`
+/// loop over a query, the empty row a loop over no row leaves, and a
+/// `FETCH` from a cursor declared with its query, as PostgreSQL 18 reports
+/// with `pg_typeof`. The query is typed where the body runs it, so an
+/// output reading a variable takes the variable's type, and an output
+/// reading the record's own field through a loop takes the type of the row
+/// that entered the loop.
+#[test]
+fn record_fields_take_the_output_types_of_the_rows_reaching_them() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE FUNCTION filled() RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE
+          r record;
+          k integer := 7;
+          c CURSOR FOR SELECT seen AS name FROM audit;
+         BEGIN
+          SELECT name, seen INTO r FROM audit;
+          EXECUTE 'SELECT ' || r.name || r.seen;
+          FOR r IN SELECT k AS name FROM audit WHERE false LOOP END LOOP;
+          EXECUTE 'SELECT ' || r.name;
+          FOR r IN SELECT name FROM audit LOOP EXECUTE 'SELECT ' || r.name; END LOOP;
+          OPEN c;
+          FETCH c INTO r;
+          CLOSE c;
+          EXECUTE 'SELECT ' || r.name;
+          FOR i IN 1..2 LOOP SELECT r.name INTO r FROM audit; END LOOP;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    let typed = |name: &str, data_type: &str| vec![(name.to_owned(), data_type.to_owned())];
+    assert_eq!(
+        names(&database, "filled"),
+        [
+            vec![
+                ("r.name".to_owned(), "pg_catalog.text".to_owned()),
+                ("r.seen".to_owned(), "pg_catalog.int4".to_owned()),
+            ],
+            typed("r.name", "pg_catalog.int4"),
+            typed("r.name", "pg_catalog.text"),
+            typed("r.name", "pg_catalog.int4"),
+            typed("r.name", "pg_catalog.int4"),
+        ]
+    );
+}
+
+/// Writing one field of a record leaves the field the type PostgreSQL 18
+/// converts the value to, the one the record's row gave it. A cursor query
+/// reading a record's field types it from the rows reaching every opening
+/// of the cursor. A row from a dynamic command or a `refcursor` stays
+/// unknown, and so does a row a cursor gives from the record's own field
+/// while such a row reaches its opening. `record_field_types` lists the
+/// first two with their unknown types, but nothing for a row variable's
+/// field, which takes its column's type.
+#[test]
+fn record_fields_skip_field_writes_and_follow_cursor_openings() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE FUNCTION mixed(p boolean) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE
+          r record;
+          s record;
+          c refcursor;
+          whole audit;
+          d CURSOR FOR SELECT r.name AS copied, seen AS name FROM audit;
+          e CURSOR FOR SELECT r.name AS name FROM audit;
+         BEGIN
+          SELECT name INTO r FROM audit;
+          r.name := 5;
+          OPEN d;
+          FETCH d INTO s;
+          CLOSE d;
+          FOR q IN d LOOP END LOOP;
+          EXECUTE 'SELECT ' || r.name || s.copied || s.name || whole.name;
+          IF p THEN
+           EXECUTE 'SELECT 1 AS name' INTO r;
+          ELSE
+           OPEN c FOR SELECT seen AS name FROM audit;
+           FETCH c INTO r;
+          END IF;
+          EXECUTE 'SELECT ' || r.name;
+          FOR i IN 1..2 LOOP
+           OPEN e;
+           FETCH e INTO r;
+           CLOSE e;
+          END LOOP;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    let text = || "pg_catalog.text".to_owned();
+    assert_eq!(
+        names(&database, "mixed"),
+        [
+            vec![
+                ("r.name".to_owned(), text()),
+                ("s.copied".to_owned(), text()),
+                ("s.name".to_owned(), "pg_catalog.int4".to_owned()),
+                ("whole.name".to_owned(), text()),
+            ],
+            Vec::new(),
+            vec![("r.name".to_owned(), "?".to_owned())],
+            vec![("r.name".to_owned(), "?".to_owned())],
+        ]
+    );
+    let body = function(&database, "mixed").dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let candidates = |site: &DynamicExecution<'_, '_, ParserDB>, written: &str| {
+        let context = site.context(IdentifierCase::Folded).unwrap();
+        let mut listed = None;
+        let _ = visit_expressions(site.command(), |expression| {
+            if expression.to_string() == written {
+                listed = Some(
+                    context
+                        .record_field_types(expression)
+                        .unwrap()
+                        .iter()
+                        .map(|(definition, field)| {
+                            (format!("{:?}", definition.source()), rendered(field))
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        listed.expect("the command reads the name")
+    };
+    assert_eq!(candidates(&sites[0], "whole.name"), []);
+    assert_eq!(candidates(&sites[0], "'SELECT '"), []);
+    let listed = candidates(&sites[2], "r.name");
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(listed[0].0.starts_with("DynamicOutput"), "{listed:?}");
+    assert!(listed[1].0.starts_with("CursorOutput"), "{listed:?}");
+    assert!(listed.iter().all(|(_, field)| field == "?"));
+}
+
+/// Rows feeding one another around a loop are typed together, so a record
+/// eight branches of a loop each refill from its own field takes the type
+/// of the row entering the loop, `text` as PostgreSQL 18 reports with
+/// `pg_typeof`, without typing the branches once per path between them.
+#[test]
+fn records_refilled_around_a_loop_by_many_branches_keep_their_type() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE FUNCTION grown(p integer) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE r record;
+         BEGIN
+          SELECT name INTO r FROM audit;
+          FOR i IN 1..p LOOP
+           CASE i
+            WHEN 1 THEN SELECT r.name AS name INTO r;
+            WHEN 2 THEN SELECT r.name AS name INTO r;
+            WHEN 3 THEN SELECT r.name AS name INTO r;
+            WHEN 4 THEN SELECT r.name AS name INTO r;
+            WHEN 5 THEN SELECT r.name AS name INTO r;
+            WHEN 6 THEN SELECT r.name AS name INTO r;
+            WHEN 7 THEN SELECT r.name AS name INTO r;
+            WHEN 8 THEN SELECT r.name AS name INTO r;
+           END CASE;
+          END LOOP;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    assert_eq!(names(&database, "grown"), [[("r.name".to_owned(), "pg_catalog.text".to_owned())]]);
+}
+
+/// A variable of a composite type other than a table's row keeps its
+/// declared fields, which PostgreSQL 18 fills by position and converts, so
+/// a field of a type or a view's row stays unknown whatever query fills it.
+/// A `FETCH` through a cursor variable that may name another portal reads
+/// that portal's row, so its fields stay unknown too.
+#[test]
+fn composite_fields_and_rows_of_renamed_cursors_stay_unknown() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE TYPE pair AS (name text, seen integer);
+         CREATE VIEW shown AS SELECT name, seen FROM audit;
+         CREATE FUNCTION filled(p boolean) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE
+          v pair;
+          w shown;
+          r record;
+          c CURSOR FOR SELECT name FROM audit;
+          d CURSOR FOR SELECT seen AS name FROM audit;
+         BEGIN
+          SELECT seen AS name, seen INTO v FROM audit;
+          SELECT seen AS name, seen INTO w FROM audit;
+          EXECUTE 'SELECT ' || v.name || w.name;
+          OPEN d;
+          IF p THEN c := d; ELSE OPEN c; END IF;
+          FETCH c INTO r;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    let unknown = |name: &str| (name.to_owned(), "?".to_owned());
+    assert_eq!(
+        names(&database, "filled"),
+        [vec![unknown("v.name"), unknown("w.name")], vec![unknown("r.name")]]
     );
 }
 
@@ -1073,4 +1274,44 @@ fn a_polymorphic_result_declares_dollar_zero() {
         [[("$0".to_owned(), "pg_catalog.anyelement".to_owned())]]
     );
     assert_eq!(names(&database, "with_out"), [[("$0".to_owned(), "?".to_owned())]]);
+}
+
+/// The rows a record's queries give are typed under each identifier case
+/// apart, so a query whose relation only the folded comparison finds twice
+/// keeps that lookup error for every field read of its row under that case
+/// alone. A record whose only row comes from its own field never takes a
+/// type, and a read no path reaches lists no definition.
+#[test]
+fn record_rows_follow_the_identifier_case_and_stay_unknown_without_a_row() {
+    let database = postgres(
+        "CREATE TABLE audit (name text);
+         CREATE TABLE \"AUDIT\" (name integer);
+         CREATE FUNCTION cased(p boolean) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE r record; s record;
+         BEGIN
+          SELECT name INTO r FROM audit;
+          EXECUTE 'SELECT ' || r.name;
+          LOOP SELECT s.name AS name INTO s; EXIT WHEN p; END LOOP;
+          EXECUTE 'SELECT ' || s.name;
+          RETURN;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    let body = function(&database, "cased").dynamic_execution_sites(&database).unwrap();
+    let read = |site: &DynamicExecution<'_, '_, ParserDB>, case: IdentifierCase| {
+        let context = site.context(case).unwrap();
+        let Expr::BinaryOp { right: field, .. } = site.command() else { panic!("a concatenation") };
+        match (context.type_of(field), context.record_field_types(field)) {
+            (Ok(data_type), Ok(listed)) => (rendered(&data_type), listed.len()),
+            (Err(LookupError::AmbiguousTableLookup { .. }), Err(_)) => ("ambiguous".to_owned(), 0),
+            unexpected => panic!("{unexpected:?}"),
+        }
+    };
+    let sites = body.sites().unwrap();
+    let text = || "pg_catalog.text".to_owned();
+    assert_eq!(read(&sites[0], IdentifierCase::AsWritten), (text(), 1));
+    assert_eq!(read(&sites[0], IdentifierCase::Folded), ("ambiguous".to_owned(), 0));
+    assert_eq!(read(&sites[0], IdentifierCase::Exact), (text(), 1));
+    assert_eq!(read(&sites[1], IdentifierCase::Folded), ("?".to_owned(), 1));
+    assert_eq!(read(&sites[2], IdentifierCase::Folded), ("?".to_owned(), 0));
 }

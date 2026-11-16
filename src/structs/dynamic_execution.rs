@@ -8,10 +8,10 @@ use sqlparser_plpgsql::embedded::Block;
 
 use crate::{
     errors::LookupError,
-    impls::{BodyNames, SiteKey, SiteSource, dql::scoped_roots::ScopedRoot, value_flow},
+    impls::{BodyNames, SiteSource, dql::scoped_roots::ScopedRoot, value_flow},
     structs::{
         ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope,
-        plpgsql_flow::{ValueFlow, VariableRead, read_variables},
+        plpgsql_flow::{FlowSource, ValueFlow, VariableRead, read_variables},
     },
     traits::DatabaseLike,
 };
@@ -60,13 +60,12 @@ enum SiteRoot<'b> {
 /// The names a site's SQL reaches besides its own relations.
 #[derive(Debug)]
 pub(crate) enum SiteScope<'b, 'db, DB: DatabaseLike> {
-    /// The variables in reach where a PL/pgSQL body evaluates it.
+    /// The variables in reach where a PL/pgSQL body evaluates it, standing
+    /// at the statement, expression or dynamic SQL of the body holding the
+    /// site.
     PlPgSql {
         /// The variables in reach.
         scope: PlPgSqlScope<'b, 'db, DB>,
-        /// The statement, expression or dynamic SQL of the body holding
-        /// the site.
-        key: SiteKey,
         /// The value flow of the body.
         flow: Arc<SiteFlow<'b, 'db, DB>>,
     },
@@ -77,8 +76,8 @@ pub(crate) enum SiteScope<'b, 'db, DB: DatabaseLike> {
 impl<DB: DatabaseLike> Clone for SiteScope<'_, '_, DB> {
     fn clone(&self) -> Self {
         match self {
-            Self::PlPgSql { scope, key, flow } => {
-                Self::PlPgSql { scope: scope.clone(), key: *key, flow: Arc::clone(flow) }
+            Self::PlPgSql { scope, flow } => {
+                Self::PlPgSql { scope: scope.clone(), flow: Arc::clone(flow) }
             }
             Self::FunctionBody(function) => Self::FunctionBody(function),
         }
@@ -87,7 +86,7 @@ impl<DB: DatabaseLike> Clone for SiteScope<'_, '_, DB> {
 
 /// The value flow of one PL/pgSQL body, which the sites of one
 /// [`DynamicExecutionSites::sites`] call share and the first
-/// [`DynamicExecution::reads`] computes.
+/// [`DynamicExecution::reads`] or record field typed computes.
 #[derive(Debug)]
 pub(crate) struct SiteFlow<'b, 'db, DB: DatabaseLike> {
     names: &'b BodyNames<'db, DB>,
@@ -113,6 +112,12 @@ impl<'b, 'db, DB: DatabaseLike> SiteFlow<'b, 'db, DB> {
             })
             .as_ref()
             .map_err(Clone::clone)
+    }
+}
+
+impl<DB: DatabaseLike> FlowSource<DB> for SiteFlow<'_, '_, DB> {
+    fn flow(&self) -> Result<&ValueFlow<'_, '_, DB>, LookupError> {
+        self.get()
     }
 }
 
@@ -291,7 +296,9 @@ impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
         &self,
         case: IdentifierCase,
     ) -> Result<Vec<VariableRead<'_, 'db, DB>>, LookupError> {
-        let SiteScope::PlPgSql { scope, key, flow } = &self.scope else { return Ok(Vec::new()) };
+        let SiteScope::PlPgSql { scope, flow } = &self.scope else { return Ok(Vec::new()) };
+        let Some(point) = scope.point() else { return Ok(Vec::new()) };
+        let state = point.reaching()?.state;
         let flow = flow.get()?;
         let mut variables = Vec::new();
         read_variables(&self.context(case)?, scope, self.command(), &mut variables)?;
@@ -301,6 +308,6 @@ impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
                 ExpressionContext::for_expression(argument, &plpgsql, self.database, case)?;
             read_variables(&context, scope, argument, &mut variables)?;
         }
-        Ok(flow.reaching(variables, flow.points.get(key)))
+        Ok(flow.reaching(variables, state))
     }
 }

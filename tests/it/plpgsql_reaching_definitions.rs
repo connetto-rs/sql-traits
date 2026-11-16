@@ -176,6 +176,7 @@ fn a_nested_assignment_keeps_the_scope_it_was_written_in() {
     let [assigned] = definitions.as_slice() else { panic!("one assignment reaches") };
     let DefinitionSource::Value(value) = assigned.source() else { panic!("a value") };
     let scope = assigned.scope().expect("an assigned value has a scope");
+    let scope = ExpressionScope::PlPgSql(&scope);
     let context =
         ExpressionContext::for_expression(value, &scope, &database, IdentifierCase::Folded)
             .unwrap();
@@ -338,8 +339,9 @@ fn a_strict_query_that_raises_leaves_the_earlier_value() {
     );
 }
 
-/// A loop over a query assigns its target each row, and a null when the
-/// query returns none. An empty `FOREACH` keeps what the target held.
+/// A loop over a query assigns its target each row, and the empty row, a
+/// null, when the query returns none. An empty `FOREACH` keeps what the
+/// target held.
 #[test]
 fn loops_over_rows_and_arrays_assign_their_targets() {
     assert_eq!(
@@ -352,16 +354,22 @@ fn loops_over_rows_and_arrays_assign_their_targets() {
              END"
         ),
         [vec![
-            read("s", &["null", "Ordinal(0) Each of SELECT name FROM t"]),
+            read(
+                "s",
+                &[
+                    "Ordinal(0) Empty of SELECT name FROM t",
+                    "Ordinal(0) Each of SELECT name FROM t"
+                ]
+            ),
             read("e", &["'SELECT 2'", "Row slice 0 of ARRAY[p]"]),
         ]]
     );
 }
 
-/// A loop over a command's rows assigns each row, and a null when the
-/// command returns none.
+/// A loop over a command's rows assigns each row, and the empty row when
+/// the command returns none.
 #[test]
-fn a_loop_over_a_command_assigns_each_row_or_a_null() {
+fn a_loop_over_a_command_assigns_each_row_or_the_empty_row() {
     assert_eq!(
         reaching(
             "DECLARE s text := 'SELECT 1';
@@ -373,7 +381,13 @@ fn a_loop_over_a_command_assigns_each_row_or_a_null() {
         [
             vec![read("p", &["incoming"])],
             vec![read("s", &["Ordinal(0) Each of EXECUTE 'SELECT ' || p"])],
-            vec![read("s", &["null", "Ordinal(0) Each of EXECUTE 'SELECT ' || p"])],
+            vec![read(
+                "s",
+                &[
+                    "Ordinal(0) Empty of EXECUTE 'SELECT ' || p",
+                    "Ordinal(0) Each of EXECUTE 'SELECT ' || p",
+                ],
+            )],
         ]
     );
 }

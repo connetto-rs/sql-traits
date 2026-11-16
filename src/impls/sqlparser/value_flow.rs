@@ -37,7 +37,7 @@ use crate::{
     errors::LookupError,
     structs::{
         DefinitionSource, DiagnosticsItem, Output, PlPgSqlScope, PlPgSqlVariable, Rows, TargetStep,
-        plpgsql_flow::{Slot, State, ValueFlow, Written},
+        plpgsql_flow::{CursorQuery, Slot, State, ValueFlow, Written},
         plpgsql_scope::stored_parts,
     },
     traits::{DatabaseLike, FunctionLike},
@@ -75,9 +75,15 @@ pub(crate) fn value_flow<'b, 'db, DB: DatabaseLike>(
         keys: BTreeMap::new(),
         points: BTreeMap::new(),
         frames: Vec::new(),
+        cursors: BTreeMap::new(),
     };
     flow.block(block, State::new())?;
-    Ok(ValueFlow { definitions: flow.definitions, points: flow.points })
+    Ok(ValueFlow {
+        definitions: flow.definitions,
+        points: flow.points,
+        cursors: flow.cursors,
+        rows: Default::default(),
+    })
 }
 
 /// Where `write` sits in the body.
@@ -183,6 +189,9 @@ struct Flow<'b, 'db, DB: DatabaseLike> {
     /// where the body evaluates it.
     points: BTreeMap<SiteKey, State>,
     frames: Vec<Frame<'b>>,
+    /// The query each cursor declared with one opens, by the cursor
+    /// variable's id, as the first `OPEN` or `FOR` loop opening it reads it.
+    cursors: BTreeMap<usize, CursorQuery<'b, 'db, DB>>,
 }
 
 impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
@@ -197,12 +206,15 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         key: SiteKey,
         sql: &dyn Display,
     ) -> Result<PlPgSqlScope<'b, 'db, DB>, LookupError> {
-        match (self.namespaces.get(&key), self.paths.get(&key)) {
-            (Some(namespace), Some(path)) => {
-                Ok(PlPgSqlScope::new(self.names, namespace.clone(), path.clone()))
-            }
-            _ => Err(self.unresolvable(sql)),
-        }
+        self.scope_of(key).ok_or_else(|| self.unresolvable(sql))
+    }
+
+    /// The names and path the SQL `key` names is evaluated under, `None`
+    /// where the body records none.
+    fn scope_of(&self, key: SiteKey) -> Option<PlPgSqlScope<'b, 'db, DB>> {
+        let namespace = self.namespaces.get(&key)?;
+        let path = self.paths.get(&key)?;
+        Some(PlPgSqlScope::new(self.names, namespace.clone(), path.clone()))
     }
 
     /// The names the targets of the write at `address` reach.
@@ -255,8 +267,8 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     }
 
     /// The definitions the write at `address` gives `targets`, each the
-    /// output `source` builds, evaluated under `scope`, or the null a loop
-    /// over no row assigns with `null`.
+    /// output `source` builds, evaluated under `scope`, `empty` telling the
+    /// ones a loop over no row makes apart.
     ///
     /// A lone target holding a row takes the whole row, any other the
     /// column at its position. With `whole`, a lone target takes the whole
@@ -267,7 +279,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         address: usize,
         targets: &'b [Target],
         whole: bool,
-        null: bool,
+        empty: bool,
         scope: Option<&PlPgSqlScope<'b, 'db, DB>>,
         source: impl Fn(Output) -> DefinitionSource<'b, 'db>,
         sql: &dyn Display,
@@ -285,18 +297,13 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             .into_iter()
             .enumerate()
             .map(|(position, Resolved { variable, part, .. })| {
-                let (source, scope) = if null {
-                    (DefinitionSource::Null, None)
-                } else {
-                    let output = if lone { Output::Row } else { Output::Ordinal(position) };
-                    (source(output), scope.cloned())
-                };
+                let output = if lone { Output::Row } else { Output::Ordinal(position) };
                 Pending {
-                    key: (address, position, null),
+                    key: (address, position, empty),
                     variable,
                     part,
-                    source,
-                    scope,
+                    source: source(output),
+                    scope: scope.cloned(),
                     kills: true,
                 }
             })
@@ -371,11 +378,19 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         }
     }
 
-    /// Records `state` as reaching the arguments and the query of `cursor`
-    /// as it opens.
-    fn opened(&mut self, cursor: &BoundCursor, state: &State) {
+    /// Records `state` as reaching the arguments and the query of `cursor`,
+    /// which the cursor variable `variable` names, as it opens, and the
+    /// query as the one the cursor opens.
+    fn opened(&mut self, variable: &PlPgSqlVariable<'db>, cursor: &'b BoundCursor, state: &State) {
+        let key = SiteKey::of(Sql::Statement(&cursor.query));
         self.evaluated_queries(&cursor.arguments, state);
-        self.evaluated(SiteKey::of(Sql::Statement(&cursor.query)), state);
+        self.evaluated(key, state);
+        if !self.cursors.contains_key(&variable.id())
+            && let Some(scope) = self.scope_of(key)
+        {
+            self.cursors
+                .insert(variable.id(), CursorQuery { statement: &cursor.query, key, scope });
+        }
     }
 
     /// Walks `nodes` from `state`, `None` where no path reaches them.
@@ -556,8 +571,9 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         open: &'b Open,
         state: &mut State,
     ) -> Result<(), LookupError> {
+        let variable = self.cursor(address, open.cursor())?;
         match open {
-            Open::Bound(cursor) => self.opened(cursor, state),
+            Open::Bound(cursor) => self.opened(&variable, cursor, state),
             Open::Query { query, .. } => {
                 self.evaluated(SiteKey::of(Sql::Statement(query)), state);
             }
@@ -568,7 +584,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         // A cursor variable already naming a portal keeps its name.
         let pending = Pending {
             key: (address, 0, false),
-            variable: self.cursor(address, open.cursor())?,
+            variable,
             part: Vec::new(),
             source: DefinitionSource::PortalName,
             scope: None,
@@ -751,7 +767,10 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             LoopControl::Query { query, .. } => {
                 self.evaluated(SiteKey::of(Sql::Statement(query)), entry);
             }
-            LoopControl::Cursor { cursor, .. } => self.opened(cursor, entry),
+            LoopControl::Cursor { cursor, .. } => {
+                let variable = self.cursor(address, &cursor.name)?;
+                self.opened(&variable, cursor, entry);
+            }
             LoopControl::Dynamic { dynamic, .. } => {
                 self.evaluated(SiteKey::of(Sql::Dynamic(dynamic)), entry);
             }
@@ -849,12 +868,14 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             }
             LoopControl::Query { targets, query } => {
                 let scope = self.scope(SiteKey::of(Sql::Statement(query)), query)?;
-                let source = |output| {
-                    DefinitionSource::QueryOutput { statement: query, output, rows: Rows::Each }
+                let source = |rows| {
+                    move |output| DefinitionSource::QueryOutput { statement: query, output, rows }
                 };
+                let each = source(Rows::Each);
+                let empty = source(Rows::Empty);
                 (
-                    self.targets(address, targets, false, false, Some(&scope), source, query)?,
-                    self.targets(address, targets, false, true, None, source, query)?,
+                    self.targets(address, targets, false, false, Some(&scope), each, query)?,
+                    self.targets(address, targets, false, true, Some(&scope), empty, query)?,
                 )
             }
             LoopControl::Cursor { variable, cursor } => {
@@ -886,10 +907,11 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             LoopControl::Dynamic { targets, dynamic } => {
                 let command = expression(&dynamic.command);
                 let scope = self.scope(SiteKey::of(Sql::Dynamic(dynamic)), &command)?;
-                let source = |output| dynamic_output(dynamic, output, Rows::Each);
+                let each = |output| dynamic_output(dynamic, output, Rows::Each);
+                let empty = |output| dynamic_output(dynamic, output, Rows::Empty);
                 (
-                    self.targets(address, targets, false, false, Some(&scope), source, &command)?,
-                    self.targets(address, targets, false, true, None, source, &command)?,
+                    self.targets(address, targets, false, false, Some(&scope), each, &command)?,
+                    self.targets(address, targets, false, true, Some(&scope), empty, &command)?,
                 )
             }
             LoopControl::Array { targets, slice, array } => {
