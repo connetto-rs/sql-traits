@@ -2014,14 +2014,23 @@ fn presenting(path: &str, condition: &str, after: &str) -> String {
     )
 }
 
+/// What `authz.presented_links` in `sql` answers, read by `read`,
+/// `app.link_ids` declared as `value`.
+fn presented_as<T>(
+    sql: &str,
+    value: SettingValue,
+    read: impl FnOnce(&HelperSet<'_, ParserDB>) -> T,
+) -> Result<T, HelperSetError> {
+    let database = postgres(sql);
+    let setting = SessionSetting::value("app.link_ids", value).expect("a custom setting name");
+    let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
+    answer(&database, &deployment, "authz", "presented_links", &[]).map(|set| read(&set))
+}
+
 /// What `authz.presented_links` in `sql` answers, `app.link_ids` declared
 /// as a set of `element` packed as `packing`.
 fn presented(sql: &str, element: DataType, packing: SetPacking) -> Result<String, HelperSetError> {
-    let database = postgres(sql);
-    let setting = SessionSetting::value("app.link_ids", SettingValue::Set { element, packing })
-        .expect("a custom setting name");
-    let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
-    answer(&database, &deployment, "authz", "presented_links", &[]).map(|set| render(&set))
+    presented_as(sql, SettingValue::Set { element, packing }, render)
 }
 
 const PRESENTED_ARM: &str = "share_links.id WHERE id IN app.link_ids";
@@ -3988,17 +3997,11 @@ fn presented_through(
     condition: &str,
     packing: SetPacking,
 ) -> Result<(String, bool, bool), HelperSetError> {
-    let database = postgres(&presenting("''", condition, after));
-    let setting = SessionSetting::value(
-        "app.link_ids",
-        SettingValue::Set { element: DataType::Uuid, packing },
-    )
-    .expect("a custom setting name");
-    let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
-    answer(&database, &deployment, "authz", "presented_links", &[]).map(|set| {
+    let sql = presenting("''", condition, after);
+    presented_as(&sql, SettingValue::Set { element: DataType::Uuid, packing }, |set| {
         let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
         let GrantedTo::Request(request) = grant.granted_to() else { panic!("the set") };
-        (render(&set), request.raises_when_unset(), request.excludes_unset())
+        (render(set), request.raises_when_unset(), request.excludes_unset())
     })
 }
 
@@ -4010,6 +4013,10 @@ fn a_set_read_through_an_accessor_reads_as_the_set_it_returns() {
     let texts = link_ids("text[]", "string_to_array(current_setting('app.link_ids'), ',')");
     let elements = link_ids("uuid[]", &format!("ARRAY(SELECT {ELEMENTS}::uuid)"));
     let unnested = link_ids("uuid[]", &format!("ARRAY(SELECT unnest({SPLIT})::uuid)"));
+    let nested = format!(
+        "{texts}{}",
+        accessor("typed_link_ids", "uuid[]", ACCESSOR, "authz.link_ids()::uuid[]")
+    );
     for (after, condition, packing, raises, excludes_unset) in [
         (&uuids, "l.id = ANY (authz.link_ids())", comma(), false, true),
         (&uuids, "l.id = ANY ((authz.link_ids()))", comma(), false, true),
@@ -4019,6 +4026,8 @@ fn a_set_read_through_an_accessor_reads_as_the_set_it_returns() {
         (&texts, "l.id IN (SELECT unnest(authz.link_ids())::uuid)", comma(), true, true),
         (&elements, "l.id = ANY (authz.link_ids())", SetPacking::JsonArray, false, false),
         (&unnested, "l.id = ANY (authz.link_ids())", comma(), false, true),
+        (&nested, "l.id = ANY (authz.typed_link_ids())", comma(), true, true),
+        (&nested, "l.id IN (SELECT unnest(authz.typed_link_ids()))", comma(), true, true),
     ] {
         let expected = (PRESENTED_ARM.to_string(), raises, excludes_unset);
         assert_eq!(
@@ -4089,18 +4098,15 @@ fn a_set_accessor_postgres_does_not_run_as_its_read_refuses_the_answer() {
         ),
         "the accessor unpacks the set as the deployment packs it"
     );
-    let database =
-        postgres(&presenting("''", "l.id = ANY (authz.link_ids())", &link_ids("uuid[]", &body)));
-    let caller = SessionSetting::value("app.link_ids", SettingValue::Caller(DataType::Uuid))
-        .expect("a custom setting name");
-    let deployment = Deployment::new("app", ["app"], [caller]).expect("a valid deployment");
-    assert!(
-        matches!(
-            answer(&database, &deployment, "authz", "presented_links", &[]),
-            Err(HelperSetError::SettingNotSet { function, setting })
-                if function == "authz.link_ids" && setting == "app.link_ids"
-        ),
-        "the accessor casts the elements of a setting declared as a set"
+    let not_a_set = presenting("''", "l.id = ANY (authz.link_ids())", &link_ids("uuid[]", &body));
+    assert_eq!(
+        presented_as(&not_a_set, SettingValue::Caller(DataType::Uuid), render),
+        Err(HelperSetError::SettingCast {
+            function: "authz.link_ids".to_string(),
+            setting: "app.link_ids".to_string(),
+            cast: "UUID[]".to_string(),
+        }),
+        "a setting not declared as a set declares no element type to cast to"
     );
     for condition in ["l.id = ANY (authz.link_ids()::uuid[])", "l.id = ANY (authz.link_ids(NULL))"]
     {

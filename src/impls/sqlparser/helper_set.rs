@@ -2504,15 +2504,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             let in_declared_type = set.is_cast();
             let element = if in_declared_type {
                 let (setting, _) = self.declared_setting(body, &set.read.name)?;
-                let SettingContent::Value(SettingValue::Set { element, .. }) = setting.content()
-                else {
-                    return Err(HelperSetError::SettingNotSet {
-                        function: body.name.clone(),
-                        setting: setting.name().to_string(),
-                    });
+                let element = match setting.content() {
+                    SettingContent::Value(SettingValue::Set { element, .. }) => Some(element),
+                    _ => None,
                 };
                 if let Some(cast) = set.cast
-                    && !self.is_declared_type(body, cast.compared, element)
+                    && element
+                        .is_none_or(|element| !self.is_declared_type(body, cast.compared, element))
                 {
                     return Err(HelperSetError::SettingCast {
                         function: body.name.clone(),
@@ -2520,7 +2518,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                         cast: cast.written.to_string(),
                     });
                 }
-                Some(element)
+                element
             } else {
                 None
             };
