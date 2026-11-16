@@ -10,7 +10,10 @@ extern crate alloc;
 
 use alloc::collections::BTreeSet;
 
-use sql_traits::{errors::HelperSetError, prelude::*};
+use sql_traits::{
+    errors::{AccessorRefusal, HelperSetError},
+    prelude::*,
+};
 use sqlparser::{
     ast::{DataType, Value},
     dialect::PostgreSqlDialect,
@@ -464,8 +467,9 @@ fn cell(row: &[(&str, &'static str)], column: &str) -> &'static str {
 }
 
 /// What a request carries: its caller, `None` where the caller setting reads
-/// `NULL`, and the values of each other setting it sets, the elements of a
-/// set or the one value of a scalar, a setting it leaves unset holding none.
+/// `NULL`, and the values of every other setting it sets, the elements of a
+/// set or the identity of a principal, a setting it leaves unset holding
+/// none.
 #[derive(Clone, Copy)]
 struct Request {
     caller: Option<&'static str>,
@@ -488,7 +492,7 @@ impl Request {
     fn carries(self, setting: &SessionSetting, value: &str) -> bool {
         match setting.content() {
             SettingContent::Value(SettingValue::Caller(_)) => self.caller == Some(value),
-            SettingContent::Value(SettingValue::Set { .. } | SettingValue::Scalar(_)) => {
+            SettingContent::Value(SettingValue::Set { .. } | SettingValue::Principal { .. }) => {
                 self.values(setting.name()).is_some_and(|values| values.contains(&value))
             }
             other => panic!("the fixtures compare with no {other:?}"),
@@ -610,10 +614,9 @@ fn arm_rows(
                     });
                     let granted = match grant.granted_to() {
                         GrantedTo::Request(compared) => {
-                            request.carries(
-                                compared.setting(),
-                                cell(row, compared.column().column_name()),
-                            )
+                            let held = cell(row, compared.column().column_name());
+                            !(compared.excludes_unset() && held.is_empty())
+                                && request.carries(compared.setting(), held)
                         }
                         GrantedTo::Set(compared) => {
                             grantees.as_ref().is_some_and(|grantees| {
@@ -1135,14 +1138,28 @@ fn a_compared_setting_must_be_declared_as_what_the_comparison_reads() {
         HelperSetError::UndeclaredSetting { setting, .. } if setting == "app.tenant"
     ));
     let equal = helper(DEFINER, GRANT_ARM, "");
-    assert!(matches!(
-        refusal_with(&equal, &declaring(delimited(","))),
-        HelperSetError::SettingNotScalar { setting, .. } if setting == "app.user_id"
-    ));
+    for value in [SettingValue::Scalar(DataType::Text), delimited(",")] {
+        assert!(
+            matches!(
+                refusal_with(&equal, &declaring(value.clone())),
+                HelperSetError::SettingNotPrincipal { setting, .. } if setting == "app.user_id"
+            ),
+            "{value:?}"
+        );
+    }
     let database = postgres(&equal);
-    let scalar = declaring(SettingValue::Scalar(DataType::Text));
-    let set = answer(&database, &scalar, "public", "docs_with", &[text("read")]).expect("answered");
-    assert_eq!(render(&set), "members.doc_id WHERE user_id = app.user_id AND role IN ('read')");
+    let rendered = |value: SettingValue| {
+        let deployment = declaring(value);
+        answer(&database, &deployment, "public", "docs_with", &[text("read")])
+            .map(|set| render(&set))
+    };
+    let installation =
+        SettingValue::Principal { kind: "installation".into(), identity: DataType::Text };
+    assert_eq!(
+        rendered(installation),
+        rendered(SettingValue::Caller(DataType::Text)),
+        "a principal compares as the caller does"
+    );
     let split = helper(
         DEFINER,
         "SELECT doc_id FROM members WHERE user_id = ANY (string_to_array(current_setting('app.user_id', true), ','))",
@@ -1567,6 +1584,12 @@ fn only_postgres_own_functions_unpack_a_set_in_either_spelling() {
 
 /// A helper over `UUID` keys reading the caller as `read`, under `path`.
 fn blocking(path: &str, read: &str, after: &str) -> String {
+    blocking_where(path, &format!("b.principal_id = {read}"), after)
+}
+
+/// A helper over `UUID` keys keeping the blocks `condition` keeps, under
+/// `path`.
+fn blocking_where(path: &str, condition: &str, after: &str) -> String {
     format!(
         "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
          CREATE SCHEMA authz;
@@ -1579,7 +1602,7 @@ fn blocking(path: &str, read: &str, after: &str) -> String {
          CREATE FUNCTION authz.blocking_organizations() RETURNS SETOF UUID
          LANGUAGE sql STABLE SECURITY DEFINER SET search_path = {path} AS $$
            SELECT b.organization_id FROM public.organization_blocks b
-           WHERE b.principal_id = {read}
+           WHERE {condition}
          $$;
          ALTER FUNCTION authz.blocking_organizations() OWNER TO authz_owner;"
     )
@@ -3215,13 +3238,7 @@ fn a_nullif_over_anything_but_a_setting_read_and_the_empty_string_refuses_the_an
 
 #[test]
 fn a_comparison_with_the_caller_read_through_nullif_excludes_the_unset_caller() {
-    let read = |read: &str| {
-        blocked_by(&blocking("''", read, ""), DataType::Uuid, |set| {
-            let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
-            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
-            (render(set), request.raises_when_unset(), request.excludes_unset())
-        })
-    };
+    let read = |read: &str| blocked_through("", read);
     for (written, raises, excludes_unset) in [
         (format!("{ABSENT}::uuid"), false, true),
         ("CAST(NULLIF(current_setting('app.user_id'), '') AS uuid)".to_string(), true, true),
@@ -3334,6 +3351,561 @@ fn a_time_condition_no_bound_represents_is_irreducible() {
     assert!(
         matches!(bounded("expires_at > now()", shadow), Err(HelperSetError::Irreducible { .. })),
         "a declared now the call may reach is not PostgreSQL's"
+    );
+}
+
+/// The attributes of an accessor running as its owner on its own path.
+const ACCESSOR: &str = "LANGUAGE sql STABLE SECURITY DEFINER SET search_path = ''";
+
+/// The accessor `authz.<name>()` returning `body` as `returns`, declared
+/// with `attributes` and owned by `authz_owner`.
+fn accessor(name: &str, returns: &str, attributes: &str, body: &str) -> String {
+    format!(
+        "CREATE FUNCTION authz.{name}() RETURNS {returns} {attributes} AS $$ SELECT {body} $$;
+         ALTER FUNCTION authz.{name}() OWNER TO authz_owner;"
+    )
+}
+
+/// `authz.caller_id()` returning the caller read through `NULLIF` as its
+/// declared `uuid`.
+fn caller_id(attributes: &str) -> String {
+    accessor("caller_id", "UUID", attributes, &format!("{ABSENT}::uuid"))
+}
+
+/// `authz.raw_caller()` returning the caller as the text it is set to,
+/// raising where it is unset.
+fn raw_caller() -> String {
+    accessor("raw_caller", "text", "LANGUAGE sql STABLE", "current_setting('app.user_id')")
+}
+
+/// What `authz.blocking_organizations` reading the caller as `read` answers
+/// once `after` declares its accessors: the arm, and whether the comparison
+/// raises where the caller is unset and excludes the unset caller.
+fn blocked_through(after: &str, read: &str) -> Result<(String, bool, bool), HelperSetError> {
+    blocked_by(&blocking("''", read, after), DataType::Uuid, |set| {
+        let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+        let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
+        (render(set), request.raises_when_unset(), request.excludes_unset())
+    })
+}
+
+#[test]
+fn a_caller_read_through_an_accessor_reads_as_the_read_it_returns() {
+    let nested = format!(
+        "{}{}",
+        raw_caller(),
+        accessor("caller_id", "uuid", "LANGUAGE sql STABLE", "authz.raw_caller()::uuid")
+    );
+    let volatile = accessor(
+        "caller_id",
+        "uuid",
+        "LANGUAGE sql VOLATILE SECURITY INVOKER",
+        "CAST(current_setting('app.user_id') AS uuid)",
+    );
+    for (after, read, raises, excludes_unset) in [
+        (caller_id(ACCESSOR), "authz.caller_id()", false, true),
+        (caller_id(ACCESSOR), "(authz.caller_id())", false, true),
+        (volatile, "authz.caller_id()", true, false),
+        (raw_caller(), "authz.raw_caller()::uuid", true, false),
+        (raw_caller(), "NULLIF(authz.raw_caller(), '')::uuid", true, true),
+        (nested, "authz.caller_id()", true, false),
+    ] {
+        let expected = (BLOCKING_ARM.to_string(), raises, excludes_unset);
+        assert_eq!(blocked_through(&after, read), Ok(expected), "{read} after {after}");
+    }
+    assert_eq!(
+        blocked_through(&caller_id(ACCESSOR), &format!("{ABSENT}::uuid")),
+        blocked_through("", &format!("{ABSENT}::uuid")),
+        "an accessor reads as the read inlined"
+    );
+}
+
+#[test]
+fn a_gate_reads_the_caller_through_an_accessor() {
+    let gate = |after: &str, gate: &str| signed_in_gate(&signing("''", gate, after));
+    assert_eq!(
+        gate(&caller_id(ACCESSOR), "authz.caller_id() IS NOT NULL"),
+        Ok(Some((false, true, true, vec![])))
+    );
+    assert_eq!(
+        gate(&caller_id(ACCESSOR), &format!("authz.caller_id() <> {NIL}::uuid")),
+        Ok(Some((false, true, true, vec![NIL.to_string()])))
+    );
+    assert_eq!(
+        gate(&raw_caller(), "authz.raw_caller() <> ''"),
+        Ok(Some((true, false, true, vec![])))
+    );
+}
+
+#[test]
+fn a_set_read_through_an_accessor_returning_its_text_reads_the_set() {
+    let link_ids =
+        accessor("link_ids", "text", ACCESSOR, "NULLIF(current_setting('app.link_ids', true), '')");
+    let comma = || SetPacking::Delimited(",".into());
+    for (condition, packing) in [
+        ("l.id = ANY (string_to_array(authz.link_ids(), ',')::uuid[])", comma()),
+        ("l.id IN (SELECT unnest(string_to_array(authz.link_ids(), ','))::uuid)", comma()),
+        (
+            "l.id IN (SELECT jsonb_array_elements_text(authz.link_ids()::jsonb)::uuid)",
+            SetPacking::JsonArray,
+        ),
+    ] {
+        let sql = presenting("''", condition, &link_ids);
+        assert_eq!(
+            presented(&sql, DataType::Uuid, packing).as_deref(),
+            Ok(PRESENTED_ARM),
+            "{condition}"
+        );
+    }
+}
+
+#[test]
+fn an_accessor_resolves_its_body_on_its_own_path_or_on_the_helpers() {
+    let shadow = "CREATE FUNCTION public.current_setting(text, boolean) RETURNS text
+                  LANGUAGE sql STABLE AS $$ SELECT 'someone' $$;";
+    let read = |attributes: &str| {
+        let after = format!("{shadow}{}", caller_id(attributes));
+        blocked_by(
+            &blocking("public, pg_catalog", "authz.caller_id()", &after),
+            DataType::Uuid,
+            render,
+        )
+    };
+    assert_eq!(read(ACCESSOR).as_deref(), Ok(BLOCKING_ARM), "its own path skips the shadow");
+    assert!(
+        matches!(read("LANGUAGE sql STABLE"), Err(HelperSetError::Irreducible { .. })),
+        "the helper's path reaches the shadow"
+    );
+}
+
+#[test]
+fn an_accessor_postgres_does_not_run_as_its_read_refuses_the_answer() {
+    let refused = |after: &str| {
+        let Err(error) = blocked_through(after, "authz.caller_id()") else { return None };
+        let HelperSetError::Accessor { function, accessor, setting, reason } = &error else {
+            return None;
+        };
+        assert_eq!(
+            (function.as_str(), accessor.as_str(), setting.as_str()),
+            ("authz.blocking_organizations", "authz.caller_id", "app.user_id"),
+            "{after}"
+        );
+        Some((*reason, error.to_string()))
+    };
+    let refusal = |reason, which: &str| {
+        Some((
+            reason,
+            format!(
+                "helper `authz.blocking_organizations` reads setting `app.user_id` through \
+                 `authz.caller_id`, which {which}"
+            ),
+        ))
+    };
+    let immutable = "LANGUAGE sql IMMUTABLE SECURITY DEFINER SET search_path = ''";
+    assert_eq!(refused(&caller_id(immutable)), refusal(AccessorRefusal::Immutable, "is IMMUTABLE"));
+    for setting in ["app.user_id", "App.User_Id"] {
+        let sets = format!("{ACCESSOR} SET {setting} = '{}'", NIL.trim_matches('\''));
+        assert_eq!(
+            refused(&caller_id(&sets)),
+            refusal(AccessorRefusal::SetsSetting, "sets the setting it reads"),
+            "{setting}"
+        );
+    }
+    let other = format!("{ACCESSOR} SET app.tenant = 'x'");
+    assert_eq!(
+        blocked_through(&caller_id(&other), "authz.caller_id()").map(|read| read.0).as_deref(),
+        Ok(BLOCKING_ARM),
+        "an accessor setting another setting"
+    );
+    let returns_nothing = format!(
+        "CREATE FUNCTION authz.caller_id() {ACCESSOR} AS $$ SELECT {ABSENT}::uuid $$;
+         ALTER FUNCTION authz.caller_id() OWNER TO authz_owner;"
+    );
+    let wrong_type =
+        refusal(AccessorRefusal::ReturnType, "returns another type than its body reads");
+    assert_eq!(refused(&returns_nothing), wrong_type, "an accessor declaring no result");
+    for (returns, body) in [
+        ("text", format!("{ABSENT}::uuid")),
+        ("varchar", "current_setting('app.user_id')".to_string()),
+        ("SETOF uuid", format!("{ABSENT}::uuid")),
+    ] {
+        let after = accessor("caller_id", returns, ACCESSOR, &body);
+        assert_eq!(refused(&after), wrong_type, "{returns}: {body}");
+    }
+}
+
+#[test]
+fn an_accessor_is_checked_as_a_call_and_its_read_as_a_read() {
+    let read = |after: &str| blocked_through(after, "authz.caller_id()");
+    let revoked = format!(
+        "CREATE ROLE accessor_owner NOLOGIN;
+         {}ALTER FUNCTION authz.caller_id() OWNER TO accessor_owner;
+         REVOKE EXECUTE ON FUNCTION authz.caller_id() FROM PUBLIC;",
+        caller_id(ACCESSOR)
+    );
+    assert!(
+        matches!(
+            read(&revoked),
+            Err(HelperSetError::MissingExecute { function, called, .. })
+                if function == "authz.blocking_organizations" && called == "authz.caller_id"
+        ),
+        "the helper's owner executes the accessor"
+    );
+    let hidden = format!(
+        "CREATE SCHEMA keys;
+         {}",
+        caller_id(ACCESSOR).replace("authz.", "keys.")
+    );
+    assert!(
+        matches!(
+            blocked_through(&hidden, "keys.caller_id()"),
+            Err(HelperSetError::MissingUsage { schema, .. }) if schema == "keys"
+        ),
+        "the helper's owner uses the accessor's schema"
+    );
+    let text =
+        accessor("caller_id", "text", ACCESSOR, "current_setting('app.user_id', true)::text");
+    assert!(
+        matches!(
+            read(&text),
+            Err(HelperSetError::SettingCast { function, .. }) if function == "authz.caller_id"
+        ),
+        "the accessor casts to the declared type"
+    );
+    let tenant =
+        accessor("caller_id", "uuid", ACCESSOR, "current_setting('app.tenant', true)::uuid");
+    assert!(
+        matches!(
+            read(&tenant),
+            Err(HelperSetError::UndeclaredSetting { function, setting })
+                if function == "authz.caller_id" && setting == "app.tenant"
+        ),
+        "the accessor reads a declared setting"
+    );
+    let cycle = format!(
+        "{}{}CREATE OR REPLACE FUNCTION authz.raw_caller() RETURNS text LANGUAGE sql STABLE
+         AS $$ SELECT authz.echo() $$;",
+        raw_caller(),
+        accessor("echo", "text", "LANGUAGE sql STABLE", "authz.raw_caller()")
+    );
+    assert!(
+        matches!(
+            blocked_through(&cycle, "authz.raw_caller()::uuid"),
+            Err(HelperSetError::CallCycle { function }) if function == "authz.raw_caller"
+        ),
+        "an accessor reaching itself"
+    );
+}
+
+#[test]
+fn a_call_returning_anything_but_a_setting_read_is_irreducible() {
+    let after = |body: &str| accessor("caller_id", "uuid", ACCESSOR, body);
+    for (after, read) in [
+        (after(&format!("lower({ABSENT})::uuid")), "authz.caller_id()"),
+        (after("o.principal_id FROM public.organization_blocks o"), "authz.caller_id()"),
+        (after(&format!("{ABSENT}::uuid WHERE true")), "authz.caller_id()"),
+        (caller_id(ACCESSOR), "authz.caller_id()::uuid"),
+        (
+            "CREATE FUNCTION authz.caller_id() RETURNS uuid LANGUAGE sql STABLE
+             RETURN NULLIF(current_setting('app.user_id', true), '')::uuid;"
+                .to_string(),
+            "authz.caller_id()",
+        ),
+        (
+            "CREATE FUNCTION authz.caller_id() RETURNS uuid LANGUAGE plpgsql STABLE
+             AS $$ BEGIN RETURN current_setting('app.user_id')::uuid; END $$;"
+                .to_string(),
+            "authz.caller_id()",
+        ),
+        (
+            "CREATE FUNCTION authz.caller_id(fallback uuid) RETURNS uuid LANGUAGE sql STABLE
+             AS $$ SELECT coalesce(current_setting('app.user_id', true)::uuid, fallback) $$;"
+                .to_string(),
+            "authz.caller_id(NULL)",
+        ),
+        (String::new(), "authz.caller_id()"),
+    ] {
+        assert!(
+            matches!(blocked_through(&after, read), Err(HelperSetError::Irreducible { .. })),
+            "{read} after {after}"
+        );
+    }
+}
+
+const INSTALLATION: &str = "app.installation_id";
+
+/// A deployment whose caller is `app.user_id` and whose app installation
+/// acting for it is `app.installation_id`, both of `identity`, either may be
+/// unset, beside a scalar `app.tenant`, a set `app.link_ids` and a JSON
+/// `request.jwt.claims`.
+fn principals(identity: &DataType) -> Deployment {
+    let setting = |name: &str, value: SettingValue| {
+        SessionSetting::value(name, value).expect("a custom setting name").may_be_unset()
+    };
+    Deployment::new(
+        "app",
+        ["app"],
+        [
+            setting("app.user_id", SettingValue::Caller(identity.clone())),
+            setting(
+                INSTALLATION,
+                SettingValue::Principal { kind: "installation".into(), identity: identity.clone() },
+            ),
+            setting("app.tenant", SettingValue::Scalar(identity.clone())),
+            setting("app.link_ids", delimited(",")),
+            SessionSetting::json(
+                "request.jwt.claims",
+                [JsonField::new(["sub"], SettingValue::Caller(identity.clone())).expect("a path")],
+            )
+            .expect("a custom setting name"),
+        ],
+    )
+    .expect("a valid deployment")
+}
+
+/// Organizations blocking the caller, the installation acting for it, or
+/// everyone, listed in one `IN`.
+const LISTED_BLOCKS: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+CREATE TABLE organization_blocks (
+  organization_id TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  active BOOLEAN NOT NULL,
+  PRIMARY KEY (organization_id, principal_id)
+);
+GRANT SELECT ON organization_blocks TO authz_owner;
+CREATE FUNCTION authz.installation_id() RETURNS TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT NULLIF(current_setting('app.installation_id', true), '')
+$$;
+ALTER FUNCTION authz.installation_id() OWNER TO authz_owner;
+CREATE FUNCTION authz.blocked_listed() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT b.organization_id FROM public.organization_blocks b
+  WHERE b.principal_id IN (NULLIF(current_setting('app.user_id', true), ''), 'everyone', authz.installation_id(), NULL)
+    AND b.active = true
+$$;
+ALTER FUNCTION authz.blocked_listed() OWNER TO authz_owner;
+";
+
+const LISTED_BLOCK_ROWS: Rows = &[
+    (
+        "organization_blocks",
+        &[("organization_id", "o1"), ("principal_id", "u1"), ("active", "true")],
+    ),
+    (
+        "organization_blocks",
+        &[("organization_id", "o2"), ("principal_id", "i1"), ("active", "true")],
+    ),
+    (
+        "organization_blocks",
+        &[("organization_id", "o3"), ("principal_id", "everyone"), ("active", "true")],
+    ),
+    (
+        "organization_blocks",
+        &[("organization_id", "o4"), ("principal_id", "u1"), ("active", "false")],
+    ),
+    (
+        "organization_blocks",
+        &[("organization_id", "o5"), ("principal_id", "i2"), ("active", "true")],
+    ),
+    ("organization_blocks", &[("organization_id", "o6"), ("principal_id", ""), ("active", "true")]),
+];
+
+/// What PostgreSQL 18.6 returns for `authz.blocked_listed()` over
+/// [`LISTED_BLOCK_ROWS`], a setting the request leaves out never set.
+const LISTED_BLOCKS_MEASURED: &[(Request, &[&str])] = &[
+    (Request { caller: Some("u1"), values: &[(INSTALLATION, &["i1"])] }, &["o1", "o2", "o3"]),
+    (Request::of("u1"), &["o1", "o3"]),
+    (Request { caller: Some("u2"), values: &[(INSTALLATION, &["i1"])] }, &["o2", "o3"]),
+    (Request { caller: None, values: &[(INSTALLATION, &["i2"])] }, &["o3", "o5"]),
+    (Request { caller: None, values: &[] }, &["o3"]),
+    (Request { caller: Some(""), values: &[(INSTALLATION, &[""])] }, &["o3"]),
+];
+
+#[test]
+fn an_in_list_of_principals_answers_one_grant_arm_per_principal_and_one_for_its_literals() {
+    let database = postgres(LISTED_BLOCKS);
+    let deployment = principals(&DataType::Text);
+    let set = answer(&database, &deployment, "authz", "blocked_listed", &[]).expect("answered");
+    assert_eq!(
+        render(&set),
+        "organization_blocks.organization_id WHERE principal_id = app.user_id AND active IN (true) \
+         UNION organization_blocks.organization_id WHERE active IN (true) AND principal_id IN ('everyone') \
+         UNION organization_blocks.organization_id WHERE principal_id = app.installation_id AND active IN (true)"
+    );
+    assert_eq!(covered(&set), None, "a block's organization is no key of its table");
+    for arm in set.arms() {
+        let HelperArm::Grant(grant) = arm else { panic!("grant arms") };
+        if let GrantedTo::Request(request) = grant.granted_to() {
+            assert!(!request.raises_when_unset() && request.excludes_unset());
+        }
+    }
+    for &(request, expected) in LISTED_BLOCKS_MEASURED {
+        let returned: Vec<_> = evaluate(&set, request, LISTED_BLOCK_ROWS).into_iter().collect();
+        assert_eq!(returned, expected, "{:?} with {:?}", request.caller, request.values);
+    }
+}
+
+/// What `authz.blocking_organizations` keeping the blocks `condition` keeps
+/// answers once `after` declares its accessors, the caller and the
+/// installation `uuid` principals.
+fn listing(condition: &str, after: &str) -> Result<String, HelperSetError> {
+    let database = postgres(&blocking_where("''", condition, after));
+    let deployment = principals(&DataType::Uuid);
+    answer(&database, &deployment, "authz", "blocking_organizations", &[]).map(|set| render(&set))
+}
+
+#[test]
+fn a_listed_principal_is_read_in_every_spelling_a_compared_one_is() {
+    let both = "organization_blocks.organization_id WHERE principal_id = app.user_id \
+                UNION organization_blocks.organization_id WHERE principal_id = app.installation_id";
+    let installation_id = accessor(
+        "installation_id",
+        "UUID",
+        ACCESSOR,
+        "NULLIF(current_setting('app.installation_id', true), '')::uuid",
+    );
+    let accessors = format!("{}{installation_id}", caller_id(ACCESSOR));
+    for (list, after) in [
+        (
+            "NULLIF(current_setting('app.user_id', true), '')::uuid, \
+             NULLIF(current_setting('app.installation_id', true), '')::uuid",
+            "",
+        ),
+        (
+            "current_setting('app.user_id')::uuid, \
+             CAST(current_setting('app.installation_id', true) AS uuid)",
+            "",
+        ),
+        ("authz.caller_id(), authz.installation_id()", accessors.as_str()),
+    ] {
+        let condition = format!("b.principal_id IN ({list})");
+        assert_eq!(listing(&condition, after).as_deref(), Ok(both), "{list}");
+    }
+    let alone = "organization_blocks.organization_id WHERE principal_id = app.installation_id";
+    let condition = "b.principal_id IN (authz.installation_id(), NULL)";
+    assert_eq!(listing(condition, &installation_id).as_deref(), Ok(alone), "NULL keeps no row");
+    assert_eq!(
+        listing("b.principal_id = authz.installation_id()", &installation_id).as_deref(),
+        Ok(alone),
+        "a principal compared alone"
+    );
+}
+
+#[test]
+fn a_list_naming_anything_but_principals_literals_and_parameters_refuses_the_answer() {
+    let user = "NULLIF(current_setting('app.user_id', true), '')::uuid";
+    let refused = |condition: String, after: &str| listing(&condition, after).map(|_| ());
+    let not_principal = |setting: &str| {
+        Err(HelperSetError::SettingNotPrincipal {
+            function: "authz.blocking_organizations".into(),
+            setting: setting.into(),
+        })
+    };
+    let tenant_id = accessor(
+        "tenant_id",
+        "UUID",
+        ACCESSOR,
+        "NULLIF(current_setting('app.tenant', true), '')::uuid",
+    );
+    for (condition, after) in [
+        (format!("b.principal_id IN ({user}, current_setting('app.tenant', true)::uuid)"), ""),
+        (format!("b.principal_id IN ({user}, authz.tenant_id())"), tenant_id.as_str()),
+    ] {
+        assert_eq!(refused(condition, after), not_principal("app.tenant"), "a scalar");
+    }
+    assert_eq!(
+        refused(format!("b.principal_id IN ({user}, current_setting('app.link_ids', true))"), ""),
+        not_principal("app.link_ids"),
+        "a set read as one value"
+    );
+    let links = accessor("links", "UUID", ACCESSOR, "current_setting('app.link_ids', true)::uuid");
+    assert!(
+        matches!(
+            refused(format!("b.principal_id IN ({user}, authz.links())"), &links),
+            Err(HelperSetError::SettingCast { function, setting, .. })
+                if function == "authz.links" && setting == "app.link_ids"
+        ),
+        "a set cast to one value's type"
+    );
+    assert!(matches!(
+        refused(format!("b.principal_id IN ({user}, current_setting('app.nope', true)::uuid)"), ""),
+        Err(HelperSetError::UndeclaredSetting { setting, .. }) if setting == "app.nope"
+    ));
+    for condition in [
+        format!("b.principal_id IN ({user}, b.organization_id)"),
+        format!("b.principal_id IN ({user}, '00000000-0000-0000-0000-000000000000'::uuid)"),
+        format!("b.principal_id IN ({user}, gen_random_uuid())"),
+        format!("b.principal_id NOT IN ({user})"),
+        format!("{user} IN (b.principal_id, b.organization_id)"),
+    ] {
+        assert!(
+            matches!(refused(condition.clone(), ""), Err(HelperSetError::Irreducible { .. })),
+            "{condition}"
+        );
+    }
+    assert!(
+        matches!(
+            refused(format!("b.principal_id IN ({user}) AND b.organization_id = {user}"), ""),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "an arm names one grantee"
+    );
+    assert_eq!(
+        refused(
+            format!(
+                "b.principal_id IN ({user}) AND current_setting('{INSTALLATION}', true) IS NOT NULL"
+            ),
+            ""
+        ),
+        Err(HelperSetError::SettingNotCaller {
+            function: "authz.blocking_organizations".into(),
+            setting: INSTALLATION.into(),
+        }),
+        "a gate reads the caller alone"
+    );
+    assert_eq!(
+        refused(
+            format!(
+                "b.principal_id IN ({user}, current_setting('request.jwt.claims', true)::uuid)"
+            ),
+            ""
+        ),
+        not_principal("request.jwt.claims"),
+        "a JSON document compared as one value"
+    );
+    let claims = "CREATE FUNCTION authz.claims() RETURNS UUID LANGUAGE sql STABLE
+                  AS $$ SELECT current_setting('request.jwt.claims', true)::uuid $$;";
+    assert!(
+        matches!(
+            refused(format!("b.principal_id IN ({user}, authz.claims())"), claims),
+            Err(HelperSetError::SettingCast { function, setting, .. })
+                if function == "authz.claims" && setting == "request.jwt.claims"
+        ),
+        "a JSON document cast to one value's type"
+    );
+}
+
+#[test]
+fn every_arm_of_a_list_keeps_the_conditions_beside_it() {
+    let user = "NULLIF(current_setting('app.user_id', true), '')::uuid";
+    let installation = "NULLIF(current_setting('app.installation_id', true), '')::uuid";
+    let list = format!("b.principal_id IN ({user}, {installation})");
+    let expiring = "ALTER TABLE organization_blocks ADD COLUMN expires_at TIMESTAMPTZ;";
+    assert_eq!(
+        listing(&format!("{list} AND b.expires_at > now()"), expiring).as_deref(),
+        Ok(
+            "organization_blocks.organization_id WHERE principal_id = app.user_id AND expires_at > now \
+            UNION organization_blocks.organization_id WHERE principal_id = app.installation_id AND expires_at > now"
+        )
+    );
+    assert_eq!(
+        listing(&format!("{list} AND 1 = 2"), "").as_deref(),
+        Ok(""),
+        "a list kept from no row"
     );
 }
 
@@ -3461,9 +4033,9 @@ const CAP_ROWS: Rows = &[
     ),
 ];
 
-/// A deployment declaring the caller, the acting installation, a scalar, and
-/// the organizations a request presents, a set, each of which a request may
-/// leave unset.
+/// A deployment declaring the caller, the acting installation, another
+/// principal, a tenant, a scalar, and the organizations a request presents,
+/// a set, each of which a request may leave unset.
 fn installation_deployment() -> Deployment {
     let setting = |name: &str, value: SettingValue| {
         SessionSetting::value(name, value).expect("a custom setting name").may_be_unset()
@@ -3473,7 +4045,11 @@ fn installation_deployment() -> Deployment {
         ["app"],
         [
             setting("app.user_id", SettingValue::Caller(DataType::Text)),
-            setting("app.installation_id", SettingValue::Scalar(DataType::Text)),
+            setting(
+                "app.installation_id",
+                SettingValue::Principal { kind: "installation".into(), identity: DataType::Text },
+            ),
+            setting("app.tenant_id", SettingValue::Scalar(DataType::Text)),
             setting(
                 "app.organization_ids",
                 SettingValue::Set { element: DataType::Text, packing: SetPacking::JsonArray },
@@ -3643,8 +4219,8 @@ fn a_cap_compares_one_operand_per_column_the_capping_helper_returns() {
         );
     }
     assert!(matches!(
-        capping("current_setting('app.tenant_id', true) IS NULL OR (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))"),
-        Err(HelperSetError::UndeclaredSetting { setting, .. }) if setting == "app.tenant_id"
+        capping("current_setting('app.region_id', true) IS NULL OR (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))"),
+        Err(HelperSetError::UndeclaredSetting { setting, .. }) if setting == "app.region_id"
     ));
     let unlifted = capping(
         "current_setting('app.installation_id', true) IS NULL OR resource.kind = 'project'",
@@ -3654,10 +4230,13 @@ fn a_cap_compares_one_operand_per_column_the_capping_helper_returns() {
 
 #[test]
 fn a_lift_records_whether_reading_its_setting_raises_when_unset() {
-    for (read, raises) in [
-        ("current_setting('app.installation_id')", true),
-        ("current_setting('app.installation_id', true)", false),
+    for (setting, missing_ok, raises) in [
+        ("app.installation_id", "", true),
+        ("app.installation_id", ", true", false),
+        ("app.tenant_id", "", true),
+        ("app.tenant_id", ", true", false),
     ] {
+        let read = format!("current_setting('{setting}'{missing_ok})::TEXT");
         let lifted = format!("{CAPPED_CONDITION} OR {read} IS NULL");
         let database = postgres(&CAPS.replace(CAPPED_CONDITION, &lifted));
         let deployment = installation_deployment();
@@ -3666,8 +4245,23 @@ fn a_lift_records_whether_reading_its_setting_raises_when_unset() {
         let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
         let [cap] = grant.caps() else { panic!("one cap") };
         let lift = cap.lift().expect("a lifted cap");
-        assert_eq!(lift.setting().name(), "app.installation_id");
+        assert_eq!(lift.setting().name(), setting);
         assert_eq!(lift.raises_when_unset(), raises, "{read}");
         assert!(!lift.lifts_on_empty(), "{read}");
     }
+}
+
+#[test]
+fn every_arm_an_in_list_of_principals_answers_keeps_the_caps() {
+    let answer = capping(
+        "resource.owner_id IN (current_setting('app.user_id', true), 'nobody') \
+         AND (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))",
+    )
+    .expect("answered");
+    let cap = "(organization_id, kind) IN authz.capped_kinds('reader')";
+    let arms: Vec<_> = answer.split(" UNION ").collect();
+    assert_eq!(arms.len(), 2, "{answer}");
+    assert!(arms[0].starts_with("resources.id WHERE owner_id = app.user_id AND "), "{answer}");
+    assert!(arms[1].starts_with("resources.id WHERE owner_id IN ('nobody') AND "), "{answer}");
+    assert!(arms.iter().all(|arm| arm.contains(cap)), "{answer}");
 }

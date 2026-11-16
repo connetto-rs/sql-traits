@@ -3,7 +3,7 @@
 //! [`FunctionLike::helper_set`](crate::traits::FunctionLike::helper_set)
 //! answers it.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use sqlparser::ast::Value;
 
@@ -41,7 +41,8 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
     }
 }
 
-/// One `SELECT` of a helper's `UNION`.
+/// One `SELECT` of a helper's `UNION`, or one grantee of a grant arm whose
+/// `IN` list names several.
 #[derive(Debug)]
 pub enum HelperArm<'db, DB: DatabaseLike> {
     /// The rows of a table its condition keeps, for the grantee it names or
@@ -64,7 +65,9 @@ pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) gate: Option<CallerGate<'db>>,
     pub(crate) restrictions: Vec<LiteralSet<'db, DB>>,
     pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
-    pub(crate) caps: Vec<RowCap<'db, DB>>,
+    /// Shared by the arms an `IN` list of request values splits one
+    /// condition into.
+    pub(crate) caps: Arc<[RowCap<'db, DB>]>,
 }
 
 impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
@@ -121,8 +124,8 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
 /// Whose rows a [`GrantArm`] keeps.
 #[derive(Debug)]
 pub enum GrantedTo<'db, DB: DatabaseLike> {
-    /// The rows whose column holds the caller, a scalar or an element of a
-    /// declared set the request carries.
+    /// The rows whose column holds the caller, another principal, or an
+    /// element of a declared set, the request carries.
     Request(SettingComparison<'db, DB>),
     /// `<column> IN (SELECT <function>(<arguments>))`, the rows naming one of
     /// the grantees another helper returns, such as every grantee the caller
@@ -296,7 +299,7 @@ impl<'db> CapLift<'db> {
 /// ends, so `IS NOT NULL` holds on a pooled connection that once carried a
 /// caller. `<> ''` and a read through `NULLIF` hold only where a caller was
 /// sent (see [`excludes_unset`](Self::excludes_unset)).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CallerGate<'db> {
     pub(crate) setting: &'db SessionSetting,
     pub(crate) raises_when_unset: bool,
@@ -348,9 +351,16 @@ impl<'db> CallerGate<'db> {
     }
 }
 
-/// `<column> = current_setting(<caller or scalar>)[::<declared type>]`, or
-/// `<column>` compared with each element of a declared set, `<column> = ANY
-/// (<array>)` or `<column> IN (SELECT <elements>)`.
+/// `<column> = current_setting(<principal>)[::<declared type>]`, the
+/// principal the caller or another the deployment declares, or `<column>`
+/// compared with each element of a declared set, `<column> = ANY (<array>)`
+/// or `<column> IN (SELECT <elements>)`.
+///
+/// `<column> IN (<values>)` listing principals beside literals and
+/// parameters is read as one grant arm per principal, compared as `=`
+/// compares it, and one arm granted to anyone for the literals together, as
+/// PostgreSQL reads the list as `<column> = <value>` for each value joined
+/// by `OR`. A principal reading `NULL` keeps no row through its arm.
 ///
 /// `<array>` is `string_to_array(current_setting(<set>),
 /// <delimiter>)[::<element type>[]]`, the set packed as
@@ -380,8 +390,8 @@ impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
 
     /// The setting compared with, as the deployment declares it, either
     /// [`SettingValue::Caller`](crate::structs::SettingValue::Caller),
-    /// [`SettingValue::Scalar`](crate::structs::SettingValue::Scalar) or
-    /// [`SettingValue::Set`](crate::structs::SettingValue::Set).
+    /// [`SettingValue::Principal`](crate::structs::SettingValue::Principal)
+    /// or [`SettingValue::Set`](crate::structs::SettingValue::Set).
     #[must_use]
     pub fn setting(&self) -> &'db SessionSetting {
         self.setting
@@ -420,6 +430,12 @@ pub struct TimeBound<'db, DB: DatabaseLike> {
     pub(crate) column: &'db DB::Column,
     pub(crate) comparison: TimeComparison,
     pub(crate) keeps_null: bool,
+}
+
+impl<DB: DatabaseLike> Clone for TimeBound<'_, DB> {
+    fn clone(&self) -> Self {
+        Self { column: self.column, comparison: self.comparison, keeps_null: self.keeps_null }
+    }
 }
 
 impl<'db, DB: DatabaseLike> TimeBound<'db, DB> {

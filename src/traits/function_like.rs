@@ -1876,32 +1876,40 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   <helper>(<arguments>))`, the helper answered in turn as a parent arm's
     ///   is. The comparison is `<column> = current_setting('<setting>'[,
     ///   <missing_ok>])` with a setting the deployment declares as the caller
-    ///   or as a scalar, or `<column>` compared with each element of a setting
-    ///   it declares as a set, unpacked as declared (see
-    ///   [`SettingComparison`](crate::structs::SettingComparison)). An arm
-    ///   naming no grantee returns the same rows for every request its gate
-    ///   lets through. A cap, `(<operands>) IN (SELECT * FROM
-    ///   <helper>(<arguments>))`, optionally behind `<setting> IS NULL OR`,
-    ///   keeps the rows whose operands are a row the helper returns, the helper
-    ///   answered in turn (see [`RowCap`](crate::structs::RowCap)). Conditions
+    ///   or as another principal, or `<column>` compared with each element of a
+    ///   setting it declares as a set, unpacked as declared (see
+    ///   [`SettingComparison`](crate::structs::SettingComparison)). `<column>
+    ///   IN (<values>)` listing principals beside literals and parameters
+    ///   answers one grant arm per principal and one granted to anyone for the
+    ///   literals together, each keeping the other conditions. An arm naming no
+    ///   grantee returns the same rows for every request its gate lets through.
+    ///   A cap, `(<operands>) IN (SELECT * FROM <helper>(<arguments>))`,
+    ///   optionally behind `<setting> IS NULL OR`, keeps the rows whose
+    ///   operands are a row the helper returns, the helper answered in turn
+    ///   (see [`RowCap`](crate::structs::RowCap)). Conditions
     ///   `current_setting('<setting>') <> <text>` and
     ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
     ///   the arm on what the setting reads (see
     ///   [`CallerGate`](crate::structs::CallerGate)). The body may cast a read
-    ///   of the caller or a scalar to its declared type, and a set to an array
-    ///   of its declared element type or each element to that type, and any
-    ///   other cast refuses the answer. It may read any setting through
+    ///   of one value to its declared type, and a set to an array of its
+    ///   declared element type or each element to that type, and any other cast
+    ///   refuses the answer. It may read any setting through
     ///   `NULLIF(current_setting(...), '')`, which reads `''` as `NULL` and so
-    ///   maps both states of an unset setting to `NULL`. A time bound is a
-    ///   conjunct `<column> <comparison> now()`, a `timestamptz` column of the
-    ///   table compared with `<`, `<=`, `>` or `>=` either way round,
-    ///   optionally `OR <column> IS NULL`, and the arm answers it as a
-    ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
-    ///   `transaction_timestamp()` read the same statement time as `now()`. The
-    ///   rest, the arguments substituted, reduce to `TRUE`, to `FALSE` or
-    ///   `NULL`, or to the literal values columns have to hold. An arm
-    ///   comparing a helper's set while returning its table's primary key is a
-    ///   parent arm, so it takes no other condition.
+    ///   maps both states of an unset setting to `NULL`. Wherever it reads a
+    ///   setting it may call an accessor instead, a zero-argument `sql`
+    ///   function written as a string whose body selects one such read, cast or
+    ///   not, and returns its type. The accessor's body resolves on its own
+    ///   path or, where it pins none, on the caller's, as the role it runs as,
+    ///   and an accessor that is `IMMUTABLE` or sets the setting it reads
+    ///   refuses the answer. A time bound is a conjunct `<column> <comparison>
+    ///   now()`, a `timestamptz` column of the table compared with `<`, `<=`,
+    ///   `>` or `>=` either way round, optionally `OR <column> IS NULL`, and
+    ///   the arm answers it as a [`TimeBound`](crate::structs::TimeBound).
+    ///   `CURRENT_TIMESTAMP` and `transaction_timestamp()` read the same
+    ///   statement time as `now()`. The rest, the arguments substituted, reduce
+    ///   to `TRUE`, to `FALSE` or `NULL`, or to the literal values columns have
+    ///   to hold. An arm comparing a helper's set while returning its table's
+    ///   primary key is a parent arm, so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it

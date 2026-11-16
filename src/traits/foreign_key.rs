@@ -7,7 +7,7 @@ use sqlparser::ast::{ConstraintReferenceMatchKind, ReferentialAction};
 
 use crate::{
     errors::LookupError,
-    structs::TargetName,
+    structs::{ConstraintDeferral, TargetName},
     traits::{ColumnLike, DatabaseLike, IndexLike, Metadata, TableLike},
 };
 
@@ -690,6 +690,35 @@ pub trait ForeignKeyLike:
     fn is_validated(&self, _database: &Self::DB) -> Result<bool, LookupError> {
         Ok(true)
     }
+
+    /// Returns when the foreign key is checked within a transaction,
+    /// matching `pg_constraint.condeferrable` and `pg_constraint.condeferred`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// for (clause, deferral) in [
+    ///     ("", ConstraintDeferral::NotDeferrable),
+    ///     ("DEFERRABLE", ConstraintDeferral::InitiallyImmediate),
+    ///     ("INITIALLY DEFERRED", ConstraintDeferral::InitiallyDeferred),
+    /// ] {
+    ///     let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+    ///         "CREATE TABLE customers (id INT PRIMARY KEY);
+    ///         CREATE TABLE orders (customer INT REFERENCES customers (id) {clause});"
+    ///     ))?;
+    ///     let orders =
+    ///         db.table_by_target(TargetName::new("orders", false), IdentifierCase::AsWritten)?;
+    ///     let foreign_key = orders.unwrap().foreign_keys(&db)?.next().unwrap();
+    ///     assert_eq!(foreign_key.deferral(&db), deferral);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn deferral(&self, database: &Self::DB) -> ConstraintDeferral;
 
     /// Returns whether the foreign key includes any host columns that are
     /// nullable.

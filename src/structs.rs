@@ -4,6 +4,7 @@
 mod absent;
 mod call_resolution;
 mod column_scope;
+mod constraint_deferral;
 mod deployment;
 mod dynamic_execution;
 mod expression_context;
@@ -26,6 +27,7 @@ mod identity;
 pub mod metadata;
 mod operator_resolution;
 mod partition_bound;
+pub(crate) mod plpgsql_flow;
 pub(crate) mod plpgsql_scope;
 pub(crate) mod policy_analysis;
 mod policy_expression;
@@ -52,18 +54,19 @@ pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
     ColumnScope, QueryOutput, RangeTableEntry, RelationBinding,
 };
+pub use constraint_deferral::ConstraintDeferral;
 pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
     SettingContent, SettingPresence, SettingValue, TimeZoneSource,
 };
-pub(crate) use dynamic_execution::SiteScope;
 pub use dynamic_execution::{DynamicExecution, DynamicExecutionSites};
+pub(crate) use dynamic_execution::{SiteFlow, SiteScope};
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
 pub(crate) use expression_context::{
     CallRefusal, ReparsePins, Site, applies_operators, array_of, column_type, declared_type,
-    declared_type_named,
+    declared_type_named, row_of,
 };
 pub use expression_scope::ExpressionScope;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
@@ -83,6 +86,10 @@ pub use operator_resolution::{
     CoercionStep, OperandEvidence, OperandType, OperatorResolution, SelectedOperator,
 };
 pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
+pub use plpgsql_flow::{
+    Definition, DefinitionId, DefinitionSource, DiagnosticsItem, Output, Reaching, Rows,
+    TargetStep, VariableRead,
+};
 pub use plpgsql_scope::{PlPgSqlScope, PlPgSqlVariable, VariableKind};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
 pub use policy_expression::PolicyExpression;

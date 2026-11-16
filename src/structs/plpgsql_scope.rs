@@ -2,13 +2,13 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use sqlparser::ast::{ArgMode, Ident, Statement};
-use sqlparser_plpgsql::namespace::{NameKind, Namespace};
+use sqlparser::ast::{ArgMode, Ident};
+use sqlparser_plpgsql::namespace::Namespace;
 
 use crate::{
     errors::LookupError,
     impls::{BodyNames, BodyPath},
-    structs::OperandType,
+    structs::{OperandType, plpgsql_flow::FlowPoint},
     traits::DatabaseLike,
     utils::identifier_resolution::stored_identifier,
 };
@@ -129,26 +129,48 @@ pub(crate) fn stored_parts<'a>(idents: impl IntoIterator<Item = &'a Ident>) -> V
 /// a name no relation of the expression's own queries holds to the innermost
 /// variable of that name, a name qualified by a block label or by the
 /// function's name to that level's variable, and `$n` to argument `n`.
+///
+/// The scope a site or a definition hands out also stands at its point in
+/// the body's value flow, so a field of a `record` takes its type from the
+/// rows the definitions reaching that point give the record.
 #[derive(Debug)]
 pub struct PlPgSqlScope<'b, 'db, DB: DatabaseLike> {
     names: &'b BodyNames<'db, DB>,
     namespace: Namespace,
     path: BodyPath<'b>,
+    point: Option<FlowPoint<'b, 'db, DB>>,
 }
 
 impl<DB: DatabaseLike> Clone for PlPgSqlScope<'_, '_, DB> {
     fn clone(&self) -> Self {
-        Self { names: self.names, namespace: self.namespace.clone(), path: self.path.clone() }
+        Self {
+            names: self.names,
+            namespace: self.namespace.clone(),
+            path: self.path.clone(),
+            point: self.point.clone(),
+        }
     }
 }
 
 impl<'b, 'db, DB: DatabaseLike> PlPgSqlScope<'b, 'db, DB> {
+    /// The scope of `namespace` and `path`, standing at no point of the
+    /// value flow.
     pub(crate) const fn new(
         names: &'b BodyNames<'db, DB>,
         namespace: Namespace,
         path: BodyPath<'b>,
     ) -> Self {
-        Self { names, namespace, path }
+        Self { names, namespace, path, point: None }
+    }
+
+    /// The scope standing at `point` of the value flow.
+    pub(crate) fn at(self, point: FlowPoint<'b, 'db, DB>) -> Self {
+        Self { point: Some(point), ..self }
+    }
+
+    /// The point of the value flow the scope stands at.
+    pub(crate) const fn point(&self) -> Option<&FlowPoint<'b, 'db, DB>> {
+        self.point.as_ref()
     }
 
     /// Returns the function whose body the scope belongs to.
@@ -173,19 +195,13 @@ impl<'b, 'db, DB: DatabaseLike> PlPgSqlScope<'b, 'db, DB> {
         Some((self.names.variable(name), consumed))
     }
 
-    /// Returns the query whose rows the variable the name `parts` writes
-    /// holds in turn, when that variable is the record a cursor `FOR` loop
-    /// declares.
-    pub(crate) fn loop_query(&self, parts: &[String]) -> Option<&Statement> {
-        let (name, _) = self.namespace.lookup(parts, |name| self.names.holds_row(name))?;
-        match name.kind() {
-            NameKind::LoopRecord { query, .. } => Some(query),
-            _ => None,
-        }
-    }
-
     /// The path the body runs the expression under.
     pub(crate) const fn path(&self) -> &BodyPath<'b> {
         &self.path
+    }
+
+    /// The database the function belongs to.
+    pub(crate) const fn database(&self) -> &'db DB {
+        self.names.database()
     }
 }
