@@ -338,23 +338,15 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
     }
 }
 
-/// The table an arm reads, with the name its columns are qualified by.
+/// The table an arm reads, with the name its columns are qualified by and
+/// the columns it declares.
 struct ArmTable<'q, 'db, DB: DatabaseLike> {
     table: &'db DB::Table,
     qualifier: Cow<'q, Ident>,
+    columns: Vec<&'db DB::Column>,
 }
 
 impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
-    /// The column `expression` names, if it names one of the table's.
-    fn column(
-        &self,
-        expression: &Expr,
-        database: &'db DB,
-    ) -> Result<Option<&'db DB::Column>, LookupError> {
-        let Some(name) = self.column_name(expression) else { return Ok(None) };
-        self.table.column(&name.to_string(), database, IdentifierCase::AsWritten)
-    }
-
     /// The name `expression` gives a column of this table, bare or qualified
     /// by the table's name or alias.
     fn column_name<'e>(&self, expression: &'e Expr) -> Option<&'e Ident> {
@@ -376,32 +368,29 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
 
     /// Every column of the table `select` names, each once, which the owner
     /// needs `SELECT` on wherever the name stands.
-    fn columns_read(
-        &self,
-        select: &Select,
-        database: &'db DB,
-    ) -> Result<Vec<&'db DB::Column>, LookupError> {
-        let columns: Vec<&'db DB::Column> = self.table.columns(database)?.collect();
+    fn columns_read(&self, select: &Select) -> Vec<&'db DB::Column> {
         let mut read: Vec<&'db DB::Column> = Vec::new();
         let _: ControlFlow<()> = walk_expressions(select, |expression| {
-            let named = self.column_name(expression).and_then(|name| {
-                let name = name.to_string();
-                columns.iter().copied().find(|column| {
-                    IdentifierCase::AsWritten.names_stored(
-                        column.column_name(),
-                        column.column_name_is_quoted(),
-                        &name,
-                    )
-                })
-            });
-            if let Some(column) = named
+            if let Some(column) = self.named_column(expression)
                 && !read.iter().any(|seen| core::ptr::eq(*seen, column))
             {
                 read.push(column);
             }
             ControlFlow::Continue(())
         });
-        Ok(read)
+        read
+    }
+
+    /// The column of the table `expression` names.
+    fn named_column(&self, expression: &Expr) -> Option<&'db DB::Column> {
+        let name = self.column_name(expression)?.to_string();
+        self.columns.iter().copied().find(|column| {
+            IdentifierCase::AsWritten.names_stored(
+                column.column_name(),
+                column.column_name_is_quoted(),
+                &name,
+            )
+        })
     }
 }
 
@@ -668,7 +657,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let named_twice = rows.iter().enumerate().any(|(index, row)| {
             rows[..index].iter().any(|other| same_ident(&row.qualifier, &other.qualifier))
         });
-        if named_twice || rows_named(&rows, select, database)?.is_none() {
+        if named_twice || rows_named(&rows, select).is_none() {
             return Err(scope.arm_shape(select));
         }
         let table = &rows[0];
@@ -677,11 +666,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         else {
             return Err(scope.arm_shape(select));
         };
-        let Some(column) = table.column(returned, database)? else {
+        let Some(column) = table.named_column(returned) else {
             return Err(scope.arm_shape(select));
         };
         for row in &rows {
-            self.require_select(scope, row.table, || row.columns_read(select, database))?;
+            self.require_select(scope, row.table, || row.columns_read(select))?;
         }
         let keyed = self.keyed_table(table.table, column)?;
         let returns_key = table
@@ -752,8 +741,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let table = self.arm_table(scope, term, relation)?;
         let (Some(key), Some(returned), Some(compared)) = (
             table.table.primary_key_column(database)?,
-            table.column(returned, database)?,
-            table.column(compared, database)?,
+            table.named_column(returned),
+            table.named_column(compared),
         ) else {
             return Err(shape());
         };
@@ -774,7 +763,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if !references_key {
             return Err(shape());
         }
-        self.require_select(scope, table.table, || Ok(vec![key, column]))?;
+        self.require_select(scope, table.table, || vec![key, column])?;
         Ok(WalkArm { table: table.table, key, column, foreign_key, direction })
     }
 
@@ -853,7 +842,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             Some(alias) => Cow::Borrowed(alias),
             None => Cow::Owned(Ident::new(table.table_name())),
         };
-        Ok(ArmTable { table, qualifier })
+        let columns = table.columns(database)?.collect();
+        Ok(ArmTable { table, qualifier, columns })
     }
 
     /// Reads `<column> IN (SELECT <helper>(<arguments>))` in an arm returning
@@ -869,7 +859,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ) -> Result<HelperArm<'db, DB>, HelperSetError> {
         let database = self.database;
         let shape = || scope.arm_shape(select);
-        let Some(column) = table.column(compared, database)? else {
+        let Some(column) = table.named_column(compared) else {
             return Err(shape());
         };
         let foreign_key = match single_column_foreign_keys(table.table, column, database)?[..] {
@@ -917,7 +907,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ) -> Result<GranteeSet<'db, DB>, HelperSetError> {
         let database = self.database;
         let shape = || scope.arm_shape(select);
-        let Some(column) = table.column(compared, database)? else {
+        let Some(column) = table.named_column(compared) else {
             return Err(shape());
         };
         let foreign_key = match single_column_foreign_keys(table.table, column, database)?[..] {
@@ -951,7 +941,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             };
             // A column of the table takes the name before a parameter does,
             // and passes a value of each row.
-            if table.column(argument, database)?.is_some() {
+            if table.named_column(argument).is_some() {
                 return Err(shape());
             }
             let passed = scope.parameter(argument).map(|(passed, _)| passed.value.clone());
@@ -1041,10 +1031,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         &self,
         scope: &Scope<'db, DB>,
         table: &'db DB::Table,
-        read: impl FnOnce() -> Result<Vec<&'db DB::Column>, LookupError>,
+        read: impl FnOnce() -> Vec<&'db DB::Column>,
     ) -> Result<(), HelperSetError> {
         let held = table.privileges(scope.owner, self.database)?.select;
-        if held.on_table() || read()?.iter().all(|column| held.on_column(column)) {
+        if held.on_table() || read().iter().all(|column| held.on_column(column)) {
             return Ok(());
         }
         Err(HelperSetError::MissingSelect {
@@ -1066,7 +1056,6 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         column: &'db DB::Column,
         returns_key: bool,
     ) -> Result<Option<HelperArm<'db, DB>>, HelperSetError> {
-        let database = self.database;
         let shape = || scope.arm_shape(select);
         let (table, joined) = rows.split_first().ok_or_else(shape)?;
         // An inner join keeps the rows its condition and `WHERE` keep alike.
@@ -1081,12 +1070,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut joining: Vec<Joining<'_, 'db, DB>> =
             joined.iter().map(|_| Joining { conditions: Vec::new(), key: Vec::new() }).collect();
         for conjunct in conjuncts {
-            match rows_named(rows, conjunct, database)?.ok_or_else(shape)?.as_slice() {
+            match rows_named(rows, conjunct).ok_or_else(shape)?.as_slice() {
                 [] | [0] => own.push(conjunct),
                 [row] => joining[row - 1].conditions.push(conjunct),
                 _ => {
-                    let (row, (host, referenced)) = self
-                        .key_equality(table, joined, conjunct)?
+                    let (row, (host, referenced)) = Self::key_equality(table, joined, conjunct)
                         .ok_or_else(|| scope.irreducible(conjunct))?;
                     let key = &mut joining[row].key;
                     if !key.iter().any(|(seen_host, seen_referenced)| {
@@ -1174,7 +1162,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut kept = Kept::All;
         let mut time_bounds = Vec::new();
         for &condition in conditions {
-            if let Some(bound) = self.time_bound(scope, table, condition)? {
+            if let Some(bound) = self.time_bound(scope, table, condition) {
                 time_bounds.push(bound);
                 continue;
             }
@@ -1204,25 +1192,18 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// own `table` equated with one of a row it joins, answered as the index
     /// of that row in `joined` beside the two columns.
     fn key_equality(
-        &self,
         table: &ArmTable<'_, 'db, DB>,
         joined: &[ArmTable<'_, 'db, DB>],
         conjunct: &Expr,
-    ) -> Result<Option<(usize, JoinedColumns<'db, DB>)>, LookupError> {
-        let database = self.database;
+    ) -> Option<(usize, JoinedColumns<'db, DB>)> {
         let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = unnest(conjunct) else {
-            return Ok(None);
+            return None;
         };
-        for (index, row) in joined.iter().enumerate() {
-            for (host, referenced) in [(left, right), (right, left)] {
-                if let (Some(host), Some(referenced)) =
-                    (table.column(host, database)?, row.column(referenced, database)?)
-                {
-                    return Ok(Some((index, (host, referenced))));
-                }
-            }
-        }
-        Ok(None)
+        joined.iter().enumerate().find_map(|(index, row)| {
+            [(left, right), (right, left)].into_iter().find_map(|(host, referenced)| {
+                Some((index, (table.named_column(host)?, row.named_column(referenced)?)))
+            })
+        })
     }
 
     /// The one foreign key of `host` referencing `joined` whose every column
@@ -1343,7 +1324,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         scope: &Scope<'db, DB>,
         table: &ArmTable<'_, 'db, DB>,
         condition: &Expr,
-    ) -> Result<Option<TimeBound<'db, DB>>, HelperSetError> {
+    ) -> Option<TimeBound<'db, DB>> {
         let database = self.database;
         let (comparison, null) = match unnest(condition) {
             Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
@@ -1351,19 +1332,19 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     (Expr::IsNull(null), comparison) | (comparison, Expr::IsNull(null)) => {
                         (comparison, Some(null))
                     }
-                    _ => return Ok(None),
+                    _ => return None,
                 }
             }
             comparison => (comparison, None),
         };
-        let Expr::BinaryOp { left, op, right } = comparison else { return Ok(None) };
+        let Expr::BinaryOp { left, op, right } = comparison else { return None };
         let (compared, comparison) = if self.statement_time(scope, right) {
             let comparison = match op {
                 BinaryOperator::Gt => TimeComparison::Later,
                 BinaryOperator::GtEq => TimeComparison::LaterOrEqual,
                 BinaryOperator::Lt => TimeComparison::Earlier,
                 BinaryOperator::LtEq => TimeComparison::EarlierOrEqual,
-                _ => return Ok(None),
+                _ => return None,
             };
             (left, comparison)
         } else if self.statement_time(scope, left) {
@@ -1372,22 +1353,22 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 BinaryOperator::LtEq => TimeComparison::LaterOrEqual,
                 BinaryOperator::Gt => TimeComparison::Earlier,
                 BinaryOperator::GtEq => TimeComparison::EarlierOrEqual,
-                _ => return Ok(None),
+                _ => return None,
             };
             (right, comparison)
         } else {
-            return Ok(None);
+            return None;
         };
-        let Some(column) = table.column(compared, database)? else { return Ok(None) };
+        let column = table.named_column(compared)?;
         if column.data_type(database).scalar_family(database) != Some(ScalarFamily::TimestampTz) {
-            return Ok(None);
+            return None;
         }
         if let Some(null) = null
-            && table.column(null, database)?.is_none_or(|nulled| !core::ptr::eq(nulled, column))
+            && table.named_column(null).is_none_or(|nulled| !core::ptr::eq(nulled, column))
         {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(TimeBound { column, comparison, keeps_null: null.is_some() }))
+        Some(TimeBound { column, comparison, keeps_null: null.is_some() })
     }
 
     /// Whether `expression` reads the statement time, the start of the
@@ -1418,7 +1399,6 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         table: &ArmTable<'_, 'db, DB>,
         conjunct: &Expr,
     ) -> Result<Option<SettingComparison<'db, DB>>, HelperSetError> {
-        let database = self.database;
         let (column, read, packing, cast) = match unnest(conjunct) {
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
                 let sides = (self.operand(scope, table, left)?, self.operand(scope, table, right)?);
@@ -1432,7 +1412,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
                 let (Some(column), Some(set)) =
-                    (table.column(left, database)?, self.set_array(scope, right))
+                    (table.named_column(left), self.set_array(scope, right))
                 else {
                     return Ok(None);
                 };
@@ -1440,7 +1420,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             Expr::In { expr, target: InTarget::Subquery(query), negated: false, .. } => {
                 let (Some(column), Some(set)) =
-                    (table.column(expr, database)?, self.set_elements(scope, query))
+                    (table.named_column(expr), self.set_elements(scope, query))
                 else {
                     return Ok(None);
                 };
@@ -1659,7 +1639,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         expression: &'q Expr,
     ) -> Result<Operand<'q, 'db, DB>, HelperSetError> {
         let expression = unnest(expression);
-        if let Some(column) = table.column(expression, self.database)? {
+        if let Some(column) = table.named_column(expression) {
             return Ok(Operand::Column(column));
         }
         if let Some((passed, _)) = scope.parameter(expression) {
@@ -1961,37 +1941,28 @@ fn join_condition(join: &Join) -> Option<&Expr> {
 /// The indexes in `rows` of the rows whose columns `node` names, each once,
 /// `None` where it names bare a column two of them hold, which PostgreSQL
 /// refuses as ambiguous.
-fn rows_named<'db, DB: DatabaseLike, N: Visit + ?Sized>(
-    rows: &[ArmTable<'_, 'db, DB>],
+fn rows_named<DB: DatabaseLike, N: Visit + ?Sized>(
+    rows: &[ArmTable<'_, '_, DB>],
     node: &N,
-    database: &'db DB,
-) -> Result<Option<Vec<usize>>, LookupError> {
+) -> Option<Vec<usize>> {
     let mut named = Vec::new();
     let walked = walk_expressions(node, |expression| {
         if !matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
             return ControlFlow::Continue(());
         }
-        let mut holding = None;
-        for (index, row) in rows.iter().enumerate() {
-            match row.column(expression, database) {
-                Err(error) => return ControlFlow::Break(Some(error)),
-                Ok(Some(_)) if holding.is_some() => return ControlFlow::Break(None),
-                Ok(Some(_)) => holding = Some(index),
-                Ok(None) => {}
-            }
-        }
-        if let Some(index) = holding
-            && !named.contains(&index)
-        {
-            named.push(index);
+        let mut holding = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.named_column(expression).is_some())
+            .map(|(index, _)| index);
+        match (holding.next(), holding.next()) {
+            (_, Some(_)) => return ControlFlow::Break(()),
+            (Some(index), None) if !named.contains(&index) => named.push(index),
+            _ => {}
         }
         ControlFlow::Continue(())
     });
-    match walked {
-        ControlFlow::Continue(()) => Ok(Some(named)),
-        ControlFlow::Break(None) => Ok(None),
-        ControlFlow::Break(Some(error)) => Err(error),
-    }
+    walked.is_continue().then_some(named)
 }
 
 /// The name and the alias of the table `relation` names with nothing else

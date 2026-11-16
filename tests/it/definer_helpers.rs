@@ -3452,6 +3452,10 @@ fn a_joined_row_is_read_from_on_and_where_in_every_spelling_of_the_join() {
          ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
          AND m.user_id = current_setting('app.user_id', true) \
          WHERE state IN ('active', 'invited') AND o.state = min_role OR o.state = 'active'",
+        "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+         ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
+         AND m.user_id = o.user_id \
+         WHERE m.user_id = current_setting('app.user_id', true) AND o.state = 'active'",
     ] {
         assert_eq!(joined(body).as_deref(), Ok(MEMBER_TEAMS), "{body}");
     }
@@ -3511,6 +3515,11 @@ fn a_join_other_than_a_whole_foreign_key_to_the_row_it_names_refuses_the_answer(
         ),
         format!(
             "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
+             ON o.organization_id = m.organization_id AND o.user_id = m.user_id \
+             AND o.state = m.user_id WHERE {caller}"
+        ),
+        format!(
+            "SELECT m.team_id FROM public.team_members m JOIN public.memberships o \
              ON o.organization_id = m.organization_id AND o.user_id = m.team_id WHERE {caller}"
         ),
         format!(
@@ -3560,6 +3569,7 @@ fn a_join_other_than_a_whole_foreign_key_to_the_row_it_names_refuses_the_answer(
         "o.organization_id IN (SELECT member_teams(min_role))",
         "o.state <> m.team_role",
         "o.state = 'active' OR m.team_role = 'admin'",
+        "lower(o.state) = m.team_role",
     ] {
         assert!(
             matches!(
@@ -3579,6 +3589,32 @@ fn a_join_other_than_a_whole_foreign_key_to_the_row_it_names_refuses_the_answer(
     assert!(
         matches!(refusal(&parent), HelperSetError::ArmShape { .. }),
         "a parent arm takes no joined row"
+    );
+}
+
+#[test]
+fn a_join_along_no_foreign_key_or_two_of_the_arm_table_refuses_the_answer() {
+    let docs_arm = refusal(&helper(
+        DEFINER,
+        "SELECT d.id FROM docs d JOIN members m ON m.doc_id = d.id \
+         WHERE m.user_id = current_setting('app.user_id', true)",
+        "",
+    ));
+    assert!(
+        matches!(docs_arm, HelperSetError::ArmShape { .. }),
+        "the arm's table holds no foreign key to the row it joins"
+    );
+
+    let key =
+        "FOREIGN KEY (organization_id, user_id) REFERENCES memberships (organization_id, user_id)";
+    let twice = JOINED.replace(key, &format!("{key},\n  {key}"));
+    assert_ne!(twice, JOINED, "the foreign key is declared twice");
+    assert!(
+        matches!(
+            answer(&postgres(&twice), &deployment(), "public", "member_teams", &[text("admin")]),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "two foreign keys equally join the row"
     );
 }
 
