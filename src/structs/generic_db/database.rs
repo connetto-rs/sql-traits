@@ -68,6 +68,10 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         P::type_facts(self, &self.ingestion, type_name)
     }
 
+    fn new_function_executable_by_public(&self, owner: Option<&str>, schema: &str) -> Option<bool> {
+        P::new_function_executable_by_public(self, &self.ingestion, owner, schema)
+    }
+
     #[inline]
     fn catalog_name(&self) -> &str {
         &self.catalog_name

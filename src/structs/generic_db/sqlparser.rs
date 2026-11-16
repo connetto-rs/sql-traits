@@ -226,6 +226,19 @@ impl SchemaProfile for SqlparserProfile {
         type_facts::type_facts(database, &type_name)
     }
 
+    fn new_function_executable_by_public(
+        database: &ParserDB,
+        ingestion: &Arc<ParserIngestion>,
+        owner: Option<&str>,
+        schema: &str,
+    ) -> Option<bool> {
+        Some(ingestion.default_privileges.function_executable_by_public(
+            owner,
+            schema,
+            database.identifier_case(),
+        ))
+    }
+
     fn initial_schemas(dialect: &SqlparserDialect) -> impl IntoIterator<Item = (Arc<Schema>, ())> {
         // PostgreSQL 15 and later hand `public` to the database owner's
         // predefined role.

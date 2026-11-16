@@ -875,3 +875,67 @@ fn an_empty_global_default_leaves_the_schema_default_alone() {
     assert_eq!(t.privileges(role(&db, "reader"), &db).map(|held| held.select.on_table()), Ok(true));
     assert_eq!(t.privileges(role(&db, "r"), &db).map(|held| held.select.on_table()), Ok(false));
 }
+
+/// Whether `PUBLIC` holds `EXECUTE` on the next function `owner` creates in
+/// `schema`.
+fn next_function_public(db: &ParserDB, owner: Option<&str>, schema: &str) -> Option<bool> {
+    db.new_function_executable_by_public(owner, schema)
+}
+
+/// The defaults a function created now would start with are readable without
+/// creating one, the global row replacing the built-in `PUBLIC EXECUTE` and a
+/// schema row only adding to it.
+#[test]
+fn the_next_function_reads_the_recorded_defaults() {
+    let builtin = parse("CREATE SCHEMA s;").expect("schema parses");
+    assert_eq!(next_function_public(&builtin, None, "public"), Some(true));
+    assert_eq!(next_function_public(&builtin, None, "s"), Some(true));
+
+    let revoked = parse(
+        "CREATE SCHEMA s;
+         ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;",
+    )
+    .expect("schema parses");
+    assert_eq!(next_function_public(&revoked, None, "public"), Some(false));
+    assert_eq!(next_function_public(&revoked, None, "s"), Some(false));
+
+    let schema_only = parse(
+        "CREATE SCHEMA s;
+         ALTER DEFAULT PRIVILEGES IN SCHEMA s REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;",
+    )
+    .expect("schema parses");
+    assert_eq!(next_function_public(&schema_only, None, "s"), Some(true));
+
+    let schema_grant = parse(
+        "CREATE SCHEMA s;
+         ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+         ALTER DEFAULT PRIVILEGES IN SCHEMA s GRANT EXECUTE ON FUNCTIONS TO PUBLIC;",
+    )
+    .expect("schema parses");
+    assert_eq!(next_function_public(&schema_grant, None, "public"), Some(false));
+    assert_eq!(next_function_public(&schema_grant, None, "s"), Some(true));
+}
+
+/// A default belongs to the role creating the function, named as
+/// [`FunctionLike::owner`] names it, and a schema by the name PostgreSQL
+/// stores.
+#[test]
+fn the_next_function_reads_the_defaults_of_its_creating_role_and_schema() {
+    let db = parse(
+        "CREATE ROLE App_Owner; CREATE SCHEMA Api; CREATE SCHEMA \"Kept\";
+         ALTER DEFAULT PRIVILEGES FOR ROLE app_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+         ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA \"Kept\"
+             GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+         SET ROLE app_owner;
+         CREATE FUNCTION api.f() RETURNS INT LANGUAGE sql AS 'SELECT 1';",
+    )
+    .expect("schema parses");
+    let owner = function_owner(&db, "api.f");
+
+    assert_eq!(owner, Some("app_owner"));
+    assert_eq!(next_function_public(&db, owner, "api"), Some(executable_by_public(&db, "api.f")));
+    assert_eq!(next_function_public(&db, owner, "api"), Some(false));
+    assert_eq!(next_function_public(&db, owner, "Kept"), Some(true));
+    assert_eq!(next_function_public(&db, owner, "kept"), Some(false));
+    assert_eq!(next_function_public(&db, None, "api"), Some(true));
+}

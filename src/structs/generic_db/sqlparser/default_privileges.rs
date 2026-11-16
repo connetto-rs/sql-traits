@@ -763,6 +763,20 @@ impl DefaultPrivileges {
         items
     }
 
+    /// Whether `PUBLIC` holds `EXECUTE` on a new function in the schema
+    /// stored as `schema`, created by `owner`.
+    pub(super) fn function_executable_by_public(
+        &self,
+        owner: Option<&str>,
+        schema: &str,
+        case: IdentifierCase,
+    ) -> bool {
+        // A stored name compares as it stands, which a quoted one does.
+        self.items(owner, DefaultKind::Functions, Some((schema, true)), case).iter().any(|item| {
+            matches!(item.holder, Holder::Public) && item.privileges.contains(Rights::EXECUTE)
+        })
+    }
+
     /// Whether a default belongs to `role` or gives it privileges, which
     /// keeps PostgreSQL from dropping the role.
     pub(super) fn references_role(&self, role: &Ident) -> bool {
