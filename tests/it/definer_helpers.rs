@@ -453,10 +453,29 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
     arms.join(" UNION ")
 }
 
-/// `<column> IN (<values>)`.
-fn render_restriction(set: &LiteralSet<'_, ParserDB>) -> String {
-    let values: Vec<String> = set.values().iter().map(ToString::to_string).collect();
-    format!("{} IN ({})", set.column().column_name(), values.join(", "))
+/// `<column> IN (<values>)`, `<column> IS NULL` or `<column> IS NOT NULL`.
+fn render_restriction(restriction: &Restriction<'_, ParserDB>) -> String {
+    let column = restriction.column().column_name();
+    match restriction {
+        Restriction::In(set) => {
+            let values: Vec<String> = set.values().iter().map(ToString::to_string).collect();
+            format!("{column} IN ({})", values.join(", "))
+        }
+        Restriction::Null(_) => format!("{column} IS NULL"),
+        Restriction::NotNull(_) => format!("{column} IS NOT NULL"),
+    }
+}
+
+/// Whether `row` meets `restriction`.
+fn restricts(restriction: &Restriction<'_, ParserDB>, row: &[(&str, &'static str)]) -> bool {
+    let value = nullable(row, restriction.column().column_name());
+    match restriction {
+        Restriction::In(set) => {
+            value.is_some_and(|value| set.values().iter().any(|allowed| holds(allowed, value)))
+        }
+        Restriction::Null(_) => value.is_none(),
+        Restriction::NotNull(_) => value.is_some(),
+    }
 }
 
 /// `<column> <comparison> now`, or `NULL` kept beside it.
@@ -634,10 +653,8 @@ fn arm_rows(
                     })
                     .collect();
                 for row in rows(fixture, grant.table().table_name()) {
-                    let restricted = grant.restrictions().iter().all(|set| {
-                        let value = cell(row, set.column().column_name());
-                        set.values().iter().any(|allowed| holds(allowed, value))
-                    });
+                    let restricted =
+                        grant.restrictions().iter().all(|restriction| restricts(restriction, row));
                     let granted = match grant.granted_to() {
                         GrantedTo::Request(compared) => {
                             let held = cell(row, compared.column().column_name());
@@ -713,10 +730,7 @@ fn blocks(anti_join: &AntiJoin<'_, ParserDB>, row: &[(&str, &'static str)], fixt
             nullable(row, correlation.arm_column().column_name()).is_some_and(|value| {
                 nullable(blocking, correlation.blocking_column().column_name()) == Some(value)
             })
-        }) && anti_join.restrictions().iter().all(|set| {
-            let value = cell(blocking, set.column().column_name());
-            set.values().iter().any(|allowed| holds(allowed, value))
-        })
+        }) && anti_join.restrictions().iter().all(|restriction| restricts(restriction, blocking))
     })
 }
 
@@ -1442,6 +1456,50 @@ fn a_boolean_or_null_condition_keeps_every_row_or_none() {
         assert!(
             matches!(
                 flag(irreducible, Value::Boolean(true)),
+                Err(HelperSetError::Irreducible { .. })
+            ),
+            "{irreducible}"
+        );
+    }
+}
+
+#[test]
+fn a_null_test_requires_a_column_to_hold_no_value_or_any_value() {
+    let text_kept =
+        |condition: &str, argument: Value| kept("min_role TEXT", "TEXT", condition, &[argument]);
+    for (condition, expected) in [
+        ("role IS NULL", " AND role IS NULL"),
+        ("members.role IS NOT NULL", " AND role IS NOT NULL"),
+        ("doc_id IS NULL AND role = min_role", " AND doc_id IS NULL AND role IN ('write')"),
+        ("role IS NOT NULL AND role IN ('admin', min_role)", " AND role IN ('admin', 'write')"),
+        ("role = min_role AND role IS NOT NULL", " AND role IN ('write')"),
+        ("(role IS NULL OR role IS NULL)", " AND role IS NULL"),
+        ("(role = 'admin' OR role IS NOT NULL)", " AND role IS NOT NULL"),
+        ("(role IS NULL OR role IS NOT NULL)", ""),
+        ("min_role IS NOT NULL", ""),
+    ] {
+        assert_eq!(
+            text_kept(condition, text("write")).expect("answered"),
+            format!("{ROLES}{expected}"),
+            "{condition}"
+        );
+    }
+    for condition in ["role IS NULL AND role = min_role", "role IS NOT NULL AND role IS NULL"] {
+        assert_eq!(text_kept(condition, text("write")).expect("answered"), "", "{condition}");
+    }
+    assert_eq!(text_kept("min_role IS NULL", Value::Null).expect("answered"), ROLES);
+    assert_eq!(text_kept("min_role IS NULL", text("write")).expect("answered"), "");
+    assert_eq!(text_kept("min_role IS NOT NULL", Value::Null).expect("answered"), "");
+    for irreducible in [
+        "role IS NULL OR role = 'admin'",
+        "role IS NULL OR doc_id IS NULL",
+        "upper(role) IS NULL",
+        "current_setting('app.user_id', true) IS NULL",
+        "NOT role IS NULL",
+    ] {
+        assert!(
+            matches!(
+                text_kept(irreducible, text("write")),
                 Err(HelperSetError::Irreducible { .. })
             ),
             "{irreducible}"
@@ -3183,7 +3241,6 @@ fn a_gate_on_the_caller_cast_to_any_other_type_refuses_the_answer() {
         format!("{CALLER}::uuid <> {NIL}::text"),
         format!("{CALLER}::uuid <> 0"),
         format!("{CALLER}::text::uuid <> {NIL}"),
-        "g.id IS NOT NULL".to_string(),
     ] {
         assert!(
             matches!(
@@ -3193,6 +3250,11 @@ fn a_gate_on_the_caller_cast_to_any_other_type_refuses_the_answer() {
             "{gate}"
         );
     }
+    assert_eq!(
+        signed_in_gate(&signing("''", "g.id IS NOT NULL", "")),
+        Ok(None),
+        "a column tested for NULL gates nothing"
+    );
     let mixed = format!("{CALLER}::uuid <> {NIL} AND {CALLER} IS NOT NULL");
     assert!(
         matches!(signed_in_gate(&signing("''", &mixed, "")), Err(HelperSetError::ArmShape { .. })),
@@ -3380,7 +3442,6 @@ fn a_time_condition_no_bound_represents_is_irreducible() {
         "local_end > now()",
         "end_day > now()",
         "starts_at < expires_at",
-        "expires_at IS NULL",
         "expires_at IS NULL OR starts_at > now()",
         "expires_at > now() OR expires_at > now()",
         "role = 'admin' OR expires_at > now()",
@@ -4451,6 +4512,11 @@ fn an_anti_join_reads_its_correlations_by_postgres_name_resolution() {
             "NOT EXISTS (memberships WHERE user_id = grants.grantee_id AND state IN ('deactivated'))",
         ),
         (
+            "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id \
+             AND m.state IS NOT NULL",
+            "NOT EXISTS (memberships WHERE user_id = grants.grantee_id AND state IS NOT NULL)",
+        ),
+        (
             "SELECT 1 FROM public.organizations o WHERE o.id = permission.organization_id",
             "NOT EXISTS (keyed organizations WHERE id = grants.organization_id)",
         ),
@@ -4565,4 +4631,85 @@ fn an_anti_join_of_any_other_shape_refuses_the_answer() {
         ),
         "`*` reads every column, as PostgreSQL 16.15 refuses it"
     );
+}
+
+#[test]
+fn a_null_test_on_a_time_column_stays_apart_from_its_bound() {
+    assert_eq!(
+        bounded("expires_at IS NULL", "").expect("answered"),
+        format!("{ROLES} AND expires_at IS NULL")
+    );
+    assert_eq!(
+        bounded("starts_at IS NULL AND (expires_at IS NULL OR expires_at > now())", "")
+            .expect("answered"),
+        format!("{ROLES} AND starts_at IS NULL AND (expires_at IS NULL OR expires_at > now)")
+    );
+}
+
+/// Share links revoked by stamping `revoked_at`, active while it is `NULL`.
+const REVOCABLE: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE TABLE docs (id TEXT PRIMARY KEY);
+CREATE TABLE share_links (
+  doc_id TEXT NOT NULL REFERENCES docs (id),
+  user_id TEXT NOT NULL,
+  revoked_at TIMESTAMPTZ
+);
+GRANT SELECT ON share_links TO authz_owner;
+CREATE FUNCTION docs_shared() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT l.doc_id FROM public.share_links l
+  WHERE l.user_id = current_setting('app.user_id', true) AND l.revoked_at IS NULL
+$$;
+CREATE FUNCTION docs_revoked() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT l.doc_id FROM public.share_links l
+  WHERE l.user_id = current_setting('app.user_id', true) AND l.revoked_at IS NOT NULL
+$$;
+ALTER FUNCTION docs_shared() OWNER TO authz_owner;
+ALTER FUNCTION docs_revoked() OWNER TO authz_owner;
+";
+
+const REVOCABLE_ROWS: Rows = &[
+    ("share_links", &[("doc_id", "a"), ("user_id", "alice")]),
+    (
+        "share_links",
+        &[("doc_id", "b"), ("user_id", "alice"), ("revoked_at", "2026-01-01 00:00:00+00")],
+    ),
+    ("share_links", &[("doc_id", "c"), ("user_id", "bob")]),
+];
+
+/// What PostgreSQL 18.6 returns for `(caller, docs_shared(), docs_revoked())`
+/// over [`REVOCABLE_ROWS`], `None` for a caller setting never set.
+const REVOCABLE_MEASURED: &[(Option<&str>, &[&str], &[&str])] = &[
+    (None, &[], &[]),
+    (Some("alice"), &["a"], &["b"]),
+    (Some("bob"), &["c"], &[]),
+    (Some("zed"), &[], &[]),
+];
+
+#[test]
+fn a_revocation_stamp_keeps_a_link_while_it_holds_no_value() {
+    let database = postgres(REVOCABLE);
+    let deployment = deployment();
+    let shared = answer(&database, &deployment, "public", "docs_shared", &[]).expect("answered");
+    assert_eq!(
+        render(&shared),
+        "share_links.doc_id WHERE user_id = app.user_id AND revoked_at IS NULL"
+    );
+    let revoked = answer(&database, &deployment, "public", "docs_revoked", &[]).expect("answered");
+    assert_eq!(
+        render(&revoked),
+        "share_links.doc_id WHERE user_id = app.user_id AND revoked_at IS NOT NULL"
+    );
+    for &(caller, expected_shared, expected_revoked) in REVOCABLE_MEASURED {
+        let request = Request { caller, values: &[] };
+        for (set, expected, called) in [
+            (&shared, expected_shared, "docs_shared()"),
+            (&revoked, expected_revoked, "docs_revoked()"),
+        ] {
+            let returned: Vec<_> = evaluate(set, request, REVOCABLE_ROWS).into_iter().collect();
+            assert_eq!(returned, expected, "{caller:?} calling {called}");
+        }
+    }
 }

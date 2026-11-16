@@ -27,9 +27,10 @@ use crate::{
     errors::{AccessorRefusal, HelperSetError, LookupError},
     structs::{
         AntiJoin, CallerGate, CapLift, CapOperand, Correlation, Deployment, FunctionBody, GrantArm,
-        GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm, RowCap,
-        RowSecurity, RowStatement, SessionSetting, SetPacking, SettingComparison, SettingContent,
-        SettingValue, TargetName, TimeBound, TimeComparison, WalkArm, WalkDirection,
+        GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase, LiteralSet, ParentArm,
+        Restriction, RowCap, RowSecurity, RowStatement, SessionSetting, SetPacking,
+        SettingComparison, SettingContent, SettingValue, TargetName, TimeBound, TimeComparison,
+        WalkArm, WalkDirection,
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, FunctionLike, IndexLike, Relation,
@@ -425,9 +426,38 @@ enum Kept<'db, DB: DatabaseLike> {
     All,
     /// No row, the condition being `FALSE` or `NULL`.
     Nothing,
-    /// The rows each listed column of which holds one of its values, each
+    /// The rows each listed column of which holds what it requires, each
     /// column listed once.
-    In(Vec<(&'db DB::Column, Vec<Passed>)>),
+    In(Vec<(&'db DB::Column, Held)>),
+}
+
+/// What a condition requires one column to hold.
+#[derive(Clone)]
+enum Held {
+    /// One of the values, which no `NULL` is.
+    Values(Vec<Passed>),
+    Null,
+    NotNull,
+}
+
+impl Held {
+    /// Narrows `self` to what `other` also requires, `false` where no value
+    /// meets both.
+    fn and(&mut self, other: Self) -> bool {
+        match (&mut *self, other) {
+            (Self::Values(values), Self::Values(others)) => {
+                values.retain(|value| others.iter().any(|other| other.literal == value.literal));
+                !values.is_empty()
+            }
+            (Self::Values(_) | Self::NotNull, Self::NotNull) | (Self::Null, Self::Null) => true,
+            (Self::NotNull, values @ Self::Values(_)) => {
+                *self = values;
+                true
+            }
+            (Self::Values(_) | Self::NotNull, Self::Null)
+            | (Self::Null, Self::Values(_) | Self::NotNull) => false,
+        }
+    }
 }
 
 impl<DB: DatabaseLike> Clone for Kept<'_, DB> {
@@ -446,7 +476,11 @@ impl<'db, DB: DatabaseLike> Kept<'db, DB> {
     }
 
     fn values(column: &'db DB::Column, values: Vec<Passed>) -> Self {
-        if values.is_empty() { Self::Nothing } else { Self::In(vec![(column, values)]) }
+        if values.is_empty() {
+            Self::Nothing
+        } else {
+            Self::In(vec![(column, Held::Values(values))])
+        }
     }
 
     /// `<column> IN (<listed>)`, each value kept once and `NULL` matching
@@ -463,41 +497,19 @@ impl<'db, DB: DatabaseLike> Kept<'db, DB> {
         Self::values(column, kept)
     }
 
-    /// The literal sets the rows kept hold, `None` where no row is kept.
-    fn literal_sets(self) -> Option<Vec<LiteralSet<'db, DB>>> {
-        match self {
-            Self::Nothing => None,
-            Self::All => Some(Vec::new()),
-            Self::In(sets) => {
-                Some(
-                    sets.into_iter()
-                        .map(|(column, values)| {
-                            LiteralSet {
-                                column,
-                                values: values.into_iter().map(|passed| passed.value).collect(),
-                            }
-                        })
-                        .collect(),
-                )
-            }
-        }
-    }
-
     fn and(self, other: Self) -> Self {
         match (self, other) {
             (Self::Nothing, _) | (_, Self::Nothing) => Self::Nothing,
             (Self::All, kept) | (kept, Self::All) => kept,
             (Self::In(mut sets), Self::In(others)) => {
-                for (column, others) in others {
-                    let Some((_, values)) =
+                for (column, other) in others {
+                    let Some((_, held)) =
                         sets.iter_mut().find(|(seen, _)| core::ptr::eq(*seen, column))
                     else {
-                        sets.push((column, others));
+                        sets.push((column, other));
                         continue;
                     };
-                    values
-                        .retain(|value| others.iter().any(|other| other.literal == value.literal));
-                    if values.is_empty() {
+                    if !held.and(other) {
                         return Self::Nothing;
                     }
                 }
@@ -507,25 +519,68 @@ impl<'db, DB: DatabaseLike> Kept<'db, DB> {
     }
 
     /// `self OR other`, `None` where the two restrict anything but the same
-    /// one column.
+    /// one column, or where one keeps its `NULL` and the other some of its
+    /// values.
     fn or(self, other: Self) -> Option<Self> {
         match (self, other) {
             (Self::All, _) | (_, Self::All) => Some(Self::All),
             (Self::Nothing, kept) | (kept, Self::Nothing) => Some(kept),
-            (Self::In(mut sets), Self::In(mut others)) => {
-                let (Some((right, others)), None) = (others.pop(), others.pop()) else {
+            (Self::In(sets), Self::In(others)) => {
+                let (Ok([(left, held)]), Ok([(right, other)])) =
+                    (<[_; 1]>::try_from(sets), <[_; 1]>::try_from(others))
+                else {
                     return None;
                 };
-                let [(left, values)] = sets.as_mut_slice() else { return None };
-                if !core::ptr::eq(*left, right) {
+                if !core::ptr::eq(left, right) {
                     return None;
                 }
-                for other in others {
-                    if !values.iter().any(|value| value.literal == other.literal) {
-                        values.push(other);
+                let held = match (held, other) {
+                    (Held::Values(mut values), Held::Values(others)) => {
+                        for other in others {
+                            if !values.iter().any(|value| value.literal == other.literal) {
+                                values.push(other);
+                            }
+                        }
+                        Held::Values(values)
                     }
-                }
-                Some(Self::In(sets))
+                    (Held::Null, Held::Null) => Held::Null,
+                    (Held::Values(_) | Held::NotNull, Held::NotNull)
+                    | (Held::NotNull, Held::Values(_)) => Held::NotNull,
+                    (Held::Null, Held::NotNull) | (Held::NotNull, Held::Null) => {
+                        return Some(Self::All);
+                    }
+                    (Held::Values(_), Held::Null) | (Held::Null, Held::Values(_)) => return None,
+                };
+                Some(Self::In(vec![(left, held)]))
+            }
+        }
+    }
+
+    /// The restrictions the rows are kept by, `None` where no row is kept.
+    fn restrictions(self) -> Option<Vec<Restriction<'db, DB>>> {
+        match self {
+            Self::Nothing => None,
+            Self::All => Some(Vec::new()),
+            Self::In(sets) => {
+                Some(
+                    sets.into_iter()
+                        .map(|(column, held)| {
+                            match held {
+                                Held::Values(values) => {
+                                    Restriction::In(LiteralSet {
+                                        column,
+                                        values: values
+                                            .into_iter()
+                                            .map(|passed| passed.value)
+                                            .collect(),
+                                    })
+                                }
+                                Held::Null => Restriction::Null(column),
+                                Held::NotNull => Restriction::NotNull(column),
+                            }
+                        })
+                        .collect(),
+                )
             }
         }
     }
@@ -1206,7 +1261,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                      kept: Kept<'db, DB>,
                      gate: Option<CallerGate<'db>>,
                      time_bounds: Vec<TimeBound<'db, DB>>| {
-            let restrictions = kept.and(own).literal_sets()?;
+            let restrictions = kept.and(own).restrictions()?;
             Some(HelperArm::Grant(GrantArm {
                 table: table.table,
                 columns: columns.to_vec(),
@@ -1321,7 +1376,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
         })?;
         let (kept, time_bounds) = self.filter(scope, &blocker, filters)?;
-        let Some(restrictions) = kept.literal_sets() else { return Ok(None) };
+        let Some(restrictions) = kept.restrictions() else { return Ok(None) };
         let correlated: Vec<_> =
             correlations.iter().map(|correlation| correlation.blocking_column).collect();
         Ok(Some(AntiJoin {
@@ -2144,7 +2199,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Some(list)
     }
 
-    /// What `condition` keeps, `None` where it reduces to no literal set.
+    /// What `condition` keeps, `None` where it reduces to no restriction.
     fn reduce(
         &self,
         scope: &Scope<'db, DB>,
@@ -2207,6 +2262,22 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     }
                     _ => Ok(None),
                 }
+            }
+            tested @ (Expr::IsNull(operand) | Expr::IsNotNull(operand)) => {
+                let null = matches!(tested, Expr::IsNull(_));
+                Ok(match self.operand(scope, table, operand)? {
+                    Operand::Passed(passed) => {
+                        let holds = (passed.literal == Literal::Null) == null;
+                        Some(Kept::of(if holds { Equality::Holds } else { Equality::Fails }))
+                    }
+                    Operand::Column(column) => {
+                        Some(Kept::In(vec![(
+                            column,
+                            if null { Held::Null } else { Held::NotNull },
+                        )]))
+                    }
+                    _ => None,
+                })
             }
             expression => {
                 Ok(match self.operand(scope, table, expression)? {

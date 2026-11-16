@@ -64,7 +64,7 @@ pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) columns: Vec<&'db DB::Column>,
     pub(crate) granted_to: GrantedTo<'db, DB>,
     pub(crate) gate: Option<CallerGate<'db>>,
-    pub(crate) restrictions: Vec<LiteralSet<'db, DB>>,
+    pub(crate) restrictions: Vec<Restriction<'db, DB>>,
     pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
     /// Shared by the arms an `IN` list of request values splits one
     /// condition into.
@@ -101,11 +101,11 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
         self.gate.as_ref()
     }
 
-    /// The values columns have to hold, each set over its own column, all of
-    /// them holding at once. Empty where the condition is absent or holds
-    /// for every row.
+    /// What columns have to hold, one restriction per column, all of them
+    /// holding at once, in the order the condition first names the columns.
+    /// Empty where the condition is absent or holds for every row.
     #[must_use]
-    pub fn restrictions(&self) -> &[LiteralSet<'db, DB>] {
+    pub fn restrictions(&self) -> &[Restriction<'db, DB>] {
         &self.restrictions
     }
 
@@ -484,6 +484,33 @@ pub enum TimeComparison {
     EarlierOrEqual,
 }
 
+/// What a grant arm's condition requires of one column.
+///
+/// `<column> IS NULL` keeps the rows whose column holds no value, as a
+/// revocation stamp left `NULL` keeps a link active. It stays apart from a
+/// [`TimeBound`] on the same column, which compares a value with the
+/// statement time.
+#[derive(Debug)]
+pub enum Restriction<'db, DB: DatabaseLike> {
+    /// The column holds one of the set's values.
+    In(LiteralSet<'db, DB>),
+    /// `<column> IS NULL`.
+    Null(&'db DB::Column),
+    /// `<column> IS NOT NULL`.
+    NotNull(&'db DB::Column),
+}
+
+impl<'db, DB: DatabaseLike> Restriction<'db, DB> {
+    /// The column restricted.
+    #[must_use]
+    pub fn column(&self) -> &'db DB::Column {
+        match self {
+            Self::In(set) => set.column,
+            Self::Null(column) | Self::NotNull(column) => column,
+        }
+    }
+}
+
 /// `<column> IN (<values>)`.
 #[derive(Debug)]
 pub struct LiteralSet<'db, DB: DatabaseLike> {
@@ -521,7 +548,7 @@ pub struct AntiJoin<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
     pub(crate) correlations: Vec<Correlation<'db, DB>>,
     pub(crate) keyed: bool,
-    pub(crate) restrictions: Vec<LiteralSet<'db, DB>>,
+    pub(crate) restrictions: Vec<Restriction<'db, DB>>,
     pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
 }
 
@@ -548,11 +575,11 @@ impl<'db, DB: DatabaseLike> AntiJoin<'db, DB> {
         self.keyed
     }
 
-    /// The values columns of a blocking row have to hold, as
+    /// What columns of a blocking row have to hold, as
     /// [`GrantArm::restrictions`] reads them. Empty where the conditions
     /// beside the correlations are absent or hold for every row.
     #[must_use]
-    pub fn restrictions(&self) -> &[LiteralSet<'db, DB>] {
+    pub fn restrictions(&self) -> &[Restriction<'db, DB>] {
         &self.restrictions
     }
 
