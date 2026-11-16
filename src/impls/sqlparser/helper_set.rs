@@ -28,9 +28,9 @@ use crate::{
     structs::{
         AntiJoin, CallerGate, CapLift, CapOperand, Correlation, Deployment, FunctionBody, GrantArm,
         GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase, JoinedRow, LiteralSet,
-        ParentArm, Restriction, RowCap, RowSecurity, RowStatement, SessionSetting, SetPacking,
-        SettingComparison, SettingContent, SettingValue, TargetName, TimeBound, TimeComparison,
-        WalkArm, WalkDirection,
+        ParentArm, RequestNormalization, Restriction, RowCap, RowSecurity, RowStatement,
+        SessionSetting, SetPacking, SettingComparison, SettingContent, SettingValue, TargetName,
+        TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, EnumerationKind, EnumerationMember, ForeignKeyLike,
@@ -109,8 +109,8 @@ enum Equality {
 }
 
 /// `current_setting('<name>'[, <missing_ok>])`, resolved to PostgreSQL's own
-/// function, or that read through `NULLIF(<read>, '')`, either returned by
-/// an accessor the body calls.
+/// function, or that read through `NULLIF(<read>, '')` or `lower(<read>)`,
+/// either returned by an accessor the body calls.
 struct SettingRead {
     name: String,
     /// Whether the body reads the setting without `missing_ok`.
@@ -121,6 +121,8 @@ struct SettingRead {
     /// Whether an accessor returns it cast to the type the deployment
     /// declares it in, or a set cast to the type it declares its elements in.
     in_declared_type: bool,
+    /// The function the body applies to the text it reads.
+    normalization: Option<RequestNormalization>,
 }
 
 /// A value the body passes: the literal it compares as and the value a
@@ -1995,6 +1997,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let Operand::Setting { read, cast } = self.operand(scope, table, read)? else {
             return Ok(None);
         };
+        if read.normalization.is_some() {
+            return Ok(None);
+        }
         let (setting, declared) = self.declared_setting(scope, &read.name)?;
         if let Some(cast) = cast
             && !declared.is_some_and(|declared| self.is_declared_type(scope, cast, declared))
@@ -2056,6 +2061,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             .as_ref()
             .is_some_and(|passed| !matches!(passed.literal, Literal::Text(_) | Literal::Null))
         {
+            return Ok(None);
+        }
+        if read.normalization.is_some() {
             return Ok(None);
         }
         let (setting, declared) = self.caller_setting(scope, &read.name)?;
@@ -2216,12 +2224,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 None,
                 SettingContent::Value(
                     SettingValue::Caller(declared)
-                    | SettingValue::Principal { identity: declared, .. },
+                    | SettingValue::Principal { identity: declared, .. }
+                    | SettingValue::Scalar(declared),
                 ),
             ) => declared,
             (None, _) => {
                 return refuse(|function, setting| {
-                    HelperSetError::SettingNotPrincipal { function, setting }
+                    HelperSetError::SettingNotSingle { function, setting }
                 });
             }
             (
@@ -2241,6 +2250,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 });
             }
         };
+        if let Some(normalization) = read.normalization
+            && !matches!(setting.content(), SettingContent::Value(SettingValue::Scalar(_)))
+        {
+            return Err(HelperSetError::SettingNormalized {
+                function: scope.name.clone(),
+                setting: setting.name().to_string(),
+                normalization,
+            });
+        }
         if let Some(cast) = cast
             && !self.is_declared_type(scope, cast.compared, declared)
         {
@@ -2255,6 +2273,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             setting,
             raises_when_unset: read.raises_when_unset,
             excludes_unset,
+            normalization: read.normalization,
         })
     }
 
@@ -2410,13 +2429,23 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// The setting `expression` reads, `current_setting(...)`,
-    /// `NULLIF(<read>, '')` or an accessor returning a read.
+    /// `NULLIF(<read>, '')`, `lower(<read>)` or an accessor returning a read.
     fn setting_expression(
         &self,
         scope: &Scope<'db, DB>,
         expression: &Expr,
     ) -> Result<Option<SettingRead>, HelperSetError> {
         let Expr::Function(call) = unnest(expression) else { return Ok(None) };
+        if let Some([FunctionArg::Unnamed(FunctionArgExpr::Expr(read))]) =
+            self.catalog_arguments(scope, call, "lower").map(|list| list.args.as_slice())
+        {
+            return Ok(self
+                .text_setting(scope, read)?
+                .filter(|read| read.normalization.is_none())
+                .map(|read| {
+                    SettingRead { normalization: Some(RequestNormalization::Lower), ..read }
+                }));
+        }
         if expression_form(&call.name) != Some(ExpressionForm::NullIf) {
             if let Some(read) = self.setting_read(scope, call) {
                 return Ok(Some(read));
@@ -2728,7 +2757,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             _ => return None,
         };
         let Literal::Text(name) = name else { return None };
-        Some(SettingRead { name, raises_when_unset, empty_as_null: false, in_declared_type: false })
+        Some(SettingRead {
+            name,
+            raises_when_unset,
+            empty_as_null: false,
+            in_declared_type: false,
+            normalization: None,
+        })
     }
 
     /// The arguments of `call` where it calls PostgreSQL's own `name`, in

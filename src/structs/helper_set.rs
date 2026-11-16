@@ -229,8 +229,8 @@ impl<'db, DB: DatabaseLike> JoinedRow<'db, DB> {
 /// Whose rows a [`GrantArm`] keeps.
 #[derive(Debug)]
 pub enum GrantedTo<'db, DB: DatabaseLike> {
-    /// The rows whose column holds the caller, another principal, or an
-    /// element of a declared set, the request carries.
+    /// The rows whose column holds the caller, another principal, an
+    /// element of a declared set, or a scalar value, the request carries.
     Request(SettingComparison<'db, DB>),
     /// `<column> IN (SELECT <function>(<arguments>))`, the rows naming one of
     /// the grantees another helper returns, such as every grantee the caller
@@ -465,16 +465,21 @@ impl<'db> CallerGate<'db> {
     }
 }
 
-/// `<column> = current_setting(<principal>)[::<declared type>]`, the
-/// principal the caller or another the deployment declares, or `<column>`
-/// compared with each element of a declared set, `<column> = ANY (<array>)`
-/// or `<column> IN (SELECT <elements>)`.
+/// `<column> = <read>`, `<read>` reading the principal the caller or another
+/// the deployment declares, or a scalar value, or `<column>` compared with
+/// each element of a declared set, `<column> = ANY (<array>)` or `<column>
+/// IN (SELECT <elements>)`.
 ///
-/// `<column> IN (<values>)` listing principals beside literals and
-/// parameters is read as one grant arm per principal, compared as `=`
+/// `<read>` is `current_setting(<setting>)[::<declared type>]`. A read of a
+/// scalar may be normalized by `lower(...)`, once, which a consumer applies
+/// to the value it supplies as PostgreSQL does (see
+/// [`normalization`](Self::normalization)).
+///
+/// `<column> IN (<values>)` listing principals or scalars beside literals
+/// and parameters is read as one grant arm per read, compared as `=`
 /// compares it, and one arm granted to anyone for the literals together, as
 /// PostgreSQL reads the list as `<column> = <value>` for each value joined
-/// by `OR`. A principal reading `NULL` keeps no row through its arm.
+/// by `OR`. A read holding `NULL` keeps no row through its arm.
 ///
 /// `<array>` is `string_to_array(current_setting(<set>),
 /// <delimiter>)[::<element type>[]]`, the set packed as
@@ -493,6 +498,7 @@ pub struct SettingComparison<'db, DB: DatabaseLike> {
     pub(crate) setting: &'db SessionSetting,
     pub(crate) raises_when_unset: bool,
     pub(crate) excludes_unset: bool,
+    pub(crate) normalization: Option<RequestNormalization>,
 }
 
 impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
@@ -504,8 +510,9 @@ impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
 
     /// The setting compared with, as the deployment declares it, either
     /// [`SettingValue::Caller`](crate::structs::SettingValue::Caller),
-    /// [`SettingValue::Principal`](crate::structs::SettingValue::Principal)
-    /// or [`SettingValue::Set`](crate::structs::SettingValue::Set).
+    /// [`SettingValue::Principal`](crate::structs::SettingValue::Principal),
+    /// [`SettingValue::Scalar`](crate::structs::SettingValue::Scalar) or
+    /// [`SettingValue::Set`](crate::structs::SettingValue::Set).
     #[must_use]
     pub fn setting(&self) -> &'db SessionSetting {
         self.setting
@@ -529,6 +536,32 @@ impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
     #[must_use]
     pub fn excludes_unset(&self) -> bool {
         self.excludes_unset
+    }
+
+    /// The normalization the body writes on its read of a scalar, `None`
+    /// where the column is compared with the value as the request sends it.
+    /// A row is kept where the column holds the normalized value, so a
+    /// consumer normalizes the value it supplies before comparing it.
+    #[must_use]
+    pub fn normalization(&self) -> Option<RequestNormalization> {
+        self.normalization
+    }
+}
+
+/// A function a [`SettingComparison`] applies to its read of a scalar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequestNormalization {
+    /// PostgreSQL's own `lower(text)`, which converts the text to lower case
+    /// by the rules of the database's default collation, and keeps `NULL`
+    /// and `''` as they are.
+    Lower,
+}
+
+impl core::fmt::Display for RequestNormalization {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Lower => "lower",
+        })
     }
 }
 

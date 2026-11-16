@@ -300,11 +300,12 @@ fn render_granted_to(granted_to: &GrantedTo<'_, ParserDB>) -> Option<String> {
                 SettingContent::Value(SettingValue::Set { .. }) => "IN",
                 _ => "=",
             };
-            Some(format!(
-                "{} {compared} {}",
-                request.column().column_name(),
-                request.setting().name()
-            ))
+            let setting = request.setting().name();
+            let read = match request.normalization() {
+                None => setting.to_string(),
+                Some(RequestNormalization::Lower) => format!("lower({setting})"),
+            };
+            Some(format!("{} {compared} {read}", request.column().column_name()))
         }
         GrantedTo::Set(grantees) => {
             let arguments: Vec<String> =
@@ -564,12 +565,23 @@ impl Request {
         self.values.iter().find(|(set, _)| *set == name).map(|(_, values)| *values)
     }
 
-    /// Whether `value` is what the request carries in `setting`.
-    fn carries(self, setting: &SessionSetting, value: &str) -> bool {
+    /// Whether `held` is what the request carries in the setting `compared`
+    /// reads, normalized as `compared` normalizes it.
+    fn carries(self, compared: &SettingComparison<'_, ParserDB>, held: &str) -> bool {
+        let setting = compared.setting();
+        let sends = |value: &str| {
+            match compared.normalization() {
+                None => value == held,
+                Some(RequestNormalization::Lower) => value.to_lowercase() == held,
+            }
+        };
         match setting.content() {
-            SettingContent::Value(SettingValue::Caller(_)) => self.caller == Some(value),
-            SettingContent::Value(SettingValue::Set { .. } | SettingValue::Principal { .. }) => {
-                self.values(setting.name()).is_some_and(|values| values.contains(&value))
+            SettingContent::Value(SettingValue::Caller(_)) => self.caller.is_some_and(sends),
+            SettingContent::Value(
+                SettingValue::Set { .. } | SettingValue::Principal { .. } | SettingValue::Scalar(_),
+            ) => {
+                self.values(setting.name())
+                    .is_some_and(|values| values.iter().any(|value| sends(value)))
             }
             other => panic!("the fixtures compare with no {other:?}"),
         }
@@ -693,8 +705,7 @@ fn grant_rows(
         let granted = match grant.granted_to() {
             GrantedTo::Request(compared) => {
                 let held = cell(row, compared.column().column_name());
-                !(compared.excludes_unset() && held.is_empty())
-                    && request.carries(compared.setting(), held)
+                !(compared.excludes_unset() && held.is_empty()) && request.carries(compared, held)
             }
             GrantedTo::Set(compared) => {
                 grantees.as_ref().is_some_and(|grantees| {
@@ -1319,15 +1330,10 @@ fn a_compared_setting_must_be_declared_as_what_the_comparison_reads() {
         HelperSetError::UndeclaredSetting { setting, .. } if setting == "app.tenant"
     ));
     let equal = helper(DEFINER, GRANT_ARM, "");
-    for value in [SettingValue::Scalar(DataType::Text), delimited(",")] {
-        assert!(
-            matches!(
-                refusal_with(&equal, &declaring(value.clone())),
-                HelperSetError::SettingNotPrincipal { setting, .. } if setting == "app.user_id"
-            ),
-            "{value:?}"
-        );
-    }
+    assert!(matches!(
+        refusal_with(&equal, &declaring(delimited(","))),
+        HelperSetError::SettingNotSingle { setting, .. } if setting == "app.user_id"
+    ));
     let database = postgres(&equal);
     let rendered = |value: SettingValue| {
         let deployment = declaring(value);
@@ -1336,11 +1342,14 @@ fn a_compared_setting_must_be_declared_as_what_the_comparison_reads() {
     };
     let installation =
         SettingValue::Principal { kind: "installation".into(), identity: DataType::Text };
-    assert_eq!(
-        rendered(installation),
-        rendered(SettingValue::Caller(DataType::Text)),
-        "a principal compares as the caller does"
-    );
+    for value in [installation, SettingValue::Scalar(DataType::Text)] {
+        let declared = format!("{value:?}");
+        assert_eq!(
+            rendered(value),
+            rendered(SettingValue::Caller(DataType::Text)),
+            "{declared} compares as the caller does"
+        );
+    }
     let split = helper(
         DEFINER,
         "SELECT doc_id FROM members WHERE user_id = ANY (string_to_array(current_setting('app.user_id', true), ','))",
@@ -4283,7 +4292,6 @@ fn an_accessor_is_checked_as_a_call_and_its_read_as_a_read() {
 fn a_call_returning_anything_but_a_setting_read_is_irreducible() {
     let after = |body: &str| accessor("caller_id", "uuid", ACCESSOR, body);
     for (after, read) in [
-        (after(&format!("lower({ABSENT})::uuid")), "authz.caller_id()"),
         (after("o.principal_id FROM public.organization_blocks o"), "authz.caller_id()"),
         (after(&format!("{ABSENT}::uuid WHERE true")), "authz.caller_id()"),
         (caller_id(ACCESSOR), "authz.caller_id()::uuid"),
@@ -4478,30 +4486,38 @@ fn a_listed_principal_is_read_in_every_spelling_a_compared_one_is() {
 }
 
 #[test]
-fn a_list_naming_anything_but_principals_literals_and_parameters_refuses_the_answer() {
+fn a_listed_scalar_is_read_in_every_spelling_a_listed_principal_is() {
     let user = "NULLIF(current_setting('app.user_id', true), '')::uuid";
-    let refused = |condition: String, after: &str| listing(&condition, after).map(|_| ());
-    let not_principal = |setting: &str| {
-        Err(HelperSetError::SettingNotPrincipal {
-            function: "authz.blocking_organizations".into(),
-            setting: setting.into(),
-        })
-    };
+    let both = "organization_blocks.organization_id WHERE principal_id = app.user_id \
+                UNION organization_blocks.organization_id WHERE principal_id = app.tenant";
     let tenant_id = accessor(
         "tenant_id",
         "UUID",
         ACCESSOR,
         "NULLIF(current_setting('app.tenant', true), '')::uuid",
     );
-    for (condition, after) in [
-        (format!("b.principal_id IN ({user}, current_setting('app.tenant', true)::uuid)"), ""),
-        (format!("b.principal_id IN ({user}, authz.tenant_id())"), tenant_id.as_str()),
+    for (listed, after) in [
+        ("current_setting('app.tenant', true)::uuid", ""),
+        ("authz.tenant_id()", tenant_id.as_str()),
     ] {
-        assert_eq!(refused(condition, after), not_principal("app.tenant"), "a scalar");
+        let condition = format!("b.principal_id IN ({user}, {listed})");
+        assert_eq!(listing(&condition, after).as_deref(), Ok(both), "{listed}");
     }
+}
+
+#[test]
+fn a_list_naming_anything_but_request_values_literals_and_parameters_refuses_the_answer() {
+    let user = "NULLIF(current_setting('app.user_id', true), '')::uuid";
+    let refused = |condition: String, after: &str| listing(&condition, after).map(|_| ());
+    let not_single = |setting: &str| {
+        Err(HelperSetError::SettingNotSingle {
+            function: "authz.blocking_organizations".into(),
+            setting: setting.into(),
+        })
+    };
     assert_eq!(
         refused(format!("b.principal_id IN ({user}, current_setting('app.link_ids', true))"), ""),
-        not_principal("app.link_ids"),
+        not_single("app.link_ids"),
         "a set read as one value"
     );
     let links = accessor("links", "UUID", ACCESSOR, "current_setting('app.link_ids', true)::uuid");
@@ -4556,7 +4572,7 @@ fn a_list_naming_anything_but_principals_literals_and_parameters_refuses_the_ans
             ),
             ""
         ),
-        not_principal("request.jwt.claims"),
+        not_single("request.jwt.claims"),
         "a JSON document compared as one value"
     );
     let claims = "CREATE FUNCTION authz.claims() RETURNS UUID LANGUAGE sql STABLE
@@ -6528,4 +6544,257 @@ fn a_bare_name_in_a_joined_cap_is_the_joined_column_before_a_parameter() {
          IN (SELECT * FROM authz.capped_kinds('admin')))",
     );
     assert!(matches!(lift, Err(HelperSetError::Irreducible { .. })), "{lift:?}");
+}
+
+const VERIFIED_EMAIL: &str = "app.verified_email";
+
+/// Invitations addressed to the email a request verified, read by helpers
+/// comparing with `authz.verified_email()`, which returns it lowered, with
+/// `authz.raw_email()`, which returns it as sent, and with the setting
+/// lowered in the arm itself.
+const INVITATIONS: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO app, authz_owner;
+CREATE TABLE invitations (id TEXT PRIMARY KEY, email TEXT NOT NULL CHECK (email = lower(email)));
+GRANT SELECT ON invitations TO authz_owner;
+CREATE FUNCTION authz.verified_email() RETURNS TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT lower(NULLIF(current_setting('app.verified_email', true), ''))
+$$;
+CREATE FUNCTION authz.raw_email() RETURNS TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT NULLIF(current_setting('app.verified_email', true), '')
+$$;
+CREATE FUNCTION authz.normalized_invitations() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT invitation.id FROM public.invitations invitation WHERE invitation.email = authz.verified_email()
+$$;
+CREATE FUNCTION authz.raw_invitations() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT invitation.id FROM public.invitations invitation WHERE invitation.email = authz.raw_email()
+$$;
+CREATE FUNCTION authz.bare_invitations() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT invitation.id FROM public.invitations invitation
+  WHERE invitation.email = lower(current_setting('app.verified_email', true))
+$$;
+ALTER FUNCTION authz.verified_email() OWNER TO authz_owner;
+ALTER FUNCTION authz.raw_email() OWNER TO authz_owner;
+ALTER FUNCTION authz.normalized_invitations() OWNER TO authz_owner;
+ALTER FUNCTION authz.raw_invitations() OWNER TO authz_owner;
+ALTER FUNCTION authz.bare_invitations() OWNER TO authz_owner;
+";
+
+/// The rows [`INVITATIONS`] was measured over.
+const INVITATION_ROWS: Rows = &[
+    ("invitations", &[("id", "i1"), ("email", "eve@example.com")]),
+    ("invitations", &[("id", "i2"), ("email", "bob@example.com")]),
+    ("invitations", &[("id", "i3"), ("email", "")]),
+];
+
+/// The rows one helper returns.
+type Returned = &'static [&'static str];
+
+/// What PostgreSQL 18.6 returns as `app` over [`INVITATION_ROWS`] for
+/// `(request, normalized_invitations, raw_invitations, bare_invitations)`.
+/// A request sending no email leaves the setting unset, and one whose
+/// transaction ended reads `''`, as one sending `''` does.
+const INVITATIONS_MEASURED: &[(Request, Returned, Returned, Returned)] = &[
+    (Request { caller: None, values: &[] }, &[], &[], &[]),
+    (Request { caller: None, values: &[(VERIFIED_EMAIL, &[""])] }, &[], &[], &["i3"]),
+    (
+        Request { caller: None, values: &[(VERIFIED_EMAIL, &["eve@example.com"])] },
+        &["i1"],
+        &["i1"],
+        &["i1"],
+    ),
+    (
+        Request { caller: None, values: &[(VERIFIED_EMAIL, &["Eve@Example.COM"])] },
+        &["i1"],
+        &[],
+        &["i1"],
+    ),
+    (
+        Request { caller: None, values: &[(VERIFIED_EMAIL, &["BOB@EXAMPLE.COM"])] },
+        &["i2"],
+        &[],
+        &["i2"],
+    ),
+    (
+        Request { caller: None, values: &[(VERIFIED_EMAIL, &["mallory@example.com"])] },
+        &[],
+        &[],
+        &[],
+    ),
+];
+
+/// A deployment declaring the caller, the email a request verified as a
+/// scalar and a delimited set of links, each of which a request may leave
+/// unset.
+fn verifying() -> Deployment {
+    let setting = |name: &str, value: SettingValue| {
+        SessionSetting::value(name, value).expect("a custom setting name").may_be_unset()
+    };
+    Deployment::new(
+        "app",
+        ["app"],
+        [
+            setting("app.user_id", SettingValue::Caller(DataType::Text)),
+            setting(VERIFIED_EMAIL, SettingValue::Scalar(DataType::Text)),
+            setting("app.link_ids", delimited(",")),
+        ],
+    )
+    .expect("a valid deployment")
+}
+
+#[test]
+fn a_column_compared_with_a_scalar_returns_what_postgres_returns_for_every_request_value() {
+    let database = postgres(INVITATIONS);
+    let deployment = verifying();
+    let answered =
+        |helper: &str| answer(&database, &deployment, "authz", helper, &[]).expect("answered");
+    let normalized = answered("normalized_invitations");
+    let raw = answered("raw_invitations");
+    let bare = answered("bare_invitations");
+    let lowered = "invitations.id WHERE email = lower(app.verified_email)";
+    assert_eq!(render(&normalized), lowered);
+    assert_eq!(render(&raw), "invitations.id WHERE email = app.verified_email");
+    assert_eq!(render(&bare), lowered);
+    for (set, excludes_unset) in [(&normalized, true), (&raw, true), (&bare, false)] {
+        assert_eq!(covered(set), Some("invitations"));
+        let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
+        let GrantedTo::Request(request) = grant.granted_to() else {
+            panic!("the email names the grantee")
+        };
+        assert!(!request.raises_when_unset());
+        assert_eq!(request.excludes_unset(), excludes_unset, "{}", render(set));
+    }
+    for &(request, normalized_returns, raw_returns, bare_returns) in INVITATIONS_MEASURED {
+        for (set, expected) in
+            [(&normalized, normalized_returns), (&raw, raw_returns), (&bare, bare_returns)]
+        {
+            let returned: Vec<_> = evaluate(set, request, INVITATION_ROWS).into_iter().collect();
+            assert_eq!(returned, expected, "{} for {:?}", render(set), request.values);
+        }
+    }
+}
+
+/// What `authz.invited()` keeping the invitations `condition` keeps answers
+/// once `after` declares what else it calls.
+fn inviting(condition: &str, after: &str) -> Result<String, HelperSetError> {
+    let sql = format!(
+        "{INVITATIONS}
+         CREATE FUNCTION authz.invited() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           SELECT invitation.id FROM public.invitations invitation WHERE {condition}
+         $$;
+         ALTER FUNCTION authz.invited() OWNER TO authz_owner;
+         {after}"
+    );
+    let database = postgres(&sql);
+    let deployment = verifying();
+    answer(&database, &deployment, "authz", "invited", &[]).map(|set| render(&set))
+}
+
+#[test]
+fn a_lowered_scalar_is_read_in_every_spelling_of_its_read() {
+    let lowered = "invitations.id WHERE email = lower(app.verified_email)";
+    let nulled = accessor(
+        "nulled_email",
+        "TEXT",
+        ACCESSOR,
+        "NULLIF(lower(current_setting('app.verified_email', true)), '')",
+    );
+    for (condition, after) in [
+        ("invitation.email = authz.verified_email()", ""),
+        ("authz.verified_email() = invitation.email", ""),
+        ("invitation.email = authz.nulled_email()", nulled.as_str()),
+        ("invitation.email = lower(NULLIF(current_setting('app.verified_email', true), ''))", ""),
+        ("invitation.email = NULLIF(lower(current_setting('app.verified_email', true)), '')", ""),
+        ("invitation.email = pg_catalog.lower(current_setting('app.verified_email'))", ""),
+        ("lower(current_setting('app.verified_email', true))::text = invitation.email", ""),
+        ("invitation.email = CAST(lower(current_setting('app.verified_email', true)) AS TEXT)", ""),
+    ] {
+        assert_eq!(inviting(condition, after).as_deref(), Ok(lowered), "{condition}");
+    }
+    assert_eq!(
+        inviting("invitation.email IN (authz.verified_email(), 'admin@example.com')", "")
+            .as_deref(),
+        Ok("invitations.id WHERE email = lower(app.verified_email) \
+            UNION invitations.id WHERE email IN ('admin@example.com')"),
+        "a listed scalar"
+    );
+    assert_eq!(
+        inviting("invitation.email IN (authz.raw_email())", "").as_deref(),
+        Ok("invitations.id WHERE email = app.verified_email"),
+        "a scalar listed as sent"
+    );
+}
+
+#[test]
+fn a_read_normalized_otherwise_or_of_anything_but_a_scalar_refuses_the_answer() {
+    let normalized = |setting: &str| {
+        Err(HelperSetError::SettingNormalized {
+            function: "authz.invited".into(),
+            setting: setting.into(),
+            normalization: RequestNormalization::Lower,
+        })
+    };
+    let lowered_caller = accessor(
+        "lowered_caller",
+        "TEXT",
+        ACCESSOR,
+        "lower(NULLIF(current_setting('app.user_id', true), ''))",
+    );
+    for (condition, after) in [
+        ("invitation.email = lower(current_setting('app.user_id', true))", ""),
+        ("invitation.email = authz.lowered_caller()", lowered_caller.as_str()),
+    ] {
+        assert_eq!(inviting(condition, after), normalized("app.user_id"), "a lowered caller");
+    }
+    assert_eq!(
+        inviting(
+            "invitation.email = ANY (string_to_array(lower(current_setting('app.link_ids', true)), ','))",
+            ""
+        ),
+        normalized("app.link_ids"),
+        "a lowered set"
+    );
+    let shadow =
+        "CREATE FUNCTION authz.lower(TEXT) RETURNS TEXT LANGUAGE sql STABLE AS $$ SELECT $1 $$;";
+    for (condition, after) in [
+        ("invitation.email = upper(current_setting('app.verified_email', true))", ""),
+        ("invitation.email = lower(lower(current_setting('app.verified_email', true)))", ""),
+        ("invitation.email = authz.lower(current_setting('app.verified_email', true))", shadow),
+        ("invitation.email = lower(current_setting('app.verified_email', true) COLLATE \"C\")", ""),
+        (
+            "invitation.email = authz.verified_email() \
+             AND lower(current_setting('app.user_id', true)) IS NOT NULL",
+            "",
+        ),
+        (
+            "invitation.email = authz.verified_email() \
+             AND lower(current_setting('app.user_id', true)) <> 'root'",
+            "",
+        ),
+    ] {
+        let refused = inviting(condition, after);
+        assert!(
+            matches!(refused, Err(HelperSetError::Irreducible { .. })),
+            "{condition}: {refused:?}"
+        );
+    }
+    assert!(
+        matches!(
+            inviting(
+                "invitation.email = authz.verified_email() \
+                 AND invitation.email = current_setting('app.user_id', true)",
+                ""
+            ),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "an arm names one grantee"
+    );
 }
