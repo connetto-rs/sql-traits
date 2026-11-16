@@ -1914,7 +1914,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to what
     ///   columns have to hold, literal values, a `boolean` column alone holding
     ///   `TRUE`, `<column> IS NULL` or `<column> IS NOT NULL` (see
-    ///   [`Restriction`](crate::structs::Restriction)). An arm comparing a
+    ///   [`Restriction`](crate::structs::Restriction)). A column of an enum
+    ///   type compared with a label by `<`, `<=`, `>` or `>=`, either way
+    ///   round, holds the labels on the kept side of it in the order the type
+    ///   declares them, `ALTER TYPE ... ADD VALUE` applied. An arm comparing a
     ///   helper's set while returning its table's primary key is a parent arm,
     ///   so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
