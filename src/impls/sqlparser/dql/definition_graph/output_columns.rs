@@ -161,19 +161,6 @@ fn match_output<'entries>(
     Err(LookupError::AmbiguousTableLookup { object_name: key.value.clone(), candidates })
 }
 
-fn values_entries<'query, 'db>(values: &Values) -> Vec<OutputEntry<'query, 'db>> {
-    let width = values.rows.first().map_or(0, |row| row.len());
-    (1..=width)
-        .map(|position| {
-            OutputEntry::Column(OutputColumn {
-                name: OutputName::exact(&format!("column{position}")),
-                definition: DefinitionId(0),
-                expression: None,
-            })
-        })
-        .collect()
-}
-
 impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     /// Records the outputs of every `SELECT` scope derived so far and of
     /// every query `root` holds, itself included when it is one.
@@ -289,9 +276,29 @@ impl<'query, 'db, DB: DatabaseLike> QueryCollector<'_, 'query, 'db, DB> {
             SetExpr::SetOperation { op, left, right, .. } => {
                 Some(QueryOutputs::Merged(self.merge(*op, left, right)))
             }
-            SetExpr::Values(values) => Some(QueryOutputs::Merged(values_entries(values))),
+            SetExpr::Values(values) => Some(QueryOutputs::Merged(self.values_entries(values))),
             _ => None,
         }
+    }
+
+    /// The outputs of `values`, `column1`, `column2`, … with the definitions
+    /// derived for them, or one unexpanded entry for a list whose columns
+    /// were not enumerated, such as one whose rows differ in length.
+    fn values_entries(&self, values: &Values) -> Vec<OutputEntry<'query, 'db>> {
+        let Some(columns) = self.derivation.graph.values_columns(values) else {
+            return vec![OutputEntry::Unexpanded];
+        };
+        columns
+            .iter()
+            .zip(1..)
+            .map(|(definition, position)| {
+                OutputEntry::Column(OutputColumn {
+                    name: OutputName::exact(&format!("column{position}")),
+                    definition: *definition,
+                    expression: None,
+                })
+            })
+            .collect()
     }
 
     fn arm(&mut self, body: &SetExpr) -> Option<Arm<'query, 'db>> {
