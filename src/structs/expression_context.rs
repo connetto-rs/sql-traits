@@ -878,11 +878,13 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                         None => OperandType::Unknown,
                     }
                 }
-                DefinitionSource::CursorOutput { cursor, output: Output::Row } => {
-                    match flow.cursor_query(cursor) {
+                DefinitionSource::CursorOutput { output: Output::Row, .. } => {
+                    match definition.cursor_query_within(visiting) {
                         Some((statement, scope)) => {
-                            record_output_type(statement, field, scope, self.case)?
+                            record_output_type(statement, field, &scope, self.case)?
                         }
+                        // A `refcursor`, a cursor never opened, or one the
+                        // record is being typed from on the way here.
                         None => OperandType::Unknown,
                     }
                 }

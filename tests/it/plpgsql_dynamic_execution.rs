@@ -525,6 +525,85 @@ fn record_fields_take_the_output_types_of_the_rows_reaching_them() {
     );
 }
 
+/// Writing one field of a record leaves the field the type PostgreSQL 18
+/// converts the value to, the one the record's row gave it. A cursor query
+/// reading a record's field types it from the rows reaching every opening
+/// of the cursor. A row from a dynamic command or a `refcursor` stays
+/// unknown, and `record_field_types` lists each with its unknown type, but
+/// nothing for a row variable's field, which takes its column's type.
+#[test]
+fn record_fields_skip_field_writes_and_follow_cursor_openings() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE FUNCTION mixed(p boolean) RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE
+          r record;
+          s record;
+          c refcursor;
+          whole audit;
+          d CURSOR FOR SELECT r.name AS copied, seen AS name FROM audit;
+         BEGIN
+          SELECT name INTO r FROM audit;
+          r.name := 5;
+          OPEN d;
+          FETCH d INTO s;
+          CLOSE d;
+          FOR q IN d LOOP END LOOP;
+          EXECUTE 'SELECT ' || r.name || s.copied || s.name || whole.name;
+          IF p THEN
+           EXECUTE 'SELECT 1 AS name' INTO r;
+          ELSE
+           OPEN c FOR SELECT seen AS name FROM audit;
+           FETCH c INTO r;
+          END IF;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    let text = || "pg_catalog.text".to_owned();
+    assert_eq!(
+        names(&database, "mixed"),
+        [
+            vec![
+                ("r.name".to_owned(), text()),
+                ("s.copied".to_owned(), text()),
+                ("s.name".to_owned(), "pg_catalog.int4".to_owned()),
+                ("whole.name".to_owned(), text()),
+            ],
+            Vec::new(),
+            vec![("r.name".to_owned(), "?".to_owned())],
+        ]
+    );
+    let body = function(&database, "mixed").dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let candidates = |site: &DynamicExecution<'_, '_, ParserDB>, written: &str| {
+        let context = site.context(IdentifierCase::Folded).unwrap();
+        let mut listed = None;
+        let _ = visit_expressions(site.command(), |expression| {
+            if expression.to_string() == written {
+                listed = Some(
+                    context
+                        .record_field_types(expression)
+                        .unwrap()
+                        .iter()
+                        .map(|(definition, field)| {
+                            (format!("{:?}", definition.source()), rendered(field))
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        listed.expect("the command reads the name")
+    };
+    assert_eq!(candidates(&sites[0], "whole.name"), []);
+    assert_eq!(candidates(&sites[0], "'SELECT '"), []);
+    let listed = candidates(&sites[2], "r.name");
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(listed[0].0.starts_with("DynamicOutput"), "{listed:?}");
+    assert!(listed[1].0.starts_with("CursorOutput"), "{listed:?}");
+    assert!(listed.iter().all(|(_, field)| field == "?"));
+}
+
 /// `%TYPE` and `%ROWTYPE` resolve through the schema under the function's
 /// own path, a row's field takes its column's type, and a record's field
 /// stays unknown.

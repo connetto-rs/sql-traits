@@ -233,8 +233,20 @@ pub(crate) struct ValueFlow<'r, 'db, DB: DatabaseLike> {
     /// some path reaches, where the body evaluates it.
     pub(crate) points: BTreeMap<SiteKey, State>,
     /// The query each cursor declared with one opens, by the cursor
-    /// variable's id, with the names and path it is evaluated under.
-    pub(crate) cursors: BTreeMap<usize, (&'r Statement, PlPgSqlScope<'r, 'db, DB>)>,
+    /// variable's id.
+    pub(crate) cursors: BTreeMap<usize, CursorQuery<'r, 'db, DB>>,
+}
+
+/// The query a cursor declared with one opens.
+#[derive(Debug)]
+pub(crate) struct CursorQuery<'r, 'db, DB: DatabaseLike> {
+    /// The query.
+    pub(crate) statement: &'r Statement,
+    /// The query as a point of the flow, which every opening of the cursor
+    /// reaches.
+    pub(crate) key: SiteKey,
+    /// The names and path the query is evaluated under.
+    pub(crate) scope: PlPgSqlScope<'r, 'db, DB>,
 }
 
 /// Gives the value flow of a body to the scopes of its sites. The flow comes
@@ -247,6 +259,7 @@ pub(crate) trait FlowSource<DB: DatabaseLike>: fmt::Debug {
 
 /// The point of a body's value flow a [`PlPgSqlScope`] stands at, which
 /// types the fields of a record from the definitions reaching it.
+#[derive(Debug, Clone)]
 pub(crate) enum FlowPoint<'r, 'db, DB: DatabaseLike> {
     /// Where a site's statement, expression or dynamic SQL is evaluated.
     Site {
@@ -264,6 +277,16 @@ pub(crate) enum FlowPoint<'r, 'db, DB: DatabaseLike> {
         /// The definitions whose sources are being typed on the way here,
         /// this one included, which a field read here takes as unknown
         /// rather than typing again.
+        visiting: Vec<usize>,
+    },
+    /// Where the query of a cursor is evaluated, which every opening of the
+    /// cursor reaches.
+    Cursor {
+        /// The flow.
+        flow: &'r ValueFlow<'r, 'db, DB>,
+        /// The query.
+        key: SiteKey,
+        /// The definitions whose sources are being typed on the way here.
         visiting: Vec<usize>,
     },
 }
@@ -289,47 +312,14 @@ impl<DB: DatabaseLike> FlowPoint<'_, '_, DB> {
             Self::Definition { flow, index, visiting } => {
                 Reached { flow, state: flow.definitions[*index].inputs.as_ref(), visiting }
             }
+            Self::Cursor { flow, key, visiting } => {
+                Reached { flow, state: flow.points.get(key), visiting }
+            }
         })
     }
 }
 
-impl<DB: DatabaseLike> Clone for FlowPoint<'_, '_, DB> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Site { flow, key } => Self::Site { flow: Arc::clone(flow), key: *key },
-            Self::Definition { flow, index, visiting } => {
-                Self::Definition { flow, index: *index, visiting: visiting.clone() }
-            }
-        }
-    }
-}
-
-impl<DB: DatabaseLike> fmt::Debug for FlowPoint<'_, '_, DB> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Site { key, .. } => formatter.debug_struct("Site").field("key", key).finish(),
-            Self::Definition { index, visiting, .. } => {
-                formatter
-                    .debug_struct("Definition")
-                    .field("index", index)
-                    .field("visiting", visiting)
-                    .finish()
-            }
-        }
-    }
-}
-
 impl<'r, 'db, DB: DatabaseLike> ValueFlow<'r, 'db, DB> {
-    /// The query the cursor `cursor` is declared with, with the names and
-    /// path it is evaluated under, `None` for a `refcursor` and a cursor the
-    /// body never opens.
-    pub(crate) fn cursor_query(
-        &self,
-        cursor: &PlPgSqlVariable<'db>,
-    ) -> Option<&(&'r Statement, PlPgSqlScope<'r, 'db, DB>)> {
-        self.cursors.get(&cursor.id())
-    }
-
     /// Each of `variables` with the definitions `state` lets reach it, or
     /// none when no path reaches the point `state` stands for.
     pub(crate) fn reaching(
@@ -584,6 +574,28 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
         let mut visiting = visiting.to_vec();
         visiting.push(*index);
         Some(scope.clone().at(FlowPoint::Definition { flow: self.flow, index: *index, visiting }))
+    }
+
+    /// The query of the cursor a [`DefinitionSource::CursorOutput`] reads,
+    /// with the names and path it is evaluated under, standing where every
+    /// opening of the cursor evaluates it, for typing the source on the way
+    /// from typing the definitions `visiting`. `None` for any other source,
+    /// a `refcursor`, a cursor the body never opens, and a definition that
+    /// is one of `visiting`.
+    pub(crate) fn cursor_query_within(
+        &self,
+        visiting: &[usize],
+    ) -> Option<(&'r Statement, PlPgSqlScope<'r, 'db, DB>)> {
+        let DefinitionKind::Written { index, written } = &self.kind else { return None };
+        let DefinitionSource::CursorOutput { cursor, .. } = &written.source else { return None };
+        if visiting.contains(index) {
+            return None;
+        }
+        let query = self.flow.cursors.get(&cursor.id())?;
+        let mut visiting = visiting.to_vec();
+        visiting.push(*index);
+        let point = FlowPoint::Cursor { flow: self.flow, key: query.key, visiting };
+        Some((query.statement, query.scope.clone().at(point)))
     }
 
     /// Returns the variables the SQL of [`Self::source`] reads, each once in

@@ -37,7 +37,7 @@ use crate::{
     errors::LookupError,
     structs::{
         DefinitionSource, DiagnosticsItem, Output, PlPgSqlScope, PlPgSqlVariable, Rows, TargetStep,
-        plpgsql_flow::{Slot, State, ValueFlow, Written},
+        plpgsql_flow::{CursorQuery, Slot, State, ValueFlow, Written},
         plpgsql_scope::stored_parts,
     },
     traits::{DatabaseLike, FunctionLike},
@@ -186,7 +186,7 @@ struct Flow<'b, 'db, DB: DatabaseLike> {
     frames: Vec<Frame<'b>>,
     /// The query each cursor declared with one opens, by the cursor
     /// variable's id, as the first `OPEN` or `FOR` loop opening it reads it.
-    cursors: BTreeMap<usize, (&'b Statement, PlPgSqlScope<'b, 'db, DB>)>,
+    cursors: BTreeMap<usize, CursorQuery<'b, 'db, DB>>,
 }
 
 impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
@@ -383,7 +383,8 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         if !self.cursors.contains_key(&variable.id())
             && let Some(scope) = self.scope_of(key)
         {
-            self.cursors.insert(variable.id(), (&cursor.query, scope));
+            self.cursors
+                .insert(variable.id(), CursorQuery { statement: &cursor.query, key, scope });
         }
     }
 
