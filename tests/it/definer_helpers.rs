@@ -2253,6 +2253,9 @@ fn a_walk_of_any_other_shape_refuses_the_answer() {
         );
         assert!(shape(&sql), "{body}");
     }
+    let two_columns = groups(&walking(CHILD_JOIN), "")
+        .replace("RETURNS SETOF TEXT", "RETURNS TABLE (id TEXT, role TEXT)");
+    assert!(shape(&two_columns), "a walk under a helper returning two columns");
 
     let shadowed = format!(
         "WITH RECURSIVE reached (id) AS (SELECT id FROM reached \
@@ -3458,8 +3461,9 @@ const CAP_ROWS: Rows = &[
     ),
 ];
 
-/// A deployment declaring the caller and the acting installation, a scalar,
-/// both of which a request may leave unset.
+/// A deployment declaring the caller, the acting installation, a scalar, and
+/// the organizations a request presents, a set, each of which a request may
+/// leave unset.
 fn installation_deployment() -> Deployment {
     let setting = |name: &str, value: SettingValue| {
         SessionSetting::value(name, value).expect("a custom setting name").may_be_unset()
@@ -3470,6 +3474,10 @@ fn installation_deployment() -> Deployment {
         [
             setting("app.user_id", SettingValue::Caller(DataType::Text)),
             setting("app.installation_id", SettingValue::Scalar(DataType::Text)),
+            setting(
+                "app.organization_ids",
+                SettingValue::Set { element: DataType::Text, packing: SetPacking::JsonArray },
+            ),
         ],
     )
     .expect("a valid deployment")
@@ -3573,13 +3581,12 @@ fn a_cap_keeps_the_rows_whose_pair_the_capping_helper_returns() {
     }
 }
 
+/// The condition of `authz.capped_resources` in [`CAPS`].
+const CAPPED_CONDITION: &str = "WHERE (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))";
+
 /// `authz.capped_resources` with `condition` as its condition.
 fn capping(condition: &str) -> Result<String, HelperSetError> {
-    let sql = CAPS.replace(
-        "WHERE (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))",
-        &format!("WHERE {condition}"),
-    );
-    let database = postgres(&sql);
+    let database = postgres(&CAPS.replace(CAPPED_CONDITION, &format!("WHERE {condition}")));
     let deployment = installation_deployment();
     answer(&database, &deployment, "authz", "capped_resources", &[text("reader")])
         .map(|set| render(&set))
@@ -3594,25 +3601,73 @@ fn a_cap_compares_one_operand_per_column_the_capping_helper_returns() {
         "(resource.organization_id, 'project'::TEXT) IN (SELECT * FROM authz.capped_kinds(min_role))",
         "(resource.organization_id, current_setting('app.user_id', true)) IN (SELECT * FROM authz.capped_kinds(min_role))",
         "(resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role) WHERE true)",
+        "(resource.organization_id, resource.kind) IN (VALUES ('o1', 'folder'))",
+        "(resource.organization_id, resource.kind) IN (SELECT * FROM public.installation_permissions)",
         "current_setting('app.installation_id', true) IS NULL OR resource.id IN (SELECT * FROM authz.capped_kinds(min_role))",
+        "current_setting('app.installation_id', true) IS NULL OR 'o1'::INT IN (SELECT authz.member_organizations())",
     ] {
         let answer = capping(condition);
         assert!(matches!(answer, Err(HelperSetError::ArmShape { .. })), "{condition}: {answer:?}");
     }
+    for (operand, rendered) in
+        [("'project'::authz.resource_kind", "'project'"), ("min_role", "'reader'")]
+    {
+        assert_eq!(
+            capping(&format!("(resource.organization_id, {operand}) IN (SELECT * FROM authz.capped_kinds(min_role) AS capped)"))
+                .expect("answered")
+                .split(" {")
+                .next(),
+            Some(format!("resources.id WHERE (organization_id, {rendered}) IN authz.capped_kinds('reader')").as_str()),
+            "{operand}"
+        );
+    }
     assert_eq!(
-        capping("(resource.organization_id, 'project'::authz.resource_kind) IN (SELECT * FROM authz.capped_kinds(min_role) AS capped)")
+        capping("current_setting('app.installation_id', true)::TEXT IS NULL OR 'o1'::TEXT IN (SELECT authz.member_organizations())")
             .expect("answered")
             .split(" {")
             .next(),
-        Some("resources.id WHERE (organization_id, 'project') IN authz.capped_kinds('reader')")
+        Some("resources.id WHERE (app.installation_id IS NULL OR ('o1') IN authz.member_organizations()")
     );
     assert_eq!(
         capping("current_setting('app.installation_id', true) IS NULL OR resource.organization_id IN (SELECT authz.member_organizations())")
             .expect("answered"),
         "resources.id WHERE (app.installation_id IS NULL OR (organization_id) IN authz.member_organizations() {memberships.organization_id WHERE user_id = app.user_id AND (app.installation_id IS UNSET OR (organization_id, 'organization') IN authz.capped_kinds('reader') {installation_permissions.(organization_id, kind) WHERE installation_id = app.installation_id AND max_role IN ('admin', 'reader')})})"
     );
+    for setting in ["app.installation_id", "app.organization_ids"] {
+        let answer = capping(&format!(
+            "current_setting('{setting}', true)::INT IS NULL OR (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))"
+        ));
+        assert!(
+            matches!(&answer, Err(HelperSetError::SettingCast { setting: cast, .. }) if cast == setting),
+            "{answer:?}"
+        );
+    }
     assert!(matches!(
-        capping("current_setting('app.installation_id', true)::INT IS NULL OR (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))"),
-        Err(HelperSetError::SettingCast { setting, .. }) if setting == "app.installation_id"
+        capping("current_setting('app.tenant_id', true) IS NULL OR (resource.organization_id, resource.kind) IN (SELECT * FROM authz.capped_kinds(min_role))"),
+        Err(HelperSetError::UndeclaredSetting { setting, .. }) if setting == "app.tenant_id"
     ));
+    let unlifted = capping(
+        "current_setting('app.installation_id', true) IS NULL OR resource.kind = 'project'",
+    );
+    assert!(matches!(unlifted, Err(HelperSetError::Irreducible { .. })), "{unlifted:?}");
+}
+
+#[test]
+fn a_lift_records_whether_reading_its_setting_raises_when_unset() {
+    for (read, raises) in [
+        ("current_setting('app.installation_id')", true),
+        ("current_setting('app.installation_id', true)", false),
+    ] {
+        let lifted = format!("{CAPPED_CONDITION} OR {read} IS NULL");
+        let database = postgres(&CAPS.replace(CAPPED_CONDITION, &lifted));
+        let deployment = installation_deployment();
+        let set = answer(&database, &deployment, "authz", "capped_resources", &[text("reader")])
+            .expect("answered");
+        let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
+        let [cap] = grant.caps() else { panic!("one cap") };
+        let lift = cap.lift().expect("a lifted cap");
+        assert_eq!(lift.setting().name(), "app.installation_id");
+        assert_eq!(lift.raises_when_unset(), raises, "{read}");
+        assert!(!lift.lifts_on_empty(), "{read}");
+    }
 }

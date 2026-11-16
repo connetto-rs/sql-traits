@@ -595,6 +595,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(scope.arm_shape(&written(written_body)));
         };
         let body = scope.body(query)?;
+        // A walk adds one column, so a helper walking a tree returns one.
+        if let Some(walk) = &body.walk
+            && arity != 1
+        {
+            return Err(scope.arm_shape(walk.term));
+        }
 
         self.answering.push(function);
         let read = body
@@ -605,10 +611,6 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         self.answering.pop();
         let mut read = read?;
         if let Some(walk) = &body.walk {
-            // A walk adds one column, so its arms return one too.
-            if arity != 1 {
-                return Err(scope.arm_shape(walk.term));
-            }
             let walk = self.walk_arm(&scope, walk)?;
             read.push((Some(walk.table), Some(HelperArm::Walk(walk))));
         }
@@ -1863,7 +1865,8 @@ fn returned_arity<F: FunctionLike>(function: &F, database: &F::DB) -> Option<usi
 }
 
 /// The type `function` declares its returned column at `index` in, where
-/// the dialect reads it back.
+/// the dialect reads it back, the element type for a helper returning
+/// `SETOF` one.
 fn returned_type<F: FunctionLike>(
     function: &F,
     database: &F::DB,
@@ -1871,8 +1874,7 @@ fn returned_type<F: FunctionLike>(
 ) -> Option<DataType> {
     let declared = match function.returned_columns(database).nth(index) {
         Some((_, declared)) => declared,
-        None if index == 0 => function.result_type_name(database)?,
-        None => return None,
+        None => function.result_type_name(database)?,
     };
     parsed_type(&declared, database).ok()
 }
