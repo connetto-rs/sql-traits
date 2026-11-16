@@ -441,14 +441,12 @@ impl SessionSetting {
     /// # Errors
     ///
     /// Returns [`DeploymentError::InvalidSettingName`] unless `name` is a
-    /// custom setting name, two or more non-empty parts joined by dots, and
+    /// custom setting name, two or more non-empty parts joined by dots,
     /// [`DeploymentError::EmptySeparator`] for a set split on the empty
-    /// string, which `string_to_array` reads as one field.
+    /// string, which `string_to_array` reads as one field, and
+    /// [`DeploymentError::EmptyPrincipalKind`] for a principal of no type.
     pub fn value(name: impl Into<String>, value: SettingValue) -> Result<Self, DeploymentError> {
-        let name = custom_name(name.into())?;
-        if value.has_empty_separator() {
-            return Err(DeploymentError::EmptySeparator { setting: name });
-        }
+        let name = value.checked(custom_name(name.into())?)?;
         Ok(Self { name, content: SettingContent::Value(value), presence: SettingPresence::Always })
     }
 
@@ -460,8 +458,9 @@ impl SessionSetting {
     /// Returns [`DeploymentError::InvalidSettingName`] as
     /// [`SessionSetting::value`] does, [`DeploymentError::NoJsonFields`] when
     /// `fields` is empty, [`DeploymentError::DuplicateJsonField`] when two
-    /// fields share a path, and [`DeploymentError::EmptySeparator`] for a
-    /// field split on the empty string.
+    /// fields share a path, and [`DeploymentError::EmptySeparator`] and
+    /// [`DeploymentError::EmptyPrincipalKind`] for a field whose value
+    /// [`SessionSetting::value`] refuses.
     ///
     /// # Example
     ///
@@ -485,7 +484,7 @@ impl SessionSetting {
         name: impl Into<String>,
         fields: impl IntoIterator<Item = JsonField>,
     ) -> Result<Self, DeploymentError> {
-        let name = custom_name(name.into())?;
+        let mut name = custom_name(name.into())?;
         let mut declared: Vec<JsonField> = Vec::new();
         for field in fields {
             if declared.iter().any(|seen| seen.path == field.path) {
@@ -494,9 +493,7 @@ impl SessionSetting {
                     path: field.path,
                 });
             }
-            if field.value.has_empty_separator() {
-                return Err(DeploymentError::EmptySeparator { setting: name });
-            }
+            name = field.value.checked(name)?;
             declared.push(field);
         }
         if declared.is_empty() {
@@ -599,6 +596,15 @@ impl JsonField {
 pub enum SettingValue {
     /// The caller's identity.
     Caller(DataType),
+    /// The identity of a principal of type `kind` the request acts as or
+    /// for beside the caller, such as the app installation acting for the
+    /// caller.
+    Principal {
+        /// The type of the principal, such as `installation`.
+        kind: String,
+        /// The type of the identity.
+        identity: DataType,
+    },
     /// One value the request carries.
     Scalar(DataType),
     /// A set of values the request carries.
@@ -611,8 +617,42 @@ pub enum SettingValue {
 }
 
 impl SettingValue {
-    fn has_empty_separator(&self) -> bool {
-        matches!(self, Self::Set { packing: SetPacking::Delimited(separator), .. } if separator.is_empty())
+    /// The type of the one value the setting holds, `None` for a set.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::ast::DataType;
+    ///
+    /// let installation =
+    ///     SettingValue::Principal { kind: "installation".into(), identity: DataType::Uuid };
+    /// assert_eq!(installation.single_type(), Some(&DataType::Uuid));
+    /// let links = SettingValue::Set { element: DataType::Uuid, packing: SetPacking::JsonArray };
+    /// assert_eq!(links.single_type(), None);
+    /// ```
+    #[must_use]
+    pub fn single_type(&self) -> Option<&DataType> {
+        match self {
+            Self::Caller(declared)
+            | Self::Principal { identity: declared, .. }
+            | Self::Scalar(declared) => Some(declared),
+            Self::Set { .. } => None,
+        }
+    }
+
+    /// `setting`, the name of the setting declaring this value, unless no
+    /// request can carry the value.
+    fn checked(&self, setting: String) -> Result<String, DeploymentError> {
+        match self {
+            Self::Set { packing: SetPacking::Delimited(separator), .. } if separator.is_empty() => {
+                Err(DeploymentError::EmptySeparator { setting })
+            }
+            Self::Principal { kind, .. } if kind.is_empty() => {
+                Err(DeploymentError::EmptyPrincipalKind { setting })
+            }
+            _ => Ok(setting),
+        }
     }
 }
 

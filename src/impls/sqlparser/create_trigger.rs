@@ -70,6 +70,18 @@ impl TriggerLike for CreateTrigger {
         self.trigger_object
     }
 
+    /// The condition inside the parentheses `WHEN` writes around it, which
+    /// the parser keeps as a nested expression.
+    #[inline]
+    fn condition(&self) -> Option<&sqlparser::ast::Expr> {
+        self.condition.as_ref().map(|condition| {
+            match condition {
+                sqlparser::ast::Expr::Nested(inner) => inner.as_ref(),
+                condition => condition,
+            }
+        })
+    }
+
     /// The function ingestion bound the trigger to, which takes no arguments
     /// and lives in the schema the bound name carries, `public` when bare.
     #[inline]

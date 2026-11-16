@@ -200,6 +200,9 @@ struct MemoryUserDefinedType {
     name: String,
     schema: Option<String>,
     kind: UserDefinedTypeKind,
+    /// The labels of an enum type in their sort order, empty for every other
+    /// kind.
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1061,6 +1064,10 @@ impl ForeignKeyLike for MemoryForeignKey {
         ConstraintReferenceMatchKind::Simple
     }
 
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        ConstraintDeferral::NotDeferrable
+    }
+
     fn referenced_columns<'db>(
         &'db self,
         _database: &'db Self::DB,
@@ -1310,6 +1317,10 @@ impl TriggerLike for MemoryTrigger {
         None
     }
 
+    fn condition(&self) -> Option<&Expr> {
+        None
+    }
+
     fn function<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db MemoryFunction>
     where
         Self: 'db,
@@ -1392,6 +1403,16 @@ impl UserDefinedTypeLike for MemoryUserDefinedType {
 
     fn kind(&self) -> UserDefinedTypeKind {
         self.kind
+    }
+
+    fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>> {
+        (self.kind == UserDefinedTypeKind::Enum).then(|| {
+            Enumeration::new(
+                EnumerationKind::Enum,
+                None,
+                self.labels.iter().map(|label| EnumerationMember::new(label, None)),
+            )
+        })
     }
 }
 
@@ -2882,4 +2903,5 @@ fn an_engine_without_operator_or_cast_catalogs_answers_none() {
     assert!(database.operators().is_none());
     assert!(database.casts().is_none());
     assert!(database.type_facts(TargetName::new("int4", false)).is_none());
+    assert_eq!(database.new_function_executable_by_public(None, "public"), None);
 }

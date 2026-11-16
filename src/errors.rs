@@ -886,6 +886,12 @@ pub enum DeploymentError {
         /// The setting holding the set.
         setting: String,
     },
+    /// A principal is declared with no type.
+    #[error("setting `{setting}` declares a principal of no type")]
+    EmptyPrincipalKind {
+        /// The setting holding the principal.
+        setting: String,
+    },
     /// A JSON field was declared with no key.
     #[error("a JSON field needs at least one key")]
     EmptyFieldPath,
@@ -1053,11 +1059,37 @@ pub enum SequenceParameterError {
     },
 }
 
+/// Why a helper's call of an accessor, a zero-argument `sql` function whose
+/// body returns a setting read, does not read as that read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccessorRefusal {
+    /// The accessor is `IMMUTABLE`, so PostgreSQL may run it once while it
+    /// plans a statement and keep that value in a cached plan.
+    Immutable,
+    /// The accessor returns a type other than its body's read, or a set,
+    /// so PostgreSQL converts the read or refuses the call where a helper
+    /// compares it.
+    ReturnType,
+    /// The accessor sets the setting it reads for its own run, so it reads
+    /// that value rather than the caller's.
+    SetsSetting,
+}
+
+impl core::fmt::Display for AccessorRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Immutable => "is IMMUTABLE",
+            Self::ReturnType => "returns another type than its body reads",
+            Self::SetsSetting => "sets the setting it reads",
+        })
+    }
+}
+
 /// Why [`FunctionLike::helper_set`](crate::traits::FunctionLike::helper_set)
 /// refuses to answer what a helper returns.
 ///
 /// Each refusal names the helper it is met in, a helper a parent arm calls
-/// where it is met there.
+/// where it is met there, and an accessor where it is met in its body.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum HelperSetError {
     /// A table, function or column of the body cannot be looked up.
@@ -1086,8 +1118,8 @@ pub enum HelperSetError {
         /// The helper.
         function: String,
     },
-    /// The helper does not return `SETOF` one scalar type.
-    #[error("helper `{function}` does not return SETOF a scalar type")]
+    /// The helper returns neither `SETOF` one scalar type nor `TABLE (...)`.
+    #[error("helper `{function}` returns neither SETOF a scalar type nor TABLE")]
     ReturnType {
         /// The helper.
         function: String,
@@ -1184,10 +1216,21 @@ pub enum HelperSetError {
         /// The setting, as written.
         setting: String,
     },
-    /// A grant arm compares a column with, or gates on, a setting the
-    /// deployment declares as something other than the caller.
-    #[error("helper `{function}` reads setting `{setting}` as the caller, which it is not")]
+    /// A grant arm gates on a setting the deployment declares as something
+    /// other than the caller.
+    #[error("helper `{function}` gates on setting `{setting}` as the caller, which it is not")]
     SettingNotCaller {
+        /// The helper.
+        function: String,
+        /// The setting.
+        setting: String,
+    },
+    /// A grant arm compares a column with a setting the deployment declares
+    /// as neither the caller nor another principal.
+    #[error(
+        "helper `{function}` compares a column with setting `{setting}` as the identity of a principal, which it is not"
+    )]
+    SettingNotPrincipal {
         /// The helper.
         function: String,
         /// The setting.
@@ -1227,10 +1270,14 @@ pub enum HelperSetError {
         setting: String,
     },
     /// A grant arm's condition, its arguments substituted and its bounds on
-    /// the statement time set aside, reduces neither to `TRUE`, `FALSE` or
-    /// `NULL` nor to literal values columns have to hold, all at once.
+    /// the statement time and anti-joins set aside, reduces neither to
+    /// `TRUE`, `FALSE` or `NULL` nor to columns holding literal values,
+    /// `NULL` or any value, all at once. The same holds of the conditions of
+    /// an anti-join beside its correlations. A `NOT EXISTS` reading anything
+    /// but one table, or correlating no column, or reading the arm's table
+    /// other than in a correlation, is irreducible too.
     #[error(
-        "helper `{function}` filters by `{condition}`, which reduces to neither a literal set nor a time bound"
+        "helper `{function}` filters by `{condition}`, which reduces to neither a column restriction nor a time bound"
     )]
     Irreducible {
         /// The helper.
@@ -1290,12 +1337,26 @@ pub enum HelperSetError {
         /// The call, as written.
         call: String,
     },
-    /// The parent arms reach a helper already being answered, which PostgreSQL
-    /// calls until the stack runs out (`54001`).
-    #[error("helper `{function}` reaches itself through its parent arms")]
+    /// The parent arms reach a helper already being answered, or an
+    /// accessor's body reaches the accessor again, which PostgreSQL calls
+    /// until the stack runs out (`54001`).
+    #[error("`{function}` reaches itself through the calls of its body")]
     CallCycle {
-        /// The helper reached again.
+        /// The helper or accessor reached again.
         function: String,
+    },
+    /// The body reads a setting through an accessor PostgreSQL does not run
+    /// as the read its body returns.
+    #[error("helper `{function}` reads setting `{setting}` through `{accessor}`, which {reason}")]
+    Accessor {
+        /// The helper, or the accessor whose body calls it.
+        function: String,
+        /// The accessor.
+        accessor: String,
+        /// The setting its body reads.
+        setting: String,
+        /// Why its call does not read as its body.
+        reason: AccessorRefusal,
     },
 }
 
@@ -1935,6 +1996,16 @@ pub enum Error {
         host_column: String,
         /// Name of the host table containing the foreign key.
         host_table: String,
+    },
+    #[error(
+        "Foreign key in table `{table_name}` is declared INITIALLY DEFERRED but NOT DEFERRABLE."
+    )]
+    /// Error indicating that a foreign key is declared `NOT DEFERRABLE
+    /// INITIALLY DEFERRED`, which PostgreSQL refuses with "constraint
+    /// declared INITIALLY DEFERRED must be DEFERRABLE".
+    InitiallyDeferredNotDeferrable {
+        /// Name of the table the foreign key is declared on.
+        table_name: String,
     },
     #[error("Table `{table_name}` not found for trigger `{trigger_name}`.")]
     /// Error indicating that a trigger references a table that does not exist.

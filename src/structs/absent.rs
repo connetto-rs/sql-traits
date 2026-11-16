@@ -18,9 +18,10 @@ use crate::{
     errors::LookupError,
     structs::{PolicyExpression, SequenceParameters, TargetName},
     traits::{
-        CastContext, CastLike, CastMethod, DatabaseLike, DomainLike, ExtensionLike, Metadata,
-        OperatorKind, OperatorLike, PolicyLike, Relation, RuleLike, SequenceLike, SequenceOrigin,
-        SequenceOwner, UserDefinedTypeKind, UserDefinedTypeLike, ViewLike,
+        CastContext, CastLike, CastMethod, DatabaseLike, DomainLike, Enumeration,
+        EnumerationMember, ExtensionLike, Metadata, OperatorKind, OperatorLike, PolicyLike,
+        Relation, RuleLike, SequenceLike, SequenceOrigin, SequenceOwner, UserDefinedTypeKind,
+        UserDefinedTypeLike, ViewLike,
     },
 };
 
@@ -292,6 +293,10 @@ impl<DB: DatabaseLike> UserDefinedTypeLike for Absent<DB> {
 
     fn kind(&self) -> UserDefinedTypeKind {
         self.unreachable()
+    }
+
+    fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>> {
+        self.unreachable::<Option<Enumeration<core::iter::Empty<_>>>>()
     }
 }
 

@@ -188,6 +188,36 @@ fn a_key_the_attached_table_already_holds_is_kept_rather_than_doubled() {
 }
 
 #[test]
+fn a_foreign_key_is_matched_by_what_postgresql_stores_rather_than_by_its_spelling() {
+    for (on_root, on_partition, expected) in [
+        ("NOT DEFERRABLE", "", &["ck"][..]),
+        ("INITIALLY IMMEDIATE", "", &["ck"]),
+        ("DEFERRABLE INITIALLY IMMEDIATE", "DEFERRABLE", &["ck"]),
+        ("INITIALLY DEFERRED", "DEFERRABLE INITIALLY DEFERRED", &["ck"]),
+        ("ON DELETE NO ACTION", "", &["ck"]),
+        ("ON UPDATE NO ACTION", "", &["ck"]),
+        ("MATCH SIMPLE", "", &["ck"]),
+        ("ENFORCED", "", &["ck"]),
+        ("DEFERRABLE", "", &["ck", "rk"]),
+        ("ON DELETE RESTRICT", "", &["ck", "rk"]),
+        ("MATCH FULL", "", &["ck", "rk"]),
+    ] {
+        let database = database(&format!(
+            "CREATE TABLE r (id INT PRIMARY KEY);
+             CREATE TABLE p (x INT, CONSTRAINT rk FOREIGN KEY (x) REFERENCES r (id) {on_root})
+                 PARTITION BY RANGE (x);
+             CREATE TABLE c (x INT, CONSTRAINT ck FOREIGN KEY (x) REFERENCES r (id) {on_partition});
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);"
+        ));
+        assert_eq!(
+            foreign_key_names(&database, "c"),
+            expected,
+            "[{on_root}] against [{on_partition}]"
+        );
+    }
+}
+
+#[test]
 fn a_unique_constraint_does_not_stand_in_for_the_roots_primary_key() {
     let database = database(
         "CREATE TABLE p (id INT PRIMARY KEY) PARTITION BY LIST (id);

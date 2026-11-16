@@ -503,6 +503,10 @@ impl<P: EmptyKinds> ForeignKeyLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        self.unreach()
+    }
+
     fn referenced_columns<'db>(
         &'db self,
         _database: &'db Self::DB,
@@ -734,6 +738,10 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
     }
 
     fn orientation(&self) -> Option<TriggerObjectKind> {
+        self.unreach()
+    }
+
+    fn condition(&self) -> Option<&Expr> {
         self.unreach()
     }
 
@@ -1189,8 +1197,9 @@ impl SchemaProfile for HooklessProfile {
     }
 }
 
-/// The operator and cast catalogs and type facts a profile leaves to the
-/// trait remain unavailable under PostgreSQL syntax.
+/// The operator and cast catalogs, type facts and the defaults a new function
+/// starts with that a profile leaves to the trait remain unavailable under
+/// PostgreSQL syntax.
 #[test]
 fn unavailable_catalogs_stay_distinct_from_empty_ones() -> Result<(), Error> {
     let database: GenericDB<HooklessProfile> =
@@ -1202,6 +1211,7 @@ fn unavailable_catalogs_stay_distinct_from_empty_ones() -> Result<(), Error> {
             .type_facts(TargetName::new("int4", false).with_schema("pg_catalog", false))
             .is_none()
     );
+    assert_eq!(database.new_function_executable_by_public(None, "public"), None);
 
     let empty = ParseOptions::default()
         .with_postgres_catalog(PostgresCatalog::empty())
