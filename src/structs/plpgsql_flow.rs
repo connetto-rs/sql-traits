@@ -39,7 +39,8 @@ pub enum Rows {
     /// The first row, as `INTO` assigns it. Without `STRICT`, a command
     /// returning no row assigns a null instead, which this definition stands
     /// for too. With `STRICT`, any row count but one raises an error and
-    /// assigns nothing.
+    /// assigns nothing, and so does more than one row of an `INSERT`,
+    /// `UPDATE`, `DELETE` or `MERGE` written in the body, `STRICT` or not.
     First {
         /// Whether `INTO STRICT` is written.
         strict: bool,
