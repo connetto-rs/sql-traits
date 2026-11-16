@@ -436,11 +436,11 @@ fn an_alias_of_a_loop_variable_answers_the_loop_name() {
 /// A field of a cursor loop's record takes the type of the cursor query's
 /// output of that name, an untyped literal's being `text`, and a scalar
 /// subquery the type of its one output, as PostgreSQL 18 reports with
-/// `pg_typeof`. The cursor query reaches no variable, so an output reading
-/// the cursor's parameter stays unknown rather than taking the type of a
-/// body variable of the same name, and so does a field the query does not
-/// output. A wildcard whose columns are unknown may output the field before
-/// the column of that name, so every field after it stays unknown too.
+/// `pg_typeof`. An output reading the cursor's parameter takes the
+/// parameter's type over a body variable of the same name, and a field the
+/// query does not output stays unknown. A wildcard whose columns are unknown
+/// may output the field before the column of that name, so every field
+/// after it stays unknown too.
 #[test]
 fn cursor_loop_fields_and_scalar_subqueries_take_their_output_types() {
     let database = postgres(
@@ -464,7 +464,7 @@ fn cursor_loop_fields_and_scalar_subqueries_take_their_output_types() {
             vec![
                 ("rec.name".to_owned(), "pg_catalog.text".to_owned()),
                 ("rec.seen".to_owned(), "pg_catalog.int4".to_owned()),
-                ("rec.shadow".to_owned(), "?".to_owned()),
+                ("rec.shadow".to_owned(), "pg_catalog.text".to_owned()),
                 ("rec.lit".to_owned(), "pg_catalog.text".to_owned()),
                 ("rec.missing".to_owned(), "?".to_owned()),
             ],
@@ -475,6 +475,52 @@ fn cursor_loop_fields_and_scalar_subqueries_take_their_output_types() {
                 ("k".to_owned(), "pg_catalog.int4".to_owned()),
             ],
             vec![("rec.name".to_owned(), "?".to_owned())],
+        ]
+    );
+}
+
+/// A field of a record takes the type of the output of that name of the
+/// query whose row reaches the read, through `SELECT ... INTO`, a `FOR`
+/// loop over a query, the empty row a loop over no row leaves, and a
+/// `FETCH` from a cursor declared with its query, as PostgreSQL 18 reports
+/// with `pg_typeof`. The query is typed where the body runs it, so an
+/// output reading a variable takes the variable's type. A record typed
+/// through a loop from its own earlier rows stays unknown.
+#[test]
+fn record_fields_take_the_output_types_of_the_rows_reaching_them() {
+    let database = postgres(
+        "CREATE TABLE audit (name text, seen integer);
+         CREATE FUNCTION filled() RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE
+          r record;
+          k integer := 7;
+          c CURSOR FOR SELECT seen AS name FROM audit;
+         BEGIN
+          SELECT name, seen INTO r FROM audit;
+          EXECUTE 'SELECT ' || r.name || r.seen;
+          FOR r IN SELECT k AS name FROM audit WHERE false LOOP END LOOP;
+          EXECUTE 'SELECT ' || r.name;
+          FOR r IN SELECT name FROM audit LOOP EXECUTE 'SELECT ' || r.name; END LOOP;
+          OPEN c;
+          FETCH c INTO r;
+          CLOSE c;
+          EXECUTE 'SELECT ' || r.name;
+          FOR i IN 1..2 LOOP SELECT r.name INTO r FROM audit; END LOOP;
+          EXECUTE 'SELECT ' || r.name;
+         END $$;",
+    );
+    let typed = |name: &str, data_type: &str| vec![(name.to_owned(), data_type.to_owned())];
+    assert_eq!(
+        names(&database, "filled"),
+        [
+            vec![
+                ("r.name".to_owned(), "pg_catalog.text".to_owned()),
+                ("r.seen".to_owned(), "pg_catalog.int4".to_owned()),
+            ],
+            typed("r.name", "pg_catalog.int4"),
+            typed("r.name", "pg_catalog.text"),
+            typed("r.name", "pg_catalog.int4"),
+            typed("r.name", "?"),
         ]
     );
 }

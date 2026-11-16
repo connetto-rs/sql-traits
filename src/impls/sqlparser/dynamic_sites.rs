@@ -35,6 +35,7 @@ use crate::{
         CallResolution, DynamicExecution, ExpressionContext, ExpressionScope, IdentifierCase,
         OperandType, PlPgSqlScope, PlPgSqlVariable, SiteFlow, SiteScope, TargetName, TypeKind,
         VariableKind, array_of, column_type, declared_type, declared_type_named,
+        plpgsql_flow::FlowPoint,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike},
     utils::{
@@ -370,7 +371,8 @@ fn plpgsql_sites<'b, 'db, DB: DatabaseLike>(
         // Only a statement setting the path goes unrecorded, which calls
         // nothing.
         let Some(path) = paths.remove(&key) else { continue };
-        let scope = PlPgSqlScope::new(names, site.namespace, path);
+        let point = FlowPoint::Site { flow: Arc::<SiteFlow<'b, 'db, DB>>::clone(flow), key };
+        let scope = PlPgSqlScope::new(names, site.namespace, path).at(point);
         let (first, arguments): (_, &[Query]) = match site.sql {
             Sql::Statement(statement) => (ScopedRoot::Statement(statement), &[]),
             Sql::Expression(query) => (ScopedRoot::Query(query), &[]),
@@ -380,8 +382,7 @@ fn plpgsql_sites<'b, 'db, DB: DatabaseLike>(
             for (command, called) in
                 text_sink_calls(root, &ExpressionScope::PlPgSql(&scope), database)?
             {
-                let holder =
-                    SiteScope::PlPgSql { scope: scope.clone(), key, flow: Arc::clone(flow) };
+                let holder = SiteScope::PlPgSql { scope: scope.clone(), flow: Arc::clone(flow) };
                 found.push(DynamicExecution::call(root, command, holder, called, database));
             }
         }
@@ -390,7 +391,7 @@ fn plpgsql_sites<'b, 'db, DB: DatabaseLike>(
             found.push(DynamicExecution::execute(
                 expression(&dynamic.command),
                 arguments,
-                SiteScope::PlPgSql { scope, key, flow: Arc::clone(flow) },
+                SiteScope::PlPgSql { scope, flow: Arc::clone(flow) },
                 database,
             ));
         }

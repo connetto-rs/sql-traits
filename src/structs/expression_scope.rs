@@ -46,11 +46,12 @@ pub enum ExpressionScope<'s, 'db, DB: DatabaseLike> {
     /// The variables a PL/pgSQL body reaches where it evaluates the
     /// expression, by name, innermost block first, qualified by a block's
     /// label or the function's name, and `$n` for any argument, output ones
-    /// included. A field of a row variable takes its column's type, and a
-    /// field of a trigger function's `NEW` or `OLD` the type it has in every
-    /// table a trigger executing the function is defined on, and a field of a
-    /// cursor loop's record the type of the cursor query's output of that
-    /// name.
+    /// included. A field of a row variable takes its column's type, a field
+    /// of a trigger function's `NEW` or `OLD` the type it has in every table
+    /// a trigger executing the function is defined on, and a field of a
+    /// record the type every row reaching the expression agrees on, as
+    /// [`ExpressionContext::record_field_types`](crate::structs::ExpressionContext::record_field_types)
+    /// lists them.
     ///
     /// A name a relation of the expression's own queries holds binds that
     /// column, even where it also names a variable. PostgreSQL 18 refuses
