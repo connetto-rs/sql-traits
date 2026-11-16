@@ -23,7 +23,9 @@ use crate::{
         AggregateKind, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope, Definition,
         DefinitionSource, ExpressionScope, FunctionKind, IdentifierCase, OperandType,
         OperatorResolution, Output, PlPgSqlScope, PlPgSqlVariable, QueryOutput, SelectedOperator,
-        TargetName, VariableKind, plpgsql_flow::Reached, plpgsql_scope::stored_parts,
+        TargetName, VariableKind,
+        plpgsql_flow::{FlowPoint, Reached},
+        plpgsql_scope::stored_parts,
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, OperatorLike, TableLike, TriggerLike,
@@ -858,11 +860,12 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         variable: &PlPgSqlVariable<'db>,
         field: &Ident,
     ) -> Result<Vec<(Definition<'query, 'query, DB>, OperandType<'db>)>, LookupError> {
-        let Some(point) = self.variables.and_then(PlPgSqlScope::point) else {
+        // A scope standing at no point of the flow, or at one no path
+        // reaches, lists no definition.
+        let reached = self.variables.and_then(PlPgSqlScope::point).map(FlowPoint::reaching);
+        let Some(Reached { flow, state: Some(state), visiting }) = reached.transpose()? else {
             return Ok(Vec::new());
         };
-        let Reached { flow, state, visiting } = point.reaching()?;
-        let Some(state) = state else { return Ok(Vec::new()) };
         let mut candidates = Vec::new();
         for definition in flow.definitions_of(state, variable) {
             if !definition.part().is_empty() {

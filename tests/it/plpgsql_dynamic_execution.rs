@@ -529,8 +529,10 @@ fn record_fields_take_the_output_types_of_the_rows_reaching_them() {
 /// converts the value to, the one the record's row gave it. A cursor query
 /// reading a record's field types it from the rows reaching every opening
 /// of the cursor. A row from a dynamic command or a `refcursor` stays
-/// unknown, and `record_field_types` lists each with its unknown type, but
-/// nothing for a row variable's field, which takes its column's type.
+/// unknown, and so does a row a cursor gives from the record's own field
+/// through a loop. `record_field_types` lists the first two with their
+/// unknown types, but nothing for a row variable's field, which takes its
+/// column's type.
 #[test]
 fn record_fields_skip_field_writes_and_follow_cursor_openings() {
     let database = postgres(
@@ -542,6 +544,7 @@ fn record_fields_skip_field_writes_and_follow_cursor_openings() {
           c refcursor;
           whole audit;
           d CURSOR FOR SELECT r.name AS copied, seen AS name FROM audit;
+          e CURSOR FOR SELECT r.name AS name FROM audit;
          BEGIN
           SELECT name INTO r FROM audit;
           r.name := 5;
@@ -557,6 +560,12 @@ fn record_fields_skip_field_writes_and_follow_cursor_openings() {
            FETCH c INTO r;
           END IF;
           EXECUTE 'SELECT ' || r.name;
+          FOR i IN 1..2 LOOP
+           OPEN e;
+           FETCH e INTO r;
+           CLOSE e;
+          END LOOP;
+          EXECUTE 'SELECT ' || r.name;
          END $$;",
     );
     let text = || "pg_catalog.text".to_owned();
@@ -570,6 +579,7 @@ fn record_fields_skip_field_writes_and_follow_cursor_openings() {
                 ("whole.name".to_owned(), text()),
             ],
             Vec::new(),
+            vec![("r.name".to_owned(), "?".to_owned())],
             vec![("r.name".to_owned(), "?".to_owned())],
         ]
     );
