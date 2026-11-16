@@ -586,3 +586,26 @@ fn a_definition_reading_an_unresolvable_query_returns_its_error() {
         Err(LookupError::AmbiguousTableLookup { .. })
     ));
 }
+
+/// A write to a name the body declares nowhere leaves the reads of its
+/// sites unresolvable, naming the target.
+#[test]
+fn a_write_to_an_undeclared_name_is_unresolvable() {
+    for body in [
+        "BEGIN missing := 1; EXECUTE p; END",
+        "BEGIN SELECT 1 INTO missing; EXECUTE p; END",
+        "BEGIN GET DIAGNOSTICS missing = ROW_COUNT; EXECUTE p; END",
+    ] {
+        let database = database(body);
+        let sites = run(&database).dynamic_execution_sites(&database).unwrap();
+        let sites = sites.sites().unwrap();
+        assert!(
+            matches!(
+                sites[0].reads(IdentifierCase::Folded),
+                Err(LookupError::FunctionBodyUnresolvable { function, statement })
+                    if function == "run" && statement == "missing"
+            ),
+            "{body}"
+        );
+    }
+}
