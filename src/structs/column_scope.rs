@@ -401,28 +401,18 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionList<'scope, 'query,
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE a(id INT);")?;
     /// let sql = "SELECT v.x FROM a, LATERAL (VALUES (NULL), (a.id)) AS v(x)";
-    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
-    ///     unreachable!()
-    /// };
-    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
+    /// let parsed = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
+    /// let Statement::Query(query) = &parsed[0] else { unreachable!() };
+    /// let scope = ColumnScope::from_query(query, &db, IdentifierCase::AsWritten)?;
     /// let reference = Expr::CompoundIdentifier(vec![Ident::new("v"), Ident::new("x")]);
-    /// let Some(ColumnDefinition::Values { rows }) = scope.resolve_column_definition(&reference)?
-    /// else {
-    ///     unreachable!()
-    /// };
-    /// let mut rows = rows.iter();
-    /// let Some(ColumnDefinition::Expression { expression, .. }) =
-    ///     rows.next().map(|row| row.definition())
-    /// else {
-    ///     unreachable!()
-    /// };
+    /// let definition = scope.resolve_column_definition(&reference)?;
+    /// let Some(ColumnDefinition::Values { rows }) = definition else { unreachable!() };
+    /// let rows: Vec<_> = rows.iter().map(|row| row.definition()).collect();
+    /// assert_eq!(rows.len(), 2);
+    /// let ColumnDefinition::Expression { expression, .. } = &rows[0] else { unreachable!() };
     /// assert_eq!(expression.to_string(), "NULL");
-    /// let Some(ColumnDefinition::Base { column, .. }) = rows.next().map(|row| row.definition())
-    /// else {
-    ///     unreachable!()
-    /// };
+    /// let ColumnDefinition::Base { column, .. } = &rows[1] else { unreachable!() };
     /// assert_eq!(column.column_name(), "id");
-    /// assert!(rows.next().is_none());
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
     pub fn iter(
