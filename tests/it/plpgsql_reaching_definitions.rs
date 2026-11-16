@@ -392,6 +392,22 @@ fn a_loop_over_a_command_assigns_each_row_or_the_empty_row() {
     );
 }
 
+/// A loop over a query whose body always returns leaves the loop only
+/// through the query returning no row, so only the empty row follows it.
+#[test]
+fn a_query_loop_that_always_returns_leaves_only_the_empty_row() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN
+              FOR s IN SELECT name FROM t LOOP RETURN; END LOOP;
+              EXECUTE s;
+             END"
+        ),
+        [vec![read("s", &["Ordinal(0) Empty of SELECT name FROM t"])]]
+    );
+}
+
 /// `FETCH`, `OPEN`, `GET DIAGNOSTICS` and `CALL` assign what they read,
 /// and a `CALL` adds what the procedure may return beside the earlier
 /// value.
