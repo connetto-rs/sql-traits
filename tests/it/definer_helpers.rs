@@ -3511,7 +3511,8 @@ const INSTALLATION: &str = "app.installation_id";
 
 /// A deployment whose caller is `app.user_id` and whose app installation
 /// acting for it is `app.installation_id`, both of `identity`, either may be
-/// unset, beside a scalar `app.tenant` and a set `app.link_ids`.
+/// unset, beside a scalar `app.tenant`, a set `app.link_ids` and a JSON
+/// `request.jwt.claims`.
 fn principals(identity: &DataType) -> Deployment {
     let setting = |name: &str, value: SettingValue| {
         SessionSetting::value(name, value).expect("a custom setting name").may_be_unset()
@@ -3527,6 +3528,11 @@ fn principals(identity: &DataType) -> Deployment {
             ),
             setting("app.tenant", SettingValue::Scalar(identity.clone())),
             setting("app.link_ids", delimited(",")),
+            SessionSetting::json(
+                "request.jwt.claims",
+                [JsonField::new(["sub"], SettingValue::Caller(identity.clone())).expect("a path")],
+            )
+            .expect("a custom setting name"),
         ],
     )
     .expect("a valid deployment")
@@ -3735,5 +3741,45 @@ fn a_list_naming_anything_but_principals_literals_and_parameters_refuses_the_ans
             setting: INSTALLATION.into(),
         }),
         "a gate reads the caller alone"
+    );
+    assert_eq!(
+        refused(
+            format!(
+                "b.principal_id IN ({user}, current_setting('request.jwt.claims', true)::uuid)"
+            ),
+            ""
+        ),
+        not_principal("request.jwt.claims"),
+        "a JSON document compared as one value"
+    );
+    let claims = "CREATE FUNCTION authz.claims() RETURNS UUID LANGUAGE sql STABLE
+                  AS $$ SELECT current_setting('request.jwt.claims', true)::uuid $$;";
+    assert!(
+        matches!(
+            refused(format!("b.principal_id IN ({user}, authz.claims())"), claims),
+            Err(HelperSetError::SettingCast { function, setting, .. })
+                if function == "authz.claims" && setting == "request.jwt.claims"
+        ),
+        "a JSON document cast to one value's type"
+    );
+}
+
+#[test]
+fn every_arm_of_a_list_keeps_the_conditions_beside_it() {
+    let user = "NULLIF(current_setting('app.user_id', true), '')::uuid";
+    let installation = "NULLIF(current_setting('app.installation_id', true), '')::uuid";
+    let list = format!("b.principal_id IN ({user}, {installation})");
+    let expiring = "ALTER TABLE organization_blocks ADD COLUMN expires_at TIMESTAMPTZ;";
+    assert_eq!(
+        listing(&format!("{list} AND b.expires_at > now()"), expiring).as_deref(),
+        Ok(
+            "organization_blocks.organization_id WHERE principal_id = app.user_id AND expires_at > now \
+            UNION organization_blocks.organization_id WHERE principal_id = app.installation_id AND expires_at > now"
+        )
+    );
+    assert_eq!(
+        listing(&format!("{list} AND 1 = 2"), "").as_deref(),
+        Ok(""),
+        "a list kept from no row"
     );
 }
