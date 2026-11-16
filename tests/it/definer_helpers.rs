@@ -3338,17 +3338,16 @@ fn an_accessor_resolves_its_body_on_its_own_path_or_on_the_helpers() {
 #[test]
 fn an_accessor_postgres_does_not_run_as_its_read_refuses_the_answer() {
     let refused = |after: &str| {
-        match blocked_through(after, "authz.caller_id()") {
-            Err(HelperSetError::Accessor { function, accessor, setting, reason }) => {
-                assert_eq!(
-                    (function.as_str(), accessor.as_str(), setting.as_str()),
-                    ("authz.blocking_organizations", "authz.caller_id", "app.user_id"),
-                    "{after}"
-                );
-                Some(reason)
-            }
-            _ => None,
-        }
+        let Err(error) = blocked_through(after, "authz.caller_id()") else { return None };
+        let HelperSetError::Accessor { function, accessor, setting, reason } = &error else {
+            return None;
+        };
+        assert_eq!(
+            (function.as_str(), accessor.as_str(), setting.as_str()),
+            ("authz.blocking_organizations", "authz.caller_id", "app.user_id"),
+            "{after}"
+        );
+        Some((*reason, error.to_string()))
     };
     let refusal = |reason, which: &str| {
         Some((
