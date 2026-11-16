@@ -75,6 +75,8 @@ fn snapshots_preserve_each_incremental_schema_state() {
         match definition {
             ColumnDefinition::Expression { expression, .. } => expression.to_string(),
             ColumnDefinition::Base { .. } => "base".to_owned(),
+            ColumnDefinition::ArrayElement { .. } => "array element".to_owned(),
+            ColumnDefinition::Ordinality => "ordinality".to_owned(),
             ColumnDefinition::SetOperation { .. } => "set operation".to_owned(),
             ColumnDefinition::RecursiveUnion { .. } => "recursive union".to_owned(),
             ColumnDefinition::Values { .. } => "values".to_owned(),

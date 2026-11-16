@@ -1026,3 +1026,49 @@ fn escaped_patterns_compare_with_the_call_postgres_inserts() {
         ]
     );
 }
+
+/// A column of `unnest` takes the element type of the array it expands, and
+/// the column `WITH ORDINALITY` adds `bigint`.
+#[test]
+fn unnest_columns_take_the_element_type_of_their_array() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TYPE role AS ENUM ('reader', 'writer', 'admin');
+         CREATE TABLE docs (tags TEXT[]);",
+    )
+    .unwrap();
+    let query = query(
+        "SELECT x, n, tag FROM unnest(enum_range(NULL::role)) WITH ORDINALITY AS t(x, n),
+         docs, unnest(docs.tags) AS tag",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let types: Vec<_> =
+        projected(&query).into_iter().map(|node| context.type_of(node).unwrap()).collect();
+    let role = OperandType::Known {
+        type_name: TargetName::new("role", true).with_schema("public", true),
+        typmod: None,
+    };
+    assert_eq!(types, [role, pg("int8"), pg("text")]);
+}
+
+/// An array parameter of the function whose body holds the `unnest` is
+/// shown to be an array, so the column takes its element type.
+#[test]
+fn unnest_of_an_array_parameter_takes_its_element_type() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION f(ids INT8[]) RETURNS BOOL LANGUAGE sql RETURN true;",
+    )
+    .unwrap();
+    let function = db.functions().find(|function| function.name() == "f").unwrap();
+    let body = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT i FROM unnest(ids) AS i")
+        .unwrap()
+        .remove(0);
+    let context = ExpressionContext::for_statement(
+        &body,
+        &ExpressionScope::FunctionBody(function),
+        &db,
+        IdentifierCase::AsWritten,
+    )
+    .unwrap();
+    let Statement::Query(query) = &body else { unreachable!() };
+    assert_eq!(context.type_of(projected(query)[0]).unwrap(), pg("int8"));
+}

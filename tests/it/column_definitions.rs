@@ -401,7 +401,7 @@ fn opaque_alias_shadows_the_parent_scope() {
     let query = query(
         "SELECT d.nested_payload FROM (\
              SELECT u.payload, \
-                    (SELECT u.payload FROM UNNEST(ARRAY[1]) AS u(payload)) \
+                    (SELECT u.payload FROM generate_series(1, 1) AS u(payload)) \
              FROM a AS u\
          ) AS d(outer_payload, nested_payload)",
     );

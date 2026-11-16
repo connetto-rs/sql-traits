@@ -19,6 +19,8 @@ const SCHEMA: &str = "
     CREATE TABLE items(id INT PRIMARY KEY, h halfvec(3), v vector(3));
     CREATE TABLE a(id INT, x INT);
     CREATE TABLE b(id INT);
+    CREATE TYPE role AS ENUM ('reader', 'writer', 'admin');
+    CREATE TABLE docs(id INT, tags TEXT[], body TSVECTOR);
 ";
 
 fn database() -> ParserDB {
@@ -34,6 +36,8 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
         ColumnDefinition::Base { table, column, .. } => {
             format!("{}.{}", table.table_name(), column.column_name())
         }
+        ColumnDefinition::ArrayElement { array, .. } => format!("element of {array}"),
+        ColumnDefinition::Ordinality => "ordinality".to_owned(),
         ColumnDefinition::Expression { expression, .. } => format!("expression {expression}"),
         ColumnDefinition::SetOperation { operator, left, right } => {
             format!(
@@ -58,10 +62,13 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
 }
 
 fn outputs_of(sql: &str, pick: fn(&Query) -> &Query) -> Vec<String> {
-    let database = database();
+    outputs_in(&database(), sql, pick)
+}
+
+fn outputs_in(database: &ParserDB, sql: &str, pick: fn(&Query) -> &Query) -> Vec<String> {
     let query = query(sql);
-    let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
-        .expect("scope builds");
+    let scope =
+        ColumnScope::from_query(&query, database, IdentifierCase::AsWritten).expect("scope builds");
     let outputs = scope.scope_for_query(pick(&query)).expect("query is recorded").outputs();
     let entries = outputs.len();
     let described = outputs
@@ -333,4 +340,110 @@ fn in_table_and_unnest_outputs_have_unnamed_expression_names() {
             assert!(matches!(definition, ColumnDefinition::Expression { .. }));
         }
     }
+}
+
+#[test]
+fn unnest_columns_expand_an_argument_shown_to_be_an_array() {
+    for (sql, expected) in [
+        (
+            "SELECT x FROM unnest(enum_range(NULL::role)) AS t(x)",
+            "element of enum_range(NULL::role)",
+        ),
+        ("SELECT x FROM unnest(ARRAY[1, 2]) AS x", "element of ARRAY[1, 2]"),
+        ("SELECT x FROM unnest('{1}'::INT[]) AS x", "element of '{1}'::INT[]"),
+        (
+            "SELECT x FROM unnest(ARRAY(SELECT id FROM b)) AS x",
+            "element of ARRAY(SELECT id FROM b)",
+        ),
+        ("SELECT x FROM pg_catalog.unnest(ARRAY[1]) AS x", "element of ARRAY[1]"),
+        (
+            "SELECT tag FROM docs CROSS JOIN LATERAL unnest(docs.tags) AS tag",
+            "element of docs.tags",
+        ),
+        (
+            "SELECT x FROM (SELECT tags AS list FROM docs) AS d, unnest(d.list) AS x",
+            "element of d.list",
+        ),
+    ] {
+        assert_eq!(outputs(sql), [expected], "{sql}");
+    }
+    let sql = "SELECT x FROM unnest(enum_range(NULL::role)) AS t(x)
+               UNION SELECT y FROM unnest(ARRAY['reader'::role]) AS u(y)";
+    assert_eq!(
+        outputs(sql),
+        ["UNION(element of enum_range(NULL::role), element of ARRAY['reader'::role])"]
+    );
+}
+
+#[test]
+fn unnest_columns_take_the_names_postgresql_gives_them() {
+    assert_eq!(names("SELECT * FROM unnest(ARRAY[1])"), ["\"unnest\""]);
+    assert_eq!(outputs("SELECT unnest.unnest FROM unnest(ARRAY[1])"), ["element of ARRAY[1]"]);
+    assert_eq!(names("SELECT * FROM unnest(ARRAY[1]) AS x"), ["x"]);
+    assert_eq!(
+        names("SELECT * FROM unnest(ARRAY[1], ARRAY['a']) AS t"),
+        ["\"unnest\"", "\"unnest\""]
+    );
+    assert_eq!(
+        outputs("SELECT * FROM unnest(ARRAY[1], ARRAY['a']) AS t(x, y)"),
+        ["element of ARRAY[1]", "element of ARRAY['a']"]
+    );
+    assert_eq!(
+        names("SELECT * FROM unnest(ARRAY[1]) WITH ORDINALITY"),
+        ["\"unnest\"", "\"ordinality\""]
+    );
+    assert_eq!(
+        names("SELECT * FROM unnest(ARRAY[1]) WITH ORDINALITY AS t"),
+        ["t", "\"ordinality\""]
+    );
+    let sql = "SELECT * FROM unnest(ARRAY[1], ARRAY['a']) WITH ORDINALITY AS t(x, y, n)";
+    assert_eq!(outputs(sql), ["element of ARRAY[1]", "element of ARRAY['a']", "ordinality"]);
+    assert_eq!(names(sql), ["x", "y", "n"]);
+}
+
+#[test]
+fn an_unnest_not_shown_to_read_arrays_stays_opaque() {
+    // `unnest(tsvector)` outputs `lexeme`, `positions` and `weights`.
+    for sql in [
+        "SELECT lexeme FROM docs, unnest(docs.body)",
+        "SELECT lexeme FROM docs, unnest(docs.tags, docs.body) AS t",
+        "SELECT x FROM unnest((SELECT tags FROM docs LIMIT 1)) AS x",
+        "SELECT x FROM unnest(ARRAY[1]) AS t(x, y)",
+        "SELECT x FROM pg_catalog.unnest(ARRAY[1], ARRAY[2]) AS x",
+    ] {
+        assert_eq!(outputs(sql), ["opaque"], "{sql}");
+    }
+}
+
+#[test]
+fn an_unnest_a_function_of_the_database_may_answer_stays_opaque() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION unnest(list INT[]) RETURNS SETOF INT LANGUAGE sql AS 'SELECT 1';",
+    )
+    .expect("schema parses");
+    let outputs = |sql| outputs_in(&database, sql, |query| query);
+    assert_eq!(outputs("SELECT x FROM unnest(ARRAY[1]) AS x"), ["opaque"]);
+    assert_eq!(outputs("SELECT x FROM unnest(ARRAY[1], ARRAY[2]) AS t(x)"), ["opaque"]);
+    assert_eq!(outputs("SELECT x FROM pg_catalog.unnest(ARRAY[1]) AS x"), ["element of ARRAY[1]"]);
+}
+
+#[test]
+fn an_unnest_argument_resolves_in_the_scope_its_item_sees() {
+    let database = database();
+    let query = query("SELECT t.x FROM a CROSS JOIN unnest(ARRAY[a.id]) AS t(x)");
+    let scope = ColumnScope::from_query(&query, &database, IdentifierCase::AsWritten)
+        .expect("scope builds");
+    let mut outputs = scope.scope_for_query(&query).expect("query is recorded").outputs();
+    let Some(QueryOutput::Column {
+        definition: ColumnDefinition::ArrayElement { array: Expr::Array(array), scope: defining },
+        ..
+    }) = outputs.next()
+    else {
+        panic!("expected an array element output")
+    };
+    let id = defining
+        .resolve_column_definition(&array.elem[0])
+        .expect("lookup succeeds")
+        .expect("a.id resolves");
+    assert_eq!(describe(&id), "a.id");
 }

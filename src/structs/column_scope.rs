@@ -39,6 +39,17 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
         /// The scope in which the expression was declared.
         scope: ColumnDefinitionScope<'scope, 'query, 'db, DB>,
     },
+    /// An element of the array a function in `FROM` expands, the column of
+    /// `unnest(array)`, which holds values of the array's element type.
+    ArrayElement {
+        /// The array argument the column expands.
+        array: &'scope Expr,
+        /// The scope the argument is read in, the one the `FROM` item sees.
+        scope: ColumnDefinitionScope<'scope, 'query, 'db, DB>,
+    },
+    /// The `bigint` row number `WITH ORDINALITY` adds after the columns of a
+    /// function in `FROM`, counting from 1.
+    Ordinality,
     /// The definitions combined by an ordinary set operation.
     SetOperation {
         /// The operation combining the definitions.

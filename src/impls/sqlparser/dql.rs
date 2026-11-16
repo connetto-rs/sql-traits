@@ -38,11 +38,12 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
-    traits::{ColumnLike, DQLLike, DatabaseLike, TableLike, ViewLike},
+    traits::{ColumnLike, DQLLike, DatabaseLike, FunctionLike, TableLike, ViewLike},
     utils::{
+        call_sites::call_reaches,
         object_name::{
-            object_name_last_part, render_table_candidate, resolve_bound_table,
-            resolve_object_name, target_name_from_object_name,
+            PG_CATALOG, Qualifier, object_name_last_part, qualifier_of, render_table_candidate,
+            resolve_bound_table, resolve_object_name, target_name_from_object_name,
         },
         walk::walk,
     },
@@ -587,6 +588,24 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         expression: AstRef<'query, 'db, Expr>,
         scope: Self::Cursor,
     ) -> Result<Self::Definition, LookupError>;
+    /// Whether `array`, an argument of an `unnest` in `FROM` read under
+    /// `scope`, is shown to be an array, its calls looked up in `database`.
+    /// A profile that resolves no column shows none.
+    fn proves_array(
+        &self,
+        array: AstRef<'query, 'db, Expr>,
+        scope: Self::Cursor,
+        database: &'db DB,
+    ) -> Result<bool, LookupError>;
+    /// The definition of the elements of `array`, an argument of an `unnest`
+    /// in `FROM` read under `scope`.
+    fn array_element_definition(
+        &mut self,
+        array: AstRef<'query, 'db, Expr>,
+        scope: Self::Cursor,
+    ) -> Self::Definition;
+    /// The definition of the row number `WITH ORDINALITY` adds.
+    fn ordinality_definition(&mut self) -> Self::Definition;
     fn set_definition(
         &mut self,
         operator: SetOperator,
@@ -701,6 +720,24 @@ where
     ) -> Result<Self::Definition, LookupError> {
         Ok(())
     }
+
+    fn proves_array(
+        &self,
+        _array: AstRef<'query, 'db, Expr>,
+        _scope: Self::Cursor,
+        _database: &'db DB,
+    ) -> Result<bool, LookupError> {
+        Ok(false)
+    }
+
+    fn array_element_definition(
+        &mut self,
+        _array: AstRef<'query, 'db, Expr>,
+        _scope: Self::Cursor,
+    ) {
+    }
+
+    fn ordinality_definition(&mut self) {}
 
     fn set_definition(
         &mut self,
@@ -4536,6 +4573,174 @@ where
     })
 }
 
+/// An `unnest` call in `FROM`: its arguments, whether `WITH ORDINALITY`
+/// follows it, and the name it calls, `None` for the `UNNEST` keyword form.
+struct UnnestCall<'query, 'db> {
+    arguments: Vec<AstRef<'query, 'db, Expr>>,
+    with_ordinality: bool,
+    name: Option<AstRef<'query, 'db, ObjectName>>,
+}
+
+/// The `unnest` call `factor` writes, unqualified or in `pg_catalog`, `None`
+/// for any other item, for one passing a named argument or `WITH OFFSET`,
+/// and for a qualified call of several arguments, which PostgreSQL does not
+/// expand.
+fn unnest_call<'query, 'db>(
+    factor: AstRef<'query, 'db, TableFactor>,
+    case: IdentifierCase,
+) -> Option<UnnestCall<'query, 'db>> {
+    if let Some(arguments) = factor.try_map(|factor| {
+        match factor {
+            TableFactor::UNNEST { array_exprs, with_offset: false, .. } => {
+                Some(array_exprs.as_slice())
+            }
+            _ => None,
+        }
+    }) {
+        let TableFactor::UNNEST { with_ordinality, .. } = factor.get() else { return None };
+        return Some(UnnestCall {
+            arguments: arguments.iter().collect(),
+            with_ordinality: *with_ordinality,
+            name: None,
+        });
+    }
+    let listed = factor.try_map(|factor| {
+        match factor {
+            TableFactor::Table {
+                args: Some(TableFunctionArgs { args, settings: None }), ..
+            }
+            | TableFactor::Function { args, .. } => Some(args.as_slice()),
+            _ => None,
+        }
+    })?;
+    let (TableFactor::Table { with_ordinality, .. }
+    | TableFactor::Function { with_ordinality, .. }) = factor.get()
+    else {
+        return None;
+    };
+    let name = factor_name(factor)?;
+    let (called, quoted) = object_name_last_part(name.get())?;
+    if name.get().0.len() > 2 || !case.identifiers_match(called, quoted, "unnest", true) {
+        return None;
+    }
+    let arguments = listed
+        .iter()
+        .map(|argument| {
+            argument.try_map(|argument| {
+                match argument {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => Some(expression),
+                    _ => None,
+                }
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let qualified = match qualifier_of(name.get()) {
+        Qualifier::Absent => false,
+        Qualifier::Named(schema, quoted)
+            if case.identifiers_match(schema, quoted, PG_CATALOG, true) =>
+        {
+            true
+        }
+        Qualifier::Named(..) | Qualifier::RunTime => return None,
+    };
+    if qualified && arguments.len() > 1 {
+        return None;
+    }
+    Some(UnnestCall { arguments, with_ordinality: *with_ordinality, name: Some(name) })
+}
+
+/// What `call`, the `unnest` call `factor` writes, contributes: one element
+/// column per argument, then the `bigint` column `WITH ORDINALITY` adds,
+/// named as PostgreSQL names them, its arguments read under `local_parent`.
+///
+/// `None` when an argument is not shown to be an array, since each argument
+/// is unnested by a call of its own and `unnest(tsvector)` outputs three
+/// columns, when a function of the database's own may answer that call, and
+/// when the alias names more columns than the call outputs.
+fn collect_unnest<'query, 'db, DB, P>(
+    factor: AstRef<'query, 'db, TableFactor>,
+    call: &UnnestCall<'query, 'db>,
+    deriving: Deriving<'_, 'db, DB>,
+    local_parent: P::Cursor,
+    profile: &mut P,
+) -> Result<Option<FactorContribution<'query, 'db, DB, P::Definition>>, LookupError>
+where
+    DB: DatabaseLike,
+    P: DerivationProfile<'query, 'db, DB>,
+{
+    let width = call.arguments.len() + usize::from(call.with_ordinality);
+    if call.arguments.is_empty() || width > MAX_DERIVED_COLUMNS {
+        return Ok(None);
+    }
+    let database = deriving.database;
+    let keyword;
+    let called = if let Some(name) = &call.name {
+        name.get()
+    } else {
+        keyword = ObjectName::from(vec![Ident::new("unnest")]);
+        &keyword
+    };
+    if database.functions_named("unnest").any(|function| {
+        function.target_name().schema() != Some(PG_CATALOG)
+            && call_reaches(function, called, 1, || database.search_path(), deriving.case)
+    }) {
+        return Ok(None);
+    }
+    for argument in &call.arguments {
+        if !profile.proves_array(*argument, local_parent, database)? {
+            return Ok(None);
+        }
+    }
+    let alias = factor_alias(factor);
+    let (element_name, element_quoted) = match &alias {
+        Some(alias) if call.arguments.len() == 1 => {
+            (alias.get().name.value.as_str(), alias.get().name.quote_style.is_some())
+        }
+        _ => ("unnest", true),
+    };
+    let mut columns = Vec::with_capacity(width);
+    for argument in &call.arguments {
+        columns.push(DerivedColumn {
+            name: element_name.to_owned(),
+            quoted: element_quoted,
+            source: None,
+            definition: profile.array_element_definition(*argument, local_parent),
+            marker: core::marker::PhantomData,
+        });
+    }
+    if call.with_ordinality {
+        columns.push(DerivedColumn {
+            name: "ordinality".to_owned(),
+            quoted: true,
+            source: None,
+            definition: profile.ordinality_definition(),
+            marker: core::marker::PhantomData,
+        });
+    }
+    let shape = DerivedShape { columns, row_preserving: false };
+    let shape = match alias {
+        Some(alias) => apply_alias_columns(Some(shape), alias.get()),
+        None => Some(shape),
+    };
+    let Some(shape) = shape else { return Ok(None) };
+    let names = derived_column_names(&shape.columns);
+    let key = alias
+        .map(alias_key)
+        .or_else(|| call.name.and_then(object_name_key))
+        .unwrap_or(RelationKey { value: factor.map(|_| "unnest"), quoted: true });
+    Ok(Some(FactorContribution {
+        relation: RelationContribution::Derived(DerivedRelationRef {
+            key: Some(key),
+            identity: Some(key),
+            shape,
+            nullable: false,
+            entry_index: 0,
+            factor: factor_address(factor.get()),
+        }),
+        names: Some(names),
+    }))
+}
+
 /// Records a single `FROM` table factor into the scope, returning the output
 /// column names it contributes and the wildcard plan entry naming what it
 /// pushed, or `None` when the factor is opaque.
@@ -4551,6 +4756,11 @@ where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
 {
+    if let Some(call) = unnest_call(factor, deriving.case)
+        && let Some(contribution) = collect_unnest(factor, &call, deriving, local_parent, profile)?
+    {
+        return Ok(contribution);
+    }
     match factor.get() {
         TableFactor::Table { args, .. } => {
             collect_table_factor(factor, args.is_some(), deriving, cte_scope, profile)
