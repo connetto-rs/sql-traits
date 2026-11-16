@@ -12,9 +12,8 @@ use alloc::{
 };
 
 use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, ColumnOptionDef, CreateTable, Expr, ForValues,
-    ForeignKeyConstraint, Ident, IndexColumn, ObjectName, OrderByExpr, OrderByOptions,
-    TableConstraint,
+    AlterTableOperation, ColumnOption, ColumnOptionDef, CreateTable, Expr, ForValues, Ident,
+    IndexColumn, ObjectName, OrderByExpr, OrderByOptions, TableConstraint,
 };
 
 use super::{
@@ -25,6 +24,7 @@ use super::{
 };
 use crate::{
     errors::{Error, ObjectKind, UnattachablePartition},
+    impls::foreign_keys_stored_alike,
     traits::TableLike,
     utils::is_identity,
 };
@@ -395,10 +395,7 @@ fn table_form(column: &Ident, option: &ColumnOptionDef) -> Option<TableConstrain
 fn same_key(left: &TableConstraint, right: &TableConstraint) -> bool {
     match (left, right) {
         (TableConstraint::ForeignKey(left), TableConstraint::ForeignKey(right)) => {
-            let bare = |key: &ForeignKeyConstraint| {
-                ForeignKeyConstraint { name: None, index_name: None, ..key.clone() }
-            };
-            bare(left) == bare(right)
+            foreign_keys_stored_alike(left, right)
         }
         _ => inheritance::is_copy_of(left, right),
     }

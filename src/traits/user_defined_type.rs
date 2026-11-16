@@ -4,7 +4,7 @@ use alloc::borrow::Cow;
 use core::fmt::Debug;
 
 use crate::{
-    traits::{DatabaseLike, Metadata},
+    traits::{DatabaseLike, Enumeration, EnumerationMember, Metadata},
     utils::identifier_resolution::stored_identifier,
 };
 
@@ -140,4 +140,34 @@ pub trait UserDefinedTypeLike: Clone + Debug + Metadata + Send + Sync {
     /// # }
     /// ```
     fn kind(&self) -> UserDefinedTypeKind;
+
+    /// Returns the labels of an enum type in their sort order, with every
+    /// `ALTER TYPE ... ADD VALUE` applied, or `None` for every other kind.
+    ///
+    /// An enum type identifies a label by its position, so the labels answer
+    /// as [`DataTypeLike::enumeration`](crate::traits::DataTypeLike::enumeration)
+    /// answers a column of the type, without values or width. A catalog reads
+    /// them from `pg_enum` ordered by `enumsortorder`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TYPE access_level AS ENUM ('read', 'admin');
+    ///      ALTER TYPE access_level ADD VALUE 'write' BEFORE 'admin';
+    ///      CREATE TYPE pair AS (x int, y int);",
+    /// )?;
+    /// let type_named = |name: &str| db.user_defined_types().find(|type_| type_.name() == name);
+    /// let enumeration = type_named("access_level").unwrap().enumeration().unwrap();
+    /// let labels: Vec<_> = enumeration.into_members().map(EnumerationMember::label).collect();
+    /// assert_eq!(labels, ["read", "write", "admin"]);
+    /// assert!(type_named("pair").unwrap().enumeration().is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>>;
 }

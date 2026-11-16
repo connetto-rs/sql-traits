@@ -6,7 +6,10 @@ use sqlparser::ast::CreateFunction;
 
 use crate::{
     structs::{IdentifierCase, ParserDB, UserDefinedType},
-    traits::{Metadata, UserDefinedTypeKind, UserDefinedTypeLike},
+    traits::{
+        Enumeration, EnumerationKind, EnumerationMember, Metadata, UserDefinedTypeKind,
+        UserDefinedTypeLike,
+    },
     utils::object_name::{object_name_identifiers, object_name_last_part, qualifier_of},
 };
 
@@ -64,6 +67,16 @@ impl UserDefinedTypeLike for UserDefinedType {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>> {
+        let labels = self.enum_labels()?;
+        Some(Enumeration::new(
+            EnumerationKind::Enum,
+            None,
+            labels.iter().map(|label| EnumerationMember::new(&label.value, None)),
+        ))
     }
 }
 

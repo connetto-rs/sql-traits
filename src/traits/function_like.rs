@@ -1860,66 +1860,106 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// tree where the body is recursive.
     ///
     /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
-    /// function returning `SETOF` one scalar type with a pinned
-    /// `search_path`, owned by a declared role holding `SELECT` on every
-    /// table it reads, or on every column of it the body names, `USAGE` on
-    /// the schema of every table and helper the body names, and exempt from
-    /// the row-level security of the tables, and when its body is a `UNION`
-    /// of arms of two shapes, alone or walked along a tree.
+    /// function returning `SETOF` one scalar type or `TABLE (...)` with a
+    /// pinned `search_path`, owned by a declared role holding `SELECT` on
+    /// every table it reads, or on every column of it the body names,
+    /// `USAGE` on the schema of every table and helper the body names, and
+    /// exempt from the row-level security of the tables, and when its body
+    /// is a `UNION` of arms of two shapes, alone or walked along a tree. A
+    /// helper returning `TABLE (...)` of several columns answers grant arms
+    /// only.
     ///
-    /// - A grant arm, `SELECT <column> FROM <table> [WHERE <conditions>]`, the
-    ///   conditions joined by `AND`. At most one of them names the grantee,
-    ///   either a comparison of a column with a value of the request or
-    ///   `<column> IN (SELECT <helper>(<arguments>))`, the helper answered in
-    ///   turn as a parent arm's is. The comparison is `<column> =
-    ///   current_setting('<setting>'[, <missing_ok>])` with a setting the
-    ///   deployment declares as the caller, or `<column>` compared with each
-    ///   element of a setting it declares as a set, unpacked as declared (see
-    ///   [`SettingComparison`](crate::structs::SettingComparison)). An arm
-    ///   naming no grantee returns the same rows for every request its gate
-    ///   lets through. Conditions `current_setting('<setting>') <> <text>` and
+    /// - A grant arm, `SELECT <columns> FROM <table> [WHERE <conditions>]`, one
+    ///   column per column the helper returns, the conditions joined by `AND`.
+    ///   At most one of them names the grantee, either a comparison of a column
+    ///   with a value of the request or `<column> IN (SELECT
+    ///   <helper>(<arguments>))`, the helper answered in turn as a parent arm's
+    ///   is. The comparison is `<column> = current_setting('<setting>'[,
+    ///   <missing_ok>])` with a setting the deployment declares as the caller
+    ///   or as another principal, or `<column>` compared with each element of a
+    ///   setting it declares as a set, unpacked as declared (see
+    ///   [`SettingComparison`](crate::structs::SettingComparison)). `<column>
+    ///   IN (<values>)` listing principals beside literals and parameters
+    ///   answers one grant arm per principal and one granted to anyone for the
+    ///   literals together, each keeping the other conditions. An arm naming no
+    ///   grantee returns the same rows for every request its gate lets through.
+    ///   A cap, `(<operands>) IN (SELECT * FROM <helper>(<arguments>))`,
+    ///   optionally behind `<setting> IS NULL OR`, keeps the rows whose
+    ///   operands are a row the helper returns, the helper answered in turn
+    ///   (see [`RowCap`](crate::structs::RowCap)). Conditions
+    ///   `current_setting('<setting>') <> <text>` and
     ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
     ///   the arm on what the setting reads (see
     ///   [`CallerGate`](crate::structs::CallerGate)). The body may cast a read
-    ///   of the caller to its declared type, and a set to an array of its
+    ///   of one value to its declared type, and a set to an array of its
     ///   declared element type or each element to that type, and any other cast
     ///   refuses the answer. It may read any setting through
     ///   `NULLIF(current_setting(...), '')`, which reads `''` as `NULL` and so
-    ///   maps both states of an unset setting to `NULL`. A time bound is a
-    ///   conjunct `<column> <comparison> now()`, a `timestamptz` column of the
-    ///   table compared with `<`, `<=`, `>` or `>=` either way round,
-    ///   optionally `OR <column> IS NULL`, and the arm answers it as a
-    ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
-    ///   `transaction_timestamp()` read the same statement time as `now()`. The
-    ///   rest, the arguments substituted, reduce to `TRUE`, to `FALSE` or
-    ///   `NULL`, or to the literal values columns have to hold. The table may
-    ///   be followed by `[INNER] JOIN <table> ON <condition>` for each row it
+    ///   maps both states of an unset setting to `NULL`. Wherever it reads a
+    ///   setting it may call an accessor instead, a zero-argument `sql`
+    ///   function written as a string whose body selects one such read, cast or
+    ///   not, and returns its type. The accessor's body resolves on its own
+    ///   path or, where it pins none, on the caller's, as the role it runs as,
+    ///   and an accessor that is `IMMUTABLE` or sets the setting it reads
+    ///   refuses the answer. A time bound is a conjunct `<column> <comparison>
+    ///   now()`, a `timestamptz` column of the table compared with `<`, `<=`,
+    ///   `>` or `>=` either way round, optionally `OR <column> IS NULL`, and
+    ///   the arm answers it as a [`TimeBound`](crate::structs::TimeBound).
+    ///   `CURRENT_TIMESTAMP` and `transaction_timestamp()` read the same
+    ///   statement time as `now()`. An anti-join is a conjunct `NOT EXISTS
+    ///   (SELECT 1 FROM <table> WHERE <conditions>)` whose conditions equal
+    ///   columns of `<table>` with columns of the arm's table and otherwise
+    ///   read `<table>` alone, and the arm answers it as an
+    ///   [`AntiJoin`](crate::structs::AntiJoin). The rest, the arguments
+    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to what
+    ///   columns have to hold, literal values, a `boolean` column alone holding
+    ///   `TRUE`, `<column> IS NULL` or `<column> IS NOT NULL` (see
+    ///   [`Restriction`](crate::structs::Restriction)). A column of an enum
+    ///   type compared with a label by `<`, `<=`, `>` or `>=`, either way
+    ///   round, holds the labels on the kept side of it in the order the type
+    ///   declares them, `ALTER TYPE ... ADD VALUE` applied. The table may be
+    ///   followed by `[INNER] JOIN <table> ON <condition>` for each row it
     ///   names through a foreign key, the conditions in `ON` read as those in
     ///   `WHERE`. Each column of the key equated with the column it references
     ///   joins the row, and the conditions on that row alone reduce to a
     ///   [`JoinedRow`](crate::structs::JoinedRow), the grantee and the returned
-    ///   column staying on the arm's own table. An arm comparing a helper's set
-    ///   while returning its table's primary key is a parent arm, so it takes
-    ///   no other condition and joins no row.
-    /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
-    ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
-    ///   literal, the helper called answered in turn for the arguments it
-    ///   receives. The column names its parent through its one single-column
-    ///   foreign key or, where it has none, through the table the called
-    ///   helper's set covers.
+    ///   columns staying on the arm's own table. An arm comparing a helper's
+    ///   set while returning a key it would return as a parent arm is one, so
+    ///   it takes no other condition and joins no row.
+    /// - A parent arm, `SELECT <key> FROM <table> WHERE <column> IN (SELECT
+    ///   <helper>(<arguments>))`, each argument a parameter or a literal, the
+    ///   helper called answered in turn for the arguments it receives. `<key>`
+    ///   is the table's primary key, and the column names its parent through
+    ///   its one single-column foreign key or, where it has none, through the
+    ///   table the called helper's set covers. `<key>` is otherwise a column a
+    ///   unique key covers alone, referencing another table's primary key
+    ///   through its one single-column foreign key, as in an edge table holding
+    ///   the parent of each child, and the column, one other than `<key>`, has
+    ///   one single-column foreign key.
     ///
     /// A body walking a tree is `WITH RECURSIVE <walk> [(<column>)] AS
     /// (<arms> UNION <term>) SELECT <column> FROM <walk>`. The term walks
-    /// down as `SELECT <key> FROM <table> JOIN <walk> ON <parent column> =
+    /// down as `SELECT <child> FROM <table> JOIN <walk> ON <parent column> =
     /// <walk>.<column>` and up as `SELECT <parent column> FROM <table> JOIN
-    /// <walk> ON <key> = <walk>.<column>`, the join either way round. `<key>`
-    /// is the table's one-column primary key, and `<parent column>` has one
-    /// single-column foreign key, referencing `<key>`. The walk answers a
-    /// [`WalkArm`](crate::structs::WalkArm) after the arms. `UNION ALL` is
-    /// refused, since it never ends on a tree holding a cycle.
+    /// <walk> ON <child> = <walk>.<column>`, the join either way round. A term
+    /// walking several edges at once is `SELECT <step>.<column> FROM <walk>
+    /// CROSS JOIN LATERAL (<edges>) <step>`, or `FROM <walk>, LATERAL`, the
+    /// edges a `UNION` or `UNION ALL` of `SELECT <child> FROM <table> WHERE
+    /// <parent column> = <walk>.<column>` walking down and `SELECT <parent
+    /// column> FROM <table> WHERE <child> = <walk>.<column>` walking up.
+    /// `<parent column>` names a row of the tree through foreign keys holding
+    /// it at the position of the tree's one-column primary key, alone or among
+    /// other columns, all of them referencing the same table and one checking
+    /// every row naming one, its match `FULL` or its other columns `NOT NULL`.
+    /// The table is the tree itself, with `<child>` its primary key, or an
+    /// edge table, with `<child>` its primary key or a column a unique key
+    /// covers alone, naming a row of the tree the same way. The walk answers a
+    /// [`WalkArm`](crate::structs::WalkArm) per edge after the arms. `UNION
+    /// ALL` between the arms and the term is refused, since it never ends on a
+    /// tree holding a cycle.
     ///
     /// A grant arm whose conditions reduce to `FALSE` or `NULL` keeps no row
-    /// and is left out, and a walk with it where no other arm remains. A
+    /// and is left out, and the walks with it where no other arm remains. A
     /// column named like a parameter is the column, as PostgreSQL resolves
     /// names in a SQL function. An unqualified name is looked up past the
     /// schemas on the path the owner cannot use, as PostgreSQL leaves them out
@@ -1970,10 +2010,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// let set =
     ///     docs_with.helper_set(&[Value::SingleQuotedString("write".into())], &deployment, &db)?;
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
-    /// assert_eq!(grant.column().column_name(), "doc_id");
+    /// let [doc] = grant.columns() else { panic!("the helper returns one column") };
+    /// assert_eq!(doc.column_name(), "doc_id");
     /// let GrantedTo::Request(request) = grant.granted_to() else { unreachable!() };
     /// assert_eq!(request.column().column_name(), "principal_id");
-    /// let [roles] = grant.restrictions() else { panic!("the condition restricts one column") };
+    /// let [Restriction::In(roles)] = grant.restrictions() else {
+    ///     panic!("the condition restricts one column to literals")
+    /// };
     /// assert_eq!(roles.column().column_name(), "role");
     /// let admin = Value::SingleQuotedString("admin".into());
     /// let write = Value::SingleQuotedString("write".into());

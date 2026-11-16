@@ -503,6 +503,10 @@ impl<P: EmptyKinds> ForeignKeyLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        self.unreach()
+    }
+
     fn referenced_columns<'db>(
         &'db self,
         _database: &'db Self::DB,
@@ -734,6 +738,10 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
     }
 
     fn orientation(&self) -> Option<TriggerObjectKind> {
+        self.unreach()
+    }
+
+    fn condition(&self) -> Option<&Expr> {
         self.unreach()
     }
 

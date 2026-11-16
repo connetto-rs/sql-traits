@@ -1307,30 +1307,19 @@ pub trait ColumnLike:
         Ok(foreign_keys.into_iter())
     }
 
-    /// Returns whether the column is compatible with another column.
+    /// Returns whether a foreign key may pair this column with `other`, the
+    /// column it references at the same position.
     ///
-    /// # Implementation Note
-    /// Two columns are considered compatible if:
-    /// - They have the same data type.
-    /// - If they are foreign keys, they reference the same table or share an
-    ///   ancestor table.
-    ///
-    /// If both columns are not foreign keys, they are considered compatible if
-    /// they have the same data type.
+    /// The two are compatible when they are the same column, or when they
+    /// share a data type and the database does not supply the values of both.
+    /// Whether the column's references name one entity is a property of the
+    /// column alone, answered by [`ColumnLike::conflicting_references`].
     ///
     /// # Arguments
     ///
     /// * `database` - A reference to the database instance to which the table
     ///   belongs.
     /// * `other` - The column in the other table to check.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold the table this column belongs to, and
-    /// [`LookupError::TableNotFound`] or [`LookupError::ColumnNotFound`] when a
-    /// foreign key reached from it names a table or a column `database` does
-    /// not hold. The same applies to the table `other` belongs to.
     ///
     /// # Example
     ///
@@ -1339,144 +1328,256 @@ pub trait ColumnLike:
     /// use sql_traits::prelude::*;
     /// let db = ParserDB::parse::<GenericDialect>(
     ///     "
-    /// CREATE TABLE referenced_table (id INT PRIMARY KEY, name TEXT);
-    /// CREATE TABLE another_referenced_table (id INT PRIMARY KEY, name TEXT);
-    /// CREATE TABLE host_table (id INT PRIMARY KEY, name TEXT,
-    ///     FOREIGN KEY (id) REFERENCES referenced_table(id));
-    /// CREATE TABLE another_host_table (id INT PRIMARY KEY, name TEXT,
-    ///     FOREIGN KEY (id) REFERENCES another_referenced_table(id));
-    /// CREATE TABLE compatible_table (id INT PRIMARY KEY, name TEXT,
-    ///     FOREIGN KEY (id) REFERENCES referenced_table(id));
-    /// CREATE TABLE incompatible_table (id INT PRIMARY KEY, name TEXT,
-    ///     FOREIGN KEY (id) REFERENCES another_referenced_table(id));
-    /// CREATE TABLE non_fk_table (id INT PRIMARY KEY, name TEXT);
-    /// CREATE TABLE serial_table_one (id SERIAL PRIMARY KEY, name TEXT);
-    /// CREATE TABLE serial_table_two (id SERIAL PRIMARY KEY, name TEXT);
+    /// CREATE TABLE parent (id SERIAL PRIMARY KEY, code SMALLINT UNIQUE);
+    /// CREATE TABLE child (id SERIAL PRIMARY KEY, parent_id INT, code INT);
     /// ",
     /// )?;
-    /// let host_table = db
-    ///     .table_by_target(TargetName::new("host_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let id_column =
-    ///     host_table.column("id", &db, IdentifierCase::AsWritten)?.expect("Column 'id' should exist");
-    /// let compatible_table = db
-    ///     .table_by_target(TargetName::new("compatible_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let serial_table_one = db
-    ///     .table_by_target(TargetName::new("serial_table_one", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let serial_id_column = serial_table_one
-    ///     .column("id", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'id' should exist");
-    /// let serial_table_two = db
-    ///     .table_by_target(TargetName::new("serial_table_two", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let serial_id_column_two = serial_table_two
-    ///     .column("id", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'id' should exist");
-    /// let compatible_id_column = compatible_table
-    ///     .column("id", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'id' should exist");
-    /// let incompatible_table = db
-    ///     .table_by_target(TargetName::new("incompatible_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let incompatible_id_column = incompatible_table
-    ///     .column("id", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'id' should exist");
-    /// let another_host_table = db
-    ///     .table_by_target(TargetName::new("another_host_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let another_id_column = another_host_table
-    ///     .column("id", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'id' should exist");
-    /// let non_fk_table = db
-    ///     .table_by_target(TargetName::new("non_fk_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let non_fk_id_column = non_fk_table
-    ///     .column("id", &db, IdentifierCase::AsWritten)?
-    ///     .expect("Column 'id' should exist");
+    /// let column = |table: &str, column: &str| -> Result<_, Box<dyn std::error::Error>> {
+    ///     Ok(db
+    ///         .table_by_target(TargetName::new(table, false), IdentifierCase::AsWritten)?
+    ///         .unwrap()
+    ///         .column(column, &db, IdentifierCase::AsWritten)?
+    ///         .unwrap())
+    /// };
+    /// assert!(column("child", "parent_id")?.is_compatible_with(&db, column("parent", "id")?));
     /// assert!(
-    ///     id_column.is_compatible_with(&db, compatible_id_column)?,
-    ///     "Columns should be compatible as they reference the same table"
+    ///     !column("child", "code")?.is_compatible_with(&db, column("parent", "code")?),
+    ///     "the two columns hold different data types"
     /// );
     /// assert!(
-    ///     !id_column.is_compatible_with(&db, incompatible_id_column)?,
-    ///     "Columns should not be compatible as they reference different tables"
-    /// );
-    /// assert!(
-    ///     !id_column.is_compatible_with(&db, another_id_column)?,
-    ///     "Columns should not be compatible as they reference different tables"
-    /// );
-    /// assert!(
-    ///     !id_column.is_compatible_with(&db, non_fk_id_column)?,
-    ///     "Columns should not be compatible as one of them is not a foreign key"
-    /// );
-    /// assert!(
-    ///     !serial_id_column.is_compatible_with(&db, serial_id_column_two)?,
-    ///     "Columns should not be compatible as both are generative"
-    /// );
-    /// assert!(
-    ///     serial_id_column.is_compatible_with(&db, non_fk_id_column)?,
-    ///     "Columns should be compatible as only one is generative and they have the same data type"
+    ///     !column("child", "id")?.is_compatible_with(&db, column("parent", "id")?),
+    ///     "both columns generate their own values"
     /// );
     /// # Ok(())
     /// # }
     /// ```
-    fn is_compatible_with(&self, database: &Self::DB, other: &Self) -> Result<bool, LookupError> {
-        let host_table: &<Self::DB as DatabaseLike>::Table = ColumnLike::table(self, database);
-        let other_table: &<Self::DB as DatabaseLike>::Table = ColumnLike::table(other, database);
-
-        // If the two columns are the same, they are compatible.
-        if host_table == other_table && self == other {
-            return Ok(true);
+    fn is_compatible_with(&self, database: &Self::DB, other: &Self) -> bool {
+        if self == other {
+            return true;
         }
 
         // When the database supplies the values of both columns, the two
         // never hold the same value.
         if self.is_generated(database) && other.is_generated(database) {
-            return Ok(false);
+            return false;
         }
 
-        if self.data_type(database).normalized_name(database)
-            != other.data_type(database).normalized_name(database)
-        {
-            return Ok(false);
+        self.data_type(database).normalized_name(database)
+            == other.data_type(database).normalized_name(database)
+    }
+
+    /// Returns the tables whose entity every value of this column is, sorted
+    /// and without repeats.
+    ///
+    /// A column that alone is the primary key of its table, or the only
+    /// column of a unique index covering every row of it, identifies one row
+    /// of that table, so its values are that table's entity. A foreign key
+    /// makes each value of its host column one of the column it references at
+    /// the same position, whatever the key's width and whether it references
+    /// a primary key or a unique key. The hierarchy is the column's own table
+    /// when it identifies a row, together with the hierarchy of every column
+    /// its foreign keys reference, followed through cycles of keys. A key from
+    /// a primary key to the primary key it extends is one such reference, so
+    /// an extension table's key carries every table it extends.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance to which the table
+    ///   belongs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table this column belongs to, and
+    /// [`LookupError::TableNotFound`] or [`LookupError::ColumnNotFound`] when a
+    /// foreign key reached from it names a table or a column `database` does
+    /// not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "
+    /// CREATE TABLE organizations (id INT PRIMARY KEY);
+    /// CREATE TABLE resources (
+    ///     id INT PRIMARY KEY,
+    ///     organization_id INT NOT NULL REFERENCES organizations (id),
+    ///     UNIQUE (organization_id, id)
+    /// );
+    /// CREATE TABLE grants (
+    ///     id INT PRIMARY KEY,
+    ///     resource_id INT NOT NULL,
+    ///     organization_id INT NOT NULL,
+    ///     FOREIGN KEY (organization_id, resource_id) REFERENCES resources (organization_id, id)
+    /// );
+    /// ",
+    /// )?;
+    /// let grants =
+    ///     db.table_by_target(TargetName::new("grants", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let hierarchy = |column: &str| -> Result<Vec<&str>, Box<dyn std::error::Error>> {
+    ///     Ok(grants
+    ///         .column(column, &db, IdentifierCase::AsWritten)?
+    ///         .unwrap()
+    ///         .extension_hierarchy(&db)?
+    ///         .into_iter()
+    ///         .map(TableLike::table_name)
+    ///         .collect())
+    /// };
+    /// assert_eq!(hierarchy("organization_id")?, ["organizations"]);
+    /// assert_eq!(hierarchy("resource_id")?, ["resources"]);
+    /// assert_eq!(hierarchy("id")?, ["grants"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn extension_hierarchy<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Vec<&'db <Self::DB as DatabaseLike>::Table>, LookupError>
+    where
+        Self: 'db,
+    {
+        let mut hierarchy = Vec::new();
+        let start: &'db <Self::DB as DatabaseLike>::Column = self.borrow();
+        let mut reached = vec![start];
+        let mut pending = vec![start];
+        while let Some(column) = pending.pop() {
+            if identifies_row(column, database)? {
+                hierarchy.push(ColumnLike::table(column, database));
+            }
+            for foreign_key in column.foreign_keys(database)? {
+                for (host_column, referenced_column) in foreign_key
+                    .host_columns(database)?
+                    .zip(foreign_key.referenced_columns(database)?)
+                {
+                    if host_column == column && !reached.contains(&referenced_column) {
+                        reached.push(referenced_column);
+                        pending.push(referenced_column);
+                    }
+                }
+            }
         }
 
-        let mut local_referenced_tables =
-            host_table.referenced_tables_via_column(database, self.borrow())?;
-        let mut other_referenced_tables =
-            other_table.referenced_tables_via_column(database, other.borrow())?;
+        hierarchy.sort_unstable();
+        hierarchy.dedup();
 
-        if local_referenced_tables.is_empty() && other_referenced_tables.is_empty() {
-            // If both columns are not foreign keys, they are compatible.
-            return Ok(true);
+        Ok(hierarchy)
+    }
+
+    /// Returns the foreign keys of this column whose references name
+    /// unrelated entities, each with the hierarchy it contributes.
+    ///
+    /// A foreign key contributes the
+    /// [`extension_hierarchy`](ColumnLike::extension_hierarchy) of the column
+    /// it references at this column's position. Two keys conflict when both
+    /// contribute a hierarchy and the two share no table, since every value
+    /// would then have to be an existing row of two unrelated entities. A key
+    /// contributing no table constrains no entity and conflicts with nothing,
+    /// and the column's own table is no contribution, so an extension table's
+    /// key does not conflict with the key it extends. A key is returned when
+    /// it conflicts with at least one other, so the result is empty or holds
+    /// at least two keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance to which the table
+    ///   belongs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table this column belongs to, and
+    /// [`LookupError::TableNotFound`] or [`LookupError::ColumnNotFound`] when a
+    /// foreign key reached from it names a table or a column `database` does
+    /// not hold.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "
+    /// CREATE TABLE root (id INT PRIMARY KEY);
+    /// CREATE TABLE left_root (id INT PRIMARY KEY REFERENCES root (id));
+    /// CREATE TABLE right_root (id INT PRIMARY KEY REFERENCES root (id));
+    /// CREATE TABLE a (id INT PRIMARY KEY);
+    /// CREATE TABLE d (
+    ///     id INT PRIMARY KEY,
+    ///     x INT REFERENCES a (id),
+    ///     y INT REFERENCES left_root (id),
+    ///     FOREIGN KEY (x) REFERENCES root (id),
+    ///     FOREIGN KEY (y) REFERENCES right_root (id)
+    /// );
+    /// ",
+    /// )?;
+    /// let d = db.table_by_target(TargetName::new("d", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let x = d.column("x", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// let mut conflicts = Vec::new();
+    /// for (foreign_key, tables) in x.conflicting_references(&db)? {
+    ///     let names: Vec<&str> = tables.into_iter().map(TableLike::table_name).collect();
+    ///     conflicts.push((foreign_key.referenced_table(&db)?.table_name(), names));
+    /// }
+    /// conflicts.sort_unstable();
+    /// assert_eq!(conflicts, [("a", vec!["a"]), ("root", vec!["root"])]);
+    ///
+    /// // Both extensions of `root` contain it, so `y` names one entity.
+    /// let y = d.column("y", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// assert!(y.conflicting_references(&db)?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[expect(
+        clippy::type_complexity,
+        reason = "a foreign key paired with its hierarchy names two associated types"
+    )]
+    fn conflicting_references<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<
+        Vec<(
+            &'db <Self::DB as DatabaseLike>::ForeignKey,
+            Vec<&'db <Self::DB as DatabaseLike>::Table>,
+        )>,
+        LookupError,
+    >
+    where
+        Self: 'db,
+    {
+        let column: &'db <Self::DB as DatabaseLike>::Column = self.borrow();
+        let mut contributions = Vec::new();
+        for foreign_key in self.foreign_keys(database)? {
+            let mut contribution = Vec::new();
+            for (host_column, referenced_column) in
+                foreign_key.host_columns(database)?.zip(foreign_key.referenced_columns(database)?)
+            {
+                if host_column == column {
+                    contribution.extend(referenced_column.extension_hierarchy(database)?);
+                }
+            }
+            if !contribution.is_empty() {
+                contribution.sort_unstable();
+                contribution.dedup();
+                contributions.push((foreign_key, contribution));
+            }
         }
 
-        // If the columns are primary keys, we include the local table as a
-        // referenced table.
-        if self.is_primary_key(database)? {
-            local_referenced_tables.push(host_table);
-        }
-        if other.is_primary_key(database)? {
-            other_referenced_tables.push(other_table);
-        }
-
-        // We determine the set of ancestors of the referenced tables.
-        let mut local_referenced_ancestors = Vec::new();
-        for &table in &local_referenced_tables {
-            local_referenced_ancestors.extend(table.ancestral_extended_tables(database)?);
-        }
-        let mut other_referenced_ancestors = Vec::new();
-        for &table in &other_referenced_tables {
-            other_referenced_ancestors.extend(table.ancestral_extended_tables(database)?);
+        let mut conflicting = vec![false; contributions.len()];
+        for (left_index, (_, left)) in contributions.iter().enumerate() {
+            for (right_index, (_, right)) in contributions.iter().enumerate().skip(left_index + 1) {
+                if !left.iter().any(|table| right.contains(table)) {
+                    conflicting[left_index] = true;
+                    conflicting[right_index] = true;
+                }
+            }
         }
 
-        // We extend the referenced tables with their ancestors.
-        local_referenced_tables.extend(local_referenced_ancestors);
-        other_referenced_tables.extend(other_referenced_ancestors);
-
-        Ok(local_referenced_tables.iter().any(|table| other_referenced_tables.contains(table)))
+        Ok(contributions
+            .into_iter()
+            .zip(conflicting)
+            .filter_map(|(contribution, conflicts)| conflicts.then_some(contribution))
+            .collect())
     }
 
     /// Iterates over the
@@ -1771,6 +1872,33 @@ pub trait ColumnLike:
 
         Ok(unique_indices.into_iter())
     }
+}
+
+/// Returns whether `column` alone is the primary key of its table, or the only
+/// column of a unique index with no predicate and no expression, so that a
+/// value of it identifies one row.
+fn identifies_row<DB: DatabaseLike>(
+    column: &DB::Column,
+    database: &DB,
+) -> Result<bool, LookupError> {
+    let table = ColumnLike::table(column, database);
+
+    let mut primary_key = table.primary_key_columns(database)?;
+    if primary_key.next() == Some(column) && primary_key.next().is_none() {
+        return Ok(true);
+    }
+
+    for index in table.unique_indices(database)? {
+        if index.predicate().is_some() || !index.is_simple(database)? {
+            continue;
+        }
+        let mut index_columns = index.columns(database)?;
+        if index_columns.next() == Some(column) && index_columns.next().is_none() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 impl<C> ColumnLike for &C

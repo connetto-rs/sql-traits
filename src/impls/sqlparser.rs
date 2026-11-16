@@ -31,13 +31,15 @@ mod schema;
 mod sequence;
 mod unique_constraint;
 mod user_defined_type;
+mod value_flow;
 mod view;
 
 pub(crate) use column_def::{foreign_options_of, serial_sequence_type};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub(crate) use data_statement::BodyPath;
 pub use dialect::SqlparserDialect;
-pub(crate) use dynamic_sites::{BodyNames, SiteSource};
+pub(crate) use dynamic_sites::{BodyNames, SiteKey, SiteSource};
+pub(crate) use foreign_key_constraint::foreign_keys_stored_alike;
 pub(crate) use function_body::{
     atomic_statements, body_calls, body_dynamic_sites, body_expression, body_reads,
     body_unqualified_names,
@@ -52,3 +54,4 @@ pub(crate) use helper_set::helper_set;
 pub(crate) use user_defined_type::{
     bound_user_type, user_type_holds, user_type_in_schema, user_type_named,
 };
+pub(crate) use value_flow::value_flow;
