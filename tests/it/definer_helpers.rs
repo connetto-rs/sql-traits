@@ -2267,6 +2267,8 @@ fn a_reselection_of_another_table_or_shape_refuses_the_answer() {
         "SELECT g.id FROM public.groups g JOIN public.orgs o ON o.id = g.id \
          WHERE g.id IN (SELECT id FROM reached)",
         "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached) ORDER BY g.id",
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached) GROUP BY g.id",
+        "SELECT * FROM public.groups g WHERE g.id IN (SELECT id FROM reached)",
     ] {
         let database = postgres(&with_orgs(&reselecting(last)));
         assert!(
@@ -2329,6 +2331,7 @@ fn a_walk_of_any_other_shape_refuses_the_answer() {
         walking(CHILD_JOIN)
             .replace("SELECT id FROM reached", "SELECT id FROM reached WHERE id <> 'x'"),
         walking(CHILD_JOIN).replace("SELECT id FROM reached", "SELECT 'x' FROM reached"),
+        walking(CHILD_JOIN).replace("SELECT id FROM reached", "SELECT * FROM reached"),
         walking(CHILD_JOIN).replace(
             ") SELECT id FROM reached",
             "), other (id) AS (SELECT 1) SELECT id FROM reached",
