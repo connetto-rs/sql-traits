@@ -9,7 +9,7 @@ use alloc::{
 };
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{ArgMode, Expr, Visit};
+use sqlparser::ast::{ArgMode, Expr, Value, Visit};
 
 use crate::{
     errors::LookupError,
@@ -182,34 +182,49 @@ fn entry_source(kind: &VariableKind) -> &'static DefinitionSource<'static> {
     }
 }
 
-/// Adds every variable `node` reads under `context`, whole or through a
-/// field, to `variables` unless already there.
+/// Adds every variable `node` reads under `context`, whole, through a field
+/// or by `$n` in `scope`, to `variables` unless already there.
 ///
 /// # Errors
 ///
 /// Returns the lookup errors resolving a name `node` writes.
 pub(crate) fn read_variables<'db, DB: DatabaseLike, N: Visit + ?Sized>(
     context: &ExpressionContext<'_, 'db, DB>,
+    scope: &PlPgSqlScope<'_, 'db, DB>,
     node: &N,
     variables: &mut Vec<PlPgSqlVariable<'db>>,
 ) -> Result<(), LookupError> {
     let found = walk_expressions(node, |node| {
-        if !matches!(node, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-            return ControlFlow::Continue(());
-        }
-        match context.reference(node) {
-            Ok(Some((
-                ColumnDefinition::Variable(variable) | ColumnDefinition::VariableField(variable),
-                _,
-            ))) => {
-                if variables.iter().all(|known| known.id() != variable.id()) {
-                    variables.push(variable);
+        let read = match node {
+            Expr::Value(value) => {
+                match &value.value {
+                    Value::Placeholder(placeholder) => {
+                        scope
+                            .variable(core::slice::from_ref(placeholder))
+                            .map(|(variable, _)| variable)
+                    }
+                    _ => None,
                 }
-                ControlFlow::Continue(())
             }
-            Ok(_) => ControlFlow::Continue(()),
-            Err(error) => ControlFlow::Break(error),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                match context.reference(node) {
+                    Ok(Some((
+                        ColumnDefinition::Variable(variable)
+                        | ColumnDefinition::VariableField(variable),
+                        _,
+                    ))) => Some(variable),
+                    Ok(_) => None,
+                    Err(error) => return ControlFlow::Break(error),
+                }
+            }
+            _ => None,
+        };
+        if let Some(variable) = read
+            && variables.iter().all(|known| known.id() != variable.id())
+        {
+            variables.push(variable);
         }
+        ControlFlow::Continue(())
     });
     match found {
         ControlFlow::Continue(()) => Ok(()),
@@ -362,10 +377,10 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
             return Ok(Vec::new());
         };
         let database = scope.database();
-        let scope = ExpressionScope::PlPgSql(scope);
-        let context = ExpressionContext::for_expression(value, &scope, database, case)?;
+        let plpgsql = ExpressionScope::PlPgSql(scope);
+        let context = ExpressionContext::for_expression(value, &plpgsql, database, case)?;
         let mut variables = Vec::new();
-        read_variables(&context, &**value, &mut variables)?;
+        read_variables(&context, scope, &**value, &mut variables)?;
         Ok(self.flow.reaching(variables, written.inputs.as_ref()))
     }
 }

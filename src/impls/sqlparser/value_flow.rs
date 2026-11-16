@@ -17,7 +17,7 @@ use core::fmt::Display;
 
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart,
-    Query, Statement,
+    Query, Statement, Value,
 };
 use sqlparser_plpgsql::{
     embedded::{
@@ -550,14 +550,24 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     ) -> Result<Vec<Pending<'b, 'db, DB>>, LookupError> {
         let namespace = &self.targets_namespace(address, call)?.namespace;
         let mut writes = Vec::new();
-        for (argument, passed) in call_arguments(call) {
-            let idents = match passed {
-                Expr::Identifier(ident) => core::slice::from_ref(ident),
-                Expr::CompoundIdentifier(idents) => idents.as_slice(),
+        for (argument, mut passed) in call_arguments(call) {
+            // Parentheses and a cast to the variable's own type leave the
+            // argument writable, and a cast to another type fails the call.
+            while let Expr::Nested(inner) | Expr::Cast { expr: inner, .. } = passed {
+                passed = inner;
+            }
+            let parts = match passed {
+                Expr::Identifier(ident) => stored_parts(core::slice::from_ref(ident)),
+                Expr::CompoundIdentifier(idents) => stored_parts(idents),
+                Expr::Value(value) => {
+                    match &value.value {
+                        Value::Placeholder(placeholder) => Vec::from([placeholder.clone()]),
+                        _ => continue,
+                    }
+                }
                 _ => continue,
             };
-            let Some(Resolved { variable, part }) = self.lookup(namespace, stored_parts(idents))
-            else {
+            let Some(Resolved { variable, part }) = self.lookup(namespace, parts) else {
                 continue;
             };
             writes.push(Pending {

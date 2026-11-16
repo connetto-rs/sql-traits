@@ -294,12 +294,12 @@ impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
         let SiteScope::PlPgSql { scope, key, flow } = &self.scope else { return Ok(Vec::new()) };
         let flow = flow.get()?;
         let mut variables = Vec::new();
-        read_variables(&self.context(case)?, self.command(), &mut variables)?;
+        read_variables(&self.context(case)?, scope, self.command(), &mut variables)?;
         let plpgsql = ExpressionScope::PlPgSql(scope);
         for argument in self.arguments() {
             let context =
                 ExpressionContext::for_expression(argument, &plpgsql, self.database, case)?;
-            read_variables(&context, argument, &mut variables)?;
+            read_variables(&context, scope, argument, &mut variables)?;
         }
         Ok(flow.reaching(variables, flow.points.get(key)))
     }

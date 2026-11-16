@@ -524,3 +524,37 @@ fn notices_continue_and_returns_end_the_path() {
         [read("p", &["incoming"])]
     );
 }
+
+/// A positional name reads the parameter it stands for, at the site and in
+/// a definition's value.
+#[test]
+fn a_positional_name_reads_its_parameter() {
+    let database = database("DECLARE s text; BEGIN s := 'SELECT ' || $1; EXECUTE s USING $2; END");
+    let body = run(&database).dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let reads = sites[0].reads(IdentifierCase::Folded).unwrap();
+    assert_eq!(spelled(&reads), [read("s", &["'SELECT ' || $1"]), read("q", &["incoming"])]);
+    let Reaching::Definitions(definitions) = reads[0].reaching() else { panic!("s is reached") };
+    assert_eq!(
+        spelled(&definitions[0].reads(IdentifierCase::Folded).unwrap()),
+        [read("p", &["incoming"])]
+    );
+}
+
+/// A procedure may return a value to a variable passed in parentheses, under
+/// a cast to its own type or by position, as PostgreSQL 18 writes an `INOUT`
+/// result back through each.
+#[test]
+fn a_call_may_write_a_parenthesised_cast_or_positional_argument() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1'; o text := 'SELECT 2';
+             BEGIN CALL fill((s), o::text, $1); EXECUTE s USING o, p; END"
+        ),
+        [vec![
+            read("s", &["'SELECT 1'", "unknown"]),
+            read("o", &["'SELECT 2'", "unknown"]),
+            read("p", &["incoming", "unknown"]),
+        ]]
+    );
+}
