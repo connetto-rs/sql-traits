@@ -100,7 +100,8 @@ fn recursive_cte_exposes_the_anchor_and_recursive_definitions() {
 }
 
 /// A definition as a short outline, `opaque` or `= expression`, with the arms
-/// of a set operation or recursive union in brackets.
+/// of a set operation or recursive union in brackets and the cells of a
+/// `VALUES` column in `values(…)`.
 fn outline(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
     match definition {
         ColumnDefinition::Opaque => "opaque".to_owned(),
@@ -110,6 +111,10 @@ fn outline(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
         }
         ColumnDefinition::RecursiveUnion { anchor, recursive } => {
             format!("[{} rec {}]", outline(&anchor.definition()), outline(&recursive.definition()))
+        }
+        ColumnDefinition::Values { rows } => {
+            let rows = rows.iter().map(|row| outline(&row.definition())).collect::<Vec<_>>();
+            format!("values({})", rows.join(", "))
         }
         other => format!("{other:?}"),
     }
@@ -128,22 +133,25 @@ fn recursive_cte_arms_of_different_widths_remain_opaque() {
     ));
 }
 
-// A `VALUES` arm enumerates its columns, each with an opaque definition, so a
-// set operation or recursive union over it keeps the other arm's definition.
+// A `VALUES` arm enumerates its columns, each with the cells of its rows, so
+// a set operation or recursive union over it pairs them with the other arm.
 #[test]
-fn values_arms_pair_with_opaque_definitions() {
+fn values_arms_pair_with_their_cell_definitions() {
     let db = schema_db();
     for (sql, expected) in [
         (
             "WITH RECURSIVE c(x) AS (VALUES (1) UNION ALL SELECT x FROM c) SELECT c.x FROM c",
-            "[opaque rec opaque]",
+            "[values(= 1) rec values(= 1)]",
         ),
         (
             "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL VALUES (2)) SELECT c.x FROM c",
-            "[= 1 rec opaque]",
+            "[= 1 rec values(= 2)]",
         ),
-        ("SELECT c.x FROM (SELECT 1 AS x UNION ALL VALUES (2)) AS c", "[= 1 | opaque]"),
-        ("SELECT c.x FROM (VALUES (1) UNION ALL SELECT 2) AS c(x)", "[opaque | = 2]"),
+        ("SELECT c.x FROM (SELECT 1 AS x UNION ALL VALUES (2)) AS c", "[= 1 | values(= 2)]"),
+        (
+            "SELECT c.x FROM (VALUES (1), (3) UNION ALL SELECT 2) AS c(x)",
+            "[values(= 1, = 3) | = 2]",
+        ),
     ] {
         let query = query(sql);
         let scope =
@@ -480,16 +488,17 @@ fn three_part_opaque_qualifiers_require_matching_schema_and_relation() {
 }
 
 #[test]
-fn a_view_over_a_values_list_enumerates_opaque_columns() {
+fn a_view_over_a_values_list_enumerates_its_cells() {
     let db =
         ParserDB::parse::<GenericDialect>("CREATE VIEW v(x) AS VALUES (1);").expect("view parses");
     let query = query("SELECT v.x FROM v");
     let scope =
         ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten).expect("scope builds");
-    assert!(matches!(
-        scope.resolve_column_definition(&reference("v.x")).expect("definition resolves"),
-        Some(ColumnDefinition::Opaque)
-    ));
+    let definition = scope
+        .resolve_column_definition(&reference("v.x"))
+        .expect("definition resolves")
+        .expect("the column resolves");
+    assert_eq!(outline(&definition), "values(= 1)");
     assert!(scope.resolve_column_definition(&reference("v.y")).expect("lookup runs").is_none());
 }
 

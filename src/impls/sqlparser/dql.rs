@@ -560,11 +560,20 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         owner: Self::Cursor,
     );
     fn opaque_definition(&self) -> Self::Definition;
-    /// A definition no other output shares, for a computed value whose
-    /// expression is not followed, such as a column of a `VALUES` list. Two
-    /// such columns are two values, while [`Self::opaque_definition`] is one
-    /// shared answer for every output that cannot be told apart.
-    fn computed_definition(&mut self) -> Self::Definition;
+    /// The definitions of the `width` columns of `values`, every row as
+    /// wide, each column the cells the rows hold at its position read under
+    /// `parent`. Every column is a node of its own, so two columns are two
+    /// values even where their cells read alike.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lookup errors resolving a cell runs into.
+    fn values_definitions(
+        &mut self,
+        values: AstRef<'query, 'db, Values>,
+        width: usize,
+        parent: Self::Cursor,
+    ) -> Result<Vec<Self::Definition>, LookupError>;
     /// The definition of a stored column, which for a column created from the
     /// query of `CREATE TABLE … AS` is that query's output.
     fn column_definition(
@@ -668,7 +677,14 @@ where
 
     fn opaque_definition(&self) {}
 
-    fn computed_definition(&mut self) {}
+    fn values_definitions(
+        &mut self,
+        _values: AstRef<'query, 'db, Values>,
+        width: usize,
+        _parent: Self::Cursor,
+    ) -> Result<Vec<Self::Definition>, LookupError> {
+        Ok(vec![(); width])
+    }
 
     fn column_definition(
         &mut self,
@@ -1642,7 +1658,7 @@ where
             if P::INDEX_NESTED_QUERIES {
                 index_values_expression_queries(values, cte_scope, deriving, parent, profile)?;
             }
-            Ok(values_shape(values.get(), profile))
+            values_shape(values, parent, profile)
         }
         SetExprRef::Modifying(statement) => {
             profile.modifying_shape(statement, cte_scope, deriving, parent)
@@ -1651,34 +1667,41 @@ where
     }
 }
 
-/// The shape of a `VALUES` list, as wide as its first row, with its columns
-/// named `column1`, `column2`, … as PostgreSQL names them. Every column is a
-/// value of its own with no expression followed, so none carries a source and
-/// no output row is a stored row.
+/// The shape of a `VALUES` list, with its columns named `column1`,
+/// `column2`, … as PostgreSQL names them, each defined by the cells the rows
+/// hold at its position read under `parent`. No column carries a source and
+/// no output row is a stored row. `None` when the rows differ in length,
+/// which PostgreSQL rejects, or the list is wider than
+/// [`MAX_DERIVED_COLUMNS`].
 fn values_shape<'query, 'db, DB, P>(
-    values: &Values,
+    values: AstRef<'query, 'db, Values>,
+    parent: P::Cursor,
     profile: &mut P,
-) -> Option<DerivedShape<'query, 'db, DB, P::Definition>>
+) -> Result<Option<DerivedShape<'query, 'db, DB, P::Definition>>, LookupError>
 where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
 {
-    let width = values.rows.first().map_or(0, |row| row.len());
-    if width > MAX_DERIVED_COLUMNS {
-        return None;
+    let rows = &values.get().rows;
+    let width = rows.first().map_or(0, |row| row.len());
+    if width > MAX_DERIVED_COLUMNS || rows.iter().any(|row| row.len() != width) {
+        return Ok(None);
     }
-    let columns = (1..=width)
-        .map(|position| {
+    let columns = profile
+        .values_definitions(values, width, parent)?
+        .into_iter()
+        .zip(1..)
+        .map(|(definition, position)| {
             DerivedColumn {
                 name: format!("column{position}"),
                 quoted: true,
                 source: None,
-                definition: profile.computed_definition(),
+                definition,
                 marker: core::marker::PhantomData,
             }
         })
         .collect();
-    Some(DerivedShape { columns, row_preserving: false })
+    Ok(Some(DerivedShape { columns, row_preserving: false }))
 }
 
 fn merge_set_operation_shapes<'query, 'db, DB, P>(
@@ -1921,6 +1944,7 @@ where
         }
         SetExprRef::Values(values) => {
             index_values_expression_queries(values, cte_scope, deriving, parent, profile)?;
+            values_shape(values, parent, profile)?;
             Ok(parent)
         }
         SetExprRef::SetOperation { left, right, .. } => {

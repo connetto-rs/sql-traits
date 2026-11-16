@@ -55,6 +55,13 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
         /// The recursive definition.
         recursive: ColumnDefinitionRef<'scope, 'query, 'db, DB>,
     },
+    /// A column of a `VALUES` list, whose type PostgreSQL resolves across
+    /// every row the way it resolves the arms of a set operation.
+    Values {
+        /// The definition of the cell each row holds at the column's
+        /// position, in row order.
+        rows: ColumnDefinitionList<'scope, 'query, 'db, DB>,
+    },
     /// An input parameter of the function whose body holds the reference,
     /// read by name where no column of the same name is in reach.
     Parameter {
@@ -363,6 +370,80 @@ impl<DB: DatabaseLike> Clone for ColumnDefinitionRef<'_, '_, '_, DB> {
 impl<DB: DatabaseLike> fmt::Debug for ColumnDefinitionRef<'_, '_, '_, DB> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_tuple("ColumnDefinitionRef").field(&self.id).finish()
+    }
+}
+
+/// A borrowed, ordered list of definition nodes.
+pub struct ColumnDefinitionList<'scope, 'query, 'db, DB: DatabaseLike> {
+    graph: &'scope DefinitionGraph<'query, 'db, DB>,
+    ids: &'scope [DefinitionId],
+}
+
+impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionList<'scope, 'query, 'db, DB> {
+    pub(crate) fn new(
+        graph: &'scope DefinitionGraph<'query, 'db, DB>,
+        ids: &'scope [DefinitionId],
+    ) -> Self {
+        Self { graph, ids }
+    }
+
+    /// Returns the listed nodes in order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, Ident, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE a(id INT);")?;
+    /// let sql = "SELECT v.x FROM a, LATERAL (VALUES (NULL), (a.id)) AS v(x)";
+    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
+    /// let reference = Expr::CompoundIdentifier(vec![Ident::new("v"), Ident::new("x")]);
+    /// let Some(ColumnDefinition::Values { rows }) = scope.resolve_column_definition(&reference)?
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let mut rows = rows.iter();
+    /// let Some(ColumnDefinition::Expression { expression, .. }) =
+    ///     rows.next().map(|row| row.definition())
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(expression.to_string(), "NULL");
+    /// let Some(ColumnDefinition::Base { column, .. }) = rows.next().map(|row| row.definition())
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(column.column_name(), "id");
+    /// assert!(rows.next().is_none());
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn iter(
+        self,
+    ) -> impl ExactSizeIterator<Item = ColumnDefinitionRef<'scope, 'query, 'db, DB>> {
+        self.ids.iter().map(move |id| ColumnDefinitionRef::new(self.graph, *id))
+    }
+}
+
+impl<DB: DatabaseLike> Copy for ColumnDefinitionList<'_, '_, '_, DB> {}
+
+#[expect(clippy::expl_impl_clone_on_copy, reason = "derive would require DB: Clone")]
+impl<DB: DatabaseLike> Clone for ColumnDefinitionList<'_, '_, '_, DB> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<DB: DatabaseLike> fmt::Debug for ColumnDefinitionList<'_, '_, '_, DB> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("ColumnDefinitionList").field(&self.ids).finish()
     }
 }
 

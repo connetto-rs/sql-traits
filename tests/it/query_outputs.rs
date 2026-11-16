@@ -49,6 +49,10 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
                 describe(&recursive.definition())
             )
         }
+        ColumnDefinition::Values { rows } => {
+            let rows = rows.iter().map(|row| describe(&row.definition())).collect::<Vec<_>>();
+            format!("values({})", rows.join(", "))
+        }
         ColumnDefinition::Parameter { ordinal, .. } => format!("parameter {ordinal}"),
         ColumnDefinition::Variable(variable) => format!("variable {}", variable.name()),
         ColumnDefinition::VariableField(variable) => format!("field of {}", variable.name()),
@@ -180,7 +184,49 @@ fn set_operations_pair_positions_only_when_every_width_is_known() {
         outputs("SELECT * FROM generate_series(1, 2) AS g UNION SELECT id FROM b"),
         ["unexpanded"]
     );
-    assert_eq!(outputs("VALUES (1, 2), (3, 4)"), ["opaque", "opaque"]);
+    assert_eq!(
+        outputs("VALUES (1, 2), (3, 4)"),
+        ["values(expression 1, expression 3)", "values(expression 2, expression 4)"]
+    );
+}
+
+// PostgreSQL resolves a `VALUES` column's type across every row, so each
+// column carries the cell of every row, read where the list sits, whether
+// the list is the whole query, a `FROM` item or a set operation arm.
+#[test]
+fn values_columns_carry_the_cell_of_every_row() {
+    for (sql, expected) in [
+        (
+            "VALUES ('reader'::role), ('writer')",
+            "values(expression 'reader'::role, expression 'writer')",
+        ),
+        (
+            "SELECT r FROM (VALUES (NULL), (2::BIGINT)) AS t(r)",
+            "values(expression NULL, expression 2::BIGINT)",
+        ),
+        ("SELECT column1 FROM (VALUES (1), (2.5))", "values(expression 1, expression 2.5)"),
+        (
+            "SELECT id FROM a UNION SELECT v.r FROM (VALUES (1)) AS v(r)",
+            "UNION(a.id, values(expression 1))",
+        ),
+        (
+            "SELECT id FROM a UNION VALUES (1), (2)",
+            "UNION(a.id, values(expression 1, expression 2))",
+        ),
+        ("SELECT v.r FROM a, LATERAL (VALUES (a.id), (a.x)) AS v(r)", "values(a.id, a.x)"),
+    ] {
+        assert_eq!(outputs(sql), [expected], "{sql}");
+    }
+    let sql = "SELECT (SELECT v.r FROM (VALUES (a.id)) AS v(r)) <-> 1 FROM a";
+    assert_eq!(outputs_of(sql, first_subquery), ["values(a.id)"]);
+}
+
+// PostgreSQL rejects a `VALUES` list whose rows differ in length, so none of
+// its columns is enumerated.
+#[test]
+fn ragged_values_lists_enumerate_no_column() {
+    assert_eq!(outputs("VALUES (1, 2), (3)"), ["unexpanded"]);
+    assert_eq!(outputs("SELECT * FROM (VALUES (1, 2), (3)) AS v"), ["unexpanded"]);
 }
 
 #[test]

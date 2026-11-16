@@ -1,8 +1,8 @@
 use alloc::{borrow::ToOwned, vec::Vec};
-use core::{marker::PhantomData, slice};
+use core::{marker::PhantomData, ops::Range, slice};
 
 use sqlparser::ast::{
-    Expr, Ident, ObjectName, Select, SetOperator, Statement, TableFactor, TableWithJoins,
+    Expr, Ident, ObjectName, Select, SetOperator, Statement, TableFactor, TableWithJoins, Values,
 };
 
 use super::{
@@ -15,8 +15,8 @@ use super::{
 use crate::{
     errors::LookupError,
     structs::{
-        ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope,
-        IdentifierCase, RangeTableEntry, RelationBinding,
+        ColumnBinding, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionRef,
+        ColumnDefinitionScope, IdentifierCase, RangeTableEntry, RelationBinding,
     },
     traits::{ColumnLike, CreatedFromQuery, DatabaseLike, TableLike},
 };
@@ -143,6 +143,11 @@ enum DefinitionNode<'query, 'db, DB: DatabaseLike> {
         anchor: DefinitionId,
         recursive: DefinitionId,
     },
+    /// A column of a `VALUES` list, the definitions of its cells in row
+    /// order at this range of [`DefinitionGraph::lists`].
+    Values {
+        cells: Range<usize>,
+    },
     Opaque,
 }
 
@@ -195,6 +200,12 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     /// The scope of every parenthesized join under an alias, by the join's
     /// address.
     joins: Vec<(usize, ScopeId)>,
+    /// The definition lists the nodes of `VALUES` columns and
+    /// [`Self::values`] name by range.
+    lists: Vec<DefinitionId>,
+    /// The column definitions of every `VALUES` list derived, by the list's
+    /// address, at a range of [`Self::lists`].
+    values: Vec<(usize, Range<usize>)>,
     case: IdentifierCase,
 }
 
@@ -233,11 +244,26 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                     recursive: ColumnDefinitionRef::new(self, *recursive),
                 }
             }
+            DefinitionNode::Values { cells } => {
+                ColumnDefinition::Values {
+                    rows: ColumnDefinitionList::new(self, &self.lists[cells.start..cells.end]),
+                }
+            }
             DefinitionNode::Parameter { function, ordinal } => {
                 ColumnDefinition::Parameter { function, ordinal: *ordinal }
             }
             DefinitionNode::Opaque => ColumnDefinition::Opaque,
         }
+    }
+
+    /// The column definitions of `values`, `None` for a list the graph did
+    /// not enumerate.
+    pub(super) fn values_columns(&self, values: &Values) -> Option<&[DefinitionId]> {
+        let address = core::ptr::from_ref(values).addr();
+        self.values
+            .iter()
+            .find(|(held, _)| *held == address)
+            .map(|(_, columns)| &self.lists[columns.start..columns.end])
     }
 
     fn resolve_definition_id<'scope>(
@@ -443,6 +469,8 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 queries: Vec::new(),
                 modifying: Vec::new(),
                 joins: Vec::new(),
+                lists: Vec::new(),
+                values: Vec::new(),
                 case,
             },
             created: Vec::new(),
@@ -729,8 +757,33 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
         DefinitionId(0)
     }
 
-    fn computed_definition(&mut self) -> Self::Definition {
-        self.push_definition(DefinitionNode::Opaque)
+    fn values_definitions(
+        &mut self,
+        values: AstRef<'query, 'db, Values>,
+        width: usize,
+        parent: Self::Cursor,
+    ) -> Result<Vec<Self::Definition>, LookupError> {
+        let scope = parent.unwrap_or_else(|| {
+            let scope = self.begin_unowned_scope(None);
+            self.graph.select_cursor(scope)
+        });
+        let rows = values.map(|values| values.rows.as_slice());
+        let mut columns = Vec::with_capacity(width);
+        for position in 0..width {
+            let start = self.graph.lists.len();
+            for row in rows.iter() {
+                let cell =
+                    self.expression_definition(row.map(|row| &row[position]), Some(scope))?;
+                self.graph.lists.push(cell);
+            }
+            let cells = start..self.graph.lists.len();
+            columns.push(self.push_definition(DefinitionNode::Values { cells }));
+        }
+        let start = self.graph.lists.len();
+        self.graph.lists.extend_from_slice(&columns);
+        let address = core::ptr::from_ref(values.get()).addr();
+        self.graph.values.push((address, start..self.graph.lists.len()));
+        Ok(columns)
     }
 
     fn column_definition(

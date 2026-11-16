@@ -51,8 +51,9 @@ mod view;
 pub use absent::Absent;
 pub use call_resolution::{ArgumentEvidence, CallResolution, SelectedFunction};
 pub use column_scope::{
-    ColumnBinding, ColumnDefinition, ColumnDefinitionRef, ColumnDefinitionScope, ColumnQueryScope,
-    ColumnScope, QueryOutput, RangeTableEntry, RelationBinding,
+    ColumnBinding, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionRef,
+    ColumnDefinitionScope, ColumnQueryScope, ColumnScope, QueryOutput, RangeTableEntry,
+    RelationBinding,
 };
 pub use constraint_deferral::ConstraintDeferral;
 pub use deployment::{

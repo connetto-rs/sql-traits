@@ -126,6 +126,7 @@ fn describe(definition: Option<&ColumnDefinition<'_, '_, '_, ParserDB>>) -> Stri
             )
         }
         Some(ColumnDefinition::RecursiveUnion { .. }) => "recursive".to_owned(),
+        Some(ColumnDefinition::Values { .. }) => "values".to_owned(),
         Some(ColumnDefinition::Parameter { ordinal, .. }) => format!("parameter {ordinal}"),
         Some(ColumnDefinition::Variable(variable)) => format!("variable {}", variable.name()),
         Some(ColumnDefinition::VariableField(variable)) => format!("field of {}", variable.name()),
@@ -189,7 +190,7 @@ fn set_operations_order_by_their_output_names_alone() {
     );
     assert_eq!(
         order_by("VALUES (1) UNION SELECT id FROM b ORDER BY column1").unwrap(),
-        "UNION(opaque, b.id)"
+        "UNION(values, b.id)"
     );
     assert_eq!(
         order_by("SELECT * FROM generate_series(1, 2) AS g UNION SELECT id FROM b ORDER BY id")
@@ -234,7 +235,7 @@ fn duplicate_output_names_are_ambiguous_only_for_different_values() {
     }
     assert_eq!(
         order_by("SELECT x.a, x.a FROM (VALUES (1, 2)) x(a, b) ORDER BY a").unwrap(),
-        "opaque"
+        "values"
     );
 }
 
