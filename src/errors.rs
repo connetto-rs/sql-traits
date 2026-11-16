@@ -1118,8 +1118,8 @@ pub enum HelperSetError {
         /// The helper.
         function: String,
     },
-    /// The helper does not return `SETOF` one scalar type.
-    #[error("helper `{function}` does not return SETOF a scalar type")]
+    /// The helper returns neither `SETOF` one scalar type nor `TABLE (...)`.
+    #[error("helper `{function}` returns neither SETOF a scalar type nor TABLE")]
     ReturnType {
         /// The helper.
         function: String,
