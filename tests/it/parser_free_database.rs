@@ -200,6 +200,9 @@ struct MemoryUserDefinedType {
     name: String,
     schema: Option<String>,
     kind: UserDefinedTypeKind,
+    /// The labels of an enum type in their sort order, empty for every other
+    /// kind.
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1314,6 +1317,10 @@ impl TriggerLike for MemoryTrigger {
         None
     }
 
+    fn condition(&self) -> Option<&Expr> {
+        None
+    }
+
     fn function<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db MemoryFunction>
     where
         Self: 'db,
@@ -1396,6 +1403,16 @@ impl UserDefinedTypeLike for MemoryUserDefinedType {
 
     fn kind(&self) -> UserDefinedTypeKind {
         self.kind
+    }
+
+    fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>> {
+        (self.kind == UserDefinedTypeKind::Enum).then(|| {
+            Enumeration::new(
+                EnumerationKind::Enum,
+                None,
+                self.labels.iter().map(|label| EnumerationMember::new(label, None)),
+            )
+        })
     }
 }
 

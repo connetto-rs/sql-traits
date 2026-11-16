@@ -6,6 +6,7 @@ use alloc::{
     collections::BTreeMap,
     format,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 use core::iter;
@@ -13,7 +14,7 @@ use core::iter;
 use sqlparser::ast::{ArgMode, Expr, ObjectName, Query, Statement};
 use sqlparser_plpgsql::{
     embedded::{Block, DeclarationKind, DeclaredType, Dynamic, expression},
-    namespace::{self, FunctionKind, Name, NameKind, Signature, Sql, TriggerVariable},
+    namespace::{self, FunctionKind, Name, NameKind, Signature, Site, Sql, TriggerVariable},
 };
 
 use super::{
@@ -32,8 +33,9 @@ use crate::{
     errors::LookupError,
     structs::{
         CallResolution, DynamicExecution, ExpressionContext, ExpressionScope, IdentifierCase,
-        OperandType, PlPgSqlScope, PlPgSqlVariable, SiteScope, TargetName, TypeKind, VariableKind,
-        array_of, column_type, declared_type, declared_type_named,
+        OperandType, PlPgSqlScope, PlPgSqlVariable, SiteFlow, SiteScope, TargetName, TypeKind,
+        VariableKind, array_of, column_type, declared_type, declared_type_named,
+        plpgsql_flow::FlowPoint,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike},
     utils::{
@@ -147,8 +149,13 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
         self.function
     }
 
+    /// Returns the database the function belongs to.
+    pub(crate) const fn database(&self) -> &'db DB {
+        self.database
+    }
+
     /// What the body learns about the function from its definition.
-    fn signature(&self) -> Signature {
+    pub(crate) fn signature(&self) -> Signature {
         Signature {
             name: stored_identifier(self.function.name(), self.function.name_is_quoted())
                 .into_owned(),
@@ -354,34 +361,18 @@ fn plpgsql_sites<'b, 'db, DB: DatabaseLike>(
     names: &'b BodyNames<'db, DB>,
     block: &'b Block,
     hex_strings_may_be_integers: bool,
+    flow: &Arc<SiteFlow<'b, 'db, DB>>,
 ) -> Result<Vec<DynamicExecution<'b, 'db, DB>>, LookupError> {
-    let function = names.function.name();
     let database = names.database;
-    let sites = block.sites(&names.signature(), |name| names.holds_row(name)).map_err(|error| {
-        match error {
-            namespace::Error::UnknownAliasTarget { alias, target } => {
-                unresolvable(function, &format_args!("{alias} ALIAS FOR {target}"))
-            }
-            namespace::Error::UnboundCursor { name } => {
-                unresolvable(function, &format_args!("OPEN {name}"))
-            }
-        }
-    })?;
-    let mut collector = PathCollector {
-        function,
-        database,
-        path: owned_path(names.declaration_path.clone()),
-        hex_strings_may_be_integers,
-        constant: false,
-        paths: BTreeMap::new(),
-    };
-    walk_body(function, RunTimeBody::PlPgSql(block), &mut collector, hex_strings_may_be_integers)?;
+    let (sites, mut paths) = body_sql(names, block, hex_strings_may_be_integers)?;
     let mut found = Vec::new();
     for site in sites {
+        let key = SiteKey::of(site.sql);
         // Only a statement setting the path goes unrecorded, which calls
         // nothing.
-        let Some(path) = collector.paths.remove(&SiteKey::of(site.sql)) else { continue };
-        let scope = PlPgSqlScope::new(names, site.namespace, path);
+        let Some(path) = paths.remove(&key) else { continue };
+        let point = FlowPoint::Site { flow: Arc::<SiteFlow<'b, 'db, DB>>::clone(flow), key };
+        let scope = PlPgSqlScope::new(names, site.namespace, path).at(point);
         let (first, arguments): (_, &[Query]) = match site.sql {
             Sql::Statement(statement) => (ScopedRoot::Statement(statement), &[]),
             Sql::Expression(query) => (ScopedRoot::Query(query), &[]),
@@ -391,7 +382,7 @@ fn plpgsql_sites<'b, 'db, DB: DatabaseLike>(
             for (command, called) in
                 text_sink_calls(root, &ExpressionScope::PlPgSql(&scope), database)?
             {
-                let holder = SiteScope::PlPgSql(scope.clone());
+                let holder = SiteScope::PlPgSql { scope: scope.clone(), flow: Arc::clone(flow) };
                 found.push(DynamicExecution::call(root, command, holder, called, database));
             }
         }
@@ -400,12 +391,54 @@ fn plpgsql_sites<'b, 'db, DB: DatabaseLike>(
             found.push(DynamicExecution::execute(
                 expression(&dynamic.command),
                 arguments,
-                scope,
+                SiteScope::PlPgSql { scope, flow: Arc::clone(flow) },
                 database,
             ));
         }
     }
     Ok(found)
+}
+
+/// Every statement and expression the PL/pgSQL body `block` of the function
+/// `names` belongs to runs, in body order with the names each reaches, and
+/// the path each runs under, a statement setting the path left out.
+///
+/// # Errors
+///
+/// Returns [`LookupError::FunctionBodyUnresolvable`] for an `ALIAS FOR`
+/// naming no variable and for an `OPEN` naming no cursor declared with a
+/// query, and the errors reading the path a statement of the body sets.
+pub(crate) fn body_sql<'b, DB: DatabaseLike>(
+    names: &BodyNames<'_, DB>,
+    block: &'b Block,
+    hex_strings_may_be_integers: bool,
+) -> Result<(Vec<Site<'b>>, BTreeMap<SiteKey, BodyPath<'static>>), LookupError> {
+    let function = names.function.name();
+    let sites = block
+        .sites(&names.signature(), |name| names.holds_row(name))
+        .map_err(|error| namespace_error(function, error))?;
+    let mut collector = PathCollector {
+        function,
+        database: names.database,
+        path: owned_path(names.declaration_path.clone()),
+        hex_strings_may_be_integers,
+        constant: false,
+        paths: BTreeMap::new(),
+    };
+    walk_body(function, RunTimeBody::PlPgSql(block), &mut collector, hex_strings_may_be_integers)?;
+    Ok((sites, collector.paths))
+}
+
+/// The error the body of `function` answers when its names do not resolve.
+pub(crate) fn namespace_error(function: &str, error: namespace::Error) -> LookupError {
+    match error {
+        namespace::Error::UnknownAliasTarget { alias, target } => {
+            unresolvable(function, &format_args!("{alias} ALIAS FOR {target}"))
+        }
+        namespace::Error::UnboundCursor { name } => {
+            unresolvable(function, &format_args!("OPEN {name}"))
+        }
+    }
 }
 
 /// The body of a function, parsed, with what reading its dynamic-execution
@@ -435,7 +468,9 @@ impl<'db, DB: DatabaseLike> SiteSource<'db, DB> {
     pub(crate) fn sites(&self) -> Result<Vec<DynamicExecution<'_, 'db, DB>>, LookupError> {
         match &self.body {
             SqlBody::PlPgSql(block) => {
-                plpgsql_sites(&self.names, block, self.hex_strings_may_be_integers)
+                let flow =
+                    Arc::new(SiteFlow::new(&self.names, block, self.hex_strings_may_be_integers));
+                plpgsql_sites(&self.names, block, self.hex_strings_may_be_integers, &flow)
             }
             SqlBody::Statements(statements) | SqlBody::Atomic(statements) => {
                 self.sql_sites(statements.iter().map(ScopedRoot::Statement))
@@ -554,19 +589,19 @@ fn owned_path(path: BodyPath<'_>) -> BodyPath<'static> {
 }
 
 /// The SQL of a site of a PL/pgSQL body, by address.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SiteKey {
-    Statement(*const Statement),
-    Expression(*const Query),
-    Dynamic(*const Dynamic),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SiteKey {
+    Statement(usize),
+    Expression(usize),
+    Dynamic(usize),
 }
 
 impl SiteKey {
-    fn of(sql: Sql<'_>) -> Self {
+    pub(crate) fn of(sql: Sql<'_>) -> Self {
         match sql {
-            Sql::Statement(statement) => Self::Statement(statement),
-            Sql::Expression(query) => Self::Expression(query),
-            Sql::Dynamic(dynamic) => Self::Dynamic(dynamic),
+            Sql::Statement(statement) => Self::Statement(core::ptr::from_ref(statement).addr()),
+            Sql::Expression(query) => Self::Expression(core::ptr::from_ref(query).addr()),
+            Sql::Dynamic(dynamic) => Self::Dynamic(core::ptr::from_ref(dynamic).addr()),
         }
     }
 }
@@ -631,10 +666,10 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for PathCollector<'_, DB> {
     }
 
     fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
-        self.record(match sql {
-            Embedded::Statement(statement) => SiteKey::Statement(statement),
-            Embedded::Expression(query) => SiteKey::Expression(query),
-        });
+        self.record(SiteKey::of(match sql {
+            Embedded::Statement(statement) => Sql::Statement(statement),
+            Embedded::Expression(query) => Sql::Expression(query),
+        }));
         Ok(())
     }
 
@@ -645,13 +680,13 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for PathCollector<'_, DB> {
     /// Code outside the body may change the path, which later names then
     /// cannot rely on.
     fn opaque(&mut self, _function: &str, statement: &'s Statement) -> Result<(), LookupError> {
-        self.record(SiteKey::Statement(statement));
+        self.record(SiteKey::of(Sql::Statement(statement)));
         self.forget(statement);
         Ok(())
     }
 
     fn dynamic(&mut self, _function: &str, dynamic: &'s Dynamic) -> Result<(), LookupError> {
-        self.record(SiteKey::Dynamic(dynamic));
+        self.record(SiteKey::of(Sql::Dynamic(dynamic)));
         match constant_command(dynamic) {
             Some(statements) => self.constant_command(&statements),
             None => self.forget(&Embedded::Expression(&dynamic.command)),

@@ -1860,28 +1860,38 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// tree where the body is recursive.
     ///
     /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
-    /// function returning `SETOF` one scalar type with a pinned
-    /// `search_path`, owned by a declared role holding `SELECT` on every
-    /// table it reads, or on every column of it the body names, `USAGE` on
-    /// the schema of every table and helper the body names, and exempt from
-    /// the row-level security of the tables, and when its body is a `UNION`
-    /// of arms of two shapes, alone or walked along a tree.
+    /// function returning `SETOF` one scalar type or `TABLE (...)` with a
+    /// pinned `search_path`, owned by a declared role holding `SELECT` on
+    /// every table it reads, or on every column of it the body names,
+    /// `USAGE` on the schema of every table and helper the body names, and
+    /// exempt from the row-level security of the tables, and when its body
+    /// is a `UNION` of arms of two shapes, alone or walked along a tree. A
+    /// helper returning `TABLE (...)` of several columns answers grant arms
+    /// only.
     ///
-    /// - A grant arm, `SELECT <column> FROM <table> [WHERE <conditions>]`, the
-    ///   conditions joined by `AND`. At most one of them names the grantee,
-    ///   either a comparison of a column with a value of the request or
-    ///   `<column> IN (SELECT <helper>(<arguments>))`, the helper answered in
-    ///   turn as a parent arm's is. The comparison is `<column> =
-    ///   current_setting('<setting>'[, <missing_ok>])` with a setting the
-    ///   deployment declares as the caller, or `<column>` compared with each
-    ///   element of a setting it declares as a set, unpacked as declared (see
-    ///   [`SettingComparison`](crate::structs::SettingComparison)). An arm
-    ///   naming no grantee returns the same rows for every request its gate
-    ///   lets through. Conditions `current_setting('<setting>') <> <text>` and
+    /// - A grant arm, `SELECT <columns> FROM <table> [WHERE <conditions>]`, one
+    ///   column per column the helper returns, the conditions joined by `AND`.
+    ///   At most one of them names the grantee, either a comparison of a column
+    ///   with a value of the request or `<column> IN (SELECT
+    ///   <helper>(<arguments>))`, the helper answered in turn as a parent arm's
+    ///   is. The comparison is `<column> = current_setting('<setting>'[,
+    ///   <missing_ok>])` with a setting the deployment declares as the caller
+    ///   or as another principal, or `<column>` compared with each element of a
+    ///   setting it declares as a set, unpacked as declared (see
+    ///   [`SettingComparison`](crate::structs::SettingComparison)). `<column>
+    ///   IN (<values>)` listing principals beside literals and parameters
+    ///   answers one grant arm per principal and one granted to anyone for the
+    ///   literals together, each keeping the other conditions. An arm naming no
+    ///   grantee returns the same rows for every request its gate lets through.
+    ///   A cap, `(<operands>) IN (SELECT * FROM <helper>(<arguments>))`,
+    ///   optionally behind `<setting> IS NULL OR`, keeps the rows whose
+    ///   operands are a row the helper returns, the helper answered in turn
+    ///   (see [`RowCap`](crate::structs::RowCap)). Conditions
+    ///   `current_setting('<setting>') <> <text>` and
     ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
     ///   the arm on what the setting reads (see
     ///   [`CallerGate`](crate::structs::CallerGate)). The body may cast a read
-    ///   of the caller to its declared type, and a set to an array of its
+    ///   of one value to its declared type, and a set to an array of its
     ///   declared element type or each element to that type, and any other cast
     ///   refuses the answer. It may read any setting through
     ///   `NULLIF(current_setting(...), '')`, which reads `''` as `NULL` and so
@@ -1896,13 +1906,20 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   `>` or `>=` either way round, optionally `OR <column> IS NULL`, and
     ///   the arm answers it as a [`TimeBound`](crate::structs::TimeBound).
     ///   `CURRENT_TIMESTAMP` and `transaction_timestamp()` read the same
-    ///   statement time as `now()`. The rest, the arguments substituted, reduce
-    ///   to `TRUE`, to `FALSE` or `NULL`, or to the literal values columns have
-    ///   to hold. A column of an enum type compared with a label by `<`, `<=`,
-    ///   `>` or `>=`, either way round, holds the labels on the kept side of it
-    ///   in the order the type declares them, `ALTER TYPE ... ADD VALUE`
-    ///   applied. An arm comparing a helper's set while returning its table's
-    ///   primary key is a parent arm, so it takes no other condition.
+    ///   statement time as `now()`. An anti-join is a conjunct `NOT EXISTS
+    ///   (SELECT 1 FROM <table> WHERE <conditions>)` whose conditions equal
+    ///   columns of `<table>` with columns of the arm's table and otherwise
+    ///   read `<table>` alone, and the arm answers it as an
+    ///   [`AntiJoin`](crate::structs::AntiJoin). The rest, the arguments
+    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to what
+    ///   columns have to hold, literal values, a `boolean` column alone holding
+    ///   `TRUE`, `<column> IS NULL` or `<column> IS NOT NULL` (see
+    ///   [`Restriction`](crate::structs::Restriction)). A column of an enum
+    ///   type compared with a label by `<`, `<=`, `>` or `>=`, either way
+    ///   round, holds the labels on the kept side of it in the order the type
+    ///   declares them, `ALTER TYPE ... ADD VALUE` applied. An arm comparing a
+    ///   helper's set while returning its table's primary key is a parent arm,
+    ///   so it takes no other condition.
     /// - A parent arm, `SELECT <primary key> FROM <table> WHERE <column> IN
     ///   (SELECT <helper>(<arguments>))`, each argument a parameter or a
     ///   literal, the helper called answered in turn for the arguments it
@@ -1972,10 +1989,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// let set =
     ///     docs_with.helper_set(&[Value::SingleQuotedString("write".into())], &deployment, &db)?;
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
-    /// assert_eq!(grant.column().column_name(), "doc_id");
+    /// let [doc] = grant.columns() else { panic!("the helper returns one column") };
+    /// assert_eq!(doc.column_name(), "doc_id");
     /// let GrantedTo::Request(request) = grant.granted_to() else { unreachable!() };
     /// assert_eq!(request.column().column_name(), "principal_id");
-    /// let [roles] = grant.restrictions() else { panic!("the condition restricts one column") };
+    /// let [Restriction::In(roles)] = grant.restrictions() else {
+    ///     panic!("the condition restricts one column to literals")
+    /// };
     /// assert_eq!(roles.column().column_name(), "role");
     /// let admin = Value::SingleQuotedString("admin".into());
     /// let write = Value::SingleQuotedString("write".into());

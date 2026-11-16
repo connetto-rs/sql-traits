@@ -886,6 +886,12 @@ pub enum DeploymentError {
         /// The setting holding the set.
         setting: String,
     },
+    /// A principal is declared with no type.
+    #[error("setting `{setting}` declares a principal of no type")]
+    EmptyPrincipalKind {
+        /// The setting holding the principal.
+        setting: String,
+    },
     /// A JSON field was declared with no key.
     #[error("a JSON field needs at least one key")]
     EmptyFieldPath,
@@ -1112,8 +1118,8 @@ pub enum HelperSetError {
         /// The helper.
         function: String,
     },
-    /// The helper does not return `SETOF` one scalar type.
-    #[error("helper `{function}` does not return SETOF a scalar type")]
+    /// The helper returns neither `SETOF` one scalar type nor `TABLE (...)`.
+    #[error("helper `{function}` returns neither SETOF a scalar type nor TABLE")]
     ReturnType {
         /// The helper.
         function: String,
@@ -1210,10 +1216,21 @@ pub enum HelperSetError {
         /// The setting, as written.
         setting: String,
     },
-    /// A grant arm compares a column with, or gates on, a setting the
-    /// deployment declares as something other than the caller.
-    #[error("helper `{function}` reads setting `{setting}` as the caller, which it is not")]
+    /// A grant arm gates on a setting the deployment declares as something
+    /// other than the caller.
+    #[error("helper `{function}` gates on setting `{setting}` as the caller, which it is not")]
     SettingNotCaller {
+        /// The helper.
+        function: String,
+        /// The setting.
+        setting: String,
+    },
+    /// A grant arm compares a column with a setting the deployment declares
+    /// as neither the caller nor another principal.
+    #[error(
+        "helper `{function}` compares a column with setting `{setting}` as the identity of a principal, which it is not"
+    )]
+    SettingNotPrincipal {
         /// The helper.
         function: String,
         /// The setting.
@@ -1253,10 +1270,14 @@ pub enum HelperSetError {
         setting: String,
     },
     /// A grant arm's condition, its arguments substituted and its bounds on
-    /// the statement time set aside, reduces neither to `TRUE`, `FALSE` or
-    /// `NULL` nor to literal values columns have to hold, all at once.
+    /// the statement time and anti-joins set aside, reduces neither to
+    /// `TRUE`, `FALSE` or `NULL` nor to columns holding literal values,
+    /// `NULL` or any value, all at once. The same holds of the conditions of
+    /// an anti-join beside its correlations. A `NOT EXISTS` reading anything
+    /// but one table, or correlating no column, or reading the arm's table
+    /// other than in a correlation, is irreducible too.
     #[error(
-        "helper `{function}` filters by `{condition}`, which reduces to neither a literal set nor a time bound"
+        "helper `{function}` filters by `{condition}`, which reduces to neither a column restriction nor a time bound"
     )]
     Irreducible {
         /// The helper.

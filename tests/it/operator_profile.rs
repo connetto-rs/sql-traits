@@ -741,6 +741,10 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn condition(&self) -> Option<&Expr> {
+        self.unreach()
+    }
+
     fn function<'db>(
         &'db self,
         _database: &'db Self::DB,
