@@ -1627,6 +1627,7 @@ fn a_set_unpacked_as_any_other_type_refuses_the_answer() {
     for condition in [
         format!("l.id = ANY ({SPLIT}::uuid)"),
         format!("l.id = ANY (ARRAY(SELECT unnest({SPLIT}))::uuid[])"),
+        format!("l.id = ANY (CAST({SPLIT} AS ARRAY))"),
     ] {
         assert!(
             matches!(
@@ -3094,13 +3095,7 @@ fn a_nullif_over_anything_but_a_setting_read_and_the_empty_string_refuses_the_an
 
 #[test]
 fn a_comparison_with_the_caller_read_through_nullif_excludes_the_unset_caller() {
-    let read = |read: &str| {
-        blocked_by(&blocking("''", read, ""), DataType::Uuid, |set| {
-            let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
-            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
-            (render(set), request.raises_when_unset(), request.excludes_unset())
-        })
-    };
+    let read = |read: &str| blocked_through("", read);
     for (written, raises, excludes_unset) in [
         (format!("{ABSENT}::uuid"), false, true),
         ("CAST(NULLIF(current_setting('app.user_id'), '') AS uuid)".to_string(), true, true),
@@ -3355,11 +3350,24 @@ fn an_accessor_postgres_does_not_run_as_its_read_refuses_the_answer() {
             _ => None,
         }
     };
+    let refusal = |reason, which: &str| {
+        Some((
+            reason,
+            format!(
+                "helper `authz.blocking_organizations` reads setting `app.user_id` through \
+                 `authz.caller_id`, which {which}"
+            ),
+        ))
+    };
     let immutable = "LANGUAGE sql IMMUTABLE SECURITY DEFINER SET search_path = ''";
-    assert_eq!(refused(&caller_id(immutable)), Some(AccessorRefusal::Immutable));
+    assert_eq!(refused(&caller_id(immutable)), refusal(AccessorRefusal::Immutable, "is IMMUTABLE"));
     for setting in ["app.user_id", "App.User_Id"] {
         let sets = format!("{ACCESSOR} SET {setting} = '{}'", NIL.trim_matches('\''));
-        assert_eq!(refused(&caller_id(&sets)), Some(AccessorRefusal::SetsSetting), "{setting}");
+        assert_eq!(
+            refused(&caller_id(&sets)),
+            refusal(AccessorRefusal::SetsSetting, "sets the setting it reads"),
+            "{setting}"
+        );
     }
     let other = format!("{ACCESSOR} SET app.tenant = 'x'");
     assert_eq!(
@@ -3367,13 +3375,20 @@ fn an_accessor_postgres_does_not_run_as_its_read_refuses_the_answer() {
         Ok(BLOCKING_ARM),
         "an accessor setting another setting"
     );
+    let returns_nothing = format!(
+        "CREATE FUNCTION authz.caller_id() {ACCESSOR} AS $$ SELECT {ABSENT}::uuid $$;
+         ALTER FUNCTION authz.caller_id() OWNER TO authz_owner;"
+    );
+    let wrong_type =
+        refusal(AccessorRefusal::ReturnType, "returns another type than its body reads");
+    assert_eq!(refused(&returns_nothing), wrong_type, "an accessor declaring no result");
     for (returns, body) in [
         ("text", format!("{ABSENT}::uuid")),
         ("varchar", "current_setting('app.user_id')".to_string()),
         ("SETOF uuid", format!("{ABSENT}::uuid")),
     ] {
         let after = accessor("caller_id", returns, ACCESSOR, &body);
-        assert_eq!(refused(&after), Some(AccessorRefusal::ReturnType), "{returns}: {body}");
+        assert_eq!(refused(&after), wrong_type, "{returns}: {body}");
     }
 }
 
