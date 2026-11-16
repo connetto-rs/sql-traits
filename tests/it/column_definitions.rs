@@ -20,7 +20,7 @@ use sqlparser::{
     },
 };
 
-use crate::support::query_parsing::query_with;
+use crate::support::{query_parsing::query_with, values_labels::values_label};
 
 const SCHEMA: &str = "
     CREATE TABLE a(payload TEXT, id INT);
@@ -112,10 +112,7 @@ fn outline(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
         ColumnDefinition::RecursiveUnion { anchor, recursive } => {
             format!("[{} rec {}]", outline(&anchor.definition()), outline(&recursive.definition()))
         }
-        ColumnDefinition::Values { rows } => {
-            let rows = rows.iter().map(|row| outline(&row.definition())).collect::<Vec<_>>();
-            format!("values({})", rows.join(", "))
-        }
+        ColumnDefinition::Values { rows } => values_label(*rows, outline),
         other => format!("{other:?}"),
     }
 }

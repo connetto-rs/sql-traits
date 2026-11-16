@@ -12,7 +12,7 @@ use sqlparser::{
     parser::Parser,
 };
 
-use crate::support::query_parsing::query_with;
+use crate::support::{query_parsing::query_with, values_labels::values_label};
 
 const SCHEMA: &str = "
     CREATE TABLE halves(h halfvec(3));
@@ -49,10 +49,7 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
                 describe(&recursive.definition())
             )
         }
-        ColumnDefinition::Values { rows } => {
-            let rows = rows.iter().map(|row| describe(&row.definition())).collect::<Vec<_>>();
-            format!("values({})", rows.join(", "))
-        }
+        ColumnDefinition::Values { rows } => values_label(*rows, describe),
         ColumnDefinition::Parameter { ordinal, .. } => format!("parameter {ordinal}"),
         ColumnDefinition::Variable(variable) => format!("variable {}", variable.name()),
         ColumnDefinition::VariableField(variable) => format!("field of {}", variable.name()),
