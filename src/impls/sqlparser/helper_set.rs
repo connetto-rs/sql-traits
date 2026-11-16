@@ -1347,7 +1347,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         };
         let call = projected_call(subquery).ok_or_else(shape)?;
         let Called { function: callee, arguments, set } =
-            self.called_set(scope, select, table, &call, 1)?;
+            self.called_set(scope, select, core::slice::from_ref(table), &call, 1)?;
         let parent_table = match foreign_key {
             Some(foreign_key) => foreign_key.referenced_table(database)?,
             None => {
@@ -1395,18 +1395,19 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         };
         let call = projected_call(subquery).ok_or_else(shape)?;
         let Called { function, arguments, set } =
-            self.called_set(scope, select, table, &call, 1)?;
+            self.called_set(scope, select, core::slice::from_ref(table), &call, 1)?;
         Ok(GranteeSet { column, foreign_key, function, arguments, set: Box::new(set) })
     }
 
     /// The helper `call` reaches, the arguments it passes, each a parameter
     /// substituted or a literal, and what the helper answers for them, the
-    /// helper returning `arity` columns.
+    /// helper returning `arity` columns. `rows` holds the tables whose
+    /// columns the call may name.
     fn called_set(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
-        table: &ArmTable<'_, 'db, DB>,
+        rows: &[ArmTable<'_, 'db, DB>],
         call: &Call<'_>,
         arity: usize,
     ) -> Result<Called<'db, DB>, HelperSetError> {
@@ -1417,9 +1418,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else {
                 return Err(shape());
             };
-            // A column of the table takes the name before a parameter does,
+            // A column of a table takes the name before a parameter does,
             // and passes a value of each row.
-            if table.column(argument).is_some() {
+            if rows.iter().any(|row| row.column(argument).is_some()) {
                 return Err(shape());
             }
             let passed = scope.parameter(argument).map(|(passed, _)| passed.value.clone());
@@ -1582,7 +1583,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut caps = Vec::new();
         let mut conditions = Vec::new();
         for conjunct in own {
-            if let Some(cap) = self.cap(scope, select, table, conjunct)? {
+            if let Some(cap) = self.cap(scope, select, rows, conjunct)? {
                 caps.push(cap);
                 continue;
             }
@@ -1699,6 +1700,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             match rows_named(rows, conjunct).ok_or_else(shape)?.as_slice() {
                 [] | [0] => own.push(conjunct),
+                // A cap reads the columns of every row as its operands.
+                _ if cap_shape(conjunct).is_some() => own.push(conjunct),
                 [row] => joining[row - 1].conditions.push(conjunct),
                 _ => {
                     let (row, (host, referenced)) = Self::key_equality(table, joined, conjunct)
@@ -1924,33 +1927,26 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// The cap `conjunct` writes, if it writes one: `<operands> IN (SELECT *
     /// FROM <helper>(<arguments>))` with two operands or more, or `<lift> OR
     /// <operands> IN (...)` either way round, with one operand or more, one
-    /// operand also compared with `(SELECT <helper>(<arguments>))`.
+    /// operand also compared with `(SELECT <helper>(<arguments>))`. `rows`
+    /// holds the arm's table and then each table it joins, whose columns
+    /// the operands may name.
     fn cap(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
-        table: &ArmTable<'_, 'db, DB>,
+        rows: &[ArmTable<'_, 'db, DB>],
         conjunct: &Expr,
     ) -> Result<Option<RowCap<'db, DB>>, HelperSetError> {
-        let (lift, membership) = match unnest(conjunct) {
-            Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
-                match (self.lift(scope, table, left)?, self.lift(scope, table, right)?) {
-                    (Some(lift), None) => (Some(lift), unnest(right)),
-                    (None, Some(lift)) => (Some(lift), unnest(left)),
-                    _ => return Ok(None),
-                }
-            }
-            membership @ Expr::In { expr, .. } if matches!(unnest(expr), Expr::Tuple(_)) => {
-                (None, membership)
-            }
-            _ => return Ok(None),
-        };
-        let Expr::In { expr, target: InTarget::Subquery(subquery), negated: false, .. } =
-            membership
-        else {
-            return Ok(None);
-        };
+        let Some((lifted, expr, subquery)) = cap_shape(conjunct) else { return Ok(None) };
         let shape = || scope.arm_shape(select);
+        let (table, joined) = rows.split_first().ok_or_else(shape)?;
+        let lift = match lifted {
+            Some(lifted) => {
+                let Some(lift) = self.lift(scope, table, lifted)? else { return Ok(None) };
+                Some(lift)
+            }
+            None => None,
+        };
         let items = match unnest(expr) {
             Expr::Tuple(items) => items.as_slice(),
             item => core::slice::from_ref(item),
@@ -1959,10 +1955,18 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             .or_else(|| projected_call(subquery).filter(|_| items.len() == 1))
             .ok_or_else(shape)?;
         let Called { function, arguments, set } =
-            self.called_set(scope, select, table, &call, items.len())?;
+            self.called_set(scope, select, rows, &call, items.len())?;
         let database = self.database;
         let mut operands = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
+            let joined_column = joined
+                .iter()
+                .enumerate()
+                .find_map(|(row, joined)| Some((row, joined.column(item)?)));
+            if let Some((row, column)) = joined_column {
+                operands.push(CapOperand::Joined { row, column });
+                continue;
+            }
             operands.push(match self.operand(scope, table, item)? {
                 Operand::Column(column) => CapOperand::Column(column),
                 Operand::Passed(passed) => CapOperand::Value(passed.value),
@@ -3224,6 +3228,34 @@ fn plain_select(select: &Select) -> bool {
         && select.qualify.is_none()
         && select.value_table_mode.is_none()
         && select.flavor == SelectFlavor::Standard
+}
+
+/// The parts of `conjunct` where it is shaped as a cap: `<operands> IN
+/// (<subquery>)` with a row of operands, or `<test> IS NULL OR <operands> IN
+/// (<subquery>)` either way round, the `IS NULL` test where written beside
+/// the operands and the subquery.
+fn cap_shape(conjunct: &Expr) -> Option<(Option<&Expr>, &Expr, &Query)> {
+    fn membership(expression: &Expr) -> Option<(&Expr, &Query)> {
+        let Expr::In { expr, target: InTarget::Subquery(subquery), negated: false, .. } =
+            unnest(expression)
+        else {
+            return None;
+        };
+        Some((expr.as_ref(), subquery.as_ref()))
+    }
+    match unnest(conjunct) {
+        Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+            [(left, right), (right, left)].into_iter().find_map(|(lift, tested)| {
+                let lift = unnest(lift);
+                let (operands, subquery) = membership(tested)?;
+                matches!(lift, Expr::IsNull(_)).then_some((Some(lift), operands, subquery))
+            })
+        }
+        written => {
+            let (operands, subquery) = membership(written)?;
+            matches!(unnest(operands), Expr::Tuple(_)).then_some((None, operands, subquery))
+        }
+    }
 }
 
 /// The call of `(SELECT <function>(<arguments>))`.

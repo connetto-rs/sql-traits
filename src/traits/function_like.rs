@@ -1925,9 +1925,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   `WHERE`. Each column of the key equated with the column it references
     ///   joins the row, and the conditions on that row alone reduce to a
     ///   [`JoinedRow`](crate::structs::JoinedRow), the grantee and the returned
-    ///   columns staying on the arm's own table. An arm comparing a helper's
-    ///   set while returning a key it would return as a parent arm is one, so
-    ///   it takes no other condition and joins no row.
+    ///   columns staying on the arm's own table. A cap may take operands from
+    ///   the joined rows as well. An arm comparing a helper's set while
+    ///   returning a key it would return as a parent arm is one, so it takes no
+    ///   other condition and joins no row.
     /// - A parent arm, `SELECT <key> FROM <table> WHERE <column> IN (SELECT
     ///   <helper>(<arguments>))`, each argument a parameter or a literal, the
     ///   helper called answered in turn for the arguments it receives. `<key>`
