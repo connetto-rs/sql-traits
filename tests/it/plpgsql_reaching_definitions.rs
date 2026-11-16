@@ -47,7 +47,9 @@ fn rendered(definition: &Definition<'_, '_, ParserDB>) -> String {
         DefinitionSource::ArrayElement { array, slice, output } => {
             format!("{output:?} slice {slice} of {array}")
         }
-        DefinitionSource::LoopIndex { lower, upper, .. } => format!("{lower} .. {upper}"),
+        DefinitionSource::LoopIndex { reverse, lower, upper, .. } => {
+            format!("{}{lower} .. {upper}", if *reverse { "reverse " } else { "" })
+        }
         DefinitionSource::CursorName => "cursor name".to_owned(),
         DefinitionSource::PortalName => "portal name".to_owned(),
         DefinitionSource::Diagnostics(item) => format!("{item:?}"),
@@ -634,6 +636,67 @@ fn elements_unknowns_and_raises() {
             ],
             vec![read("p", &["unreachable"])],
         ]
+    );
+}
+
+/// The count of a `FETCH` or `MOVE` and the value of a `RAISE` option run
+/// where the statement stands, after the writes before it.
+#[test]
+fn cursor_counts_and_raise_options_read_the_definitions_before_them() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1'; c refcursor; n integer;
+             BEGIN
+              OPEN c SCROLL FOR SELECT id FROM t;
+              s := p;
+              FETCH ABSOLUTE length(query_to_xml(s, false, false, '')::text) FROM c INTO n;
+              s := s || ' UNION SELECT 2';
+              MOVE RELATIVE length(query_to_xml(s, false, false, '')::text) FROM c;
+              RAISE NOTICE 'moved' USING DETAIL = query_to_xml(s || q, false, false, '')::text;
+             END"
+        ),
+        [
+            vec![read("s", &["p"])],
+            vec![read("s", &["s || ' UNION SELECT 2'"])],
+            vec![read("s", &["s || ' UNION SELECT 2'"]), read("q", &["incoming"])],
+        ]
+    );
+}
+
+/// A function runs in its caller's transaction, so `COMMIT` and `ROLLBACK`
+/// in its body raise `invalid_transaction_termination` and nothing after
+/// them runs, while a handler of their block takes what reached them.
+#[test]
+fn commit_and_rollback_raise_in_a_function() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN
+              BEGIN
+               IF q > 0 THEN COMMIT; ELSE ROLLBACK AND CHAIN; END IF;
+               s := p;
+              EXCEPTION WHEN invalid_transaction_termination THEN
+               EXECUTE s;
+              END;
+              EXECUTE s;
+             END"
+        ),
+        [vec![read("s", &["'SELECT 1'"])], vec![read("s", &["'SELECT 1'"])]]
+    );
+}
+
+/// `REVERSE` counts down from the first bound written, so the index of a
+/// reversed loop is told apart from one counting up between the same bounds.
+#[test]
+fn a_reversed_range_starts_at_its_first_bound() {
+    assert_eq!(
+        reaching(
+            "BEGIN
+              FOR i IN REVERSE q .. 1 LOOP EXECUTE 'SELECT ' || i; END LOOP;
+              FOR i IN q .. 1 LOOP EXECUTE 'SELECT ' || i; END LOOP;
+             END"
+        ),
+        [vec![read("i", &["reverse q .. 1"])], vec![read("i", &["q .. 1"])]]
     );
 }
 
