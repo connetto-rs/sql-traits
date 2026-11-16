@@ -8,7 +8,7 @@
     reason = "a test fails loudly on a broken premise"
 )]
 
-use sql_traits::prelude::*;
+use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::dialect::PostgreSqlDialect;
 
 const SCHEMA: &str = "CREATE TABLE t (name text, id integer);";
@@ -557,4 +557,32 @@ fn a_call_may_write_a_parenthesised_cast_or_positional_argument() {
             read("p", &["incoming", "unknown"]),
         ]]
     );
+}
+
+/// A procedure returns no value to an argument computed from an expression,
+/// nor to a call written without its argument list.
+#[test]
+fn a_call_writes_no_computed_argument() {
+    assert_eq!(
+        reaching("BEGIN CALL fill(p || p, q); CALL fill; EXECUTE p USING q; END"),
+        [vec![read("p", &["incoming"]), read("q", &["incoming", "unknown"])]]
+    );
+}
+
+/// The variables a definition reads come with the lookup error a query of
+/// its source runs into.
+#[test]
+fn a_definition_reading_an_unresolvable_query_returns_its_error() {
+    let database = database(
+        "DECLARE s text;
+         BEGIN s := (SELECT name FROM t AS a, t AS b); EXECUTE s; END",
+    );
+    let body = run(&database).dynamic_execution_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let reads = sites[0].reads(IdentifierCase::Folded).unwrap();
+    let Reaching::Definitions(definitions) = reads[0].reaching() else { panic!("s is reached") };
+    assert!(matches!(
+        definitions[0].reads(IdentifierCase::Folded),
+        Err(LookupError::AmbiguousTableLookup { .. })
+    ));
 }
