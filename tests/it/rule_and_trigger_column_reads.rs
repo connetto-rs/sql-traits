@@ -36,6 +36,10 @@ fn rule_condition(rule: &<ParserDB as DatabaseLike>::Rule) -> String {
     rule.condition().map(ToString::to_string).expect("the rule has a condition")
 }
 
+fn trigger_condition(trigger: &<ParserDB as DatabaseLike>::Trigger) -> Option<String> {
+    trigger.condition().map(ToString::to_string)
+}
+
 fn only_trigger(database: &ParserDB) -> &sqlparser::ast::CreateTrigger {
     let mut triggers = database.triggers();
     let trigger = triggers.next().expect("one trigger is recorded");
@@ -355,9 +359,29 @@ fn a_trigger_when_follows_a_renamed_column() {
     ))
     .expect("schema builds");
 
+    assert_eq!(trigger_condition(only_trigger(&database)).as_deref(), Some("NEW.aa > OLD.aa"));
+}
+
+/// A trigger `WHEN` condition reads the same after its table is renamed, and
+/// a trigger without one still reads none.
+#[test]
+fn a_trigger_when_survives_a_renamed_table() {
+    let database = parse(&format!(
+        "{TRIGGER}
+         CREATE TABLE notes (id INT PRIMARY KEY, body TEXT NOT NULL);
+         CREATE TRIGGER filtered AFTER UPDATE ON notes FOR EACH ROW
+             WHEN (OLD.* IS DISTINCT FROM NEW.*) EXECUTE FUNCTION touch();
+         CREATE TRIGGER unfiltered AFTER UPDATE ON notes FOR EACH ROW EXECUTE FUNCTION touch();
+         ALTER TABLE notes RENAME TO memos;
+         ALTER TABLE memos RENAME COLUMN body TO content;"
+    ))
+    .expect("schema builds");
+
+    let conditions: Vec<(&str, Option<String>)> =
+        database.triggers().map(|trigger| (trigger.name(), trigger_condition(trigger))).collect();
     assert_eq!(
-        only_trigger(&database).condition.as_ref().map(ToString::to_string).as_deref(),
-        Some("(NEW.aa > OLD.aa)")
+        conditions,
+        [("filtered", Some("OLD.* IS DISTINCT FROM NEW.*".to_owned())), ("unfiltered", None)]
     );
 }
 
