@@ -1303,6 +1303,18 @@ pub enum HelperSetError {
         /// The helper.
         function: String,
     },
+    /// A walk's final query reselects keys of a table not every arm and the
+    /// walk return keys of, so the keys it reached are not all keys of that
+    /// table.
+    #[error(
+        "helper `{function}` reselects the keys of `{table}` from a walk whose arms do not all return keys of it"
+    )]
+    UncoveredReselection {
+        /// The helper.
+        function: String,
+        /// The table the final query reads.
+        table: String,
+    },
     /// A parent arm compares a column with no single-column foreign key to a
     /// helper whose set covers no one table, so nothing names the parent
     /// table.

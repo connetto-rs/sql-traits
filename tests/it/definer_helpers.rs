@@ -352,76 +352,77 @@ fn render_cap(cap: &RowCap<'_, ParserDB>) -> String {
     }
 }
 
+/// A grant arm as its table and columns followed by what filters it.
+fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
+    let granted_to = render_granted_to(grant.granted_to());
+    let gate = grant.gate().map(|gate| {
+        let name = gate.setting().name();
+        let excluded: Vec<String> = gate.excluded().iter().map(ToString::to_string).collect();
+        let mut gated = Vec::new();
+        if gate.excludes_unset() {
+            gated.push(format!("{name} IS SET"));
+        }
+        if !excluded.is_empty() {
+            gated.push(format!("{name} NOT IN ({})", excluded.join(", ")));
+        } else if !gate.excludes_unset() {
+            gated.push(format!("{name} IS NOT NULL"));
+        }
+        gated.join(" AND ")
+    });
+    let restrictions = grant.restrictions().iter().map(render_restriction);
+    let bounds = grant.time_bounds().iter().map(render_bound);
+    let joins = grant.joined_rows().iter().map(render_joined_row);
+    let anti_joins = grant.anti_joins().iter().map(|anti_join| {
+        let correlations = anti_join.correlations().iter().map(|correlation| {
+            format!(
+                "{} = {}.{}",
+                correlation.blocking_column().column_name(),
+                grant.table().table_name(),
+                correlation.arm_column().column_name()
+            )
+        });
+        let conditions: Vec<String> = correlations
+            .chain(anti_join.restrictions().iter().map(render_restriction))
+            .chain(anti_join.time_bounds().iter().map(render_bound))
+            .collect();
+        let keyed = if anti_join.is_keyed() { "keyed " } else { "" };
+        format!(
+            "NOT EXISTS ({keyed}{} WHERE {})",
+            anti_join.table().table_name(),
+            conditions.join(" AND ")
+        )
+    });
+    let conditions: Vec<String> = granted_to
+        .into_iter()
+        .chain(gate)
+        .chain(restrictions)
+        .chain(bounds)
+        .chain(joins)
+        .chain(grant.caps().iter().map(render_cap))
+        .chain(anti_joins)
+        .collect();
+    let filter = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    let columns: Vec<&str> = grant.columns().iter().copied().map(ColumnLike::column_name).collect();
+    let returned = match columns.as_slice() {
+        [column] => (*column).to_string(),
+        columns => format!("({})", columns.join(", ")),
+    };
+    format!("{}.{returned}{filter}", grant.table().table_name())
+}
+
 /// An answer as one line, each arm as its table and column followed by what
-/// filters it.
+/// filters it, and the selection kept from their union last.
 fn render(set: &HelperSet<'_, ParserDB>) -> String {
     let arms: Vec<String> = set
         .arms()
         .iter()
         .map(|arm| {
             match arm {
-                HelperArm::Grant(grant) => {
-                    let granted_to = render_granted_to(grant.granted_to());
-                    let gate = grant.gate().map(|gate| {
-                        let name = gate.setting().name();
-                        let excluded: Vec<String> =
-                            gate.excluded().iter().map(ToString::to_string).collect();
-                        let mut gated = Vec::new();
-                        if gate.excludes_unset() {
-                            gated.push(format!("{name} IS SET"));
-                        }
-                        if !excluded.is_empty() {
-                            gated.push(format!("{name} NOT IN ({})", excluded.join(", ")));
-                        } else if !gate.excludes_unset() {
-                            gated.push(format!("{name} IS NOT NULL"));
-                        }
-                        gated.join(" AND ")
-                    });
-                    let restrictions = grant.restrictions().iter().map(render_restriction);
-                    let bounds = grant.time_bounds().iter().map(render_bound);
-                    let joins = grant.joined_rows().iter().map(render_joined_row);
-                    let anti_joins = grant.anti_joins().iter().map(|anti_join| {
-                        let correlations = anti_join.correlations().iter().map(|correlation| {
-                            format!(
-                                "{} = {}.{}",
-                                correlation.blocking_column().column_name(),
-                                grant.table().table_name(),
-                                correlation.arm_column().column_name()
-                            )
-                        });
-                        let conditions: Vec<String> = correlations
-                            .chain(anti_join.restrictions().iter().map(render_restriction))
-                            .chain(anti_join.time_bounds().iter().map(render_bound))
-                            .collect();
-                        let keyed = if anti_join.is_keyed() { "keyed " } else { "" };
-                        format!(
-                            "NOT EXISTS ({keyed}{} WHERE {})",
-                            anti_join.table().table_name(),
-                            conditions.join(" AND ")
-                        )
-                    });
-                    let conditions: Vec<String> = granted_to
-                        .into_iter()
-                        .chain(gate)
-                        .chain(restrictions)
-                        .chain(bounds)
-                        .chain(joins)
-                        .chain(grant.caps().iter().map(render_cap))
-                        .chain(anti_joins)
-                        .collect();
-                    let filter = if conditions.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" WHERE {}", conditions.join(" AND "))
-                    };
-                    let columns: Vec<&str> =
-                        grant.columns().iter().copied().map(ColumnLike::column_name).collect();
-                    let returned = match columns.as_slice() {
-                        [column] => (*column).to_string(),
-                        columns => format!("({})", columns.join(", ")),
-                    };
-                    format!("{}.{returned}{filter}", grant.table().table_name())
-                }
+                HelperArm::Grant(grant) => render_grant(grant),
                 HelperArm::Walk(walk) => {
                     let (returned, compared) = match walk.direction() {
                         WalkDirection::Down => (walk.child(), walk.column()),
@@ -452,7 +453,14 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
             }
         })
         .collect();
-    arms.join(" UNION ")
+    let union = arms.join(" UNION ");
+    match set.selection() {
+        Some(selection) => {
+            let kept: Vec<String> = selection.iter().map(render_grant).collect();
+            format!("{union} INTERSECT ({})", kept.join(" UNION "))
+        }
+        None => union,
+    }
 }
 
 /// `(<host columns>) -> <table> {<conditions>}`.
@@ -632,7 +640,70 @@ fn evaluate(
             }
         }
         if !grew {
-            return returned;
+            break;
+        }
+    }
+    if let Some(selection) = set.selection() {
+        let mut kept = BTreeSet::new();
+        for grant in selection {
+            grant_rows(grant, request, fixture, &mut kept);
+        }
+        returned.retain(|value| kept.contains(&vec![*value]));
+    }
+    returned
+}
+
+/// Adds the rows `grant` returns over `fixture` for `request` to `returned`,
+/// each as the values of its columns.
+fn grant_rows(
+    grant: &GrantArm<'_, ParserDB>,
+    request: Request,
+    fixture: Rows,
+    returned: &mut BTreeSet<Vec<&'static str>>,
+) {
+    let gated = grant.gate().is_none_or(|gate| {
+        request.caller.is_some_and(|caller| {
+            !(gate.excludes_unset() && caller.is_empty())
+                && gate.excluded().iter().all(|value| !holds(value, caller))
+        })
+    });
+    if !gated {
+        return;
+    }
+    let grantees = match grant.granted_to() {
+        GrantedTo::Set(grantees) => Some(evaluate(grantees.set(), request, fixture)),
+        GrantedTo::Request(_) | GrantedTo::Anyone => None,
+    };
+    // A lifted cap keeps every row, so its rows are `None`.
+    let caps: Vec<_> = grant
+        .caps()
+        .iter()
+        .map(|cap| {
+            (!cap.lift().is_some_and(|lift| lifted(lift, request)))
+                .then(|| cap_rows(cap, request, fixture))
+        })
+        .collect();
+    for row in rows(fixture, grant.table().table_name()) {
+        let restricted = grant.restrictions().iter().all(|restriction| restricts(restriction, row))
+            && grant.joined_rows().iter().all(|joined| joins(row, joined, fixture));
+        let granted = match grant.granted_to() {
+            GrantedTo::Request(compared) => {
+                let held = cell(row, compared.column().column_name());
+                !(compared.excludes_unset() && held.is_empty())
+                    && request.carries(compared.setting(), held)
+            }
+            GrantedTo::Set(compared) => {
+                grantees.as_ref().is_some_and(|grantees| {
+                    grantees.contains(cell(row, compared.column().column_name()))
+                })
+            }
+            GrantedTo::Anyone => true,
+        };
+        let unblocked = grant.anti_joins().iter().all(|anti_join| !blocks(anti_join, row, fixture));
+        if granted && restricted && unblocked && capped(grant.caps(), &caps, row) {
+            returned.insert(
+                grant.columns().iter().map(|column| cell(row, column.column_name())).collect(),
+            );
         }
     }
 }
@@ -648,59 +719,7 @@ fn arm_rows(
     let mut returned = BTreeSet::new();
     for arm in set.arms() {
         match arm {
-            HelperArm::Grant(grant) => {
-                let gated = grant.gate().is_none_or(|gate| {
-                    request.caller.is_some_and(|caller| {
-                        !(gate.excludes_unset() && caller.is_empty())
-                            && gate.excluded().iter().all(|value| !holds(value, caller))
-                    })
-                });
-                if !gated {
-                    continue;
-                }
-                let grantees = match grant.granted_to() {
-                    GrantedTo::Set(grantees) => Some(evaluate(grantees.set(), request, fixture)),
-                    GrantedTo::Request(_) | GrantedTo::Anyone => None,
-                };
-                // A lifted cap keeps every row, so its rows are `None`.
-                let caps: Vec<_> = grant
-                    .caps()
-                    .iter()
-                    .map(|cap| {
-                        (!cap.lift().is_some_and(|lift| lifted(lift, request)))
-                            .then(|| cap_rows(cap, request, fixture))
-                    })
-                    .collect();
-                for row in rows(fixture, grant.table().table_name()) {
-                    let restricted =
-                        grant.restrictions().iter().all(|restriction| restricts(restriction, row))
-                            && grant.joined_rows().iter().all(|joined| joins(row, joined, fixture));
-                    let granted = match grant.granted_to() {
-                        GrantedTo::Request(compared) => {
-                            let held = cell(row, compared.column().column_name());
-                            !(compared.excludes_unset() && held.is_empty())
-                                && request.carries(compared.setting(), held)
-                        }
-                        GrantedTo::Set(compared) => {
-                            grantees.as_ref().is_some_and(|grantees| {
-                                grantees.contains(cell(row, compared.column().column_name()))
-                            })
-                        }
-                        GrantedTo::Anyone => true,
-                    };
-                    let unblocked =
-                        grant.anti_joins().iter().all(|anti_join| !blocks(anti_join, row, fixture));
-                    if granted && restricted && unblocked && capped(grant.caps(), &caps, row) {
-                        returned.insert(
-                            grant
-                                .columns()
-                                .iter()
-                                .map(|column| cell(row, column.column_name()))
-                                .collect(),
-                        );
-                    }
-                }
-            }
+            HelperArm::Grant(grant) => grant_rows(grant, request, fixture, &mut returned),
             HelperArm::Parent(parent) => {
                 let parents = evaluate(parent.set(), request, fixture);
                 for row in rows(fixture, parent.table().table_name()) {
@@ -894,6 +913,58 @@ fn a_set_covers_the_one_table_whose_primary_key_every_arm_returns() {
         let set = answer(&database, &deployment, "public", "docs_with", &[text("read")])
             .expect("answered");
         assert_eq!(covered(&set), None, "{body}");
+    }
+}
+
+#[test]
+fn a_column_of_a_composite_foreign_key_returns_keys_of_the_table_it_references() {
+    let deployment = deployment();
+    let body = "SELECT folder_id FROM folder_members \
+                WHERE user_id = current_setting('app.user_id', true) AND role = min_role";
+    for (members, expected) in [
+        (
+            "folder_kind TEXT NOT NULL, \
+             FOREIGN KEY (folder_kind, folder_id) REFERENCES folders (kind, id)",
+            Some("folders"),
+        ),
+        (
+            "folder_kind TEXT, \
+             FOREIGN KEY (folder_kind, folder_id) REFERENCES folders (kind, id) MATCH FULL",
+            Some("folders"),
+        ),
+        (
+            "folder_kind TEXT NOT NULL, \
+             FOREIGN KEY (folder_kind, folder_id) REFERENCES folders (kind, id), \
+             FOREIGN KEY (folder_id) REFERENCES folders (id)",
+            Some("folders"),
+        ),
+        (
+            "folder_kind TEXT, \
+             FOREIGN KEY (folder_kind, folder_id) REFERENCES folders (kind, id)",
+            None,
+        ),
+        (
+            "folder_kind TEXT NOT NULL, \
+             FOREIGN KEY (folder_id, folder_kind) REFERENCES folders (kind, id)",
+            None,
+        ),
+        (
+            "folder_kind TEXT NOT NULL, \
+             FOREIGN KEY (folder_kind, folder_id) REFERENCES folders (kind, id), \
+             FOREIGN KEY (folder_id) REFERENCES shelves (id)",
+            None,
+        ),
+    ] {
+        let after = format!(
+            "CREATE TABLE folders (id TEXT PRIMARY KEY, kind TEXT NOT NULL, UNIQUE (kind, id));
+             CREATE TABLE shelves (id TEXT PRIMARY KEY);
+             CREATE TABLE folder_members (folder_id TEXT, user_id TEXT, role TEXT, {members});
+             GRANT SELECT ON folders, shelves, folder_members TO owner;"
+        );
+        let database = postgres(&helper(DEFINER, body, &after));
+        let set = answer(&database, &deployment, "public", "docs_with", &[text("read")])
+            .expect("answered");
+        assert_eq!(covered(&set), expected, "{members}");
     }
 }
 
@@ -2467,6 +2538,171 @@ fn a_walk_with_union_all_refuses_the_answer() {
     ));
 }
 
+/// [`walking`] down [`CHILD_JOIN`] with `last` as its final query.
+fn reselecting(last: &str) -> String {
+    walking(CHILD_JOIN).replace("SELECT id FROM reached", last)
+}
+
+/// [`groups`] whose rows carry a kind.
+fn kinded(body: &str, after: &str) -> String {
+    groups(body, after).replace(
+        "parent_id TEXT REFERENCES groups (id));",
+        "parent_id TEXT REFERENCES groups (id), kind TEXT NOT NULL, label TEXT);",
+    )
+}
+
+/// [`TREE`] with a kind on every group.
+const KINDED_TREE: Rows = &[
+    ("groups", &[("id", "org"), ("kind", "folder")]),
+    ("groups", &[("id", "team"), ("parent_id", "org"), ("kind", "team")]),
+    ("groups", &[("id", "squad"), ("parent_id", "team"), ("kind", "project")]),
+    ("groups", &[("id", "other"), ("kind", "folder")]),
+    ("group_grants", &[("group_id", "team"), ("principal_id", "alice"), ("role", "read")]),
+    ("group_grants", &[("group_id", "org"), ("principal_id", "bob"), ("role", "write")]),
+];
+
+const KIND_RESELECTION: &str = "SELECT g.id FROM public.groups g \
+     WHERE g.id IN (SELECT id FROM reached) AND (g.kind IN ('folder', 'project') OR min_role = 'read')";
+
+/// What PostgreSQL 18.6 returns for `(caller, minimum role)`, calling
+/// `authz.groups_with` written as `reselecting(KIND_RESELECTION)` over
+/// [`KINDED_TREE`].
+const KIND_RESELECTION_MEASURED: &[(&str, &str, &[&str])] = &[
+    ("alice", "read", &["squad", "team"]),
+    ("alice", "write", &[]),
+    ("bob", "read", &["org", "squad", "team"]),
+    ("bob", "write", &["org", "squad"]),
+];
+
+#[test]
+fn a_walk_reselecting_the_keys_it_reached_answers_the_walk_alone() {
+    let deployment = deployment();
+    let direct = postgres(&groups(&walking(CHILD_JOIN), ""));
+    let expected = render(&groups_with(&direct, &deployment, "read").expect("answered"));
+    for last in [
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached)",
+        "SELECT groups.id AS id FROM public.groups WHERE (groups.id IN (SELECT r.id FROM reached r))",
+        "SELECT id FROM public.groups WHERE id IN (SELECT reached.id FROM reached)",
+    ] {
+        let database = postgres(&groups(&reselecting(last), ""));
+        let set = groups_with(&database, &deployment, "read").expect("answered");
+        assert_eq!(render(&set), expected, "{last}");
+        assert!(set.selection().is_none(), "{last}");
+        assert_eq!(covered(&set), Some("groups"), "{last}");
+    }
+}
+
+#[test]
+fn a_walk_reselecting_under_conditions_answers_the_rows_they_keep() {
+    let database = postgres(&kinded(&reselecting(KIND_RESELECTION), ""));
+    let deployment = deployment();
+    let set = groups_with(&database, &deployment, "write").expect("answered");
+    assert_eq!(
+        render(&set),
+        "group_grants.group_id WHERE principal_id = app.user_id AND role IN ('write') \
+         UNION groups.id WHERE parent_id IN itself \
+         INTERSECT (groups.id WHERE kind IN ('folder', 'project'))"
+    );
+    let set = groups_with(&database, &deployment, "read").expect("answered");
+    assert!(set.selection().is_none(), "the condition holds for every row read");
+    for &(caller, role, expected) in KIND_RESELECTION_MEASURED {
+        let set = groups_with(&database, &deployment, role).expect("answered");
+        let returned: Vec<_> =
+            evaluate(&set, Request::of(caller), KINDED_TREE).into_iter().collect();
+        assert_eq!(returned, expected, "{caller} calling groups_with('{role}')");
+    }
+
+    let nothing = reselecting(
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached) AND min_role = 'admin'",
+    );
+    let database = postgres(&kinded(&nothing, ""));
+    let set = groups_with(&database, &deployment, "read").expect("answered");
+    assert!(set.arms().is_empty(), "the final query keeps no row");
+    assert!(set.selection().is_none());
+    assert_eq!(covered(&set), Some("groups"));
+
+    let keyed = reselecting(
+        "SELECT g.id FROM public.groups g \
+         WHERE g.id IN (SELECT id FROM reached) AND g.id IN ('org', 'squad')",
+    );
+    let database = postgres(&kinded(&keyed, ""));
+    let set = groups_with(&database, &deployment, "read").expect("answered");
+    let returned: Vec<_> = evaluate(&set, Request::of("bob"), KINDED_TREE).into_iter().collect();
+    assert_eq!(returned, ["org", "squad"], "the key is a condition beside the walk");
+}
+
+#[test]
+fn a_reselection_needs_the_owner_to_read_the_columns_its_conditions_name() {
+    let deployment = deployment();
+    let columns = |granted: &str| {
+        kinded(
+            &reselecting(KIND_RESELECTION),
+            &format!("GRANT SELECT ({granted}) ON groups TO authz_owner;"),
+        )
+        .replace("GRANT SELECT ON groups, group_grants", "GRANT SELECT ON group_grants")
+    };
+    let database = postgres(&columns("id, parent_id, kind"));
+    groups_with(&database, &deployment, "write").expect("answered");
+    let database = postgres(&columns("id, parent_id"));
+    assert!(matches!(
+        groups_with(&database, &deployment, "write"),
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "groups"
+    ));
+}
+
+#[test]
+fn a_reselection_of_another_table_or_shape_refuses_the_answer() {
+    let deployment = deployment();
+    let with_orgs = |body: &str| {
+        kinded(
+            body,
+            "CREATE TABLE orgs (id TEXT PRIMARY KEY);
+             GRANT SELECT ON orgs TO authz_owner;",
+        )
+    };
+    let database = postgres(&with_orgs(&reselecting(
+        "SELECT o.id FROM public.orgs o WHERE o.id IN (SELECT id FROM reached)",
+    )));
+    assert!(matches!(
+        groups_with(&database, &deployment, "read"),
+        Err(HelperSetError::UncoveredReselection { function, table })
+            if function == "authz.groups_with" && table == "orgs"
+    ));
+
+    for last in [
+        "SELECT g.parent_id FROM public.groups g WHERE g.id IN (SELECT id FROM reached)",
+        "SELECT g.id FROM public.groups g WHERE g.parent_id IN (SELECT id FROM reached)",
+        "SELECT g.id FROM public.groups g WHERE g.id NOT IN (SELECT id FROM reached)",
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached WHERE id <> 'x')",
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached) OR g.kind = 'team'",
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached) \
+         AND g.id IN (SELECT id FROM reached)",
+        "SELECT g.id FROM public.groups g",
+        "SELECT g.id FROM public.groups g JOIN public.orgs o ON o.id = g.id \
+         WHERE g.id IN (SELECT id FROM reached)",
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached) ORDER BY g.id",
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached) GROUP BY g.id",
+        "SELECT * FROM public.groups g WHERE g.id IN (SELECT id FROM reached)",
+    ] {
+        let database = postgres(&with_orgs(&reselecting(last)));
+        assert!(
+            matches!(
+                groups_with(&database, &deployment, "read"),
+                Err(HelperSetError::ArmShape { function, .. }) if function == "authz.groups_with"
+            ),
+            "{last}"
+        );
+    }
+
+    let database = postgres(&with_orgs(&reselecting(
+        "SELECT g.id FROM public.groups g WHERE g.id IN (SELECT id FROM reached) AND g.label LIKE 'x%'",
+    )));
+    assert!(matches!(
+        groups_with(&database, &deployment, "read"),
+        Err(HelperSetError::Irreducible { .. })
+    ));
+}
+
 #[test]
 fn a_walk_of_any_other_shape_refuses_the_answer() {
     let deployment = deployment();
@@ -2519,6 +2755,7 @@ fn a_walk_of_any_other_shape_refuses_the_answer() {
         walking(CHILD_JOIN)
             .replace("SELECT id FROM reached", "SELECT id FROM reached WHERE id <> 'x'"),
         walking(CHILD_JOIN).replace("SELECT id FROM reached", "SELECT 'x' FROM reached"),
+        walking(CHILD_JOIN).replace("SELECT id FROM reached", "SELECT * FROM reached"),
         walking(CHILD_JOIN).replace(
             ") SELECT id FROM reached",
             "), other (id) AS (SELECT 1) SELECT id FROM reached",
