@@ -9,7 +9,6 @@
 use sql_traits::{
     errors::{LookupError, ObjectKind},
     prelude::*,
-    utils::maintenance_trigger_parser::{MaintenanceBodyError, parse_maintenance_body},
 };
 use sqlparser::{
     ast::{CreateTable, Statement},
@@ -185,43 +184,28 @@ fn a_foreign_key_cycle_is_reported_rather_than_aborting() {
 
 /// A maintenance trigger body resolves its assigned columns against the host
 /// table, so an absent host table means the question cannot be decided. It must
-/// not collapse into "this is not a maintenance body".
+/// not collapse into "this is not a maintenance trigger".
 #[test]
-fn a_maintenance_body_over_an_absent_table_reports_the_lookup() {
-    let (stale, database) = parse_with_create_table(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, edited_at TIMESTAMP);
-         RENAME TABLE t TO t2;",
-    );
-    let body = "BEGIN NEW.edited_at = CURRENT_TIMESTAMP; RETURN NEW; END;";
+fn a_maintenance_trigger_over_an_absent_table_reports_the_lookup() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION stamp() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN NEW.edited_at = CURRENT_TIMESTAMP; RETURN NEW; END; $$;",
+    )
+    .expect("schema builds");
+    let statements = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "CREATE TRIGGER tg BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION stamp();",
+    )
+    .expect("SQL parses");
+    let trigger = match statements.as_slice() {
+        [Statement::CreateTrigger(trigger)] => Some(trigger),
+        _ => None,
+    }
+    .expect("the SQL is one CREATE TRIGGER");
+    let absent = Some(LookupError::TableNotFound { object_name: "t".to_string() });
 
-    assert_eq!(
-        parse_maintenance_body(body, &stale, &database),
-        Err(MaintenanceBodyError::Lookup(ObjectKind::Table.not_in_database("t")))
-    );
-}
-
-#[test]
-fn a_body_that_is_not_a_maintenance_body_stays_distinguishable() {
-    let (_, database) =
-        parse_with_create_table("CREATE TABLE t (id INTEGER PRIMARY KEY, edited_at TIMESTAMP);");
-    let table = database
-        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
-        .expect("unambiguous lookup")
-        .expect("t exists");
-
-    assert_eq!(
-        parse_maintenance_body("BEGIN RAISE NOTICE 'hello'; END;", table, &database),
-        Err(MaintenanceBodyError::NotMaintenanceBody)
-    );
-    assert_eq!(
-        parse_maintenance_body(
-            "BEGIN NEW.edited_at = CURRENT_TIMESTAMP; RETURN NEW; END;",
-            table,
-            &database,
-        )
-        .map(|assignments| assignments.len()),
-        Ok(1)
-    );
+    assert_eq!(trigger.is_maintenance_trigger(&database).err(), absent);
+    assert_eq!(trigger.maintenance_assignments(&database).err(), absent);
 }
 
 /// These four answer from the tables `database` holds rather than from the

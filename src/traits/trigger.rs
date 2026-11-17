@@ -5,9 +5,9 @@ use core::fmt::Debug;
 
 use crate::{
     errors::LookupError,
+    impls::maintenance_assignments,
     structs::{TargetName, TriggerEnablement},
     traits::{DatabaseLike, FunctionLike, Metadata},
-    utils::maintenance_trigger_parser::{MaintenanceBodyError, parse_maintenance_body},
 };
 
 /// A trait for types that can be treated as SQL triggers.
@@ -605,9 +605,9 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
 
     /// Returns whether the trigger is a maintenance trigger.
     ///
-    /// A maintenance trigger is defined as a trigger that solely consists of
-    /// updating values in `NEW.{column_name} = ...` and concludes by
-    /// returning `NEW`.
+    /// A maintenance trigger's PL/pgSQL body solely assigns columns of `NEW`,
+    /// alone or under `IF`, `ELSIF` and `ELSE`, and concludes by returning
+    /// `NEW`. Any other statement, an early `RETURN` included, makes it none.
     ///
     /// # Example
     ///
@@ -635,15 +635,14 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// let trigger = db.triggers().next().unwrap();
     /// assert!(trigger.is_maintenance_trigger(&db)?);
     ///
-    /// // Example of a non-maintenance trigger (extra logic)
+    /// // A body with any other statement is no maintenance trigger
     /// let db2 = ParserDB::parse::<GenericDialect>(
     ///     "
     /// CREATE TABLE brands (id INT);
     /// CREATE OR REPLACE FUNCTION complex_trigger() RETURNS TRIGGER AS $$
     /// BEGIN
-    ///     IF NEW.id > 10 THEN
-    ///         NEW.id = 10;
-    ///     END IF;
+    ///     RAISE NOTICE 'updating %', NEW.id;
+    ///     NEW.id = 10;
     ///     RETURN NEW;
     /// END;
     /// $$ LANGUAGE plpgsql;
@@ -673,20 +672,24 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         let Some(function) = self.function(database) else {
             return Ok(false);
         };
-        let Some(body) = function.body() else {
+        if function.body().is_none() {
             return Ok(false);
-        };
-        let table = self.table(database)?;
-
-        match parse_maintenance_body(body, table, database) {
-            Ok(_) => Ok(true),
-            Err(MaintenanceBodyError::NotMaintenanceBody) => Ok(false),
-            Err(MaintenanceBodyError::Lookup(error)) => Err(error),
         }
+        let table = self.table(database)?;
+        Ok(maintenance_assignments(function, table, database)?.is_some())
     }
 
-    /// Returns the assignments in a maintenance trigger.
-    /// Returns iterator of (column, expression_ast).
+    /// Returns the assignments in a maintenance trigger, as
+    /// [`TriggerLike::is_maintenance_trigger`] describes one, each assigned
+    /// column with the expression it holds when the body returns `NEW`, in
+    /// the order the body first assigns them.
+    ///
+    /// An `IF` folds into a `CASE` over its conditions in order, whose arms
+    /// are the values each branch assigns and whose `ELSE` is the column's
+    /// value before the `IF`. A column read through `NEW` after the body
+    /// assigned it reads the assigned expression, so every expression reads
+    /// `NEW` as the row was before the trigger ran. The body of a trigger
+    /// that is no maintenance trigger yields nothing.
     ///
     /// # Example
     ///
@@ -724,6 +727,29 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// assert_eq!(assignments[0].1.to_string(), "CURRENT_TIMESTAMP");
     /// assert_eq!(assignments[1].0, name_column);
     /// assert_eq!(assignments[1].1.to_string(), "lower(NEW.name)");
+    ///
+    /// // Columns assigned under `IF` fold into a `CASE`
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "
+    /// CREATE TABLE brands (id INT);
+    /// CREATE OR REPLACE FUNCTION clamp_id() RETURNS TRIGGER AS $$
+    /// BEGIN
+    ///     IF NEW.id > 10 THEN
+    ///         NEW.id = 10;
+    ///     END IF;
+    ///     RETURN NEW;
+    /// END;
+    /// $$ LANGUAGE plpgsql;
+    /// CREATE TRIGGER clamp
+    /// BEFORE UPDATE ON brands
+    /// FOR EACH ROW EXECUTE FUNCTION clamp_id();
+    /// ",
+    /// )?;
+    /// let trigger = db.triggers().next().unwrap();
+    /// let assignments: Vec<_> = trigger.maintenance_assignments(&db)?.collect();
+    /// assert_eq!(assignments.len(), 1);
+    /// assert_eq!(assignments[0].0.column_name(), "id");
+    /// assert_eq!(assignments[0].1.to_string(), "CASE WHEN NEW.id > 10 THEN 10 ELSE NEW.id END");
     /// # Ok(())
     /// # }
     /// ```
@@ -745,16 +771,11 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         let Some(function) = self.function(database) else {
             return Ok(Vec::new().into_iter());
         };
-        let Some(body) = function.body() else {
+        if function.body().is_none() {
             return Ok(Vec::new().into_iter());
-        };
-        let table = self.table(database)?;
-
-        match parse_maintenance_body(body, table, database) {
-            Ok(assignments) => Ok(assignments.into_iter()),
-            Err(MaintenanceBodyError::NotMaintenanceBody) => Ok(Vec::new().into_iter()),
-            Err(MaintenanceBodyError::Lookup(error)) => Err(error),
         }
+        let table = self.table(database)?;
+        Ok(maintenance_assignments(function, table, database)?.unwrap_or_default().into_iter())
     }
 }
 
