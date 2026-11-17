@@ -156,6 +156,12 @@ fn dropping_a_trigger_drops_its_copies() {
              EXECUTE FUNCTION f();
          DROP TRIGGER rowtrg;");
     assert_eq!(unnamed_table.triggers().count(), 0);
+
+    let path_moved = db("CREATE SCHEMA s;
+         CREATE TRIGGER rowtrg AFTER INSERT ON p FOR EACH ROW EXECUTE FUNCTION f();
+         SET search_path = s;
+         DROP TRIGGER rowtrg ON public.p;");
+    assert_eq!(path_moved.triggers().count(), 0);
 }
 
 #[test]
@@ -178,6 +184,16 @@ fn a_partition_holding_the_name_refuses_the_copy() {
         ),
         Err(Error::TriggerAlreadyExists { trigger_name, table_name })
             if trigger_name == "n" && table_name == "q1"
+    ));
+    assert!(matches!(
+        parse(
+            "CREATE TRIGGER n AFTER INSERT ON p FOR EACH ROW EXECUTE FUNCTION f();
+             CREATE TABLE p2 (id INT, v INT);
+             CREATE TRIGGER n AFTER INSERT ON p2 FOR EACH ROW EXECUTE FUNCTION f();
+             ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (10) TO (20);"
+        ),
+        Err(Error::TriggerAlreadyExists { trigger_name, table_name })
+            if trigger_name == "n" && table_name == "p2"
     ));
 }
 
@@ -210,8 +226,11 @@ fn replacing_with_a_statement_trigger_leaves_the_copies() {
     ));
     let dropped = db("CREATE TRIGGER n AFTER INSERT ON p FOR EACH ROW EXECUTE FUNCTION f();
          CREATE OR REPLACE TRIGGER n AFTER INSERT ON p FOR EACH STATEMENT EXECUTE FUNCTION f();
+         CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20);
+         CREATE TRIGGER n AFTER INSERT ON p2 FOR EACH ROW EXECUTE FUNCTION f();
          DROP TRIGGER n ON p;");
     assert_eq!(triggers_on(&dropped, "p1a"), owned(&[]));
+    assert_eq!(triggers_on(&dropped, "p2"), owned(&[("n", None)]));
 }
 
 #[test]

@@ -898,6 +898,9 @@ mod tests {
             Some("OLD.id IS DISTINCT FROM NEW.id")
         );
 
+        assert_eq!(trigger_ref.enablement(&db), Ok(crate::structs::TriggerEnablement::Origin));
+        assert_eq!(trigger_ref.parent_trigger(&db), Ok(None));
+
         let function = trigger_ref.function(&db).expect("Function should exist");
         assert_eq!(function.name(), "update_timestamp");
 

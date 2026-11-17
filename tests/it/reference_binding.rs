@@ -65,6 +65,8 @@ fn every_reference_keeps_its_table_across_a_path_change() {
          SET search_path TO app;
          CREATE TABLE t (id INT PRIMARY KEY);
          CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION public.touch();
+         CREATE CONSTRAINT TRIGGER ctrg AFTER INSERT ON t FROM t
+             FOR EACH ROW EXECUTE FUNCTION public.touch();
          CREATE POLICY pol ON t USING (true);
          GRANT SELECT ON t TO reader;
          CREATE INDEX i ON t (id);
@@ -75,6 +77,12 @@ fn every_reference_keeps_its_table_across_a_path_change() {
 
     let trigger = db.triggers().next().expect("the trigger exists");
     assert_eq!(trigger.table(&db).expect("resolves").table_schema(), Some("app"));
+    let constraint_trigger =
+        db.triggers().find(|trigger| trigger.name() == "ctrg").expect("ctrg exists");
+    assert_eq!(
+        constraint_trigger.referenced_table_name.as_ref().map(ToString::to_string).as_deref(),
+        Some("app.t")
+    );
 
     let policy = db.policies().next().expect("the policy exists");
     assert_eq!(policy.table(&db).expect("resolves").table_schema(), Some("app"));
