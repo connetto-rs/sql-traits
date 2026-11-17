@@ -10,7 +10,7 @@ use crate::{
     errors::LookupError,
     impls::{BodyNames, SiteSource, dql::scoped_roots::ScopedRoot, value_flow},
     structs::{
-        ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope,
+        ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope, PlPgSqlVariable,
         plpgsql_flow::{FlowSource, ValueFlow, VariableRead, read_variables},
     },
     traits::DatabaseLike,
@@ -85,8 +85,9 @@ impl<DB: DatabaseLike> Clone for SiteScope<'_, '_, DB> {
 }
 
 /// The value flow of one PL/pgSQL body, which the sites of one
-/// [`DynamicExecutionSites::sites`] call share and the first
-/// [`DynamicExecution::reads`] or record field typed computes.
+/// [`DynamicExecutionSites::sites`] or
+/// [`PlPgSqlSites::sites`](crate::structs::PlPgSqlSites::sites) call share
+/// and the first read or record field typed computes.
 #[derive(Debug)]
 pub(crate) struct SiteFlow<'b, 'db, DB: DatabaseLike> {
     names: &'b BodyNames<'db, DB>,
@@ -112,6 +113,22 @@ impl<'b, 'db, DB: DatabaseLike> SiteFlow<'b, 'db, DB> {
             })
             .as_ref()
             .map_err(Clone::clone)
+    }
+
+    /// Each of `variables`, which the SQL of a site standing under `scope`
+    /// reads, with the definitions that may reach the site.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors computing the value flow of the body.
+    pub(crate) fn reads(
+        &self,
+        scope: &PlPgSqlScope<'b, 'db, DB>,
+        variables: Vec<PlPgSqlVariable<'db>>,
+    ) -> Result<Vec<VariableRead<'_, 'db, DB>>, LookupError> {
+        let Some(point) = scope.point() else { return Ok(Vec::new()) };
+        let state = point.reaching()?.state;
+        Ok(self.get()?.reaching(variables, state))
     }
 }
 
@@ -297,9 +314,6 @@ impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
         case: IdentifierCase,
     ) -> Result<Vec<VariableRead<'_, 'db, DB>>, LookupError> {
         let SiteScope::PlPgSql { scope, flow } = &self.scope else { return Ok(Vec::new()) };
-        let Some(point) = scope.point() else { return Ok(Vec::new()) };
-        let state = point.reaching()?.state;
-        let flow = flow.get()?;
         let mut variables = Vec::new();
         read_variables(&self.context(case)?, scope, self.command(), &mut variables)?;
         let plpgsql = ExpressionScope::PlPgSql(scope);
@@ -308,6 +322,6 @@ impl<'b, 'db, DB: DatabaseLike> DynamicExecution<'b, 'db, DB> {
                 ExpressionContext::for_expression(argument, &plpgsql, self.database, case)?;
             read_variables(&context, scope, argument, &mut variables)?;
         }
-        Ok(flow.reaching(variables, state))
+        flow.reads(scope, variables)
     }
 }

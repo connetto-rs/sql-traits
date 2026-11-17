@@ -391,15 +391,17 @@ fn plpgsql_sql_sites<'b, 'db, DB: DatabaseLike>(
     for (sql, scope) in scoped_sites(names, block, hex_strings_may_be_integers, flow)? {
         match sql {
             Sql::Statement(statement) => {
-                found.push(PlPgSqlSite::new(EmbeddedSql::Statement(statement), scope, database));
+                let sql = EmbeddedSql::Statement(statement);
+                found.push(PlPgSqlSite::new(sql, scope, Arc::clone(flow), database));
             }
             Sql::Expression(query) => {
-                found.push(PlPgSqlSite::new(EmbeddedSql::Expression(query), scope, database));
+                let sql = EmbeddedSql::Expression(query);
+                found.push(PlPgSqlSite::new(sql, scope, Arc::clone(flow), database));
             }
             Sql::Dynamic(dynamic) => {
                 for query in iter::once(&*dynamic.command).chain(&dynamic.arguments) {
                     let sql = EmbeddedSql::Expression(query);
-                    found.push(PlPgSqlSite::new(sql, scope.clone(), database));
+                    found.push(PlPgSqlSite::new(sql, scope.clone(), Arc::clone(flow), database));
                 }
             }
         }

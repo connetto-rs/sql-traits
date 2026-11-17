@@ -1,7 +1,7 @@
-//! Every statement and expression a PL/pgSQL body runs, and the variable a
+//! Every statement and expression a PL/pgSQL body runs, the variable a
 //! column reference's written name reaches beside the column it binds, which
 //! PostgreSQL 18 refuses as ambiguous under `plpgsql.variable_conflict =
-//! error`.
+//! error`, and the definitions reaching each variable a site reads.
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -325,4 +325,78 @@ fn wildcards_and_conflict_targets_reach_through_the_scope() {
     };
     let output = sites[0].plpgsql_scope().variable(&columns[..1]).expect("id is the output column");
     assert_eq!(output.kind(), &VariableKind::Parameter { position: 1, mode: ArgMode::Out });
+}
+
+/// Each read of `name`'s sites, in body order, as the variable read and
+/// what reaches it, a value as written and any other source by kind.
+fn reads(database: &ParserDB, name: &str) -> Vec<Vec<String>> {
+    let body = function(database, name).plpgsql_sites(database).unwrap();
+    let sites = body.sites().unwrap();
+    sites
+        .iter()
+        .map(|site| {
+            site.reads(IdentifierCase::Folded)
+                .unwrap()
+                .iter()
+                .map(|read| {
+                    let reaching = match read.reaching() {
+                        Reaching::Definitions(definitions) => {
+                            definitions
+                                .iter()
+                                .map(|definition| {
+                                    match definition.source() {
+                                        DefinitionSource::Value(value) => value.to_string(),
+                                        DefinitionSource::Incoming => "incoming".to_owned(),
+                                        DefinitionSource::QueryOutput { .. } => "query".to_owned(),
+                                        other => format!("{other:?}"),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        }
+                        Reaching::Unreachable => "unreachable".to_owned(),
+                    };
+                    format!("{}: {reaching}", read.variable().name())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Every site reads the variables its own SQL names, with the definitions
+/// each path to it may leave: a column binds ahead of a variable, an `INTO`
+/// target is written and not read, an `EXECUTE`'s command and `USING`
+/// argument each read their own, and a site after `RETURN` is reached by no
+/// path.
+#[test]
+fn each_site_reads_its_variables_with_the_definitions_reaching_it() {
+    let database = postgres(
+        "CREATE TABLE notes (id integer PRIMARY KEY, label text);
+         CREATE FUNCTION relabel(p integer, q text) RETURNS text LANGUAGE plpgsql AS $$
+         DECLARE
+           target integer := 0;
+           found text;
+         BEGIN
+           IF p > 0 THEN
+             target := p;
+           END IF;
+           SELECT label INTO found FROM notes WHERE id = target;
+           EXECUTE 'SELECT ' || found USING q;
+           RETURN found;
+           RETURN q;
+         END $$;",
+    );
+    assert_eq!(
+        reads(&database, "relabel"),
+        [
+            vec![],
+            vec!["p: incoming".to_owned()],
+            vec!["p: incoming".to_owned()],
+            vec!["target: 0 | p".to_owned()],
+            vec!["found: query".to_owned()],
+            vec!["q: incoming".to_owned()],
+            vec!["found: query".to_owned()],
+            vec!["q: unreachable".to_owned()],
+        ]
+    );
 }
