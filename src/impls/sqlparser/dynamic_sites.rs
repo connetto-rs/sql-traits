@@ -18,9 +18,10 @@ use sqlparser_plpgsql::{
 };
 
 use super::{
+    callee_path::calls_path_changer,
     data_statement::{
-        BodyPath, BodyWalk, RunTimeBody, calls_user_code, resolve_on_body_path, unresolvable,
-        walk_body, walk_statement,
+        BodyPath, BodyWalk, RunTimeBody, resolve_on_body_path, unresolvable, walk_body,
+        walk_statement,
     },
     dql::{
         call_nodes::{CallNode, call_nodes},
@@ -747,8 +748,8 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for PathCollector<'_, DB> {
         Ok(())
     }
 
-    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool {
-        calls_user_code(&sql, self.database)
+    fn calls_path_changer(&self, sql: EmbeddedSql<'_>) -> bool {
+        calls_path_changer(&sql, self.database)
     }
 
     /// Code outside the body may change the path, which later names then
@@ -767,7 +768,7 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for PathCollector<'_, DB> {
         }
         let calling = core::iter::once(&*dynamic.command)
             .chain(&dynamic.arguments)
-            .find(|query| self.runs_user_code(EmbeddedSql::Expression(query)));
+            .find(|query| self.calls_path_changer(EmbeddedSql::Expression(query)));
         if let Some(query) = calling {
             self.forget(query);
         }

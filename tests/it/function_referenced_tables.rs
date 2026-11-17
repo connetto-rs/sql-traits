@@ -508,49 +508,112 @@ fn a_path_set_at_run_time_hides_later_unqualified_names() {
     ));
 }
 
-/// A function outside `pg_catalog` may set `search_path` for its caller, its
-/// own `SET search_path` clause included, since PostgreSQL 18 keeps a plain
-/// `SET` past the function's end. A `pg_catalog` function keeps the path.
+/// Functions a call may reach, some leaving the caller's path changed.
+const CALLEES: &str = "
+        CREATE SCHEMA authz;
+        CREATE TABLE docs (id INT);
+        CREATE FUNCTION helper() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+        CREATE FUNCTION authz.organization_exists(target INT) RETURNS BOOLEAN
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+        BEGIN
+          PERFORM d.id FROM public.docs d WHERE d.id = target;
+          RETURN FOUND;
+        END $$;
+        CREATE FUNCTION pinned_local() RETURNS INT LANGUAGE plpgsql SET search_path = public AS $$
+        BEGIN
+          SET LOCAL search_path = authz;
+          PERFORM set_config('search_path', 'authz', true);
+          RETURN 1;
+        END $$;
+        CREATE FUNCTION through_helper() RETURNS INT LANGUAGE sql AS 'SELECT helper()';
+        CREATE FUNCTION recursive(n INT) RETURNS INT LANGUAGE sql
+        AS 'SELECT CASE WHEN n > 0 THEN recursive(n - 1) ELSE 0 END';
+        CREATE FUNCTION pinned_plain() RETURNS INT LANGUAGE plpgsql SET search_path = public AS $$
+        BEGIN SET search_path = authz; RETURN 1; END $$;
+        CREATE FUNCTION pinned_reset() RETURNS INT LANGUAGE plpgsql SET search_path = public AS $$
+        BEGIN RESET search_path; RETURN 1; END $$;
+        CREATE FUNCTION pinned_set_config() RETURNS INT LANGUAGE sql SET search_path = public
+        AS $$ SELECT length(set_config('search_path', 'authz', false)) $$;
+        CREATE FUNCTION unpinned_local() RETURNS INT LANGUAGE plpgsql AS $$
+        BEGIN SET LOCAL search_path = authz; RETURN 1; END $$;
+        CREATE FUNCTION unpinned_set_config() RETURNS INT LANGUAGE sql
+        AS $$ SELECT length(set_config('search_path', 'authz', true)) $$;
+        CREATE FUNCTION through_changer() RETURNS INT LANGUAGE sql AS 'SELECT pinned_plain()';
+        CREATE FUNCTION builds() RETURNS INT LANGUAGE plpgsql SET search_path = public AS $$
+        BEGIN EXECUTE 'SET search_path = ' || 'authz'; RETURN 1; END $$;
+        CREATE FUNCTION external() RETURNS INT LANGUAGE c AS 'library', 'symbol';
+";
+
+/// A call leaves the caller's path changed only when a function it may reach
+/// sets the path past its own exit. PostgreSQL keeps a plain `SET`, a `RESET`
+/// and `set_config(..., false)` after the function ends, its own
+/// `SET search_path` clause included, and a `SET LOCAL` or
+/// `set_config(..., true)` too where the function has no such clause. A
+/// function whose body is not in the schema, or builds SQL at run time, may
+/// set anything. A `pg_catalog` function keeps the path.
 #[test]
-fn a_call_to_a_user_function_hides_later_unqualified_names() {
-    let database = postgres(
-        "CREATE TABLE docs (id INT);
-         CREATE FUNCTION helper() RETURNS INT LANGUAGE sql AS 'SELECT 1';
-         CREATE FUNCTION pinned() RETURNS INT LANGUAGE sql SET search_path = public AS 'SELECT 1';
-         CREATE FUNCTION after_helper() RETURNS INT LANGUAGE sql AS $$
-             SELECT helper(); SELECT count(*)::int FROM docs
-         $$;
-         CREATE FUNCTION after_pinned() RETURNS INT LANGUAGE plpgsql AS $$
-             BEGIN PERFORM pinned(); RETURN (SELECT count(*) FROM docs); END
-         $$;
+fn a_call_hides_later_unqualified_names_when_its_callee_may_set_the_path() {
+    let keepers = [
+        "helper()",
+        "authz.organization_exists(1)",
+        "pinned_local()",
+        "through_helper()",
+        "recursive(2)",
+    ];
+    let changers = [
+        "pinned_plain()",
+        "pinned_reset()",
+        "pinned_set_config()",
+        "unpinned_local()",
+        "unpinned_set_config()",
+        "through_changer()",
+        "builds()",
+        "external()",
+    ];
+    let caller = |index: usize, call: &str| {
+        format!(
+            "CREATE FUNCTION after_{index}() RETURNS BIGINT LANGUAGE plpgsql AS $$
+             BEGIN PERFORM {call}; RETURN (SELECT count(*) FROM docs); END $$;"
+        )
+    };
+    let after_calls: String = keepers
+        .iter()
+        .chain(&changers)
+        .enumerate()
+        .map(|(index, call)| caller(index, call))
+        .collect();
+    let database = postgres(&format!(
+        "{CALLEES}{after_calls}
          CREATE FUNCTION qualified_after() RETURNS INT LANGUAGE sql AS $$
-             SELECT helper(); SELECT count(*)::int FROM public.docs
+             SELECT pinned_plain(); SELECT count(*)::int FROM public.docs
          $$;
-         CREATE FUNCTION before_helper() RETURNS INT LANGUAGE sql AS $$
-             SELECT count(*)::int FROM docs; SELECT helper()
+         CREATE FUNCTION before_changer() RETURNS INT LANGUAGE sql AS $$
+             SELECT count(*)::int FROM docs; SELECT pinned_plain()
          $$;
          CREATE FUNCTION catalog_only() RETURNS INT LANGUAGE sql AS $$
              SELECT length(lower('A')); SELECT count(*)::int FROM docs
          $$;
-         CREATE FUNCTION helper_in_loop() RETURNS INT LANGUAGE plpgsql AS $$
+         CREATE FUNCTION changer_in_loop() RETURNS INT LANGUAGE plpgsql AS $$
              BEGIN
               FOR i IN 1..2 LOOP
                RETURN (SELECT count(*) FROM docs);
-               PERFORM helper();
+               PERFORM pinned_plain();
               END LOOP;
              END
          $$;
          CREATE FUNCTION after_assigned() RETURNS INT LANGUAGE plpgsql AS $$
              DECLARE x INT;
-             BEGIN x := helper(); RETURN (SELECT count(*) FROM docs); END
-         $$;",
-    );
-    for (function, statement) in [
-        ("after_helper", "SELECT helper()"),
-        ("after_pinned", "SELECT pinned()"),
-        ("helper_in_loop", "SELECT helper()"),
-        ("after_assigned", "SELECT helper()"),
-    ] {
+             BEGIN x := pinned_plain(); RETURN (SELECT count(*) FROM docs); END
+         $$;"
+    ));
+    for (index, call) in keepers.iter().enumerate() {
+        assert_eq!(
+            read_by(&database, &format!("after_{index}")),
+            Ok(vec!["public.docs".into()]),
+            "{call}"
+        );
+    }
+    let hidden = |function: &str, statement: &str| {
         assert!(
             matches!(
                 read_by(&database, function),
@@ -560,10 +623,69 @@ fn a_call_to_a_user_function_hides_later_unqualified_names() {
             "{function}: {:?}",
             read_by(&database, function)
         );
+    };
+    for (index, call) in changers.iter().enumerate() {
+        hidden(&format!("after_{}", keepers.len() + index), &format!("SELECT {call}"));
     }
+    hidden("changer_in_loop", "SELECT pinned_plain()");
+    hidden("after_assigned", "SELECT pinned_plain()");
     assert_eq!(read_by(&database, "qualified_after").unwrap(), ["public.docs"]);
-    assert_eq!(read_by(&database, "before_helper").unwrap(), ["public.docs"]);
+    assert_eq!(read_by(&database, "before_changer").unwrap(), ["public.docs"]);
     assert_eq!(read_by(&database, "catalog_only").unwrap(), ["public.docs"]);
+}
+
+/// A trigger function locking its organization through a helper pinned to an
+/// empty path still reads the edges table and resolves the bare `count`
+/// after the call.
+#[test]
+fn a_trigger_reads_past_a_pinned_helper_that_keeps_the_path() {
+    let database = postgres(
+        "CREATE SCHEMA authz_write;
+         CREATE TABLE organizations (id UUID PRIMARY KEY);
+         CREATE TABLE teams (id UUID PRIMARY KEY, organization_id UUID NOT NULL REFERENCES organizations (id));
+         CREATE TABLE team_parents (id UUID PRIMARY KEY REFERENCES teams (id), organization_id UUID NOT NULL, parent_id UUID NOT NULL REFERENCES teams (id));
+         CREATE FUNCTION authz_write.organization_exists(target_organization UUID) RETURNS BOOLEAN
+         LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+         BEGIN
+           PERFORM organization.id FROM public.organizations organization WHERE organization.id = target_organization;
+           RETURN FOUND;
+         END
+         $$;
+         CREATE FUNCTION authz_write.check_team_parent() RETURNS TRIGGER
+         LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+         DECLARE
+           siblings INTEGER;
+         BEGIN
+           PERFORM authz_write.organization_exists(NEW.organization_id);
+           SELECT count(*) INTO siblings FROM public.team_parents edge WHERE edge.parent_id = NEW.parent_id;
+           IF siblings > 100 THEN
+             RAISE EXCEPTION 'too many children' USING ERRCODE = 'check_violation';
+           END IF;
+           RETURN NEW;
+         END
+         $$;",
+    );
+    let checker = database
+        .function_by_target(
+            TargetName::new("check_team_parent", false).with_schema("authz_write", false),
+            IdentifierCase::AsWritten,
+        )
+        .unwrap()
+        .unwrap();
+    let read: Vec<String> = checker
+        .referenced_tables(&database)
+        .unwrap()
+        .into_iter()
+        .map(|table| format!("{}.{}", table.table_schema().unwrap_or("public"), table.table_name()))
+        .collect();
+    assert_eq!(read, ["public.team_parents"]);
+    let called: Vec<&str> = checker
+        .referenced_functions(&database)
+        .unwrap()
+        .into_iter()
+        .map(FunctionLike::name)
+        .collect();
+    assert_eq!(called, ["organization_exists", "count"]);
 }
 
 fn named_by(database: &ParserDB, function: &str) -> Result<Vec<String>, LookupError> {

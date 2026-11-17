@@ -88,7 +88,7 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for NameCollector<'_, 's, DB> {
         Ok(())
     }
 
-    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool {
-        self.calls.runs_user_code(sql)
+    fn calls_path_changer(&self, sql: EmbeddedSql<'_>) -> bool {
+        self.calls.calls_path_changer(sql)
     }
 }

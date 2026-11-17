@@ -1067,8 +1067,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// language other than SQL or PL/pgSQL
     /// ([`LookupError::FunctionBodyNotSql`]), when the function's code lives
     /// outside the schema ([`LookupError::FunctionBodyUnavailable`]), or when
-    /// the body runs code outside it, through `CALL`, `EXECUTE` or a
-    /// `set_config` of `search_path` before an unqualified name
+    /// the body runs code outside it, through `CALL`, `EXECUTE` or `DO`, or
+    /// changes `search_path` at run time before an unqualified name, through
+    /// `set_config` or a call to a function whose body, or a function it
+    /// calls, may leave the path changed for its caller
     /// ([`LookupError::FunctionBodyUnresolvable`]). Returns
     /// [`LookupError::FunctionBodyUnparsable`] when the body text does not
     /// parse, under the database's dialect for SQL, or when the printed

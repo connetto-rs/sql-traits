@@ -3,6 +3,7 @@
 
 mod body_calls;
 mod body_names;
+mod callee_path;
 mod check_constraint;
 mod column_def;
 mod create_domain;
