@@ -5,11 +5,11 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Delete, Distinct, DoUpdate, Expr, FromTable, GroupByExpr, Ident, Insert, Merge, MergeAction,
-    MergeClause, MergeInsertExpr, MergeUpdateExpr, MergeUpdateKind, ObjectName, ObjectNamePart,
-    OnConflict, OnConflictAction, OnInsert, OrderByKind, OutputClause, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, TableWithJoins, Update,
-    UpdateTableFromKind, Visit, Visitor,
+    Delete, Distinct, DoUpdate, Expr, FromTable, GroupByExpr, Ident, Insert, LimitClause, Merge,
+    MergeAction, MergeClause, MergeInsertExpr, MergeUpdateExpr, MergeUpdateKind, ObjectName,
+    ObjectNamePart, OnConflict, OnConflictAction, OnInsert, OrderByKind, OutputClause, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor,
+    TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
 };
 
 use super::{
@@ -334,13 +334,41 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
             }
             self.node(&order_by.interpolate, body_cursor);
         }
-        self.node(limit_clause, None);
-        self.node(fetch, None);
+        // PostgreSQL resolves a row count against the names outside the
+        // query and refuses a column of the query's own `FROM` there.
+        let outer = self.outer_cursor(body);
+        match limit_clause {
+            Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
+                self.node(limit, outer);
+                self.node(offset, outer);
+                self.node(limit_by, None);
+            }
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                self.node(offset, outer);
+                self.node(limit, outer);
+            }
+            None => {}
+        }
+        self.node(fetch, outer);
         self.node(locks, None);
         self.node(for_clause, None);
         self.node(settings, None);
         self.node(format_clause, None);
         self.node(pipe_operators, None);
+    }
+
+    /// The scope a query with body `body` reads outer references from, the
+    /// parent of the scope of its first `SELECT`, `None` for a body with no
+    /// `SELECT` and for a query nothing encloses.
+    fn outer_cursor(&self, body: &SetExpr) -> Option<ScopeCursor> {
+        match body {
+            SetExpr::Select(select) => {
+                self.graph.select_scope(select).and_then(|scope| self.graph.scopes[scope.0].parent)
+            }
+            SetExpr::Query(query) => self.outer_cursor(&query.body),
+            SetExpr::SetOperation { left, .. } => self.outer_cursor(left),
+            _ => None,
+        }
     }
 
     fn set_expr(&mut self, body: &SetExpr) {
