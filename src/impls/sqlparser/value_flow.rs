@@ -23,7 +23,7 @@ use sqlparser_plpgsql::{
     embedded::{
         Assignment, Block, BoundCursor, Branch, Declaration, DeclarationKind, Diagnostics,
         DiagnosticsKind, Dynamic, Exit, ExitKind, Indirection, IntoTargets, Loop, LoopControl,
-        Node, Open, RaiseLevel, ReturnQuery, Target, expression,
+        Node, NodeKind, Open, RaiseLevel, ReturnQuery, Target, expression,
     },
     namespace::{Name, NameKind, Namespace, Site, Sql, TriggerVariable, Write, WriteSite},
 };
@@ -411,15 +411,15 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     fn node(&mut self, node: &'b Node, mut state: State) -> Result<Option<State>, LookupError> {
         self.raised(&state);
         let address = core::ptr::from_ref(node).addr();
-        match node {
-            Node::Statement { statement, into } => {
+        match &node.kind {
+            NodeKind::Statement { statement, into } => {
                 self.statement(address, statement, into.as_ref(), &mut state)?;
             }
-            Node::Perform { query } | Node::ReturnQuery(ReturnQuery::Query(query)) => {
+            NodeKind::Perform { query } | NodeKind::ReturnQuery(ReturnQuery::Query(query)) => {
                 self.evaluated(SiteKey::of(Sql::Statement(query)), &state);
             }
-            Node::Assignment(assignment) => self.assignment(address, assignment, &mut state)?,
-            Node::Dynamic { dynamic, into } => {
+            NodeKind::Assignment(assignment) => self.assignment(address, assignment, &mut state)?,
+            NodeKind::Dynamic { dynamic, into } => {
                 let key = SiteKey::of(Sql::Dynamic(dynamic));
                 self.evaluated(key, &state);
                 if let Some(into) = into {
@@ -439,10 +439,10 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                     self.write_all(&writes, &mut state);
                 }
             }
-            Node::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
+            NodeKind::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
                 self.evaluated(SiteKey::of(Sql::Dynamic(dynamic)), &state);
             }
-            Node::Fetch(fetch) => {
+            NodeKind::Fetch(fetch) => {
                 self.evaluated_queries(fetch.direction.expression(), &state);
                 let cursor = self.cursor(address, &fetch.cursor)?;
                 let source =
@@ -458,43 +458,47 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 )?;
                 self.write_all(&writes, &mut state);
             }
-            Node::Diagnostics(diagnostics) => {
+            NodeKind::Diagnostics(diagnostics) => {
                 self.diagnostics(address, diagnostics, &mut state)?;
             }
-            Node::Move { direction, .. } => self.evaluated_queries(direction.expression(), &state),
-            Node::Close { .. } => {}
+            NodeKind::Move { direction, .. } => {
+                self.evaluated_queries(direction.expression(), &state);
+            }
+            NodeKind::Close { .. } => {}
             // A function runs inside its caller's transaction, which it may
             // not end, so these raise `invalid_transaction_termination`.
-            Node::Commit { .. } | Node::Rollback { .. } => return Ok(None),
-            Node::Open(open) => self.open(address, open, &mut state)?,
-            Node::Block(block) => return self.block(block, state),
-            Node::If(choice) => return self.branches(&choice.branches, &choice.otherwise, state),
+            NodeKind::Commit { .. } | NodeKind::Rollback { .. } => return Ok(None),
+            NodeKind::Open(open) => self.open(address, open, &mut state)?,
+            NodeKind::Block(block) => return self.block(block, state),
+            NodeKind::If(choice) => {
+                return self.branches(&choice.branches, &choice.otherwise, state);
+            }
             // The parser does not tell a missing `ELSE` from an empty one, so
             // a value no branch matches also falls through, beside the
             // `case_not_found` the raise at the statement stands for.
-            Node::Case(choice) => {
+            NodeKind::Case(choice) => {
                 self.evaluated_queries(choice.subject.as_deref(), &state);
                 return self.branches(&choice.branches, &choice.otherwise, state);
             }
-            Node::Loop(repeated) => return self.repeated(address, repeated, &state),
-            Node::Exit(exit) => {
+            NodeKind::Loop(repeated) => return self.repeated(address, repeated, &state),
+            NodeKind::Exit(exit) => {
                 self.evaluated_queries(transfer_expressions(node), &state);
                 self.exit(exit, &state);
                 if exit.condition.is_none() {
                     return Ok(None);
                 }
             }
-            Node::Return { .. } => {
+            NodeKind::Return { .. } => {
                 self.evaluated_queries(transfer_expressions(node), &state);
                 return Ok(None);
             }
-            Node::Raise(raise) => {
+            NodeKind::Raise(raise) => {
                 self.evaluated_queries(transfer_expressions(node), &state);
                 if raise.level == RaiseLevel::Exception {
                     return Ok(None);
                 }
             }
-            Node::ReturnNext { .. } | Node::Assert(_) => {
+            NodeKind::ReturnNext { .. } | NodeKind::Assert(_) => {
                 self.evaluated_queries(transfer_expressions(node), &state);
             }
         }
