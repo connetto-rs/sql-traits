@@ -15,7 +15,7 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        Action, ArgMode, ConstraintReferenceMatchKind, Expr, Function, FunctionCalledOnNull,
+        Action, ArgMode, ConstraintReferenceMatchKind, Expr, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, ReferentialAction, TriggerEvent,
         TriggerObjectKind, TriggerPeriod,
     },
@@ -302,9 +302,9 @@ impl<P: EmptyKinds> ColumnLike for NoneKind<P> {
         self.unreach()
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        _call: &Function,
+        _call: impl Into<WrittenCall<'call>>,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
@@ -436,9 +436,9 @@ impl<P: EmptyKinds> IndexLike for NoneKind<P> {
         self.unreach()
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        _call: &Function,
+        _call: impl Into<WrittenCall<'call>>,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
@@ -698,9 +698,9 @@ impl<P: EmptyKinds> CheckConstraintLike for NoneKind<P> {
         self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        _call: &Function,
+        _call: impl Into<WrittenCall<'call>>,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {

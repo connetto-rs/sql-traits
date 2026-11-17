@@ -10,13 +10,12 @@ use core::{
 };
 
 use sqlparser::ast::{
-    CreatePolicyCommand, CreatePolicyType, CreateRuleAction, CreateRuleEvent, Expr, Function,
-    Owner, Query,
+    CreatePolicyCommand, CreatePolicyType, CreateRuleAction, CreateRuleEvent, Expr, Owner, Query,
 };
 
 use crate::{
     errors::LookupError,
-    structs::{PolicyExpression, SequenceParameters, TargetName},
+    structs::{PolicyExpression, SequenceParameters, TargetName, WrittenCall},
     traits::{
         CastContext, CastLike, CastMethod, DatabaseLike, DomainLike, Enumeration,
         EnumerationMember, ExtensionLike, Metadata, OperatorKind, OperatorLike, PolicyLike,
@@ -263,9 +262,9 @@ impl<DB: DatabaseLike> DomainLike for Absent<DB> {
         self.unreachable::<core::iter::Empty<_>>()
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        _: &Function,
+        _: impl Into<WrittenCall<'call>>,
         _: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db DB::Function> + 'db, LookupError> {
         self.unreachable::<Result<core::iter::Empty<_>, _>>()
@@ -420,9 +419,9 @@ impl<DB: DatabaseLike<Policy = Self>> PolicyLike for Absent<DB> {
         self.unreachable::<Result<core::iter::Empty<_>, _>>()
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        _: &Function,
+        _: impl Into<WrittenCall<'call>>,
         _: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db DB::Function>, LookupError> {
         self.unreachable::<Result<core::iter::Empty<_>, _>>()

@@ -3,11 +3,11 @@
 use alloc::{borrow::Cow, vec::Vec};
 use core::fmt::Debug;
 
-use sqlparser::ast::{Expr, Function, IndexType};
+use sqlparser::ast::{Expr, IndexType};
 
 use crate::{
     errors::LookupError,
-    structs::TargetName,
+    structs::{TargetName, WrittenCall},
     traits::{DatabaseLike, Metadata, TableLike},
     utils::columns_in_expression::columns_in_expression,
 };
@@ -402,8 +402,9 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// reach, resolved under the search path of the statement that created
     /// the index.
     ///
-    /// `call` is a node of [`Self::expression`] or of [`Self::predicate`] at
-    /// any depth, subqueries included. Resolution follows the rules of
+    /// `call` is a [`WrittenCall`] of [`Self::expression`] or of
+    /// [`Self::predicate`] at any depth, subqueries included. Resolution
+    /// follows the rules of
     /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by).
     /// An expression PostgreSQL's grammar writes like a call, such as
     /// `COALESCE` or `CURRENT_USER`, reaches no function.
@@ -437,9 +438,9 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
 

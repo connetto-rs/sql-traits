@@ -13,7 +13,7 @@ use crate::{
     errors::LookupError,
     structs::{
         ArgumentEvidence, CallResolution, IdentifierCase, OperandEvidence, OperandType,
-        OperatorResolution, SelectedFunction, TargetName, TypeCategory, TypeKind,
+        OperatorResolution, SelectedFunction, TargetName, TypeCategory, TypeKind, WrittenCall,
     },
     traits::{DatabaseLike, FunctionLike, OperatorLike},
     utils::{
@@ -941,14 +941,14 @@ fn input_signature<F: FunctionLike>(
 /// than two parts or a part built at run time.
 pub(crate) fn reached_functions<'db, D: DatabaseLike>(
     database: &'db D,
-    call: &Function,
+    call: WrittenCall<'_>,
     case: IdentifierCase,
 ) -> Result<Vec<(&'db D::Function, Matched)>, LookupError> {
-    let target = called_name(call)?;
-    if expression_form(&call.name).is_some() {
+    let target = called_object_name(call.name())?;
+    if expression_form(call.name()).is_some() {
         return Ok(Vec::new());
     }
-    let Some(written) = written_argument_names(call) else { return Ok(Vec::new()) };
+    let Some(written) = call.written_names() else { return Ok(Vec::new()) };
     Ok(reached_by_name(database, &target, &written, RoutinePath::Database, case))
 }
 
@@ -1141,7 +1141,7 @@ pub(crate) fn resolve_call<'a, D: DatabaseLike>(
     };
     check_argument_count(call, written.len(), argument_types.len())?;
     let actuals = actuals(database, argument_types);
-    let reached = reached_functions(database, call, case)?;
+    let reached = reached_functions(database, WrittenCall::from(call), case)?;
     if let ([None], [input]) = (written.as_slice(), actuals.as_slice()) {
         let input = input.as_ref().map(|actual| &actual.pg_type);
         let candidates = reached.iter().map(|(_, matched)| matched);

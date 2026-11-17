@@ -25,7 +25,7 @@ use sql_traits::{
 use sqlparser::{
     ast::{
         Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
-        CreateRuleAction, CreateRuleEvent, Expr, Function, FunctionBehavior, FunctionCalledOnNull,
+        CreateRuleAction, CreateRuleEvent, Expr, FunctionBehavior, FunctionCalledOnNull,
         FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, ReferentialAction,
         Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
@@ -795,13 +795,15 @@ impl ColumnLike for MemoryColumn {
         None
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
         // The column holds no expression, so no call is one of its nodes.
-        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression {
+            call: call.into().to_string(),
+        })
     }
 
     fn foreign_options(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, str>, &str)> {
@@ -947,13 +949,15 @@ impl IndexLike for MemoryIndex {
         false
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
         // The key names a column alone, so no call is one of its nodes.
-        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression {
+            call: call.into().to_string(),
+        })
     }
 }
 
@@ -993,9 +997,9 @@ impl IndexLike for MemoryUniqueIndex {
         true
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
         self.0.functions_reached_by(call, database)
@@ -1116,9 +1120,9 @@ impl CheckConstraintLike for MemoryCheckConstraint {
         Ok(core::iter::empty())
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        _call: &Function,
+        _call: impl Into<WrittenCall<'call>>,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
         Ok(core::iter::empty())
@@ -1372,13 +1376,15 @@ impl DomainLike for MemoryDomain {
         core::iter::empty()
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
         // The domain holds no expression, so no call is one of its nodes.
-        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression {
+            call: call.into().to_string(),
+        })
     }
 }
 
@@ -1554,13 +1560,15 @@ impl PolicyLike for MemoryPolicy {
         Ok(core::iter::empty())
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction>, LookupError> {
         // The policy holds no expression, so no call is one of its nodes.
-        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression { call: call.to_string() })
+        Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression {
+            call: call.into().to_string(),
+        })
     }
 }
 

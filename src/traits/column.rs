@@ -3,11 +3,11 @@
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
-use sqlparser::ast::{Expr, Function, Query};
+use sqlparser::ast::{Expr, Query};
 
 use crate::{
     errors::LookupError,
-    structs::TargetName,
+    structs::{TargetName, WrittenCall},
     traits::{
         CheckConstraintLike, DataTypeLike, DatabaseLike, ForeignKeyLike, IndexLike, Metadata,
         TableLike, check_constraint::non_tautological,
@@ -852,7 +852,7 @@ pub trait ColumnLike:
     /// expression may reach, resolved under the search path of the statement
     /// that wrote it.
     ///
-    /// `call` is a node of [`Self::default_expression`] or
+    /// `call` is a [`WrittenCall`] of [`Self::default_expression`] or
     /// [`Self::generation_expression`] at any depth, subqueries included.
     /// Resolution follows the rules of
     /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by).
@@ -888,9 +888,9 @@ pub trait ColumnLike:
     /// # Ok(())
     /// # }
     /// ```
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
 
@@ -1989,9 +1989,9 @@ where
     }
 
     #[inline]
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
@@ -2100,9 +2100,9 @@ where
     }
 
     #[inline]
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {

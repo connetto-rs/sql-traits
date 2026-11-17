@@ -3,11 +3,11 @@
 use alloc::vec::Vec;
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
-use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Function, Owner};
+use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Expr, Owner};
 
 use crate::{
     errors::LookupError,
-    structs::{PolicyAnalysis, PolicyExpression, TargetName},
+    structs::{PolicyAnalysis, PolicyExpression, TargetName, WrittenCall},
     traits::{DatabaseLike, Metadata, RoleLike, role::privilege_holders},
     utils::identifier_resolution::stored_identifier,
 };
@@ -740,8 +740,10 @@ pub trait PolicyLike:
     /// Returns the functions one call in the policy's expressions may reach,
     /// resolved under the search path of the statement that wrote the clause.
     ///
-    /// `call` is a node of [`Self::using_clause`], [`Self::check_clause`],
-    /// [`Self::written_using`] or [`Self::written_check`], at any depth,
+    /// `call` is a function expression or a `FROM` item written as a call,
+    /// as [`WrittenCall`] takes either, borrowed from
+    /// [`Self::using_clause`], [`Self::check_clause`],
+    /// [`Self::written_using`] or [`Self::written_check`] at any depth,
     /// subqueries included. An unqualified name reaches `pg_catalog` and every
     /// schema on the path, a qualified one only its own schema, and every
     /// overload accepting the call's argument count counts, since argument
@@ -780,9 +782,9 @@ pub trait PolicyLike:
     /// # Ok(())
     /// # }
     /// ```
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError>;
 }
@@ -894,9 +896,9 @@ where
         (*self).check_functions(database)
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError> {
         (*self).functions_reached_by(call, database)

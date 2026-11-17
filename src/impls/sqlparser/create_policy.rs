@@ -3,13 +3,13 @@
 use alloc::string::ToString;
 
 use sqlparser::ast::{
-    CreateFunction, CreatePolicy, CreatePolicyCommand, CreatePolicyType, Expr, Function, Owner,
+    CreateFunction, CreatePolicy, CreatePolicyCommand, CreatePolicyType, Expr, Owner,
 };
 
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
-        ParserDB, PolicyExpression, TargetName,
+        ParserDB, PolicyExpression, TargetName, WrittenCall,
         metadata::{ClauseLiterals, ExpressionCalls, PolicyMetadata},
     },
     traits::{DatabaseLike, Metadata, PolicyLike},
@@ -66,7 +66,7 @@ fn reached<'db>(
     stored: &Expr,
     literals: &ClauseLiterals,
     calls: &'db ExpressionCalls<CreateFunction>,
-    call: &Function,
+    call: WrittenCall<'_>,
 ) -> Option<impl Iterator<Item = &'db CreateFunction> + use<'db>> {
     calls.reached_by(stored, call).or_else(|| {
         match literals {
@@ -188,11 +188,12 @@ impl PolicyLike for CreatePolicy {
         Ok(policy_metadata(self, database)?.check_calls().functions())
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function>, LookupError> {
+        let call = call.into();
         let metadata = policy_metadata(self, database)?;
         self.using
             .as_ref()

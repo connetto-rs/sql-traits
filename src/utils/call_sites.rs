@@ -9,7 +9,7 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    structs::IdentifierCase,
+    structs::{IdentifierCase, WrittenCall},
     traits::FunctionLike,
     utils::{
         identifier_resolution::identifiers_match,
@@ -25,9 +25,8 @@ pub(crate) struct Call<'a> {
     pub(crate) name: &'a ObjectName,
     /// How many arguments the call passes.
     pub(crate) arguments: usize,
-    /// The node of a call written as a function expression. A table function
-    /// in a `FROM` clause or an `IN` target has none.
-    pub(crate) node: Option<&'a Function>,
+    /// The node the call is written as. A call in an `IN` target has none.
+    pub(crate) node: Option<WrittenCall<'a>>,
 }
 
 /// One node a walk meets that is written with the syntax of a call.
@@ -175,7 +174,7 @@ impl<B> Visitor for Sites<'_, B> {
                 (self.each)(Site::Call(Call {
                     name: &function.name,
                     arguments,
-                    node: Some(function),
+                    node: Some(WrittenCall::from(function)),
                 }))
             }
             Expr::In { target: InTarget::Table { name, args: Some(args) }, .. } => {
@@ -188,10 +187,18 @@ impl<B> Visitor for Sites<'_, B> {
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<B> {
         match factor {
             TableFactor::Table { name, args: Some(args), .. } => {
-                (self.each)(Site::Call(Call { name, arguments: args.args.len(), node: None }))
+                (self.each)(Site::Call(Call {
+                    name,
+                    arguments: args.args.len(),
+                    node: WrittenCall::relation(factor),
+                }))
             }
             TableFactor::Function { name, args, .. } => {
-                (self.each)(Site::Call(Call { name, arguments: args.len(), node: None }))
+                (self.each)(Site::Call(Call {
+                    name,
+                    arguments: args.len(),
+                    node: WrittenCall::relation(factor),
+                }))
             }
             _ => ControlFlow::Continue(()),
         }
