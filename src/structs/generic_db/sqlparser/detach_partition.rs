@@ -12,6 +12,7 @@ use sqlparser::ast::{AlterTableOperation, DetachPartitionMode, ForValues, Object
 use super::{
     AlterTableScope, ParserDB, ParserDBBuilder, StoredTable,
     inheritance::{self, ParentKind},
+    triggers,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -87,6 +88,7 @@ pub(super) fn detach_partition(
         metadata.set_inherited_column_names(Vec::new());
         metadata.set_inherited_constraints(Vec::new());
     }
+    triggers::drop_clones_on_detached(&mut builder, &partition);
     // The identity stays with the root, so it leaves the whole detached tree.
     let mut frontier = vec![partition];
     while let Some(table) = frontier.pop() {

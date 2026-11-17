@@ -43,7 +43,7 @@ use crate::{
     structs::{
         ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
         IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
-        Sequence, TableAttribute, TableMetadata, UserDefinedType, View,
+        Sequence, TableAttribute, TableMetadata, TriggerEnablement, UserDefinedType, View,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -121,6 +121,7 @@ mod stored_subqueries;
 mod table_as;
 mod table_owner;
 mod transactions;
+mod triggers;
 mod type_arrays;
 mod type_facts;
 mod user_defined_types;
@@ -1228,8 +1229,8 @@ impl ParserDBBuilder {
         for (_, calls) in self.user_defined_types_mut() {
             calls.replace_function(stale, fresh);
         }
-        for (_, calls) in self.triggers_mut() {
-            calls.replace_function(stale, fresh);
+        for (_, metadata) in self.triggers_mut() {
+            metadata.calls_mut().replace_function(stale, fresh);
         }
         for (_, metadata, _) in self.tables_mut() {
             metadata.partition_key_calls_mut().replace_function(stale, fresh);
@@ -8671,9 +8672,14 @@ impl ParserDB {
 
             let tables: Vec<&StoredTable> = core::iter::once(&stored).chain(&inheritors).collect();
             let readers = Self::column_readers(&builder, &tables, &column)?;
+            let inheritor_triggers = builder.triggers().iter().any(|(trigger, _)| {
+                inheritors.iter().any(|child| child.named_by(&trigger.table_name))
+                    && trigger_depends_on_column(trigger, &column)
+            });
 
             if !cascade
                 && (!readers.is_empty()
+                    || inheritor_triggers
                     || builder.column_has_outside_dependents(&stored, &declaring, &column))
             {
                 return Err(crate::errors::Error::ColumnReferenced {
@@ -8710,6 +8716,12 @@ impl ParserDB {
             for child in &inheritors {
                 let declaring = tables_declaring_column(&builder, child, &column);
                 builder.take_column_dependents(child, &declaring, &column);
+                // An inheritor's trigger firing on the column goes too,
+                // partition copies included.
+                builder.triggers_mut().retain(|(trigger, _)| {
+                    !(child.named_by(&trigger.table_name)
+                        && trigger_depends_on_column(trigger, &column))
+                });
                 builder = Self::replace_table_node(builder, child, |_, node| {
                     drop_column_from_node(node, child, &declaring, &column);
                     Ok(())
@@ -9802,119 +9814,14 @@ impl ParserDB {
                         table_metadata.replace_index(&stored, &renamed);
                     }
                 }
-                Statement::CreateTrigger(mut create_trigger) => {
-                    require_named(&create_trigger.name, crate::errors::ObjectKind::Trigger)?;
-                    let table_name = last_str(&create_trigger.table_name);
-                    let table_exists =
-                        builder.resolve_table_object_name(&create_trigger.table_name)?.is_some();
-
-                    if !table_exists {
-                        // A view holding the name is a different complaint.
-                        // PostgreSQL does allow an `INSTEAD OF` row trigger on
-                        // a view, which this model cannot record yet, so the
-                        // refusal names the kind rather than claiming the
-                        // relation is absent.
-                        if let Some(actual_kind) =
-                            views::holds_view(&builder, &create_trigger.table_name)
-                        {
-                            return Err(crate::errors::Error::RelationKindMismatch {
-                                object_name: table_name.to_string(),
-                                expected_kind: crate::errors::ObjectKind::Table,
-                                actual_kind,
-                            });
-                        }
-                        return Err(crate::errors::Error::TableNotFoundForTrigger {
-                            table_name: table_name.to_string(),
-                            trigger_name: last_str(&create_trigger.name).to_string(),
-                        });
-                    }
-                    stored_subqueries::refuse_in_trigger_condition(
-                        &builder,
-                        &create_trigger.condition,
-                    )?;
-
-                    if let Some(exec_body) = &mut create_trigger.exec_body {
-                        let Some(function) = builder.trigger_function(&exec_body.func_desc.name)
-                        else {
-                            return Err(crate::errors::Error::FunctionNotFoundForTrigger {
-                                function_name: last_str(&exec_body.func_desc.name).to_string(),
-                                trigger_name: last_str(&create_trigger.name).to_string(),
-                            });
-                        };
-                        bind_reference(
-                            &mut exec_body.func_desc.name,
-                            stored_qualifier(&function.name),
-                        );
-                    }
-
-                    builder.bind_table_reference(&mut create_trigger.table_name);
-                    if let Some(referenced) = &mut create_trigger.referenced_table_name {
-                        builder.bind_table_reference(referenced);
-                    }
-
-                    // A trigger name is unique per table, so the same name on
-                    // another table is fine and the match takes both. A
-                    // `CREATE OR REPLACE` replaces the stored node rather than
-                    // appending a second one, which would leave the stale node
-                    // answering every lookup.
-                    let case = builder.identifier_case();
-                    let existing = builder.triggers().iter().position(|(existing, _)| {
-                        object_names_match(&existing.name, &create_trigger.name, case)
-                            && target_tables_match(
-                                &existing.table_name,
-                                &create_trigger.table_name,
-                                case,
-                            )
-                    });
-                    match (existing, create_trigger.or_replace) {
-                        (Some(_), false) => {
-                            return Err(crate::errors::Error::TriggerAlreadyExists {
-                                trigger_name: last_str(&create_trigger.name).to_string(),
-                                table_name: last_str(&create_trigger.table_name).to_string(),
-                            });
-                        }
-                        (Some(position), true) => {
-                            builder.triggers_mut().remove(position);
-                        }
-                        (None, _) => {}
-                    }
-
-                    let calls = builder.calls_in(&create_trigger.condition);
-                    builder = builder.add_trigger(Arc::new(create_trigger), calls);
+                Statement::CreateTrigger(create_trigger) => {
+                    builder = triggers::create_trigger(builder, create_trigger)?;
                 }
                 Statement::CreateRule(create_rule) => {
                     builder = rules::create_rule(builder, create_rule)?;
                 }
-                Statement::DropTrigger(mut drop_trigger) => {
-                    if let Some(table_name) = &mut drop_trigger.table_name {
-                        builder.bind_table_reference(table_name);
-                    }
-                    let trigger_name = last_str(&drop_trigger.trigger_name);
-
-                    // A trigger belongs to the table it was created on, so the
-                    // statement names both and both have to match. Dropping by
-                    // name alone reached a trigger of the same name on another
-                    // table, which the database refuses to do.
-                    let case = builder.identifier_case();
-                    let matches = |trigger: &CreateTrigger| {
-                        object_names_match(&trigger.name, &drop_trigger.trigger_name, case)
-                            && drop_trigger.table_name.as_ref().is_none_or(|table_name| {
-                                target_tables_match(&trigger.table_name, table_name, case)
-                            })
-                    };
-
-                    let Some(position) =
-                        builder.triggers().iter().position(|(trigger, _)| matches(trigger))
-                    else {
-                        if drop_trigger.if_exists {
-                            continue;
-                        }
-                        return Err(crate::errors::Error::DropTriggerNotFound {
-                            trigger_name: trigger_name.to_string(),
-                        });
-                    };
-
-                    builder.triggers_mut().remove(position);
+                Statement::DropTrigger(drop_trigger) => {
+                    builder = triggers::drop_trigger(builder, drop_trigger)?;
                 }
                 Statement::DropPolicy(mut drop_policy) => {
                     builder.bind_table_reference(&mut drop_policy.table_name);
@@ -10740,6 +10647,43 @@ impl ParserDB {
                                 )?;
                             }
 
+                            AlterTableOperation::EnableTrigger { name } => {
+                                builder = triggers::alter_enablement(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
+                                    TriggerEnablement::Origin,
+                                )?;
+                            }
+                            AlterTableOperation::DisableTrigger { name } => {
+                                builder = triggers::alter_enablement(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
+                                    TriggerEnablement::Disabled,
+                                )?;
+                            }
+                            AlterTableOperation::EnableReplicaTrigger { name } => {
+                                builder = triggers::alter_enablement(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
+                                    TriggerEnablement::Replica,
+                                )?;
+                            }
+                            AlterTableOperation::EnableAlwaysTrigger { name } => {
+                                builder = triggers::alter_enablement(
+                                    builder,
+                                    &alter_table.name,
+                                    scope,
+                                    &name,
+                                    TriggerEnablement::Always,
+                                )?;
+                            }
+
                             // Ignored: each of these changes something the
                             // model carries no representation of, so nothing it
                             // answers can change.
@@ -10775,12 +10719,6 @@ impl ParserDB {
                             | AlterTableOperation::EnableAlwaysRule { .. }
                             | AlterTableOperation::EnableReplicaRule { .. }
                             | AlterTableOperation::DisableRule { .. }
-                            // A trigger is modelled, but whether it is armed is
-                            // not, so enablement changes nothing answerable.
-                            | AlterTableOperation::EnableTrigger { .. }
-                            | AlterTableOperation::EnableAlwaysTrigger { .. }
-                            | AlterTableOperation::EnableReplicaTrigger { .. }
-                            | AlterTableOperation::DisableTrigger { .. }
                             // Replication identity selects which columns
                             // identify a row downstream, which the model does
                             // not track.
@@ -11012,6 +10950,10 @@ impl ParserDB {
                             bound,
                         )?;
                     }
+                    let partition_root = match &create_table.partition_of {
+                        Some(root) => builder.resolve_bound_table_name(root)?.map(StoredTable::of),
+                        None => None,
+                    };
                     refuse_no_inherit_constraints_on_partitioned(&create_table)?;
                     record_implied_not_null(&mut create_table);
                     bind_foreign_key_targets(&builder, &mut create_table);
@@ -11053,6 +10995,9 @@ impl ParserDB {
                         &inherited.column_metadata,
                         TableOrigin::Declaration(documentation, creations),
                     )?;
+                    if let Some(root) = &partition_root {
+                        triggers::clone_onto_partition(&mut builder, root, &stored)?;
+                    }
                     Arc::make_mut(&mut type_arrays).create(&builder, &name);
                     sequences::own_column_sequences(&mut builder, &stored, column_sequences);
                     builder = creator.grant(
