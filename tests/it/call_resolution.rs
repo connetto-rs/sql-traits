@@ -642,16 +642,18 @@ fn per_relation_call<T>(
     relations.answers
 }
 
-/// A policy reading set-returning helpers in `FROM`.
+/// A policy reading set-returning helpers in `FROM`, after an expression
+/// form that the walk meets first.
 const FROM_CALL_POLICY: &str = "CREATE SCHEMA app;
      CREATE TABLE members (team_id INT, member TEXT);
      CREATE FUNCTION app.my_teams() RETURNS SETOF INT LANGUAGE sql STABLE AS 'SELECT 1';
      CREATE FUNCTION my_teams() RETURNS SETOF INT LANGUAGE sql STABLE
          AS $$ SELECT team_id FROM members WHERE member = current_setting('app.user_id', true) $$;
-     CREATE FUNCTION team_size(team INT) RETURNS SETOF INT LANGUAGE sql STABLE AS 'SELECT 1';
+     CREATE FUNCTION team_size(team INT, depth INT) RETURNS SETOF INT LANGUAGE sql STABLE
+         AS 'SELECT 1';
      SET search_path TO app, public;
      CREATE POLICY w ON public.members FOR INSERT WITH CHECK (
-         team_id IN (SELECT t FROM my_teams() t CROSS JOIN LATERAL team_size(t) s
+         team_id IN (SELECT coalesce(t, 0) FROM my_teams() t CROSS JOIN LATERAL team_size(t, 1) s
                      WHERE lower(member) = 'a')
      );
      SET search_path TO public;";
@@ -671,13 +673,13 @@ fn a_from_call_in_a_policy_reaches_its_functions() {
         relations,
         [
             ("my_teams()".to_owned(), vec!["app.my_teams".to_owned()]),
-            ("team_size(t)".to_owned(), vec!["team_size".to_owned()]),
+            ("team_size(t, 1)".to_owned(), vec!["team_size".to_owned()]),
         ]
     );
     let calls = names_per_call(check, |call| policy.functions_reached_by(call, &db).map(names));
     // `lower` takes one argument as text, a range or a multirange.
     let lower = vec!["pg_catalog.lower".to_owned(); 3];
-    assert_eq!(calls, [("lower".to_owned(), lower)]);
+    assert_eq!(calls, [("coalesce".to_owned(), Vec::new()), ("lower".to_owned(), lower)]);
 }
 
 /// A `FROM` call copied out of a policy is refused as no node of it.
@@ -697,7 +699,7 @@ fn a_copied_from_call_is_refused() {
         refusals,
         [
             ("my_teams()".to_owned(), "my_teams()".to_owned()),
-            ("team_size(t)".to_owned(), "team_size(t)".to_owned()),
+            ("team_size(t, 1)".to_owned(), "team_size(t, 1)".to_owned()),
         ]
     );
 }
