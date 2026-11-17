@@ -12,17 +12,24 @@ fn assignments(columns: &str, statements: &str) -> Vec<(String, String)> {
     assignments_of_body(columns, &format!("BEGIN {statements} RETURN NEW; END"))
 }
 
-/// The `(column, expression)` pairs of a `BEFORE` row trigger on `t`, declared
-/// with `columns`, whose function's body is `body`, none when it is no
-/// maintenance trigger.
-fn assignments_of_body(columns: &str, body: &str) -> Vec<(String, String)> {
-    let database = ParserDB::parse::<PostgreSqlDialect>(&format!(
+/// The database holding table `t`, declared with `columns`, and a `BEFORE`
+/// row trigger on it whose function's body is `body`, written after one
+/// space.
+fn database(columns: &str, body: &str) -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(&format!(
         "CREATE TABLE t ({columns});
          CREATE FUNCTION maintain() RETURNS TRIGGER LANGUAGE plpgsql AS $$ {body} $$;
          CREATE TRIGGER tg BEFORE INSERT OR UPDATE ON t
              FOR EACH ROW EXECUTE FUNCTION maintain();"
     ))
-    .expect("schema builds");
+    .expect("schema builds")
+}
+
+/// The `(column, expression)` pairs of a `BEFORE` row trigger on `t`, declared
+/// with `columns`, whose function's body is `body`, none when it is no
+/// maintenance trigger.
+fn assignments_of_body(columns: &str, body: &str) -> Vec<(String, String)> {
+    let database = database(columns, body);
     let trigger = database.triggers().next().expect("the trigger is declared");
     let pairs: Vec<(String, String)> = trigger
         .maintenance_assignments(&database)
@@ -34,7 +41,29 @@ fn assignments_of_body(columns: &str, body: &str) -> Vec<(String, String)> {
         !pairs.is_empty(),
         "a maintenance trigger is one with assignments"
     );
+    assert_eq!(
+        trigger.maintenance_refusal(&database).expect("t is in the database").is_none(),
+        !pairs.is_empty(),
+        "a maintenance trigger is one without refusal"
+    );
     pairs
+}
+
+/// What makes the trigger [`assignments`] describes no maintenance trigger.
+fn refusal(columns: &str, statements: &str) -> MaintenanceRefusal {
+    refusal_of_body(columns, &format!("BEGIN {statements} RETURN NEW; END"))
+}
+
+/// What makes the trigger [`assignments_of_body`] describes no maintenance
+/// trigger.
+fn refusal_of_body(columns: &str, body: &str) -> MaintenanceRefusal {
+    assert_eq!(assignments_of_body(columns, body), pairs(&[]), "{body} is refused");
+    let database = database(columns, body);
+    let trigger = database.triggers().next().expect("the trigger is declared");
+    trigger
+        .maintenance_refusal(&database)
+        .expect("t is in the database")
+        .expect("a trigger without assignments is refused")
 }
 
 /// The pairs `expected` writes as string slices.
@@ -146,7 +175,10 @@ fn the_whole_row_read_after_an_assignment_refuses_the_body() {
         assignments("a INT, h TEXT", "NEW.h := md5(NEW::text); NEW.a := 1;"),
         pairs(&[("h", "md5(NEW::TEXT)"), ("a", "1")])
     );
-    assert_eq!(assignments("a INT, h TEXT", "NEW.a := 1; NEW.h := md5(NEW::text);"), pairs(&[]));
+    assert_eq!(
+        refusal("a INT, h TEXT", "NEW.a := 1; NEW.h := md5(NEW::text);").to_string(),
+        "`NEW` in `NEW.h := md5(NEW::text);` at line 1, column 20 reads NEW after a column of it is assigned"
+    );
 }
 
 /// `NEW.*` expands to the whole row, so it reads the assigned values too, in
@@ -157,17 +189,18 @@ fn a_wildcard_over_new_after_an_assignment_refuses_the_body() {
         assignments("a INT, h TEXT", "NEW.h := row_to_json(NEW.*); NEW.a := 1;"),
         pairs(&[("h", "row_to_json(NEW.*)"), ("a", "1")])
     );
-    for read in [
-        "md5(ROW(NEW.*)::text)",
-        "row_to_json(NEW.*)",
-        "(SELECT NEW.*)",
-        "row_to_json(maintain.NEW.*)",
-        "row_to_json(NEW.a.*)",
+    for (read, refused) in [
+        ("md5(ROW(NEW.*)::text)", "ROW(NEW.*)"),
+        ("row_to_json(NEW.*)", "row_to_json(NEW.*)"),
+        ("(SELECT NEW.*)", "NEW.*"),
+        ("row_to_json(maintain.NEW.*)", "row_to_json(maintain.NEW.*)"),
+        ("row_to_json(NEW.a.*)", "row_to_json(NEW.a.*)"),
     ] {
         assert_eq!(
-            assignments("a INT, h TEXT", &format!("NEW.a := 1; NEW.h := {read};")),
-            pairs(&[]),
-            "{read}"
+            refusal("a INT, h TEXT", &format!("NEW.a := 1; NEW.h := {read};")).to_string(),
+            format!(
+                "`{refused}` in `NEW.h := {read};` at line 1, column 20 reads NEW after a column of it is assigned"
+            )
         );
     }
 }
@@ -176,43 +209,96 @@ fn a_wildcard_over_new_after_an_assignment_refuses_the_body() {
 /// of an assigned column reads a value no pair can write.
 #[test]
 fn reading_a_field_the_row_lacks_or_inside_an_assigned_column_refuses_the_body() {
-    assert_eq!(assignments("a INT", "NEW.a := NEW.missing;"), pairs(&[]));
-    assert_eq!(assignments("a INT, b INT", "NEW.a := 1; NEW.b := NEW.a.x;"), pairs(&[]));
+    assert_eq!(
+        refusal("a INT", "NEW.a := NEW.missing;").to_string(),
+        "the table declares no column `missing`, which the body writes at line 1, column 21"
+    );
+    assert_eq!(
+        refusal("a INT, b INT", "NEW.a := 1; NEW.b := NEW.a.x;").to_string(),
+        "`NEW.a.x` in `NEW.b := NEW.a.x;` at line 1, column 20 reads NEW after a column of it is assigned"
+    );
 }
 
+/// Each statement but an assignment to a column of `NEW` or an `IF` over
+/// such assignments is named, with where the body writes it.
 #[test]
-fn any_other_statement_refuses_the_body() {
+fn any_other_statement_refuses_the_body_naming_it() {
     for statement in [
         "RAISE NOTICE 'stamping';",
         "PERFORM pg_notify('t', 'stamped');",
         "INSERT INTO t (a) VALUES (1);",
         "LOOP EXIT; END LOOP;",
-        "IF NEW.a IS NULL THEN RETURN NEW; END IF;",
         "BEGIN NEW.a := 2; END;",
     ] {
         assert_eq!(
-            assignments("a INT", &format!("NEW.a := 1; {statement}")),
-            pairs(&[]),
-            "{statement}"
+            refusal("a INT", &format!("NEW.a := 1; {statement}")).to_string(),
+            format!(
+                "`{statement}` at line 1, column 20 neither assigns a column of NEW nor is an IF over such assignments"
+            )
         );
     }
+    assert_eq!(
+        refusal("a INT", "NEW.a := 1; IF NEW.a IS NULL THEN RETURN NEW; END IF;").to_string(),
+        "`RETURN NEW;` at line 1, column 42 returns before the end of the body"
+    );
+}
+
+/// The statement refusing a body on a later line is named on that line.
+#[test]
+fn a_refusing_statement_is_placed_on_its_line() {
+    assert_eq!(
+        refusal_of_body(
+            "txt TEXT",
+            "BEGIN\n  NEW.txt := upper(NEW.txt);\n  INSERT INTO audit (txt) VALUES (NEW.txt);\n  RETURN NEW;\nEND"
+        )
+        .to_string(),
+        "`INSERT INTO audit (txt) VALUES (NEW.txt);` at line 3, column 3 neither assigns a column of NEW nor is an IF over such assignments"
+    );
 }
 
 #[test]
 fn a_body_that_does_not_return_new_or_assigns_elsewhere_is_refused() {
-    for body in [
-        "BEGIN NEW.a := 1; RETURN NULL; END",
-        "BEGIN NEW.a := 1; END",
-        "BEGIN RETURN NEW; END",
-        "DECLARE x INT; BEGIN NEW.a := 1; RETURN NEW; END",
-        "BEGIN NEW.a := 1; RETURN NEW; EXCEPTION WHEN OTHERS THEN RETURN NEW; END",
-        "BEGIN NEW.a := (1; RETURN NEW; END",
-        "BEGIN OLD.a := 1; RETURN NEW; END",
-        "BEGIN NEW := OLD; RETURN NEW; END",
-        "BEGIN NEW.a.x := 1; RETURN NEW; END",
-        "BEGIN NEW.a[1] := 1; RETURN NEW; END",
-        "BEGIN NEW.b := 1; RETURN NEW; END",
+    for (body, refused) in [
+        (
+            "BEGIN NEW.a := 1; RETURN NULL; END",
+            "`RETURN NULL;` at line 1, column 20 ends the body without returning NEW",
+        ),
+        (
+            "BEGIN NEW.a := 1; END",
+            "`NEW.a := 1;` at line 1, column 8 ends the body without returning NEW",
+        ),
+        ("BEGIN END", "the body has no statement"),
+        ("BEGIN RETURN NEW; END", "the body assigns no column of NEW"),
+        ("DECLARE x INT; BEGIN NEW.a := 1; RETURN NEW; END", "the body declares `x`"),
+        (
+            "BEGIN NEW.a := 1; RETURN NEW; EXCEPTION WHEN OTHERS THEN RETURN NEW; END",
+            "the body handles errors",
+        ),
+        (
+            "BEGIN OLD.a := 1; RETURN NEW; END",
+            "`OLD.a := 1;` at line 1, column 8 neither assigns a column of NEW nor is an IF over such assignments",
+        ),
+        (
+            "BEGIN NEW := OLD; RETURN NEW; END",
+            "`NEW := OLD;` at line 1, column 8 neither assigns a column of NEW nor is an IF over such assignments",
+        ),
+        (
+            "BEGIN NEW.a.x := 1; RETURN NEW; END",
+            "`NEW.a.x := 1;` at line 1, column 8 neither assigns a column of NEW nor is an IF over such assignments",
+        ),
+        (
+            "BEGIN NEW.a[1] := 1; RETURN NEW; END",
+            "`NEW.a[1] := 1;` at line 1, column 8 neither assigns a column of NEW nor is an IF over such assignments",
+        ),
+        (
+            "BEGIN NEW.b := 1; RETURN NEW; END",
+            "the table declares no column `b`, which the body writes at line 1, column 12",
+        ),
     ] {
-        assert_eq!(assignments_of_body("a INT", body), pairs(&[]), "{body}");
+        assert_eq!(refusal_of_body("a INT", body).to_string(), refused, "{body}");
     }
+    assert!(matches!(
+        refusal_of_body("a INT", "BEGIN NEW.a := (1; RETURN NEW; END"),
+        MaintenanceRefusal::UnparsableBody { .. }
+    ));
 }
