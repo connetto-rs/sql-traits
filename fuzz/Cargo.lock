@@ -206,7 +206,8 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.2.3"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#2f2a39d9534bfeb115b0e489c7ba614e29fa3c48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbc53e27137b6802ed1417ac7d85eee5e18857ae504247c8f8e527d806e2ff6d"
 dependencies = [
  "barnes-hut-tree",
  "hashbrown",
@@ -491,6 +492,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9d441c3b2ebf55cebf796bfdc265d67fa09db17b7bb6bd4be75c509e1e8fec3"
 
 [[package]]
+name = "seahash"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -536,6 +543,7 @@ dependencies = [
  "sha2",
  "sql-values",
  "sqlparser",
+ "sqlparser-canonicalize",
  "sqlparser-plpgsql",
  "thiserror",
  "unicode-normalization",
@@ -568,6 +576,17 @@ dependencies = [
  "log",
  "recursive",
  "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser-canonicalize"
+version = "0.2.1"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#07e59506f43915ac188a99ce0afa677f14ed82f4"
+dependencies = [
+ "recursive",
+ "seahash",
+ "sqlparser",
+ "thiserror",
 ]
 
 [[package]]

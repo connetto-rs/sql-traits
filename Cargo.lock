@@ -335,7 +335,8 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.2.3"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#2f2a39d9534bfeb115b0e489c7ba614e29fa3c48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbc53e27137b6802ed1417ac7d85eee5e18857ae504247c8f8e527d806e2ff6d"
 dependencies = [
  "barnes-hut-tree",
  "hashbrown",

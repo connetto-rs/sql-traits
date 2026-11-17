@@ -67,4 +67,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Status
 
-This crate is not yet published to `crates.io` because we still need to finalize the upstream crate [`geometric-traits`](https://github.com/earth-metabolome-initiative/geometric-traits).
+This crate is not yet published to `crates.io` because it depends on git revisions of [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) (through `[patch.crates-io]`), [`sqlparser-plpgsql`](https://github.com/connetto-rs/sqlparser-plpgsql) and [`sqlparser-canonicalize`](https://github.com/connetto-rs/sqlparser-canonicalize).
