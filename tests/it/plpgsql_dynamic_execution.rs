@@ -217,16 +217,17 @@ fn called_schemas(database: &ParserDB, name: &str) -> Vec<Vec<String>> {
 }
 
 /// A constant command setting `search_path` sets it for the sites after it,
-/// while a command built at run time or a call to a user function, in a
-/// statement or a `USING` argument, leaves a later call reaching a name only
-/// `pg_catalog` defines, and nothing for a name another schema defines too.
-/// In a loop, later also means an earlier statement on the next iteration.
+/// while a command built at run time or a call to a function setting the
+/// path, in a statement or a `USING` argument, leaves a later call reaching a
+/// name only `pg_catalog` defines, and nothing for a name another schema
+/// defines too. In a loop, later also means an earlier statement on the next
+/// iteration.
 #[test]
 fn later_sites_follow_the_path_earlier_statements_leave() {
     let database = postgres(
         "CREATE SCHEMA evil;
          CREATE FUNCTION evil.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1';
-         CREATE FUNCTION helper() RETURNS void LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION helper() RETURNS void LANGUAGE sql AS 'SET search_path = evil';
          CREATE FUNCTION constant_set(p text) RETURNS void LANGUAGE plpgsql AS $$
          BEGIN
           EXECUTE 'SET search_path = evil, pg_catalog';
@@ -826,7 +827,8 @@ fn a_cursor_opened_in_a_branch_hides_the_path_from_later_sites() {
     let database = postgres(
         "CREATE SCHEMA evil;
          CREATE FUNCTION evil.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1';
-         CREATE FUNCTION side() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION side() RETURNS integer LANGUAGE sql
+         AS 'SELECT length(set_config(''search_path'', ''evil'', false))';
          CREATE FUNCTION via_open(flag boolean, p text) RETURNS void LANGUAGE plpgsql AS $$
          DECLARE c CURSOR FOR SELECT side();
          BEGIN
@@ -838,11 +840,11 @@ fn a_cursor_opened_in_a_branch_hides_the_path_from_later_sites() {
     assert_eq!(last, ["?", "pg_catalog"]);
 }
 
-/// A call to user code in a branch hides the path from later sites wherever
-/// the branch runs it, in an assignment's subscript, a cursor opened for a
-/// query, a nested block's default or a loop's query.
+/// A call to a function setting the path in a branch hides the path from
+/// later sites wherever the branch runs it, in an assignment's subscript, a
+/// cursor opened for a query, a nested block's default or a loop's query.
 #[test]
-fn user_code_anywhere_in_a_branch_hides_the_path_from_later_sites() {
+fn a_path_setting_call_anywhere_in_a_branch_hides_the_path_from_later_sites() {
     let forms = [
         ("subscript", "arr[side()] := 1;"),
         ("opened", "OPEN c FOR SELECT side();"),
@@ -865,7 +867,8 @@ fn user_code_anywhere_in_a_branch_hides_the_path_from_later_sites() {
     let database = postgres(&format!(
         "CREATE SCHEMA evil;
          CREATE FUNCTION evil.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1';
-         CREATE FUNCTION side() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION side() RETURNS integer LANGUAGE sql
+         AS 'SELECT length(set_config(''search_path'', ''evil'', false))';
          {functions}"
     ));
     for (name, _) in forms {
@@ -1201,13 +1204,14 @@ fn missing_copied_types_keep_their_errors() {
 
 /// A constant command in dollar quotes sets the path for the sites after it,
 /// a constant command that does not parse or is no string hides it, and a
-/// `USING` argument calling user code inside a loop hides it from the
-/// loop's earlier sites.
+/// `USING` argument calling a function that sets the path inside a loop
+/// hides it from the loop's earlier sites.
 #[test]
 fn constant_commands_and_looped_arguments_shape_the_path() {
     let database = postgres(
         "CREATE SCHEMA evil;
-         CREATE FUNCTION evil.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1';
+         CREATE FUNCTION evil.quote_ident(text) RETURNS text LANGUAGE sql
+         AS 'SELECT set_config(''search_path'', $1, false)';
          CREATE FUNCTION dollar_set(p text) RETURNS void LANGUAGE plpgsql AS $$
          BEGIN
           EXECUTE $q$SET search_path = evil, pg_catalog$q$;

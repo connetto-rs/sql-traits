@@ -45,7 +45,7 @@ pub(crate) enum SqlBody<'f> {
 
 /// Whether the dialect of `database` parses `0x1F` into the hex string
 /// variant `X'1F'` also parses to, so that variant may hold an integer.
-fn hex_strings_may_be_integers<DB: DatabaseLike>(database: &DB) -> bool {
+pub(super) fn hex_strings_may_be_integers<DB: DatabaseLike>(database: &DB) -> bool {
     !database.dialect().sqlparser_dialect().supports_non_decimal_integer_literals()
 }
 

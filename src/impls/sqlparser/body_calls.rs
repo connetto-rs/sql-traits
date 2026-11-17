@@ -11,8 +11,9 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::Visit;
 
-use super::data_statement::{
-    BodyPath, BodyWalk, RunTimeBody, add_unqualified, calls_user_code, walk_body,
+use super::{
+    callee_path::calls_path_changer,
+    data_statement::{BodyPath, BodyWalk, RunTimeBody, add_unqualified, walk_body},
 };
 use crate::{
     errors::LookupError,
@@ -131,8 +132,8 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for CallCollector<'_, 's, DB> {
         self.collect(&sql)
     }
 
-    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool {
-        calls_user_code(&sql, self.database)
+    fn calls_path_changer(&self, sql: EmbeddedSql<'_>) -> bool {
+        calls_path_changer(&sql, self.database)
     }
 }
 

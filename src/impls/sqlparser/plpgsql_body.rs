@@ -213,10 +213,10 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
 
     /// The first statement or expression in `nodes`, nested ones included,
     /// that changes the path or may. Such SQL sets the path, runs code
-    /// outside the body, calls user code, or builds SQL at run time. Constant
-    /// SQL text counts only when a statement it parses into would, or when
-    /// PostgreSQL would refuse it once it runs, as the straight line reads
-    /// it.
+    /// outside the body, calls a function that may set the path for its
+    /// caller, or builds SQL at run time. Constant SQL text counts only when
+    /// a statement it parses into would, or when PostgreSQL would refuse it
+    /// once it runs, as the straight line reads it.
     fn first_change(&self, nodes: &'s [Node]) -> Result<Option<EmbeddedSql<'s>>, LookupError> {
         let may_change = |sql: EmbeddedSql<'_>| -> Result<bool, LookupError> {
             let changes = match sql {
@@ -227,7 +227,7 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 }
                 EmbeddedSql::Expression(_) => false,
             };
-            Ok(changes || sets_search_path_at_run_time(&sql) || self.walker.runs_user_code(sql))
+            Ok(changes || sets_search_path_at_run_time(&sql) || self.walker.calls_path_changer(sql))
         };
         let found = each_sql(nodes, &mut |sql, command| {
             let changed = match command {
@@ -299,14 +299,7 @@ fn each_sql<'s, B>(
                 transfer_expressions(node)
                     .try_for_each(|query| visit(EmbeddedSql::Expression(query), None))?;
             }
-            Node::Block(block) => {
-                defaults(block)
-                    .try_for_each(|default| visit(EmbeddedSql::Expression(default), None))?;
-                each_sql(&block.statements, visit)?;
-                for handler in &block.handlers {
-                    each_sql(&handler.statements, visit)?;
-                }
-            }
+            Node::Block(block) => each_block_sql(block, visit)?,
             Node::If(choice) => each_branch_sql(&choice.branches, &choice.otherwise, visit)?,
             Node::Case(choice) => {
                 if let Some(subject) = &choice.subject {
@@ -338,6 +331,18 @@ fn each_sql<'s, B>(
         }
     }
     ControlFlow::Continue(())
+}
+
+/// Hands `visit` every statement and expression `block` runs as
+/// [`each_sql`] does, the defaults its `DECLARE` section evaluates first and
+/// its handlers last.
+pub(crate) fn each_block_sql<'s, B>(
+    block: &'s Block,
+    visit: &mut impl FnMut(EmbeddedSql<'s>, Option<&'s Dynamic>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    defaults(block).try_for_each(|default| visit(EmbeddedSql::Expression(default), None))?;
+    each_sql(&block.statements, visit)?;
+    block.handlers.iter().try_for_each(|handler| each_sql(&handler.statements, visit))
 }
 
 /// The `SELECT` evaluating each default the `DECLARE` section of `block`

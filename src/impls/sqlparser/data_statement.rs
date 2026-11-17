@@ -27,16 +27,15 @@ use sqlparser::ast::{
 };
 use sqlparser_plpgsql::embedded::{Block, Dynamic, expression};
 
-use super::plpgsql_body::walk_block;
+use super::{callee_path::calls_path_changer, plpgsql_body::walk_block};
 use crate::{
     errors::LookupError,
     structs::{EmbeddedSql, IdentifierCase, UnqualifiedName},
-    traits::{DataStatementLike, DatabaseLike, FunctionLike, Relation, TableLike, ViewLike},
+    traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
     utils::{
-        call_sites::for_each_call,
-        identifier_resolution::{SearchPath, identifiers_match},
+        identifier_resolution::SearchPath,
         object_name::{
-            DEFAULT_SEARCH_PATH, PG_CATALOG, Qualifier, SearchPathChange, object_name_identifiers,
+            DEFAULT_SEARCH_PATH, Qualifier, SearchPathChange, object_name_identifiers,
             object_name_last_part, qualifier_of, resolve_bound_relation_object_name,
             resolve_relation_object_name, resolve_relation_object_name_on_path, search_path_change,
             target_name_from_object_name,
@@ -465,9 +464,9 @@ pub(crate) trait BodyWalk<'s> {
     fn walk(&mut self, sql: EmbeddedSql<'_>) -> Result<(), LookupError>;
 
     /// Whether `sql` calls code that may set `search_path` for the
-    /// statements after it, as [`calls_user_code`] decides over the
+    /// statements after it, as [`calls_path_changer`] decides over the
     /// walker's database.
-    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool;
+    fn calls_path_changer(&self, sql: EmbeddedSql<'_>) -> bool;
 
     /// Takes a statement that runs code outside the body, as
     /// [`runs_code_outside`] picks it, which hides what the body reads.
@@ -571,7 +570,7 @@ pub(crate) fn walk_statement<'s>(
         None => {
             walker.walk(EmbeddedSql::Statement(statement))?;
             let embedded = EmbeddedSql::Statement(statement);
-            if sets_search_path_at_run_time(statement) || walker.runs_user_code(embedded) {
+            if sets_search_path_at_run_time(statement) || walker.calls_path_changer(embedded) {
                 walker.set_path(BodyPath::Unknown(unresolvable(function, statement)));
             }
         }
@@ -580,8 +579,8 @@ pub(crate) fn walk_statement<'s>(
 }
 
 /// Hands the `SELECT` evaluating an expression of the PL/pgSQL body of
-/// `function` to `walker`, after which a call setting `search_path` or user
-/// code leaves the path unknown.
+/// `function` to `walker`, after which a call setting `search_path`, or one
+/// reaching code that may, leaves the path unknown.
 ///
 /// # Errors
 ///
@@ -592,7 +591,8 @@ pub(crate) fn walk_expression<'s>(
     walker: &mut impl BodyWalk<'s>,
 ) -> Result<(), LookupError> {
     walker.walk(EmbeddedSql::Expression(query))?;
-    if sets_search_path_at_run_time(query) || walker.runs_user_code(EmbeddedSql::Expression(query))
+    if sets_search_path_at_run_time(query)
+        || walker.calls_path_changer(EmbeddedSql::Expression(query))
     {
         walker.set_path(BodyPath::Unknown(unresolvable(function, query)));
     }
@@ -628,8 +628,8 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
         self.collect(&sql, listed)
     }
 
-    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool {
-        calls_user_code(&sql, self.database)
+    fn calls_path_changer(&self, sql: EmbeddedSql<'_>) -> bool {
+        calls_path_changer(&sql, self.database)
     }
 }
 
@@ -656,7 +656,17 @@ pub(crate) fn reads_of_body<'db, DB: DatabaseLike>(
 /// Whether `node` calls `set_config` on `search_path`, or on a setting named
 /// only when it runs.
 pub(crate) fn sets_search_path_at_run_time<N: Visit + ?Sized>(node: &N) -> bool {
-    struct SetConfigCalls;
+    sets_search_path_past_exit(node, false)
+}
+
+/// Whether `node` calls `set_config` as [`sets_search_path_at_run_time`]
+/// reads it, leaving out a call whose `is_local` is `true` when `restores`
+/// says the function running `node` restores its own path on exit, which
+/// undoes such a call.
+pub(crate) fn sets_search_path_past_exit<N: Visit + ?Sized>(node: &N, restores: bool) -> bool {
+    struct SetConfigCalls {
+        restores: bool,
+    }
     impl Visitor for SetConfigCalls {
         type Break = ();
 
@@ -676,56 +686,21 @@ pub(crate) fn sets_search_path_at_run_time<N: Visit + ?Sized>(node: &N) -> bool 
                     ..
                 })))) if !setting.eq_ignore_ascii_case("search_path")
             );
-            if calls_set_config && !names_other_setting {
+            let undone_on_exit = self.restores
+                && matches!(
+                    arguments.args.get(2),
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
+                        value: Value::Boolean(true),
+                        ..
+                    }))))
+                );
+            if calls_set_config && !names_other_setting && !undone_on_exit {
                 return ControlFlow::Break(());
             }
             ControlFlow::Continue(())
         }
     }
-    walk(node, &mut SetConfigCalls).is_break()
-}
-
-/// Whether a call in `node` may run a function outside `pg_catalog`, which
-/// may set `search_path` for the statements after it.
-///
-/// PostgreSQL keeps a plain `SET` or `set_config(..., false)` past the end of
-/// the function running it, even one with its own `SET search_path` clause,
-/// so any such function counts. So does a call no function the database
-/// holds answers, or one whose name or schema only run time knows.
-pub(crate) fn calls_user_code<N: Visit + ?Sized, DB: DatabaseLike>(
-    node: &N,
-    database: &DB,
-) -> bool {
-    let in_catalog =
-        |schema: &str, quoted: bool| identifiers_match(schema, quoted, PG_CATALOG, false);
-    for_each_call(node, |call| {
-        let user = match (qualifier_of(call.name), object_name_last_part(call.name)) {
-            (Qualifier::Named(schema, quoted), _) => !in_catalog(schema, quoted),
-            // A name built at run time may name any function.
-            (Qualifier::RunTime, _) | (Qualifier::Absent, None) => true,
-            (Qualifier::Absent, Some((called, called_quoted))) => {
-                let mut reached = database.functions_named(called).filter(|function| {
-                    identifiers_match(
-                        function.name(),
-                        function.name_is_quoted(),
-                        called,
-                        called_quoted,
-                    ) && function.accepts_argument_count(call.arguments)
-                });
-                let mut known = false;
-                let outside = reached.any(|function| {
-                    known = true;
-                    let declared = function.target_name();
-                    declared
-                        .schema()
-                        .is_none_or(|schema| !in_catalog(schema, declared.schema_is_quoted()))
-                });
-                outside || !known
-            }
-        };
-        if user { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
-    })
-    .is_break()
+    walk(node, &mut SetConfigCalls { restores }).is_break()
 }
 
 impl<DB: DatabaseLike> DataStatementLike<DB> for Query {
@@ -1311,9 +1286,9 @@ mod tests {
     }
 
     /// A call whose name or schema a part built at run time writes may run
-    /// any function, so it counts as user code.
+    /// any function, so it may change the path.
     #[test]
-    fn a_call_named_at_run_time_runs_user_code() {
+    fn a_call_named_at_run_time_may_change_the_path() {
         use sqlparser::ast::{
             Expr, Ident, ObjectName, ObjectNamePart, ObjectNamePartFunction, SelectItem, SetExpr,
         };
@@ -1330,7 +1305,7 @@ mod tests {
             let item = &mut select.projection[0];
             let SelectItem::UnnamedExpr(Expr::Function(call)) = item else { panic!("a call") };
             call.name = ObjectName(name);
-            assert!(super::calls_user_code(&statement, &db), "{statement}");
+            assert!(super::calls_path_changer(&statement, &db), "{statement}");
         }
     }
 }
