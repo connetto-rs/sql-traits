@@ -400,3 +400,40 @@ fn each_site_reads_its_variables_with_the_definitions_reaching_it() {
         ]
     );
 }
+
+/// A `LIMIT` or `OFFSET` count reads the variables and outer columns it
+/// names, and binds no column of its own query's `FROM`, which PostgreSQL
+/// refuses there.
+#[test]
+fn row_counts_read_variables_and_outer_columns_but_not_their_own_from() {
+    let database = postgres(
+        "CREATE TABLE notes (id integer PRIMARY KEY, label text);
+         CREATE FUNCTION page(p integer) RETURNS SETOF text LANGUAGE plpgsql AS $$
+         DECLARE
+           size integer := 10;
+           skip integer := 0;
+         BEGIN
+           RETURN QUERY SELECT label FROM notes LIMIT size OFFSET skip;
+           RETURN QUERY SELECT label FROM notes OFFSET p ROWS FETCH FIRST 5 ROWS ONLY;
+         END $$;
+         CREATE FUNCTION nested() RETURNS SETOF text LANGUAGE plpgsql AS $$
+         BEGIN
+           RETURN QUERY SELECT n.label FROM notes AS n
+             WHERE n.label IN (SELECT label FROM notes LIMIT n.id);
+         END $$;
+         CREATE FUNCTION own() RETURNS SETOF text LANGUAGE plpgsql AS $$
+         BEGIN RETURN QUERY SELECT label FROM notes LIMIT id; END $$;",
+    );
+    assert_eq!(
+        reads(&database, "page"),
+        [
+            vec![],
+            vec![],
+            vec!["size: 10".to_owned(), "skip: 0".to_owned()],
+            vec!["p: incoming".to_owned()],
+        ]
+    );
+    assert_eq!(reached(&database, "page", "size"), ("variable", Some("size".to_owned())));
+    assert_eq!(reached(&database, "nested", "n.id"), ("column", None));
+    assert_eq!(reached(&database, "own", "id"), ("nothing", None));
+}
