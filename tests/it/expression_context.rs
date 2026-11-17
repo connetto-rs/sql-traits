@@ -314,6 +314,37 @@ fn references_bind_as_their_clause_binds_them() {
     assert_eq!(context.type_of(z).unwrap(), OperandType::Unknown);
 }
 
+/// A row count binds a column of the enclosing query, in the comma spelling
+/// of `LIMIT` too.
+#[test]
+fn row_counts_bind_columns_of_the_enclosing_query() {
+    let db =
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE a (n INT); CREATE TABLE b (id INT);")
+            .unwrap();
+    let sql = "SELECT (SELECT id FROM b LIMIT a.n, a.n) FROM a";
+    let Statement::Query(comma) =
+        Parser::parse_sql(&sqlparser::dialect::MySqlDialect {}, sql).unwrap().remove(0)
+    else {
+        unreachable!()
+    };
+    let context = ExpressionContext::new(&comma, &db, IdentifierCase::AsWritten).unwrap();
+    let Expr::Subquery(subquery) = projected(&comma)[0] else { unreachable!() };
+    let Some(sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit }) =
+        &subquery.limit_clause
+    else {
+        unreachable!()
+    };
+    for count in [offset, limit] {
+        let Some((ColumnDefinition::Base { column, .. }, binding)) =
+            context.reference(count).unwrap()
+        else {
+            panic!("{count} binds the column of a")
+        };
+        assert_eq!(column.column_name(), "n");
+        assert!(binding.entry().is_some());
+    }
+}
+
 const OPERANDS: &str = "CREATE TABLE t (i INT4, s INT2, v VARCHAR(5), n NUMERIC(6, 2), a INT4[]);";
 
 /// The operator names each node applies, in order, `None` for a node whose
