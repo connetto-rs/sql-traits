@@ -2588,15 +2588,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let refuse = |reason: fn(String, String) -> HelperSetError| {
             Err(reason(scope.name.clone(), setting.name().to_string()))
         };
-        let declared = match (packing, setting.content()) {
+        let (value, declared) = match (packing, setting.content()) {
             (
                 None,
                 SettingContent::Value(
-                    SettingValue::Caller(declared)
+                    value @ (SettingValue::Caller(declared)
                     | SettingValue::Principal { identity: declared, .. }
-                    | SettingValue::Scalar(declared),
+                    | SettingValue::Scalar(declared)),
                 ),
-            ) => declared,
+            ) => (value, declared),
             (None, _) => {
                 return refuse(|function, setting| {
                     HelperSetError::SettingNotSingle { function, setting }
@@ -2604,14 +2604,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             (
                 Some(packing),
-                SettingContent::Value(SettingValue::Set { element, packing: declared }),
+                SettingContent::Value(value @ SettingValue::Set { element, packing: declared }),
             ) => {
                 if packing != declared {
                     return refuse(|function, setting| {
                         HelperSetError::MispackedSet { function, setting }
                     });
                 }
-                element
+                (value, element)
             }
             (Some(_), _) => {
                 return refuse(|function, setting| {
@@ -2620,7 +2620,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
         };
         if let Some(normalization) = read.normalization
-            && !matches!(setting.content(), SettingContent::Value(SettingValue::Scalar(_)))
+            && !matches!(value, SettingValue::Scalar(_))
         {
             return Err(HelperSetError::SettingNormalized {
                 function: scope.name.clone(),
@@ -2640,6 +2640,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(SettingComparison {
             column,
             setting,
+            value,
             raises_when_unset: read.raises_when_unset,
             excludes_unset,
             normalization: read.normalization,
