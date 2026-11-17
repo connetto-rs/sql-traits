@@ -296,9 +296,11 @@ fn answer<'db>(
 fn render_granted_to(granted_to: &GrantedTo<'_, ParserDB>) -> Option<String> {
     match granted_to {
         GrantedTo::Request(request) => {
-            let compared = match request.setting().content() {
-                SettingContent::Value(SettingValue::Set { .. }) => "IN",
-                _ => "=",
+            let compared = match request.value() {
+                SettingValue::Set { .. } => "IN",
+                SettingValue::Caller(_)
+                | SettingValue::Principal { .. }
+                | SettingValue::Scalar(_) => "=",
             };
             let setting = request.setting().name();
             let read = match request.normalization() {
@@ -596,22 +598,18 @@ impl Request {
     /// Whether `held` is what the request carries in the setting `compared`
     /// reads, normalized as `compared` normalizes it.
     fn carries(self, compared: &SettingComparison<'_, ParserDB>, held: &str) -> bool {
-        let setting = compared.setting();
         let sends = |value: &str| {
             match compared.normalization() {
                 None => value == held,
                 Some(RequestNormalization::Lower) => value.to_lowercase() == held,
             }
         };
-        match setting.content() {
-            SettingContent::Value(SettingValue::Caller(_)) => self.caller.is_some_and(sends),
-            SettingContent::Value(
-                SettingValue::Set { .. } | SettingValue::Principal { .. } | SettingValue::Scalar(_),
-            ) => {
-                self.values(setting.name())
+        match compared.value() {
+            SettingValue::Caller(_) => self.caller.is_some_and(sends),
+            SettingValue::Set { .. } | SettingValue::Principal { .. } | SettingValue::Scalar(_) => {
+                self.values(compared.setting().name())
                     .is_some_and(|values| values.iter().any(|value| sends(value)))
             }
-            other => panic!("the fixtures compare with no {other:?}"),
         }
     }
 }
@@ -2192,6 +2190,29 @@ fn a_set_unpacked_as_its_declared_element_type_reads_the_set() {
             Ok(PRESENTED_ARM),
             "{condition}"
         );
+    }
+}
+
+#[test]
+fn a_comparison_answers_the_value_its_setting_declares() {
+    let single = presenting("''", "l.id = current_setting('app.link_ids', true)::uuid", "");
+    let split = presenting("''", &format!("l.id = ANY ({SPLIT}::uuid[])"), "");
+    let installation =
+        SettingValue::Principal { kind: "installation".into(), identity: DataType::Uuid };
+    let links =
+        SettingValue::Set { element: DataType::Uuid, packing: SetPacking::Delimited(",".into()) };
+    for (sql, value) in [
+        (&single, SettingValue::Caller(DataType::Uuid)),
+        (&single, installation),
+        (&single, SettingValue::Scalar(DataType::Uuid)),
+        (&split, links),
+    ] {
+        let answered = presented_as(sql, value.clone(), |set| {
+            let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
+            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the request") };
+            request.value() == &value
+        });
+        assert_eq!(answered, Ok(true), "{value:?}");
     }
 }
 

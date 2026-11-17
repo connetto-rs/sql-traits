@@ -7,7 +7,10 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use sqlparser::ast::Value;
 
-use crate::{structs::SessionSetting, traits::DatabaseLike};
+use crate::{
+    structs::{SessionSetting, SettingValue},
+    traits::DatabaseLike,
+};
 
 /// The set a helper returns, the union of its arms kept to the rows its
 /// [`selection`](Self::selection) keeps.
@@ -521,6 +524,7 @@ impl<'db> CallerGate<'db> {
 pub struct SettingComparison<'db, DB: DatabaseLike> {
     pub(crate) column: &'db DB::Column,
     pub(crate) setting: &'db SessionSetting,
+    pub(crate) value: &'db SettingValue,
     pub(crate) raises_when_unset: bool,
     pub(crate) excludes_unset: bool,
     pub(crate) normalization: Option<RequestNormalization>,
@@ -533,14 +537,18 @@ impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {
         self.column
     }
 
-    /// The setting compared with, as the deployment declares it, either
-    /// [`SettingValue::Caller`](crate::structs::SettingValue::Caller),
-    /// [`SettingValue::Principal`](crate::structs::SettingValue::Principal),
-    /// [`SettingValue::Scalar`](crate::structs::SettingValue::Scalar) or
-    /// [`SettingValue::Set`](crate::structs::SettingValue::Set).
+    /// The setting compared with, as the deployment declares it.
     #[must_use]
     pub fn setting(&self) -> &'db SessionSetting {
         self.setting
+    }
+
+    /// What the column is compared with, the [`SettingValue::Caller`],
+    /// [`SettingValue::Principal`], [`SettingValue::Scalar`] or
+    /// [`SettingValue::Set`] the [`setting`](Self::setting) holds.
+    #[must_use]
+    pub fn value(&self) -> &'db SettingValue {
+        self.value
     }
 
     /// Whether the body reads the setting with `current_setting(name)`, which
