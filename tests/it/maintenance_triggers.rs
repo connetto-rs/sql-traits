@@ -115,6 +115,27 @@ fn quoted_columns_resolve_and_substitute_as_written() {
         pairs(&[("ColA", "1"), ("b", "1")])
     );
     assert_eq!(assignments("\"ColA\" INT", "NEW.cola := 1;"), pairs(&[]));
+    assert_eq!(
+        assignments("\"ColA\" INT", "IF TG_OP = 'INSERT' THEN NEW.\"ColA\" := 1; END IF;"),
+        pairs(&[("ColA", "CASE WHEN TG_OP = 'INSERT' THEN 1 ELSE NEW.\"ColA\" END")])
+    );
+}
+
+/// PL/pgSQL labels the level holding `NEW` with the function's name, so
+/// `maintain.NEW` is `NEW` in every place a body writes it.
+#[test]
+fn new_qualified_by_the_function_name_is_new() {
+    assert_eq!(
+        assignments_of_body(
+            "a INT, b INT",
+            "BEGIN maintain.NEW.a := 1; NEW.b := maintain.new.a + 1; RETURN maintain.NEW; END",
+        ),
+        pairs(&[("a", "1"), ("b", "1 + 1")])
+    );
+    assert_eq!(
+        assignments("a INT, h TEXT", "NEW.a := 1; NEW.h := md5(maintain.NEW::text);"),
+        pairs(&[])
+    );
 }
 
 /// The whole row read after an assignment holds the assigned value, which no
@@ -126,6 +147,37 @@ fn the_whole_row_read_after_an_assignment_refuses_the_body() {
         pairs(&[("h", "md5(NEW::TEXT)"), ("a", "1")])
     );
     assert_eq!(assignments("a INT, h TEXT", "NEW.a := 1; NEW.h := md5(NEW::text);"), pairs(&[]));
+}
+
+/// `NEW.*` expands to the whole row, so it reads the assigned values too, in
+/// a row constructor, as a function argument and in a select list.
+#[test]
+fn a_wildcard_over_new_after_an_assignment_refuses_the_body() {
+    assert_eq!(
+        assignments("a INT, h TEXT", "NEW.h := row_to_json(NEW.*); NEW.a := 1;"),
+        pairs(&[("h", "row_to_json(NEW.*)"), ("a", "1")])
+    );
+    for read in [
+        "md5(ROW(NEW.*)::text)",
+        "row_to_json(NEW.*)",
+        "(SELECT NEW.*)",
+        "row_to_json(maintain.NEW.*)",
+        "row_to_json(NEW.a.*)",
+    ] {
+        assert_eq!(
+            assignments("a INT, h TEXT", &format!("NEW.a := 1; NEW.h := {read};")),
+            pairs(&[]),
+            "{read}"
+        );
+    }
+}
+
+/// PostgreSQL refuses a body reading a field `NEW` does not have, and a field
+/// of an assigned column reads a value no pair can write.
+#[test]
+fn reading_a_field_the_row_lacks_or_inside_an_assigned_column_refuses_the_body() {
+    assert_eq!(assignments("a INT", "NEW.a := NEW.missing;"), pairs(&[]));
+    assert_eq!(assignments("a INT, b INT", "NEW.a := 1; NEW.b := NEW.a.x;"), pairs(&[]));
 }
 
 #[test]
@@ -153,7 +205,12 @@ fn a_body_that_does_not_return_new_or_assigns_elsewhere_is_refused() {
         "BEGIN NEW.a := 1; END",
         "BEGIN RETURN NEW; END",
         "DECLARE x INT; BEGIN NEW.a := 1; RETURN NEW; END",
+        "BEGIN NEW.a := 1; RETURN NEW; EXCEPTION WHEN OTHERS THEN RETURN NEW; END",
+        "BEGIN NEW.a := (1; RETURN NEW; END",
         "BEGIN OLD.a := 1; RETURN NEW; END",
+        "BEGIN NEW := OLD; RETURN NEW; END",
+        "BEGIN NEW.a.x := 1; RETURN NEW; END",
+        "BEGIN NEW.a[1] := 1; RETURN NEW; END",
         "BEGIN NEW.b := 1; RETURN NEW; END",
     ] {
         assert_eq!(assignments_of_body("a INT", body), pairs(&[]), "{body}");

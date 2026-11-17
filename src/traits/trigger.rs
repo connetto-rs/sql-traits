@@ -672,11 +672,11 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         let Some(function) = self.function(database) else {
             return Ok(false);
         };
-        let Some(body) = function.body() else {
+        if function.body().is_none() {
             return Ok(false);
-        };
+        }
         let table = self.table(database)?;
-        Ok(maintenance_assignments(body, table, database)?.is_some())
+        Ok(maintenance_assignments(function, table, database)?.is_some())
     }
 
     /// Returns the assignments in a maintenance trigger, as
@@ -771,11 +771,11 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         let Some(function) = self.function(database) else {
             return Ok(Vec::new().into_iter());
         };
-        let Some(body) = function.body() else {
+        if function.body().is_none() {
             return Ok(Vec::new().into_iter());
-        };
+        }
         let table = self.table(database)?;
-        Ok(maintenance_assignments(body, table, database)?.unwrap_or_default().into_iter())
+        Ok(maintenance_assignments(function, table, database)?.unwrap_or_default().into_iter())
     }
 }
 
