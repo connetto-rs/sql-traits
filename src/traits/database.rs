@@ -14,6 +14,7 @@ use crate::{
     errors::{Error, LookupError},
     structs::{
         IdentifierCase, OperandType, OperatorResolution, RoleSetting, TargetName, TypeFacts,
+        WrittenCall,
     },
     traits::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
@@ -1653,6 +1654,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// Returns the functions a call written in any statement may run, as
     /// PostgreSQL gathers them before it weighs argument types.
     ///
+    /// `call` is a function expression or a `FROM` item written as a call,
+    /// as [`WrittenCall`] takes either.
+    ///
     /// A qualified name reaches its own schema. An unqualified one reaches
     /// `pg_catalog`, unless [`Self::search_path`] names it, and every schema
     /// of the path, a function hidden by one taking the same arguments in a
@@ -1698,12 +1702,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         case: IdentifierCase,
     ) -> Result<impl Iterator<Item = &'db Self::Function>, LookupError> {
-        Ok(reached_functions(self, call, case)?.into_iter().map(|(function, _)| function))
+        Ok(reached_functions(self, call.into(), case)?.into_iter().map(|(function, _)| function))
     }
 
     /// Returns the function a call runs, given the type of each argument it

@@ -10,8 +10,9 @@ use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
-    ast::{Expr, visit_expressions},
+    ast::{Expr, Statement, TableFactor, Visit, Visitor, visit_expressions},
     dialect::PostgreSqlDialect,
+    parser::Parser,
 };
 
 fn parse(sql: &str) -> ParserDB {
@@ -614,4 +615,115 @@ fn an_index_refuses_calls_it_does_not_hold() {
     let refusals =
         refusals_per_call(other, |call| keyed.functions_reached_by(call, &db).map(names));
     assert_eq!(refusals, [("norm".to_owned(), vec!["norm(x)".to_owned()])]);
+}
+
+/// Every `FROM` item of `node` written as a call, in walk order, with what
+/// `lookup` answers for it.
+fn per_relation_call<T>(
+    node: &impl Visit,
+    mut lookup: impl FnMut(WrittenCall<'_>) -> T,
+) -> Vec<(String, T)> {
+    struct Relations<'f, T> {
+        lookup: &'f mut dyn FnMut(WrittenCall<'_>) -> T,
+        answers: Vec<(String, T)>,
+    }
+    impl<T> Visitor for Relations<'_, T> {
+        type Break = Infallible;
+
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Infallible> {
+            if let Some(call) = WrittenCall::relation(factor) {
+                self.answers.push((call.to_string(), (self.lookup)(call)));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut relations = Relations { lookup: &mut lookup, answers: Vec::new() };
+    let ControlFlow::Continue(()) = node.visit(&mut relations);
+    relations.answers
+}
+
+/// A policy reading set-returning helpers in `FROM`.
+const FROM_CALL_POLICY: &str = "CREATE SCHEMA app;
+     CREATE TABLE members (team_id INT, member TEXT);
+     CREATE FUNCTION app.my_teams() RETURNS SETOF INT LANGUAGE sql STABLE AS 'SELECT 1';
+     CREATE FUNCTION my_teams() RETURNS SETOF INT LANGUAGE sql STABLE
+         AS $$ SELECT team_id FROM members WHERE member = current_setting('app.user_id', true) $$;
+     CREATE FUNCTION team_size(team INT) RETURNS SETOF INT LANGUAGE sql STABLE AS 'SELECT 1';
+     SET search_path TO app, public;
+     CREATE POLICY w ON public.members FOR INSERT WITH CHECK (
+         team_id IN (SELECT t FROM my_teams() t CROSS JOIN LATERAL team_size(t) s
+                     WHERE lower(member) = 'a')
+     );
+     SET search_path TO public;";
+
+/// A `FROM` item written as a call answers the functions it reaches under
+/// the path of the statement that wrote the policy, `LATERAL` or not, and
+/// the function expressions beside it keep their own answers.
+#[test]
+fn a_from_call_in_a_policy_reaches_its_functions() {
+    let db = parse(FROM_CALL_POLICY);
+    let policy = policy(&db, "w");
+    let check = policy.check_expression(&db).expect("literals read").expect("WITH CHECK clause");
+    let relations = per_relation_call(check, |call| {
+        names(policy.functions_reached_by(call, &db).expect("call belongs to the policy"))
+    });
+    assert_eq!(
+        relations,
+        [
+            ("my_teams()".to_owned(), vec!["app.my_teams".to_owned()]),
+            ("team_size(t)".to_owned(), vec!["team_size".to_owned()]),
+        ]
+    );
+    let calls = names_per_call(check, |call| policy.functions_reached_by(call, &db).map(names));
+    // `lower` takes one argument as text, a range or a multirange.
+    let lower = vec!["pg_catalog.lower".to_owned(); 3];
+    assert_eq!(calls, [("lower".to_owned(), lower)]);
+}
+
+/// A `FROM` call copied out of a policy is refused as no node of it.
+#[test]
+fn a_copied_from_call_is_refused() {
+    let db = parse(FROM_CALL_POLICY);
+    let policy = policy(&db, "w");
+    let copy =
+        policy.check_expression(&db).expect("literals read").expect("WITH CHECK clause").clone();
+    let refusals = per_relation_call(&copy, |call| {
+        match policy.functions_reached_by(call, &db).map(names) {
+            Err(LookupError::CallNotInExpression { call }) => call,
+            other => panic!("a call from elsewhere was answered: {other:?}"),
+        }
+    });
+    assert_eq!(
+        refusals,
+        [
+            ("my_teams()".to_owned(), "my_teams()".to_owned()),
+            ("team_size(t)".to_owned(), "team_size(t)".to_owned()),
+        ]
+    );
+}
+
+/// A `FROM` call written in any statement reaches the functions the
+/// database's path finds, and a `FROM` item naming a relation is no call.
+#[test]
+fn a_from_call_in_any_statement_reaches_its_functions() {
+    let db = parse(FROM_CALL_POLICY);
+    let statements = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "SELECT t FROM members, my_teams() t, LATERAL app.my_teams() u",
+    )
+    .expect("query parses");
+    let [Statement::Query(query)] = statements.as_slice() else { panic!("one query") };
+    let relations = per_relation_call(query, |call| {
+        names(
+            db.functions_reached_by(call, IdentifierCase::AsWritten)
+                .expect("the called name resolves"),
+        )
+    });
+    assert_eq!(
+        relations,
+        [
+            ("my_teams()".to_owned(), vec!["my_teams".to_owned()]),
+            ("app.my_teams()".to_owned(), vec!["app.my_teams".to_owned()]),
+        ]
+    );
 }

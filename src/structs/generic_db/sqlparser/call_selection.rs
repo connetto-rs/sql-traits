@@ -39,7 +39,7 @@ use crate::{
     structs::{
         ArraySource, CallApplication, CallRefusal, CallResolution, ExpressionContext,
         ExpressionScope, IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution,
-        OperatorRow, ReparsePins, Site, TableAttribute, TargetName, applies_operators,
+        OperatorRow, ReparsePins, Site, TableAttribute, TargetName, WrittenCall, applies_operators,
         metadata::{
             CallChoice, ExpressionCalls, NodeState, OperatorNode, WrittenPins,
             for_each_operator_node,
@@ -702,10 +702,11 @@ impl<'r> Recorded<'r> {
         let mut written_calls = Vec::new();
         let mut previous = calls.previous_calls().iter();
         let ControlFlow::<Infallible>::Continue(()) = for_each_call(node, |call| {
-            if let (Some(previous), Some(written)) = (previous.next(), call.node) {
+            let function = call.node.and_then(WrittenCall::function);
+            if let (Some(previous), Some(written)) = (previous.next(), function) {
                 reached.insert(address(written), previous.as_slice());
             }
-            written_calls.push(call.node.map(address));
+            written_calls.push(function.map(address));
             ControlFlow::Continue(())
         });
         let node_at = nodes.iter().enumerate().map(|(at, node)| (*node, at)).collect();

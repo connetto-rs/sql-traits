@@ -4,13 +4,15 @@
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    ColumnDef, CreateTable, Expr, Function, IndexType, NullsDistinctOption, UniqueConstraint,
+    ColumnDef, CreateTable, Expr, IndexType, NullsDistinctOption, UniqueConstraint,
 };
 
 use super::index_clauses::{included_columns, written_access_method};
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ConstraintObject, ParserDB, TableAttribute, metadata::UniqueIndexMetadata},
+    structs::{
+        ConstraintObject, ParserDB, TableAttribute, WrittenCall, metadata::UniqueIndexMetadata,
+    },
     traits::{DatabaseLike, IndexLike, Metadata, TableLike},
 };
 
@@ -123,12 +125,13 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
         included_columns(&self.attribute().include, self.table(), database)
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
+        let call = call.into();
         self.metadata(database)?
             .reached_by(self.attribute(), call)
             .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })

@@ -15,7 +15,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::IdentifierCase,
+    structs::{IdentifierCase, WrittenCall},
     traits::{
         ColumnCollation, DataTypeLike, DatabaseLike, Metadata, MySqlCollationPadding, TableLike,
         column::ColumnLike, function_like::FunctionLike,
@@ -1053,8 +1053,8 @@ pub trait CheckConstraintLike:
     /// Returns the functions one call in the constraint's expression may
     /// reach, resolved under the search path of the statement that wrote it.
     ///
-    /// `call` is a node of [`Self::expression`] at any depth, subqueries
-    /// included. Resolution follows the rules of
+    /// `call` is a [`WrittenCall`] of [`Self::expression`] at any depth,
+    /// subqueries included. Resolution follows the rules of
     /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by).
     /// An expression PostgreSQL's grammar writes like a call, such as
     /// `COALESCE` or `CURRENT_USER`, reaches no function.
@@ -1086,9 +1086,9 @@ pub trait CheckConstraintLike:
     /// # Ok(())
     /// # }
     /// ```
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
 

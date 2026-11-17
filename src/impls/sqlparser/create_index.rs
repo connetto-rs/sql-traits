@@ -2,12 +2,12 @@
 
 use alloc::{borrow::Cow, string::ToString};
 
-use sqlparser::ast::{ColumnDef, CreateIndex, CreateTable, Expr, Function, IndexType};
+use sqlparser::ast::{ColumnDef, CreateIndex, CreateTable, Expr, IndexType};
 
 use super::index_clauses::{included_columns, written_access_method};
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ParserDB, TableAttribute, metadata::IndexMetadata},
+    structs::{ParserDB, TableAttribute, WrittenCall, metadata::IndexMetadata},
     traits::{DatabaseLike, IndexLike, Metadata, TableLike},
     utils::object_name::object_name_last_part,
 };
@@ -114,12 +114,13 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
 
     /// The calls of the whole statement are bound in one record, so a call
     /// of the predicate is counted after every call of the key.
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
+        let call = call.into();
         self.metadata(database)?
             .reached_by(self.attribute(), call)
             .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })

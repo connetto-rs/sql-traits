@@ -2,10 +2,13 @@
 
 use alloc::sync::Arc;
 
-use sqlparser::ast::{Expr, Function, Visit};
+use sqlparser::ast::{Expr, Visit};
 
 use super::{ExpressionCalls, expression_calls::call_site};
-use crate::traits::{DatabaseLike, IndexLike};
+use crate::{
+    structs::WrittenCall,
+    traits::{DatabaseLike, IndexLike},
+};
 
 #[derive(Debug, Clone)]
 /// Struct collecting metadata about an index.
@@ -50,7 +53,7 @@ impl<I: IndexLike> IndexMetadata<I> {
     pub(crate) fn reached_by<'s, N: Visit + ?Sized>(
         &'s self,
         statement: &N,
-        call: &Function,
+        call: WrittenCall<'_>,
     ) -> Option<impl Iterator<Item = &'s <I::DB as DatabaseLike>::Function> + use<'s, I, N>> {
         let site = call_site(&self.expression, call).or_else(|| call_site(statement, call))?;
         self.calls.reached_at(site)

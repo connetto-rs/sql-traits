@@ -3,14 +3,12 @@
 
 use alloc::{borrow::Cow, string::ToString};
 
-use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, DataType, Expr, Function, ObjectNamePart,
-};
+use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, Expr, ObjectNamePart};
 
 use crate::{
     errors::{LookupError, ObjectKind},
     impls::SqlparserDialect,
-    structs::{ColumnMetadata, ParserDB, TableAttribute},
+    structs::{ColumnMetadata, ParserDB, TableAttribute, WrittenCall},
     traits::{
         ColumnCollation, ColumnLike, CreatedFromQuery, DatabaseLike, IdentityGeneration, Metadata,
         NamedColumnCollation, TableLike,
@@ -238,12 +236,13 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
 
     /// The calls of the whole declaration are bound in one record, so a
     /// call is counted from the start of the column's node.
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
+        let call = call.into();
         held_column_metadata(self, database)?
             .calls()
             .reached_by(self.attribute(), call)

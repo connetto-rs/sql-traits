@@ -3,11 +3,11 @@
 
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
-use sqlparser::ast::{CheckConstraint, CreateTable, Expr, Function};
+use sqlparser::ast::{CheckConstraint, CreateTable, Expr};
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ConstraintObject, ParserDB, TableAttribute, metadata::CheckMetadata},
+    structs::{ConstraintObject, ParserDB, TableAttribute, WrittenCall, metadata::CheckMetadata},
     traits::{CheckConstraintLike, DatabaseLike, Metadata, TableLike},
 };
 
@@ -84,12 +84,13 @@ impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
         Ok(check_constraint_metadata(self, database)?.functions())
     }
 
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
+        let call = call.into();
         check_constraint_metadata(self, database)?
             .calls()
             .reached_by(self.expression(database), call)

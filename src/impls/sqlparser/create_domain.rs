@@ -3,11 +3,11 @@
 
 use alloc::string::ToString;
 
-use sqlparser::ast::{CreateDomain, DataType, Expr, Function, ObjectName, TableConstraint};
+use sqlparser::ast::{CreateDomain, DataType, Expr, ObjectName, TableConstraint};
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{IdentifierCase, ParserDB},
+    structs::{IdentifierCase, ParserDB, WrittenCall},
     traits::{DatabaseLike, DomainLike, Metadata},
     utils::{
         identifier_resolution::stored_identifier,
@@ -72,12 +72,13 @@ impl DomainLike for CreateDomain {
 
     /// The calls of the default and every check are bound in one record, so
     /// a call is counted from the start of the domain's node.
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
+        let call = call.into();
         database
             .domain_metadata(self)
             .ok_or_else(|| ObjectKind::Domain.not_in_database(self.name()))?

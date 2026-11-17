@@ -3,10 +3,11 @@
 use alloc::borrow::Cow;
 use core::fmt::Debug;
 
-use sqlparser::ast::{Expr, Function};
+use sqlparser::ast::Expr;
 
 use crate::{
     errors::LookupError,
+    structs::WrittenCall,
     traits::{DatabaseLike, Metadata},
     utils::identifier_resolution::stored_identifier,
 };
@@ -178,7 +179,7 @@ pub trait DomainLike: Clone + Debug + Metadata + Send + Sync {
     /// reach, resolved under the search path of the statement that created
     /// the domain.
     ///
-    /// `call` is a node of [`Self::default_expression`] or of one of
+    /// `call` is a [`WrittenCall`] of [`Self::default_expression`] or of one of
     /// [`Self::check_expressions`] at any depth, subqueries included.
     /// Resolution follows the rules of
     /// [`PolicyLike::functions_reached_by`](crate::traits::PolicyLike::functions_reached_by).
@@ -213,9 +214,9 @@ pub trait DomainLike: Clone + Debug + Metadata + Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
 }
@@ -262,9 +263,9 @@ impl<T: DomainLike> DomainLike for &T {
     }
 
     #[inline]
-    fn functions_reached_by<'db>(
+    fn functions_reached_by<'db, 'call>(
         &'db self,
-        call: &Function,
+        call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {

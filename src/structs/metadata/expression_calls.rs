@@ -9,10 +9,12 @@ use alloc::{
 };
 use core::{convert::Infallible, ops::ControlFlow};
 
-use sqlparser::ast::{DataType, Expr, Function, Ident, ObjectName, Visit};
+use sqlparser::ast::{DataType, Expr, Ident, ObjectName, Visit};
 
 use crate::{
-    structs::{IdentifierCase, OperandType, OperatorRow, TargetName, applies_operators},
+    structs::{
+        IdentifierCase, OperandType, OperatorRow, TargetName, WrittenCall, applies_operators,
+    },
     traits::FunctionLike,
     utils::{
         call_sites::{Call, Site, call_reaches, for_each_call, for_each_site},
@@ -511,7 +513,7 @@ impl<F> ExpressionCalls<F> {
     pub fn reached_by<'s, N: Visit + ?Sized>(
         &'s self,
         node: &N,
-        call: &Function,
+        call: WrittenCall<'_>,
     ) -> Option<impl Iterator<Item = &'s F> + use<'s, F, N>> {
         self.reached_at(call_site(node, call)?)
     }
@@ -557,14 +559,16 @@ pub(crate) enum CallSite {
 
 /// Returns where `call` sits among the calls of `node`, or `None` when
 /// `call` is not a node of `node`, which is matched by address.
-pub(crate) fn call_site<N: Visit + ?Sized>(node: &N, call: &Function) -> Option<CallSite> {
+pub(crate) fn call_site<N: Visit + ?Sized>(node: &N, call: WrittenCall<'_>) -> Option<CallSite> {
     let mut position = 0;
     let found = for_each_site(node, |site| {
         match site {
-            Site::Call(Call { node: Some(node), .. }) if core::ptr::eq(node, call) => {
+            Site::Call(Call { node: Some(node), .. }) if node.is(call) => {
                 ControlFlow::Break(CallSite::Call(position))
             }
-            Site::ExpressionForm(node) if core::ptr::eq(node, call) => {
+            Site::ExpressionForm(node)
+                if call.function().is_some_and(|function| core::ptr::eq(function, node)) =>
+            {
                 ControlFlow::Break(CallSite::ExpressionForm)
             }
             Site::Call(_) => {
