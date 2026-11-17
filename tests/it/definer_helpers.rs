@@ -7094,6 +7094,13 @@ fn labels_are_read_in_every_spelling_postgres_resolves_to_the_declared_type() {
             "{labels}"
         );
     }
+    let unaliased = "SELECT resource.id, unnest FROM public.resources resource \
+                     CROSS JOIN unnest(enum_range(NULL::authz.role))";
+    assert_eq!(
+        sharing(unaliased, keep, "").as_deref().map(|set| set.split(" UNION ").next()),
+        Ok(Some("resources.(id, EACH('reader', 'writer', 'admin'))")),
+        "an unaliased unnest names its column unnest"
+    );
     let (called, set) = resources_with("admin")
         .split_once(" {")
         .map(|(called, set)| (called.to_string(), set.to_string()))
@@ -7116,6 +7123,22 @@ fn labels_are_read_in_every_spelling_postgres_resolves_to_the_declared_type() {
             "{first}"
         );
     }
+    // An unqualified enum type is the one in `public`.
+    let public = "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+        CREATE TYPE access AS ENUM ('reader', 'writer');
+        CREATE TABLE resources (id TEXT PRIMARY KEY);
+        GRANT SELECT ON resources TO authz_owner;
+        CREATE FUNCTION accesses() RETURNS TABLE (resource_id TEXT, access access)
+        LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+          SELECT resource.id, allowed.access FROM resources resource
+          CROSS JOIN unnest(enum_range(NULL::access)) allowed(access)
+        $$;
+        ALTER FUNCTION accesses() OWNER TO authz_owner;";
+    let database = postgres(public);
+    let deployment = deployment();
+    let accesses =
+        answer(&database, &deployment, "public", "accesses", &[]).map(|set| render(&set));
+    assert_eq!(accesses.as_deref(), Ok("resources.(id, EACH('reader', 'writer'))"));
 }
 
 #[test]
@@ -7138,6 +7161,16 @@ fn labels_postgres_refuses_or_names_beside_the_rows_refuse_the_answer() {
         crossing("unnest(enum_range(NULL::TEXT)) allowed(role)", ""),
         crossing("unnest(enum_range('reader'::authz.role)) allowed(role)", ""),
         crossing("unnest(enum_range(NULL::authz.role, NULL)) allowed(role)", ""),
+        crossing("unnest(enum_range(NULL)) allowed(role)", ""),
+        crossing("unnest(enum_range(NULL::authz.role)) allowed(role authz.role)", ""),
+        // PostgreSQL answers these two, but a limited list or one the arm
+        // does not return is no list of labels the rows are paired with.
+        crossing("(VALUES ('reader'::authz.role) LIMIT 1) allowed(role)", ""),
+        crossing(
+            "unnest(enum_range(NULL::authz.role)) allowed(role) \
+             CROSS JOIN (VALUES ('reader'::authz.role)) granted(other)",
+            "",
+        ),
         crossing(
             "unnest(enum_range(NULL::authz.role)) WITH ORDINALITY allowed(role, position)",
             "",
@@ -7167,6 +7200,13 @@ fn labels_postgres_refuses_or_names_beside_the_rows_refuse_the_answer() {
         let answered = sharing(first, &second, "");
         assert!(matches!(answered, Err(HelperSetError::ArmShape { .. })), "{second}: {answered:?}");
     }
+    let missing = "SELECT resource.id, allowed.role FROM authz.missing('writer') resource(id) \
+                   CROSS JOIN (VALUES ('reader'::authz.role)) allowed(role)";
+    let answered = sharing(first, missing, "");
+    assert!(
+        matches!(&answered, Err(HelperSetError::UnresolvedCall { call, .. }) if call == "authz.missing"),
+        "{answered:?}"
+    );
     // `SET search_path = authz` puts `pg_catalog` first, but a reachable
     // overload is refused as it is for every catalog function.
     let pathed = |after: &str| {

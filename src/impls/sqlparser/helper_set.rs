@@ -40,7 +40,7 @@ use crate::{
         call_sites::{ExpressionForm, call_reaches, expression_form},
         identifier_resolution::{SearchPath, identifiers_match},
         object_name::{
-            PG_CATALOG, Qualifier, object_name_last_part, qualifier_of,
+            PG_CATALOG, Qualifier, object_name_identifiers, object_name_last_part, qualifier_of,
             resolve_relation_object_name_on_path, target_name_of_table, type_search_path,
         },
         postgres_types::{PgType, parse_data_type},
@@ -853,15 +853,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut lists = Vec::new();
         let mut joins = Vec::new();
         for join in &from.joins {
-            if join.global {
-                return Err(shape());
-            }
-            if is_cross(join) {
-                lists.push(self.label_list(scope, &join.relation).ok_or_else(shape)?);
-            } else if join_condition(join).is_some() {
-                joins.push(join);
-            } else {
-                return Err(shape());
+            match (join.global, is_cross(join), join_condition(join)) {
+                (false, true, _) => {
+                    lists.push(self.label_list(scope, &join.relation).ok_or_else(shape)?);
+                }
+                (false, false, Some(_)) => joins.push(join),
+                _ => return Err(shape()),
             }
         }
         if let Some(call) = called_relation(&from.relation) {
@@ -1141,17 +1138,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// The labels of the enum type `declared` names, in the order it declares
     /// them, an unqualified name naming one in `public`.
     fn enum_labels(&self, declared: &DataType) -> Option<Vec<&'db str>> {
-        let DataType::Custom(name, modifiers) = declared else { return None };
-        if !modifiers.is_empty() {
-            return None;
-        }
-        let (schema, name) = match name.0.as_slice() {
-            [ObjectNamePart::Identifier(name)] => (("public", false), name),
-            [ObjectNamePart::Identifier(schema), ObjectNamePart::Identifier(name)] => {
-                ((schema.value.as_str(), schema.quote_style.is_some()), name)
-            }
-            _ => return None,
-        };
+        // PostgreSQL refuses a modifier on an enum type.
+        let DataType::Custom(name, _) = declared else { return None };
+        let (schema, name) = object_name_identifiers(name).ok()?;
+        let schema = schema.map_or(("public", false), |schema| {
+            (schema.value.as_str(), schema.quote_style.is_some())
+        });
         let user_type = self.database.user_defined_types().find(|user_type| {
             identifiers_match(
                 user_type.name(),
