@@ -20,7 +20,7 @@ use sqlparser::{
 };
 use sqlparser_plpgsql::embedded::{
     Assignment, Block, BoundCursor, Branch, DeclarationKind, Dynamic, Fetch, Indirection, Loop,
-    LoopControl, Node, Open, RaiseOption, ReturnQuery,
+    LoopControl, Node, NodeKind, Open, RaiseOption, ReturnQuery,
 };
 
 use super::data_statement::{
@@ -67,42 +67,42 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
     }
 
     fn node(&mut self, node: &'s Node) -> Result<(), LookupError> {
-        match node {
-            Node::Statement { statement, .. }
-            | Node::Perform { query: statement }
-            | Node::ReturnQuery(ReturnQuery::Query(statement)) => self.statement(statement),
-            Node::Assignment(assignment) => {
+        match &node.kind {
+            NodeKind::Statement { statement, .. }
+            | NodeKind::Perform { query: statement }
+            | NodeKind::ReturnQuery(ReturnQuery::Query(statement)) => self.statement(statement),
+            NodeKind::Assignment(assignment) => {
                 subscripts(assignment).try_for_each(|subscript| self.expression(subscript))?;
                 self.expression(&assignment.value)
             }
-            Node::Dynamic { dynamic, .. }
-            | Node::Open(Open::Dynamic { dynamic, .. })
-            | Node::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
+            NodeKind::Dynamic { dynamic, .. }
+            | NodeKind::Open(Open::Dynamic { dynamic, .. })
+            | NodeKind::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
                 self.walker.dynamic(self.function, dynamic)
             }
-            Node::Open(Open::Bound(cursor)) => self.opened(cursor),
-            Node::Open(Open::Query { query, .. }) => self.statement(query),
-            Node::Fetch(Fetch { direction, .. }) | Node::Move { direction, .. } => {
+            NodeKind::Open(Open::Bound(cursor)) => self.opened(cursor),
+            NodeKind::Open(Open::Query { query, .. }) => self.statement(query),
+            NodeKind::Fetch(Fetch { direction, .. }) | NodeKind::Move { direction, .. } => {
                 direction.expression().map_or(Ok(()), |count| self.expression(count))
             }
-            Node::Close { .. }
-            | Node::Commit { .. }
-            | Node::Rollback { .. }
-            | Node::Diagnostics(_) => Ok(()),
-            Node::Block(block) => self.block(block),
-            Node::If(choice) => self.branches(&choice.branches, &choice.otherwise),
-            Node::Case(choice) => {
+            NodeKind::Close { .. }
+            | NodeKind::Commit { .. }
+            | NodeKind::Rollback { .. }
+            | NodeKind::Diagnostics(_) => Ok(()),
+            NodeKind::Block(block) => self.block(block),
+            NodeKind::If(choice) => self.branches(&choice.branches, &choice.otherwise),
+            NodeKind::Case(choice) => {
                 if let Some(subject) = &choice.subject {
                     self.expression(subject)?;
                 }
                 self.branches(&choice.branches, &choice.otherwise)
             }
-            Node::Loop(repeated) => self.repeated(repeated),
-            Node::Exit(_)
-            | Node::Return { .. }
-            | Node::ReturnNext { .. }
-            | Node::Raise(_)
-            | Node::Assert(_) => {
+            NodeKind::Loop(repeated) => self.repeated(repeated),
+            NodeKind::Exit(_)
+            | NodeKind::Return { .. }
+            | NodeKind::ReturnNext { .. }
+            | NodeKind::Raise(_)
+            | NodeKind::Assert(_) => {
                 transfer_expressions(node).try_for_each(|query| self.expression(query))
             }
         }
@@ -264,50 +264,52 @@ fn each_sql<'s, B>(
     visit: &mut impl FnMut(EmbeddedSql<'s>, Option<&'s Dynamic>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
     for node in nodes {
-        match node {
-            Node::Statement { statement, .. }
-            | Node::Perform { query: statement }
-            | Node::ReturnQuery(ReturnQuery::Query(statement)) => {
+        match &node.kind {
+            NodeKind::Statement { statement, .. }
+            | NodeKind::Perform { query: statement }
+            | NodeKind::ReturnQuery(ReturnQuery::Query(statement)) => {
                 visit(EmbeddedSql::Statement(statement), None)?;
             }
-            Node::Assignment(assignment) => {
+            NodeKind::Assignment(assignment) => {
                 subscripts(assignment)
                     .try_for_each(|subscript| visit(EmbeddedSql::Expression(subscript), None))?;
                 visit(EmbeddedSql::Expression(&assignment.value), None)?;
             }
-            Node::Dynamic { dynamic, .. }
-            | Node::Open(Open::Dynamic { dynamic, .. })
-            | Node::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
+            NodeKind::Dynamic { dynamic, .. }
+            | NodeKind::Open(Open::Dynamic { dynamic, .. })
+            | NodeKind::ReturnQuery(ReturnQuery::Dynamic(dynamic)) => {
                 each_dynamic_sql(dynamic, visit)?;
             }
-            Node::Open(Open::Bound(cursor)) => each_cursor_sql(cursor, visit)?,
-            Node::Open(Open::Query { query, .. }) => visit(EmbeddedSql::Statement(query), None)?,
-            Node::Fetch(Fetch { direction, .. }) | Node::Move { direction, .. } => {
+            NodeKind::Open(Open::Bound(cursor)) => each_cursor_sql(cursor, visit)?,
+            NodeKind::Open(Open::Query { query, .. }) => {
+                visit(EmbeddedSql::Statement(query), None)?;
+            }
+            NodeKind::Fetch(Fetch { direction, .. }) | NodeKind::Move { direction, .. } => {
                 if let Some(count) = direction.expression() {
                     visit(EmbeddedSql::Expression(count), None)?;
                 }
             }
-            Node::Close { .. }
-            | Node::Commit { .. }
-            | Node::Rollback { .. }
-            | Node::Diagnostics(_) => {}
-            Node::Exit(_)
-            | Node::Return { .. }
-            | Node::ReturnNext { .. }
-            | Node::Raise(_)
-            | Node::Assert(_) => {
+            NodeKind::Close { .. }
+            | NodeKind::Commit { .. }
+            | NodeKind::Rollback { .. }
+            | NodeKind::Diagnostics(_) => {}
+            NodeKind::Exit(_)
+            | NodeKind::Return { .. }
+            | NodeKind::ReturnNext { .. }
+            | NodeKind::Raise(_)
+            | NodeKind::Assert(_) => {
                 transfer_expressions(node)
                     .try_for_each(|query| visit(EmbeddedSql::Expression(query), None))?;
             }
-            Node::Block(block) => each_block_sql(block, visit)?,
-            Node::If(choice) => each_branch_sql(&choice.branches, &choice.otherwise, visit)?,
-            Node::Case(choice) => {
+            NodeKind::Block(block) => each_block_sql(block, visit)?,
+            NodeKind::If(choice) => each_branch_sql(&choice.branches, &choice.otherwise, visit)?,
+            NodeKind::Case(choice) => {
                 if let Some(subject) = &choice.subject {
                     visit(EmbeddedSql::Expression(subject), None)?;
                 }
                 each_branch_sql(&choice.branches, &choice.otherwise, visit)?;
             }
-            Node::Loop(repeated) => {
+            NodeKind::Loop(repeated) => {
                 match &repeated.control {
                     LoopControl::Unconditional => {}
                     LoopControl::While(query) | LoopControl::Array { array: query, .. } => {
@@ -374,11 +376,13 @@ fn subscripts(assignment: &Assignment) -> impl Iterator<Item = &Query> {
 /// `RETURN NEXT`, `RAISE` or `ASSERT` evaluates, in the order written, and
 /// none for any other node.
 pub(crate) fn transfer_expressions(node: &Node) -> impl Iterator<Item = &Query> {
-    let (first, arguments, options, last): (_, &[Query], &[RaiseOption], _) = match node {
-        Node::Exit(exit) => (exit.condition.as_deref(), &[], &[], None),
-        Node::Return { value } | Node::ReturnNext { value } => (value.as_deref(), &[], &[], None),
-        Node::Raise(raise) => (None, &raise.arguments, &raise.options, None),
-        Node::Assert(assert) => (Some(&*assert.condition), &[], &[], assert.message.as_deref()),
+    let (first, arguments, options, last): (_, &[Query], &[RaiseOption], _) = match &node.kind {
+        NodeKind::Exit(exit) => (exit.condition.as_deref(), &[], &[], None),
+        NodeKind::Return { value } | NodeKind::ReturnNext { value } => {
+            (value.as_deref(), &[], &[], None)
+        }
+        NodeKind::Raise(raise) => (None, &raise.arguments, &raise.options, None),
+        NodeKind::Assert(assert) => (Some(&*assert.condition), &[], &[], assert.message.as_deref()),
         _ => (None, &[], &[], None),
     };
     first.into_iter().chain(arguments).chain(options.iter().map(|option| &option.value)).chain(last)

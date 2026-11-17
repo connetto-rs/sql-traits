@@ -105,9 +105,9 @@ dependencies = [
 
 [[package]]
 name = "bytes"
-version = "1.12.1"
+version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "cc"
@@ -1008,7 +1008,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#6b2ab812a6ff04b527c1c0ec8cd549e5fbf65c27"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#aebe905b6faae6b27d82a281d447b06ac5dc4dbd"
 dependencies = [
  "sqlparser",
  "sqlstate",

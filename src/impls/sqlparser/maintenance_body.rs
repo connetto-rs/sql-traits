@@ -49,7 +49,7 @@ pub(crate) fn maintenance_assignments<'db, DB: DatabaseLike>(
     // A body `fields_of_new` folds declares nothing and holds no loop or
     // nested block, so the names `RETURN` reads, the last site, are those of
     // every statement.
-    let Some((fields, namespace)) = block.fields_of_new(&signature).and_then(|fields| {
+    let Some((fields, namespace)) = block.fields_of_new(&signature).ok().and_then(|fields| {
         let site = block.sites(&signature, |name| names.holds_row(name)).ok()?.pop()?;
         Some((fields, site.namespace))
     }) else {
