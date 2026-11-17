@@ -1035,6 +1035,10 @@ mod tests {
             trigger_ref.maintenance_assignments(&db).expect("maintenance assignments").count(),
             0
         );
+        assert_eq!(
+            trigger_ref.maintenance_refusal(&db),
+            Ok(Some(crate::structs::MaintenanceRefusal::NoBody))
+        );
     }
 
     #[test]
