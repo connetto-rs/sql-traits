@@ -94,6 +94,7 @@ mod keyword_grantees;
 mod leading_comment_documentation;
 mod length_check_spellings;
 mod literal_list_text_checks;
+mod maintenance_triggers;
 mod names_outside_this_catalog;
 mod negated_length_checks;
 mod object_kind_reporting;
