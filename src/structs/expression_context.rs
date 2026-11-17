@@ -2228,7 +2228,7 @@ fn unquoted_name(function: &Function) -> Option<&str> {
 /// The nodes the arguments of `function` come from, in the order it writes
 /// them, or `None` for a call written with an aggregate's or a window
 /// function's clauses, with a subquery or with a `*` argument.
-fn plain_arguments(function: &Function) -> Option<Vec<&Expr>> {
+pub(crate) fn plain_arguments(function: &Function) -> Option<Vec<&Expr>> {
     let plain = matches!(function.parameters, FunctionArguments::None)
         && function.filter.is_none()
         && function.null_treatment.is_none()

@@ -364,6 +364,16 @@ fn unnest_columns_expand_an_argument_shown_to_be_an_array() {
             "SELECT x FROM (SELECT tags AS list FROM docs) AS d, unnest(d.list) AS x",
             "element of d.list",
         ),
+        ("SELECT x FROM unnest((ARRAY[1])) AS x", "element of (ARRAY[1])"),
+        (
+            "WITH c AS (SELECT ARRAY[1] AS list) SELECT x FROM c, unnest(c.list) AS x",
+            "element of c.list",
+        ),
+        (
+            "WITH RECURSIVE r(list) AS (SELECT ARRAY[1] UNION ALL SELECT list FROM r WHERE false)
+             SELECT x FROM r, unnest(r.list) AS x",
+            "element of r.list",
+        ),
     ] {
         assert_eq!(outputs(sql), [expected], "{sql}");
     }
@@ -410,6 +420,55 @@ fn an_unnest_not_shown_to_read_arrays_stays_opaque() {
         "SELECT x FROM unnest((SELECT tags FROM docs LIMIT 1)) AS x",
         "SELECT x FROM unnest(ARRAY[1]) AS t(x, y)",
         "SELECT x FROM pg_catalog.unnest(ARRAY[1], ARRAY[2]) AS x",
+        "SELECT x FROM pg_catalog.unnest() AS x",
+        "SELECT x FROM pg_catalog.unnest(list => ARRAY[1]) AS x",
+        "SELECT x FROM other.unnest(ARRAY[1]) AS x",
+        "SELECT x FROM unnest(current_timestamp) AS x",
+        "SELECT x FROM unnest(current_schema) AS x",
+        "SELECT x FROM unnest(missing) AS x",
+        "SELECT y FROM a, b, unnest(id) AS y",
+        "SELECT y FROM unnest(ARRAY[1]) AS x, unnest(x) AS y",
+        "SELECT y FROM unnest(ARRAY[1]) WITH ORDINALITY AS t(x, n), unnest(t.n) AS y",
+        "SELECT y FROM generate_series(1, 2) AS g(n), unnest(g.n) AS y",
+    ] {
+        assert_eq!(outputs(sql), ["opaque"], "{sql}");
+    }
+}
+
+/// `COALESCE`, `GREATEST`, `LEAST`, a set operation and a `VALUES` column
+/// take the common type of their inputs, an array when any input is one,
+/// and `NULLIF` the type of its first argument.
+#[test]
+fn an_unnest_of_a_common_type_expands_when_any_input_is_an_array() {
+    for (sql, expected) in [
+        (
+            "SELECT tag FROM docs, unnest(coalesce(docs.tags, '{}')) AS tag",
+            "element of coalesce(docs.tags, '{}')",
+        ),
+        (
+            "SELECT x FROM unnest(greatest(NULL, ARRAY[1])) AS x",
+            "element of greatest(NULL, ARRAY[1])",
+        ),
+        (
+            "SELECT tag FROM docs, unnest(nullif(docs.tags, '{}')) AS tag",
+            "element of nullif(docs.tags, '{}')",
+        ),
+        (
+            "SELECT x FROM (SELECT NULL AS list UNION SELECT ARRAY[1]) AS d, unnest(d.list) AS x",
+            "element of d.list",
+        ),
+        (
+            "SELECT x FROM (VALUES (NULL), (ARRAY[1])) AS v(list), unnest(v.list) AS x",
+            "element of v.list",
+        ),
+    ] {
+        assert_eq!(outputs(sql), [expected], "{sql}");
+    }
+    for sql in [
+        "SELECT x FROM unnest(coalesce(1, 2)) AS x",
+        "SELECT x FROM docs, unnest(coalesce(docs.*)) AS x",
+        "SELECT x FROM docs, unnest(nullif(docs.id, 0)) AS x",
+        "SELECT x FROM (SELECT 1 AS list UNION SELECT 2) AS d, unnest(d.list) AS x",
     ] {
         assert_eq!(outputs(sql), ["opaque"], "{sql}");
     }
@@ -446,4 +505,19 @@ fn an_unnest_argument_resolves_in_the_scope_its_item_sees() {
         .expect("lookup succeeds")
         .expect("a.id resolves");
     assert_eq!(describe(&id), "a.id");
+}
+
+/// An `unnest` beside a table is a relation of its own to the projection's
+/// source, so a name both may answer has no single source table.
+#[test]
+fn an_unnest_item_takes_part_in_the_projection_source() {
+    let database = database();
+    let source = |sql| {
+        query(sql)
+            .projection_source_table(&database)
+            .expect("source resolves")
+            .map(TableLike::table_name)
+    };
+    assert_eq!(source("SELECT a.x FROM a, unnest(ARRAY[1]) AS x"), Some("a"));
+    assert_eq!(source("SELECT x FROM a, unnest(ARRAY[1]) AS x"), None);
 }

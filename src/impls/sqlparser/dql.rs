@@ -588,24 +588,18 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         expression: AstRef<'query, 'db, Expr>,
         scope: Self::Cursor,
     ) -> Result<Self::Definition, LookupError>;
-    /// Whether `array`, an argument of an `unnest` in `FROM` read under
-    /// `scope`, is shown to be an array, its calls looked up in `database`.
-    /// A profile that resolves no column shows none.
-    fn proves_array(
-        &self,
-        array: AstRef<'query, 'db, Expr>,
+    /// The definitions of the columns an `unnest` in `FROM` outputs, the
+    /// elements of each of `arguments` read under `scope`, then the row
+    /// number `WITH ORDINALITY` adds. `None` when an argument is not shown
+    /// to be an array, its calls looked up in `database`, which a profile
+    /// that resolves no column never shows.
+    fn unnest_definitions(
+        &mut self,
+        arguments: &[AstRef<'query, 'db, Expr>],
+        with_ordinality: bool,
         scope: Self::Cursor,
         database: &'db DB,
-    ) -> Result<bool, LookupError>;
-    /// The definition of the elements of `array`, an argument of an `unnest`
-    /// in `FROM` read under `scope`.
-    fn array_element_definition(
-        &mut self,
-        array: AstRef<'query, 'db, Expr>,
-        scope: Self::Cursor,
-    ) -> Self::Definition;
-    /// The definition of the row number `WITH ORDINALITY` adds.
-    fn ordinality_definition(&mut self) -> Self::Definition;
+    ) -> Result<Option<Vec<Self::Definition>>, LookupError>;
     fn set_definition(
         &mut self,
         operator: SetOperator,
@@ -721,23 +715,15 @@ where
         Ok(())
     }
 
-    fn proves_array(
-        &self,
-        _array: AstRef<'query, 'db, Expr>,
+    fn unnest_definitions(
+        &mut self,
+        _arguments: &[AstRef<'query, 'db, Expr>],
+        _with_ordinality: bool,
         _scope: Self::Cursor,
         _database: &'db DB,
-    ) -> Result<bool, LookupError> {
-        Ok(false)
+    ) -> Result<Option<Vec<Self::Definition>>, LookupError> {
+        Ok(None)
     }
-
-    fn array_element_definition(
-        &mut self,
-        _array: AstRef<'query, 'db, Expr>,
-        _scope: Self::Cursor,
-    ) {
-    }
-
-    fn ordinality_definition(&mut self) {}
 
     fn set_definition(
         &mut self,
@@ -4604,20 +4590,21 @@ fn unnest_call<'query, 'db>(
             name: None,
         });
     }
+    let mut with_ordinality = false;
     let listed = factor.try_map(|factor| {
         match factor {
             TableFactor::Table {
-                args: Some(TableFunctionArgs { args, settings: None }), ..
+                args: Some(TableFunctionArgs { args, .. }),
+                with_ordinality: ordinality,
+                ..
             }
-            | TableFactor::Function { args, .. } => Some(args.as_slice()),
+            | TableFactor::Function { args, with_ordinality: ordinality, .. } => {
+                with_ordinality = *ordinality;
+                Some(args.as_slice())
+            }
             _ => None,
         }
     })?;
-    let (TableFactor::Table { with_ordinality, .. }
-    | TableFactor::Function { with_ordinality, .. }) = factor.get()
-    else {
-        return None;
-    };
     let name = factor_name(factor)?;
     let (called, quoted) = object_name_last_part(name.get())?;
     if name.get().0.len() > 2 || !case.identifiers_match(called, quoted, "unnest", true) {
@@ -4646,7 +4633,7 @@ fn unnest_call<'query, 'db>(
     if qualified && arguments.len() > 1 {
         return None;
     }
-    Some(UnnestCall { arguments, with_ordinality: *with_ordinality, name: Some(name) })
+    Some(UnnestCall { arguments, with_ordinality, name: Some(name) })
 }
 
 /// What `call`, the `unnest` call `factor` writes, contributes: one element
@@ -4686,11 +4673,15 @@ where
     }) {
         return Ok(None);
     }
-    for argument in &call.arguments {
-        if !profile.proves_array(*argument, local_parent, database)? {
-            return Ok(None);
-        }
-    }
+    let Some(definitions) = profile.unnest_definitions(
+        &call.arguments,
+        call.with_ordinality,
+        local_parent,
+        database,
+    )?
+    else {
+        return Ok(None);
+    };
     let alias = factor_alias(factor);
     let (element_name, element_quoted) = match &alias {
         Some(alias) if call.arguments.len() == 1 => {
@@ -4698,25 +4689,24 @@ where
         }
         _ => ("unnest", true),
     };
-    let mut columns = Vec::with_capacity(width);
-    for argument in &call.arguments {
-        columns.push(DerivedColumn {
-            name: element_name.to_owned(),
-            quoted: element_quoted,
-            source: None,
-            definition: profile.array_element_definition(*argument, local_parent),
-            marker: core::marker::PhantomData,
-        });
-    }
-    if call.with_ordinality {
-        columns.push(DerivedColumn {
-            name: "ordinality".to_owned(),
-            quoted: true,
-            source: None,
-            definition: profile.ordinality_definition(),
-            marker: core::marker::PhantomData,
-        });
-    }
+    let columns = definitions
+        .into_iter()
+        .enumerate()
+        .map(|(position, definition)| {
+            let (name, quoted) = if position < call.arguments.len() {
+                (element_name, element_quoted)
+            } else {
+                ("ordinality", true)
+            };
+            DerivedColumn {
+                name: name.to_owned(),
+                quoted,
+                source: None,
+                definition,
+                marker: core::marker::PhantomData,
+            }
+        })
+        .collect();
     let shape = DerivedShape { columns, row_preserving: false };
     let shape = match alias {
         Some(alias) => apply_alias_columns(Some(shape), alias.get()),
