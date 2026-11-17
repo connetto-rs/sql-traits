@@ -34,7 +34,7 @@ The library is designed around a set of traits that abstract over database schem
 
 ### Build & Linting
 - Comparison with strict lints: The project enables `pedantic` clippy lints and forbids missing docs. Ensure all new public items are documented.
-- **Dependencies**: Note the git dependency on `geometric-traits`.
+- **Dependencies**: `sqlparser-plpgsql` and `sqlparser-canonicalize` come from git `main`, and `sqlparser` is patched to its git `main` through `[patch.crates-io]`.
 
 ## Example: Traversing Schema
 
