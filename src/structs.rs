@@ -7,6 +7,7 @@ mod column_scope;
 mod constraint_deferral;
 mod deployment;
 mod dynamic_execution;
+mod embedded_sql;
 mod expression_context;
 mod expression_scope;
 pub(crate) mod fingerprint;
@@ -29,6 +30,7 @@ mod operator_resolution;
 mod partition_bound;
 pub(crate) mod plpgsql_flow;
 pub(crate) mod plpgsql_scope;
+mod plpgsql_site;
 pub(crate) mod policy_analysis;
 mod policy_expression;
 mod privilege_holder;
@@ -62,6 +64,7 @@ pub use deployment::{
 };
 pub use dynamic_execution::{DynamicExecution, DynamicExecutionSites};
 pub(crate) use dynamic_execution::{SiteFlow, SiteScope};
+pub use embedded_sql::EmbeddedSql;
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
@@ -93,6 +96,7 @@ pub use plpgsql_flow::{
     TargetStep, VariableRead,
 };
 pub use plpgsql_scope::{PlPgSqlScope, PlPgSqlVariable, VariableKind};
+pub use plpgsql_site::{PlPgSqlSite, PlPgSqlSites};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
 pub use policy_expression::PolicyExpression;
 pub use privilege_holder::PrivilegeHolder;

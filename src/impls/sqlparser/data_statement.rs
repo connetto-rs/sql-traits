@@ -30,7 +30,7 @@ use sqlparser_plpgsql::embedded::{Block, Dynamic, expression};
 use super::plpgsql_body::walk_block;
 use crate::{
     errors::LookupError,
-    structs::{IdentifierCase, UnqualifiedName},
+    structs::{EmbeddedSql, IdentifierCase, UnqualifiedName},
     traits::{DataStatementLike, DatabaseLike, FunctionLike, Relation, TableLike, ViewLike},
     utils::{
         call_sites::for_each_call,
@@ -441,34 +441,6 @@ pub(crate) fn reads_on_path<'db, N: Visit, DB: DatabaseLike>(
     Ok(collector.reads)
 }
 
-/// One piece of SQL a function body runs, a statement or the `SELECT` a
-/// PL/pgSQL body evaluates an expression with.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Embedded<'s> {
-    /// A statement.
-    Statement(&'s Statement),
-    /// The `SELECT` evaluating an expression.
-    Expression(&'s Query),
-}
-
-impl Visit for Embedded<'_> {
-    fn visit<V: Visitor>(&self, visitor: &mut V) -> ControlFlow<V::Break> {
-        match self {
-            Self::Statement(statement) => walk(*statement, visitor),
-            Self::Expression(query) => walk(*query, visitor),
-        }
-    }
-}
-
-impl core::fmt::Display for Embedded<'_> {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Statement(statement) => statement.fmt(formatter),
-            Self::Expression(query) => query.fmt(formatter),
-        }
-    }
-}
-
 /// What a walk over the statements of a function body read when it runs
 /// gathers, one statement after another, under the path in force for each.
 pub(crate) trait BodyWalk<'s> {
@@ -490,12 +462,12 @@ pub(crate) trait BodyWalk<'s> {
     /// # Errors
     ///
     /// Returns any error resolving a name the statement holds.
-    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError>;
+    fn walk(&mut self, sql: EmbeddedSql<'_>) -> Result<(), LookupError>;
 
     /// Whether `sql` calls code that may set `search_path` for the
     /// statements after it, as [`calls_user_code`] decides over the
     /// walker's database.
-    fn runs_user_code(&self, sql: Embedded<'_>) -> bool;
+    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool;
 
     /// Takes a statement that runs code outside the body, as
     /// [`runs_code_outside`] picks it, which hides what the body reads.
@@ -597,8 +569,8 @@ pub(crate) fn walk_statement<'s>(
         Some(SearchPathChange::Set(path)) => walker.set_path(BodyPath::Set(path)),
         Some(SearchPathChange::Reset) => walker.set_path(BodyPath::default_path()),
         None => {
-            walker.walk(Embedded::Statement(statement))?;
-            let embedded = Embedded::Statement(statement);
+            walker.walk(EmbeddedSql::Statement(statement))?;
+            let embedded = EmbeddedSql::Statement(statement);
             if sets_search_path_at_run_time(statement) || walker.runs_user_code(embedded) {
                 walker.set_path(BodyPath::Unknown(unresolvable(function, statement)));
             }
@@ -619,8 +591,9 @@ pub(crate) fn walk_expression<'s>(
     query: &Query,
     walker: &mut impl BodyWalk<'s>,
 ) -> Result<(), LookupError> {
-    walker.walk(Embedded::Expression(query))?;
-    if sets_search_path_at_run_time(query) || walker.runs_user_code(Embedded::Expression(query)) {
+    walker.walk(EmbeddedSql::Expression(query))?;
+    if sets_search_path_at_run_time(query) || walker.runs_user_code(EmbeddedSql::Expression(query))
+    {
         walker.set_path(BodyPath::Unknown(unresolvable(function, query)));
     }
     Ok(())
@@ -647,15 +620,15 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for RelationCollector<'_, 's, DB> {
         self.path = Some(path);
     }
 
-    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
+    fn walk(&mut self, sql: EmbeddedSql<'_>) -> Result<(), LookupError> {
         let listed = match sql {
-            Embedded::Statement(Statement::Delete(delete)) => delete.tables.as_slice(),
+            EmbeddedSql::Statement(Statement::Delete(delete)) => delete.tables.as_slice(),
             _ => &[],
         };
         self.collect(&sql, listed)
     }
 
-    fn runs_user_code(&self, sql: Embedded<'_>) -> bool {
+    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool {
         calls_user_code(&sql, self.database)
     }
 }

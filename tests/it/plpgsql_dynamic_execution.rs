@@ -11,7 +11,7 @@
     reason = "test code ships in no binary, so walking the tree directly costs nothing"
 )]
 
-use core::ops::ControlFlow;
+use core::{fmt::Write, ops::ControlFlow};
 
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
@@ -836,6 +836,42 @@ fn a_cursor_opened_in_a_branch_hides_the_path_from_later_sites() {
     );
     let last = called_schemas(&database, "via_open").pop().unwrap();
     assert_eq!(last, ["?", "pg_catalog"]);
+}
+
+/// A call to user code in a branch hides the path from later sites wherever
+/// the branch runs it, in an assignment's subscript, a cursor opened for a
+/// query, a nested block's default or a loop's query.
+#[test]
+fn user_code_anywhere_in_a_branch_hides_the_path_from_later_sites() {
+    let forms = [
+        ("subscript", "arr[side()] := 1;"),
+        ("opened", "OPEN c FOR SELECT side();"),
+        ("defaulted", "DECLARE x integer := side(); BEGIN NULL; END;"),
+        ("looped", "FOR r IN SELECT side() LOOP NULL; END LOOP;"),
+    ];
+    let functions = forms.iter().fold(String::new(), |mut functions, (name, form)| {
+        write!(
+            functions,
+            "CREATE FUNCTION {name}(flag boolean, p text) RETURNS void LANGUAGE plpgsql AS $$
+             DECLARE arr integer[] := '{{}}'; c refcursor; r record;
+             BEGIN
+              IF flag THEN {form} END IF;
+              EXECUTE 'SELECT ' || quote_ident(p) || quote_literal(p);
+             END $$;"
+        )
+        .unwrap();
+        functions
+    });
+    let database = postgres(&format!(
+        "CREATE SCHEMA evil;
+         CREATE FUNCTION evil.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1';
+         CREATE FUNCTION side() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+         {functions}"
+    ));
+    for (name, _) in forms {
+        let last = called_schemas(&database, name).pop().unwrap();
+        assert_eq!(last, ["?", "pg_catalog"], "{name}");
+    }
 }
 
 /// `OPEN outer.c` under a record named `outer` reads a field of the record,

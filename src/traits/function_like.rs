@@ -11,12 +11,12 @@ use sqlparser::ast::{
 use crate::{
     errors::{HelperSetError, LookupError},
     impls::{
-        atomic_statements, body_calls, body_dynamic_sites, body_expression, body_reads,
+        atomic_statements, body_calls, body_expression, body_reads, body_site_source,
         body_unqualified_names, helper_set,
     },
     structs::{
         AggregateKind, Deployment, DynamicExecutionSites, FunctionBody, FunctionKind, HelperSet,
-        PrivilegeHolder, TargetName, UnqualifiedName,
+        PlPgSqlSites, PrivilegeHolder, TargetName, UnqualifiedName,
     },
     traits::{DatabaseLike, Metadata, Relation, TriggerLike},
     utils::{
@@ -1392,7 +1392,81 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         &'db self,
         database: &'db Self::DB,
     ) -> Result<DynamicExecutionSites<'db, Self::DB>, LookupError> {
-        body_dynamic_sites(self, database)
+        body_site_source(self, database).map(DynamicExecutionSites::new)
+    }
+
+    /// Returns the statements and expressions of a PL/pgSQL body, owning the
+    /// parsed body, whose [`sites`](PlPgSqlSites::sites) are every piece of
+    /// SQL PostgreSQL 18 compiles while the body runs, in body order through
+    /// nested blocks, branches, loops and exception handlers.
+    ///
+    /// A site is a statement, the query of a `FOR` loop or of a cursor where
+    /// it opens, or the `SELECT` evaluating an expression, such as a
+    /// condition, an assigned value, a loop bound or array, a default, a
+    /// cursor argument, a `RETURN` value, and an `EXECUTE`'s command and each
+    /// `USING` argument by itself. A `SET` or `RESET` of `search_path`, which
+    /// reads no name, is no site.
+    ///
+    /// Each site's [`context`](crate::structs::PlPgSqlSite::context) binds
+    /// its column references as
+    /// [`ExpressionScope::PlPgSql`](crate::structs::ExpressionScope::PlPgSql)
+    /// describes, under the variables in reach where the site sits, and
+    /// [`ExpressionContext::variable`](crate::structs::ExpressionContext::variable)
+    /// answers the variable a column reference's name also reaches.
+    ///
+    /// A body in SQL answers no site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::FunctionBodyNotSql`] for a body in a language
+    /// sql-traits does not read, [`LookupError::FunctionBodyUnavailable`] when
+    /// the source is unavailable, [`LookupError::FunctionBodyUnparsable`] for
+    /// a body that does not parse, a PL/pgSQL block declaring a name twice
+    /// included, and the errors reading the function's own `search_path`
+    /// setting.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, SelectItem, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE notes (id integer PRIMARY KEY);
+    ///      CREATE FUNCTION find_note(id integer) RETURNS integer LANGUAGE plpgsql AS $$
+    ///      DECLARE result integer;
+    ///      BEGIN
+    ///          SELECT id INTO result FROM notes;
+    ///          RETURN result;
+    ///      END $$;",
+    /// )?;
+    /// let find_note = db
+    ///     .function_by_target(TargetName::new("find_note", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = find_note.plpgsql_sites(&db)?;
+    /// let sites = body.sites()?;
+    /// let [select, _returned] = sites.as_slice() else { panic!("two sites") };
+    /// let EmbeddedSql::Statement(Statement::Query(query)) = select.sql() else { panic!("a query") };
+    /// let SetExpr::Select(projection) = query.body.as_ref() else { panic!("a select") };
+    /// let SelectItem::UnnamedExpr(id) = &projection.projection[0] else { panic!("one column") };
+    /// let context = select.context(IdentifierCase::Folded)?;
+    /// // The column binds, and PostgreSQL 18 refuses the name as ambiguous.
+    /// assert!(matches!(context.reference(id)?, Some((ColumnDefinition::Base { .. }, _))));
+    /// let parameter = context.variable(id)?.expect("the argument shares the name");
+    /// assert!(matches!(parameter.kind(), VariableKind::Parameter { position: 1, .. }));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn plpgsql_sites<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<PlPgSqlSites<'db, Self::DB>, LookupError> {
+        body_site_source(self, database).map(PlPgSqlSites::new)
     }
 
     /// Returns the triggers that execute the function, row-level and

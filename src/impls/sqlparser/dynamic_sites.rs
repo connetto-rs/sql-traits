@@ -19,8 +19,8 @@ use sqlparser_plpgsql::{
 
 use super::{
     data_statement::{
-        BodyPath, BodyWalk, Embedded, RunTimeBody, calls_user_code, resolve_on_body_path,
-        unresolvable, walk_body, walk_statement,
+        BodyPath, BodyWalk, RunTimeBody, calls_user_code, resolve_on_body_path, unresolvable,
+        walk_body, walk_statement,
     },
     dql::{
         call_nodes::{CallNode, call_nodes},
@@ -32,10 +32,10 @@ use super::{
 use crate::{
     errors::LookupError,
     structs::{
-        CallResolution, DynamicExecution, ExpressionContext, ExpressionScope, IdentifierCase,
-        OperandType, PlPgSqlScope, PlPgSqlVariable, SiteFlow, SiteScope, TargetName, TypeKind,
-        VariableKind, array_of, column_type, declared_type, declared_type_named,
-        plpgsql_flow::FlowPoint,
+        CallResolution, DynamicExecution, EmbeddedSql, ExpressionContext, ExpressionScope,
+        IdentifierCase, OperandType, PlPgSqlScope, PlPgSqlSite, PlPgSqlVariable, SiteFlow,
+        SiteScope, TargetName, TypeKind, VariableKind, array_of, column_type, declared_type,
+        declared_type_named, plpgsql_flow::FlowPoint,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike},
     utils::{
@@ -345,6 +345,68 @@ const fn trigger_type(variable: TriggerVariable) -> &'static str {
     }
 }
 
+/// Every statement and expression the PL/pgSQL body `block` of the function
+/// `names` belongs to runs, in body order, each with the names it reaches
+/// and the path it runs under. A `SET` or `RESET` of `search_path`, which
+/// reads no name, is left out.
+///
+/// # Errors
+///
+/// Returns [`LookupError::FunctionBodyUnresolvable`] for an `ALIAS FOR`
+/// naming no variable and for an `OPEN` naming no cursor declared with a
+/// query, and the errors reading the path a statement of the body sets.
+fn scoped_sites<'b, 'db, DB: DatabaseLike>(
+    names: &'b BodyNames<'db, DB>,
+    block: &'b Block,
+    hex_strings_may_be_integers: bool,
+    flow: &Arc<SiteFlow<'b, 'db, DB>>,
+) -> Result<Vec<(Sql<'b>, PlPgSqlScope<'b, 'db, DB>)>, LookupError> {
+    let (sites, mut paths) = body_sql(names, block, hex_strings_may_be_integers)?;
+    Ok(sites
+        .into_iter()
+        .filter_map(|site| {
+            let key = SiteKey::of(site.sql);
+            // Only a statement setting the path goes unrecorded.
+            let path = paths.remove(&key)?;
+            let point = FlowPoint::Site { flow: Arc::<SiteFlow<'b, 'db, DB>>::clone(flow), key };
+            Some((site.sql, PlPgSqlScope::new(names, site.namespace, path).at(point)))
+        })
+        .collect())
+}
+
+/// Every statement and expression the PL/pgSQL body `block` of the function
+/// `names` belongs to runs, as [`FunctionLike::plpgsql_sites`] describes.
+///
+/// # Errors
+///
+/// Returns the errors of [`scoped_sites`].
+fn plpgsql_sql_sites<'b, 'db, DB: DatabaseLike>(
+    names: &'b BodyNames<'db, DB>,
+    block: &'b Block,
+    hex_strings_may_be_integers: bool,
+    flow: &Arc<SiteFlow<'b, 'db, DB>>,
+) -> Result<Vec<PlPgSqlSite<'b, 'db, DB>>, LookupError> {
+    let database = names.database;
+    let mut found = Vec::new();
+    for (sql, scope) in scoped_sites(names, block, hex_strings_may_be_integers, flow)? {
+        match sql {
+            Sql::Statement(statement) => {
+                found.push(PlPgSqlSite::new(EmbeddedSql::Statement(statement), scope, database));
+            }
+            Sql::Expression(query) => {
+                found.push(PlPgSqlSite::new(EmbeddedSql::Expression(query), scope, database));
+            }
+            Sql::Dynamic(dynamic) => {
+                for query in iter::once(&*dynamic.command).chain(&dynamic.arguments) {
+                    let sql = EmbeddedSql::Expression(query);
+                    found.push(PlPgSqlSite::new(sql, scope.clone(), database));
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Every place the PL/pgSQL body `block` of the function `names` belongs to
 /// runs SQL text, in the order the body evaluates it. The calls a statement
 /// or expression writes come in the order [`call_nodes`] meets them, and an
@@ -353,27 +415,17 @@ const fn trigger_type(variable: TriggerVariable) -> &'static str {
 ///
 /// # Errors
 ///
-/// Returns [`LookupError::FunctionBodyUnresolvable`] for an `ALIAS FOR`
-/// naming no variable and for an `OPEN` naming no cursor declared with a
-/// query, the errors reading the path a statement of the body sets, and the
-/// errors of [`text_sink_calls`].
-fn plpgsql_sites<'b, 'db, DB: DatabaseLike>(
+/// Returns the errors of [`scoped_sites`] and of [`text_sink_calls`].
+fn plpgsql_dynamic_sites<'b, 'db, DB: DatabaseLike>(
     names: &'b BodyNames<'db, DB>,
     block: &'b Block,
     hex_strings_may_be_integers: bool,
     flow: &Arc<SiteFlow<'b, 'db, DB>>,
 ) -> Result<Vec<DynamicExecution<'b, 'db, DB>>, LookupError> {
     let database = names.database;
-    let (sites, mut paths) = body_sql(names, block, hex_strings_may_be_integers)?;
     let mut found = Vec::new();
-    for site in sites {
-        let key = SiteKey::of(site.sql);
-        // Only a statement setting the path goes unrecorded, which calls
-        // nothing.
-        let Some(path) = paths.remove(&key) else { continue };
-        let point = FlowPoint::Site { flow: Arc::<SiteFlow<'b, 'db, DB>>::clone(flow), key };
-        let scope = PlPgSqlScope::new(names, site.namespace, path).at(point);
-        let (first, arguments): (_, &[Query]) = match site.sql {
+    for (sql, scope) in scoped_sites(names, block, hex_strings_may_be_integers, flow)? {
+        let (first, arguments): (_, &[Query]) = match sql {
             Sql::Statement(statement) => (ScopedRoot::Statement(statement), &[]),
             Sql::Expression(query) => (ScopedRoot::Query(query), &[]),
             Sql::Dynamic(dynamic) => (ScopedRoot::Query(&dynamic.command), &dynamic.arguments),
@@ -386,7 +438,7 @@ fn plpgsql_sites<'b, 'db, DB: DatabaseLike>(
                 found.push(DynamicExecution::call(root, command, holder, called, database));
             }
         }
-        if let Sql::Dynamic(dynamic) = site.sql {
+        if let Sql::Dynamic(dynamic) = sql {
             let arguments = dynamic.arguments.iter().map(expression).collect();
             found.push(DynamicExecution::execute(
                 expression(&dynamic.command),
@@ -441,8 +493,7 @@ pub(crate) fn namespace_error(function: &str, error: namespace::Error) -> Lookup
     }
 }
 
-/// The body of a function, parsed, with what reading its dynamic-execution
-/// sites needs.
+/// The body of a function, parsed, with what reading its sites needs.
 #[derive(Debug)]
 pub(crate) struct SiteSource<'db, DB: DatabaseLike> {
     names: BodyNames<'db, DB>,
@@ -463,14 +514,14 @@ impl<'db, DB: DatabaseLike> SiteSource<'db, DB> {
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`plpgsql_sites`] for a PL/pgSQL body, and the
-    /// lookup errors resolving a call [`text_sink_calls`] reads.
-    pub(crate) fn sites(&self) -> Result<Vec<DynamicExecution<'_, 'db, DB>>, LookupError> {
+    /// Returns the errors of [`plpgsql_dynamic_sites`] for a PL/pgSQL body,
+    /// and the lookup errors resolving a call [`text_sink_calls`] reads.
+    pub(crate) fn dynamic_sites(&self) -> Result<Vec<DynamicExecution<'_, 'db, DB>>, LookupError> {
         match &self.body {
             SqlBody::PlPgSql(block) => {
                 let flow =
                     Arc::new(SiteFlow::new(&self.names, block, self.hex_strings_may_be_integers));
-                plpgsql_sites(&self.names, block, self.hex_strings_may_be_integers, &flow)
+                plpgsql_dynamic_sites(&self.names, block, self.hex_strings_may_be_integers, &flow)
             }
             SqlBody::Statements(statements) | SqlBody::Atomic(statements) => {
                 self.sql_sites(statements.iter().map(ScopedRoot::Statement))
@@ -481,6 +532,27 @@ impl<'db, DB: DatabaseLike> SiteSource<'db, DB> {
             // Another dialect's `AS (expression)` or `AS RETURN SELECT`,
             // where no `pg_catalog` function resolves.
             SqlBody::Expression(_) | SqlBody::Select(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Every statement and expression of a PL/pgSQL body, in body order, and
+    /// none for a body in another language.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`scoped_sites`].
+    pub(crate) fn plpgsql_sites(&self) -> Result<Vec<PlPgSqlSite<'_, 'db, DB>>, LookupError> {
+        match &self.body {
+            SqlBody::PlPgSql(block) => {
+                let flow =
+                    Arc::new(SiteFlow::new(&self.names, block, self.hex_strings_may_be_integers));
+                plpgsql_sql_sites(&self.names, block, self.hex_strings_may_be_integers, &flow)
+            }
+            SqlBody::Statements(_)
+            | SqlBody::Atomic(_)
+            | SqlBody::Return(_)
+            | SqlBody::Expression(_)
+            | SqlBody::Select(_) => Ok(Vec::new()),
         }
     }
 
@@ -665,15 +737,15 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for PathCollector<'_, DB> {
         self.path = owned_path(path);
     }
 
-    fn walk(&mut self, sql: Embedded<'_>) -> Result<(), LookupError> {
+    fn walk(&mut self, sql: EmbeddedSql<'_>) -> Result<(), LookupError> {
         self.record(SiteKey::of(match sql {
-            Embedded::Statement(statement) => Sql::Statement(statement),
-            Embedded::Expression(query) => Sql::Expression(query),
+            EmbeddedSql::Statement(statement) => Sql::Statement(statement),
+            EmbeddedSql::Expression(query) => Sql::Expression(query),
         }));
         Ok(())
     }
 
-    fn runs_user_code(&self, sql: Embedded<'_>) -> bool {
+    fn runs_user_code(&self, sql: EmbeddedSql<'_>) -> bool {
         calls_user_code(&sql, self.database)
     }
 
@@ -689,11 +761,11 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for PathCollector<'_, DB> {
         self.record(SiteKey::of(Sql::Dynamic(dynamic)));
         match constant_command(dynamic) {
             Some(statements) => self.constant_command(&statements),
-            None => self.forget(&Embedded::Expression(&dynamic.command)),
+            None => self.forget(&EmbeddedSql::Expression(&dynamic.command)),
         }
         let calling = core::iter::once(&*dynamic.command)
             .chain(&dynamic.arguments)
-            .find(|query| self.runs_user_code(Embedded::Expression(query)));
+            .find(|query| self.runs_user_code(EmbeddedSql::Expression(query)));
         if let Some(query) = calling {
             self.forget(query);
         }

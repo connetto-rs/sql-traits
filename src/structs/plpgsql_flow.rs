@@ -597,7 +597,7 @@ pub(crate) fn read_variables<'db, DB: DatabaseLike, N: Visit + ?Sized>(
                 match &value.value {
                     Value::Placeholder(placeholder) => {
                         scope
-                            .variable(core::slice::from_ref(placeholder))
+                            .lookup(core::slice::from_ref(placeholder))
                             .map(|(variable, _)| variable)
                     }
                     _ => None,

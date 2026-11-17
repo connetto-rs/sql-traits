@@ -54,10 +54,11 @@ pub enum ExpressionScope<'s, 'db, DB: DatabaseLike> {
     /// lists them.
     ///
     /// A name a relation of the expression's own queries holds binds that
-    /// column, even where it also names a variable. PostgreSQL 18 refuses
-    /// such a name as ambiguous under its default
-    /// `plpgsql.variable_conflict = error`. Calls and operators resolve
-    /// under the path the body runs the expression with. Relations in the
-    /// expression's queries resolve under the database's own path.
+    /// column, even where it also names a variable, which
+    /// [`ExpressionContext::variable`](crate::structs::ExpressionContext::variable)
+    /// answers. PostgreSQL 18 refuses such a name as ambiguous under its
+    /// default `plpgsql.variable_conflict = error`. Calls and operators
+    /// resolve under the path the body runs the expression with. Relations
+    /// in the expression's queries resolve under the database's own path.
     PlPgSql(&'s PlPgSqlScope<'s, 'db, DB>),
 }
