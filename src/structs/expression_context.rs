@@ -1048,6 +1048,12 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             ColumnDefinition::Expression { expression, .. } if self.holds(expression) => {
                 self.type_of(expression)?
             }
+            // A column of `unnest` takes the element type of the array it
+            // expands.
+            ColumnDefinition::ArrayElement { array, .. } if self.holds(array) => {
+                element_type(self.database, self.type_of(array)?)
+            }
+            ColumnDefinition::Ordinality => catalog("int8"),
             ColumnDefinition::Parameter { ordinal, .. } => {
                 self.parameters.get(ordinal).cloned().unwrap_or(OperandType::Unknown)
             }
@@ -2222,7 +2228,7 @@ fn unquoted_name(function: &Function) -> Option<&str> {
 /// The nodes the arguments of `function` come from, in the order it writes
 /// them, or `None` for a call written with an aggregate's or a window
 /// function's clauses, with a subquery or with a `*` argument.
-fn plain_arguments(function: &Function) -> Option<Vec<&Expr>> {
+pub(crate) fn plain_arguments(function: &Function) -> Option<Vec<&Expr>> {
     let plain = matches!(function.parameters, FunctionArguments::None)
         && function.filter.is_none()
         && function.null_treatment.is_none()

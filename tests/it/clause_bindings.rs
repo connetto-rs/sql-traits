@@ -53,6 +53,8 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
             format!("{}.{}", table.table_name(), column.column_name())
         }
         ColumnDefinition::Expression { expression, .. } => format!("expression {expression}"),
+        ColumnDefinition::ArrayElement { array, .. } => format!("element of {array}"),
+        ColumnDefinition::Ordinality => "ordinality".to_owned(),
         ColumnDefinition::SetOperation { operator, .. } => format!("{operator}"),
         ColumnDefinition::RecursiveUnion { .. } => "recursive".to_owned(),
         ColumnDefinition::Values { .. } => "values".to_owned(),

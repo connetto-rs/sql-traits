@@ -2,7 +2,8 @@ use alloc::{borrow::ToOwned, vec::Vec};
 use core::{marker::PhantomData, ops::Range, slice};
 
 use sqlparser::ast::{
-    Expr, Ident, ObjectName, Select, SetOperator, Statement, TableFactor, TableWithJoins, Values,
+    CastKind, Expr, Function, FunctionArguments, Ident, ObjectName, ObjectNamePart, Select,
+    SetOperator, Statement, TableFactor, TableWithJoins, Values,
 };
 
 use super::{
@@ -11,14 +12,20 @@ use super::{
     derive_query_shape, factor_address,
     modifying::{self, ModifyingScopes},
     resolve_definition_local, resolve_relation_local,
+    scoped_roots::is_input,
 };
 use crate::{
     errors::LookupError,
     structs::{
         ColumnBinding, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionRef,
-        ColumnDefinitionScope, IdentifierCase, RangeTableEntry, RelationBinding,
+        ColumnDefinitionScope, IdentifierCase, RangeTableEntry, RelationBinding, plain_arguments,
     },
-    traits::{ColumnLike, CreatedFromQuery, DatabaseLike, TableLike},
+    traits::{ColumnLike, CreatedFromQuery, DataTypeLike, DatabaseLike, FunctionLike, TableLike},
+    utils::{
+        call_sites::{ExpressionForm, call_reaches, expression_form},
+        object_name::object_name_last_part,
+        postgres_types::{PgType, Polymorphic},
+    },
 };
 
 /// A resolved column's definition and the names it matched.
@@ -129,6 +136,11 @@ enum DefinitionNode<'query, 'db, DB: DatabaseLike> {
         expression: AstRef<'query, 'db, Expr>,
         scope: ScopeCursor,
     },
+    ArrayElement {
+        array: AstRef<'query, 'db, Expr>,
+        scope: ScopeCursor,
+    },
+    Ordinality,
     SetOperation {
         operator: SetOperator,
         left: DefinitionId,
@@ -231,6 +243,13 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                     scope: ColumnDefinitionScope::new(self, *scope),
                 }
             }
+            DefinitionNode::ArrayElement { array, scope } => {
+                ColumnDefinition::ArrayElement {
+                    array: array.get(),
+                    scope: ColumnDefinitionScope::new(self, *scope),
+                }
+            }
+            DefinitionNode::Ordinality => ColumnDefinition::Ordinality,
             DefinitionNode::SetOperation { operator, left, right } => {
                 ColumnDefinition::SetOperation {
                     operator: *operator,
@@ -448,6 +467,168 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             candidate = owner;
         }
     }
+
+    /// Whether `expression`, read in the scope `cursor` names, is shown to
+    /// be an array: an `ARRAY` constructor, a cast to an array type, a call
+    /// whose every reachable function returns an array, a `COALESCE`,
+    /// `GREATEST` or `LEAST` with an argument shown to be one, a `NULLIF`
+    /// whose first argument is, or a column whose definition is shown to be
+    /// one. Function calls are looked up in `database`.
+    ///
+    /// A value of the common type of several inputs is an array when any
+    /// input is, since PostgreSQL rejects an array beside a scalar of a
+    /// known type and reads an untyped literal as the array type.
+    fn proves_array(
+        &self,
+        cursor: ScopeCursor,
+        expression: &Expr,
+        database: &'db DB,
+    ) -> Result<bool, LookupError> {
+        Ok(match expression {
+            Expr::Nested(inner) => self.proves_array(cursor, inner, database)?,
+            Expr::Array(_) => true,
+            Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, data_type, .. } => {
+                PgType::of(data_type).element().is_some()
+            }
+            Expr::Function(call) => {
+                match expression_form(&call.name) {
+                    Some(ExpressionForm::CommonType) => {
+                        let inputs = plain_arguments(call).unwrap_or_default();
+                        self.any_proves_array(cursor, inputs.into_iter(), database)?
+                    }
+                    Some(ExpressionForm::NullIf) => {
+                        let inputs = plain_arguments(call).unwrap_or_default();
+                        self.any_proves_array(cursor, inputs.into_iter().take(1), database)?
+                    }
+                    Some(ExpressionForm::Value(_)) => false,
+                    None => {
+                        call_returns_array(call, database, self.scopes[cursor.scope.0].data.case)
+                    }
+                }
+            }
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                let resolved = match self.resolve_definition_id(cursor, expression) {
+                    Err(LookupError::AmbiguousTableLookup { .. }) => None,
+                    resolved => resolved?,
+                };
+                match resolved {
+                    Some(resolved) => self.defines_array(resolved.definition, database)?,
+                    None => false,
+                }
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether any of `expressions`, read in the scope `cursor` names, is
+    /// shown to be an array, on the terms of [`Self::proves_array`].
+    fn any_proves_array<'expression>(
+        &self,
+        cursor: ScopeCursor,
+        expressions: impl Iterator<Item = &'expression Expr>,
+        database: &'db DB,
+    ) -> Result<bool, LookupError> {
+        for expression in expressions {
+            if self.proves_array(cursor, expression, database)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether any of `definitions` defines values shown to be arrays, on
+    /// the terms of [`Self::proves_array`].
+    fn any_defines_array(
+        &self,
+        definitions: &[DefinitionId],
+        database: &'db DB,
+    ) -> Result<bool, LookupError> {
+        for definition in definitions {
+            if self.defines_array(*definition, database)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the values `definition` defines are shown to be arrays, on the
+    /// terms of [`Self::proves_array`].
+    fn defines_array(
+        &self,
+        definition: DefinitionId,
+        database: &'db DB,
+    ) -> Result<bool, LookupError> {
+        Ok(match &self.definitions[definition.0] {
+            DefinitionNode::Base { column, database, .. } => {
+                column.data_type(database).array_element(database).is_some()
+            }
+            DefinitionNode::Expression { expression, scope } => {
+                self.proves_array(*scope, expression.get(), database)?
+            }
+            DefinitionNode::Parameter { function, ordinal } => {
+                function
+                    .argument_modes()
+                    .zip(function.argument_type_names(database))
+                    .filter(|(mode, _)| is_input(mode))
+                    .nth(*ordinal)
+                    .and_then(|(_, name)| PgType::parse(&name))
+                    .is_some_and(|declared| names_array(&declared))
+            }
+            DefinitionNode::SetOperation { left, right, .. } => {
+                self.any_defines_array(&[*left, *right], database)?
+            }
+            DefinitionNode::RecursiveUnion { anchor, .. } => {
+                self.defines_array(*anchor, database)?
+            }
+            DefinitionNode::Values { cells } => {
+                self.any_defines_array(&self.lists[cells.start..cells.end], database)?
+            }
+            DefinitionNode::ArrayElement { .. }
+            | DefinitionNode::Ordinality
+            | DefinitionNode::Opaque => false,
+        })
+    }
+}
+
+/// Whether `declared` is an array type or a pseudo-type standing for one.
+fn names_array(declared: &PgType) -> bool {
+    declared.element().is_some()
+        || matches!(declared.polymorphic(), Some(Polymorphic::Array | Polymorphic::CompatibleArray))
+}
+
+/// Whether `call`, which [`expression_form`] reads as no expression, is
+/// shown to return an array: an `ARRAY(subquery)` constructor, or a call
+/// whose name reaches at least one function of `database` under `case`,
+/// each returning one array rather than a set.
+fn call_returns_array<DB: DatabaseLike>(
+    call: &Function,
+    database: &DB,
+    case: IdentifierCase,
+) -> bool {
+    let FunctionArguments::List(list) = &call.args else {
+        return matches!(call.args, FunctionArguments::Subquery(_))
+            && matches!(
+                call.name.0.as_slice(),
+                [ObjectNamePart::Identifier(Ident { value, quote_style: None, .. })]
+                    if value.eq_ignore_ascii_case("array")
+            );
+    };
+    let arguments = list.args.len();
+    let Some((called, _)) = object_name_last_part(&call.name) else { return false };
+    let mut reached = database
+        .functions_named(called)
+        .filter(|function| {
+            call_reaches(*function, &call.name, arguments, || database.search_path(), case)
+        })
+        .peekable();
+    reached.peek().is_some()
+        && reached.all(|function| {
+            !function.returns_set()
+                && function
+                    .return_type_name(database)
+                    .and_then(|name| PgType::parse(&name))
+                    .is_some_and(|returned| names_array(&returned))
+        })
 }
 
 pub(super) struct DefinitionDerivation<'query, 'db, DB: DatabaseLike> {
@@ -812,6 +993,29 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             Err(LookupError::AmbiguousTableLookup { .. }) => Ok(DefinitionId(0)),
             Err(error) => Err(error),
         }
+    }
+
+    fn unnest_definitions(
+        &mut self,
+        arguments: &[AstRef<'query, 'db, Expr>],
+        with_ordinality: bool,
+        scope: Self::Cursor,
+        database: &'db DB,
+    ) -> Result<Option<Vec<Self::Definition>>, LookupError> {
+        let Some(scope) = scope else { return Ok(None) };
+        for array in arguments {
+            if !self.graph.proves_array(scope, array.get(), database)? {
+                return Ok(None);
+            }
+        }
+        let mut definitions = Vec::with_capacity(arguments.len() + usize::from(with_ordinality));
+        for &array in arguments {
+            definitions.push(self.push_definition(DefinitionNode::ArrayElement { array, scope }));
+        }
+        if with_ordinality {
+            definitions.push(self.push_definition(DefinitionNode::Ordinality));
+        }
+        Ok(Some(definitions))
     }
 
     fn set_definition(
