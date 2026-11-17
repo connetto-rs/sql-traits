@@ -75,9 +75,10 @@ pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
 pub use function_kind::{AggregateKind, FunctionKind};
 pub use helper_set::{
-    AntiJoin, CallerGate, CapLift, CapOperand, Correlation, GrantArm, GrantedTo, GranteeSet,
-    HelperArm, HelperSet, JoinedRow, LiteralSet, ParentArm, RequestNormalization, Restriction,
-    RowCap, SettingComparison, TimeBound, TimeComparison, WalkArm, WalkDirection,
+    AntiJoin, CalledArm, CallerGate, CapLift, CapOperand, Correlation, GrantArm, GrantedTo,
+    GranteeSet, HelperArm, HelperSet, JoinedRow, LiteralSet, ParentArm, RequestNormalization,
+    Restriction, Returned, RowCap, SettingComparison, TimeBound, TimeComparison, WalkArm,
+    WalkDirection,
 };
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;

@@ -31,7 +31,9 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
 
     /// The one table whose primary key every arm the body writes returns,
     /// as its own primary key or through a foreign key referencing it, so
-    /// that every value of the set is a key of that table.
+    /// that every value of the set is a key of that table. An arm calling a
+    /// helper returning one column and returning that column alone returns
+    /// keys of the table that helper's set covers.
     ///
     /// A foreign key counts where the column stands at the position of the
     /// table's one-column primary key among the columns it references, and
@@ -73,6 +75,8 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Grant(GrantArm<'db, DB>),
     /// The rows of a table whose parent another helper returns.
     Parent(ParentArm<'db, DB>),
+    /// The rows another helper returns.
+    Called(CalledArm<'db, DB>),
     /// The rows next to the ones the set itself holds, along one edge of a
     /// tree, the set growing along every walk at once.
     Walk(WalkArm<'db, DB>),
@@ -84,6 +88,23 @@ impl<'db, DB: DatabaseLike> From<GrantArm<'db, DB>> for HelperArm<'db, DB> {
     }
 }
 
+/// What an arm returns in one column of the helper's rows.
+///
+/// A list of labels is `CROSS JOIN unnest(enum_range(NULL::<type>))
+/// [<alias>] [(<column>)]`, every label of an enum type in the order the
+/// type declares them, `ALTER TYPE ... ADD VALUE` applied, or `CROSS JOIN
+/// (VALUES (<label>), ...) <alias> [(<column>)]`, the labels it lists,
+/// each once. Every label is of the type the helper declares the column
+/// in, written as a literal of it, and the arm returns every row it keeps
+/// once per label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Returned<S> {
+    /// The value `S` names, read off each row the arm keeps.
+    Read(S),
+    /// Each of these labels in turn, beside the values read off the row.
+    Labels(Vec<Value>),
+}
+
 /// `SELECT <columns> FROM <table> [JOIN <joined table> ON <key>]... [WHERE
 /// <conditions>]`, the rows the conditions keep for the grantee they name,
 /// the caller gate they write, the restrictions and bounds the rest of them
@@ -92,7 +113,7 @@ impl<'db, DB: DatabaseLike> From<GrantArm<'db, DB>> for HelperArm<'db, DB> {
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
-    pub(crate) columns: Vec<&'db DB::Column>,
+    pub(crate) returned: Vec<Returned<&'db DB::Column>>,
     pub(crate) granted_to: GrantedTo<'db, DB>,
     pub(crate) gate: Option<CallerGate<'db>>,
     pub(crate) restrictions: Vec<Restriction<'db, DB>>,
@@ -113,12 +134,13 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
         self.table
     }
 
-    /// The columns the arm returns, in the order the helper returns them,
-    /// one for a helper returning `SETOF` a scalar type and one per column
-    /// of a helper returning `TABLE (...)`.
+    /// What the arm returns, in the order the helper returns it, one column
+    /// for a helper returning `SETOF` a scalar type and one per column of a
+    /// helper returning `TABLE (...)`, each a column of the arm's
+    /// [`table`](Self::table) or a list of labels.
     #[must_use]
-    pub fn columns(&self) -> &[&'db DB::Column] {
-        &self.columns
+    pub fn returned(&self) -> &[Returned<&'db DB::Column>] {
+        &self.returned
     }
 
     /// Whose rows the arm keeps.
@@ -293,14 +315,17 @@ impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
 /// the setting unset.
 ///
 /// The operands are written as a row, `(<operand>, ...)`, one per column
-/// the helper returns. A single operand is a cap only behind `IS NULL OR`,
-/// and may then compare with `(SELECT <function>(<arguments>))` as well,
-/// since without it the conjunct names the arm's grantee (see
-/// [`GrantedTo::Set`]). Each operand is a column of the arm's table or of a
-/// row it joins (see [`GrantArm::joined_rows`]), or a literal or an
-/// argument, plain or cast to the type the helper declares the column it
-/// pairs with in. An operand holding `NULL` matches no row, as PostgreSQL's
-/// row comparison answers `NULL` for it.
+/// the helper returns. A single operand is a cap behind `IS NULL OR`, and
+/// may then compare with `(SELECT <function>(<arguments>))` as well. Without
+/// it, a single operand is a cap only where it is the primary key of the
+/// arm's table, which the arm returns and which references no table through
+/// a single-column foreign key, since otherwise the conjunct names the
+/// arm's grantee (see [`GrantedTo::Set`]) or its parent (see [`ParentArm`]).
+/// Each operand is a column of the arm's table or of a row it joins (see
+/// [`GrantArm::joined_rows`]), or a literal or an argument, plain or cast to
+/// the type the helper declares the column it pairs with in. An operand
+/// holding `NULL` matches no row, as PostgreSQL's row comparison answers
+/// `NULL` for it.
 #[derive(Debug)]
 pub struct RowCap<'db, DB: DatabaseLike> {
     pub(crate) operands: Vec<CapOperand<'db, DB>>,
@@ -818,6 +843,52 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
     }
 
     /// The helper returning the parents.
+    #[must_use]
+    pub fn function(&self) -> &'db DB::Function {
+        self.function
+    }
+
+    /// The arguments the arm passes to [`function`](Self::function), the
+    /// helper's own arguments substituted.
+    #[must_use]
+    pub fn arguments(&self) -> &[Value] {
+        &self.arguments
+    }
+
+    /// What [`function`](Self::function) returns for
+    /// [`arguments`](Self::arguments).
+    #[must_use]
+    pub fn set(&self) -> &HelperSet<'db, DB> {
+        &self.set
+    }
+}
+
+/// `SELECT <returned> FROM <function>(<arguments>) [<alias>] [(<columns>)]
+/// [CROSS JOIN <labels>]...`, every row another helper returns.
+///
+/// Each column the arm returns is a column of the called helper's rows or a
+/// list of labels (see [`Returned`]). A column is named by the alias's
+/// column list, else by the name the helper declares it under in `TABLE
+/// (...)`, else, for a helper returning `SETOF` a scalar type, by the alias
+/// or the function's name.
+#[derive(Debug)]
+pub struct CalledArm<'db, DB: DatabaseLike> {
+    pub(crate) returned: Vec<Returned<usize>>,
+    pub(crate) function: &'db DB::Function,
+    pub(crate) arguments: Vec<Value>,
+    pub(crate) set: Box<HelperSet<'db, DB>>,
+}
+
+impl<'db, DB: DatabaseLike> CalledArm<'db, DB> {
+    /// What the arm returns, in the order the helper returns it, each the
+    /// position of a column of the rows [`set`](Self::set) holds or a list
+    /// of labels.
+    #[must_use]
+    pub fn returned(&self) -> &[Returned<usize>] {
+        &self.returned
+    }
+
+    /// The helper the arm calls.
     #[must_use]
     pub fn function(&self) -> &'db DB::Function {
         self.function

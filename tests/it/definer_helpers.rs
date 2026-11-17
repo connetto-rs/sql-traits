@@ -411,12 +411,29 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
     } else {
         format!(" WHERE {}", conditions.join(" AND "))
     };
-    let columns: Vec<&str> = grant.columns().iter().copied().map(ColumnLike::column_name).collect();
-    let returned = match columns.as_slice() {
-        [column] => (*column).to_string(),
-        columns => format!("({})", columns.join(", ")),
-    };
+    let returned = render_returned(grant.returned(), |column| column.column_name().to_string());
     format!("{}.{returned}{filter}", grant.table().table_name())
+}
+
+/// The columns an arm returns, one bare and several in parentheses, each
+/// read by `read` or a list of labels as `EACH(<labels>)`.
+fn render_returned<S>(returned: &[Returned<S>], read: impl Fn(&S) -> String) -> String {
+    let returned: Vec<String> = returned
+        .iter()
+        .map(|returned| {
+            match returned {
+                Returned::Read(source) => read(source),
+                Returned::Labels(labels) => {
+                    let labels: Vec<String> = labels.iter().map(ToString::to_string).collect();
+                    format!("EACH({})", labels.join(", "))
+                }
+            }
+        })
+        .collect();
+    if let [_] = returned.as_slice() {
+        return returned.into_iter().collect();
+    }
+    format!("({})", returned.join(", "))
 }
 
 /// An answer as one line, each arm as its table and column followed by what
@@ -453,6 +470,17 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         parent.function().target_name(),
                         arguments.join(", "),
                         render(parent.set()),
+                    )
+                }
+                HelperArm::Called(called) => {
+                    let arguments: Vec<String> =
+                        called.arguments().iter().map(ToString::to_string).collect();
+                    format!(
+                        "{}({}).{} {{{}}}",
+                        called.function().target_name(),
+                        arguments.join(", "),
+                        render_returned(called.returned(), |index| format!("#{index}")),
+                        render(called.set()),
                     )
                 }
             }
@@ -716,11 +744,61 @@ fn grant_rows(
         };
         let unblocked = grant.anti_joins().iter().all(|anti_join| !blocks(anti_join, row, fixture));
         if granted && restricted && unblocked && capped(grant, &caps, row, fixture) {
-            returned.insert(
-                grant.columns().iter().map(|column| cell(row, column.column_name())).collect(),
-            );
+            let columns: Vec<Vec<&'static str>> = grant
+                .returned()
+                .iter()
+                .map(|column| {
+                    match column {
+                        Returned::Read(column) => vec![cell(row, column.column_name())],
+                        Returned::Labels(labels) => labels.iter().map(label).collect(),
+                    }
+                })
+                .collect();
+            returned.extend(crossed(&columns));
         }
     }
+}
+
+/// The labels the fixtures cross rows with.
+const LABELS: &[&str] = &["reader", "writer", "admin"];
+
+/// The fixture label `value` holds.
+fn label(value: &Value) -> &'static str {
+    let Value::SingleQuotedString(text) = value else { panic!("a label is text, not {value}") };
+    LABELS
+        .iter()
+        .copied()
+        .find(|label| label == text)
+        .unwrap_or_else(|| panic!("the fixtures label no {text}"))
+}
+
+/// Every row taking one value of each column's values, in order.
+fn crossed(columns: &[Vec<&'static str>]) -> Vec<Vec<&'static str>> {
+    columns.iter().fold(vec![Vec::new()], |rows, values| {
+        rows.iter()
+            .flat_map(|row| {
+                values.iter().map(move |value| {
+                    let mut row = row.clone();
+                    row.push(*value);
+                    row
+                })
+            })
+            .collect()
+    })
+}
+
+/// The rows `set` returns over `fixture` for `request`, the walks of a set
+/// of one column included.
+fn helper_rows(
+    set: &HelperSet<'_, ParserDB>,
+    request: Request,
+    fixture: Rows,
+) -> BTreeSet<Vec<&'static str>> {
+    let walks = set.arms().iter().any(|arm| matches!(arm, HelperArm::Walk(_)));
+    if walks || set.selection().is_some() {
+        return evaluate(set, request, fixture).into_iter().map(|value| vec![value]).collect();
+    }
+    arm_rows(set, request, fixture)
 }
 
 /// The rows the grant and parent arms of `set` return over `fixture` for
@@ -741,6 +819,21 @@ fn arm_rows(
                     if parents.contains(cell(row, parent.column().column_name())) {
                         returned.insert(vec![cell(row, parent.key().column_name())]);
                     }
+                }
+            }
+            HelperArm::Called(called) => {
+                for row in helper_rows(called.set(), request, fixture) {
+                    let columns: Vec<Vec<&'static str>> = called
+                        .returned()
+                        .iter()
+                        .map(|column| {
+                            match column {
+                                Returned::Read(index) => vec![row[*index]],
+                                Returned::Labels(labels) => labels.iter().map(label).collect(),
+                            }
+                        })
+                        .collect();
+                    returned.extend(crossed(&columns));
                 }
             }
             HelperArm::Walk(_) => {}
@@ -1068,12 +1161,12 @@ fn a_column_without_a_foreign_key_compared_to_a_set_covering_no_table_refuses_th
         Err(HelperSetError::UncoveredParent { function, column, called })
             if function == "notes_with" && column == "target" && called == "docs_with"
     ));
-    assert!(
-        matches!(
-            notes(GRANT_ARM, "SELECT id FROM notes WHERE id IN (SELECT docs_with(min_role))"),
-            Err(HelperSetError::ArmShape { .. })
-        ),
-        "the key the arm returns is no parent"
+    assert_eq!(
+        notes(GRANT_ARM, "SELECT id FROM notes WHERE id IN (SELECT docs_with(min_role))")
+            .expect("answered"),
+        "notes.id WHERE (id) IN docs_with('read') \
+         {members.doc_id WHERE user_id = app.user_id AND role IN ('read')}",
+        "the key the arm returns is no parent, so the set caps it"
     );
 }
 
@@ -2173,7 +2266,6 @@ fn a_body_or_arm_outside_the_two_shapes_refuses_the_answer() {
         GRANT_ARM.replace("FROM members", "FROM members AS m (a, b, c)"),
         GRANT_ARM.replace("FROM members", "FROM member_view"),
         "SELECT id FROM docs WHERE upper(parent_id) IN (SELECT docs_with(min_role))".into(),
-        "SELECT id FROM docs WHERE id IN (SELECT docs_with(min_role))".into(),
         "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(min_role) FROM docs)".into(),
         "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(min_role) AS x)".into(),
         "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(DISTINCT min_role))".into(),
@@ -6595,13 +6687,13 @@ const INVITATION_ROWS: Rows = &[
 ];
 
 /// The rows one helper returns.
-type Returned = &'static [&'static str];
+type HelperRows = &'static [&'static str];
 
 /// What PostgreSQL 18.6 returns as `app` over [`INVITATION_ROWS`] for
 /// `(request, normalized_invitations, raw_invitations, bare_invitations)`.
 /// A request sending no email leaves the setting unset, and one whose
 /// transaction ended reads `''`, as one sending `''` does.
-const INVITATIONS_MEASURED: &[(Request, Returned, Returned, Returned)] = &[
+const INVITATIONS_MEASURED: &[(Request, HelperRows, HelperRows, HelperRows)] = &[
     (Request { caller: None, values: &[] }, &[], &[], &[]),
     (Request { caller: None, values: &[(VERIFIED_EMAIL, &[""])] }, &[], &[], &["i3"]),
     (
@@ -6812,5 +6904,315 @@ fn a_read_normalized_otherwise_or_of_anything_but_a_scalar_refuses_the_answer() 
             Err(HelperSetError::ArmShape { .. })
         ),
         "an arm names one grantee"
+    );
+}
+
+/// Grants a caller may share, as connetto's core schema writes them, an
+/// admin of a resource sharing every role on it and a writer sharing the
+/// roles up to writer on a resource whose writers may share.
+const SHARES: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+CREATE TYPE authz.role AS ENUM ('reader', 'writer', 'admin');
+CREATE TABLE resources (id TEXT PRIMARY KEY, writers_can_share BOOLEAN NOT NULL DEFAULT false);
+CREATE TABLE grants (
+  resource_id TEXT NOT NULL REFERENCES resources (id), principal_id TEXT NOT NULL,
+  role authz.role NOT NULL, PRIMARY KEY (resource_id, principal_id));
+GRANT SELECT ON resources, grants TO authz_owner;
+CREATE FUNCTION authz.resources_with(min_role authz.role) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT g.resource_id FROM public.grants g
+  WHERE g.principal_id = current_setting('app.user_id', true) AND g.role >= min_role
+$$;
+CREATE FUNCTION authz.sharable_grants() RETURNS TABLE (resource_id TEXT, role authz.role)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT resource.id, allowed.role
+  FROM authz.resources_with('admin') resource(id)
+  CROSS JOIN unnest(enum_range(NULL::authz.role)) allowed(role)
+  UNION
+  SELECT resource.id, allowed.role FROM public.resources resource
+  CROSS JOIN (VALUES ('reader'::authz.role), ('writer'::authz.role)) allowed(role)
+  WHERE resource.writers_can_share AND resource.id IN (SELECT authz.resources_with('writer'))
+$$;
+CREATE FUNCTION authz.shared_resources() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT share.resource_id FROM authz.sharable_grants() share(resource_id, role)
+$$;
+CREATE FUNCTION authz.sharing_writers() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT resource.id FROM public.resources resource
+  WHERE resource.writers_can_share AND resource.id IN (SELECT authz.resources_with('writer'))
+$$;
+ALTER FUNCTION authz.resources_with(authz.role) OWNER TO authz_owner;
+ALTER FUNCTION authz.sharable_grants() OWNER TO authz_owner;
+ALTER FUNCTION authz.shared_resources() OWNER TO authz_owner;
+ALTER FUNCTION authz.sharing_writers() OWNER TO authz_owner;
+";
+
+/// The rows [`SHARES`] was measured over.
+const SHARE_ROWS: Rows = &[
+    ("resources", &[("id", "r1"), ("writers_can_share", "true")]),
+    ("resources", &[("id", "r2"), ("writers_can_share", "false")]),
+    ("resources", &[("id", "r3"), ("writers_can_share", "true")]),
+    ("resources", &[("id", "r4"), ("writers_can_share", "true")]),
+    ("grants", &[("resource_id", "r1"), ("principal_id", "alice"), ("role", "writer")]),
+    ("grants", &[("resource_id", "r2"), ("principal_id", "alice"), ("role", "admin")]),
+    ("grants", &[("resource_id", "r3"), ("principal_id", "alice"), ("role", "reader")]),
+    ("grants", &[("resource_id", "r4"), ("principal_id", "bob"), ("role", "writer")]),
+    ("grants", &[("resource_id", "r1"), ("principal_id", "bob"), ("role", "admin")]),
+    ("grants", &[("resource_id", "r3"), ("principal_id", "bob"), ("role", "writer")]),
+];
+
+/// What PostgreSQL 18.6 returns for `(helper, caller, returned)` over
+/// [`SHARE_ROWS`], each returned row its columns joined by `,`.
+const SHARES_MEASURED: &[(&str, &str, &[&str])] = &[
+    ("sharable_grants", "alice", &["r1,reader", "r1,writer", "r2,admin", "r2,reader", "r2,writer"]),
+    (
+        "sharable_grants",
+        "bob",
+        &["r1,admin", "r1,reader", "r1,writer", "r3,reader", "r3,writer", "r4,reader", "r4,writer"],
+    ),
+    ("sharable_grants", "carol", &[]),
+    ("shared_resources", "alice", &["r1", "r2"]),
+    ("shared_resources", "bob", &["r1", "r3", "r4"]),
+    ("sharing_writers", "alice", &["r1"]),
+    ("sharing_writers", "bob", &["r1", "r3", "r4"]),
+];
+
+/// `authz.resources_with` as answered at `role`, rendered.
+fn resources_with(role: &str) -> String {
+    format!(
+        "authz.resources_with('{role}') {{grants.resource_id WHERE principal_id = app.user_id AND role IN ({})}}",
+        match role {
+            "admin" => "'admin'",
+            "writer" => "'writer', 'admin'",
+            other => panic!("the fixtures call no {other}"),
+        }
+    )
+}
+
+#[test]
+fn a_helper_returning_labelled_keys_answers_each_label_beside_its_rows() {
+    let database = postgres(SHARES);
+    let deployment = deployment();
+    let sharable =
+        answer(&database, &deployment, "authz", "sharable_grants", &[]).expect("answered");
+    let admin = resources_with("admin");
+    let (called, set) = admin.split_once(" {").expect("a set follows the call");
+    assert_eq!(
+        render(&sharable),
+        format!(
+            "{called}.(#0, EACH('reader', 'writer', 'admin')) {{{set} \
+             UNION resources.(id, EACH('reader', 'writer')) WHERE writers_can_share IN (true) AND (id) IN {}",
+            resources_with("writer"),
+        )
+    );
+    assert!(sharable.covered_table().is_none(), "a pair is no key of one table");
+    let shared =
+        answer(&database, &deployment, "authz", "shared_resources", &[]).expect("answered");
+    let [HelperArm::Called(projected)] = shared.arms() else { panic!("one arm calls the pairs") };
+    assert_eq!(projected.returned(), [Returned::Read(0)]);
+    assert_eq!(covered(&shared), None, "a column of pairs covers no table");
+    let administered = SHARES.to_string()
+        + "CREATE FUNCTION authz.administered() RETURNS SETOF TEXT
+           LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+             SELECT administered FROM authz.resources_with('admin') administered
+           $$;
+           ALTER FUNCTION authz.administered() OWNER TO authz_owner;";
+    let administered = postgres(&administered);
+    let set = answer(&administered, &deployment, "authz", "administered", &[]).expect("answered");
+    assert_eq!(covered(&set), Some("resources"), "the called set's keys");
+    let writers =
+        answer(&database, &deployment, "authz", "sharing_writers", &[]).expect("answered");
+    assert_eq!(
+        render(&writers),
+        format!(
+            "resources.id WHERE writers_can_share IN (true) AND (id) IN {}",
+            resources_with("writer")
+        )
+    );
+    assert_eq!(covered(&writers), Some("resources"));
+    for &(helper, caller, expected) in SHARES_MEASURED {
+        let set = answer(&database, &deployment, "authz", helper, &[]).expect("answered");
+        let returned: Vec<String> = arm_rows(&set, Request::of(caller), SHARE_ROWS)
+            .into_iter()
+            .map(|row| row.join(","))
+            .collect();
+        assert_eq!(returned, expected, "{helper} for {caller}");
+    }
+}
+
+#[test]
+fn the_keys_of_labelled_rows_are_their_union_over_every_label() {
+    let database = postgres(SHARES);
+    let deployment = deployment();
+    let sharable =
+        answer(&database, &deployment, "authz", "sharable_grants", &[]).expect("answered");
+    // `resource_id IN (SELECT share.resource_id FROM authz.sharable_grants()
+    // share)`, as PostgreSQL 18.6 answers it over [`SHARE_ROWS`].
+    for (caller, measured) in [("alice", ["r1", "r2"].as_slice()), ("bob", &["r1", "r3", "r4"])] {
+        let keys: BTreeSet<&str> = arm_rows(&sharable, Request::of(caller), SHARE_ROWS)
+            .into_iter()
+            .map(|row| row[0])
+            .collect();
+        assert_eq!(keys.into_iter().collect::<Vec<_>>(), measured, "{caller}");
+    }
+}
+
+/// `authz.sharable_grants` with its first arm written as `first` and its
+/// second as `second`, beside `after`.
+fn sharing(first: &str, second: &str, after: &str) -> Result<String, HelperSetError> {
+    let first_arm = "SELECT resource.id, allowed.role
+  FROM authz.resources_with('admin') resource(id)
+  CROSS JOIN unnest(enum_range(NULL::authz.role)) allowed(role)";
+    let second_arm = "SELECT resource.id, allowed.role FROM public.resources resource
+  CROSS JOIN (VALUES ('reader'::authz.role), ('writer'::authz.role)) allowed(role)
+  WHERE resource.writers_can_share AND resource.id IN (SELECT authz.resources_with('writer'))";
+    let sql = SHARES.replace(first_arm, first).replace(second_arm, second) + after;
+    let database = postgres(&sql);
+    let deployment = deployment();
+    answer(&database, &deployment, "authz", "sharable_grants", &[]).map(|set| render(&set))
+}
+
+#[test]
+fn labels_are_read_in_every_spelling_postgres_resolves_to_the_declared_type() {
+    let keep = "SELECT resource.id, allowed.role FROM public.resources resource CROSS JOIN (VALUES ('admin'::authz.role)) allowed(role)";
+    for (labels, rendered) in [
+        ("unnest(enum_range(NULL::authz.role)) allowed(role)", "EACH('reader', 'writer', 'admin')"),
+        ("unnest(enum_range(NULL::authz.role)) role", "EACH('reader', 'writer', 'admin')"),
+        (
+            "(VALUES ('writer'), ('reader'::authz.role), ('writer')) allowed(role)",
+            "EACH('writer', 'reader')",
+        ),
+    ] {
+        let first =
+            format!("SELECT resource.id, role FROM public.resources resource CROSS JOIN {labels}");
+        assert_eq!(
+            sharing(&first, keep, "").as_deref().map(|set| set.split(" UNION ").next()),
+            Ok(Some(format!("resources.(id, {rendered})").as_str())),
+            "{labels}"
+        );
+    }
+    let (called, set) = resources_with("admin")
+        .split_once(" {")
+        .map(|(called, set)| (called.to_string(), set.to_string()))
+        .expect("a set follows the call");
+    for (first, returned) in [
+        (
+            "SELECT id, allowed.role FROM authz.resources_with('admin') id CROSS JOIN unnest(enum_range(NULL::authz.role)) allowed(role)",
+            "(#0, EACH('reader', 'writer', 'admin'))",
+        ),
+        (
+            "SELECT resources_with, allowed.role FROM authz.resources_with('admin') CROSS JOIN unnest(enum_range(NULL::authz.role)) allowed(role)",
+            "(#0, EACH('reader', 'writer', 'admin'))",
+        ),
+    ] {
+        let answered = sharing(first, keep, "");
+        let expected = format!("{called}.{returned} {{{set}");
+        assert_eq!(
+            answered.as_deref().map(|set| set.split(" UNION ").next()),
+            Ok(Some(expected.as_str())),
+            "{first}"
+        );
+    }
+}
+
+#[test]
+fn labels_postgres_refuses_or_names_beside_the_rows_refuse_the_answer() {
+    let first = "SELECT resource.id, allowed.role
+  FROM authz.resources_with('admin') resource(id)
+  CROSS JOIN unnest(enum_range(NULL::authz.role)) allowed(role)";
+    let crossing = |labels: &str, condition: &str| {
+        format!(
+            "SELECT resource.id, allowed.role FROM public.resources resource CROSS JOIN {labels} {condition}"
+        )
+    };
+    let values = "(VALUES ('reader'::authz.role)) allowed(role)";
+    for second in [
+        crossing("(VALUES ('reader'), ('writer')) allowed(role)", ""),
+        crossing("(VALUES ('owner'::authz.role)) allowed(role)", ""),
+        crossing("(VALUES ('reader'::TEXT)) allowed(role)", ""),
+        crossing("(VALUES ('reader'::authz.role, 1)) allowed(role)", ""),
+        crossing("(VALUES (resource.id::authz.role)) allowed(role)", ""),
+        crossing("unnest(enum_range(NULL::TEXT)) allowed(role)", ""),
+        crossing("unnest(enum_range('reader'::authz.role)) allowed(role)", ""),
+        crossing("unnest(enum_range(NULL::authz.role, NULL)) allowed(role)", ""),
+        crossing(
+            "unnest(enum_range(NULL::authz.role)) WITH ORDINALITY allowed(role, position)",
+            "",
+        ),
+        crossing("public.grants allowed", ""),
+        crossing(values, "WHERE allowed.role = 'reader'"),
+        crossing(values, "WHERE role = 'reader'"),
+        crossing("(VALUES ('reader'::authz.role)) resource(role)", ""),
+        "SELECT resource.id, allowed.role FROM public.resources resource \
+         CROSS JOIN (VALUES ('reader'::authz.role)) allowed(role) \
+         CROSS JOIN (VALUES ('writer'::authz.role)) allowed(role)"
+            .to_string(),
+        "SELECT resource.id, allowed.role FROM authz.resources_with('writer') resource(id) \
+         CROSS JOIN (VALUES ('reader'::authz.role)) allowed(role) WHERE resource.id = 'r1'"
+            .to_string(),
+        "SELECT resource.id, allowed.role FROM authz.resources_with(resource.id) resource(id) \
+         CROSS JOIN (VALUES ('reader'::authz.role)) allowed(role)"
+            .to_string(),
+        "SELECT resource.id, allowed.role FROM authz.resources_with('writer') resource(id, other) \
+         CROSS JOIN (VALUES ('reader'::authz.role)) allowed(role)"
+            .to_string(),
+        // PostgreSQL refuses `text` returned as `authz.role`.
+        "SELECT allowed.role, resource.id FROM authz.resources_with('admin') resource(id) \
+         CROSS JOIN unnest(enum_range(NULL::authz.role)) allowed(role)"
+            .to_string(),
+    ] {
+        let answered = sharing(first, &second, "");
+        assert!(matches!(answered, Err(HelperSetError::ArmShape { .. })), "{second}: {answered:?}");
+    }
+    // `SET search_path = authz` puts `pg_catalog` first, but a reachable
+    // overload is refused as it is for every catalog function.
+    let pathed = |after: &str| {
+        let sql = SHARES.replace("SET search_path = ''", "SET search_path = authz") + after;
+        let database = postgres(&sql);
+        let deployment = deployment();
+        answer(&database, &deployment, "authz", "sharable_grants", &[]).map(|set| render(&set))
+    };
+    assert!(pathed("").is_ok(), "{:?}", pathed(""));
+    let shadowing = "CREATE FUNCTION authz.unnest(anyarray) RETURNS SETOF anyelement \
+                     LANGUAGE sql IMMUTABLE AS $$ SELECT NULL $$;";
+    let answered = pathed(shadowing);
+    assert!(matches!(answered, Err(HelperSetError::ArmShape { .. })), "{answered:?}");
+    // PostgreSQL refuses two lists of one name crossed with a call.
+    let crossing_call = |alias: &str| {
+        let sql = format!(
+            "{SHARES}CREATE FUNCTION authz.role_pairs()
+             RETURNS TABLE (resource_id TEXT, role authz.role, other authz.role)
+             LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+               SELECT resource.id, allowed.role, {alias}.other
+               FROM authz.resources_with('admin') resource(id)
+               CROSS JOIN unnest(enum_range(NULL::authz.role)) allowed(role)
+               CROSS JOIN (VALUES ('reader'::authz.role)) {alias}(other)
+             $$;
+             ALTER FUNCTION authz.role_pairs() OWNER TO authz_owner;"
+        );
+        let database = postgres(&sql);
+        answer(&database, &deployment(), "authz", "role_pairs", &[]).map(|set| render(&set))
+    };
+    assert!(crossing_call("granted").is_ok(), "{:?}", crossing_call("granted"));
+    let answered = crossing_call("allowed");
+    assert!(matches!(answered, Err(HelperSetError::ArmShape { .. })), "{answered:?}");
+}
+
+#[test]
+fn a_key_compared_with_a_set_alone_is_capped_by_it() {
+    let alone = SHARES.replace(
+        "WHERE resource.writers_can_share AND resource.id IN (SELECT authz.resources_with('writer'))\n$$;\nALTER",
+        "WHERE resource.id IN (SELECT * FROM authz.resources_with('writer'))\n$$;\nALTER",
+    );
+    let database = postgres(&alone);
+    let deployment = deployment();
+    let writers =
+        answer(&database, &deployment, "authz", "sharing_writers", &[]).expect("answered");
+    assert_eq!(
+        render(&writers),
+        format!("resources.id WHERE (id) IN {}", resources_with("writer"))
     );
 }

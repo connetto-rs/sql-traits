@@ -15,7 +15,7 @@ use sqlparser::ast::{
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior, FunctionSecurity,
     GroupByExpr, Ident, InTarget, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart,
     Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    TableAliasColumnDef, TableFactor, TableFunctionArgs, UnaryOperator, Value, Visit,
+    TableAlias, TableAliasColumnDef, TableFactor, TableFunctionArgs, UnaryOperator, Value, Visit,
     WildcardAdditionalOptions,
 };
 
@@ -26,15 +26,15 @@ use super::{
 use crate::{
     errors::{AccessorRefusal, HelperSetError, LookupError},
     structs::{
-        AntiJoin, CallerGate, CapLift, CapOperand, Correlation, Deployment, FunctionBody, GrantArm,
-        GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase, JoinedRow, LiteralSet,
-        ParentArm, RequestNormalization, Restriction, RowCap, RowSecurity, RowStatement,
-        SessionSetting, SetPacking, SettingComparison, SettingContent, SettingValue, TargetName,
-        TimeBound, TimeComparison, WalkArm, WalkDirection,
+        AntiJoin, CalledArm, CallerGate, CapLift, CapOperand, Correlation, Deployment,
+        FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase,
+        JoinedRow, LiteralSet, ParentArm, RequestNormalization, Restriction, Returned, RowCap,
+        RowSecurity, RowStatement, SessionSetting, SetPacking, SettingComparison, SettingContent,
+        SettingValue, TargetName, TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, EnumerationKind, EnumerationMember, ForeignKeyLike,
-        FunctionLike, IndexLike, Relation, RoleLike, SchemaLike, TableLike,
+        FunctionLike, IndexLike, Relation, RoleLike, SchemaLike, TableLike, UserDefinedTypeLike,
     },
     utils::{
         call_sites::{ExpressionForm, call_reaches, expression_form},
@@ -418,6 +418,59 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
     }
 }
 
+/// A relation an arm reads that is no table, with the name its columns are
+/// qualified by and the names of its columns.
+struct Named<'q> {
+    qualifier: Cow<'q, Ident>,
+    columns: Vec<Cow<'q, Ident>>,
+}
+
+impl<'q> Named<'q> {
+    /// The names `alias` gives a relation named `name` whose columns are
+    /// named `columns` unless the alias renames them, `None` for an alias
+    /// renaming more columns than the relation has or typing one.
+    fn aliased(
+        alias: Option<&'q TableAlias>,
+        name: Cow<'q, Ident>,
+        mut columns: Vec<Cow<'q, Ident>>,
+    ) -> Option<Self> {
+        let Some(alias) = alias else { return Some(Self { qualifier: name, columns }) };
+        if alias.at.is_some() || alias.columns.len() > columns.len() {
+            return None;
+        }
+        for (column, renamed) in columns.iter_mut().zip(&alias.columns) {
+            if renamed.data_type.is_some() {
+                return None;
+            }
+            *column = Cow::Borrowed(&renamed.name);
+        }
+        Some(Self { qualifier: Cow::Borrowed(&alias.name), columns })
+    }
+
+    /// The position of the column `expression` names, bare or qualified.
+    fn position(&self, expression: &Expr) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|column| names_column(expression, &self.qualifier, column, true))
+    }
+}
+
+/// The labels a list an arm crosses its rows with writes, before the type
+/// of the column returning them is known.
+enum LabelSource<'q> {
+    /// `unnest(enum_range(NULL::<type>))`.
+    EnumRange(&'q DataType),
+    /// `(VALUES (<label>), ...)`, one expression per row.
+    Values(Vec<&'q Expr>),
+}
+
+/// A list of labels an arm crosses its rows with, and the names it is read
+/// by.
+struct LabelList<'q> {
+    named: Named<'q>,
+    source: LabelSource<'q>,
+}
+
 /// What a grant arm's condition keeps.
 enum Kept<'db, DB: DatabaseLike> {
     /// Every row.
@@ -797,39 +850,52 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(scope.arm_shape(select));
         };
         let shape = || scope.arm_shape(select);
-        let mut rows = vec![self.arm_table(scope, &from.relation, true, shape)?];
+        let mut lists = Vec::new();
+        let mut joins = Vec::new();
         for join in &from.joins {
-            if join.global || join_condition(join).is_none() {
+            if join.global {
                 return Err(shape());
             }
+            if is_cross(join) {
+                lists.push(self.label_list(scope, &join.relation).ok_or_else(shape)?);
+            } else if join_condition(join).is_some() {
+                joins.push(join);
+            } else {
+                return Err(shape());
+            }
+        }
+        if let Some(call) = called_relation(&from.relation) {
+            if !joins.is_empty() || select.selection.is_some() {
+                return Err(shape());
+            }
+            return self.called_arm(scope, select, call, &lists);
+        }
+        let mut rows = vec![self.arm_table(scope, &from.relation, true, shape)?];
+        for join in joins {
             rows.push(self.arm_table(scope, &join.relation, true, shape)?);
         }
-        // PostgreSQL refuses two rows of one name, and a bare name two rows
-        // hold.
-        let named_twice = rows.iter().enumerate().any(|(index, row)| {
-            rows[..index].iter().any(|other| same_ident(&row.qualifier, &other.qualifier))
-        });
-        if named_twice || rows_named(&rows, select).is_none() {
+        // PostgreSQL refuses two relations of one name, and a bare name two
+        // rows hold.
+        let qualifiers = rows.iter().map(|row| row.qualifier.as_ref());
+        if named_twice(qualifiers, &lists)
+            || rows_named(&rows, select).is_none()
+            || names_list(select, &lists)
+        {
             return Err(shape());
         }
         let table = &rows[0];
-        let mut columns = Vec::with_capacity(arity);
-        for item in &select.projection {
-            let (SelectItem::UnnamedExpr(returned)
-            | SelectItem::ExprWithAlias { expr: returned, .. }) = item
-            else {
-                return Err(shape());
-            };
-            let Some(column) = table.column(returned) else {
-                return Err(shape());
-            };
-            columns.push(column);
-        }
+        let returned = self.returned(scope, select, &lists, |returned| {
+            let column = table.column(returned);
+            // A bare name a row and a list both hold is ambiguous.
+            let ambiguous = matches!(unnest(returned), Expr::Identifier(_))
+                && rows.iter().any(|row| row.column(returned).is_some());
+            (column, ambiguous)
+        })?;
         for row in &rows {
             self.require_select(scope, row.table, || row.columns_read(select))?;
         }
-        let [column] = columns[..] else {
-            return Ok((None, self.grant_arm(scope, select, &rows, &columns, None, None)?));
+        let [Returned::Read(column)] = returned[..] else {
+            return Ok((None, self.grant_arm(scope, select, &rows, &returned, None, None)?));
         };
         let keyed = self.keyed_table(table.table, column)?;
         let child = self.child_table(table.table, column)?;
@@ -841,11 +907,316 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             && !matches!(unnest(expr), Expr::Tuple(_))
             && self.set_elements(scope, called)?.is_none()
             && self.parent_comparison(table, column, child, expr)?
+            && self.capping_key(table, &returned, expr)?.is_none()
         {
             let arm = self.parent_arm(scope, select, table, (column, child), expr, called)?;
             return Ok((keyed, vec![arm]));
         }
-        Ok((keyed, self.grant_arm(scope, select, &rows, &columns, child, None)?))
+        Ok((keyed, self.grant_arm(scope, select, &rows, &returned, child, None)?))
+    }
+
+    /// What each item of `select` returns, a column `read` answers or a
+    /// list of `lists` it names, each list returned once. `read` answers the
+    /// column an item names, beside whether the item is a bare name a list
+    /// could hold too.
+    fn returned<S>(
+        &self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        lists: &[LabelList<'_>],
+        read: impl Fn(&Expr) -> (Option<S>, bool),
+    ) -> Result<Vec<Returned<S>>, HelperSetError> {
+        let shape = || scope.arm_shape(select);
+        let mut returned = Vec::with_capacity(select.projection.len());
+        let mut listed = vec![false; lists.len()];
+        for (index, item) in select.projection.iter().enumerate() {
+            let (SelectItem::UnnamedExpr(item) | SelectItem::ExprWithAlias { expr: item, .. }) =
+                item
+            else {
+                return Err(shape());
+            };
+            let mut naming =
+                lists.iter().enumerate().filter(|(_, list)| list.named.position(item).is_some());
+            let (column, ambiguous) = read(item);
+            match (column, naming.next(), naming.next()) {
+                (Some(column), None, None) => returned.push(Returned::Read(column)),
+                (None, Some((position, list)), None) if !ambiguous && !listed[position] => {
+                    listed[position] = true;
+                    let declared =
+                        returned_type(scope.function, self.database, index).ok_or_else(shape)?;
+                    let labels = self.labels(scope, &list.source, &declared).ok_or_else(shape)?;
+                    returned.push(Returned::Labels(labels));
+                }
+                _ => return Err(shape()),
+            }
+        }
+        // A list returned nowhere only repeats the rows.
+        if listed.contains(&false) {
+            return Err(shape());
+        }
+        Ok(returned)
+    }
+
+    /// Reads an arm whose `FROM` calls another helper, crossed with `lists`,
+    /// `call` being the name it calls, its alias and its arguments.
+    fn called_arm(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        (name, alias, arguments): (&ObjectName, Option<&TableAlias>, &[FunctionArg]),
+        lists: &[LabelList<'_>],
+    ) -> Result<ReadArm<'db, DB>, HelperSetError> {
+        let database = self.database;
+        let shape = || scope.arm_shape(select);
+        let Some(callee) = self.called(scope, name, arguments.len())? else {
+            return Err(HelperSetError::UnresolvedCall {
+                function: scope.name.clone(),
+                call: name.to_string(),
+            });
+        };
+        // A function in `FROM` is named by its own name, without its schema.
+        let (function_name, quoted) = object_name_last_part(name).ok_or_else(shape)?;
+        let function_name =
+            Ident { quote_style: quoted.then_some('"'), ..Ident::new(function_name) };
+        let declared: Vec<Cow<'_, Ident>> = callee
+            .returned_columns(database)
+            .map(|(column, _)| {
+                let ident = Ident::new(column.name());
+                Cow::Owned(Ident { quote_style: column.name_is_quoted().then_some('"'), ..ident })
+            })
+            .collect();
+        let columns = if declared.is_empty() {
+            vec![alias.map_or_else(
+                || Cow::Owned(function_name.clone()),
+                |alias| Cow::Borrowed(&alias.name),
+            )]
+        } else {
+            declared
+        };
+        let callee_arity = columns.len();
+        let named = Named::aliased(alias, Cow::Owned(function_name), columns).ok_or_else(shape)?;
+        if named_twice([named.qualifier.as_ref()], lists) || names_list(select, lists) {
+            return Err(shape());
+        }
+        let returned =
+            self.returned(scope, select, lists, |returned| (named.position(returned), false))?;
+        let call = Call { name, arguments };
+        let Called { function, arguments, set } =
+            self.called_set(scope, select, &[], &call, callee_arity)?;
+        let keyed = match returned[..] {
+            [Returned::Read(0)] if callee_arity == 1 => set.covered_table(),
+            _ => None,
+        };
+        let arm = CalledArm { returned, function, arguments, set: Box::new(set) };
+        Ok((keyed, vec![HelperArm::Called(arm)]))
+    }
+
+    /// The list of labels `relation` writes, `unnest(enum_range(NULL::<type>))`
+    /// with PostgreSQL's own functions or `(VALUES (<label>), ...)` under an
+    /// alias, one column per row, `None` where it writes no such list.
+    fn label_list<'q>(
+        &self,
+        scope: &Scope<'db, DB>,
+        relation: &'q TableFactor,
+    ) -> Option<LabelList<'q>> {
+        match relation {
+            TableFactor::UNNEST {
+                alias,
+                array_exprs,
+                with_offset: false,
+                with_offset_alias: None,
+                with_ordinality: false,
+            } => {
+                let [Expr::Function(range)] = array_exprs.as_slice() else { return None };
+                let unnest_name = ObjectName::from(vec![Ident::new("unnest")]);
+                if !self.reaches_catalog(scope, &unnest_name, "unnest", 1) {
+                    return None;
+                }
+                let [FunctionArg::Unnamed(FunctionArgExpr::Expr(null))] =
+                    self.catalog_arguments(scope, range, "enum_range")?.args.as_slice()
+                else {
+                    return None;
+                };
+                let Expr::Cast {
+                    kind: CastKind::Cast | CastKind::DoubleColon,
+                    expr,
+                    data_type,
+                    format: None,
+                } = unnest(null)
+                else {
+                    return None;
+                };
+                let Expr::Value(null) = unnest(expr) else { return None };
+                if !matches!(Literal::of(&null.value), Some(Literal::Null)) {
+                    return None;
+                }
+                // A function returning one column names it after its alias.
+                let column = alias.as_ref().map_or_else(
+                    || Cow::Owned(Ident::new("unnest")),
+                    |alias| Cow::Borrowed(&alias.name),
+                );
+                let named =
+                    Named::aliased(alias.as_ref(), Cow::Owned(Ident::new("unnest")), vec![column])?;
+                Some(LabelList { named, source: LabelSource::EnumRange(data_type) })
+            }
+            TableFactor::Derived { lateral: false, subquery, alias: Some(alias), sample: None } => {
+                let SetExpr::Values(values) = subquery.body.as_ref() else { return None };
+                if !plain_query(subquery) || values.explicit_row || values.value_keyword {
+                    return None;
+                }
+                let mut labels = Vec::with_capacity(values.rows.len());
+                for row in &values.rows {
+                    let [label] = row.content.as_slice() else { return None };
+                    labels.push(label);
+                }
+                let column = Cow::Owned(Ident::new("column1"));
+                let named = Named::aliased(Some(alias), Cow::Borrowed(&alias.name), vec![column])?;
+                Some(LabelList { named, source: LabelSource::Values(labels) })
+            }
+            _ => None,
+        }
+    }
+
+    /// The labels `source` lists as values of `declared`, in the order it
+    /// lists them, each once, `None` where `declared` is no enum type or the
+    /// list writes anything but labels of it. `VALUES` reads as text unless
+    /// one row casts its label, so one has to, and every cast has to name
+    /// the declared type.
+    fn labels(
+        &self,
+        scope: &Scope<'db, DB>,
+        source: &LabelSource<'_>,
+        declared: &DataType,
+    ) -> Option<Vec<Value>> {
+        let declared_labels = self.enum_labels(declared)?;
+        let listed = match source {
+            LabelSource::EnumRange(cast) => {
+                if !self.is_declared_type(scope, cast, declared) {
+                    return None;
+                }
+                declared_labels.clone()
+            }
+            LabelSource::Values(rows) => {
+                let mut cast_once = false;
+                let mut listed = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let literal = match unnest(row) {
+                        Expr::Cast {
+                            kind: CastKind::Cast | CastKind::DoubleColon,
+                            expr,
+                            data_type,
+                            format: None,
+                        } => {
+                            if !self.is_declared_type(scope, data_type, declared) {
+                                return None;
+                            }
+                            cast_once = true;
+                            unnest(expr)
+                        }
+                        literal => literal,
+                    };
+                    let Expr::Value(literal) = literal else { return None };
+                    let Value::SingleQuotedString(label) = &literal.value else { return None };
+                    listed.push(label.as_str());
+                }
+                if !cast_once {
+                    return None;
+                }
+                listed
+            }
+        };
+        let mut labels: Vec<&str> = Vec::with_capacity(listed.len());
+        for label in listed {
+            // PostgreSQL refuses a label the type does not declare.
+            if !declared_labels.contains(&label) {
+                return None;
+            }
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        Some(labels.into_iter().map(|label| Value::SingleQuotedString(label.to_string())).collect())
+    }
+
+    /// The labels of the enum type `declared` names, in the order it declares
+    /// them, an unqualified name naming one in `public`.
+    fn enum_labels(&self, declared: &DataType) -> Option<Vec<&'db str>> {
+        let DataType::Custom(name, modifiers) = declared else { return None };
+        if !modifiers.is_empty() {
+            return None;
+        }
+        let (schema, name) = match name.0.as_slice() {
+            [ObjectNamePart::Identifier(name)] => (("public", false), name),
+            [ObjectNamePart::Identifier(schema), ObjectNamePart::Identifier(name)] => {
+                ((schema.value.as_str(), schema.quote_style.is_some()), name)
+            }
+            _ => return None,
+        };
+        let user_type = self.database.user_defined_types().find(|user_type| {
+            identifiers_match(
+                user_type.name(),
+                user_type.name_is_quoted(),
+                &name.value,
+                name.quote_style.is_some(),
+            ) && identifiers_match(
+                user_type.schema().unwrap_or("public"),
+                user_type.schema_is_quoted(),
+                schema.0,
+                schema.1,
+            )
+        })?;
+        let enumeration = user_type.enumeration()?;
+        (enumeration.kind() == EnumerationKind::Enum)
+            .then(|| enumeration.into_members().map(EnumerationMember::label).collect())
+    }
+
+    /// The column `compared` names where its comparison with a helper's set
+    /// caps an arm returning `returned`, `None` where it names the arm's
+    /// grantee or parent. It caps where the column is the arm's table's
+    /// primary key, which the arm returns and which references no other
+    /// table through a single-column foreign key.
+    fn capping_key(
+        &self,
+        table: &ArmTable<'_, 'db, DB>,
+        returned: &[Returned<&'db DB::Column>],
+        compared: &Expr,
+    ) -> Result<Option<&'db DB::Column>, LookupError> {
+        let database = self.database;
+        let Some(column) = table.column(compared) else { return Ok(None) };
+        let is_returned = returned.iter().any(
+            |returned| matches!(returned, Returned::Read(read) if core::ptr::eq(*read, column)),
+        );
+        let is_primary = table
+            .table
+            .primary_key_column(database)?
+            .is_some_and(|primary| core::ptr::eq(primary, column));
+        let caps = is_returned
+            && is_primary
+            && single_column_foreign_keys(table.table, column, database)?.is_empty();
+        Ok(caps.then_some(column))
+    }
+
+    /// The cap `<key> IN (SELECT <helper>(<arguments>))` or `<key> IN
+    /// (SELECT * FROM <helper>(<arguments>))` writes on the arm's own key.
+    fn key_cap(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        rows: &[ArmTable<'_, 'db, DB>],
+        key: &'db DB::Column,
+        subquery: &Query,
+    ) -> Result<RowCap<'db, DB>, HelperSetError> {
+        let call = selected_call(subquery)
+            .or_else(|| projected_call(subquery))
+            .ok_or_else(|| scope.arm_shape(select))?;
+        let Called { function, arguments, set } = self.called_set(scope, select, rows, &call, 1)?;
+        Ok(RowCap {
+            operands: vec![CapOperand::Column(key)],
+            function,
+            arguments,
+            set: Box::new(set),
+            lift: None,
+        })
     }
 
     /// Reads the final query of a walk reselecting the keys it reached,
@@ -909,7 +1280,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             read
         })?;
         let rows = [table];
-        self.grant_arm(scope, select, &rows, &[key], None, Some(reached))
+        self.grant_arm(scope, select, &rows, &[Returned::Read(key)], None, Some(reached))
     }
 
     /// Reads the recursive term of a walk, one arm per edge it follows.
@@ -1559,13 +1930,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         })
     }
 
-    /// Reads a grant arm returning `columns`, answering one arm per grantee
+    /// Reads a grant arm returning `returned`, answering one arm per grantee
     /// an `IN` list naming the request lists and none where its conditions
     /// keep no row, each as an `A`. An arm returning a row of `child` from a
     /// helper's set is a parent arm where
     /// [`parent_comparison`](Self::parent_comparison) reads it as one, which
-    /// takes no other condition, so such a set beside one is refused. `rows`
-    /// holds the arm's table and then each table it joins. `reached` is the
+    /// takes no other condition, so such a set beside one is refused unless
+    /// [`capping_key`](Self::capping_key) reads it as a cap. `rows` holds
+    /// the arm's table and then each table it joins. `reached` is the
     /// conjunct of a walk's final query keeping the keys the walk reached,
     /// which is no condition of the arm.
     fn grant_arm<A: From<GrantArm<'db, DB>>>(
@@ -1573,7 +1945,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         scope: &Scope<'db, DB>,
         select: &Select,
         rows: &[ArmTable<'_, 'db, DB>],
-        columns: &[&'db DB::Column],
+        returned: &[Returned<&'db DB::Column>],
         child: Option<&'db DB::Table>,
         reached: Option<&Expr>,
     ) -> Result<Vec<A>, HelperSetError> {
@@ -1600,7 +1972,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 ..
             } = unnest(conjunct)
             {
-                if let (Some(child), [column]) = (child, columns)
+                if let Some(key) = self.capping_key(table, returned, expr)? {
+                    caps.push(self.key_cap(scope, select, rows, key, called)?);
+                    continue;
+                }
+                if let (Some(child), [Returned::Read(column)]) = (child, returned)
                     && self.parent_comparison(table, column, child, expr)?
                 {
                     return Err(shape());
@@ -1647,7 +2023,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             let restrictions = kept.and(own).restrictions()?;
             Some(A::from(GrantArm {
                 table: table.table,
-                columns: columns.to_vec(),
+                returned: returned.to_vec(),
                 granted_to,
                 gate,
                 restrictions,
@@ -1680,9 +2056,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ) -> Result<JoinedConditions<'q, 'db, DB>, HelperSetError> {
         let shape = || scope.arm_shape(select);
         let (table, joined) = rows.split_first().ok_or_else(shape)?;
-        // An inner join keeps the rows its condition and `WHERE` keep alike.
+        // An inner join keeps the rows its condition and `WHERE` keep alike,
+        // and a list of labels crossed with them keeps every one.
         let mut conjuncts = Vec::new();
-        for join in select.from.iter().flat_map(|from| &from.joins) {
+        for join in select.from.iter().flat_map(|from| &from.joins).filter(|join| !is_cross(join)) {
             conjunction(join_condition(join).ok_or_else(shape)?, &mut conjuncts);
         }
         if let Some(selection) = &select.selection {
@@ -2774,28 +3151,38 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         call: &'c Function,
         name: &str,
     ) -> Option<&'c FunctionArgumentList> {
+        let list = plain_arguments(call)?;
+        self.reaches_catalog(scope, &call.name, name, list.args.len()).then_some(list)
+    }
+
+    /// Whether a call written as `written` with `arguments` arguments calls
+    /// PostgreSQL's own `name`, in `pg_catalog`, and nothing else it could
+    /// reach.
+    fn reaches_catalog(
+        &self,
+        scope: &Scope<'db, DB>,
+        written: &ObjectName,
+        name: &str,
+        arguments: usize,
+    ) -> bool {
         // A qualifier built when the statement runs names no schema.
-        let catalog = match qualifier_of(&call.name) {
+        let catalog = match qualifier_of(written) {
             Qualifier::Named(schema, quoted) => {
                 identifiers_match(schema, quoted, "pg_catalog", false)
             }
             qualifier => qualifier == Qualifier::Absent,
         };
-        let (called, quoted) = object_name_last_part(&call.name)?;
+        let Some((called, quoted)) = object_name_last_part(written) else { return false };
         if !catalog || !identifiers_match(called, quoted, name, false) {
-            return None;
+            return false;
         }
-        let list = plain_arguments(call)?;
         // An overload declared in a schema the owner can use, which the call
         // may reach, is refused.
         let path = || scope.usable_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
-        if self.database.functions_named(called).any(|function| {
-            call_reaches(function, &call.name, list.args.len(), path, IdentifierCase::AsWritten)
+        !self.database.functions_named(called).any(|function| {
+            call_reaches(function, written, arguments, path, IdentifierCase::AsWritten)
                 && function.target_name().schema() != Some("pg_catalog")
-        }) {
-            return None;
-        }
-        Some(list)
+        })
     }
 
     /// What `condition` keeps, `None` where it reduces to no restriction.
@@ -3127,6 +3514,25 @@ fn plain_table(relation: &TableFactor) -> Option<(&ObjectName, Option<&Ident>)> 
 fn plain_relation(
     relation: &TableFactor,
 ) -> Option<(&ObjectName, Option<&Ident>, Option<&TableFunctionArgs>)> {
+    let (name, alias, args) = aliased_relation(relation)?;
+    let plain = alias.is_none_or(|alias| alias.columns.is_empty() && alias.at.is_none());
+    plain.then(|| (name, alias.map(|alias| &alias.name), args))
+}
+
+/// The name, the alias and the arguments of the function `relation` calls
+/// with nothing else written, the alias naming its columns or not.
+fn called_relation(
+    relation: &TableFactor,
+) -> Option<(&ObjectName, Option<&TableAlias>, &[FunctionArg])> {
+    let (name, alias, Some(args)) = aliased_relation(relation)? else { return None };
+    Some((name, alias, &args.args))
+}
+
+/// The name, the alias and the arguments, where it calls a function, of the
+/// relation `relation` names with nothing but its alias written.
+fn aliased_relation(
+    relation: &TableFactor,
+) -> Option<(&ObjectName, Option<&TableAlias>, Option<&TableFunctionArgs>)> {
     let TableFactor::Table {
         name,
         alias,
@@ -3146,9 +3552,47 @@ fn plain_relation(
     let plain = with_hints.is_empty()
         && partitions.is_empty()
         && index_directives.is_empty()
-        && args.as_ref().is_none_or(|args| args.settings.is_none())
-        && alias.as_ref().is_none_or(|alias| alias.columns.is_empty() && alias.at.is_none());
-    plain.then(|| (name, alias.as_ref().map(|alias| &alias.name), args.as_ref()))
+        && args.as_ref().is_none_or(|args| args.settings.is_none());
+    plain.then_some((name, alias.as_ref(), args.as_ref()))
+}
+
+/// Whether `join` is `CROSS JOIN <relation>`, which pairs every row with
+/// every row of the relation.
+fn is_cross(join: &Join) -> bool {
+    matches!(join.join_operator, JoinOperator::CrossJoin(JoinConstraint::None))
+}
+
+/// Whether two of the relations an arm reads, the ones `qualifiers` name and
+/// `lists`, share a name, which PostgreSQL refuses.
+fn named_twice<'n>(
+    qualifiers: impl IntoIterator<Item = &'n Ident>,
+    lists: &'n [LabelList<'_>],
+) -> bool {
+    let names: Vec<&Ident> = qualifiers
+        .into_iter()
+        .chain(lists.iter().map(|list| list.named.qualifier.as_ref()))
+        .collect();
+    names
+        .iter()
+        .enumerate()
+        .any(|(index, name)| names[..index].iter().any(|other| same_ident(name, other)))
+}
+
+/// Whether a condition of `select`, its `WHERE` or the `ON` of a join, names
+/// a column of one of `lists`, whose labels an arm only crosses its rows
+/// with.
+fn names_list(select: &Select, lists: &[LabelList<'_>]) -> bool {
+    let joined = select.from.iter().flat_map(|from| &from.joins).filter_map(join_condition);
+    select.selection.iter().chain(joined).any(|condition| {
+        walk_expressions(condition, |expression| {
+            if lists.iter().any(|list| list.named.position(expression).is_some()) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    })
 }
 
 /// The name `relation`'s columns are qualified by where it reads the walk

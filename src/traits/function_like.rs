@@ -1856,8 +1856,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ) -> Result<bool, LookupError>;
 
     /// What this helper returns for a request of `deployment`, called with
-    /// `arguments`, as a union of grant arms and parent arms, walked along a
-    /// tree where the body is recursive.
+    /// `arguments`, as a union of grant arms, parent arms and called arms,
+    /// walked along a tree where the body is recursive.
     ///
     /// A helper answers when it is a `LANGUAGE sql STABLE SECURITY DEFINER`
     /// function returning `SETOF` one scalar type or `TABLE (...)` with a
@@ -1865,9 +1865,16 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// every table it reads, or on every column of it the body names,
     /// `USAGE` on the schema of every table and helper the body names, and
     /// exempt from the row-level security of the tables, and when its body
-    /// is a `UNION` of arms of two shapes, alone or walked along a tree. A
-    /// helper returning `TABLE (...)` of several columns answers grant arms
-    /// only.
+    /// is a `UNION` of arms of three shapes, alone or walked along a tree. A
+    /// helper returning `TABLE (...)` of several columns answers no parent
+    /// arm.
+    ///
+    /// An arm may cross its rows with lists of labels of an enum type, each
+    /// a `CROSS JOIN` of `unnest(enum_range(NULL::<type>))` or of `(VALUES
+    /// (<label>), ...)`, which the arm returns as one column the helper
+    /// declares in that type (see [`Returned`](crate::structs::Returned)).
+    /// No condition names a label, and a list the arm does not return, or a
+    /// bare name both a list and a row of the arm hold, refuses the answer.
     ///
     /// - A grant arm, `SELECT <columns> FROM <table> [WHERE <conditions>]`, one
     ///   column per column the helper returns, the conditions joined by `AND`.
@@ -1927,9 +1934,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   joins the row, and the conditions on that row alone reduce to a
     ///   [`JoinedRow`](crate::structs::JoinedRow), the grantee and the returned
     ///   columns staying on the arm's own table. A cap may take operands from
-    ///   the joined rows as well. An arm comparing a helper's set while
-    ///   returning a key it would return as a parent arm is one, so it takes no
-    ///   other condition and joins no row.
+    ///   the joined rows as well. The arm's table's primary key, returned by
+    ///   the arm and referencing no table through a single-column foreign key,
+    ///   compared by `<key> IN (SELECT <helper>(<arguments>))` or `<key> IN
+    ///   (SELECT * FROM <helper>(<arguments>))`, is a cap of one operand,
+    ///   keeping the rows whose key the helper returns. Any other arm comparing
+    ///   a helper's set while returning a key it would return as a parent arm
+    ///   is one, so it takes no other condition and joins no row.
     /// - A parent arm, `SELECT <key> FROM <table> WHERE <column> IN (SELECT
     ///   <helper>(<arguments>))`, each argument a parameter or a literal, the
     ///   helper called answered in turn for the arguments it receives. `<key>`
@@ -1940,6 +1951,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   through its one single-column foreign key, as in an edge table holding
     ///   the parent of each child, and the column, one other than `<key>`, has
     ///   one single-column foreign key.
+    /// - A called arm, `SELECT <columns> FROM <helper>(<arguments>) [<alias>
+    ///   [(<names>)]]`, returning columns of the rows another helper returns,
+    ///   answered in turn, crossed with lists of labels and with no other
+    ///   condition (see [`CalledArm`](crate::structs::CalledArm)).
     ///
     /// A body walking a tree is `WITH RECURSIVE <walk> [(<column>)] AS
     /// (<arms> UNION <term>) SELECT <column> FROM <walk>`. The term walks
@@ -2022,7 +2037,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// let set =
     ///     docs_with.helper_set(&[Value::SingleQuotedString("write".into())], &deployment, &db)?;
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
-    /// let [doc] = grant.columns() else { panic!("the helper returns one column") };
+    /// let [Returned::Read(doc)] = grant.returned() else { panic!("the helper returns one column") };
     /// assert_eq!(doc.column_name(), "doc_id");
     /// let GrantedTo::Request(request) = grant.granted_to() else { unreachable!() };
     /// assert_eq!(request.column().column_name(), "principal_id");
