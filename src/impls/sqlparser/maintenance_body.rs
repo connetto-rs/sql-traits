@@ -46,21 +46,16 @@ pub(crate) fn maintenance_assignments<'db, DB: DatabaseLike>(
     };
     let names = BodyNames::new(function, database)?;
     let signature = names.signature();
-    let Some(fields) = block.fields_of_new(&signature) else {
-        return Ok(None);
-    };
-    let columns: Vec<&'db DB::Column> = table.columns(database)?.collect();
     // A body `fields_of_new` folds declares nothing and holds no loop or
     // nested block, so the names `RETURN` reads, the last site, are those of
     // every statement.
-    let Some(namespace) = block
-        .sites(&signature, |name| names.holds_row(name))
-        .ok()
-        .and_then(|mut sites| sites.pop())
-        .map(|site| site.namespace)
-    else {
+    let Some((fields, namespace)) = block.fields_of_new(&signature).and_then(|fields| {
+        let site = block.sites(&signature, |name| names.holds_row(name)).ok()?.pop()?;
+        Some((fields, site.namespace))
+    }) else {
         return Ok(None);
     };
+    let columns: Vec<&'db DB::Column> = table.columns(database)?.collect();
     let reader = Reader { columns, names: &names, namespace };
     Ok(fields
         .into_iter()
