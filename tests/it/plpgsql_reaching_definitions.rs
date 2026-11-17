@@ -568,6 +568,41 @@ fn continue_while_and_case_join_their_paths() {
     );
 }
 
+/// A `CASE` without an `ELSE` raises `case_not_found` where no `WHEN`
+/// holds, so a definition no `WHEN` matched does not fall through it.
+#[test]
+fn a_case_without_an_else_raises_where_no_when_holds() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN
+              CASE q WHEN 0 THEN s := 'SELECT 2'; END CASE;
+              EXECUTE s;
+             END"
+        ),
+        [vec![read("s", &["'SELECT 2'"])]]
+    );
+}
+
+/// The `case_not_found` a `CASE` without an `ELSE` raises is still a raise,
+/// so a handler of it sees what reached the `CASE` and what a `WHEN` wrote.
+#[test]
+fn a_handler_of_the_missing_else_sees_every_state_that_raised() {
+    assert_eq!(
+        reaching(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN
+              BEGIN
+               CASE q WHEN 0 THEN s := 'SELECT 2'; END CASE;
+              EXCEPTION WHEN OTHERS THEN
+               EXECUTE s;
+              END;
+             END"
+        ),
+        [vec![read("s", &["'SELECT 1'", "'SELECT 2'"])]]
+    );
+}
+
 /// `EXIT` naming an outer loop leaves both loops, so the statements after
 /// the inner loop never run.
 #[test]
