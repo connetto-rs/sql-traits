@@ -35,11 +35,13 @@ use sqlparser::{
 ///      CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION maintain();",
 /// )?;
 /// let trigger = db.triggers().next().unwrap();
-/// let Some(MaintenanceRefusal::Statement(insert)) = trigger.maintenance_refusal(&db)? else {
-///     panic!("the INSERT refuses the body");
-/// };
-/// assert_eq!(insert.text(), "INSERT INTO audit (txt) VALUES (NEW.txt);");
-/// assert_eq!(insert.span().start.line, 4);
+/// let refusal = trigger.maintenance_refusal(&db)?;
+/// assert!(matches!(
+///     refusal,
+///     Some(MaintenanceRefusal::Statement(insert))
+///         if insert.text() == "INSERT INTO audit (txt) VALUES (NEW.txt);"
+///             && insert.span().start.line == 4
+/// ));
 /// # Ok(())
 /// # }
 /// ```

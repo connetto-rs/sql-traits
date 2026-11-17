@@ -12,7 +12,7 @@ use sqlparser_plpgsql::{
     new_row::{FieldValue, NotFolded},
 };
 
-use super::dynamic_sites::{BodyNames, namespace_error};
+use super::dynamic_sites::BodyNames;
 use crate::{
     errors::LookupError,
     structs::{BodyExcerpt, IdentifierCase, MaintenanceRefusal},
@@ -30,8 +30,8 @@ pub(crate) type MaintenanceAssignments<'db, DB> = Vec<(&'db <DB as DatabaseLike>
 /// # Errors
 ///
 /// Returns the [`LookupError`] that resolving the table of `trigger`, or
-/// reading its function's `search_path` setting, the names of the body or
-/// the columns of the table from `database`, raises.
+/// reading its function's `search_path` setting or the columns of the table
+/// from `database`, raises.
 pub(crate) fn maintenance_assignments<'db, T: TriggerLike>(
     trigger: &'db T,
     database: &'db T::DB,
@@ -56,8 +56,7 @@ pub(crate) fn maintenance_assignments<'db, T: TriggerLike>(
 /// # Errors
 ///
 /// Returns the [`LookupError`] that reading the function's own `search_path`
-/// setting, the names of the body or the columns of `table` from `database`
-/// raises.
+/// setting or the columns of `table` from `database` raises.
 fn body_assignments<'db, DB: DatabaseLike>(
     function: &'db DB::Function,
     body: &str,
@@ -76,13 +75,12 @@ fn body_assignments<'db, DB: DatabaseLike>(
         Ok(fields) => fields,
         Err(refused) => return Ok(Err(refusal(body, refused))),
     };
-    // A body `fields_of_new` folds declares nothing and holds no loop or
-    // nested block, so the names `RETURN` reads, the last site, are those of
-    // every statement.
+    // A folded body has no block or loop, so the last site's names are every
+    // statement's.
     let namespace = block
         .sites(&signature, |name| names.holds_row(name))
-        .map_err(|error| namespace_error(function.name(), error))?
-        .pop()
+        .ok()
+        .and_then(|mut sites| sites.pop())
         .map(|site| site.namespace);
     let columns: Vec<&'db DB::Column> = table.columns(database)?.collect();
     let reader = Reader { columns, names: &names, namespace };
