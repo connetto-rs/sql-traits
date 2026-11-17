@@ -1,21 +1,22 @@
 //! The `NEW` columns a trigger's PL/pgSQL body assigns before returning `NEW`,
 //! each with the one expression it holds when the body returns.
 
-use alloc::vec::Vec;
+use alloc::{string::ToString, vec::Vec};
 use core::{ops::ControlFlow, slice};
 
 use sqlparser::ast::{Expr, Ident};
 use sqlparser_plpgsql::{
+    embedded::Node,
     embedded_sql,
     namespace::{NameKind, Namespace, TriggerVariable},
-    new_row::FieldValue,
+    new_row::{FieldValue, NotFolded},
 };
 
 use super::dynamic_sites::BodyNames;
 use crate::{
     errors::LookupError,
-    structs::IdentifierCase,
-    traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
+    structs::{BodyExcerpt, IdentifierCase, MaintenanceRefusal},
+    traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike, TriggerLike},
     utils::{identifier_resolution::stored_identifier, walk::walk_expressions},
 };
 
@@ -23,8 +24,28 @@ use crate::{
 /// when the body returns, in the order the body first assigns them.
 pub(crate) type MaintenanceAssignments<'db, DB> = Vec<(&'db <DB as DatabaseLike>::Column, Expr)>;
 
-/// The assignments of the PL/pgSQL body of `function`, run by a trigger on
-/// `table`, or [`None`] when it is no maintenance body.
+/// The assignments of the PL/pgSQL body `trigger` runs, or what makes it no
+/// maintenance body.
+///
+/// # Errors
+///
+/// Returns the [`LookupError`] that resolving the table of `trigger`, or
+/// reading its function's `search_path` setting or the columns of the table
+/// from `database`, raises.
+pub(crate) fn maintenance_assignments<'db, T: TriggerLike>(
+    trigger: &'db T,
+    database: &'db T::DB,
+) -> Result<Result<MaintenanceAssignments<'db, T::DB>, MaintenanceRefusal>, LookupError> {
+    let Some((function, body)) =
+        trigger.function(database).and_then(|function| Some((function, function.body()?)))
+    else {
+        return Ok(Err(MaintenanceRefusal::NoBody));
+    };
+    body_assignments(function, body, trigger.table(database)?, database)
+}
+
+/// The assignments of `body`, the PL/pgSQL body of `function` run by a
+/// trigger on `table`, or what makes it no maintenance body.
 ///
 /// A maintenance body is one whose fields of `NEW`
 /// [`Block::fields_of_new`](sqlparser_plpgsql::embedded::Block::fields_of_new)
@@ -36,34 +57,64 @@ pub(crate) type MaintenanceAssignments<'db, DB> = Vec<(&'db <DB as DatabaseLike>
 ///
 /// Returns the [`LookupError`] that reading the function's own `search_path`
 /// setting or the columns of `table` from `database` raises.
-pub(crate) fn maintenance_assignments<'db, DB: DatabaseLike>(
+fn body_assignments<'db, DB: DatabaseLike>(
     function: &'db DB::Function,
+    body: &str,
     table: &'db DB::Table,
     database: &'db DB,
-) -> Result<Option<MaintenanceAssignments<'db, DB>>, LookupError> {
-    let Some(Ok(block)) = function.body().map(embedded_sql) else {
-        return Ok(None);
+) -> Result<Result<MaintenanceAssignments<'db, DB>, MaintenanceRefusal>, LookupError> {
+    let block = match embedded_sql(body) {
+        Ok(block) => block,
+        Err(error) => {
+            return Ok(Err(MaintenanceRefusal::UnparsableBody { reason: error.to_string() }));
+        }
     };
     let names = BodyNames::new(function, database)?;
     let signature = names.signature();
-    // A body `fields_of_new` folds declares nothing and holds no loop or
-    // nested block, so the names `RETURN` reads, the last site, are those of
-    // every statement.
-    let Some((fields, namespace)) = block.fields_of_new(&signature).ok().and_then(|fields| {
-        let site = block.sites(&signature, |name| names.holds_row(name)).ok()?.pop()?;
-        Some((fields, site.namespace))
-    }) else {
-        return Ok(None);
+    let fields = match block.fields_of_new(&signature) {
+        Ok(fields) => fields,
+        Err(refused) => return Ok(Err(refusal(body, refused))),
     };
+    // A folded body has no block or loop, so the last site's names are every
+    // statement's.
+    let namespace = block
+        .sites(&signature, |name| names.holds_row(name))
+        .ok()
+        .and_then(|mut sites| sites.pop())
+        .map(|site| site.namespace);
     let columns: Vec<&'db DB::Column> = table.columns(database)?.collect();
     let reader = Reader { columns, names: &names, namespace };
     Ok(fields
         .into_iter()
         .map(|FieldValue { field, value }| {
-            let column = reader.column(&field)?;
-            reader.reads_columns(&value).then_some((column, value))
+            let Some(column) = reader.column(&field) else {
+                return Err(MaintenanceRefusal::UndeclaredColumn { field });
+            };
+            match reader.undeclared_read(&value) {
+                Some(field) => Err(MaintenanceRefusal::UndeclaredColumn { field }),
+                None => Ok((column, value)),
+            }
         })
         .collect())
+}
+
+/// The refusal `refused` names, its statements quoted from `body`.
+fn refusal(body: &str, refused: NotFolded<'_>) -> MaintenanceRefusal {
+    let excerpt = |node: &Node| BodyExcerpt::new(body, node.span);
+    match refused {
+        NotFolded::Declaration(declaration) => {
+            MaintenanceRefusal::Declaration(declaration.name.clone())
+        }
+        NotFolded::Handler(_) => MaintenanceRefusal::Handler,
+        NotFolded::Statement(node) => MaintenanceRefusal::Statement(excerpt(node)),
+        NotFolded::EarlyReturn(node) => MaintenanceRefusal::EarlyReturn(excerpt(node)),
+        NotFolded::NoReturnOfNew(node) => MaintenanceRefusal::NoReturnOfNew(excerpt(node)),
+        NotFolded::NoStatement => MaintenanceRefusal::NoStatement,
+        NotFolded::Read { statement, read } => {
+            MaintenanceRefusal::ReadAfterAssignment { read, statement: excerpt(statement) }
+        }
+        NotFolded::NothingAssigned => MaintenanceRefusal::NothingAssigned,
+    }
 }
 
 /// Resolves the names a folded body reads against the trigger's table.
@@ -72,8 +123,9 @@ struct Reader<'names, 'db, DB: DatabaseLike> {
     columns: Vec<&'db DB::Column>,
     /// The names of the trigger function's body.
     names: &'names BodyNames<'db, DB>,
-    /// The names every statement of the body reaches.
-    namespace: Namespace,
+    /// The names every statement of the body reaches, [`None`] for a body
+    /// with no statement.
+    namespace: Option<Namespace>,
 }
 
 impl<'db, DB: DatabaseLike> Reader<'_, 'db, DB> {
@@ -90,16 +142,18 @@ impl<'db, DB: DatabaseLike> Reader<'_, 'db, DB> {
         })
     }
 
-    /// Whether every field of `NEW` that `value` reads is a column of the
-    /// table.
-    fn reads_columns(&self, value: &Expr) -> bool {
+    /// The first field of `NEW` that `value` reads and the table does not
+    /// declare.
+    fn undeclared_read(&self, value: &Expr) -> Option<Ident> {
         walk_expressions(value, |read| {
             match name_parts(read).and_then(|parts| self.after_new(parts)) {
-                Some([field, ..]) if self.column(field).is_none() => ControlFlow::Break(()),
+                Some([field, ..]) if self.column(field).is_none() => {
+                    ControlFlow::Break(field.clone())
+                }
                 _ => ControlFlow::Continue(()),
             }
         })
-        .is_continue()
+        .break_value()
     }
 
     /// The parts of the name `parts` writes after those that reach `NEW`, or
@@ -109,7 +163,8 @@ impl<'db, DB: DatabaseLike> Reader<'_, 'db, DB> {
             .iter()
             .map(|part| stored_identifier(&part.value, part.quote_style.is_some()))
             .collect();
-        let (name, consumed) = self.namespace.lookup(&stored, |name| self.names.holds_row(name))?;
+        let (name, consumed) =
+            self.namespace.as_ref()?.lookup(&stored, |name| self.names.holds_row(name))?;
         if matches!(name.kind(), NameKind::Trigger(TriggerVariable::New)) {
             parts.get(consumed..)
         } else {

@@ -1,13 +1,12 @@
 //! Submodule providing a trait for describing SQL Trigger-like entities.
 
-use alloc::vec::Vec;
 use core::fmt::Debug;
 
 use crate::{
     errors::LookupError,
     impls::maintenance_assignments,
-    structs::{TargetName, TriggerEnablement},
-    traits::{DatabaseLike, FunctionLike, Metadata},
+    structs::{MaintenanceRefusal, TargetName, TriggerEnablement},
+    traits::{DatabaseLike, Metadata},
 };
 
 /// A trait for types that can be treated as SQL triggers.
@@ -669,14 +668,49 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         &'db self,
         database: &'db Self::DB,
     ) -> Result<bool, LookupError> {
-        let Some(function) = self.function(database) else {
-            return Ok(false);
-        };
-        if function.body().is_none() {
-            return Ok(false);
-        }
-        let table = self.table(database)?;
-        Ok(maintenance_assignments(function, table, database)?.is_some())
+        Ok(maintenance_assignments(self, database)?.is_ok())
+    }
+
+    /// Returns what makes the trigger no maintenance trigger, as
+    /// [`TriggerLike::is_maintenance_trigger`] describes one, or [`None`] for
+    /// a maintenance trigger.
+    ///
+    /// The first part of the body, in the order written, that a maintenance
+    /// body may not hold decides, quoted with where the body writes it, so a
+    /// consumer refusing the trigger can name the statement that makes it
+    /// refuse. [`MaintenanceRefusal`] lists every answer.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (n INT);
+    ///      CREATE FUNCTION maintain() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    ///      BEGIN NEW.n := 1; RAISE NOTICE 'set'; RETURN NEW; END $$;
+    ///      CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION maintain();",
+    /// )?;
+    /// let trigger = db.triggers().next().unwrap();
+    /// let Some(MaintenanceRefusal::Statement(raise)) = trigger.maintenance_refusal(&db)? else {
+    ///     panic!("RAISE refuses the body");
+    /// };
+    /// assert_eq!(raise.text(), "RAISE NOTICE 'set';");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`TriggerLike::is_maintenance_trigger`] returns.
+    #[inline]
+    fn maintenance_refusal<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<MaintenanceRefusal>, LookupError> {
+        Ok(maintenance_assignments(self, database)?.err())
     }
 
     /// Returns the assignments in a maintenance trigger, as
@@ -768,14 +802,7 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         impl Iterator<Item = (&'db <Self::DB as DatabaseLike>::Column, sqlparser::ast::Expr)>,
         LookupError,
     > {
-        let Some(function) = self.function(database) else {
-            return Ok(Vec::new().into_iter());
-        };
-        if function.body().is_none() {
-            return Ok(Vec::new().into_iter());
-        }
-        let table = self.table(database)?;
-        Ok(maintenance_assignments(function, table, database)?.unwrap_or_default().into_iter())
+        Ok(maintenance_assignments(self, database)?.unwrap_or_default().into_iter())
     }
 }
 
@@ -853,6 +880,13 @@ impl<T: TriggerLike> TriggerLike for &T {
         database: &'db Self::DB,
     ) -> Result<bool, LookupError> {
         (*self).is_maintenance_trigger(database)
+    }
+
+    fn maintenance_refusal<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<MaintenanceRefusal>, LookupError> {
+        (*self).maintenance_refusal(database)
     }
 
     fn maintenance_assignments<'db>(
@@ -1000,6 +1034,10 @@ mod tests {
         assert_eq!(
             trigger_ref.maintenance_assignments(&db).expect("maintenance assignments").count(),
             0
+        );
+        assert_eq!(
+            trigger_ref.maintenance_refusal(&db),
+            Ok(Some(crate::structs::MaintenanceRefusal::NoBody))
         );
     }
 
