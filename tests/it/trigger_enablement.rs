@@ -186,6 +186,18 @@ fn replacing_a_trigger_starts_it_and_its_new_copies_over() {
 }
 
 #[test]
+fn a_trigger_answers_only_for_the_database_holding_it() {
+    let database = db("");
+    let other =
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT);").expect("the table parses");
+    let trigger = database.triggers().next().expect("a trigger exists");
+    assert!(matches!(
+        trigger.enablement(&other),
+        Err(sql_traits::errors::LookupError::ObjectNotInDatabase { .. })
+    ));
+}
+
+#[test]
 fn a_pg_dump_schema_ingests_with_each_triggers_state() {
     use TriggerEnablement::{Always, Disabled, Origin, Replica};
     let dump = "CREATE FUNCTION public.fired() RETURNS trigger LANGUAGE plpgsql AS $$

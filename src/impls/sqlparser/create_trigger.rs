@@ -102,10 +102,10 @@ impl TriggerLike for CreateTrigger {
         if !trigger_metadata(self, database)?.is_clone() {
             return Ok(None);
         }
-        let Some(parent_table) = self.table(database)?.partition_root(database)? else {
-            return Ok(None);
-        };
-        Ok(database.trigger(self.name(), parent_table))
+        Ok(self
+            .table(database)?
+            .partition_root(database)?
+            .and_then(|parent_table| database.trigger(self.name(), parent_table)))
     }
 
     fn enablement(&self, database: &Self::DB) -> Result<TriggerEnablement, LookupError> {

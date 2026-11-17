@@ -143,11 +143,7 @@ pub(super) fn drop_trigger(
     };
 
     let (trigger, metadata) = &builder.triggers()[position];
-    let Some(table) = builder.resolve_table_object_name(&trigger.table_name)?.map(StoredTable::of)
-    else {
-        builder.triggers_mut().remove(position);
-        return Ok(builder);
-    };
+    let table = holder(&builder, trigger)?;
     let name = trigger.name.clone();
     if metadata.is_clone() {
         let parent = ParserDB::stored_node(&builder, &table)?.partition_of.as_ref();
@@ -265,17 +261,14 @@ fn set_enablement(
     enablement: TriggerEnablement,
     down: bool,
 ) {
-    if let Some(position) = position_on(builder, name, table) {
-        builder.triggers_mut()[position].1.set_enablement(enablement);
-    }
-    if !down {
-        return;
-    }
-    for partition in partitions(builder, table) {
-        let copied = position_on(builder, name, &partition)
-            .is_some_and(|position| builder.triggers()[position].1.is_clone());
-        if copied {
-            set_enablement(builder, name, &partition, enablement, true);
+    let case = builder.identifier_case();
+    let below = if down { inheritance::descendants(builder, table) } else { Vec::new() };
+    for (trigger, metadata) in builder.triggers_mut() {
+        let reached = table.named_by(&trigger.table_name)
+            || (metadata.is_clone()
+                && below.iter().any(|partition| partition.named_by(&trigger.table_name)));
+        if reached && object_names_match(&trigger.name, name, case) {
+            metadata.set_enablement(enablement);
         }
     }
 }
@@ -298,6 +291,17 @@ fn partitions(builder: &ParserDBBuilder, table: &StoredTable) -> Vec<StoredTable
         .into_iter()
         .filter_map(|(kind, child)| (kind == ParentKind::PartitionOf).then_some(child))
         .collect()
+}
+
+/// The stored table holding `trigger`, found by the identity its stored name
+/// carries whatever the session's path has become since.
+fn holder(builder: &ParserDBBuilder, trigger: &CreateTrigger) -> Result<StoredTable, Error> {
+    builder
+        .tables()
+        .iter()
+        .map(|(table, _, _)| StoredTable::of(table))
+        .find(|table| table.named_by(&trigger.table_name))
+        .ok_or_else(|| ObjectKind::Table.not_in_database(last_str(&trigger.table_name)).into())
 }
 
 /// Where the trigger named `name` on `table` is stored.
@@ -372,9 +376,10 @@ fn clone_down(
 
 /// Drops the trigger named `name` on `table` and its copies below `table`.
 fn drop_with_clones(builder: &mut ParserDBBuilder, name: &ObjectName, table: &StoredTable) {
-    if let Some(position) = position_on(builder, name, table) {
-        builder.triggers_mut().remove(position);
-    }
+    let case = builder.identifier_case();
+    builder.triggers_mut().retain(|(trigger, _)| {
+        !(table.named_by(&trigger.table_name) && object_names_match(&trigger.name, name, case))
+    });
     for partition in partitions(builder, table) {
         let copied = position_on(builder, name, &partition)
             .is_some_and(|position| builder.triggers()[position].1.is_clone());

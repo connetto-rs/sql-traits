@@ -132,6 +132,19 @@ fn a_trigger_reports_the_function_it_runs() {
     assert!(trigger.function(&spelled_public).is_some(), "public.f is the f a bare name reaches");
 }
 
+#[test]
+fn a_trigger_running_no_stored_function_is_refused() {
+    assert!(matches!(
+        parse(
+            "CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT 1';
+             CREATE TABLE t (id INT);
+             CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();"
+        ),
+        Err(Error::FunctionNotFoundForTrigger { function_name, trigger_name })
+            if function_name == "f" && trigger_name == "tr"
+    ));
+}
+
 /// A trigger name is unique per table, so one name on two tables names two
 /// triggers, each with the calls of its own `WHEN` condition.
 #[test]
