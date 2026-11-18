@@ -1012,10 +1012,12 @@ impl ColumnCollation<'_> {
     /// schema and name the engine stores. PostgreSQL settles a side on the
     /// identity its database resolved the name to at parse time, walking the
     /// search path in force then with `pg_catalog` searched first, and it
-    /// treats the `default` spelling as the database's default rule. A side
-    /// that resolves to nothing, an unqualified name its source never
-    /// resolved among them, leaves the rule
-    /// [`CollationMatch::Undetermined`].
+    /// treats the `default` spelling as the database's default rule. SQLite
+    /// compares bare names with ASCII letters folded, the way it looks a
+    /// collation up, and reads a column with no `COLLATE` as `BINARY`. A side
+    /// that resolves to nothing, an unqualified PostgreSQL name its source
+    /// never resolved or a schema-qualified SQLite name among them, leaves
+    /// the rule [`CollationMatch::Undetermined`].
     ///
     /// The outcome is symmetric in the two collations.
     ///
@@ -1052,6 +1054,7 @@ impl ColumnCollation<'_> {
     ) -> CollationMatch {
         match dialect {
             SqlparserDialect::PostgreSql => postgres_collation_match(self, other),
+            SqlparserDialect::SQLite => sqlite_collation_match(self, other),
             _ => collation_match_core(self, other),
         }
     }
@@ -1130,6 +1133,32 @@ fn postgres_collation_match(
         | (PostgresCollationRule::DatabaseDefault, PostgresCollationRule::Named { .. }) => {
             CollationMatch::Different
         }
+        _ => CollationMatch::Undetermined,
+    }
+}
+
+/// The collation name a SQLite side settles to, `BINARY` for a column with no
+/// `COLLATE`, or `None` for a side that names no collation SQLite can hold.
+fn sqlite_collation_name<'a>(collation: &'a ColumnCollation<'a>) -> Option<&'a str> {
+    match collation {
+        ColumnCollation::DatabaseDefault => Some("BINARY"),
+        ColumnCollation::Unknown => None,
+        ColumnCollation::Named(named) => {
+            let name = named.name();
+            name.schema().is_none().then(|| name.name())
+        }
+    }
+}
+
+/// Whether the two sides name one SQLite collation, comparing the names with
+/// ASCII letters folded as `sqlite3_strnicmp` does.
+fn sqlite_collation_match(
+    left: &ColumnCollation<'_>,
+    right: &ColumnCollation<'_>,
+) -> CollationMatch {
+    match (sqlite_collation_name(left), sqlite_collation_name(right)) {
+        (Some(left), Some(right)) if left.eq_ignore_ascii_case(right) => CollationMatch::Same,
+        (Some(_), Some(_)) => CollationMatch::Different,
         _ => CollationMatch::Undetermined,
     }
 }

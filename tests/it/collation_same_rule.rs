@@ -2,11 +2,12 @@
 //!
 //! A drift check compares the collation a catalog writes for a column with
 //! the collation a live read of the same column reports. The two sides spell
-//! the same rule differently, a written name without its schema against the
-//! schema the engine stores, so the comparison settles on the rule each side
-//! resolves to instead of comparing text. The live side here is shaped the
-//! way PostgreSQL's `information_schema.columns` hands it back, schema and
-//! name both quoted, or absent for the database default.
+//! the same rule differently, so the comparison settles on the rule each side
+//! resolves to instead of comparing text. A PostgreSQL live side is shaped
+//! the way `information_schema.columns` hands it back, schema and name both
+//! quoted, or absent for the database default. A SQLite live side is shaped
+//! the way `sqlite3_table_column_metadata` hands it back, a bare name that
+//! reads `BINARY` for a column with no `COLLATE`.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -14,7 +15,7 @@ use sql_traits::{
     prelude::*,
     traits::{ColumnCollation, NamedColumnCollation},
 };
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{Dialect, PostgreSqlDialect, SQLiteDialect};
 
 /// The collation a live read of PostgreSQL reports for a column, with the
 /// schema and name quoted the way `information_schema.columns` hands them
@@ -35,15 +36,21 @@ fn default_table() -> TargetName<'static> {
     TargetName::new("t", false)
 }
 
-/// Parses `sql`, reads the collation of `column` in the table `table` names,
-/// and compares it with `live` under the PostgreSQL rules.
-fn compare(
+/// The collation a live read of SQLite reports for a column, a bare name.
+fn sqlite_live(name: &'static str) -> ColumnCollation<'static> {
+    ColumnCollation::Named(NamedColumnCollation::new(TargetName::new(name, false)))
+}
+
+/// Parses `sql` under the dialect `D`, reads the collation of `column` in the
+/// table `table` names, and compares it with `live` under that dialect's
+/// rules.
+fn compare<D: Dialect + Default + 'static>(
     sql: &str,
     table: TargetName<'static>,
     column: &str,
     live: &ColumnCollation<'_>,
 ) -> CollationMatch {
-    let db = ParserDB::parse::<PostgreSqlDialect>(sql).expect("the DDL parses");
+    let db = ParserDB::parse::<D>(sql).expect("the DDL parses");
     let table = db
         .table_by_target(table, IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
@@ -53,19 +60,24 @@ fn compare(
         .expect("column lookup")
         .expect("the column exists");
     let written = column.collation(&db).expect("the collation reads");
-    written.is_same_rule(SqlparserDialect::PostgreSql, live)
+    written.is_same_rule(*db.dialect(), live)
 }
 
 #[test]
 fn the_database_default_and_a_written_default_are_one_rule() {
     // No `COLLATE` at all answers the database default, as does the live read.
     assert_eq!(
-        compare("CREATE TABLE t (a TEXT);", default_table(), "a", &live_default()),
+        compare::<PostgreSqlDialect>(
+            "CREATE TABLE t (a TEXT);",
+            default_table(),
+            "a",
+            &live_default()
+        ),
         CollationMatch::Same
     );
     // A written `default` names the database default itself.
     assert_eq!(
-        compare(
+        compare::<PostgreSqlDialect>(
             "CREATE TABLE t (b TEXT COLLATE \"default\");",
             default_table(),
             "b",
@@ -78,7 +90,7 @@ fn the_database_default_and_a_written_default_are_one_rule() {
 #[test]
 fn an_unqualified_builtin_resolves_to_pg_catalog() {
     assert_eq!(
-        compare(
+        compare::<PostgreSqlDialect>(
             "CREATE TABLE t (c TEXT COLLATE \"C\");",
             default_table(),
             "c",
@@ -91,7 +103,7 @@ fn an_unqualified_builtin_resolves_to_pg_catalog() {
 #[test]
 fn an_unqualified_name_resolves_to_the_schema_the_engine_stores() {
     assert_eq!(
-        compare(
+        compare::<PostgreSqlDialect>(
             "
             CREATE COLLATION ci (
                 provider = icu,
@@ -111,7 +123,7 @@ fn an_unqualified_name_resolves_to_the_schema_the_engine_stores() {
 #[test]
 fn a_different_named_rule_is_a_different_rule() {
     assert_eq!(
-        compare(
+        compare::<PostgreSqlDialect>(
             "CREATE TABLE t (f TEXT COLLATE \"C\");",
             default_table(),
             "f",
@@ -125,7 +137,12 @@ fn a_different_named_rule_is_a_different_rule() {
 fn a_named_rule_against_the_database_default_is_different() {
     // The stored collation is 950 against the default 100.
     assert_eq!(
-        compare("CREATE TABLE t (g TEXT COLLATE \"C\");", default_table(), "g", &live_default()),
+        compare::<PostgreSqlDialect>(
+            "CREATE TABLE t (g TEXT COLLATE \"C\");",
+            default_table(),
+            "g",
+            &live_default()
+        ),
         CollationMatch::Different
     );
 }
@@ -143,10 +160,13 @@ fn an_unqualified_name_resolves_on_the_search_path_in_force() {
         CREATE TABLE t (name TEXT COLLATE ci);
     ";
     let table = TargetName::new("t", false).with_schema("app", false);
-    assert_eq!(compare(sql, table, "name", &live_collation("app", "ci")), CollationMatch::Same);
+    assert_eq!(
+        compare::<PostgreSqlDialect>(sql, table, "name", &live_collation("app", "ci")),
+        CollationMatch::Same
+    );
     let table = TargetName::new("t", false).with_schema("app", false);
     assert_eq!(
-        compare(sql, table, "name", &live_collation("public", "ci")),
+        compare::<PostgreSqlDialect>(sql, table, "name", &live_collation("public", "ci")),
         CollationMatch::Different
     );
 }
@@ -164,11 +184,16 @@ fn postgres_folds_unquoted_names_before_resolving_them() {
         CREATE TABLE t (name TEXT COLLATE C);
     ";
     assert_eq!(
-        compare(sql, default_table(), "name", &live_collation("pg_catalog", "C")),
+        compare::<PostgreSqlDialect>(
+            sql,
+            default_table(),
+            "name",
+            &live_collation("pg_catalog", "C")
+        ),
         CollationMatch::Different
     );
     assert_eq!(
-        compare(sql, default_table(), "name", &live_collation("public", "c")),
+        compare::<PostgreSqlDialect>(sql, default_table(), "name", &live_collation("public", "c")),
         CollationMatch::Same
     );
 }
@@ -251,21 +276,114 @@ fn a_resolved_identity_compares_part_by_part() {
 }
 
 #[test]
-fn only_postgres_settles_named_rules_here() {
-    // Only PostgreSQL settles a named rule; every other dialect settles the
-    // dialect-neutral outcomes alone.
+fn a_dialect_without_its_own_rule_settles_only_the_defaults() {
     let written =
         ColumnCollation::Named(NamedColumnCollation::new(TargetName::new("utf8mb4_bin", false)));
     let live =
         ColumnCollation::Named(NamedColumnCollation::new(TargetName::new("UTF8MB4_BIN", false)));
-    assert_eq!(written.is_same_rule(SqlparserDialect::MySql, &live), CollationMatch::Undetermined);
+    assert_eq!(
+        written.is_same_rule(SqlparserDialect::Generic, &live),
+        CollationMatch::Undetermined
+    );
     assert_eq!(
         ColumnCollation::DatabaseDefault
-            .is_same_rule(SqlparserDialect::MySql, &ColumnCollation::DatabaseDefault),
+            .is_same_rule(SqlparserDialect::Generic, &ColumnCollation::DatabaseDefault),
         CollationMatch::Same
     );
     assert_eq!(
-        ColumnCollation::Unknown.is_same_rule(SqlparserDialect::SQLite, &written),
+        ColumnCollation::Unknown.is_same_rule(SqlparserDialect::Generic, &written),
         CollationMatch::Undetermined
     );
+}
+
+#[test]
+fn sqlite_names_one_collation_whatever_its_case() {
+    assert_eq!(
+        compare::<SQLiteDialect>(
+            "CREATE TABLE t (a TEXT COLLATE NOCASE);",
+            default_table(),
+            "a",
+            &sqlite_live("nocase"),
+        ),
+        CollationMatch::Same
+    );
+    // Quoting a collation name changes nothing in SQLite, which looks names
+    // up without regard to case.
+    assert_eq!(
+        compare::<SQLiteDialect>(
+            "CREATE TABLE t (b TEXT COLLATE \"nocase\");",
+            default_table(),
+            "b",
+            &sqlite_live("NOCASE"),
+        ),
+        CollationMatch::Same
+    );
+}
+
+#[test]
+fn sqlite_reads_a_column_without_collate_as_binary() {
+    assert_eq!(
+        compare::<SQLiteDialect>(
+            "CREATE TABLE t (c TEXT);",
+            default_table(),
+            "c",
+            &sqlite_live("BINARY"),
+        ),
+        CollationMatch::Same
+    );
+    assert_eq!(
+        compare::<SQLiteDialect>(
+            "CREATE TABLE t (d TEXT COLLATE binary);",
+            default_table(),
+            "d",
+            &ColumnCollation::DatabaseDefault,
+        ),
+        CollationMatch::Same
+    );
+    assert_eq!(
+        compare::<SQLiteDialect>(
+            "CREATE TABLE t (e TEXT);",
+            default_table(),
+            "e",
+            &sqlite_live("NOCASE"),
+        ),
+        CollationMatch::Different
+    );
+}
+
+#[test]
+fn sqlite_tells_two_differently_named_collations_apart() {
+    assert_eq!(
+        compare::<SQLiteDialect>(
+            "CREATE TABLE t (f TEXT COLLATE NOCASE);",
+            default_table(),
+            "f",
+            &sqlite_live("RTRIM"),
+        ),
+        CollationMatch::Different
+    );
+    // SQLite folds ASCII letters alone, so `Ä` and `ä` name two collations.
+    assert_eq!(
+        sqlite_live("\u{c4}").is_same_rule(SqlparserDialect::SQLite, &sqlite_live("\u{e4}")),
+        CollationMatch::Different
+    );
+}
+
+#[test]
+fn sqlite_leaves_a_side_without_a_collation_name_undetermined() {
+    let qualified = ColumnCollation::Named(NamedColumnCollation::new(
+        TargetName::new("nocase", false).with_schema("main", false),
+    ));
+    for unresolvable in [ColumnCollation::Unknown, qualified] {
+        for other in [sqlite_live("NOCASE"), ColumnCollation::DatabaseDefault] {
+            assert_eq!(
+                unresolvable.is_same_rule(SqlparserDialect::SQLite, &other),
+                CollationMatch::Undetermined
+            );
+            assert_eq!(
+                other.is_same_rule(SqlparserDialect::SQLite, &unresolvable),
+                CollationMatch::Undetermined
+            );
+        }
+    }
 }
