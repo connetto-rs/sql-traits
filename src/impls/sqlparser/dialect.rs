@@ -1075,51 +1075,31 @@ enum PostgresCollationRule<'a> {
     DatabaseDefault,
     /// The schema and name the engine stores, with the quoting each part
     /// carries.
-    Named { schema: Option<(&'a str, bool)>, name: (&'a str, bool) },
+    Named { schema: (&'a str, bool), name: (&'a str, bool) },
     /// The side resolves to no rule.
     Unresolvable,
 }
 
-/// The rule `collation` settles to under the PostgreSQL rules, the stored
-/// identity a database resolved at parse time first, then the identity the
-/// name already carries, then the `default` spelling.
+/// The rule `collation` settles to under the PostgreSQL rules. A name settles
+/// on the identity its database resolved at parse time, else on the identity
+/// it carries as written, and an unqualified `default` spelling settles on
+/// the database's default rule.
 fn postgres_collation_rule<'a>(collation: &'a ColumnCollation<'a>) -> PostgresCollationRule<'a> {
-    match collation {
-        ColumnCollation::DatabaseDefault => PostgresCollationRule::DatabaseDefault,
-        ColumnCollation::Unknown => PostgresCollationRule::Unresolvable,
-        ColumnCollation::Named(named) => {
-            match named.postgres_resolution() {
-                Some(resolution) => {
-                    match resolution.schema() {
-                        Some(schema) => {
-                            PostgresCollationRule::Named {
-                                schema: Some((schema, resolution.schema_is_quoted())),
-                                name: (resolution.name(), resolution.name_is_quoted()),
-                            }
-                        }
-                        None => PostgresCollationRule::Unresolvable,
-                    }
-                }
-                None => {
-                    let name = named.name();
-                    if let Some(schema) = name.schema() {
-                        PostgresCollationRule::Named {
-                            schema: Some((schema, name.schema_is_quoted())),
-                            name: (name.name(), name.name_is_quoted()),
-                        }
-                    } else if identifiers_match(
-                        "default",
-                        false,
-                        name.name(),
-                        name.name_is_quoted(),
-                    ) {
-                        PostgresCollationRule::DatabaseDefault
-                    } else {
-                        PostgresCollationRule::Unresolvable
-                    }
-                }
-            }
+    let named = match collation {
+        ColumnCollation::DatabaseDefault => return PostgresCollationRule::DatabaseDefault,
+        ColumnCollation::Unknown => return PostgresCollationRule::Unresolvable,
+        ColumnCollation::Named(named) => named,
+    };
+    let identity = named.postgres_resolution().unwrap_or(named.name());
+    if let Some(schema) = identity.schema() {
+        PostgresCollationRule::Named {
+            schema: (schema, identity.schema_is_quoted()),
+            name: (identity.name(), identity.name_is_quoted()),
         }
+    } else if identifiers_match("default", false, identity.name(), identity.name_is_quoted()) {
+        PostgresCollationRule::DatabaseDefault
+    } else {
+        PostgresCollationRule::Unresolvable
     }
 }
 
@@ -1138,24 +1118,12 @@ fn postgres_collation_match(
             PostgresCollationRule::Named { schema: left_schema, name: left_name },
             PostgresCollationRule::Named { schema: right_schema, name: right_name },
         ) => {
-            match (left_schema, right_schema) {
-                (
-                    Some((left_schema, left_schema_quoted)),
-                    Some((right_schema, right_schema_quoted)),
-                ) => {
-                    if identifiers_match(
-                        left_schema,
-                        left_schema_quoted,
-                        right_schema,
-                        right_schema_quoted,
-                    ) && identifiers_match(left_name.0, left_name.1, right_name.0, right_name.1)
-                    {
-                        CollationMatch::Same
-                    } else {
-                        CollationMatch::Different
-                    }
-                }
-                _ => CollationMatch::Undetermined,
+            if identifiers_match(left_schema.0, left_schema.1, right_schema.0, right_schema.1)
+                && identifiers_match(left_name.0, left_name.1, right_name.0, right_name.1)
+            {
+                CollationMatch::Same
+            } else {
+                CollationMatch::Different
             }
         }
         (PostgresCollationRule::Named { .. }, PostgresCollationRule::DatabaseDefault)
@@ -1180,23 +1148,18 @@ mod tests {
         traits::DatabaseLike,
     };
 
-    /// The rule `collation` settles to, exposed for the assertions below.
-    fn rule<'a>(collation: &'a ColumnCollation<'a>) -> PostgresCollationRule<'a> {
-        postgres_collation_rule(collation)
-    }
-
     #[test]
     fn postgres_settles_the_default_spelling_on_the_default_rule() {
         for (name, quoted) in [("default", false), ("default", true), ("DEFAULT", false)] {
             let written =
                 ColumnCollation::Named(NamedColumnCollation::new(TargetName::new(name, quoted)));
-            assert_eq!(rule(&written), PostgresCollationRule::DatabaseDefault);
+            assert_eq!(postgres_collation_rule(&written), PostgresCollationRule::DatabaseDefault);
         }
-        // A different casing under quotes names a collation the rule
-        // cannot settle, not the default rule.
+        // A different casing under quotes names some other collation, which
+        // a schema-less name cannot settle.
         let other_case =
             ColumnCollation::Named(NamedColumnCollation::new(TargetName::new("Default", true)));
-        assert_eq!(rule(&other_case), PostgresCollationRule::Unresolvable);
+        assert_eq!(postgres_collation_rule(&other_case), PostgresCollationRule::Unresolvable);
         assert_eq!(
             other_case
                 .is_same_rule(SqlparserDialect::PostgreSql, &ColumnCollation::DatabaseDefault),

@@ -120,7 +120,7 @@ impl<'a> NamedColumnCollation<'a> {
             name: self.name.into_owned(),
             postgres_deterministic: self.postgres_deterministic,
             mysql_padding: self.mysql_padding,
-            postgres_resolution: self.postgres_resolution.map(|resolution| resolution.into_owned()),
+            postgres_resolution: self.postgres_resolution.map(TargetName::into_owned),
         }
     }
 
