@@ -7,7 +7,9 @@
 //! the way `information_schema.columns` hands it back, schema and name both
 //! quoted, or absent for the database default. A SQLite live side is shaped
 //! the way `sqlite3_table_column_metadata` hands it back, a bare name that
-//! reads `BINARY` for a column with no `COLLATE`.
+//! reads `BINARY` for a column with no `COLLATE`. A MySQL live side is
+//! shaped the way `information_schema.COLUMNS` hands it back, the bare name
+//! of the collation the server stores.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -15,7 +17,7 @@ use sql_traits::{
     prelude::*,
     traits::{ColumnCollation, NamedColumnCollation},
 };
-use sqlparser::dialect::{Dialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 
 /// The collation a live read of PostgreSQL reports for a column, with the
 /// schema and name quoted the way `information_schema.columns` hands them
@@ -36,8 +38,9 @@ fn default_table() -> TargetName<'static> {
     TargetName::new("t", false)
 }
 
-/// The collation a live read of SQLite reports for a column, a bare name.
-fn sqlite_live(name: &'static str) -> ColumnCollation<'static> {
+/// The collation a live read of SQLite or MySQL reports for a column, a bare
+/// name.
+fn bare_live(name: &'static str) -> ColumnCollation<'static> {
     ColumnCollation::Named(NamedColumnCollation::new(TargetName::new(name, false)))
 }
 
@@ -303,7 +306,7 @@ fn sqlite_names_one_collation_whatever_its_case() {
             "CREATE TABLE t (a TEXT COLLATE NOCASE);",
             default_table(),
             "a",
-            &sqlite_live("nocase"),
+            &bare_live("nocase"),
         ),
         CollationMatch::Same
     );
@@ -314,7 +317,7 @@ fn sqlite_names_one_collation_whatever_its_case() {
             "CREATE TABLE t (b TEXT COLLATE \"nocase\");",
             default_table(),
             "b",
-            &sqlite_live("NOCASE"),
+            &bare_live("NOCASE"),
         ),
         CollationMatch::Same
     );
@@ -327,7 +330,7 @@ fn sqlite_reads_a_column_without_collate_as_binary() {
             "CREATE TABLE t (c TEXT);",
             default_table(),
             "c",
-            &sqlite_live("BINARY"),
+            &bare_live("BINARY"),
         ),
         CollationMatch::Same
     );
@@ -345,7 +348,7 @@ fn sqlite_reads_a_column_without_collate_as_binary() {
             "CREATE TABLE t (e TEXT);",
             default_table(),
             "e",
-            &sqlite_live("NOCASE"),
+            &bare_live("NOCASE"),
         ),
         CollationMatch::Different
     );
@@ -358,13 +361,13 @@ fn sqlite_tells_two_differently_named_collations_apart() {
             "CREATE TABLE t (f TEXT COLLATE NOCASE);",
             default_table(),
             "f",
-            &sqlite_live("RTRIM"),
+            &bare_live("RTRIM"),
         ),
         CollationMatch::Different
     );
     // SQLite folds ASCII letters alone, so `Ä` and `ä` name two collations.
     assert_eq!(
-        sqlite_live("\u{c4}").is_same_rule(SqlparserDialect::SQLite, &sqlite_live("\u{e4}")),
+        bare_live("\u{c4}").is_same_rule(SqlparserDialect::SQLite, &bare_live("\u{e4}")),
         CollationMatch::Different
     );
 }
@@ -375,13 +378,120 @@ fn sqlite_leaves_a_side_without_a_collation_name_undetermined() {
         TargetName::new("nocase", false).with_schema("main", false),
     ));
     for unresolvable in [ColumnCollation::Unknown, qualified] {
-        for other in [sqlite_live("NOCASE"), ColumnCollation::DatabaseDefault] {
+        for other in [bare_live("NOCASE"), ColumnCollation::DatabaseDefault] {
             assert_eq!(
                 unresolvable.is_same_rule(SqlparserDialect::SQLite, &other),
                 CollationMatch::Undetermined
             );
             assert_eq!(
                 other.is_same_rule(SqlparserDialect::SQLite, &unresolvable),
+                CollationMatch::Undetermined
+            );
+        }
+    }
+}
+
+#[test]
+fn mysql_names_one_collation_whatever_its_case_or_quoting() {
+    assert_eq!(
+        compare::<MySqlDialect>(
+            "CREATE TABLE t (a VARCHAR(4) COLLATE utf8mb4_bin);",
+            default_table(),
+            "a",
+            &bare_live("UTF8MB4_BIN"),
+        ),
+        CollationMatch::Same
+    );
+    assert_eq!(
+        compare::<MySqlDialect>(
+            "CREATE TABLE t (b VARCHAR(4) COLLATE `UTF8MB4_bin`);",
+            default_table(),
+            "b",
+            &bare_live("utf8mb4_bin"),
+        ),
+        CollationMatch::Same
+    );
+    assert_eq!(
+        compare::<MySqlDialect>(
+            "CREATE TABLE t (c VARCHAR(4) COLLATE utf8mb4_bin);",
+            default_table(),
+            "c",
+            &bare_live("utf8mb4_0900_ai_ci"),
+        ),
+        CollationMatch::Different
+    );
+}
+
+#[test]
+fn mysql_leaves_a_column_without_collate_undetermined_against_a_named_rule() {
+    // The table's default, else the server's, decides the rule MySQL stores,
+    // `utf8mb4_0900_ai_ci` on a stock 8.4 server.
+    assert_eq!(
+        compare::<MySqlDialect>(
+            "CREATE TABLE t (d VARCHAR(4));",
+            default_table(),
+            "d",
+            &bare_live("utf8mb4_0900_ai_ci"),
+        ),
+        CollationMatch::Undetermined
+    );
+    assert_eq!(
+        bare_live("utf8mb4_bin").is_same_rule(SqlparserDialect::MySql, &live_default()),
+        CollationMatch::Undetermined
+    );
+    assert_eq!(
+        live_default().is_same_rule(SqlparserDialect::MySql, &live_default()),
+        CollationMatch::Same
+    );
+    // A character set without a collation reads as unknown, which MySQL
+    // stores as that set's default collation.
+    assert_eq!(
+        compare::<MySqlDialect>(
+            "CREATE TABLE t (e VARCHAR(4) CHARACTER SET latin1);",
+            default_table(),
+            "e",
+            &bare_live("latin1_swedish_ci"),
+        ),
+        CollationMatch::Undetermined
+    );
+}
+
+#[test]
+fn mysql_reads_a_utf8_name_as_either_utf8mb3_or_utf8mb4() {
+    // MySQL 8.4 and MariaDB under its default `old_mode` store `utf8_bin` as
+    // `utf8mb3_bin`, and MariaDB without `UTF8_IS_UTF8MB3` as `utf8mb4_bin`.
+    let sql = "CREATE TABLE t (f VARCHAR(4) COLLATE utf8_bin);";
+    let against = |stored| compare::<MySqlDialect>(sql, default_table(), "f", &bare_live(stored));
+    assert_eq!(against("utf8mb3_bin"), CollationMatch::Undetermined);
+    assert_eq!(against("UTF8MB4_BIN"), CollationMatch::Undetermined);
+    assert_eq!(against("utf8mb4_general_ci"), CollationMatch::Different);
+    assert_eq!(against("UTF8_BIN"), CollationMatch::Same);
+    assert_eq!(against("utf8_general_ci"), CollationMatch::Different);
+    // A name whose bytes split a character where a character set prefix ends
+    // is no spelling of the alias.
+    assert_eq!(
+        bare_live("utf8_bin").is_same_rule(SqlparserDialect::MySql, &bare_live("utf8mb3\u{e9}in")),
+        CollationMatch::Different
+    );
+    assert_eq!(
+        bare_live("utf8mb3_bin").is_same_rule(SqlparserDialect::MySql, &bare_live("utf8_bin")),
+        CollationMatch::Undetermined
+    );
+}
+
+#[test]
+fn mysql_leaves_a_side_without_a_collation_name_undetermined() {
+    let qualified = ColumnCollation::Named(NamedColumnCollation::new(
+        TargetName::new("utf8mb4_bin", false).with_schema("d", false),
+    ));
+    for unresolvable in [ColumnCollation::Unknown, qualified] {
+        for other in [bare_live("utf8mb4_bin"), ColumnCollation::DatabaseDefault] {
+            assert_eq!(
+                unresolvable.is_same_rule(SqlparserDialect::MySql, &other),
+                CollationMatch::Undetermined
+            );
+            assert_eq!(
+                other.is_same_rule(SqlparserDialect::MySql, &unresolvable),
                 CollationMatch::Undetermined
             );
         }

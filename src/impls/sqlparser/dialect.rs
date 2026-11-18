@@ -1014,9 +1014,13 @@ impl ColumnCollation<'_> {
     /// search path in force then with `pg_catalog` searched first, and it
     /// treats the `default` spelling as the database's default rule. SQLite
     /// compares bare names with ASCII letters folded, the way it looks a
-    /// collation up, and reads a column with no `COLLATE` as `BINARY`. A side
-    /// that resolves to nothing, an unqualified PostgreSQL name its source
-    /// never resolved or a schema-qualified SQLite name among them, leaves
+    /// collation up, and reads a column with no `COLLATE` as `BINARY`. MySQL
+    /// compares bare names without regard to case, reads a `utf8_` name as
+    /// either the `utf8mb3_` or the `utf8mb4_` name its server stores, and
+    /// leaves a column with no `COLLATE` undetermined against a named rule,
+    /// since the table's or the server's default decides it. A side that
+    /// resolves to nothing, an unqualified PostgreSQL name its source never
+    /// resolved or a schema-qualified SQLite or MySQL name among them, leaves
     /// the rule [`CollationMatch::Undetermined`].
     ///
     /// The outcome is symmetric in the two collations.
@@ -1055,6 +1059,7 @@ impl ColumnCollation<'_> {
         match dialect {
             SqlparserDialect::PostgreSql => postgres_collation_match(self, other),
             SqlparserDialect::SQLite => sqlite_collation_match(self, other),
+            SqlparserDialect::MySql => mysql_collation_match(self, other),
             _ => collation_match_core(self, other),
         }
     }
@@ -1160,6 +1165,78 @@ fn sqlite_collation_match(
         (Some(left), Some(right)) if left.eq_ignore_ascii_case(right) => CollationMatch::Same,
         (Some(_), Some(_)) => CollationMatch::Different,
         _ => CollationMatch::Undetermined,
+    }
+}
+
+/// The prefix MySQL and MariaDB read as an alias of another character set.
+const MYSQL_UTF8_ALIAS: &str = "utf8_";
+
+/// The character set prefixes a server may store a `utf8_` name under, by
+/// version and, on MariaDB, by whether `old_mode` holds `UTF8_IS_UTF8MB3`.
+const MYSQL_UTF8_TARGETS: [&str; 2] = ["utf8mb3_", "utf8mb4_"];
+
+/// A MySQL collation name as a server reads it.
+enum MySqlCollationName<'a> {
+    /// A name the server stores as written, up to the case of its letters.
+    Exact(&'a str),
+    /// A `utf8_` name, holding the part after the prefix.
+    Utf8Alias(&'a str),
+}
+
+/// The part of `name` after `prefix`, when `name` starts with `prefix` up to
+/// the case of ASCII letters.
+fn strip_ascii_prefix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let (head, rest) = name.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
+/// The collation name a MySQL side settles to, or `None` for a side that
+/// names no collation, the column default and a schema-qualified name among
+/// them.
+fn mysql_collation_name<'a>(collation: &'a ColumnCollation<'a>) -> Option<MySqlCollationName<'a>> {
+    let ColumnCollation::Named(named) = collation else {
+        return None;
+    };
+    let name = named.name();
+    if name.schema().is_some() {
+        return None;
+    }
+    let name = name.name();
+    Some(match strip_ascii_prefix(name, MYSQL_UTF8_ALIAS) {
+        Some(rest) => MySqlCollationName::Utf8Alias(rest),
+        None => MySqlCollationName::Exact(name),
+    })
+}
+
+/// Whether the two sides name one MySQL collation, comparing the names
+/// without regard to case and leaving a `utf8_` name undetermined against
+/// the `utf8mb3_` or `utf8mb4_` name it may be stored as.
+fn mysql_collation_match(
+    left: &ColumnCollation<'_>,
+    right: &ColumnCollation<'_>,
+) -> CollationMatch {
+    let (Some(left_name), Some(right_name)) =
+        (mysql_collation_name(left), mysql_collation_name(right))
+    else {
+        return collation_match_core(left, right);
+    };
+    match (left_name, right_name) {
+        (MySqlCollationName::Exact(left), MySqlCollationName::Exact(right))
+        | (MySqlCollationName::Utf8Alias(left), MySqlCollationName::Utf8Alias(right)) => {
+            if left.eq_ignore_ascii_case(right) {
+                CollationMatch::Same
+            } else {
+                CollationMatch::Different
+            }
+        }
+        (MySqlCollationName::Utf8Alias(suffix), MySqlCollationName::Exact(stored))
+        | (MySqlCollationName::Exact(stored), MySqlCollationName::Utf8Alias(suffix)) => {
+            let may_be_stored_as = MYSQL_UTF8_TARGETS.iter().any(|charset| {
+                strip_ascii_prefix(stored, charset)
+                    .is_some_and(|rest| rest.eq_ignore_ascii_case(suffix))
+            });
+            if may_be_stored_as { CollationMatch::Undetermined } else { CollationMatch::Different }
+        }
     }
 }
 
