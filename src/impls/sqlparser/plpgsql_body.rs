@@ -95,7 +95,9 @@ impl<'s, W: BodyWalk<'s>> BlockWalk<'_, W> {
                 if let Some(subject) = &choice.subject {
                     self.expression(subject)?;
                 }
-                self.branches(&choice.branches, &choice.otherwise)
+                // A missing `ELSE` raises `case_not_found` where no `WHEN`
+                // holds, so it visits no statement.
+                self.branches(&choice.branches, choice.otherwise.as_deref().unwrap_or_default())
             }
             NodeKind::Loop(repeated) => self.repeated(repeated),
             NodeKind::Exit(_)
@@ -307,7 +309,13 @@ fn each_sql<'s, B>(
                 if let Some(subject) = &choice.subject {
                     visit(EmbeddedSql::Expression(subject), None)?;
                 }
-                each_branch_sql(&choice.branches, &choice.otherwise, visit)?;
+                // A missing `ELSE` raises `case_not_found` where no `WHEN`
+                // holds, so it visits no SQL.
+                each_branch_sql(
+                    &choice.branches,
+                    choice.otherwise.as_deref().unwrap_or_default(),
+                    visit,
+                )?;
             }
             NodeKind::Loop(repeated) => {
                 match &repeated.control {

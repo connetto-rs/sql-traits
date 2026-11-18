@@ -471,14 +471,11 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             NodeKind::Open(open) => self.open(address, open, &mut state)?,
             NodeKind::Block(block) => return self.block(block, state),
             NodeKind::If(choice) => {
-                return self.branches(&choice.branches, &choice.otherwise, state);
+                return self.branches(&choice.branches, Some(&choice.otherwise), state);
             }
-            // The parser does not tell a missing `ELSE` from an empty one, so
-            // a value no branch matches also falls through, beside the
-            // `case_not_found` the raise at the statement stands for.
             NodeKind::Case(choice) => {
                 self.evaluated_queries(choice.subject.as_deref(), &state);
-                return self.branches(&choice.branches, &choice.otherwise, state);
+                return self.branches(&choice.branches, choice.otherwise.as_deref(), state);
             }
             NodeKind::Loop(repeated) => return self.repeated(address, repeated, &state),
             NodeKind::Exit(exit) => {
@@ -747,11 +744,12 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     }
 
     /// Walks the branches of an `IF` or `CASE`, each condition tried after
-    /// the ones before it failed, and the statements after none matched.
+    /// the ones before it failed, and the statements after none matched. A
+    /// `CASE` without an `ELSE` ends that last path with `case_not_found`.
     fn branches(
         &mut self,
         branches: &'b [Branch],
-        otherwise: &'b [Node],
+        otherwise: Option<&'b [Node]>,
         state: State,
     ) -> Result<Option<State>, LookupError> {
         let mut end = None;
@@ -760,7 +758,10 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
             let taken = self.nodes(&branch.statements, Some(state.clone()))?;
             join(&mut end, taken.as_ref());
         }
-        let fallen = self.nodes(otherwise, Some(state))?;
+        let fallen = match otherwise {
+            Some(nodes) => self.nodes(nodes, Some(state))?,
+            None => None,
+        };
         join(&mut end, fallen.as_ref());
         Ok(end)
     }
