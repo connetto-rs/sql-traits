@@ -833,6 +833,91 @@ fn a_call_writes_no_computed_argument() {
     );
 }
 
+/// The schema with the routines `routines` declares and `run(p text, q
+/// integer)` running `body`.
+fn database_with(routines: &str, body: &str) -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{SCHEMA} {routines} CREATE FUNCTION run(p text, q integer) RETURNS void LANGUAGE \
+         plpgsql AS $$ {body} $$;"
+    ))
+    .expect("schema parses")
+}
+
+/// A `CALL` reaching one procedure surely writes the variables it passes at
+/// the procedure's `INOUT` and `OUT` parameters, matched by position or by
+/// name, and leaves the variables it passes elsewhere as they were. The
+/// second call names its schema since the first may change the path.
+#[test]
+fn a_call_of_one_procedure_writes_its_output_parameters() {
+    let database = database_with(
+        "CREATE PROCEDURE fill(a text, INOUT b text, OUT c text) LANGUAGE plpgsql AS $$ BEGIN END $$;",
+        "DECLARE s text := 'SELECT 1'; o text := 'SELECT 2'; r text := 'SELECT 3';
+         BEGIN
+          CALL fill(s, o, r); EXECUTE s USING o, r;
+          CALL public.fill(c => s, a => r, b => o); EXECUTE s USING o, r;
+         END",
+    );
+    assert_eq!(
+        reaching_in(&database, "run"),
+        [
+            vec![
+                read("s", &["'SELECT 1'"]),
+                read("o", &["argument 1 of CALL fill(s, o, r)"]),
+                read("r", &["argument 2 of CALL fill(s, o, r)"]),
+            ],
+            vec![
+                read("s", &["argument 0 of CALL public.fill(c => s, a => r, b => o)"]),
+                read("o", &["argument 2 of CALL public.fill(c => s, a => r, b => o)"]),
+                read("r", &["argument 2 of CALL fill(s, o, r)"]),
+            ],
+        ]
+    );
+}
+
+/// A `CALL` reaching no procedure, or several the argument count cannot
+/// tell apart, may write every variable it passes.
+#[test]
+fn a_call_of_no_single_procedure_may_write_every_variable() {
+    for routines in [
+        "CREATE FUNCTION fill(a text, b text) RETURNS void LANGUAGE sql AS 'SELECT';",
+        "CREATE PROCEDURE fill(a text, INOUT b text) LANGUAGE sql AS 'SELECT 1';
+         CREATE PROCEDURE fill(a integer, INOUT b text) LANGUAGE sql AS 'SELECT 1';",
+        "CREATE PROCEDURE fill(a text) LANGUAGE sql AS 'SELECT 1';",
+    ] {
+        let database = database_with(
+            routines,
+            "DECLARE s text := 'SELECT 1'; BEGIN CALL fill(p, s); EXECUTE s USING p; END",
+        );
+        assert_eq!(
+            reaching_in(&database, "run"),
+            [vec![
+                read("s", &["'SELECT 1'", "argument 1 of CALL fill(p, s)"]),
+                read("p", &["incoming", "argument 0 of CALL fill(p, s)"]),
+            ]],
+            "{routines}"
+        );
+    }
+}
+
+/// A `CALL` whose path walks a schema the model does not hold may reach a
+/// procedure there taking only `IN` arguments, so it may write every variable
+/// it passes and leaves the earlier definitions in place.
+#[test]
+fn a_call_through_an_unheld_schema_may_write_every_variable() {
+    let database = database_with(
+        "CREATE PROCEDURE fill(a text, INOUT b text) LANGUAGE sql AS 'SELECT 1';",
+        "DECLARE s text := 'SELECT 1';
+         BEGIN SET search_path = ext, public; CALL fill(p, s); EXECUTE s USING p; END",
+    );
+    assert_eq!(
+        reaching_in(&database, "run"),
+        [vec![
+            read("s", &["'SELECT 1'", "argument 1 of CALL fill(p, s)"]),
+            read("p", &["incoming", "argument 0 of CALL fill(p, s)"]),
+        ]]
+    );
+}
+
 /// The variables a definition reads come with the lookup error a query of
 /// its source runs into.
 #[test]

@@ -304,8 +304,9 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///
     /// The positions line up with
     /// [`argument_type_names`](FunctionLike::argument_type_names). A call
-    /// passes the `IN`, `INOUT` and `VARIADIC` arguments, and an `OUT`
-    /// argument describes the result.
+    /// passes the `IN`, `INOUT` and `VARIADIC` arguments, an `OUT` argument
+    /// describes a function's result, and `CALL` passes a procedure's `OUT`
+    /// arguments too.
     ///
     /// # Example
     ///
@@ -522,7 +523,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// Returns what a call of the function computes, mirroring
     /// `pg_proc.prokind`.
     ///
-    /// A function the input declares is [`FunctionKind::Normal`]. The
+    /// A `CREATE FUNCTION` declares a [`FunctionKind::Normal`] function and
+    /// a `CREATE PROCEDURE` a [`FunctionKind::Procedure`]. The
     /// built-in aggregates such as `count` and the built-in window functions
     /// such as `row_number` answer their own kinds, and `count(*)` reaches the
     /// parameterless `count` PostgreSQL resolves it to.

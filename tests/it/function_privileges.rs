@@ -260,8 +260,7 @@ fn all_functions_in_schema_covers_the_functions_already_there() {
     );
 }
 
-/// `ROUTINE` names a function or a procedure, and this model holds only
-/// functions, so it reaches exactly what `FUNCTION` reaches.
+/// `ROUTINE` names a function by its signature as `FUNCTION` does.
 #[test]
 fn a_routine_target_reaches_its_function() {
     let db = parse(
@@ -342,7 +341,6 @@ fn the_closed_world_refuses_a_function_the_schema_does_not_declare() {
     for sql in [
         "REVOKE EXECUTE ON FUNCTION nope() FROM PUBLIC;",
         "CREATE ROLE bob; GRANT EXECUTE ON FUNCTION nope() TO bob;",
-        // No procedure can be declared in this model.
         "CREATE ROLE bob; GRANT EXECUTE ON PROCEDURE nope() TO bob;",
         "CREATE ROLE bob; GRANT EXECUTE ON ROUTINE nope() TO bob;",
         "REVOKE EXECUTE ON ROUTINE nope() FROM PUBLIC;",

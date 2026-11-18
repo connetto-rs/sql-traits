@@ -14,8 +14,9 @@ use sqlparser::ast::{
 };
 
 use super::{
-    AccessResolution, ParserDB, ParserDBBuilder, grantee_role_ident, schema_qualifiers_match,
-    stored_role_name, type_arrays::TypeArrays, validate_access_targets_against_builder,
+    AccessResolution, ParserDB, ParserDBBuilder, grantee_role_ident, procedures::RoutineKeyword,
+    schema_qualifiers_match, stored_role_name, type_arrays::TypeArrays,
+    validate_access_targets_against_builder,
 };
 use crate::{
     errors::Error,
@@ -25,34 +26,39 @@ use crate::{
     },
 };
 
-/// The functions a grant or a revoke names, taken out of its object list.
-///
-/// This model holds no procedure, so a routine is a function or nothing.
+/// The routines a grant or a revoke names, taken out of its object list,
+/// with the keyword telling which kinds it reaches.
 pub(super) enum Routines {
-    /// `ON FUNCTION` or `ON ROUTINE`, one signature per routine.
-    Functions(Vec<FunctionDesc>),
-    /// `ON PROCEDURE`, one signature per procedure.
-    Procedures(Vec<FunctionDesc>),
-    /// `ON ALL FUNCTIONS IN SCHEMA` or `ON ALL ROUTINES IN SCHEMA`.
-    Schemas(Vec<ObjectName>),
-    /// `ON ALL PROCEDURES IN SCHEMA`, which reaches no function.
-    AllProcedures,
+    /// `ON FUNCTION`, `ON PROCEDURE` or `ON ROUTINE`, one signature per
+    /// routine.
+    Signatures(RoutineKeyword, Vec<FunctionDesc>),
+    /// `ON ALL FUNCTIONS`, `ALL PROCEDURES` or `ALL ROUTINES IN SCHEMA`.
+    Schemas(RoutineKeyword, Vec<ObjectName>),
 }
 
 impl Routines {
-    /// Takes the objects out when they name functions, and leaves relation
+    /// Takes the objects out when they name routines, and leaves relation
     /// objects in place.
     pub(super) fn take(objects: &mut Option<GrantObjects>) -> Option<Self> {
         match objects.take() {
-            Some(GrantObjects::Functions(signatures) | GrantObjects::Routines(signatures)) => {
-                Some(Self::Functions(signatures))
+            Some(GrantObjects::Functions(signatures)) => {
+                Some(Self::Signatures(RoutineKeyword::Function, signatures))
             }
-            Some(GrantObjects::Procedures(signatures)) => Some(Self::Procedures(signatures)),
-            Some(
-                GrantObjects::AllFunctionsInSchema { schemas }
-                | GrantObjects::AllRoutinesInSchema { schemas },
-            ) => Some(Self::Schemas(schemas)),
-            Some(GrantObjects::AllProceduresInSchema { .. }) => Some(Self::AllProcedures),
+            Some(GrantObjects::Procedures(signatures)) => {
+                Some(Self::Signatures(RoutineKeyword::Procedure, signatures))
+            }
+            Some(GrantObjects::Routines(signatures)) => {
+                Some(Self::Signatures(RoutineKeyword::Routine, signatures))
+            }
+            Some(GrantObjects::AllFunctionsInSchema { schemas }) => {
+                Some(Self::Schemas(RoutineKeyword::Function, schemas))
+            }
+            Some(GrantObjects::AllProceduresInSchema { schemas }) => {
+                Some(Self::Schemas(RoutineKeyword::Procedure, schemas))
+            }
+            Some(GrantObjects::AllRoutinesInSchema { schemas }) => {
+                Some(Self::Schemas(RoutineKeyword::Routine, schemas))
+            }
             other => {
                 *objects = other;
                 None
@@ -82,7 +88,7 @@ pub(super) fn grant(
             .grant(&grant.grantees, grant.with_grant_option);
     }
 
-    let (Routines::Functions(signatures) | Routines::Procedures(signatures)) = routines else {
+    let Routines::Signatures(_, signatures) = routines else {
         return Ok(Vec::new());
     };
     Ok(signatures
@@ -152,14 +158,15 @@ struct Reached {
 }
 
 impl Reached {
-    /// Resolves the functions `routines` names, as of this statement.
+    /// Resolves the routines `routines` names, as of this statement.
     ///
-    /// A signature with an argument list reaches the one function of that
-    /// identity, and one without reaches the only function of that name,
-    /// which PostgreSQL refuses to guess between when there are several. A
-    /// schema-wide statement reaches the functions the schema holds now, and
-    /// none created after it. A signature reaching nothing is refused under
-    /// the closed world, in list order alongside an ambiguous one.
+    /// A signature with an argument list reaches the one routine of that
+    /// identity, and one without reaches the only routine of that name and
+    /// of a kind the keyword admits, which PostgreSQL refuses to guess
+    /// between when there are several. A schema-wide statement reaches the
+    /// routines of the admitted kinds the schema holds now, and none created
+    /// after it. A signature reaching nothing is refused under the closed
+    /// world, in list order alongside an ambiguous one.
     fn of(
         builder: &ParserDBBuilder,
         routines: &Routines,
@@ -171,9 +178,9 @@ impl Reached {
         let mut reached = Self { functions: Vec::new(), unresolved: Vec::new() };
 
         match routines {
-            Routines::Functions(signatures) => {
+            Routines::Signatures(keyword, signatures) => {
                 for (index, signature) in signatures.iter().enumerate() {
-                    let matching = ParserDB::functions_named(builder, signature, arrays);
+                    let matching = ParserDB::functions_named(builder, signature, arrays, *keyword)?;
                     match matching.as_slice() {
                         [] => reached.miss(index, signature, access_resolution)?,
                         [_, _, ..] if signature.args.is_none() => {
@@ -185,27 +192,20 @@ impl Reached {
                     }
                 }
             }
-            // This model holds no procedure, so none is ever reached.
-            Routines::Procedures(signatures) => {
-                for (index, signature) in signatures.iter().enumerate() {
-                    reached.miss(index, signature, access_resolution)?;
-                }
-            }
-            Routines::Schemas(schemas) => {
+            Routines::Schemas(keyword, schemas) => {
                 reached.functions.extend(functions.iter().enumerate().filter_map(
-                    |(position, (function, _))| {
+                    |(position, (function, metadata))| {
                         // `CREATE FUNCTION` refuses a qualifier built at run
                         // time.
                         let qualifier = qualifier_of(&function.name).named();
-                        schemas
-                            .iter()
-                            .filter_map(object_name_last_part)
-                            .any(|schema| schema_qualifiers_match(qualifier, Some(schema), case))
-                            .then_some(position)
+                        (keyword.admits(metadata.kind())
+                            && schemas.iter().filter_map(object_name_last_part).any(|schema| {
+                                schema_qualifiers_match(qualifier, Some(schema), case)
+                            }))
+                        .then_some(position)
                     },
                 ));
             }
-            Routines::AllProcedures => {}
         }
         Ok(reached)
     }

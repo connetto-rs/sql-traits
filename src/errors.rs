@@ -186,6 +186,8 @@ pub enum Misapplied {
     OrderByWithinGroup,
     /// `DISTINCT` beside `WITHIN GROUP`.
     DistinctWithinGroup,
+    /// A procedure called as a function, which only `CALL` runs.
+    ProcedureCalled,
 }
 
 impl Misapplied {
@@ -248,6 +250,7 @@ impl Misapplied {
                 "cannot use multiple ORDER BY clauses with WITHIN GROUP".into()
             }
             Self::DistinctWithinGroup => "cannot use DISTINCT with WITHIN GROUP".into(),
+            Self::ProcedureCalled => format!("{function} is a procedure"),
         }
     }
 }
@@ -2462,6 +2465,47 @@ pub enum Error {
         /// Name of the function that was not found.
         function_name: String,
     },
+    #[error("Procedure `{procedure_name}` not found for DROP PROCEDURE statement.")]
+    /// Error indicating that a `DROP PROCEDURE` statement without `IF EXISTS`
+    /// names a procedure that does not exist.
+    DropProcedureNotFound {
+        /// Name of the procedure that was not found.
+        procedure_name: String,
+    },
+    #[error("`{function_name}` is not a function.")]
+    /// Error indicating that a statement naming a function, `DROP FUNCTION`,
+    /// `ALTER FUNCTION` or a grant `ON FUNCTION`, gives the signature of a
+    /// procedure.
+    ///
+    /// PostgreSQL looks the signature up among every routine and refuses the
+    /// statement once it finds a routine of the other kind, `IF EXISTS`
+    /// notwithstanding.
+    NotAFunction {
+        /// The signature the statement wrote.
+        function_name: String,
+    },
+    #[error("`{procedure_name}` is not a procedure.")]
+    /// Error indicating that a statement naming a procedure, `DROP
+    /// PROCEDURE` or a grant `ON PROCEDURE`, gives the signature of a routine
+    /// that is no procedure.
+    ///
+    /// PostgreSQL looks the signature up among every routine and refuses the
+    /// statement once it finds a routine of the other kind, `IF EXISTS`
+    /// notwithstanding.
+    NotAProcedure {
+        /// The signature the statement wrote.
+        procedure_name: String,
+    },
+    #[error(
+        "Procedure `{procedure_name}` has a body of bare statements, which PostgreSQL does not read."
+    )]
+    /// Error indicating that a `CREATE PROCEDURE` writes its body as a list
+    /// of statements after `AS`, a spelling of other engines, where
+    /// PostgreSQL takes a string or a `BEGIN ATOMIC` block.
+    ProcedureBodyUnsupported {
+        /// Name of the procedure.
+        procedure_name: String,
+    },
     #[error(
         "Function `{function_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
     )]
@@ -3731,10 +3775,10 @@ pub enum Error {
         role_name: String,
     },
     #[error(
-        "Cannot change routine kind: `{function_name}` is an aggregate or window function, which `CREATE OR REPLACE FUNCTION` cannot replace."
+        "Cannot change routine kind: `{function_name}` is {kind}, which `CREATE OR REPLACE FUNCTION` cannot replace."
     )]
     /// Error indicating that a `CREATE OR REPLACE FUNCTION` statement would
-    /// replace an aggregate or a window function.
+    /// replace an aggregate, a window function or a procedure.
     ///
     /// The replacement keeps the function's `pg_proc` row, and PostgreSQL
     /// refuses one that would change the row's `prokind`.
@@ -3827,6 +3871,25 @@ pub enum Error {
     AmbiguousDropFunction {
         /// The name covering more than one function.
         function_name: String,
+    },
+    #[error(
+        "Procedure name `{procedure_name}` is not unique: a `DROP PROCEDURE` naming no argument list cannot say which one to drop."
+    )]
+    /// Error indicating that a `DROP PROCEDURE` statement omits the argument
+    /// list while the name it gives covers more than one procedure.
+    AmbiguousDropProcedure {
+        /// The name covering more than one procedure.
+        procedure_name: String,
+    },
+    #[error(
+        "`{signature}` gives the input types of one routine and every type of another, so it names no single routine."
+    )]
+    /// Error indicating that a `PROCEDURE` or `ROUTINE` statement spells an
+    /// argument list without modes that matches one routine by its input
+    /// types and another by every type it declares, `OUT` ones included.
+    AmbiguousRoutineSignature {
+        /// The signature as the statement spelled it.
+        signature: String,
     },
     #[error("Schema `{schema_name}` not found for DROP SCHEMA statement.")]
     /// Error indicating that a DROP SCHEMA statement references a schema
