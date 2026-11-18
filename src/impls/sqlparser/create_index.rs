@@ -4,10 +4,10 @@ use alloc::{borrow::Cow, string::ToString};
 
 use sqlparser::ast::{ColumnDef, CreateIndex, CreateTable, Expr, IndexType};
 
-use super::index_clauses::{included_columns, written_access_method};
+use super::index_clauses::{included_columns, written_access_method, written_keys};
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ParserDB, TableAttribute, WrittenCall, metadata::IndexMetadata},
+    structs::{IndexKey, ParserDB, TableAttribute, WrittenCall, metadata::IndexMetadata},
     traits::{DatabaseLike, IndexLike, Metadata, TableLike},
     utils::object_name::object_name_last_part,
 };
@@ -87,6 +87,18 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
         Self: 'db,
     {
         Ok(self.metadata(database)?.expression())
+    }
+
+    #[inline]
+    fn keys<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = IndexKey<'db>>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.metadata(database)?;
+        Ok(written_keys(&self.attribute().columns))
     }
 
     #[inline]

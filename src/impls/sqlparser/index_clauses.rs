@@ -3,11 +3,11 @@
 
 use alloc::vec::Vec;
 
-use sqlparser::ast::{ColumnDef, CreateTable, Ident, IndexOption, IndexType};
+use sqlparser::ast::{ColumnDef, CreateTable, Ident, IndexColumn, IndexOption, IndexType};
 
 use crate::{
     errors::LookupError,
-    structs::{ParserDB, TableAttribute},
+    structs::{IndexKey, ParserDB, TableAttribute},
     traits::{ColumnLike, TableLike},
 };
 
@@ -29,6 +29,24 @@ pub(super) fn written_access_method<'a>(
             }
         })
         .or(before_columns)
+}
+
+/// The keys a column list writes, in order, each with the sort direction, the
+/// null ordering and the operator class written for it.
+pub(super) fn written_keys(columns: &[IndexColumn]) -> impl Iterator<Item = IndexKey<'_>> {
+    columns.iter().map(|column| {
+        let mut key = IndexKey::new(&column.column.expr);
+        if let Some(order) = &column.column.options.sort {
+            key = key.with_order(order);
+        }
+        if let Some(nulls_first) = column.column.options.nulls_first {
+            key = key.with_nulls_first(nulls_first);
+        }
+        if let Some(operator_class) = &column.operator_class {
+            key = key.with_operator_class(operator_class);
+        }
+        key
+    })
 }
 
 /// The columns of `table` an `INCLUDE` list names, in the order written.

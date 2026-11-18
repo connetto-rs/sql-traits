@@ -7,11 +7,12 @@ use sqlparser::ast::{
     ColumnDef, CreateTable, Expr, IndexType, NullsDistinctOption, UniqueConstraint,
 };
 
-use super::index_clauses::{included_columns, written_access_method};
+use super::index_clauses::{included_columns, written_access_method, written_keys};
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
-        ConstraintObject, ParserDB, TableAttribute, WrittenCall, metadata::UniqueIndexMetadata,
+        ConstraintObject, IndexKey, ParserDB, TableAttribute, WrittenCall,
+        metadata::UniqueIndexMetadata,
     },
     traits::{DatabaseLike, IndexLike, Metadata, TableLike},
 };
@@ -105,6 +106,18 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
         Self: 'db,
     {
         Ok(self.metadata(database)?.expression())
+    }
+
+    #[inline]
+    fn keys<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = IndexKey<'db>>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.metadata(database)?;
+        Ok(written_keys(&self.attribute().columns))
     }
 
     #[inline]

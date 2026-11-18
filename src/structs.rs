@@ -25,6 +25,7 @@ mod function_kind;
 mod helper_set;
 mod identifier_case;
 mod identity;
+mod index_key;
 mod maintenance_refusal;
 pub mod metadata;
 mod operator_resolution;
@@ -89,6 +90,7 @@ pub use helper_set::{
 pub use identifier_case::IdentifierCase;
 pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
+pub use index_key::IndexKey;
 pub use maintenance_refusal::{BodyExcerpt, MaintenanceRefusal};
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
 pub use operator_resolution::{

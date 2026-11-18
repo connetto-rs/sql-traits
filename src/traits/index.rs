@@ -7,7 +7,7 @@ use sqlparser::ast::{Expr, IndexType};
 
 use crate::{
     errors::LookupError,
-    structs::{TargetName, WrittenCall},
+    structs::{IndexKey, TargetName, WrittenCall},
     traits::{DatabaseLike, Metadata, TableLike},
     utils::columns_in_expression::columns_in_expression,
 };
@@ -154,6 +154,52 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     where
         Self: 'db;
 
+    /// Returns the keys of the index in the order written, each with the sort
+    /// direction, the null ordering and the operator class written for it.
+    ///
+    /// A key's expression is the entry [`Self::expression`] holds at its
+    /// position. Two indexes over the same expressions can still differ in
+    /// what they serve, so comparing two indexes compares their keys.
+    ///
+    /// Defaults to one key per entry of [`Self::expression`] with no option
+    /// written, which is what every index writing no key options means.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::{ast::OrderBySort, dialect::PostgreSqlDialect};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id int, title text);
+    ///      CREATE INDEX plain ON docs (title);
+    ///      CREATE INDEX descending ON docs (title DESC);",
+    /// )?;
+    /// let orders = db
+    ///     .indexes()
+    ///     .map(|index| Ok(index.keys(&db)?.map(|key| key.order().cloned()).collect()))
+    ///     .collect::<Result<Vec<Vec<_>>, LookupError>>()?;
+    /// assert_eq!(orders, [vec![Some(OrderBySort::Desc)], vec![None]]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn keys<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = IndexKey<'db>>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(key_expressions(self.expression(database)?).iter().map(IndexKey::new))
+    }
+
     /// Returns a reference to the table this index belongs to.
     ///
     /// # Example
@@ -231,11 +277,7 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// ```
     #[inline]
     fn is_simple(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        let entries = match self.expression(database)? {
-            Expr::Tuple(entries) => entries.as_slice(),
-            entry => core::slice::from_ref(entry),
-        };
-        Ok(entries.iter().all(|entry| {
+        Ok(key_expressions(self.expression(database)?).iter().all(|entry| {
             let mut column = entry;
             while let Expr::Nested(inner) = column {
                 column = inner;
@@ -477,5 +519,17 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     #[inline]
     fn nulls_distinct(&self) -> bool {
         true
+    }
+}
+
+/// The entries of an index expression, one per key.
+///
+/// The expression mirrors the parenthesized list of a parsed index, which
+/// nests a single key and makes a tuple of several.
+fn key_expressions(expression: &Expr) -> &[Expr] {
+    match expression {
+        Expr::Tuple(entries) => entries,
+        Expr::Nested(entry) => core::slice::from_ref(entry),
+        entry => core::slice::from_ref(entry),
     }
 }
