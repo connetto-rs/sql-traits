@@ -52,7 +52,7 @@ fn declared<'db>(
 
 /// The operators outside `pg_catalog`.
 fn declared_count(db: &ParserDB) -> usize {
-    db.operators().unwrap().filter(|operator| operator.schema() != Some("pg_catalog")).count()
+    db.operators().unwrap().filter(|operator| operator.schema() != "pg_catalog").count()
 }
 
 #[test]

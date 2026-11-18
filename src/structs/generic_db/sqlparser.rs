@@ -380,12 +380,11 @@ impl<'a> CollationResolution<'a> {
                         .with_schema(schema, schema_quoted),
                 )
             }
-            // A catalog collation a lookup reaches always has the schema it
-            // matched.
             Self::Catalog(metadata) => {
-                let name =
-                    crate::structs::TargetName::new(metadata.name(), metadata.name_is_quoted());
-                Some(name.with_schema(metadata.schema()?, metadata.schema_is_quoted()))
+                Some(
+                    crate::structs::TargetName::new(metadata.name(), metadata.name_is_quoted())
+                        .with_schema(metadata.schema(), metadata.schema_is_quoted()),
+                )
             }
         }
     }
@@ -402,14 +401,12 @@ impl<'a> CollationResolution<'a> {
             self,
             Self::Catalog(metadata)
                 if identifiers_match("default", false, metadata.name(), metadata.name_is_quoted())
-                    && metadata.schema().is_some_and(|schema| {
-                        identifiers_match(
-                            "pg_catalog",
-                            false,
-                            schema,
-                            metadata.schema_is_quoted(),
-                        )
-                    })
+                    && identifiers_match(
+                        "pg_catalog",
+                        false,
+                        metadata.schema(),
+                        metadata.schema_is_quoted(),
+                    )
         )
     }
 }
@@ -827,21 +824,19 @@ fn column_metadata_from_created_collation(metadata: &CreatedCollationMetadata) -
     };
     ColumnMetadata::default()
         .with_postgres_deterministic(metadata.postgres_deterministic)
-        .with_postgres_collation(Some(collation_effective_schema(&metadata.name)), name)
+        .with_postgres_collation(collation_effective_schema(&metadata.name), name)
 }
 
 fn column_metadata_from_catalog_collation(metadata: &PostgresCatalogCollation) -> ColumnMetadata {
     let base =
         ColumnMetadata::default().with_postgres_deterministic(Some(metadata.deterministic()));
     if identifiers_match("default", false, metadata.name(), metadata.name_is_quoted())
-        && metadata.schema().is_some_and(|schema| {
-            identifiers_match("pg_catalog", false, schema, metadata.schema_is_quoted())
-        })
+        && identifiers_match("pg_catalog", false, metadata.schema(), metadata.schema_is_quoted())
     {
         return base.with_postgres_default_collation();
     }
     base.with_postgres_collation(
-        metadata.schema().map(|schema| (schema, metadata.schema_is_quoted())),
+        (metadata.schema(), metadata.schema_is_quoted()),
         (metadata.name(), metadata.name_is_quoted()),
     )
 }
@@ -869,25 +864,20 @@ fn catalog_collation_for_schema<'a>(
 ) -> Option<&'a PostgresCatalogCollation> {
     catalog.collations().rev().find(|metadata| {
         let identity = metadata.identity();
-        identity.schema().is_some_and(|stored| {
-            identifiers_match(stored, identity.schema_is_quoted(), schema, schema_quoted)
-        }) && identifiers_match(identity.name(), identity.name_is_quoted(), name, quoted)
+        identity.schema_matches(schema, schema_quoted)
+            && identifiers_match(identity.name(), identity.name_is_quoted(), name, quoted)
     })
 }
 
-/// Whether a catalog fact's name spells `lookup` within `schema`. A fact with
-/// no schema matches nothing.
+/// Whether a catalog fact's name spells `lookup` within `schema`.
 fn catalog_name_matches(
     name: &CatalogName,
     lookup: &ObjectName,
     schema: &str,
     schema_quoted: bool,
 ) -> bool {
-    let Some(name_schema) = name.schema() else {
-        return false;
-    };
     collation_names_match_parts(name.name(), name.name_is_quoted(), lookup)
-        && identifiers_match(name_schema, name.schema_is_quoted(), schema, schema_quoted)
+        && name.schema_matches(schema, schema_quoted)
 }
 
 fn collation_resolution_for_name<'a>(

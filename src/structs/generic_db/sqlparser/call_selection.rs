@@ -774,7 +774,7 @@ impl ReparsePins<ParserDB> for Recorded<'_> {
         }
         let row = self.recorded(site)?;
         let operator = self.database.operators()?.find(|operator| operator.row == row)?;
-        Some((operator.target.schema()?, operator.target.schema_is_quoted()))
+        Some((operator.target.schema(), operator.target.schema_is_quoted()))
     }
 
     fn admits_call(&self, call: usize, function: &CreateFunction) -> bool {

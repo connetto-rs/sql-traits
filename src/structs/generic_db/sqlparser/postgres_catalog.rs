@@ -69,10 +69,10 @@ pub struct PostgresCatalogType {
     identity: CatalogName,
 }
 
-/// The optional schema and the name of a catalog fact, each with its quoting.
+/// The schema and the name of a catalog fact, each with its quoting.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CatalogName {
-    schema: Option<Cow<'static, str>>,
+    schema: Cow<'static, str>,
     schema_is_quoted: bool,
     name: Cow<'static, str>,
     name_is_quoted: bool,
@@ -81,18 +81,13 @@ pub(crate) struct CatalogName {
 impl CatalogName {
     /// A name in `pg_catalog`, which is unquoted.
     pub(super) const fn in_pg_catalog(name: Cow<'static, str>, name_is_quoted: bool) -> Self {
-        Self {
-            schema: Some(Cow::Borrowed(PG_CATALOG)),
-            schema_is_quoted: false,
-            name,
-            name_is_quoted,
-        }
+        Self { schema: Cow::Borrowed(PG_CATALOG), schema_is_quoted: false, name, name_is_quoted }
     }
 
     /// The name `name` in the schema `schema`, each with its quoting.
     pub(super) fn new(schema: (&str, bool), name: (&str, bool)) -> Self {
         Self {
-            schema: Some(Cow::Owned(String::from(schema.0))),
+            schema: Cow::Owned(String::from(schema.0)),
             schema_is_quoted: schema.1,
             name: Cow::Owned(String::from(name.0)),
             name_is_quoted: name.1,
@@ -100,12 +95,12 @@ impl CatalogName {
     }
 
     pub(super) fn set_schema(&mut self, schema: String, schema_is_quoted: bool) {
-        self.schema = Some(Cow::Owned(schema));
+        self.schema = Cow::Owned(schema);
         self.schema_is_quoted = schema_is_quoted;
     }
 
-    pub(crate) fn schema(&self) -> Option<&str> {
-        self.schema.as_deref()
+    pub(crate) fn schema(&self) -> &str {
+        &self.schema
     }
 
     pub(crate) const fn schema_is_quoted(&self) -> bool {
@@ -122,18 +117,13 @@ impl CatalogName {
 
     /// The name the identity reads as, with its schema.
     pub(crate) fn target_name(&self) -> TargetName<'_> {
-        let mut target = TargetName::new(&self.name, self.name_is_quoted);
-        if let Some(schema) = self.schema.as_deref() {
-            target = target.with_schema(schema, self.schema_is_quoted);
-        }
-        target
+        TargetName::new(&self.name, self.name_is_quoted)
+            .with_schema(&self.schema, self.schema_is_quoted)
     }
 
     /// Whether the identity's schema is the one `schema` names.
     pub(crate) fn schema_matches(&self, schema: &str, quoted: bool) -> bool {
-        self.schema
-            .as_deref()
-            .is_some_and(|stored| identifiers_match(stored, self.schema_is_quoted, schema, quoted))
+        identifiers_match(&self.schema, self.schema_is_quoted, schema, quoted)
     }
 
     /// Moves the identity's schema from `from` to `to`, answering whether it
@@ -315,10 +305,7 @@ impl PostgresCatalog {
         to_quoted: bool,
     ) {
         let in_renamed_schema = |collation: &PostgresCatalogCollation| {
-            let identity = &collation.identity;
-            identity.schema().is_some_and(|schema| {
-                identifiers_match(schema, identity.schema_is_quoted(), from, from_quoted)
-            })
+            collation.identity.schema_matches(from, from_quoted)
         };
         if self.collations.iter().any(in_renamed_schema) {
             for collation in self.collations.to_mut() {
@@ -583,7 +570,7 @@ impl PostgresCatalogCollation {
 
     /// Returns the owning schema.
     #[must_use]
-    pub fn schema(&self) -> Option<&str> {
+    pub fn schema(&self) -> &str {
         self.identity.schema()
     }
 
@@ -638,7 +625,7 @@ impl PostgresCatalogType {
 
     /// Returns the owning schema.
     #[must_use]
-    pub fn schema(&self) -> Option<&str> {
+    pub fn schema(&self) -> &str {
         self.identity.schema()
     }
 

@@ -499,8 +499,7 @@ fn schema_rename_preserves_shells_and_unrelated_collations() {
              kept TEXT COLLATE other.folded
          );",
     );
-    let operator =
-        db.operators().unwrap().find(|operator| operator.schema() == Some("moved")).unwrap();
+    let operator = db.operators().unwrap().find(|operator| operator.schema() == "moved").unwrap();
     assert_eq!(operator.kind(), OperatorKind::Prefix);
     assert!(operator.left_type(&db).is_none());
     assert!(operator.result_type(&db).is_none());
