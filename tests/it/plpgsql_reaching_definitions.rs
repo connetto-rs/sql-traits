@@ -918,6 +918,60 @@ fn a_call_through_an_unheld_schema_may_write_every_variable() {
     );
 }
 
+/// A `CALL` whose arguments the procedure's parameters cannot settle, through
+/// a parameter given twice or a name that is no identifier, may write every
+/// variable it passes.
+#[test]
+fn a_call_its_parameters_cannot_settle_may_write_every_variable() {
+    for (routine, call, s_argument, p_argument) in [
+        (
+            "CREATE PROCEDURE fill(a text, INOUT b text) LANGUAGE sql AS 'SELECT 1';",
+            "CALL fill(s, a => p)",
+            0,
+            1,
+        ),
+        (
+            "CREATE PROCEDURE fill(a text, INOUT b text) LANGUAGE sql AS 'SELECT 1';",
+            "CALL fill(p, 'b' => s)",
+            1,
+            0,
+        ),
+    ] {
+        let database = database_with(
+            routine,
+            &format!("DECLARE s text := 'SELECT 1'; BEGIN {call}; EXECUTE s USING p; END"),
+        );
+        let s_written = format!("argument {s_argument} of {call}");
+        let p_written = format!("argument {p_argument} of {call}");
+        assert_eq!(
+            reaching_in(&database, "run"),
+            [vec![
+                read("s", &["'SELECT 1'", s_written.as_str()]),
+                read("p", &["incoming", p_written.as_str()]),
+            ]],
+            "{call}"
+        );
+    }
+}
+
+/// An unqualified `CALL` after another `CALL`, which may have changed the
+/// path, may write every variable it passes.
+#[test]
+fn a_call_after_a_call_may_write_every_variable() {
+    let database = database_with(
+        "CREATE PROCEDURE fill(a text, INOUT b text) LANGUAGE sql AS 'SELECT 1';",
+        "DECLARE s text := 'SELECT 1';
+         BEGIN CALL public.fill(p, s); CALL fill(p, s); EXECUTE s USING p; END",
+    );
+    assert_eq!(
+        reaching_in(&database, "run"),
+        [vec![
+            read("s", &["argument 1 of CALL public.fill(p, s)", "argument 1 of CALL fill(p, s)"]),
+            read("p", &["incoming", "argument 0 of CALL fill(p, s)"]),
+        ]]
+    );
+}
+
 /// The variables a definition reads come with the lookup error a query of
 /// its source runs into.
 #[test]

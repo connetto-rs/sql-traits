@@ -140,16 +140,18 @@ fn a_function_of_another_database_has_no_kind() {
 /// normal one.
 #[test]
 fn a_replacement_cannot_change_a_routine_kind() {
-    for (sql, name, kind) in [
+    for (sql, name, kind, phrase) in [
         (
             "CREATE OR REPLACE FUNCTION pg_catalog.count() RETURNS BIGINT LANGUAGE sql AS 'SELECT 1::bigint';",
             "count",
             FunctionKind::Aggregate,
+            "an aggregate function",
         ),
         (
             "CREATE OR REPLACE FUNCTION pg_catalog.row_number() RETURNS BIGINT LANGUAGE sql AS 'SELECT 1::bigint';",
             "row_number",
             FunctionKind::Window,
+            "a window function",
         ),
     ] {
         let error = ParserDB::parse::<PostgreSqlDialect>(sql).expect_err("PostgreSQL refuses it");
@@ -161,7 +163,9 @@ fn a_replacement_cannot_change_a_routine_kind() {
             ),
             "{error:?}"
         );
+        assert!(error.to_string().contains(&format!("`{name}` is {phrase},")), "{error}");
     }
+    assert_eq!(FunctionKind::Normal.to_string(), "a normal function");
     let db = parse(
         "CREATE OR REPLACE FUNCTION pg_catalog.lower(x TEXT) RETURNS TEXT LANGUAGE sql AS 'SELECT x';",
     );

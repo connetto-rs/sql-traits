@@ -33,10 +33,10 @@
 //!   siblings) does not parse beyond the spellings already honoured here.
 //! - `ALTER PROCEDURE` and `DROP ROUTINE` do not parse, so a schema carrying
 //!   either fails to parse.
-//! - `CREATE PROCEDURE` refuses `SECURITY DEFINER`, `SET`, an unnamed parameter
-//!   and the `DEFAULT` keyword for a parameter default, so a procedure is held
-//!   only without them, and every procedure here runs with its caller's rights
-//!   and `search_path`.
+//! - `CREATE PROCEDURE` refuses `SECURITY DEFINER`, `SET`, an unnamed
+//!   parameter, a `VARIADIC` parameter and the `DEFAULT` keyword for a
+//!   parameter default, so a procedure is held only without them, and every
+//!   procedure here runs with its caller's rights and `search_path`.
 //! - `CREATE RECURSIVE VIEW`, `REFRESH MATERIALIZED VIEW` and `CREATE
 //!   MATERIALIZED VIEW ... WITH NO DATA` do not parse, and the parser accepts
 //!   `CREATE VIEW IF NOT EXISTS` and `CREATE OR REPLACE MATERIALIZED VIEW`,

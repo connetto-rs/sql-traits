@@ -150,6 +150,7 @@ fn a_procedure_and_a_function_never_share_a_signature() {
         ),
         "{result:?}"
     );
+    assert!(result.unwrap_err().to_string().contains("`p` is a procedure,"));
 
     let db = parse(
         "CREATE PROCEDURE p(a int) LANGUAGE sql AS 'SELECT 1';
