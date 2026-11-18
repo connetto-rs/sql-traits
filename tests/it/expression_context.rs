@@ -11,7 +11,7 @@ use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{
         BinaryOperator, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement,
-        TableFactor,
+        TableFactor, Update,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -698,6 +698,36 @@ fn in_lists_inside_an_aliased_join_keep_their_own_level_apart() {
     assert_eq!(
         described(&context, &[&conditions[0].condition]),
         [some(&["= ANY [1, 2]", "= o.j"])]
+    );
+}
+
+/// An `IN` list in a `RETURNING` list keeps apart an element reading the
+/// target bare or through `old`, both of the statement's own query level, as
+/// PostgreSQL 18 stores it.
+#[test]
+fn in_lists_in_returning_keep_the_target_and_its_old_row_apart() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(LISTS).unwrap();
+    let query = query(
+        "WITH m AS (UPDATE t SET j = 1 RETURNING i IN (1, j, 2), i IN (1, old.j, 2)) SELECT 1",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let SetExpr::Update(Statement::Update(Update { returning, .. })) =
+        query.with.as_ref().unwrap().cte_tables[0].query.body.as_ref()
+    else {
+        unreachable!()
+    };
+    let nodes: Vec<&Expr> = returning
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            let SelectItem::UnnamedExpr(expression) = item else { unreachable!() };
+            expression
+        })
+        .collect();
+    assert_eq!(
+        described(&context, &nodes),
+        [some(&["= ANY [1, 2]", "= j"]), some(&["= ANY [1, 2]", "= old.j"])]
     );
 }
 

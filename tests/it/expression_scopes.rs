@@ -14,7 +14,7 @@ use sqlparser::{
         Assignment, CreateRuleEvent, Cte, DataType, Delete, DoUpdate, Expr, Insert, Merge,
         MergeAction, MergeClause, MergeInsertExpr, MergeInsertKind, MergeUpdateExpr,
         MergeUpdateKind, OnConflictAction, OnInsert, OutputClause, Query, SelectItem, SetExpr,
-        Statement, Update,
+        Statement, TableFactor, Update, UpdateTableFromKind,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -637,6 +637,62 @@ fn returning_reads_old_and_new_unless_a_relation_takes_the_name() {
         .map(|node| context.type_of(node).unwrap())
         .collect();
     assert_eq!(types, [pg("int8"), pg("int8")]);
+}
+
+/// `old` and `new` are in reach of `RETURNING` alone, so the other clauses
+/// of an `UPDATE`, `DELETE` or `MERGE`, and the queries their `FROM`,
+/// `USING` or source nest, bind no column through them.
+#[test]
+fn old_and_new_stay_out_of_every_clause_but_returning() {
+    let db = db();
+    let unknown = || [OperandType::Unknown, pg("int4")];
+
+    let root = statement(
+        "UPDATE t SET b = old.b FROM (SELECT new.a) AS s \
+         WHERE old.a > 1 RETURNING old.a, new.b",
+    );
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Update(Update { assignments, from, selection, returning, .. }) = &root else {
+        unreachable!()
+    };
+    assert_eq!(context.type_of(&assignments[0].value).unwrap(), OperandType::Unknown);
+    assert_eq!(both(&context, selection.as_ref().unwrap()).unwrap(), unknown());
+    let Some(UpdateTableFromKind::AfterSet(from)) = from else { unreachable!() };
+    let TableFactor::Derived { subquery, .. } = &from[0].relation else { unreachable!() };
+    assert_eq!(context.type_of(projected(subquery)[0]).unwrap(), OperandType::Unknown);
+    let types: Vec<_> = returned(returning.as_ref().unwrap())
+        .into_iter()
+        .map(|node| context.type_of(node).unwrap())
+        .collect();
+    assert_eq!(types, [pg("int4"), pg("numeric")]);
+
+    let root = statement("DELETE FROM t WHERE old.a > 1 RETURNING old.b");
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Delete(Delete { selection, returning, .. }) = &root else { unreachable!() };
+    assert_eq!(both(&context, selection.as_ref().unwrap()).unwrap(), unknown());
+    let types: Vec<_> = returned(returning.as_ref().unwrap())
+        .into_iter()
+        .map(|node| context.type_of(node).unwrap())
+        .collect();
+    assert_eq!(types, [pg("numeric")]);
+
+    let root = statement(
+        "MERGE INTO t USING logt AS s ON old.a > 1 \
+         WHEN MATCHED AND new.a > 1 THEN UPDATE SET b = old.b RETURNING new.a",
+    );
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let Statement::Merge(Merge { on, clauses, output, .. }) = &root else { unreachable!() };
+    assert_eq!(both(&context, on).unwrap(), unknown());
+    let MergeClause { predicate, action, .. } = &clauses[0];
+    assert_eq!(both(&context, predicate.as_ref().unwrap()).unwrap(), unknown());
+    let MergeAction::Update(MergeUpdateExpr { kind: MergeUpdateKind::Set(assignments), .. }) =
+        action
+    else {
+        unreachable!()
+    };
+    assert_eq!(context.type_of(&assignments[0].value).unwrap(), OperandType::Unknown);
+    let Some(OutputClause::Returning { select_items, .. }) = output else { unreachable!() };
+    assert_eq!(context.type_of(returned(select_items)[0]).unwrap(), pg("int4"));
 }
 
 #[test]
