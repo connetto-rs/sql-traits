@@ -144,7 +144,8 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
                 ColumnOption::Collation(name) => {
                     let named = NamedColumnCollation::new(target_name_of_object_name(name))
                         .with_postgres_deterministic(metadata.postgres_deterministic())
-                        .with_mysql_padding(metadata.mysql_padding());
+                        .with_mysql_padding(metadata.mysql_padding())
+                        .with_postgres_resolution(metadata.postgres_resolution());
                     return Ok(ColumnCollation::Named(named));
                 }
                 ColumnOption::CharacterSet(_) => unknown = true,

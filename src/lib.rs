@@ -30,5 +30,5 @@ pub mod utils;
 pub mod prelude {
     pub use sqlparser::dialect::GenericDialect;
 
-    pub use crate::{structs::*, traits::*};
+    pub use crate::{impls::SqlparserDialect, structs::*, traits::*};
 }

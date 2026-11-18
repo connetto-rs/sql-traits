@@ -10,8 +10,8 @@ pub mod type_match;
 use core::fmt::Debug;
 
 pub use column::{
-    ColumnCollation, ColumnLike, CreatedFromQuery, IdentityGeneration, MySqlCollationPadding,
-    NamedColumnCollation,
+    CollationMatch, ColumnCollation, ColumnLike, CreatedFromQuery, IdentityGeneration,
+    MySqlCollationPadding, NamedColumnCollation,
 };
 pub use data_type::{
     ArrayDimension, BinarySend, CharacterLengthUnit, DataTypeLike, EnumWidth, Enumeration,

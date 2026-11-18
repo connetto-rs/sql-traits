@@ -827,7 +827,7 @@ fn column_metadata_from_created_collation(metadata: &CreatedCollationMetadata) -
     };
     ColumnMetadata::default()
         .with_postgres_deterministic(metadata.postgres_deterministic)
-        .with_postgres_collation(qualifier_of(&metadata.name).named(), name)
+        .with_postgres_collation(Some(collation_effective_schema(&metadata.name)), name)
 }
 
 fn column_metadata_from_catalog_collation(metadata: &PostgresCatalogCollation) -> ColumnMetadata {
