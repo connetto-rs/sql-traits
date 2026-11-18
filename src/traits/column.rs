@@ -32,13 +32,14 @@ pub struct NamedColumnCollation<'a> {
     name: TargetName<'a>,
     postgres_deterministic: Option<bool>,
     mysql_padding: Option<MySqlCollationPadding>,
+    postgres_resolution: Option<TargetName<'a>>,
 }
 
 impl<'a> NamedColumnCollation<'a> {
     /// Creates named collation metadata from the SQL name.
     #[must_use]
     pub fn new(name: TargetName<'a>) -> Self {
-        Self { name, postgres_deterministic: None, mysql_padding: None }
+        Self { name, postgres_deterministic: None, mysql_padding: None, postgres_resolution: None }
     }
 
     /// Stores PostgreSQL determinism, or `None` when it is unknown.
@@ -52,6 +53,19 @@ impl<'a> NamedColumnCollation<'a> {
     #[must_use]
     pub fn with_mysql_padding(mut self, padding: Option<MySqlCollationPadding>) -> Self {
         self.mysql_padding = padding;
+        self
+    }
+
+    /// Stores the PostgreSQL identity the written name resolved to, or
+    /// `None` when the name did not resolve to a stored schema and name.
+    ///
+    /// A database that parsed the name answers the schema and name its
+    /// engine stores, with their quoting, which can differ from the
+    /// spelling the SQL wrote, `COLLATE "C"` against the stored
+    /// `pg_catalog."C"` among them.
+    #[must_use]
+    pub fn with_postgres_resolution(mut self, resolution: Option<TargetName<'a>>) -> Self {
+        self.postgres_resolution = resolution;
         self
     }
 
@@ -78,6 +92,14 @@ impl<'a> NamedColumnCollation<'a> {
         self.mysql_padding
     }
 
+    /// Returns the PostgreSQL identity the written name resolved to, the
+    /// schema and name the engine stores with their quoting, or `None` when
+    /// the name did not resolve to one.
+    #[must_use]
+    pub fn postgres_resolution(&self) -> Option<&TargetName<'a>> {
+        self.postgres_resolution.as_ref()
+    }
+
     /// Takes ownership of the collation name, so the metadata outlives the
     /// database it was resolved against.
     ///
@@ -98,6 +120,7 @@ impl<'a> NamedColumnCollation<'a> {
             name: self.name.into_owned(),
             postgres_deterministic: self.postgres_deterministic,
             mysql_padding: self.mysql_padding,
+            postgres_resolution: self.postgres_resolution.map(|resolution| resolution.into_owned()),
         }
     }
 
@@ -164,6 +187,25 @@ impl ColumnCollation<'_> {
             Self::Unknown => ColumnCollation::Unknown,
         }
     }
+}
+
+/// The outcome of comparing the rules two column collations name.
+///
+/// A drift check compares the collation a catalog writes for a column with
+/// the collation a live read of the same column reports. The two sides spell
+/// one rule in different ways, the catalog keeping a name as written while
+/// the live read answers the schema and name the engine stores, so the
+/// comparison settles on the rule each side resolves to and answers
+/// [`Self::Undetermined`] where a side resolves to nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CollationMatch {
+    /// Both sides resolve to the same comparison rule.
+    Same,
+    /// Both sides resolve to different comparison rules.
+    Different,
+    /// A side resolves to no rule, so the comparison cannot settle.
+    Undetermined,
 }
 
 /// Which values of an identity column the database supplies.

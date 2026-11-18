@@ -53,19 +53,28 @@ fn a_collation_round_trips_with_and_without_catalog_facts() {
         .with_postgres_deterministic(Some(true))
         .with_mysql_padding(Some(MySqlCollationPadding::PadSpace));
     let unknown_facts = NamedColumnCollation::new(TargetName::new("ci", false));
+    let resolved = NamedColumnCollation::new(TargetName::new("C", true)).with_postgres_resolution(
+        Some(TargetName::new("C", true).with_schema("pg_catalog", false)),
+    );
 
-    for original in [known, padded, unknown_facts] {
+    for original in [known, padded, unknown_facts, resolved] {
         let restored: NamedColumnCollation<'static> = round_trip(&original);
         assert_eq!(restored, original);
         assert_eq!(restored.name(), original.name());
         assert_eq!(restored.postgres_deterministic(), original.postgres_deterministic());
         assert_eq!(restored.mysql_padding(), original.mysql_padding());
+        assert_eq!(restored.postgres_resolution(), original.postgres_resolution());
     }
 
     for original in [
         ColumnCollation::DatabaseDefault,
         ColumnCollation::Unknown,
         ColumnCollation::Named(NamedColumnCollation::new(TargetName::new("C", true))),
+        ColumnCollation::Named(
+            NamedColumnCollation::new(TargetName::new("C", true)).with_postgres_resolution(Some(
+                TargetName::new("C", true).with_schema("pg_catalog", false),
+            )),
+        ),
     ] {
         let restored: ColumnCollation<'static> = round_trip(&original);
         assert_eq!(restored, original);

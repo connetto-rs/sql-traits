@@ -5,7 +5,10 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use sqlparser::ast::{CreateFunction, Query};
 
 use super::ExpressionCalls;
-use crate::{structs::ParserDB, traits::MySqlCollationPadding};
+use crate::{
+    structs::{ParserDB, TargetName},
+    traits::MySqlCollationPadding,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedCollation {
@@ -135,6 +138,22 @@ impl ColumnMetadata {
 
     pub(crate) fn postgres_collation_matches(&self, other: &Self) -> Option<bool> {
         Some(self.postgres_collation.as_ref()? == other.postgres_collation.as_ref()?)
+    }
+
+    /// The stored schema and name a PostgreSQL `COLLATE` resolved to at parse
+    /// time, borrowed, or `None` for a column the database resolves to its
+    /// default rule.
+    pub(crate) fn postgres_resolution(&self) -> Option<TargetName<'_>> {
+        match &self.postgres_collation {
+            Some(ResolvedCollation::Named { schema, schema_quoted, name, name_quoted }) => {
+                let mut resolved = TargetName::new(name, *name_quoted);
+                if let Some(schema) = schema {
+                    resolved = resolved.with_schema(schema, *schema_quoted);
+                }
+                Some(resolved)
+            }
+            _ => None,
+        }
     }
 
     /// Returns PostgreSQL determinism when it is known.

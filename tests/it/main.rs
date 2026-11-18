@@ -22,6 +22,7 @@ mod check_constraint_columns;
 mod clause_bindings;
 mod coercion;
 mod collation_name_cost;
+mod collation_same_rule;
 mod column_alterations;
 mod column_definitions;
 mod column_identifier_rules;
