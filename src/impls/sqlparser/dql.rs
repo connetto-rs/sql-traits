@@ -498,6 +498,10 @@ struct FromScope<'query, 'db, DB: DatabaseLike, D: Copy> {
     opaque: Vec<OpaqueRelation<'query, 'db>>,
     from_entry_count: usize,
     unqualified_poison: bool,
+    /// Whether only a reference qualified by a relation's name reaches the
+    /// scope's relations, as with the `old` and `new` rows of a `RETURNING`
+    /// list, so a bare column name passes it by.
+    qualified_only: bool,
     /// The comparison a written column, relation or output name is read
     /// under, fixed for the whole scope at the moment it is built.
     case: IdentifierCase,
@@ -514,6 +518,7 @@ impl<DB: DatabaseLike, D: Copy> FromScope<'_, '_, DB, D> {
             opaque: Vec::new(),
             from_entry_count: 0,
             unqualified_poison: false,
+            qualified_only: false,
             case,
         }
     }
@@ -3901,6 +3906,9 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
     require_row_identity: bool,
     case: IdentifierCase,
 ) -> Result<LookupOutcome<ResolvedColumn<'scope, 'db, DB, D>>, LookupError> {
+    if scope.qualified_only {
+        return Ok(LookupOutcome::SearchParent);
+    }
     if scope.unqualified_poison
         || scope.opaque.iter().any(|entry| entry.entry_index < visible_entries)
     {

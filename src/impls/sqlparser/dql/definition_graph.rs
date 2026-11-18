@@ -167,9 +167,10 @@ struct ScopeNode<'query, 'db, DB: DatabaseLike> {
     select: Option<AstRef<'query, 'db, Select>>,
     parent: Option<ScopeCursor>,
     owner: Option<ScopeId>,
-    /// Whether the scope holds the items of a parenthesized join under an
-    /// alias, which belong to the query level of the scope owning it.
-    join: bool,
+    /// Whether the scope belongs to the query level of the scope owning it,
+    /// as the items of a parenthesized join under an alias and the `old` and
+    /// `new` rows of a `RETURNING` list do.
+    owner_level: bool,
     data: FromScope<'query, 'db, DB, DefinitionId>,
     outputs: Vec<OutputEntry<'query, 'db>>,
 }
@@ -340,10 +341,10 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     }
 
     /// The scope standing for the query level `scope` belongs to: `scope`
-    /// itself, or for the scope of a parenthesized join the scope of the
-    /// query holding the join.
+    /// itself, or for a scope of its owner's level, such as a parenthesized
+    /// join's, the scope of that level.
     fn level_scope(&self, mut scope: ScopeId) -> Option<ScopeId> {
-        while self.scopes[scope.0].join {
+        while self.scopes[scope.0].owner_level {
             scope = self.scopes[scope.0].owner?;
         }
         Some(scope)
@@ -718,8 +719,26 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             select: None,
             parent,
             owner: parent.map(|parent| parent.scope),
-            join: false,
+            owner_level: false,
             data: FromScope::new(self.graph.case),
+            outputs: Vec::new(),
+        });
+        scope
+    }
+
+    /// Opens a scope under `parent`, of its query level, whose relations
+    /// only a qualified reference reaches: the `old` and `new` rows of a
+    /// `RETURNING` list.
+    pub(super) fn begin_qualified_scope(&mut self, parent: ScopeCursor) -> ScopeId {
+        let scope = ScopeId(self.graph.scopes.len());
+        let mut data = FromScope::new(self.graph.case);
+        data.qualified_only = true;
+        self.graph.scopes.push(ScopeNode {
+            select: None,
+            parent: Some(parent),
+            owner: Some(parent.scope),
+            owner_level: true,
+            data,
             outputs: Vec::new(),
         });
         scope
@@ -844,7 +863,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             select: Some(select),
             parent,
             owner,
-            join: false,
+            owner_level: false,
             data: FromScope::new(match select {
                 AstRef::Query(_) => self.graph.case,
                 AstRef::Database(_) => IdentifierCase::AsWritten,
@@ -877,7 +896,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             select: None,
             parent,
             owner: parent.map(|parent| parent.scope),
-            join: true,
+            owner_level: true,
             data: FromScope::new(match join {
                 AstRef::Query(_) => self.graph.case,
                 AstRef::Database(_) => IdentifierCase::AsWritten,

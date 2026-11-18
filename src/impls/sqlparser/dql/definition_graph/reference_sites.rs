@@ -538,19 +538,19 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
                     self.node(&assignment.value, cursor);
                 }
                 self.node(selection, cursor);
-                self.node(returning, cursor);
+                self.node(returning, scopes.returning);
             }
             Statement::Delete(Delete { from, using, selection, returning, .. }) => {
                 let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
                 self.relations(&[from, using.as_deref().unwrap_or_default()], scope);
                 self.node(selection, cursor);
-                self.node(returning, cursor);
+                self.node(returning, scopes.returning);
             }
             Statement::Insert(Insert { source, returning, on, .. }) => {
                 if let Some(source) = source {
                     self.query(source);
                 }
-                self.node(returning, cursor);
+                self.node(returning, scopes.returning);
                 if let Some(OnInsert::OnConflict(OnConflict {
                     action: OnConflictAction::DoUpdate(DoUpdate { assignments, selection }),
                     ..
@@ -574,7 +574,7 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
                 }
                 match output {
                     Some(OutputClause::Returning { select_items, .. }) => {
-                        self.node(select_items, cursor);
+                        self.node(select_items, scopes.returning);
                     }
                     other => self.node(other, None),
                 }

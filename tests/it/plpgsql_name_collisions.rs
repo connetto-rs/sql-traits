@@ -227,6 +227,36 @@ fn new_reaches_a_variable_only_in_a_trigger_function() {
     assert_eq!((bound, variable.as_deref()), ("column", Some("new")));
 }
 
+/// In a trigger function, `OLD` and `NEW` outside a `RETURNING` list reach
+/// the trigger's records alone, while inside it they bind the statement's
+/// rows as well, the reference PostgreSQL 18 refuses as ambiguous.
+#[test]
+fn old_and_new_bind_rows_only_in_returning() {
+    let database = postgres(
+        "CREATE TABLE notes (id integer PRIMARY KEY, label text);
+         CREATE FUNCTION removed() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN DELETE FROM notes WHERE id = OLD.id; RETURN NULL; END $$;
+         CREATE FUNCTION changed() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN UPDATE notes SET label = OLD.label WHERE id = NEW.id; RETURN NULL; END $$;
+         CREATE FUNCTION merged() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           MERGE INTO notes USING notes AS s ON s.id = OLD.id
+           WHEN MATCHED THEN UPDATE SET label = NEW.label;
+           RETURN NULL;
+         END $$;
+         CREATE FUNCTION returned() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE result text;
+         BEGIN UPDATE notes SET label = 'x' WHERE id = 1 RETURNING old.label INTO result; RETURN NULL; END $$;",
+    );
+    let variable = |name: &str| ("variable", Some(name.to_owned()));
+    assert_eq!(reached(&database, "removed", "OLD.id"), variable("old"));
+    assert_eq!(reached(&database, "changed", "OLD.label"), variable("old"));
+    assert_eq!(reached(&database, "changed", "NEW.id"), variable("new"));
+    assert_eq!(reached(&database, "merged", "OLD.id"), variable("old"));
+    assert_eq!(reached(&database, "merged", "NEW.label"), variable("new"));
+    assert_eq!(reached(&database, "returned", "old.label"), ("column", Some("old".to_owned())));
+}
+
 /// PostgreSQL 18 analyzes a utility statement such as `CREATE INDEX` with no
 /// PL/pgSQL names in reach, so its column reaches no argument of its name.
 #[test]
