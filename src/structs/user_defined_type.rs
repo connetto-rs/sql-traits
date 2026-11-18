@@ -7,7 +7,7 @@ use sqlparser::ast::{
     UserDefinedTypeRepresentation,
 };
 
-use crate::traits::MySqlCollationPadding;
+use crate::{structs::metadata::ResolvedCollation, traits::MySqlCollationPadding};
 
 /// The facts of the collation a composite attribute's `COLLATE` resolved to
 /// when its type was created.
@@ -19,6 +19,8 @@ pub(crate) struct AttributeCollation {
     pub(crate) postgres_deterministic: Option<bool>,
     /// The collation's padding, where MySQL records it.
     pub(crate) mysql_padding: Option<MySqlCollationPadding>,
+    /// The collation the `COLLATE` resolved to, where PostgreSQL records it.
+    pub(crate) postgres_collation: Option<ResolvedCollation>,
 }
 
 /// A user-defined type `CREATE TYPE` defines, stored after its type
