@@ -10,10 +10,24 @@ use crate::{
     traits::MySqlCollationPadding,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The collation a PostgreSQL `COLLATE` resolved to at parse time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ResolvedCollation {
     DatabaseDefault,
     Named { schema: String, schema_quoted: bool, name: String, name_quoted: bool },
+}
+
+impl ResolvedCollation {
+    /// The stored schema and name, borrowed, or `None` for the database's
+    /// default rule.
+    pub(crate) fn target_name(&self) -> Option<TargetName<'_>> {
+        match self {
+            Self::Named { schema, schema_quoted, name, name_quoted } => {
+                Some(TargetName::new(name, *name_quoted).with_schema(schema, *schema_quoted))
+            }
+            Self::DatabaseDefault => None,
+        }
+    }
 }
 
 /// The query of a `CREATE TABLE … AS` statement, with its output names and the
@@ -144,12 +158,13 @@ impl ColumnMetadata {
     /// time, borrowed, or `None` for a column the database resolves to its
     /// default rule.
     pub(crate) fn postgres_resolution(&self) -> Option<TargetName<'_>> {
-        match &self.postgres_collation {
-            Some(ResolvedCollation::Named { schema, schema_quoted, name, name_quoted }) => {
-                Some(TargetName::new(name, *name_quoted).with_schema(schema, *schema_quoted))
-            }
-            _ => None,
-        }
+        self.postgres_collation.as_ref()?.target_name()
+    }
+
+    /// The collation a PostgreSQL `COLLATE` resolved to at parse time, taken
+    /// out of the metadata.
+    pub(crate) fn into_postgres_collation(self) -> Option<ResolvedCollation> {
+        self.postgres_collation
     }
 
     /// Returns PostgreSQL determinism when it is known.

@@ -468,6 +468,7 @@ fn attribute_collations(
                 attribute: attribute.name.clone(),
                 postgres_deterministic: metadata.postgres_deterministic(),
                 mysql_padding: metadata.mysql_padding(),
+                postgres_collation: metadata.into_postgres_collation(),
             })
         })
         .collect()

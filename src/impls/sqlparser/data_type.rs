@@ -18,7 +18,7 @@ use sqlparser::ast::{
 
 use crate::{
     impls::sqlparser::{SqlparserDialect, bound_domain, bound_user_type},
-    structs::{ParserDB, UserDefinedType},
+    structs::{ParserDB, UserDefinedType, metadata::ResolvedCollation},
     traits::{
         ArrayDimension, CharacterLengthUnit, ColumnCollation, DataTypeLike, DatabaseLike,
         EnumWidth, Enumeration, EnumerationKind, EnumerationMember, ExtensionLike, IntervalFields,
@@ -450,7 +450,13 @@ impl<'db> Iterator for FieldsOf<'db> {
                 if let Some(resolved) = user_type.attribute_collation(&attribute.name) {
                     named = named
                         .with_postgres_deterministic(resolved.postgres_deterministic)
-                        .with_mysql_padding(resolved.mysql_padding);
+                        .with_mysql_padding(resolved.mysql_padding)
+                        .with_postgres_resolution(
+                            resolved
+                                .postgres_collation
+                                .as_ref()
+                                .and_then(ResolvedCollation::target_name),
+                        );
                 }
                 built.with_collation(ColumnCollation::Named(named))
             }

@@ -339,3 +339,33 @@ fn composite_collation_facts_follow_the_search_path_at_creation() {
     assert_eq!(collation.name().name(), "folded");
     assert_eq!(collation.postgres_deterministic(), Some(false));
 }
+
+#[test]
+fn composite_collations_settle_on_the_identity_resolved_at_creation() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA a;
+         CREATE SCHEMA b;
+         CREATE COLLATION a.folded (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE COLLATION b.folded (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         SET search_path TO a;
+         CREATE TYPE pair AS (bytewise TEXT COLLATE \"C\", label TEXT COLLATE folded);
+         SET search_path TO b;
+         CREATE TABLE public.t (c a.pair);",
+    )
+    .expect("schema builds");
+    let stored = |schema: &'static str, name: &'static str| {
+        ColumnCollation::Named(NamedColumnCollation::new(
+            TargetName::new(name, true).with_schema(schema, false),
+        ))
+    };
+    let fields: Vec<_> =
+        column_type(&database).structured_fields(&database).expect("a composite").collect();
+    let settles = |field: usize, other: &ColumnCollation<'_>| {
+        fields[field].collation().is_same_rule(*database.dialect(), other)
+    };
+    assert_eq!(settles(0, &stored("pg_catalog", "C")), CollationMatch::Same);
+    assert_eq!(settles(0, &stored("pg_catalog", "POSIX")), CollationMatch::Different);
+    assert_eq!(settles(0, &ColumnCollation::DatabaseDefault), CollationMatch::Different);
+    assert_eq!(settles(1, &stored("a", "folded")), CollationMatch::Same);
+    assert_eq!(settles(1, &stored("b", "folded")), CollationMatch::Different);
+}
