@@ -2318,7 +2318,8 @@ impl CallClauses {
 
     /// The rule the clauses break on a call passing `arguments` arguments
     /// to a function of `kind`, an aggregate of `aggregate`, in the order
-    /// `ParseFuncOrColumn` checks them.
+    /// `ParseFuncOrColumn` checks them, which refuses a procedure before
+    /// looking at any clause.
     const fn kind_rule(
         self,
         kind: FunctionKind,
@@ -2331,6 +2332,7 @@ impl CallClauses {
         );
         let rule = match kind {
             FunctionKind::Normal => return self.plain_rule(),
+            FunctionKind::Procedure => return Some(Misapplied::ProcedureCalled),
             FunctionKind::Aggregate if ordered_set => {
                 if self.within_group == 0 {
                     Some(Misapplied::WithinGroupRequired)

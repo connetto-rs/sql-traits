@@ -16,8 +16,8 @@ use alloc::{
 use core::fmt::Display;
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart,
-    Query, Statement, Value,
+    ArgMode, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    ObjectNamePart, Query, Statement, Value,
 };
 use sqlparser_plpgsql::{
     embedded::{
@@ -36,12 +36,17 @@ use super::{
 use crate::{
     errors::LookupError,
     structs::{
-        DefinitionSource, DiagnosticsItem, Output, PlPgSqlScope, PlPgSqlVariable, Rows, TargetStep,
+        DefinitionSource, DiagnosticsItem, FunctionKind, IdentifierCase, Output, PlPgSqlScope,
+        PlPgSqlVariable, Rows, TargetStep,
         plpgsql_flow::{CursorQuery, Slot, State, ValueFlow, Written},
         plpgsql_scope::stored_parts,
     },
     traits::{DatabaseLike, FunctionLike},
-    utils::identifier_resolution::stored_identifier,
+    utils::{
+        call_typing::called_object_name,
+        identifier_resolution::stored_identifier,
+        object_name::{RoutinePath, reaches_unheld_schema},
+    },
 };
 
 /// Every definition of the PL/pgSQL body `block` of the function `names`
@@ -637,10 +642,10 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
         }
     }
 
-    /// The value the procedure `call` may return to each variable it
-    /// passes, listed beside the variable's earlier definitions. Only the
-    /// procedure's signature tells which parameters return one, and the
-    /// model holds no procedure.
+    /// The value the procedure `call` returns to each variable it passes.
+    /// A call reaching one procedure surely writes the variables at its
+    /// `INOUT` and `OUT` parameters, and any other call may write every
+    /// variable it passes, listed beside the variable's earlier definitions.
     fn call(
         &self,
         address: usize,
@@ -648,8 +653,14 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
     ) -> Result<Vec<Pending<'b, 'db, DB>>, LookupError> {
         let scope = self.scope(SiteKey::of(Sql::Statement(call)), call)?;
         let namespace = &self.targets_namespace(address, call)?.namespace;
+        let written_back = written_back(call, &scope);
         let mut writes = Vec::new();
         for (argument, mut passed) in call_arguments(call) {
+            let surely = match written_back.as_ref().and_then(|written| written.get(argument)) {
+                Some(false) => continue,
+                Some(true) => true,
+                None => false,
+            };
             // Parentheses and a cast to the variable's own type leave the
             // argument writable, and a cast to another type fails the call.
             while let Expr::Nested(inner) | Expr::Cast { expr: inner, .. } = passed {
@@ -675,7 +686,7 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 part,
                 source: DefinitionSource::CallOutput { call, argument },
                 scope: Some(scope.clone()),
-                kills: false,
+                kills: surely,
             });
         }
         Ok(writes)
@@ -997,6 +1008,113 @@ fn call_arguments(call: &Statement) -> impl Iterator<Item = (usize, &Expr)> {
             }
         }
     })
+}
+
+/// Whether `call` writes back to each argument it passes, when it reaches
+/// one procedure under the path `scope` runs it on, matching every
+/// argument, `OUT` ones included, by position or by name, and `None` when
+/// it reaches none or several or may land in a schema the model does not
+/// hold.
+fn written_back<DB: DatabaseLike>(
+    call: &Statement,
+    scope: &PlPgSqlScope<'_, '_, DB>,
+) -> Option<Vec<bool>> {
+    let Statement::Call(Function { name, args: FunctionArguments::List(list), .. }) = call else {
+        return None;
+    };
+    let written = list
+        .args
+        .iter()
+        .map(|argument| {
+            match argument {
+                FunctionArg::Unnamed(_) => Some(None),
+                FunctionArg::Named { name, .. }
+                | FunctionArg::ExprNamed { name: Expr::Identifier(name), .. } => Some(Some(name)),
+                FunctionArg::ExprNamed { .. } => None,
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let target = called_object_name(name).ok()?;
+    let database = scope.database();
+    let case = IdentifierCase::Folded;
+    let routine_path = match (target.schema(), scope.path()) {
+        (None, BodyPath::Unknown(_)) => return None,
+        (Some(_), _) | (None, BodyPath::Database) => RoutinePath::Database,
+        (None, BodyPath::Set(path)) => RoutinePath::Set(path),
+    };
+    if reaches_unheld_schema(database, &target, routine_path, case) {
+        return None;
+    }
+    let path = match target.schema() {
+        Some(schema) => Vec::from([(schema, target.schema_is_quoted())]),
+        None => routine_path.schemas(database),
+    };
+    let mut reached = database.functions_named(target.name()).filter_map(|function| {
+        let declared = function.target_name();
+        let (schema, quoted) = declared
+            .schema()
+            .map_or(("public", false), |schema| (schema, declared.schema_is_quoted()));
+        let on_path = path.iter().any(|&(entry, entry_quoted)| {
+            case.identifiers_match(schema, quoted, entry, entry_quoted)
+        });
+        let named = case.identifiers_match(
+            function.name(),
+            function.name_is_quoted(),
+            target.name(),
+            target.name_is_quoted(),
+        );
+        (on_path && named && function.kind(database) == Ok(FunctionKind::Procedure))
+            .then(|| parameter_writes(function, database, &written, case))
+            .flatten()
+    });
+    let writes = reached.next()?;
+    reached.next().is_none().then_some(writes)
+}
+
+/// Whether a call of `function` passing arguments under the names `written`
+/// writes back to each, `None` when the arguments do not match its
+/// parameters.
+fn parameter_writes<F: FunctionLike>(
+    function: &F,
+    database: &F::DB,
+    written: &[Option<&Ident>],
+    case: IdentifierCase,
+) -> Option<Vec<bool>> {
+    let modes: Vec<ArgMode> = function.argument_modes().collect();
+    if modes.contains(&ArgMode::Variadic) {
+        return None;
+    }
+    let names: Vec<_> = function.argument_names(database).collect();
+    let mut supplied = Vec::from_iter(core::iter::repeat_n(false, modes.len()));
+    let mut writes = Vec::with_capacity(written.len());
+    let mut named_seen = false;
+    for (position, written) in written.iter().enumerate() {
+        let parameter = match written {
+            // PostgreSQL refuses a positional argument after a named one.
+            None if named_seen => return None,
+            None => position,
+            Some(written) => {
+                named_seen = true;
+                names.iter().position(|declared| {
+                    declared.as_ref().is_some_and(|declared| {
+                        case.identifiers_match(
+                            declared.name(),
+                            declared.name_is_quoted(),
+                            &written.value,
+                            written.quote_style.is_some(),
+                        )
+                    })
+                })?
+            }
+        };
+        let already = core::mem::replace(supplied.get_mut(parameter)?, true);
+        if already {
+            return None;
+        }
+        writes.push(matches!(modes.get(parameter), Some(ArgMode::Out | ArgMode::InOut)));
+    }
+    let missing = supplied.iter().filter(|supplied| !**supplied).count();
+    (missing <= function.argument_default_count()).then_some(writes)
 }
 
 /// Whether the variable `name` reaches holds a row, asking `names` for the

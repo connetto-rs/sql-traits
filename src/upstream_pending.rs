@@ -20,6 +20,9 @@
 //!   `ALTER DEFAULT PRIVILEGES` does not parse, so a schema carrying one fails
 //!   to parse, and the `EXECUTE` a function receives on creation is always
 //!   PostgreSQL's built-in default rather than the one such a statement set.
+//! - [`sqlparser#2851`](https://github.com/apache/datafusion-sqlparser-rs/pull/2851),
+//!   `CREATE OR REPLACE PROCEDURE` does not parse, so a schema redefining a
+//!   procedure fails to parse.
 //!
 //! Found and written up, not yet filed:
 //!
@@ -28,9 +31,12 @@
 //!   the `CREATE TABLE` wrote them.
 //! - The `CREATE TABLE ... LIKE` option list (`INCLUDING INDEXES` and its
 //!   siblings) does not parse beyond the spellings already honoured here.
-//! - `ALTER PROCEDURE` and the PostgreSQL body spelling of `CREATE PROCEDURE`
-//!   do not parse. This costs nothing yet, since no procedure can exist here
-//!   for a statement to alter.
+//! - `ALTER PROCEDURE` and `DROP ROUTINE` do not parse, so a schema carrying
+//!   either fails to parse.
+//! - `CREATE PROCEDURE` refuses `SECURITY DEFINER`, `SET`, an unnamed
+//!   parameter, a `VARIADIC` parameter and the `DEFAULT` keyword for a
+//!   parameter default, so a procedure is held only without them, and every
+//!   procedure here runs with its caller's rights and `search_path`.
 //! - `CREATE RECURSIVE VIEW`, `REFRESH MATERIALIZED VIEW` and `CREATE
 //!   MATERIALIZED VIEW ... WITH NO DATA` do not parse, and the parser accepts
 //!   `CREATE VIEW IF NOT EXISTS` and `CREATE OR REPLACE MATERIALIZED VIEW`,

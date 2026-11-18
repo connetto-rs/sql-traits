@@ -25,14 +25,14 @@ use sqlparser::{
         ColumnOption, ColumnOptionDef, CreateCollation, CreateCollationDefinition, CreateDomain,
         CreateExtension, CreateForeignTable, CreateFunction, CreateFunctionBody, CreateIndex,
         CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
-        DataType, DeferrableInitial, DropBehavior, DropDomain, Expr, ForeignKeyConstraint,
-        FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue, GeneratedAs, Grant,
-        GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn, MySQLColumnPosition,
-        NotNullConstraint, ObjectName, ObjectNamePart, OperateFunctionArg, OrderByExpr,
-        OrderByOptions, Owner, PrimaryKeyConstraint, Privileges, Query, RenameTableNameKind,
-        ResetConfig, RoleOption, SchemaName, SqlOption, Statement, TableConstraint, TriggerEvent,
-        UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut,
-        helpers::stmt_create_table::CreateTableBuilder,
+        DataType, DeferrableInitial, DropBehavior, DropDomain, DropFunction, Expr,
+        ForeignKeyConstraint, FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue,
+        GeneratedAs, Grant, GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn,
+        MySQLColumnPosition, NotNullConstraint, ObjectName, ObjectNamePart, OperateFunctionArg,
+        OrderByExpr, OrderByOptions, Owner, PrimaryKeyConstraint, Privileges, Query,
+        RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
+        TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut,
+        Visitor, VisitorMut, helpers::stmt_create_table::CreateTableBuilder,
     },
     dialect::Dialect,
 };
@@ -108,6 +108,8 @@ mod postgres_18_collations;
 mod postgres_18_functions;
 mod postgres_builtins;
 mod postgres_catalog;
+mod procedures;
+use procedures::RoutineKeyword;
 mod range_constructors;
 mod revocations;
 mod role_memberships;
@@ -1254,11 +1256,13 @@ impl ParserDBBuilder {
     /// The function a trigger written to run `called` runs, as of this
     /// statement.
     ///
-    /// PostgreSQL looks for a function of that name taking no arguments, in the
-    /// named schema or else in the first schema of the path holding one,
-    /// `pg_catalog` first unless the path names it.
+    /// PostgreSQL looks for a routine of that name taking no arguments, in
+    /// the named schema or else in the first schema of the path holding one,
+    /// `pg_catalog` first unless the path names it, and finds nothing when
+    /// that routine is a procedure.
     fn trigger_function(&self, called: &ObjectName) -> Option<Arc<CreateFunction>> {
-        let functions = self.function_arc_vec();
+        let functions: Vec<Arc<CreateFunction>> =
+            self.functions().iter().map(|(function, _)| Arc::clone(function)).collect();
         let search_path: Vec<(&str, bool)> = self.search_path().collect();
         let case = self.identifier_case();
         let scope = calls_in_expression::CallScope {
@@ -1282,6 +1286,11 @@ impl ParserDBBuilder {
                     && function_argument_types(function.args.as_deref()).is_empty()
             })
             .min_by_key(|function| path_position(function))
+            .filter(|chosen| {
+                !self.functions().iter().any(|(function, metadata)| {
+                    Arc::ptr_eq(function, chosen) && metadata.kind() == FunctionKind::Procedure
+                })
+            })
             .cloned()
     }
 
@@ -3243,6 +3252,69 @@ fn function_argument_types(args: Option<&[OperateFunctionArg]>) -> Vec<Cow<'_, s
         .collect()
 }
 
+/// Returns the types of every argument a routine declares, `OUT` ones
+/// included, which a `PROCEDURE` or `ROUTINE` statement marking no mode
+/// may spell in place of the input types alone.
+fn every_argument_type(args: Option<&[OperateFunctionArg]>) -> Vec<Cow<'_, str>> {
+    args.unwrap_or_default()
+        .iter()
+        .map(|argument| normalize_postgres_type_cow(normalize_sqlparser_type(&argument.data_type)))
+        .collect()
+}
+
+/// The positions of the stored routines `name` reaches whose types, as
+/// `types_of` lists them, are `wanted`, or of every routine it reaches when
+/// `wanted` is `None`.
+///
+/// An unqualified name walks the search path, skipping `pg_temp`, a routine
+/// in an earlier schema hiding a later one of the same types, so the
+/// earliest comes first. Routines of the same types in one schema are all
+/// kept.
+fn routines_on_path(
+    builder: &ParserDBBuilder,
+    name: &ObjectName,
+    wanted: Option<&[Cow<'_, str>]>,
+    types_of: fn(Option<&[OperateFunctionArg]>) -> Vec<Cow<'_, str>>,
+) -> Vec<usize> {
+    let case = builder.identifier_case();
+    let same = |left: &[Cow<'_, str>], right: &[Cow<'_, str>]| {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(left, right)| left.eq_ignore_ascii_case(right))
+    };
+    let types_at = |position: usize| types_of(builder.functions()[position].0.args.as_deref());
+    let positions = |name: &ObjectName| {
+        builder
+            .functions()
+            .iter()
+            .enumerate()
+            .filter(|(_, (function, _))| {
+                function_names_match(&function.name, name, case)
+                    && wanted.is_none_or(|wanted| same(&types_of(function.args.as_deref()), wanted))
+            })
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>()
+    };
+    if !matches!(qualifier_of(name), Qualifier::Absent) {
+        return positions(name);
+    }
+    let mut found: Vec<usize> = Vec::new();
+    for (schema, quoted) in builder
+        .search_path()
+        .filter(|&(schema, quoted)| !schema.is_empty() && !is_temporary_schema(schema, quoted))
+    {
+        let mut qualified = name.clone();
+        bind_reference(&mut qualified, Some(stored_ident(schema, quoted)));
+        let earlier = found.len();
+        for position in positions(&qualified) {
+            let types = types_at(position);
+            if !found[..earlier].iter().any(|&hiding| same(&types_at(hiding), &types)) {
+                found.push(position);
+            }
+        }
+    }
+    found
+}
+
 /// Returns whether two function names name the same function or set of
 /// overloads, which takes the same name in the same schema, a missing
 /// qualifier reading as `public`. A qualifier built at run time names no
@@ -3635,14 +3707,14 @@ fn take_builtins_named_by(builder: &mut ParserDBBuilder, statement: &Statement) 
         }
         Statement::AlterFunction(alter) => core::slice::from_ref(&alter.function),
         Statement::DropFunction(drop) => &drop.func_desc,
-        // This model holds no procedure, so `DROP PROCEDURE` and a grant on
-        // procedures reach no provided function.
+        // No provided function is a procedure, but a procedure signature may
+        // name one to refuse.
         Statement::Grant(Grant { objects: Some(objects), .. })
         | Statement::Revoke(sqlparser::ast::Revoke { objects: Some(objects), .. }) => {
             match objects {
-                GrantObjects::Functions(signatures) | GrantObjects::Routines(signatures) => {
-                    signatures
-                }
+                GrantObjects::Functions(signatures)
+                | GrantObjects::Procedures(signatures)
+                | GrantObjects::Routines(signatures) => signatures,
                 GrantObjects::AllFunctionsInSchema { schemas }
                 | GrantObjects::AllRoutinesInSchema { schemas } => {
                     let names_catalog = |schema: &ObjectName| {
@@ -7786,88 +7858,81 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// The positions of the stored functions `func_desc` names.
+    /// The positions of the stored routines `func_desc` names, under a
+    /// statement naming routines of the kinds `routine` admits.
     ///
-    /// A statement that spells the argument list names one function, and one
-    /// that omits it names whichever function carries the name in the schema it
-    /// names, so long as only one does. An unqualified name walks the search
-    /// path, a function earlier on it hiding a later one taking the same
-    /// arguments, so the earliest comes first. The built-ins of the implicit
-    /// `pg_catalog` are left out, as a statement naming one has always been
-    /// refused as naming nothing here, and functions are never looked for in
-    /// `pg_temp`.
+    /// A statement that spells the argument list names one routine of any
+    /// kind by its input types. A `PROCEDURE` or `ROUTINE` statement marking
+    /// no argument's mode also names one of an admitted kind by all its
+    /// types, `OUT` ones included. One that omits the list names whichever
+    /// routine carries the name in the schema it names, so long as only one
+    /// does, keeping those of an admitted kind once the path has hidden the
+    /// others. The earliest on the path comes first. The built-ins of the
+    /// implicit `pg_catalog` are left out, as a statement naming one has
+    /// always been refused as naming nothing here, and routines are never
+    /// looked for in `pg_temp`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::Error::AmbiguousRoutineSignature`] for an
+    /// argument list naming one routine by its input types and another by
+    /// all its types, and the refusal [`RoutineKeyword::refuse_other_kind`]
+    /// gives an argument list naming a routine of a kind `routine` does not
+    /// admit.
     fn functions_named(
         builder: &ParserDBBuilder,
         func_desc: &FunctionDesc,
         arrays: &TypeArrays,
-    ) -> Vec<usize> {
-        let case = builder.identifier_case();
+        routine: RoutineKeyword,
+    ) -> Result<Vec<usize>, crate::errors::Error> {
+        let kind = |position: usize| builder.functions()[position].1.kind();
+        let Some(mut args) = func_desc.args.clone() else {
+            let mut found =
+                routines_on_path(builder, &func_desc.name, None, function_argument_types);
+            found.retain(|&position| routine.admits(kind(position)));
+            return Ok(found);
+        };
         // The listed types bind as the signatures they are compared with did.
-        let args = func_desc.args.clone().map(|mut args| {
-            signature_types::bind_arguments(builder, &mut args, arrays);
-            args
-        });
-        let named = |function: &CreateFunction, name: &ObjectName| {
-            match &args {
-                Some(args) => {
-                    function_signatures_match(
-                        &function.name,
-                        function.args.as_deref(),
-                        name,
-                        Some(args),
-                        case,
-                    )
-                }
-                None => function_names_match(&function.name, name, case),
+        signature_types::bind_arguments(builder, &mut args, arrays);
+        let input = function_argument_types(Some(&args));
+        let mut found =
+            routines_on_path(builder, &func_desc.name, Some(&input), function_argument_types);
+        let unmarked = !args.is_empty() && args.iter().all(|argument| argument.mode.is_none());
+        if routine != RoutineKeyword::Function && unmarked {
+            let every = every_argument_type(Some(&args));
+            // Every routine left shares the leading schema, as the path hid
+            // the later ones. PostgreSQL refuses two there before the kind
+            // filter for an unqualified name, and after it for a qualified one.
+            let mut full =
+                routines_on_path(builder, &func_desc.name, Some(&every), every_argument_type);
+            let unqualified = matches!(qualifier_of(&func_desc.name), Qualifier::Absent);
+            let mut ambiguous = unqualified && full.len() > 1;
+            full.retain(|&position| routine.admits(kind(position)));
+            ambiguous |= full.len() > 1;
+            let disagree = matches!((found.first(), full.first()), (Some(by_input), Some(by_every)) if by_input != by_every);
+            if ambiguous || disagree {
+                return Err(crate::errors::Error::AmbiguousRoutineSignature {
+                    signature: func_desc.to_string(),
+                });
             }
-        };
-        let positions = |name: &ObjectName| {
-            builder
-                .functions()
-                .iter()
-                .enumerate()
-                .filter(|(_, (function, _))| named(function, name))
-                .map(|(position, _)| position)
-                .collect::<Vec<_>>()
-        };
-        if !matches!(qualifier_of(&func_desc.name), Qualifier::Absent) {
-            return positions(&func_desc.name);
-        }
-
-        let arguments_of = |position: usize| {
-            function_argument_types(builder.functions()[position].0.args.as_deref())
-        };
-        let mut found: Vec<usize> = Vec::new();
-        for (schema, quoted) in builder
-            .search_path()
-            .filter(|&(schema, quoted)| !schema.is_empty() && !is_temporary_schema(schema, quoted))
-        {
-            let mut qualified = func_desc.name.clone();
-            bind_reference(&mut qualified, Some(stored_ident(schema, quoted)));
-            for position in positions(&qualified) {
-                let arguments = arguments_of(position);
-                if !found.iter().any(|&earlier| {
-                    let hiding = arguments_of(earlier);
-                    hiding.len() == arguments.len()
-                        && hiding
-                            .iter()
-                            .zip(&arguments)
-                            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-                }) {
-                    found.push(position);
-                }
+            if found.is_empty() {
+                found = full;
             }
         }
-        found
+        if let Some(&position) = found.first() {
+            routine.refuse_other_kind(func_desc, kind(position))?;
+        }
+        Ok(found)
     }
 
-    /// Resolves the stored function an `ALTER FUNCTION` names.
+    /// Resolves the stored function an `ALTER FUNCTION` names, which reaches
+    /// no procedure.
     fn alter_function_target(
         builder: &ParserDBBuilder,
         func_desc: &FunctionDesc,
         arrays: &TypeArrays,
     ) -> Result<usize, crate::errors::Error> {
-        let matching = Self::functions_named(builder, func_desc, arrays);
+        let matching = Self::functions_named(builder, func_desc, arrays, RoutineKeyword::Function)?;
 
         let Some(&position) = matching.first() else {
             return Err(crate::errors::Error::AlterFunctionNotFound {
@@ -9480,6 +9545,24 @@ impl ParserDB {
                 }
                 statement => (statement, None),
             };
+            // A procedure takes the function path, as both live in `pg_proc`,
+            // the keyword telling which kinds the statement reaches.
+            let (statement, routine) = match statement {
+                Statement::CreateProcedure { or_alter, name, params, language, body }
+                    if procedures::holds_procedures(dialect) =>
+                {
+                    let function =
+                        procedures::procedure_function(or_alter, name, params, language, body)?;
+                    (Statement::CreateFunction(function), RoutineKeyword::Procedure)
+                }
+                Statement::DropProcedure { if_exists, proc_desc, drop_behavior }
+                    if procedures::holds_procedures(dialect) =>
+                {
+                    let drop = DropFunction { if_exists, func_desc: proc_desc, drop_behavior };
+                    (Statement::DropFunction(drop), RoutineKeyword::Procedure)
+                }
+                statement => (statement, RoutineKeyword::Function),
+            };
             take_builtins_named_by(&mut builder, &statement);
             match statement {
                 Statement::CreateFunction(mut create_function) => {
@@ -9555,7 +9638,12 @@ impl ParserDB {
                     } else {
                         let creator = Creator::session(&session_roles, &default_privileges);
                         let schema = qualifier_of(&create_function.name).named();
-                        (None, creator.function_metadata(schema, builder.identifier_case()))
+                        let mut metadata =
+                            creator.function_metadata(schema, builder.identifier_case());
+                        if routine == RoutineKeyword::Procedure {
+                            metadata.set_kind(FunctionKind::Procedure);
+                        }
+                        (None, metadata)
                     };
                     metadata.set_null_returning_arguments(&[]);
                     // PostgreSQL drops the dependency on a range whose
@@ -9583,7 +9671,8 @@ impl ParserDB {
                         .iter()
                         .filter_map(|func_desc| {
                             let position =
-                                *Self::functions_named(&builder, func_desc, &type_arrays)
+                                *Self::functions_named(&builder, func_desc, &type_arrays, routine)
+                                    .ok()?
                                     .first()?;
                             Some(Arc::clone(&builder.functions()[position].0))
                         })
@@ -9592,20 +9681,33 @@ impl ParserDB {
                     let mut removed = user_defined_types::TypeDrop::default();
                     for func_desc in &drop_function.func_desc {
                         let function_name = last_str(&func_desc.name);
-                        let matching = Self::functions_named(&builder, func_desc, &type_arrays);
+                        let matching =
+                            Self::functions_named(&builder, func_desc, &type_arrays, routine)?;
 
                         let Some(&position) = matching.first() else {
                             if drop_function.if_exists {
                                 continue;
                             }
-                            return Err(crate::errors::Error::DropFunctionNotFound {
-                                function_name: function_name.to_string(),
+                            return Err(if routine == RoutineKeyword::Procedure {
+                                crate::errors::Error::DropProcedureNotFound {
+                                    procedure_name: function_name.to_string(),
+                                }
+                            } else {
+                                crate::errors::Error::DropFunctionNotFound {
+                                    function_name: function_name.to_string(),
+                                }
                             });
                         };
 
                         if func_desc.args.is_none() && matching.len() > 1 {
-                            return Err(crate::errors::Error::AmbiguousDropFunction {
-                                function_name: function_name.to_string(),
+                            return Err(if routine == RoutineKeyword::Procedure {
+                                crate::errors::Error::AmbiguousDropProcedure {
+                                    procedure_name: function_name.to_string(),
+                                }
+                            } else {
+                                crate::errors::Error::AmbiguousDropFunction {
+                                    function_name: function_name.to_string(),
+                                }
                             });
                         }
 

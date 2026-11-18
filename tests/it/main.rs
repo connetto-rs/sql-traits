@@ -132,6 +132,7 @@ mod policy_literals;
 mod policy_recursion;
 mod possible_privileges;
 mod postgres_catalog_cost;
+mod procedures;
 mod propagated_constraints;
 mod public_principals;
 mod public_schema;

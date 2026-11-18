@@ -8,9 +8,10 @@
 /// passes its `WHERE`. A window function computes one value per row and so
 /// yields nothing from no input, as a normal function does.
 ///
-/// A function the input declares with `CREATE FUNCTION` is normal. The
-/// aggregates and window functions are the built-ins PostgreSQL ships, since
-/// the parser reads no `CREATE AGGREGATE`.
+/// A function the input declares with `CREATE FUNCTION` is normal, and one
+/// it declares with `CREATE PROCEDURE` is a procedure. The aggregates and
+/// window functions are the built-ins PostgreSQL ships, since the parser
+/// reads no `CREATE AGGREGATE`.
 ///
 /// # Example
 ///
@@ -42,6 +43,20 @@ pub enum FunctionKind {
     /// `prokind = 'w'`, a window function computing one value per row of its
     /// window.
     Window,
+    /// `prokind = 'p'`, a procedure, which only `CALL` runs and which
+    /// returns values through its `INOUT` and `OUT` parameters alone.
+    Procedure,
+}
+
+impl core::fmt::Display for FunctionKind {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Normal => "a normal function",
+            Self::Aggregate => "an aggregate function",
+            Self::Window => "a window function",
+            Self::Procedure => "a procedure",
+        })
+    }
 }
 
 /// How an aggregate takes its arguments, mirroring `pg_aggregate.aggkind`

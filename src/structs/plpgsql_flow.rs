@@ -198,10 +198,10 @@ pub enum DefinitionSource<'r, 'db> {
     PortalName,
     /// What `GET DIAGNOSTICS` reads.
     Diagnostics(DiagnosticsItem),
-    /// The value a procedure's `INOUT` or `OUT` parameter may return to the
-    /// variable `CALL` passes there. Every variable passed has one, listed
-    /// beside its earlier definitions, since the model holds no procedure
-    /// whose signature tells which parameters return a value.
+    /// The value a procedure's `INOUT` or `OUT` parameter returns to the
+    /// variable `CALL` passes there. A call reaching one procedure replaces
+    /// what the variables at those parameters held, and any other call gives
+    /// every variable it passes one beside its earlier definitions.
     CallOutput {
         /// The `CALL`.
         call: &'r Statement,
