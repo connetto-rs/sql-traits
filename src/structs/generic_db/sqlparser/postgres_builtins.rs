@@ -118,10 +118,42 @@ impl Language {
     }
 }
 
+/// The `NULL` facts `pg_aggregate` and an aggregate's transition and final
+/// functions carry, for a row that is an aggregate.
+#[derive(Clone, Copy)]
+pub(super) struct AggregateState {
+    /// `pg_aggregate.agginitval` is `NULL`, so the state starts `NULL`.
+    pub(super) initial_null: bool,
+    /// `pg_aggregate.aggtransfn`'s `pg_proc.proisstrict`: a `NULL` input
+    /// leaves the state untouched.
+    pub(super) transition_strict: bool,
+    /// `pg_aggregate.aggfinalfn` is set and not strict, so the final function
+    /// may turn a `NULL` state into a value.
+    pub(super) final_nonstrict: bool,
+}
+
+impl AggregateState {
+    /// Whether the aggregate returns `NULL` when it aggregates no input row:
+    /// a `NULL` initial state that no non-strict final function turns into a
+    /// value. The transition function is never called, so its strictness does
+    /// not matter.
+    const fn returns_null_over_no_input_row(self) -> bool {
+        self.initial_null && !self.final_nonstrict
+    }
+
+    /// Whether the aggregate returns `NULL` when every input it aggregates is
+    /// `NULL`: a `NULL` initial state a strict transition function never moves
+    /// and no non-strict final function turns into a value.
+    const fn returns_null_over_null_inputs(self) -> bool {
+        self.initial_null && self.transition_strict && !self.final_nonstrict
+    }
+}
+
 /// One `pg_proc` row: the function's name, its parameters as
 /// `pg_get_function_arguments` spells them, its result as
 /// `pg_get_function_result` does, its strictness, volatility, leakproof
-/// status, kind and language.
+/// status, kind and language, and for an aggregate the `NULL` facts of its
+/// state.
 ///
 /// A tuple struct, so a row is built by its constructor rather than by a
 /// function only const evaluation ever runs.
@@ -135,6 +167,7 @@ pub(super) struct PostgresBuiltin(
     pub(super) Leakage,
     pub(super) Kind,
     pub(super) Language,
+    pub(super) Option<AggregateState>,
 );
 
 impl PostgresBuiltin {
@@ -146,7 +179,7 @@ impl PostgresBuiltin {
     /// The declaration in `pg_catalog`, so a user function may shadow it the
     /// way the server allows.
     fn function(&self) -> Option<CreateFunction> {
-        let Self(name, arguments, result, null_input, volatility, leakage, _, language) = *self;
+        let Self(name, arguments, result, null_input, volatility, leakage, _, language, _) = *self;
         let name = ObjectName(vec![
             ObjectNamePart::Identifier(Ident::new(PG_CATALOG)),
             ObjectNamePart::Identifier(stored_ident(name)),
@@ -166,7 +199,7 @@ impl PostgresBuiltin {
     }
 
     fn metadata(&self) -> FunctionMetadata {
-        let Self(name, arguments, _, _, _, _, kind, _) = *self;
+        let Self(name, arguments, _, _, _, _, kind, _, aggregate_state) = *self;
         let mut metadata = FunctionMetadata::default();
         if let Some(positions) =
             null_returning_positions(name, |types| arguments.split(", ").eq(types.iter().copied()))
@@ -175,6 +208,12 @@ impl PostgresBuiltin {
         }
         metadata.set_kind(kind.function());
         metadata.set_aggregate_kind(kind.aggregate());
+        if let Some(state) = aggregate_state {
+            metadata.set_aggregate_null(
+                state.returns_null_over_no_input_row(),
+                state.returns_null_over_null_inputs(),
+            );
+        }
         metadata
     }
 }

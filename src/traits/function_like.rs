@@ -588,6 +588,93 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn aggregate_kind(&self, database: &Self::DB) -> Result<Option<AggregateKind>, LookupError>;
 
+    /// Returns whether the function, as an aggregate, returns `NULL` when it
+    /// aggregates no input row.
+    ///
+    /// The answer is provable from the aggregate's initial state
+    /// (`pg_aggregate.agginitval`) and the strictness of its final function. A
+    /// `NULL` initial state that no non-strict final function turns into a
+    /// value returns `NULL` over no input row, as `max` and `bool_or` do. An
+    /// aggregate that starts from a value, like `count`, returns that value,
+    /// so it answers `false`. A non-strict final function may turn a `NULL`
+    /// state into a value, so it answers `false` even when the state starts
+    /// `NULL`, as `array_agg` does.
+    ///
+    /// A function that is no aggregate answers `false`, and a builtin answers
+    /// from the `pg_aggregate` facts of its `pg_proc` row.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let database = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let max =
+    ///     database.functions().find(|function| function.name() == "max").expect("max is a builtin");
+    /// // `max` starts from `NULL` and has no final function, so over no
+    /// // input row it returns `NULL`.
+    /// assert!(max.returns_null_over_no_input_row(&database));
+    ///
+    /// let count = database
+    ///     .functions()
+    ///     .find(|function| function.name() == "count")
+    ///     .expect("count is a builtin");
+    /// // `count` starts from `0`, so over no input row it returns `0`.
+    /// assert!(!count.returns_null_over_no_input_row(&database));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn returns_null_over_no_input_row(&self, _database: &Self::DB) -> bool {
+        false
+    }
+
+    /// Returns whether the function, as an aggregate, returns `NULL` when
+    /// every input it aggregates is `NULL`.
+    ///
+    /// The answer is provable from the aggregate's initial state
+    /// (`pg_aggregate.agginitval`) and the strictness of its transition and
+    /// final functions. A `NULL` initial state a strict transition function
+    /// never moves and no non-strict final function turns into a value returns
+    /// `NULL` over `NULL` inputs, as `max` and `bool_or` do. A non-strict
+    /// transition function may turn `NULL` inputs into a value, so it answers
+    /// `false`, as `array_agg` does. See
+    /// [`returns_null_over_no_input_row`](FunctionLike::returns_null_over_no_input_row)
+    /// for the no-input-row case.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let database = ParserDB::parse::<PostgreSqlDialect>("")?;
+    /// let bool_or = database
+    ///     .functions()
+    ///     .find(|function| function.name() == "bool_or")
+    ///     .expect("bool_or is a builtin");
+    /// // `bool_or` starts from `NULL`, its transition function is strict, so
+    /// // over `NULL` inputs it returns `NULL`.
+    /// assert!(bool_or.returns_null_over_null_inputs(&database));
+    ///
+    /// let array_agg = database
+    ///     .functions()
+    ///     .find(|function| function.name() == "array_agg")
+    ///     .expect("array_agg is a builtin");
+    /// // `array_agg`'s transition function is not strict, so the answer is
+    /// // not provable from the catalog.
+    /// assert!(!array_agg.returns_null_over_null_inputs(&database));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn returns_null_over_null_inputs(&self, _database: &Self::DB) -> bool {
+        false
+    }
+
     /// Returns the language the body is written in, as the input spells it.
     ///
     /// The body only means anything under its language, so a caller reading
