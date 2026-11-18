@@ -5753,7 +5753,7 @@ impl ParserDB {
     /// [`crate::traits::IndexLike::is_simple`] reads: one key nests, several
     /// keys form a tuple. An ordering qualifier or an operator class qualifies
     /// a key rather than forming part of the expression, so neither appears
-    /// here.
+    /// here, and [`crate::traits::IndexLike::keys`] reports them.
     fn create_index_expression(columns: &[IndexColumn]) -> Option<Expr> {
         match columns {
             [] => None,
