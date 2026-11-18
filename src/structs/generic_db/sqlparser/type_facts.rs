@@ -136,9 +136,8 @@ fn built_in_kind(name: &str, category: u8) -> TypeKind {
 /// the active catalog holds it not collatable.
 fn built_in_collation(database: &ParserDB, name: &str) -> Option<TargetName<'static>> {
     let collatable = database.ingestion.active_postgres_catalog.collatable_types().any(|type_| {
-        type_.schema().is_some_and(|schema| {
-            identifiers_match(schema, type_.schema_is_quoted(), PG_CATALOG, false)
-        }) && identifiers_match(type_.name(), type_.name_is_quoted(), name, true)
+        identifiers_match(type_.schema(), type_.schema_is_quoted(), PG_CATALOG, false)
+            && identifiers_match(type_.name(), type_.name_is_quoted(), name, true)
     });
     // `name` and its array compare bytewise, every other type by the
     // database's collation.

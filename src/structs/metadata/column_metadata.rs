@@ -13,7 +13,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedCollation {
     DatabaseDefault,
-    Named { schema: Option<String>, schema_quoted: bool, name: String, name_quoted: bool },
+    Named { schema: String, schema_quoted: bool, name: String, name_quoted: bool },
 }
 
 /// The query of a `CREATE TABLE … AS` statement, with its output names and the
@@ -113,12 +113,12 @@ impl ColumnMetadata {
 
     pub(crate) fn with_postgres_collation(
         mut self,
-        schema: Option<(&str, bool)>,
+        schema: (&str, bool),
         name: (&str, bool),
     ) -> Self {
         self.postgres_collation = Some(ResolvedCollation::Named {
-            schema: schema.map(|(schema, _)| String::from(schema)),
-            schema_quoted: schema.is_some_and(|(_, quoted)| quoted),
+            schema: String::from(schema.0),
+            schema_quoted: schema.1,
             name: String::from(name.0),
             name_quoted: name.1,
         });
@@ -146,11 +146,7 @@ impl ColumnMetadata {
     pub(crate) fn postgres_resolution(&self) -> Option<TargetName<'_>> {
         match &self.postgres_collation {
             Some(ResolvedCollation::Named { schema, schema_quoted, name, name_quoted }) => {
-                let mut resolved = TargetName::new(name, *name_quoted);
-                if let Some(schema) = schema {
-                    resolved = resolved.with_schema(schema, *schema_quoted);
-                }
-                Some(resolved)
+                Some(TargetName::new(name, *name_quoted).with_schema(schema, *schema_quoted))
             }
             _ => None,
         }

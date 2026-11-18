@@ -173,7 +173,7 @@ fn replacement_uses_catalog_identity_including_schema_quoting() {
         .map(|operator| {
             (
                 TargetName::new(operator.name(), operator.name_is_quoted())
-                    .with_schema(operator.schema().unwrap(), operator.schema_is_quoted()),
+                    .with_schema(operator.schema(), operator.schema_is_quoted()),
                 operator.result_type(&db),
             )
         })

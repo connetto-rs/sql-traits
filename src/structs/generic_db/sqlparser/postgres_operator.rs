@@ -163,7 +163,7 @@ impl PostgresCatalogOperator {
 
     /// Returns the schema that owns the operator.
     #[must_use]
-    pub fn schema(&self) -> Option<&str> {
+    pub fn schema(&self) -> &str {
         self.target.schema()
     }
 
@@ -479,7 +479,7 @@ pub(super) fn function_name_matches(
     !matches!(qualifier, super::Qualifier::RunTime)
         && case.identifiers_match(identity.name(), identity.name_is_quoted(), written, quoted)
         && super::schema_qualifiers_match(
-            identity.schema().map(|schema| (schema, identity.schema_is_quoted())),
+            Some((identity.schema(), identity.schema_is_quoted())),
             qualifier.named(),
             case,
         )
@@ -525,7 +525,7 @@ fn pg_type_identity(type_arrays: &TypeArrays, pg_type: PgType) -> Option<Catalog
         PgType::Array(element) => {
             let element = pg_type_identity(type_arrays, *element)?;
             let array = type_arrays.array_in(
-                element.schema()?,
+                element.schema(),
                 element.schema_is_quoted(),
                 element.name(),
                 element.name_is_quoted(),
@@ -554,13 +554,7 @@ fn target_identity(target: &TargetName<'_>) -> CatalogName {
 
 /// Compares schema identities using PostgreSQL identifier rules.
 fn schema_repeats(left: &CatalogName, right: &CatalogName) -> bool {
-    match (left.schema(), right.schema()) {
-        (Some(schema), Some(other)) => {
-            identifiers_match(schema, left.schema_is_quoted(), other, right.schema_is_quoted())
-        }
-        (None, None) => true,
-        (None, Some(_)) | (Some(_), None) => false,
-    }
+    left.schema_matches(right.schema(), right.schema_is_quoted())
 }
 
 /// Whether two catalog names hold the same schema-qualified identifier.

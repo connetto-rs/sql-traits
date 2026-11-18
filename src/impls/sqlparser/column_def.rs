@@ -1973,7 +1973,7 @@ mod tests {
         let built_ins = PostgresCatalog::postgres_18().collations().count();
         assert_eq!(catalog.collations().count(), built_ins);
         let is_c = |collation: &&PostgresCatalogCollation| {
-            collation.schema() == Some("pg_catalog") && collation.name() == "C"
+            collation.schema() == "pg_catalog" && collation.name() == "C"
         };
         assert_eq!(catalog.collations().filter(is_c).count(), 1);
         let newest = catalog.collations().next_back().expect("the catalog holds collations");
@@ -1998,7 +1998,7 @@ mod tests {
         let built_ins = PostgresCatalog::postgres_18().collatable_types().count();
         assert_eq!(catalog.collatable_types().count(), built_ins);
         let newest = catalog.collatable_types().last().expect("the catalog holds types");
-        assert_eq!((newest.schema(), newest.name()), (Some("pg_catalog"), "text"));
+        assert_eq!((newest.schema(), newest.name()), ("pg_catalog", "text"));
     }
 
     #[test]
