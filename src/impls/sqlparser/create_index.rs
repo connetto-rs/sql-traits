@@ -176,18 +176,21 @@ impl Metadata for MaterializedViewIndex {
 }
 
 impl MaterializedViewIndex {
+    /// The error saying a database holds no such index.
+    fn not_in_database(&self) -> LookupError {
+        ObjectKind::Index.not_in_database(&match self.index().name.as_ref() {
+            Some(name) => name.to_string(),
+            None => self.index().to_string(),
+        })
+    }
+
     /// The metadata `database` keeps for this index, or the error saying it
     /// holds no such index.
     fn metadata<'db>(
         &self,
         database: &'db ParserDB,
     ) -> Result<&'db IndexMetadata<Self>, LookupError> {
-        database.materialized_view_index_metadata(self).ok_or_else(|| {
-            ObjectKind::Index.not_in_database(&match self.index().name.as_ref() {
-                Some(name) => name.to_string(),
-                None => self.index().to_string(),
-            })
-        })
+        database.materialized_view_index_metadata(self).ok_or_else(|| self.not_in_database())
     }
 }
 
@@ -204,6 +207,8 @@ impl IndexLike for MaterializedViewIndex {
         Ok(None)
     }
 
+    /// An index is held with the view it is on, so a database lacking either
+    /// reports the index as one it does not hold.
     fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -211,13 +216,11 @@ impl IndexLike for MaterializedViewIndex {
     where
         Self: 'db,
     {
-        self.metadata(database)?;
         database
-            .materialized_view_by_identity(self.view())
+            .materialized_view_index_metadata(self)
+            .and_then(|_| database.materialized_view_by_identity(self.view()))
             .map(Relation::MaterializedView)
-            .ok_or_else(|| {
-                ObjectKind::MaterializedView.not_in_database(&self.index().table_name.to_string())
-            })
+            .ok_or_else(|| self.not_in_database())
     }
 
     #[inline]
