@@ -10,6 +10,8 @@ use sql_traits::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 
+use crate::support::table_lookup::trigger_table;
+
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
 }
@@ -169,7 +171,7 @@ fn a_trigger_name_on_two_tables_names_each_tables_own_trigger() {
                 .expect("the lookup runs")
                 .expect("the table exists");
             let trigger = db.trigger("t", table).expect("the table carries t");
-            assert_eq!(trigger.table(&db).expect("the trigger's table"), table);
+            assert_eq!(trigger_table(trigger, &db), table);
             let calls: Vec<&str> = db
                 .trigger_metadata(trigger)
                 .expect("the trigger is held")

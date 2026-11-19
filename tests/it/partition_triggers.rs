@@ -13,7 +13,7 @@ use sqlparser::{
     dialect::PostgreSqlDialect,
 };
 
-use crate::support::table_lookup::table;
+use crate::support::table_lookup::{table, trigger_table};
 
 const SCHEMA: &str =
     "CREATE FUNCTION f() RETURNS TRIGGER AS 'BEGIN RETURN NEW; END' LANGUAGE plpgsql;
@@ -53,9 +53,7 @@ fn triggers_on(database: &ParserDB, table_name: &str) -> Vec<(String, Option<Str
             let parent = trigger.parent_trigger(database).expect("trigger is in this database");
             (
                 trigger.name().to_owned(),
-                parent.map(|parent| {
-                    parent.table(database).expect("parent table exists").table_name().to_owned()
-                }),
+                parent.map(|parent| trigger_table(parent, database).table_name().to_owned()),
             )
         })
         .collect();
@@ -137,8 +135,8 @@ fn a_copy_is_neither_dropped_nor_replaced_on_its_own() {
         parse(&format!(
             "{schema} CREATE TRIGGER rowtrg AFTER INSERT ON p1a FOR EACH ROW EXECUTE FUNCTION f();"
         )),
-        Err(Error::TriggerAlreadyExists { trigger_name, table_name })
-            if trigger_name == "rowtrg" && table_name == "p1a"
+        Err(Error::TriggerAlreadyExists { trigger_name, relation_name })
+            if trigger_name == "rowtrg" && relation_name == "p1a"
     ));
 }
 
@@ -171,8 +169,8 @@ fn a_partition_holding_the_name_refuses_the_copy() {
             "CREATE TRIGGER n AFTER INSERT ON p1a FOR EACH ROW EXECUTE FUNCTION f();
              CREATE TRIGGER n AFTER INSERT ON p FOR EACH ROW EXECUTE FUNCTION f();"
         ),
-        Err(Error::TriggerAlreadyExists { trigger_name, table_name })
-            if trigger_name == "n" && table_name == "p1a"
+        Err(Error::TriggerAlreadyExists { trigger_name, relation_name })
+            if trigger_name == "n" && relation_name == "p1a"
     ));
     assert!(matches!(
         parse(
@@ -182,8 +180,8 @@ fn a_partition_holding_the_name_refuses_the_copy() {
              CREATE TRIGGER n AFTER INSERT ON q1 FOR EACH ROW EXECUTE FUNCTION f();
              ALTER TABLE p ATTACH PARTITION q FOR VALUES FROM (10) TO (20);"
         ),
-        Err(Error::TriggerAlreadyExists { trigger_name, table_name })
-            if trigger_name == "n" && table_name == "q1"
+        Err(Error::TriggerAlreadyExists { trigger_name, relation_name })
+            if trigger_name == "n" && relation_name == "q1"
     ));
     assert!(matches!(
         parse(
@@ -192,8 +190,8 @@ fn a_partition_holding_the_name_refuses_the_copy() {
              CREATE TRIGGER n AFTER INSERT ON p2 FOR EACH ROW EXECUTE FUNCTION f();
              ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (10) TO (20);"
         ),
-        Err(Error::TriggerAlreadyExists { trigger_name, table_name })
-            if trigger_name == "n" && table_name == "p2"
+        Err(Error::TriggerAlreadyExists { trigger_name, relation_name })
+            if trigger_name == "n" && relation_name == "p2"
     ));
 }
 

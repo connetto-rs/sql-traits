@@ -12,6 +12,8 @@ use sql_traits::{
 };
 use sqlparser::{ast::CreateTable, dialect::PostgreSqlDialect, parser::Parser};
 
+use crate::support::table_lookup::trigger_table;
+
 const REMOTE: &str = "CREATE ROLE app;
      CREATE FOREIGN TABLE remote (id INT NOT NULL, amount INT DEFAULT 0 CHECK (amount > 0))
      SERVER warehouse OPTIONS (schema_name 'sales', \"Table_Name\" 'Orders');";
@@ -361,7 +363,7 @@ fn a_trigger_on_a_foreign_table_is_kept_on_it_and_a_rule_is_refused() {
     ));
     let remote = foreign(&db, "remote");
     let trigger = db.triggers().next().expect("one trigger");
-    assert_eq!(trigger.table(&db).expect("its table resolves"), remote);
+    assert_eq!(trigger_table(trigger, &db), remote);
     assert_eq!(remote.triggers(&db).expect("held").count(), 1);
 
     assert!(matches!(

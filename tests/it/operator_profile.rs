@@ -727,17 +727,17 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
         self.unreach()
     }
 
-    fn table<'db>(
+    fn relation<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> Result<&'db <Self::DB as DatabaseLike>::Table, LookupError>
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
         self.unreach()
     }
 
-    fn target_table_name(&self) -> TargetName<'_> {
+    fn target_relation_name(&self) -> TargetName<'_> {
         self.unreach()
     }
 

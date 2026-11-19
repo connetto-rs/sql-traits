@@ -51,6 +51,10 @@ pub enum MaintenanceRefusal {
     /// without a body.
     #[error("the trigger's function has no body")]
     NoBody,
+    /// The trigger is defined on a view, where an assignment to `NEW` writes
+    /// no row, since the view stores none.
+    #[error("the trigger is defined on a view")]
+    OnView,
     /// The body does not parse as PL/pgSQL.
     #[error("the body does not parse: {reason}")]
     UnparsableBody {

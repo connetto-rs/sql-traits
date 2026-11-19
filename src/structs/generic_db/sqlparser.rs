@@ -1564,15 +1564,7 @@ impl ParserDBBuilder {
 
         for (trigger, _) in self.triggers_mut() {
             if table.named_by(&trigger.table_name) {
-                let trigger = Arc::make_mut(trigger);
-                for event in &mut trigger.events {
-                    if let TriggerEvent::Update(columns) = event {
-                        rename_column_idents(columns, from, to);
-                    }
-                }
-                if let Some(condition) = trigger.condition.as_mut() {
-                    rules::rename_row_column_in_expression(condition, from, to);
-                }
+                triggers::rename_column(Arc::make_mut(trigger), from, to);
             }
         }
 

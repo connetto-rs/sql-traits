@@ -21,7 +21,7 @@ pub(crate) use sqlparser::{ConstraintObject, OperatorRow, table_not_null};
 
 use crate::{
     structs::{ColumnIdentity, IdentifierCase, IdentityCounter, RelationIdentity, RoleSetting},
-    traits::{PolicyLike, RoleLike, SchemaLike, TableLike, TriggerLike},
+    traits::{PolicyLike, Relation, RoleLike, SchemaLike, TableLike, TriggerLike},
     utils::{
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{RelationKey, stored_view_key},
@@ -576,7 +576,12 @@ impl<P: SchemaProfile> GenericDB<P> {
             .iter()
             .map(|(t, _)| t.as_ref())
             .take_while(|t| t.name() == name)
-            .find(|t| t.table(self).is_ok_and(|on| on == table))
+            .find(|t| {
+                matches!(
+                    t.relation(self),
+                    Ok(Relation::Table(on) | Relation::ForeignTable(on)) if on == table
+                )
+            })
     }
 
     /// Returns a reference to the metadata of the specified trigger, if it
@@ -609,7 +614,7 @@ impl<P: SchemaProfile> GenericDB<P> {
             .binary_search_by(|(t, _)| {
                 t.name()
                     .cmp(trigger.name())
-                    .then_with(|| t.target_table_name().cmp(&trigger.target_table_name()))
+                    .then_with(|| t.target_relation_name().cmp(&trigger.target_relation_name()))
             })
             .ok()
             .map(|index| &self.triggers[index].1)

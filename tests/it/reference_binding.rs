@@ -14,6 +14,8 @@ use sqlparser::{
     parser::Parser,
 };
 
+use crate::support::table_lookup::trigger_table;
+
 fn db(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("the schema builds")
 }
@@ -76,7 +78,7 @@ fn every_reference_keeps_its_table_across_a_path_change() {
     ));
 
     let trigger = db.triggers().next().expect("the trigger exists");
-    assert_eq!(trigger.table(&db).expect("resolves").table_schema(), Some("app"));
+    assert_eq!(trigger_table(trigger, &db).table_schema(), Some("app"));
     let constraint_trigger =
         db.triggers().find(|trigger| trigger.name() == "ctrg").expect("ctrg exists");
     assert_eq!(
@@ -141,7 +143,7 @@ fn a_dropped_trigger_is_the_one_the_name_reaches() {
     ));
     let remaining: Vec<_> = db.triggers().collect();
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].table(&db).expect("resolves").table_schema(), None);
+    assert_eq!(trigger_table(remaining[0], &db).table_schema(), None);
 }
 
 #[test]
@@ -213,7 +215,7 @@ fn references_to_a_permanent_table_ignore_a_later_temporary_one() {
     assert!(!key.referenced_table(&db).expect("resolves").is_temporary());
 
     let trigger = db.triggers().next().expect("the trigger exists");
-    assert!(!trigger.table(&db).expect("resolves").is_temporary());
+    assert!(!trigger_table(trigger, &db).is_temporary());
 
     let policy = db.policies().next().expect("the policy exists");
     assert!(!policy.table(&db).expect("resolves").is_temporary());
@@ -239,7 +241,7 @@ fn references_reaching_a_temporary_table_bind_to_it() {
          CREATE INDEX i ON t (id);
          CREATE VIEW v AS SELECT id FROM t;"
     ));
-    assert!(db.triggers().next().expect("trigger").table(&db).expect("resolves").is_temporary());
+    assert!(trigger_table(db.triggers().next().expect("trigger"), &db).is_temporary());
     assert!(db.policies().next().expect("policy").table(&db).expect("resolves").is_temporary());
     assert!(TableIndexLike::table(db.indexes().next().expect("index"), &db).is_temporary());
     assert!(row_source(&db, "SELECT id FROM pg_temp.v").is_temporary());
@@ -257,7 +259,7 @@ fn a_dropped_trigger_is_the_one_on_the_temporary_table() {
     ));
     let remaining: Vec<_> = db.triggers().collect();
     assert_eq!(remaining.len(), 1);
-    assert!(!remaining[0].table(&db).expect("resolves").is_temporary());
+    assert!(!trigger_table(remaining[0], &db).is_temporary());
 }
 
 #[test]

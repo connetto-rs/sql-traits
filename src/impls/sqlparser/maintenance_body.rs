@@ -16,7 +16,7 @@ use super::dynamic_sites::BodyNames;
 use crate::{
     errors::LookupError,
     structs::{BodyExcerpt, IdentifierCase, MaintenanceRefusal},
-    traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike, TriggerLike},
+    traits::{ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike, TriggerLike},
     utils::{identifier_resolution::stored_identifier, walk::walk_expressions},
 };
 
@@ -29,7 +29,7 @@ pub(crate) type MaintenanceAssignments<'db, DB> = Vec<(&'db <DB as DatabaseLike>
 ///
 /// # Errors
 ///
-/// Returns the [`LookupError`] that resolving the table of `trigger`, or
+/// Returns the [`LookupError`] that resolving the relation of `trigger`, or
 /// reading its function's `search_path` setting or the columns of the table
 /// from `database`, raises.
 pub(crate) fn maintenance_assignments<'db, T: TriggerLike>(
@@ -41,7 +41,13 @@ pub(crate) fn maintenance_assignments<'db, T: TriggerLike>(
     else {
         return Ok(Err(MaintenanceRefusal::NoBody));
     };
-    body_assignments(function, body, trigger.table(database)?, database)
+    let table = match trigger.relation(database)? {
+        Relation::Table(table) | Relation::ForeignTable(table) => table,
+        Relation::View(_) | Relation::MaterializedView(_) | Relation::Sequence(_) => {
+            return Ok(Err(MaintenanceRefusal::OnView));
+        }
+    };
+    body_assignments(function, body, table, database)
 }
 
 /// The assignments of `body`, the PL/pgSQL body of `function` run by a

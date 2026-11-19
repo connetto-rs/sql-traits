@@ -1,5 +1,5 @@
-//! Triggers, and the copies PostgreSQL keeps of a row trigger on the
-//! partitions below its table.
+//! Triggers, on tables and on plain views, and the copies PostgreSQL keeps of
+//! a row trigger on the partitions below its table.
 //!
 //! A `FOR EACH ROW` trigger on a partitioned table is copied onto each of its
 //! partitions under the same name, and a copy on a partitioned partition onto
@@ -11,62 +11,164 @@
 //! Each trigger, copies included, carries its own enablement. An `ALTER
 //! TABLE` without `ONLY` that changes a row trigger's enablement changes
 //! every copy below it as well.
+//!
+//! A trigger on a view fires `INSTEAD OF` the write to the view, or under
+//! PostgreSQL also `BEFORE` or `AFTER` it once per statement. It goes with
+//! the view, follows its renames and outlives its replacement.
 
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 
 use sqlparser::ast::{
-    CreateTable, CreateTrigger, DropTrigger, Ident, ObjectName, TriggerObject, TriggerObjectKind,
+    CreateTable, CreateTrigger, DropTrigger, Ident, ObjectName, TriggerEvent, TriggerObject,
+    TriggerObjectKind, TriggerPeriod,
 };
 
 use super::{
-    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference,
+    AlterTableScope, NamedColumn, ParserDB, ParserDBBuilder, StoredTable, bind_reference,
     inheritance::{self, ParentKind},
-    object_names_match, require_named, stored_qualifier, stored_subqueries, views,
+    object_names_match, rename_column_idents, require_named, rules, stored_qualifier,
+    stored_subqueries, stored_view_qualifier,
+    views::{self, ViewHost},
 };
 use crate::{
-    errors::{Error, ObjectKind},
+    errors::{Error, ObjectKind, TriggerFiringRefusal},
+    impls::SqlparserDialect,
     structs::{TriggerEnablement, metadata::TriggerMetadata},
     traits::TableLike,
     utils::last_str,
 };
 
-/// Records a `CREATE TRIGGER` on the table its target reaches, with its
-/// copies on the partitions below when it fires per row.
+/// Records a `CREATE TRIGGER` on the table or plain view its target reaches,
+/// with its copies on the partitions below a table when it fires per row.
 ///
 /// # Errors
 ///
-/// Returns [`Error::RelationKindMismatch`] for a target a view holds,
-/// [`Error::TableNotFoundForTrigger`] for one nothing holds,
+/// Returns [`Error::TriggerFiringRefused`] for a timing, level, event or
+/// clause the engine of the dialect refuses on the relation,
+/// [`Error::RelationKindMismatch`] for a target a materialized view holds,
+/// [`Error::RelationNotFoundForTrigger`] for one nothing holds,
 /// [`Error::FunctionNotFoundForTrigger`] for a function the trigger cannot
-/// run, [`Error::TriggerAlreadyExists`] when the table or a partition below
+/// run, [`Error::TriggerAlreadyExists`] when the relation or a partition below
 /// carries a trigger of the name and the statement wrote no `OR REPLACE`,
 /// [`Error::ClonedTriggerReplaced`] when the trigger replaced is a copy, and
 /// [`Error::ConstraintTriggerOnForeignTable`] for a constraint trigger that
 /// would land on a foreign table.
 pub(super) fn create_trigger(
-    mut builder: ParserDBBuilder,
-    mut create_trigger: CreateTrigger,
+    builder: ParserDBBuilder,
+    create_trigger: CreateTrigger,
 ) -> Result<ParserDBBuilder, Error> {
     require_named(&create_trigger.name, ObjectKind::Trigger)?;
-    let Some(table) =
+    if let Some(table) =
         builder.resolve_table_object_name(&create_trigger.table_name)?.map(StoredTable::of)
-    else {
-        let table_name = last_str(&create_trigger.table_name).to_string();
-        // An `INSTEAD OF` trigger on a view is not modelled.
-        if let Some(actual_kind) = views::holds_view(&builder, &create_trigger.table_name) {
-            return Err(Error::RelationKindMismatch {
-                object_name: table_name,
-                expected_kind: ObjectKind::Table,
-                actual_kind,
-            });
-        }
-        return Err(Error::TableNotFoundForTrigger {
-            table_name,
-            trigger_name: last_str(&create_trigger.name).to_string(),
+    {
+        refuse_firing(&builder, &create_trigger, false)?;
+        let mut create_trigger = bind_parts(&builder, create_trigger)?;
+        builder.bind_table_reference(&mut create_trigger.table_name);
+        return create_on_table(builder, create_trigger, &table);
+    }
+    if let Some(view) = builder.resolve_view_object_name(&create_trigger.table_name)? {
+        let host = ViewHost::of_view(view);
+        let qualifier = stored_view_qualifier(view);
+        refuse_firing(&builder, &create_trigger, true)?;
+        let mut create_trigger = bind_parts(&builder, create_trigger)?;
+        bind_reference(&mut create_trigger.table_name, qualifier);
+        return create_on_view(builder, create_trigger, &host);
+    }
+    let relation_name = last_str(&create_trigger.table_name).to_string();
+    if let Some(actual_kind) = views::holds_view(&builder, &create_trigger.table_name) {
+        return Err(Error::RelationKindMismatch {
+            object_name: relation_name,
+            expected_kind: ObjectKind::Table,
+            actual_kind,
         });
-    };
-    stored_subqueries::refuse_in_trigger_condition(&builder, &create_trigger.condition)?;
+    }
+    Err(Error::RelationNotFoundForTrigger {
+        relation_name,
+        trigger_name: last_str(&create_trigger.name).to_string(),
+    })
+}
 
+/// Refuses `trigger` on its table, or on its view when `on_view` is set, when
+/// the engine of the dialect refuses its timing, level, events or clauses
+/// there. Other dialects refuse none.
+fn refuse_firing(
+    builder: &ParserDBBuilder,
+    trigger: &CreateTrigger,
+    on_view: bool,
+) -> Result<(), Error> {
+    let refusal = match builder.dialect() {
+        SqlparserDialect::PostgreSql => postgres_firing_refusal(trigger, on_view),
+        SqlparserDialect::SQLite => sqlite_firing_refusal(trigger, on_view),
+        _ => None,
+    };
+    refusal.map_or(Ok(()), |reason| {
+        Err(Error::TriggerFiringRefused {
+            trigger_name: last_str(&trigger.name).to_string(),
+            relation_name: last_str(&trigger.table_name).to_string(),
+            reason,
+        })
+    })
+}
+
+/// What PostgreSQL refuses in `trigger`, checking the relation's kind, then
+/// the shape of an `INSTEAD OF` trigger, then the transition tables, as
+/// PostgreSQL does.
+fn postgres_firing_refusal(trigger: &CreateTrigger, on_view: bool) -> Option<TriggerFiringRefusal> {
+    let instead = trigger.period == Some(TriggerPeriod::InsteadOf);
+    if on_view {
+        if !instead && fires_per_row(trigger) {
+            return Some(TriggerFiringRefusal::RowLevelBeforeOrAfterOnView);
+        }
+        if trigger.events.contains(&TriggerEvent::Truncate) {
+            return Some(TriggerFiringRefusal::TruncateOnView);
+        }
+    } else if instead {
+        return Some(TriggerFiringRefusal::InsteadOfOnTable);
+    }
+    if instead {
+        if !fires_per_row(trigger) {
+            return Some(TriggerFiringRefusal::InsteadOfPerStatement);
+        }
+        if trigger.condition.is_some() {
+            return Some(TriggerFiringRefusal::InsteadOfCondition);
+        }
+        if trigger
+            .events
+            .iter()
+            .any(|event| matches!(event, TriggerEvent::Update(columns) if !columns.is_empty()))
+        {
+            return Some(TriggerFiringRefusal::InsteadOfColumnList);
+        }
+    }
+    (on_view && !trigger.referencing.is_empty())
+        .then_some(TriggerFiringRefusal::TransitionTablesOnView)
+}
+
+/// What SQLite refuses in `trigger`: an `INSTEAD OF` trigger fires only on a
+/// view, and a view takes no other timing, a written-out one or the `BEFORE`
+/// a trigger writing none fires at.
+fn sqlite_firing_refusal(trigger: &CreateTrigger, on_view: bool) -> Option<TriggerFiringRefusal> {
+    match (on_view, trigger.period == Some(TriggerPeriod::InsteadOf)) {
+        (true, false) => Some(TriggerFiringRefusal::BeforeOrAfterOnView),
+        (false, true) => Some(TriggerFiringRefusal::InsteadOfOnTable),
+        _ => None,
+    }
+}
+
+/// `trigger` with its `WHEN` condition checked and the function it runs and
+/// the table its `FROM` names bound, which a trigger on a table and one on a
+/// view take alike.
+///
+/// # Errors
+///
+/// Returns the refusal of a subquery in the condition and
+/// [`Error::FunctionNotFoundForTrigger`] for a function the trigger cannot
+/// run.
+fn bind_parts(
+    builder: &ParserDBBuilder,
+    mut create_trigger: CreateTrigger,
+) -> Result<CreateTrigger, Error> {
+    stored_subqueries::refuse_in_trigger_condition(builder, &create_trigger.condition)?;
     if let Some(exec_body) = &mut create_trigger.exec_body {
         let Some(function) = builder.trigger_function(&exec_body.func_desc.name) else {
             return Err(Error::FunctionNotFoundForTrigger {
@@ -76,23 +178,28 @@ pub(super) fn create_trigger(
         };
         bind_reference(&mut exec_body.func_desc.name, stored_qualifier(&function.name));
     }
-
-    builder.bind_table_reference(&mut create_trigger.table_name);
     if let Some(referenced) = &mut create_trigger.referenced_table_name {
         builder.bind_table_reference(referenced);
     }
+    Ok(create_trigger)
+}
+
+/// Records `create_trigger`, bound to `table`, with its copies on the
+/// partitions below `table` when it fires per row.
+fn create_on_table(
+    mut builder: ParserDBBuilder,
+    create_trigger: CreateTrigger,
+    table: &StoredTable,
+) -> Result<ParserDBBuilder, Error> {
     refuse_constraint_trigger_on_foreign_table(
         &builder,
         &create_trigger,
-        ParserDB::stored_node(&builder, &table)?,
+        ParserDB::stored_node(&builder, table)?,
     )?;
 
-    if let Some(position) = position_on(&builder, &create_trigger.name, &table) {
+    if let Some(position) = position_on(&builder, &create_trigger.name, table) {
         if !create_trigger.or_replace {
-            return Err(Error::TriggerAlreadyExists {
-                trigger_name: last_str(&create_trigger.name).to_string(),
-                table_name: last_str(&create_trigger.table_name).to_string(),
-            });
+            return Err(already_exists(&create_trigger, last_str(&create_trigger.table_name)));
         }
         if builder.triggers()[position].1.is_clone() {
             return Err(Error::ClonedTriggerReplaced {
@@ -106,12 +213,30 @@ pub(super) fn create_trigger(
     let metadata = TriggerMetadata::new(builder.calls_in(&create_trigger.condition));
     // A statement trigger leaves the copies of the row trigger it replaces.
     if fires_per_row(&create_trigger) {
-        clone_down(&mut builder, &create_trigger, &metadata, &table, create_trigger.or_replace)?;
+        clone_down(&mut builder, &create_trigger, &metadata, table, create_trigger.or_replace)?;
     }
     Ok(builder.add_trigger(Arc::new(create_trigger), metadata))
 }
 
-/// Applies a `DROP TRIGGER`, dropping the copies below the trigger with it.
+/// Records `create_trigger`, bound to the view `host`.
+fn create_on_view(
+    mut builder: ParserDBBuilder,
+    create_trigger: CreateTrigger,
+    host: &ViewHost,
+) -> Result<ParserDBBuilder, Error> {
+    let existing = position_on(&builder, &create_trigger.name, host.stored());
+    if let Some(position) = existing {
+        if !create_trigger.or_replace {
+            return Err(already_exists(&create_trigger, last_str(&create_trigger.table_name)));
+        }
+        builder.triggers_mut().remove(position);
+    }
+    let metadata = TriggerMetadata::new(builder.calls_in(&create_trigger.condition));
+    Ok(builder.add_trigger(Arc::new(create_trigger), metadata))
+}
+
+/// Applies a `DROP TRIGGER`, dropping the copies below a trigger on a table
+/// with it.
 ///
 /// # Errors
 ///
@@ -122,12 +247,18 @@ pub(super) fn drop_trigger(
     mut builder: ParserDBBuilder,
     mut drop_trigger: DropTrigger,
 ) -> Result<ParserDBBuilder, Error> {
-    if let Some(table_name) = &mut drop_trigger.table_name {
-        builder.bind_table_reference(table_name);
+    if let Some(relation_name) = &mut drop_trigger.table_name {
+        if let Ok(Some(view)) = builder.resolve_view_object_name(relation_name) {
+            let qualifier = stored_view_qualifier(view);
+            bind_reference(relation_name, qualifier);
+        } else {
+            builder.bind_table_reference(relation_name);
+        }
     }
     let case = builder.identifier_case();
-    // Matching the table too spares a same-named trigger elsewhere, and a
-    // statement naming no table means a trigger written on one, never a copy.
+    // Matching the relation too spares a same-named trigger elsewhere, and a
+    // statement naming no relation means a trigger written on one, never a
+    // copy.
     let Some(position) = builder.triggers().iter().position(|(trigger, metadata)| {
         object_names_match(&trigger.name, &drop_trigger.trigger_name, case)
             && drop_trigger.table_name.as_ref().map_or(!metadata.is_clone(), |table_name| {
@@ -143,7 +274,11 @@ pub(super) fn drop_trigger(
     };
 
     let (trigger, metadata) = &builder.triggers()[position];
-    let table = holder(&builder, trigger)?;
+    // A trigger no table holds is on a view, which carries no copies.
+    let Some(table) = holder(&builder, trigger) else {
+        builder.triggers_mut().remove(position);
+        return Ok(builder);
+    };
     let name = trigger.name.clone();
     if metadata.is_clone() {
         let parent = ParserDB::stored_node(&builder, &table)?.partition_of.as_ref();
@@ -181,7 +316,7 @@ pub(super) fn clone_onto_partition(
         .collect();
     for (trigger, metadata) in row_triggers {
         if position_on(builder, &trigger.name, partition).is_some() {
-            return Err(already_exists(&trigger, partition));
+            return Err(already_exists(&trigger, &partition.name));
         }
         let clone = clone_onto(builder, &trigger, partition)?;
         clone_down(builder, &clone, &metadata, partition, false)?;
@@ -294,14 +429,14 @@ fn partitions(builder: &ParserDBBuilder, table: &StoredTable) -> Vec<StoredTable
 }
 
 /// The stored table holding `trigger`, found by the identity its stored name
-/// carries whatever the session's path has become since.
-fn holder(builder: &ParserDBBuilder, trigger: &CreateTrigger) -> Result<StoredTable, Error> {
+/// carries whatever the session's path has become since, or `None` for a
+/// trigger on a view.
+fn holder(builder: &ParserDBBuilder, trigger: &CreateTrigger) -> Option<StoredTable> {
     builder
         .tables()
         .iter()
         .map(|(table, _, _)| StoredTable::of(table))
         .find(|table| table.named_by(&trigger.table_name))
-        .ok_or_else(|| ObjectKind::Table.not_in_database(last_str(&trigger.table_name)).into())
 }
 
 /// Where the trigger named `name` on `table` is stored.
@@ -312,11 +447,12 @@ fn position_on(builder: &ParserDBBuilder, name: &ObjectName, table: &StoredTable
     })
 }
 
-/// The refusal of `trigger` on `table`, which carries one of its name.
-fn already_exists(trigger: &CreateTrigger, table: &StoredTable) -> Error {
+/// The refusal of `trigger` on the relation `relation_name`, which carries
+/// one of its name.
+fn already_exists(trigger: &CreateTrigger, relation_name: &str) -> Error {
     Error::TriggerAlreadyExists {
         trigger_name: last_str(&trigger.name).to_string(),
-        table_name: table.name.clone(),
+        relation_name: relation_name.to_string(),
     }
 }
 
@@ -362,7 +498,7 @@ fn clone_down(
     for partition in partitions(builder, table) {
         if let Some(position) = position_on(builder, &trigger.name, &partition) {
             if !replace {
-                return Err(already_exists(trigger, &partition));
+                return Err(already_exists(trigger, &partition.name));
             }
             builder.triggers_mut().remove(position);
         }
@@ -386,5 +522,52 @@ fn drop_with_clones(builder: &mut ParserDBBuilder, name: &ObjectName, table: &St
         if copied {
             drop_with_clones(builder, name, &partition);
         }
+    }
+}
+
+/// Drops the triggers on the view `host`, which is going away.
+pub(super) fn drop_on_view(builder: &mut ParserDBBuilder, host: &ViewHost) {
+    builder.triggers_mut().retain(|(trigger, _)| !host.named_by(&trigger.table_name));
+}
+
+/// Points the triggers on the renamed or moved view `host` at its stored name
+/// `new_name`.
+pub(super) fn follow_view_rename(
+    builder: &mut ParserDBBuilder,
+    host: &ViewHost,
+    new_name: &ObjectName,
+) {
+    for (trigger, _) in builder.triggers_mut() {
+        if host.named_by(&trigger.table_name) {
+            Arc::make_mut(trigger).table_name = new_name.clone();
+        }
+    }
+}
+
+/// Carries the rename of the column `from` of the view `host` to `to` into
+/// the triggers on the view.
+pub(super) fn follow_view_column_rename(
+    builder: &mut ParserDBBuilder,
+    host: &ViewHost,
+    from: &NamedColumn,
+    to: &Ident,
+) {
+    for (trigger, _) in builder.triggers_mut() {
+        if host.named_by(&trigger.table_name) {
+            rename_column(Arc::make_mut(trigger), from, to);
+        }
+    }
+}
+
+/// Renames the column `from` of the trigger's relation to `to` in the
+/// `UPDATE OF` lists and the `WHEN` condition of `trigger`.
+pub(super) fn rename_column(trigger: &mut CreateTrigger, from: &NamedColumn, to: &Ident) {
+    for event in &mut trigger.events {
+        if let TriggerEvent::Update(columns) = event {
+            rename_column_idents(columns, from, to);
+        }
+    }
+    if let Some(condition) = trigger.condition.as_mut() {
+        rules::rename_row_column_in_expression(condition, from, to);
     }
 }

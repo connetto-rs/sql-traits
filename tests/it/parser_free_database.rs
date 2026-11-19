@@ -1323,7 +1323,10 @@ impl TriggerLike for MemoryTrigger {
         &self.name
     }
 
-    fn table<'db>(&'db self, database: &'db Self::DB) -> Result<&'db MemoryTable, LookupError>
+    fn relation<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
@@ -1331,10 +1334,11 @@ impl TriggerLike for MemoryTrigger {
             .tables
             .iter()
             .find(|table| table.name == self.table_name)
-            .ok_or(LookupError::TableNotFound { object_name: self.table_name.clone() })
+            .map(Relation::Table)
+            .ok_or_else(|| LookupError::RelationNotFound { object_name: self.table_name.clone() })
     }
 
-    fn target_table_name(&self) -> TargetName<'_> {
+    fn target_relation_name(&self) -> TargetName<'_> {
         TargetName::new(&self.table_name, false)
     }
 

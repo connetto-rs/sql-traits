@@ -8,12 +8,12 @@ use sqlparser::ast::{ArgMode, CreateTrigger};
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, TargetName, TriggerEnablement, metadata::TriggerMetadata},
-    traits::{DatabaseLike, FunctionLike, Metadata, TableLike, TriggerLike},
+    traits::{DatabaseLike, FunctionLike, Metadata, Relation, TableLike, TriggerLike},
     utils::{
         identifier_resolution::stored_identifier,
         last_str,
         object_name::{
-            object_name_last_part, qualifier_of, resolve_required_bound_table_or_foreign_table,
+            object_name_last_part, qualifier_of, resolve_bound_relation_object_name,
             target_name_of_object_name,
         },
     },
@@ -46,20 +46,28 @@ impl TriggerLike for CreateTrigger {
         last_str(&self.name)
     }
 
-    #[inline]
-    fn table<'db>(
+    /// Ingestion bound the target to the relation it reached, so the name is
+    /// read as written with no search path. Only a table, a foreign table or
+    /// a plain view carries a trigger.
+    fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<&'db <Self::DB as DatabaseLike>::Table, LookupError>
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
-        // A foreign table carries triggers as a table does.
-        resolve_required_bound_table_or_foreign_table(&self.table_name, database)
+        match resolve_bound_relation_object_name(&self.table_name, database)? {
+            Some(
+                relation @ (Relation::Table(_) | Relation::ForeignTable(_) | Relation::View(_)),
+            ) => Ok(relation),
+            Some(Relation::MaterializedView(_) | Relation::Sequence(_)) | None => {
+                Err(LookupError::RelationNotFound { object_name: self.table_name.to_string() })
+            }
+        }
     }
 
     #[inline]
-    fn target_table_name(&self) -> TargetName<'_> {
+    fn target_relation_name(&self) -> TargetName<'_> {
         target_name_of_object_name(&self.table_name)
     }
 
@@ -102,8 +110,13 @@ impl TriggerLike for CreateTrigger {
         if !trigger_metadata(self, database)?.is_clone() {
             return Ok(None);
         }
-        Ok(self
-            .table(database)?
+        // A copy lives on a partition, which is a table or a foreign table.
+        let (Relation::Table(partition) | Relation::ForeignTable(partition)) =
+            self.relation(database)?
+        else {
+            return Ok(None);
+        };
+        Ok(partition
             .partition_root(database)?
             .and_then(|parent_table| database.trigger(self.name(), parent_table)))
     }

@@ -6,7 +6,7 @@ use crate::{
     errors::LookupError,
     impls::maintenance_assignments,
     structs::{MaintenanceRefusal, TargetName, TriggerEnablement},
-    traits::{DatabaseLike, Metadata},
+    traits::{DatabaseLike, Metadata, Relation},
 };
 
 /// A trait for types that can be treated as SQL triggers.
@@ -65,20 +65,24 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// ```
     fn name(&self) -> &str;
 
-    /// Returns the table the trigger is associated with, the one its target
-    /// reached when the trigger was created.
+    /// Returns the table or view the trigger is defined on, the one its
+    /// target reached when the trigger was created.
+    ///
+    /// A trigger on a table answers [`Relation::Table`], one on a foreign
+    /// table [`Relation::ForeignTable`], and one on a plain view, such as the
+    /// `INSTEAD OF` triggers that make a view writable, [`Relation::View`].
     ///
     /// # Arguments
     ///
-    /// * `database` - A reference to the database instance to query the table
-    ///   from.
+    /// * `database` - A reference to the database instance to query the
+    ///   relation from.
     ///
     /// # Errors
     ///
-    /// Returns [`LookupError::TableNotFound`] when no table matches the target,
-    /// and [`LookupError::InvalidObjectName`] or
-    /// [`LookupError::AmbiguousTableLookup`] when the target name cannot denote
-    /// a single table.
+    /// Returns [`LookupError::RelationNotFound`] when neither a table nor a
+    /// view matches the target, and [`LookupError::InvalidObjectName`] or
+    /// [`LookupError::AmbiguousTableLookup`] when the target name cannot
+    /// denote a single relation.
     ///
     /// # Example
     ///
@@ -98,7 +102,7 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// ",
     /// )?;
     /// let trigger = db.triggers().next().unwrap();
-    /// let table = trigger.table(&db)?;
+    /// let Relation::Table(table) = trigger.relation(&db)? else { panic!("a table") };
     /// assert_eq!(table.table_name(), "MyTable");
     /// assert_eq!(table.table_schema(), Some("app"));
     /// # Ok(())
@@ -114,11 +118,11 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     ///
     /// let sql = "
     /// CREATE TABLE my_table (id INT);
+    /// CREATE VIEW my_view AS SELECT id FROM my_table;
     /// CREATE TRIGGER my_trigger
-    /// AFTER INSERT ON my_table
-    /// FOR EACH ROW
+    /// INSTEAD OF INSERT ON my_view
     /// BEGIN
-    ///     UPDATE my_table SET id = id + 1;
+    ///     INSERT INTO my_table (id) VALUES (NEW.id);
     /// END;
     /// ";
     ///
@@ -126,25 +130,25 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// let statements = Parser::parse_sql(&dialect, sql)?;
     /// let db = ParserDB::from_statements(statements, "test".to_string())?;
     /// let trigger = db.triggers().next().unwrap();
-    /// let table = trigger.table(&db)?;
-    /// assert_eq!(table.table_name(), "my_table");
+    /// let Relation::View(view) = trigger.relation(&db)? else { panic!("a view") };
+    /// assert_eq!(view.view_name(), "my_view");
     /// # Ok(())
     /// # }
     /// ```
-    fn table<'db>(
+    fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<&'db <Self::DB as DatabaseLike>::Table, LookupError>
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db;
 
-    /// Returns the table name the trigger targets, as ingestion bound it.
+    /// Returns the relation name the trigger targets, as ingestion bound it.
     ///
-    /// The name carries the qualifier of the table it reached when the trigger
-    /// was created, or none for a table in the default schema, and keeps the
-    /// quoting written on the table name. Unlike [`Self::table`] this applies
-    /// no resolution and cannot fail, so a caller with its own resolution rules
-    /// can read the target and resolve it itself.
+    /// The name carries the qualifier of the table or view it reached when the
+    /// trigger was created, or none for a relation in the default schema, and
+    /// keeps the quoting written on the name. Unlike [`Self::relation`] this
+    /// applies no resolution and cannot fail, so a caller with its own
+    /// resolution rules can read the target and resolve it itself.
     ///
     /// # Example
     ///
@@ -164,7 +168,7 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// ",
     /// )?;
     /// let trigger = db.triggers().next().unwrap();
-    /// let target = trigger.target_table_name();
+    /// let target = trigger.target_relation_name();
     /// assert_eq!(target.name(), "MyTable");
     /// assert!(target.name_is_quoted());
     /// assert_eq!(target.schema(), Some("app"));
@@ -191,13 +195,13 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// ",
     /// )?;
     /// let trigger = db.triggers().next().unwrap();
-    /// let target = trigger.target_table_name();
+    /// let target = trigger.target_relation_name();
     /// assert_eq!(target.name(), "my_table");
     /// assert_eq!(target.schema(), None);
     /// # Ok(())
     /// # }
     /// ```
-    fn target_table_name(&self) -> TargetName<'_>;
+    fn target_relation_name(&self) -> TargetName<'_>;
 
     /// Returns the events that fire the trigger.
     ///
@@ -439,7 +443,7 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// # Errors
     ///
     /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this trigger, and the errors of [`Self::table`] when the table
+    /// hold this trigger, and the errors of [`Self::relation`] when the table
     /// holding a copy cannot be found.
     ///
     /// # Example
@@ -463,7 +467,7 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// let copy = low.triggers(&db)?.next().unwrap();
     /// let parent = copy.parent_trigger(&db)?.unwrap();
     /// assert_eq!(parent.name(), "audit");
-    /// assert_eq!(parent.table(&db)?.table_name(), "events");
+    /// assert_eq!(parent.target_relation_name().name(), "events");
     /// assert!(parent.parent_trigger(&db)?.is_none());
     /// # Ok(())
     /// # }
@@ -658,11 +662,13 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`LookupError::TableNotFound`] when no table matches the target,
-    /// and [`LookupError::InvalidObjectName`] or
-    /// [`LookupError::AmbiguousTableLookup`] when the target name cannot denote
-    /// a single table. The assigned columns are resolved against that table, so
-    /// the question cannot be decided without it.
+    /// Returns [`LookupError::RelationNotFound`] when neither a table nor a
+    /// view matches the target, and [`LookupError::InvalidObjectName`] or
+    /// [`LookupError::AmbiguousTableLookup`] when the target name cannot
+    /// denote a single relation. The assigned columns are resolved against
+    /// the table the trigger is on, so the question cannot be decided without
+    /// it. A trigger on a view is no maintenance trigger, as
+    /// [`MaintenanceRefusal::OnView`] says.
     #[inline]
     fn is_maintenance_trigger<'db>(
         &'db self,
@@ -790,10 +796,11 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`LookupError::TableNotFound`] when no table matches the target,
-    /// and [`LookupError::InvalidObjectName`] or
-    /// [`LookupError::AmbiguousTableLookup`] when the target name cannot denote
-    /// a single table. The assigned columns are resolved against that table.
+    /// Returns [`LookupError::RelationNotFound`] when neither a table nor a
+    /// view matches the target, and [`LookupError::InvalidObjectName`] or
+    /// [`LookupError::AmbiguousTableLookup`] when the target name cannot
+    /// denote a single relation. The assigned columns are resolved against
+    /// the table the trigger is on.
     #[inline]
     fn maintenance_assignments<'db>(
         &'db self,
@@ -813,18 +820,18 @@ impl<T: TriggerLike> TriggerLike for &T {
         (*self).name()
     }
 
-    fn table<'db>(
+    fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> Result<&'db <Self::DB as DatabaseLike>::Table, LookupError>
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
-        (*self).table(database)
+        (*self).relation(database)
     }
 
-    fn target_table_name(&self) -> TargetName<'_> {
-        (*self).target_table_name()
+    fn target_relation_name(&self) -> TargetName<'_> {
+        (*self).target_relation_name()
     }
 
     fn events(&self) -> &[sqlparser::ast::TriggerEvent] {
@@ -910,6 +917,17 @@ mod tests {
         traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
     };
 
+    /// The table `trigger` is defined on in `db`.
+    fn table_of<'db>(
+        trigger: &'db impl TriggerLike<DB = ParserDB>,
+        db: &'db ParserDB,
+    ) -> &'db <ParserDB as DatabaseLike>::Table {
+        match trigger.relation(db) {
+            Ok(Relation::Table(table)) => table,
+            other => panic!("the trigger is on a table, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_trigger_ref_implementation() {
         let sql = r"
@@ -934,7 +952,7 @@ mod tests {
 
         assert_eq!(trigger_ref.name(), "my_trigger");
 
-        let table = trigger_ref.table(&db).expect("Table not found");
+        let table = table_of(trigger_ref, &db);
         assert_eq!(table.table_name(), "users");
 
         let events = trigger_ref.events();
@@ -1051,7 +1069,7 @@ mod tests {
         ";
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let trigger = db.triggers().next().expect("Trigger not found");
-        let table = trigger.table(&db).expect("Trigger target should resolve");
+        let table = table_of(trigger, &db);
 
         assert_eq!(table.table_name(), "docs");
         assert_eq!(table.table_schema(), Some("app"));
@@ -1066,7 +1084,7 @@ mod tests {
         "#;
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let trigger = db.triggers().next().expect("Trigger not found");
-        let table = trigger.table(&db).expect("Trigger target should resolve");
+        let table = table_of(trigger, &db);
 
         assert_eq!(table.table_name(), "MyTable");
         assert_eq!(table.table_schema(), None);
@@ -1082,7 +1100,7 @@ mod tests {
         ";
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let trigger = db.triggers().next().expect("Trigger not found");
-        let table = trigger.table(&db).expect("the rename carried the trigger along");
+        let table = table_of(trigger, &db);
 
         assert_eq!(table.table_name(), "people");
     }
@@ -1105,8 +1123,8 @@ mod tests {
         let trigger = with_trigger.triggers().next().expect("Trigger not found");
 
         assert_eq!(
-            trigger.table(&elsewhere).err(),
-            Some(LookupError::TableNotFound { object_name: "users".to_string() })
+            trigger.relation(&elsewhere).err(),
+            Some(LookupError::RelationNotFound { object_name: "users".to_string() })
         );
     }
 }

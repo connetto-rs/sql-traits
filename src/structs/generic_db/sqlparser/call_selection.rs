@@ -371,7 +371,11 @@ impl ParserDBBuilder {
             }
         }
         for (trigger, metadata) in self.triggers() {
-            if let (true, Ok(table)) = (is_waiting(metadata.calls()), trigger.table(database)) {
+            // A trigger on a view sees rows the typing scopes do not describe,
+            // as a rule on one does.
+            if let (true, Ok(Relation::Table(table) | Relation::ForeignTable(table))) =
+                (is_waiting(metadata.calls()), trigger.relation(database))
+            {
                 select.roots(&trigger.condition, &ExpressionScope::Trigger(table));
             }
         }

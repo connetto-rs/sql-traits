@@ -20,6 +20,8 @@ use sql_traits::{
 };
 use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 
+use crate::support::table_lookup::trigger_table;
+
 const ON_THE_PATH: &str = "CREATE SCHEMA app;
      SET search_path TO app;
      CREATE TABLE app.docs (id INT PRIMARY KEY);
@@ -45,7 +47,7 @@ fn every_statement_kind_resolves_through_the_path() {
     assert_eq!(policy.table(&db).expect("resolves").table_schema(), Some("app"));
 
     let trigger = db.triggers().next().expect("the trigger exists");
-    assert_eq!(trigger.table(&db).expect("resolves").table_schema(), Some("app"));
+    assert_eq!(trigger_table(trigger, &db).table_schema(), Some("app"));
 
     let grant = db.table_grants().next().expect("the grant exists");
     assert_eq!(grant.tables(&db).count(), 1);
