@@ -2074,6 +2074,21 @@ fn functions_without_volatility_metadata_report_volatile() -> Result<(), LookupE
     Ok(())
 }
 
+/// An engine that records no aggregate state answers that no function returns
+/// `NULL` over no input row or over `NULL` inputs, the answer that never hides
+/// a value.
+#[test]
+fn functions_without_aggregate_state_report_no_null_result() -> Result<(), LookupError> {
+    let catalog = catalog();
+    let function = catalog
+        .resolve_target_function(TargetName::new("touch", false), IdentifierCase::AsWritten)?
+        .expect("the default schema holds one");
+
+    assert!(!function.returns_null_over_no_input_row(&catalog));
+    assert!(!function.returns_null_over_null_inputs(&catalog));
+    Ok(())
+}
+
 /// A body the catalog stores as text is parsed under the catalog's dialect
 /// and read under the path the function pins, as a parsed script reads it.
 #[test]

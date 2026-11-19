@@ -124,8 +124,8 @@ impl Language {
 pub(super) struct AggregateState {
     /// `pg_aggregate.agginitval` is `NULL`, so the state starts `NULL`.
     pub(super) initial_null: bool,
-    /// `pg_aggregate.aggtransfn`'s `pg_proc.proisstrict`: a `NULL` input
-    /// leaves the state untouched.
+    /// `pg_aggregate.aggtransfn` is strict in `pg_proc.proisstrict`, so a
+    /// `NULL` input leaves the state untouched.
     pub(super) transition_strict: bool,
     /// `pg_aggregate.aggfinalfn` is set and not strict, so the final function
     /// may turn a `NULL` state into a value.
@@ -133,17 +133,18 @@ pub(super) struct AggregateState {
 }
 
 impl AggregateState {
-    /// Whether the aggregate returns `NULL` when it aggregates no input row:
-    /// a `NULL` initial state that no non-strict final function turns into a
-    /// value. The transition function is never called, so its strictness does
-    /// not matter.
+    /// Whether the aggregate returns `NULL` when it aggregates no input row,
+    /// which holds when the state starts `NULL` and no non-strict final
+    /// function turns it into a value. The transition function is never
+    /// called, so its strictness does not matter.
     const fn returns_null_over_no_input_row(self) -> bool {
         self.initial_null && !self.final_nonstrict
     }
 
     /// Whether the aggregate returns `NULL` when every input it aggregates is
-    /// `NULL`: a `NULL` initial state a strict transition function never moves
-    /// and no non-strict final function turns into a value.
+    /// `NULL`, which holds when the state starts `NULL`, a strict transition
+    /// function never moves it, and no non-strict final function turns it
+    /// into a value.
     const fn returns_null_over_null_inputs(self) -> bool {
         self.initial_null && self.transition_strict && !self.final_nonstrict
     }

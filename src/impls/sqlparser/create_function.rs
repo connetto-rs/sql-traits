@@ -207,8 +207,7 @@ impl FunctionLike for CreateFunction {
 
     #[inline]
     fn returns_null_over_null_inputs(&self, database: &Self::DB) -> bool {
-        function_metadata(self, database)
-            .is_ok_and(FunctionMetadata::returns_null_over_null_inputs)
+        function_metadata(self, database).is_ok_and(FunctionMetadata::returns_null_over_null_inputs)
     }
 
     fn written_body(&self) -> Option<FunctionBody<'_>> {
