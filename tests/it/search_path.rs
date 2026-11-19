@@ -51,7 +51,7 @@ fn every_statement_kind_resolves_through_the_path() {
     assert_eq!(grant.tables(&db).count(), 1);
 
     let index = db.indexes().next().expect("the index exists");
-    assert_eq!(IndexLike::table(index, &db).table_schema(), Some("app"));
+    assert_eq!(TableIndexLike::table(index, &db).table_schema(), Some("app"));
 
     let child = db
         .table_by_target(
@@ -791,7 +791,7 @@ fn statements_may_qualify_the_default_schema() {
     assert!(core::ptr::eq(policy.table(&db).expect("resolves"), docs));
 
     let index = db.indexes().next().expect("the index exists");
-    assert_eq!(IndexLike::table(index, &db).table_name(), "docs");
+    assert_eq!(TableIndexLike::table(index, &db).table_name(), "docs");
 
     let grant = db.table_grants().next().expect("the grant exists");
     assert_eq!(grant.tables(&db).count(), 1);

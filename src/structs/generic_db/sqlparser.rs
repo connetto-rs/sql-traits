@@ -42,8 +42,9 @@ use crate::{
     impls::{PrivilegeKind, SqlparserDialect},
     structs::{
         ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
-        IdentifierCase, MaterializedView, RelationIdentity, RoleMembership, Schema, SchemaProfile,
-        Sequence, TableAttribute, TableMetadata, TriggerEnablement, UserDefinedType, View,
+        IdentifierCase, MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership,
+        Schema, SchemaProfile, Sequence, TableAttribute, TableMetadata, TriggerEnablement,
+        UserDefinedType, View,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -97,6 +98,7 @@ mod grantors;
 mod inheritance;
 mod leading_comments;
 mod like;
+mod materialized_view_indexes;
 mod operator_carry;
 mod operator_ddl;
 mod parse_options;
@@ -161,6 +163,7 @@ impl SchemaProfile for SqlparserProfile {
     type Column = TableAttribute<CreateTable, ColumnDef>;
     type DataType = DataType;
     type Index = TableAttribute<CreateTable, CreateIndex>;
+    type MaterializedViewIndex = MaterializedViewIndex;
     type UniqueIndex = TableAttribute<CreateTable, UniqueConstraint>;
     type ForeignKey = TableAttribute<CreateTable, ForeignKeyConstraint>;
     type Function = CreateFunction;
@@ -1203,6 +1206,9 @@ impl ParserDBBuilder {
         for (_, metadata) in self.indices_mut() {
             metadata.replace_function(stale, fresh);
         }
+        for (_, metadata) in self.materialized_view_indices_mut() {
+            metadata.replace_function(stale, fresh);
+        }
         for (_, metadata) in self.unique_indices_mut() {
             metadata.replace_function(stale, fresh);
         }
@@ -2068,13 +2074,41 @@ impl ParserDBBuilder {
         &self,
         create_index: &CreateIndex,
     ) -> Result<Option<Ident>, crate::errors::Error> {
-        let Some(table) = self.resolve_table_object_name(&create_index.table_name)? else {
-            return Err(crate::errors::Error::TableNotFoundForIndex {
-                table_name: last_str(&create_index.table_name).to_string(),
-                index_name: "<unnamed>".to_string(),
-            });
-        };
+        if self.resolve_table_object_name(&create_index.table_name)?.is_none()
+            && let Some(view) =
+                self.resolve_materialized_view_object_name(&create_index.table_name)?
+        {
+            return Ok(generated_names::create_index_name_on_view(self, view, create_index));
+        }
+        let table = self.index_table(create_index)?;
         Ok(generated_names::create_index_name(self, table, create_index))
+    }
+
+    /// The table a `CREATE INDEX` that reaches no materialized view is on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::Error::RelationKindMismatch`] when the name
+    /// reaches a relation PostgreSQL does not index, and
+    /// [`crate::errors::Error::TableNotFoundForIndex`] when it reaches none.
+    fn index_table(
+        &self,
+        create_index: &CreateIndex,
+    ) -> Result<&CreateTable, crate::errors::Error> {
+        if let Some(table) = self.resolve_table_object_name(&create_index.table_name)? {
+            return Ok(table);
+        }
+        if let Some((actual_kind, _)) = self.relation_reached(&create_index.table_name) {
+            return Err(crate::errors::Error::RelationKindMismatch {
+                object_name: create_index.table_name.to_string(),
+                expected_kind: ObjectKind::Table,
+                actual_kind,
+            });
+        }
+        Err(crate::errors::Error::TableNotFoundForIndex {
+            table_name: last_str(&create_index.table_name).to_string(),
+            index_name: create_index.name.as_ref().map_or("<unnamed>", last_str).to_string(),
+        })
     }
 
     /// Resolves a reference a stored node carries, which ingestion bound, so
@@ -2090,26 +2124,39 @@ impl ParserDBBuilder {
         )
     }
 
-    /// The position of the index a written name reaches through the shared
-    /// relation pool, refusing a name another kind holds there.
-    fn index_position(&self, name: &ObjectName) -> Result<Option<usize>, crate::errors::Error> {
-        let Some((index_name, index_quoted)) = object_name_last_part(name) else {
+    /// Where the index a written name reaches through the shared relation
+    /// pool is stored, refusing a name another kind holds there.
+    fn index_position(&self, name: &ObjectName) -> Result<Option<IndexSlot>, crate::errors::Error> {
+        let Some(written) = object_name_last_part(name) else {
             return Ok(None);
         };
         let case = self.identifier_case();
         match self.relation_reached(name) {
             None => Ok(None),
             Some((ObjectKind::Index, schema)) => {
-                Ok(self.indices().iter().position(|(index, _)| {
+                let on_table = self.indices().iter().position(|(index, _)| {
                     index.attribute().name.as_ref().and_then(object_name_last_part).is_some_and(
                         |(stored, quoted)| {
-                            case.identifiers_match(stored, quoted, index_name, index_quoted)
+                            case.identifiers_match(stored, quoted, written.0, written.1)
                         },
                     ) && schema_qualifiers_match(
                         table_schema_qualifier(TableAttribute::table(index.as_ref())),
                         Some(schema),
                         case,
                     )
+                });
+                Ok(on_table.map(IndexSlot::Table).or_else(|| {
+                    self.materialized_view_indices()
+                        .iter()
+                        .position(|(index, _)| {
+                            materialized_view_indexes::holds_name(
+                                index,
+                                written,
+                                Some(schema),
+                                case,
+                            )
+                        })
+                        .map(IndexSlot::MaterializedView)
                 }))
             }
             Some((actual_kind, _)) => {
@@ -2122,12 +2169,19 @@ impl ParserDBBuilder {
         }
     }
 
-    /// Removes the index at `position`, from the index store and from the
-    /// metadata of the table it is on.
-    fn remove_index_at(&mut self, position: usize) {
-        let (removed, _) = self.indices_mut().remove(position);
-        for (_, table_meta, _) in self.tables_mut() {
-            table_meta.retain_indices(|index| !Arc::ptr_eq(index, &removed));
+    /// Removes the index stored at `slot`, an index on a table from the
+    /// metadata of that table too.
+    fn remove_index_at(&mut self, slot: IndexSlot) {
+        match slot {
+            IndexSlot::Table(position) => {
+                let (removed, _) = self.indices_mut().remove(position);
+                for (_, table_meta, _) in self.tables_mut() {
+                    table_meta.retain_indices(|index| !Arc::ptr_eq(index, &removed));
+                }
+            }
+            IndexSlot::MaterializedView(position) => {
+                self.materialized_view_indices_mut().remove(position);
+            }
         }
     }
 
@@ -2435,6 +2489,15 @@ impl StoredTable {
             name_quoted: table.table_name_is_quoted(),
             schema: table.table_schema().map(str::to_string),
             schema_quoted: table.table_schema_is_quoted(),
+        }
+    }
+
+    fn of_view<V: ViewLike>(view: &V) -> Self {
+        Self {
+            name: view.view_name().to_string(),
+            name_quoted: view.view_name_is_quoted(),
+            schema: view.view_schema().map(str::to_string),
+            schema_quoted: view.view_schema_is_quoted(),
         }
     }
 
@@ -4134,6 +4197,15 @@ fn stored_view_qualifier<V: ViewLike>(view: &V) -> Option<Ident> {
     })
 }
 
+/// Where an index a statement names is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexSlot {
+    /// At this position among the indexes on tables.
+    Table(usize),
+    /// At this position among the indexes on materialized views.
+    MaterializedView(usize),
+}
+
 /// The relation a reference reached when the statement holding it ran.
 struct BoundRelation {
     /// Qualifier that relation is stored under.
@@ -4376,7 +4448,8 @@ fn relation_names_of(create_table: &CreateTable) -> Vec<(ObjectKind, &Ident)> {
 }
 
 /// Refuses a qualifier on the name of `create_index` naming a schema other
-/// than the one `table` is in, since an index lives in its table's schema.
+/// than `schema`, the one its relation `relation_name` is in, since an index
+/// lives in its relation's schema.
 ///
 /// # Errors
 ///
@@ -4384,7 +4457,8 @@ fn relation_names_of(create_table: &CreateTable) -> Vec<(ObjectKind, &Ident)> {
 /// names another schema.
 fn refuse_index_in_another_schema(
     create_index: &CreateIndex,
-    table: &CreateTable,
+    relation_name: &str,
+    schema: SchemaQualifier<'_>,
     case: IdentifierCase,
 ) -> Result<(), crate::errors::Error> {
     let Some(name) = create_index.name.as_ref() else {
@@ -4393,13 +4467,13 @@ fn refuse_index_in_another_schema(
     let Some(written) = qualifier_of(name).named() else {
         return Ok(());
     };
-    if schema_qualifiers_match(Some(written), table_schema_qualifier(table), case) {
+    if schema_qualifiers_match(Some(written), schema, case) {
         return Ok(());
     }
     Err(crate::errors::Error::IndexInAnotherSchema {
         index_name: last_str(name).to_string(),
         schema_name: written.0.to_string(),
-        table_name: table.table_name().to_string(),
+        table_name: relation_name.to_string(),
     })
 }
 
@@ -4425,15 +4499,24 @@ where
 }
 
 /// Returns the kind of index already holding `name` in `schema`, if any,
-/// whether it came from a `CREATE INDEX` or from a named `UNIQUE` or
-/// `PRIMARY KEY` constraint.
+/// whether it came from a `CREATE INDEX` on a table or a materialized view or
+/// from a named `UNIQUE` or `PRIMARY KEY` constraint.
 fn index_name_holder(
     builder: &ParserDBBuilder,
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
     let case = builder.identifier_case();
-    if builder.indices().iter().any(|(index, _)| index_holds_name(index, name, schema, case)) {
+    if builder.indices().iter().any(|(index, _)| index_holds_name(index, name, schema, case))
+        || builder.materialized_view_indices().iter().any(|(index, _)| {
+            materialized_view_indexes::holds_name(
+                index,
+                (name.value.as_str(), name.quote_style.is_some()),
+                schema,
+                case,
+            )
+        })
+    {
         return Some(ObjectKind::Index);
     }
     builder
@@ -4511,9 +4594,9 @@ fn sequence_name_holder(
 /// Returns the kind of relation already holding `name` in `schema`, if any.
 ///
 /// Tables and foreign tables in a schema, views and materialized views over
-/// them, sequences, and indexes on tables all share one pool of names. A
-/// relation the caller is about to replace has to be out of the stores before
-/// this is asked.
+/// them, sequences, and indexes on tables and materialized views all share one
+/// pool of names. A relation the caller is about to replace has to be out of
+/// the stores before this is asked.
 fn relation_name_holder(
     builder: &ParserDBBuilder,
     name: &Ident,
@@ -5859,7 +5942,7 @@ impl ParserDB {
             &mut calls,
         );
         table_metadata.add_unique_index(unique_index.clone());
-        let metadata = UniqueIndexMetadata::new(expression, create_table.clone()).with_calls(calls);
+        let metadata = UniqueIndexMetadata::new(expression).with_calls(calls);
         builder.add_unique_index(unique_index, metadata)
     }
 
@@ -5875,15 +5958,13 @@ impl ParserDB {
         ),
         crate::errors::Error,
     > {
-        let table_name = last_str(&create_index.table_name);
-
-        let Some(table) = builder.resolve_table_object_name(&create_index.table_name)? else {
-            return Err(crate::errors::Error::TableNotFoundForIndex {
-                table_name: table_name.to_string(),
-                index_name: create_index.name.as_ref().map_or("<unnamed>", last_str).to_string(),
-            });
-        };
-        refuse_index_in_another_schema(&create_index, table, builder.identifier_case())?;
+        let table = builder.index_table(&create_index)?;
+        refuse_index_in_another_schema(
+            &create_index,
+            table.table_name(),
+            table_schema_qualifier(table),
+            builder.identifier_case(),
+        )?;
         builder.refuse_foreign_table(table, &create_index.table_name)?;
         if create_index.unique {
             Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
@@ -5903,8 +5984,8 @@ impl ParserDB {
                 reason: "index has no columns".to_string(),
             });
         };
-        let metadata = IndexMetadata::new(expression, Arc::new(table.clone()))
-            .with_calls(builder.calls_in(index_arc.attribute()));
+        let metadata =
+            IndexMetadata::new(expression).with_calls(builder.calls_in(index_arc.attribute()));
         Ok((index_arc, metadata))
     }
 
@@ -6263,10 +6344,7 @@ impl ParserDB {
             metadata.add_index(index.clone());
             let mut calls = builder.calls_carried(index.attribute(), &mut carried);
             carried.operators.take_index(index.attribute(), selections, &mut calls);
-            builder = builder.add_index(
-                index,
-                IndexMetadata::new(expression, replacement.clone()).with_calls(calls),
-            );
+            builder = builder.add_index(index, IndexMetadata::new(expression).with_calls(calls));
         }
 
         builder = Self::ingest_table_node_with_collations(
@@ -9873,14 +9951,25 @@ impl ParserDB {
                             constraint_names::rename_key_index(builder, stored, old, new_ident)?;
                         continue;
                     }
-                    let Some(position) = builder.index_position(&name)? else {
+                    let Some(slot) = builder.index_position(&name)? else {
                         return Err(crate::errors::Error::AlterIndexNotFound {
                             index_name: last_str(&name).to_string(),
                         });
                     };
 
-                    let (stored, metadata) = builder.indices()[position].clone();
-                    let schema = table_schema_qualifier(TableAttribute::table(stored.as_ref()));
+                    let schema = match slot {
+                        IndexSlot::Table(position) => {
+                            table_schema_qualifier(TableAttribute::table(
+                                builder.indices()[position].0.as_ref(),
+                            ))
+                        }
+                        IndexSlot::MaterializedView(position) => {
+                            qualifier_of(
+                                &builder.materialized_view_indices()[position].0.index().table_name,
+                            )
+                            .named()
+                        }
+                    };
                     // The renamed index lands in the same pool the old name
                     // came out of, so the new name has to be free there.
                     if let Some(ObjectNamePart::Identifier(new_ident)) = new_name.0.last()
@@ -9894,16 +9983,25 @@ impl ParserDB {
                         });
                     }
 
-                    let mut renamed = (*stored).clone();
-                    renamed.attribute_mut().name = Some(new_name);
-                    let renamed = Arc::new(renamed);
+                    match slot {
+                        IndexSlot::Table(position) => {
+                            let (stored, metadata) = builder.indices()[position].clone();
+                            let mut renamed = (*stored).clone();
+                            renamed.attribute_mut().name = Some(new_name);
+                            let renamed = Arc::new(renamed);
 
-                    // The same handle sits in the index store and in the
-                    // metadata of the table the index is on, so both take the
-                    // replacement.
-                    builder.indices_mut()[position] = (renamed.clone(), metadata);
-                    for (_, table_metadata, _) in builder.tables_mut() {
-                        table_metadata.replace_index(&stored, &renamed);
+                            // The same handle sits in the index store and in
+                            // the metadata of the table the index is on, so
+                            // both take the replacement.
+                            builder.indices_mut()[position] = (renamed.clone(), metadata);
+                            for (_, table_metadata, _) in builder.tables_mut() {
+                                table_metadata.replace_index(&stored, &renamed);
+                            }
+                        }
+                        IndexSlot::MaterializedView(position) => {
+                            let (index, _) = &mut builder.materialized_view_indices_mut()[position];
+                            Arc::make_mut(index).index_mut().name = Some(new_name);
+                        }
                     }
                 }
                 Statement::CreateTrigger(create_trigger) => {
@@ -10231,6 +10329,15 @@ impl ParserDB {
                 Statement::CreateIndex(mut create_index) => {
                     if let Some(index_name) = create_index.name.as_ref() {
                         require_named(index_name, crate::errors::ObjectKind::Index)?;
+                    }
+                    // PostgreSQL indexes a table or a materialized view.
+                    if builder.resolve_table_object_name(&create_index.table_name)?.is_none()
+                        && let Some(position) =
+                            views::materialized_view_position(&builder, &create_index.table_name)
+                    {
+                        builder =
+                            materialized_view_indexes::create(builder, create_index, position)?;
+                        continue;
                     }
                     builder.bind_table_reference(&mut create_index.table_name);
                     if create_index.name.is_none() {

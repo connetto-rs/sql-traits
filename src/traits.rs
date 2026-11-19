@@ -21,7 +21,7 @@ pub use data_type::{
 pub mod index;
 pub use database::{DatabaseLike, Relation};
 pub use dialect::DialectLike;
-pub use index::IndexLike;
+pub use index::{IndexLike, TableIndexLike};
 pub use table::{PartitionStrategy, TableLike};
 pub use type_match::{TypeMatch, TypeMatchLike};
 pub mod check_constraint;

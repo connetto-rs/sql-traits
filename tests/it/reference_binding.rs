@@ -92,7 +92,7 @@ fn every_reference_keeps_its_table_across_a_path_change() {
     assert!(matches!(granted[..], [table] if table.table_schema() == Some("app")));
 
     let index = db.indexes().next().expect("the index exists");
-    assert_eq!(IndexLike::table(index, &db).table_schema(), Some("app"));
+    assert_eq!(TableIndexLike::table(index, &db).table_schema(), Some("app"));
 
     assert_eq!(row_source(&db, "SELECT id FROM app.v").table_schema(), Some("app"));
 }
@@ -223,7 +223,7 @@ fn references_to_a_permanent_table_ignore_a_later_temporary_one() {
     assert!(matches!(granted[..], [table] if !table.is_temporary()));
 
     let index = db.indexes().next().expect("the index exists");
-    assert!(!IndexLike::table(index, &db).is_temporary());
+    assert!(!TableIndexLike::table(index, &db).is_temporary());
 
     assert!(!row_source(&db, "SELECT id FROM v").is_temporary());
 }
@@ -241,7 +241,7 @@ fn references_reaching_a_temporary_table_bind_to_it() {
     ));
     assert!(db.triggers().next().expect("trigger").table(&db).expect("resolves").is_temporary());
     assert!(db.policies().next().expect("policy").table(&db).expect("resolves").is_temporary());
-    assert!(IndexLike::table(db.indexes().next().expect("index"), &db).is_temporary());
+    assert!(TableIndexLike::table(db.indexes().next().expect("index"), &db).is_temporary());
     assert!(row_source(&db, "SELECT id FROM pg_temp.v").is_temporary());
 }
 

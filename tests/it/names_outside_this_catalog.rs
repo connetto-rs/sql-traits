@@ -182,7 +182,7 @@ fn local_names_are_unaffected() {
         .map(|column| column.column_name().to_string())
         .collect();
     assert_eq!(columns, vec!["id"]);
-    assert_eq!(IndexLike::table(index, &db).table_name(), docs.table_name());
+    assert_eq!(TableIndexLike::table(index, &db).table_name(), docs.table_name());
 }
 
 /// A check constraint may qualify a column by its own table, and nothing

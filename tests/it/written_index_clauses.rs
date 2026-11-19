@@ -30,7 +30,7 @@ fn unique_index<'db>(
         .expect("the unique index exists")
 }
 
-fn included<I: IndexLike<DB = ParserDB>>(database: &ParserDB, index: &I) -> Vec<String> {
+fn included<I: TableIndexLike<DB = ParserDB>>(database: &ParserDB, index: &I) -> Vec<String> {
     index
         .include_columns(database)
         .expect("the index is in this database")

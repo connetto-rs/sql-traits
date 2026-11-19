@@ -580,7 +580,7 @@ fn new_names(
             let own =
                 |candidate: &str| recorded.iter().any(|generated| generated.name == candidate);
             if naming.names_index {
-                generated_names::index_name_on(
+                generated_names::index_name_on_table(
                     builder,
                     node,
                     naming.columns.as_deref(),

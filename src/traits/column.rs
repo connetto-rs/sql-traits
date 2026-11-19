@@ -10,7 +10,7 @@ use crate::{
     structs::{TargetName, WrittenCall},
     traits::{
         CheckConstraintLike, DataTypeLike, DatabaseLike, ForeignKeyLike, IndexLike, Metadata,
-        TableLike, check_constraint::non_tautological,
+        TableIndexLike, TableLike, check_constraint::non_tautological,
     },
     utils::identifier_resolution::stored_identifier,
 };

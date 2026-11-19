@@ -151,6 +151,8 @@ impl ParserDBBuilder {
         let checks = self.check_constraints().iter().map(|(_, metadata)| metadata.calls());
         let columns = self.columns().iter().map(|(_, metadata, _)| metadata.calls());
         let indices = self.indices().iter().map(|(_, metadata)| metadata.calls());
+        let view_indices =
+            self.materialized_view_indices().iter().map(|(_, metadata)| metadata.calls());
         let unique_keys = self.unique_indices().iter().map(|(_, metadata)| metadata.calls());
         let views = self.views().iter().map(|(_, metadata, _)| metadata.calls());
         let materialized =
@@ -169,6 +171,7 @@ impl ParserDBBuilder {
         checks
             .chain(columns)
             .chain(indices)
+            .chain(view_indices)
             .chain(unique_keys)
             .chain(views)
             .chain(materialized)
@@ -197,6 +200,9 @@ impl ParserDBBuilder {
             metadata.calls_mut().settle_on_built_ins();
         }
         for (_, metadata) in self.indices_mut() {
+            metadata.calls_mut().settle_on_built_ins();
+        }
+        for (_, metadata) in self.materialized_view_indices_mut() {
             metadata.calls_mut().settle_on_built_ins();
         }
         for (_, metadata) in self.unique_indices_mut() {
@@ -254,6 +260,9 @@ impl ParserDBBuilder {
         }
         for (index, metadata) in self.indices_mut() {
             settle(metadata.calls_mut(), index.attribute(), selections, refuse)?;
+        }
+        for (index, metadata) in self.materialized_view_indices_mut() {
+            settle(metadata.calls_mut(), index.index(), selections, refuse)?;
         }
         for (unique_key, metadata) in self.unique_indices_mut() {
             settle(metadata.calls_mut(), unique_key.attribute(), selections, refuse)?;

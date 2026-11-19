@@ -28,7 +28,7 @@ fn an_index_follows_the_rename() {
     .expect("t exists when the index and the rename land");
 
     let index = database.indexes().next().expect("the index survives the rename");
-    let table = IndexLike::table(index, &database);
+    let table = TableIndexLike::table(index, &database);
     assert_eq!(table.table_name(), "t2");
     assert_eq!(
         table.indices(&database).expect("the index host is in this database").count(),

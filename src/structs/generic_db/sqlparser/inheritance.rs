@@ -687,7 +687,7 @@ fn generated_key_name(
     label: &str,
     taken: &mut Vec<Ident>,
 ) -> Ident {
-    let name = generated_names::index_name_on(builder, child, columns, label, |candidate| {
+    let name = generated_names::index_name_on_table(builder, child, columns, label, |candidate| {
         taken.iter().any(|held| super::idents_match(held, candidate))
     });
     taken.push(name.clone());

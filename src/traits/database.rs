@@ -20,7 +20,8 @@ use crate::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
         DomainLike, ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, OperatorLike,
         PolicyLike, RoleLike, RoleMembershipLike, RuleLike, SchemaLike, SequenceLike,
-        TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
+        TableGrantLike, TableIndexLike, TableLike, TriggerLike, UniqueIndexLike,
+        UserDefinedTypeLike, ViewLike,
     },
     utils::{
         call_sites::expression_form,
@@ -54,8 +55,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type Column: ColumnLike<DB = Self>;
     /// Type of the declared data types of the columns in the schema.
     type DataType: DataTypeLike<DB = Self>;
-    /// Type of the indices in the schema.
-    type Index: IndexLike<DB = Self>;
+    /// Type of the indices on tables in the schema.
+    type Index: TableIndexLike<DB = Self>;
+    /// Type of the indices on materialized views in the schema.
+    type MaterializedViewIndex: IndexLike<DB = Self>;
     /// Type of the foreign keys in the schema.
     type ForeignKey: ForeignKeyLike<DB = Self>;
     /// Type of the functions in the schema.
@@ -302,7 +305,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// ```
     fn user_defined_types(&self) -> impl Iterator<Item = &Self::UserDefinedType>;
 
-    /// Iterates over the indexes defined in the schema.
+    /// Iterates over the indexes defined on the tables of the schema.
+    ///
+    /// An index on a materialized view is listed by
+    /// [`Self::materialized_view_indexes`] instead.
     ///
     /// # Example
     ///
@@ -323,6 +329,76 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # }
     /// ```
     fn indexes(&self) -> impl Iterator<Item = &Self::Index>;
+
+    /// Iterates over the indexes defined on the materialized views of the
+    /// schema.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE documents (id int PRIMARY KEY, title text);
+    ///      CREATE MATERIALIZED VIEW titles AS SELECT id, title FROM documents;
+    ///      CREATE UNIQUE INDEX titles_id ON titles (id);",
+    /// )?;
+    /// let names: Vec<_> = db.materialized_view_indexes().map(|index| index.name()).collect();
+    /// assert_eq!(names, [Some("titles_id")]);
+    /// assert_eq!(db.indexes().count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn materialized_view_indexes(&self) -> impl Iterator<Item = &Self::MaterializedViewIndex>;
+
+    /// Iterates over the indexes defined on `view`, a materialized view this
+    /// database holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when this database does
+    /// not hold `view`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE documents (id int PRIMARY KEY, title text);
+    ///      CREATE MATERIALIZED VIEW titles AS SELECT id, title FROM documents;
+    ///      CREATE MATERIALIZED VIEW ids AS SELECT id FROM documents;
+    ///      CREATE INDEX titles_title ON titles (title);
+    ///      CREATE INDEX ids_id ON ids (id);",
+    /// )?;
+    /// let titles = db
+    ///     .materialized_view_by_target(TargetName::new("titles", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// let names: Vec<_> =
+    ///     db.indexes_on_materialized_view(titles)?.map(|index| index.name()).collect();
+    /// assert_eq!(names, [Some("titles_title")]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn indexes_on_materialized_view<'db>(
+        &'db self,
+        view: &'db Self::MaterializedView,
+    ) -> Result<impl Iterator<Item = &'db Self::MaterializedViewIndex>, LookupError> {
+        let identity = self.materialized_view_identity(view).ok_or_else(|| {
+            crate::errors::ObjectKind::MaterializedView.not_in_database(view.view_name())
+        })?;
+        Ok(self.materialized_view_indexes().filter(move |index| {
+            matches!(
+                index.relation(self),
+                Ok(Relation::MaterializedView(indexed))
+                    if self.materialized_view_identity(indexed) == Some(identity)
+            )
+        }))
+    }
 
     /// Returns whether the database has at least one table.
     ///

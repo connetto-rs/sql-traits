@@ -11,9 +11,9 @@ use alloc::{
 
 use sqlparser::ast::{CreateIndex, CreateTable, Ident, IndexColumn};
 
-use super::{ParserDBBuilder, relation_name_holder, table_schema_qualifier};
+use super::{ParserDBBuilder, SchemaQualifier, relation_name_holder, table_schema_qualifier};
 use crate::{
-    traits::TableLike,
+    traits::{TableLike, ViewLike},
     utils::{
         figured_names::{Figure, figure},
         identifier_resolution::{MAX_NAME_BYTES, clipped, stored_identifier},
@@ -118,29 +118,49 @@ pub(super) fn object_name(name1: &str, name2: Option<&str>, label: Option<&str>)
     name
 }
 
-/// The first name for an index on `table` that no relation in its schema holds
-/// and `also_taken` does not report.
+/// The first name for an index on the relation `relation` names, in the
+/// schema `schema` names, that no relation there holds and `also_taken` does
+/// not report.
 pub(super) fn index_name_on(
     builder: &ParserDBBuilder,
-    table: &CreateTable,
+    (relation, relation_quoted): (&str, bool),
+    schema: SchemaQualifier<'_>,
     columns: Option<&str>,
     label: &str,
     mut also_taken: impl FnMut(&Ident) -> bool,
 ) -> Ident {
-    let table_name = stored(table.table_name(), table.table_name_is_quoted());
-    let schema = table_schema_qualifier(table);
+    let relation_name = stored(relation, relation_quoted);
     let mut pass = 0u32;
     loop {
         let candidate = if pass == 0 {
-            spelled(object_name(&table_name, columns, Some(label)))
+            spelled(object_name(&relation_name, columns, Some(label)))
         } else {
-            spelled(object_name(&table_name, columns, Some(&format!("{label}{pass}"))))
+            spelled(object_name(&relation_name, columns, Some(&format!("{label}{pass}"))))
         };
         if relation_name_holder(builder, &candidate, schema).is_none() && !also_taken(&candidate) {
             return candidate;
         }
         pass += 1;
     }
+}
+
+/// The first name for an index on `table` that no relation in its schema holds
+/// and `also_taken` does not report.
+pub(super) fn index_name_on_table(
+    builder: &ParserDBBuilder,
+    table: &CreateTable,
+    columns: Option<&str>,
+    label: &str,
+    also_taken: impl FnMut(&Ident) -> bool,
+) -> Ident {
+    index_name_on(
+        builder,
+        (table.table_name(), table.table_name_is_quoted()),
+        table_schema_qualifier(table),
+        columns,
+        label,
+        also_taken,
+    )
 }
 
 /// The first name for a constraint on `table` that `taken` does not report,
@@ -174,5 +194,24 @@ pub(super) fn create_index_name(
     create_index: &CreateIndex,
 ) -> Option<Ident> {
     let columns = index_columns_part(&create_index.columns, &create_index.include)?;
-    Some(index_name_on(builder, table, Some(&columns), "idx", |_| false))
+    Some(index_name_on_table(builder, table, Some(&columns), "idx", |_| false))
+}
+
+/// The name of the index `create_index` creates on the materialized view
+/// `view` without naming it, or [`None`] when an index expression's name is
+/// not modeled.
+pub(super) fn create_index_name_on_view<V: ViewLike>(
+    builder: &ParserDBBuilder,
+    view: &V,
+    create_index: &CreateIndex,
+) -> Option<Ident> {
+    let columns = index_columns_part(&create_index.columns, &create_index.include)?;
+    Some(index_name_on(
+        builder,
+        (view.view_name(), view.view_name_is_quoted()),
+        view.view_schema().map(|schema| (schema, view.view_schema_is_quoted())),
+        Some(&columns),
+        "idx",
+        |_| false,
+    ))
 }

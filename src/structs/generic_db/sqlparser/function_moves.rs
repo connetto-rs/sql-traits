@@ -262,6 +262,11 @@ pub(super) fn move_functions(
             respell(Arc::make_mut(view).declaration_mut().query_mut(), metadata.calls(), moves)?;
         }
     }
+    for (index, metadata) in builder.materialized_view_indices_mut() {
+        if moves.reached_by(metadata.calls()) {
+            respell(Arc::make_mut(index).index_mut(), metadata.calls(), moves)?;
+        }
+    }
     for (rule, calls) in builder.rules_mut() {
         if moves.reached_by(calls) {
             respell(Arc::make_mut(rule), calls, moves)?;

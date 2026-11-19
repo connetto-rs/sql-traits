@@ -34,7 +34,8 @@ use crate::{
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, EnumerationKind, EnumerationMember, ForeignKeyLike,
-        FunctionLike, IndexLike, Relation, RoleLike, SchemaLike, TableLike, UserDefinedTypeLike,
+        FunctionLike, IndexLike, Relation, RoleLike, SchemaLike, TableIndexLike, TableLike,
+        UserDefinedTypeLike,
     },
     utils::{
         call_sites::{ExpressionForm, call_reaches, expression_form},

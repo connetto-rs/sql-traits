@@ -283,6 +283,7 @@ impl DatabaseLike for MemoryCatalog {
     type Column = MemoryColumn;
     type DataType = MemoryDataType;
     type Index = MemoryIndex;
+    type MaterializedViewIndex = sql_traits::structs::Absent<Self>;
     type ForeignKey = MemoryForeignKey;
     type Function = MemoryFunction;
     type Operator = sql_traits::structs::Absent<Self>;
@@ -355,6 +356,10 @@ impl DatabaseLike for MemoryCatalog {
 
     fn indexes(&self) -> impl Iterator<Item = &Self::Index> {
         self.indexes.iter()
+    }
+
+    fn materialized_view_indexes(&self) -> impl Iterator<Item = &Self::MaterializedViewIndex> {
+        core::iter::empty()
     }
 
     fn functions(&self) -> impl Iterator<Item = &Self::Function> {
@@ -934,15 +939,14 @@ impl IndexLike for MemoryIndex {
         Ok(&self.expression)
     }
 
-    fn table<'db>(&'db self, database: &'db Self::DB) -> &'db MemoryTable
+    fn relation<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
-        database
-            .tables
-            .iter()
-            .find(|table| table.name == self.table_name)
-            .expect("every index of this catalog belongs to one of its tables")
+        Ok(Relation::Table(TableIndexLike::table(self, database)))
     }
 
     fn is_unique(&self) -> bool {
@@ -958,6 +962,19 @@ impl IndexLike for MemoryIndex {
         Err::<core::iter::Empty<_>, _>(LookupError::CallNotInExpression {
             call: call.into().to_string(),
         })
+    }
+}
+
+impl TableIndexLike for MemoryIndex {
+    fn table<'db>(&'db self, database: &'db Self::DB) -> &'db MemoryTable
+    where
+        Self: 'db,
+    {
+        database
+            .tables
+            .iter()
+            .find(|table| table.name == self.table_name)
+            .expect("every index of this catalog belongs to one of its tables")
     }
 }
 
@@ -986,11 +1003,14 @@ impl IndexLike for MemoryUniqueIndex {
         self.0.expression(database)
     }
 
-    fn table<'db>(&'db self, database: &'db Self::DB) -> &'db MemoryTable
+    fn relation<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
-        self.0.table(database)
+        self.0.relation(database)
     }
 
     fn is_unique(&self) -> bool {
@@ -1003,6 +1023,15 @@ impl IndexLike for MemoryUniqueIndex {
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db MemoryFunction> + 'db, LookupError> {
         self.0.functions_reached_by(call, database)
+    }
+}
+
+impl TableIndexLike for MemoryUniqueIndex {
+    fn table<'db>(&'db self, database: &'db Self::DB) -> &'db MemoryTable
+    where
+        Self: 'db,
+    {
+        TableIndexLike::table(&self.0, database)
     }
 }
 

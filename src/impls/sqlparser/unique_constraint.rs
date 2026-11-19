@@ -7,14 +7,16 @@ use sqlparser::ast::{
     ColumnDef, CreateTable, Expr, IndexType, NullsDistinctOption, UniqueConstraint,
 };
 
-use super::index_clauses::{included_columns, written_access_method, written_keys};
+use super::index_clauses::{
+    included_columns, written_access_method, written_include_names, written_keys,
+};
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
         ConstraintObject, IndexKey, ParserDB, TableAttribute, WrittenCall,
         metadata::UniqueIndexMetadata,
     },
-    traits::{DatabaseLike, IndexLike, Metadata, TableLike},
+    traits::{DatabaseLike, IndexLike, Metadata, Relation, TableIndexLike, TableLike},
 };
 
 impl Metadata for TableAttribute<CreateTable, UniqueConstraint> {
@@ -52,11 +54,15 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     type DB = ParserDB;
 
     #[inline]
-    fn table<'db>(&'db self, _database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
+    fn relation<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
-        self.table()
+        self.metadata(database)?;
+        Ok(Relation::Table(self.table()))
     }
 
     /// Always `true`, since the parser stores here only primary keys and
@@ -127,15 +133,8 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     }
 
     #[inline]
-    fn include_columns<'db>(
-        &'db self,
-        database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db TableAttribute<CreateTable, ColumnDef>>, LookupError>
-    where
-        Self: 'db,
-    {
-        self.metadata(database)?;
-        included_columns(&self.attribute().include, self.table(), database)
+    fn include_column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        written_include_names(&self.attribute().include)
     }
 
     fn functions_reached_by<'db, 'call>(
@@ -153,5 +152,27 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     #[inline]
     fn nulls_distinct(&self) -> bool {
         self.attribute().nulls_distinct != NullsDistinctOption::NotDistinct
+    }
+}
+
+impl TableIndexLike for TableAttribute<CreateTable, UniqueConstraint> {
+    #[inline]
+    fn table<'db>(&'db self, _database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
+    where
+        Self: 'db,
+    {
+        self.table()
+    }
+
+    #[inline]
+    fn include_columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db TableAttribute<CreateTable, ColumnDef>>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.metadata(database)?;
+        included_columns(&self.attribute().include, self.table(), database)
     }
 }
