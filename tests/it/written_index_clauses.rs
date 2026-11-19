@@ -173,6 +173,10 @@ fn an_index_reports_its_include_columns_in_written_order() {
     );
     assert_eq!(included(&database, index(&database, "covering")), ["c", "b"]);
     assert_eq!(included(&database, index(&database, "plain")), [""; 0]);
+    assert_eq!(
+        index(&database, "covering").include_column_names().collect::<Vec<_>>(),
+        [("C", false), ("b", false)]
+    );
 }
 
 #[test]
@@ -187,6 +191,14 @@ fn a_key_constraint_reports_its_include_columns() {
     assert_eq!(included(&database, unique_index(&database, "pk")), ["b"]);
     assert_eq!(included(&database, unique_index(&database, "u")), ["id", "b"]);
     assert_eq!(included(&database, unique_index(&database, "plain")), [""; 0]);
+    assert_eq!(
+        unique_index(&database, "u").include_column_names().collect::<Vec<_>>(),
+        [("id", false), ("b", false)]
+    );
+    assert!(matches!(
+        unique_index(&database, "u").relation(&database),
+        Ok(Relation::Table(table)) if table.table_name() == "t"
+    ));
 }
 
 /// A constraint's `INCLUDE` list is plain identifiers, so it needs following

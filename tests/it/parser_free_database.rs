@@ -2318,6 +2318,7 @@ fn indexes_without_clause_records_report_none_written() -> Result<(), LookupErro
 
     assert_eq!(index.access_method(), None);
     assert_eq!(index.include_columns(&catalog)?.count(), 0);
+    assert_eq!(index.include_column_names().count(), 0);
     assert_eq!(index.predicate(), None);
     assert!(index.nulls_distinct());
     let keys: Vec<_> = index.keys(&catalog)?.collect();
