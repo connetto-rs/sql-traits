@@ -45,7 +45,7 @@ use super::{
     postgres_catalog::{CatalogDependent, PostgresCatalog},
     relation_name_holder, require_named_in_catalog,
     rules::{self, RuleHost},
-    stored_ident,
+    stored_ident, stored_view_qualifier,
     table_owner::Handover,
     type_arrays::TypeArrays,
     user_defined_types::{self, TypeDrop},
@@ -145,6 +145,9 @@ pub(super) fn create_view(
         check_replacement_columns(&builder, existing.as_ref(), &exposed)?;
         refuse_repeated_columns(&exposed.0, &name_ident.value, builder.identifier_case())?;
         metadata.set_calls(builder.calls_in(&node.query));
+        // The replacement keeps the stored name of the view it replaces,
+        // whichever spelling of its schema the statement wrote.
+        bind_reference(&mut node.name, stored_view_qualifier(existing.as_ref()));
         let mut view = View::from_node(&node)?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
