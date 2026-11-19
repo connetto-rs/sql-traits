@@ -199,6 +199,17 @@ impl FunctionLike for CreateFunction {
         Ok(function_metadata(self, database)?.aggregate_kind())
     }
 
+    #[inline]
+    fn returns_null_over_no_input_row(&self, database: &Self::DB) -> bool {
+        function_metadata(self, database)
+            .is_ok_and(FunctionMetadata::returns_null_over_no_input_row)
+    }
+
+    #[inline]
+    fn returns_null_over_null_inputs(&self, database: &Self::DB) -> bool {
+        function_metadata(self, database).is_ok_and(FunctionMetadata::returns_null_over_null_inputs)
+    }
+
     fn written_body(&self) -> Option<FunctionBody<'_>> {
         // Code a `USING` clause or a remote connection names lives outside
         // the schema, whatever text the statement carries beside it.

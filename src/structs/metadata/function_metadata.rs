@@ -35,6 +35,11 @@ pub struct FunctionMetadata {
     /// The aggregate's `pg_aggregate.aggkind`, `None` for a function that is
     /// no aggregate.
     aggregate_kind: Option<AggregateKind>,
+    /// Whether the aggregate returns `NULL` when it aggregates no input row.
+    returns_null_over_no_input_row: bool,
+    /// Whether the aggregate returns `NULL` when every input it aggregates is
+    /// `NULL`.
+    returns_null_over_null_inputs: bool,
     /// The name of the extension the function belongs to, which creates and
     /// drops it.
     extension: Option<Ident>,
@@ -127,6 +132,33 @@ impl FunctionMetadata {
     #[inline]
     pub(crate) fn set_aggregate_kind(&mut self, kind: Option<AggregateKind>) {
         self.aggregate_kind = kind;
+    }
+
+    /// Returns whether the aggregate returns `NULL` when it aggregates no
+    /// input row, from its initial state and the strictness of its final
+    /// function.
+    #[must_use]
+    #[inline]
+    pub(crate) fn returns_null_over_no_input_row(&self) -> bool {
+        self.returns_null_over_no_input_row
+    }
+
+    /// Returns whether the aggregate returns `NULL` when every input it
+    /// aggregates is `NULL`, from its initial state and the strictness of its
+    /// transition and final functions.
+    #[must_use]
+    #[inline]
+    pub(crate) fn returns_null_over_null_inputs(&self) -> bool {
+        self.returns_null_over_null_inputs
+    }
+
+    /// Records the aggregate's `NULL` answers, derived from its initial state
+    /// and the strictness of its transition and final functions. A function
+    /// that is no aggregate keeps both answers `false`.
+    #[inline]
+    pub(crate) fn set_aggregate_null(&mut self, no_input_row: bool, null_inputs: bool) {
+        self.returns_null_over_no_input_row = no_input_row;
+        self.returns_null_over_null_inputs = null_inputs;
     }
 
     /// Returns the name of the extension the function belongs to.
