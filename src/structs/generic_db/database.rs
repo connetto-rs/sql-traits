@@ -30,6 +30,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type Column = P::Column;
     type DataType = P::DataType;
     type Index = P::Index;
+    type MaterializedViewIndex = P::MaterializedViewIndex;
     type ForeignKey = P::ForeignKey;
     type Function = P::Function;
     type Operator = P::Operator;
@@ -406,6 +407,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     #[inline]
     fn indexes(&self) -> impl Iterator<Item = &Self::Index> {
         self.indices.iter().map(|(index, _)| index.as_ref())
+    }
+
+    #[inline]
+    fn materialized_view_indexes(&self) -> impl Iterator<Item = &Self::MaterializedViewIndex> {
+        self.materialized_view_indices.iter().map(|(index, _)| index.as_ref())
     }
 
     #[inline]

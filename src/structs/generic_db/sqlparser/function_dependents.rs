@@ -11,7 +11,7 @@ use core::{convert::Infallible, ops::ControlFlow};
 use sqlparser::ast::{ColumnOption, CreateFunction, CreatePolicy, CreateTrigger, Ident, Visit};
 
 use super::{
-    ParserDBBuilder, StoredTable,
+    IndexSlot, ParserDBBuilder, StoredTable,
     calls_in_expression::CallScope,
     constraint_names::{self, Position},
     function_argument_types, inheritance, partition_keys, rules, views,
@@ -42,8 +42,8 @@ pub(super) enum Held {
     /// The check at the position in the table, its own rather than one a
     /// parent passes down.
     Check(StoredTable, Position),
-    /// The index at the position among the stored indexes.
-    Index(usize),
+    /// The index stored at the slot.
+    Index(IndexSlot),
     /// The exclusion constraint at the position of the table's constraint
     /// list.
     Exclusion(StoredTable, usize),
@@ -239,14 +239,8 @@ impl ParserDBBuilder {
                 }
             }
         }
-        for (position, (index, metadata)) in self.indices().iter().enumerate() {
-            if dropped.is_held_by(metadata.calls()) {
-                let name = IndexLike::name(index.as_ref())
-                    .map_or_else(|| index.attribute().to_string(), ToString::to_string);
-                return Some(Holder::new(ObjectKind::Index, name, Held::Index(position)));
-            }
-        }
-        if let Some(holder) = self.unique_key_holder(dropped) {
+        if let Some(holder) = self.index_holder(dropped).or_else(|| self.unique_key_holder(dropped))
+        {
             return Some(holder);
         }
         for (table, metadata, _) in self.tables() {
@@ -283,6 +277,31 @@ impl ParserDBBuilder {
             }
         }
         None
+    }
+
+    /// The first index built by `CREATE INDEX`, on a table or on a
+    /// materialized view, whose key or predicate holds `dropped`.
+    fn index_holder(&self, dropped: &Dropped<'_>) -> Option<Holder> {
+        let on_tables =
+            self.indices().iter().enumerate().find_map(|(position, (index, metadata))| {
+                dropped.is_held_by(metadata.calls()).then(|| {
+                    let name = IndexLike::name(index.as_ref())
+                        .map_or_else(|| index.attribute().to_string(), ToString::to_string);
+                    Holder::new(ObjectKind::Index, name, Held::Index(IndexSlot::Table(position)))
+                })
+            });
+        on_tables.or_else(|| {
+            self.materialized_view_indices().iter().enumerate().find_map(
+                |(position, (index, metadata))| {
+                    dropped.is_held_by(metadata.calls()).then(|| {
+                        let name = IndexLike::name(index.as_ref())
+                            .map_or_else(|| index.index().to_string(), ToString::to_string);
+                        let slot = IndexSlot::MaterializedView(position);
+                        Holder::new(ObjectKind::Index, name, Held::Index(slot))
+                    })
+                },
+            )
+        })
     }
 
     /// The first unique key written among a table's constraints that holds

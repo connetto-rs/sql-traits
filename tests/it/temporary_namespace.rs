@@ -368,11 +368,11 @@ fn indexes_on_temporary_and_permanent_tables_share_a_name() {
     let dropped = db(&format!("{two} DROP INDEX i;"));
     let remaining: Vec<_> = dropped.indexes().collect();
     assert_eq!(remaining.len(), 1);
-    assert!(!IndexLike::table(remaining[0], &dropped).is_temporary());
+    assert!(!TableIndexLike::table(remaining[0], &dropped).is_temporary());
 
     let renamed = db(&format!("{two} ALTER INDEX i RENAME TO j;"));
     for index in renamed.indexes() {
-        let on_temporary = IndexLike::table(index, &renamed).is_temporary();
+        let on_temporary = TableIndexLike::table(index, &renamed).is_temporary();
         assert_eq!(index.name(), Some(if on_temporary { "j" } else { "i" }));
     }
 }

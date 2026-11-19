@@ -33,15 +33,15 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, AlterView, AlterViewOperation, CreateFunction,
-    CreateView, Expr, Grant, GrantObjects, Ident, ObjectName, ObjectNamePart, Owner, Query,
-    RenameTableNameKind, SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visitor,
+    CreateView, Expr, Grant, GrantObjects, Ident, IndexColumn, ObjectName, ObjectNamePart, Owner,
+    Query, RenameTableNameKind, SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visitor,
     VisitorMut,
 };
 
 use super::{
     AlterTableScope, Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier,
-    bind_reference, domains, first_repeated_column, function_bodies, object_name_last_identifier,
-    object_name_matches_resolved_identity, place_relation,
+    bind_reference, domains, first_repeated_column, function_bodies, materialized_view_indexes,
+    object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
     postgres_catalog::{CatalogDependent, PostgresCatalog},
     relation_name_holder, require_named_in_catalog,
     rules::{self, RuleHost},
@@ -399,6 +399,7 @@ pub(super) fn drop_views(
             }
             // A sequence the view owned goes with it.
             super::sequences::drop_orphaned_sequences(&mut builder);
+            materialized_view_indexes::drop_orphaned(&mut builder);
             continue;
         }
 
@@ -427,7 +428,10 @@ pub(super) fn drop_views(
 
 /// The position of the materialized view a written `name` resolves to,
 /// through the search path.
-fn materialized_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<usize> {
+pub(super) fn materialized_view_position(
+    builder: &ParserDBBuilder,
+    name: &ObjectName,
+) -> Option<usize> {
     let key = stored_view_key(
         builder.resolve_materialized_view_object_name(name).ok()??,
         IdentifierCase::AsWritten,
@@ -740,6 +744,32 @@ fn require_exposed(
     Ok(())
 }
 
+/// Checks that every column an index on the materialized view at `position`
+/// names, a plain key or an `INCLUDE` entry, is one the view exposes. A key
+/// that is an expression names no single column and is left alone.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ColumnNotFound`] for the first name the view does
+/// not expose, when every column it exposes can be named.
+pub(super) fn require_indexed_columns(
+    builder: &ParserDBBuilder,
+    position: usize,
+    keys: &[IndexColumn],
+    include: &[Ident],
+) -> Result<(), Error> {
+    let declaration = builder.materialized_views()[position].0.declaration();
+    keys.iter()
+        .filter_map(|key| {
+            match &key.column.expr {
+                Expr::Identifier(name) => Some(name),
+                _ => None,
+            }
+        })
+        .chain(include)
+        .try_for_each(|name| require_exposed(builder, declaration, name))
+}
+
 /// Sets the options an `ALTER TABLE ... SET (...)` names on a view, leaving
 /// the others as they are.
 ///
@@ -1046,6 +1076,9 @@ fn retarget_view(
         rules::follow_relation_rename(&mut builder, host, &stored_name);
     }
     current.rename_grants(&mut builder, &stored_name);
+    if kind == ObjectKind::MaterializedView {
+        materialized_view_indexes::follow_view_rename(&mut builder, position);
+    }
     Ok(builder)
 }
 
@@ -1139,6 +1172,9 @@ fn rename_view_column(
     }
     if let Some(host) = &host {
         rules::follow_column_rename(&mut builder, host, old_name, new_name);
+    }
+    if kind == ObjectKind::MaterializedView {
+        materialized_view_indexes::follow_column_rename(&mut builder, position, old_name, new_name);
     }
     Ok(builder)
 }
@@ -1797,5 +1833,6 @@ pub(super) fn remove_readers(
         rules::drop_rules_on(builder, host);
     }
     super::sequences::drop_orphaned_sequences(builder);
+    materialized_view_indexes::drop_orphaned(builder);
     TypeDrop { types, functions, operators: Vec::new() }
 }

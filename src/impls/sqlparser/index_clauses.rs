@@ -49,6 +49,12 @@ pub(super) fn written_keys(columns: &[IndexColumn]) -> impl Iterator<Item = Inde
     })
 }
 
+/// The names an `INCLUDE` list writes, in order, each with whether it was
+/// quoted.
+pub(super) fn written_include_names(include: &[Ident]) -> impl Iterator<Item = (&str, bool)> {
+    include.iter().map(|column| (column.value.as_str(), column.quote_style.is_some()))
+}
+
 /// The columns of `table` an `INCLUDE` list names, in the order written.
 ///
 /// A name is compared as the creation compared it, which refused any name the

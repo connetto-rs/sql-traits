@@ -14,7 +14,8 @@ use crate::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
         DomainLike, ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, Metadata, OperatorLike,
         PolicyLike, RoleLike, RoleMembershipLike, RuleLike, SchemaLike, SequenceLike,
-        TableGrantLike, TableLike, TriggerLike, UniqueIndexLike, UserDefinedTypeLike, ViewLike,
+        TableGrantLike, TableIndexLike, TableLike, TriggerLike, UniqueIndexLike,
+        UserDefinedTypeLike, ViewLike,
     },
 };
 
@@ -58,8 +59,10 @@ pub trait SchemaProfile: Sized {
     type Column: ColumnLike<DB = GenericDB<Self>>;
     /// The declared data types of the columns the schema holds.
     type DataType: DataTypeLike<DB = GenericDB<Self>>;
-    /// The indexes the schema holds.
-    type Index: IndexLike<DB = GenericDB<Self>>;
+    /// The indexes on tables the schema holds.
+    type Index: TableIndexLike<DB = GenericDB<Self>>;
+    /// The indexes on materialized views the schema holds.
+    type MaterializedViewIndex: IndexLike<DB = GenericDB<Self>>;
     /// The unique indexes the schema holds.
     type UniqueIndex: UniqueIndexLike<DB = GenericDB<Self>>;
     /// The foreign keys the schema holds.

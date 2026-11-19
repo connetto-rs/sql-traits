@@ -1,6 +1,6 @@
 //! The kind of schema object a database engine does not have.
 
-use alloc::string::String;
+use alloc::{borrow::Cow, string::String};
 use core::{
     cmp::Ordering,
     convert::Infallible,
@@ -18,9 +18,9 @@ use crate::{
     structs::{PolicyExpression, SequenceParameters, TargetName, WrittenCall},
     traits::{
         CastContext, CastLike, CastMethod, DatabaseLike, DomainLike, Enumeration,
-        EnumerationMember, ExtensionLike, Metadata, OperatorKind, OperatorLike, PolicyLike,
-        Relation, RuleLike, SequenceLike, SequenceOrigin, SequenceOwner, UserDefinedTypeKind,
-        UserDefinedTypeLike, ViewLike,
+        EnumerationMember, ExtensionLike, IndexLike, Metadata, OperatorKind, OperatorLike,
+        PolicyLike, Relation, RuleLike, SequenceLike, SequenceOrigin, SequenceOwner,
+        UserDefinedTypeKind, UserDefinedTypeLike, ViewLike,
     },
 };
 
@@ -29,9 +29,9 @@ use crate::{
 /// A [`SchemaProfile`](crate::structs::SchemaProfile) names it for every kind
 /// its engine lacks, as in `type Policy = Absent<GenericDB<Self>>` for an
 /// engine without row-level security. It stands for policies, rules,
-/// extensions, domains, sequences and plain or materialized views. No value
-/// of this type can exist, so a database holds none of that kind and every
-/// listing of it is empty.
+/// extensions, domains, sequences, plain or materialized views and indexes on
+/// materialized views. No value of this type can exist, so a database holds
+/// none of that kind and every listing of it is empty.
 pub struct Absent<DB> {
     /// Leaves the type without values.
     never: Infallible,
@@ -296,6 +296,51 @@ impl<DB: DatabaseLike> UserDefinedTypeLike for Absent<DB> {
 
     fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>> {
         self.unreachable::<Option<Enumeration<core::iter::Empty<_>>>>()
+    }
+}
+
+impl<DB: DatabaseLike> IndexLike for Absent<DB> {
+    type DB = DB;
+
+    fn name(&self) -> Option<&str> {
+        self.unreachable()
+    }
+
+    fn schema(&self) -> Option<&str> {
+        self.unreachable()
+    }
+
+    fn constraint_name<'db>(
+        &'db self,
+        _: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        self.unreachable()
+    }
+
+    fn expression<'db>(&'db self, _: &'db Self::DB) -> Result<&'db Expr, LookupError>
+    where
+        Self: 'db,
+    {
+        self.unreachable()
+    }
+
+    fn relation<'db>(&'db self, _: &'db Self::DB) -> Result<Relation<'db, Self::DB>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.unreachable()
+    }
+
+    fn is_unique(&self) -> bool {
+        self.unreachable()
+    }
+
+    fn functions_reached_by<'db, 'call>(
+        &'db self,
+        _: impl Into<WrittenCall<'call>>,
+        _: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db DB::Function> + 'db, LookupError> {
+        self.unreachable::<Result<core::iter::Empty<&'db DB::Function>, LookupError>>()
     }
 }
 

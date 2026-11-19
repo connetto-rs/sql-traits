@@ -1,4 +1,5 @@
-//! Submodule defining the `IndexLike` trait for SQL indices.
+//! Submodule defining the `IndexLike` trait for SQL indices, and the
+//! `TableIndexLike` trait for the indices built on a table.
 
 use alloc::{borrow::Cow, vec::Vec};
 use core::fmt::Debug;
@@ -8,13 +9,18 @@ use sqlparser::ast::{Expr, IndexType};
 use crate::{
     errors::LookupError,
     structs::{IndexKey, TargetName, WrittenCall},
-    traits::{DatabaseLike, Metadata, TableLike},
+    traits::{DatabaseLike, Metadata, Relation, TableLike},
     utils::columns_in_expression::columns_in_expression,
 };
 
 /// An index is a rule that specifies that the values in a column
-/// (or a group of columns) must used to speed up queries on a table.
+/// (or a group of columns) must used to speed up queries on a relation.
 /// This trait represents such an index in a database-agnostic way.
+///
+/// Every reader here means the same for an index on a table and for one on a
+/// materialized view, which PostgreSQL indexes alike. The readers that hand
+/// out the columns of a table are on [`TableIndexLike`], since a materialized
+/// view has no column of its own to hand out.
 pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// The database type the index belongs to.
     type DB: DatabaseLike;
@@ -51,8 +57,9 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     }
 
     /// Returns the schema the index lives in, which is always the schema of
-    /// the table it is built on, or `None` when that table has none, as
-    /// [`TableLike::table_schema`] answers.
+    /// the relation it is built on, or `None` when that relation has none, as
+    /// [`TableLike::table_schema`] and
+    /// [`ViewLike::view_schema`](crate::traits::ViewLike::view_schema) answer.
     ///
     /// # Example
     ///
@@ -97,7 +104,7 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// # Errors
     ///
     /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold the table of this index.
+    /// hold this index.
     ///
     /// # Example
     ///
@@ -200,25 +207,41 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
         Ok(key_expressions(self.expression(database)?).iter().map(IndexKey::new))
     }
 
-    /// Returns a reference to the table this index belongs to.
+    /// Returns the relation the index is built on, a table or a materialized
+    /// view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "CREATE TABLE users (id int, name text); CREATE INDEX idx_name ON users (name);",
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id int, name text);
+    ///      CREATE INDEX users_name ON users (name);
+    ///      CREATE MATERIALIZED VIEW names AS SELECT name FROM users;
+    ///      CREATE INDEX names_name ON names (name);",
     /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let index = table.indices(&db)?.next().unwrap();
-    /// assert_eq!(IndexLike::table(index, &db).table_name(), "users");
+    /// let on_table = db.indexes().next().unwrap();
+    /// assert!(matches!(on_table.relation(&db)?, Relation::Table(table) if table.table_name() == "users"));
+    /// let on_view = db.materialized_view_indexes().next().unwrap();
+    /// assert!(matches!(
+    ///     on_view.relation(&db)?,
+    ///     Relation::MaterializedView(view) if view.view_name() == "names"
+    /// ));
     /// # Ok(())
     /// # }
     /// ```
-    fn table<'db>(&'db self, database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
+    fn relation<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db;
 
@@ -286,57 +309,38 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
         }))
     }
 
-    /// Returns the columns which appear in the index.
+    /// Returns the names of the columns the index carries in its `INCLUDE`
+    /// list, in the order written, each with whether it was quoted.
     ///
-    /// # Errors
+    /// They are stored alongside the key for index-only scans and take no part
+    /// in its ordering or its uniqueness. A name is one the relation exposes,
+    /// a column of a table or an output column of a materialized view, so two
+    /// lists on one relation compare under the database's identifier rules.
     ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this index.
+    /// Defaults to none, which is what every index not spelling `INCLUDE`
+    /// means.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "CREATE TABLE users (id int, name text); CREATE INDEX idx_name ON users (name);",
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id int, name text, email text);
+    ///      CREATE MATERIALIZED VIEW contacts AS SELECT id, name, email AS \"Email\" FROM users;
+    ///      CREATE INDEX contacts_name ON contacts (name) INCLUDE (\"Email\", id);",
     /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let index = table.indices(&db)?.next().unwrap();
-    /// let columns: Vec<_> = index.columns(&db)?.collect();
-    /// assert_eq!(columns.len(), 1);
-    /// assert_eq!(columns[0].column_name(), "name");
+    /// let index = db.materialized_view_indexes().next().unwrap();
+    /// let included: Vec<_> = index.include_column_names().collect();
+    /// assert_eq!(included, [("Email", true), ("id", false)]);
     /// # Ok(())
     /// # }
     /// ```
-    fn columns<'db>(
-        &'db self,
-        database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Column>, LookupError>
-    where
-        Self: 'db,
-    {
-        let table = <Self as IndexLike>::table(self, database);
-        let expr = self.expression(database)?;
-
-        let all_columns: Vec<&<Self::DB as DatabaseLike>::Column> =
-            table.columns(database)?.collect();
-
-        let mut target = TargetName::new(table.table_name(), table.table_name_is_quoted());
-        if let Some(schema) = table.table_schema() {
-            target = target.with_schema(schema, table.table_schema_is_quoted());
-        }
-
-        // A reference this table does not own, or a column it does not
-        // declare, leaves the index reporting no columns rather than a wrong
-        // one. A creation refuses both before they can be recorded.
-        let found_cols: Vec<&<Self::DB as DatabaseLike>::Column> =
-            columns_in_expression(expr, database.catalog_name(), &target, &all_columns)
-                .unwrap_or_default();
-
-        Ok(found_cols.into_iter())
+    #[inline]
+    fn include_column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        core::iter::empty()
     }
 
     /// Returns the access method the index was written with, or `None` when
@@ -369,48 +373,6 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     #[inline]
     fn access_method(&self) -> Option<&IndexType> {
         None
-    }
-
-    /// Returns the columns the index carries in its `INCLUDE` list, in the
-    /// order written.
-    ///
-    /// They are stored alongside the key for index-only scans and take no part
-    /// in its ordering or its uniqueness.
-    ///
-    /// Defaults to none, which is what every index not spelling `INCLUDE`
-    /// means.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this index.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use sql_traits::prelude::*;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    ///
-    /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TABLE users (id int, name text, email text);
-    ///      CREATE INDEX users_name ON users (name) INCLUDE (email, id);",
-    /// )?;
-    /// let index = db.indexes().next().unwrap();
-    /// let included: Vec<_> = index.include_columns(&db)?.map(|column| column.column_name()).collect();
-    /// assert_eq!(included, ["email", "id"]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    fn include_columns<'db>(
-        &'db self,
-        _database: &'db Self::DB,
-    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Column>, LookupError>
-    where
-        Self: 'db,
-    {
-        Ok(core::iter::empty())
     }
 
     /// Returns the predicate of a partial index, the `WHERE` clause choosing
@@ -519,6 +481,125 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     #[inline]
     fn nulls_distinct(&self) -> bool {
         true
+    }
+}
+
+/// An index built on a table, whose key and `INCLUDE` list name columns the
+/// table declares.
+pub trait TableIndexLike: IndexLike {
+    /// Returns a reference to the table this index belongs to.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "CREATE TABLE users (id int, name text); CREATE INDEX idx_name ON users (name);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let index = table.indices(&db)?.next().unwrap();
+    /// assert_eq!(TableIndexLike::table(index, &db).table_name(), "users");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn table<'db>(&'db self, database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
+    where
+        Self: 'db;
+
+    /// Returns the columns which appear in the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "CREATE TABLE users (id int, name text); CREATE INDEX idx_name ON users (name);",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let index = table.indices(&db)?.next().unwrap();
+    /// let columns: Vec<_> = index.columns(&db)?.collect();
+    /// assert_eq!(columns.len(), 1);
+    /// assert_eq!(columns[0].column_name(), "name");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db,
+    {
+        let table = <Self as TableIndexLike>::table(self, database);
+        let expr = self.expression(database)?;
+
+        let all_columns: Vec<&<Self::DB as DatabaseLike>::Column> =
+            table.columns(database)?.collect();
+
+        let mut target = TargetName::new(table.table_name(), table.table_name_is_quoted());
+        if let Some(schema) = table.table_schema() {
+            target = target.with_schema(schema, table.table_schema_is_quoted());
+        }
+
+        // A reference this table does not own, or a column it does not
+        // declare, leaves the index reporting no columns rather than a wrong
+        // one. A creation refuses both before they can be recorded.
+        let found_cols: Vec<&<Self::DB as DatabaseLike>::Column> =
+            columns_in_expression(expr, database.catalog_name(), &target, &all_columns)
+                .unwrap_or_default();
+
+        Ok(found_cols.into_iter())
+    }
+
+    /// Returns the columns the index carries in its `INCLUDE` list, in the
+    /// order written, the table's columns
+    /// [`IndexLike::include_column_names`] names.
+    ///
+    /// Defaults to none, which is what every index not spelling `INCLUDE`
+    /// means.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE users (id int, name text, email text);
+    ///      CREATE INDEX users_name ON users (name) INCLUDE (email, id);",
+    /// )?;
+    /// let index = db.indexes().next().unwrap();
+    /// let included: Vec<_> = index.include_columns(&db)?.map(|column| column.column_name()).collect();
+    /// assert_eq!(included, ["email", "id"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn include_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(core::iter::empty())
     }
 }
 

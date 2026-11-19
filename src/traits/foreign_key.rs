@@ -8,7 +8,7 @@ use sqlparser::ast::{ConstraintReferenceMatchKind, ReferentialAction};
 use crate::{
     errors::LookupError,
     structs::{ConstraintDeferral, TargetName},
-    traits::{ColumnLike, DatabaseLike, IndexLike, Metadata, TableLike},
+    traits::{ColumnLike, DatabaseLike, Metadata, TableIndexLike, TableLike},
 };
 
 /// A foreign key constraint is a rule that specifies a relationship between

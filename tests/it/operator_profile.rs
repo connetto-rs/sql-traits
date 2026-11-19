@@ -425,7 +425,10 @@ impl<P: EmptyKinds> IndexLike for NoneKind<P> {
         self.unreach()
     }
 
-    fn table<'db>(&'db self, _database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
+    fn relation<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Relation<'db, Self::DB>, LookupError>
     where
         Self: 'db,
     {
@@ -443,6 +446,15 @@ impl<P: EmptyKinds> IndexLike for NoneKind<P> {
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>
     {
         self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
+    }
+}
+
+impl<P: EmptyKinds> TableIndexLike for NoneKind<P> {
+    fn table<'db>(&'db self, _database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
+    where
+        Self: 'db,
+    {
+        self.unreach()
     }
 }
 
@@ -1104,6 +1116,7 @@ impl SchemaProfile for AlternateProfile {
     type Column = NoneKind<Self>;
     type DataType = NoneKind<Self>;
     type Index = NoneKind<Self>;
+    type MaterializedViewIndex = Absent<AlternateDB>;
     type UniqueIndex = NoneKind<Self>;
     type ForeignKey = NoneKind<Self>;
     type Function = NoneKind<Self>;
@@ -1178,6 +1191,7 @@ impl SchemaProfile for HooklessProfile {
     type Column = NoneKind<Self>;
     type DataType = NoneKind<Self>;
     type Index = NoneKind<Self>;
+    type MaterializedViewIndex = Absent<GenericDB<Self>>;
     type UniqueIndex = NoneKind<Self>;
     type ForeignKey = NoneKind<Self>;
     type Function = NoneKind<Self>;

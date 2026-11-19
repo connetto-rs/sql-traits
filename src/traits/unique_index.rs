@@ -3,13 +3,13 @@
 
 use crate::{
     errors::LookupError,
-    traits::{IndexLike, TableLike},
+    traits::{IndexLike, TableIndexLike, TableLike},
 };
 
 /// A unique index is a rule that specifies that the values in a column
 /// (or a group of columns) must be unique across all rows in a table.
 /// This trait represents such a unique index in a database-agnostic way.
-pub trait UniqueIndexLike: IndexLike {
+pub trait UniqueIndexLike: TableIndexLike {
     /// Returns whether this unique index is also the primary key of the table.
     ///
     /// # Errors
@@ -41,4 +41,4 @@ pub trait UniqueIndexLike: IndexLike {
     }
 }
 
-impl<T: IndexLike> UniqueIndexLike for T {}
+impl<T: TableIndexLike> UniqueIndexLike for T {}

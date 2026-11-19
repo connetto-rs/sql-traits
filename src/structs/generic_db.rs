@@ -93,6 +93,8 @@ pub struct GenericDB<P: SchemaProfile> {
     identities: IdentityCounter,
     /// List of indices in the database.
     indices: Vec<Stored<P::Index>>,
+    /// List of indices on materialized views in the database.
+    materialized_view_indices: Vec<Stored<P::MaterializedViewIndex>>,
     /// List of unique indices in the database.
     unique_indices: Vec<Stored<P::UniqueIndex>>,
     /// List of foreign keys in the database.
@@ -160,6 +162,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("relation_identities", &self.relation_identities.len())
             .field("column_identities", &self.column_identities.len())
             .field("indices", &self.indices.len())
+            .field("materialized_view_indices", &self.materialized_view_indices.len())
             .field("unique_indices", &self.unique_indices.len())
             .field("foreign_keys", &self.foreign_keys.len())
             .field("functions", &self.functions.len())
@@ -204,6 +207,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             column_identities: self.column_identities.clone(),
             identities: self.identities,
             indices: self.indices.clone(),
+            materialized_view_indices: self.materialized_view_indices.clone(),
             unique_indices: self.unique_indices.clone(),
             foreign_keys: self.foreign_keys.clone(),
             functions: self.functions.clone(),
@@ -470,6 +474,39 @@ impl<P: SchemaProfile> GenericDB<P> {
             .binary_search_by(|(i, _)| i.as_ref().cmp(index))
             .ok()
             .map(|index| &self.indices[index].1)
+    }
+
+    /// Returns a reference to the metadata of the specified index on a
+    /// materialized view, if it exists in the database.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (id INT);
+    ///      CREATE MATERIALIZED VIEW m AS SELECT id FROM t;
+    ///      CREATE INDEX m_id ON m (id);",
+    /// )?;
+    /// let index = db.materialized_view_indexes().next().expect("index should exist");
+    /// assert_eq!(
+    ///     db.materialized_view_index_metadata(index).unwrap().expression().to_string(),
+    ///     "(id)"
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn materialized_view_index_metadata(
+        &self,
+        index: &P::MaterializedViewIndex,
+    ) -> Option<&Meta<P::MaterializedViewIndex>> {
+        self.materialized_view_indices
+            .binary_search_by(|(i, _)| i.as_ref().cmp(index))
+            .ok()
+            .map(|index| &self.materialized_view_indices[index].1)
     }
 
     /// Returns a reference to the metadata of the specified function, if it

@@ -27,6 +27,7 @@ mod identifier_case;
 mod identity;
 mod index_key;
 mod maintenance_refusal;
+mod materialized_view_index;
 pub mod metadata;
 mod operator_resolution;
 mod partition_bound;
@@ -92,6 +93,7 @@ pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
 pub use index_key::IndexKey;
 pub use maintenance_refusal::{BodyExcerpt, MaintenanceRefusal};
+pub use materialized_view_index::MaterializedViewIndex;
 pub use metadata::{ColumnMetadata, FunctionMetadata, TableAttribute, TableMetadata, ViewMetadata};
 pub use operator_resolution::{
     CoercionStep, OperandEvidence, OperandType, OperatorResolution, SelectedOperator,

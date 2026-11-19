@@ -141,7 +141,7 @@ fn an_index_counts_the_names_in_its_own_tables_schema() {
 
     let mut placed: Vec<(Option<&str>, Option<&str>)> = db
         .indexes()
-        .map(|index| (IndexLike::table(index, &db).table_schema(), index.name()))
+        .map(|index| (TableIndexLike::table(index, &db).table_schema(), index.name()))
         .collect();
     placed.sort_unstable();
     assert_eq!(
