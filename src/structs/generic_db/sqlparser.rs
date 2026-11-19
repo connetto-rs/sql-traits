@@ -18,8 +18,8 @@ use git2::Repository;
 use sqlparser::parser::ParserError;
 use sqlparser::{
     ast::{
-        Action, AlterColumnOperation, AlterFunction, AlterFunctionAction, AlterFunctionKind,
-        AlterFunctionOperation, AlterGenericOption, AlterIndexOperation, AlterPolicy,
+        Action, AlterColumnOperation, AlterFunction, AlterFunctionAction, AlterFunctionOperation,
+        AlterFunctionSignature, AlterGenericOption, AlterIndexOperation, AlterPolicy,
         AlterPolicyOperation, AlterRoleOperation, AlterSchema, AlterSchemaOperation, AlterTable,
         AlterTableOperation, AlterTableType, ArgMode, ArrayElemTypeDef, CheckConstraint, ColumnDef,
         ColumnOption, ColumnOptionDef, CreateCollation, CreateCollationDefinition, CreateDomain,
@@ -3705,7 +3705,16 @@ fn take_builtins_named_by(builder: &mut ParserDBBuilder, statement: &Statement) 
             }
             return;
         }
-        Statement::AlterFunction(alter) => core::slice::from_ref(&alter.function),
+        Statement::AlterFunction(alter) => {
+            let name = match &alter.signature {
+                AlterFunctionSignature::Function(function) => &function.name,
+                AlterFunctionSignature::Aggregate(aggregate) => &aggregate.name,
+            };
+            if let Some(name) = named(name) {
+                builder.take_builtins_named(name);
+            }
+            return;
+        }
         Statement::DropFunction(drop) => &drop.func_desc,
         // No provided function is a procedure, but a procedure signature may
         // name one to refuse.
@@ -7949,21 +7958,6 @@ impl ParserDB {
         Ok(position)
     }
 
-    /// Refuses `ALTER AGGREGATE ... RENAME TO` and `SET SCHEMA`, since this
-    /// model holds no aggregate and PostgreSQL refuses to reach a function
-    /// through the statement.
-    fn refuse_aggregate_alteration(
-        kind: &AlterFunctionKind,
-        func_desc: &FunctionDesc,
-    ) -> Result<(), crate::errors::Error> {
-        if matches!(kind, AlterFunctionKind::Aggregate) {
-            return Err(crate::errors::Error::AggregateAlterationUnsupported {
-                aggregate_name: last_str(&func_desc.name).to_string(),
-            });
-        }
-        Ok(())
-    }
-
     /// Moves the stored function `function` to `moved`, its new name, as
     /// `ALTER FUNCTION ... RENAME TO` and `SET SCHEMA` do.
     ///
@@ -11610,30 +11604,28 @@ impl ParserDB {
                         )?;
                     }
                 }
-                Statement::AlterFunction(AlterFunction {
-                    kind,
-                    function: func_desc,
-                    operation,
-                    ..
-                }) => {
+                Statement::AlterFunction(AlterFunction { signature, operation }) => {
+                    let func_desc = match signature {
+                        AlterFunctionSignature::Function(func_desc) => func_desc,
+                        // `ALTER AGGREGATE` never names a function.
+                        AlterFunctionSignature::Aggregate(aggregate) => {
+                            let aggregate_name = last_str(&aggregate.name).to_string();
+                            return Err(match operation {
+                                AlterFunctionOperation::OwnerTo(_) => {
+                                    crate::errors::Error::AggregateOwnerUnsupported {
+                                        aggregate_name,
+                                    }
+                                }
+                                _ => {
+                                    crate::errors::Error::AggregateAlterationUnsupported {
+                                        aggregate_name,
+                                    }
+                                }
+                            });
+                        }
+                    };
                     match operation {
                         AlterFunctionOperation::OwnerTo(new_owner) => {
-                            // An aggregate reaches here as this same statement,
-                            // and PostgreSQL refuses to reach a function
-                            // through it, so a same-named function must not
-                            // answer for one.
-                            //
-                            // TODO: record the aggregate and its owner once
-                            // upstream parses `CREATE AGGREGATE`, tracked in
-                            // `upstream/sqlparser-create-aggregate.md`. Until
-                            // then no aggregate can be in this model, so the
-                            // statement is refused rather than dropped.
-                            if matches!(kind, AlterFunctionKind::Aggregate) {
-                                return Err(crate::errors::Error::AggregateOwnerUnsupported {
-                                    aggregate_name: last_str(&func_desc.name).to_string(),
-                                });
-                            }
-
                             let position =
                                 Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
 
@@ -11723,7 +11715,6 @@ impl ParserDB {
                             builder.repoint_function(&stale, &fresh);
                         }
                         AlterFunctionOperation::RenameTo { new_name } => {
-                            Self::refuse_aggregate_alteration(&kind, &func_desc)?;
                             let position =
                                 Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
                             let function = Arc::clone(&builder.functions()[position].0);
@@ -11741,7 +11732,6 @@ impl ParserDB {
                             );
                         }
                         AlterFunctionOperation::SetSchema { schema_name } => {
-                            Self::refuse_aggregate_alteration(&kind, &func_desc)?;
                             let position =
                                 Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
                             let function = Arc::clone(&builder.functions()[position].0);
