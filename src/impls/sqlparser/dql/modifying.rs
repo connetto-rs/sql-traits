@@ -122,7 +122,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
         };
         let target = self.target(&table.relation)?;
         let scope = self.relations(&[slice::from_ref(table), from])?;
-        let cursor = self.profile.cursor(&scope);
+        let cursor = Some(self.profile.location(&scope));
         self.nested(cursor, |walker| {
             for assignment in assignments {
                 walker.expression(&assignment.value)?;
@@ -131,8 +131,11 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
         })?;
         let rows = self.returning_rows(target, scope);
         let returned = self.returning(scope, rows, returning.as_deref())?;
-        let scopes =
-            ModifyingScopes { relations: cursor, returning: rows, ..ModifyingScopes::default() };
+        let scopes = ModifyingScopes {
+            relations: cursor,
+            returning: Some(rows),
+            ..ModifyingScopes::default()
+        };
         Ok((scopes, returned))
     }
 
@@ -145,12 +148,15 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
         // The first table a `DELETE` names is its target.
         let target = from.first().map(|table| self.target(&table.relation)).transpose()?.flatten();
         let scope = self.relations(&[from, using.as_deref().unwrap_or_default()])?;
-        let cursor = self.profile.cursor(&scope);
+        let cursor = Some(self.profile.location(&scope));
         self.nested(cursor, |walker| walker.optional_expression(selection.as_ref()))?;
         let rows = self.returning_rows(target, scope);
         let returned = self.returning(scope, rows, returning.as_deref())?;
-        let scopes =
-            ModifyingScopes { relations: cursor, returning: rows, ..ModifyingScopes::default() };
+        let scopes = ModifyingScopes {
+            relations: cursor,
+            returning: Some(rows),
+            ..ModifyingScopes::default()
+        };
         Ok((scopes, returned))
     }
 
@@ -198,7 +204,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
                         Some(("excluded", false)),
                     );
                 }
-                let cursor = self.profile.cursor(&scope);
+                let cursor = Some(self.profile.location(&scope));
                 self.nested(cursor, |walker| {
                     for assignment in assignments {
                         walker.expression(&assignment.value)?;
@@ -211,7 +217,8 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
         };
         let rows = self.returning_rows(target, returned_scope);
         let returned = self.returning(returned_scope, rows, returning.as_deref())?;
-        let scopes = ModifyingScopes { returning: rows, conflict, ..ModifyingScopes::default() };
+        let scopes =
+            ModifyingScopes { returning: Some(rows), conflict, ..ModifyingScopes::default() };
         Ok((scopes, returned))
     }
 
@@ -234,7 +241,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             self.outer,
             self.profile,
         )?;
-        let source_alone = self.profile.cursor(&both);
+        let source_alone = Some(self.profile.location(&both));
         self.profile.record_factor(table);
         collect_lone_factor(
             AstRef::Query(table),
@@ -253,12 +260,13 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             self.outer,
             self.profile,
         )?;
+        let rows = self.returning_rows(target, both);
         let scopes = ModifyingScopes {
-            relations: self.profile.cursor(&both),
-            returning: self.returning_rows(target, both),
+            relations: Some(self.profile.location(&both)),
+            returning: Some(rows),
             conflict: None,
             source: source_alone,
-            target: self.profile.cursor(&target_alone),
+            target: Some(self.profile.location(&target_alone)),
         };
         self.nested(scopes.relations, |walker| walker.expression(on))?;
         for MergeClause { clause_kind, predicate, action, .. } in clauses {
@@ -292,7 +300,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             Some(OutputClause::Returning { select_items, .. }) => Some(select_items.as_slice()),
             _ => None,
         };
-        let returned = self.returning(both, scopes.returning, returning)?;
+        let returned = self.returning(both, rows, returning)?;
         Ok((scopes, returned))
     }
 
@@ -312,9 +320,9 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
         &mut self,
         target: Option<&'db DB::Table>,
         relations: ScopeId,
-    ) -> Option<ScopeCursor> {
-        let relations = self.profile.cursor(&relations);
-        let (Some(target), Some(parent)) = (target, relations) else {
+    ) -> ScopeCursor {
+        let relations = self.profile.location(&relations);
+        let Some(target) = target else {
             return relations;
         };
         let mut rows = None;
@@ -322,7 +330,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             if self.profile.reaches_relation(relations, name) {
                 continue;
             }
-            let scope = *rows.get_or_insert_with(|| self.profile.begin_qualified_scope(parent));
+            let scope = *rows.get_or_insert_with(|| self.profile.begin_qualified_scope(relations));
             self.profile.push_table_entry(
                 scope,
                 target,
@@ -330,7 +338,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
                 Some((name, false)),
             );
         }
-        rows.map_or(relations, |rows| self.profile.cursor(&rows))
+        rows.map_or(relations, |rows| self.profile.location(&rows))
     }
 
     /// A scope under the one the statement stands in, holding the relations
@@ -366,13 +374,15 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
     fn returning(
         &mut self,
         scope: ScopeId,
-        cursor: Option<ScopeCursor>,
+        cursor: ScopeCursor,
         items: Option<&'query [SelectItem]>,
     ) -> Result<Returned<'query, 'db, DB>, LookupError> {
         let Some(items) = items else {
             return Ok(None);
         };
-        self.nested(cursor, |walker| items.iter().try_for_each(|item| walker.select_item(item)))?;
+        self.nested(Some(cursor), |walker| {
+            items.iter().try_for_each(|item| walker.select_item(item))
+        })?;
         let mut columns = Vec::with_capacity(items.len());
         for item in items {
             if !append_select_item(
