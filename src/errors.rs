@@ -3588,12 +3588,53 @@ pub enum Error {
         "Virtual table `{table_name}` uses module `{module_name}`, whose columns `ParserDB` cannot derive."
     )]
     /// Error indicating that a `CREATE VIRTUAL TABLE` names a module whose
-    /// argument grammar `ParserDB` does not read, so its columns are unknown.
+    /// argument grammar `ParserDB` does not read, so its columns are unknown
+    /// unless [`ParserDBIngestor::apply_virtual_table`] supplies them.
+    ///
+    /// [`ParserDBIngestor::apply_virtual_table`]: crate::structs::ParserDBIngestor::apply_virtual_table
     UnknownVirtualTableModule {
         /// Name of the virtual table.
         table_name: String,
         /// Name of the module, as written.
         module_name: String,
+    },
+    #[error(
+        "Virtual table `{table_name}` of module `{module_name}` declares column `{column_name}` otherwise than `ParserDB` derives it from the arguments."
+    )]
+    /// Error indicating that the columns supplied for a virtual table of a
+    /// module whose arguments `ParserDB` reads differ from the columns it
+    /// derives, by name, declared type, hidden flag or order, so one of the
+    /// two misreads the module.
+    VirtualTableColumnsMismatch {
+        /// Name of the virtual table.
+        table_name: String,
+        /// Name of the module, as written.
+        module_name: String,
+        /// Name of the first column the two lists differ at, as supplied,
+        /// or as derived when the supplied list ends before it.
+        column_name: String,
+    },
+    #[error(
+        "Virtual table `{table_name}` of module `{module_name}` cannot keep a shadow table with suffix `{suffix}`."
+    )]
+    /// Error indicating that a shadow table suffix supplied for a virtual
+    /// table names no table SQLite reads as one of its shadow tables: the
+    /// suffix is empty, holds an underscore, or is one a module whose
+    /// arguments `ParserDB` reads does not keep.
+    VirtualTableShadowSuffixRefused {
+        /// Name of the virtual table.
+        table_name: String,
+        /// Name of the module, as written.
+        module_name: String,
+        /// The suffix, as supplied.
+        suffix: String,
+    },
+    #[error("`{statement}` is no `CREATE VIRTUAL TABLE`, so it declares no virtual table columns.")]
+    /// Error indicating that declared virtual table columns came with a
+    /// statement other than a `CREATE VIRTUAL TABLE`.
+    NotAVirtualTable {
+        /// The statement as written.
+        statement: String,
     },
     #[error(
         "Module `{module_name}` refuses the arguments of virtual table `{table_name}`: {refusal}."

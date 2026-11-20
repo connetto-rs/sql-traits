@@ -41,10 +41,10 @@ use crate::{
     errors::{KeyConstraint, LookupError, ObjectKind},
     impls::{PrivilegeKind, SqlparserDialect},
     structs::{
-        ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
-        IdentifierCase, MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership,
-        Schema, SchemaProfile, Sequence, TableAttribute, TableMetadata, TriggerEnablement,
-        UserDefinedType, View, VirtualTableSource,
+        ColumnIdentity, ColumnMetadata, DeclaredVirtualTable, ForeignTableSource, FunctionKind,
+        GenericDB, IdentifierCase, MaterializedView, MaterializedViewIndex, RelationIdentity,
+        RoleMembership, Schema, SchemaProfile, Sequence, TableAttribute, TableMetadata,
+        TriggerEnablement, UserDefinedType, View, VirtualTableSource,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -5388,6 +5388,7 @@ impl ParserDBIngestor {
                 access_resolution,
                 statement,
                 source,
+                None,
             )?;
         }
         Ok(Self { catalog, access_resolution, transaction })
@@ -5409,6 +5410,50 @@ impl ParserDBIngestor {
     /// current transaction state.
     pub fn apply_statement(self, statement: Statement) -> Result<Self, crate::errors::Error> {
         self.apply_statements(core::iter::once((statement, None)))
+    }
+
+    /// Applies `statement`, a `CREATE VIRTUAL TABLE`, with the columns and
+    /// shadow tables a live database reports for it in `declared`.
+    ///
+    /// A virtual table of any module enters the schema this way, its
+    /// [`VirtualTableSource`] as written. For a module whose arguments
+    /// [`ParserDB`] reads, the columns it derives from them must match
+    /// `declared`, and every declared shadow suffix must be one the module
+    /// keeps, though a table may keep fewer shadow tables than its module
+    /// could.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotAVirtualTable`] for any other statement,
+    /// [`Error::VirtualTableColumnsMismatch`] when the derived columns differ
+    /// from `declared` by name, declared type, hidden flag or order,
+    /// [`Error::VirtualTableShadowSuffixRefused`] for a shadow suffix SQLite
+    /// cannot read as one of the table's, and otherwise the errors
+    /// [`Self::apply_statement`] returns.
+    ///
+    /// [`Error::NotAVirtualTable`]: crate::errors::Error::NotAVirtualTable
+    /// [`Error::VirtualTableColumnsMismatch`]: crate::errors::Error::VirtualTableColumnsMismatch
+    /// [`Error::VirtualTableShadowSuffixRefused`]: crate::errors::Error::VirtualTableShadowSuffixRefused
+    pub fn apply_virtual_table(
+        self,
+        statement: Statement,
+        declared: DeclaredVirtualTable,
+    ) -> Result<Self, crate::errors::Error> {
+        if !matches!(statement, Statement::CreateVirtualTable { .. }) {
+            return Err(crate::errors::Error::NotAVirtualTable {
+                statement: statement.to_string(),
+            });
+        }
+        let Self { catalog, access_resolution, mut transaction } = self;
+        let catalog = transactions::apply(
+            catalog,
+            &mut transaction,
+            access_resolution,
+            statement,
+            None,
+            Some(declared),
+        )?;
+        Ok(Self { catalog, access_resolution, transaction })
     }
 
     /// Returns a queryable snapshot without consuming the builder. Inside a
@@ -5620,10 +5665,10 @@ impl ParserDB {
         else {
             return Ok(None);
         };
-        let keeps_suffix =
-            self.table_metadata(owner).and_then(TableMetadata::virtual_source).is_some_and(
-                |source| virtual_tables::shadow_suffix(source.module_name(), suffix).is_some(),
-            );
+        let keeps_suffix = self
+            .table_metadata(owner)
+            .filter(|metadata| metadata.virtual_source().is_some())
+            .is_some_and(|metadata| virtual_tables::shadow_suffix(metadata, suffix).is_some());
         Ok(keeps_suffix.then_some(owner))
     }
 
@@ -6430,6 +6475,7 @@ impl ParserDB {
             previous_node,
             replacement,
         ));
+        metadata.set_shadow_suffixes(previous_metadata.take_shadow_suffixes());
         // Which columns came from a parent is not spelled by the node, so it
         // has to survive the rebuild the way the other unspelled settings do.
         metadata.set_inherited_column_names(previous_metadata.inherited_column_names().to_vec());
@@ -9649,6 +9695,7 @@ impl ParserDB {
         access_resolution: AccessResolution,
         statements: &mut dyn Iterator<Item = Statement>,
         source: Option<StatementSource<'_>>,
+        mut declared_virtual_table: Option<DeclaredVirtualTable>,
         in_transaction: bool,
     ) -> Result<transactions::Catalog, crate::errors::Error> {
         let transactions::Catalog {
@@ -11149,13 +11196,18 @@ impl ParserDB {
                     }
                     // SQLite refuses a taken name before the module reads its
                     // arguments.
-                    let hidden_column_names = match &virtual_source {
+                    let declaration = match &virtual_source {
                         Some(source) => {
                             validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
                             builder.ensure_table_lookup_invariants(&create_table)?;
-                            virtual_tables::declare_columns(&builder, &mut create_table, source)?
+                            virtual_tables::declare_columns(
+                                &builder,
+                                &mut create_table,
+                                source,
+                                declared_virtual_table.take(),
+                            )?
                         }
-                        None => Vec::new(),
+                        None => virtual_tables::ModuleDeclaration::default(),
                     };
                     if let Some((previous, current)) =
                         Arc::make_mut(&mut type_arrays).displace(&builder, &create_table.name)
@@ -11275,7 +11327,8 @@ impl ParserDB {
                     ));
                     metadata.set_foreign_source(foreign_source);
                     metadata.set_virtual_source(virtual_source);
-                    metadata.set_hidden_column_names(hidden_column_names);
+                    metadata.set_hidden_column_names(declaration.hidden_column_names);
+                    metadata.set_shadow_suffixes(declaration.shadow_suffixes);
                     metadata.set_inherited_not_null(
                         create_table
                             .columns
