@@ -81,24 +81,24 @@ where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
 {
-    let with_ordinality = match factor.get() {
-        TableFactor::Table { args: Some(_), with_ordinality, .. }
-        | TableFactor::Function { with_ordinality, .. } => *with_ordinality,
-        _ => return Ok(None),
+    let Some(arguments) = factor.try_map(|factor| {
+        match factor {
+            TableFactor::Table { args: Some(args), .. } => Some(args.args.as_slice()),
+            TableFactor::Function { args, .. } => Some(args.as_slice()),
+            _ => None,
+        }
+    }) else {
+        return Ok(None);
     };
+    let with_ordinality = matches!(
+        factor.get(),
+        TableFactor::Table { with_ordinality: true, .. }
+            | TableFactor::Function { with_ordinality: true, .. }
+    );
     let Some(function) = reached_function(factor.get(), deriving.database, deriving.case)? else {
         return Ok(None);
     };
-    let call = Call {
-        arguments: factor.map(|factor| {
-            match factor {
-                TableFactor::Table { args: Some(args), .. } => args.args.as_slice(),
-                TableFactor::Function { args, .. } => args.as_slice(),
-                _ => &[],
-            }
-        }),
-        scope: local_parent,
-    };
+    let call = Call { arguments, scope: local_parent };
     let alias = factor_alias(factor);
     let Some(columns) = result_columns(function, call, alias, with_ordinality, deriving, profile)?
     else {
