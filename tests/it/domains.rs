@@ -138,6 +138,67 @@ fn every_fact_of_the_base_type_is_reached() {
     assert_eq!(base.numeric_scale(&database), Some(2));
 }
 
+/// The domain the type `column` of `table` names directly, as `schema.name`
+/// with `-` for the default schema, or `None` when it names no domain.
+fn named_domain(database: &ParserDB, table: &str, column: &str) -> Option<String> {
+    column_type(database, table, column).domain(database).map(qualified)
+}
+
+/// A domain as `schema.name`, with `-` for the default schema.
+fn qualified(domain: &impl DomainLike) -> String {
+    format!("{}.{}", domain.stored_schema().as_deref().unwrap_or("-"), domain.stored_name())
+}
+
+const CHAIN: &str = "CREATE SCHEMA app;
+     CREATE DOMAIN span AS double precision;
+     CREATE DOMAIN positive_span AS span CHECK (VALUE > 0);
+     CREATE DOMAIN other_span AS span CHECK (VALUE < 5);
+     CREATE DOMAIN app.span AS real;
+     CREATE TABLE t (took positive_span, spans span[], n INT, q app.span);";
+
+#[test]
+fn a_type_names_each_domain_of_its_chain_one_step_at_a_time() {
+    let database = parse(CHAIN).expect("the schema is accepted");
+    let took = column_type(&database, "t", "took").domain(&database).expect("took names a domain");
+    assert_eq!(qualified(took), "-.positive_span");
+    let span = took.data_type(&database).domain(&database).expect("positive_span is over a domain");
+    assert_eq!(qualified(span), "-.span");
+    assert!(span.data_type(&database).domain(&database).is_none());
+}
+
+#[test]
+fn an_array_of_a_domain_names_the_domain_only_through_its_element() {
+    let database = parse(CHAIN).expect("the schema is accepted");
+    let spans = column_type(&database, "t", "spans");
+    assert!(spans.domain(&database).is_none());
+    let element = spans.array_element(&database).expect("spans is an array");
+    assert_eq!(element.domain(&database).map(qualified).as_deref(), Some("-.span"));
+}
+
+#[test]
+fn a_type_names_the_domain_of_the_schema_it_qualifies() {
+    let database = parse(CHAIN).expect("the schema is accepted");
+    assert_eq!(named_domain(&database, "t", "q").as_deref(), Some("app.span"));
+    assert_eq!(named_domain(&database, "t", "n"), None);
+}
+
+#[test]
+fn a_domain_chain_reaching_no_base_type_names_no_domain() {
+    let database = parse(
+        "CREATE DOMAIN d AS d;
+         CREATE DOMAIN a AS b;
+         CREATE DOMAIN b AS a;
+         CREATE DOMAIN c AS a;
+         CREATE TABLE t (x d, y a, z c);",
+    )
+    .expect("an unknown base type is kept");
+    assert_eq!(named_domain(&database, "t", "x"), None);
+    assert_eq!(named_domain(&database, "t", "y"), None);
+    assert_eq!(named_domain(&database, "t", "z"), None);
+    assert_eq!(base_name(&database, "t", "y"), None);
+    assert_eq!(base_name(&database, "t", "z"), None);
+}
+
 #[test]
 fn domains_are_listed_with_the_type_written_for_them() {
     let database = parse(

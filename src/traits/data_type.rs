@@ -1257,6 +1257,63 @@ pub trait DataTypeLike: Debug + Send + Sync {
         database: &'db Self::DB,
     ) -> Option<impl Iterator<Item = ArrayDimension>>;
 
+    /// Returns the domain the type names directly, or `None` for a type that
+    /// names no domain.
+    ///
+    /// This is one step of the chain [`Self::base_type`] follows to its end,
+    /// and the domain's
+    /// [`DomainLike::data_type`](crate::traits::DomainLike::data_type) takes
+    /// the next one. PostgreSQL applies the checks of every domain on the
+    /// chain to a value of the outermost, so a consumer reading what a column
+    /// admits walks it whole. The name is resolved as `base_type` resolves
+    /// it, through the schema it is qualified with or that the search path
+    /// reached when it was declared. An array of a domain names no domain,
+    /// while its [`Self::array_element`] does. A type whose chain loops among
+    /// domains declared over each other's names, which PostgreSQL refuses,
+    /// names no domain, so every walk ends.
+    ///
+    /// The default answers `None`, so an implementation over a backend with
+    /// domains must override it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE DOMAIN span AS double precision;
+    /// CREATE DOMAIN positive_span AS span CHECK (VALUE > 0);
+    /// CREATE DOMAIN short_span AS span CHECK (VALUE < 5);
+    /// CREATE TABLE t (took positive_span, n INT);
+    /// ",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let took = table.column("took", &db, IdentifierCase::AsWritten)?.unwrap();
+    /// let n = table.column("n", &db, IdentifierCase::AsWritten)?.unwrap();
+    ///
+    /// let mut checks = 0;
+    /// let mut domain = took.data_type(&db).domain(&db);
+    /// while let Some(current) = domain {
+    ///     checks += current.check_expressions().count();
+    ///     domain = current.data_type(&db).domain(&db);
+    /// }
+    /// assert_eq!(checks, 1);
+    /// assert!(n.data_type(&db).domain(&db).is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn domain<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Option<&'db <Self::DB as DatabaseLike>::Domain> {
+        None
+    }
+
     /// Returns the type a domain is defined over, followed through every
     /// domain in between, or `None` for a type that names no domain.
     ///

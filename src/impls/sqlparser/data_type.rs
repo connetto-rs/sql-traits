@@ -10,10 +10,10 @@ use alloc::{
 use core::{iter, slice};
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, ColumnDef, ColumnOption, DataType, EnumMember, ExactNumberInfo, Expr, Ident,
-    MapBracketKind, ObjectName, ObjectNamePart, SqlOption, StructField, TimezoneInfo, TypeModifier,
-    UnaryOperator, UnionField, UserDefinedTypeCompositeAttributeDef, UserDefinedTypeRepresentation,
-    UserDefinedTypeSqlDefinitionOption, Value, ValueWithSpan,
+    ArrayElemTypeDef, ColumnDef, ColumnOption, CreateDomain, DataType, EnumMember, ExactNumberInfo,
+    Expr, Ident, MapBracketKind, ObjectName, ObjectNamePart, SqlOption, StructField, TimezoneInfo,
+    TypeModifier, UnaryOperator, UnionField, UserDefinedTypeCompositeAttributeDef,
+    UserDefinedTypeRepresentation, UserDefinedTypeSqlDefinitionOption, Value, ValueWithSpan,
 };
 
 use crate::{
@@ -102,6 +102,33 @@ fn on_type_search_path(database: &ParserDB, schema: &str) -> bool {
     schema == PG_CATALOG
         || relation_search_path(|| database.search_path())
             .any(|(entry, quoted)| stored_identifier(entry, quoted) == schema)
+}
+
+/// The first and the last domain of the chain `data_type` names, or `None`
+/// when it names no domain or the chain never leaves the domains.
+fn domain_chain<'db>(
+    data_type: &'db DataType,
+    database: &'db ParserDB,
+) -> Option<(&'db CreateDomain, &'db CreateDomain)> {
+    let case = database.identifier_case();
+    let named = |data_type: &DataType| {
+        match data_type {
+            DataType::Custom(name, _) => bound_domain(database.domains(), name, case),
+            _ => None,
+        }
+    };
+    let first = named(data_type)?;
+    let mut last = first;
+    // A chain visiting more domains than there are has met one of them twice,
+    // so it loops among domains declared over each other's names, which
+    // PostgreSQL refuses.
+    for _ in 0..database.domains().count() {
+        match named(&last.data_type) {
+            Some(next) => last = next,
+            None => return Some((first, last)),
+        }
+    }
+    None
 }
 
 impl DataTypeLike for DataType {
@@ -268,24 +295,12 @@ impl DataTypeLike for DataType {
         }
     }
 
+    fn domain<'db>(&'db self, database: &'db Self::DB) -> Option<&'db CreateDomain> {
+        domain_chain(self, database).map(|(first, _)| first)
+    }
+
     fn base_type<'db>(&'db self, database: &'db Self::DB) -> Option<&'db Self> {
-        let case = database.identifier_case();
-        let mut current = self;
-        let mut reached = None;
-        // A chain through every domain ends one step after the last of them,
-        // so a walk lasting longer has met a domain declared over a type of
-        // its own name, which PostgreSQL refuses and which reaches no base.
-        for _ in 0..=database.domains().count() {
-            let Self::Custom(name, _) = current else {
-                return reached;
-            };
-            let Some(domain) = bound_domain(database.domains(), name, case) else {
-                return reached;
-            };
-            current = &domain.data_type;
-            reached = Some(current);
-        }
-        None
+        domain_chain(self, database).map(|(_, last)| &last.data_type)
     }
 
     fn send_function(&self, database: &Self::DB) -> Option<bool> {
