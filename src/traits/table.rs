@@ -1724,8 +1724,14 @@ pub trait TableLike:
         Ok(Some(pk_column))
     }
 
-    /// Returns whether the primary key of the table is generated (i.e.,
-    /// auto-incrementing).
+    /// Returns whether the primary key of the table is a surrogate key, one
+    /// whose every column the database assigns, so that an insert leaves the
+    /// key out and reads it back.
+    ///
+    /// The database assigns a serial or identity column, which it generates,
+    /// and a computed column, which it derives from its row through
+    /// [`ColumnLike::generation_expression`]. A table without a primary key
+    /// has no surrogate key.
     ///
     /// # Arguments
     ///
@@ -1740,27 +1746,43 @@ pub trait TableLike:
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "
-    /// CREATE TABLE my_table (id SERIAL PRIMARY KEY, name TEXT);
-    /// CREATE TABLE my_no_gen_pk_table (id INT PRIMARY KEY, name TEXT);
-    /// ",
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE serial_key (id SERIAL PRIMARY KEY);
+    ///      CREATE TABLE identity_key (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY);
+    ///      CREATE TABLE computed_key (
+    ///          price INT NOT NULL,
+    ///          doubled INT GENERATED ALWAYS AS (price * 2) STORED PRIMARY KEY
+    ///      );
+    ///      CREATE TABLE mixed_key (
+    ///          price INT NOT NULL,
+    ///          doubled INT GENERATED ALWAYS AS (price * 2) STORED,
+    ///          PRIMARY KEY (price, doubled)
+    ///      );
+    ///      CREATE TABLE natural_key (id INT PRIMARY KEY);
+    ///      CREATE TABLE keyless (id SERIAL);",
     /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// assert!(table.has_surrogate_primary_key(&db)?);
-    /// let no_gen_pk_table = db
-    ///     .table_by_target(TargetName::new("my_no_gen_pk_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// assert!(!no_gen_pk_table.has_surrogate_primary_key(&db)?);
+    /// let surrogate = |name| -> Result<bool, sql_traits::errors::Error> {
+    ///     let table =
+    ///         db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)?.unwrap();
+    ///     Ok(table.has_surrogate_primary_key(&db)?)
+    /// };
+    /// assert!(surrogate("serial_key")?);
+    /// assert!(surrogate("identity_key")?);
+    /// assert!(surrogate("computed_key")?);
+    /// assert!(!surrogate("mixed_key")?, "the caller sets price");
+    /// assert!(!surrogate("natural_key")?);
+    /// assert!(!surrogate("keyless")?);
     /// # Ok(())
     /// # }
     /// ```
     fn has_surrogate_primary_key(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(self.primary_key_columns(database)?.all(|column| column.is_generated(database))
-            && self.has_primary_key(database)?)
+        Ok(self.primary_key_columns(database)?.all(|column| {
+            column.is_generated(database) || column.generation_expression().is_some()
+        }) && self.has_primary_key(database)?)
     }
 
     /// Returns a vector with the normalized data types of the primary key
