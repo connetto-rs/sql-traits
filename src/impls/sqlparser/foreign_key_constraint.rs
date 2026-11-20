@@ -171,7 +171,8 @@ pub(crate) fn foreign_keys_stored_alike(
     StoredForeignKey::from(left) == StoredForeignKey::from(right)
 }
 
-/// Resolves `column_names` against the columns `table` declares.
+/// Resolves `column_names` against the columns `table` declares, compared
+/// under the identifier case the catalog took its names under.
 ///
 /// A foreign key naming a column its table does not declare is a dangling
 /// reference rather than a translatable constraint, so it is reported instead
@@ -184,12 +185,21 @@ fn resolve_columns<'db>(
     // Resolve the declared columns once rather than per named column: the
     // metadata lookup is the expensive half and the answer does not change.
     let declared: alloc::vec::Vec<_> = table.columns(database)?.collect();
+    let case = database.identifier_case();
     let mut columns = alloc::vec::Vec::with_capacity(column_names.len());
     for column_name in column_names {
         let column = declared
             .iter()
             .copied()
-            .find(|column| &column.attribute().name == column_name)
+            .find(|column| {
+                let declared_name = &column.attribute().name;
+                case.identifiers_match(
+                    &declared_name.value,
+                    declared_name.quote_style.is_some(),
+                    &column_name.value,
+                    column_name.quote_style.is_some(),
+                )
+            })
             .ok_or_else(|| {
                 LookupError::ColumnNotFound {
                     table_name: table.table_name().to_string(),

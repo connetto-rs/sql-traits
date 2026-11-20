@@ -3197,8 +3197,7 @@ fn retain_action_columns(action: &mut Action, keep: impl Fn(&Ident) -> bool) {
     }
 }
 
-/// Returns whether two identifiers name the same object under PostgreSQL
-/// folding: an unquoted one is case-insensitive, a quoted one exact.
+/// Returns whether two identifiers name the same object under `case`.
 fn case_idents_match(left: &Ident, right: &Ident, case: IdentifierCase) -> bool {
     case.identifiers_match(
         left.value.as_str(),
@@ -3577,10 +3576,10 @@ fn plain_key_columns(columns: &[IndexColumn]) -> Option<Vec<&Ident>> {
         .collect()
 }
 
-/// Returns whether two column lists name the same set of columns.
-fn key_columns_match(left: &[&Ident], right: &[&Ident]) -> bool {
+/// Returns whether two column lists name the same set of columns under `case`.
+fn key_columns_match(left: &[&Ident], right: &[&Ident], case: IdentifierCase) -> bool {
     left.len() == right.len()
-        && left.iter().all(|wanted| right.iter().any(|have| idents_match(wanted, have)))
+        && left.iter().all(|wanted| right.iter().any(|have| case_idents_match(wanted, have, case)))
 }
 
 /// Collects every set of columns on `table` that a foreign key may point at:
@@ -6707,9 +6706,10 @@ impl ParserDB {
             });
         }
 
+        let case = builder.identifier_case();
         for col_ident in &fk.columns {
             let column_exists = table_metadata.column_arcs().any(|col| {
-                identifiers_match(
+                case.identifiers_match(
                     col.column_name(),
                     col.column_name_is_quoted(),
                     col_ident.value.as_str(),
@@ -6731,7 +6731,7 @@ impl ParserDB {
 
         for ref_col_ident in &fk.referred_columns {
             let column_exists = referenced_table.columns.iter().any(|col| {
-                identifiers_match(
+                case.identifiers_match(
                     col.name.value.as_str(),
                     col.name.quote_style.is_some(),
                     ref_col_ident.value.as_str(),
@@ -6765,7 +6765,7 @@ impl ParserDB {
             }));
             candidates
                 .iter()
-                .any(|candidate| key_columns_match(&referred, candidate))
+                .any(|candidate| key_columns_match(&referred, candidate, case))
                 .then_some(referred.len())
         };
 
