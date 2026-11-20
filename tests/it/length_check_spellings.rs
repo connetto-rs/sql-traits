@@ -72,3 +72,22 @@ fn a_lower_length_bound_of_at_least_one_rejects_the_empty_string() -> Result<(),
         ],
     )
 }
+
+#[test]
+fn a_bound_read_through_another_column_takes_its_tightest_check() -> Result<(), Error> {
+    assert_facts(
+        "CREATE TABLE notes (
+            s TEXT CHECK (length(s) < length(r)),
+            u TEXT CHECK (length(u) > length(r)),
+            r TEXT,
+            CHECK (length(r) <= 9 AND length(r) >= 2),
+            CHECK (length(r) < 5 AND length(r) > 3)
+        );",
+        &[
+            (Some(5), None, false),
+            (None, Some(5), false),
+            (Some(10), Some(2), true),
+            (Some(5), Some(4), true),
+        ],
+    )
+}
