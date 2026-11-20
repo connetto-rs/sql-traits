@@ -11,7 +11,7 @@ use alloc::{
 };
 use core::marker::PhantomData;
 
-use sqlparser::ast::{ArgMode, DataType, TableAlias, TableFactor};
+use sqlparser::ast::{ArgMode, DataType, FunctionArg, TableAlias, TableFactor};
 
 use super::{
     AstRef, DerivationProfile, DerivedColumn, DerivedRelationRef, DerivedShape, Deriving,
@@ -34,10 +34,15 @@ const DEFAULT_SCHEMA: &str = "public";
 
 /// What declares the type of a column of the result a function called in
 /// `FROM` returns, the graph's form of
-/// [`FunctionResultType`](crate::structs::FunctionResultType).
-pub(super) enum ResultColumnType<'query, 'db, DB: DatabaseLike, D> {
-    /// A type the function's signature names.
+/// [`FunctionResultType`](crate::structs::FunctionResultType), its arguments
+/// read under a scope of cursor type `C`.
+pub(super) enum ResultColumnType<'query, 'db, DB: DatabaseLike, D, C> {
+    /// A type the function's signature names for a column among two or more
+    /// outputs.
     Signature(Cow<'db, str>),
+    /// The type the function's signature names for its only output, with
+    /// the arguments the call writes and the scope they are read in.
+    Scalar { name: Cow<'db, str>, arguments: AstRef<'query, 'db, [FunctionArg]>, scope: C },
     /// A column of the relation whose row type the function returns, by the
     /// column's definition.
     RowType(D),
@@ -51,15 +56,16 @@ pub(super) enum ResultColumnType<'query, 'db, DB: DatabaseLike, D> {
 
 /// One column of a function's result: its name, whether the name is quoted,
 /// and what declares its type.
-type ResultColumn<'query, 'db, DB, D> = (String, bool, ResultColumnType<'query, 'db, DB, D>);
+type ResultColumn<'query, 'db, DB, D, C> = (String, bool, ResultColumnType<'query, 'db, DB, D, C>);
 
 /// The columns of a function's result, `None` when they are not known.
-type ResultColumns<'query, 'db, DB, D> = Option<Vec<ResultColumn<'query, 'db, DB, D>>>;
+type ResultColumns<'query, 'db, DB, D, C> = Option<Vec<ResultColumn<'query, 'db, DB, D, C>>>;
 
 /// What `factor`, a `FROM` item written as a call, contributes when the call
 /// reaches one function of the database whose result PostgreSQL describes
 /// without running it: the columns of that result, then the `bigint` column
-/// `WITH ORDINALITY` adds, renamed by the alias's column list.
+/// `WITH ORDINALITY` adds, renamed by the alias's column list. The call's
+/// arguments are read under `local_parent`.
 ///
 /// `None` for any other item, and for a call that reaches no function or
 /// several, one of a procedure, an aggregate or a window function, a
@@ -69,22 +75,34 @@ type ResultColumns<'query, 'db, DB, D> = Option<Vec<ResultColumn<'query, 'db, DB
 pub(super) fn collect_function_call<'query, 'db, DB, P>(
     factor: AstRef<'query, 'db, TableFactor>,
     deriving: Deriving<'_, 'db, DB>,
+    local_parent: P::Cursor,
     profile: &mut P,
 ) -> Result<Option<FactorContribution<'query, 'db, DB, P::Definition>>, LookupError>
 where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
 {
-    let with_ordinality = match factor.get() {
-        TableFactor::Table { args: Some(_), with_ordinality, .. }
-        | TableFactor::Function { with_ordinality, .. } => *with_ordinality,
-        _ => return Ok(None),
+    let Some(arguments) = factor.try_map(|factor| {
+        match factor {
+            TableFactor::Table { args: Some(args), .. } => Some(args.args.as_slice()),
+            TableFactor::Function { args, .. } => Some(args.as_slice()),
+            _ => None,
+        }
+    }) else {
+        return Ok(None);
     };
+    let with_ordinality = matches!(
+        factor.get(),
+        TableFactor::Table { with_ordinality: true, .. }
+            | TableFactor::Function { with_ordinality: true, .. }
+    );
     let Some(function) = reached_function(factor.get(), deriving.database, deriving.case)? else {
         return Ok(None);
     };
+    let call = Call { arguments, scope: local_parent };
     let alias = factor_alias(factor);
-    let Some(columns) = result_columns(function, alias, with_ordinality, deriving, profile)? else {
+    let Some(columns) = result_columns(function, call, alias, with_ordinality, deriving, profile)?
+    else {
         return Ok(None);
     };
     let mut derived = Vec::with_capacity(columns.len() + usize::from(with_ordinality));
@@ -123,6 +141,13 @@ where
     }))
 }
 
+/// The arguments a call in `FROM` writes and the scope they are read in.
+#[derive(Clone, Copy)]
+struct Call<'query, 'db, C> {
+    arguments: AstRef<'query, 'db, [FunctionArg]>,
+    scope: C,
+}
+
 /// The one function of `database` the call `factor` writes reaches under
 /// `case`, or `None` when it reaches none or several, when the called name
 /// has more than two parts or a part built at run time, and for a procedure,
@@ -145,15 +170,16 @@ fn reached_function<'db, DB: DatabaseLike>(
     Ok((function.kind(database)? == FunctionKind::Normal).then_some(function))
 }
 
-/// The columns of the result `function` returns when called in `FROM`, named
-/// as PostgreSQL's `chooseScalarFunctionAlias` and
+/// The columns of the result `function` returns when called in `FROM` as
+/// `call`, named as PostgreSQL's `chooseScalarFunctionAlias` and
 /// `build_function_result_tupdesc_d` name them, the column definition list
 /// of `alias` declaring those of a `record` result.
 ///
 /// A function's output arguments, its `RETURNS TABLE` columns among them,
 /// name its columns, an unnamed one taking `column` and its position among
 /// the outputs. A single unnamed output and a scalar result take the alias,
-/// or else the function's name.
+/// or else the function's name. The column of a function of one output
+/// carries `call`, from which PostgreSQL derives the column's collation.
 ///
 /// # Errors
 ///
@@ -161,11 +187,12 @@ fn reached_function<'db, DB: DatabaseLike>(
 /// function returns, or deriving that of a view, runs into.
 fn result_columns<'query, 'db, DB, P>(
     function: &'db DB::Function,
+    call: Call<'query, 'db, P::Cursor>,
     alias: Option<AstRef<'query, 'db, TableAlias>>,
     with_ordinality: bool,
     deriving: Deriving<'_, 'db, DB>,
     profile: &mut P,
-) -> Result<ResultColumns<'query, 'db, DB, P::Definition>, LookupError>
+) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Cursor>, LookupError>
 where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
@@ -182,6 +209,8 @@ where
             },
         )
     };
+    let scalar =
+        |name| ResultColumnType::Scalar { name, arguments: call.arguments, scope: call.scope };
     let outputs: Vec<(Option<TargetName<'db>>, Cow<'db, str>)> = function
         .argument_modes()
         .zip(function.argument_names(database))
@@ -201,7 +230,9 @@ where
                 None if single => scalar_name(),
                 None => (format!("column{}", position + 1), true),
             };
-            (name, quoted, ResultColumnType::Signature(data_type))
+            let data_type =
+                if single { scalar(data_type) } else { ResultColumnType::Signature(data_type) };
+            (name, quoted, data_type)
         });
         return Ok(Some(columns.collect()));
     }
@@ -222,7 +253,7 @@ where
         ResultShape::Row(row_type) => row_type_columns(&row_type, deriving, profile),
         ResultShape::Scalar => {
             let (name, quoted) = scalar_name();
-            Ok(Some(vec![(name, quoted, ResultColumnType::Signature(result))]))
+            Ok(Some(vec![(name, quoted, scalar(result))]))
         }
         ResultShape::Unknown => Ok(None),
     }
@@ -236,9 +267,9 @@ fn is_polymorphic(name: &str) -> bool {
 
 /// The columns the column definition list of `alias` declares, or `None`
 /// when one of its columns declares no type.
-fn definition_list<'query, 'db, DB: DatabaseLike, D>(
+fn definition_list<'query, 'db, DB: DatabaseLike, D, C>(
     alias: AstRef<'query, 'db, TableAlias>,
-) -> ResultColumns<'query, 'db, DB, D> {
+) -> ResultColumns<'query, 'db, DB, D, C> {
     (0..alias.get().columns.len())
         .map(|position| {
             let column = alias.map(|alias| &alias.columns[position]);
@@ -296,7 +327,7 @@ fn row_type_columns<'query, 'db, DB, P>(
     name: &TargetName<'_>,
     deriving: Deriving<'_, 'db, DB>,
     profile: &mut P,
-) -> Result<ResultColumns<'query, 'db, DB, P::Definition>, LookupError>
+) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Cursor>, LookupError>
 where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
@@ -360,7 +391,7 @@ fn relation_columns<'query, 'db, DB, P>(
     relation: Relation<'db, DB>,
     deriving: Deriving<'_, 'db, DB>,
     profile: &mut P,
-) -> Result<ResultColumns<'query, 'db, DB, P::Definition>, LookupError>
+) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Cursor>, LookupError>
 where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,

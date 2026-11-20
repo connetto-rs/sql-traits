@@ -14,7 +14,10 @@ use core::ops::ControlFlow;
 
 use sql_traits::prelude::*;
 use sqlparser::{
-    ast::{Expr, Ident, Query, SelectItem, SetExpr, visit_expressions},
+    ast::{
+        Expr, FunctionArg, FunctionArgExpr, Ident, ObjectName, Query, SelectItem, SetExpr,
+        visit_expressions,
+    },
     dialect::PostgreSqlDialect,
 };
 
@@ -68,6 +71,8 @@ const SCHEMA: &str = "
     CREATE FUNCTION pair_list() RETURNS _pair LANGUAGE sql AS $$ SELECT '{}' $$;
     CREATE TYPE shell;
     CREATE FUNCTION shell_value() RETURNS shell LANGUAGE sql AS $$ SELECT NULL $$;
+    CREATE TABLE people (name TEXT);
+    CREATE FUNCTION shout(word TEXT) RETURNS TEXT LANGUAGE sql AS $$ SELECT upper(word) $$;
 ";
 
 fn database() -> ParserDB {
@@ -83,6 +88,11 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
         ColumnDefinition::FunctionResult { function, data_type } => {
             let data_type = match data_type {
                 FunctionResultType::Signature(name) => (*name).to_owned(),
+                FunctionResultType::Scalar { name, arguments, .. } => {
+                    let arguments: Vec<String> =
+                        arguments.iter().map(ToString::to_string).collect();
+                    format!("scalar {name}({})", arguments.join(", "))
+                }
                 FunctionResultType::RowType(column) => {
                     format!("row {}", describe(&column.definition()))
                 }
@@ -194,24 +204,62 @@ fn returns_table_and_output_arguments_expose_their_columns_in_order() {
 }
 
 /// A function of one output names its column after the output, then the
-/// alias, then itself, as PostgreSQL's `chooseScalarFunctionAlias` does.
+/// alias, then itself, as PostgreSQL's `chooseScalarFunctionAlias` does, and
+/// the column carries the call's arguments, as any function of one output.
 #[test]
 fn a_single_column_takes_the_name_postgresql_chooses() {
-    assert_eq!(columns("one_out() AS t"), named(&[("total", "one_out INT")]));
-    assert_eq!(columns("one_unnamed_out() AS t"), named(&[("t", "one_unnamed_out INT")]));
+    assert_eq!(columns("one_out() AS t"), named(&[("total", "one_out scalar INT()")]));
+    assert_eq!(columns("one_unnamed_out() AS t"), named(&[("t", "one_unnamed_out scalar INT()")]));
     assert_eq!(
         columns("one_unnamed_out()"),
-        named(&[("\"one_unnamed_out\"", "one_unnamed_out INT")])
+        named(&[("\"one_unnamed_out\"", "one_unnamed_out scalar INT()")])
     );
-    assert_eq!(columns("ids()"), named(&[("\"ids\"", "ids BIGINT")]));
-    assert_eq!(columns("ids() AS i"), named(&[("i", "ids BIGINT")]));
-    assert_eq!(columns("ids() AS t(i)"), named(&[("i", "ids BIGINT")]));
-    assert_eq!(columns("one_id()"), named(&[("\"one_id\"", "one_id INT")]));
+    assert_eq!(columns("ids()"), named(&[("\"ids\"", "ids scalar BIGINT()")]));
+    assert_eq!(columns("ids() AS i"), named(&[("i", "ids scalar BIGINT()")]));
+    assert_eq!(columns("ids() AS t(i)"), named(&[("i", "ids scalar BIGINT()")]));
+    assert_eq!(columns("one_id()"), named(&[("\"one_id\"", "one_id scalar INT()")]));
     // A domain over a scalar type and an enum are scalar results.
-    assert_eq!(columns("one_positive() AS p"), named(&[("p", "one_positive positive")]));
-    assert_eq!(columns("one_mood()"), named(&[("\"one_mood\"", "one_mood mood")]));
+    assert_eq!(columns("one_positive() AS p"), named(&[("p", "one_positive scalar positive()")]));
+    assert_eq!(columns("one_mood()"), named(&[("\"one_mood\"", "one_mood scalar mood()")]));
     // An array type spelled as its stored `_` name is a scalar result too.
-    assert_eq!(columns("pair_list()"), named(&[("\"pair_list\"", "pair_list public.pair[]")]));
+    assert_eq!(
+        columns("pair_list()"),
+        named(&[("\"pair_list\"", "pair_list scalar public.pair[]()")])
+    );
+    // A one-column `RETURNS TABLE` is a function of one output.
+    assert_eq!(columns("tag_lists()"), named(&[("tags", "tag_lists scalar TEXT[]()")]));
+}
+
+/// PostgreSQL derives the collation of the column of a function of one
+/// output from the call's arguments, so the column carries them as the call
+/// writes them, named notation included, read in the scope the item sees.
+#[test]
+fn a_scalar_result_carries_the_arguments_of_its_call() {
+    let database = database();
+    let query = query(r#"SELECT s FROM people AS p, LATERAL shout(p.name COLLATE "C") AS s"#);
+    let scope =
+        ColumnScope::from_query(&query, &database, IdentifierCase::Folded).expect("scope builds");
+    let Some(ColumnDefinition::FunctionResult {
+        data_type: FunctionResultType::Scalar { name, arguments, scope: defining },
+        ..
+    }) = scope.resolve_column_definition(&Expr::Identifier(Ident::new("s"))).expect("lookup")
+    else {
+        panic!("`s` resolves to a scalar function result")
+    };
+    assert_eq!(name, "TEXT");
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Collate { expr, collation }))] =
+        arguments
+    else {
+        panic!("one collated argument, got {arguments:?}")
+    };
+    assert_eq!(*collation, ObjectName::from(vec![Ident::with_quote('"', "C")]));
+    let name = defining.resolve_column_definition(expr).expect("lookup").expect("p.name resolves");
+    assert_eq!(describe(&name), "people.name");
+
+    assert_eq!(
+        columns("people p, LATERAL shout(word => p.name) s")[1..],
+        named(&[("s", "shout scalar TEXT(word => p.name)")])
+    );
 }
 
 #[test]
@@ -295,14 +343,14 @@ fn aliases_rename_and_ordinality_appends() {
     );
     assert_eq!(
         columns("ids() WITH ORDINALITY AS t(i, n)"),
-        named(&[("i", "ids BIGINT"), ("n", "ordinality")])
+        named(&[("i", "ids scalar BIGINT()"), ("n", "ordinality")])
     );
     // A `LATERAL` call and a schema-qualified call reach the same function.
     assert_eq!(
         columns("notes, LATERAL held_notes() AS h(a, b)")[2..],
         named(&[("a", "held_notes INT"), ("b", "held_notes TEXT")])
     );
-    assert_eq!(columns("public.one_id() AS o"), named(&[("o", "one_id INT")]));
+    assert_eq!(columns("public.one_id() AS o"), named(&[("o", "one_id scalar INT()")]));
 }
 
 #[test]

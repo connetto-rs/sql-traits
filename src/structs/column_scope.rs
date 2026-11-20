@@ -2,7 +2,9 @@
 
 use core::fmt;
 
-use sqlparser::ast::{DataType, Expr, ObjectName, Query, Select, SetOperator, TableFactor};
+use sqlparser::ast::{
+    DataType, Expr, FunctionArg, ObjectName, Query, Select, SetOperator, TableFactor,
+};
 
 use crate::{
     errors::LookupError,
@@ -105,10 +107,23 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
 /// `FROM` returns.
 #[derive(Debug)]
 pub enum FunctionResultType<'scope, 'query, 'db, DB: DatabaseLike> {
-    /// A type the function's signature names, as its `RETURNS TABLE` column,
-    /// its output argument or its scalar result declares it. PostgreSQL
-    /// drops the modifier a signature writes, so the name carries none.
+    /// A type the function's signature names for a column among two or more
+    /// outputs, as its `RETURNS TABLE` columns or its output arguments
+    /// declare it. PostgreSQL drops the modifier a signature writes, so the
+    /// name carries none, and gives the column the type's default collation.
     Signature(&'scope str),
+    /// The type the function's signature names for its only output, its
+    /// scalar result, its single output argument or its one-column `RETURNS
+    /// TABLE`, the name carrying no modifier. PostgreSQL gives the column the
+    /// collation of the call, which it derives from the arguments.
+    Scalar {
+        /// The declared type's name.
+        name: &'scope str,
+        /// The arguments the call writes, in the order it writes them.
+        arguments: &'scope [FunctionArg],
+        /// The scope the arguments are read in, the one the `FROM` item sees.
+        scope: ColumnDefinitionScope<'scope, 'query, 'db, DB>,
+    },
     /// The type of a column of the relation whose row type the function
     /// returns, as that column's own definition declares it.
     RowType(ColumnDefinitionRef<'scope, 'query, 'db, DB>),

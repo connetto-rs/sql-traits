@@ -1076,7 +1076,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             ColumnDefinition::Ordinality => catalog("int8"),
             ColumnDefinition::FunctionResult { data_type, .. } => {
                 match data_type {
-                    FunctionResultType::Signature(name) => declared_type_named(self.database, name),
+                    FunctionResultType::Signature(name)
+                    | FunctionResultType::Scalar { name, .. } => {
+                        declared_type_named(self.database, name)
+                    }
                     FunctionResultType::RowType(column) => {
                         self.definition_type(column.definition())?
                     }
