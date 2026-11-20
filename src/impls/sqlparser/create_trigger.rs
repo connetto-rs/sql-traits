@@ -1,7 +1,7 @@
 //! Implementation of the `TriggerLike` trait for sqlparser's `CreateTrigger`
 //! type.
 
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, string::ToString};
 
 use sqlparser::ast::{ArgMode, CreateTrigger};
 
