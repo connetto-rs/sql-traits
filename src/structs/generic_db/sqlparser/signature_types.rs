@@ -23,7 +23,10 @@ use super::{
     view_rewrites::edit_function,
     views::bound_read_key,
 };
-use crate::utils::object_name::{Namespaces, RelationKey, qualifier_of};
+use crate::{
+    structs::IdentifierCase,
+    utils::object_name::{Namespaces, RelationKey, qualifier_of},
+};
 
 /// The columns of a `RETURNS TABLE`, or the one type another result names.
 fn result_types(function: &CreateFunction) -> (Option<&[ColumnDef]>, Option<&DataType>) {
@@ -124,10 +127,11 @@ pub(super) fn retarget_signatures(
 pub(super) fn row_type_keys(
     namespaces: Namespaces,
     function: &CreateFunction,
+    case: IdentifierCase,
 ) -> impl Iterator<Item = RelationKey> {
     signature_types(function)
         .filter_map(custom_name)
-        .filter_map(move |name| bound_read_key(namespaces, None, name))
+        .filter_map(move |name| bound_read_key(namespaces, None, name, case))
 }
 
 /// The stored functions whose signature names a domain, a user-defined type

@@ -78,18 +78,17 @@ fn creates_implicit_default_ambiguity<T: TableLike>(
             || (right.table_schema().is_none() && table_schema_is_default(namespaces, left, case)))
 }
 
-/// The stored views one of `keys` names, each keyed as written.
+/// The stored views one of `keys` names under the catalog's identifier case.
 fn views_named_by<V: ViewLike>(
     namespaces: Namespaces,
     views: &[Identified<V, RelationIdentity>],
     keys: &[RelationKey],
+    case: IdentifierCase,
 ) -> Vec<Identified<V, RelationIdentity>> {
     views
         .iter()
         .filter(|(view, _, _)| {
-            keys.iter().any(|key| {
-                view_matches_key(namespaces, view.as_ref(), key, IdentifierCase::AsWritten)
-            })
+            keys.iter().any(|key| view_matches_key(namespaces, view.as_ref(), key, case))
         })
         .cloned()
         .collect()
@@ -226,7 +225,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         keys: &[RelationKey],
         column_table: impl Fn(&P::Column) -> &P::Table,
     ) -> GenericDB<P> {
-        let case = IdentifierCase::AsWritten;
+        let case = self.identifier_case();
         let namespaces = self.namespaces();
         let tables: Vec<_> = self
             .tables
@@ -249,8 +248,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             dialect: self.dialect.clone(),
             catalog_name: self.catalog_name.clone(),
             role_settings: Vec::new(),
-            views: views_named_by(namespaces, &self.views, keys),
-            materialized_views: views_named_by(namespaces, &self.materialized_views, keys),
+            views: views_named_by(namespaces, &self.views, keys, case),
+            materialized_views: views_named_by(namespaces, &self.materialized_views, keys, case),
             sequences: Vec::new(),
             dropped_sequences: Vec::new(),
             tables,

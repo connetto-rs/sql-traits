@@ -31,7 +31,7 @@ use super::{
 };
 use crate::{
     structs::{
-        ColumnDefinition, ColumnDefinitionScope, ColumnScope, IdentifierCase, ParserDB,
+        ColumnDefinition, ColumnDefinitionScope, ColumnScope, ParserDB,
         metadata::{ClauseLiterals, UnreadableLiteral},
     },
     traits::ColumnLike,
@@ -619,7 +619,7 @@ fn coercions(
     }
     let read = view_rewrites::catalog(builder, core::iter::once(query));
     // A query whose scopes cannot be derived types only its casts.
-    let scope = ColumnScope::from_query(query, &read, IdentifierCase::AsWritten).ok();
+    let scope = ColumnScope::from_query(query, &read, builder.identifier_case()).ok();
     let mut scoped = Coercions::new(scope.as_ref().map(|scope| (scope, &read)), session);
     let walked = walk(query, &mut scoped);
     debug_assert!(walked.is_continue(), "the walk never breaks");

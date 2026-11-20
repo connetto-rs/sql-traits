@@ -56,6 +56,7 @@ mod expression_truth;
 mod extensions;
 mod fixed_length_text_checks;
 mod folded_catalog_reads;
+mod folded_catalog_rewrites;
 mod foreign_key_column_case;
 mod foreign_key_deferral;
 mod foreign_tables;
