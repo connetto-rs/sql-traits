@@ -17,6 +17,9 @@ pub enum ObjectKind {
     /// A table whose rows live behind a foreign server, declared by a `CREATE
     /// FOREIGN TABLE` statement.
     ForeignTable,
+    /// A table a SQLite module serves, declared by a `CREATE VIRTUAL TABLE`
+    /// statement.
+    VirtualTable,
     /// A view declared by a `CREATE VIEW` statement.
     View,
     /// A view declared by a `CREATE MATERIALIZED VIEW` statement.
@@ -64,6 +67,7 @@ impl core::fmt::Display for ObjectKind {
         f.write_str(match self {
             Self::Table => "Table",
             Self::ForeignTable => "Foreign table",
+            Self::VirtualTable => "Virtual table",
             Self::View => "View",
             Self::MaterializedView => "Materialized view",
             Self::Column => "Column",
@@ -681,6 +685,101 @@ impl core::fmt::Display for UnattachablePartition {
             }
         }
     }
+}
+
+/// Why SQLite refuses the arguments of a `CREATE VIRTUAL TABLE` naming a
+/// module whose argument grammar `ParserDB` reads.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq, Hash)]
+pub enum VirtualTableArgumentRefusal {
+    /// The arguments declare fewer columns than the module needs.
+    #[error("too few columns")]
+    TooFewColumns,
+    /// The arguments declare more columns than the module takes.
+    #[error("too many columns")]
+    TooManyColumns,
+    /// An `rtree` table declares an odd number of coordinate columns.
+    #[error("an odd number of coordinate columns")]
+    OddCoordinateCount,
+    /// An `rtree` table declares a coordinate column after an auxiliary one.
+    #[error("an auxiliary column before a coordinate column")]
+    AuxiliaryColumnNotLast,
+    /// An `fts5` column takes a name the module keeps for itself.
+    #[error("reserved column name `{column_name}`")]
+    ReservedColumnName {
+        /// The name as written.
+        column_name: String,
+    },
+    /// An `fts5` table is named `rank`, the name of its own hidden column.
+    #[error("reserved table name")]
+    ReservedTableName,
+    /// An argument is neither a column nor an option.
+    #[error("unreadable argument `{argument}`")]
+    MalformedArgument {
+        /// The argument as written.
+        argument: String,
+    },
+    /// An `fts5` column carries an option other than `UNINDEXED`.
+    #[error("unrecognized option `{option}` on column `{column_name}`")]
+    UnrecognizedColumnOption {
+        /// The column the option follows.
+        column_name: String,
+        /// The option as written.
+        option: String,
+    },
+    /// An option the module does not know.
+    #[error("unrecognized option `{option}`")]
+    UnrecognizedOption {
+        /// The option name as written.
+        option: String,
+    },
+    /// An option whose value the module refuses.
+    #[error("malformed value `{value}` of option `{option}`")]
+    MalformedOption {
+        /// The option name as written.
+        option: String,
+        /// The value, dequoted.
+        value: String,
+    },
+    /// An option the module takes once, given twice.
+    #[error("option `{option}` given twice")]
+    RepeatedOption {
+        /// The option name as written.
+        option: String,
+    },
+    /// An option that needs `content=''`, on a table that keeps content.
+    #[error("option `{option}` requires a contentless table")]
+    RequiresContentless {
+        /// The option name as written.
+        option: String,
+    },
+    /// Two options the module refuses together.
+    #[error("option `{option}` conflicts with option `{conflicting}`")]
+    ConflictingOptions {
+        /// The option refused.
+        option: String,
+        /// The option it conflicts with.
+        conflicting: String,
+    },
+    /// An option given without the option it pairs with.
+    #[error("option `{option}` given without option `{missing}`")]
+    UnpairedOption {
+        /// The option given.
+        option: String,
+        /// The option missing.
+        missing: String,
+    },
+    /// An `fts4` `notindexed=` option names no column of the table.
+    #[error("no column `{column_name}` to leave unindexed")]
+    NotIndexedColumnNotFound {
+        /// The column name the option gives.
+        column_name: String,
+    },
+    /// An `fts4` table declaring no column names an absent content table.
+    #[error("no content table `{content_table}`")]
+    ContentTableNotFound {
+        /// The content table name the option gives.
+        content_table: String,
+    },
 }
 
 impl ObjectKind {
@@ -3484,6 +3583,61 @@ pub enum Error {
         table_name: String,
         /// The kind of constraint refused.
         constraint: KeyConstraint,
+    },
+    #[error(
+        "Virtual table `{table_name}` uses module `{module_name}`, whose columns `ParserDB` cannot derive."
+    )]
+    /// Error indicating that a `CREATE VIRTUAL TABLE` names a module whose
+    /// argument grammar `ParserDB` does not read, so its columns are unknown.
+    UnknownVirtualTableModule {
+        /// Name of the virtual table.
+        table_name: String,
+        /// Name of the module, as written.
+        module_name: String,
+    },
+    #[error(
+        "Module `{module_name}` refuses the arguments of virtual table `{table_name}`: {refusal}."
+    )]
+    /// Error indicating that a `CREATE VIRTUAL TABLE` gives a known module
+    /// arguments SQLite refuses.
+    VirtualTableArgumentsRefused {
+        /// Name of the virtual table.
+        table_name: String,
+        /// Name of the module, as written.
+        module_name: String,
+        /// What the module refuses.
+        refusal: VirtualTableArgumentRefusal,
+    },
+    #[error(
+        "Virtual table `{table_name}` takes its columns from `{content_table}`, whose columns `ParserDB` cannot enumerate."
+    )]
+    /// Error indicating that an `fts4` table declaring no column names a
+    /// content view whose output columns are not known, so its own columns
+    /// are not known either.
+    VirtualTableContentColumnsUnknown {
+        /// Name of the virtual table.
+        table_name: String,
+        /// Name of the content view, as written.
+        content_table: String,
+    },
+    #[error(
+        "Virtual table `{table_name}` cannot be renamed because {dependent_kind} `{dependent_name}` reads its hidden column `{column_name}`."
+    )]
+    /// Error indicating that an `ALTER TABLE ... RENAME TO` names a virtual
+    /// table whose hidden column carrying the table name a view, a
+    /// materialized view, a rule or a bound function body reads.
+    ///
+    /// The rename renames that column too, which SQLite refuses for a view
+    /// still reading the old name.
+    VirtualTableRenameBlocked {
+        /// Name of the virtual table.
+        table_name: String,
+        /// Name of the hidden column, the old table name.
+        column_name: String,
+        /// Kind of the object reading the column.
+        dependent_kind: ObjectKind,
+        /// Name of the object reading the column.
+        dependent_name: String,
     },
     #[error("{constraint} constraint of table `{table_name}` names column `{column_name}` twice.")]
     /// Error indicating that a primary key or unique constraint names one

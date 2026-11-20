@@ -53,6 +53,7 @@ mod type_facts;
 mod unqualified_name;
 mod user_defined_type;
 mod view;
+mod virtual_table_source;
 mod written_call;
 
 pub use absent::Absent;
@@ -129,4 +130,5 @@ pub use unqualified_name::UnqualifiedName;
 pub(crate) use user_defined_type::AttributeCollation;
 pub use user_defined_type::UserDefinedType;
 pub use view::{MaterializedView, View, ViewDeclaration};
+pub use virtual_table_source::VirtualTableSource;
 pub use written_call::WrittenCall;

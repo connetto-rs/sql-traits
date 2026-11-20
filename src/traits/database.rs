@@ -797,6 +797,29 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         self.tables().chain(self.foreign_tables())
     }
 
+    /// Iterates over the SQLite virtual tables, which [`Self::tables`] also
+    /// lists.
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE notes_log (id INT);
+    ///      CREATE VIRTUAL TABLE notes USING fts5(body);",
+    /// )?;
+    /// assert_eq!(db.tables().count(), 2);
+    /// let names: Vec<&str> = db.virtual_tables().map(TableLike::table_name).collect();
+    /// assert_eq!(names, ["notes"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn virtual_tables(&self) -> impl Iterator<Item = &Self::Table> {
+        self.tables().filter(|table| matches!(table.is_virtual(self), Ok(true)))
+    }
+
     /// Resolves a name a statement wrote into the table it denotes, comparing
     /// identifiers as `case` says the engine does.
     ///

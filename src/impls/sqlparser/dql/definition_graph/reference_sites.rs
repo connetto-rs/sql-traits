@@ -690,7 +690,10 @@ fn unqualified_wildcard_items<DB: DatabaseLike>(
                     data,
                     base.entry_index,
                     qualifier.as_ref().map(<[Ident; 1]>::as_slice),
-                    base.output_columns.iter().map(|column| (&*column.name, column.quoted)),
+                    base.output_columns
+                        .iter()
+                        .filter(|column| !column.hidden)
+                        .map(|column| (&*column.name, column.quoted)),
                 );
             }
             WildcardEntry::Derived(index) => {

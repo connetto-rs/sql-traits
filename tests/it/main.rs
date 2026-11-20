@@ -210,4 +210,5 @@ mod view_options;
 mod view_triggers;
 mod views;
 mod views_follow_renames;
+mod virtual_tables;
 mod written_index_clauses;

@@ -127,6 +127,17 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
             .documentation())
     }
 
+    fn is_hidden(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        let table = self.table();
+        let metadata = database
+            .table_metadata(table)
+            .ok_or_else(|| ObjectKind::Table.not_in_database(table.table_name()))?;
+        Ok(metadata
+            .hidden_column_names()
+            .iter()
+            .any(|hidden| *hidden == self.attribute().name.value))
+    }
+
     #[inline]
     fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db DataType {
         &self.attribute().data_type

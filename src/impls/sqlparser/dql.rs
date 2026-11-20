@@ -195,6 +195,8 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
 struct BaseColumnRef<D: Copy> {
     name: String,
     quoted: bool,
+    /// Whether a wildcard leaves the column out, as one SQLite hides.
+    hidden: bool,
     definition: D,
 }
 
@@ -1832,7 +1834,7 @@ fn each_wildcard_column<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
             WildcardEntry::Base(index) => {
                 let base = &scope.bases[*index];
                 for (ordinal, column) in base.output_columns.iter().enumerate() {
-                    if kept(base.entry_index, &column.name, column.quoted) {
+                    if !column.hidden && kept(base.entry_index, &column.name, column.quoted) {
                         visit(WildcardColumn::Base(base, ordinal));
                     }
                 }
@@ -3535,13 +3537,17 @@ fn three_part_output_name<DB: DatabaseLike, D: Copy>(
         .then(|| (parts[2].value.clone(), parts[2].quote_style.is_some()))
 }
 
-/// Every column a base relation outputs as a derived column sourced by that
-/// table: the relation's `output_names` in declaration order, so an alias
+/// Every column a qualified wildcard over a base relation reaches, as a
+/// derived column sourced by that table, which are the relation's
+/// `output_names` in declaration order without the hidden ones, so an alias
 /// column list renames the wildcard expansion too.
 fn base_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
     base: &FromTableRef<'query, 'db, DB, D>,
 ) -> Vec<DerivedColumn<'query, 'db, DB, D>> {
-    (0..base.output_columns.len()).map(|ordinal| base_column(base, ordinal)).collect()
+    (0..base.output_columns.len())
+        .filter(|&ordinal| !base.output_columns[ordinal].hidden)
+        .map(|ordinal| base_column(base, ordinal))
+        .collect()
 }
 
 /// Output column `ordinal` of a base relation as a derived column sourced by
@@ -4234,13 +4240,14 @@ where
     let mut output_columns = table
         .columns(database)?
         .map(|column| {
-            BaseColumnRef {
+            Ok(BaseColumnRef {
                 name: column.column_name().to_string(),
                 quoted: column.column_name_is_quoted(),
+                hidden: column.is_hidden(database)?,
                 definition: profile.column_definition(table, column, database),
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LookupError>>()?;
     if let Some(table_alias) = alias
         && !table_alias.get().columns.is_empty()
     {

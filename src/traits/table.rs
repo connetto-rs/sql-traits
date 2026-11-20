@@ -8,7 +8,7 @@ use crate::{
     structs::{
         ActingRole, ColumnDefinition, ColumnPrivilege, ColumnScope, ForeignTableSource,
         IdentifierCase, PartitionBound, RowSecurity, RowStatement, SchemaFingerprint,
-        TablePrivileges,
+        TablePrivileges, VirtualTableSource,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
@@ -614,6 +614,92 @@ pub trait TableLike:
     #[inline]
     fn is_foreign(&self, database: &Self::DB) -> Result<bool, LookupError> {
         Ok(self.foreign_source(database)?.is_some())
+    }
+
+    /// Returns the module and arguments this table runs on when it is a
+    /// SQLite virtual table, or [`None`] for any other table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when the database does not hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE plain (id INT);
+    ///      CREATE VIRTUAL TABLE places USING rtree(id, min_x, max_x);",
+    /// )?;
+    /// let plain = db.table_by_target(TargetName::new("plain", false), IdentifierCase::AsWritten)?;
+    /// assert!(plain.unwrap().virtual_source(&db)?.is_none());
+    /// let places = db.table_by_target(TargetName::new("places", false), IdentifierCase::AsWritten)?;
+    /// let source = places.unwrap().virtual_source(&db)?.unwrap();
+    /// assert_eq!(source.module_name(), "rtree");
+    /// assert_eq!(source.arguments(), ["id", "min_x", "max_x"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn virtual_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db VirtualTableSource>, LookupError> {
+        self.require_in_database(database)?;
+        Ok(None)
+    }
+
+    /// Returns whether this table is a SQLite virtual table, whose rows a
+    /// module serves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when the database does not hold this table.
+    #[inline]
+    fn is_virtual(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(self.virtual_source(database)?.is_some())
+    }
+
+    /// Returns the virtual table this table stores data for when it is one of
+    /// the shadow tables a SQLite module keeps, or [`None`] for any other
+    /// table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when the database does not hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE VIRTUAL TABLE notes USING fts5(body);
+    ///      CREATE TABLE notes_data (id INTEGER PRIMARY KEY, block BLOB);
+    ///      CREATE TABLE notes_archive (id INTEGER PRIMARY KEY);",
+    /// )?;
+    /// let table = |name| db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// let owner = table("notes_data")?.unwrap().shadow_owner(&db)?;
+    /// assert_eq!(owner.map(TableLike::table_name), Some("notes"));
+    /// assert!(table("notes_archive")?.unwrap().shadow_owner(&db)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn shadow_owner<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Table>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.require_in_database(database)?;
+        Ok(None)
     }
 
     /// Returns the table ID according to its position in the database's table
@@ -4904,6 +4990,23 @@ where
         database: &'db Self::DB,
     ) -> Result<Option<&'db ForeignTableSource>, LookupError> {
         T::foreign_source(self, database)
+    }
+
+    fn virtual_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db VirtualTableSource>, LookupError> {
+        T::virtual_source(self, database)
+    }
+
+    fn shadow_owner<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Table>, LookupError>
+    where
+        Self: 'db,
+    {
+        T::shadow_owner(self, database)
     }
 
     fn table_id(&self, database: &Self::DB) -> Option<usize> {

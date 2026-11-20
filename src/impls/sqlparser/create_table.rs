@@ -12,7 +12,7 @@ use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
         ActingRole, ColumnPrivilege, ForeignTableSource, ListDatum, ParserDB, PartitionBound,
-        RangeDatum, RevokedPrivilege, TableMetadata, TablePrivileges,
+        RangeDatum, RevokedPrivilege, TableMetadata, TablePrivileges, VirtualTableSource,
     },
     traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
     utils::{
@@ -225,6 +225,24 @@ impl TableLike for CreateTable {
         database: &'db Self::DB,
     ) -> Result<Option<&'db ForeignTableSource>, LookupError> {
         Ok(table_metadata(self, database)?.foreign_source())
+    }
+
+    #[inline]
+    fn virtual_source<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db VirtualTableSource>, LookupError> {
+        Ok(table_metadata(self, database)?.virtual_source())
+    }
+
+    fn shadow_owner<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Table>, LookupError>
+    where
+        Self: 'db,
+    {
+        database.shadow_owner_of(self)
     }
 
     fn columns<'db>(

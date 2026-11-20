@@ -45,7 +45,8 @@ use crate::{
 ///
 /// Returns [`Error::TriggerFiringRefused`] for a timing, level, event or
 /// clause the engine of the dialect refuses on the relation,
-/// [`Error::RelationKindMismatch`] for a target a materialized view holds,
+/// [`Error::RelationKindMismatch`] for a target a materialized view or a
+/// virtual table holds,
 /// [`Error::RelationNotFoundForTrigger`] for one nothing holds,
 /// [`Error::FunctionNotFoundForTrigger`] for a function the trigger cannot
 /// run, [`Error::TriggerAlreadyExists`] when the relation or a partition below
@@ -58,9 +59,13 @@ pub(super) fn create_trigger(
     create_trigger: CreateTrigger,
 ) -> Result<ParserDBBuilder, Error> {
     require_named(&create_trigger.name, ObjectKind::Trigger)?;
-    if let Some(table) =
-        builder.resolve_table_object_name(&create_trigger.table_name)?.map(StoredTable::of)
-    {
+    if let Some(table) = builder.resolve_table_object_name(&create_trigger.table_name)? {
+        builder.refuse_table_kinds(
+            table,
+            &create_trigger.table_name,
+            &[ObjectKind::VirtualTable],
+        )?;
+        let table = StoredTable::of(table);
         refuse_firing(&builder, &create_trigger, false)?;
         let mut create_trigger = bind_parts(&builder, create_trigger)?;
         builder.bind_table_reference(&mut create_trigger.table_name);
