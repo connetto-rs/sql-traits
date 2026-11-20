@@ -880,6 +880,49 @@ pub enum LookupError {
         /// Name of the column that was not found.
         column_name: String,
     },
+    /// A foreign key naming no referenced columns targets a table holding no
+    /// primary key. SQLite stores such a key and reports a foreign key
+    /// mismatch when it is used.
+    #[error(
+        "Foreign key in table `{host_table}` references the primary key of table `{referenced_table}`, which has none."
+    )]
+    ReferencedPrimaryKeyNotFound {
+        /// Name of the host table containing the foreign key.
+        host_table: String,
+        /// Name of the referenced table, as the key names it.
+        referenced_table: String,
+    },
+    /// A foreign key's referenced columns are neither the primary key of the
+    /// referenced table nor unique in it. SQLite stores such a key and reports
+    /// a foreign key mismatch when it is used.
+    #[error(
+        "Foreign key in table `{host_table}` references columns ({referenced_columns}) of table `{referenced_table}`, which are neither its primary key nor unique."
+    )]
+    ReferencedColumnsNotUnique {
+        /// Name of the host table containing the foreign key.
+        host_table: String,
+        /// Name of the referenced table, as the key names it.
+        referenced_table: String,
+        /// The referenced columns, comma separated.
+        referenced_columns: String,
+    },
+    /// A foreign key names a different number of host columns than the
+    /// referenced key holds. SQLite stores a key naming no referenced columns
+    /// whatever the width of the primary key it reaches, and reports a
+    /// foreign key mismatch when it is used.
+    #[error(
+        "Foreign key in table `{host_table}` names {host_columns} column(s), but its target in table `{referenced_table}` has {referenced_columns}."
+    )]
+    ForeignKeyColumnCountMismatch {
+        /// Name of the host table containing the foreign key.
+        host_table: String,
+        /// Number of host columns the foreign key names.
+        host_columns: usize,
+        /// Name of the referenced table, as the key names it.
+        referenced_table: String,
+        /// Number of columns in the referenced key.
+        referenced_columns: usize,
+    },
     /// A call handed to a per-call resolver is not a node of the expressions
     /// the queried object holds, for instance because it was borrowed from a
     /// copy of them.
@@ -2147,6 +2190,18 @@ pub enum Error {
         referenced_table: String,
         /// Number of columns in the referenced key.
         referenced_columns: usize,
+    },
+    #[error(
+        "Foreign key in table `{host_table}` names its target `{referenced_table}` with a schema, which SQLite does not accept."
+    )]
+    /// Error indicating that a foreign key qualifies its target with a schema
+    /// under SQLite, whose foreign key clause takes a bare table name and
+    /// looks it up in the schema of the host table.
+    QualifiedForeignKeyTarget {
+        /// Name of the host table containing the foreign key.
+        host_table: String,
+        /// The target, as the key names it.
+        referenced_table: String,
     },
     #[error("Host column `{host_column}` not found in table `{host_table}` for foreign key.")]
     /// Error indicating that a foreign key references a host column that does

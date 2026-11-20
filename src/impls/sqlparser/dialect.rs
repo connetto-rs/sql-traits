@@ -151,6 +151,14 @@ impl SqlparserDialect {
         !self.stock().supports_non_decimal_integer_literals()
     }
 
+    /// Whether a foreign key names its target without binding to it, so the
+    /// `REFERENCES` clause is stored as written and resolved by name on every
+    /// use. SQLite does this, and never looks at the target when a table is
+    /// created, altered or dropped.
+    pub(crate) fn binds_foreign_keys_on_use(self) -> bool {
+        matches!(self, Self::SQLite)
+    }
+
     /// The stock sqlparser dialect this variant names.
     fn stock(self) -> &'static dyn Dialect {
         match self {

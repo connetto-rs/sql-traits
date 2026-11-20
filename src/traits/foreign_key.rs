@@ -199,6 +199,9 @@ pub trait ForeignKeyLike:
     /// Returns the referenced table, the one the `REFERENCES` clause reached
     /// when the foreign key was declared.
     ///
+    /// SQLite binds a key to no table, so under it this is whichever table
+    /// holds the name now, in the schema of the host table.
+    ///
     /// # Arguments
     ///
     /// * `database` - A reference to the database instance to which the foreign
@@ -208,7 +211,8 @@ pub trait ForeignKeyLike:
     ///
     /// Returns [`LookupError`] when `database` does not hold the host table of
     /// this foreign key, or when the table or column it references is
-    /// absent.
+    /// absent, which under SQLite includes a target never created, dropped,
+    /// or whose name a view holds.
     ///
     /// # Example
     ///
@@ -873,7 +877,11 @@ pub trait ForeignKeyLike:
     ///
     /// Returns [`LookupError`] when `database` does not hold the host table of
     /// this foreign key, or when the table or column it references is
-    /// absent.
+    /// absent. SQLite checks nothing about the target when the key is
+    /// declared, so under it this also reports what SQLite calls a foreign
+    /// key mismatch, as [`LookupError::ReferencedColumnsNotUnique`],
+    /// [`LookupError::ReferencedPrimaryKeyNotFound`] or
+    /// [`LookupError::ForeignKeyColumnCountMismatch`].
     ///
     /// # Example
     ///

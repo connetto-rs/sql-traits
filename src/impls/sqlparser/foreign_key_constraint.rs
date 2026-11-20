@@ -10,9 +10,14 @@ use sqlparser::ast::{
 
 use crate::{
     errors::LookupError,
-    structs::{ConstraintDeferral, ConstraintObject, ParserDB, TableAttribute, TargetName},
+    structs::{
+        ConstraintDeferral, ConstraintObject, ParserDB, TableAttribute, TargetName,
+        generic_db::is_candidate_key,
+    },
     traits::{ForeignKeyLike, Metadata, database::DatabaseLike, table::TableLike},
-    utils::object_name::{resolve_required_bound_table, target_name_of_object_name},
+    utils::object_name::{
+        object_name_identifiers, target_name_of_idents, target_name_of_object_name,
+    },
 };
 
 impl Metadata for TableAttribute<CreateTable, ForeignKeyConstraint> {
@@ -52,11 +57,19 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     /// Reads the target as ingestion bound it, the table the name reached
     /// when the key was declared, so neither a later search path nor a later
     /// temporary table of the same name moves it.
+    ///
+    /// A dialect binding keys on use bound only the schema, so the name
+    /// reaches whichever table holds it in that schema now, and none while
+    /// the target is absent or a view holds the name.
     fn referenced_table<'db>(
         &self,
         database: &'db Self::DB,
     ) -> Result<&'db <Self::DB as DatabaseLike>::Table, LookupError> {
-        resolve_required_bound_table(&self.attribute().foreign_table, database)
+        let foreign_table = &self.attribute().foreign_table;
+        let (schema, table) = object_name_identifiers(foreign_table)?;
+        database
+            .table_by_target(target_name_of_idents(schema, table), database.identifier_case())?
+            .ok_or_else(|| LookupError::TableNotFound { object_name: foreign_table.to_string() })
     }
 
     #[inline]
@@ -99,6 +112,13 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
         resolve_columns(host_table, database, &self.attribute().columns)
     }
 
+    /// A key naming no referenced columns references the primary key of its
+    /// target, which only a key bound on use still leaves unnamed, since
+    /// binding at declaration spells the key out the way `confkey` does.
+    ///
+    /// A dialect binding keys on use checks nothing about the target when
+    /// the key is declared, so the mismatches SQLite reports on use are
+    /// answered here.
     fn referenced_columns<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -106,8 +126,56 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     where
         Self: 'db,
     {
+        let foreign_key = self.attribute();
         let referenced_table = self.referenced_table(database)?;
-        resolve_columns(referenced_table, database, &self.attribute().referred_columns)
+        let host_table = || self.table().name.to_string();
+        if foreign_key.referred_columns.is_empty() {
+            let primary_key: Vec<_> = referenced_table.primary_key_columns(database)?.collect();
+            if primary_key.is_empty() {
+                return Err(LookupError::ReferencedPrimaryKeyNotFound {
+                    host_table: host_table(),
+                    referenced_table: foreign_key.foreign_table.to_string(),
+                });
+            }
+            if primary_key.len() != foreign_key.columns.len() {
+                return Err(LookupError::ForeignKeyColumnCountMismatch {
+                    host_table: host_table(),
+                    host_columns: foreign_key.columns.len(),
+                    referenced_table: foreign_key.foreign_table.to_string(),
+                    referenced_columns: primary_key.len(),
+                });
+            }
+            return Ok(primary_key.into_iter());
+        }
+
+        let columns = resolve_columns(referenced_table, database, &foreign_key.referred_columns)?;
+        if database.dialect().binds_foreign_keys_on_use() {
+            // SQLite takes a unique index only when it covers every row and
+            // names plain columns.
+            let unique_indexes = referenced_table
+                .indices(database)?
+                .map(TableAttribute::attribute)
+                .filter(|index| index.unique && index.predicate.is_none());
+            let referred: Vec<&Ident> = foreign_key.referred_columns.iter().collect();
+            if !is_candidate_key(
+                referenced_table,
+                unique_indexes,
+                &referred,
+                database.identifier_case(),
+            ) {
+                return Err(LookupError::ReferencedColumnsNotUnique {
+                    host_table: host_table(),
+                    referenced_table: foreign_key.foreign_table.to_string(),
+                    referenced_columns: foreign_key
+                        .referred_columns
+                        .iter()
+                        .map(|column| column.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+        }
+        Ok(columns)
     }
 }
 
