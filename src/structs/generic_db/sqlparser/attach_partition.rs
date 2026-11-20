@@ -12,8 +12,9 @@ use alloc::{
 };
 
 use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, ColumnOptionDef, CreateTable, Expr, ForValues, Ident,
-    IndexColumn, ObjectName, OrderByExpr, OrderByOptions, TableConstraint,
+    AlterTableOperation, ColumnOption, ColumnOptionDef, CreateTable, Expr, ForValues,
+    ForeignKeyConstraint, Ident, IndexColumn, ObjectName, OrderByExpr, OrderByOptions,
+    TableConstraint,
 };
 
 use super::{
@@ -398,14 +399,59 @@ fn table_form(column: &Ident, option: &ColumnOptionDef) -> Option<TableConstrain
 }
 
 /// Whether two keys or foreign keys enforce the same thing, whatever each is
-/// called, which is how PostgreSQL matches an index or a foreign key.
-fn same_key(left: &TableConstraint, right: &TableConstraint) -> bool {
+/// called and however it spells the names it holds, which is how PostgreSQL
+/// matches an index or a foreign key.
+fn same_key(builder: &ParserDBBuilder, left: &TableConstraint, right: &TableConstraint) -> bool {
+    let case = builder.identifier_case();
     match (left, right) {
         (TableConstraint::ForeignKey(left), TableConstraint::ForeignKey(right)) => {
-            foreign_keys_stored_alike(left, right)
+            foreign_keys_stored_alike(
+                &compared_foreign_key(builder, left),
+                &compared_foreign_key(builder, right),
+            )
         }
-        _ => inheritance::is_copy_of(left, right),
+        _ => inheritance::is_copy_of(&compared_key(left, case), &compared_key(right, case)),
     }
+}
+
+/// The identifier in the form the parse compares it under, so two spellings
+/// of one name read alike.
+fn compared_ident(ident: &Ident, case: IdentifierCase) -> Ident {
+    Ident::new(case.compared_form(&ident.value, ident.quote_style.is_some()))
+}
+
+/// The key with the columns it names in their compared form.
+fn compared_key(key: &TableConstraint, case: IdentifierCase) -> TableConstraint {
+    let mut compared = key.clone();
+    let columns = match &mut compared {
+        TableConstraint::PrimaryKey(primary_key) => &mut primary_key.columns,
+        TableConstraint::Unique(unique) => &mut unique.columns,
+        _ => return compared,
+    };
+    for column in columns {
+        if let Expr::Identifier(ident) = &mut column.column.expr {
+            *ident = compared_ident(ident, case);
+        }
+    }
+    compared
+}
+
+/// The foreign key with its columns in their compared form and the table it
+/// references named as stored, so two spellings reaching one table read
+/// alike.
+fn compared_foreign_key(
+    builder: &ParserDBBuilder,
+    key: &ForeignKeyConstraint,
+) -> ForeignKeyConstraint {
+    let case = builder.identifier_case();
+    let mut compared = key.clone();
+    if let Ok(Some(table)) = builder.resolve_bound_table_name(&key.foreign_table) {
+        compared.foreign_table = table.name.clone();
+    }
+    for column in compared.columns.iter_mut().chain(&mut compared.referred_columns) {
+        *column = compared_ident(column, case);
+    }
+    compared
 }
 
 /// What `table` receives of the keys and foreign keys its parent passes down.
@@ -424,7 +470,9 @@ fn receive(
     let mut taken = Vec::new();
 
     for arriving in passed {
-        if let Some(own) = held.iter().find(|own| same_key(&own.constraint, &arriving.constraint)) {
+        if let Some(own) =
+            held.iter().find(|own| same_key(builder, &own.constraint, &arriving.constraint))
+        {
             if own.written_on.is_none() {
                 let validated = constraint_validity::merged_copy_validated(
                     builder,
