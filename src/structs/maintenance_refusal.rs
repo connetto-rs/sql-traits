@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, string::String};
 
 use sqlparser::{
-    ast::{Expr, Ident},
+    ast::Expr,
     tokenizer::{Location, Span},
 };
 
@@ -108,16 +108,6 @@ pub enum MaintenanceRefusal {
     /// A body that returns `NEW` and assigns no column of it.
     #[error("the body assigns no column of NEW")]
     NothingAssigned,
-    /// A field of `NEW` the body assigns or reads that the trigger's table
-    /// does not declare, as the body writes it.
-    #[error(
-        "the table declares no column `{field}`, which the body writes at line {}, column {}",
-        .field.span.start.line, .field.span.start.column
-    )]
-    UndeclaredColumn {
-        /// The field, carrying where the body writes it.
-        field: Ident,
-    },
 }
 
 /// A statement of a trigger body, as the body writes it and where.

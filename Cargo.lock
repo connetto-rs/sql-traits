@@ -969,6 +969,7 @@ dependencies = [
  "sqlparser",
  "sqlparser-canonicalize",
  "sqlparser-plpgsql",
+ "sqlstate",
  "tempfile",
  "thiserror",
  "unicode-normalization",

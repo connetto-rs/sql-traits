@@ -52,6 +52,7 @@ sqlparser = { version = "0.64", default-features = false, features = ["visitor"]
 geometric-traits = { version = "0.2.3", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0", default-features = false }
 sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", default-features = false, features = ["body-parse"] }
+sqlstate = "0.2"
 git2 = { version = "0.20.3", optional = true }
 tempfile = { version = "3.25", optional = true }
 sha2 = { version = "0.10", default-features = false }

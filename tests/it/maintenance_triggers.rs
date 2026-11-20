@@ -36,17 +36,36 @@ fn assignments_of_body(columns: &str, body: &str) -> Vec<(String, String)> {
         .expect("t is in the database")
         .map(|(column, expression)| (column.column_name().to_owned(), expression.to_string()))
         .collect();
-    assert_eq!(
-        trigger.is_maintenance_trigger(&database).expect("t is in the database"),
-        !pairs.is_empty(),
-        "a maintenance trigger is one with assignments"
-    );
+    let maintenance = trigger.is_maintenance_trigger(&database).expect("t is in the database");
     assert_eq!(
         trigger.maintenance_refusal(&database).expect("t is in the database").is_none(),
-        !pairs.is_empty(),
+        maintenance,
         "a maintenance trigger is one without refusal"
     );
+    assert!(maintenance || pairs.is_empty(), "only a maintenance trigger has assignments");
     pairs
+}
+
+/// Each field of `NEW` or `OLD` the trigger [`assignments`] describes names
+/// and `t` lacks, in body order, as PostgreSQL's message, whether the body
+/// assigns it, and the column where the body writes it.
+fn undeclared(columns: &str, statements: &str) -> Vec<(String, bool, u64)> {
+    let database = database(columns, &format!("BEGIN {statements} RETURN NEW; END"));
+    let trigger = database.triggers().next().expect("the trigger is declared");
+    trigger
+        .maintenance_undeclared_fields(&database)
+        .expect("t is in the database")
+        .inspect(|field| assert_eq!(field.sqlstate().as_str(), "42703"))
+        .map(|field| (field.to_string(), field.is_assigned(), field.field().span.start.column))
+        .collect()
+}
+
+/// The triples `expected` writes with string slices.
+fn named(expected: &[(&str, bool, u64)]) -> Vec<(String, bool, u64)> {
+    expected
+        .iter()
+        .map(|(message, assigned, column)| ((*message).to_owned(), *assigned, *column))
+        .collect()
 }
 
 /// What makes the trigger [`assignments`] describes no maintenance trigger.
@@ -205,17 +224,63 @@ fn a_wildcard_over_new_after_an_assignment_refuses_the_body() {
     }
 }
 
-/// PostgreSQL refuses a body reading a field `NEW` does not have, and a field
-/// of an assigned column reads a value no pair can write.
+/// A field of the row inside an assigned column reads a value no pair can
+/// write.
 #[test]
-fn reading_a_field_the_row_lacks_or_inside_an_assigned_column_refuses_the_body() {
-    assert_eq!(
-        refusal("a INT", "NEW.a := NEW.missing;").to_string(),
-        "the table declares no column `missing`, which the body writes at line 1, column 21"
-    );
+fn reading_inside_an_assigned_column_refuses_the_body() {
     assert_eq!(
         refusal("a INT, b INT", "NEW.a := 1; NEW.b := NEW.a.x;").to_string(),
         "`NEW.a.x` in `NEW.b := NEW.a.x;` at line 1, column 20 reads NEW after a column of it is assigned"
+    );
+}
+
+/// PostgreSQL loads a body naming a field its table lacks, as after `RENAME
+/// COLUMN v TO vv`, and fails only the run reaching it with `42703 record
+/// "new" has no field "v"`, so the body stays a maintenance body whose
+/// assignment to `v` is no pair.
+#[test]
+fn a_field_the_table_lacks_keeps_the_maintenance_body() {
+    let statements = "IF NEW.id > 5 THEN NEW.v := NEW.w; END IF;";
+    assert_eq!(assignments("id INT, vv INT, w INT", statements), pairs(&[]));
+    assert_eq!(
+        undeclared("id INT, vv INT, w INT", statements),
+        named(&[(r#"record "new" has no field "v""#, true, 31)])
+    );
+}
+
+/// PostgreSQL raises for the target of `NEW.x := NEW.y` before its value,
+/// and for the leftmost field of an expression, a field of `OLD` included,
+/// so every naming is listed in body order. The pairs read the fields as
+/// written.
+#[test]
+fn every_naming_of_a_lacking_field_is_listed_in_body_order() {
+    let statements =
+        r#"NEW.x := NEW.y; NEW.a := NEW.p + NEW.q; IF NEW.zz > 0 THEN NEW.a := OLD."ZZ"; END IF;"#;
+    assert_eq!(
+        assignments("a INT", statements),
+        pairs(&[("a", r#"CASE WHEN NEW.zz > 0 THEN OLD."ZZ" ELSE NEW.p + NEW.q END"#)])
+    );
+    assert_eq!(
+        undeclared("a INT", statements),
+        named(&[
+            (r#"record "new" has no field "x""#, true, 12),
+            (r#"record "new" has no field "y""#, false, 21),
+            (r#"record "new" has no field "p""#, false, 37),
+            (r#"record "new" has no field "q""#, false, 45),
+            (r#"record "new" has no field "zz""#, false, 55),
+            (r#"record "old" has no field "ZZ""#, false, 80),
+        ])
+    );
+}
+
+/// PostgreSQL names the field as it stores it, wherever `NEW` is qualified
+/// with the function's name, and reads `NEW.zz.x` as a column of a relation
+/// `zz`, never as a field of `NEW`.
+#[test]
+fn the_message_names_the_field_as_stored_and_three_parts_name_no_field() {
+    assert_eq!(
+        undeclared("a INT", "NEW.a := maintain.NEW.Qq + NEW.zz.x;"),
+        named(&[(r#"record "new" has no field "qq""#, false, 30)])
     );
 }
 
@@ -289,10 +354,6 @@ fn a_body_that_does_not_return_new_or_assigns_elsewhere_is_refused() {
         (
             "BEGIN NEW.a[1] := 1; RETURN NEW; END",
             "`NEW.a[1] := 1;` at line 1, column 8 neither assigns a column of NEW nor is an IF over such assignments",
-        ),
-        (
-            "BEGIN NEW.b := 1; RETURN NEW; END",
-            "the table declares no column `b`, which the body writes at line 1, column 12",
         ),
     ] {
         assert_eq!(refusal_of_body("a INT", body).to_string(), refused, "{body}");
