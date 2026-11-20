@@ -842,6 +842,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 BaseColumnRef {
                     name: column.column_name().to_owned(),
                     quoted: column.column_name_is_quoted(),
+                    hidden: matches!(column.is_hidden(database), Ok(true)),
                     definition: self.column_definition(table, column, database),
                 }
             })

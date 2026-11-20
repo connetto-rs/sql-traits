@@ -679,6 +679,36 @@ pub trait ColumnLike:
         self.is_serial(database) || self.identity_generation(database).is_some()
     }
 
+    /// Returns whether the column is a hidden column of a SQLite virtual
+    /// table, which `SELECT *` leaves out while a query naming it reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table this column belongs to.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>("CREATE VIRTUAL TABLE notes USING fts5(body);")?;
+    /// let notes = db.virtual_tables().next().expect("notes is virtual");
+    /// let hidden: Vec<(&str, bool)> = notes
+    ///     .columns(&db)?
+    ///     .map(|column| Ok((column.column_name(), column.is_hidden(&db)?)))
+    ///     .collect::<Result<_, sql_traits::errors::LookupError>>()?;
+    /// assert_eq!(hidden, [("body", false), ("notes", true), ("rank", true)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_hidden(&self, _database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(false)
+    }
+
     /// Returns whether the column is the primary key of its table (not just
     /// part of it).
     ///
@@ -2009,6 +2039,11 @@ where
     }
 
     #[inline]
+    fn is_hidden(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        (*self).is_hidden(database)
+    }
+
+    #[inline]
     fn is_nullable(&self, database: &Self::DB) -> Result<bool, LookupError> {
         (*self).is_nullable(database)
     }
@@ -2117,6 +2152,11 @@ where
     #[inline]
     fn is_generated(&self, database: &Self::DB) -> bool {
         (**self).is_generated(database)
+    }
+
+    #[inline]
+    fn is_hidden(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        (**self).is_hidden(database)
     }
 
     #[inline]

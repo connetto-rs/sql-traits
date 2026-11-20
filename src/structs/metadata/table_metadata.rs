@@ -7,7 +7,7 @@ use sqlparser::ast::{Action, ColumnDef, CreateTable, Privileges};
 use super::ExpressionCalls;
 use crate::{
     impls::PrivilegeKind,
-    structs::{ForeignTableSource, RevokedPrivilege, TableAttribute},
+    structs::{ForeignTableSource, RevokedPrivilege, TableAttribute, VirtualTableSource},
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 
@@ -95,6 +95,12 @@ pub struct TableMetadata<T: TableLike> {
     /// The server and options a foreign table reads its rows through, absent
     /// for an ordinary table.
     foreign_source: Option<ForeignTableSource>,
+    /// The module and arguments a virtual table runs on, absent for any other
+    /// table.
+    virtual_source: Option<VirtualTableSource>,
+    /// The names of the columns a virtual table's module hides from `SELECT
+    /// *`, held as names for the same reason as the inherited columns above.
+    hidden_column_names: Vec<String>,
     /// The calls of the partition key's expressions, bound when the table was
     /// written.
     partition_key_calls: ExpressionCalls<<T::DB as DatabaseLike>::Function>,
@@ -126,6 +132,8 @@ impl<T: TableLike> Default for TableMetadata<T> {
             revoked_privileges: Vec::new(),
             documentation: None,
             foreign_source: None,
+            virtual_source: None,
+            hidden_column_names: Vec::new(),
             partition_key_calls: ExpressionCalls::default(),
             exclusion_calls: Vec::new(),
         }
@@ -518,6 +526,40 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub(crate) fn foreign_source_mut(&mut self) -> Option<&mut ForeignTableSource> {
         self.foreign_source.as_mut()
+    }
+
+    /// Returns the module and arguments a virtual table runs on, or [`None`]
+    /// for any other table.
+    #[inline]
+    #[must_use]
+    pub fn virtual_source(&self) -> Option<&VirtualTableSource> {
+        self.virtual_source.as_ref()
+    }
+
+    /// Marks the table as a virtual table running on `source`, or as an
+    /// ordinary table when [`None`].
+    #[inline]
+    pub fn set_virtual_source(&mut self, source: Option<VirtualTableSource>) {
+        self.virtual_source = source;
+    }
+
+    /// Moves the virtual source out, for a rebuild that carries it over.
+    #[inline]
+    pub(crate) fn take_virtual_source(&mut self) -> Option<VirtualTableSource> {
+        self.virtual_source.take()
+    }
+
+    /// Returns the names of the columns `SELECT *` leaves out.
+    #[inline]
+    #[must_use]
+    pub fn hidden_column_names(&self) -> &[String] {
+        &self.hidden_column_names
+    }
+
+    /// Records the names of the columns `SELECT *` leaves out.
+    #[inline]
+    pub fn set_hidden_column_names(&mut self, names: Vec<String>) {
+        self.hidden_column_names = names;
     }
 
     /// The calls of the partition key's expressions.

@@ -44,7 +44,7 @@ use crate::{
         ColumnIdentity, ColumnMetadata, ForeignTableSource, FunctionKind, GenericDB,
         IdentifierCase, MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership,
         Schema, SchemaProfile, Sequence, TableAttribute, TableMetadata, TriggerEnablement,
-        UserDefinedType, View,
+        UserDefinedType, View, VirtualTableSource,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -131,6 +131,7 @@ mod type_facts;
 mod user_defined_types;
 mod view_rewrites;
 mod views;
+mod virtual_tables;
 
 use default_privileges::{
     Creator, DefaultKind, DefaultPrivileges, SessionChange, SessionRoles, tracks_session_roles,
@@ -1805,30 +1806,49 @@ impl ParserDBBuilder {
         )
     }
 
-    /// Whether `table`, a node this builder stores, is a foreign table.
-    fn is_foreign_table(&self, table: &CreateTable) -> bool {
-        self.tables().iter().any(|(stored, metadata, _)| {
-            core::ptr::eq(stored.as_ref(), table) && SqlparserProfile::is_foreign_table(metadata)
-        })
+    /// The metadata this builder stores for `table`, one of its nodes.
+    fn stored_metadata(&self, table: &CreateTable) -> Option<&TableMetadata<CreateTable>> {
+        self.tables()
+            .iter()
+            .find(|(stored, _, _)| core::ptr::eq(stored.as_ref(), table))
+            .map(|(_, metadata, _)| metadata)
     }
 
-    /// Refuses `table`, which `name` reached, when it is a foreign table and
-    /// the statement needs a table holding its own rows.
+    /// The kind of table `table`, a node this builder stores, is.
+    fn stored_table_kind(&self, table: &CreateTable) -> ObjectKind {
+        match self.stored_metadata(table) {
+            Some(metadata) if SqlparserProfile::is_foreign_table(metadata) => {
+                ObjectKind::ForeignTable
+            }
+            Some(metadata) if metadata.virtual_source().is_some() => ObjectKind::VirtualTable,
+            _ => ObjectKind::Table,
+        }
+    }
+
+    /// Whether `table`, a node this builder stores, is a foreign table.
+    fn is_foreign_table(&self, table: &CreateTable) -> bool {
+        self.stored_table_kind(table) == ObjectKind::ForeignTable
+    }
+
+    /// Refuses `table`, which `name` reached, when it is of one of the
+    /// `refused` kinds the statement cannot act on.
     ///
     /// # Errors
     ///
     /// Returns [`Error::RelationKindMismatch`](crate::errors::Error::RelationKindMismatch)
-    /// for a foreign table.
-    fn refuse_foreign_table(
+    /// for a table of a refused kind.
+    fn refuse_table_kinds(
         &self,
         table: &CreateTable,
         name: &ObjectName,
+        refused: &[ObjectKind],
     ) -> Result<(), crate::errors::Error> {
-        if self.is_foreign_table(table) {
+        let actual_kind = self.stored_table_kind(table);
+        if refused.contains(&actual_kind) {
             return Err(crate::errors::Error::RelationKindMismatch {
                 object_name: name.to_string(),
                 expected_kind: ObjectKind::Table,
-                actual_kind: ObjectKind::ForeignTable,
+                actual_kind,
             });
         }
         Ok(())
@@ -5570,6 +5590,43 @@ impl ParserDB {
         )
     }
 
+    /// Resolves the virtual table `table` is a shadow table of, the way
+    /// SQLite reads a table name as `<virtual table>_<suffix>` with a suffix
+    /// the module keeps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when this database does not hold `table`, or
+    /// when the lookup of the virtual table is ambiguous.
+    pub(crate) fn shadow_owner_of(
+        &self,
+        table: &CreateTable,
+    ) -> Result<Option<&CreateTable>, LookupError> {
+        let metadata = self
+            .table_metadata(table)
+            .ok_or_else(|| ObjectKind::Table.not_in_database(table.table_name()))?;
+        if metadata.virtual_source().is_some() {
+            return Ok(None);
+        }
+        let Some((owner_name, suffix)) = table.table_name().rsplit_once('_') else {
+            return Ok(None);
+        };
+        let mut target = crate::structs::TargetName::new(owner_name, table.table_name_is_quoted());
+        if let Some(schema) = table.table_schema() {
+            target = target.with_schema(schema, table.table_schema_is_quoted());
+        }
+        let Some(owner) =
+            crate::traits::DatabaseLike::table_by_target(self, target, self.identifier_case())?
+        else {
+            return Ok(None);
+        };
+        let keeps_suffix =
+            self.table_metadata(owner).and_then(TableMetadata::virtual_source).is_some_and(
+                |source| virtual_tables::shadow_suffix(source.module_name(), suffix).is_some(),
+            );
+        Ok(keeps_suffix.then_some(owner))
+    }
+
     /// Resolves a table from an SQL object name, trying each schema on the
     /// database's search path for an unqualified name.
     ///
@@ -5966,7 +6023,11 @@ impl ParserDB {
             table_schema_qualifier(table),
             builder.identifier_case(),
         )?;
-        builder.refuse_foreign_table(table, &create_index.table_name)?;
+        builder.refuse_table_kinds(
+            table,
+            &create_index.table_name,
+            &[ObjectKind::ForeignTable, ObjectKind::VirtualTable],
+        )?;
         if create_index.unique {
             Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
         }
@@ -6278,34 +6339,12 @@ impl ParserDB {
             validate_table_schema(&builder, &replacement)?;
         }
 
-        let mut metadata: TableMetadata<CreateTable> = TableMetadata::default();
-        metadata.set_rls_enabled(previous_metadata.rls_enabled());
-        metadata.set_rls_forced(previous_metadata.rls_forced());
-        metadata.set_owner(previous_metadata.owner().map(str::to_string));
-        metadata.set_owner_privileges(previous_metadata.take_owner_privileges());
-        metadata.set_revocations(previous_metadata.take_revocations());
-        metadata.set_documentation(previous_metadata.take_documentation());
-        metadata.set_foreign_source(previous_metadata.take_foreign_source());
-        // Which columns came from a parent is not spelled by the node, so it
-        // has to survive the rebuild the way the other unspelled settings do.
-        metadata.set_inherited_column_names(previous_metadata.inherited_column_names().to_vec());
-        metadata.set_inherited_not_null(previous_metadata.inherited_not_null().to_vec());
-        metadata.set_inherited_constraints(inheritance::follow_constraint_rewrite(
-            previous_metadata.inherited_constraints(),
-            &previous_node.constraints,
-            &replacement.constraints,
-        ));
-        metadata.set_unvalidated_constraints(inheritance::follow_constraint_rewrite(
-            previous_metadata.unvalidated_constraints(),
-            &previous_node.constraints,
-            &replacement.constraints,
-        ));
-        metadata.set_generated_constraint_names(constraint_names::follow(
-            previous_metadata.generated_constraint_names(),
+        let mut metadata = Self::carried_table_metadata(
+            &mut previous_metadata,
             &previous_node,
             &replacement,
             removed,
-        ));
+        );
 
         let mut preserved_collations =
             preserved_column_metadata_for_table(&builder, &previous_node);
@@ -6366,6 +6405,52 @@ impl ParserDB {
         sequences::drop_orphaned_sequences(&mut builder);
         sequences::follow_identity_types(&mut builder)?;
         Ok(builder)
+    }
+
+    /// The metadata a table rebuilt from `previous_node` into `replacement`
+    /// keeps from `previous_metadata`, the settings no node spells, each
+    /// following its column or constraint to the rebuilt node.
+    fn carried_table_metadata(
+        previous_metadata: &mut TableMetadata<CreateTable>,
+        previous_node: &CreateTable,
+        replacement: &CreateTable,
+        removed: Option<constraint_names::Position>,
+    ) -> TableMetadata<CreateTable> {
+        let mut metadata: TableMetadata<CreateTable> = TableMetadata::default();
+        metadata.set_rls_enabled(previous_metadata.rls_enabled());
+        metadata.set_rls_forced(previous_metadata.rls_forced());
+        metadata.set_owner(previous_metadata.owner().map(str::to_string));
+        metadata.set_owner_privileges(previous_metadata.take_owner_privileges());
+        metadata.set_revocations(previous_metadata.take_revocations());
+        metadata.set_documentation(previous_metadata.take_documentation());
+        metadata.set_foreign_source(previous_metadata.take_foreign_source());
+        metadata.set_virtual_source(previous_metadata.take_virtual_source());
+        metadata.set_hidden_column_names(virtual_tables::follow_hidden_columns(
+            previous_metadata.hidden_column_names(),
+            previous_node,
+            replacement,
+        ));
+        // Which columns came from a parent is not spelled by the node, so it
+        // has to survive the rebuild the way the other unspelled settings do.
+        metadata.set_inherited_column_names(previous_metadata.inherited_column_names().to_vec());
+        metadata.set_inherited_not_null(previous_metadata.inherited_not_null().to_vec());
+        metadata.set_inherited_constraints(inheritance::follow_constraint_rewrite(
+            previous_metadata.inherited_constraints(),
+            &previous_node.constraints,
+            &replacement.constraints,
+        ));
+        metadata.set_unvalidated_constraints(inheritance::follow_constraint_rewrite(
+            previous_metadata.unvalidated_constraints(),
+            &previous_node.constraints,
+            &replacement.constraints,
+        ));
+        metadata.set_generated_constraint_names(constraint_names::follow(
+            previous_metadata.generated_constraint_names(),
+            previous_node,
+            replacement,
+            removed,
+        ));
+        metadata
     }
 
     /// Has `carried` hold the operator selections of the exclusions and the
@@ -6552,7 +6637,11 @@ impl ParserDB {
                 host_table: create_table.name.to_string(),
             });
         };
-        builder.refuse_foreign_table(referenced_table, &fk.foreign_table)?;
+        builder.refuse_table_kinds(
+            referenced_table,
+            &fk.foreign_table,
+            &[ObjectKind::ForeignTable],
+        )?;
         Ok(referenced_table)
     }
 
@@ -8343,6 +8432,11 @@ impl ParserDB {
             }
 
             let mut doomed = inheritance::descendants(&builder, &dropped);
+            // SQLite drops the shadow tables of a virtual table with it.
+            let owner = Self::stored_node(&builder, &dropped)?;
+            doomed.extend(
+                virtual_tables::shadows_of(&builder, owner).into_iter().map(|(shadow, _)| shadow),
+            );
             for table in &doomed {
                 let reader_rowtypes =
                     Self::release_dependent_views(&mut builder, table, &dropped, cascade, arrays)?;
@@ -9607,19 +9701,27 @@ impl ParserDB {
             )? {
                 continue;
             }
-            // A foreign table takes the table path, so every check on a table's
-            // shape applies.
-            let (statement, foreign_source) = match statement {
+            // A foreign table and a virtual table take the table path, so every
+            // check on a table's shape applies.
+            let (statement, foreign_source, virtual_source) = match statement {
                 Statement::CreateForeignTable(foreign_table) => {
                     let (node, foreign_source) = foreign_table_node(foreign_table);
-                    (Statement::CreateTable(node), Some(foreign_source))
+                    (Statement::CreateTable(node), Some(foreign_source), None)
+                }
+                Statement::CreateVirtualTable { name, if_not_exists, module_name, module_args } => {
+                    let source = VirtualTableSource::new(
+                        module_name.value,
+                        module_args.into_iter().map(|argument| argument.value),
+                    );
+                    let node = CreateTableBuilder::new(name).if_not_exists(if_not_exists).build();
+                    (Statement::CreateTable(node), None, Some(source))
                 }
                 // PostgreSQL runs a top-level `SELECT … INTO` as `CREATE TABLE
                 // … AS`.
                 Statement::Query(query) if matches!(dialect, SqlparserDialect::PostgreSql) => {
-                    (table_as::select_into_table(query), None)
+                    (table_as::select_into_table(query), None, None)
                 }
-                statement => (statement, None),
+                statement => (statement, None, None),
             };
             // A procedure takes the function path, as both live in `pg_proc`,
             // the keyword telling which kinds the statement reaches.
@@ -10439,20 +10541,20 @@ impl ParserDB {
                             continue;
                         }
                         if let Some(table) = builder.resolve_table_object_name(&alter_table.name)? {
-                            let foreign = builder.is_foreign_table(table);
-                            let refused = if foreign {
-                                foreign_table_refuses(&operation)
-                            } else {
-                                needs_foreign_table(&operation)
+                            let object_kind = builder.stored_table_kind(table);
+                            // SQLite renames a virtual table and alters nothing
+                            // else of it.
+                            let refused = match object_kind {
+                                ObjectKind::VirtualTable => {
+                                    !matches!(operation, AlterTableOperation::RenameTable { .. })
+                                }
+                                ObjectKind::ForeignTable => foreign_table_refuses(&operation),
+                                _ => needs_foreign_table(&operation),
                             };
                             if refused {
                                 return Err(
                                     crate::errors::Error::AlterActionUnsupportedOnRelation {
-                                        object_kind: if foreign {
-                                            ObjectKind::ForeignTable
-                                        } else {
-                                            ObjectKind::Table
-                                        },
+                                        object_kind,
                                         relation_name: alter_table.name.to_string(),
                                         operation: operation.to_string(),
                                     },
@@ -10497,7 +10599,7 @@ impl ParserDB {
                                     RenameTableNameKind::As(name)
                                     | RenameTableNameKind::To(name) => name,
                                 };
-                                builder = Self::rename_table_checked(
+                                builder = virtual_tables::rename_table(
                                     builder,
                                     &alter_table.name,
                                     new_name,
@@ -11045,6 +11147,16 @@ impl ParserDB {
                     {
                         continue;
                     }
+                    // SQLite refuses a taken name before the module reads its
+                    // arguments.
+                    let hidden_column_names = match &virtual_source {
+                        Some(source) => {
+                            validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
+                            builder.ensure_table_lookup_invariants(&create_table)?;
+                            virtual_tables::declare_columns(&builder, &mut create_table, source)?
+                        }
+                        None => Vec::new(),
+                    };
                     if let Some((previous, current)) =
                         Arc::make_mut(&mut type_arrays).displace(&builder, &create_table.name)
                     {
@@ -11162,6 +11274,8 @@ impl ParserDB {
                         builder.identifier_case(),
                     ));
                     metadata.set_foreign_source(foreign_source);
+                    metadata.set_virtual_source(virtual_source);
+                    metadata.set_hidden_column_names(hidden_column_names);
                     metadata.set_inherited_not_null(
                         create_table
                             .columns
@@ -11356,7 +11470,11 @@ impl ParserDB {
                             policy_name: policy.name.value.clone(),
                         });
                     };
-                    builder.refuse_foreign_table(table, &policy.table_name)?;
+                    builder.refuse_table_kinds(
+                        table,
+                        &policy.table_name,
+                        &[ObjectKind::ForeignTable],
+                    )?;
                     builder.bind_table_reference(&mut policy.table_name);
 
                     // A policy name is unique per table, whatever command the
