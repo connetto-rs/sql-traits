@@ -120,6 +120,7 @@ mod postgres_catalog;
 mod procedures;
 use procedures::RoutineKeyword;
 mod range_constructors;
+mod replica_identity;
 mod revocations;
 mod role_memberships;
 mod role_settings;
@@ -1513,11 +1514,23 @@ impl ParserDBBuilder {
         column: &NamedColumn,
     ) {
         let case = self.identifier_case();
+        let mut dropped = Vec::new();
         self.indices_mut().retain(|(index, _)| {
-            !(table.matches(TableAttribute::table(index), case)
+            let depends = table.matches(TableAttribute::table(index), case)
                 && (column.in_expressions(index.attribute(), table, declaring)
-                    || column.in_idents(&index.attribute().include)))
+                    || column.in_idents(&index.attribute().include));
+            if depends && let Some(name) = replica_identity::created_index_name(index.attribute()) {
+                dropped.push(name.into_owned());
+            }
+            !depends
         });
+        for (_, metadata, _) in
+            self.tables_mut().iter_mut().filter(|(held, _, _)| table.matches(held, case))
+        {
+            for name in &dropped {
+                replica_identity::forget(metadata, name);
+            }
+        }
 
         self.table_grants_mut().retain_mut(|(grant, ())| {
             !grant_names_table(grant, table) || drop_grant_column(Arc::make_mut(grant), column)
@@ -2240,8 +2253,16 @@ impl ParserDBBuilder {
         match slot {
             IndexSlot::Table(position) => {
                 let (removed, _) = self.indices_mut().remove(position);
-                for (_, table_meta, _) in self.tables_mut() {
+                let owner = StoredTable::of(TableAttribute::table(&removed));
+                let name = replica_identity::created_index_name(removed.attribute());
+                let case = self.identifier_case();
+                for (table, table_meta, _) in self.tables_mut() {
                     table_meta.retain_indices(|index| !Arc::ptr_eq(index, &removed));
+                    if let Some(name) = &name
+                        && owner.matches(table, case)
+                    {
+                        replica_identity::forget(table_meta, name);
+                    }
                 }
             }
             IndexSlot::MaterializedView(position) => {
@@ -6714,6 +6735,13 @@ impl ParserDB {
             &replacement,
             removed,
         );
+        replica_identity::follow_rebuild(
+            &mut metadata,
+            &previous_node,
+            previous_metadata.generated_constraint_names(),
+            &replacement,
+            builder.identifier_case(),
+        );
 
         let mut preserved_collations =
             preserved_column_metadata_for_table(&builder, &previous_node);
@@ -6820,6 +6848,7 @@ impl ParserDB {
             replacement,
             removed,
         ));
+        metadata.set_replica_identity(previous_metadata.take_replica_identity());
         metadata
     }
 
@@ -8113,9 +8142,10 @@ impl ParserDB {
     /// Returns [`crate::errors::Error::InheritedConstraintNotDroppable`] for a
     /// copy a parent still passes down,
     /// [`crate::errors::Error::RequiredValueNotDroppable`] for a column a key
-    /// covers, [`crate::errors::Error::AlterTableNotFound`] for an absent
-    /// table and `ObjectKind::Table.not_in_database` when the stored entry is
-    /// missing.
+    /// covers or that is in the replica identity index of the table or of a
+    /// table below losing it, [`crate::errors::Error::AlterTableNotFound`] for
+    /// an absent table and `ObjectKind::Table.not_in_database` when the stored
+    /// entry is missing.
     fn drop_not_null_constraint(
         builder: ParserDBBuilder,
         stored: &StoredTable,
@@ -8149,6 +8179,12 @@ impl ParserDB {
                 reason: crate::errors::RequiredValue::CoveredByKey,
             });
         }
+        replica_identity::refuse_losing_requirement(
+            &builder,
+            &stored.name,
+            node,
+            &not_null.column,
+        )?;
 
         let column = not_null.column.clone();
         let column_name = not_null.column.value.clone();
@@ -8176,8 +8212,9 @@ impl ParserDB {
     ///
     /// # Errors
     ///
-    /// Returns `ObjectKind::Table.not_in_database` when a stored entry is
-    /// missing.
+    /// Returns [`crate::errors::Error::RequiredValueNotDroppable`] for a table
+    /// below losing a column in its replica identity index, and
+    /// `ObjectKind::Table.not_in_database` when a stored entry is missing.
     fn drop_not_null_copies_below(
         builder: ParserDBBuilder,
         stored: &StoredTable,
@@ -8254,6 +8291,7 @@ impl ParserDB {
                     Ok(())
                 })?;
                 inheritance::unmark_inherited_constraint(&mut builder, &child, &removed);
+                replica_identity::refuse_lost_requirement(&builder, &child, column)?;
                 inheritance::mark_inherited_not_null(&mut builder, &child, column_name, false);
                 frontier.push((child, copy));
             }
@@ -8268,6 +8306,14 @@ impl ParserDB {
     /// in the constraint list: a child's copy always arrives with the column it
     /// is written on, so it can never be the child's own, and whether a parent
     /// still writes it is read from the parents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::Error::RequiredValueNotDroppable`] for a
+    /// `NOT NULL` on a column a key covers or that is in the replica identity
+    /// index of the table or of a table below losing it, and
+    /// [`crate::errors::Error::InheritedConstraintNotDroppable`] for a copy a
+    /// parent still writes.
     fn drop_column_constraint(
         builder: ParserDBBuilder,
         stored: &StoredTable,
@@ -8304,6 +8350,9 @@ impl ParserDB {
                 table_name: stored.name.clone(),
                 constraint_name: name.value.clone(),
             });
+        }
+        if matches!(&option.option, ColumnOption::NotNull) {
+            replica_identity::refuse_losing_requirement(&builder, &stored.name, node, written_on)?;
         }
 
         let removed = constraint_names::Position::Column(column, position);
@@ -8364,6 +8413,9 @@ impl ParserDB {
                     remove_copied_column_constraint(node, written_on, &removed, case);
                     Ok(())
                 })?;
+                if matches!(&held.option, ColumnOption::NotNull) {
+                    replica_identity::refuse_lost_requirement(&builder, &child, written_on)?;
+                }
                 frontier.push((child, held));
             }
         }
@@ -9799,6 +9851,9 @@ impl ParserDB {
             core::iter::once((stored, false)).chain(below.into_iter().map(|child| (child, set)))
         {
             builder = Self::apply_not_null_to_table(builder, &table, &column, received, operation)?;
+            if !set {
+                replica_identity::refuse_lost_requirement(&builder, &table, &column.ident())?;
+            }
         }
         Ok(builder)
     }
@@ -9974,7 +10029,8 @@ impl ParserDB {
     ///
     /// Removing the requirement to hold a value is refused where a key covers
     /// the column, which PostgreSQL reports as the column being in a primary
-    /// key, and where a parent enforces it, which only the parent may lift.
+    /// key, where a parent enforces it, which only the parent may lift, and
+    /// where the column is in the table's replica identity index.
     /// Adding an identity is refused while the column may still hold nothing,
     /// since an identity supplies a value on every row.
     fn refuse_alter_column(
@@ -10010,6 +10066,12 @@ impl ParserDB {
                         reason: crate::errors::RequiredValue::EnforcedByParent,
                     });
                 }
+                replica_identity::refuse_losing_requirement(
+                    builder,
+                    &stored.name,
+                    node,
+                    &column.ident(),
+                )?;
             }
             AlterColumnOperation::AddGenerated { .. } => {
                 if !requires_value(node, &column.ident(), column.case) {
@@ -10575,8 +10637,17 @@ impl ParserDB {
                             // the metadata of the table the index is on, so
                             // both take the replacement.
                             builder.indices_mut()[position] = (renamed.clone(), metadata);
-                            for (_, table_metadata, _) in builder.tables_mut() {
+                            let owner = StoredTable::of(TableAttribute::table(&stored));
+                            let names = replica_identity::created_index_name(stored.attribute())
+                                .zip(replica_identity::created_index_name(renamed.attribute()));
+                            let case = builder.identifier_case();
+                            for (table, table_metadata, _) in builder.tables_mut() {
                                 table_metadata.replace_index(&stored, &renamed);
+                                if let Some((old, new)) = &names
+                                    && owner.matches(table, case)
+                                {
+                                    replica_identity::follow_rename(table_metadata, old, new);
+                                }
                             }
                         }
                         IndexSlot::MaterializedView(position) => {
@@ -10989,6 +11060,7 @@ impl ParserDB {
                     // The persistence the table had before a clause of this
                     // statement changed it.
                     let mut persistence_before_change = None;
+                    let mut replica_identities = Vec::new();
                     if alter_table.table_type == Some(AlterTableType::Foreign) {
                         refuse_alter_foreign_table_of_other_kind(&builder, &alter_table)?;
                     }
@@ -11100,6 +11172,7 @@ impl ParserDB {
                                         &foreign_key.foreign_table,
                                     )?;
                                 }
+                                let adoption = replica_identity::adoption(&constraint);
                                 builder = Self::alter_table_add_constraint(
                                     builder,
                                     &alter_table.name,
@@ -11107,6 +11180,16 @@ impl ParserDB {
                                     constraint,
                                     !not_valid,
                                 )?;
+                                if let Some((index, key)) = adoption {
+                                    builder = Self::alter_table_metadata(
+                                        builder,
+                                        &alter_table.name,
+                                        alter_table.if_exists,
+                                        |_, metadata| {
+                                            replica_identity::follow_rename(metadata, &index, &key);
+                                        },
+                                    )?;
+                                }
                             }
                             AlterTableOperation::RenameConstraint { old_name, new_name } => {
                                 builder = constraint_names::rename_constraint(
@@ -11508,10 +11591,6 @@ impl ParserDB {
                             | AlterTableOperation::EnableAlwaysRule { .. }
                             | AlterTableOperation::EnableReplicaRule { .. }
                             | AlterTableOperation::DisableRule { .. }
-                            // Replication identity selects which columns
-                            // identify a row downstream, which the model does
-                            // not track.
-                            | AlterTableOperation::ReplicaIdentity { .. }
                             // The next value of an auto-increment counter is
                             // table data rather than schema.
                             | AlterTableOperation::AutoIncrement { .. }
@@ -11524,7 +11603,22 @@ impl ParserDB {
                             // change, with no effect on the result.
                             | AlterTableOperation::Algorithm { .. }
                             | AlterTableOperation::Lock { .. } => {}
+                            AlterTableOperation::ReplicaIdentity { identity } => {
+                                replica_identities.push(identity);
+                            }
                         }
+                    }
+                    // PostgreSQL sets the replica identity in its last pass.
+                    if !replica_identities.is_empty() {
+                        constraint_names::name_pending(&mut builder);
+                    }
+                    for identity in &replica_identities {
+                        builder = replica_identity::set(
+                            builder,
+                            &alter_table.name,
+                            alter_table.if_exists,
+                            identity,
+                        )?;
                     }
                 }
                 Statement::CreateExtension(create_extension) => {

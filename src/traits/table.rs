@@ -7,8 +7,8 @@ use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
         ActingRole, ColumnDefinition, ColumnPrivilege, ColumnScope, ForeignTableSource,
-        IdentifierCase, PartitionBound, RowSecurity, RowStatement, SchemaFingerprint,
-        TablePrivileges, VirtualTableSource,
+        IdentifierCase, PartitionBound, ReplicaIdentity, RowSecurity, RowStatement,
+        SchemaFingerprint, TablePrivileges, VirtualTableSource,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
@@ -4362,6 +4362,60 @@ pub trait TableLike:
     /// ```
     fn has_forced_row_level_security(&self, database: &Self::DB) -> Result<bool, LookupError>;
 
+    /// Returns what this table's `UPDATE` and `DELETE` write to the logical
+    /// replication stream to identify the old row, as
+    /// `pg_class.relreplident` and `pg_index.indisreplident` record it.
+    ///
+    /// A table starts at [`ReplicaIdentity::Default`] and each `ALTER TABLE
+    /// ... REPLICA IDENTITY` moves it. `USING INDEX` resolves to the index
+    /// while the table holds it, through its renames, and to
+    /// [`ReplicaIdentity::Index`] holding [`None`] once it is dropped, which
+    /// PostgreSQL reads as `NOTHING`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT);
+    /// ALTER TABLE notes REPLICA IDENTITY NOTHING;
+    /// CREATE TABLE events (id UUID PRIMARY KEY);
+    /// ALTER TABLE events REPLICA IDENTITY USING INDEX events_pkey;
+    /// CREATE TABLE tags (name TEXT NOT NULL);
+    /// CREATE UNIQUE INDEX tags_name ON tags (name);
+    /// ALTER TABLE tags REPLICA IDENTITY USING INDEX tags_name;
+    /// DROP INDEX tags_name;
+    /// ",
+    /// )?;
+    /// let lookup = |name| db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// let notes = lookup("notes")?.unwrap();
+    /// assert!(matches!(notes.replica_identity(&db)?, ReplicaIdentity::Nothing));
+    /// let events = lookup("events")?.unwrap();
+    /// assert!(matches!(
+    ///     events.replica_identity(&db)?,
+    ///     ReplicaIdentity::Index(Some(ReplicaIdentityIndex::UniqueIndex(_)))
+    /// ));
+    /// let tags = lookup("tags")?.unwrap();
+    /// assert!(matches!(tags.replica_identity(&db)?, ReplicaIdentity::Index(None)));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn replica_identity<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<ReplicaIdentity<'db, Self::DB>, LookupError>
+    where
+        Self: 'db;
+
     /// Returns the role the input names as the table's owner.
     ///
     /// A table owner bypasses every policy on the table unless the table also
@@ -5126,6 +5180,16 @@ where
 
     fn has_forced_row_level_security(&self, database: &Self::DB) -> Result<bool, LookupError> {
         T::has_forced_row_level_security(self, database)
+    }
+
+    fn replica_identity<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<ReplicaIdentity<'db, Self::DB>, LookupError>
+    where
+        Self: 'db,
+    {
+        T::replica_identity(self, database)
     }
 
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {

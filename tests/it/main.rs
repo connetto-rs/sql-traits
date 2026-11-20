@@ -160,6 +160,7 @@ mod relation_identity;
 mod relation_lookup_identifier_case;
 mod renamed_table_references;
 mod repeated_key_columns;
+mod replica_identity;
 mod request_time_zone;
 mod required_column_values;
 mod role_lifecycle;

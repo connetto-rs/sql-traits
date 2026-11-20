@@ -217,6 +217,16 @@ impl<P: EmptyKinds> TableLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn replica_identity<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<ReplicaIdentity<'db, Self::DB>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.unreach()
+    }
+
     fn owner<'db>(&self, _database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         self.unreach()
     }

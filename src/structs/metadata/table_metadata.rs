@@ -7,7 +7,10 @@ use sqlparser::ast::{Action, ColumnDef, CreateTable, Privileges};
 use super::ExpressionCalls;
 use crate::{
     impls::PrivilegeKind,
-    structs::{ForeignTableSource, RevokedPrivilege, TableAttribute, VirtualTableSource},
+    structs::{
+        ForeignTableSource, RevokedPrivilege, StoredReplicaIdentity, TableAttribute,
+        VirtualTableSource,
+    },
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 
@@ -80,6 +83,8 @@ pub struct TableMetadata<T: TableLike> {
     /// Whether Row Level Security is forced for the table (applies to table
     /// owners too).
     rls_forced: bool,
+    /// The replica identity `ALTER TABLE ... REPLICA IDENTITY` last set.
+    replica_identity: StoredReplicaIdentity,
     /// The role the input names as the table's owner, if it names one.
     owner: Option<String>,
     /// The table-level privileges the owner's own entry holds.
@@ -129,6 +134,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             constraint_names_pending: false,
             rls_enabled: false,
             rls_forced: false,
+            replica_identity: StoredReplicaIdentity::Default,
             owner: None,
             // The owner holds every privilege on the table it creates.
             owner_privileges: PrivilegeKind::Relation.all_privileges(),
@@ -180,6 +186,25 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub fn set_rls_forced(&mut self, rls_forced: bool) {
         self.rls_forced = rls_forced;
+    }
+
+    /// Returns the replica identity `ALTER TABLE ... REPLICA IDENTITY` last
+    /// set.
+    #[inline]
+    pub(crate) fn replica_identity(&self) -> &StoredReplicaIdentity {
+        &self.replica_identity
+    }
+
+    /// Takes the table's replica identity, leaving `DEFAULT`.
+    #[inline]
+    pub(crate) fn take_replica_identity(&mut self) -> StoredReplicaIdentity {
+        core::mem::take(&mut self.replica_identity)
+    }
+
+    /// Sets the table's replica identity.
+    #[inline]
+    pub(crate) fn set_replica_identity(&mut self, replica_identity: StoredReplicaIdentity) {
+        self.replica_identity = replica_identity;
     }
 
     /// Returns the role the input names as the table's owner.
