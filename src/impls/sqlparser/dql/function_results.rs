@@ -75,7 +75,7 @@ type ResultColumns<'query, 'db, DB, D, C> = Option<Vec<ResultColumn<'query, 'db,
 pub(super) fn collect_function_call<'query, 'db, DB, P>(
     factor: AstRef<'query, 'db, TableFactor>,
     deriving: Deriving<'_, 'db, DB>,
-    local_parent: P::Cursor,
+    local_parent: P::Location,
     profile: &mut P,
 ) -> Result<Option<FactorContribution<'query, 'db, DB, P::Definition>>, LookupError>
 where
@@ -187,12 +187,12 @@ fn reached_function<'db, DB: DatabaseLike>(
 /// function returns, or deriving that of a view, runs into.
 fn result_columns<'query, 'db, DB, P>(
     function: &'db DB::Function,
-    call: Call<'query, 'db, P::Cursor>,
+    call: Call<'query, 'db, P::Location>,
     alias: Option<AstRef<'query, 'db, TableAlias>>,
     with_ordinality: bool,
     deriving: Deriving<'_, 'db, DB>,
     profile: &mut P,
-) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Cursor>, LookupError>
+) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Location>, LookupError>
 where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
@@ -327,7 +327,7 @@ fn row_type_columns<'query, 'db, DB, P>(
     name: &TargetName<'_>,
     deriving: Deriving<'_, 'db, DB>,
     profile: &mut P,
-) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Cursor>, LookupError>
+) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Location>, LookupError>
 where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,
@@ -391,7 +391,7 @@ fn relation_columns<'query, 'db, DB, P>(
     relation: Relation<'db, DB>,
     deriving: Deriving<'_, 'db, DB>,
     profile: &mut P,
-) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Cursor>, LookupError>
+) -> Result<ResultColumns<'query, 'db, DB, P::Definition, P::Location>, LookupError>
 where
     DB: DatabaseLike,
     P: DerivationProfile<'query, 'db, DB>,

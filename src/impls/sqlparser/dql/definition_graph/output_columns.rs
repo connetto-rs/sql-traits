@@ -210,7 +210,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                     }
                     _ => OutputName::figured(figure(expression.get())),
                 };
-                let definition = self.expression_definition(expression, Some(cursor))?;
+                let definition = self.expression_definition(expression, cursor)?;
                 outputs.push(OutputEntry::Column(OutputColumn {
                     name,
                     definition,

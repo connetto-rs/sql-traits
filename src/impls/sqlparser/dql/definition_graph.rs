@@ -810,9 +810,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     }
 
     /// Whether a relation named `name`, unquoted, is in reach from `cursor`.
-    pub(super) fn reaches_relation(&self, cursor: Option<ScopeCursor>, name: &str) -> bool {
+    pub(super) fn reaches_relation(&self, cursor: ScopeCursor, name: &str) -> bool {
         let qualifier = ObjectName::from(alloc::vec![Ident::new(name)]);
-        cursor.is_some_and(|cursor| self.graph.resolve_relation(cursor, &qualifier).is_some())
+        self.graph.resolve_relation(cursor, &qualifier).is_some()
     }
 
     /// The definition of input parameter `ordinal` of `function`.
@@ -887,6 +887,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
     type Definition = DefinitionId;
     type Scope = ScopeId;
     type Cursor = Option<ScopeCursor>;
+    type Location = ScopeCursor;
     type Checkpoint = GraphCheckpoint;
 
     const INDEX_NESTED_QUERIES: bool = true;
@@ -964,20 +965,20 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
         &mut self.graph.scopes[scope.0].data
     }
 
-    fn cursor(&self, scope: &Self::Scope) -> Self::Cursor {
-        Some(ScopeCursor {
+    fn location(&self, scope: &Self::Scope) -> Self::Location {
+        ScopeCursor {
             scope: *scope,
             visible_entries: self.graph.scopes[scope.0].data.from_entry_count,
-        })
+        }
     }
 
-    fn cursor_for_select(&self, select: AstRef<'query, 'db, Select>) -> Option<Self::Cursor> {
+    fn location_of_select(&self, select: AstRef<'query, 'db, Select>) -> Option<Self::Location> {
         let address = select_address(select.get());
         self.graph.select_index.iter().rev().find(|entry| entry.address == address).map(|entry| {
-            Some(ScopeCursor {
+            ScopeCursor {
                 scope: entry.scope,
                 visible_entries: self.graph.scopes[entry.scope.0].data.from_entry_count,
-            })
+            }
         })
     }
 
@@ -1015,8 +1016,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
         for position in 0..width {
             let start = self.graph.lists.len();
             for row in rows.iter() {
-                let cell =
-                    self.expression_definition(row.map(|row| &row[position]), Some(scope))?;
+                let cell = self.expression_definition(row.map(|row| &row[position]), scope)?;
                 self.graph.lists.push(cell);
             }
             let cells = start..self.graph.lists.len();
@@ -1044,11 +1044,8 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
     fn expression_definition(
         &mut self,
         expression: AstRef<'query, 'db, Expr>,
-        scope: Self::Cursor,
+        scope: Self::Location,
     ) -> Result<Self::Definition, LookupError> {
-        let Some(scope) = scope else {
-            return Ok(DefinitionId(0));
-        };
         match self.graph.resolve_definition_id(scope, expression.get()) {
             Ok(Some(resolved)) => Ok(resolved.definition),
             Ok(None) => Ok(self.push_definition(DefinitionNode::Expression { expression, scope })),
@@ -1061,10 +1058,9 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
         &mut self,
         arguments: &[AstRef<'query, 'db, Expr>],
         with_ordinality: bool,
-        scope: Self::Cursor,
+        scope: Self::Location,
         database: &'db DB,
     ) -> Result<Option<Vec<Self::Definition>>, LookupError> {
-        let Some(scope) = scope else { return Ok(None) };
         for array in arguments {
             if !self.graph.proves_array(scope, array.get(), database)? {
                 return Ok(None);
@@ -1083,22 +1079,8 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
     fn function_result_definition(
         &mut self,
         function: &'db DB::Function,
-        data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Cursor>,
+        data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Location>,
     ) -> Self::Definition {
-        let data_type = match data_type {
-            ResultColumnType::Signature(name) => ResultColumnType::Signature(name),
-            ResultColumnType::Scalar { name, arguments, scope: Some(scope) } => {
-                ResultColumnType::Scalar { name, arguments, scope }
-            }
-            ResultColumnType::Scalar { scope: None, .. } => return DefinitionId(0),
-            ResultColumnType::RowType(column) => ResultColumnType::RowType(column),
-            ResultColumnType::Attribute(data_type, database) => {
-                ResultColumnType::Attribute(data_type, database)
-            }
-            ResultColumnType::DefinitionList(data_type) => {
-                ResultColumnType::DefinitionList(data_type)
-            }
-        };
         self.push_definition(DefinitionNode::FunctionResult { function, data_type })
     }
 

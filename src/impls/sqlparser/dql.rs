@@ -533,7 +533,12 @@ impl<DB: DatabaseLike, D: Copy> FromScope<'_, '_, DB, D> {
 trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
     type Definition: Copy;
     type Scope;
+    /// Where a clause is read, a scope that exists or none at all, as for the
+    /// outermost query.
     type Cursor: Copy;
+    /// A position in a scope that exists, which every clause of a `SELECT`
+    /// is read at.
+    type Location: Copy + Into<Self::Cursor>;
     type Checkpoint: Copy;
 
     const INDEX_NESTED_QUERIES: bool;
@@ -559,8 +564,8 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         &'scope mut self,
         scope: &'scope mut Self::Scope,
     ) -> &'scope mut FromScope<'query, 'db, DB, Self::Definition>;
-    fn cursor(&self, scope: &Self::Scope) -> Self::Cursor;
-    fn cursor_for_select(&self, select: AstRef<'query, 'db, Select>) -> Option<Self::Cursor>;
+    fn location(&self, scope: &Self::Scope) -> Self::Location;
+    fn location_of_select(&self, select: AstRef<'query, 'db, Select>) -> Option<Self::Location>;
     fn set_scope_owners_since(
         &mut self,
         checkpoint: Self::Checkpoint,
@@ -593,7 +598,7 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
     fn expression_definition(
         &mut self,
         expression: AstRef<'query, 'db, Expr>,
-        scope: Self::Cursor,
+        scope: Self::Location,
     ) -> Result<Self::Definition, LookupError>;
     /// The definitions of the columns an `unnest` in `FROM` outputs, the
     /// elements of each of `arguments` read under `scope`, then the row
@@ -604,7 +609,7 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         &mut self,
         arguments: &[AstRef<'query, 'db, Expr>],
         with_ordinality: bool,
-        scope: Self::Cursor,
+        scope: Self::Location,
         database: &'db DB,
     ) -> Result<Option<Vec<Self::Definition>>, LookupError>;
     /// The definition of a column of the result `function`, called in
@@ -612,7 +617,7 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
     fn function_result_definition(
         &mut self,
         function: &'db DB::Function,
-        data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Cursor>,
+        data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Location>,
     ) -> Self::Definition;
     /// The definition of the `bigint` row number `WITH ORDINALITY` adds
     /// after the columns of a function in `FROM`.
@@ -655,6 +660,7 @@ where
     type Definition = ();
     type Scope = FromScope<'query, 'db, DB, ()>;
     type Cursor = ();
+    type Location = ();
     type Checkpoint = ();
 
     const INDEX_NESTED_QUERIES: bool = false;
@@ -691,9 +697,9 @@ where
         scope
     }
 
-    fn cursor(&self, _scope: &Self::Scope) {}
+    fn location(&self, _scope: &Self::Scope) {}
 
-    fn cursor_for_select(&self, _select: AstRef<'query, 'db, Select>) -> Option<Self::Cursor> {
+    fn location_of_select(&self, _select: AstRef<'query, 'db, Select>) -> Option<Self::Location> {
         None
     }
 
@@ -727,7 +733,7 @@ where
     fn expression_definition(
         &mut self,
         _expression: AstRef<'query, 'db, Expr>,
-        _scope: Self::Cursor,
+        _scope: Self::Location,
     ) -> Result<Self::Definition, LookupError> {
         Ok(())
     }
@@ -736,7 +742,7 @@ where
         &mut self,
         _arguments: &[AstRef<'query, 'db, Expr>],
         _with_ordinality: bool,
-        _scope: Self::Cursor,
+        _scope: Self::Location,
         _database: &'db DB,
     ) -> Result<Option<Vec<Self::Definition>>, LookupError> {
         Ok(None)
@@ -745,7 +751,7 @@ where
     fn function_result_definition(
         &mut self,
         _function: &'db DB::Function,
-        _data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Cursor>,
+        _data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Location>,
     ) {
     }
 
@@ -877,20 +883,20 @@ where
         let Some(alias) = factor_alias(factor) else {
             return collect_joined(table, scope, cte_scope, deriving, parent, profile);
         };
-        let local_parent = profile.cursor(scope);
+        let local_parent = profile.location(scope).into();
         let join = AliasedJoin { factor, table, alias };
         let contribution =
             collect_aliased_join(join, deriving, cte_scope, parent, local_parent, profile)?;
         return Ok(append_factor(profile, scope, contribution));
     }
-    let local_parent = profile.cursor(scope);
+    let local_parent = profile.location(scope);
     if P::INDEX_NESTED_QUERIES {
         index_table_factor_expression_queries(
             factor,
             cte_scope,
             deriving,
             parent,
-            local_parent,
+            local_parent.into(),
             profile,
         )?;
     }
@@ -985,7 +991,7 @@ where
         )?;
         let (right_names, right_entries) = right.unzip();
         if P::INDEX_NESTED_QUERIES {
-            let local_parent = profile.cursor(scope);
+            let local_parent = profile.location(scope).into();
             index_join_expression_queries(join, cte_scope, deriving, local_parent, profile)?;
         }
         let (left_nullable, right_nullable) = nullable_sides(&join.get().join_operator);
@@ -1522,7 +1528,7 @@ where
     P: DerivationProfile<'query, 'db, DB>,
 {
     match set_expr_ref(body) {
-        SetExprRef::Select(select) => profile.cursor_for_select(select).unwrap_or(parent),
+        SetExprRef::Select(select) => profile.location_of_select(select).map_or(parent, Into::into),
         SetExprRef::Query(query) => {
             derived_body_cursor(query.map(|query| query.body.as_ref()), parent, profile)
         }
@@ -1931,7 +1937,7 @@ fn projection_output_name<DB: DatabaseLike, D: Copy>(
 
 fn projection_definition<'query, 'db, DB, P>(
     expression: AstRef<'query, 'db, Expr>,
-    scope: P::Cursor,
+    scope: P::Location,
     profile: &mut P,
 ) -> Result<P::Definition, LookupError>
 where
@@ -1984,7 +1990,7 @@ where
     match set_expr_ref(body) {
         SetExprRef::Select(select) => {
             let scope = collect_select_from(select, cte_scope, deriving, parent, profile)?;
-            let cursor = profile.cursor(&scope);
+            let cursor = profile.location(&scope).into();
             index_select_expression_queries(select, cte_scope, deriving, cursor, profile)?;
             Ok(cursor)
         }
@@ -3342,7 +3348,7 @@ fn derived_projection_source<'db, DB: DatabaseLike, D: Copy>(
 fn append_select_item<'query, 'db, DB, P>(
     item: AstRef<'query, 'db, SelectItem>,
     scope: &P::Scope,
-    scope_cursor: P::Cursor,
+    location: P::Location,
     output_names: Option<&OutputNameSource<'_, 'query, 'db, DB, P::Definition>>,
     profile: &mut P,
     columns: &mut Vec<DerivedColumn<'query, 'db, DB, P::Definition>>,
@@ -3373,7 +3379,7 @@ where
             let Some((name, quoted)) = named else {
                 return Ok(false);
             };
-            let definition = projection_definition(expression, scope_cursor, profile)?;
+            let definition = projection_definition(expression, location, profile)?;
             columns.push(DerivedColumn {
                 name,
                 quoted,
@@ -3389,7 +3395,7 @@ where
             };
             let opaque = profile.opaque_definition();
             let source = derived_projection_source(expression.get(), profile.scope(scope), opaque)?;
-            let definition = projection_definition(expression, scope_cursor, profile)?;
+            let definition = projection_definition(expression, location, profile)?;
             columns.push(DerivedColumn {
                 name: alias.value.clone(),
                 quoted: alias.quote_style.is_some(),
@@ -3452,16 +3458,16 @@ where
         return Ok(None);
     }
     let scope = collect_select_from(select, cte_scope, deriving, parent, profile)?;
-    let scope_cursor = profile.cursor(&scope);
+    let location = profile.location(&scope);
     if P::INDEX_NESTED_QUERIES {
-        index_select_expression_queries(select, cte_scope, deriving, scope_cursor, profile)?;
+        index_select_expression_queries(select, cte_scope, deriving, location.into(), profile)?;
     }
     if unsupported {
         return Ok(None);
     }
     let mut columns = Vec::new();
     for item in select.map(|select| select.projection.as_slice()).iter() {
-        if !append_select_item(item, &scope, scope_cursor, output_names, profile, &mut columns)? {
+        if !append_select_item(item, &scope, location, output_names, profile, &mut columns)? {
             return Ok(None);
         }
     }
@@ -4677,7 +4683,7 @@ fn collect_unnest<'query, 'db, DB, P>(
     factor: AstRef<'query, 'db, TableFactor>,
     call: &UnnestCall<'query, 'db>,
     deriving: Deriving<'_, 'db, DB>,
-    local_parent: P::Cursor,
+    local_parent: P::Location,
     profile: &mut P,
 ) -> Result<Option<FactorContribution<'query, 'db, DB, P::Definition>>, LookupError>
 where
@@ -4768,7 +4774,7 @@ fn collect_factor<'query, 'db, DB, P>(
     deriving: Deriving<'_, 'db, DB>,
     cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
     inherited_parent: P::Cursor,
-    local_parent: P::Cursor,
+    local_parent: P::Location,
     profile: &mut P,
 ) -> Result<FactorContribution<'query, 'db, DB, P::Definition>, LookupError>
 where
@@ -4793,7 +4799,7 @@ where
             };
             let alias = factor_alias(factor);
             let output_names = alias.and_then(OutputNameSource::from_alias);
-            let parent = if *lateral { local_parent } else { inherited_parent };
+            let parent = if *lateral { local_parent.into() } else { inherited_parent };
             let body =
                 derive_query_shape(subquery, cte_scope, output_names, deriving, parent, profile)?;
             let shape = match alias {
@@ -5133,7 +5139,7 @@ mod tests {
         ) {
             let mut profile = SourceDerivation;
             assert!(
-                <SourceDerivation as DerivationProfile<'query, 'db, ParserDB>>::cursor_for_select(
+                <SourceDerivation as DerivationProfile<'query, 'db, ParserDB>>::location_of_select(
                     &profile,
                     AstRef::Query(select),
                 )

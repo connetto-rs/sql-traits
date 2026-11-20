@@ -56,7 +56,7 @@ pub(crate) fn scoped_graph<'query, 'db, DB: DatabaseLike>(
     let mut profile = DefinitionDerivation::new(case);
     let outer = profile.begin_unowned_scope(None);
     reach(&mut profile, outer, scope, database);
-    let outer_cursor = profile.cursor(&outer);
+    let outer_cursor = Some(profile.location(&outer));
     match root.unwrapped() {
         ScopedRoot::Expression(expression) => {
             index_nested(&mut profile, &[], deriving, outer_cursor, |walker| {
