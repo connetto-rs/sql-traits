@@ -1083,6 +1083,10 @@ impl ForeignKeyLike for MemoryForeignKey {
         TargetName::new(&self.referenced_table_name, false)
     }
 
+    fn referenced_column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        core::iter::empty()
+    }
+
     fn host_columns<'db>(
         &'db self,
         _database: &'db Self::DB,

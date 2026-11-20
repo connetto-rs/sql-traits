@@ -116,6 +116,21 @@ fn a_target_that_never_exists_is_kept_as_written() {
     assert_eq!(referenced_of(&database, "child"), Err(table_not_found("parent")));
 }
 
+/// The referenced columns a key names read back in the order written, each
+/// with whether it was quoted, with no target to resolve them against. A key
+/// naming none reads back empty, which is how SQLite spells the primary key.
+#[test]
+fn referenced_column_names_read_without_a_target() {
+    let database = parse(
+        "CREATE TABLE child (a, b, FOREIGN KEY (a, b) REFERENCES parent (\"Code\", id));
+         CREATE TABLE orphan (pid REFERENCES absent);",
+    )
+    .expect("SQLite stores keys whose targets never exist");
+    let written: Vec<(&str, bool)> = key_of(&database, "child").referenced_column_names().collect();
+    assert_eq!(written, [("Code", true), ("id", false)]);
+    assert_eq!(key_of(&database, "orphan").referenced_column_names().next(), None);
+}
+
 /// A view holding the name is no table to reference, whether it comes before
 /// or after the key.
 #[test]

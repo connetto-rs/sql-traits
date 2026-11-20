@@ -78,6 +78,14 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     }
 
     #[inline]
+    fn referenced_column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.attribute()
+            .referred_columns
+            .iter()
+            .map(|column| (column.value.as_str(), column.quote_style.is_some()))
+    }
+
+    #[inline]
     fn on_delete(&self, _database: &Self::DB) -> ReferentialAction {
         self.attribute().on_delete.unwrap_or(ReferentialAction::NoAction)
     }

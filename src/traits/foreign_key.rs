@@ -309,6 +309,52 @@ pub trait ForeignKeyLike:
     /// ```
     fn referenced_table_name(&self) -> TargetName<'_>;
 
+    /// Returns the names of the columns the `REFERENCES` clause names, as
+    /// ingestion bound them, in the order written, each with whether it was
+    /// quoted.
+    ///
+    /// Like [`Self::referenced_table_name`] this applies no resolution and
+    /// cannot fail, so it reads a key whose target is absent or holds no
+    /// matching key, which SQLite stores. A key naming no columns references
+    /// the primary key of its target and reads back empty under a dialect
+    /// binding keys on use. A dialect binding keys at declaration spells that
+    /// primary key out, the way `confkey` does, so the key reads back with it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE named (a, b, FOREIGN KEY (a, b) REFERENCES absent (\"Code\", id));
+    ///      CREATE TABLE implied (parent_id REFERENCES absent);",
+    /// )?;
+    /// let named =
+    ///     db.table_by_target(TargetName::new("named", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let foreign_key = named.foreign_keys(&db)?.next().unwrap();
+    /// let written: Vec<(&str, bool)> = foreign_key.referenced_column_names().collect();
+    /// assert_eq!(written, [("Code", true), ("id", false)]);
+    /// let implied =
+    ///     db.table_by_target(TargetName::new("implied", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let foreign_key = implied.foreign_keys(&db)?.next().unwrap();
+    /// assert_eq!(foreign_key.referenced_column_names().next(), None);
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE parent (id INT PRIMARY KEY);
+    ///      CREATE TABLE implied (parent_id INT REFERENCES parent);",
+    /// )?;
+    /// let implied =
+    ///     db.table_by_target(TargetName::new("implied", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let foreign_key = implied.foreign_keys(&db)?.next().unwrap();
+    /// let bound: Vec<(&str, bool)> = foreign_key.referenced_column_names().collect();
+    /// assert_eq!(bound, [("id", false)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn referenced_column_names(&self) -> impl Iterator<Item = (&str, bool)>;
+
     /// Returns an iterator over the columns in the host table that are part of
     /// the foreign key.
     ///
