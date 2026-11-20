@@ -413,10 +413,11 @@ fn a_view_cycle_terminates_with_no_base_table() {
 }
 
 /// Three spellings a case-sensitive server holds apart are one name under
-/// PostgreSQL's rule, and the unified resolvers report them as the ambiguity
-/// one name is supposed to be, whatever the kinds.
+/// PostgreSQL's rule, and the unified resolver reports them as the ambiguity
+/// one name is supposed to be, whatever the kinds. The bound reading and a
+/// statement compare under the catalog's own rule, which keeps them apart.
 #[test]
-fn a_name_held_by_relations_of_every_kind_is_an_error() {
+fn a_name_held_by_relations_of_every_kind_is_ambiguous_under_postgres_rule() {
     let db = ParseOptions::default()
         .with_identifier_case(IdentifierCase::Exact)
         .parse::<GenericDialect>(
@@ -435,28 +436,17 @@ fn a_name_held_by_relations_of_every_kind_is_an_error() {
     };
     assert_eq!(candidates, vec!["DOCS".to_string(), "Docs".to_string(), "docs".to_string()]);
 
-    // The bound reading takes the same comparison, so it is ambiguous too.
     assert!(
         matches!(
             db.resolve_bound_relation(TargetName::new("docs", false)),
-            Err(LookupError::AmbiguousTableLookup { .. })
+            Ok(Some(Relation::Table(table))) if table.table_name() == "docs"
         ),
-        "the bound name is ambiguous too"
+        "the bound name reaches the table alone"
     );
-
-    // A statement reading the name carries the error through both accessors.
-    assert!(
-        matches!(
-            query("SELECT * FROM docs").referenced_tables(&db),
-            Err(LookupError::AmbiguousTableLookup { .. })
-        ),
-        "referenced_tables reports the ambiguity"
-    );
-    assert!(
-        matches!(
-            query("SELECT * FROM docs").referenced_relations(&db),
-            Err(LookupError::AmbiguousTableLookup { .. })
-        ),
-        "referenced_relations reports the ambiguity"
+    let tables = query("SELECT * FROM docs").referenced_tables(&db).expect("one table");
+    assert_eq!(tables.into_iter().map(TableLike::table_name).collect::<Vec<_>>(), ["docs"]);
+    assert_eq!(
+        query("SELECT * FROM docs").referenced_relations(&db).expect("one relation").len(),
+        1
     );
 }

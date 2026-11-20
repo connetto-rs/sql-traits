@@ -10,7 +10,7 @@
 use alloc::{borrow::Cow, vec::Vec};
 
 use crate::{
-    structs::{CoercionStep, IdentifierCase, TargetName, TypeCategory, TypeFacts, TypeKind},
+    structs::{CoercionStep, TargetName, TypeCategory, TypeFacts, TypeKind},
     traits::{CastContext, CastLike, CastMethod, DatabaseLike, Relation, TableLike},
     utils::{
         object_name::{PG_CATALOG, type_search_path},
@@ -476,7 +476,7 @@ fn inherits<'db, D: DatabaseLike, S: Steps<'db, D>>(
     };
     let relation = |name: &TargetName<'_>| {
         database
-            .resolve_target_relation(view(name), IdentifierCase::AsWritten)
+            .resolve_target_relation(view(name), database.identifier_case())
             .map_err(|_| Undetermined)
     };
     let relations = relation(source_name).and_then(|source| Ok((source, relation(target_name)?)));

@@ -120,11 +120,10 @@ struct DerivingFrame<'s, 'db, DB: DatabaseLike> {
 struct Deriving<'s, 'db, DB: DatabaseLike> {
     /// The database every relation name resolves against.
     database: &'db DB,
-    /// The comparison a written relation or column name is read under. It
-    /// only applies outside a view. A stored view's own definition is read
-    /// as written, following [`IdentifierCase::AsWritten`] regardless of
-    /// this value, since it is a PostgreSQL-bound reference rather than text
-    /// the caller wrote.
+    /// The comparison a written relation or column name is read under: the
+    /// caller's outside a view, and inside a stored view's definition the
+    /// catalog's [`DatabaseLike::identifier_case`], the rule ingestion bound
+    /// that definition under.
     case: IdentifierCase,
     /// The innermost view being derived right now, if any.
     views: Option<&'s DerivingFrame<'s, 'db, DB>>,
@@ -158,8 +157,8 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
     ///
     /// A query handed in by a caller resolves through the session's search
     /// path. A stored view's definition was bound when the view was created,
-    /// so inside one the name is read as written instead, which keeps it on
-    /// the relation it reached then.
+    /// so inside one the name is read with no search path instead, which
+    /// keeps it on the relation it reached then.
     fn table(&self, name: &ObjectName) -> Result<Option<&'db DB::Table>, LookupError> {
         if self.views.is_some() {
             resolve_bound_table(name, self.database)
@@ -172,7 +171,7 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
     /// [`Self::table`] reads a table.
     fn view(&self, target: TargetName<'_>) -> Result<Option<&'db DB::View>, LookupError> {
         if self.views.is_some() {
-            self.database.view_by_target(target, IdentifierCase::AsWritten)
+            self.database.view_by_target(target, self.case)
         } else {
             self.database.resolve_target_view(target, self.case)
         }
@@ -185,7 +184,7 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
         target: TargetName<'_>,
     ) -> Result<Option<&'db DB::MaterializedView>, LookupError> {
         if self.views.is_some() {
-            self.database.materialized_view_by_target(target, IdentifierCase::AsWritten)
+            self.database.materialized_view_by_target(target, self.case)
         } else {
             self.database.resolve_target_materialized_view(target, self.case)
         }
@@ -653,7 +652,12 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
     }
 }
 
-struct SourceDerivation;
+/// The profile that finds the relations a query's `FROM` clause reads,
+/// comparing every name under the catalog's
+/// [`DatabaseLike::identifier_case`].
+struct SourceDerivation {
+    case: IdentifierCase,
+}
 
 impl<'query, 'db, DB> DerivationProfile<'query, 'db, DB> for SourceDerivation
 where
@@ -675,7 +679,7 @@ where
         _select: AstRef<'query, 'db, Select>,
         _parent: Self::Cursor,
     ) -> Self::Scope {
-        FromScope::new(IdentifierCase::AsWritten)
+        FromScope::new(self.case)
     }
 
     fn begin_join_scope(
@@ -683,7 +687,7 @@ where
         _join: AstRef<'query, 'db, TableFactor>,
         _parent: Self::Cursor,
     ) -> Self::Scope {
-        FromScope::new(IdentifierCase::AsWritten)
+        FromScope::new(self.case)
     }
 
     fn scope<'scope>(
@@ -828,8 +832,9 @@ fn collect_source_from_clause<'query, 'db, DB: DatabaseLike>(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
-    let deriving = Deriving::of(database, IdentifierCase::AsWritten);
-    let mut profile = SourceDerivation;
+    let case = database.identifier_case();
+    let deriving = Deriving::of(database, case);
+    let mut profile = SourceDerivation { case };
     let parent = ();
     let cte_scope = match &query.with {
         Some(with) => derive_cte_shapes(AstRef::Query(with), &[], deriving, parent, &mut profile)?,
@@ -4355,7 +4360,7 @@ where
     let frame = DerivingFrame { view, parent: deriving.views };
     let inner = Deriving {
         database: deriving.database,
-        case: IdentifierCase::AsWritten,
+        case: deriving.database.identifier_case(),
         views: Some(&frame),
     };
     let output_names = (!declared.is_empty()).then_some(OutputNameSource::Declared(declared));
@@ -4957,7 +4962,7 @@ pub(crate) fn build_definition_graph<'query, 'db, DB: DatabaseLike>(
     case: IdentifierCase,
 ) -> Result<(definition_graph::DefinitionGraph<'query, 'db, DB>, ScopeCursor), LookupError> {
     let deriving = Deriving::of(database, case);
-    let mut profile = DefinitionDerivation::new(case);
+    let mut profile = DefinitionDerivation::new(database, case);
     let parent = profile.no_parent();
     let root =
         index_nested_query_scopes(AstRef::Query(query), &[], deriving, parent, &mut profile)?;
@@ -5152,7 +5157,7 @@ mod tests {
             select: &'query sqlparser::ast::Select,
             _database: &'db ParserDB,
         ) {
-            let mut profile = SourceDerivation;
+            let mut profile = SourceDerivation { case: IdentifierCase::AsWritten };
             assert!(
                 <SourceDerivation as DerivationProfile<'query, 'db, ParserDB>>::location_of_select(
                     &profile,

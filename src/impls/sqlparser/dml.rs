@@ -16,7 +16,6 @@ use sqlparser::ast::{Delete, FromTable, Insert, TableFactor, TableObject, Update
 
 use crate::{
     errors::LookupError,
-    structs::IdentifierCase,
     traits::{DMLLike, DatabaseLike, DmlKind, DmlStatement},
     utils::object_name::resolve_required_table,
 };
@@ -30,7 +29,7 @@ fn resolve_table_factor<'db, DB: DatabaseLike>(
 ) -> Result<&'db DB::Table, LookupError> {
     match factor {
         TableFactor::Table { name, args: None, .. } => {
-            resolve_required_table(name, database, IdentifierCase::AsWritten)
+            resolve_required_table(name, database, database.identifier_case())
         }
         other => {
             Err(LookupError::InvalidObjectName {
@@ -51,7 +50,7 @@ impl<DB: DatabaseLike> DMLLike<DB> for Insert {
     fn target_table<'db>(&self, database: &'db DB) -> Result<&'db DB::Table, LookupError> {
         match &self.table {
             TableObject::TableName(name) => {
-                resolve_required_table(name, database, IdentifierCase::AsWritten)
+                resolve_required_table(name, database, database.identifier_case())
             }
             TableObject::TableFunction(_) | TableObject::TableQuery(_) => {
                 Err(LookupError::InvalidObjectName {

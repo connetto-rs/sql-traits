@@ -369,6 +369,7 @@ struct ArmTable<'q, 'db, DB: DatabaseLike> {
     table: &'db DB::Table,
     qualifier: Cow<'q, Ident>,
     columns: Vec<&'db DB::Column>,
+    case: IdentifierCase,
 }
 
 impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
@@ -376,11 +377,7 @@ impl<'db, DB: DatabaseLike> ArmTable<'_, 'db, DB> {
     fn column(&self, expression: &Expr) -> Option<&'db DB::Column> {
         let name = self.column_name(expression)?.to_string();
         self.columns.iter().copied().find(|column| {
-            IdentifierCase::AsWritten.names_stored(
-                column.column_name(),
-                column.column_name_is_quoted(),
-                &name,
-            )
+            self.case.names_stored(column.column_name(), column.column_name_is_quoted(), &name)
         })
     }
 
@@ -1648,7 +1645,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(shape());
         };
         let resolve = |path: &SearchPath<'db>| {
-            resolve_relation_object_name_on_path(name, database, path, IdentifierCase::AsWritten)
+            resolve_relation_object_name_on_path(name, database, path, database.identifier_case())
         };
         let table = match resolve(&scope.usable_path)? {
             Some(Relation::Table(table)) => table,
@@ -1685,7 +1682,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             None => Cow::Owned(Ident::new(table.table_name())),
         };
         let columns = table.columns(database)?.collect();
-        Ok(ArmTable { table, qualifier, columns })
+        Ok(ArmTable { table, qualifier, columns, case: database.identifier_case() })
     }
 
     /// Reads `<column> IN (SELECT <helper>(<arguments>))` in an arm returning
@@ -1825,7 +1822,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let reached = |path: &SearchPath<'db>| {
             let path = || path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
             let mut reached = database.functions_named(name).filter(move |function| {
-                call_reaches(*function, written, arguments, path, IdentifierCase::AsWritten)
+                call_reaches(*function, written, arguments, path, database.identifier_case())
             });
             match (reached.next(), reached.next()) {
                 (Some(callee), None) => Some(callee),
@@ -3174,7 +3171,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         // may reach, is refused.
         let path = || scope.usable_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
         !self.database.functions_named(called).any(|function| {
-            call_reaches(function, written, arguments, path, IdentifierCase::AsWritten)
+            call_reaches(function, written, arguments, path, self.database.identifier_case())
                 && function.target_name().schema() != Some("pg_catalog")
         })
     }

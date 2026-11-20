@@ -8,7 +8,7 @@ use sqlparser::ast::{ColumnDef, CreateTable, Ident, IndexColumn, IndexOption, In
 use crate::{
     errors::LookupError,
     structs::{IndexKey, ParserDB, TableAttribute},
-    traits::{ColumnLike, TableLike},
+    traits::{ColumnLike, DatabaseLike, TableLike},
 };
 
 /// The access method a statement wrote, the last `USING` it spelled.

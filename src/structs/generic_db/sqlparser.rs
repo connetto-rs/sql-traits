@@ -50,7 +50,7 @@ use crate::{
             PolicyMetadata, UniqueIndexMetadata,
         },
     },
-    traits::{ColumnLike, IndexLike, SequenceLike, TableLike, ViewLike},
+    traits::{ColumnLike, DatabaseLike, IndexLike, SequenceLike, TableLike, ViewLike},
     utils::{
         columns_in_expression,
         identifier_resolution::{
@@ -6191,6 +6191,7 @@ impl ParserDB {
                 builder.catalog_name(),
                 &target_name_of_object_name(&create_table.name),
                 table_metadata.column_arc_slice(),
+                builder.identifier_case(),
             )?;
         let calls = builder.calls_carried(check_expr, carried);
         Ok((columns_in_expression, calls))
@@ -6878,6 +6879,7 @@ impl ParserDB {
                         builder.catalog_name(),
                         &target_name_of_object_name(&create_table.name),
                         table_metadata.column_arc_slice(),
+                        builder.identifier_case(),
                     )?;
                 }
                 _ => {}

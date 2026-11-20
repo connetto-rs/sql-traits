@@ -1398,8 +1398,9 @@ pub(crate) fn resolve_required_table<'db, DB: DatabaseLike>(
 ///
 /// Ingestion rewrites every stored reference to the qualifier of the relation
 /// it reached when the object was created, leaving it bare only for a
-/// relation stored bare. So the name is read as written, with no search path,
-/// and neither a later path nor a later temporary relation of the same name
+/// relation stored bare. So the name is read with no search path, comparing
+/// under [`DatabaseLike::identifier_case`], the rule it was bound under, and
+/// neither a later path nor a later temporary relation of the same name
 /// reaches it, exactly as PostgreSQL keeps the object it bound.
 ///
 /// # Errors
@@ -1413,7 +1414,7 @@ pub(crate) fn resolve_bound_table<'db, DB: DatabaseLike>(
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
     database.table_by_target(
         target_name_of_idents(schema_ident, table_ident),
-        IdentifierCase::AsWritten,
+        database.identifier_case(),
     )
 }
 
@@ -1473,9 +1474,10 @@ pub(crate) fn resolve_bound_table_or_foreign_table<'db, DB: DatabaseLike>(
 ) -> Result<Option<&'db DB::Table>, LookupError> {
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
     let target = || target_name_of_idents(schema_ident, table_ident);
-    match database.table_by_target(target(), IdentifierCase::AsWritten)? {
+    let case = database.identifier_case();
+    match database.table_by_target(target(), case)? {
         Some(table) => Ok(Some(table)),
-        None => database.foreign_table_by_target(target(), IdentifierCase::AsWritten),
+        None => database.foreign_table_by_target(target(), case),
     }
 }
 

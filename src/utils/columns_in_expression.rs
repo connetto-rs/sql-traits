@@ -11,15 +11,14 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    structs::TargetName,
+    structs::{IdentifierCase, TargetName},
     traits::column::ColumnLike,
-    utils::{identifier_resolution::identifiers_match, walk::walk},
+    utils::walk::walk,
 };
 
-/// Whether a written reference names a stored column, folding an unquoted
-/// spelling as the engine does.
-fn column_named_by<C: ColumnLike>(column: &C, written: &Ident) -> bool {
-    identifiers_match(
+/// Whether a written reference names a stored column under `case`.
+fn column_named_by<C: ColumnLike>(column: &C, written: &Ident, case: IdentifierCase) -> bool {
+    case.identifiers_match(
         column.column_name(),
         column.column_name_is_quoted(),
         written.value.as_str(),
@@ -28,15 +27,20 @@ fn column_named_by<C: ColumnLike>(column: &C, written: &Ident) -> bool {
 }
 
 /// Returns whether a column reference's qualifier chain names the table the
-/// expression belongs to.
+/// expression belongs to, comparing each part under `case`.
 ///
 /// A reference may name the table, its schema and this catalog, in that
 /// order outwards, which is what a server accepts inside a check constraint.
 /// Anything else names another table, and a table recorded without a schema
 /// resides in the default one, so `public` reaches it.
-fn qualifier_names_table(qualifier: &[Ident], catalog_name: &str, table: &TargetName<'_>) -> bool {
+fn qualifier_names_table(
+    qualifier: &[Ident],
+    catalog_name: &str,
+    table: &TargetName<'_>,
+    case: IdentifierCase,
+) -> bool {
     let matches = |ident: &Ident, value: &str, quoted: bool| {
-        identifiers_match(ident.value.as_str(), ident.quote_style.is_some(), value, quoted)
+        case.identifiers_match(ident.value.as_str(), ident.quote_style.is_some(), value, quoted)
     };
     let names_table = |ident: &Ident| matches(ident, table.name(), table.name_is_quoted());
     let names_schema = |ident: &Ident| {
@@ -126,6 +130,8 @@ struct ColumnsRead<'a, 't, C> {
     catalog_name: &'a str,
     table: &'a TargetName<'t>,
     columns: &'a [C],
+    /// The comparison every written name is read under.
+    case: IdentifierCase,
     read: Vec<C>,
     /// How many subqueries enclose the visited expression, which read the
     /// tables of their own `FROM` rather than this one.
@@ -140,7 +146,7 @@ struct ColumnsRead<'a, 't, C> {
 impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
     fn is_parameter(&self, ident: &Ident) -> bool {
         self.parameters.iter().any(|parameter| {
-            identifiers_match(
+            self.case.identifiers_match(
                 parameter.value.as_str(),
                 parameter.quote_style.is_some(),
                 ident.value.as_str(),
@@ -152,7 +158,8 @@ impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
     /// Records the column `ident` names, `reference` being the whole
     /// reference as written.
     fn column(&mut self, ident: &Ident, reference: &Expr) -> Result<(), crate::errors::Error> {
-        let Some(column) = self.columns.iter().find(|column| column_named_by(*column, ident))
+        let Some(column) =
+            self.columns.iter().find(|column| column_named_by(*column, ident, self.case))
         else {
             return Err(crate::errors::Error::UnknownColumn { reference: reference.to_string() });
         };
@@ -172,7 +179,7 @@ impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
                 if qualifier.first().is_some_and(|first| self.is_parameter(first)) {
                     return Ok(());
                 }
-                if !qualifier_names_table(qualifier, self.catalog_name, self.table) {
+                if !qualifier_names_table(qualifier, self.catalog_name, self.table, self.case) {
                     return Err(crate::errors::Error::ForeignColumnReference {
                         reference: rendered_reference(idents),
                         table_name: self.table.name().to_string(),
@@ -236,6 +243,9 @@ impl<C: ColumnLike + Clone> Visitor for ColumnsRead<'_, '_, C> {
 /// * `table` - The table the expression belongs to, with the schema and quoting
 ///   a qualified reference is matched against.
 /// * `columns` - The list of columns available in the table.
+/// * `case` - The comparison a written name is read under, the catalog's
+///   [`DatabaseLike::identifier_case`](crate::traits::DatabaseLike::identifier_case)
+///   for an expression a catalog stores.
 ///
 /// # Returns
 ///
@@ -254,11 +264,13 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
     catalog_name: &str,
     table: &TargetName<'_>,
     columns: &[C],
+    case: IdentifierCase,
 ) -> Result<Vec<C>, crate::errors::Error> {
     let mut visitor = ColumnsRead {
         catalog_name,
         table,
         columns,
+        case,
         read: Vec::new(),
         subqueries: 0,
         labels: Labels::default(),
@@ -318,17 +330,18 @@ mod tests {
             Ident::new("id"),
         ]);
         assert!(matches!(
-            columns_in_expression(&deep, "catalog", &table, &columns),
+            columns_in_expression(&deep, "catalog", &table, &columns, IdentifierCase::AsWritten),
             Err(crate::errors::Error::ForeignColumnReference { .. })
         ));
 
         let empty = Expr::CompoundIdentifier(Vec::new());
-        let found: Vec<String> = columns_in_expression(&empty, "catalog", &table, &columns)
-            .expect("a reference with no parts reads no column")
-            .iter()
-            .map(|column| ColumnLike::column_name(column).to_owned())
-            .collect();
-        assert_eq!(found, Vec::<String>::new());
+        let found =
+            columns_in_expression(&empty, "catalog", &table, &columns, IdentifierCase::AsWritten)
+                .expect("a reference with no parts reads no column");
+        assert_eq!(
+            found.iter().map(ColumnLike::column_name).collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
@@ -337,9 +350,14 @@ mod tests {
         let columns = vec![col_a.clone()];
         let expr = Expr::Identifier(Ident::new("a"));
 
-        let result: Vec<<ParserDB as DatabaseLike>::Column> =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns)
-                .unwrap();
+        let result: Vec<<ParserDB as DatabaseLike>::Column> = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].column_name(), "a");
     }
@@ -350,9 +368,14 @@ mod tests {
         let columns = vec![col_a.clone()];
         let expr = Expr::CompoundIdentifier(vec![Ident::new("t"), Ident::new("a")]);
 
-        let result: Vec<<ParserDB as DatabaseLike>::Column> =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns)
-                .unwrap();
+        let result: Vec<<ParserDB as DatabaseLike>::Column> = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].column_name(), "a");
     }
@@ -368,9 +391,14 @@ mod tests {
             right: Box::new(Expr::Identifier(Ident::new("b"))),
         };
 
-        let result: Vec<<ParserDB as DatabaseLike>::Column> =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns)
-                .unwrap();
+        let result: Vec<<ParserDB as DatabaseLike>::Column> = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].column_name(), "a");
         assert_eq!(result[1].column_name(), "b");
@@ -387,9 +415,14 @@ mod tests {
             right: Box::new(Expr::Identifier(Ident::new("a"))),
         };
 
-        let result: Vec<<ParserDB as DatabaseLike>::Column> =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns)
-                .unwrap();
+        let result: Vec<<ParserDB as DatabaseLike>::Column> = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].column_name(), "a");
     }
@@ -416,9 +449,14 @@ mod tests {
             uses_odbc_syntax: false,
         });
 
-        let result: Vec<<ParserDB as DatabaseLike>::Column> =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns)
-                .unwrap();
+        let result: Vec<<ParserDB as DatabaseLike>::Column> = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].column_name(), "a");
     }
@@ -437,9 +475,14 @@ mod tests {
             high: Box::new(Expr::Identifier(Ident::new("c"))),
         };
 
-        let result: Vec<<ParserDB as DatabaseLike>::Column> =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns)
-                .unwrap();
+        let result: Vec<<ParserDB as DatabaseLike>::Column> = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].column_name(), "a");
         assert_eq!(result[1].column_name(), "b");
@@ -459,9 +502,14 @@ mod tests {
             global: false,
         };
 
-        let result: Vec<<ParserDB as DatabaseLike>::Column> =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns)
-                .unwrap();
+        let result: Vec<<ParserDB as DatabaseLike>::Column> = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].column_name(), "a");
         assert_eq!(result[1].column_name(), "b");
@@ -473,8 +521,13 @@ mod tests {
         let columns = vec![col_a.clone()];
         let expr = Expr::Identifier(Ident::new("b"));
 
-        let result =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns);
+        let result = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        );
         assert!(matches!(
             result,
             Err(crate::errors::Error::UnknownColumn { reference }) if reference == "b"
@@ -491,8 +544,13 @@ mod tests {
         // `t.b` — last ident is `b`, not in our column list.
         let expr = Expr::CompoundIdentifier(vec![Ident::new("t"), Ident::new("b")]);
 
-        let result =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns);
+        let result = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        );
         assert!(matches!(
             result,
             Err(crate::errors::Error::UnknownColumn { reference }) if reference == "t.b"
@@ -514,9 +572,14 @@ mod tests {
             Expr::Identifier(Ident::new("c")),
         ]);
 
-        let result =
-            columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns)
-                .expect("tuple of known columns parses");
+        let result = columns_in_expression(
+            &expr,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )
+        .expect("tuple of known columns parses");
         let names: Vec<&str> = result.iter().map(ColumnLike::column_name).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
     }
@@ -532,9 +595,14 @@ mod tests {
             panic!("expected an expression")
         };
 
-        let result =
-            columns_in_expression(expression, "catalog", &TargetName::new("t", false), &[column])
-                .expect("column resolves");
+        let result = columns_in_expression(
+            expression,
+            "catalog",
+            &TargetName::new("t", false),
+            &[column],
+            IdentifierCase::AsWritten,
+        )
+        .expect("column resolves");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].column_name(), "a");
     }
@@ -558,6 +626,7 @@ mod tests {
                 "catalog",
                 &TargetName::new("t", false),
                 &columns,
+                IdentifierCase::AsWritten,
             )
             .expect("local columns resolve");
             let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
@@ -577,6 +646,7 @@ mod tests {
             "catalog",
             &TargetName::new("t", false),
             &[create_column("a")],
+            IdentifierCase::AsWritten,
         );
         assert!(matches!(
             result,
@@ -600,6 +670,7 @@ mod tests {
                 "catalog",
                 &TargetName::new("t", false),
                 &columns,
+                IdentifierCase::AsWritten,
             )
             .expect("local columns resolve");
             let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
@@ -619,6 +690,7 @@ mod tests {
             "catalog",
             &TargetName::new("t", false),
             &[create_column("a"), create_column("b")],
+            IdentifierCase::AsWritten,
         )
         .expect("argument values resolve");
         let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
@@ -637,10 +709,16 @@ mod tests {
             .parse_expr()
             .expect("expression parses");
         let columns = [create_column("a"), create_column("b"), create_column("c")];
-        Ok(columns_in_expression(&expression, "catalog", &TargetName::new("t", false), &columns)?
-            .iter()
-            .map(|column| ColumnLike::column_name(column).to_owned())
-            .collect())
+        Ok(columns_in_expression(
+            &expression,
+            "catalog",
+            &TargetName::new("t", false),
+            &columns,
+            IdentifierCase::AsWritten,
+        )?
+        .iter()
+        .map(|column| ColumnLike::column_name(column).to_owned())
+        .collect())
     }
 
     #[test]

@@ -677,6 +677,9 @@ fn call_returns_array<DB: DatabaseLike>(
 
 pub(super) struct DefinitionDerivation<'query, 'db, DB: DatabaseLike> {
     graph: DefinitionGraph<'query, 'db, DB>,
+    /// The comparison a stored definition's names are read under, the
+    /// catalog's [`DatabaseLike::identifier_case`].
+    catalog_case: IdentifierCase,
     /// The output definitions of every `CREATE TABLE … AS` query derived so
     /// far, by the query's address, so a table read twice derives it once.
     created: Vec<(usize, Vec<DefinitionId>)>,
@@ -684,7 +687,9 @@ pub(super) struct DefinitionDerivation<'query, 'db, DB: DatabaseLike> {
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
-    pub(super) fn new(case: IdentifierCase) -> Self {
+    /// A derivation reading the caller's names under `case` and the stored
+    /// definitions of `database` under its own comparison.
+    pub(super) fn new(database: &DB, case: IdentifierCase) -> Self {
         Self {
             graph: DefinitionGraph {
                 definitions: alloc::vec![DefinitionNode::Opaque],
@@ -698,6 +703,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 values: Vec::new(),
                 case,
             },
+            catalog_case: database.identifier_case(),
             created: Vec::new(),
             marker: PhantomData,
         }
@@ -714,7 +720,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     fn created_definition(&mut self, created: &CreatedFromQuery<'db, DB>) -> DefinitionId {
         let address = core::ptr::from_ref(created.query()).addr();
         if !self.created.iter().any(|(derived, _)| *derived == address) {
-            let deriving = Deriving::of(created.catalog(), IdentifierCase::AsWritten);
+            let deriving = Deriving::of(created.catalog(), self.catalog_case);
             let parent = self.no_parent();
             // Reading the same query against the same catalog succeeded when
             // the table was created, so a lookup error cannot arise here.
@@ -914,7 +920,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             owner_level: false,
             data: FromScope::new(match select {
                 AstRef::Query(_) => self.graph.case,
-                AstRef::Database(_) => IdentifierCase::AsWritten,
+                AstRef::Database(_) => self.catalog_case,
             }),
             outputs: Vec::new(),
         });
@@ -947,7 +953,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             owner_level: true,
             data: FromScope::new(match join {
                 AstRef::Query(_) => self.graph.case,
-                AstRef::Database(_) => IdentifierCase::AsWritten,
+                AstRef::Database(_) => self.catalog_case,
             }),
             outputs: Vec::new(),
         });
@@ -1129,7 +1135,7 @@ pub(crate) fn table_graph<'db, DB: DatabaseLike>(
     database: &'db DB,
     case: IdentifierCase,
 ) -> (DefinitionGraph<'db, 'db, DB>, ScopeCursor) {
-    let mut profile = DefinitionDerivation::new(case);
+    let mut profile = DefinitionDerivation::new(database, case);
     let scope = profile.begin_unowned_scope(None);
     profile.push_table_entry(scope, table, database, None);
     profile.finish(scope)

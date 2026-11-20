@@ -294,7 +294,8 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
             // A view's columns take the types of its query's outputs.
             return Ok(OperandType::Unknown);
         };
-        let column = table.column(&column.to_string(), self.database, IdentifierCase::AsWritten)?;
+        let column =
+            table.column(&column.to_string(), self.database, self.database.identifier_case())?;
         let column = column.ok_or_else(|| {
             LookupError::ColumnNotFound {
                 table_name: relation.to_string(),

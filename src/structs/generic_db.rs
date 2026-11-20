@@ -243,17 +243,11 @@ impl<P: SchemaProfile> GenericDB<P> {
         GenericDBBuilder::new(catalog_name, dialect)
     }
 
-    /// The comparison the creations in this catalog were taken under.
-    pub(crate) const fn identifier_case(&self) -> IdentifierCase {
-        self.identifier_case
-    }
-
     /// How this catalog's dialect names schemas and resolves an unqualified
     /// name.
     pub(crate) fn namespaces(&self) -> Namespaces {
         Namespaces::of(self.dialect.sqlparser_dialect())
     }
-
     /// Returns a reference to the metadata of the specified table, if it exists
     /// in the database.
     ///
