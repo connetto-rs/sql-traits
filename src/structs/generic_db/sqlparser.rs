@@ -4420,7 +4420,7 @@ fn bind_to_host_schema(
 ) -> Result<(), crate::errors::Error> {
     let [_] = foreign_key.foreign_table.0.as_slice() else {
         return Err(crate::errors::Error::QualifiedForeignKeyTarget {
-            host_table: host_table.to_owned(),
+            host_table: host_table.to_string(),
             referenced_table: foreign_key.foreign_table.to_string(),
         });
     };
