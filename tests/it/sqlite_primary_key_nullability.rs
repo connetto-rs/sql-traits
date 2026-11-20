@@ -22,7 +22,7 @@ struct Measured {
     stated_not_null: bool,
 }
 
-const MEASURED: [Measured; 16] = [
+const MEASURED: [Measured; 17] = [
     Measured {
         statement: "CREATE TABLE a (k TEXT PRIMARY KEY)",
         table: "a",
@@ -41,6 +41,13 @@ const MEASURED: [Measured; 16] = [
         statement: "CREATE TABLE c (a TEXT, b INT, PRIMARY KEY (a, b))",
         table: "c",
         column: "b",
+        nullable: true,
+        stated_not_null: false,
+    },
+    Measured {
+        statement: "CREATE TABLE m (k INTEGER, j INT, UNIQUE (j), PRIMARY KEY (k, j))",
+        table: "m",
+        column: "k",
         nullable: true,
         stated_not_null: false,
     },
