@@ -536,6 +536,24 @@ fn replacing_a_view_reads_the_names_its_definition_gives() {
     .expect("a definition the model cannot name is compared on nothing");
 }
 
+/// Measured on PostgreSQL 18.6: the replaced view keeps its relation, so its
+/// rule follows a later rename and goes with a later drop.
+#[test]
+fn a_replacement_writing_the_schema_keeps_the_stored_name() {
+    let schema = "CREATE TABLE t (a INT);
+         CREATE VIEW v AS SELECT a FROM t;
+         CREATE RULE r AS ON INSERT TO v DO INSTEAD NOTHING;
+         CREATE OR REPLACE VIEW public.v AS SELECT a FROM t;
+         ALTER VIEW v RENAME TO w;";
+    let db = parse(schema).expect("the rename is accepted");
+    let targets: Vec<String> =
+        db.rules().map(|rule| rule.target_relation_name().to_string()).collect();
+    assert_eq!(targets, ["w"]);
+
+    let db = parse(&format!("{schema} DROP VIEW w;")).expect("the drop is accepted");
+    assert_eq!(db.rules().count(), 0, "the rule goes with the view");
+}
+
 #[test]
 fn a_replacement_keeps_the_recorded_owner() {
     let db = parse(
