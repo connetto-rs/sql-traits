@@ -229,6 +229,10 @@ fn a_row_type_result_exposes_the_columns_of_its_type() {
         ])
     );
     assert_eq!(
+        columns("all_note_labels()"),
+        named(&[("label", "all_note_labels row notes.label")])
+    );
+    assert_eq!(
         columns("one_pair()"),
         named(&[
             ("left_side", "one_pair attribute INT"),
