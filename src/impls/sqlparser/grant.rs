@@ -25,9 +25,9 @@ use crate::{
             SessionPrincipal, identifiers_match, is_public_pseudo_role, session_principal,
         },
         object_name::{
-            RelationKey, object_name_identifiers, object_name_last_part, resolve_bound_table,
-            resolve_table_object_name_on_search_path_in_iter, table_matches_object_name,
-            target_name_from_object_name,
+            Namespaces, RelationKey, object_name_identifiers, object_name_last_part,
+            resolve_bound_table, resolve_table_object_name_on_search_path_in_iter,
+            table_matches_object_name, target_name_from_object_name,
         },
     },
 };
@@ -286,6 +286,7 @@ fn action_columns(action: &Action) -> Option<&[Ident]> {
 /// [`crate::errors::Error::IdentifierLookupError`] when a resolvable name
 /// matches more than one table.
 pub(crate) fn validate_granted_columns(
+    namespaces: Namespaces,
     privileges: &Privileges,
     objects: Option<&GrantObjects>,
     database_tables: &[&CreateTable],
@@ -303,6 +304,7 @@ pub(crate) fn validate_granted_columns(
     for name in names {
         let resolved = if object_name_identifiers(name).is_ok() {
             resolve_table_object_name_on_search_path_in_iter(
+                namespaces,
                 database_tables.iter().copied(),
                 name,
                 || search_path.iter().copied(),
@@ -311,7 +313,10 @@ pub(crate) fn validate_granted_columns(
             )
             .map_err(crate::errors::Error::IdentifierLookupError)?
         } else {
-            database_tables.iter().copied().find(|table| table_matches_object_name(*table, name))
+            database_tables
+                .iter()
+                .copied()
+                .find(|table| table_matches_object_name(namespaces, *table, name))
         };
         let Some(table) = resolved else {
             // The table did not resolve, which the open world excuses and the

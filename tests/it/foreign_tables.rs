@@ -68,6 +68,16 @@ fn a_foreign_table_is_recorded_apart_from_tables() {
 }
 
 #[test]
+fn a_folded_lookup_reaches_a_foreign_table_on_the_search_path() {
+    let db = db(REMOTE);
+    let resolved = db
+        .resolve_target_foreign_table(TargetName::new("REMOTE", false), IdentifierCase::Folded)
+        .expect("lookup")
+        .expect("the search path reaches it");
+    assert_eq!(resolved, foreign(&db, "remote"));
+}
+
+#[test]
 fn a_foreign_table_resolves_as_a_relation_of_its_own_kind() {
     let db = db(&format!("{REMOTE} CREATE TABLE local (id INT);"));
     let remote = foreign(&db, "remote");

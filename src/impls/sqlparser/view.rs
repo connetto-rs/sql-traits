@@ -33,6 +33,10 @@ impl ViewLike for View {
         self.declaration().schema_is_quoted()
     }
 
+    fn is_temporary(&self) -> bool {
+        self.declaration().is_temporary()
+    }
+
     fn is_materialized(&self) -> bool {
         false
     }

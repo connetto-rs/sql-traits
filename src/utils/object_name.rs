@@ -15,15 +15,21 @@ use alloc::{
     vec::Vec,
 };
 
-use sqlparser::ast::{
-    Expr, Ident, ObjectName, ObjectNamePart, Reset, Set, Statement, UnaryOperator, Value,
-    ValueWithSpan,
+use sqlparser::{
+    ast::{
+        Expr, Ident, ObjectName, ObjectNamePart, Reset, Set, Statement, UnaryOperator, Value,
+        ValueWithSpan,
+    },
+    dialect::{Dialect, SQLiteDialect},
 };
 
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
-    traits::{DatabaseLike, FunctionLike, Relation, SchemaLike, SequenceLike, TableLike, ViewLike},
+    traits::{
+        DatabaseLike, DialectLike, FunctionLike, Relation, SchemaLike, SequenceLike, TableLike,
+        ViewLike,
+    },
     utils::identifier_resolution::{
         SearchPath, identifiers_match, is_temporary_schema, stored_identifier,
     },
@@ -36,19 +42,103 @@ pub(crate) const TEMPORARY_SCHEMA: &str = "pg_temp";
 /// The schema holding PostgreSQL's built-in objects.
 pub(crate) const PG_CATALOG: &str = "pg_catalog";
 
-/// The schemas a relation lookup walks for an unqualified name.
-///
-/// PostgreSQL searches the temporary schema before the path unless the path
-/// names it, in which case it is searched where the path puts it. Functions
-/// never search it, so only relation lookups take this walk.
-pub(crate) fn relation_search_path<'path, I>(
-    search_path: impl Fn() -> I,
-) -> impl Iterator<Item = (&'path str, bool)>
-where
-    I: Iterator<Item = (&'path str, bool)>,
-{
-    let named = search_path().any(|(schema, quoted)| is_temporary_schema(schema, quoted));
-    (!named).then_some((TEMPORARY_SCHEMA, false)).into_iter().chain(search_path())
+/// The schemas an engine holds without any statement creating them, and the
+/// order an unqualified relation name searches them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Namespaces {
+    /// PostgreSQL's, which every dialect but SQLite reads names under.
+    ///
+    /// A name naming no schema means `public`, and the session's temporary
+    /// relations live in `pg_temp`, which a relation lookup searches before
+    /// the search path unless the path names it. Schema names compare as
+    /// quoting decides.
+    PostgreSql,
+    /// SQLite's, whose schemas are the databases of the connection.
+    ///
+    /// A name naming no database means `main`, temporary objects live in
+    /// `temp`, and `ATTACH DATABASE` adds the others. The search path lists
+    /// every database in the order an unqualified name searches them,
+    /// `temp`, then `main`, then the attached ones in attach order. Database
+    /// names compare under the same [`IdentifierCase`] as every other name.
+    Sqlite,
+}
+
+impl Namespaces {
+    /// The namespaces of the engine `dialect` parses for.
+    pub(crate) fn of(dialect: &dyn Dialect) -> Self {
+        if dialect.is::<SQLiteDialect>() { Self::Sqlite } else { Self::PostgreSql }
+    }
+
+    /// The namespaces of the engine `database` was read for.
+    pub(crate) fn of_database<D: DatabaseLike>(database: &D) -> Self {
+        Self::of(database.dialect().sqlparser_dialect())
+    }
+
+    /// The schema a name naming none means, which the model leaves unwritten.
+    pub(crate) const fn default_schema(self) -> &'static str {
+        match self {
+            Self::PostgreSql => "public",
+            Self::Sqlite => "main",
+        }
+    }
+
+    /// The schema holding the session's temporary relations.
+    pub(crate) const fn temporary_schema(self) -> &'static str {
+        match self {
+            Self::PostgreSql => TEMPORARY_SCHEMA,
+            Self::Sqlite => "temp",
+        }
+    }
+
+    /// The search path a new database starts with.
+    pub(crate) const fn initial_search_path(self) -> &'static [(&'static str, bool)] {
+        match self {
+            Self::PostgreSql => DEFAULT_SEARCH_PATH,
+            Self::Sqlite => &[("temp", false), ("main", false)],
+        }
+    }
+
+    /// Whether two schema names name one schema. PostgreSQL's compare as
+    /// quoting decides, SQLite's as `case` decides, like every other name.
+    pub(crate) fn schemas_match(
+        self,
+        (left, left_quoted): (&str, bool),
+        (right, right_quoted): (&str, bool),
+        case: IdentifierCase,
+    ) -> bool {
+        match self {
+            Self::PostgreSql => identifiers_match(left, left_quoted, right, right_quoted),
+            Self::Sqlite => case.identifiers_match(left, left_quoted, right, right_quoted),
+        }
+    }
+
+    /// Whether a schema name names the temporary schema.
+    pub(crate) fn is_temporary(self, schema: (&str, bool), case: IdentifierCase) -> bool {
+        self.schemas_match(schema, (self.temporary_schema(), false), case)
+    }
+
+    /// Whether a schema name names the default schema.
+    pub(crate) fn is_default(self, schema: (&str, bool), case: IdentifierCase) -> bool {
+        self.schemas_match(schema, (self.default_schema(), false), case)
+    }
+
+    /// The schemas a relation lookup walks for an unqualified name.
+    ///
+    /// PostgreSQL searches the temporary schema before the path unless the
+    /// path names it, in which case it is searched where the path puts it.
+    /// Functions never search it, so only relation lookups take this walk.
+    /// SQLite's path already lists every database in search order.
+    pub(crate) fn relation_search_path<'path, I>(
+        self,
+        search_path: impl Fn() -> I,
+    ) -> impl Iterator<Item = (&'path str, bool)>
+    where
+        I: Iterator<Item = (&'path str, bool)>,
+    {
+        let named = search_path().any(|(schema, quoted)| is_temporary_schema(schema, quoted));
+        let prepended = self == Self::PostgreSql && !named;
+        prepended.then_some((TEMPORARY_SCHEMA, false)).into_iter().chain(search_path())
+    }
 }
 
 /// The schemas a function lookup walks for an unqualified name.
@@ -449,9 +539,13 @@ pub(crate) fn target_name_from_object_name(object_name: &ObjectName) -> Option<T
 ///
 /// This is the matching style used by grant resolution, where object names may
 /// carry catalog-qualified prefixes. A table stored without a schema resides in
-/// the default schema, so a `public` qualifier reaches it and a table stored in
-/// `public` answers an unqualified name.
-pub(crate) fn table_matches_object_name<T: TableLike>(table: &T, object_name: &ObjectName) -> bool {
+/// the default schema, so a qualifier naming it reaches the table and a table
+/// stored in it answers an unqualified name.
+pub(crate) fn table_matches_object_name<T: TableLike>(
+    namespaces: Namespaces,
+    table: &T,
+    object_name: &ObjectName,
+) -> bool {
     let Some((table_lookup_name, table_lookup_quoted)) = object_name_last_part(object_name) else {
         return false;
     };
@@ -468,18 +562,20 @@ pub(crate) fn table_matches_object_name<T: TableLike>(table: &T, object_name: &O
     match (qualifier_of(object_name), table.table_schema()) {
         (Qualifier::Absent, None) => true,
         (Qualifier::Named(schema_lookup, schema_lookup_quoted), Some(table_schema)) => {
-            identifiers_match(
-                table_schema,
-                table.table_schema_is_quoted(),
-                schema_lookup,
-                schema_lookup_quoted,
+            namespaces.schemas_match(
+                (table_schema, table.table_schema_is_quoted()),
+                (schema_lookup, schema_lookup_quoted),
+                IdentifierCase::AsWritten,
             )
         }
         (Qualifier::Named(schema_lookup, schema_lookup_quoted), None) => {
-            identifiers_match("public", false, schema_lookup, schema_lookup_quoted)
+            namespaces.is_default((schema_lookup, schema_lookup_quoted), IdentifierCase::AsWritten)
         }
         (Qualifier::Absent, Some(table_schema)) => {
-            identifiers_match(table_schema, table.table_schema_is_quoted(), "public", false)
+            namespaces.is_default(
+                (table_schema, table.table_schema_is_quoted()),
+                IdentifierCase::AsWritten,
+            )
         }
         // A qualifier built at run time names no schema a comparison can use.
         (Qualifier::RunTime, _) => false,
@@ -551,20 +647,25 @@ pub(crate) fn target_name_of_idents<'a>(
 ///
 /// PostgreSQL keeps tables, views and materialized views in one pool of
 /// names, so all three are indexed under this key and a name can hold at most
-/// one of them. A relation stored without a schema and one stored in `public`
-/// share a key, mirroring that the two spellings name one place.
+/// one of them. A relation stored without a schema and one stored in the
+/// default schema share a key, mirroring that the two spellings name one
+/// place.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RelationKey {
-    /// Normalized schema, `public` for a schema-less relation.
+    /// Normalized schema, the default schema for a schema-less relation.
     pub schema: String,
     /// Normalized relation name.
     pub name: String,
 }
 
 /// Normalizes a stored schema under `case`, folding a schema-less table into
-/// `public`.
-fn stored_schema_key<T: TableLike>(table: &T, case: IdentifierCase) -> Cow<'_, str> {
-    table.table_schema().map_or(Cow::Borrowed("public"), |schema| {
+/// the default schema.
+fn stored_schema_key<T: TableLike>(
+    namespaces: Namespaces,
+    table: &T,
+    case: IdentifierCase,
+) -> Cow<'_, str> {
+    table.table_schema().map_or(Cow::Borrowed(namespaces.default_schema()), |schema| {
         case.compared_form(schema, table.table_schema_is_quoted())
     })
 }
@@ -575,10 +676,14 @@ fn stored_name_key<T: TableLike>(table: &T, case: IdentifierCase) -> Cow<'_, str
 }
 
 /// Key of a written target name under `case`, normalizing each part once.
-pub(crate) fn target_key(target: &TargetName<'_>, case: IdentifierCase) -> RelationKey {
+pub(crate) fn target_key(
+    namespaces: Namespaces,
+    target: &TargetName<'_>,
+    case: IdentifierCase,
+) -> RelationKey {
     RelationKey {
         schema: target.schema().map_or_else(
-            || String::from("public"),
+            || String::from(namespaces.default_schema()),
             |schema| case.compared_form(schema, target.schema_is_quoted()).into_owned(),
         ),
         name: case.compared_form(target.name(), target.name_is_quoted()).into_owned(),
@@ -586,36 +691,46 @@ pub(crate) fn target_key(target: &TargetName<'_>, case: IdentifierCase) -> Relat
 }
 
 /// Key a stored table is indexed under, comparing each part under `case`.
-pub(crate) fn stored_table_key<T: TableLike>(table: &T, case: IdentifierCase) -> RelationKey {
+pub(crate) fn stored_table_key<T: TableLike>(
+    namespaces: Namespaces,
+    table: &T,
+    case: IdentifierCase,
+) -> RelationKey {
     RelationKey {
-        schema: stored_schema_key(table, case).into_owned(),
+        schema: stored_schema_key(namespaces, table, case).into_owned(),
         name: stored_name_key(table, case).into_owned(),
     }
 }
 
 /// Key a stored identity is found under, taking each part exactly as stored.
 ///
-/// The index folds a schema-less relation into `public`, so this key reaches
-/// the bucket holding both spellings and the caller separates them by
-/// comparing the stored parts.
-pub(crate) fn stored_identity_key(schema: Option<&str>, name: &str) -> RelationKey {
+/// The index folds a schema-less relation into the default schema, so this
+/// key reaches the bucket holding both spellings and the caller separates
+/// them by comparing the stored parts.
+pub(crate) fn stored_identity_key(
+    namespaces: Namespaces,
+    schema: Option<&str>,
+    name: &str,
+) -> RelationKey {
     RelationKey {
-        schema: schema.map_or_else(|| String::from("public"), String::from),
+        schema: String::from(schema.unwrap_or(namespaces.default_schema())),
         name: String::from(name),
     }
 }
 
 /// Key a stored function is found under under `case`, folding a function
-/// declared without a schema into `public` exactly as a relation is folded.
+/// declared without a schema into the default schema exactly as a relation
+/// is folded.
 ///
 /// Functions have their own pool of names, so this key indexes them apart
 /// from relations, and a name carrying several argument lists holds several
 /// functions.
 pub(crate) fn stored_function_key<F: FunctionLike>(
+    namespaces: Namespaces,
     function: &F,
     case: IdentifierCase,
 ) -> RelationKey {
-    target_key(&function.target_name(), case)
+    target_key(namespaces, &function.target_name(), case)
 }
 
 /// Whether a function is stored under exactly this identity, with both parts
@@ -662,13 +777,15 @@ pub(crate) fn resolve_one_function<'a, F: FunctionLike>(
 /// Returns [`LookupError::AmbiguousFunctionLookup`] when the name carries more
 /// than one declaration in the schema that wins.
 pub(crate) fn resolve_function_on_search_path_in_iter<'a, 'path, F: FunctionLike>(
+    namespaces: Namespaces,
     functions: impl Iterator<Item = &'a F>,
     target: &TargetName<'_>,
     search_path: impl Iterator<Item = (&'path str, bool)>,
     case: IdentifierCase,
 ) -> Result<Option<&'a F>, LookupError> {
-    let indexed: Vec<(RelationKey, &'a F)> =
-        functions.map(|function| (stored_function_key(function, case), function)).collect();
+    let indexed: Vec<(RelationKey, &'a F)> = functions
+        .map(|function| (stored_function_key(namespaces, function, case), function))
+        .collect();
     let written = target.to_string();
     let matching = |key: &RelationKey| -> Vec<&'a F> {
         indexed
@@ -678,7 +795,7 @@ pub(crate) fn resolve_function_on_search_path_in_iter<'a, 'path, F: FunctionLike
     };
 
     if target.schema().is_some() {
-        return resolve_one_function(&written, &matching(&target_key(target, case)));
+        return resolve_one_function(&written, &matching(&target_key(namespaces, target, case)));
     }
 
     let name = case.compared_form(target.name(), target.name_is_quoted()).into_owned();
@@ -697,11 +814,15 @@ pub(crate) fn resolve_function_on_search_path_in_iter<'a, 'path, F: FunctionLike
 }
 
 /// Key a stored view is indexed under under `case`, folding a schema-less
-/// view into `public` exactly as a table is folded.
-pub(crate) fn stored_view_key<V: ViewLike>(view: &V, case: IdentifierCase) -> RelationKey {
+/// view into the default schema exactly as a table is folded.
+pub(crate) fn stored_view_key<V: ViewLike>(
+    namespaces: Namespaces,
+    view: &V,
+    case: IdentifierCase,
+) -> RelationKey {
     RelationKey {
         schema: view.view_schema().map_or_else(
-            || String::from("public"),
+            || String::from(namespaces.default_schema()),
             |schema| case.compared_form(schema, view.view_schema_is_quoted()).into_owned(),
         ),
         name: case.compared_form(view.view_name(), view.view_name_is_quoted()).into_owned(),
@@ -711,35 +832,39 @@ pub(crate) fn stored_view_key<V: ViewLike>(view: &V, case: IdentifierCase) -> Re
 /// Returns whether a stored table answers a key normalized under `case`,
 /// normalizing only the stored side.
 pub(crate) fn table_matches_key<T: TableLike>(
+    namespaces: Namespaces,
     table: &T,
     key: &RelationKey,
     case: IdentifierCase,
 ) -> bool {
-    key.name == stored_name_key(table, case) && key.schema == stored_schema_key(table, case)
+    key.name == stored_name_key(table, case)
+        && key.schema == stored_schema_key(namespaces, table, case)
 }
 
 /// Returns whether a stored view answers a key normalized under `case`,
 /// normalizing only the stored side.
 pub(crate) fn view_matches_key<V: ViewLike>(
+    namespaces: Namespaces,
     view: &V,
     key: &RelationKey,
     case: IdentifierCase,
 ) -> bool {
     key.name == case.compared_form(view.view_name(), view.view_name_is_quoted())
-        && view.view_schema().map_or(key.schema == "public", |schema| {
+        && view.view_schema().map_or(key.schema == namespaces.default_schema(), |schema| {
             key.schema == case.compared_form(schema, view.view_schema_is_quoted())
         })
 }
 
 /// Key a stored sequence is indexed under under `case`, folding a schema-less
-/// sequence into `public` exactly as a table is folded.
+/// sequence into the default schema exactly as a table is folded.
 pub(crate) fn stored_sequence_key<S: SequenceLike>(
+    namespaces: Namespaces,
     sequence: &S,
     case: IdentifierCase,
 ) -> RelationKey {
     RelationKey {
         schema: sequence.sequence_schema().map_or_else(
-            || String::from("public"),
+            || String::from(namespaces.default_schema()),
             |schema| case.compared_form(schema, sequence.sequence_schema_is_quoted()).into_owned(),
         ),
         name: case
@@ -751,12 +876,13 @@ pub(crate) fn stored_sequence_key<S: SequenceLike>(
 /// Returns whether a stored sequence answers a key normalized under `case`,
 /// normalizing only the stored side.
 pub(crate) fn sequence_matches_key<S: SequenceLike>(
+    namespaces: Namespaces,
     sequence: &S,
     key: &RelationKey,
     case: IdentifierCase,
 ) -> bool {
     key.name == case.compared_form(sequence.sequence_name(), sequence.sequence_name_is_quoted())
-        && sequence.sequence_schema().map_or(key.schema == "public", |schema| {
+        && sequence.sequence_schema().map_or(key.schema == namespaces.default_schema(), |schema| {
             key.schema == case.compared_form(schema, sequence.sequence_schema_is_quoted())
         })
 }
@@ -769,7 +895,8 @@ pub(crate) fn table_matches_target<T: TableLike>(
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> bool {
-    table_matches_key(table, &target_key(target, case), case)
+    let namespaces = Namespaces::PostgreSql;
+    table_matches_key(namespaces, table, &target_key(namespaces, target, case), case)
 }
 
 /// Renders a table for inclusion in an ambiguity error, quoting parts that were
@@ -837,13 +964,14 @@ pub(crate) fn resolve_target_from_candidates<'a, T: TableLike>(
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one table.
 pub(crate) fn resolve_target_in_iter<'a, T: TableLike>(
+    namespaces: Namespaces,
     tables: impl Iterator<Item = &'a T>,
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> Result<Option<&'a T>, LookupError> {
-    let key = target_key(target, case);
+    let key = target_key(namespaces, target, case);
     let candidates: Vec<&T> =
-        tables.filter(|table| table_matches_key(*table, &key, case)).collect();
+        tables.filter(|table| table_matches_key(namespaces, *table, &key, case)).collect();
     resolve_target_from_candidates(target, &candidates)
 }
 
@@ -861,34 +989,41 @@ pub(crate) fn resolve_target_in_iter<'a, T: TableLike>(
 /// Returns an error when the object name is malformed for table lookup, or when
 /// the lookup is ambiguous.
 pub(crate) fn resolve_table_object_name_in_iter<'a, T: TableLike>(
+    namespaces: Namespaces,
     tables: impl Iterator<Item = &'a T>,
     object_name: &ObjectName,
     case: IdentifierCase,
 ) -> Result<Option<&'a T>, LookupError> {
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
-    resolve_target_in_iter(tables, &target_name_of_idents(schema_ident, table_ident), case)
+    let target = target_name_of_idents(schema_ident, table_ident);
+    resolve_target_in_iter(namespaces, tables, &target, case)
 }
 
 /// Resolves a written target name against an iterator of relations of one
 /// kind, trying each schema on `search_path` in turn for an unqualified name.
 ///
 /// The path is walked in order and the first schema holding a match wins,
-/// which is what the database does. The temporary schema comes first unless
-/// the path names it, as [`relation_search_path`] spells out. A relation
-/// stored without a schema resides in the default schema, so it is found
-/// where `public` sits on the path rather than ahead of it.
+/// which is what the database does. The temporary schema comes where
+/// [`Namespaces::relation_search_path`] puts it. A relation stored without a
+/// schema resides in the default schema, so it is found where that schema
+/// sits on the path rather than ahead of it.
 ///
 /// # Errors
 ///
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one relation in the schema that wins, reported under the name the
 /// statement wrote.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the walk is shared by tables, views and sequences, each naming how to key and render its candidates"
+)]
 fn resolve_relation_on_search_path<'a, 'path, R, I>(
+    namespaces: Namespaces,
     relations: impl Iterator<Item = &'a R>,
     target: &TargetName<'_>,
     search_path: impl Fn() -> I,
     case: IdentifierCase,
-    key_of: impl Fn(&R, IdentifierCase) -> RelationKey,
+    key_of: impl Fn(Namespaces, &R, IdentifierCase) -> RelationKey,
     claimed: impl Fn(&RelationKey) -> bool,
     render: impl Fn(&R) -> String,
 ) -> Result<Option<&'a R>, LookupError>
@@ -896,19 +1031,19 @@ where
     I: Iterator<Item = (&'path str, bool)>,
 {
     if target.schema().is_some() {
-        let key = target_key(target, case);
+        let key = target_key(namespaces, target, case);
         let candidates: Vec<&R> =
-            relations.filter(|relation| key_of(relation, case) == key).collect();
+            relations.filter(|relation| key_of(namespaces, relation, case) == key).collect();
         return resolve_one_relation(target, &candidates, render);
     }
 
     let indexed: Vec<(RelationKey, &'a R)> =
-        relations.map(|relation| (key_of(relation, case), relation)).collect();
+        relations.map(|relation| (key_of(namespaces, relation, case), relation)).collect();
     let mut key = RelationKey {
         schema: String::new(),
         name: case.compared_form(target.name(), target.name_is_quoted()).into_owned(),
     };
-    for (entry_schema, entry_quoted) in relation_search_path(search_path) {
+    for (entry_schema, entry_quoted) in namespaces.relation_search_path(search_path) {
         key.schema.clear();
         key.schema.push_str(&case.compared_form(entry_schema, entry_quoted));
         let candidates: Vec<&'a R> = indexed
@@ -936,10 +1071,15 @@ pub(crate) fn relation_name_is_claimed<DB: DatabaseLike>(
     key: &RelationKey,
     case: IdentifierCase,
 ) -> bool {
-    database.tables_and_foreign_tables().any(|table| stored_table_key(table, case) == *key)
-        || database.views().any(|view| stored_view_key(view, case) == *key)
-        || database.materialized_views().any(|view| stored_view_key(view, case) == *key)
-        || database.sequences().any(|sequence| stored_sequence_key(sequence, case) == *key)
+    let namespaces = Namespaces::of_database(database);
+    database
+        .tables_and_foreign_tables()
+        .any(|table| stored_table_key(namespaces, table, case) == *key)
+        || database.views().any(|view| stored_view_key(namespaces, view, case) == *key)
+        || database.materialized_views().any(|view| stored_view_key(namespaces, view, case) == *key)
+        || database
+            .sequences()
+            .any(|sequence| stored_sequence_key(namespaces, sequence, case) == *key)
 }
 
 /// Resolves a written target name against an iterator of tables, trying each
@@ -954,6 +1094,7 @@ pub(crate) fn relation_name_is_claimed<DB: DatabaseLike>(
 /// than one table in the schema that wins, reported under the name the
 /// statement wrote.
 pub(crate) fn resolve_target_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
+    namespaces: Namespaces,
     tables: impl Iterator<Item = &'a T>,
     target: &TargetName<'_>,
     search_path: impl Fn() -> I,
@@ -964,6 +1105,7 @@ where
     I: Iterator<Item = (&'path str, bool)>,
 {
     resolve_relation_on_search_path(
+        namespaces,
         tables,
         target,
         search_path,
@@ -986,6 +1128,7 @@ where
 /// than one view in the schema that wins, reported under the name the
 /// statement wrote.
 pub(crate) fn resolve_view_on_search_path_in_iter<'a, 'path, V: ViewLike, I>(
+    namespaces: Namespaces,
     views: impl Iterator<Item = &'a V>,
     target: &TargetName<'_>,
     search_path: impl Fn() -> I,
@@ -996,6 +1139,7 @@ where
     I: Iterator<Item = (&'path str, bool)>,
 {
     resolve_relation_on_search_path(
+        namespaces,
         views,
         target,
         search_path,
@@ -1015,11 +1159,19 @@ where
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one view.
 pub(crate) fn resolve_view_in_iter<'a, V: ViewLike>(
+    namespaces: Namespaces,
     views: impl Iterator<Item = &'a V>,
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> Result<Option<&'a V>, LookupError> {
-    resolve_relation_in_iter(views, target, case, stored_view_key, render_view_candidate)
+    resolve_relation_in_iter(
+        namespaces,
+        views,
+        target,
+        case,
+        stored_view_key,
+        render_view_candidate,
+    )
 }
 
 /// Resolves a written target name against an iterator of sequences, trying
@@ -1034,6 +1186,7 @@ pub(crate) fn resolve_view_in_iter<'a, V: ViewLike>(
 /// than one sequence in the schema that wins, reported under the name the
 /// statement wrote.
 pub(crate) fn resolve_sequence_on_search_path_in_iter<'a, 'path, S: SequenceLike, I>(
+    namespaces: Namespaces,
     sequences: impl Iterator<Item = &'a S>,
     target: &TargetName<'_>,
     search_path: impl Fn() -> I,
@@ -1044,6 +1197,7 @@ where
     I: Iterator<Item = (&'path str, bool)>,
 {
     resolve_relation_on_search_path(
+        namespaces,
         sequences,
         target,
         search_path,
@@ -1063,11 +1217,13 @@ where
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one sequence.
 pub(crate) fn resolve_sequence_in_iter<'a, S: SequenceLike>(
+    namespaces: Namespaces,
     sequences: impl Iterator<Item = &'a S>,
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> Result<Option<&'a S>, LookupError> {
     resolve_relation_in_iter(
+        namespaces,
         sequences,
         target,
         case,
@@ -1085,14 +1241,16 @@ pub(crate) fn resolve_sequence_in_iter<'a, S: SequenceLike>(
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one relation.
 fn resolve_relation_in_iter<'a, R>(
+    namespaces: Namespaces,
     relations: impl Iterator<Item = &'a R>,
     target: &TargetName<'_>,
     case: IdentifierCase,
-    key_of: impl Fn(&R, IdentifierCase) -> RelationKey,
+    key_of: impl Fn(Namespaces, &R, IdentifierCase) -> RelationKey,
     render: impl Fn(&R) -> String,
 ) -> Result<Option<&'a R>, LookupError> {
-    let key = target_key(target, case);
-    let candidates: Vec<&R> = relations.filter(|relation| key_of(relation, case) == key).collect();
+    let key = target_key(namespaces, target, case);
+    let candidates: Vec<&R> =
+        relations.filter(|relation| key_of(namespaces, relation, case) == key).collect();
     resolve_one_relation(target, &candidates, render)
 }
 
@@ -1106,13 +1264,15 @@ fn resolve_relation_in_iter<'a, R>(
 /// more than one declaration, since resolution by name alone cannot choose
 /// between argument lists.
 pub(crate) fn resolve_function_in_iter<'a, F: FunctionLike>(
+    namespaces: Namespaces,
     functions: impl Iterator<Item = &'a F>,
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> Result<Option<&'a F>, LookupError> {
-    let key = target_key(target, case);
-    let candidates: Vec<&F> =
-        functions.filter(|function| stored_function_key(*function, case) == key).collect();
+    let key = target_key(namespaces, target, case);
+    let candidates: Vec<&F> = functions
+        .filter(|function| stored_function_key(namespaces, *function, case) == key)
+        .collect();
     resolve_one_function(&target.to_string(), &candidates)
 }
 
@@ -1127,6 +1287,7 @@ pub(crate) fn resolve_function_in_iter<'a, F: FunctionLike>(
 /// Returns an error when the object name is malformed for table lookup, or when
 /// the lookup is ambiguous.
 pub(crate) fn resolve_table_object_name_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
+    namespaces: Namespaces,
     tables: impl Iterator<Item = &'a T>,
     object_name: &ObjectName,
     search_path: impl Fn() -> I,
@@ -1138,6 +1299,7 @@ where
 {
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
     resolve_target_on_search_path_in_iter(
+        namespaces,
         tables,
         &target_name_of_idents(schema_ident, table_ident),
         search_path,
@@ -1326,7 +1488,7 @@ mod tests {
     };
 
     use super::{
-        Qualifier, object_name_identifiers, object_name_last_part, qualifier_of,
+        Namespaces, Qualifier, object_name_identifiers, object_name_last_part, qualifier_of,
         relation_name_is_claimed, render_table_candidate, render_view_candidate,
         require_local_object_name, resolve_object_name, resolve_table_object_name_in_iter,
         resolve_table_object_name_on_search_path_in_iter, resolve_target_from_candidates,
@@ -1339,6 +1501,9 @@ mod tests {
         structs::{IdentifierCase, TargetName},
         traits::{DatabaseLike, TableLike},
     };
+
+    /// The namespaces every dialect but SQLite reads names under.
+    const PG: Namespaces = Namespaces::PostgreSql;
 
     fn ident(value: &str, quoted: bool) -> Ident {
         if quoted { Ident::with_quote('"', value) } else { Ident::new(value) }
@@ -1437,7 +1602,7 @@ mod tests {
                 object_name_identifiers(name),
                 Err(LookupError::InvalidObjectName { .. })
             ));
-            assert!(!table_matches_object_name(users, name));
+            assert!(!table_matches_object_name(PG, users, name));
         }
     }
 
@@ -1455,7 +1620,7 @@ mod tests {
             assert_eq!(target.name(), "");
             assert_eq!(target.schema(), None);
             assert!(
-                resolve_target_in_iter(tables.iter(), &target, IdentifierCase::AsWritten)
+                resolve_target_in_iter(PG, tables.iter(), &target, IdentifierCase::AsWritten)
                     .expect("nothing is ambiguous")
                     .is_none()
             );
@@ -1468,15 +1633,19 @@ mod tests {
         let users = find(&tables, "users");
         let scoped = find(&tables, "scoped");
 
-        assert!(!table_matches_object_name(users, &ObjectName(Vec::new())));
-        assert!(!table_matches_object_name(users, &obj(&[("orders", false)])));
-        assert!(table_matches_object_name(users, &obj(&[("users", false)])));
-        assert!(table_matches_object_name(scoped, &obj(&[("s", false), ("scoped", false)])));
+        assert!(!table_matches_object_name(PG, users, &ObjectName(Vec::new())));
+        assert!(!table_matches_object_name(PG, users, &obj(&[("orders", false)])));
+        assert!(table_matches_object_name(PG, users, &obj(&[("users", false)])));
+        assert!(table_matches_object_name(PG, scoped, &obj(&[("s", false), ("scoped", false)])));
         // The two spellings of the default schema are one place.
-        assert!(table_matches_object_name(users, &obj(&[("public", false), ("users", false)])));
-        assert!(table_matches_object_name(find(&tables, "only_pub"), &obj(&[("only_pub", false)])));
+        assert!(table_matches_object_name(PG, users, &obj(&[("public", false), ("users", false)])));
+        assert!(table_matches_object_name(
+            PG,
+            find(&tables, "only_pub"),
+            &obj(&[("only_pub", false)])
+        ));
         // A non-public qualifier misses a schema-less table.
-        assert!(!table_matches_object_name(users, &obj(&[("nope", false), ("users", false)])));
+        assert!(!table_matches_object_name(PG, users, &obj(&[("nope", false), ("users", false)])));
     }
 
     #[test]
@@ -1563,6 +1732,7 @@ mod tests {
     fn resolve_in_iter_rejects_overqualified_names() {
         let tables = fixtures();
         let resolved = resolve_table_object_name_in_iter(
+            PG,
             tables.iter(),
             &obj(&[("users", false)]),
             IdentifierCase::AsWritten,
@@ -1573,6 +1743,7 @@ mod tests {
 
         assert!(matches!(
             resolve_table_object_name_in_iter(
+                PG,
                 tables.iter(),
                 &obj(&[("a", false), ("b", false), ("c", false)]),
                 IdentifierCase::AsWritten,
@@ -1587,6 +1758,7 @@ mod tests {
 
         // Qualified name delegates to the strict resolver.
         let scoped = resolve_table_object_name_on_search_path_in_iter(
+            PG,
             tables.iter(),
             &obj(&[("s", false), ("scoped", false)]),
             default_path,
@@ -1599,6 +1771,7 @@ mod tests {
 
         // Resolved only through the implicit `public` schema.
         let only_pub = resolve_table_object_name_on_search_path_in_iter(
+            PG,
             tables.iter(),
             &obj(&[("only_pub", false)]),
             default_path,
@@ -1613,6 +1786,7 @@ mod tests {
         // one place: ambiguous, reported under the written name.
         assert!(matches!(
             resolve_table_object_name_on_search_path_in_iter(
+                PG,
                 tables.iter(),
                 &obj(&[("things", false)]),
                 default_path,
@@ -1624,6 +1798,7 @@ mod tests {
 
         // The first schema on the path holding the name wins.
         let on_s_first = resolve_table_object_name_on_search_path_in_iter(
+            PG,
             tables.iter(),
             &obj(&[("users", false)]),
             || [("s", false), ("public", false)].into_iter(),
@@ -1635,6 +1810,7 @@ mod tests {
         assert_eq!(on_s_first.table_schema(), Some("s"));
 
         let on_public_first = resolve_table_object_name_on_search_path_in_iter(
+            PG,
             tables.iter(),
             &obj(&[("users", false)]),
             || [("public", false), ("s", false)].into_iter(),
@@ -1648,6 +1824,7 @@ mod tests {
         // A schema-less table is unreachable when `public` is off the path.
         assert!(
             resolve_table_object_name_on_search_path_in_iter(
+                PG,
                 tables.iter(),
                 &obj(&[("only_pub", false)]),
                 || core::iter::once(("s", false)),
@@ -1661,6 +1838,7 @@ mod tests {
         // No match anywhere.
         assert!(
             resolve_table_object_name_on_search_path_in_iter(
+                PG,
                 tables.iter(),
                 &obj(&[("absent", false)]),
                 default_path,
@@ -1713,6 +1891,7 @@ mod tests {
             .expect("view exists");
         assert_eq!(render_view_candidate(view), "s.v");
         let resolved = resolve_view_on_search_path_in_iter(
+            PG,
             db.views(),
             &TargetName::new("v", false),
             || [("s", false)].into_iter(),

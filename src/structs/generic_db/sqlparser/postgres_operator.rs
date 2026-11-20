@@ -479,6 +479,7 @@ pub(super) fn function_name_matches(
     !matches!(qualifier, super::Qualifier::RunTime)
         && case.identifiers_match(identity.name(), identity.name_is_quoted(), written, quoted)
         && super::schema_qualifiers_match(
+            super::Namespaces::PostgreSql,
             Some((identity.schema(), identity.schema_is_quoted())),
             qualifier.named(),
             case,

@@ -35,7 +35,7 @@ use crate::{
     utils::{
         identifier_resolution::{SessionPrincipal, stored_identifier},
         last_str,
-        object_name::{qualifier_of, search_path_entry},
+        object_name::{Namespaces, qualifier_of, search_path_entry},
     },
 };
 
@@ -750,7 +750,12 @@ impl DefaultPrivileges {
             row.role.as_deref() == owner
                 && row.kind == kind
                 && row.schema.as_ref().is_some_and(|(name, quoted)| {
-                    schema_qualifiers_match(Some((name.as_str(), *quoted)), schema, case)
+                    schema_qualifiers_match(
+                        Namespaces::PostgreSql,
+                        Some((name.as_str(), *quoted)),
+                        schema,
+                        case,
+                    )
                 })
         }) {
             for item in &row.items {

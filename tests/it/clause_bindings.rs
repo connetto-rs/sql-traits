@@ -335,11 +335,11 @@ fn a_qualified_wildcard_over_a_derived_table_reports_its_alias() {
 
 #[test]
 fn a_schema_qualified_wildcard_reports_the_table_it_matched() {
-    let sql = "SELECT PUBLIC.\"DOCS\".* FROM public.docs";
-    let resolved = relation_in(&PostgreSqlDialect {}, sql, |query| query);
+    let sql = "SELECT MAIN.\"DOCS\".* FROM main.docs";
+    let resolved = relation_in(&SQLiteDialect {}, sql, |query| query);
     assert_eq!(resolved, Some(Some(named("docs", false))));
-    let sql = "SELECT other.docs.* FROM public.docs";
-    assert_eq!(relation_in(&PostgreSqlDialect {}, sql, |query| query), None);
+    let sql = "SELECT other.docs.* FROM main.docs";
+    assert_eq!(relation_in(&SQLiteDialect {}, sql, |query| query), None);
 }
 
 #[test]

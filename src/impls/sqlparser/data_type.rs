@@ -28,8 +28,7 @@ use crate::{
         identifier_resolution::{identifiers_match, stored_identifier},
         normalize_sqlparser_type,
         object_name::{
-            PG_CATALOG, Qualifier, object_name_last_part, qualifier_of, relation_search_path,
-            target_name_of_object_name,
+            PG_CATALOG, Qualifier, object_name_last_part, qualifier_of, target_name_of_object_name,
         },
         postgres_types::PgType,
         scalar_family::ScalarFamily,
@@ -100,7 +99,9 @@ pub(super) fn written_element(definition: &ArrayElemTypeDef) -> Option<&DataType
 /// extension in either is reached whatever the path says.
 fn on_type_search_path(database: &ParserDB, schema: &str) -> bool {
     schema == PG_CATALOG
-        || relation_search_path(|| database.search_path())
+        || database
+            .namespaces()
+            .relation_search_path(|| database.search_path())
             .any(|(entry, quoted)| stored_identifier(entry, quoted) == schema)
 }
 

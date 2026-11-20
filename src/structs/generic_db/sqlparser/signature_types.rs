@@ -23,7 +23,7 @@ use super::{
     view_rewrites::edit_function,
     views::bound_read_key,
 };
-use crate::utils::object_name::{RelationKey, qualifier_of};
+use crate::utils::object_name::{Namespaces, RelationKey, qualifier_of};
 
 /// The columns of a `RETURNS TABLE`, or the one type another result names.
 fn result_types(function: &CreateFunction) -> (Option<&[ColumnDef]>, Option<&DataType>) {
@@ -121,8 +121,13 @@ pub(super) fn retarget_signatures(
 
 /// The relations whose row types the signature of `function` names, keyed
 /// as a body's reads are.
-pub(super) fn row_type_keys(function: &CreateFunction) -> impl Iterator<Item = RelationKey> {
-    signature_types(function).filter_map(custom_name).filter_map(|name| bound_read_key(None, name))
+pub(super) fn row_type_keys(
+    namespaces: Namespaces,
+    function: &CreateFunction,
+) -> impl Iterator<Item = RelationKey> {
+    signature_types(function)
+        .filter_map(custom_name)
+        .filter_map(move |name| bound_read_key(namespaces, None, name))
 }
 
 /// The stored functions whose signature names a domain, a user-defined type
@@ -134,11 +139,15 @@ pub(super) fn functions_naming_schema_types(
 ) -> Vec<Arc<CreateFunction>> {
     let case = builder.identifier_case();
     let held = |name: &ObjectName| {
-        schema_qualifiers_match(qualifier_of(name).named(), Some(schema), case)
-            && object_name_last_identifier(name).is_some_and(|ident| {
-                reach_in_schema(builder, ident, schema)
-                    .is_some_and(|reached| !matches!(reached, Reached::Catalog))
-            })
+        schema_qualifiers_match(
+            builder.namespaces(),
+            qualifier_of(name).named(),
+            Some(schema),
+            case,
+        ) && object_name_last_identifier(name).is_some_and(|ident| {
+            reach_in_schema(builder, ident, schema)
+                .is_some_and(|reached| !matches!(reached, Reached::Catalog))
+        })
     };
     builder
         .functions()

@@ -42,8 +42,9 @@ use crate::{
     utils::{
         call_sites::call_reaches,
         object_name::{
-            PG_CATALOG, Qualifier, object_name_last_part, qualifier_of, render_table_candidate,
-            resolve_bound_table, resolve_object_name, target_name_from_object_name,
+            Namespaces, PG_CATALOG, Qualifier, object_name_last_part, qualifier_of,
+            render_table_candidate, resolve_bound_table, resolve_object_name,
+            target_name_from_object_name,
         },
         walk::walk,
     },
@@ -4441,9 +4442,14 @@ fn object_name_schema<'query, 'db>(
     }
 }
 
-fn stored_schema_key<'query, DB: DatabaseLike>(table: &DB::Table) -> RelationKey<'query, '_> {
+/// The key of the schema `table` lives in, the default schema for one stored
+/// without a qualifier.
+fn stored_schema_key<'query, DB: DatabaseLike>(
+    namespaces: Namespaces,
+    table: &DB::Table,
+) -> RelationKey<'query, '_> {
     RelationKey {
-        value: AstRef::Database(table.table_schema().unwrap_or("public")),
+        value: AstRef::Database(table.table_schema().unwrap_or(namespaces.default_schema())),
         quoted: table.table_schema().is_some() && table.table_schema_is_quoted(),
     }
 }
@@ -4588,7 +4594,9 @@ where
     Ok(FactorContribution {
         relation: RelationContribution::Base(FromTableRef {
             key,
-            schema_key: alias.is_none().then(|| stored_schema_key::<DB>(table)),
+            schema_key: alias
+                .is_none()
+                .then(|| stored_schema_key::<DB>(Namespaces::of_database(database), table)),
             table,
             has_alias: alias.is_some(),
             nullable: false,

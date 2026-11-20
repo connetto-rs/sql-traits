@@ -26,7 +26,7 @@ use crate::{
     utils::{
         identifier_resolution::identifiers_match,
         last_str,
-        object_name::{RelationKey, target_key, target_name_of_object_name},
+        object_name::{Namespaces, RelationKey, target_key, target_name_of_object_name},
         walk::{walk, walk_mut},
     },
 };
@@ -159,16 +159,16 @@ pub(super) fn write_action_statements(action: &mut CreateRuleAction, statements:
 
 /// The key the rule's relation is stored under, which a rename or drop of
 /// that relation or one of its columns must reach the rule by.
-pub(super) fn relation_key(rule: &CreateRule) -> RelationKey {
-    target_key(&target_name_of_object_name(&rule.table_name), IdentifierCase::AsWritten)
+pub(super) fn relation_key(namespaces: Namespaces, rule: &CreateRule) -> RelationKey {
+    target_key(namespaces, &target_name_of_object_name(&rule.table_name), IdentifierCase::AsWritten)
 }
 
 /// The rule as a dependency walk reaches it, by its name on its relation.
-pub(super) fn dependent(rule: &CreateRule) -> views::Dependent {
+pub(super) fn dependent(namespaces: Namespaces, rule: &CreateRule) -> views::Dependent {
     let name = IdentifierCase::AsWritten
         .compared_form(&rule.name.value, rule.name.quote_style.is_some())
         .into_owned();
-    views::Dependent::Rule(relation_key(rule), name)
+    views::Dependent::Rule(relation_key(namespaces, rule), name)
 }
 
 /// The normalized identity of every relation the rule's action and condition
@@ -176,7 +176,10 @@ pub(super) fn dependent(rule: &CreateRule) -> views::Dependent {
 pub(super) fn rules_reading(builder: &ParserDBBuilder, rule: &CreateRule) -> Vec<RelationKey> {
     let mut read = statements_read(builder, action_statements(&rule.action));
     if let Some(condition) = rule.condition.as_ref() {
-        read.extend(relations_read_in(&function_bodies::definition(condition)));
+        read.extend(relations_read_in(
+            builder.namespaces(),
+            &function_bodies::definition(condition),
+        ));
     }
     read
 }

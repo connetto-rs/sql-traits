@@ -311,7 +311,9 @@ pub(super) fn relations_read(
     body: &CreateFunctionBody,
 ) -> Option<Vec<RelationKey>> {
     match body {
-        CreateFunctionBody::Return(expr) => Some(relations_read_in(&definition(expr))),
+        CreateFunctionBody::Return(expr) => {
+            Some(relations_read_in(builder.namespaces(), &definition(expr)))
+        }
         CreateFunctionBody::BeginAtomic(block) => Some(statements_read(builder, &block.statements)),
         _ => None,
     }
