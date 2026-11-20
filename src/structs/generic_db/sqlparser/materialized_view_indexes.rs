@@ -14,7 +14,7 @@ use sqlparser::ast::{CreateIndex, Ident, ObjectName, ObjectNamePart};
 use super::{
     NamedColumn, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, generated_names,
     refuse_index_in_another_schema, relation_name_holder, rename_column_idents,
-    rename_column_in_expressions, schema_qualifiers_match, stored_ident, stored_subqueries,
+    rename_column_in_expressions, schema_qualifiers_match, stored_expressions, stored_ident,
     stored_view_qualifier, views,
 };
 use crate::{
@@ -82,7 +82,7 @@ pub(super) fn create(
             reason: "index has no columns".into(),
         });
     };
-    stored_subqueries::refuse_in_index(&builder, &create_index)?;
+    stored_expressions::refuse_in_index(&builder, &create_index)?;
 
     if let Some(ObjectNamePart::Identifier(index_name)) =
         create_index.name.as_ref().and_then(|name| name.0.last())

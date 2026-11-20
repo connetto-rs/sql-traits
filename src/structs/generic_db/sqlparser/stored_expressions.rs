@@ -1,11 +1,13 @@
 //! Refuses a subquery in an expression PostgreSQL stores and evaluates without
 //! running a query, as `transformSubLink` does for every expression kind but
-//! policies, rules and the queries of views.
+//! policies, rules and the queries of views, and a column reference in a
+//! default, as `transformColumnRef` does.
 
+use alloc::string::ToString;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterColumnOperation, ColumnDef, ColumnOption, CreateDomain, CreateIndex, CreateTable,
+    AlterColumnOperation, ColumnDef, ColumnOption, CreateDomain, CreateIndex, CreateTable, Expr,
     ForValues, PartitionBoundValue, Query, TableConstraint, Visit, Visitor,
 };
 
@@ -13,17 +15,34 @@ use super::ParserDBBuilder;
 use crate::{
     errors::{Error, ExpressionPlace},
     impls::SqlparserDialect,
-    utils::walk::walk,
+    utils::{columns_in_expression::Labels, walk::walk},
 };
 
-/// Finds the first query of a node.
-struct Subquery;
+/// Finds the first query of an expression stored at `place`, or in a default
+/// the first column reference, whichever PostgreSQL meets first.
+struct Refused {
+    place: ExpressionPlace,
+    labels: Labels,
+}
 
-impl Visitor for Subquery {
-    type Break = ();
+impl Visitor for Refused {
+    type Break = Error;
 
     fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-        ControlFlow::Break(())
+        ControlFlow::Break(Error::SubqueryInExpression { place: self.place })
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if self.place != ExpressionPlace::Default || self.labels.holds(expr) {
+            return ControlFlow::Continue(());
+        }
+        self.labels.enter(expr);
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::QualifiedWildcard(..) => {
+                ControlFlow::Break(Error::ColumnReferenceInDefault { reference: expr.to_string() })
+            }
+            _ => ControlFlow::Continue(()),
+        }
     }
 }
 
@@ -32,16 +51,17 @@ fn postgres(builder: &ParserDBBuilder) -> bool {
     matches!(builder.dialect(), SqlparserDialect::PostgreSql)
 }
 
-/// Refuses `node`, an expression stored at `place`, when it holds a subquery.
+/// Refuses `node`, an expression stored at `place`, when it holds a subquery
+/// or, as a default, a column reference.
 fn refuse<N: Visit + ?Sized>(node: &N, place: ExpressionPlace) -> Result<(), Error> {
-    match walk(node, &mut Subquery) {
-        ControlFlow::Break(()) => Err(Error::SubqueryInExpression { place }),
+    match walk(node, &mut Refused { place, labels: Labels::default() }) {
+        ControlFlow::Break(error) => Err(error),
         ControlFlow::Continue(()) => Ok(()),
     }
 }
 
 /// Refuses a subquery in the default, generation expression or checks of
-/// `column`.
+/// `column`, and a column reference in its default.
 fn column_options(column: &ColumnDef) -> Result<(), Error> {
     for option in &column.options {
         match &option.option {
@@ -87,7 +107,8 @@ fn bound(bound: &ForValues) -> Result<(), Error> {
 
 /// Refuses a subquery in an expression `create_table` stores: a column's
 /// default, generation expression or check, a table constraint, the
-/// partition key or the partition bound.
+/// partition key or the partition bound, and a column reference in a
+/// column's default.
 pub(super) fn refuse_in_table(
     builder: &ParserDBBuilder,
     create_table: &CreateTable,
@@ -102,7 +123,8 @@ pub(super) fn refuse_in_table(
 }
 
 /// Refuses a subquery in the default, generation expression or checks of
-/// `column`, a column `ALTER TABLE` adds.
+/// `column`, a column `ALTER TABLE` adds, and a column reference in its
+/// default.
 pub(super) fn refuse_in_column(builder: &ParserDBBuilder, column: &ColumnDef) -> Result<(), Error> {
     if postgres(builder) { column_options(column) } else { Ok(()) }
 }
@@ -137,7 +159,8 @@ pub(super) fn refuse_in_index(
     refuse(&create_index.predicate, ExpressionPlace::IndexPredicate)
 }
 
-/// Refuses a subquery in the default or the checks of `create_domain`.
+/// Refuses a subquery in the default or the checks of `create_domain`, and a
+/// column reference, `VALUE` included, in its default.
 pub(super) fn refuse_in_domain(
     builder: &ParserDBBuilder,
     create_domain: &CreateDomain,
@@ -150,7 +173,7 @@ pub(super) fn refuse_in_domain(
 }
 
 /// Refuses a subquery in the default or the `USING` expression `operation`
-/// sets on a column.
+/// sets on a column, and a column reference in the default.
 pub(super) fn refuse_in_column_change(
     builder: &ParserDBBuilder,
     operation: &AlterColumnOperation,

@@ -121,7 +121,7 @@ mod rules;
 mod schema_usage;
 mod sequences;
 mod signature_types;
-mod stored_subqueries;
+mod stored_expressions;
 mod table_as;
 mod table_owner;
 mod transactions;
@@ -7298,7 +7298,7 @@ impl ParserDB {
             return Ok(builder);
         };
         Self::refuse_repeated_added_key_column(&builder, &stored, &constraint)?;
-        stored_subqueries::refuse_in_constraint(&builder, &constraint)?;
+        stored_expressions::refuse_in_constraint(&builder, &constraint)?;
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
         if let TableConstraint::NotNull(not_null) = &constraint
             && requires_value(Self::stored_node(&builder, &stored)?, &not_null.column)
@@ -8535,7 +8535,7 @@ impl ParserDB {
         stored: &StoredTable,
         column_def: &ColumnDef,
     ) -> Result<(), crate::errors::Error> {
-        stored_subqueries::refuse_in_column(builder, column_def)?;
+        stored_expressions::refuse_in_column(builder, column_def)?;
         if column_def.options.iter().any(is_no_inherit_check)
             && Self::stored_node(builder, stored)?.partition_by.is_some()
         {
@@ -9101,7 +9101,7 @@ impl ParserDB {
         }
         let mut identity_sequence = None;
         if let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? {
-            stored_subqueries::refuse_in_column_change(&builder, &operation)?;
+            stored_expressions::refuse_in_column_change(&builder, &operation)?;
             let node = Self::stored_node(&builder, &stored)?;
             let column = NamedColumn::of(column_name, builder.identifier_case());
             if column.declared_by(node) {
@@ -10345,7 +10345,7 @@ impl ParserDB {
                     }
                     let if_not_exists = create_index.if_not_exists;
                     let (index, metadata) = Self::process_create_index(create_index, &builder)?;
-                    stored_subqueries::refuse_in_index(&builder, index.attribute())?;
+                    stored_expressions::refuse_in_index(&builder, index.attribute())?;
                     let resolved_table = index.table();
                     let resolved_table_name = resolved_table.table_name().to_string();
                     let resolved_table_quoted = resolved_table.table_name_is_quoted();
@@ -11054,7 +11054,7 @@ impl ParserDB {
                     for column in &mut create_table.columns {
                         domains::bind_type(&builder, &mut column.data_type, &type_arrays)?;
                     }
-                    stored_subqueries::refuse_in_table(&builder, &create_table)?;
+                    stored_expressions::refuse_in_table(&builder, &create_table)?;
 
                     if create_table.unlogged && create_table.partition_by.is_some() {
                         return Err(crate::errors::Error::UnloggedPartitionedTable {

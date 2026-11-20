@@ -2389,6 +2389,13 @@ pub enum Error {
         /// Where the expression is stored.
         place: ExpressionPlace,
     },
+    #[error("cannot use column reference `{reference}` in DEFAULT expression")]
+    /// Error indicating that the `DEFAULT` of a column or a domain reads a
+    /// column, `VALUE` included, which PostgreSQL refuses.
+    ColumnReferenceInDefault {
+        /// The reference as written, such as `mid`, `t.a` or `VALUE`.
+        reference: String,
+    },
     #[error("Function `{function_name}` not found for trigger `{trigger_name}`.")]
     /// Error indicating that a trigger references a function that does not
     /// exist.
