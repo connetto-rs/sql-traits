@@ -581,6 +581,30 @@ fn fts5_arguments_sqlite_refuses_are_refused() {
             "CREATE VIRTUAL TABLE v USING fts5(a, content='', contentless_delete=1, columnsize=0);",
             |r| matches!(r, R::ConflictingOptions { .. }),
         ),
+        (
+            "CREATE VIRTUAL TABLE v USING fts5(a, contentless_unindexed=1);",
+            |r| matches!(r, R::RequiresContentless { option } if option == "contentless_unindexed"),
+        ),
+        (
+            "CREATE VIRTUAL TABLE v USING fts5(a, content_rowid=rowid, content_rowid=rowid);",
+            |r| matches!(r, R::RepeatedOption { option } if option == "content_rowid"),
+        ),
+        (
+            "CREATE VIRTUAL TABLE v USING fts5(a, prefix='2,,3');",
+            |r| matches!(r, R::MalformedOption { option, .. } if option == "prefix"),
+        ),
+        (
+            "CREATE VIRTUAL TABLE v USING fts5(a, prefix=1000);",
+            |r| matches!(r, R::MalformedOption { option, .. } if option == "prefix"),
+        ),
+        (
+            "CREATE VIRTUAL TABLE v USING fts5(a, prefix=10000);",
+            |r| matches!(r, R::MalformedOption { option, .. } if option == "prefix"),
+        ),
+        (
+            "CREATE VIRTUAL TABLE v USING fts5(a, prefix='1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32');",
+            |r| matches!(r, R::MalformedOption { option, .. } if option == "prefix"),
+        ),
     ]);
 }
 
@@ -618,6 +642,14 @@ fn fts4_arguments_sqlite_refuses_are_refused() {
             "CREATE VIRTUAL TABLE v USING fts4(content=missing);",
             |r| matches!(r, R::ContentTableNotFound { content_table } if content_table == "missing"),
         ),
+        (
+            "CREATE VIRTUAL TABLE v USING fts4(a, uncompress=u);",
+            |r| matches!(r, R::UnpairedOption { option, missing } if option == "uncompress" && missing == "compress"),
+        ),
+        (
+            "CREATE VIRTUAL TABLE v USING fts4(\"k=\" = 'v');",
+            |r| matches!(r, R::UnrecognizedOption { option } if option == "\"k"),
+        ),
     ]);
 }
 
@@ -636,6 +668,11 @@ fn rtree_arguments_sqlite_refuses_are_refused() {
         ("CREATE VIRTUAL TABLE v USING rtree(id, x0, x1, +a, y0, y1);", |r| {
             matches!(r, R::AuxiliaryColumnNotLast)
         }),
+        ("CREATE VIRTUAL TABLE v USING rtree(id, +a, +b);", |r| matches!(r, R::TooFewColumns)),
+        (
+            "CREATE VIRTUAL TABLE v USING rtree(id, -x, y);",
+            |r| matches!(r, R::MalformedArgument { argument } if argument == "-x"),
+        ),
     ]);
 }
 
@@ -910,4 +947,188 @@ fn declared_columns_apply_only_to_a_virtual_table() {
         .err()
         .expect("sqlite3_declare_vtab refuses a repeated column");
     assert!(matches!(refused, Error::ColumnAlreadyExists { .. }), "{refused:?}");
+}
+
+#[test]
+fn an_rtree_table_takes_at_most_one_hundred_arguments() {
+    let arguments: Vec<String> =
+        core::iter::once("id".to_string()).chain((0..100).map(|i| format!("c{i}"))).collect();
+    let refused = sqlite(&format!("CREATE VIRTUAL TABLE r USING rtree({});", arguments.join(", ")))
+        .expect_err("SQLite refuses an rtree table of 101 columns");
+    assert!(
+        matches!(
+            refused,
+            Error::VirtualTableArgumentsRefused {
+                refusal: VirtualTableArgumentRefusal::TooManyColumns,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn rtree_dequotes_its_column_names() {
+    let db = sqlite("CREATE VIRTUAL TABLE r USING rtree(id, \"x 0\", [x1], +\"a\"\"b\");")
+        .expect("rtree takes quoted column names");
+    assert_eq!(
+        columns(&db, "r"),
+        [
+            column("id", "INT", false),
+            column("x 0", "REAL", false),
+            column("x1", "REAL", false),
+            column("a\"b", "", false),
+        ]
+    );
+}
+
+#[test]
+fn fts3_reads_quoted_and_operator_led_column_arguments() {
+    let db =
+        sqlite("CREATE VIRTUAL TABLE t USING fts3(\"a\"\"b\" text, [my col] text, `c`, -x y);")
+            .expect("fts3 takes these column arguments");
+    assert_eq!(
+        columns(&db, "t"),
+        [
+            column("a\"b", "", false),
+            column("my col", "", false),
+            column("c", "", false),
+            column("x", "", false),
+            column("t", "", true),
+            column("docid", "", true),
+            column("__langid", "", true),
+        ]
+    );
+    let db = sqlite("CREATE VIRTUAL TABLE t USING fts3(+);")
+        .expect("an argument holding no token names an empty column");
+    assert_eq!(columns(&db, "t")[0], column("", "", false));
+}
+
+#[test]
+fn fts4_dequotes_the_columns_of_its_content_table() {
+    let db = sqlite(
+        "CREATE TABLE src(\"\"\"x\", \"[y\", z);
+         CREATE VIRTUAL TABLE t USING fts4(content=src, languageid=zz, prefix='');",
+    )
+    .expect("the content table exists");
+    assert_eq!(
+        columns(&db, "t"),
+        [
+            column("x", "", false),
+            column("y", "", false),
+            column("z", "", false),
+            column("t", "", true),
+            column("docid", "", true),
+            column("zz", "", true),
+        ]
+    );
+}
+
+#[test]
+fn fts4_takes_the_columns_of_a_content_view() {
+    let db = sqlite(
+        "CREATE TABLE src(x, lid, y);
+         CREATE VIEW v AS SELECT x, lid, y FROM src;
+         CREATE VIRTUAL TABLE t USING fts4(content=v, languageid=lid);",
+    )
+    .expect("the content view exists");
+    assert_eq!(
+        columns(&db, "t"),
+        [
+            column("x", "", false),
+            column("y", "", false),
+            column("t", "", true),
+            column("docid", "", true),
+            column("lid", "", true),
+        ]
+    );
+    let refused = sqlite(
+        "CREATE VIEW v AS SELECT * FROM json_each('[1]');
+         CREATE VIRTUAL TABLE t USING fts4(content=v);",
+    )
+    .expect_err("the columns json_each gives are not known to the model");
+    assert!(
+        matches!(
+            &refused,
+            Error::VirtualTableContentColumnsUnknown { table_name, content_table }
+                if table_name == "t" && content_table == "v"
+        ),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn fts5_options_sqlite_accepts_declare_no_column() {
+    for statement in [
+        "CREATE TABLE src(a); CREATE VIRTUAL TABLE t USING fts5(a, content=src, content_rowid=rowid, detail=full, tokendata=1, locale=0);",
+        "CREATE VIRTUAL TABLE t USING fts5(a, content='', contentless_unindexed=1);",
+        "CREATE VIRTUAL TABLE t USING fts5(a, prefix=' 2 3', prefix='4,  5');",
+    ] {
+        let db = sqlite(statement).expect(statement);
+        assert_eq!(
+            columns(&db, "t"),
+            [column("a", "", false), column("t", "", true), column("rank", "", true)],
+            "{statement}"
+        );
+    }
+}
+
+#[test]
+fn shadow_tables_of_a_qualified_virtual_table_follow_its_rename() {
+    let db = sqlite(
+        "CREATE SCHEMA s;
+         CREATE VIRTUAL TABLE s.f5 USING fts5(a);
+         CREATE TABLE s.f5_data(id INTEGER PRIMARY KEY, block BLOB);
+         CREATE TABLE s.f5_config(k PRIMARY KEY, v) WITHOUT ROWID;
+         CREATE TABLE docs_data(id);
+         ALTER TABLE s.f5 RENAME TO docs;",
+    )
+    .expect("SQLite renames the shadow tables in the schema of their virtual table");
+    let mut owned: Vec<(Option<String>, String)> = db
+        .tables()
+        .filter(|table| {
+            table
+                .shadow_owner(&db)
+                .expect("the table is held")
+                .is_some_and(|owner| owner.table_schema() == Some("s"))
+        })
+        .map(|table| (table.table_schema().map(str::to_string), table.table_name().to_string()))
+        .collect();
+    owned.sort();
+    assert_eq!(
+        owned,
+        [
+            (Some("s".to_string()), "docs_config".to_string()),
+            (Some("s".to_string()), "docs_data".to_string())
+        ]
+    );
+}
+
+#[test]
+fn a_table_named_like_a_shadow_table_without_its_virtual_table_has_no_owner() {
+    let db = sqlite("CREATE TABLE notes_data(id); CREATE TABLE notes(id);").expect("plain tables");
+    assert!(table(&db, "notes_data").shadow_owner(&db).expect("the table is held").is_none());
+    let db = sqlite("CREATE TABLE notes_data(id);").expect("a plain table");
+    assert!(table(&db, "notes_data").shadow_owner(&db).expect("the table is held").is_none());
+}
+
+#[test]
+fn a_table_of_another_database_is_refused() {
+    let first = sqlite(FTS5).expect("the fts5 schema");
+    let second = sqlite("CREATE TABLE other(id);").expect("another schema");
+    let shadow = table(&first, "f5_data");
+    assert!(shadow.shadow_owner(&second).is_err());
+    let hidden = table(&first, "f5")
+        .columns(&first)
+        .expect("the table is held")
+        .last()
+        .expect("the rank column");
+    assert!(hidden.is_hidden(&second).is_err());
+}
+
+#[test]
+fn a_refusal_names_the_virtual_table_kind() {
+    let refused =
+        sqlite(&format!("{FTS5} ALTER TABLE f5 ADD COLUMN c;")).expect_err("SQLite refuses it");
+    assert!(refused.to_string().contains("Virtual table `f5`"), "{refused}");
 }

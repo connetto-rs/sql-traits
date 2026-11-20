@@ -2766,6 +2766,31 @@ fn the_inherited_foreign_table_lookups_answer_only_foreign_tables() -> Result<()
     Ok(())
 }
 
+/// A catalog that models no virtual table answers every table as an
+/// ordinary one through the inherited accessors.
+#[test]
+fn the_inherited_virtual_table_accessors_answer_no_virtual_table() -> Result<(), LookupError> {
+    let mut catalog = catalog();
+    catalog.tables.push(table(Some("app"), "notes_data"));
+    let notes_data = catalog
+        .table_by_target(
+            TargetName::new("notes_data", false).with_schema("app", false),
+            IdentifierCase::AsWritten,
+        )?
+        .expect("the catalog holds it");
+    assert!(notes_data.virtual_source(&catalog)?.is_none());
+    assert!(notes_data.shadow_owner(&catalog)?.is_none());
+    let notes = catalog
+        .table_by_target(
+            TargetName::new("notes", false).with_schema("app", false),
+            IdentifierCase::AsWritten,
+        )?
+        .expect("the catalog holds it");
+    let id = notes.columns(&catalog)?.next().expect("a column");
+    assert!(!id.is_hidden(&catalog)?);
+    Ok(())
+}
+
 /// A key column the table does not declare is an error, not a shorter key.
 #[test]
 fn an_unresolvable_key_column_stops_the_ordinals() -> Result<(), LookupError> {
