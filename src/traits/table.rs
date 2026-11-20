@@ -4367,10 +4367,11 @@ pub trait TableLike:
     /// `pg_class.relreplident` and `pg_index.indisreplident` record it.
     ///
     /// A table starts at [`ReplicaIdentity::Default`] and each `ALTER TABLE
-    /// ... REPLICA IDENTITY` moves it. `USING INDEX` resolves to the index
-    /// while the table holds it, through its renames, and to
-    /// [`ReplicaIdentity::Index`] holding [`None`] once it is dropped, which
-    /// PostgreSQL reads as `NOTHING`.
+    /// ... REPLICA IDENTITY` moves it. A foreign table holds
+    /// [`ReplicaIdentity::Nothing`], which no statement moves. `USING INDEX`
+    /// resolves to the index while the table holds it, through its renames,
+    /// and to [`ReplicaIdentity::Index`] holding [`None`] once it is dropped,
+    /// which PostgreSQL reads as `NOTHING`.
     ///
     /// # Errors
     ///

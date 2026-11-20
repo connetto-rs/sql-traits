@@ -24,8 +24,13 @@ fn db(sql: &str) -> ParserDB {
 }
 
 fn table<'db>(db: &'db ParserDB, name: &str) -> &'db CreateTable {
-    db.resolve_target_table(TargetName::new(name, false), IdentifierCase::AsWritten)
+    let target = TargetName::new(name, false);
+    db.resolve_target_table(target.clone(), IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
+        .or_else(|| {
+            db.foreign_table_by_target(target, IdentifierCase::AsWritten)
+                .expect("unambiguous lookup")
+        })
         .expect("the name resolves")
 }
 
@@ -91,6 +96,13 @@ fn using_index_names_a_unique_index_or_the_index_of_a_key() {
     let generated_unique = "CREATE TABLE t (a INT NOT NULL UNIQUE);
          ALTER TABLE t REPLICA IDENTITY USING INDEX t_a_key;";
     assert_eq!(identity_of(generated_unique, "t"), "key t_a_key");
+    let table_primary_key = "CREATE TABLE t (id INT, PRIMARY KEY (id));
+         ALTER TABLE t REPLICA IDENTITY USING INDEX t_pkey;";
+    assert_eq!(identity_of(table_primary_key, "t"), "key t_pkey");
+    // The named key is found past an earlier key of the same table.
+    let second_key = "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, CONSTRAINT k UNIQUE (a));
+         ALTER TABLE t REPLICA IDENTITY USING INDEX k;";
+    assert_eq!(identity_of(second_key, "t"), "key k");
     // Only the key columns must require a value, and a unique index that
     // treats nulls as equal is unique all the same.
     let including = "CREATE TABLE t (a INT NOT NULL, b INT);
@@ -206,6 +218,9 @@ fn using_index_refuses_a_name_that_is_no_index_of_the_table() {
     let other_key = "CREATE TABLE t (a INT NOT NULL); CREATE TABLE u (a INT PRIMARY KEY);
          ALTER TABLE t REPLICA IDENTITY USING INDEX u_pkey;";
     assert!(matches!(refusal(other_key), Error::ReplicaIdentityIndexOfOtherTable { .. }));
+    let view_index = "CREATE TABLE t (a INT NOT NULL); CREATE MATERIALIZED VIEW m AS SELECT 1 AS a;
+         CREATE UNIQUE INDEX mi ON m (a); ALTER TABLE t REPLICA IDENTITY USING INDEX mi;";
+    assert!(matches!(refusal(view_index), Error::ReplicaIdentityIndexOfOtherTable { .. }));
     let a_table = "CREATE TABLE t (a INT NOT NULL); CREATE TABLE u (a INT);
          ALTER TABLE t REPLICA IDENTITY USING INDEX u;";
     assert!(matches!(refusal(a_table), Error::RelationKindMismatch { .. }));
@@ -278,6 +293,10 @@ fn a_key_column_of_the_identity_keeps_its_required_value() {
     refused(&format!("{UNIQUE_INDEX} ALTER TABLE t ALTER COLUMN a DROP NOT NULL;"));
     refused(&format!("{UNIQUE_KEY} ALTER TABLE t ALTER COLUMN a DROP NOT NULL;"));
     refused(
+        "CREATE TABLE t (a INT NOT NULL UNIQUE); ALTER TABLE t REPLICA IDENTITY USING INDEX t_a_key;
+         ALTER TABLE t ALTER COLUMN a DROP NOT NULL;",
+    );
+    refused(
         "CREATE TABLE t (a INT CONSTRAINT nn NOT NULL); CREATE UNIQUE INDEX i ON t (a);
          ALTER TABLE t REPLICA IDENTITY USING INDEX i; ALTER TABLE t DROP CONSTRAINT nn;",
     );
@@ -324,10 +343,15 @@ fn a_table_below_losing_its_required_value_refuses_while_in_its_identity() {
          ALTER TABLE p ALTER COLUMN a DROP NOT NULL;"
     ));
     // A table below that states the requirement itself keeps it.
-    db(&format!(
-        "CREATE TABLE p (a INT NOT NULL); CREATE TABLE c (a INT NOT NULL) INHERITS (p); {child}
-         ALTER TABLE p ALTER COLUMN a DROP NOT NULL;"
-    ));
+    for (parent, drop) in [
+        ("CREATE TABLE p (a INT NOT NULL)", "ALTER TABLE p ALTER COLUMN a DROP NOT NULL;"),
+        ("CREATE TABLE p (a INT CONSTRAINT nn NOT NULL)", "ALTER TABLE p DROP CONSTRAINT nn;"),
+        ("CREATE TABLE p (a INT, CONSTRAINT nn NOT NULL a)", "ALTER TABLE p DROP CONSTRAINT nn;"),
+    ] {
+        for own in ["a INT NOT NULL", "a INT, CONSTRAINT cnn NOT NULL a"] {
+            db(&format!("{parent}; CREATE TABLE c ({own}) INHERITS (p); {child} {drop}"));
+        }
+    }
     // The parent's refusal comes first on the table below itself.
     for parent in [
         "CREATE TABLE p (a INT NOT NULL); CREATE TABLE c () INHERITS (p);",
@@ -443,4 +467,37 @@ fn relations_without_a_replica_identity_refuse_it() {
          CREATE FOREIGN TABLE t (a INT) SERVER s; ALTER TABLE t REPLICA IDENTITY FULL;";
     assert!(matches!(refusal(foreign), Error::AlterActionUnsupportedOnRelation { .. }));
     db("ALTER TABLE IF EXISTS t REPLICA IDENTITY FULL;");
+    db("ALTER TABLE IF EXISTS t REPLICA IDENTITY USING INDEX i;");
+}
+
+#[test]
+fn a_foreign_table_holds_nothing() {
+    // PostgreSQL starts only a table, a partitioned table and a materialized
+    // view at `DEFAULT`, so a foreign table reads `NOTHING`, as a partition
+    // too.
+    let server = "CREATE FOREIGN DATA WRAPPER w; CREATE SERVER s FOREIGN DATA WRAPPER w;";
+    assert_eq!(
+        identity_of(&format!("{server} CREATE FOREIGN TABLE t (a INT) SERVER s;"), "t"),
+        "nothing"
+    );
+    assert_eq!(
+        identity_of(
+            &format!(
+                "{server} CREATE TABLE p (a INT) PARTITION BY LIST (a);
+                 CREATE FOREIGN TABLE t PARTITION OF p FOR VALUES IN (1) SERVER s;"
+            ),
+            "t"
+        ),
+        "nothing"
+    );
+}
+
+#[test]
+fn a_reference_to_a_table_answers_its_identity() {
+    let database = db(UNIQUE_INDEX);
+    let reference = &table(&database, "t");
+    assert!(matches!(
+        TableLike::replica_identity(reference, &database).expect("t is held"),
+        ReplicaIdentity::Index(Some(ReplicaIdentityIndex::Index(index))) if index.name() == Some("i")
+    ));
 }

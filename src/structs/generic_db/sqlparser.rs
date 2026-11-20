@@ -44,8 +44,8 @@ use crate::{
         ColumnIdentity, ColumnMetadata, ConstraintDeferral, DeclaredVirtualTable, DefaultPrivilege,
         DefaultPrivilegeKind, ForeignTableSource, FunctionKind, GenericDB, IdentifierCase,
         MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership, Schema,
-        SchemaProfile, Sequence, TableAttribute, TableMetadata, TriggerEnablement, UserDefinedType,
-        View, VirtualTableSource,
+        SchemaProfile, Sequence, StoredReplicaIdentity, TableAttribute, TableMetadata,
+        TriggerEnablement, UserDefinedType, View, VirtualTableSource,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -11870,6 +11870,11 @@ impl ParserDB {
                         qualifier_of(&name).named(),
                         builder.identifier_case(),
                     ));
+                    // PostgreSQL starts only a table, a partitioned table and a
+                    // materialized view at `DEFAULT`.
+                    if foreign_source.is_some() {
+                        metadata.set_replica_identity(StoredReplicaIdentity::Nothing);
+                    }
                     metadata.set_foreign_source(foreign_source);
                     metadata.set_virtual_source(virtual_source);
                     metadata.set_hidden_column_names(declaration.hidden_column_names);

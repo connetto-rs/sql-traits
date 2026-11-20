@@ -8,8 +8,9 @@ use alloc::{
 };
 
 use sqlparser::ast::{
-    ColumnOption, ConstraintCharacteristics, ConstraintUsingIndex, CreateIndex, CreateTable, Expr,
-    Ident, IndexColumn, ObjectName, ReplicaIdentity, TableConstraint,
+    ColumnOption, ColumnOptionDef, ConstraintCharacteristics, ConstraintUsingIndex, CreateIndex,
+    CreateTable, Expr, Ident, IndexColumn, ObjectName, PrimaryKeyConstraint, ReplicaIdentity,
+    TableConstraint, UniqueConstraint,
 };
 
 use super::{
@@ -189,22 +190,27 @@ fn refuse_key(
         }
     };
     match slot {
-        Slot::Column { def, held, .. } => {
-            let characteristics = match &held.option {
-                ColumnOption::PrimaryKey(primary_key) => primary_key.characteristics,
-                ColumnOption::Unique(unique) => unique.characteristics,
-                _ => return Err(ReplicaIdentityRefusal::NotUnique),
-            };
-            refuse_immediate(characteristics)?;
+        Slot::Column {
+            def,
+            held:
+                ColumnOptionDef {
+                    option:
+                        ColumnOption::PrimaryKey(PrimaryKeyConstraint { characteristics, .. })
+                        | ColumnOption::Unique(UniqueConstraint { characteristics, .. }),
+                    ..
+                },
+            ..
+        } => {
+            refuse_immediate(*characteristics)?;
             refuse_nullable(builder, table, core::slice::from_ref(&def.name))
         }
-        Slot::Table(_, TableConstraint::PrimaryKey(primary_key)) => {
-            refuse_immediate(primary_key.characteristics)?;
-            refuse_nullable(builder, table, &key_columns(&primary_key.columns).unwrap_or_default())
-        }
-        Slot::Table(_, TableConstraint::Unique(unique)) => {
-            refuse_immediate(unique.characteristics)?;
-            refuse_nullable(builder, table, &key_columns(&unique.columns).unwrap_or_default())
+        Slot::Table(
+            _,
+            TableConstraint::PrimaryKey(PrimaryKeyConstraint { characteristics, columns, .. })
+            | TableConstraint::Unique(UniqueConstraint { characteristics, columns, .. }),
+        ) => {
+            refuse_immediate(*characteristics)?;
+            refuse_nullable(builder, table, &plain_column_names(columns))
         }
         // The model keeps the adopted index under its own name.
         Slot::Table(
@@ -216,7 +222,7 @@ fn refuse_key(
             adopted_index(builder, table, using_index)
                 .map_or(Ok(()), |created| refuse_created_index(builder, table, created))
         }
-        Slot::Table(..) => Err(ReplicaIdentityRefusal::NotUnique),
+        Slot::Column { .. } | Slot::Table(..) => Err(ReplicaIdentityRefusal::NotUnique),
     }
 }
 
@@ -307,12 +313,11 @@ fn refuse_nullable(
 fn covers_column(builder: &ParserDBBuilder, table: &CreateTable, column: &Ident) -> bool {
     let case = builder.identifier_case();
     let owner = StoredTable::of(table);
-    let Some((_, metadata, _)) =
-        builder.tables().iter().find(|(held, _, _)| owner.matches(held, case))
+    let Some((metadata, wanted)) =
+        builder.tables().iter().find(|(held, _, _)| owner.matches(held, case)).and_then(
+            |(_, metadata, _)| Some((metadata, metadata.replica_identity().index_name()?)),
+        )
     else {
-        return false;
-    };
-    let Some(wanted) = metadata.replica_identity().index_name() else {
         return false;
     };
     let created = builder
@@ -339,10 +344,11 @@ fn covers_column(builder: &ParserDBBuilder, table: &CreateTable, column: &Ident)
 fn key_slot_columns(builder: &ParserDBBuilder, table: &CreateTable, slot: Slot<'_>) -> Vec<Ident> {
     match slot {
         Slot::Column { def, .. } => alloc::vec![def.name.clone()],
-        Slot::Table(_, TableConstraint::PrimaryKey(primary_key)) => {
-            plain_column_names(&primary_key.columns)
-        }
-        Slot::Table(_, TableConstraint::Unique(unique)) => plain_column_names(&unique.columns),
+        Slot::Table(
+            _,
+            TableConstraint::PrimaryKey(PrimaryKeyConstraint { columns, .. })
+            | TableConstraint::Unique(UniqueConstraint { columns, .. }),
+        ) => plain_column_names(columns),
         Slot::Table(
             _,
             TableConstraint::PrimaryKeyUsingIndex(using_index)
