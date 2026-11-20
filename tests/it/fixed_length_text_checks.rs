@@ -128,12 +128,14 @@ fn sqlite_date_formatting_bounds_the_text_it_admits() -> Result<(), Error> {
             e TEXT CHECK (date(e, 'subsec') IS e),
             f TEXT CHECK (date(f) IS NOT f),
             g TEXT COLLATE RTRIM CHECK (date(g) IS g),
-            h TEXT COLLATE RTRIM CHECK (h IN ('read', 'write'))
+            h TEXT COLLATE RTRIM CHECK (h IN ('read', 'write')),
+            i TEXT CHECK (i IS lower(i))
         );",
         &[
             (Some(12), Some(10), true),
             (Some(9), Some(8), true),
             (Some(21), Some(19), true),
+            (None, None, false),
             (None, None, false),
             (None, None, false),
             (None, None, false),
