@@ -120,6 +120,7 @@ mod partition_index_families;
 mod partition_indexes;
 mod partition_keys;
 mod policy_literals;
+mod postgis_functions;
 mod postgres_18_collations;
 mod postgres_18_functions;
 mod postgres_builtins;

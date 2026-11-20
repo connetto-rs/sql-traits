@@ -3,21 +3,32 @@
 //! that take the extension along.
 //!
 //! The functions an extension's install script creates are registered in that
-//! schema for the extensions modelled here, and dropped with the extension.
+//! schema, and dropped with the extension: every one `uuid-ossp` creates, and
+//! the ones of PostGIS [`POSTGIS_FUNCTIONS`] lists.
 //! The requirements an extension's control file declares, which `CASCADE`
 //! installs alongside it, are not visible in SQL text and are not recorded.
 
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
 use sqlparser::ast::{CreateExtension, CreateFunction, DropExtension, Ident, ObjectName};
 
 use super::{
     Creator, ParserDBBuilder, case_idents_match, declared_schema, function_signatures_match,
     object_name_last_identifier,
+    postgis_functions::POSTGIS_FUNCTIONS,
     postgres_builtins::{
-        Language,
-        Volatility::{self, Immutable, Volatile},
-        declaration,
+        Kind::Normal,
+        Language::C,
+        Leakage::NotLeakproof,
+        NullInput::Strict,
+        PostgresBuiltin,
+        Volatility::{Immutable, Volatile},
     },
     stored_ident,
 };
@@ -53,39 +64,49 @@ pub(super) fn holds_only_plpgsql(builder: &ParserDBBuilder) -> bool {
     })
 }
 
-/// One function an extension's install script creates, by name, parameters
-/// and result as PostgreSQL prints them, and volatility. Every one modelled
-/// here is strict and written in C.
-struct ExtensionFunction(&'static str, &'static str, &'static str, Volatility);
+/// The placeholder PostgreSQL replaces with the extension's schema when it
+/// runs the install script, with the dot that follows it.
+const EXTENSION_SCHEMA: &str = "@extschema@.";
 
-impl ExtensionFunction {
-    /// The declaration, in the schema the extension landed in.
-    fn function(&self, schema: Option<&Ident>) -> Option<CreateFunction> {
-        let Self(name, arguments, result, volatility) = *self;
-        let name = schema.cloned().into_iter().chain([Ident::new(name)]).collect::<Vec<_>>();
-        declaration(ObjectName::from(name), arguments, result, true, volatility, Language::C)
+/// The declaration of the function `row` describes, as the install script of
+/// an extension landing in `schema` creates it.
+fn extension_function(row: &PostgresBuiltin, schema: Option<&Ident>) -> Option<CreateFunction> {
+    let PostgresBuiltin(name, arguments, result, ..) = *row;
+    let name = schema.cloned().into_iter().chain([Ident::new(name)]).collect::<Vec<_>>();
+    row.declared(ObjectName::from(name), &in_schema(arguments, schema), &in_schema(result, schema))
+}
+
+/// `text` with every type the extension creates qualified by `schema`, left
+/// unqualified for the default schema.
+fn in_schema<'text>(text: &'text str, schema: Option<&Ident>) -> Cow<'text, str> {
+    if !text.contains(EXTENSION_SCHEMA) {
+        return Cow::Borrowed(text);
     }
+    let qualifier = schema.map_or_else(String::new, |schema| format!("{schema}."));
+    Cow::Owned(text.replace(EXTENSION_SCHEMA, &qualifier))
 }
 
 /// The functions `uuid-ossp` 1.1 creates, the version PostgreSQL 18 installs.
-static UUID_OSSP: &[ExtensionFunction] = &[
-    ExtensionFunction("uuid_nil", "", "uuid", Immutable),
-    ExtensionFunction("uuid_ns_dns", "", "uuid", Immutable),
-    ExtensionFunction("uuid_ns_url", "", "uuid", Immutable),
-    ExtensionFunction("uuid_ns_oid", "", "uuid", Immutable),
-    ExtensionFunction("uuid_ns_x500", "", "uuid", Immutable),
-    ExtensionFunction("uuid_generate_v1", "", "uuid", Volatile),
-    ExtensionFunction("uuid_generate_v1mc", "", "uuid", Volatile),
-    ExtensionFunction("uuid_generate_v3", "namespace uuid, name text", "uuid", Immutable),
-    ExtensionFunction("uuid_generate_v4", "", "uuid", Volatile),
-    ExtensionFunction("uuid_generate_v5", "namespace uuid, name text", "uuid", Immutable),
+#[rustfmt::skip]
+static UUID_OSSP: &[PostgresBuiltin] = &[
+    PostgresBuiltin("uuid_nil", "", "uuid", Strict, Immutable, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_ns_dns", "", "uuid", Strict, Immutable, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_ns_url", "", "uuid", Strict, Immutable, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_ns_oid", "", "uuid", Strict, Immutable, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_ns_x500", "", "uuid", Strict, Immutable, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_generate_v1", "", "uuid", Strict, Volatile, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_generate_v1mc", "", "uuid", Strict, Volatile, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_generate_v3", "namespace uuid, name text", "uuid", Strict, Immutable, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_generate_v4", "", "uuid", Strict, Volatile, NotLeakproof, Normal, C, 0.0, None),
+    PostgresBuiltin("uuid_generate_v5", "namespace uuid, name text", "uuid", Strict, Immutable, NotLeakproof, Normal, C, 0.0, None),
 ];
 
 /// The functions the extension called `name` creates, empty for an extension
 /// whose functions are not modelled.
-fn extension_functions(name: &Ident) -> &'static [ExtensionFunction] {
+fn extension_functions(name: &Ident) -> &'static [PostgresBuiltin] {
     match stored_identifier(&name.value, name.quote_style.is_some()).as_ref() {
         "uuid-ossp" => UUID_OSSP,
+        "postgis" => POSTGIS_FUNCTIONS,
         _ => &[],
     }
 }
@@ -108,7 +129,9 @@ fn create_extension_functions(
         .as_ref()
         .map(|schema| (schema.value.as_str(), schema.quote_style.is_some()));
     for member in extension_functions(&extension.name) {
-        let Some(function) = member.function(extension.schema.as_ref()) else { continue };
+        let Some(function) = extension_function(member, extension.schema.as_ref()) else {
+            continue;
+        };
         let taken = builder.functions().iter().any(|(existing, _)| {
             function_signatures_match(
                 &existing.name,
@@ -119,9 +142,10 @@ fn create_extension_functions(
             )
         });
         if taken {
-            return Err(Error::FunctionAlreadyExists { function_name: member.0.to_string() });
+            return Err(Error::FunctionAlreadyExists { function_name: member.name().to_string() });
         }
         let mut metadata = creator.function_metadata(schema, case);
+        member.describe(&mut metadata);
         metadata.set_extension(extension.name.clone());
         builder = builder.add_function(Arc::new(function), metadata);
     }
@@ -379,4 +403,23 @@ fn search_path_schema(
         }
     }
     Err(Error::NoSchemaSelectedForExtension { extension_name: extension_name.value.clone() })
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::ast::Ident;
+
+    use super::{POSTGIS_FUNCTIONS, PostgresBuiltin, UUID_OSSP, extension_function};
+
+    #[test]
+    fn every_row_declares_its_function_in_any_schema() {
+        for schema in [None, Some(Ident::with_quote('"', "Geo Tools"))] {
+            for row @ PostgresBuiltin(name, arguments, result, ..) in
+                UUID_OSSP.iter().chain(POSTGIS_FUNCTIONS)
+            {
+                let declared = extension_function(row, schema.as_ref()).is_some();
+                assert!(declared, "sqlparser cannot declare {name}({arguments}) {result}");
+            }
+        }
+    }
 }

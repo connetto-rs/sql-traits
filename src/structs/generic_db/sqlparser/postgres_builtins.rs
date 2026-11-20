@@ -180,19 +180,29 @@ pub(super) struct PostgresBuiltin(
 
 impl PostgresBuiltin {
     /// The name `pg_proc` stores.
-    fn name(&self) -> &'static str {
+    pub(super) fn name(&self) -> &'static str {
         self.0
     }
 
     /// The declaration in `pg_catalog`, so a user function may shadow it the
     /// way the server allows.
     fn function(&self) -> Option<CreateFunction> {
-        let Self(name, arguments, result, null_input, volatility, leakage, _, language, rows, _) =
-            *self;
         let name = ObjectName(vec![
             ObjectNamePart::Identifier(Ident::new(PG_CATALOG)),
-            ObjectNamePart::Identifier(stored_ident(name)),
+            ObjectNamePart::Identifier(stored_ident(self.name())),
         ]);
+        self.declared(name, self.1, self.2)
+    }
+
+    /// The declaration called `name`, taking `arguments` and returning
+    /// `result` as PostgreSQL prints them, with the row's other facts.
+    pub(super) fn declared(
+        &self,
+        name: ObjectName,
+        arguments: &str,
+        result: &str,
+    ) -> Option<CreateFunction> {
+        let Self(_, _, _, null_input, volatility, leakage, _, language, rows, _) = *self;
         declaration(
             name,
             arguments,
@@ -211,13 +221,21 @@ impl PostgresBuiltin {
     }
 
     fn metadata(&self) -> FunctionMetadata {
-        let Self(name, arguments, _, _, _, _, kind, _, _, aggregate_state) = *self;
+        let Self(name, arguments, ..) = *self;
         let mut metadata = FunctionMetadata::default();
         if let Some(positions) =
             null_returning_positions(name, |types| arguments.split(", ").eq(types.iter().copied()))
         {
             metadata.set_null_returning_arguments(positions);
         }
+        self.describe(&mut metadata);
+        metadata
+    }
+
+    /// Records the row's kind and, for an aggregate, the `NULL` facts of its
+    /// state in `metadata`.
+    pub(super) fn describe(&self, metadata: &mut FunctionMetadata) {
+        let Self(.., kind, _, _, aggregate_state) = *self;
         metadata.set_kind(kind.function());
         metadata.set_aggregate_kind(kind.aggregate());
         if let Some(state) = aggregate_state {
@@ -226,7 +244,6 @@ impl PostgresBuiltin {
                 state.returns_null_over_null_inputs(),
             );
         }
-        metadata
     }
 }
 

@@ -369,6 +369,65 @@ fn uuid_ossp_functions_go_with_the_extension() {
 }
 
 #[test]
+fn postgis_functions_are_granted_where_the_extension_lands() {
+    let grant = "GRANT EXECUTE ON FUNCTION geography(geography, integer, boolean),
+        st_distance(geography, geography, boolean), st_asgeojson(geometry, integer, integer)
+        TO app;";
+    parse(&format!("CREATE EXTENSION postgis; CREATE ROLE app; {grant}"))
+        .expect("the extension's functions are granted");
+    assert!(matches!(
+        parse(&format!("CREATE ROLE app; {grant}")),
+        Err(Error::FunctionNotFoundForGrant { .. })
+    ));
+
+    let elsewhere = "CREATE SCHEMA gis; CREATE EXTENSION postgis WITH SCHEMA gis; CREATE ROLE app;";
+    parse(&format!(
+        "{elsewhere} GRANT EXECUTE ON FUNCTION gis.geography(gis.geography, integer, boolean),
+             gis.geography(bytea), gis.geography(gis.geometry), gis.st_x(gis.geometry) TO app;"
+    ))
+    .expect("the functions and their types sit in the extension's schema");
+    assert!(matches!(
+        parse(&format!(
+            "{elsewhere} GRANT EXECUTE ON FUNCTION gis.geography(geography, integer, boolean) TO app;"
+        )),
+        Err(Error::FunctionNotFoundForGrant { .. })
+    ));
+}
+
+#[test]
+fn postgis_functions_keep_what_pg_proc_records() {
+    let database = parse("CREATE SCHEMA gis; CREATE EXTENSION postgis WITH SCHEMA gis;")
+        .expect("the extension is created");
+    let mut facts: Vec<String> = database
+        .functions()
+        .filter(|function| ["st_collect", "st_distance"].contains(&function.name()))
+        .map(|function| {
+            format!(
+                "{}({}) {:?} {} defaults {} returns {}",
+                function.target_name(),
+                function.argument_type_names(&database).collect::<Vec<_>>().join(", "),
+                function.kind(&database).expect("the function is stored"),
+                function.language().unwrap_or_default(),
+                function.argument_default_count(),
+                function.return_type_name(&database).unwrap_or_default(),
+            )
+        })
+        .collect();
+    facts.sort();
+    assert_eq!(
+        facts,
+        [
+            "gis.st_collect(gis.geometry) Aggregate internal defaults 0 returns gis.geometry",
+            "gis.st_collect(gis.geometry, gis.geometry) Normal c defaults 0 returns gis.geometry",
+            "gis.st_collect(gis.geometry[]) Normal c defaults 0 returns gis.geometry",
+            "gis.st_distance(TEXT, TEXT) Normal sql defaults 0 returns DOUBLE PRECISION",
+            "gis.st_distance(gis.geography, gis.geography, BOOLEAN) Normal c defaults 1 returns DOUBLE PRECISION",
+            "gis.st_distance(gis.geometry, gis.geometry) Normal c defaults 0 returns DOUBLE PRECISION",
+        ]
+    );
+}
+
+#[test]
 fn decode_is_a_builtin_returning_bytea() {
     let database = parse("").expect("empty input parses");
     assert_eq!(
