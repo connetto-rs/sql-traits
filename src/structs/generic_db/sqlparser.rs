@@ -6418,7 +6418,15 @@ impl ParserDB {
         mut builder: ParserDBBuilder,
         carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        for option in &column.attribute().options {
+        let options = &column.attribute().options;
+        for (position, option) in options.iter().enumerate() {
+            // sqlparser reads a column's conflict clause as an option of its
+            // own, and SQLite binds it to the constraint written right before
+            // it.
+            let conflict_clause = match options.get(position + 1).map(|next| &next.option) {
+                Some(ColumnOption::OnConflict(keyword)) => Some(*keyword),
+                _ => None,
+            };
             match option.option.clone() {
                 ColumnOption::Check(check_constraint) => {
                     builder = Self::add_check_constraint(
@@ -6458,6 +6466,8 @@ impl ParserDB {
                         },
                         operator_class: None,
                     });
+                    unique_constraint.on_conflict =
+                        unique_constraint.on_conflict.or(conflict_clause);
                     builder = Self::add_unique_key(
                         unique_constraint,
                         create_table,
@@ -6466,7 +6476,7 @@ impl ParserDB {
                         carried,
                     );
                 }
-                ColumnOption::PrimaryKey(_) => {
+                ColumnOption::PrimaryKey(primary_key) => {
                     let primary_key_unique_constraint = UniqueConstraint {
                         name: option.name.clone(),
                         index_name: None,
@@ -6484,6 +6494,7 @@ impl ParserDB {
                         index_options: vec![],
                         characteristics: None,
                         nulls_distinct: sqlparser::ast::NullsDistinctOption::None,
+                        on_conflict: primary_key.on_conflict.or(conflict_clause),
                     };
                     builder = Self::add_unique_key(
                         primary_key_unique_constraint,
@@ -6727,6 +6738,7 @@ impl ParserDB {
                         index_options: pk.index_options.clone(),
                         characteristics: pk.characteristics,
                         nulls_distinct: sqlparser::ast::NullsDistinctOption::None,
+                        on_conflict: pk.on_conflict,
                     };
                     builder = Self::add_unique_key(
                         primary_key_unique_constraint,
