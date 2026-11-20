@@ -1066,3 +1066,21 @@ fn a_default_names_stored_identifiers_and_grant_options() {
         Some([vec![String::from("SELECT"), String::from("UPDATE")], vec![String::from("SELECT")]])
     );
 }
+
+/// A grantee naming no plain role, such as MySQL's `'user'@'host'`, is listed
+/// as written.
+#[test]
+fn a_grantee_naming_no_plain_role_is_listed_as_written() {
+    let db = ParseOptions::default()
+        .with_access_resolution(AccessResolution::OpenWorld)
+        .parse::<MySqlDialect>(
+            "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO 'app'@'localhost';",
+        )
+        .expect("schema parses");
+    let entry = &only_standing(&db);
+
+    assert_eq!(
+        held(entry, &DefaultGrantee::Role("'app'@'localhost'".into())),
+        Some([vec![String::from("SELECT")], Vec::new()])
+    );
+}
