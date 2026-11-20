@@ -8,17 +8,20 @@ use alloc::{
 };
 use core::{borrow::Borrow, fmt::Debug};
 
-use sqlparser::ast::{
-    ArrayElemTypeDef, BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Ident, InTarget, Value,
+use sqlparser::{
+    ast::{
+        ArrayElemTypeDef, BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg,
+        FunctionArgExpr, FunctionArguments, Ident, InTarget, Value,
+    },
+    dialect::SQLiteDialect,
 };
 
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, WrittenCall},
     traits::{
-        ColumnCollation, DataTypeLike, DatabaseLike, Metadata, MySqlCollationPadding, TableLike,
-        column::ColumnLike, function_like::FunctionLike,
+        ColumnCollation, DataTypeLike, DatabaseLike, DialectLike, Metadata, MySqlCollationPadding,
+        TableLike, column::ColumnLike, function_like::FunctionLike,
     },
 };
 
@@ -143,23 +146,27 @@ fn swap_cmp_op(op: &BinaryOperator) -> BinaryOperator {
     }
 }
 
-/// The character lengths of the shortest and longest literal a check lists.
+/// The character lengths of the shortest and longest string a check admits,
+/// `longest` being `None` when it admits strings of any length.
 #[derive(Clone, Copy)]
-struct ListedLengths {
+struct TextLengths {
     shortest: usize,
-    longest: usize,
+    longest: Option<usize>,
 }
 
-impl ListedLengths {
+impl TextLengths {
     fn of(literal: &str) -> Self {
         let length = literal.chars().count();
-        Self { shortest: length, longest: length }
+        Self { shortest: length, longest: Some(length) }
     }
 
     fn union(self, other: Self) -> Self {
         Self {
             shortest: core::cmp::min(self.shortest, other.shortest),
-            longest: core::cmp::max(self.longest, other.longest),
+            longest: self
+                .longest
+                .zip(other.longest)
+                .map(|(left, right)| core::cmp::max(left, right)),
         }
     }
 }
@@ -231,17 +238,17 @@ fn array_elements(expr: &Expr) -> Option<&[Expr]> {
 }
 
 /// The lengths of `literals` when every one of them is a string literal.
-fn literal_lengths(literals: &[Expr]) -> Option<ListedLengths> {
+fn literal_lengths(literals: &[Expr]) -> Option<TextLengths> {
     let (first, rest) = literals.split_first()?;
-    rest.iter().try_fold(ListedLengths::of(text_literal(first)?), |lengths, literal| {
-        Some(lengths.union(ListedLengths::of(text_literal(literal)?)))
+    rest.iter().try_fold(TextLengths::of(text_literal(first)?), |lengths, literal| {
+        Some(lengths.union(TextLengths::of(text_literal(literal)?)))
     })
 }
 
 /// The column `expr` holds to listed string literals, with their lengths,
 /// when `expr` is `col IN (...)`, `col = ANY (ARRAY[...])` or an `OR` of
 /// equalities between the column and a literal.
-fn listed_literal_lengths(expr: &Expr) -> Option<(&Ident, ListedLengths)> {
+fn listed_literal_lengths(expr: &Expr) -> Option<(&Ident, TextLengths)> {
     match unnested(expr) {
         Expr::In { expr, target: InTarget::List(list), negated: false, .. } => {
             Some((listed_column(expr)?, literal_lengths(list)?))
@@ -253,7 +260,7 @@ fn listed_literal_lengths(expr: &Expr) -> Option<(&Ident, ListedLengths)> {
             let (column, literal) = listed_column(left)
                 .zip(text_literal(right))
                 .or_else(|| listed_column(right).zip(text_literal(left)))?;
-            Some((column, ListedLengths::of(literal)))
+            Some((column, TextLengths::of(literal)))
         }
         Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
             let (column, left) = listed_literal_lengths(left)?;
@@ -264,38 +271,162 @@ fn listed_literal_lengths(expr: &Expr) -> Option<(&Ident, ListedLengths)> {
     }
 }
 
+/// The lengths of the strings the `LIKE` pattern `pattern` matches, `escape`
+/// being the character its `ESCAPE` clause names, when every dialect reads
+/// the pattern alike.
+fn like_pattern_lengths(pattern: &str, escape: Option<char>) -> Option<TextLengths> {
+    let mut characters = pattern.chars();
+    let mut fixed = 0;
+    let mut open = false;
+    while let Some(character) = characters.next() {
+        match character {
+            _ if Some(character) == escape => {
+                characters.next()?;
+            }
+            '%' => {
+                open = true;
+                continue;
+            }
+            // PostgreSQL and MySQL escape with a backslash by default, which
+            // SQLite and SQL Server read as itself.
+            '\\' if escape.is_none() => return None,
+            // SQL Server reads a bracket expression as one character.
+            '[' => return None,
+            _ => {}
+        }
+        fixed += 1;
+    }
+    Some(TextLengths { shortest: fixed, longest: (!open).then_some(fixed) })
+}
+
+/// The lengths of the strings the SQLite `GLOB` pattern `pattern` matches,
+/// when each of its bracket expressions closes.
+fn glob_pattern_lengths(pattern: &str) -> Option<TextLengths> {
+    let mut characters = pattern.chars();
+    let mut fixed = 0;
+    let mut open = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '*' => {
+                open = true;
+                continue;
+            }
+            '[' => {
+                // The first member of a set, `]` included, never closes it.
+                if characters.next()? == '^' {
+                    characters.next()?;
+                }
+                characters.find(|&member| member == ']')?;
+            }
+            _ => {}
+        }
+        fixed += 1;
+    }
+    Some(TextLengths { shortest: fixed, longest: (!open).then_some(fixed) })
+}
+
+/// The column `expr` matches against a `LIKE` or `GLOB` pattern literal, with
+/// the lengths of the strings that pattern matches.
+fn pattern_lengths(expr: &Expr) -> Option<(&Ident, TextLengths)> {
+    match unnested(expr) {
+        Expr::Like { negated: false, any: false, expr, pattern, escape_char } => {
+            let escape = match escape_char.as_deref() {
+                Some(escape) => {
+                    let mut characters = text_literal(escape)?.chars();
+                    let escape = characters.next()?;
+                    if characters.next().is_some() {
+                        return None;
+                    }
+                    Some(escape)
+                }
+                None => None,
+            };
+            Some((listed_column(expr)?, like_pattern_lengths(text_literal(pattern)?, escape)?))
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Glob, right } => {
+            Some((listed_column(left)?, glob_pattern_lengths(text_literal(right)?)?))
+        }
+        _ => None,
+    }
+}
+
+/// The lengths of the text SQLite's one-argument `date`, `time` or `datetime`
+/// call `call` answers, a year before 1 taking a leading `-`.
+fn formatted_lengths(call: &Expr) -> Option<TextLengths> {
+    let Expr::Function(Function { name, args: FunctionArguments::List(list), .. }) = unnested(call)
+    else {
+        return None;
+    };
+    if list.args.len() != 1 {
+        return None;
+    }
+    let name = name.to_string();
+    let (shortest, longest) = if name.eq_ignore_ascii_case("date") {
+        (10, 11)
+    } else if name.eq_ignore_ascii_case("time") {
+        (8, 8)
+    } else if name.eq_ignore_ascii_case("datetime") {
+        (19, 20)
+    } else {
+        return None;
+    };
+    Some(TextLengths { shortest, longest: Some(longest) })
+}
+
+/// The column `expr` holds to the text a SQLite `date`, `time` or
+/// `datetime` call answers, with the lengths of that text, when `expr` is
+/// `col IS call` or `col IS NOT DISTINCT FROM call`, either way around.
+///
+/// `=` admits any string the call answers `NULL` for, so it bounds nothing.
+fn formatted_column_lengths(expr: &Expr) -> Option<(&Ident, TextLengths)> {
+    let (Expr::BinaryOp { left, op: BinaryOperator::Is, right }
+    | Expr::IsNotDistinctFrom(left, right)) = unnested(expr)
+    else {
+        return None;
+    };
+    listed_column(left)
+        .zip(formatted_lengths(right))
+        .or_else(|| listed_column(right).zip(formatted_lengths(left)))
+}
+
 /// Whether equality under `collation` holds only between identical strings,
 /// so a listed literal fixes the characters of the value equal to it.
-fn equality_is_identity(collation: &ColumnCollation<'_>) -> bool {
+fn equality_is_identity(collation: &ColumnCollation<'_>, sqlite: bool) -> bool {
     match collation {
         ColumnCollation::DatabaseDefault => true,
         ColumnCollation::Named(named) => {
             named.postgres_deterministic() != Some(false)
                 && named.mysql_padding() != Some(MySqlCollationPadding::PadSpace)
+                && !(sqlite && named.name().name().eq_ignore_ascii_case("rtrim"))
         }
         ColumnCollation::Unknown => false,
     }
 }
 
-/// The lengths of the string literals `expr` holds a textual column of
-/// `check_constraint` to, when it admits no other string for that column,
-/// limited to `target_col` when given.
-fn admitted_literal_lengths<C>(
+/// The textual column of `check_constraint` that `expr` holds to listed string
+/// literals, to a `LIKE` or `GLOB` pattern, or to the text a SQLite `date`,
+/// `time` or `datetime` call answers, with the lengths of the strings it
+/// admits, limited to `target_col` when given.
+fn admitted_lengths<'expr, C>(
     database: &C::DB,
-    expr: &Expr,
+    expr: &'expr Expr,
     check_constraint: &C,
     target_col: Option<&str>,
-) -> Result<Option<ListedLengths>, LookupError>
+) -> Result<Option<(&'expr Ident, TextLengths)>, LookupError>
 where
     C: CheckConstraintLike,
 {
-    let Some((column, lengths)) = listed_literal_lengths(expr) else {
+    let sqlite = database.dialect().sqlparser_dialect().is::<SQLiteDialect>();
+    let Some((column, lengths)) = listed_literal_lengths(expr)
+        .or_else(|| pattern_lengths(expr))
+        .or_else(|| sqlite.then(|| formatted_column_lengths(expr)).flatten())
+    else {
         return Ok(None);
     };
     if target_col.is_some_and(|target| column.value != target) {
         return Ok(None);
     }
-    let Some(column) = check_constraint
+    let Some(checked) = check_constraint
         .columns(database)?
         .find(|candidate| {
             IdentifierCase::AsWritten.identifiers_match(
@@ -305,11 +436,11 @@ where
                 column.quote_style.is_some(),
             )
         })
-        .filter(|column| column.data_type(database).is_textual(database))
+        .filter(|candidate| candidate.data_type(database).is_textual(database))
     else {
         return Ok(None);
     };
-    Ok(equality_is_identity(&column.collation(database)?).then_some(lengths))
+    Ok(equality_is_identity(&checked.collation(database)?, sqlite).then_some((column, lengths)))
 }
 
 /// The direction of the length bound we are checking for.
@@ -319,6 +450,58 @@ enum BoundDirection {
     Lower,
     /// Strict maximum length (e.g. `LEN < 5` -> 5)
     Upper,
+}
+
+/// A length bound a check holds one column to.
+#[derive(Clone, Copy)]
+struct ColumnBound<'expr> {
+    column: &'expr Ident,
+    limit: usize,
+}
+
+/// Whether `left` and `right` name one column.
+fn same_column(left: &Ident, right: &Ident) -> bool {
+    IdentifierCase::AsWritten.identifiers_match(
+        &left.value,
+        left.quote_style.is_some(),
+        &right.value,
+        right.quote_style.is_some(),
+    )
+}
+
+impl BoundDirection {
+    /// The bound left when both `left` and `right` hold.
+    fn tighter<'expr>(
+        self,
+        left: ColumnBound<'expr>,
+        right: ColumnBound<'expr>,
+    ) -> ColumnBound<'expr> {
+        match self {
+            Self::Upper => core::cmp::min_by_key(left, right, |bound| bound.limit),
+            Self::Lower => core::cmp::max_by_key(left, right, |bound| bound.limit),
+        }
+    }
+
+    /// The bound left when either `left` or `right` holds.
+    fn looser<'expr>(
+        self,
+        left: ColumnBound<'expr>,
+        right: ColumnBound<'expr>,
+    ) -> ColumnBound<'expr> {
+        match self {
+            Self::Upper => core::cmp::max_by_key(left, right, |bound| bound.limit),
+            Self::Lower => core::cmp::min_by_key(left, right, |bound| bound.limit),
+        }
+    }
+
+    /// The bound a length comparison against `value` sets, `inclusive` when
+    /// the comparison admits `value` itself.
+    fn limit(self, value: usize, inclusive: bool) -> usize {
+        match (self, inclusive) {
+            (Self::Upper, true) | (Self::Lower, false) => value + 1,
+            (Self::Upper, false) | (Self::Lower, true) => value,
+        }
+    }
 }
 
 /// Helper to resolve the global bound for a column.
@@ -349,9 +532,13 @@ where
             direction,
         )? {
             bound_agg = match (bound_agg, direction) {
-                (Some(current), BoundDirection::Upper) => Some(core::cmp::min(current, bound)),
-                (Some(current), BoundDirection::Lower) => Some(core::cmp::max(current, bound)),
-                (None, _) => Some(bound),
+                (Some(current), BoundDirection::Upper) => {
+                    Some(core::cmp::min(current, bound.limit))
+                }
+                (Some(current), BoundDirection::Lower) => {
+                    Some(core::cmp::max(current, bound.limit))
+                }
+                (None, _) => Some(bound.limit),
             };
         }
     }
@@ -362,16 +549,16 @@ where
 
 /// Helper to extract length limit from an expression
 #[allow(clippy::too_many_arguments)]
-fn get_length_bound<C>(
+fn get_length_bound<'expr, C>(
     database: &C::DB,
-    func_expr: &Expr,
+    func_expr: &'expr Expr,
     op: &BinaryOperator,
     val_expr: &Expr,
     check_constraint: &C,
     target_col: Option<&str>,
     visited_cols: &mut Vec<String>,
     direction: BoundDirection,
-) -> Result<Option<usize>, LookupError>
+) -> Result<Option<ColumnBound<'expr>>, LookupError>
 where
     C: CheckConstraintLike,
 {
@@ -380,7 +567,8 @@ where
         (BoundDirection::Upper, BinaryOperator::Lt)
         | (BoundDirection::Lower, BinaryOperator::Gt) => false,
         (BoundDirection::Upper, BinaryOperator::LtEq)
-        | (BoundDirection::Lower, BinaryOperator::GtEq) => true,
+        | (BoundDirection::Lower, BinaryOperator::GtEq)
+        | (_, BinaryOperator::Eq) => true,
         _ => return Ok(None),
     };
 
@@ -426,10 +614,10 @@ where
         && let Value::Number(num_str, _) = &val.value
         && let Ok(limit) = num_str.parse::<usize>()
     {
-        return Ok(match direction {
-            BoundDirection::Upper => Some(if is_inclusive { limit + 1 } else { limit }),
-            BoundDirection::Lower => Some(if is_inclusive { limit } else { limit + 1 }),
-        });
+        return Ok(Some(ColumnBound {
+            column: col_ident,
+            limit: direction.limit(limit, is_inclusive),
+        }));
     }
 
     // Case 2: Another Function Call (Transitive Check)
@@ -464,10 +652,10 @@ where
                     visited_cols,
                     direction,
                 )? {
-                    return Ok(match direction {
-                        BoundDirection::Upper => Some(if is_inclusive { limit + 1 } else { limit }),
-                        BoundDirection::Lower => Some(if is_inclusive { limit } else { limit + 1 }),
-                    });
+                    return Ok(Some(ColumnBound {
+                        column: col_ident,
+                        limit: direction.limit(limit, is_inclusive),
+                    }));
                 }
             }
         }
@@ -478,22 +666,24 @@ where
 
 /// Helper function to recursively determine the bound of a text length
 /// constraint.
-fn check_text_length_bound_recursive<C>(
+fn check_text_length_bound_recursive<'expr, C>(
     database: &C::DB,
-    expr: &Expr,
+    expr: &'expr Expr,
     check_constraint: &C,
     target_col: Option<&str>,
     visited_cols: &mut Vec<String>,
     direction: BoundDirection,
-) -> Result<Option<usize>, LookupError>
+) -> Result<Option<ColumnBound<'expr>>, LookupError>
 where
     C: CheckConstraintLike,
 {
-    if let Some(lengths) = admitted_literal_lengths(database, expr, check_constraint, target_col)? {
-        return Ok(Some(match direction {
-            BoundDirection::Upper => lengths.longest + 1,
-            BoundDirection::Lower => lengths.shortest,
-        }));
+    if let Some((column, lengths)) = admitted_lengths(database, expr, check_constraint, target_col)?
+    {
+        let limit = match direction {
+            BoundDirection::Upper => lengths.longest.map(|longest| longest + 1),
+            BoundDirection::Lower => Some(lengths.shortest),
+        };
+        return Ok(limit.map(|limit| ColumnBound { column, limit }));
     }
     match expr {
         Expr::BinaryOp { left, op, right } => {
@@ -529,7 +719,7 @@ where
             }
 
             if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
-                let l = check_text_length_bound_recursive(
+                let left = check_text_length_bound_recursive(
                     database,
                     left,
                     check_constraint,
@@ -537,7 +727,7 @@ where
                     visited_cols,
                     direction,
                 )?;
-                let r = check_text_length_bound_recursive(
+                let right = check_text_length_bound_recursive(
                     database,
                     right,
                     check_constraint,
@@ -545,19 +735,18 @@ where
                     visited_cols,
                     direction,
                 )?;
-                return Ok(match (op, l, r, direction) {
-                    // AND + Upper: Minimize (most restrictive limit)
-                    // OR + Lower: Minimize (least restrictive minimum)
-                    (BinaryOperator::And, Some(a), Some(b), BoundDirection::Upper)
-                    | (BinaryOperator::Or, Some(a), Some(b), BoundDirection::Lower) => {
-                        Some(core::cmp::min(a, b))
+                return Ok(match (op, left, right) {
+                    (BinaryOperator::And, Some(left), Some(right)) => {
+                        Some(direction.tighter(left, right))
                     }
-                    // AND + Lower: Maximize (most restrictive minimum)
-                    (BinaryOperator::And, Some(a), Some(b), BoundDirection::Lower) => {
-                        Some(core::cmp::max(a, b))
+                    (BinaryOperator::And, bound, None) | (BinaryOperator::And, None, bound) => {
+                        bound
                     }
-                    (BinaryOperator::And, Some(a), None, _) => Some(a),
-                    (BinaryOperator::And, None, Some(b), _) => Some(b),
+                    (BinaryOperator::Or, Some(left), Some(right))
+                        if same_column(left.column, right.column) =>
+                    {
+                        Some(direction.looser(left, right))
+                    }
                     _ => None,
                 });
             }
@@ -593,20 +782,20 @@ where
     }
 }
 
-/// Whether `length <op> limit` holds a textual column of `check_constraint`
-/// to a length of at least one, `limit` being a number literal.
-fn requires_nonzero_length<C>(
+/// The textual column of `check_constraint` that `length <op> limit` holds to
+/// a length of at least one, `limit` being a number literal.
+fn nonzero_length_column<'expr, C>(
     database: &C::DB,
-    length: &Expr,
+    length: &'expr Expr,
     op: &BinaryOperator,
     limit: &Expr,
     check_constraint: &C,
-) -> Result<bool, LookupError>
+) -> Result<Option<&'expr Ident>, LookupError>
 where
     C: CheckConstraintLike,
 {
     if !matches!(limit, Expr::Value(_)) {
-        return Ok(false);
+        return Ok(None);
     }
     Ok(get_length_bound(
         database,
@@ -618,23 +807,24 @@ where
         &mut Vec::new(),
         BoundDirection::Lower,
     )?
-    .is_some_and(|bound| bound >= 1))
+    .filter(|bound| bound.limit >= 1)
+    .map(|bound| bound.column))
 }
 
-/// Helper function to recursively determine if an expression checks for a
-/// not-empty text constraint.
-fn check_not_empty_text_recursive<C>(
+/// The textual column of `check_constraint` for which `expr` rejects the
+/// empty string.
+fn not_empty_text_column<'expr, C>(
     database: &C::DB,
-    expr: &Expr,
+    expr: &'expr Expr,
     check_constraint: &C,
-) -> Result<bool, LookupError>
+) -> Result<Option<&'expr Ident>, LookupError>
 where
     C: CheckConstraintLike,
 {
-    if admitted_literal_lengths(database, expr, check_constraint, None)?
-        .is_some_and(|lengths| lengths.shortest > 0)
+    if let Some((column, lengths)) = admitted_lengths(database, expr, check_constraint, None)?
+        && lengths.shortest > 0
     {
-        return Ok(true);
+        return Ok(Some(column));
     }
     match expr {
         Expr::BinaryOp { left, op, right } => {
@@ -650,35 +840,45 @@ where
                             .column(database, &ident.value, IdentifierCase::AsWritten)?
                             .is_some_and(|c| c.data_type(database).is_textual(database))
                     {
-                        return Ok(true);
+                        return Ok(Some(ident));
                     }
                 }
             }
 
-            if requires_nonzero_length(database, left, op, right, check_constraint)?
-                || requires_nonzero_length(
-                    database,
-                    right,
-                    &swap_cmp_op(op),
-                    left,
-                    check_constraint,
-                )?
+            if let Some(column) =
+                nonzero_length_column(database, left, op, right, check_constraint)?
             {
-                return Ok(true);
+                return Ok(Some(column));
+            }
+            if let Some(column) =
+                nonzero_length_column(database, right, &swap_cmp_op(op), left, check_constraint)?
+            {
+                return Ok(Some(column));
             }
 
-            if matches!(op, BinaryOperator::And) {
-                return Ok(check_not_empty_text_recursive(database, left, check_constraint)?
-                    || check_not_empty_text_recursive(database, right, check_constraint)?);
+            match op {
+                BinaryOperator::And => {
+                    if let Some(column) = not_empty_text_column(database, left, check_constraint)? {
+                        return Ok(Some(column));
+                    }
+                    not_empty_text_column(database, right, check_constraint)
+                }
+                BinaryOperator::Or => {
+                    let left = not_empty_text_column(database, left, check_constraint)?;
+                    let right = not_empty_text_column(database, right, check_constraint)?;
+                    Ok(left
+                        .zip(right)
+                        .filter(|(left, right)| same_column(left, right))
+                        .map(|(left, _)| left))
+                }
+                _ => Ok(None),
             }
-
-            Ok(false)
         }
-        Expr::Nested(inner) => check_not_empty_text_recursive(database, inner, check_constraint),
+        Expr::Nested(inner) => not_empty_text_column(database, inner, check_constraint),
         Expr::Between { expr, negated: false, low, .. } => {
-            requires_nonzero_length(database, expr, &BinaryOperator::GtEq, low, check_constraint)
+            nonzero_length_column(database, expr, &BinaryOperator::GtEq, low, check_constraint)
         }
-        _ => Ok(false),
+        _ => Ok(None),
     }
 }
 
@@ -1378,6 +1578,7 @@ pub trait CheckConstraintLike:
             let Some(upper) = upper else {
                 continue;
             };
+            let upper = upper.limit;
             let mut visited_cols = Vec::new();
             let lower = check_text_length_bound_recursive(
                 database,
@@ -1389,7 +1590,7 @@ pub trait CheckConstraintLike:
             )?;
             // upper is the exclusive upper bound and lower the inclusive
             // lower bound, so lower >= upper leaves no accepted length
-            if lower.is_some_and(|lower| lower >= upper) {
+            if lower.is_some_and(|lower| lower.limit >= upper) {
                 return Ok(true);
             }
         }
@@ -1465,17 +1666,26 @@ pub trait CheckConstraintLike:
 
     /// Returns whether the check constraint checks that a textual column is not
     /// empty (i.e., `col <> ''` or `col != ''`), holds its length to at least
-    /// one by a number literal (`length(col) >= 1`, `length(col) > 0` or
-    /// `length(col) BETWEEN 1 AND n`), or holds it to listed string literals
-    /// none of which is `''`.
+    /// one by a number literal (`length(col) >= 1`, `length(col) > 0`,
+    /// `length(col) = n` or `length(col) BETWEEN 1 AND n`), holds it to listed
+    /// string literals none of which is `''`, or matches it against a pattern
+    /// needing at least one character. An `OR` rejects the empty string when
+    /// each of its arms rejects it for the same column.
     ///
     /// The listed forms are `col IN ('x', ...)`, `col = ANY (ARRAY['x', ...])`
-    /// and an `OR` of `col = 'x'` equalities, read through casts to `TEXT` or
-    /// to a `VARCHAR` without a length, and without a `COLLATE`. They count
-    /// only when the column's collation equates identical strings alone, so not
-    /// under a PostgreSQL collation known to be nondeterministic, a MySQL
-    /// `PAD SPACE` collation, or a comparison rule the column changes without
-    /// naming it.
+    /// and an `OR` of `col = 'x'` equalities. The patterns are `col LIKE 'p'`,
+    /// with an optional one-character `ESCAPE`, and SQLite's `col GLOB 'p'`. A
+    /// `LIKE` pattern counts only without a `[` and, lacking an `ESCAPE`,
+    /// without a backslash, since dialects read those characters differently.
+    /// Under SQLite, `col IS date(...)` or `col IS NOT DISTINCT FROM
+    /// date(...)` holds the column to what a one-argument `date`, `time` or
+    /// `datetime` call answers, 10 or 11, 8, and 19 or 20 characters, a year
+    /// before 1 taking a leading `-`. All of them are read through casts to
+    /// `TEXT` or to a `VARCHAR` without a length, and without a `COLLATE`.
+    /// They count only when the column's collation equates identical strings
+    /// alone, so not under a PostgreSQL collation known to be
+    /// nondeterministic, a MySQL `PAD SPACE` collation, SQLite's `RTRIM`, or
+    /// a comparison rule the column changes without naming it.
     ///
     /// # Arguments
     ///
@@ -1515,7 +1725,7 @@ pub trait CheckConstraintLike:
     /// assert!(!cc2.is_not_empty_text_constraint(&db)?);
     /// assert!(cc3.is_not_empty_text_constraint(&db)?);
     /// assert!(cc4.is_not_empty_text_constraint(&db)?);
-    /// assert!(!cc5.is_not_empty_text_constraint(&db)?);
+    /// assert!(cc5.is_not_empty_text_constraint(&db)?);
     /// assert!(cc6.is_not_empty_text_constraint(&db)?);
     /// assert!(!cc7.is_not_empty_text_constraint(&db)?);
     /// assert!(cc8.is_not_empty_text_constraint(&db)?);
@@ -1524,7 +1734,7 @@ pub trait CheckConstraintLike:
     /// ```
     fn is_not_empty_text_constraint(&self, database: &Self::DB) -> Result<bool, LookupError> {
         let expr = self.expression(database);
-        check_not_empty_text_recursive(database, expr, self)
+        Ok(not_empty_text_column(database, expr, self)?.is_some())
     }
 
     /// Returns the upper bound of a text length constraint if the constraint
@@ -1533,11 +1743,19 @@ pub trait CheckConstraintLike:
     /// The returned value is the first non-accepted length (i.e., the strict
     /// upper bound).
     /// - `length(col) < N` returns `Some(N)`
-    /// - `length(col) <= N` returns `Some(N + 1)`
+    /// - `length(col) <= N` and `length(col) = N` return `Some(N + 1)`
     /// - `length(col) BETWEEN M AND N` returns `Some(N + 1)`
     /// - `col IN ('ab', 'abc')` returns `Some(4)`, one past the longest listed
-    ///   literal in characters, under the forms and collations
-    ///   [`Self::is_not_empty_text_constraint`] reads
+    ///   literal in characters
+    /// - `col LIKE 'a_c'` and `col GLOB '[0-9]?c'` return `Some(4)`, one past
+    ///   the width of a pattern holding no `%` or `*`
+    /// - under SQLite, `col IS date(...)` returns `Some(12)`, one past the
+    ///   longest text the call answers
+    /// - an `OR` returns the largest bound of its arms when each arm bounds the
+    ///   same column
+    ///
+    /// Listed literals and patterns count under the forms and collations
+    /// [`Self::is_not_empty_text_constraint`] reads.
     ///
     /// # Arguments
     ///
@@ -1587,7 +1805,7 @@ pub trait CheckConstraintLike:
     /// assert_eq!(cc5.is_upper_bounded_text_constraint(&db)?, Some(5));
     /// assert_eq!(cc6.is_upper_bounded_text_constraint(&db)?, None);
     /// assert_eq!(cc7.is_upper_bounded_text_constraint(&db)?, Some(10));
-    /// assert_eq!(cc8.is_upper_bounded_text_constraint(&db)?, None);
+    /// assert_eq!(cc8.is_upper_bounded_text_constraint(&db)?, Some(10));
     /// assert_eq!(cc9.is_upper_bounded_text_constraint(&db)?, None);
     /// assert_eq!(cc10.is_upper_bounded_text_constraint(&db)?, None);
     /// assert_eq!(cc11.is_upper_bounded_text_constraint(&db)?, Some(10));
@@ -1600,14 +1818,15 @@ pub trait CheckConstraintLike:
     ) -> Result<Option<usize>, LookupError> {
         let expr = self.expression(database);
         let mut visited_cols = Vec::new();
-        check_text_length_bound_recursive(
+        Ok(check_text_length_bound_recursive(
             database,
             expr,
             self,
             None,
             &mut visited_cols,
             BoundDirection::Upper,
-        )
+        )?
+        .map(|bound| bound.limit))
     }
 
     /// Returns the lower bound of a text length constraint if the constraint
@@ -1616,11 +1835,19 @@ pub trait CheckConstraintLike:
     /// The returned value is the inclusive lower bound (i.e., the minimum
     /// accepted length).
     /// - `length(col) > N` returns `Some(N + 1)`
-    /// - `length(col) >= N` returns `Some(N)`
+    /// - `length(col) >= N` and `length(col) = N` return `Some(N)`
     /// - `length(col) BETWEEN N AND M` returns `Some(N)`
     /// - `col IN ('ab', 'abc')` returns `Some(2)`, the shortest listed literal
-    ///   in characters, under the forms and collations
-    ///   [`Self::is_not_empty_text_constraint`] reads
+    ///   in characters
+    /// - `col LIKE 'ab%'` and `col GLOB 'ab*'` return `Some(2)`, the characters
+    ///   the pattern needs
+    /// - under SQLite, `col IS date(...)` returns `Some(10)`, the shortest text
+    ///   the call answers
+    /// - an `OR` returns the smallest bound of its arms when each arm bounds
+    ///   the same column
+    ///
+    /// Listed literals and patterns count under the forms and collations
+    /// [`Self::is_not_empty_text_constraint`] reads.
     ///
     /// # Arguments
     ///
@@ -1673,14 +1900,15 @@ pub trait CheckConstraintLike:
     ) -> Result<Option<usize>, LookupError> {
         let expr = self.expression(database);
         let mut visited_cols = Vec::new();
-        check_text_length_bound_recursive(
+        Ok(check_text_length_bound_recursive(
             database,
             expr,
             self,
             None,
             &mut visited_cols,
             BoundDirection::Lower,
-        )
+        )?
+        .map(|bound| bound.limit))
     }
 }
 
