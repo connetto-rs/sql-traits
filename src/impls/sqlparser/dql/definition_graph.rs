@@ -264,8 +264,8 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                         ResultColumnType::RowType(column) => {
                             FunctionResultType::RowType(ColumnDefinitionRef::new(self, *column))
                         }
-                        ResultColumnType::Attribute(data_type, database) => {
-                            FunctionResultType::Attribute { data_type, database }
+                        ResultColumnType::Attribute(field, database) => {
+                            FunctionResultType::Attribute { field, database }
                         }
                         ResultColumnType::DefinitionList(data_type) => {
                             FunctionResultType::DefinitionList(data_type.get())
@@ -612,8 +612,8 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                         PgType::parse(name).is_some_and(|declared| names_array(&declared))
                     }
                     ResultColumnType::RowType(column) => self.defines_array(*column, database)?,
-                    ResultColumnType::Attribute(data_type, database) => {
-                        data_type.array_element(database).is_some()
+                    ResultColumnType::Attribute(field, database) => {
+                        field.data_type().array_element(database).is_some()
                     }
                     ResultColumnType::DefinitionList(data_type) => {
                         PgType::of(data_type.get()).element().is_some()

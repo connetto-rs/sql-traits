@@ -23,7 +23,7 @@ use crate::support::query_parsing::query_with;
 const SCHEMA: &str = "
     CREATE TABLE notes (id INT PRIMARY KEY, label VARCHAR(12) NOT NULL);
     CREATE VIEW labels AS SELECT label, id + 1 AS next_id FROM notes;
-    CREATE TYPE pair AS (left_side INT, right_side TEXT);
+    CREATE TYPE pair AS (left_side INT, right_side TEXT COLLATE \"C\");
     CREATE DOMAIN positive AS INT CHECK (VALUE > 0);
     CREATE FUNCTION held_notes() RETURNS TABLE (note_id INT, label TEXT)
         LANGUAGE sql AS $$ SELECT id, label FROM notes $$;
@@ -86,8 +86,14 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
                 FunctionResultType::RowType(column) => {
                     format!("row {}", describe(&column.definition()))
                 }
-                FunctionResultType::Attribute { data_type, database } => {
-                    format!("attribute {}", data_type.name(database))
+                FunctionResultType::Attribute { field, database } => {
+                    let data_type = field.data_type().name(database);
+                    match field.collation() {
+                        ColumnCollation::Named(collation) => {
+                            format!("attribute {data_type} COLLATE {}", collation.name().name())
+                        }
+                        _ => format!("attribute {data_type}"),
+                    }
                 }
                 FunctionResultType::DefinitionList(data_type) => format!("listed {data_type}"),
             };
@@ -236,9 +242,41 @@ fn a_row_type_result_exposes_the_columns_of_its_type() {
         columns("one_pair()"),
         named(&[
             ("left_side", "one_pair attribute INT"),
-            ("right_side", "one_pair attribute TEXT")
+            ("right_side", "one_pair attribute TEXT COLLATE C")
         ])
     );
+}
+
+/// A column of a composite attribute declared with `COLLATE` keeps the
+/// collation and the facts the type resolved when it was declared, as
+/// PostgreSQL hands the attribute's `attcollation` to the column.
+#[test]
+fn a_composite_attribute_column_keeps_its_collation() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TYPE labelled AS (label TEXT COLLATE \"C\");
+         CREATE FUNCTION labels() RETURNS SETOF labelled LANGUAGE sql AS $$ SELECT 'a'::text $$;",
+    )
+    .expect("schema parses");
+    let query = query("SELECT l.label FROM labels() AS l");
+    let scope =
+        ColumnScope::from_query(&query, &database, IdentifierCase::Folded).expect("scope builds");
+    let reference = Expr::CompoundIdentifier(vec![Ident::new("l"), Ident::new("label")]);
+    let Some((
+        ColumnDefinition::FunctionResult {
+            data_type: FunctionResultType::Attribute { field, database: holding },
+            ..
+        },
+        _,
+    )) = scope.resolve_column_binding(&reference).expect("lookup succeeds")
+    else {
+        panic!("`l.label` resolves to an attribute of the composite result");
+    };
+    assert_eq!((field.name(), field.data_type().name(holding)), (Some("label"), "TEXT".into()));
+    let ColumnCollation::Named(collation) = field.collation() else {
+        panic!("a declared COLLATE names the collation");
+    };
+    assert_eq!(collation.name().name(), "C");
+    assert_eq!(collation.postgres_deterministic(), Some(true));
 }
 
 #[test]

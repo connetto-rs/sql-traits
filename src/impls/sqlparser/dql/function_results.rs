@@ -23,8 +23,8 @@ use crate::{
     errors::LookupError,
     structs::{FunctionKind, IdentifierCase, TargetName, TypeKind, WrittenCall},
     traits::{
-        ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike, UserDefinedTypeKind,
-        UserDefinedTypeLike,
+        ColumnLike, DatabaseLike, FunctionLike, Relation, StructuredField, TableLike,
+        UserDefinedTypeKind, UserDefinedTypeLike,
     },
     utils::{object_name::type_search_path, postgres_types::PgType},
 };
@@ -41,9 +41,10 @@ pub(super) enum ResultColumnType<'query, 'db, DB: DatabaseLike, D> {
     /// A column of the relation whose row type the function returns, by the
     /// column's definition.
     RowType(D),
-    /// An attribute of the composite type the function returns, by its
-    /// declared type, with the database holding the type.
-    Attribute(&'db DB::DataType, &'db DB),
+    /// An attribute of the composite type the function returns, as a field
+    /// carrying its declared type and collation, with the database holding
+    /// the type.
+    Attribute(StructuredField<'db, DB::DataType>, &'db DB),
     /// A type the column definition list of the call declares.
     DefinitionList(AstRef<'query, 'db, DataType>),
 }
@@ -317,13 +318,13 @@ where
                 type_.kind() == UserDefinedTypeKind::Composite
                     && holds_type(*type_, &target, deriving.case)
             })
-            .and_then(UserDefinedTypeLike::attributes)
+            .and_then(|type_| type_.attributes(database))
         {
-            let columns = attributes.map(|(name, data_type)| {
-                let data_type = ResultColumnType::Attribute(data_type, database);
-                (name.name().to_owned(), name.name_is_quoted(), data_type)
+            let columns = attributes.map(|field| {
+                let (name, quoted) = (field.name()?.to_owned(), field.name_is_quoted());
+                Some((name, quoted, ResultColumnType::Attribute(field, database)))
             });
-            return Ok(Some(columns.collect()));
+            return Ok(columns.collect());
         }
     }
     Ok(None)

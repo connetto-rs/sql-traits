@@ -16,7 +16,7 @@ use crate::{
         scoped_roots::{ScopedRoot, scoped_graph},
     },
     structs::{ExpressionScope, IdentifierCase, PlPgSqlVariable},
-    traits::DatabaseLike,
+    traits::{DatabaseLike, StructuredField},
 };
 
 /// The definition that determines one resolved column's declared type.
@@ -112,10 +112,11 @@ pub enum FunctionResultType<'scope, 'query, 'db, DB: DatabaseLike> {
     /// The type of a column of the relation whose row type the function
     /// returns, as that column's own definition declares it.
     RowType(ColumnDefinitionRef<'scope, 'query, 'db, DB>),
-    /// The type of an attribute of the composite type the function returns.
+    /// An attribute of the composite type the function returns.
     Attribute {
-        /// The attribute's declared type.
-        data_type: &'scope DB::DataType,
+        /// The attribute, with its declared type and the collation it
+        /// declares.
+        field: &'scope StructuredField<'db, DB::DataType>,
         /// The database holding the composite type.
         database: &'scope DB,
     },
