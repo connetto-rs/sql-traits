@@ -21,24 +21,6 @@ impl DeclaredColumn {
         Self { name: name.into(), declared_type: declared_type.into(), hidden }
     }
 
-    /// Returns the column name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Returns the declared type as written, empty for an untyped column.
-    #[must_use]
-    pub fn declared_type(&self) -> &str {
-        &self.declared_type
-    }
-
-    /// Returns whether `SELECT *` leaves the column out.
-    #[must_use]
-    pub const fn is_hidden(&self) -> bool {
-        self.hidden
-    }
-
     /// Moves out the name, the declared type and the hidden flag.
     pub(crate) fn into_parts(self) -> (String, String, bool) {
         (self.name, self.declared_type, self.hidden)
@@ -94,18 +76,6 @@ impl DeclaredVirtualTable {
             columns: columns.into_iter().collect(),
             shadow_suffixes: shadow_suffixes.into_iter().map(Into::into).collect(),
         }
-    }
-
-    /// Returns the columns, in declaration order.
-    #[must_use]
-    pub fn columns(&self) -> &[DeclaredColumn] {
-        &self.columns
-    }
-
-    /// Returns the suffixes of the shadow tables the module keeps.
-    #[must_use]
-    pub fn shadow_suffixes(&self) -> &[String] {
-        &self.shadow_suffixes
     }
 
     /// Moves out the columns and the shadow suffixes.
