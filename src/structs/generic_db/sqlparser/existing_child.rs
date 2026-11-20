@@ -42,11 +42,9 @@ fn refuse_column(
     child_node: &CreateTable,
 ) -> Result<(), ChildMismatch> {
     let column_name = parent_column.name.value.clone();
-    let Some(column) = child_node
-        .columns
-        .iter()
-        .find(|held| inheritance::same_column(&held.name, &parent_column.name))
-    else {
+    let Some(column) = child_node.columns.iter().find(|held| {
+        super::case_idents_match(&held.name, &parent_column.name, builder.identifier_case())
+    }) else {
         return Err(ChildMismatch::MissingColumn { column_name });
     };
     if inheritance::types_conflict(builder, &parent_column.data_type, &column.data_type) {
@@ -91,33 +89,37 @@ struct HeldCheck {
 
 /// Every check the table holds.
 fn checks_of(builder: &ParserDBBuilder, table: &StoredTable, node: &CreateTable) -> Vec<HeldCheck> {
-    constraint_names::names(node, super::generated_constraint_names(builder, table))
-        .into_iter()
-        .filter_map(|(slot, name)| {
-            let name = name.map(Cow::into_owned);
-            match slot {
-                Slot::Column { held, .. } => {
-                    let ColumnOption::Check(check) = &held.option else {
-                        return None;
-                    };
-                    let mut check = check.clone();
-                    check.name = check.name.or_else(|| held.name.clone());
-                    Some(HeldCheck { check, validated: true, name, in_constraint_list: false })
-                }
-                Slot::Table(_, constraint) => {
-                    let TableConstraint::Check(check) = constraint else {
-                        return None;
-                    };
-                    Some(HeldCheck {
-                        check: check.clone(),
-                        validated: constraint_validity::is_validated(builder, table, constraint),
-                        name,
-                        in_constraint_list: true,
-                    })
-                }
+    constraint_names::names(
+        node,
+        super::generated_constraint_names(builder, table),
+        builder.identifier_case(),
+    )
+    .into_iter()
+    .filter_map(|(slot, name)| {
+        let name = name.map(Cow::into_owned);
+        match slot {
+            Slot::Column { held, .. } => {
+                let ColumnOption::Check(check) = &held.option else {
+                    return None;
+                };
+                let mut check = check.clone();
+                check.name = check.name.or_else(|| held.name.clone());
+                Some(HeldCheck { check, validated: true, name, in_constraint_list: false })
             }
-        })
-        .collect()
+            Slot::Table(_, constraint) => {
+                let TableConstraint::Check(check) = constraint else {
+                    return None;
+                };
+                Some(HeldCheck {
+                    check: check.clone(),
+                    validated: constraint_validity::is_validated(builder, table, constraint),
+                    name,
+                    in_constraint_list: true,
+                })
+            }
+        }
+    })
+    .collect()
 }
 
 /// Finds the child's own copy of each check the parent passes down, refusing a

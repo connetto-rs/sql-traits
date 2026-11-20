@@ -29,6 +29,7 @@ use super::{
 };
 use crate::{
     errors::Error,
+    structs::IdentifierCase,
     traits::TableLike,
     utils::{identifier_resolution::stored_ident_name, is_identity, walk::walk_expressions_mut},
 };
@@ -450,17 +451,18 @@ pub(super) fn receives_column_constraint(
     written_on: &Ident,
     option: &ColumnOptionDef,
 ) -> bool {
+    let case = builder.identifier_case();
     parents_with_kind(child).any(|(kind, name)| {
         option_passes_down(kind, &option.option)
             && builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
                 parent.columns.iter().any(|declared| {
-                    same_column(&declared.name, written_on)
+                    super::case_idents_match(&declared.name, written_on, case)
                         && declared.options.iter().any(|held| is_copy_of_option(option, held))
                 })
             })
     }) || super::constraint_names::slots(child).into_iter().any(|slot| {
         matches!(slot, super::constraint_names::Slot::Column { def, held, .. }
-            if same_column(&def.name, written_on) && held == option)
+            if super::case_idents_match(&def.name, written_on, case) && held == option)
             && super::constraint_names::receives_check(builder, child, slot)
     })
 }
@@ -475,29 +477,20 @@ pub(super) fn receives_column_constraint(
 pub(super) fn requires_a_value(
     builder: &ParserDBBuilder,
     child: &CreateTable,
-    column: &str,
+    column: &Ident,
 ) -> bool {
+    let case = builder.identifier_case();
     parents_with_kind(child).any(|(_, name)| {
         builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
             parent.columns.iter().any(|declared| {
-                super::identifiers_match(
-                    declared.name.value.as_str(),
-                    declared.name.quote_style.is_some(),
-                    column,
-                    false,
-                ) && declared
-                    .options
-                    .iter()
-                    .any(|option| matches!(option.option, ColumnOption::NotNull))
+                super::case_idents_match(&declared.name, column, case)
+                    && declared
+                        .options
+                        .iter()
+                        .any(|option| matches!(option.option, ColumnOption::NotNull))
             }) || parent.constraints.iter().any(|constraint| {
                 matches!(constraint, TableConstraint::NotNull(not_null)
-                if !not_null.no_inherit
-                && super::identifiers_match(
-                    &not_null.column.value,
-                    not_null.column.quote_style.is_some(),
-                    column,
-                    false,
-                ))
+                if !not_null.no_inherit && super::case_idents_match(&not_null.column, column, case))
             })
         })
     })
@@ -646,16 +639,6 @@ pub(super) fn types_conflict(
         (Some(parent), Some(child)) => parent != child,
         _ => false,
     }
-}
-
-/// Whether the two column names denote the same column.
-pub(super) fn same_column(left: &Ident, right: &Ident) -> bool {
-    super::identifiers_match(
-        left.value.as_str(),
-        left.quote_style.is_some(),
-        right.value.as_str(),
-        right.quote_style.is_some(),
-    )
 }
 
 /// Whether a parent linked by this spelling passes the constraint down.
@@ -893,12 +876,14 @@ pub(super) fn collations_conflict(
     (parent, parent_column): (&CreateTable, &ColumnDef),
     (child, child_column): (&CreateTable, &ColumnDef),
 ) -> bool {
+    let case = builder.identifier_case();
     let metadata = |table: &CreateTable, column: &ColumnDef| {
         builder
             .columns()
             .iter()
             .find(|(stored, _, _)| {
-                stored.table() == table && same_column(&stored.attribute().name, &column.name)
+                stored.table() == table
+                    && super::case_idents_match(&stored.attribute().name, &column.name, case)
             })
             .map(|(_, metadata, _)| metadata)
     };
@@ -918,7 +903,12 @@ fn inherited_column_metadata(
         .columns()
         .iter()
         .find(|(stored, _, _)| {
-            stored.table() == parent && same_column(&stored.attribute().name, &source.name)
+            stored.table() == parent
+                && super::case_idents_match(
+                    &stored.attribute().name,
+                    &source.name,
+                    builder.identifier_case(),
+                )
         })
         .map(|(_, metadata, _)| {
             super::PreservedColumnMetadata {
@@ -934,9 +924,10 @@ fn inherited_column_metadata(
 fn inherited_column_metadata_for<'a>(
     column: &Ident,
     metadata: &'a [super::PreservedColumnMetadata],
+    case: IdentifierCase,
 ) -> Option<&'a super::PreservedColumnMetadata> {
     metadata.iter().find(|metadata| {
-        super::identifiers_match(
+        case.identifiers_match(
             &metadata.column_name,
             metadata.column_name_quoted,
             &column.value,
@@ -1037,6 +1028,8 @@ fn merge_local_columns(
     columns: &mut Vec<ColumnDef>,
     column_metadata: &[super::PreservedColumnMetadata],
 ) -> Result<(), Error> {
+    let case = context.builder.identifier_case();
+    let same_column = |left: &Ident, right: &Ident| super::case_idents_match(left, right, case);
     for (index, column) in local_columns.iter().enumerate() {
         // Merging would fold a repeated entry into one column, which
         // PostgreSQL refuses before it reaches any parent.
@@ -1061,7 +1054,7 @@ fn merge_local_columns(
             }
             if !is_options_only(column)
                 && let Some(inherited_metadata) =
-                    inherited_column_metadata_for(&column.name, column_metadata)
+                    inherited_column_metadata_for(&column.name, column_metadata, case)
                 && let Some(error) = local_collation_conflict(context, column, inherited_metadata)?
             {
                 return Err(error);
@@ -1145,7 +1138,8 @@ fn copy_parent_constraint(
 ) -> Result<(), Error> {
     if let TableConstraint::NotNull(not_null) = constraint
         && create_table.columns.iter().any(|declared| {
-            same_column(&declared.name, &not_null.column) && super::states_not_null(declared)
+            super::case_idents_match(&declared.name, &not_null.column, builder.identifier_case())
+                && super::states_not_null(declared)
         })
     {
         return Ok(());
@@ -1189,6 +1183,7 @@ fn apply_not_null_options(
     child_name: &str,
     columns: &mut [ColumnDef],
 ) -> Result<(), Error> {
+    let case = builder.identifier_case();
     for (kind, parent_name) in parents {
         let parent = resolve_parent(builder, parent_name, child_name)?;
         for constraint in &parent.constraints {
@@ -1199,7 +1194,7 @@ fn apply_not_null_options(
                 continue;
             }
             for column in columns.iter_mut() {
-                if same_column(&column.name, &not_null.column)
+                if super::case_idents_match(&column.name, &not_null.column, case)
                     && !column
                         .options
                         .iter()
@@ -1259,6 +1254,7 @@ pub(super) fn apply_parents(
 
     let context =
         ParentApplication::new(builder, &parents, &child_name, collations, catalog, &search_path);
+    let case = builder.identifier_case();
 
     for (kind, parent_name) in &parents {
         let parent = resolve_parent(builder, parent_name, &child_name)?;
@@ -1266,7 +1262,8 @@ pub(super) fn apply_parents(
         for column in &parent.columns {
             // A second parent declaring the same column merges into the one
             // already taken, keeping the position the first parent gave it.
-            if !columns.iter().any(|held| same_column(&held.name, &column.name)) {
+            if !columns.iter().any(|held| super::case_idents_match(&held.name, &column.name, case))
+            {
                 let inherited = inherited_column(builder, *kind, create_table, column, &mut taken);
                 if let Some(metadata) =
                     inherited_column_metadata(builder, parent, column, &inherited)
@@ -1275,7 +1272,7 @@ pub(super) fn apply_parents(
                 }
                 columns.push(inherited);
             } else if let Some(inherited_metadata) =
-                inherited_column_metadata_for(&column.name, &column_metadata)
+                inherited_column_metadata_for(&column.name, &column_metadata, case)
                 && let Some(incoming_metadata) =
                     inherited_column_metadata(builder, parent, column, column)
                 && let Some(error) = inherited_collation_conflict(
@@ -1307,7 +1304,7 @@ pub(super) fn apply_parents(
 
     column_metadata.retain(|metadata| {
         !local_collations.iter().any(|local| {
-            super::identifiers_match(
+            case.identifiers_match(
                 &metadata.column_name,
                 metadata.column_name_quoted,
                 &local.value,
@@ -1323,7 +1320,9 @@ pub(super) fn apply_parents(
         columns: columns
             .iter()
             .map(|column| &column.name)
-            .filter(|name| !local.iter().any(|declared| same_column(declared, name)))
+            .filter(|name| {
+                !local.iter().any(|declared| super::case_idents_match(declared, name, case))
+            })
             .map(|name| name.value.clone())
             .collect(),
         constraints: constraints.iter().map(TableConstraint::to_string).collect(),
@@ -1422,7 +1421,12 @@ fn parent_owning(
     parents
         .iter()
         .filter_map(|(_, name)| builder.resolve_bound_table_name(name).ok().flatten())
-        .find(|parent| parent.columns.iter().any(|held| same_column(&held.name, column)))
+        .find(|parent| {
+            parent
+                .columns
+                .iter()
+                .any(|held| super::case_idents_match(&held.name, column, builder.identifier_case()))
+        })
         .map(|parent| parent.name.to_string())
 }
 
@@ -1536,5 +1540,10 @@ pub(super) fn is_inherited_column(
 ) -> bool {
     parent_names(table)
         .filter_map(|name| builder.resolve_bound_table_name(name).ok().flatten())
-        .any(|parent| parent.columns.iter().any(|held| same_column(&held.name, column)))
+        .any(|parent| {
+            parent
+                .columns
+                .iter()
+                .any(|held| super::case_idents_match(&held.name, column, builder.identifier_case()))
+        })
 }

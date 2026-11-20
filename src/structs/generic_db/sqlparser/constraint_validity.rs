@@ -169,8 +169,12 @@ pub(super) fn validate_constraint(
         }
     };
 
-    let located =
-        constraint_names::locate(node, super::generated_constraint_names(&builder, &stored), name);
+    let located = constraint_names::locate(
+        node,
+        super::generated_constraint_names(&builder, &stored),
+        name,
+        builder.identifier_case(),
+    );
     if let Some(Position::Table(position)) = located {
         let held = &node.constraints[position];
         if !takes_validation(held) {
