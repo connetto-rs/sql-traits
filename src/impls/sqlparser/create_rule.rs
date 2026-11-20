@@ -6,7 +6,7 @@ use sqlparser::ast::{CreateRule, CreateRuleAction, CreateRuleDoKind, CreateRuleE
 
 use crate::{
     errors::LookupError,
-    structs::{IdentifierCase, ParserDB, TargetName},
+    structs::{ParserDB, TargetName},
     traits::{DatabaseLike, Metadata, Relation, RuleLike},
     utils::object_name::{
         object_name_identifiers, resolve_bound_table, target_name_of_idents,
@@ -34,7 +34,8 @@ impl RuleLike for CreateRule {
     }
 
     /// Ingestion bound the target to the relation it reached, so the name is
-    /// read as written with no search path, a table first and then a view,
+    /// read with no search path under the catalog's
+    /// [`DatabaseLike::identifier_case`], a table first and then a view,
     /// since one name holds at most one of the two.
     fn relation<'db>(
         &'db self,
@@ -50,7 +51,7 @@ impl RuleLike for CreateRule {
         database
             .view_by_target(
                 target_name_of_idents(schema_ident, name_ident),
-                IdentifierCase::AsWritten,
+                database.identifier_case(),
             )?
             .map(Relation::View)
             .ok_or_else(|| {

@@ -1,8 +1,9 @@
 //! The functions the calls of a function body may reach when it runs.
 //!
 //! A call resolves where PostgreSQL resolves it, under the path the body runs
-//! with as [`walk_body`] tracks it, and reaches every overload accepting its
-//! argument count, as [`call_reaches`] decides. Only the calls the body
+//! with as [`walk_body`] tracks it, comparing names under the catalog's
+//! [`DatabaseLike::identifier_case`], and reaches every overload accepting
+//! its argument count, as [`call_reaches`] decides. Only the calls the body
 //! writes count, so a view the body reads does not add the calls of its
 //! definition.
 
@@ -17,7 +18,7 @@ use super::{
 };
 use crate::{
     errors::LookupError,
-    structs::{EmbeddedSql, IdentifierCase, UnqualifiedName},
+    structs::{EmbeddedSql, UnqualifiedName},
     traits::DatabaseLike,
     utils::{
         call_sites::{Call, call_reaches, for_each_call},
@@ -53,7 +54,7 @@ impl<'db, 'path, DB: DatabaseLike> CallCollector<'db, 'path, DB> {
 
     /// Records every function `call` may reach under the walk's path.
     fn reach(&mut self, call: Call<'_>) -> Result<(), LookupError> {
-        let (name, arguments, case) = (call.name, call.arguments, IdentifierCase::AsWritten);
+        let (name, arguments, case) = (call.name, call.arguments, self.database.identifier_case());
         let database = self.database;
         let path = &self.path;
         let unqualified = qualifier_of(name) == Qualifier::Absent;

@@ -53,7 +53,7 @@ pub(crate) fn scoped_graph<'query, 'db, DB: DatabaseLike>(
     case: IdentifierCase,
 ) -> Result<(DefinitionGraph<'query, 'db, DB>, ScopeCursor), LookupError> {
     let deriving = Deriving::of(database, case);
-    let mut profile = DefinitionDerivation::new(case);
+    let mut profile = DefinitionDerivation::new(database, case);
     let outer = profile.begin_unowned_scope(None);
     reach(&mut profile, outer, scope, database);
     let outer_cursor = Some(profile.location(&outer));

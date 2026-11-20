@@ -739,7 +739,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let Ok(OperandType::Known { type_name, .. }) = variable.data_type() else {
             return Ok(None);
         };
-        self.database.table_by_target(type_name.clone(), IdentifierCase::AsWritten)
+        self.database.table_by_target(type_name.clone(), self.database.identifier_case())
     }
 
     /// The field `expression` names of the variable it reaches, `None` for a
@@ -763,7 +763,8 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         table: &'db DB::Table,
         field: &Ident,
     ) -> Result<OperandType<'db>, LookupError> {
-        let column = table.column(&field.to_string(), self.database, IdentifierCase::AsWritten)?;
+        let column =
+            table.column(&field.to_string(), self.database, self.database.identifier_case())?;
         Ok(column.map_or(OperandType::Unknown, |column| {
             column_type(self.database, column.data_type(self.database))
         }))

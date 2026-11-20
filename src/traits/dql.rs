@@ -49,6 +49,9 @@ pub trait DQLLike<DB: DatabaseLike>: DataStatementLike<DB> {
     /// - the query body is a set operation (`UNION`/`EXCEPT`/`INTERSECT`),
     ///   `VALUES`, or `TABLE`.
     ///
+    /// Relation and column names compare under the catalog's
+    /// [`DatabaseLike::identifier_case`].
+    ///
     /// # Errors
     ///
     /// Returns [`LookupError::AmbiguousTableLookup`] when an unqualified column

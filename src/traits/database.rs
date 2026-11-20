@@ -1092,10 +1092,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     ///
     /// Ingestion rewrites every stored reference to the qualifier of the
     /// relation it reached when the object was created, leaving it bare only
-    /// for a relation stored bare. So the name is read as written, with no
-    /// search path, and neither a later path nor a later temporary relation
-    /// of the same name reaches it, exactly as PostgreSQL keeps the object it
-    /// bound.
+    /// for a relation stored bare. So the name is read with no search path,
+    /// comparing under [`Self::identifier_case`], the rule it was bound
+    /// under, and neither a later path nor a later temporary relation of the
+    /// same name reaches it, exactly as PostgreSQL keeps the object it bound.
     ///
     /// # Errors
     ///
@@ -1133,24 +1133,20 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         &self,
         target: TargetName<'_>,
     ) -> Result<Option<Relation<'_, Self>>, LookupError> {
-        if let Some(table) = self.table_by_target(target.clone(), IdentifierCase::AsWritten)? {
+        let case = self.identifier_case();
+        if let Some(table) = self.table_by_target(target.clone(), case)? {
             return Ok(Some(Relation::Table(table)));
         }
-        if let Some(table) =
-            self.foreign_table_by_target(target.clone(), IdentifierCase::AsWritten)?
-        {
+        if let Some(table) = self.foreign_table_by_target(target.clone(), case)? {
             return Ok(Some(Relation::ForeignTable(table)));
         }
-        if let Some(view) = self.view_by_target(target.clone(), IdentifierCase::AsWritten)? {
+        if let Some(view) = self.view_by_target(target.clone(), case)? {
             return Ok(Some(Relation::View(view)));
         }
-        if let Some(view) =
-            self.materialized_view_by_target(target.clone(), IdentifierCase::AsWritten)?
-        {
+        if let Some(view) = self.materialized_view_by_target(target.clone(), case)? {
             return Ok(Some(Relation::MaterializedView(view)));
         }
-        self.sequence_by_target(target, IdentifierCase::AsWritten)
-            .map(|sequence| sequence.map(Relation::Sequence))
+        self.sequence_by_target(target, case).map(|sequence| sequence.map(Relation::Sequence))
     }
 
     /// Resolves a name a statement wrote into the sequence it denotes,
@@ -2696,6 +2692,38 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     #[inline]
     fn search_path(&self) -> impl Iterator<Item = (&str, bool)> {
         Namespaces::of_database(self).initial_search_path().iter().copied()
+    }
+
+    /// Returns the comparison the catalog's names were taken under, which is
+    /// also the one a stored definition's names are read back under.
+    ///
+    /// A view, a foreign key or a trigger bound its references when it was
+    /// created, under the engine's rule, so reading one back compares under
+    /// that rule whatever comparison the caller states for its own query. The
+    /// default is [`IdentifierCase::AsWritten`], which is PostgreSQL's.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParseOptions::default()
+    ///     .with_identifier_case(IdentifierCase::Folded)
+    ///     .parse::<SQLiteDialect>(r#"CREATE TABLE "T" (x INT); CREATE VIEW v AS SELECT x FROM t;"#)?;
+    /// assert_eq!(db.identifier_case(), IdentifierCase::Folded);
+    /// // The view's `t` binds to `"T"` the way SQLite binds it.
+    /// assert!(matches!(
+    ///     db.resolve_bound_relation(TargetName::new("t", false))?,
+    ///     Some(Relation::Table(_))
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn identifier_case(&self) -> IdentifierCase {
+        IdentifierCase::AsWritten
     }
 
     /// Returns the schema with the given name, if it exists.

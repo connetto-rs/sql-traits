@@ -30,7 +30,7 @@ use sqlparser_plpgsql::embedded::{Block, Dynamic, expression};
 use super::{callee_path::calls_path_changer, plpgsql_body::walk_block};
 use crate::{
     errors::LookupError,
-    structs::{EmbeddedSql, IdentifierCase, UnqualifiedName},
+    structs::{EmbeddedSql, UnqualifiedName},
     traits::{DataStatementLike, DatabaseLike, Relation, TableLike, ViewLike},
     utils::{
         identifier_resolution::SearchPath,
@@ -90,7 +90,7 @@ pub(super) fn resolve_on_body_path<'db, DB: DatabaseLike>(
     database: &'db DB,
     path: &BodyPath<'_>,
 ) -> Result<Option<Relation<'db, DB>>, LookupError> {
-    let case = IdentifierCase::AsWritten;
+    let case = database.identifier_case();
     match path {
         BodyPath::Set(path) => {
             resolve_relation_object_name_on_path(object_name, database, path, case)

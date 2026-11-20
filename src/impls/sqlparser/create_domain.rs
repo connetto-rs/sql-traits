@@ -113,7 +113,7 @@ pub(crate) fn domain_named(
 ///
 /// Ingestion rewrites every type name reaching a domain to the qualifier of
 /// that domain, as it does for every other stored reference, so the name is
-/// read as written with no search path, and a bare name names the default
+/// read under `case` with no search path, and a bare name names the default
 /// schema. A bare name of a type `pg_catalog` holds reaches that catalog type,
 /// and ingestion writes `public` out for a domain of such a name, so a bare
 /// one never reaches a domain.

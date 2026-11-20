@@ -721,7 +721,7 @@ fn granted_relations<'a>(grant: &'a Grant, database: &'a ParserDB) -> Vec<Relati
                     database
                         .sequence_by_target(
                             target_name_from_object_name(name)?,
-                            IdentifierCase::AsWritten,
+                            database.identifier_case(),
                         )
                         .ok()
                         .flatten()
@@ -743,24 +743,24 @@ fn resolve_relation_name<'a>(
     }
     let target = target_name_from_object_name(name)?;
     if let Some(table) =
-        database.foreign_table_by_target(target.clone(), IdentifierCase::AsWritten).ok().flatten()
+        database.foreign_table_by_target(target.clone(), database.identifier_case()).ok().flatten()
     {
         return Some(Relation::ForeignTable(table));
     }
     if let Some(view) =
-        database.view_by_target(target.clone(), IdentifierCase::AsWritten).ok().flatten()
+        database.view_by_target(target.clone(), database.identifier_case()).ok().flatten()
     {
         return Some(Relation::View(view));
     }
     if let Some(view) = database
-        .materialized_view_by_target(target.clone(), IdentifierCase::AsWritten)
+        .materialized_view_by_target(target.clone(), database.identifier_case())
         .ok()
         .flatten()
     {
         return Some(Relation::MaterializedView(view));
     }
     database
-        .sequence_by_target(target, IdentifierCase::AsWritten)
+        .sequence_by_target(target, database.identifier_case())
         .ok()
         .flatten()
         .map(Relation::Sequence)

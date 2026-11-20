@@ -88,6 +88,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         self.search_path.iter().map(|(name, quoted)| (name.as_str(), *quoted))
     }
 
+    #[inline]
+    fn identifier_case(&self) -> IdentifierCase {
+        self.identifier_case
+    }
+
     fn table_by_stored_identity(&self, schema: Option<&str>, name: &str) -> Option<&Self::Table> {
         // One bucket holds both spellings of the default schema, so the probe
         // narrows to a name and the comparison decides the identity.
@@ -297,7 +302,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         &self,
         target: TargetName<'_>,
     ) -> Result<Option<Relation<'_, Self>>, LookupError> {
-        let probe = IndexProbe::new(self.namespaces(), &target, IdentifierCase::AsWritten, None);
+        let probe = IndexProbe::new(self.namespaces(), &target, self.identifier_case, None);
         self.resolve_probed_relation(&probe, &target)
     }
 

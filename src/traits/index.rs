@@ -555,9 +555,14 @@ pub trait TableIndexLike: IndexLike {
         // A reference this table does not own, or a column it does not
         // declare, leaves the index reporting no columns rather than a wrong
         // one. A creation refuses both before they can be recorded.
-        let found_cols: Vec<&<Self::DB as DatabaseLike>::Column> =
-            columns_in_expression(expr, database.catalog_name(), &target, &all_columns)
-                .unwrap_or_default();
+        let found_cols: Vec<&<Self::DB as DatabaseLike>::Column> = columns_in_expression(
+            expr,
+            database.catalog_name(),
+            &target,
+            &all_columns,
+            database.identifier_case(),
+        )
+        .unwrap_or_default();
 
         Ok(found_cols.into_iter())
     }

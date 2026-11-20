@@ -1,7 +1,7 @@
 //! Implementation of the `TriggerLike` trait for sqlparser's `CreateTrigger`
 //! type.
 
-use alloc::{borrow::Cow, string::ToString};
+use alloc::string::ToString;
 
 use sqlparser::ast::{ArgMode, CreateTrigger};
 
@@ -10,7 +10,6 @@ use crate::{
     structs::{ParserDB, TargetName, TriggerEnablement, metadata::TriggerMetadata},
     traits::{DatabaseLike, FunctionLike, Metadata, Relation, TableLike, TriggerLike},
     utils::{
-        identifier_resolution::stored_identifier,
         last_str,
         object_name::{
             object_name_last_part, qualifier_of, resolve_bound_relation_object_name,
@@ -18,11 +17,6 @@ use crate::{
         },
     },
 };
-
-/// The schema a stored or bound name lives in, `public` when it writes none.
-fn in_schema(schema: Option<(&str, bool)>) -> Cow<'_, str> {
-    schema.map_or(Cow::Borrowed("public"), |(schema, quoted)| stored_identifier(schema, quoted))
-}
 
 /// Resolves the metadata `database` holds for `trigger`.
 fn trigger_metadata<'db>(
@@ -47,8 +41,9 @@ impl TriggerLike for CreateTrigger {
     }
 
     /// Ingestion bound the target to the relation it reached, so the name is
-    /// read as written with no search path. Only a table, a foreign table or
-    /// a plain view carries a trigger.
+    /// read with no search path under the catalog's
+    /// [`DatabaseLike::identifier_case`]. Only a table, a foreign table or a
+    /// plain view carries a trigger.
     fn relation<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -133,9 +128,9 @@ impl TriggerLike for CreateTrigger {
     {
         let called = &self.exec_body.as_ref()?.func_desc.name;
         let (name, quoted) = object_name_last_part(called)?;
-        let name = stored_identifier(name, quoted);
-        let schema = in_schema(qualifier_of(called).named());
-        database.functions_named(&name).find(|function| {
+        let case = database.identifier_case();
+        let (schema, schema_quoted) = qualifier_of(called).named().unwrap_or(("public", false));
+        database.functions_named(name).find(|function| {
             let target = function.target_name();
             function
                 .args
@@ -143,9 +138,13 @@ impl TriggerLike for CreateTrigger {
                 .unwrap_or_default()
                 .iter()
                 .all(|argument| argument.mode == Some(ArgMode::Out))
-                && function.stored_name() == name
-                && in_schema(target.schema().map(|schema| (schema, target.schema_is_quoted())))
-                    == schema
+                && case.identifiers_match(target.name(), target.name_is_quoted(), name, quoted)
+                && case.identifiers_match(
+                    target.schema().unwrap_or("public"),
+                    target.schema_is_quoted(),
+                    schema,
+                    schema_quoted,
+                )
         })
     }
 

@@ -18,7 +18,7 @@ use crate::{
     utils::{
         identifier_resolution::{identifiers_match, is_temporary_schema, stored_ident_name},
         last_str,
-        object_name::{qualifier_of, resolve_bound_table_or_foreign_table},
+        object_name::{qualifier_of, resolve_bound_table, resolve_bound_table_or_foreign_table},
     },
 };
 
@@ -304,7 +304,7 @@ impl TableLike for CreateTable {
     {
         self.require_in_database(database)?;
         match &self.partition_of {
-            Some(root) => database.resolve_table_object_name(root),
+            Some(root) => resolve_bound_table(root, database),
             None => Ok(None),
         }
     }

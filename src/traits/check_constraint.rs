@@ -429,7 +429,7 @@ where
     let Some(checked) = check_constraint
         .columns(database)?
         .find(|candidate| {
-            IdentifierCase::AsWritten.identifiers_match(
+            database.identifier_case().identifiers_match(
                 candidate.column_name(),
                 candidate.column_name_is_quoted(),
                 &column.value,
@@ -460,8 +460,8 @@ struct ColumnBound<'expr> {
 }
 
 /// Whether `left` and `right` name one column.
-fn same_column(left: &Ident, right: &Ident) -> bool {
-    IdentifierCase::AsWritten.identifiers_match(
+fn same_column(left: &Ident, right: &Ident, case: IdentifierCase) -> bool {
+    case.identifiers_match(
         &left.value,
         left.quote_style.is_some(),
         &right.value,
@@ -602,7 +602,7 @@ where
 
     // Verify it's a textual column
     if !check_constraint
-        .column(database, &col_ident.value, IdentifierCase::AsWritten)?
+        .column(database, &col_ident.value, database.identifier_case())?
         .is_some_and(|c| c.data_type(database).is_textual(database))
     {
         return Ok(None);
@@ -743,7 +743,7 @@ where
                         bound
                     }
                     (BinaryOperator::Or, Some(left), Some(right))
-                        if same_column(left.column, right.column) =>
+                        if same_column(left.column, right.column, database.identifier_case()) =>
                     {
                         Some(direction.looser(left, right))
                     }
@@ -837,7 +837,7 @@ where
                         && let Value::SingleQuotedString(s) = &val_wrapper.value
                         && s.is_empty()
                         && check_constraint
-                            .column(database, &ident.value, IdentifierCase::AsWritten)?
+                            .column(database, &ident.value, database.identifier_case())?
                             .is_some_and(|c| c.data_type(database).is_textual(database))
                     {
                         return Ok(Some(ident));
@@ -868,7 +868,9 @@ where
                     let right = not_empty_text_column(database, right, check_constraint)?;
                     Ok(left
                         .zip(right)
-                        .filter(|(left, right)| same_column(left, right))
+                        .filter(|(left, right)| {
+                            same_column(left, right, database.identifier_case())
+                        })
                         .map(|(left, _)| left))
                 }
                 _ => Ok(None),
@@ -1488,7 +1490,7 @@ pub trait CheckConstraintLike:
         Ok(self.table(database)?.expression_truth(
             database,
             self.expression(database),
-            IdentifierCase::AsWritten,
+            database.identifier_case(),
         )? == Some(true))
     }
 
@@ -1554,7 +1556,7 @@ pub trait CheckConstraintLike:
         if self.table(database)?.expression_truth(
             database,
             self.expression(database),
-            IdentifierCase::AsWritten,
+            database.identifier_case(),
         )? == Some(false)
         {
             return Ok(true);

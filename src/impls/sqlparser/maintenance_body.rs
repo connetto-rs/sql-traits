@@ -92,7 +92,7 @@ fn body_assignments<'db, DB: DatabaseLike>(
         .and_then(|mut sites| sites.pop())
         .map(|site| site.namespace);
     let columns: Vec<&'db DB::Column> = table.columns(database)?.collect();
-    let reader = Reader { columns, names: &names, namespace };
+    let reader = Reader { columns, names: &names, namespace, case: database.identifier_case() };
     Ok(fields
         .into_iter()
         .map(|FieldValue { field, value }| {
@@ -135,14 +135,14 @@ struct Reader<'names, 'db, DB: DatabaseLike> {
     /// The names every statement of the body reaches, [`None`] for a body
     /// with no statement.
     namespace: Option<Namespace>,
+    case: IdentifierCase,
 }
 
 impl<'db, DB: DatabaseLike> Reader<'_, 'db, DB> {
-    /// The column of the table `name` denotes, as PostgreSQL compares
-    /// identifiers.
+    /// The column `name` denotes under the catalog's case.
     fn column(&self, name: &Ident) -> Option<&'db DB::Column> {
         self.columns.iter().copied().find(|column| {
-            IdentifierCase::AsWritten.identifiers_match(
+            self.case.identifiers_match(
                 column.column_name(),
                 column.column_name_is_quoted(),
                 &name.value,
