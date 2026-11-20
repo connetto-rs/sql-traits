@@ -94,6 +94,7 @@ mod inheritance_changes;
 mod inherited_column_declarations;
 mod inherited_definition_matching;
 mod inherited_privileges;
+mod key_conflict_clauses;
 mod key_ordinal_cost;
 mod keyword_grantees;
 mod leading_comment_documentation;
