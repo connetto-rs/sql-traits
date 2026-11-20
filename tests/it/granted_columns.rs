@@ -165,3 +165,23 @@ fn a_catalog_qualified_grant_keeps_its_column_check() {
         "got {refused:?}"
     );
 }
+
+/// PostgreSQL folds an unquoted granted column as it folds the column it
+/// grants on, so `(ID)` reads back as the column created `id`.
+#[test]
+fn a_granted_column_reads_back_under_the_folding_rule() {
+    let database = parse(
+        "CREATE ROLE r;
+         CREATE TABLE docs (id INT, name TEXT);
+         GRANT SELECT (ID) ON docs TO r;",
+    )
+    .expect("the folded column exists");
+    let table = database.tables().next().expect("docs exists");
+    let grant = database.column_grants().next().expect("the column grant is stored");
+    let granted: Vec<&str> = grant
+        .columns(table, &database)
+        .expect("docs is in this database")
+        .map(ColumnLike::column_name)
+        .collect();
+    assert_eq!(granted, ["id"]);
+}
