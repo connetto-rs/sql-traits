@@ -14,7 +14,7 @@ use crate::{
         last_str,
         object_name::{
             object_name_last_part, qualifier_of, resolve_bound_relation_object_name,
-            target_name_of_object_name,
+            resolve_bound_table_or_foreign_table, target_name_of_object_name,
         },
     },
 };
@@ -111,11 +111,10 @@ impl TriggerLike for CreateTrigger {
             return Ok(None);
         }
         // A copy lives on a partition, which is a table or a foreign table.
-        let (Relation::Table(partition) | Relation::ForeignTable(partition)) =
-            self.relation(database)?
-        else {
-            return Ok(None);
-        };
+        let partition = resolve_bound_table_or_foreign_table(&self.table_name, database)?
+            .ok_or_else(|| {
+                LookupError::RelationNotFound { object_name: self.table_name.to_string() }
+            })?;
         Ok(partition
             .partition_root(database)?
             .and_then(|parent_table| database.trigger(self.name(), parent_table)))

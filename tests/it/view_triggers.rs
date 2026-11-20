@@ -184,6 +184,56 @@ fn postgres_refuses_what_it_refuses_on_tables_and_views() {
 }
 
 #[test]
+fn a_refusal_names_the_trigger_the_relation_and_what_the_engine_refuses() {
+    let row = "FOR EACH ROW EXECUTE FUNCTION f();";
+    for (parsed, message) in [
+        (
+            postgres(&format!("CREATE TRIGGER x INSTEAD OF INSERT ON t {row}")),
+            "Trigger `x` on `t` is refused because a table cannot have INSTEAD OF triggers.",
+        ),
+        (
+            sqlite("CREATE TRIGGER x BEFORE INSERT ON v BEGIN SELECT 1; END;"),
+            "Trigger `x` on `v` is refused because a view cannot have BEFORE or AFTER triggers.",
+        ),
+        (
+            postgres(&format!("CREATE TRIGGER x AFTER INSERT ON v {row}")),
+            "Trigger `x` on `v` is refused because a view cannot have row-level BEFORE or AFTER \
+             triggers.",
+        ),
+        (
+            postgres("CREATE TRIGGER x AFTER TRUNCATE ON v EXECUTE FUNCTION f();"),
+            "Trigger `x` on `v` is refused because a view cannot have TRUNCATE triggers.",
+        ),
+        (
+            postgres("CREATE TRIGGER x INSTEAD OF INSERT ON v EXECUTE FUNCTION f();"),
+            "Trigger `x` on `v` is refused because INSTEAD OF triggers must be FOR EACH ROW.",
+        ),
+        (
+            postgres(&format!("CREATE TRIGGER x INSTEAD OF UPDATE OF a ON v {row}")),
+            "Trigger `x` on `v` is refused because INSTEAD OF triggers cannot have column lists.",
+        ),
+        (
+            postgres(
+                "CREATE TRIGGER x INSTEAD OF UPDATE ON v FOR EACH ROW WHEN (OLD.a > 0)
+                     EXECUTE FUNCTION f();",
+            ),
+            "Trigger `x` on `v` is refused because INSTEAD OF triggers cannot have WHEN \
+             conditions.",
+        ),
+        (
+            postgres(
+                "CREATE TRIGGER x AFTER INSERT ON v REFERENCING NEW TABLE AS n
+                     FOR EACH STATEMENT EXECUTE FUNCTION f();",
+            ),
+            "Trigger `x` on `v` is refused because triggers on views cannot have transition \
+             tables.",
+        ),
+    ] {
+        assert_eq!(parsed.expect_err(message).to_string(), message);
+    }
+}
+
+#[test]
 fn a_trigger_on_a_materialized_view_is_refused() {
     let statements = "CREATE MATERIALIZED VIEW m AS SELECT a FROM t;
          CREATE TRIGGER x AFTER INSERT ON m FOR EACH STATEMENT EXECUTE FUNCTION f();";
@@ -316,14 +366,29 @@ fn the_triggers_follow_a_renamed_schema() {
 }
 
 #[test]
-fn a_view_column_rename_reaches_the_column_list_of_its_triggers() {
-    let statements = "CREATE TRIGGER x BEFORE UPDATE OF a ON v EXECUTE FUNCTION f();
-         ALTER TABLE v RENAME COLUMN a TO b;";
+fn a_view_column_rename_and_rename_reach_only_the_view_triggers() {
+    let statements = "CREATE TRIGGER tt BEFORE UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION f();
+         CREATE TRIGGER vt BEFORE INSERT OR UPDATE OF a ON v EXECUTE FUNCTION f();
+         ALTER TABLE v RENAME COLUMN a TO b;
+         ALTER VIEW v RENAME TO w;";
     let database = accepted(postgres(statements), statements);
-    let trigger = database.triggers().next().expect("x exists");
+    let trigger = |name| {
+        database.triggers().find(|trigger| trigger.name() == name).expect("the trigger exists")
+    };
+
+    let on_view = trigger("vt");
+    assert_eq!(on_view.target_relation_name().name(), "w");
     assert!(matches!(
-        trigger.events(),
-        [TriggerEvent::Update(columns)] if columns.len() == 1 && columns[0].value == "b"
+        on_view.events(),
+        [TriggerEvent::Insert, TriggerEvent::Update(columns)]
+            if columns.len() == 1 && columns[0].value == "b"
+    ));
+
+    let on_table = trigger("tt");
+    assert_eq!(on_table.target_relation_name().name(), "t");
+    assert!(matches!(
+        on_table.events(),
+        [TriggerEvent::Update(columns)] if columns.len() == 1 && columns[0].value == "a"
     ));
 }
 

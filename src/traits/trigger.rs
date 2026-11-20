@@ -917,17 +917,6 @@ mod tests {
         traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
     };
 
-    /// The table `trigger` is defined on in `db`.
-    fn table_of<'db>(
-        trigger: &'db impl TriggerLike<DB = ParserDB>,
-        db: &'db ParserDB,
-    ) -> &'db <ParserDB as DatabaseLike>::Table {
-        match trigger.relation(db) {
-            Ok(Relation::Table(table)) => table,
-            other => panic!("the trigger is on a table, got {other:?}"),
-        }
-    }
-
     #[test]
     fn test_trigger_ref_implementation() {
         let sql = r"
@@ -952,8 +941,10 @@ mod tests {
 
         assert_eq!(trigger_ref.name(), "my_trigger");
 
-        let table = table_of(trigger_ref, &db);
-        assert_eq!(table.table_name(), "users");
+        assert!(matches!(
+            trigger_ref.relation(&db),
+            Ok(Relation::Table(table)) if table.table_name() == "users"
+        ));
 
         let events = trigger_ref.events();
         assert_eq!(events.len(), 1);
@@ -1069,10 +1060,11 @@ mod tests {
         ";
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let trigger = db.triggers().next().expect("Trigger not found");
-        let table = table_of(trigger, &db);
-
-        assert_eq!(table.table_name(), "docs");
-        assert_eq!(table.table_schema(), Some("app"));
+        assert!(matches!(
+            trigger.relation(&db),
+            Ok(Relation::Table(table))
+                if table.table_name() == "docs" && table.table_schema() == Some("app")
+        ));
     }
 
     #[test]
@@ -1084,10 +1076,11 @@ mod tests {
         "#;
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let trigger = db.triggers().next().expect("Trigger not found");
-        let table = table_of(trigger, &db);
-
-        assert_eq!(table.table_name(), "MyTable");
-        assert_eq!(table.table_schema(), None);
+        assert!(matches!(
+            trigger.relation(&db),
+            Ok(Relation::Table(table))
+                if table.table_name() == "MyTable" && table.table_schema().is_none()
+        ));
     }
 
     #[test]
@@ -1100,9 +1093,10 @@ mod tests {
         ";
         let db = ParserDB::parse::<GenericDialect>(sql).expect("Failed to parse SQL");
         let trigger = db.triggers().next().expect("Trigger not found");
-        let table = table_of(trigger, &db);
-
-        assert_eq!(table.table_name(), "people");
+        assert!(matches!(
+            trigger.relation(&db),
+            Ok(Relation::Table(table)) if table.table_name() == "people"
+        ));
     }
 
     #[test]

@@ -767,6 +767,24 @@ fn a_statement_reading_a_sequence_reports_it() {
 }
 
 #[test]
+fn a_sequence_read_twice_is_reported_once() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE SEQUENCE app.x;
+         CREATE TABLE x (id INT);
+         SET search_path = app, public;",
+    )
+    .expect("schema parses");
+    let query = sqlparser::parser::Parser::new(&PostgreSqlDialect {})
+        .try_with_sql("SELECT x.last_value FROM x, public.x AS t, app.x AS again")
+        .and_then(|mut parser| parser.parse_query())
+        .expect("query parses");
+    let read: Vec<String> =
+        query.referenced_relations(&db).expect("names resolve").iter().map(describe).collect();
+    assert_eq!(read, ["sequence app.x", "table public.x"]);
+}
+
+#[test]
 fn a_view_column_it_cannot_list_is_refused_as_an_owner() {
     assert!(matches!(
         parse(
