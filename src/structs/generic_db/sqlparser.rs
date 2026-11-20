@@ -5756,7 +5756,7 @@ impl ParserDB {
     ) -> Option<Cow<'db, str>> {
         let recorded =
             self.table_metadata(table).map_or(&[][..], TableMetadata::generated_constraint_names);
-        constraint_names::names(table, recorded)
+        constraint_names::names(table, recorded, self.identifier_case())
             .into_iter()
             .filter(|(slot, _)| {
                 match kind {
@@ -5777,10 +5777,11 @@ impl ParserDB {
     ) -> Option<Cow<'db, str>> {
         let recorded =
             self.table_metadata(table).map_or(&[][..], TableMetadata::generated_constraint_names);
-        constraint_names::names(table, recorded)
+        constraint_names::names(table, recorded, self.identifier_case())
             .into_iter()
             .find(|(slot, _)| {
-                slot.not_null_of().is_some_and(|held| inheritance::same_column(held, column))
+                slot.not_null_of()
+                    .is_some_and(|held| case_idents_match(held, column, self.identifier_case()))
             })
             .and_then(|(_, name)| name)
     }
@@ -7551,7 +7552,7 @@ impl ParserDB {
         column: &Ident,
     ) -> String {
         let case = builder.identifier_case();
-        constraint_names::names(node, generated_constraint_names(builder, stored))
+        constraint_names::names(node, generated_constraint_names(builder, stored), case)
             .into_iter()
             .find(|(slot, _)| {
                 slot.not_null_of().is_some_and(|held| case_idents_match(held, column, case))
@@ -7708,6 +7709,7 @@ impl ParserDB {
                 Self::stored_node(&builder, &stored)?,
                 generated_constraint_names(&builder, &stored),
                 name,
+                builder.identifier_case(),
             )
             .is_some()
         {
@@ -7866,7 +7868,12 @@ impl ParserDB {
         };
 
         let node = Self::stored_node(&builder, &stored)?;
-        match constraint_names::locate(node, generated_constraint_names(&builder, &stored), name) {
+        match constraint_names::locate(
+            node,
+            generated_constraint_names(&builder, &stored),
+            name,
+            builder.identifier_case(),
+        ) {
             Some(constraint_names::Position::Table(position)) => {
                 let dropped = node.constraints[position].clone();
                 if let TableConstraint::NotNull(not_null) = &dropped {
@@ -8015,7 +8022,7 @@ impl ParserDB {
         let case = builder.identifier_case();
         let named = NamedColumn::of(&not_null.column, case);
         let held = TableConstraint::NotNull(not_null.clone());
-        if inheritance::requires_a_value(&builder, node, &not_null.column.value) {
+        if inheritance::requires_a_value(&builder, node, &not_null.column) {
             return Err(crate::errors::Error::InheritedConstraintNotDroppable {
                 table_name: stored.name.clone(),
                 constraint_name: name.value.clone(),
@@ -8122,7 +8129,7 @@ impl ParserDB {
                 // A copy the table declared itself stays, and so does one
                 // another parent still requires, whichever spelling it uses.
                 if !inheritance::records_inherited_constraint(&builder, &child, &copy)
-                    || inheritance::requires_a_value(&builder, node, column_name)
+                    || inheritance::requires_a_value(&builder, node, column)
                 {
                     continue;
                 }
@@ -9884,7 +9891,7 @@ impl ParserDB {
                         reason: crate::errors::RequiredValue::CoveredByKey,
                     });
                 }
-                if inheritance::requires_a_value(builder, node, &column.name) {
+                if inheritance::requires_a_value(builder, node, &column.ident()) {
                     return Err(crate::errors::Error::RequiredValueNotDroppable {
                         table_name: stored.name.clone(),
                         column_name: column.name.clone(),
@@ -11647,7 +11654,7 @@ impl ParserDB {
                                     && inheritance::requires_a_value(
                                         &builder,
                                         &create_table,
-                                        &column.name.value,
+                                        &column.name,
                                     )
                             })
                             .map(|column| column.name.value.clone())

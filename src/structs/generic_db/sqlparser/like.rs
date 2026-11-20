@@ -21,7 +21,7 @@ use sqlparser::ast::{
     CreateTableLikeKind, DataType, Ident, ObjectName, TableConstraint,
 };
 
-use super::{ParserDBBuilder, column_copy::copy_column, inheritance};
+use super::{ParserDBBuilder, column_copy::copy_column};
 use crate::{
     errors::Error,
     structs::{TableAttribute, metadata::ColumnCreation},
@@ -96,6 +96,7 @@ pub(super) fn apply_like(
     };
 
     let mut creations = Vec::new();
+    let case = builder.identifier_case();
     let mut columns: Vec<ColumnDef> = copied
         .columns
         .iter()
@@ -105,7 +106,7 @@ pub(super) fn apply_like(
             // requirement the copy's column carries the way the option would.
             if copied.constraints.iter().any(|constraint| {
                 matches!(constraint, TableConstraint::NotNull(not_null)
-                    if inheritance::same_column(&not_null.column, &copy.name))
+                    if super::case_idents_match(&not_null.column, &copy.name, case))
             }) && !copy.options.iter().any(|held| matches!(held.option, ColumnOption::NotNull))
             {
                 copy.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });

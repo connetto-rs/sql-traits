@@ -154,7 +154,7 @@ pub(super) fn no_inherit(
     let still_required: Vec<String> = node
         .columns
         .iter()
-        .filter(|column| inheritance::requires_a_value(&builder, node, &column.name.value))
+        .filter(|column| inheritance::requires_a_value(&builder, node, &column.name))
         .map(|column| column.name.value.clone())
         .collect();
     let case = builder.identifier_case();
@@ -166,7 +166,7 @@ pub(super) fn no_inherit(
             .iter()
             .filter(|column| {
                 let column = Ident::with_quote('"', column.as_str());
-                passed_columns.iter().any(|passed| inheritance::same_column(passed, &column))
+                passed_columns.iter().any(|passed| super::case_idents_match(passed, &column, case))
             })
             .cloned()
             .collect();

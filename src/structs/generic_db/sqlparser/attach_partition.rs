@@ -25,6 +25,7 @@ use super::{
 use crate::{
     errors::{Error, ObjectKind, UnattachablePartition},
     impls::foreign_keys_stored_alike,
+    structs::IdentifierCase,
     traits::TableLike,
     utils::is_identity,
 };
@@ -120,7 +121,7 @@ pub(super) fn attach_partition(
 
     let passed = passed_keys(&builder, &root, root_node);
     let mut received = receive(&builder, root_node, &partition, partition_node, &passed)?;
-    received.options.extend(identities_of(root_node, partition_node));
+    received.options.extend(identities_of(root_node, partition_node, builder.identifier_case()));
     received.merged.extend(merged_checks);
     refuse_foreign_under_unique_index(&builder, (&root, root_node), (&partition, partition_node))?;
     let mut bound_root = root_name.clone();
@@ -285,8 +286,12 @@ fn refuse_unattachable(
         });
     }
 
+    let case = builder.identifier_case();
     for column in &partition_node.columns {
-        if !root_node.columns.iter().any(|held| inheritance::same_column(&held.name, &column.name))
+        if !root_node
+            .columns
+            .iter()
+            .any(|held| super::case_idents_match(&held.name, &column.name, case))
         {
             return refuse(UnattachablePartition::ExtraColumn {
                 column_name: column.name.value.clone(),
@@ -309,6 +314,7 @@ fn refuse_unattachable(
 fn identities_of(
     root_node: &CreateTable,
     partition_node: &CreateTable,
+    case: IdentifierCase,
 ) -> Vec<(Ident, ColumnOptionDef)> {
     root_node
         .columns
@@ -318,7 +324,7 @@ fn identities_of(
             let column = partition_node
                 .columns
                 .iter()
-                .find(|held| inheritance::same_column(&held.name, &root_column.name))?;
+                .find(|held| super::case_idents_match(&held.name, &root_column.name, case))?;
             Some((column.name.clone(), identity.clone()))
         })
         .collect()

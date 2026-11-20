@@ -156,6 +156,26 @@ fn a_child_cannot_stop_requiring_a_value_its_parent_requires() {
     ));
 }
 
+/// PostgreSQL refuses both statements with `cannot drop inherited constraint
+/// "par_Body_not_null" of relation "chi"`.
+#[test]
+fn a_child_cannot_stop_requiring_a_value_its_parent_requires_of_a_quoted_column() {
+    let declared = "CREATE TABLE par (\"Body\" TEXT NOT NULL);
+                    CREATE TABLE chi () INHERITS (par);";
+    assert!(matches!(
+        parse(&format!("{declared} ALTER TABLE chi ALTER COLUMN \"Body\" DROP NOT NULL;")),
+        Err(Error::RequiredValueNotDroppable {
+            ref table_name,
+            ref column_name,
+            reason: RequiredValue::EnforcedByParent,
+        }) if table_name == "chi" && column_name == "Body"
+    ));
+    assert!(matches!(
+        parse(&format!("{declared} ALTER TABLE chi DROP CONSTRAINT \"par_Body_not_null\";")),
+        Err(Error::InheritedConstraintNotDroppable { ref table_name, .. }) if table_name == "chi"
+    ));
+}
+
 #[test]
 fn a_child_may_stop_requiring_a_value_it_required_itself() {
     let database = database(

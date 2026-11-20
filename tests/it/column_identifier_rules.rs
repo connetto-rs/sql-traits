@@ -163,6 +163,28 @@ fn a_folding_parse_requires_a_value_under_another_spelling() -> Result<(), Looku
     Ok(())
 }
 
+/// A folding parse takes a requirement written on a column and on the table
+/// under another spelling as one constraint answering to the table's name,
+/// which PostgreSQL does for one spelling, refusing to drop
+/// `t_body_not_null` beside `body_required`.
+#[test]
+fn a_folding_parse_names_one_requirement_written_twice() {
+    let parse = |drop: &str| {
+        ParseOptions::default()
+            .with_identifier_case(IdentifierCase::Folded)
+            .parse::<PostgreSqlDialect>(&format!(
+                "CREATE TABLE t (\"Body\" TEXT NOT NULL, CONSTRAINT body_required NOT NULL body);
+                 ALTER TABLE t DROP CONSTRAINT {drop};"
+            ))
+    };
+
+    assert!(parse("body_required").is_ok());
+    assert!(matches!(
+        parse("\"t_Body_not_null\""),
+        Err(sql_traits::errors::Error::DropConstraintNotFound { .. })
+    ));
+}
+
 /// An exact parse keeps two spellings apart for a key as it does for a column
 /// read.
 #[test]
@@ -174,4 +196,53 @@ fn an_exact_parse_refuses_a_key_on_another_spelling() {
         parsed,
         Err(sql_traits::errors::Error::IdentifierLookupError(LookupError::ColumnNotFound { .. }))
     ));
+}
+
+/// A folding parse merges a child's column into the parent's one under
+/// another spelling and keeps the parent's requirement on it, as PostgreSQL
+/// does for two columns of one name.
+#[test]
+fn a_folding_parse_inherits_a_column_under_another_spelling() -> Result<(), LookupError> {
+    let folded = || ParseOptions::default().with_identifier_case(IdentifierCase::Folded);
+    let db = folded()
+        .parse::<PostgreSqlDialect>(
+            "CREATE TABLE p (id INT NOT NULL); CREATE TABLE c (\"ID\" INT) INHERITS (p);",
+        )
+        .expect("the child's column merges into the parent's");
+    let nullable: Vec<bool> = table(&db, "c")
+        .columns(&db)?
+        .map(|column| column.is_nullable(&db))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(nullable, [false]);
+
+    assert!(matches!(
+        folded().parse::<PostgreSqlDialect>(
+            "CREATE TABLE p (\"Body\" TEXT NOT NULL);
+             CREATE TABLE c () INHERITS (p);
+             ALTER TABLE c ALTER COLUMN body DROP NOT NULL;",
+        ),
+        Err(sql_traits::errors::Error::RequiredValueNotDroppable {
+            reason: sql_traits::errors::RequiredValue::EnforcedByParent,
+            ..
+        })
+    ));
+
+    Ok(())
+}
+
+/// An exact parse keeps a child's column apart from the parent's one under
+/// another spelling.
+#[test]
+fn an_exact_parse_keeps_an_inherited_column_apart() -> Result<(), LookupError> {
+    let db = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Exact)
+        .parse::<PostgreSqlDialect>(
+            "CREATE TABLE p (ID INT); CREATE TABLE c (id INT) INHERITS (p);",
+        )
+        .expect("the two spellings are two columns");
+
+    let columns: Vec<&str> = table(&db, "c").columns(&db)?.map(ColumnLike::column_name).collect();
+    assert_eq!(columns, ["ID", "id"]);
+
+    Ok(())
 }
