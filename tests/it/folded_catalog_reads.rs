@@ -4,7 +4,11 @@
 #![expect(clippy::expect_used, reason = "the fixtures declare every object a test reads")]
 
 use sql_traits::{errors::Error, prelude::*};
-use sqlparser::{ast::Statement, dialect::SQLiteDialect, parser::Parser};
+use sqlparser::{
+    ast::Statement,
+    dialect::{PostgreSqlDialect, SQLiteDialect},
+    parser::Parser,
+};
 
 #[test]
 fn folded_foreign_key_reaches_quoted_table() -> Result<(), Error> {
@@ -161,4 +165,57 @@ fn dml_targets_take_the_catalog_case() -> Result<(), Error> {
         assert!(missing.is_err());
     }
     Ok(())
+}
+
+#[test]
+fn folded_column_grants_read_back_quoted_columns() -> Result<(), Error> {
+    let database = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Folded)
+        .parse::<SQLiteDialect>(
+        "CREATE TABLE t (\"Body\" TEXT, other TEXT);
+             CREATE ROLE reader;
+             GRANT SELECT (body) ON t TO reader;",
+    )?;
+    let table = database
+        .table_by_target(TargetName::new("t", false), IdentifierCase::Folded)?
+        .expect("table exists");
+    let grant = database.column_grants().next().expect("the column grant is stored");
+    let granted: Vec<&str> =
+        grant.columns(table, &database)?.map(ColumnLike::column_name).collect();
+    assert_eq!(granted, ["Body"]);
+    Ok(())
+}
+
+#[test]
+fn folded_grant_targets_are_resolved() -> Result<(), Error> {
+    let database = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Folded)
+        .parse::<SQLiteDialect>(
+        "CREATE TABLE \"T\" (x INT); CREATE ROLE r; GRANT SELECT ON t TO r;",
+    )?;
+    assert_eq!(database.unresolved_access_references()?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn default_grant_targets_keep_quoted_tables_apart() -> Result<(), Error> {
+    let database =
+        ParseOptions::default()
+            .with_access_resolution(AccessResolution::OpenWorld)
+            .parse::<SQLiteDialect>("CREATE TABLE \"T\" (x INT); GRANT SELECT ON t TO PUBLIC;")?;
+    assert!(matches!(
+        database.unresolved_access_references()?.collect::<Vec<_>>().as_slice(),
+        [UnresolvedAccessReference::GrantTable(table)] if table.to_string() == "t"
+    ));
+    Ok(())
+}
+
+#[test]
+fn folded_postgres_views_reach_quoted_columns() {
+    let parsed = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Folded)
+        .parse::<PostgreSqlDialect>(
+        "CREATE TABLE t (\"X\" INT); CREATE VIEW v AS SELECT x FROM t;",
+    );
+    assert!(parsed.is_ok(), "{:?}", parsed.err());
 }

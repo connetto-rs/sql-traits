@@ -830,9 +830,17 @@ impl ColumnGrantLike for Grant {
             }
         };
 
-        Ok(table
-            .columns(database)?
-            .filter(move |col| column_idents.iter().any(|ident| ident.value == col.column_name())))
+        let case = database.identifier_case();
+        Ok(table.columns(database)?.filter(move |column| {
+            column_idents.iter().any(|ident| {
+                case.identifiers_match(
+                    column.column_name(),
+                    column.column_name_is_quoted(),
+                    &ident.value,
+                    ident.quote_style.is_some(),
+                )
+            })
+        }))
     }
 
     fn table<'a>(

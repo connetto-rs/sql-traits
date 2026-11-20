@@ -21,7 +21,6 @@ use super::{
 use crate::{
     errors::Error,
     impls::{SqlparserDialect, dql::definition_graph::reference_sites::first_unknown_column},
-    structs::IdentifierCase,
     utils::{
         identifier_resolution::{identifiers_match, stored_identifier},
         postgres_types::names_catalog_type,
@@ -59,7 +58,7 @@ pub(super) fn refuse_in_query(builder: &ParserDBBuilder, query: &Query) -> Resul
     }
     let read = view_rewrites::catalog(builder, core::iter::once(query));
     let names_routine = |name: &Ident| names_routine(builder, name);
-    match first_unknown_column(query, &read, IdentifierCase::AsWritten, &names_routine) {
+    match first_unknown_column(query, &read, builder.identifier_case(), &names_routine) {
         Some(reference) => Err(Error::UnknownColumn { reference }),
         None => Ok(()),
     }
