@@ -2677,6 +2677,7 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
     assert!(first_type.array_element(&catalog).is_none());
     assert_eq!(first_type.array_dimensions(&catalog), None);
     assert!(first_type.base_type(&catalog).is_none());
+    assert!(first_type.domain(&catalog).is_none());
 
     Ok(())
 }
