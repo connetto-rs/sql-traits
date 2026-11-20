@@ -4,8 +4,9 @@
 /// When a constraint is checked within a transaction, mirroring
 /// `pg_constraint.condeferrable` and `pg_constraint.condeferred`.
 ///
-/// PostgreSQL refuses `NOT DEFERRABLE INITIALLY DEFERRED`, so these three are
-/// every state a constraint can hold.
+/// PostgreSQL refuses `NOT DEFERRABLE INITIALLY DEFERRED` and SQLite checks it
+/// as [`ConstraintDeferral::NotDeferrable`], so these three are every state a
+/// constraint can hold.
 ///
 /// # Example
 ///

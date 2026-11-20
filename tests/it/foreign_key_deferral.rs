@@ -1,12 +1,14 @@
-//! Tests that a foreign key reads back when PostgreSQL checks it, from every
+//! Tests that a foreign key reads back when the database checks it, from every
 //! spelling that declares one.
 //!
-//! Every expectation here was measured against PostgreSQL 18 by reading
-//! `pg_constraint.condeferrable` and `pg_constraint.condeferred`.
+//! Every PostgreSQL expectation here was measured against PostgreSQL 18 by
+//! reading `pg_constraint.condeferrable` and `pg_constraint.condeferred`, and
+//! every SQLite expectation against SQLite 3.51.1 by inserting an orphan row
+//! inside a transaction.
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -110,5 +112,31 @@ fn initially_deferred_without_deferrable_is_refused() {
             ),
             "{declaration}: {result:?}"
         );
+    }
+}
+
+/// SQLite stores a foreign key declared `NOT DEFERRABLE INITIALLY DEFERRED`
+/// and checks it immediately, whichever spelling declares it.
+#[test]
+fn sqlite_checks_not_deferrable_initially_deferred_immediately() {
+    for declaration in [
+        "CREATE TABLE c (pid REFERENCES p (id) NOT DEFERRABLE INITIALLY DEFERRED);",
+        "CREATE TABLE c (pid INT, FOREIGN KEY (pid) REFERENCES p (id) NOT DEFERRABLE INITIALLY DEFERRED);",
+    ] {
+        let result = ParserDB::parse::<SQLiteDialect>(&format!(
+            "CREATE TABLE p (id INTEGER PRIMARY KEY); {declaration}"
+        ));
+        assert!(result.is_ok(), "{declaration}: {result:?}");
+        let database = result.expect("schema parses");
+        let table = database
+            .table_by_target(TargetName::new("c", false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("table exists");
+        let deferrals: Vec<_> = table
+            .foreign_keys(&database)
+            .expect("table is in this database")
+            .map(|key| key.deferral(&database))
+            .collect();
+        assert_eq!(deferrals, [ConstraintDeferral::NotDeferrable], "{declaration}");
     }
 }
