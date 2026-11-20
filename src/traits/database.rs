@@ -8,13 +8,13 @@ use geometric_traits::{
     prelude::{GenericEdgesBuilder, Kahn, SquareCSR2D},
     traits::EdgesBuilder,
 };
-use sqlparser::ast::Function;
+use sqlparser::ast::{Action, Function};
 
 use crate::{
     errors::{Error, LookupError},
     structs::{
-        IdentifierCase, OperandType, OperatorResolution, RoleSetting, TargetName, TypeFacts,
-        WrittenCall,
+        DefaultGrantee, DefaultPrivilege, DefaultPrivilegeKind, IdentifierCase, OperandType,
+        OperatorResolution, RoleSetting, TargetName, TypeFacts, WrittenCall,
     },
     traits::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
@@ -2556,6 +2556,46 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         self.column_grants().next().is_some()
     }
 
+    /// Returns the standing defaults `ALTER DEFAULT PRIVILEGES` recorded, as
+    /// `pg_default_acl` lists them, or `None` when the database does not know
+    /// its defaults.
+    ///
+    /// Each [`DefaultPrivilege`] belongs to the role that will create the
+    /// object and names the kind of object it reaches and, optionally, the one
+    /// schema it is limited to. Nothing lists a default PostgreSQL would not
+    /// store, such as one an input granted and then revoked.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE SCHEMA api;
+    /// ALTER DEFAULT PRIVILEGES IN SCHEMA api GRANT SELECT, INSERT ON TABLES TO PUBLIC;
+    /// ",
+    /// )?;
+    /// let public_tables: Vec<Option<String>> = db
+    ///     .default_privileges()
+    ///     .unwrap()
+    ///     .filter(|entry| {
+    ///         entry.kind() == DefaultPrivilegeKind::Tables
+    ///             && entry.grant_to(&DefaultGrantee::Public).is_some()
+    ///     })
+    ///     .map(|entry| entry.schema().map(String::from))
+    ///     .collect();
+    /// assert_eq!(public_tables, [Some(String::from("api"))]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn default_privileges(&self) -> Option<impl Iterator<Item = DefaultPrivilege<'_>>> {
+        None::<core::iter::Empty<DefaultPrivilege<'_>>>
+    }
+
     /// Returns whether `PUBLIC` would hold `EXECUTE` on a function `owner`
     /// created now in `schema`, or `None` when the database does not know the
     /// defaults it would start with.
@@ -2568,7 +2608,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// holding `EXECUTE` on the next function in `s`. The next function
     /// `owner` creates in `schema` answers
     /// [`FunctionLike::is_executable_by_public`] the same until a `GRANT` or
-    /// `REVOKE` reaches it.
+    /// `REVOKE` reaches it. The answer is read from
+    /// [`default_privileges`](Self::default_privileges).
     ///
     /// # Arguments
     ///
@@ -2606,13 +2647,36 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    #[inline]
-    fn new_function_executable_by_public(
-        &self,
-        _owner: Option<&str>,
-        _schema: &str,
-    ) -> Option<bool> {
-        None
+    fn new_function_executable_by_public(&self, owner: Option<&str>, schema: &str) -> Option<bool> {
+        let mut global = None;
+        let mut in_schema = None;
+        for entry in self.default_privileges()? {
+            if entry.kind() != DefaultPrivilegeKind::Functions || entry.role() != owner {
+                continue;
+            }
+            match entry.schema() {
+                None => global = Some(entry),
+                Some(limited) if limited == schema => in_schema = Some(entry),
+                Some(_) => {}
+            }
+        }
+        let public_executes = |entry: &DefaultPrivilege<'_>| {
+            entry.grant_to(&DefaultGrantee::Public).is_some_and(|grant| {
+                grant
+                    .privileges()
+                    .iter()
+                    .any(|privilege| matches!(privilege, Action::Execute { .. }))
+            })
+        };
+        Some(match (global, in_schema) {
+            // PostgreSQL stores an empty merge as no list, which reads as the
+            // built-in grant.
+            (Some(global), None) if global.grants().is_empty() => true,
+            (global, in_schema) => {
+                global.as_ref().is_none_or(public_executes)
+                    || in_schema.as_ref().is_some_and(public_executes)
+            }
+        })
     }
 
     /// Iterates over the schemas the database holds, `public` among them while

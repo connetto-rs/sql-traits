@@ -39,9 +39,9 @@ use sqlparser::ast::{
 };
 
 use super::{
-    AlterTableScope, Creator, DefaultKind, NamedColumn, ParserDB, ParserDBBuilder, SchemaQualifier,
-    StoredTable, bind_reference, column_references, domains, first_repeated_column,
-    function_bodies, materialized_view_indexes, object_name_last_identifier,
+    AlterTableScope, Creator, DefaultPrivilegeKind, NamedColumn, ParserDB, ParserDBBuilder,
+    SchemaQualifier, StoredTable, bind_reference, column_references, domains,
+    first_repeated_column, function_bodies, materialized_view_indexes, object_name_last_identifier,
     object_name_matches_resolved_identity, place_relation,
     postgres_catalog::{CatalogDependent, PostgresCatalog},
     relation_name_holder, require_named_in_catalog, rules, stored_ident, stored_view_qualifier,
@@ -202,7 +202,7 @@ pub(super) fn create_view(
         builder.add_view(Arc::new(view), metadata)
     };
     Arc::make_mut(arrays).create(&builder, &node.name);
-    Ok(creator.grant(builder, DefaultKind::Relations, &GrantObjects::Tables(vec![node.name])))
+    Ok(creator.grant(builder, DefaultPrivilegeKind::Tables, &GrantObjects::Tables(vec![node.name])))
 }
 
 /// Checks the two rules a replacement has to keep: it may not drop an output

@@ -9,7 +9,7 @@
 use alloc::sync::Arc;
 
 use crate::{
-    structs::{GenericDB, TargetName, TypeFacts},
+    structs::{DefaultPrivilege, GenericDB, TargetName, TypeFacts},
     traits::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
         DomainLike, ExtensionLike, ForeignKeyLike, FunctionLike, IndexLike, Metadata, OperatorLike,
@@ -156,16 +156,12 @@ pub trait SchemaProfile: Sized {
         None
     }
 
-    /// Returns whether `PUBLIC` would hold `EXECUTE` on a function `owner`
-    /// created now in the schema stored as `schema`, under the defaults
-    /// `ingestion` holds, or `None` when the profile does not know them.
-    fn new_function_executable_by_public(
-        _database: &GenericDB<Self>,
+    /// Returns the standing defaults `ingestion` holds, or `None` when the
+    /// profile does not know them.
+    fn default_privileges(
         _ingestion: &Self::Ingestion,
-        _owner: Option<&str>,
-        _schema: &str,
-    ) -> Option<bool> {
-        None
+    ) -> Option<impl Iterator<Item = DefaultPrivilege<'_>>> {
+        None::<core::iter::Empty<DefaultPrivilege<'_>>>
     }
 
     /// Returns the schemas a database of this profile starts with under the

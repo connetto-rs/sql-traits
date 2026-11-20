@@ -1240,6 +1240,7 @@ fn unavailable_catalogs_stay_distinct_from_empty_ones() -> Result<(), Error> {
             .is_none()
     );
     assert_eq!(database.new_function_executable_by_public(None, "public"), None);
+    assert!(database.default_privileges().is_none());
 
     let empty = ParseOptions::default()
         .with_postgres_catalog(PostgresCatalog::empty())
