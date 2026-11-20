@@ -2220,7 +2220,8 @@ pub enum Error {
     )]
     /// Error indicating that a foreign key is declared `NOT DEFERRABLE
     /// INITIALLY DEFERRED`, which PostgreSQL refuses with "constraint
-    /// declared INITIALLY DEFERRED must be DEFERRABLE".
+    /// declared INITIALLY DEFERRED must be DEFERRABLE". Ingestion accepts it
+    /// under SQLite, which stores such a key and checks it immediately.
     InitiallyDeferredNotDeferrable {
         /// Name of the table the foreign key is declared on.
         table_name: String,

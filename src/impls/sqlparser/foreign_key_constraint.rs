@@ -179,14 +179,17 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     }
 }
 
-/// `INITIALLY DEFERRED` implies `DEFERRABLE`, as in PostgreSQL, and ingestion
-/// refuses the one combination contradicting it.
+/// `NOT DEFERRABLE` outweighs `INITIALLY DEFERRED`, which is how SQLite checks
+/// a key declaring both and a combination every other dialect refuses at
+/// ingestion. Otherwise `INITIALLY DEFERRED` implies `DEFERRABLE`, as in
+/// PostgreSQL.
 fn deferral_of(characteristics: Option<ConstraintCharacteristics>) -> ConstraintDeferral {
     let characteristics = characteristics.unwrap_or_default();
     match (characteristics.deferrable, characteristics.initially) {
+        (Some(false), _) => ConstraintDeferral::NotDeferrable,
         (_, Some(DeferrableInitial::Deferred)) => ConstraintDeferral::InitiallyDeferred,
         (Some(true), _) => ConstraintDeferral::InitiallyImmediate,
-        (Some(false) | None, _) => ConstraintDeferral::NotDeferrable,
+        (None, _) => ConstraintDeferral::NotDeferrable,
     }
 }
 

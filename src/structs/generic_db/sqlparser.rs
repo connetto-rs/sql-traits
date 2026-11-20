@@ -6846,6 +6846,7 @@ impl ParserDB {
         if let Some(characteristics) = fk.characteristics
             && characteristics.deferrable == Some(false)
             && characteristics.initially == Some(DeferrableInitial::Deferred)
+            && !builder.dialect().is_sqlite()
         {
             return Err(crate::errors::Error::InitiallyDeferredNotDeferrable {
                 table_name: create_table.name.to_string(),
