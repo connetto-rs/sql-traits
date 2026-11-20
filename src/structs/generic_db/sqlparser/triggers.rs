@@ -26,8 +26,8 @@ use sqlparser::ast::{
 use super::{
     AlterTableScope, NamedColumn, ParserDB, ParserDBBuilder, StoredTable, bind_reference,
     inheritance::{self, ParentKind},
-    object_names_match, rename_column_idents, require_named, rules, stored_qualifier,
-    stored_subqueries, stored_view_qualifier,
+    object_names_match, rename_column_idents, require_named, rules, stored_expressions,
+    stored_qualifier, stored_view_qualifier,
     views::{self, ViewHost},
 };
 use crate::{
@@ -168,7 +168,7 @@ fn bind_parts(
     builder: &ParserDBBuilder,
     mut create_trigger: CreateTrigger,
 ) -> Result<CreateTrigger, Error> {
-    stored_subqueries::refuse_in_trigger_condition(builder, &create_trigger.condition)?;
+    stored_expressions::refuse_in_trigger_condition(builder, &create_trigger.condition)?;
     if let Some(exec_body) = &mut create_trigger.exec_body {
         let Some(function) = builder.trigger_function(&exec_body.func_desc.name) else {
             return Err(Error::FunctionNotFoundForTrigger {

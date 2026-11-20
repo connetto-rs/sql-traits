@@ -83,6 +83,43 @@ fn argument_labels(arguments: &[FunctionArg]) -> impl Iterator<Item = &Expr> {
     })
 }
 
+/// The expressions a walk has met standing in a name position, a named
+/// argument's label or a field after a dot, which read no column.
+#[derive(Default)]
+pub(crate) struct Labels(Vec<*const Expr>);
+
+impl Labels {
+    /// Records the labels `expr` holds, before the walk reaches them.
+    pub(crate) fn enter(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Function(function) => {
+                for arguments in [&function.parameters, &function.args] {
+                    if let FunctionArguments::List(list) = arguments {
+                        self.0.extend(argument_labels(&list.args).map(core::ptr::from_ref));
+                    }
+                }
+            }
+            Expr::In { target: InTarget::Table { args: Some(arguments), .. }, .. } => {
+                self.0.extend(argument_labels(arguments).map(core::ptr::from_ref));
+            }
+            Expr::CompoundFieldAccess { access_chain, .. } => {
+                self.0.extend(access_chain.iter().filter_map(|access| {
+                    match access {
+                        AccessExpr::Dot(field) => Some(core::ptr::from_ref(field)),
+                        AccessExpr::Subscript(_) => None,
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `expr` stands in a name position recorded earlier.
+    pub(crate) fn holds(&self, expr: &Expr) -> bool {
+        self.0.iter().any(|label| core::ptr::eq(*label, expr))
+    }
+}
+
 /// Collects the columns of one table an expression reads, in the order it
 /// first reads them.
 struct ColumnsRead<'a, 't, C> {
@@ -93,19 +130,14 @@ struct ColumnsRead<'a, 't, C> {
     /// How many subqueries enclose the visited expression, which read the
     /// tables of their own `FROM` rather than this one.
     subqueries: usize,
-    /// The expressions standing in a name position, a named argument's label
-    /// or a field after a dot, which read no column.
-    labels: Vec<*const Expr>,
+    /// The expressions standing in a name position, which read no column.
+    labels: Labels,
     /// The parameters of the lambdas enclosing the visited expression, which
     /// hide a column of the same name.
     parameters: Vec<Ident>,
 }
 
 impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
-    fn is_label(&self, expr: &Expr) -> bool {
-        self.labels.iter().any(|label| core::ptr::eq(*label, expr))
-    }
-
     fn is_parameter(&self, ident: &Ident) -> bool {
         self.parameters.iter().any(|parameter| {
             identifiers_match(
@@ -168,33 +200,12 @@ impl<C: ColumnLike + Clone> Visitor for ColumnsRead<'_, '_, C> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-        if self.subqueries > 0 || self.is_label(expr) {
+        if self.subqueries > 0 || self.labels.holds(expr) {
             return ControlFlow::Continue(());
         }
-        match expr {
-            Expr::Function(function) => {
-                for arguments in [&function.parameters, &function.args] {
-                    if let FunctionArguments::List(list) = arguments {
-                        self.labels.extend(argument_labels(&list.args).map(core::ptr::from_ref));
-                    }
-                }
-            }
-            Expr::In { target: InTarget::Table { args: Some(arguments), .. }, .. } => {
-                self.labels.extend(argument_labels(arguments).map(core::ptr::from_ref));
-            }
-            Expr::CompoundFieldAccess { access_chain, .. } => {
-                self.labels.extend(access_chain.iter().filter_map(|access| {
-                    match access {
-                        AccessExpr::Dot(field) => Some(core::ptr::from_ref(field)),
-                        AccessExpr::Subscript(_) => None,
-                    }
-                }));
-            }
-            Expr::Lambda(lambda) => {
-                self.parameters
-                    .extend(lambda.params.iter().map(|parameter| parameter.name.clone()));
-            }
-            _ => {}
+        self.labels.enter(expr);
+        if let Expr::Lambda(lambda) = expr {
+            self.parameters.extend(lambda.params.iter().map(|parameter| parameter.name.clone()));
         }
         match self.reference(expr) {
             Ok(()) => ControlFlow::Continue(()),
@@ -251,7 +262,7 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
         columns,
         read: Vec::new(),
         subqueries: 0,
-        labels: Vec::new(),
+        labels: Labels::default(),
         parameters: Vec::new(),
     };
     match walk(expr, &mut visitor) {
