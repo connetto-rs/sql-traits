@@ -1187,11 +1187,6 @@ fn a_statement_needing_a_table_names_the_view_it_found_instead() {
     let schema = "CREATE TABLE t (a INT PRIMARY KEY); CREATE VIEW v AS SELECT a FROM t;";
     let cases = [
         format!("{schema} CREATE POLICY pol ON v USING (true);"),
-        format!(
-            "{schema}
-             CREATE FUNCTION f() RETURNS TRIGGER AS 'BEGIN END' LANGUAGE plpgsql;
-             CREATE TRIGGER tg INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION f();"
-        ),
         format!("{schema} CREATE TABLE fk (x INT REFERENCES v(a));"),
     ];
     for sql in cases {

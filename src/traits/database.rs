@@ -2736,3 +2736,20 @@ impl<DB: DatabaseLike> Debug for Relation<'_, DB> {
         }
     }
 }
+
+impl<DB: DatabaseLike> Relation<'_, DB> {
+    /// Whether `self` and `other` are the same relation, compared by the
+    /// address the database hands back for it.
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Table(left), Self::Table(right))
+            | (Self::ForeignTable(left), Self::ForeignTable(right)) => core::ptr::eq(*left, *right),
+            (Self::View(left), Self::View(right)) => core::ptr::eq(*left, *right),
+            (Self::MaterializedView(left), Self::MaterializedView(right)) => {
+                core::ptr::eq(*left, *right)
+            }
+            (Self::Sequence(left), Self::Sequence(right)) => core::ptr::eq(*left, *right),
+            _ => false,
+        }
+    }
+}

@@ -1007,7 +1007,10 @@ fn row_field_types(database: &ParserDB, name: &str, written: &str) -> Vec<(Strin
     found
         .expect("the command writes the name")
         .iter()
-        .map(|(table, data_type)| (table.table_name().to_owned(), rendered(data_type)))
+        .map(|(relation, data_type)| {
+            let Relation::Table(table) = relation else { panic!("a table, got {relation:?}") };
+            (table.table_name().to_owned(), rendered(data_type))
+        })
         .collect()
 }
 

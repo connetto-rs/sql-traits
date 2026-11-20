@@ -1,5 +1,10 @@
-//! Looks up a table by name and optional schema.
-#![expect(clippy::expect_used, reason = "a test helper fails loudly on a broken premise")]
+//! Looks up a table by name and optional schema, or as the one a trigger is
+//! defined on.
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test helper fails loudly on a broken premise"
+)]
 
 use sql_traits::prelude::*;
 
@@ -17,4 +22,15 @@ pub(crate) fn table<'db>(
         .table_by_target(target, IdentifierCase::AsWritten)
         .expect("unambiguous lookup")
         .expect("the table exists")
+}
+
+/// The table or foreign table `trigger` is defined on.
+pub(crate) fn trigger_table<'db>(
+    trigger: &'db <ParserDB as DatabaseLike>::Trigger,
+    database: &'db ParserDB,
+) -> &'db <ParserDB as DatabaseLike>::Table {
+    match trigger.relation(database) {
+        Ok(Relation::Table(table) | Relation::ForeignTable(table)) => table,
+        other => panic!("the trigger is on a table, got {other:?}"),
+    }
 }

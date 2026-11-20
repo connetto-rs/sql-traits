@@ -182,9 +182,9 @@ fn a_foreign_key_cycle_is_reported_rather_than_aborting() {
     );
 }
 
-/// A maintenance trigger body resolves its assigned columns against the host
-/// table, so an absent host table means the question cannot be decided. It must
-/// not collapse into "this is not a maintenance trigger".
+/// A maintenance trigger body resolves its assigned columns against the
+/// relation the trigger is on, so an absent relation means the question cannot
+/// be decided. It must not collapse into "this is not a maintenance trigger".
 #[test]
 fn a_maintenance_trigger_over_an_absent_table_reports_the_lookup() {
     let database = ParserDB::parse::<PostgreSqlDialect>(
@@ -202,7 +202,7 @@ fn a_maintenance_trigger_over_an_absent_table_reports_the_lookup() {
         _ => None,
     }
     .expect("the SQL is one CREATE TRIGGER");
-    let absent = Some(LookupError::TableNotFound { object_name: "t".to_string() });
+    let absent = Some(LookupError::RelationNotFound { object_name: "t".to_string() });
 
     assert_eq!(trigger.is_maintenance_trigger(&database).err(), absent);
     assert_eq!(trigger.maintenance_assignments(&database).err(), absent);

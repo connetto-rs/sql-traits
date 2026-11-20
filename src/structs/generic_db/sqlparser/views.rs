@@ -39,14 +39,14 @@ use sqlparser::ast::{
 };
 
 use super::{
-    AlterTableScope, Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier,
-    bind_reference, domains, first_repeated_column, function_bodies, materialized_view_indexes,
-    object_name_last_identifier, object_name_matches_resolved_identity, place_relation,
+    AlterTableScope, Creator, DefaultKind, NamedColumn, ParserDB, ParserDBBuilder, SchemaQualifier,
+    StoredTable, bind_reference, domains, first_repeated_column, function_bodies,
+    materialized_view_indexes, object_name_last_identifier, object_name_matches_resolved_identity,
+    place_relation,
     postgres_catalog::{CatalogDependent, PostgresCatalog},
-    relation_name_holder, require_named_in_catalog,
-    rules::{self, RuleHost},
-    stored_ident, stored_view_qualifier,
+    relation_name_holder, require_named_in_catalog, rules, stored_ident, stored_view_qualifier,
     table_owner::Handover,
+    triggers,
     type_arrays::TypeArrays,
     user_defined_types::{self, TypeDrop},
     view_rewrites::{self, Rename},
@@ -393,7 +393,7 @@ pub(super) fn drop_views(
                     Arc::make_mut(arrays).remove(&dropped.type_name());
                 } else {
                     let (view, _, _) = builder.views_mut().remove(position);
-                    rules::drop_rules_on(&mut builder, &RuleHost::of_view(view.as_ref()));
+                    ViewHost::of_view(view.as_ref()).drop_dependents(&mut builder);
                     let dropped = GrantedView::of(view.as_ref());
                     drop.types.extend(rowtype_identities(arrays, &dropped.type_name()));
                     dropped.forget_grants(&mut builder);
@@ -1036,9 +1036,9 @@ fn retarget_view(
         let view = builder.views()[position].0.as_ref();
         (GrantedView::of(view), stored_view_key(view, IdentifierCase::AsWritten))
     };
-    // Only a plain view carries rules.
+    // Only a plain view carries rules and triggers.
     let host =
-        (kind == ObjectKind::View).then(|| RuleHost::of_view(builder.views()[position].0.as_ref()));
+        (kind == ObjectKind::View).then(|| ViewHost::of_view(builder.views()[position].0.as_ref()));
 
     let readers = view_rewrites::readers(&builder, &[&key]);
 
@@ -1076,7 +1076,7 @@ fn retarget_view(
         view_rewrites::follow_renames(&mut builder, readers, &[Rename::Relation { key, to }])?;
     }
     if let Some(host) = &host {
-        rules::follow_relation_rename(&mut builder, host, &stored_name);
+        host.follow_rename(&mut builder, &stored_name);
     }
     current.rename_grants(&mut builder, &stored_name);
     if kind == ObjectKind::MaterializedView {
@@ -1123,9 +1123,9 @@ fn rename_view_column(
         let view = builder.views()[position].0.as_ref();
         (view.declaration(), stored_view_key(view, IdentifierCase::AsWritten))
     };
-    // Only a plain view carries rules.
+    // Only a plain view carries rules and triggers.
     let host =
-        (kind == ObjectKind::View).then(|| RuleHost::of_view(builder.views()[position].0.as_ref()));
+        (kind == ObjectKind::View).then(|| ViewHost::of_view(builder.views()[position].0.as_ref()));
     let view_name = declaration.name().to_string();
 
     let (names, enumerable) = output_names(&builder, declaration)?;
@@ -1174,7 +1174,7 @@ fn rename_view_column(
         )?;
     }
     if let Some(host) = &host {
-        rules::follow_column_rename(&mut builder, host, old_name, new_name);
+        host.follow_column_rename(&mut builder, old_name, new_name);
     }
     if kind == ObjectKind::MaterializedView {
         materialized_view_indexes::follow_column_rename(&mut builder, position, old_name, new_name);
@@ -1758,8 +1758,8 @@ pub(super) fn remove_dependent_views(
 }
 
 /// Removes the views, materialized views, functions and rules `doomed` names,
-/// with the grants on them, the rules on the views, and the sequences they
-/// owned.
+/// with the grants on them, the rules and triggers on the views, and the
+/// sequences they owned.
 ///
 /// Returns the identities the row types of the removed views hold, each with
 /// its stored array, and the functions the removal takes, whose own
@@ -1771,14 +1771,14 @@ pub(super) fn remove_readers(
 ) -> TypeDrop {
     let is_doomed =
         |kind: ObjectKind, own_key: RelationKey| doomed.contains(&Dependent::Reader(kind, own_key));
-    let hosts: Vec<RuleHost> = builder
+    let hosts: Vec<ViewHost> = builder
         .views()
         .iter()
         .map(|(view, _, _)| view.as_ref())
         .filter(|view| {
             is_doomed(ObjectKind::View, stored_view_key(*view, IdentifierCase::AsWritten))
         })
-        .map(RuleHost::of_view)
+        .map(ViewHost::of_view)
         .collect();
     let granted: Vec<GrantedView> = builder
         .views()
@@ -1833,9 +1833,51 @@ pub(super) fn remove_readers(
         .retain(|(function, _)| !functions.iter().any(|doomed| Arc::ptr_eq(doomed, function)));
     builder.rules_mut().retain(|(rule, _)| !doomed.contains(&rules::dependent(rule)));
     for host in &hosts {
-        rules::drop_rules_on(builder, host);
+        host.drop_dependents(builder);
     }
     super::sequences::drop_orphaned_sequences(builder);
     materialized_view_indexes::drop_orphaned(builder);
     TypeDrop { types, functions, operators: Vec::new() }
+}
+
+/// The stored identity of a plain view whose rules and triggers a statement
+/// drops or rewrites, owned so it survives the edits made to the view store.
+pub(super) struct ViewHost(StoredTable);
+
+impl ViewHost {
+    pub(super) fn of_view<V: ViewLike>(view: &V) -> Self {
+        Self(StoredTable::of_view(view))
+    }
+
+    /// The identity the view is stored under.
+    pub(super) fn stored(&self) -> &StoredTable {
+        &self.0
+    }
+
+    /// Whether `name`, the bound target of a rule or a trigger, names this
+    /// view.
+    pub(super) fn named_by(&self, name: &ObjectName) -> bool {
+        self.0.named_by(name)
+    }
+
+    /// Drops the rules and triggers on the view, which is going away.
+    fn drop_dependents(&self, builder: &mut ParserDBBuilder) {
+        rules::drop_rules_on(builder, self);
+        triggers::drop_on_view(builder, self);
+    }
+
+    /// Points the rules and triggers on the renamed or moved view at its
+    /// stored name `new_name`.
+    fn follow_rename(&self, builder: &mut ParserDBBuilder, new_name: &ObjectName) {
+        rules::follow_relation_rename(builder, self, new_name);
+        triggers::follow_view_rename(builder, self, new_name);
+    }
+
+    /// Carries the rename of the view's column `from` to `to` into the rules
+    /// and triggers on the view.
+    fn follow_column_rename(&self, builder: &mut ParserDBBuilder, from: &Ident, to: &Ident) {
+        let from = NamedColumn::of(from, builder.identifier_case());
+        rules::follow_column_rename(builder, self, &from, to);
+        triggers::follow_view_column_rename(builder, self, &from, to);
+    }
 }

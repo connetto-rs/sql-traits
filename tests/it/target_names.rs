@@ -98,9 +98,10 @@ fn policy_target_preserves_quoting_and_qualification() {
 }
 
 /// A trigger target that does not resolve cannot reach a built schema, since
-/// the parse refuses it with `TableNotFoundForTrigger`. What the reader still
-/// buys here is the name without a parser node, and without the failure mode
-/// that [`TriggerLike::table`] carries for the caller who only wants a name.
+/// the parse refuses it with `RelationNotFoundForTrigger`. What the reader
+/// still buys here is the name without a parser node, and without the failure
+/// mode that [`TriggerLike::relation`] carries for the caller who only wants a
+/// name.
 #[test]
 fn trigger_target_reads_back_unqualified() {
     let db = parse(
@@ -111,13 +112,13 @@ fn trigger_target_reads_back_unqualified() {
     );
     let trigger = db.triggers().next().expect("the trigger exists");
 
-    let target = trigger.target_table_name();
+    let target = trigger.target_relation_name();
     assert_eq!(target.name(), "docs");
     assert!(!target.name_is_quoted());
     assert_eq!(target.schema(), None);
 
     let by_reference = &trigger;
-    assert_eq!(by_reference.target_table_name(), target);
+    assert_eq!(by_reference.target_relation_name(), target);
 }
 
 /// An unresolvable trigger target is refused outright, unlike the policy above
@@ -133,7 +134,7 @@ fn trigger_target_that_does_not_resolve_is_refused() {
     );
 
     assert!(
-        matches!(refused, Err(Error::TableNotFoundForTrigger { ref table_name, .. }) if table_name == "docs"),
+        matches!(refused, Err(Error::RelationNotFoundForTrigger { ref relation_name, .. }) if relation_name == "docs"),
         "got {refused:?}"
     );
 }
@@ -149,7 +150,7 @@ fn trigger_target_preserves_quoting_and_qualification() {
     );
     let trigger = db.triggers().next().expect("the trigger exists");
 
-    let target = trigger.target_table_name();
+    let target = trigger.target_relation_name();
     assert_eq!(target.name(), "Docs");
     assert!(target.name_is_quoted());
     assert_eq!(target.schema(), Some("app"));

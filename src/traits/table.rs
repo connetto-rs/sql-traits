@@ -184,7 +184,11 @@ pub trait TableLike:
         self.require_in_database(database)?;
 
         Ok(database.triggers().filter(move |trigger| {
-            trigger.table(database).is_ok_and(|t| t.borrow() == self.borrow())
+            matches!(
+                trigger.relation(database),
+                Ok(Relation::Table(table) | Relation::ForeignTable(table))
+                    if table.borrow() == self.borrow()
+            )
         }))
     }
 

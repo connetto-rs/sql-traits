@@ -1317,21 +1317,6 @@ pub(crate) fn resolve_bound_table_or_foreign_table<'db, DB: DatabaseLike>(
     }
 }
 
-/// Resolves a reference a stored object carries to the table or foreign table
-/// it cannot exist without, such as the one a trigger fires on.
-///
-/// # Errors
-///
-/// Returns [`LookupError::TableNotFound`] when neither kind matches, and an
-/// error when the object name is malformed for table lookup or the lookup is
-/// ambiguous.
-pub(crate) fn resolve_required_bound_table_or_foreign_table<'db, DB: DatabaseLike>(
-    object_name: &ObjectName,
-    database: &'db DB,
-) -> Result<&'db DB::Table, LookupError> {
-    resolve_bound_table_or_foreign_table(object_name, database)?
-        .ok_or_else(|| LookupError::TableNotFound { object_name: object_name.to_string() })
-}
 #[cfg(test)]
 mod tests {
     use sqlparser::{

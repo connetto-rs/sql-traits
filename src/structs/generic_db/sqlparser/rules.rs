@@ -7,11 +7,7 @@
 //! creation, the way a `BEGIN ATOMIC` function body does, and follow their
 //! renames and drops.
 
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -21,14 +17,12 @@ use sqlparser::ast::{
 
 use super::{
     NamedColumn, ParserDBBuilder, bind_reference, case_idents_match, function_bodies,
-    object_name_matches_resolved_identity, require_named, stored_qualifier, stored_view_qualifier,
-    target_tables_match,
-    views::{self, relations_read_in, statements_read},
+    require_named, stored_qualifier, stored_view_qualifier, target_tables_match,
+    views::{self, ViewHost, relations_read_in, statements_read},
 };
 use crate::{
     errors::{Error, ObjectKind},
     structs::IdentifierCase,
-    traits::ViewLike,
     utils::{
         identifier_resolution::identifiers_match,
         last_str,
@@ -187,68 +181,36 @@ pub(super) fn rules_reading(builder: &ParserDBBuilder, rule: &CreateRule) -> Vec
     read
 }
 
-/// The stored identity of a view whose rules a statement drops or rewrites,
-/// owned so it survives the edits made to the view store.
-pub(super) struct RuleHost {
-    name: String,
-    name_quoted: bool,
-    schema: Option<String>,
-    schema_quoted: bool,
+/// Drops the rules defined on a view that is going away.
+pub(super) fn drop_rules_on(builder: &mut ParserDBBuilder, host: &ViewHost) {
+    builder.rules_mut().retain(|(rule, _)| !host.named_by(&rule.table_name));
 }
 
-impl RuleHost {
-    pub(super) fn of_view<V: ViewLike>(view: &V) -> Self {
-        Self {
-            name: view.view_name().to_string(),
-            name_quoted: view.view_name_is_quoted(),
-            schema: view.view_schema().map(ToString::to_string),
-            schema_quoted: view.view_schema_is_quoted(),
-        }
-    }
-
-    /// Whether the rule is defined on this relation.
-    fn carries(&self, rule: &CreateRule) -> bool {
-        object_name_matches_resolved_identity(
-            &rule.table_name,
-            &self.name,
-            self.name_quoted,
-            self.schema.as_deref(),
-            self.schema_quoted,
-        )
-    }
-}
-
-/// Drops the rules defined on a relation that is going away.
-pub(super) fn drop_rules_on(builder: &mut ParserDBBuilder, host: &RuleHost) {
-    builder.rules_mut().retain(|(rule, _)| !host.carries(rule));
-}
-
-/// Points the rules on a renamed or moved relation at its stored name
+/// Points the rules on a renamed or moved view at its stored name
 /// `new_name`.
 pub(super) fn follow_relation_rename(
     builder: &mut ParserDBBuilder,
-    host: &RuleHost,
+    host: &ViewHost,
     new_name: &ObjectName,
 ) {
     for (rule, _) in builder.rules_mut() {
-        if host.carries(rule) {
+        if host.named_by(&rule.table_name) {
             Arc::make_mut(rule).table_name = new_name.clone();
         }
     }
 }
 
 /// Rewrites the `NEW` and `OLD` references to a renamed column in the rules
-/// on its relation.
+/// on its view.
 pub(super) fn follow_column_rename(
     builder: &mut ParserDBBuilder,
-    host: &RuleHost,
-    from: &Ident,
+    host: &ViewHost,
+    from: &NamedColumn,
     to: &Ident,
 ) {
-    let from = NamedColumn::of(from, builder.identifier_case());
     for (rule, _) in builder.rules_mut() {
-        if host.carries(rule) {
-            rename_row_column(Arc::make_mut(rule), &from, to);
+        if host.named_by(&rule.table_name) {
+            rename_row_column(Arc::make_mut(rule), from, to);
         }
     }
 }

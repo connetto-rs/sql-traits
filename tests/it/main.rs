@@ -203,6 +203,7 @@ mod unique_key_calls;
 mod unresolved_expressions;
 mod user_defined_types;
 mod view_options;
+mod view_triggers;
 mod views;
 mod views_follow_renames;
 mod written_index_clauses;

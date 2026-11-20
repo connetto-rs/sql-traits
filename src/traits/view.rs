@@ -8,7 +8,7 @@ use sqlparser::ast::Query;
 use crate::{
     errors::LookupError,
     structs::TargetName,
-    traits::{DatabaseLike, Metadata},
+    traits::{DatabaseLike, Metadata, Relation, TriggerLike},
     utils::{
         identifier_resolution::{is_temporary_schema, stored_identifier},
         output_from_wildcard,
@@ -370,6 +370,57 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// # }
     /// ```
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError>;
+
+    /// Returns the triggers defined on the view, such as the `INSTEAD OF`
+    /// triggers that make it writable.
+    ///
+    /// They are the triggers `database` holds on the view of this view's
+    /// name. A materialized view carries none, since PostgreSQL refuses a
+    /// trigger on one.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance to query the
+    ///   triggers from.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE t (a INTEGER);
+    ///      CREATE VIEW v AS SELECT a FROM t;
+    ///      CREATE TRIGGER v_insert INSTEAD OF INSERT ON v
+    ///      BEGIN INSERT INTO t (a) VALUES (NEW.a); END;",
+    /// )?;
+    /// let view = db
+    ///     .view_by_target(TargetName::new("v", false), IdentifierCase::AsWritten)?
+    ///     .expect("the view is recorded");
+    /// let triggers: Vec<&str> = view.triggers(&db).map(TriggerLike::name).collect();
+    /// assert_eq!(triggers, ["v_insert"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn triggers<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Trigger>
+    where
+        Self: 'db,
+    {
+        let target = self.target_name();
+        let materialized = self.is_materialized();
+        database.triggers().filter(move |trigger| {
+            !materialized
+                && matches!(
+                    trigger.relation(database),
+                    Ok(Relation::View(view)) if view.target_name() == target
+                )
+        })
+    }
 
     /// Returns the column names the declaration wrote, each with its quote
     /// state, or an empty slice when it wrote none.

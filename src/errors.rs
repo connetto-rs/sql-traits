@@ -405,6 +405,50 @@ impl core::fmt::Display for FixedPersistence {
     }
 }
 
+/// What the engine of the dialect refuses in a trigger on the kind of
+/// relation it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TriggerFiringRefusal {
+    /// An `INSTEAD OF` trigger on a table, foreign and partitioned tables
+    /// included, which PostgreSQL and SQLite refuse.
+    InsteadOfOnTable,
+    /// A `BEFORE` or `AFTER` trigger on a view, which SQLite refuses.
+    BeforeOrAfterOnView,
+    /// A `FOR EACH ROW` trigger on a view firing `BEFORE` or `AFTER`, a
+    /// constraint trigger included, which PostgreSQL refuses.
+    RowLevelBeforeOrAfterOnView,
+    /// A `TRUNCATE` trigger on a view, which PostgreSQL refuses.
+    TruncateOnView,
+    /// An `INSTEAD OF` trigger firing once per statement, explicitly or by
+    /// PostgreSQL's default, which PostgreSQL refuses.
+    InsteadOfPerStatement,
+    /// An `INSTEAD OF UPDATE OF` column list, which PostgreSQL refuses.
+    InsteadOfColumnList,
+    /// An `INSTEAD OF` trigger with a `WHEN` condition, which PostgreSQL
+    /// refuses.
+    InsteadOfCondition,
+    /// A trigger on a view with a `REFERENCING` transition table, which
+    /// PostgreSQL refuses.
+    TransitionTablesOnView,
+}
+
+impl core::fmt::Display for TriggerFiringRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::InsteadOfOnTable => "a table cannot have INSTEAD OF triggers",
+            Self::BeforeOrAfterOnView => "a view cannot have BEFORE or AFTER triggers",
+            Self::RowLevelBeforeOrAfterOnView => {
+                "a view cannot have row-level BEFORE or AFTER triggers"
+            }
+            Self::TruncateOnView => "a view cannot have TRUNCATE triggers",
+            Self::InsteadOfPerStatement => "INSTEAD OF triggers must be FOR EACH ROW",
+            Self::InsteadOfColumnList => "INSTEAD OF triggers cannot have column lists",
+            Self::InsteadOfCondition => "INSTEAD OF triggers cannot have WHEN conditions",
+            Self::TransitionTablesOnView => "triggers on views cannot have transition tables",
+        })
+    }
+}
+
 /// What an existing table lacks of the shape of the table it is made a child
 /// of, by `ALTER TABLE ... INHERIT` or `ATTACH PARTITION`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2024,13 +2068,26 @@ pub enum Error {
         /// Name of the table the foreign key is declared on.
         table_name: String,
     },
-    #[error("Table `{table_name}` not found for trigger `{trigger_name}`.")]
-    /// Error indicating that a trigger references a table that does not exist.
-    TableNotFoundForTrigger {
-        /// Name of the table the trigger belongs to.
-        table_name: String,
+    #[error("Relation `{relation_name}` not found for trigger `{trigger_name}`.")]
+    /// Error indicating that a trigger names a table or view that does not
+    /// exist.
+    RelationNotFoundForTrigger {
+        /// Name of the relation the trigger is declared on.
+        relation_name: String,
         /// Name of the trigger.
         trigger_name: String,
+    },
+    #[error("Trigger `{trigger_name}` on `{relation_name}` is refused because {reason}.")]
+    /// Error indicating that a `CREATE TRIGGER` names a timing, a level, an
+    /// event or a clause the engine of the dialect refuses on the kind of
+    /// relation it names.
+    TriggerFiringRefused {
+        /// Name of the trigger.
+        trigger_name: String,
+        /// Name of the table or view the trigger names.
+        relation_name: String,
+        /// What the engine refuses.
+        reason: TriggerFiringRefusal,
     },
     #[error("Table `{table_name}` not found for policy `{policy_name}`.")]
     /// Error indicating that a policy names a table that does not exist.
@@ -3657,15 +3714,15 @@ pub enum Error {
         /// Name of the table carrying it.
         table_name: String,
     },
-    #[error("Trigger `{trigger_name}` already exists on table `{table_name}`.")]
+    #[error("Trigger `{trigger_name}` already exists on relation `{relation_name}`.")]
     /// Error indicating that a `CREATE TRIGGER` statement names a trigger the
-    /// table already carries. A trigger name is unique per table, so the same
-    /// name on another table is fine.
+    /// table or view already carries. A trigger name is unique per relation,
+    /// so the same name on another relation is fine.
     TriggerAlreadyExists {
         /// Name of the trigger that already exists.
         trigger_name: String,
-        /// Name of the table carrying it.
-        table_name: String,
+        /// Name of the table or view carrying it.
+        relation_name: String,
     },
     #[error(
         "Trigger `{trigger_name}` on table `{table_name}` is the partition's copy of the trigger \

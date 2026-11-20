@@ -225,7 +225,7 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
     /// its stored definition.
     fn read(&mut self, relation: Relation<'db, DB>) -> Result<(), LookupError> {
         let reads = &mut self.reads;
-        if !self.bound && !reads.relations.iter().any(|seen| same_relation(seen, &relation)) {
+        if !self.bound && !reads.relations.iter().any(|seen| seen.is_same(&relation)) {
             reads.relations.push(relation);
         }
         match relation {
@@ -306,23 +306,6 @@ impl<'db, 'path, DB: DatabaseLike> RelationCollector<'db, 'path, DB> {
     }
 }
 
-/// Whether two relations are the same one, compared by the address the
-/// database hands back for it.
-fn same_relation<DB: DatabaseLike>(left: &Relation<'_, DB>, right: &Relation<'_, DB>) -> bool {
-    match (left, right) {
-        (Relation::Table(left), Relation::Table(right))
-        | (Relation::ForeignTable(left), Relation::ForeignTable(right)) => {
-            core::ptr::eq(*left, *right)
-        }
-        (Relation::View(left), Relation::View(right)) => core::ptr::eq(*left, *right),
-        (Relation::MaterializedView(left), Relation::MaterializedView(right)) => {
-            core::ptr::eq(*left, *right)
-        }
-        (Relation::Sequence(left), Relation::Sequence(right)) => core::ptr::eq(*left, *right),
-        _ => false,
-    }
-}
-
 /// Adds `name` to `names` unless they hold the same spelling of the same
 /// kind already, reaching the same objects.
 pub(super) fn add_unqualified<'db, DB: DatabaseLike>(
@@ -337,7 +320,7 @@ pub(super) fn add_unqualified<'db, DB: DatabaseLike>(
             ) => {
                 left == right
                     && match (left_relation, right_relation) {
-                        (Some(left), Some(right)) => same_relation(left, right),
+                        (Some(left), Some(right)) => left.is_same(right),
                         (left, right) => left.is_none() && right.is_none(),
                     }
             }

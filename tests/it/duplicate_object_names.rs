@@ -541,8 +541,8 @@ fn a_trigger_name_used_twice_on_one_table_is_refused() {
          CREATE TRIGGER t AFTER UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION touch();"
     ));
     assert!(
-        matches!(&refused, Err(Error::TriggerAlreadyExists { trigger_name, table_name })
-            if trigger_name == "t" && table_name == "docs"),
+        matches!(&refused, Err(Error::TriggerAlreadyExists { trigger_name, relation_name })
+            if trigger_name == "t" && relation_name == "docs"),
         "a different event does not make it a second trigger, got {refused:?}"
     );
 }
@@ -573,7 +573,7 @@ fn dropping_a_trigger_leaves_the_same_name_on_another_table_alone() {
          CREATE TRIGGER t AFTER INSERT ON b FOR EACH ROW EXECUTE FUNCTION touch();"
     ));
     assert!(
-        matches!(&refused, Err(Error::TriggerAlreadyExists { table_name, .. }) if table_name == "b"),
+        matches!(&refused, Err(Error::TriggerAlreadyExists { relation_name, .. }) if relation_name == "b"),
         "got {refused:?}"
     );
 

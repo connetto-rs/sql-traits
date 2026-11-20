@@ -28,7 +28,8 @@ use crate::{
         plpgsql_scope::stored_parts,
     },
     traits::{
-        ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, OperatorLike, TableLike, TriggerLike,
+        ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, OperatorLike, Relation, TableLike,
+        TriggerLike,
     },
     utils::{
         call_sites::expression_form,
@@ -769,23 +770,25 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     }
 
     /// Returns, for a field of a trigger function's `NEW` or `OLD` that
-    /// `expression` names, each table a trigger executing the function is
+    /// `expression` names, each relation a trigger executing the function is
     /// defined on, once, in the order the database holds the triggers, with
-    /// the type the field takes when that table's trigger fires. That is the
-    /// column's type, or [`OperandType::Unknown`] where the table has no such
-    /// column. PostgreSQL 18 types the field from the table on a
-    /// statement-level trigger too, where the row itself is null.
+    /// the type the field takes when that relation's trigger fires. On a
+    /// table that is the column's type, or [`OperandType::Unknown`] where the
+    /// table has no such column. PostgreSQL 18 types the field from the table
+    /// on a statement-level trigger too, where the row itself is null. On a
+    /// view it is [`OperandType::Unknown`], since the typing scopes do not
+    /// describe a view's columns.
     ///
-    /// [`Self::type_of`] answers the type every table agrees on, and
+    /// [`Self::type_of`] answers the type every relation agrees on, and
     /// [`OperandType::Unknown`] when they disagree. Any other node, a field
-    /// of a field, and a function no trigger executes answer no table.
+    /// of a field, and a function no trigger executes answer no relation.
     ///
     /// # Errors
     ///
     /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
     /// query, the lookup errors resolving the reference returns, and the
-    /// error [`TriggerLike::table`] returns for a trigger whose table does
-    /// not resolve.
+    /// error [`TriggerLike::relation`] returns for a trigger whose relation
+    /// does not resolve.
     ///
     /// # Example
     ///
@@ -817,7 +820,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// let types: Vec<_> = context
     ///     .row_field_types(name)?
     ///     .into_iter()
-    ///     .map(|(table, field)| (table.table_name(), field))
+    ///     .map(|(relation, field)| {
+    ///         let Relation::Table(table) = relation else { panic!("both are tables") };
+    ///         (table.table_name(), field)
+    ///     })
     ///     .collect();
     /// let int4 = TargetName::new("int4", false).with_schema("pg_catalog", false);
     /// let text = TargetName::new("text", false).with_schema("pg_catalog", false);
@@ -834,7 +840,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     pub fn row_field_types(
         &self,
         expression: &Expr,
-    ) -> Result<Vec<(&'db DB::Table, OperandType<'db>)>, LookupError> {
+    ) -> Result<Vec<(Relation<'db, DB>, OperandType<'db>)>, LookupError> {
         let Some((ColumnDefinition::VariableField(variable), _)) = self.reference(expression)?
         else {
             return Ok(Vec::new());
@@ -977,21 +983,35 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         Ok((candidates, round))
     }
 
-    /// Each table a trigger executing the function of the PL/pgSQL scope is
-    /// defined on, once, with the type of its column `field`.
+    /// Each relation a trigger executing the function of the PL/pgSQL scope
+    /// is defined on, once, with the type of its column `field`, unknown on a
+    /// view.
     fn trigger_field_types(
         &self,
         field: &Ident,
-    ) -> Result<Vec<(&'db DB::Table, OperandType<'db>)>, LookupError> {
+    ) -> Result<Vec<(Relation<'db, DB>, OperandType<'db>)>, LookupError> {
         let Some(variables) = self.variables else { return Ok(Vec::new()) };
-        let mut tables: Vec<&'db DB::Table> = Vec::new();
+        let mut relations: Vec<Relation<'db, DB>> = Vec::new();
         for trigger in variables.function().triggers(self.database) {
-            let table = trigger.table(self.database)?;
-            if !tables.iter().any(|seen| core::ptr::eq(*seen, table)) {
-                tables.push(table);
+            let relation = trigger.relation(self.database)?;
+            if !relations.iter().any(|seen| seen.is_same(&relation)) {
+                relations.push(relation);
             }
         }
-        tables.into_iter().map(|table| Ok((table, self.column_of(table, field)?))).collect()
+        relations
+            .into_iter()
+            .map(|relation| {
+                let field_type = match relation {
+                    Relation::Table(table) | Relation::ForeignTable(table) => {
+                        self.column_of(table, field)?
+                    }
+                    Relation::View(_) | Relation::MaterializedView(_) | Relation::Sequence(_) => {
+                        OperandType::Unknown
+                    }
+                };
+                Ok((relation, field_type))
+            })
+            .collect()
     }
 
     /// The type of the one column `query` outputs, as a scalar subquery
