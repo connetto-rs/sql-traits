@@ -58,10 +58,11 @@ fn refuse_column(
     }
     // A `NO INHERIT` table-level `NOT NULL` states nothing the child must
     // hold, so only a requirement that passes down shapes the child.
+    let case = builder.identifier_case();
     let parent_requires = states_not_null(parent_column)
-        || super::table_not_null(parent_node, &parent_column.name)
+        || super::table_not_null(parent_node, &parent_column.name, case)
             .is_some_and(|held| !held.no_inherit);
-    if parent_requires && !super::requires_value(child_node, &column.name) {
+    if parent_requires && !super::requires_value(child_node, &column.name, case) {
         return Err(ChildMismatch::ColumnNullable { column_name });
     }
     match (is_stored_generated(parent_column), is_stored_generated(column)) {
