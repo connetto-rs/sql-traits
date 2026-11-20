@@ -9,7 +9,7 @@
 
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
-use sqlparser::ast::{Function, Ident};
+use sqlparser::ast::{Expr, Function, Ident};
 use unicode_normalization::UnicodeNormalization;
 
 use super::object_name::TEMPORARY_SCHEMA;
@@ -253,6 +253,15 @@ pub fn stored_identifier(value: &str, quoted: bool) -> Cow<'_, str> {
 #[must_use]
 pub fn stored_ident_name(ident: &Ident) -> Cow<'_, str> {
     stored_identifier(&ident.value, ident.quote_style.is_some())
+}
+
+/// The parts of the name `expression` writes, when it is a name.
+pub(crate) fn name_parts(expression: &Expr) -> Option<&[Ident]> {
+    match expression {
+        Expr::Identifier(name) => Some(core::slice::from_ref(name)),
+        Expr::CompoundIdentifier(parts) => Some(parts),
+        _ => None,
+    }
 }
 
 /// Returns the folded terminal name of a call, and [`None`] when that name was

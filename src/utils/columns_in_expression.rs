@@ -149,13 +149,12 @@ impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
         })
     }
 
-    fn column(&mut self, ident: &Ident) -> Result<(), crate::errors::Error> {
+    /// Records the column `ident` names, `reference` being the whole
+    /// reference as written.
+    fn column(&mut self, ident: &Ident, reference: &Expr) -> Result<(), crate::errors::Error> {
         let Some(column) = self.columns.iter().find(|column| column_named_by(*column, ident))
         else {
-            return Err(crate::errors::Error::UnknownColumnInCheckConstraint {
-                column_name: ident.value.clone(),
-                table_name: self.table.name().to_string(),
-            });
+            return Err(crate::errors::Error::UnknownColumn { reference: reference.to_string() });
         };
         if !self.read.contains(column) {
             self.read.push(column.clone());
@@ -165,7 +164,7 @@ impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
 
     fn reference(&mut self, expr: &Expr) -> Result<(), crate::errors::Error> {
         match expr {
-            Expr::Identifier(ident) if !self.is_parameter(ident) => self.column(ident),
+            Expr::Identifier(ident) if !self.is_parameter(ident) => self.column(ident, expr),
             Expr::CompoundIdentifier(idents) => {
                 let Some((column, qualifier)) = idents.split_last() else {
                     return Ok(());
@@ -179,7 +178,7 @@ impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
                         table_name: self.table.name().to_string(),
                     });
                 }
-                self.column(column)
+                self.column(column, expr)
             }
             _ => Ok(()),
         }
@@ -245,8 +244,8 @@ impl<C: ColumnLike + Clone> Visitor for ColumnsRead<'_, '_, C> {
 ///
 /// # Errors
 ///
-/// * [`Error::UnknownColumnInCheckConstraint`](crate::errors::Error::UnknownColumnInCheckConstraint)
-///   when a column in the expression is not one of `columns`.
+/// * [`Error::UnknownColumn`](crate::errors::Error::UnknownColumn) when a
+///   column in the expression is not one of `columns`.
 /// * [`Error::ForeignColumnReference`](crate::errors::Error::ForeignColumnReference)
 ///   when a reference is qualified by another table, schema or catalog, since
 ///   such a column is not this table's under a shorter name.
@@ -476,19 +475,15 @@ mod tests {
 
         let result =
             columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns);
-        assert!(result.is_err());
-        match result.err().unwrap() {
-            crate::errors::Error::UnknownColumnInCheckConstraint { column_name, table_name } => {
-                assert_eq!(column_name, "b");
-                assert_eq!(table_name, "t");
-            }
-            _ => panic!("Unexpected error type"),
-        }
+        assert!(matches!(
+            result,
+            Err(crate::errors::Error::UnknownColumn { reference }) if reference == "b"
+        ));
     }
 
     /// `CompoundIdentifier` error path — the last component of a
     /// `schema.bad_column` reference must resolve, otherwise the
-    /// walker returns `UnknownColumnInCheckConstraint`.
+    /// walker returns `UnknownColumn` naming the whole reference.
     #[test]
     fn test_columns_in_expression_compound_identifier_unknown() {
         let col_a = create_column("a");
@@ -498,14 +493,10 @@ mod tests {
 
         let result =
             columns_in_expression(&expr, "catalog", &TargetName::new("t", false), &columns);
-        assert!(result.is_err());
-        match result.err().unwrap() {
-            crate::errors::Error::UnknownColumnInCheckConstraint { column_name, table_name } => {
-                assert_eq!(column_name, "b");
-                assert_eq!(table_name, "t");
-            }
-            other => panic!("Unexpected error type: {other:?}"),
-        }
+        assert!(matches!(
+            result,
+            Err(crate::errors::Error::UnknownColumn { reference }) if reference == "t.b"
+        ));
     }
 
     /// `Expr::Tuple` branch — every element is walked, columns inside the
@@ -589,8 +580,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(crate::errors::Error::UnknownColumnInCheckConstraint { column_name, .. })
-                if column_name == "missing"
+            Err(crate::errors::Error::UnknownColumn { reference }) if reference == "missing"
         ));
     }
 
@@ -709,8 +699,7 @@ mod tests {
             assert!(
                 matches!(
                     names_in(dialect, sql),
-                    Err(crate::errors::Error::UnknownColumnInCheckConstraint { column_name, .. })
-                        if column_name == "missing"
+                    Err(crate::errors::Error::UnknownColumn { reference }) if reference == "missing"
                 ),
                 "{sql}"
             );

@@ -40,9 +40,9 @@ use sqlparser::ast::{
 
 use super::{
     AlterTableScope, Creator, DefaultKind, NamedColumn, ParserDB, ParserDBBuilder, SchemaQualifier,
-    StoredTable, bind_reference, domains, first_repeated_column, function_bodies,
-    materialized_view_indexes, object_name_last_identifier, object_name_matches_resolved_identity,
-    place_relation,
+    StoredTable, bind_reference, column_references, domains, first_repeated_column,
+    function_bodies, materialized_view_indexes, object_name_last_identifier,
+    object_name_matches_resolved_identity, place_relation,
     postgres_catalog::{CatalogDependent, PostgresCatalog},
     relation_name_holder, require_named_in_catalog, rules, stored_ident, stored_view_qualifier,
     table_owner::Handover,
@@ -86,11 +86,11 @@ fn view_schema_qualifier(name: &ObjectName) -> SchemaQualifier<'_> {
 ///
 /// # Errors
 ///
-/// Refuses the spellings the parser accepts and PostgreSQL does not, a name
-/// another relation in the schema already holds, a schema the input never
-/// creates, a temporary view outside the temporary schema, a materialized view
-/// reading a temporary relation, and a replacement that renames or drops an
-/// output column.
+/// Refuses the spellings the parser accepts and PostgreSQL does not, a column
+/// reference of the definition that reaches nothing, a name another relation
+/// in the schema already holds, a schema the input never creates, a temporary
+/// view outside the temporary schema, a materialized view reading a temporary
+/// relation, and a replacement that renames or drops an output column.
 pub(super) fn create_view(
     mut builder: ParserDBBuilder,
     mut node: CreateView,
@@ -116,6 +116,7 @@ pub(super) fn create_view(
     // A view reading a temporary relation is temporary whatever it wrote.
     let temporary_read = bind_definition(&builder, &mut node.query);
     let promoted = temporary_read.is_some();
+    column_references::refuse_in_query(&builder, &node.query)?;
     // Read before the wildcards are spelled out of the definition.
     let selects_wildcard = output_from_wildcard(&node.query);
     view_rewrites::spell_out(&builder, &mut node.query);

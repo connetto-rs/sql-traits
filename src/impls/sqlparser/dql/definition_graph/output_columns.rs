@@ -465,6 +465,15 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             .collect()
     }
 
+    /// The scope an `ORDER BY` key of `query` reads its input through, none
+    /// for a set operation, whose keys name its outputs alone.
+    pub(crate) fn order_by_cursor(&self, query: QueryId) -> Option<ScopeCursor> {
+        match &self.queries[query.0].outputs {
+            QueryOutputs::Select(scope) => Some(self.select_cursor(*scope)),
+            QueryOutputs::Merged(_) => None,
+        }
+    }
+
     pub(crate) fn resolve_order_by<'scope>(
         &'scope self,
         query: QueryId,
