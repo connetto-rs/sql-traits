@@ -28,7 +28,7 @@ use crate::{
     errors::Error,
     impls::serial_sequence_type,
     structs::{
-        ColumnDefinition, ColumnScope, IdentifierCase, QueryOutput,
+        ColumnDefinition, ColumnScope, QueryOutput,
         metadata::{ColumnCreation, CreatingQuery},
     },
 };
@@ -104,7 +104,7 @@ pub(super) fn query_columns(
     let mut output_names = Vec::new();
     let mut computed = Vec::new();
     {
-        let scope = ColumnScope::from_query(&bound, &read, IdentifierCase::AsWritten)?;
+        let scope = ColumnScope::from_query(&bound, &read, builder.identifier_case())?;
         let Some(outputs) = scope.scope_for_query(&bound) else {
             return Ok(None);
         };

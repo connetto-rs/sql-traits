@@ -28,6 +28,11 @@ fn a_reader_naming_the_column_refuses_the_type_change() {
         ("CREATE VIEW v AS SELECT a FROM t;", ObjectKind::View, "v"),
         ("CREATE VIEW v AS SELECT b FROM t WHERE a > 0;", ObjectKind::View, "v"),
         ("CREATE VIEW v AS SELECT * FROM t;", ObjectKind::View, "v"),
+        (
+            "CREATE VIEW v AS SELECT a FROM t CROSS JOIN generate_series(1, 3) AS g;",
+            ObjectKind::View,
+            "v",
+        ),
         ("CREATE MATERIALIZED VIEW m AS SELECT a FROM t;", ObjectKind::MaterializedView, "m"),
         (
             "CREATE TABLE u (a INT); CREATE VIEW v AS SELECT b FROM t JOIN u USING (a);",

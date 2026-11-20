@@ -61,8 +61,8 @@ use crate::{
     errors::{Error, ObjectKind},
     impls::{SqlparserDialect, serial_sequence_type},
     structs::{
-        ColumnIdentity, IdentifierCase, Sequence, SequenceParameters, SequenceType,
-        StoredSequenceOwner, TableAttribute, TargetName,
+        ColumnIdentity, Sequence, SequenceParameters, SequenceType, StoredSequenceOwner,
+        TableAttribute, TargetName,
     },
     traits::{ColumnLike, DatabaseLike, SequenceLike, SequenceOrigin, TableLike},
     utils::{
@@ -385,7 +385,7 @@ pub(super) fn drop_sequences(
             let key = stored_sequence_key(
                 builder.namespaces(),
                 doomed.as_ref(),
-                IdentifierCase::AsWritten,
+                builder.identifier_case(),
             );
             if cascade {
                 let taken = views::remove_dependent_views(&mut builder, &key, arrays);
@@ -1191,7 +1191,7 @@ pub(super) fn move_sequences(
     for position in moving {
         let previous = Arc::clone(&builder.sequences()[position].0);
         let key =
-            stored_sequence_key(builder.namespaces(), previous.as_ref(), IdentifierCase::AsWritten);
+            stored_sequence_key(builder.namespaces(), previous.as_ref(), builder.identifier_case());
         let readers = super::view_rewrites::readers(&builder, &[&key]);
         let mut moved = (*previous).clone();
         moved.set_schema(to.0.to_string(), to.1);

@@ -2980,10 +2980,12 @@ fn column_rename(
     node: &CreateTable,
     from: &NamedColumn,
     to: &Ident,
+    case: IdentifierCase,
 ) -> Option<view_rewrites::Rename> {
     let ordinal = node.columns.iter().position(|column| from.matches(&column.name))?;
     Some(view_rewrites::Rename::Column {
-        key: stored_table_key(namespaces, node, IdentifierCase::AsWritten),
+        key: stored_table_key(namespaces, node, case),
+        relation_name: node.table_name().to_string(),
         ordinal,
         to: to.clone(),
         columns: node.columns.iter().map(|column| column.name.clone()).collect(),
@@ -5930,18 +5932,14 @@ impl ParserDB {
     /// Returns an error when the object name is malformed for relation lookup,
     /// or when lookup is ambiguous.
     fn resolve_grant_relation(&self, object_name: &ObjectName) -> Result<Option<()>, LookupError> {
-        use crate::traits::DatabaseLike as _;
-
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let target = target_name_of_idents(schema_ident, name_ident);
-        if self.view_by_target(target.clone(), IdentifierCase::AsWritten)?.is_some()
-            || self
-                .materialized_view_by_target(target.clone(), IdentifierCase::AsWritten)?
-                .is_some()
+        if self.view_by_target(target.clone(), self.identifier_case())?.is_some()
+            || self.materialized_view_by_target(target.clone(), self.identifier_case())?.is_some()
         {
             return Ok(Some(()));
         }
-        Ok(self.sequence_by_target(target, IdentifierCase::AsWritten)?.map(|_| ()))
+        Ok(self.sequence_by_target(target, self.identifier_case())?.map(|_| ()))
     }
 
     /// Reports the roles, table targets and function targets that this
@@ -6343,7 +6341,7 @@ impl ParserDB {
             });
         };
         let renamed = StoredTable::of(resolved_table);
-        let key = stored_table_key(builder.namespaces(), resolved_table, IdentifierCase::AsWritten);
+        let key = stored_table_key(builder.namespaces(), resolved_table, builder.identifier_case());
         let target = RenameTarget::new(new_name, &resolved_table.name)?;
         let original = resolved_table.name.clone();
         // A rename cannot take a shell over the way a creation fills it.
@@ -8813,7 +8811,7 @@ impl ParserDB {
         let key = stored_table_key(
             builder.namespaces(),
             Self::stored_node(builder, table)?,
-            IdentifierCase::AsWritten,
+            builder.identifier_case(),
         );
         if cascade {
             return Ok(views::remove_dependent_views(builder, &key, arrays));
@@ -9120,6 +9118,7 @@ impl ParserDB {
                 Self::stored_node(builder, table)?,
                 column,
                 &probe,
+                builder.identifier_case(),
             ));
         }
         let keys: Vec<&RelationKey> = probes.iter().map(view_rewrites::Rename::key).collect();
@@ -9390,6 +9389,7 @@ impl ParserDB {
                 Self::stored_node(&builder, table)?,
                 &from,
                 new_column_name,
+                builder.identifier_case(),
             ));
         }
         let keys: Vec<&RelationKey> = renames.iter().map(view_rewrites::Rename::key).collect();
@@ -10479,7 +10479,7 @@ impl ParserDB {
                             && target_tables_match(
                                 &policy.table_name,
                                 &drop_policy.table_name,
-                                IdentifierCase::AsWritten,
+                                builder.identifier_case(),
                             )
                     }) else {
                         if drop_policy.if_exists {
@@ -11860,7 +11860,7 @@ impl ParserDB {
                             && target_tables_match(
                                 &existing.table_name,
                                 &policy.table_name,
-                                IdentifierCase::AsWritten,
+                                builder.identifier_case(),
                             )
                     }) {
                         return Err(crate::errors::Error::PolicyAlreadyExists {
@@ -12394,7 +12394,7 @@ impl ParserDB {
                             && target_tables_match(
                                 &policy.table_name,
                                 &table_name,
-                                IdentifierCase::AsWritten,
+                                builder.identifier_case(),
                             )
                     }) else {
                         return Err(crate::errors::Error::AlterPolicyNotFound {

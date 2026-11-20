@@ -358,13 +358,13 @@ pub(super) fn drop_views(
                 stored_view_key(
                     builder.namespaces(),
                     builder.materialized_views()[position].0.as_ref(),
-                    IdentifierCase::AsWritten,
+                    builder.identifier_case(),
                 )
             } else {
                 stored_view_key(
                     builder.namespaces(),
                     builder.views()[position].0.as_ref(),
-                    IdentifierCase::AsWritten,
+                    builder.identifier_case(),
                 )
             };
             if cascade {
@@ -1049,13 +1049,13 @@ fn retarget_view(
         let view = builder.materialized_views()[position].0.as_ref();
         (
             GrantedView::of(view),
-            stored_view_key(builder.namespaces(), view, IdentifierCase::AsWritten),
+            stored_view_key(builder.namespaces(), view, builder.identifier_case()),
         )
     } else {
         let view = builder.views()[position].0.as_ref();
         (
             GrantedView::of(view),
-            stored_view_key(builder.namespaces(), view, IdentifierCase::AsWritten),
+            stored_view_key(builder.namespaces(), view, builder.identifier_case()),
         )
     };
     // Only a plain view carries rules and triggers.
@@ -1140,10 +1140,10 @@ fn rename_view_column(
     };
     let (declaration, key) = if kind == ObjectKind::MaterializedView {
         let view = builder.materialized_views()[position].0.as_ref();
-        (view.declaration(), stored_view_key(builder.namespaces(), view, IdentifierCase::AsWritten))
+        (view.declaration(), stored_view_key(builder.namespaces(), view, builder.identifier_case()))
     } else {
         let view = builder.views()[position].0.as_ref();
-        (view.declaration(), stored_view_key(builder.namespaces(), view, IdentifierCase::AsWritten))
+        (view.declaration(), stored_view_key(builder.namespaces(), view, builder.identifier_case()))
     };
     // Only a plain view carries rules and triggers.
     let host =
@@ -1192,7 +1192,13 @@ fn rename_view_column(
         view_rewrites::follow_renames(
             &mut builder,
             readers,
-            &[Rename::Column { key, ordinal, to: new_name.clone(), columns }],
+            &[Rename::Column {
+                key,
+                relation_name: view_name,
+                ordinal,
+                to: new_name.clone(),
+                columns,
+            }],
         )?;
     }
     if let Some(host) = &host {
@@ -1230,7 +1236,7 @@ fn exposed_names<'a>(
     declared: impl Iterator<Item = (&'a str, bool)>,
 ) -> Result<(Vec<(String, bool)>, bool), Error> {
     let read = view_rewrites::catalog(builder, core::iter::once(query));
-    let derived = query_output_names(query, &read, IdentifierCase::AsWritten)?;
+    let derived = query_output_names(query, &read, builder.identifier_case())?;
     let enumerable = derived.is_some();
     let mut names = derived.unwrap_or_default();
     for (ordinal, (name, quoted)) in declared.enumerate() {
@@ -1500,6 +1506,7 @@ struct RelationsRead<'builder, 'read> {
     /// The builder the names bound against, which a block statement needs to
     /// reach a temporary relation under its temporary schema.
     builder: Option<&'builder ParserDBBuilder>,
+    case: IdentifierCase,
     scopes: WithScopes,
     read: &'read mut Vec<RelationKey>,
 }
@@ -1520,7 +1527,7 @@ impl Visitor for RelationsRead<'_, '_> {
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
         if let TableFactor::Table { name, args: None, .. } = factor
             && !self.scopes.reads_item(name)
-            && let Some(key) = bound_read_key(self.namespaces, self.builder, name)
+            && let Some(key) = bound_read_key(self.namespaces, self.builder, name, self.case)
         {
             self.read.push(key);
         }
@@ -1528,19 +1535,29 @@ impl Visitor for RelationsRead<'_, '_> {
     }
 }
 
-/// The normalized identity of every relation a view's definition reads.
-///
-/// Ingestion bound each name to the relation it reached, so a bare one means
-/// the default schema.
-fn relations_read_by<V: ViewLike>(namespaces: Namespaces, view: &V) -> Vec<RelationKey> {
-    relations_read_in(namespaces, view.definition())
+/// The identity of every relation a view reads under the catalog's case.
+fn relations_read_by<V: ViewLike>(
+    namespaces: Namespaces,
+    view: &V,
+    case: IdentifierCase,
+) -> Vec<RelationKey> {
+    relations_read_in(namespaces, view.definition(), case)
 }
 
-/// The normalized identity of every relation a bound definition reads.
-pub(super) fn relations_read_in(namespaces: Namespaces, definition: &Query) -> Vec<RelationKey> {
+/// The identity of every relation a bound definition reads under `case`.
+pub(super) fn relations_read_in(
+    namespaces: Namespaces,
+    definition: &Query,
+    case: IdentifierCase,
+) -> Vec<RelationKey> {
     let mut read = Vec::new();
-    let mut visitor =
-        RelationsRead { namespaces, builder: None, scopes: WithScopes::default(), read: &mut read };
+    let mut visitor = RelationsRead {
+        namespaces,
+        builder: None,
+        case,
+        scopes: WithScopes::default(),
+        read: &mut read,
+    };
     let walked = walk(definition, &mut visitor);
     debug_assert!(walked.is_continue(), "the visitor never breaks");
     read
@@ -1553,12 +1570,17 @@ pub(super) fn bound_read_key(
     namespaces: Namespaces,
     builder: Option<&ParserDBBuilder>,
     name: &ObjectName,
+    case: IdentifierCase,
 ) -> Option<RelationKey> {
     let target = target_name_from_object_name(name)?;
-    let case = IdentifierCase::AsWritten;
     match builder {
         Some(builder) => {
-            Some(view_rewrites::bound_factor_key(namespaces, &builder.bound_relation(name)?, name))
+            Some(view_rewrites::bound_factor_key(
+                namespaces,
+                &builder.bound_relation(name)?,
+                name,
+                case,
+            ))
         }
         None => Some(target_key(namespaces, &target, case)),
     }
@@ -1577,13 +1599,15 @@ pub(super) fn statements_read<'a>(
         // top-level and under a `WITH` clause alike, so it is named before
         // the statement is visited.
         if let Some(name) = insert_target(statement)
-            && let Some(key) = bound_read_key(builder.namespaces(), Some(builder), name)
+            && let Some(key) =
+                bound_read_key(builder.namespaces(), Some(builder), name, builder.identifier_case())
         {
             read.push(key);
         }
         let mut visitor = RelationsRead {
             namespaces: builder.namespaces(),
             builder: Some(builder),
+            case: builder.identifier_case(),
             scopes: WithScopes::default(),
             read: &mut read,
         };
@@ -1610,8 +1634,8 @@ fn insert_target(statement: &Statement) -> Option<&ObjectName> {
 /// One object a dependency walk reaches.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Dependent {
-    /// A view or a materialized view, under the key its readers name it by.
-    Reader(ObjectKind, RelationKey),
+    /// A view's catalog-case key and stored name, or a materialized view's.
+    Reader(ObjectKind, RelationKey, String),
     /// A function whose bound body or signature reads a relation, which is
     /// one overload alone.
     Function(Arc<CreateFunction>),
@@ -1621,10 +1645,20 @@ pub(super) enum Dependent {
 }
 
 impl Dependent {
+    /// The view or materialized view `view` as a reader, keyed under `case`.
+    pub(super) fn view<V: ViewLike>(
+        namespaces: Namespaces,
+        kind: ObjectKind,
+        view: &V,
+        case: IdentifierCase,
+    ) -> Self {
+        Self::Reader(kind, stored_view_key(namespaces, view, case), view.view_name().to_string())
+    }
+
     /// The kind of object reached.
     pub(super) const fn kind(&self) -> ObjectKind {
         match self {
-            Self::Reader(kind, _) => *kind,
+            Self::Reader(kind, ..) => *kind,
             Self::Function(_) => ObjectKind::Function,
             Self::Rule(..) => ObjectKind::Rule,
         }
@@ -1633,9 +1667,8 @@ impl Dependent {
     /// The name the object is stored under.
     pub(super) fn name(&self) -> &str {
         match self {
-            Self::Reader(_, key) => &key.name,
+            Self::Reader(_, _, name) | Self::Rule(_, name) => name,
             Self::Function(function) => last_str(&function.name),
-            Self::Rule(_, name) => name,
         }
     }
 }
@@ -1663,7 +1696,7 @@ pub(super) fn readers_and_dependents(
         .iter()
         .filter_map(|reader| {
             match reader {
-                Dependent::Reader(_, key) => Some(key.clone()),
+                Dependent::Reader(_, key, _) => Some(key.clone()),
                 Dependent::Function(_) | Dependent::Rule(..) => None,
             }
         })
@@ -1686,21 +1719,35 @@ fn readers_closure(
         .views()
         .iter()
         .map(|(view, _, _)| {
-            let key =
-                stored_view_key(builder.namespaces(), view.as_ref(), IdentifierCase::AsWritten);
             (
-                Dependent::Reader(ObjectKind::View, key.clone()),
-                Some(key),
-                relations_read_by(builder.namespaces(), view.as_ref()),
+                Dependent::view(
+                    builder.namespaces(),
+                    ObjectKind::View,
+                    view.as_ref(),
+                    builder.identifier_case(),
+                ),
+                Some(stored_view_key(
+                    builder.namespaces(),
+                    view.as_ref(),
+                    builder.identifier_case(),
+                )),
+                relations_read_by(builder.namespaces(), view.as_ref(), builder.identifier_case()),
             )
         })
         .chain(builder.materialized_views().iter().map(|(view, _, _)| {
-            let key =
-                stored_view_key(builder.namespaces(), view.as_ref(), IdentifierCase::AsWritten);
             (
-                Dependent::Reader(ObjectKind::MaterializedView, key.clone()),
-                Some(key),
-                relations_read_by(builder.namespaces(), view.as_ref()),
+                Dependent::view(
+                    builder.namespaces(),
+                    ObjectKind::MaterializedView,
+                    view.as_ref(),
+                    builder.identifier_case(),
+                ),
+                Some(stored_view_key(
+                    builder.namespaces(),
+                    view.as_ref(),
+                    builder.identifier_case(),
+                )),
+                relations_read_by(builder.namespaces(), view.as_ref(), builder.identifier_case()),
             )
         }))
         .chain(builder.functions().iter().map(|(function, _)| {
@@ -1715,14 +1762,18 @@ fn readers_closure(
                     .and_then(|body| function_bodies::relations_read(builder, body))
                     .unwrap_or_default()
                     .into_iter()
-                    .chain(super::signature_types::row_type_keys(builder.namespaces(), function))
+                    .chain(super::signature_types::row_type_keys(
+                        builder.namespaces(),
+                        function,
+                        builder.identifier_case(),
+                    ))
                     .collect(),
             )
         }))
         .chain(builder.rules().iter().map(|(rule, _)| {
             (
-                rules::dependent(builder.namespaces(), rule),
-                Some(rules::relation_key(builder.namespaces(), rule)),
+                rules::dependent(builder.namespaces(), rule, builder.identifier_case()),
+                Some(rules::relation_key(builder.namespaces(), rule, builder.identifier_case())),
                 rules::rules_reading(builder, rule),
             )
         }))
@@ -1736,7 +1787,9 @@ fn readers_closure(
             if !found.contains(dependent) {
                 // Nothing reads a function or a rule as a relation, so the
                 // walk goes no further from one.
-                if let Dependent::Reader(_, key) = dependent {
+                if matches!(dependent, Dependent::Reader(..))
+                    && let Some(key) = own_relation
+                {
                     frontier.push(key.clone());
                 }
                 found.push(dependent.clone());
@@ -1797,17 +1850,18 @@ pub(super) fn remove_readers(
     doomed: &[Dependent],
     arrays: &mut Arc<TypeArrays>,
 ) -> TypeDrop {
-    let is_doomed =
-        |kind: ObjectKind, own_key: RelationKey| doomed.contains(&Dependent::Reader(kind, own_key));
+    let case = builder.identifier_case();
+    let is_doomed = |kind: ObjectKind, own_key: RelationKey| {
+        doomed.iter().any(|dependent| {
+            matches!(dependent, Dependent::Reader(held_kind, key, _) if *held_kind == kind && *key == own_key)
+        })
+    };
     let hosts: Vec<ViewHost> = builder
         .views()
         .iter()
         .map(|(view, _, _)| view.as_ref())
         .filter(|view| {
-            is_doomed(
-                ObjectKind::View,
-                stored_view_key(builder.namespaces(), *view, IdentifierCase::AsWritten),
-            )
+            is_doomed(ObjectKind::View, stored_view_key(builder.namespaces(), *view, case))
         })
         .map(ViewHost::of_view)
         .collect();
@@ -1816,10 +1870,7 @@ pub(super) fn remove_readers(
         .iter()
         .map(|(view, _, _)| view.as_ref())
         .filter(|view| {
-            is_doomed(
-                ObjectKind::View,
-                stored_view_key(builder.namespaces(), *view, IdentifierCase::AsWritten),
-            )
+            is_doomed(ObjectKind::View, stored_view_key(builder.namespaces(), *view, case))
         })
         .map(GrantedView::of)
         .chain(
@@ -1830,7 +1881,7 @@ pub(super) fn remove_readers(
                 .filter(|view| {
                     is_doomed(
                         ObjectKind::MaterializedView,
-                        stored_view_key(builder.namespaces(), *view, IdentifierCase::AsWritten),
+                        stored_view_key(builder.namespaces(), *view, case),
                     )
                 })
                 .map(GrantedView::of),
@@ -1851,16 +1902,10 @@ pub(super) fn remove_readers(
         .collect();
     let namespaces = builder.namespaces();
     builder.views_mut().retain(|(view, _, _)| {
-        !is_doomed(
-            ObjectKind::View,
-            stored_view_key(namespaces, view.as_ref(), IdentifierCase::AsWritten),
-        )
+        !is_doomed(ObjectKind::View, stored_view_key(namespaces, view.as_ref(), case))
     });
     builder.materialized_views_mut().retain(|(view, _, _)| {
-        !is_doomed(
-            ObjectKind::MaterializedView,
-            stored_view_key(namespaces, view.as_ref(), IdentifierCase::AsWritten),
-        )
+        !is_doomed(ObjectKind::MaterializedView, stored_view_key(namespaces, view.as_ref(), case))
     });
     for view in &granted {
         view.forget_grants(builder);
@@ -1869,7 +1914,9 @@ pub(super) fn remove_readers(
     builder
         .functions_mut()
         .retain(|(function, _)| !functions.iter().any(|doomed| Arc::ptr_eq(doomed, function)));
-    builder.rules_mut().retain(|(rule, _)| !doomed.contains(&rules::dependent(namespaces, rule)));
+    builder
+        .rules_mut()
+        .retain(|(rule, _)| !doomed.contains(&rules::dependent(namespaces, rule, case)));
     for host in &hosts {
         host.drop_dependents(builder);
     }

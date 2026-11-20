@@ -159,16 +159,22 @@ pub(super) fn write_action_statements(action: &mut CreateRuleAction, statements:
 
 /// The key the rule's relation is stored under, which a rename or drop of
 /// that relation or one of its columns must reach the rule by.
-pub(super) fn relation_key(namespaces: Namespaces, rule: &CreateRule) -> RelationKey {
-    target_key(namespaces, &target_name_of_object_name(&rule.table_name), IdentifierCase::AsWritten)
+pub(super) fn relation_key(
+    namespaces: Namespaces,
+    rule: &CreateRule,
+    case: IdentifierCase,
+) -> RelationKey {
+    target_key(namespaces, &target_name_of_object_name(&rule.table_name), case)
 }
 
 /// The rule as a dependency walk reaches it, by its name on its relation.
-pub(super) fn dependent(namespaces: Namespaces, rule: &CreateRule) -> views::Dependent {
-    let name = IdentifierCase::AsWritten
-        .compared_form(&rule.name.value, rule.name.quote_style.is_some())
-        .into_owned();
-    views::Dependent::Rule(relation_key(namespaces, rule), name)
+pub(super) fn dependent(
+    namespaces: Namespaces,
+    rule: &CreateRule,
+    case: IdentifierCase,
+) -> views::Dependent {
+    let name = case.compared_form(&rule.name.value, rule.name.quote_style.is_some()).into_owned();
+    views::Dependent::Rule(relation_key(namespaces, rule, case), name)
 }
 
 /// The normalized identity of every relation the rule's action and condition
@@ -179,6 +185,7 @@ pub(super) fn rules_reading(builder: &ParserDBBuilder, rule: &CreateRule) -> Vec
         read.extend(relations_read_in(
             builder.namespaces(),
             &function_bodies::definition(condition),
+            builder.identifier_case(),
         ));
     }
     read

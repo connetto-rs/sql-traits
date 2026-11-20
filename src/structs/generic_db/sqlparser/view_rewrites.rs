@@ -45,10 +45,6 @@ use crate::{
     },
 };
 
-/// Stored definitions are bound when recorded, so every name in one is read
-/// the way PostgreSQL reads it.
-const CASE: IdentifierCase = IdentifierCase::AsWritten;
-
 /// What a statement renamed, as stored definitions name it.
 pub(super) enum Rename {
     /// The relation stored under `key` is now called `to`, the schema part
@@ -64,6 +60,8 @@ pub(super) enum Rename {
     Column {
         /// The relation's key.
         key: RelationKey,
+        /// The relation's stored name for refusals.
+        relation_name: String,
         /// The position of the renamed column among the relation's columns.
         ordinal: usize,
         /// The column's new name.
@@ -201,7 +199,7 @@ fn definitions_reading(
     let mut reads: Vec<RelationKey> = Vec::new();
     for (position, (view, _, _)) in builder.views().iter().enumerate() {
         let definition = view.definition();
-        let read = relations_read_in(builder.namespaces(), definition);
+        let read = relations_read_in(builder.namespaces(), definition, builder.identifier_case());
         if names(&read) {
             definitions.push(Definition::Query {
                 slot: Slot::Plain(position),
@@ -212,7 +210,7 @@ fn definitions_reading(
     }
     for (position, (view, _, _)) in builder.materialized_views().iter().enumerate() {
         let definition = view.definition();
-        let read = relations_read_in(builder.namespaces(), definition);
+        let read = relations_read_in(builder.namespaces(), definition, builder.identifier_case());
         if names(&read) {
             definitions.push(Definition::Query {
                 slot: Slot::Materialized(position),
@@ -255,7 +253,7 @@ fn rule_definition_reads(
     let mut definitions = Vec::new();
     if let Some(expr) = rule.condition.as_ref() {
         let query = alloc::boxed::Box::new(function_bodies::definition(expr));
-        let read = relations_read_in(builder.namespaces(), &query);
+        let read = relations_read_in(builder.namespaces(), &query, builder.identifier_case());
         definitions.push((Definition::Query { slot, query }, read));
     }
     let statements = rules::action_statements(&rule.action);
@@ -281,7 +279,7 @@ fn function_definition_reads(
     match body {
         Some(CreateFunctionBody::Return(expr)) => {
             let query = alloc::boxed::Box::new(function_bodies::definition(expr));
-            let read = relations_read_in(builder.namespaces(), &query);
+            let read = relations_read_in(builder.namespaces(), &query, builder.identifier_case());
             Some((Definition::Query { slot: Slot::Function(position), query }, read))
         }
         Some(CreateFunctionBody::BeginAtomic(block)) => {
@@ -306,7 +304,7 @@ pub(super) fn catalog<'q>(
     let namespaces = builder.namespaces();
     let reads: Vec<RelationKey> = definitions
         .into_iter()
-        .flat_map(|definition| relations_read_in(namespaces, definition))
+        .flat_map(|definition| relations_read_in(namespaces, definition, builder.identifier_case()))
         .collect();
     catalog_reads(builder, reads)
 }
@@ -321,14 +319,24 @@ fn catalog_reads(builder: &ParserDBBuilder, reads: Vec<RelationKey>) -> ParserDB
             continue;
         }
         let plain = builder.views().iter().map(|(view, _, _)| view.as_ref());
-        for view in plain.filter(|view| view_matches_key(builder.namespaces(), *view, &key, CASE)) {
-            pending.extend(relations_read_in(builder.namespaces(), view.definition()));
+        for view in plain.filter(|view| {
+            view_matches_key(builder.namespaces(), *view, &key, builder.identifier_case())
+        }) {
+            pending.extend(relations_read_in(
+                builder.namespaces(),
+                view.definition(),
+                builder.identifier_case(),
+            ));
         }
         let materialized = builder.materialized_views().iter().map(|(view, _, _)| view.as_ref());
-        for view in
-            materialized.filter(|view| view_matches_key(builder.namespaces(), *view, &key, CASE))
-        {
-            pending.extend(relations_read_in(builder.namespaces(), view.definition()));
+        for view in materialized.filter(|view| {
+            view_matches_key(builder.namespaces(), *view, &key, builder.identifier_case())
+        }) {
+            pending.extend(relations_read_in(
+                builder.namespaces(),
+                view.definition(),
+                builder.identifier_case(),
+            ));
         }
         keys.push(key);
     }
@@ -371,7 +379,10 @@ pub(super) fn column_readers(
                     let mut respelled = (**query).clone();
                     let reads = match respell(&mut respelled, before, columns) {
                         Some(_) => respelled != **query,
-                        None => shielded(builder.namespaces(), query, columns) != **query,
+                        None => {
+                            shielded(builder.namespaces(), query, columns, before.identifier_case())
+                                != **query
+                        }
                     };
                     reads.then(|| slot_reader(builder, *slot))
                 }
@@ -395,26 +406,30 @@ pub(super) fn column_readers(
 fn slot_reader(builder: &ParserDBBuilder, slot: Slot) -> Dependent {
     match slot {
         Slot::Plain(position) => {
-            Dependent::Reader(
+            Dependent::view(
+                builder.namespaces(),
                 ObjectKind::View,
-                stored_view_key(builder.namespaces(), builder.views()[position].0.as_ref(), CASE),
+                builder.views()[position].0.as_ref(),
+                builder.identifier_case(),
             )
         }
         Slot::Materialized(position) => {
-            Dependent::Reader(
+            Dependent::view(
+                builder.namespaces(),
                 ObjectKind::MaterializedView,
-                stored_view_key(
-                    builder.namespaces(),
-                    builder.materialized_views()[position].0.as_ref(),
-                    CASE,
-                ),
+                builder.materialized_views()[position].0.as_ref(),
+                builder.identifier_case(),
             )
         }
         Slot::Function(position) => {
             Dependent::Function(Arc::clone(&builder.functions()[position].0))
         }
         Slot::Rule(position) => {
-            rules::dependent(builder.namespaces(), &builder.rules()[position].0)
+            rules::dependent(
+                builder.namespaces(),
+                &builder.rules()[position].0,
+                builder.identifier_case(),
+            )
         }
     }
 }
@@ -532,7 +547,12 @@ pub(super) fn follow_renames(
                         store_query(
                             builder,
                             slot,
-                            shielded(builder.namespaces(), &original, renames),
+                            shielded(
+                                builder.namespaces(),
+                                &original,
+                                renames,
+                                before.identifier_case(),
+                            ),
                         );
                     }
                 }
@@ -567,24 +587,27 @@ pub(super) fn follow_renames(
     let after = {
         let reads: Vec<RelationKey> = parts
             .iter()
-            .flat_map(|part| relations_read_in(builder.namespaces(), &part.stored))
+            .flat_map(|part| {
+                relations_read_in(builder.namespaces(), &part.stored, builder.identifier_case())
+            })
             .collect();
         catalog_reads(builder, reads)
     };
     for part in parts {
-        if query_references(&part.stored, &after, CASE)
+        if query_references(&part.stored, &after, after.identifier_case())
             .is_some_and(|references| reaches(&references, &part.expected, part.factors))
         {
             continue;
         }
         // Qualifications are keyed by address, so resolve the copy edited.
         let mut qualified = part.stored.clone();
-        let settled = query_references(&qualified, &after, CASE).is_some_and(|references| {
-            qualify_captured(&mut qualified, &references, &part.expected)
-        }) && query_references(&qualified, &after, CASE)
+        let settled = query_references(&qualified, &after, after.identifier_case()).is_some_and(
+            |references| qualify_captured(&mut qualified, &references, &part.expected),
+        ) && query_references(&qualified, &after, after.identifier_case())
             .is_some_and(|references| reaches(&references, &part.expected, part.factors));
         let fallback = {
-            let mut fallback = shielded(builder.namespaces(), &part.original, renames);
+            let mut fallback =
+                shielded(builder.namespaces(), &part.original, renames, before.identifier_case());
             // The original holds unprocessed data-modifying bodies, which the
             // shield left as written, so the copy shields takes them through
             // their own clauses.
@@ -775,7 +798,7 @@ pub(super) fn spell_out(builder: &ParserDBBuilder, query: &mut Query) {
         return;
     }
     let database = catalog(builder, core::iter::once(&*query));
-    let Some(references) = query_references(query, &database, CASE) else {
+    let Some(references) = query_references(query, &database, database.identifier_case()) else {
         return;
     };
     let mut spell = Spell {
@@ -838,10 +861,12 @@ fn renamed_factors(
     namespaces: Namespaces,
     query: &Query,
     renames: &[Rename],
+    case: IdentifierCase,
 ) -> BTreeMap<usize, usize> {
     struct Finder<'r> {
         namespaces: Namespaces,
         renames: &'r [Rename],
+        case: IdentifierCase,
         scopes: WithScopes,
         /// The data-modifying statements the walk sits in, whose factors the
         /// query path never reads.
@@ -878,7 +903,7 @@ fn renamed_factors(
                 && !self.scopes.reads_item(name)
                 && let Some(target) = target_name_from_object_name(name)
             {
-                let key = target_key(self.namespaces, &target, CASE);
+                let key = target_key(self.namespaces, &target, self.case);
                 if let Some(rename) = self.renames.iter().position(|rename| *rename.key() == key) {
                     self.found.insert(address(factor), rename);
                 }
@@ -890,6 +915,7 @@ fn renamed_factors(
     let mut finder = Finder {
         namespaces,
         renames,
+        case,
         scopes: WithScopes::default(),
         dml_depth: 0,
         found: BTreeMap::new(),
@@ -1247,11 +1273,11 @@ fn same_identifier(left: &Ident, right: &Ident) -> bool {
 /// what every reference of it reached before them, or `None` when that is not
 /// certain enough to respell by.
 fn respell(query: &mut Query, before: &ParserDB, renames: &[Rename]) -> Option<QueryReferences> {
-    let references = query_references(query, before, CASE)?;
+    let references = query_references(query, before, before.identifier_case())?;
     if !references.certain() {
         return None;
     }
-    let reading = renamed_factors(before.namespaces(), query, renames);
+    let reading = renamed_factors(before.namespaces(), query, renames, before.identifier_case());
     let through_using = merged_through_using(query, &reading, renames);
     let shapes = factor_shapes(query);
     let bare = bare_names(query);
@@ -1387,9 +1413,14 @@ fn qualify_captured(
 /// reading a renamed relation taking the new name under an alias bringing
 /// back the old one, or an alias column list bringing back the old column
 /// names.
-fn shielded(namespaces: Namespaces, original: &Query, renames: &[Rename]) -> Query {
+fn shielded(
+    namespaces: Namespaces,
+    original: &Query,
+    renames: &[Rename],
+    case: IdentifierCase,
+) -> Query {
     let mut query = original.clone();
-    let reading = renamed_factors(namespaces, &query, renames);
+    let reading = renamed_factors(namespaces, &query, renames, case);
     let shapes = factor_shapes(&query);
     let mut edits = Edits::default();
     for (factor, rename) in &reading {
@@ -1551,7 +1582,7 @@ fn respell_statements(
                     });
                     respelled
                 }
-                None => shielded(before.namespaces(), &original, renames),
+                None => shielded(before.namespaces(), &original, renames, before.identifier_case()),
             };
             // The queries the respelling left untouched, which are the ones
             // nested in data-modifying bodies, respell on their own, and the
@@ -1730,7 +1761,9 @@ fn normalize_statement_references(
     let keys = names
         .iter()
         .filter_map(|name| {
-            builder.bound_relation(name).map(|bound| bound_factor_key(namespaces, &bound, name))
+            builder
+                .bound_relation(name)
+                .map(|bound| bound_factor_key(namespaces, &bound, name, builder.identifier_case()))
         })
         .collect::<Vec<_>>();
     let slice = catalog_reads(builder, keys);
@@ -1745,7 +1778,8 @@ fn normalize_statement_references(
                 !factor.has_alias && factor.key.is_some() && same_identifier(&factor.exposed, table)
             })
             && let Some(key) = &factor.key
-            && identifiers_match(&key.schema, false, &schema.value, schema.quote_style.is_some())
+            && builder.identifier_case().compared_form(&schema.value, schema.quote_style.is_some())
+                == key.schema
         {
             let matches_column = factor.columns.as_ref().is_none_or(|columns| {
                 columns.iter().any(|(name, quoted)| {
@@ -1796,21 +1830,22 @@ pub(super) fn bound_factor_key(
     namespaces: Namespaces,
     bound: &BoundRelation,
     name: &ObjectName,
+    case: IdentifierCase,
 ) -> RelationKey {
     let target = target_name_of_object_name(name);
     let schema = if bound.temporary {
-        CASE.compared_form(namespaces.temporary_schema(), false)
+        case.compared_form(namespaces.temporary_schema(), false)
     } else {
         match &bound.qualifier {
             Some(qualifier) => {
-                CASE.compared_form(&qualifier.value, qualifier.quote_style.is_some())
+                case.compared_form(&qualifier.value, qualifier.quote_style.is_some())
             }
-            None => CASE.compared_form(namespaces.default_schema(), false),
+            None => case.compared_form(namespaces.default_schema(), false),
         }
     };
     RelationKey {
         schema: schema.into_owned(),
-        name: CASE.compared_form(target.name(), target.name_is_quoted()).into_owned(),
+        name: case.compared_form(target.name(), target.name_is_quoted()).into_owned(),
     }
 }
 
@@ -1985,7 +2020,7 @@ fn cte_output_columns(query: &Query, slice: &ParserDB) -> Option<Vec<(String, bo
     if let Some(items) = dml_returning_items(query.body.as_ref()) {
         return items.iter().map(select_item_output_name).collect::<Option<_>>();
     }
-    query_output_names(query, slice, CASE).ok().flatten()
+    query_output_names(query, slice, slice.identifier_case()).ok().flatten()
 }
 
 /// The names a select item's output had, or `None` when the item writes no
@@ -2361,7 +2396,9 @@ fn table_factors(factor: &TableFactor, slice: &ParserDB, ctes: &[ScopeFactor]) -
         TableFactor::Derived { subquery, alias: Some(alias), .. } => {
             alloc::vec![ScopeFactor {
                 exposed: alias.name.clone(),
-                columns: query_output_names(subquery, slice, CASE).ok().flatten(),
+                columns: query_output_names(subquery, slice, slice.identifier_case())
+                    .ok()
+                    .flatten(),
             }]
         }
         _ => Vec::new(),
@@ -2822,21 +2859,22 @@ fn push_shell_factor(
 /// always reaches a relation, and the key the name spells stands in otherwise.
 fn resolved_factor_key(catalog: &ParserDB, name: &ObjectName) -> RelationKey {
     let namespaces = catalog.namespaces();
+    let case = catalog.identifier_case();
     let target = target_name_of_object_name(name);
     if name.0.len() == 2 {
-        return target_key(namespaces, &target, CASE);
+        return target_key(namespaces, &target, case);
     }
-    if let Ok(Some(table)) = catalog.resolve_table_object_name_on_search_path(name) {
-        return stored_table_key(namespaces, table, CASE);
+    if let Ok(Some(table)) = catalog.resolve_target_table(target.clone(), case) {
+        return stored_table_key(namespaces, table, case);
     }
-    let claimed = |key: &RelationKey| relation_name_is_claimed(catalog, key, CASE);
+    let claimed = |key: &RelationKey| relation_name_is_claimed(catalog, key, case);
     let path = || catalog.search_path();
     let plain = resolve_view_on_search_path_in_iter(
         namespaces,
         catalog.views(),
         &target,
         path,
-        CASE,
+        case,
         claimed,
     );
     let materialized = resolve_view_on_search_path_in_iter(
@@ -2844,13 +2882,13 @@ fn resolved_factor_key(catalog: &ParserDB, name: &ObjectName) -> RelationKey {
         catalog.materialized_views(),
         &target,
         path,
-        CASE,
+        case,
         claimed,
     );
-    let plain = plain.ok().flatten().map(|view| stored_view_key(namespaces, view, CASE));
+    let plain = plain.ok().flatten().map(|view| stored_view_key(namespaces, view, case));
     let materialized =
-        materialized.ok().flatten().map(|view| stored_view_key(namespaces, view, CASE));
-    plain.or(materialized).unwrap_or(target_key(namespaces, &target, CASE))
+        materialized.ok().flatten().map(|view| stored_view_key(namespaces, view, case));
+    plain.or(materialized).unwrap_or(target_key(namespaces, &target, case))
 }
 
 /// The identifier a stored factor name's last part spells, which a static
@@ -2885,7 +2923,9 @@ fn respelled_factor_name(to: &ObjectName) -> ObjectName {
 /// or `None` when some output cannot be named.
 fn relation_columns(before: &ParserDB, key: &RelationKey) -> Option<Vec<(String, bool)>> {
     let namespaces = before.namespaces();
-    let table = before.tables().find(|table| table_matches_key(namespaces, *table, key, CASE));
+    let table = before
+        .tables()
+        .find(|table| table_matches_key(namespaces, *table, key, before.identifier_case()));
     if let Some(table) = table {
         let columns = table.columns(before).ok()?;
         return Some(
@@ -2895,15 +2935,18 @@ fn relation_columns(before: &ParserDB, key: &RelationKey) -> Option<Vec<(String,
         );
     }
     // The key came from a resolved factor, so a view of one kind holds it.
-    before.views().find(|view| view_matches_key(namespaces, *view, key, CASE)).map_or_else(
-        || {
-            before
-                .materialized_views()
-                .find(|view| view_matches_key(namespaces, *view, key, CASE))
-                .and_then(|view| view_output_names(view, before))
-        },
-        |view| view_output_names(view, before),
-    )
+    before
+        .views()
+        .find(|view| view_matches_key(namespaces, *view, key, before.identifier_case()))
+        .map_or_else(
+            || {
+                before
+                    .materialized_views()
+                    .find(|view| view_matches_key(namespaces, *view, key, before.identifier_case()))
+                    .and_then(|view| view_output_names(view, before))
+            },
+            |view| view_output_names(view, before),
+        )
 }
 
 /// The names a view's outputs had, declared or derived from its definition.
@@ -2911,7 +2954,7 @@ fn view_output_names<V: ViewLike>(view: &V, before: &ParserDB) -> Option<Vec<(St
     if let Some(declared) = view.declared_output_names() {
         return Some(declared);
     }
-    query_output_names(view.definition(), before, CASE).ok().flatten()
+    query_output_names(view.definition(), before, before.identifier_case()).ok().flatten()
 }
 
 /// What a reference of a statement's own clauses reached before the renames.
@@ -3153,7 +3196,12 @@ fn respell_embedded(
             }
             let original = query.clone();
             let Some(references) = respell(query, self.before, self.renames) else {
-                *query = shielded(self.before.namespaces(), &original, self.renames);
+                *query = shielded(
+                    self.before.namespaces(),
+                    &original,
+                    self.renames,
+                    self.before.identifier_case(),
+                );
                 return false;
             };
             if self.open.contains(&true) {
@@ -3294,7 +3342,7 @@ fn whole_row_outcomes(
             return Ok(true);
         }
         for rename in renames.iter().filter(|candidate| candidate.key() == key) {
-            let Rename::Column { ordinal, to, columns, .. } = rename else {
+            let Rename::Column { ordinal, to, columns, relation_name, .. } = rename else {
                 continue;
             };
             if !identifiers_match(
@@ -3313,7 +3361,7 @@ fn whole_row_outcomes(
             if whole_row_sites.iter().any(|site| returning.contains(&site.address)) {
                 return Err(Error::FunctionBodyBlocksColumnRename {
                     column_name: columns[*ordinal].value.clone(),
-                    relation_name: key.name.clone(),
+                    relation_name: relation_name.clone(),
                     function_name: holder_name.to_string(),
                 });
             }
@@ -3621,11 +3669,11 @@ fn shield_shell(
                         }
                     }
                 }
-                Rename::Column { ordinal, columns, .. } => {
+                Rename::Column { ordinal, columns, relation_name, .. } => {
                     if position == 0 {
                         return Err(Error::FunctionBodyBlocksColumnRename {
                             column_name: columns[*ordinal].value.clone(),
-                            relation_name: key.name.clone(),
+                            relation_name: relation_name.clone(),
                             function_name: holder_name.to_string(),
                         });
                     }

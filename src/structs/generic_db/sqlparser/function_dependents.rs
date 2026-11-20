@@ -19,12 +19,12 @@ use super::{
 use crate::{
     errors::{Error, ObjectKind},
     structs::{
-        IdentifierCase, OperatorRow, TableAttribute,
+        OperatorRow, TableAttribute,
         generic_db::builtin_functions::Builtins,
         metadata::{ExpressionCalls, operator_node_count},
     },
     traits::{DomainLike, IndexLike, UserDefinedTypeLike},
-    utils::{call_sites::for_each_call, last_str, object_name::stored_view_key},
+    utils::{call_sites::for_each_call, last_str},
 };
 
 /// An object holding a function or an operator, by its kind and the name a
@@ -81,6 +81,11 @@ impl Holder {
     /// The holder `held`, named `name` of `kind`.
     const fn new(kind: ObjectKind, name: String, held: Held) -> Self {
         Self { named: (kind, name), held }
+    }
+
+    /// The reader `reader`, named as it is stored.
+    fn reader(reader: views::Dependent) -> Self {
+        Self::new(reader.kind(), reader.name().to_string(), Held::Reader(reader))
     }
 }
 
@@ -335,24 +340,24 @@ impl ParserDBBuilder {
         if let Some((view, _, _)) =
             self.views().iter().find(|(_, metadata, _)| calls_dropped(metadata.calls()))
         {
-            let key = stored_view_key(self.namespaces(), view.as_ref(), IdentifierCase::AsWritten);
-            return Some(Holder::new(
+            return Some(Holder::reader(views::Dependent::view(
+                self.namespaces(),
                 ObjectKind::View,
-                key.name.clone(),
-                Held::Reader(views::Dependent::Reader(ObjectKind::View, key)),
-            ));
+                view.as_ref(),
+                self.identifier_case(),
+            )));
         }
         if let Some((view, _, _)) = self
             .materialized_views()
             .iter()
             .find(|(_, metadata, _)| calls_dropped(metadata.calls()))
         {
-            let key = stored_view_key(self.namespaces(), view.as_ref(), IdentifierCase::AsWritten);
-            return Some(Holder::new(
+            return Some(Holder::reader(views::Dependent::view(
+                self.namespaces(),
                 ObjectKind::MaterializedView,
-                key.name.clone(),
-                Held::Reader(views::Dependent::Reader(ObjectKind::MaterializedView, key)),
-            ));
+                view.as_ref(),
+                self.identifier_case(),
+            )));
         }
         if let Some((policy, _)) = self.policies().iter().find(|(_, metadata)| {
             calls_dropped(metadata.using_calls()) || calls_dropped(metadata.check_calls())
@@ -367,7 +372,7 @@ impl ParserDBBuilder {
             return Some(Holder::new(
                 ObjectKind::Rule,
                 rule.name.value.clone(),
-                Held::Reader(rules::dependent(self.namespaces(), rule)),
+                Held::Reader(rules::dependent(self.namespaces(), rule, self.identifier_case())),
             ));
         }
         // A bound name left bare is one in the default schema.
@@ -412,11 +417,7 @@ impl ParserDBBuilder {
         if let Some((caller, _)) = self.functions().iter().find(|(caller, metadata)| {
             !dropping_too(caller) && calls_dropped(metadata.body_calls())
         }) {
-            return Some(Holder::new(
-                ObjectKind::Function,
-                last_str(&caller.name).to_string(),
-                Held::Reader(views::Dependent::Function(Arc::clone(caller))),
-            ));
+            return Some(Holder::reader(views::Dependent::Function(Arc::clone(caller))));
         }
         if let Some(holder) = self.domain_holder(dropped) {
             return Some(holder);
