@@ -3750,7 +3750,9 @@ fn declared_candidate_keys(table: &CreateTable) -> Vec<DeclaredKey<'_>> {
 /// `table`, of one of its unique constraints, or of one of `unique_indexes`,
 /// the unique indexes built on it by `CREATE UNIQUE INDEX`, which are the
 /// keys a foreign key may reference. A deferrable key does not count, since
-/// it may hold duplicates until the transaction commits.
+/// it may hold duplicates until the transaction commits, and neither does a
+/// partial index, which keeps its columns unique only among the rows its
+/// predicate admits.
 pub(crate) fn is_candidate_key<'index>(
     table: &CreateTable,
     unique_indexes: impl IntoIterator<Item = &'index CreateIndex>,
@@ -3762,6 +3764,7 @@ pub(crate) fn is_candidate_key<'index>(
         .any(|key| !key.deferrable && key_columns_match(referred, &key.columns, case))
         || unique_indexes
             .into_iter()
+            .filter(|index| index.predicate.is_none())
             .filter_map(|index| plain_key_columns(&index.columns))
             .any(|key| key_columns_match(referred, &key, case))
 }
@@ -16520,6 +16523,35 @@ mod tests {
                 ParserDB::parse::<GenericDialect>(plain_index),
                 Err(Error::ReferencedColumnsNotUniqueForForeignKey { .. })
             ));
+        }
+
+        /// A partial unique index keeps the columns unique only among the rows
+        /// its predicate admits, so it backs no foreign key, while a full
+        /// unique index on the same columns still does. Verified against
+        /// PostgreSQL 18.
+        #[test]
+        fn a_partial_unique_index_does_not_back_the_target() {
+            let partial = "
+                CREATE TABLE parent (id INT, live BOOL);
+                CREATE UNIQUE INDEX parent_live ON parent (id) WHERE live;
+                CREATE TABLE child (pid INT REFERENCES parent(id));
+            ";
+            let partial_and_full = "
+                CREATE TABLE parent (id INT, live BOOL);
+                CREATE UNIQUE INDEX parent_live ON parent (id) WHERE live;
+                CREATE UNIQUE INDEX parent_id ON parent (id);
+                CREATE TABLE child (pid INT REFERENCES parent(id));
+            ";
+
+            assert!(matches!(
+                ParserDB::parse::<PostgreSqlDialect>(partial),
+                Err(Error::ReferencedColumnsNotUniqueForForeignKey {
+                    referenced_columns,
+                    referenced_table,
+                    host_table,
+                }) if referenced_columns == "id" && referenced_table == "parent" && host_table == "child"
+            ));
+            assert!(ParserDB::parse::<PostgreSqlDialect>(partial_and_full).is_ok());
         }
 
         #[test]

@@ -2163,7 +2163,8 @@ pub enum Error {
         "No unique constraint on table `{referenced_table}` matches the columns `{referenced_columns}` a foreign key in table `{host_table}` points at."
     )]
     /// Error indicating that a foreign key points at columns of the referenced
-    /// table that no primary key, unique constraint or unique index covers.
+    /// table that no primary key, unique constraint or unique index without a
+    /// predicate covers.
     ///
     /// PostgreSQL, MySQL and SQLite all refuse such a constraint, since without
     /// a unique key on the far side a row could match more than one parent.
