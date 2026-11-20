@@ -144,7 +144,7 @@ enum DefinitionNode<'query, 'db, DB: DatabaseLike> {
     Ordinality,
     FunctionResult {
         function: &'db DB::Function,
-        data_type: ResultColumnType<'query, 'db, DB, DefinitionId>,
+        data_type: ResultColumnType<'query, 'db, DB, DefinitionId, ScopeCursor>,
     },
     SetOperation {
         operator: SetOperator,
@@ -261,6 +261,13 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                     function,
                     data_type: match data_type {
                         ResultColumnType::Signature(name) => FunctionResultType::Signature(name),
+                        ResultColumnType::Scalar { name, arguments, scope } => {
+                            FunctionResultType::Scalar {
+                                name,
+                                arguments: arguments.get(),
+                                scope: ColumnDefinitionScope::new(self, *scope),
+                            }
+                        }
                         ResultColumnType::RowType(column) => {
                             FunctionResultType::RowType(ColumnDefinitionRef::new(self, *column))
                         }
@@ -608,7 +615,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             }
             DefinitionNode::FunctionResult { data_type, .. } => {
                 match data_type {
-                    ResultColumnType::Signature(name) => {
+                    ResultColumnType::Signature(name) | ResultColumnType::Scalar { name, .. } => {
                         PgType::parse(name).is_some_and(|declared| names_array(&declared))
                     }
                     ResultColumnType::RowType(column) => self.defines_array(*column, database)?,
@@ -1076,8 +1083,22 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
     fn function_result_definition(
         &mut self,
         function: &'db DB::Function,
-        data_type: ResultColumnType<'query, 'db, DB, Self::Definition>,
+        data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Cursor>,
     ) -> Self::Definition {
+        let data_type = match data_type {
+            ResultColumnType::Signature(name) => ResultColumnType::Signature(name),
+            ResultColumnType::Scalar { name, arguments, scope: Some(scope) } => {
+                ResultColumnType::Scalar { name, arguments, scope }
+            }
+            ResultColumnType::Scalar { scope: None, .. } => return DefinitionId(0),
+            ResultColumnType::RowType(column) => ResultColumnType::RowType(column),
+            ResultColumnType::Attribute(data_type, database) => {
+                ResultColumnType::Attribute(data_type, database)
+            }
+            ResultColumnType::DefinitionList(data_type) => {
+                ResultColumnType::DefinitionList(data_type)
+            }
+        };
         self.push_definition(DefinitionNode::FunctionResult { function, data_type })
     }
 

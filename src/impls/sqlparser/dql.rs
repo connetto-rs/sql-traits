@@ -612,7 +612,7 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
     fn function_result_definition(
         &mut self,
         function: &'db DB::Function,
-        data_type: ResultColumnType<'query, 'db, DB, Self::Definition>,
+        data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Cursor>,
     ) -> Self::Definition;
     /// The definition of the `bigint` row number `WITH ORDINALITY` adds
     /// after the columns of a function in `FROM`.
@@ -745,7 +745,7 @@ where
     fn function_result_definition(
         &mut self,
         _function: &'db DB::Function,
-        _data_type: ResultColumnType<'query, 'db, DB, Self::Definition>,
+        _data_type: ResultColumnType<'query, 'db, DB, Self::Definition, Self::Cursor>,
     ) {
     }
 
@@ -4780,7 +4780,7 @@ where
     {
         return Ok(contribution);
     }
-    if let Some(contribution) = collect_function_call(factor, deriving, profile)? {
+    if let Some(contribution) = collect_function_call(factor, deriving, local_parent, profile)? {
         return Ok(contribution);
     }
     match factor.get() {
