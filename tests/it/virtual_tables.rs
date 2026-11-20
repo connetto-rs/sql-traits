@@ -653,3 +653,261 @@ fn derived_columns_may_not_repeat() {
         assert!(matches!(refused, Error::ColumnAlreadyExists { .. }), "{statement}: {refused:?}");
     }
 }
+
+/// The `pragma_table_xinfo` rows SQLite 3.51.1 reports for a `dbstat` table.
+const DBSTAT: [(&str, &str, bool); 12] = [
+    ("name", "TEXT", false),
+    ("path", "TEXT", false),
+    ("pageno", "INTEGER", false),
+    ("pagetype", "TEXT", false),
+    ("ncell", "INTEGER", false),
+    ("payload", "INTEGER", false),
+    ("unused", "INTEGER", false),
+    ("mx_payload", "INTEGER", false),
+    ("pgoffset", "INTEGER", false),
+    ("pgsize", "INTEGER", false),
+    ("schema", "TEXT", true),
+    ("aggregate", "BOOLEAN", true),
+];
+
+/// The `pragma_table_xinfo` rows SQLite 3.51.1 reports for
+/// `geopoly(a, b)`.
+const GEOPOLY: [(&str, &str, bool); 3] =
+    [("_shape", "", false), ("a", "", false), ("b", "", false)];
+
+/// The suffixes of the `type = 'shadow'` rows SQLite 3.51.1 reports in
+/// `pragma_table_list` for a `geopoly` table.
+const GEOPOLY_SHADOWS: [&str; 3] = ["node", "parent", "rowid"];
+
+fn statement(sql: &str) -> Statement {
+    Parser::parse_sql(&SQLiteDialect {}, sql).expect("the statement parses").remove(0)
+}
+
+/// An ingestor comparing names the way SQLite does.
+fn ingestor() -> ParserDBIngestor {
+    ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Folded)
+        .ingestor::<SQLiteDialect>("main".to_owned())
+}
+
+/// Applies each statement of `sql` in turn to `ingestor`.
+fn apply(ingestor: ParserDBIngestor, sql: &[&str]) -> Result<ParserDBIngestor, Error> {
+    sql.iter().try_fold(ingestor, |ingestor, sql| ingestor.apply_statement(statement(sql)))
+}
+
+/// Columns supplied for a virtual table, each its name, declared type and
+/// hidden flag as `pragma_table_xinfo` reports them.
+type SuppliedColumns = &'static [(&'static str, &'static str, bool)];
+
+fn declared(columns: &[(&str, &str, bool)], shadow_suffixes: &[&str]) -> DeclaredVirtualTable {
+    DeclaredVirtualTable::new(
+        columns
+            .iter()
+            .map(|&(name, declared_type, hidden)| DeclaredColumn::new(name, declared_type, hidden)),
+        shadow_suffixes.iter().copied(),
+    )
+}
+
+#[test]
+fn a_virtual_table_of_an_unknown_module_takes_the_columns_its_module_declares() {
+    let db = ingestor()
+        .apply_virtual_table(
+            statement("CREATE VIRTUAL TABLE s USING dbstat;"),
+            declared(&DBSTAT, &[]),
+        )
+        .expect("the catalog states the columns of dbstat")
+        .finish();
+    // The model names a declared type the same way for any table.
+    let plain = DBSTAT
+        .iter()
+        .map(|(name, declared_type, _)| format!("{name} {declared_type}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plain =
+        sqlite(&format!("CREATE TABLE plain ({plain});")).expect("SQLite reads these types");
+    let expected: Vec<_> = columns(&plain, "plain")
+        .into_iter()
+        .zip(DBSTAT)
+        .map(|((name, data_type, _), (_, _, hidden))| (name, data_type, hidden))
+        .collect();
+    assert_eq!(columns(&db, "s"), expected);
+    assert_eq!(arguments(&db, "s"), ("dbstat".to_string(), Vec::new()));
+    assert!(table(&db, "s").is_virtual(&db).expect("held"));
+    assert_eq!(output_names(&db, "SELECT * FROM s").len(), 10);
+
+    let refused = sqlite("CREATE VIRTUAL TABLE s USING dbstat;")
+        .expect_err("the DDL alone does not tell the columns of dbstat");
+    assert!(matches!(refused, Error::UnknownVirtualTableModule { .. }), "{refused:?}");
+}
+
+#[test]
+fn declared_shadow_suffixes_make_shadow_tables_whichever_comes_first() {
+    let db = apply(ingestor(), &["CREATE TABLE \"g_node\"(nodeno INTEGER PRIMARY KEY, data);"])
+        .expect("a shadow table may come first")
+        .apply_virtual_table(
+            statement("CREATE VIRTUAL TABLE g USING geopoly(a, b);"),
+            declared(&GEOPOLY, &GEOPOLY_SHADOWS),
+        )
+        .expect("the catalog states the columns of geopoly");
+    let db = apply(
+        db,
+        &[
+            "CREATE TABLE \"g_rowid\"(rowid INTEGER PRIMARY KEY, nodeno, a0, a1, a2);",
+            "CREATE TABLE \"g_parent\"(nodeno INTEGER PRIMARY KEY, parentnode);",
+            "CREATE TABLE g_other(x);",
+            "CREATE SCHEMA aux;",
+            "CREATE TABLE aux.g_node(x);",
+        ],
+    )
+    .expect("SQLite stores this schema")
+    .finish();
+    assert_eq!(
+        columns(&db, "g"),
+        GEOPOLY.map(|(name, data_type, hidden)| column(name, data_type, hidden))
+    );
+    assert_eq!(arguments(&db, "g"), ("geopoly".to_string(), names(&["a", "b"])));
+    assert_eq!(shadows(&db, "g"), names(&["g_node", "g_parent", "g_rowid"]));
+}
+
+#[test]
+fn renaming_and_dropping_take_declared_shadow_tables_along() {
+    let schema = ingestor()
+        .apply_virtual_table(
+            statement("CREATE VIRTUAL TABLE g USING geopoly(a, b);"),
+            declared(&GEOPOLY, &GEOPOLY_SHADOWS),
+        )
+        .expect("the catalog states the columns of geopoly");
+    let schema = apply(
+        schema,
+        &[
+            "CREATE TABLE \"g_rowid\"(rowid INTEGER PRIMARY KEY, nodeno, a0, a1, a2);",
+            "CREATE TABLE \"g_node\"(nodeno INTEGER PRIMARY KEY, data);",
+            "CREATE TABLE \"g_parent\"(nodeno INTEGER PRIMARY KEY, parentnode);",
+            "CREATE TABLE keep(x);",
+            "ALTER TABLE g RENAME TO h;",
+        ],
+    )
+    .expect("SQLite renames the shadow tables along");
+    let renamed = schema.snapshot();
+    assert_eq!(table_names(&renamed), names(&["h", "h_node", "h_parent", "h_rowid", "keep"]));
+    assert_eq!(shadows(&renamed, "h"), names(&["h_node", "h_parent", "h_rowid"]));
+
+    let dropped = apply(schema, &["DROP TABLE h;"]).expect("SQLite drops them along").finish();
+    assert_eq!(table_names(&dropped), names(&["keep"]));
+}
+
+#[test]
+fn columns_declared_for_a_known_module_must_match_the_derived_ones() {
+    let fts5 = [("a", "", false), ("b", "", false), ("f5", "", true), ("rank", "", true)];
+    let fts5_shadows = ["config", "content", "data", "docsize", "idx"];
+    let create_fts5 = "CREATE VIRTUAL TABLE f5 USING fts5(a, b UNINDEXED, tokenize='porter');";
+    let db = ingestor()
+        .apply_virtual_table(statement(create_fts5), declared(&fts5, &fts5_shadows))
+        .expect("the catalog agrees with the arguments")
+        .apply_virtual_table(
+            statement("CREATE VIRTUAL TABLE r USING rtree(id, minx, maxx, +aux);"),
+            declared(
+                &[
+                    ("id", "INT", false),
+                    ("minx", "REAL", false),
+                    ("maxx", "REAL", false),
+                    ("aux", "", false),
+                ],
+                &["node", "rowid"],
+            ),
+        )
+        .expect("a table may keep fewer shadow tables than its module could")
+        .finish();
+    assert_eq!(
+        columns(&db, "f5"),
+        fts5.map(|(name, data_type, hidden)| column(name, data_type, hidden))
+    );
+
+    let rtree = "CREATE VIRTUAL TABLE r USING rtree(id, minx, maxx);";
+    let cases: [(&str, SuppliedColumns, &str); 5] = [
+        (
+            create_fts5,
+            &[("a", "", false), ("b", "", false), ("f5", "", false), ("rank", "", true)],
+            "f5",
+        ),
+        (create_fts5, &[("a", "", false), ("b", "", false), ("f5", "", true)], "rank"),
+        (
+            create_fts5,
+            &[
+                ("a", "", false),
+                ("b", "", false),
+                ("f5", "", true),
+                ("rank", "", true),
+                ("x", "", false),
+            ],
+            "x",
+        ),
+        (
+            create_fts5,
+            &[("A", "", false), ("b", "", false), ("f5", "", true), ("rank", "", true)],
+            "A",
+        ),
+        (
+            rtree,
+            &[("id", "INTEGER", false), ("minx", "REAL", false), ("maxx", "REAL", false)],
+            "id",
+        ),
+    ];
+    for (create, columns, differing) in cases {
+        let refused = ingestor()
+            .apply_virtual_table(statement(create), declared(columns, &[]))
+            .err()
+            .unwrap_or_else(|| panic!("{create} with {columns:?} is accepted"));
+        assert!(
+            matches!(
+                &refused,
+                Error::VirtualTableColumnsMismatch { column_name, .. } if column_name == differing
+            ),
+            "{create} with {columns:?}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_shadow_suffix_sqlite_cannot_read_as_one_is_refused() {
+    let cases = [
+        (
+            "CREATE VIRTUAL TABLE f5 USING fts5(a);",
+            &[("a", "", false), ("f5", "", true), ("rank", "", true)][..],
+            "node",
+        ),
+        ("CREATE VIRTUAL TABLE g USING geopoly(a, b);", &GEOPOLY[..], "node_map"),
+        ("CREATE VIRTUAL TABLE g USING geopoly(a, b);", &GEOPOLY[..], ""),
+    ];
+    for (create, columns, suffix) in cases {
+        let refused = ingestor()
+            .apply_virtual_table(statement(create), declared(columns, &[suffix]))
+            .err()
+            .unwrap_or_else(|| panic!("{create} keeping {suffix:?} is accepted"));
+        assert!(
+            matches!(
+                &refused,
+                Error::VirtualTableShadowSuffixRefused { suffix: refused, .. } if refused == suffix
+            ),
+            "{create} keeping {suffix:?}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn declared_columns_apply_only_to_a_virtual_table() {
+    let refused = ingestor()
+        .apply_virtual_table(statement("CREATE TABLE t(x);"), declared(&[("x", "", false)], &[]))
+        .err()
+        .expect("declared columns need a virtual table");
+    assert!(matches!(refused, Error::NotAVirtualTable { .. }), "{refused:?}");
+
+    let refused = ingestor()
+        .apply_virtual_table(
+            statement("CREATE VIRTUAL TABLE v USING app;"),
+            declared(&[("x", "", false), ("X", "", true)], &[]),
+        )
+        .err()
+        .expect("sqlite3_declare_vtab refuses a repeated column");
+    assert!(matches!(refused, Error::ColumnAlreadyExists { .. }), "{refused:?}");
+}

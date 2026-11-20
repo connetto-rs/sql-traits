@@ -14,7 +14,11 @@ use super::{
     ParserIngestion, PostgresCatalog, SessionRoles, SessionSettings, UndeclaredRoleAlteration,
     parsed_source::StatementSource, type_arrays::TypeArrays,
 };
-use crate::{errors::Error, impls::SqlparserDialect, structs::IdentifierCase};
+use crate::{
+    errors::Error,
+    impls::SqlparserDialect,
+    structs::{DeclaredVirtualTable, IdentifierCase},
+};
 
 /// The schema state statements change and a rollback restores.
 #[derive(Clone)]
@@ -99,6 +103,7 @@ impl Catalog {
         statement: Statement,
         access_resolution: AccessResolution,
         source: Option<StatementSource<'_>>,
+        declared_virtual_table: Option<DeclaredVirtualTable>,
         in_transaction: bool,
     ) -> Result<Self, Error> {
         // A drop without `CASCADE` may leave a default drawing from a dropped
@@ -109,6 +114,7 @@ impl Catalog {
             access_resolution,
             &mut core::iter::once(statement),
             source,
+            declared_virtual_table,
             in_transaction,
         )?;
         catalog.builder = super::sequences::settle_dropped_sequences(catalog.builder, cascade)?;
@@ -157,13 +163,16 @@ struct Savepoint {
     saved: Option<Catalog>,
 }
 
-/// Applies one statement, transaction control included, to the catalog.
+/// Applies one statement, transaction control included, to the catalog, with
+/// the columns a live database reports for it when it creates a virtual
+/// table.
 pub(super) fn apply(
     catalog: Catalog,
     transaction: &mut Option<Transaction>,
     access_resolution: AccessResolution,
     statement: Statement,
     source: Option<StatementSource<'_>>,
+    declared_virtual_table: Option<DeclaredVirtualTable>,
 ) -> Result<Catalog, Error> {
     let rules = Rules::of(*catalog.builder.dialect());
     let control = Control::of(&statement);
@@ -203,7 +212,7 @@ pub(super) fn apply(
         }
     }
     let in_transaction = transaction.is_some();
-    catalog.apply(statement, access_resolution, source, in_transaction)
+    catalog.apply(statement, access_resolution, source, declared_virtual_table, in_transaction)
 }
 
 /// The catalog an ingestion ending now leaves behind. A session that ends

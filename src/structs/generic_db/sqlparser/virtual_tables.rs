@@ -1,6 +1,7 @@
 //! The columns SQLite's `fts3`, `fts4`, `fts5`, `rtree` and `rtree_i32`
 //! modules declare for a virtual table, read from its arguments the way each
-//! module's constructor reads them, and the shadow tables the modules keep.
+//! module's constructor reads them, the columns a live database reports for
+//! a table of any module, and the shadow tables the modules keep.
 
 use alloc::{
     borrow::Cow,
@@ -11,7 +12,12 @@ use alloc::{
     vec::Vec,
 };
 
-use sqlparser::ast::{ColumnDef, CreateTable, DataType, Ident, ObjectName, ObjectNamePart};
+use sqlparser::{
+    ast::{ColumnDef, CreateTable, DataType, Ident, ObjectName, ObjectNamePart},
+    dialect::Dialect,
+    parser::Parser,
+    tokenizer::Token,
+};
 
 use super::{
     NamedColumn, ParserDBBuilder, StoredTable, postgres_catalog::PostgresCatalog,
@@ -20,8 +26,8 @@ use super::{
 };
 use crate::{
     errors::{Error, VirtualTableArgumentRefusal as Refusal},
-    structs::{ParserDB, VirtualTableSource},
-    traits::TableLike,
+    structs::{DeclaredColumn, DeclaredVirtualTable, ParserDB, TableMetadata, VirtualTableSource},
+    traits::{DialectLike, TableLike},
     utils::object_name::object_name_identifiers,
 };
 
@@ -57,33 +63,129 @@ impl Module {
             Self::Rtree | Self::RtreeI32 => &["node", "parent", "rowid"],
         }
     }
+
+    /// The suffixes of the shadow tables the module keeps, owned.
+    fn kept_suffixes(self) -> Vec<String> {
+        self.shadow_suffixes().iter().map(ToString::to_string).collect()
+    }
 }
 
-/// The suffix module `module_name` keeps a shadow table under, spelled as
-/// the module spells it, when `suffix` names one without regard to case.
-pub(crate) fn shadow_suffix(module_name: &str, suffix: &str) -> Option<&'static str> {
-    Module::named(module_name)?
+/// The suffix `owner`, a virtual table, keeps a shadow table under, spelled
+/// as its module spells it, when `suffix` names one without regard to case.
+pub(crate) fn shadow_suffix<'a>(
+    owner: &'a TableMetadata<CreateTable>,
+    suffix: &str,
+) -> Option<&'a str> {
+    owner
         .shadow_suffixes()
         .iter()
-        .copied()
+        .map(String::as_str)
         .find(|known| known.eq_ignore_ascii_case(suffix))
 }
 
-/// Gives `create_table` the columns its module declares and returns the
-/// names of those the module hides.
+/// What a virtual table's module declares beyond its columns.
+#[derive(Default)]
+pub(super) struct ModuleDeclaration {
+    /// The names of the columns the module hides from `SELECT *`.
+    pub(super) hidden_column_names: Vec<String>,
+    /// The suffixes of the shadow tables the module keeps.
+    pub(super) shadow_suffixes: Vec<String>,
+}
+
+/// Gives `create_table` the columns its module declares, derived from the
+/// arguments for a module whose grammar `ParserDB` reads and taken from
+/// `declared` for any other, and returns what else the module declares.
 ///
 /// # Errors
 ///
 /// Returns [`Error::UnknownVirtualTableModule`] for a module whose grammar
-/// `ParserDB` does not read, [`Error::VirtualTableArgumentsRefused`] for
-/// arguments the module refuses, [`Error::ColumnAlreadyExists`] for an
-/// `rtree` column repeating another, and
+/// `ParserDB` does not read and no `declared` columns,
+/// [`Error::VirtualTableArgumentsRefused`] for arguments the module refuses,
+/// [`Error::ColumnAlreadyExists`] for a column repeating another,
 /// [`Error::VirtualTableContentColumnsUnknown`] for an `fts4` table taking
-/// its columns from a view whose columns are not known.
+/// its columns from a view whose columns are not known,
+/// [`Error::VirtualTableShadowSuffixRefused`] and
+/// [`Error::VirtualTableColumnsMismatch`] for `declared` columns or shadow
+/// suffixes the module cannot declare, and [`Error::SqlParserError`] for a
+/// declared type the dialect does not read.
 pub(super) fn declare_columns(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
     source: &VirtualTableSource,
+    declared: Option<DeclaredVirtualTable>,
+) -> Result<ModuleDeclaration, Error> {
+    let module = Module::named(source.module_name());
+    let Some(declared) = declared else {
+        let Some(module) = module else {
+            return Err(Error::UnknownVirtualTableModule {
+                table_name: create_table.table_name().to_string(),
+                module_name: source.module_name().to_string(),
+            });
+        };
+        return Ok(ModuleDeclaration {
+            hidden_column_names: derive_columns(builder, create_table, source, module)?,
+            shadow_suffixes: module.kept_suffixes(),
+        });
+    };
+    let (declared_columns, shadow_suffixes) = declared.into_parts();
+    let refused_suffix = shadow_suffixes.iter().find(|suffix| {
+        let readable = !suffix.is_empty() && !suffix.contains('_');
+        let kept = module.is_none_or(|module| {
+            module.shadow_suffixes().iter().any(|known| known.eq_ignore_ascii_case(suffix))
+        });
+        !(readable && kept)
+    });
+    if let Some(suffix) = refused_suffix {
+        return Err(Error::VirtualTableShadowSuffixRefused {
+            table_name: create_table.table_name().to_string(),
+            module_name: source.module_name().to_string(),
+            suffix: suffix.clone(),
+        });
+    }
+    let columns = typed_columns(builder.dialect().sqlparser_dialect(), declared_columns)?;
+    let Some(module) = module else {
+        let hidden_column_names = columns
+            .iter()
+            .filter(|(_, hidden)| *hidden)
+            .map(|(column, _)| column.name.value.clone())
+            .collect();
+        create_table.columns = columns.into_iter().map(|(column, _)| column).collect();
+        validate_distinct_columns(create_table, builder.identifier_case())?;
+        return Ok(ModuleDeclaration { hidden_column_names, shadow_suffixes });
+    };
+    let hidden_column_names = derive_columns(builder, create_table, source, module)?;
+    let differing = (0..columns.len().max(create_table.columns.len())).find_map(|position| {
+        let supplied = columns.get(position).map(|(column, hidden)| (column, *hidden));
+        let derived = create_table
+            .columns
+            .get(position)
+            .map(|column| (column, hidden_column_names.contains(&column.name.value)));
+        let same = supplied.zip(derived).is_some_and(
+            |((supplied, supplied_hidden), (derived, derived_hidden))| {
+                supplied.name.value == derived.name.value
+                    && supplied.data_type == derived.data_type
+                    && supplied_hidden == derived_hidden
+            },
+        );
+        if same { None } else { supplied.or(derived).map(|(column, _)| column.name.value.clone()) }
+    });
+    if let Some(column_name) = differing {
+        return Err(Error::VirtualTableColumnsMismatch {
+            table_name: create_table.table_name().to_string(),
+            module_name: source.module_name().to_string(),
+            column_name,
+        });
+    }
+    Ok(ModuleDeclaration { hidden_column_names, shadow_suffixes: module.kept_suffixes() })
+}
+
+/// Gives `create_table` the columns `module` declares for the arguments of
+/// `source` and returns the names of those it hides.
+fn derive_columns(
+    builder: &ParserDBBuilder,
+    create_table: &mut CreateTable,
+    source: &VirtualTableSource,
+    module: Module,
 ) -> Result<Vec<String>, Error> {
     let table_name = create_table.table_name().to_string();
     let refuse = |refusal| {
@@ -94,11 +196,11 @@ pub(super) fn declare_columns(
         }
     };
     let arguments = source.arguments();
-    let declared = match Module::named(source.module_name()) {
-        Some(Module::Fts3) => fts3(builder, create_table, arguments, false)?.map_err(refuse)?,
-        Some(Module::Fts4) => fts3(builder, create_table, arguments, true)?.map_err(refuse)?,
-        Some(Module::Fts5) => fts5(&table_name, arguments).map_err(refuse)?,
-        Some(module @ (Module::Rtree | Module::RtreeI32)) => {
+    let declared = match module {
+        Module::Fts3 => fts3(builder, create_table, arguments, false)?.map_err(refuse)?,
+        Module::Fts4 => fts3(builder, create_table, arguments, true)?.map_err(refuse)?,
+        Module::Fts5 => fts5(&table_name, arguments).map_err(refuse)?,
+        Module::Rtree | Module::RtreeI32 => {
             let coordinate = if matches!(module, Module::RtreeI32) {
                 DataType::Int(None)
             } else {
@@ -111,12 +213,6 @@ pub(super) fn declare_columns(
             rtree_dimensions(arguments).map_err(refuse)?;
             return Ok(Vec::new());
         }
-        None => {
-            return Err(Error::UnknownVirtualTableModule {
-                table_name,
-                module_name: source.module_name().to_string(),
-            });
-        }
     };
     create_table.columns = declared
         .columns
@@ -125,6 +221,31 @@ pub(super) fn declare_columns(
         .map(|name| column(name, DataType::Unspecified))
         .collect();
     Ok(declared.hidden)
+}
+
+/// Each of `columns` as a column definition, its declared type read with
+/// `dialect` and an empty one leaving it untyped, beside whether it is
+/// hidden.
+fn typed_columns(
+    dialect: &dyn Dialect,
+    columns: Vec<DeclaredColumn>,
+) -> Result<Vec<(ColumnDef, bool)>, Error> {
+    columns
+        .into_iter()
+        .map(|declared| {
+            let (name, declared_type, hidden) = declared.into_parts();
+            let declared_type = declared_type.trim();
+            let data_type = if declared_type.is_empty() {
+                DataType::Unspecified
+            } else {
+                let mut parser = Parser::new(dialect).try_with_sql(declared_type)?;
+                let data_type = parser.parse_data_type()?;
+                parser.expect_token(&Token::EOF)?;
+                data_type
+            };
+            Ok((column(name, data_type), hidden))
+        })
+        .collect()
 }
 
 /// The columns a full-text module declares, the hidden ones apart.
@@ -689,9 +810,9 @@ fn sql_name(text: &str) -> Option<String> {
 pub(super) fn shadows_of(
     builder: &ParserDBBuilder,
     owner: &CreateTable,
-) -> Vec<(StoredTable, &'static str)> {
-    let Some(source) =
-        builder.stored_metadata(owner).and_then(|metadata| metadata.virtual_source())
+) -> Vec<(StoredTable, String)> {
+    let Some(owner_metadata) =
+        builder.stored_metadata(owner).filter(|metadata| metadata.virtual_source().is_some())
     else {
         return Vec::new();
     };
@@ -702,7 +823,7 @@ pub(super) fn shadows_of(
         .filter(|(_, metadata, _)| metadata.virtual_source().is_none())
         .filter_map(|(table, _, _)| {
             let (owner_name, suffix) = table.table_name().rsplit_once('_')?;
-            let suffix = shadow_suffix(source.module_name(), suffix)?;
+            let suffix = shadow_suffix(owner_metadata, suffix)?;
             let belongs = case.identifiers_match(
                 owner_name,
                 table.table_name_is_quoted(),
@@ -713,7 +834,7 @@ pub(super) fn shadows_of(
                 table_schema_qualifier(owner),
                 case,
             );
-            belongs.then(|| (StoredTable::of(table), suffix))
+            belongs.then(|| (StoredTable::of(table), suffix.to_string()))
         })
         .collect()
 }
@@ -826,7 +947,7 @@ pub(super) fn rename_table(
 /// hidden column carrying its name, both empty for a table no module keeps.
 struct RenameFollowers {
     table: StoredTable,
-    shadows: Vec<(StoredTable, &'static str)>,
+    shadows: Vec<(StoredTable, String)>,
     named_column: Option<NamedColumn>,
 }
 

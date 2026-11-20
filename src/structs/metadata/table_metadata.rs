@@ -101,6 +101,9 @@ pub struct TableMetadata<T: TableLike> {
     /// The names of the columns a virtual table's module hides from `SELECT
     /// *`, held as names for the same reason as the inherited columns above.
     hidden_column_names: Vec<String>,
+    /// The suffixes of the shadow tables a virtual table's module keeps,
+    /// each spelled as the module spells it.
+    shadow_suffixes: Vec<String>,
     /// The calls of the partition key's expressions, bound when the table was
     /// written.
     partition_key_calls: ExpressionCalls<<T::DB as DatabaseLike>::Function>,
@@ -134,6 +137,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             foreign_source: None,
             virtual_source: None,
             hidden_column_names: Vec::new(),
+            shadow_suffixes: Vec::new(),
             partition_key_calls: ExpressionCalls::default(),
             exclusion_calls: Vec::new(),
         }
@@ -560,6 +564,27 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub fn set_hidden_column_names(&mut self, names: Vec<String>) {
         self.hidden_column_names = names;
+    }
+
+    /// Returns the suffixes of the shadow tables a virtual table's module
+    /// keeps, each spelled as the module spells it, none for any other table.
+    #[inline]
+    #[must_use]
+    pub fn shadow_suffixes(&self) -> &[String] {
+        &self.shadow_suffixes
+    }
+
+    /// Records the suffixes of the shadow tables a virtual table's module
+    /// keeps.
+    #[inline]
+    pub fn set_shadow_suffixes(&mut self, suffixes: Vec<String>) {
+        self.shadow_suffixes = suffixes;
+    }
+
+    /// Moves the shadow suffixes out, for a rebuild that carries them over.
+    #[inline]
+    pub(crate) fn take_shadow_suffixes(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.shadow_suffixes)
     }
 
     /// The calls of the partition key's expressions.
