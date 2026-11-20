@@ -120,6 +120,9 @@ fn describe(definition: Option<&ColumnDefinition<'_, '_, '_, ParserDB>>) -> Stri
         Some(ColumnDefinition::Expression { expression, .. }) => format!("expression {expression}"),
         Some(ColumnDefinition::ArrayElement { array, .. }) => format!("element of {array}"),
         Some(ColumnDefinition::Ordinality) => "ordinality".to_owned(),
+        Some(ColumnDefinition::FunctionResult { function, .. }) => {
+            format!("result of {}", function.name())
+        }
         Some(ColumnDefinition::SetOperation { operator, left, right }) => {
             format!(
                 "{operator}({}, {})",

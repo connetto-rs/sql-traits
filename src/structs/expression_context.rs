@@ -21,9 +21,9 @@ use crate::{
     },
     structs::{
         AggregateKind, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope, Definition,
-        DefinitionSource, ExpressionScope, FunctionKind, IdentifierCase, OperandType,
-        OperatorResolution, PlPgSqlScope, PlPgSqlVariable, QueryOutput, SelectedOperator,
-        TargetName, VariableKind,
+        DefinitionSource, ExpressionScope, FunctionKind, FunctionResultType, IdentifierCase,
+        OperandType, OperatorResolution, PlPgSqlScope, PlPgSqlVariable, QueryOutput,
+        SelectedOperator, TargetName, VariableKind,
         plpgsql_flow::{FlowPoint, Reached, Round, Row, is_record, join},
         plpgsql_scope::stored_parts,
     },
@@ -1074,6 +1074,20 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                 element_type(self.database, self.type_of(array)?)
             }
             ColumnDefinition::Ordinality => catalog("int8"),
+            ColumnDefinition::FunctionResult { data_type, .. } => {
+                match data_type {
+                    FunctionResultType::Signature(name) => declared_type_named(self.database, name),
+                    FunctionResultType::RowType(column) => {
+                        self.definition_type(column.definition())?
+                    }
+                    FunctionResultType::Attribute { data_type, database } => {
+                        column_type(database, data_type)
+                    }
+                    FunctionResultType::DefinitionList(data_type) => {
+                        declared_type(self.database, data_type)
+                    }
+                }
+            }
             ColumnDefinition::Parameter { ordinal, .. } => {
                 self.parameters.get(ordinal).cloned().unwrap_or(OperandType::Unknown)
             }

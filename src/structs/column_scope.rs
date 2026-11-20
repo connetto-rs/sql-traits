@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use sqlparser::ast::{Expr, ObjectName, Query, Select, SetOperator, TableFactor};
+use sqlparser::ast::{DataType, Expr, ObjectName, Query, Select, SetOperator, TableFactor};
 
 use crate::{
     errors::LookupError,
@@ -50,6 +50,15 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
     /// The `bigint` row number `WITH ORDINALITY` adds after the columns of a
     /// function in `FROM`, counting from 1.
     Ordinality,
+    /// A column of the result a function called in `FROM` returns, which
+    /// PostgreSQL builds from the function's declaration or, for a `record`
+    /// result, from the column definition list the call writes.
+    FunctionResult {
+        /// The function the call reaches.
+        function: &'scope DB::Function,
+        /// What declares the column's type.
+        data_type: FunctionResultType<'scope, 'query, 'db, DB>,
+    },
     /// The definitions combined by an ordinary set operation.
     SetOperation {
         /// The operation combining the definitions.
@@ -90,6 +99,29 @@ pub enum ColumnDefinition<'scope, 'query, 'db, DB: DatabaseLike> {
     VariableField(PlPgSqlVariable<'db>),
     /// A relation exposes the name without an inspectable definition.
     Opaque,
+}
+
+/// What declares the type of a column of the result a function called in
+/// `FROM` returns.
+#[derive(Debug)]
+pub enum FunctionResultType<'scope, 'query, 'db, DB: DatabaseLike> {
+    /// A type the function's signature names, as its `RETURNS TABLE` column,
+    /// its output argument or its scalar result declares it. PostgreSQL
+    /// drops the modifier a signature writes, so the name carries none.
+    Signature(&'scope str),
+    /// The type of a column of the relation whose row type the function
+    /// returns, as that column's own definition declares it.
+    RowType(ColumnDefinitionRef<'scope, 'query, 'db, DB>),
+    /// The type of an attribute of the composite type the function returns.
+    Attribute {
+        /// The attribute's declared type.
+        data_type: &'scope DB::DataType,
+        /// The database holding the composite type.
+        database: &'scope DB,
+    },
+    /// A type the column definition list of a call of a function returning
+    /// `record` declares, as `AS t(id INT, label TEXT)` does.
+    DefinitionList(&'scope DataType),
 }
 
 /// One entry of a query's ordered output list.

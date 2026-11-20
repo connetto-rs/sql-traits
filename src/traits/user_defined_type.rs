@@ -4,6 +4,7 @@ use alloc::borrow::Cow;
 use core::fmt::Debug;
 
 use crate::{
+    structs::TargetName,
     traits::{DatabaseLike, Enumeration, EnumerationMember, Metadata},
     utils::identifier_resolution::stored_identifier,
 };
@@ -170,4 +171,44 @@ pub trait UserDefinedTypeLike: Clone + Debug + Metadata + Send + Sync {
     /// # }
     /// ```
     fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>>;
+
+    /// Returns the name and declared type of each attribute of a composite
+    /// type, in declaration order, or `None` for every other kind.
+    ///
+    /// A function returning the type outputs one column per attribute when
+    /// called in `FROM`, as `pg_attribute` lists them for the type's
+    /// `typrelid`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TYPE pair AS (left_side INT, \"Right\" VARCHAR(3));
+    ///      CREATE TYPE mood AS ENUM ('sad');",
+    /// )?;
+    /// let type_named = |name: &str| db.user_defined_types().find(|type_| type_.name() == name);
+    /// let attributes: Vec<_> = type_named("pair")
+    ///     .unwrap()
+    ///     .attributes()
+    ///     .unwrap()
+    ///     .map(|(name, data_type)| (name, data_type.name(&db), data_type.max_character_length(&db)))
+    ///     .collect();
+    /// assert_eq!(
+    ///     attributes,
+    ///     [
+    ///         (TargetName::new("left_side", false), "INT".into(), None),
+    ///         (TargetName::new("Right", true), "VARCHAR".into(), Some(3))
+    ///     ]
+    /// );
+    /// assert!(type_named("mood").unwrap().attributes().is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn attributes(
+        &self,
+    ) -> Option<impl Iterator<Item = (TargetName<'_>, &<Self::DB as DatabaseLike>::DataType)>>;
 }

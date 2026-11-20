@@ -2,10 +2,10 @@
 //! `UserDefinedType` node, and the resolver that reads a bound type name
 //! back to the type it reached.
 
-use sqlparser::ast::CreateFunction;
+use sqlparser::ast::{CreateFunction, DataType};
 
 use crate::{
-    structs::{IdentifierCase, ParserDB, UserDefinedType},
+    structs::{IdentifierCase, ParserDB, TargetName, UserDefinedType},
     traits::{
         Enumeration, EnumerationKind, EnumerationMember, Metadata, UserDefinedTypeKind,
         UserDefinedTypeLike,
@@ -77,6 +77,14 @@ impl UserDefinedTypeLike for UserDefinedType {
             None,
             labels.iter().map(|label| EnumerationMember::new(&label.value, None)),
         ))
+    }
+
+    #[inline]
+    fn attributes(&self) -> Option<impl Iterator<Item = (TargetName<'_>, &DataType)>> {
+        Some(self.composite_attributes()?.iter().map(|attribute| {
+            let name = TargetName::new(&attribute.name.value, attribute.name.quote_style.is_some());
+            (name, &attribute.data_type)
+        }))
     }
 }
 

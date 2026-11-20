@@ -60,6 +60,9 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
         ColumnDefinition::Values { .. } => "values".to_owned(),
         ColumnDefinition::Parameter { ordinal, .. } => format!("parameter {ordinal}"),
         ColumnDefinition::Variable(variable) => format!("variable {}", variable.name()),
+        ColumnDefinition::FunctionResult { function, .. } => {
+            format!("result of {}", function.name())
+        }
         ColumnDefinition::VariableField(variable) => format!("field of {}", variable.name()),
         ColumnDefinition::Opaque => "opaque".to_owned(),
     }

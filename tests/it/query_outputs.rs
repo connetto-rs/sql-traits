@@ -38,6 +38,9 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
         }
         ColumnDefinition::ArrayElement { array, .. } => format!("element of {array}"),
         ColumnDefinition::Ordinality => "ordinality".to_owned(),
+        ColumnDefinition::FunctionResult { function, .. } => {
+            format!("result of {}", function.name())
+        }
         ColumnDefinition::Expression { expression, .. } => format!("expression {expression}"),
         ColumnDefinition::SetOperation { operator, left, right } => {
             format!(
