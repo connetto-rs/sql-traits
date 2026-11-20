@@ -111,13 +111,10 @@ impl TriggerLike for CreateTrigger {
             return Ok(None);
         }
         // A copy lives on a partition, which is a table or a foreign table.
-        let partition = resolve_bound_table_or_foreign_table(&self.table_name, database)?
-            .ok_or_else(|| {
-                LookupError::RelationNotFound { object_name: self.table_name.to_string() }
-            })?;
-        Ok(partition
-            .partition_root(database)?
-            .and_then(|parent_table| database.trigger(self.name(), parent_table)))
+        let partition = resolve_bound_table_or_foreign_table(&self.table_name, database)?;
+        let parent_table =
+            partition.map(|partition| partition.partition_root(database)).transpose()?.flatten();
+        Ok(parent_table.and_then(|parent_table| database.trigger(self.name(), parent_table)))
     }
 
     fn enablement(&self, database: &Self::DB) -> Result<TriggerEnablement, LookupError> {

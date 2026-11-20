@@ -443,8 +443,8 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// # Errors
     ///
     /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
-    /// hold this trigger, and the errors of [`Self::relation`] when the table
-    /// holding a copy cannot be found.
+    /// hold this trigger, and a [`LookupError`] when the partition holding a
+    /// copy, or the table above it, cannot be looked up.
     ///
     /// # Example
     ///
