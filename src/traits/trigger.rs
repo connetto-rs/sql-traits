@@ -4,8 +4,8 @@ use core::fmt::Debug;
 
 use crate::{
     errors::LookupError,
-    impls::maintenance_assignments,
-    structs::{MaintenanceRefusal, TargetName, TriggerEnablement},
+    impls::maintenance_body,
+    structs::{MaintenanceRefusal, TargetName, TriggerEnablement, UndeclaredRowField},
     traits::{DatabaseLike, Metadata, Relation},
 };
 
@@ -608,9 +608,12 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
 
     /// Returns whether the trigger is a maintenance trigger.
     ///
-    /// A maintenance trigger's PL/pgSQL body solely assigns columns of `NEW`,
+    /// A maintenance trigger's PL/pgSQL body solely assigns fields of `NEW`,
     /// alone or under `IF`, `ELSIF` and `ELSE`, and concludes by returning
     /// `NEW`. Any other statement, an early `RETURN` included, makes it none.
+    /// A field the table does not declare keeps the body a maintenance body,
+    /// since PostgreSQL loads it and fails only the run reaching it, and
+    /// [`TriggerLike::maintenance_undeclared_fields`] lists it.
     ///
     /// # Example
     ///
@@ -674,7 +677,7 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         &'db self,
         database: &'db Self::DB,
     ) -> Result<bool, LookupError> {
-        Ok(maintenance_assignments(self, database)?.is_ok())
+        Ok(maintenance_body(self, database)?.is_ok())
     }
 
     /// Returns what makes the trigger no maintenance trigger, as
@@ -716,7 +719,7 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         &'db self,
         database: &'db Self::DB,
     ) -> Result<Option<MaintenanceRefusal>, LookupError> {
-        Ok(maintenance_assignments(self, database)?.err())
+        Ok(maintenance_body(self, database)?.err())
     }
 
     /// Returns the assignments in a maintenance trigger, as
@@ -730,6 +733,11 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// assigned it reads the assigned expression, so every expression reads
     /// `NEW` as the row was before the trigger ran. The body of a trigger
     /// that is no maintenance trigger yields nothing.
+    ///
+    /// An assignment to a field the table does not declare is none of them,
+    /// and an expression keeps a read of such a field as written. The runs
+    /// these assignments describe are those reaching no naming of such a
+    /// field, which [`TriggerLike::maintenance_undeclared_fields`] lists.
     ///
     /// # Example
     ///
@@ -809,7 +817,66 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         impl Iterator<Item = (&'db <Self::DB as DatabaseLike>::Column, sqlparser::ast::Expr)>,
         LookupError,
     > {
-        Ok(maintenance_assignments(self, database)?.unwrap_or_default().into_iter())
+        Ok(maintenance_body(self, database)?
+            .map(|body| body.assignments)
+            .unwrap_or_default()
+            .into_iter())
+    }
+
+    /// Returns each field of `NEW` or `OLD` that the body of a maintenance
+    /// trigger, as [`TriggerLike::is_maintenance_trigger`] describes one,
+    /// assigns or reads and the trigger's table does not declare, every
+    /// naming in the order PostgreSQL raises for them, which is statement by
+    /// statement as written, an assignment's target before its value, and
+    /// the fields of one expression from left to right.
+    ///
+    /// PostgreSQL loads such a body and fails each run reaching the
+    /// statement, or the `IF` or `ELSIF` condition, that names one of them,
+    /// with the error [`UndeclaredRowField`] describes, so a body reaching
+    /// none of them runs as [`TriggerLike::maintenance_assignments`] says.
+    /// The body of a trigger that is no maintenance trigger yields nothing.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// // `v` was renamed to `vv` after the function was created
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (id INT, vv INT, w INT);
+    ///      CREATE FUNCTION stamp() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    ///      BEGIN
+    ///        NEW.w := NEW.id;
+    ///        IF NEW.id > 5 THEN NEW.v := NEW.w; END IF;
+    ///        RETURN NEW;
+    ///      END $$;
+    ///      CREATE TRIGGER stamp BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION stamp();",
+    /// )?;
+    /// let trigger = db.triggers().next().unwrap();
+    /// let assignments: Vec<_> = trigger.maintenance_assignments(&db)?.collect();
+    /// assert_eq!(assignments.len(), 1);
+    /// assert_eq!(assignments[0].0.column_name(), "w");
+    /// let undeclared: Vec<_> =
+    ///     trigger.maintenance_undeclared_fields(&db)?.map(|field| field.to_string()).collect();
+    /// assert_eq!(undeclared, [r#"record "new" has no field "v""#]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`TriggerLike::is_maintenance_trigger`] returns.
+    #[inline]
+    fn maintenance_undeclared_fields<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = UndeclaredRowField>, LookupError> {
+        Ok(maintenance_body(self, database)?
+            .map(|body| body.undeclared)
+            .unwrap_or_default()
+            .into_iter())
     }
 }
 
@@ -905,6 +972,13 @@ impl<T: TriggerLike> TriggerLike for &T {
     > {
         (*self).maintenance_assignments(database)
     }
+
+    fn maintenance_undeclared_fields<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = UndeclaredRowField>, LookupError> {
+        (*self).maintenance_undeclared_fields(database)
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +998,7 @@ mod tests {
             CREATE FUNCTION update_timestamp() RETURNS TRIGGER AS $$
             BEGIN
                 NEW.updated_at = CURRENT_TIMESTAMP;
+                NEW.edited_by = OLD.id;
                 RETURN NEW;
             END;
             $$ LANGUAGE plpgsql;
@@ -979,6 +1054,13 @@ mod tests {
         let (col, expr) = &assignments[0];
         assert_eq!(col.column_name(), "updated_at");
         assert_eq!(expr.to_string(), "CURRENT_TIMESTAMP");
+
+        let undeclared = trigger_ref
+            .maintenance_undeclared_fields(&db)
+            .expect("undeclared fields")
+            .map(|field| field.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(undeclared, [r#"record "new" has no field "edited_by""#]);
     }
 
     #[test]

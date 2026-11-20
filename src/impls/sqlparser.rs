@@ -53,7 +53,7 @@ pub(crate) use grant::{
     split_by_column_scope, validate_granted_columns,
 };
 pub(crate) use helper_set::helper_set;
-pub(crate) use maintenance_body::maintenance_assignments;
+pub(crate) use maintenance_body::maintenance_body;
 pub(crate) use user_defined_type::{
     bound_user_type, user_type_holds, user_type_in_schema, user_type_named,
 };

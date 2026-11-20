@@ -1,12 +1,13 @@
 //! The `NEW` columns a trigger's PL/pgSQL body assigns before returning `NEW`,
-//! each with the one expression it holds when the body returns.
+//! each with the one expression it holds when the body returns, and the fields
+//! of `NEW` and `OLD` it names that the trigger's table does not declare.
 
 use alloc::{string::ToString, vec::Vec};
-use core::ops::ControlFlow;
+use core::{borrow::Borrow, ops::ControlFlow};
 
-use sqlparser::ast::{Expr, Ident};
+use sqlparser::ast::{Expr, Ident, ObjectNamePart, Query};
 use sqlparser_plpgsql::{
-    embedded::Node,
+    embedded::{Branch, Node, NodeKind},
     embedded_sql,
     namespace::{NameKind, Namespace, TriggerVariable},
     new_row::{FieldValue, NotFolded},
@@ -15,7 +16,7 @@ use sqlparser_plpgsql::{
 use super::dynamic_sites::BodyNames;
 use crate::{
     errors::LookupError,
-    structs::{BodyExcerpt, IdentifierCase, MaintenanceRefusal},
+    structs::{BodyExcerpt, IdentifierCase, MaintenanceRefusal, TriggerRow, UndeclaredRowField},
     traits::{ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike, TriggerLike},
     utils::{
         identifier_resolution::{name_parts, stored_identifier},
@@ -23,11 +24,18 @@ use crate::{
     },
 };
 
-/// The columns a maintenance body assigns, each with the expression it holds
-/// when the body returns, in the order the body first assigns them.
-pub(crate) type MaintenanceAssignments<'db, DB> = Vec<(&'db <DB as DatabaseLike>::Column, Expr)>;
+/// What a maintenance body leaves in the row it returns, and the fields of the
+/// rows it names that the trigger's table does not declare.
+pub(crate) struct MaintenanceBody<'db, DB: DatabaseLike> {
+    /// The columns the body assigns, each with the expression it holds when
+    /// the body returns, in the order the body first assigns them.
+    pub(crate) assignments: Vec<(&'db DB::Column, Expr)>,
+    /// Each naming of a field of `NEW` or `OLD` the table does not declare,
+    /// in body order.
+    pub(crate) undeclared: Vec<UndeclaredRowField>,
+}
 
-/// The assignments of the PL/pgSQL body `trigger` runs, or what makes it no
+/// The maintenance body `trigger` runs, or what makes its body no
 /// maintenance body.
 ///
 /// # Errors
@@ -35,10 +43,10 @@ pub(crate) type MaintenanceAssignments<'db, DB> = Vec<(&'db <DB as DatabaseLike>
 /// Returns the [`LookupError`] that resolving the relation of `trigger`, or
 /// reading its function's `search_path` setting or the columns of the table
 /// from `database`, raises.
-pub(crate) fn maintenance_assignments<'db, T: TriggerLike>(
+pub(crate) fn maintenance_body<'db, T: TriggerLike>(
     trigger: &'db T,
     database: &'db T::DB,
-) -> Result<Result<MaintenanceAssignments<'db, T::DB>, MaintenanceRefusal>, LookupError> {
+) -> Result<Result<MaintenanceBody<'db, T::DB>, MaintenanceRefusal>, LookupError> {
     let Some((function, body)) =
         trigger.function(database).and_then(|function| Some((function, function.body()?)))
     else {
@@ -50,28 +58,28 @@ pub(crate) fn maintenance_assignments<'db, T: TriggerLike>(
             return Ok(Err(MaintenanceRefusal::OnView));
         }
     };
-    body_assignments(function, body, table, database)
+    read_body(function, body, table, database)
 }
 
-/// The assignments of `body`, the PL/pgSQL body of `function` run by a
+/// The maintenance body `body` is, the PL/pgSQL body of `function` run by a
 /// trigger on `table`, or what makes it no maintenance body.
 ///
 /// A maintenance body is one whose fields of `NEW`
 /// [`Block::fields_of_new`](sqlparser_plpgsql::embedded::Block::fields_of_new)
-/// folds, each field a column of `table`. Every expression reads `NEW` as it
-/// was before the body ran, and reading a field of `NEW` the table does not
-/// declare refuses the body.
+/// folds. Every expression reads `NEW` as it was before the body ran. A field
+/// the table does not declare is no assignment, and PostgreSQL fails each run
+/// reaching a statement that names one, so each naming is listed instead.
 ///
 /// # Errors
 ///
 /// Returns the [`LookupError`] that reading the function's own `search_path`
 /// setting or the columns of `table` from `database` raises.
-fn body_assignments<'db, DB: DatabaseLike>(
+fn read_body<'db, DB: DatabaseLike>(
     function: &'db DB::Function,
     body: &str,
     table: &'db DB::Table,
     database: &'db DB,
-) -> Result<Result<MaintenanceAssignments<'db, DB>, MaintenanceRefusal>, LookupError> {
+) -> Result<Result<MaintenanceBody<'db, DB>, MaintenanceRefusal>, LookupError> {
     let block = match embedded_sql(body) {
         Ok(block) => block,
         Err(error) => {
@@ -93,18 +101,13 @@ fn body_assignments<'db, DB: DatabaseLike>(
         .map(|site| site.namespace);
     let columns: Vec<&'db DB::Column> = table.columns(database)?.collect();
     let reader = Reader { columns, names: &names, namespace, case: database.identifier_case() };
-    Ok(fields
+    let assignments = fields
         .into_iter()
-        .map(|FieldValue { field, value }| {
-            let Some(column) = reader.column(&field) else {
-                return Err(MaintenanceRefusal::UndeclaredColumn { field });
-            };
-            match reader.undeclared_read(&value) {
-                Some(field) => Err(MaintenanceRefusal::UndeclaredColumn { field }),
-                None => Ok((column, value)),
-            }
-        })
-        .collect())
+        .filter_map(|FieldValue { field, value }| Some((reader.column(&field)?, value)))
+        .collect();
+    let mut undeclared = Vec::new();
+    reader.undeclared_in(&block.statements, &mut undeclared);
+    Ok(Ok(MaintenanceBody { assignments, undeclared }))
 }
 
 /// The refusal `refused` names, its statements quoted from `body`.
@@ -151,33 +154,76 @@ impl<'db, DB: DatabaseLike> Reader<'_, 'db, DB> {
         })
     }
 
-    /// The first field of `NEW` that `value` reads and the table does not
-    /// declare.
-    fn undeclared_read(&self, value: &Expr) -> Option<Ident> {
-        walk_expressions(value, |read| {
-            match name_parts(read).and_then(|parts| self.after_new(parts)) {
-                Some([field, ..]) if self.column(field).is_none() => {
-                    ControlFlow::Break(field.clone())
+    /// Pushes onto `found` each field the table does not declare that
+    /// `statements`, those of a folded body, name, in the order PostgreSQL
+    /// raises for them, an assignment's target before its value and an
+    /// `IF`'s conditions and branches as written.
+    fn undeclared_in(&self, statements: &[Node], found: &mut Vec<UndeclaredRowField>) {
+        for statement in statements {
+            match &statement.kind {
+                NodeKind::Assignment(assignment) => {
+                    let target: Option<Vec<&Ident>> =
+                        assignment.target.name.0.iter().map(ObjectNamePart::as_ident).collect();
+                    found.extend(target.and_then(|parts| self.undeclared(&parts, true)));
+                    self.undeclared_reads(&assignment.value, found);
                 }
-                _ => ControlFlow::Continue(()),
+                NodeKind::If(conditional) => {
+                    for Branch { condition, statements } in &conditional.branches {
+                        self.undeclared_reads(condition, found);
+                        self.undeclared_in(statements, found);
+                    }
+                    self.undeclared_in(&conditional.otherwise, found);
+                }
+                _ => {}
             }
-        })
-        .break_value()
+        }
     }
 
-    /// The parts of the name `parts` writes after those that reach `NEW`, or
-    /// [`None`] when it does not start with `NEW`.
-    fn after_new<'parts>(&self, parts: &'parts [Ident]) -> Option<&'parts [Ident]> {
+    /// Pushes onto `found` each field the table does not declare that
+    /// `query`, an expression of the body, reads, leftmost first.
+    fn undeclared_reads(&self, query: &Query, found: &mut Vec<UndeclaredRowField>) {
+        let _: ControlFlow<()> = walk_expressions(query, |read| {
+            found.extend(name_parts(read).and_then(|parts| self.undeclared(parts, false)));
+            ControlFlow::Continue(())
+        });
+    }
+
+    /// The field of `NEW` or `OLD` the name `parts` writes, when the table
+    /// does not declare it, which the body assigns when `assigned`.
+    fn undeclared<P: Borrow<Ident>>(
+        &self,
+        parts: &[P],
+        assigned: bool,
+    ) -> Option<UndeclaredRowField> {
+        let (row, field) = self.row_field(parts)?;
+        self.column(field).is_none().then(|| UndeclaredRowField::new(row, field.clone(), assigned))
+    }
+
+    /// The row and the field of it the name `parts` writes, or [`None`] when
+    /// it names no field of `NEW` or `OLD`.
+    ///
+    /// PL/pgSQL reads a field only from a name that ends one part after the
+    /// row, and reads `NEW.a.x` as column `x` of a relation `a`.
+    fn row_field<'parts, P: Borrow<Ident>>(
+        &self,
+        parts: &'parts [P],
+    ) -> Option<(TriggerRow, &'parts Ident)> {
         let stored: Vec<_> = parts
             .iter()
-            .map(|part| stored_identifier(&part.value, part.quote_style.is_some()))
+            .map(|part| {
+                stored_identifier(&part.borrow().value, part.borrow().quote_style.is_some())
+            })
             .collect();
         let (name, consumed) =
             self.namespace.as_ref()?.lookup(&stored, |name| self.names.holds_row(name))?;
-        if matches!(name.kind(), NameKind::Trigger(TriggerVariable::New)) {
-            parts.get(consumed..)
-        } else {
-            None
+        let row = match name.kind() {
+            NameKind::Trigger(TriggerVariable::New) => TriggerRow::New,
+            NameKind::Trigger(TriggerVariable::Old) => TriggerRow::Old,
+            _ => return None,
+        };
+        match parts.get(consumed..)? {
+            [field] => Some((row, field.borrow())),
+            _ => None,
         }
     }
 }
