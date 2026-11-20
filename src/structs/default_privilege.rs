@@ -39,6 +39,19 @@ pub enum DefaultGrantee<'a> {
     Role(Cow<'a, str>),
 }
 
+impl DefaultGrantee<'_> {
+    /// Returns the grantee with its name copied, so it outlives the database
+    /// it was read from.
+    #[must_use]
+    pub fn into_owned(self) -> DefaultGrantee<'static> {
+        match self {
+            Self::Public => DefaultGrantee::Public,
+            Self::Owner => DefaultGrantee::Owner,
+            Self::Role(name) => DefaultGrantee::Role(Cow::Owned(name.into_owned())),
+        }
+    }
+}
+
 /// The privileges one grantee holds on each new object a default reaches.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DefaultGrant<'a> {
@@ -76,6 +89,17 @@ impl<'a> DefaultGrant<'a> {
     #[must_use]
     pub fn grantable(&self) -> &[Action] {
         &self.grantable
+    }
+
+    /// Returns the grant with the grantee's name copied, so it outlives the
+    /// database it was read from.
+    #[must_use]
+    pub fn into_owned(self) -> DefaultGrant<'static> {
+        DefaultGrant {
+            grantee: self.grantee.into_owned(),
+            privileges: self.privileges,
+            grantable: self.grantable,
+        }
     }
 }
 
@@ -163,5 +187,42 @@ impl<'a> DefaultPrivilege<'a> {
     #[must_use]
     pub fn grant_to(&self, grantee: &DefaultGrantee<'_>) -> Option<&DefaultGrant<'a>> {
         self.grants.iter().find(|grant| grant.grantee == *grantee)
+    }
+
+    /// Returns the default with every name it borrows copied, so it outlives
+    /// the database it was read from.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let owned: Vec<DefaultPrivilege<'static>> = {
+    ///     let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///         "
+    /// CREATE ROLE migrator; CREATE ROLE reader;
+    /// ALTER DEFAULT PRIVILEGES FOR ROLE migrator GRANT SELECT ON TABLES TO reader, PUBLIC;
+    /// ",
+    ///     )?;
+    ///     db.default_privileges().unwrap().map(DefaultPrivilege::into_owned).collect()
+    /// };
+    /// let [entry] = owned.as_slice() else { unreachable!() };
+    /// assert_eq!(entry.role(), Some("migrator"));
+    /// assert!(entry.grant_to(&DefaultGrantee::Role("reader".into())).is_some());
+    /// assert!(entry.grant_to(&DefaultGrantee::Public).is_some());
+    /// assert!(entry.grant_to(&DefaultGrantee::Owner).is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn into_owned(self) -> DefaultPrivilege<'static> {
+        DefaultPrivilege {
+            role: self.role.map(|role| Cow::Owned(role.into_owned())),
+            kind: self.kind,
+            schema: self.schema.map(|schema| Cow::Owned(schema.into_owned())),
+            grants: self.grants.into_iter().map(DefaultGrant::into_owned).collect(),
+        }
     }
 }
